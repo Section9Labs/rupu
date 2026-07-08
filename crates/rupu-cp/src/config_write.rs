@@ -1,5 +1,10 @@
 //! Config write-path safety: validate against the typed schema, then persist
 //! atomically with a backup. Used by the `api/config` write endpoints.
+//!
+//! [`write_atomic_raw`] is the same backup+atomic mechanism minus the
+//! TOML-schema gate, for callers editing a non-TOML file under a different
+//! validator (currently `api::autoflows`'s enable/disable endpoint, which
+//! validates workflow YAML via `rupu_orchestrator::Workflow::parse`).
 
 use std::path::Path;
 
@@ -53,6 +58,54 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<(), ConfigWriteError>
     }
     // Temp write + rename.
     let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, contents).map_err(|e| ConfigWriteError::Io(e.to_string()))?;
+    std::fs::rename(&tmp, path).map_err(|e| ConfigWriteError::Io(e.to_string()))?;
+
+    let _ = fs2::FileExt::unlock(&lock_file);
+    Ok(())
+}
+
+/// Backup + atomic write for files `write_atomic`'s `validate_toml` gate does
+/// not apply to (e.g. workflow YAML) — same backup/lock/rename mechanics,
+/// minus the TOML-schema check. Callers own validating `contents` first (see
+/// `api::autoflows`'s enable/disable endpoint, which validates via
+/// `rupu_orchestrator::Workflow::parse`).
+///
+/// Backup/lock/temp siblings are named by *appending* `.bak` / `.lock` /
+/// `.tmp` to the full file name (`nightly.yaml` -> `nightly.yaml.bak`),
+/// unlike `write_atomic`'s TOML-specific `path.with_extension("toml.bak")`
+/// scheme, which would rename-away a non-`.toml` extension.
+pub fn write_atomic_raw(path: &Path, contents: &str) -> Result<(), ConfigWriteError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| ConfigWriteError::Io("path has no parent".into()))?;
+    std::fs::create_dir_all(parent).map_err(|e| ConfigWriteError::Io(e.to_string()))?;
+
+    let append = |suffix: &str| {
+        let mut s = path.as_os_str().to_os_string();
+        s.push(".");
+        s.push(suffix);
+        std::path::PathBuf::from(s)
+    };
+
+    // Advisory lock (best-effort serialization), mirroring `write_atomic`.
+    let lock_path = append("lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&lock_path)
+        .map_err(|e| ConfigWriteError::Io(e.to_string()))?;
+    fs2::FileExt::lock_exclusive(&lock_file)
+        .map_err(|e| ConfigWriteError::Locked(e.to_string()))?;
+
+    // Backup existing.
+    if path.exists() {
+        let bak = append("bak");
+        std::fs::copy(path, &bak).map_err(|e| ConfigWriteError::Io(e.to_string()))?;
+    }
+    // Temp write + rename.
+    let tmp = append("tmp");
     std::fs::write(&tmp, contents).map_err(|e| ConfigWriteError::Io(e.to_string()))?;
     std::fs::rename(&tmp, path).map_err(|e| ConfigWriteError::Io(e.to_string()))?;
 

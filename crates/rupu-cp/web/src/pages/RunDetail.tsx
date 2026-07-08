@@ -14,7 +14,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { Archive, ArrowLeft, FileText, ListOrdered, Pause, ShieldAlert, Trash2 } from 'lucide-react';
+import { Archive, ArrowLeft, FileText, GitBranch, ListOrdered, Pause, ShieldAlert, Trash2 } from 'lucide-react';
 import {
   api,
   ApiError,
@@ -38,6 +38,7 @@ import TranscriptPanel from '../components/TranscriptPanel';
 import StepTranscriptBrowser from '../components/run/StepTranscriptBrowser';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
 import AutoflowPanel from '../components/AutoflowPanel';
+import CyclesTab from '../components/run/CyclesTab';
 import { buildRunGraphModel, type GraphNode, type RunGraphModel } from '../lib/runGraphModel';
 import { layoutGraph, type Pos } from '../lib/graphLayout';
 import { absoluteTime } from '../lib/time';
@@ -45,7 +46,7 @@ import { formatTokens, formatCost } from '../lib/usage';
 
 const MAX_EVENTS = 2000;
 
-type Tab = 'transcript' | 'events' | 'findings';
+type Tab = 'transcript' | 'events' | 'findings' | 'cycles';
 
 /**
  * A single selection cursor that the whole tab panel follows. `unitIndex` is an
@@ -269,6 +270,13 @@ export default function RunDetail() {
       cancelled = true;
     };
   }, [id]);
+
+  // The Cycles tab only exists for autoflow runs — if the id changes (e.g. a
+  // graph-node link) and the new run has no autoflow trail, fall back off a
+  // tab whose button no longer renders instead of leaving it stranded.
+  useEffect(() => {
+    if (tab === 'cycles' && !autoflowCtx) setTab('transcript');
+  }, [tab, autoflowCtx]);
 
   // Lazy-load this run's findings the first time the Findings tab is opened.
   // Keyed on (id, tab); the ref guard ensures a single fetch per run id.
@@ -912,6 +920,9 @@ export default function RunDetail() {
           <TabButton active={tab === 'transcript'} onClick={() => setTab('transcript')} icon={FileText} label="Transcript" />
           <TabButton active={tab === 'events'} onClick={() => setTab('events')} icon={ListOrdered} label="Events" />
           <TabButton active={tab === 'findings'} onClick={() => setTab('findings')} icon={ShieldAlert} label={findingsCount > 0 ? `Findings (${findingsCount})` : 'Findings'} />
+          {autoflowCtx && (
+            <TabButton active={tab === 'cycles'} onClick={() => setTab('cycles')} icon={GitBranch} label="Cycles" />
+          )}
         </TabBar>
       </div>
 
@@ -977,6 +988,16 @@ export default function RunDetail() {
                 </ListCard>
               </div>
             )}
+          </div>
+        )}
+        {tab === 'cycles' && autoflowCtx && (
+          <div className="h-full min-h-0 overflow-auto">
+            <CyclesTab
+              context={autoflowCtx}
+              currentRunId={run.id}
+              currentRunStartedAt={run.started_at}
+              host={host}
+            />
           </div>
         )}
       </div>

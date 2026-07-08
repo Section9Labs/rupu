@@ -7,7 +7,7 @@
 import { lazy, Suspense, useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, Trash2 } from 'lucide-react';
-import { api, type AgentSummary, type WorkflowDetail } from '../lib/api';
+import { api, ApiError, type AgentSummary, type WorkflowDetail } from '../lib/api';
 import { ScopeChip } from '../components/ScopeChip';
 import LauncherSheet from '../components/LauncherSheet';
 import { Button } from '../components/ui/Button';
@@ -33,35 +33,44 @@ function readInputNames(workflow: Record<string, unknown>): string[] {
 }
 
 interface AutoflowInfo {
+  /** Whether `autoflow.enabled` is currently `true`. A disabled autoflow is
+   *  still recognized as an autoflow (the `autoflow:` block is present) —
+   *  this field is what distinguishes the two, driving the Disable/Resume
+   *  button and its label. */
+  enabled: boolean;
   /** Human-readable trigger summary, e.g. a cron expression, `event: …`, or
    *  `wakes on: github.issue.opened, …`. Undefined when nothing to show. */
   trigger?: string;
 }
 
 /**
- * When the workflow has `autoflow.enabled: true`, return a small descriptor so
- * the header can mark it as an autoflow and summarize what triggers it. Returns
- * null for plain (manually-launched) workflows. Reads the parsed `workflow`
- * object defensively — every field is optional on the wire.
+ * When the workflow has a top-level `autoflow:` block, return a small
+ * descriptor so the header can mark it as an autoflow, summarize what
+ * triggers it, and show the Disable/Resume toggle. Returns null for plain
+ * (manually-launched) workflows with no `autoflow:` block at all. Note this
+ * recognizes a *disabled* autoflow (`autoflow.enabled: false`) too — only the
+ * `enabled` field distinguishes the two states — so the button to re-enable
+ * it still has somewhere to render. Reads the parsed `workflow` object
+ * defensively — every field is optional on the wire.
  */
 function readAutoflow(workflow: Record<string, unknown>): AutoflowInfo | null {
   const af = workflow.autoflow;
   if (typeof af !== 'object' || af === null) return null;
   const afo = af as Record<string, unknown>;
-  if (afo.enabled !== true) return null;
+  const enabled = afo.enabled === true;
 
   const trig = workflow.trigger;
   const trigo = typeof trig === 'object' && trig !== null ? (trig as Record<string, unknown>) : {};
   const on = asString(trigo.on);
-  if (on === 'cron' && asString(trigo.cron)) return { trigger: `cron: ${asString(trigo.cron)}` };
-  if (on === 'event' && asString(trigo.event)) return { trigger: `event: ${asString(trigo.event)}` };
+  if (on === 'cron' && asString(trigo.cron)) return { enabled, trigger: `cron: ${asString(trigo.cron)}` };
+  if (on === 'event' && asString(trigo.event)) return { enabled, trigger: `event: ${asString(trigo.event)}` };
 
   const wake = afo.wake_on;
   if (Array.isArray(wake)) {
     const events = wake.filter((e): e is string => typeof e === 'string');
-    if (events.length > 0) return { trigger: `wakes on: ${events.join(', ')}` };
+    if (events.length > 0) return { enabled, trigger: `wakes on: ${events.join(', ')}` };
   }
-  return {};
+  return { enabled };
 }
 
 export default function WorkflowDetailPage() {
@@ -82,6 +91,15 @@ export default function WorkflowDetailPage() {
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
 
+  // ── Autoflow enable/disable ───────────────────────────────────────────
+  // `autoflowEnabledOverride` overrides the enabled state read from `detail`
+  // once the operator has toggled it — set from the server response so the
+  // button label flips immediately without waiting on a full refetch.
+  const [autoflowEnabledOverride, setAutoflowEnabledOverride] = useState<boolean | null>(null);
+  const [autoflowPending, setAutoflowPending] = useState(false);
+  const [autoflowReadOnly, setAutoflowReadOnly] = useState(false);
+  const [autoflowError, setAutoflowError] = useState<string | null>(null);
+
   // ── Agents (for the visual editor's step/panel pickers) ──────────────
   const [agents, setAgents] = useState<AgentSummary[]>([]);
 
@@ -93,6 +111,9 @@ export default function WorkflowDetailPage() {
     let cancelled = false;
     setDetail(null);
     setError(null);
+    setAutoflowEnabledOverride(null);
+    setAutoflowReadOnly(false);
+    setAutoflowError(null);
     api
       .getWorkflow(name)
       .then((data) => {
@@ -196,6 +217,31 @@ export default function WorkflowDetailPage() {
     }
   }
 
+  /** Flip `autoflow.enabled` — `currentlyEnabled` is the state the button was
+   *  rendered from, so a Disable click always requests `enabled: false` and a
+   *  Resume click always requests `enabled: true`, regardless of any race. On
+   *  success the returned state overrides the one read from `detail` (see
+   *  `autoflowEnabledOverride`); a 501 (read-only deploy, no `rupu cp serve`)
+   *  renders a distinct message rather than the generic error. */
+  async function toggleAutoflow(currentlyEnabled: boolean) {
+    if (autoflowPending) return;
+    setAutoflowPending(true);
+    setAutoflowReadOnly(false);
+    setAutoflowError(null);
+    try {
+      const resp = await api.setAutoflowEnabled(name, !currentlyEnabled);
+      setAutoflowEnabledOverride(resp.enabled);
+    } catch (e: unknown) {
+      if (e instanceof ApiError && e.status === 501) {
+        setAutoflowReadOnly(true);
+      } else {
+        setAutoflowError(e instanceof Error ? e.message : 'Failed to update autoflow');
+      }
+    } finally {
+      setAutoflowPending(false);
+    }
+  }
+
   if (error) {
     return (
       <div className="p-8">
@@ -221,6 +267,7 @@ export default function WorkflowDetailPage() {
   const description = asString(detail.workflow.description);
   const autoflow = readAutoflow(detail.workflow);
   const inputNames = readInputNames(detail.workflow);
+  const autoflowIsEnabled = autoflowEnabledOverride ?? autoflow?.enabled ?? false;
 
   const saveDisabled = saving || !dirty || validity?.ok === false;
   const revertDisabled = saving || !dirty;
@@ -246,6 +293,27 @@ export default function WorkflowDetailPage() {
             <Button onClick={save} disabled={saveDisabled}>
               {saving ? 'Saving…' : 'Save'}
             </Button>
+            {autoflow &&
+              (autoflowIsEnabled ? (
+                <Button
+                  variant="danger-outline"
+                  onClick={() => void toggleAutoflow(true)}
+                  disabled={autoflowPending}
+                  aria-label={`Disable ${wfName}`}
+                >
+                  {autoflowPending ? 'Working…' : 'Disable'}
+                </Button>
+              ) : (
+                <Button
+                  variant="secondary"
+                  onClick={() => void toggleAutoflow(false)}
+                  disabled={autoflowPending}
+                  aria-label={`Resume ${wfName}`}
+                  className="border-ok/30 bg-ok-bg text-ok hover:bg-ok-bg"
+                >
+                  {autoflowPending ? 'Working…' : 'Resume'}
+                </Button>
+              ))}
             <Button
               variant="danger-outline"
               onClick={remove}
@@ -269,6 +337,17 @@ export default function WorkflowDetailPage() {
         {deleteError && (
           <p role="alert" className="mt-2 text-ui font-medium text-err">
             {deleteError}
+          </p>
+        )}
+        {autoflowReadOnly && (
+          <p role="alert" className="mt-2 text-ui font-medium text-warn">
+            This is a read-only deploy — enabling/disabling an autoflow requires{' '}
+            <code className="font-mono">rupu cp serve</code>.
+          </p>
+        )}
+        {autoflowError && (
+          <p role="alert" className="mt-2 text-ui font-medium text-err">
+            {autoflowError}
           </p>
         )}
         {description && (

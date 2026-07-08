@@ -53,7 +53,10 @@ fn repo_store(s: &AppState) -> RepoRegistryStore {
 /// (if absent there) each registered project's `<path>/.rupu/workflows/`, in
 /// `store().list()` order. First match wins; a later task may thread the
 /// resolved scope through to the caller for a disambiguating URL.
-fn resolve_workflow_path(s: &AppState, name: &str) -> Option<std::path::PathBuf> {
+///
+/// `pub(crate)` so `api::autoflows`'s enable/disable endpoint can reuse the
+/// same project-aware resolution rather than re-deriving it.
+pub(crate) fn resolve_workflow_path(s: &AppState, name: &str) -> Option<std::path::PathBuf> {
     let global = workflows_dir(s).join(format!("{name}.yaml"));
     if global.exists() {
         return Some(global);

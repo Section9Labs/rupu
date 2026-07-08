@@ -1,15 +1,22 @@
 // @vitest-environment jsdom
-// AutoflowRuns — the Claims tab lists active autoflow claims, each with
-// Requeue + Release controls. The page's mount fetch (events + cycles) is
-// stubbed so the test can switch to Claims and drive the per-row actions.
+// AutoflowRuns — mirrors WorkflowRuns: the primary "Runs" tab is a clean run
+// list (row click → /runs/:id); "Cycles" (batch view) and "Claims"
+// (requeue/release) are secondary tabs. The page's mount fetch (events +
+// cycles) is stubbed so tests can switch tabs and drive per-row actions.
 // Also tests the host filter that drives server-side fetch scope for the
-// Launched runs and Cycles tabs.
+// Runs and Cycles tabs.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { api, type AutoflowClaim, type AutoflowEventRow, type HostView } from '../../lib/api';
+import {
+  api,
+  type AutoflowClaim,
+  type AutoflowCycleRow,
+  type AutoflowEventRow,
+  type HostView,
+} from '../../lib/api';
 import AutoflowRuns from './AutoflowRuns';
 
 afterEach(() => {
@@ -40,6 +47,20 @@ const REMOTE_EVENT: AutoflowEventRow = {
   workflow: 'fix-issue',
   usage: { input_tokens: 100, output_tokens: 50, cached_tokens: 0, total_tokens: 150, cost_usd: null, priced: false, runs: 1 },
   host_id: 'host_prod',
+};
+
+const CYCLE: AutoflowCycleRow = {
+  cycle_id: 'cyc-42',
+  mode: 'bypass',
+  worker_name: 'worker-1',
+  started_at: '2026-06-01T00:00:00Z',
+  finished_at: '2026-06-01T00:05:00Z',
+  workflow_count: 2,
+  ran_cycles: 2,
+  skipped_cycles: 0,
+  failed_cycles: 0,
+  run_ids: ['run-9'],
+  usage: { input_tokens: 100, output_tokens: 50, cached_tokens: 0, total_tokens: 150, cost_usd: null, priced: false, runs: 2 },
 };
 
 const CLAIM: AutoflowClaim = {
@@ -158,7 +179,7 @@ describe('AutoflowRuns host filter — server-driven (runs + cycles tabs)', () =
     });
   });
 
-  it('Host column renders host_id on the Launched runs tab', async () => {
+  it('Host column renders host_id on the Runs tab', async () => {
     vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
     vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([REMOTE_EVENT]);
     vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
@@ -168,7 +189,7 @@ describe('AutoflowRuns host filter — server-driven (runs + cycles tabs)', () =
     await waitFor(() => expect(screen.getByText('host_prod')).toBeInTheDocument());
   });
 
-  it('a launched-run row links to the shared /runs/:id route (RunDetail)', async () => {
+  it('a run row links to the shared /runs/:id route (RunDetail)', async () => {
     const eventWithRun: AutoflowEventRow = {
       event_id: 'evt-2',
       cycle_id: 'cyc-2',
@@ -188,7 +209,7 @@ describe('AutoflowRuns host filter — server-driven (runs + cycles tabs)', () =
     expect(link).toHaveAttribute('href', '/runs/run-9');
   });
 
-  it('a launched-run row on a remote host links to /runs/:id?host=<id>', async () => {
+  it('a run row on a remote host links to /runs/:id?host=<id>', async () => {
     const remoteRunEvent: AutoflowEventRow = {
       event_id: 'evt-3',
       cycle_id: 'cyc-3',
@@ -207,6 +228,50 @@ describe('AutoflowRuns host filter — server-driven (runs + cycles tabs)', () =
 
     const link = await screen.findByRole('link', { name: /run-10/ });
     expect(link).toHaveAttribute('href', '/runs/run-10?host=host_prod');
+  });
+
+  it('the whole row is clickable, not just the Run cell — the Workflow cell links to the same /runs/:id', async () => {
+    const eventWithRun: AutoflowEventRow = {
+      event_id: 'evt-4',
+      cycle_id: 'cyc-4',
+      at: '2026-06-01T00:00:00Z',
+      kind: 'run_launched',
+      workflow: 'fix-issue',
+      run_id: 'run-11',
+      usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: false, runs: 1 },
+    };
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([eventWithRun]);
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+
+    renderPage();
+
+    const link = await screen.findByRole('link', { name: /fix-issue/ });
+    expect(link).toHaveAttribute('href', '/runs/run-11');
+  });
+
+  it('Runs is the default/primary tab (rendered without clicking a tab)', async () => {
+    stubPage();
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('No autoflow activity yet')).toBeInTheDocument());
+    // Cycles/Claims content is not rendered until their tab is selected.
+    expect(screen.queryByText('No autoflow cycles yet')).not.toBeInTheDocument();
+  });
+
+  it('Cycles tab is reachable and renders the batch cycle view', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([]);
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([CYCLE]);
+
+    renderPage();
+    fireEvent.click(screen.getByText('Cycles'));
+
+    await waitFor(() => expect(screen.getByText('worker-1')).toBeInTheDocument());
+    // The cycle's spawned run id is exposed via the expandable detail row.
+    fireEvent.click(screen.getByLabelText('Expand row'));
+    const link = await screen.findByRole('link', { name: /run-9/ });
+    expect(link).toHaveAttribute('href', '/runs/run-9');
   });
 
   it('host filter is NOT shown on the Claims tab', async () => {

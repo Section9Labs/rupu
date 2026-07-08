@@ -172,4 +172,74 @@ describe('WorkflowDetail', () => {
     expect(delSpy).not.toHaveBeenCalled();
     expect(navigateMock).not.toHaveBeenCalled();
   });
+
+  // ── Autoflow enable/disable ──────────────────────────────────────────────
+
+  const ENABLED_AUTOFLOW: WorkflowDetail = {
+    ...DETAIL,
+    workflow: { ...DETAIL.workflow, autoflow: { enabled: true } },
+  };
+
+  const DISABLED_AUTOFLOW: WorkflowDetail = {
+    ...DETAIL,
+    workflow: { ...DETAIL.workflow, autoflow: { enabled: false } },
+  };
+
+  it('an enabled autoflow shows Disable; clicking calls /disable and reflects disabled', async () => {
+    vi.spyOn(api, 'getWorkflow').mockResolvedValue(ENABLED_AUTOFLOW);
+    const setSpy = vi
+      .spyOn(api, 'setAutoflowEnabled')
+      .mockResolvedValue({ name: 'nightly', enabled: false });
+    renderPage();
+
+    const disableBtn = await screen.findByRole('button', { name: 'Disable nightly' });
+    expect(screen.queryByRole('button', { name: 'Resume nightly' })).not.toBeInTheDocument();
+
+    fireEvent.click(disableBtn);
+
+    await waitFor(() => expect(setSpy).toHaveBeenCalledWith('nightly', false));
+    expect(await screen.findByRole('button', { name: 'Resume nightly' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Disable nightly' })).not.toBeInTheDocument();
+  });
+
+  it('a disabled autoflow shows Resume; clicking calls /enable and reflects enabled', async () => {
+    vi.spyOn(api, 'getWorkflow').mockResolvedValue(DISABLED_AUTOFLOW);
+    const setSpy = vi
+      .spyOn(api, 'setAutoflowEnabled')
+      .mockResolvedValue({ name: 'nightly', enabled: true });
+    renderPage();
+
+    const resumeBtn = await screen.findByRole('button', { name: 'Resume nightly' });
+    expect(screen.queryByRole('button', { name: 'Disable nightly' })).not.toBeInTheDocument();
+
+    fireEvent.click(resumeBtn);
+
+    await waitFor(() => expect(setSpy).toHaveBeenCalledWith('nightly', true));
+    expect(await screen.findByRole('button', { name: 'Disable nightly' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Resume nightly' })).not.toBeInTheDocument();
+  });
+
+  it('a 501 (read-only deploy) renders a clear message and leaves state unchanged', async () => {
+    vi.spyOn(api, 'getWorkflow').mockResolvedValue(ENABLED_AUTOFLOW);
+    vi.spyOn(api, 'setAutoflowEnabled').mockRejectedValue(
+      new ApiError(501, 'enabling/disabling an autoflow requires `rupu cp serve`'),
+    );
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Disable nightly' }));
+
+    await screen.findByText(/requires/i);
+    expect(screen.getByText(/rupu cp serve/)).toBeInTheDocument();
+    // State is unchanged — the button still reads Disable (still enabled).
+    expect(screen.getByRole('button', { name: 'Disable nightly' })).toBeInTheDocument();
+  });
+
+  it('a non-autoflow workflow shows neither Disable nor Resume', async () => {
+    vi.spyOn(api, 'getWorkflow').mockResolvedValue(DETAIL);
+    renderPage();
+
+    await screen.findByRole('heading', { name: 'nightly' });
+    expect(screen.queryByRole('button', { name: 'Disable nightly' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Resume nightly' })).not.toBeInTheDocument();
+  });
 });

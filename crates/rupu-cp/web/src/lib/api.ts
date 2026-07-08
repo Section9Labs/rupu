@@ -422,11 +422,34 @@ export interface AutoflowClaim {
 }
 
 /**
+ * One raw autoflow-cycle event, as embedded in `AutoflowPriorCycle.events`.
+ * Mirrors `rupu_runtime::autoflow_history::AutoflowCycleEvent`'s serde shape
+ * (the per-event record nested inside a cycle) — distinct from
+ * `AutoflowEventRow` (the flattened dashboard-feed shape served by
+ * `GET /api/runs/autoflows/events`). This is the only place a *prior* cycle's
+ * `run_id` for a specific entity is recoverable from: `AutoflowCycleRecord`
+ * itself carries no top-level `run_id`/`run_ids`, only this event log.
+ */
+export interface AutoflowCycleEventRaw {
+  kind: string;
+  issue_ref?: string | null;
+  issue_display_ref?: string | null;
+  repo_ref?: string | null;
+  source_ref?: string | null;
+  workflow?: string | null;
+  run_id?: string | null;
+  wake_id?: string | null;
+  wake_event_id?: string | null;
+  status?: string | null;
+  detail?: string | null;
+}
+
+/**
  * One prior autoflow cycle that touched the same entity as the current run.
  * Mirrors `rupu_runtime::AutoflowCycleRecord`'s serde shape — only the
- * fields the Autoflow panel renders are declared; the raw JSON carries more
- * (e.g. `events`), which is fine because TS doesn't reject unread extra
- * properties on values obtained from `fetch`/`JSON.parse`.
+ * fields the Autoflow panel / Cycles tab render are declared; the raw JSON
+ * carries a couple more (e.g. `version`), which is fine because TS doesn't
+ * reject unread extra properties on values obtained from `fetch`/`JSON.parse`.
  */
 export interface AutoflowPriorCycle {
   cycle_id: string;
@@ -437,6 +460,10 @@ export interface AutoflowPriorCycle {
   skipped_cycles: number;
   failed_cycles: number;
   worker_name?: string | null;
+  /** Raw per-event log for this cycle (omitted by the server when empty).
+   *  The Cycles tab scans this for the entry matching the current run's
+   *  entity to recover the `run_id`/`workflow` a prior cycle drove it with. */
+  events?: AutoflowCycleEventRaw[];
 }
 
 /**
@@ -491,6 +518,13 @@ export interface AutoflowDefRow {
   slug: string;
   trigger: string;
   scope: string;
+}
+
+/** Response from `POST /api/autoflows/:name/enable` and `.../disable` —
+ *  mirrors `SetEnabledResponse` in `rupu-cp/src/api/autoflows.rs`. */
+export interface SetAutoflowEnabledResponse {
+  name: string;
+  enabled: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1315,6 +1349,18 @@ export const api = {
   },
   getAutoflowDefs(): Promise<AutoflowDefRow[]> {
     return request<AutoflowDefRow[]>('/api/autoflows');
+  },
+  /**
+   * Enable or disable an autoflow — writes `autoflow.enabled` to the on-disk
+   * workflow YAML. Throws `ApiError` (501) when this deploy has no launcher
+   * (`rupu cp serve` not running), or (404) when `name` doesn't resolve to a
+   * known autoflow. Resolves to the updated `{ name, enabled }` state.
+   */
+  setAutoflowEnabled(name: string, enabled: boolean): Promise<SetAutoflowEnabledResponse> {
+    return request<SetAutoflowEnabledResponse>(
+      `/api/autoflows/${encodeURIComponent(name)}/${enabled ? 'enable' : 'disable'}`,
+      { method: 'POST' },
+    );
   },
 
   // --- Agents ---
