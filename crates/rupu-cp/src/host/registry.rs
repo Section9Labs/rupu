@@ -129,6 +129,60 @@ impl HostRegistry {
         Ok(conn)
     }
 
+    /// Resolve `host_id` to a connector bounded by `timeout`, for the
+    /// host-probe fallback (`api::run_resolve::probe_hosts`) only.
+    ///
+    /// - `"local"` → the local connector, same as [`Self::resolve`] (probing
+    ///   the local host doesn't happen in practice — `probe_hosts` skips
+    ///   `"local"` — but this keeps the method total).
+    /// - `HttpCp` transport → a **fresh, uncached** [`HttpHostConnector`]
+    ///   built with [`HttpHostConnector::new_with_timeout`], so an
+    ///   unreachable host fails fast instead of stalling on the OS's TCP
+    ///   connect timeout. Deliberately bypasses the connector cache: the
+    ///   cached connector (built by [`Self::resolve`]) is shared with the
+    ///   explicit `?host=<id>` path, which must keep its current
+    ///   (effectively unbounded) timeout behavior.
+    /// - Every other transport (SSH/Tunnel/Bucket) falls back to
+    ///   [`Self::resolve`] unchanged — bounding those is out of scope for
+    ///   this fix (they don't share `HttpHostConnector`'s unbounded
+    ///   `reqwest::Client::new()` root cause).
+    pub fn resolve_for_probe(
+        &self,
+        host_id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Arc<dyn HostConnector>, HostConnectorError> {
+        if host_id == "local" {
+            return Ok(Arc::clone(&self.local));
+        }
+
+        let host = self
+            .store
+            .load(host_id)?
+            .ok_or_else(|| HostConnectorError::NotFound(host_id.to_string()))?;
+
+        match &host.transport {
+            HostTransport::HttpCp { base_url } => {
+                let token = match get_host_token(&host.id) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(
+                            host_id = %host.id,
+                            error = %e,
+                            "host_registry: keychain unavailable; probing without token"
+                        );
+                        None
+                    }
+                };
+                Ok(Arc::new(HttpHostConnector::new_with_timeout(
+                    base_url.clone(),
+                    token,
+                    timeout,
+                )))
+            }
+            _ => self.resolve(host_id),
+        }
+    }
+
     /// List all known hosts: local (host[0]) first, then every persisted host
     /// from the store in sorted order.
     pub fn list_hosts(&self) -> Vec<Host> {

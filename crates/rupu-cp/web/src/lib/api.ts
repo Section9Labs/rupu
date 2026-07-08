@@ -421,6 +421,52 @@ export interface AutoflowClaim {
   updated_at: string;
 }
 
+/**
+ * One prior autoflow cycle that touched the same entity as the current run.
+ * Mirrors `rupu_runtime::AutoflowCycleRecord`'s serde shape — only the
+ * fields the Autoflow panel renders are declared; the raw JSON carries more
+ * (e.g. `events`), which is fine because TS doesn't reject unread extra
+ * properties on values obtained from `fetch`/`JSON.parse`.
+ */
+export interface AutoflowPriorCycle {
+  cycle_id: string;
+  mode: string;
+  started_at: string;
+  finished_at: string;
+  ran_cycles: number;
+  skipped_cycles: number;
+  failed_cycles: number;
+  worker_name?: string | null;
+}
+
+/**
+ * Autoflow-history context for a run — which entity/claim/cycle produced it,
+ * prior cycles for the same entity, and (when known) which project/host it
+ * ran under. Mirrors the `GET /api/runs/:id/autoflow` response built in
+ * `crates/rupu-cp/src/api/runs.rs`'s `get_run_autoflow` handler.
+ */
+export interface AutoflowRunContext {
+  repo_ref: string;
+  issue_ref: string | null;
+  /** Display-preferred issue/PR ref (e.g. `"42"`) — the short form. */
+  entity: string | null;
+  workflow_name: string;
+  status: RunStatusStr;
+  /** Failure detail for a blocked/failed cycle; `null` otherwise. */
+  failure: string | null;
+  cycle_id: string;
+  /** Project workspace path the run executed in, when known. */
+  workspace_path: string | null;
+  /** Host id the run executed on; `null` on all current real data (see
+   *  `run_resolve.rs`'s "`host_id` signal" doc comment) — forward-compatible
+   *  field, always local until distributed autoflow dispatch exists. */
+  host_id: string | null;
+  /** The autoflow claim this run belongs to, when one is still on record. */
+  claim: AutoflowClaim | null;
+  /** Earlier cycles for the same entity, newest first, excluding this cycle. */
+  prior_cycles: AutoflowPriorCycle[];
+}
+
 export interface AgentRunRow {
   run_id: string;
   source: 'standalone' | 'session';
@@ -1114,6 +1160,20 @@ export const api = {
   getRunGraph(id: string, opts?: { host?: string }): Promise<RunGraphResponse> {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
     return request<RunGraphResponse>(`/api/runs/${encodeURIComponent(id)}/graph${qs}`);
+  },
+  /**
+   * Autoflow-history context for a run, for the Autoflow panel on RunDetail.
+   * Returns `null` (never throws) when the run has no autoflow-history trail
+   * — a plain, non-autoflow run — which is the caller's signal to render no
+   * panel at all.
+   */
+  async getRunAutoflow(id: string): Promise<AutoflowRunContext | null> {
+    try {
+      return await request<AutoflowRunContext>(`/api/runs/${encodeURIComponent(id)}/autoflow`);
+    } catch (e: unknown) {
+      if (e instanceof ApiError && e.status === 404) return null;
+      throw e;
+    }
   },
   /** Record approval for an awaiting run. The run stays `awaiting_approval`
    *  but gains `resume_requested_at` (+ `resume_mode`); a worker then resumes

@@ -168,6 +168,47 @@ describe('AutoflowRuns host filter — server-driven (runs + cycles tabs)', () =
     await waitFor(() => expect(screen.getByText('host_prod')).toBeInTheDocument());
   });
 
+  it('a launched-run row links to the shared /runs/:id route (RunDetail)', async () => {
+    const eventWithRun: AutoflowEventRow = {
+      event_id: 'evt-2',
+      cycle_id: 'cyc-2',
+      at: '2026-06-01T00:00:00Z',
+      kind: 'run_launched',
+      workflow: 'fix-issue',
+      run_id: 'run-9',
+      usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: false, runs: 1 },
+    };
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([eventWithRun]);
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+
+    renderPage();
+
+    const link = await screen.findByRole('link', { name: /run-9/ });
+    expect(link).toHaveAttribute('href', '/runs/run-9');
+  });
+
+  it('a launched-run row on a remote host links to /runs/:id?host=<id>', async () => {
+    const remoteRunEvent: AutoflowEventRow = {
+      event_id: 'evt-3',
+      cycle_id: 'cyc-3',
+      at: '2026-06-01T00:00:00Z',
+      kind: 'run_launched',
+      workflow: 'fix-issue',
+      run_id: 'run-10',
+      host_id: 'host_prod',
+      usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: false, runs: 1 },
+    };
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([remoteRunEvent]);
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+
+    renderPage();
+
+    const link = await screen.findByRole('link', { name: /run-10/ });
+    expect(link).toHaveAttribute('href', '/runs/run-10?host=host_prod');
+  });
+
   it('host filter is NOT shown on the Claims tab', async () => {
     stubPage();
     vi.spyOn(api, 'getAutoflowClaims').mockResolvedValue([]);

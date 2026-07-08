@@ -7,6 +7,7 @@
 #![deny(clippy::all)]
 
 use futures_util::StreamExt as _;
+use std::time::Duration;
 
 use crate::{
     agent_launcher::AgentLaunchRequest,
@@ -46,6 +47,30 @@ impl HttpHostConnector {
     pub fn new(base_url: String, token: Option<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
+            base_url,
+            token,
+        }
+    }
+
+    /// Like [`Self::new`], but bounds every request's connect + total time to
+    /// `timeout`. Used by the host-probe fallback
+    /// (`api::run_resolve::probe_hosts`) so a registered-but-unreachable
+    /// host fails fast instead of stalling on the OS's TCP connect timeout
+    /// (which can be minutes) — never used for the connector backing an
+    /// explicit `?host=<id>` request, which keeps `reqwest`'s default
+    /// (effectively unbounded) behavior.
+    ///
+    /// Falls back to an unbounded client if the `reqwest::ClientBuilder`
+    /// itself fails to build (e.g. an invalid TLS config) — best-effort, not
+    /// a hard requirement for probing to function.
+    pub fn new_with_timeout(base_url: String, token: Option<String>, timeout: Duration) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(timeout)
+            .timeout(timeout)
+            .build()
+            .unwrap_or_default();
+        Self {
+            client,
             base_url,
             token,
         }
@@ -454,4 +479,52 @@ fn extract_string_field(
         .and_then(|v| v.as_str())
         .map(String::from)
         .ok_or_else(|| HostConnectorError::Invalid(format!("missing `{field}` in response")))
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `new_with_timeout` must bound a request even when the remote accepts
+    /// the TCP connection but never responds — this is the fix for the
+    /// host-probe fallback (`api::run_resolve::probe_hosts`) stalling on an
+    /// unreachable-but-listening host. A bare `HttpHostConnector::new` (used
+    /// for the normal, explicit `?host=` path) has no such bound and would
+    /// hang here.
+    #[tokio::test]
+    async fn new_with_timeout_bounds_a_hanging_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Accept the connection and hold it open without ever writing a
+        // response, so only the connector's own timeout (not a refusal or
+        // EOF) can end the call.
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(stream);
+            }
+        });
+
+        let conn = HttpHostConnector::new_with_timeout(
+            format!("http://{addr}"),
+            None,
+            Duration::from_millis(300),
+        );
+
+        let start = std::time::Instant::now();
+        let result = conn.proxy_get_json("/api/runs/does-not-matter").await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "expected the bounded client to time out on a non-responding host, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "bounded probe took {elapsed:?}; expected well under the OS default connect timeout"
+        );
+    }
 }

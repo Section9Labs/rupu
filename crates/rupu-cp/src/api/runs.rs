@@ -1,4 +1,5 @@
 use crate::{
+    api::run_resolve::{resolve_run_location, RunLocation},
     error::{ApiError, ApiResult},
     host::connector::{HostConnectorError, RunKind, RunListQuery},
     state::AppState,
@@ -11,9 +12,10 @@ use axum::{
 };
 use futures_util::future::join_all;
 use rupu_orchestrator::{
-    runs::{CancelError, CancelOutcome, PauseError},
+    runs::{CancelError, CancelOutcome, PauseError, RunStore},
     ApprovalError, RunRecord, RunStatus, RunStoreError,
 };
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub fn routes() -> Router<AppState> {
@@ -24,6 +26,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/runs/:id", get(get_run).delete(delete_run))
         .route("/api/runs/:id/log", get(get_run_log))
         .route("/api/runs/:id/usage-timeline", get(get_run_usage_timeline))
+        .route("/api/runs/:id/autoflow", get(get_run_autoflow))
         .route("/api/runs/:id/approve", post(approve_run))
         .route("/api/runs/:id/reject", post(reject_run))
         .route("/api/runs/:id/cancel", post(cancel_run))
@@ -682,42 +685,205 @@ pub(crate) struct RunDetailQuery {
     pub(crate) host: Option<String>,
 }
 
+/// Map a [`RunStoreError`] to 404 (not found) or 500 (anything else) — the
+/// mapping shared by every run-detail endpoint's local-store read path.
+pub(crate) fn run_not_found_or_internal(id: &str, e: RunStoreError) -> ApiError {
+    match e {
+        RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
+        other => ApiError::internal(other.to_string()),
+    }
+}
+
+/// Map a [`HostConnectorError`] from a proxied run-detail read to an
+/// [`ApiError`] — fail-closed on an unreachable host (a clear error, never a
+/// panic/500-with-no-context).
+fn host_connector_err(id: &str, host_id: &str, e: HostConnectorError) -> ApiError {
+    match e {
+        HostConnectorError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
+        HostConnectorError::Unreachable(m) => {
+            ApiError::internal(format!("host {host_id} unreachable: {m}"))
+        }
+        other => ApiError::internal(other.to_string()),
+    }
+}
+
+/// Proxy `GET /api/runs/:id` to a resolved host. Shared by the explicit
+/// `?host=` branch and the resolver's [`RunLocation::Host`] branch.
+async fn get_run_from_host(s: &AppState, host_id: &str, id: &str) -> ApiResult<serde_json::Value> {
+    let conn = resolve_host(s, host_id)?;
+    conn.get_run(id)
+        .await
+        .map_err(|e| host_connector_err(id, host_id, e))
+}
+
+/// Build a `RunRecord`-shaped JSON value (plus a sibling `cycle_id`) for a
+/// [`RunLocation::Unpersisted`] run — no `run.json` was ever written (the
+/// autoflow dispatch failed before/without persisting one), so the
+/// structural fields the schema requires but the history doesn't carry
+/// (`workspace_id`, `workspace_path`, `transcript_dir`, `started_at`) are
+/// filled with an explicit empty/best-effort placeholder rather than
+/// silently defaulting — the point is to surface the failure, not pretend a
+/// real run executed. Shared by `get_run` and `run_graph` so both
+/// endpoints' `"run"` key stays byte-for-byte the same shape.
+///
+/// `error_message` is only populated for a terminal-failure `status`
+/// (`Failed`) — a synthesized `Running`/`AwaitingApproval` record has no
+/// failure yet, so showing one would misrepresent an in-flight/awaiting run
+/// as broken.
+///
+/// `issue_ref` is the resolver's full stable ref (e.g.
+/// `github:owner/repo/issues/42`, from [`super::run_resolve::RunLocation::Unpersisted`]'s
+/// `issue_ref` field) — not the bare display number.
+pub(crate) fn synthesize_unpersisted_run(
+    id: &str,
+    cycle_id: &str,
+    status: RunStatus,
+    failure: &str,
+    workflow_name: &str,
+    issue_ref: Option<&str>,
+) -> serde_json::Value {
+    let now = chrono::Utc::now();
+    let error_message = matches!(status, RunStatus::Failed).then(|| failure.to_string());
+    let record = RunRecord {
+        id: id.to_string(),
+        workflow_name: workflow_name.to_string(),
+        status,
+        inputs: Default::default(),
+        event: None,
+        workspace_id: String::new(),
+        workspace_path: PathBuf::new(),
+        transcript_dir: PathBuf::new(),
+        started_at: now,
+        finished_at: Some(now),
+        error_message,
+        awaiting_step_id: None,
+        approval_prompt: None,
+        awaiting_since: None,
+        expires_at: None,
+        issue_ref: issue_ref.map(str::to_string),
+        issue: None,
+        parent_run_id: None,
+        backend_id: None,
+        worker_id: None,
+        artifact_manifest_path: None,
+        runner_pid: None,
+        source_wake_id: None,
+        active_step_id: None,
+        active_step_kind: None,
+        active_step_agent: None,
+        active_step_transcript_path: None,
+        resume_requested_at: None,
+        resume_claimed_at: None,
+        resume_claimed_by: None,
+        resume_mode: None,
+        final_output: None,
+    };
+    let mut v = serde_json::to_value(&record).unwrap_or_else(|_| serde_json::json!({ "id": id }));
+    v["cycle_id"] = serde_json::json!(cycle_id);
+    v
+}
+
 /// `GET /api/runs/:id[?host=<id>]`
 ///
-/// Without `?host=` (or `?host=local`): read from the local store (unchanged).
-/// With `?host=<remote-id>`: proxy to that host's `GET /api/runs/:id`.
-/// Unknown host id → 404.
+/// An explicit `?host=<remote-id>` takes precedence over the resolver and
+/// proxies unchanged (today's behavior for callers who already know the
+/// host). Otherwise, dispatches on [`resolve_run_location`]:
+/// - `Global` → the local store (unchanged).
+/// - `ProjectLocal` → a project's own `.rupu/runs/` store, same DTO shape.
+/// - `Host` → proxy to the resolved host.
+/// - `Unpersisted` → synthesize a failed/blocked record instead of 404ing.
+/// - `NotFound` → 404.
 async fn get_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<RunDetailQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let host_id = q.host.as_deref().unwrap_or("local");
-    if host_id != "local" {
-        let conn = resolve_host(&s, host_id)?;
-        let detail = conn.get_run(&id).await.map_err(|e| match e {
-            HostConnectorError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
-            other => ApiError::internal(other.to_string()),
-        })?;
-        return Ok(Json(detail));
+    if let Some(host_id) = q.host.as_deref().filter(|h| *h != "local") {
+        return get_run_from_host(&s, host_id, &id).await.map(Json);
     }
-    // Local path: unchanged
-    let detail = query_run_detail(&s.run_store, &id, &s.pricing).map_err(|e| match e {
-        RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
+
+    match resolve_run_location(&s, &id).await {
+        RunLocation::Global => {
+            let detail = query_run_detail(&s.run_store, &id, &s.pricing)
+                .map_err(|e| run_not_found_or_internal(&id, e))?;
+            Ok(Json(detail))
+        }
+        RunLocation::ProjectLocal { path } => {
+            let store = RunStore::new(path.join(".rupu").join("runs"));
+            let detail = query_run_detail(&store, &id, &s.pricing)
+                .map_err(|e| run_not_found_or_internal(&id, e))?;
+            Ok(Json(detail))
+        }
+        RunLocation::Host { host_id } => get_run_from_host(&s, &host_id, &id).await.map(Json),
+        RunLocation::Unpersisted {
+            cycle_id,
+            status,
+            failure,
+            workflow_name,
+            issue_ref,
+            ..
+        } => {
+            let run = synthesize_unpersisted_run(
+                &id,
+                &cycle_id,
+                status,
+                &failure,
+                &workflow_name,
+                issue_ref.as_deref(),
+            );
+            Ok(Json(serde_json::json!({
+                "run": run,
+                "steps": [],
+                "usage": crate::usage::UsageSummary::default(),
+            })))
+        }
+        RunLocation::NotFound => Err(ApiError::not_found(format!("run {id} not found"))),
+    }
+}
+
+/// Proxy `GET /api/runs/:id/log` (as `stream_run_events`) to a resolved host.
+/// Shared by the explicit `?host=` branch and the resolver's
+/// [`RunLocation::Host`] branch.
+async fn get_run_log_from_host(
+    s: &AppState,
+    host_id: &str,
+    id: &str,
+) -> Result<Response, ApiError> {
+    let conn = resolve_host(s, host_id)?;
+    let stream = conn.stream_run_events(id).await.map_err(|e| match e {
+        HostConnectorError::NotFound(_) => {
+            ApiError::not_found(format!("run {id} not found on host {host_id}"))
+        }
+        HostConnectorError::Unreachable(m) => {
+            ApiError::internal(format!("host {host_id} unreachable: {m}"))
+        }
         other => ApiError::internal(other.to_string()),
     })?;
-    Ok(Json(detail))
+    crate::api::events::proxy_event_byte_stream(stream)
+}
+
+/// Verify the run exists in `store`, then tail its `events.jsonl`. Shared by
+/// the `Global` and `ProjectLocal` branches of `get_run_log`.
+async fn tail_local_log(store: &RunStore, id: &str) -> Result<Response, ApiError> {
+    store
+        .load(id)
+        .map_err(|e| run_not_found_or_internal(id, e))?;
+    let events_path = store.events_path(id);
+    let sse = crate::sse::tail_events_sse(events_path)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(sse.into_response())
 }
 
 /// `GET /api/runs/:id/log[?host=<id>]` — tail the run's `events.jsonl` as a
 /// live SSE stream.
 ///
-/// Without `?host=` (or `?host=local`): reads from the local `events.jsonl`
-/// (unchanged from before). Returns 404 if the run does not exist.
-///
-/// With `?host=<remote-id>`: resolves the connector and proxies
-/// [`HostConnector::stream_run_events`] as an SSE response — mirrors exactly
-/// how `events_stream` builds the proxied SSE stream. Unknown host id → 404.
+/// An explicit `?host=<remote-id>` takes precedence over the resolver
+/// (unchanged proxy behavior). Otherwise dispatches on
+/// [`resolve_run_location`]: `Global`/`ProjectLocal` tail the resolved
+/// store's `events.jsonl`; `Host` proxies; `Unpersisted` has no
+/// `events.jsonl` anywhere (the run never persisted one) so it returns an
+/// empty-but-OK SSE stream rather than erroring; `NotFound` → 404.
 ///
 /// The stream stays open while the run is in progress and emits each
 /// [`rupu_orchestrator::executor::Event`] as a JSON `data:` line.
@@ -726,66 +892,48 @@ async fn get_run_log(
     Path(id): Path<String>,
     Query(q): Query<RunDetailQuery>,
 ) -> Result<Response, ApiError> {
-    let host_id = q.host.as_deref().unwrap_or("local");
+    if let Some(host_id) = q.host.as_deref().filter(|h| *h != "local") {
+        return get_run_log_from_host(&s, host_id, &id).await;
+    }
 
-    // Remote host: proxy stream_run_events via the connector.
-    if host_id != "local" {
-        let conn = resolve_host(&s, host_id)?;
-        let stream = conn.stream_run_events(&id).await.map_err(|e| match e {
-            HostConnectorError::NotFound(_) => {
-                ApiError::not_found(format!("run {id} not found on host {host_id}"))
-            }
+    match resolve_run_location(&s, &id).await {
+        RunLocation::Global => tail_local_log(&s.run_store, &id).await,
+        RunLocation::ProjectLocal { path } => {
+            let store = RunStore::new(path.join(".rupu").join("runs"));
+            tail_local_log(&store, &id).await
+        }
+        RunLocation::Host { host_id } => get_run_log_from_host(&s, &host_id, &id).await,
+        RunLocation::Unpersisted { .. } => Ok(crate::sse::empty_events_sse().into_response()),
+        RunLocation::NotFound => Err(ApiError::not_found(format!("run {id} not found"))),
+    }
+}
+
+/// Proxy `GET /api/runs/:id/usage-timeline` to a resolved host. Shared by the
+/// explicit `?host=` branch and the resolver's [`RunLocation::Host`] branch.
+async fn usage_timeline_from_host(
+    s: &AppState,
+    host_id: &str,
+    id: &str,
+) -> ApiResult<serde_json::Value> {
+    let conn = resolve_host(s, host_id)?;
+    conn.proxy_get_json(&format!("/api/runs/{id}/usage-timeline"))
+        .await
+        .map_err(|e| match e {
+            HostConnectorError::NotFound(m) => ApiError::not_found(m),
             HostConnectorError::Unreachable(m) => {
                 ApiError::internal(format!("host {host_id} unreachable: {m}"))
             }
             other => ApiError::internal(other.to_string()),
-        })?;
-        return crate::api::events::proxy_event_byte_stream(stream);
-    }
-
-    // Local path: unchanged — verify the run exists, then tail its events.jsonl.
-    s.run_store.load(&id).map_err(|e| match e {
-        RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
-        other => ApiError::internal(other.to_string()),
-    })?;
-
-    let events_path = s.run_store.events_path(&id);
-    let sse = crate::sse::tail_events_sse(events_path)
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(sse.into_response())
+        })
 }
 
-/// `GET /api/runs/:id/usage-timeline[?host=<id>]` — ordered per-turn token
-/// series across every transcript the run produced (step results + fan-out
-/// items), labeled by step id.
-///
-/// Without `?host=` (or `?host=local`): reads from the local store (unchanged).
-/// With `?host=<remote-id>`: proxies to that host's `GET /api/runs/:id/usage-timeline`.
-/// Unknown host id → 404.
-async fn get_run_usage_timeline(
-    State(s): State<AppState>,
-    Path(id): Path<String>,
-    Query(q): Query<RunDetailQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let host_id = q.host.as_deref().unwrap_or("local");
-    if host_id != "local" {
-        let conn = resolve_host(&s, host_id)?;
-        let value = conn
-            .proxy_get_json(&format!("/api/runs/{id}/usage-timeline"))
-            .await
-            .map_err(|e| match e {
-                HostConnectorError::NotFound(m) => ApiError::not_found(m),
-                other => ApiError::internal(other.to_string()),
-            })?;
-        return Ok(Json(value));
-    }
-    // Local path: unchanged.
-    s.run_store.load(&id).map_err(|e| match e {
-        RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
-        other => ApiError::internal(other.to_string()),
-    })?;
-    let steps = s.run_store.read_step_results(&id).unwrap_or_default();
+/// Build the per-turn usage-timeline series for a run in `store`. Shared by
+/// the `Global` and `ProjectLocal` branches of `get_run_usage_timeline`.
+fn build_usage_timeline_json(store: &RunStore, id: &str) -> ApiResult<serde_json::Value> {
+    store
+        .load(id)
+        .map_err(|e| run_not_found_or_internal(id, e))?;
+    let steps = store.read_step_results(id).unwrap_or_default();
     let mut labeled: Vec<(String, std::path::PathBuf)> = Vec::new();
     for st in &steps {
         labeled.push((st.step_id.clone(), st.transcript_path.clone()));
@@ -794,9 +942,92 @@ async fn get_run_usage_timeline(
         }
     }
     let series = crate::usage::turn_series(&labeled);
-    Ok(Json(
-        serde_json::to_value(series).map_err(|e| ApiError::internal(e.to_string()))?,
-    ))
+    serde_json::to_value(series).map_err(|e| ApiError::internal(e.to_string()))
+}
+
+/// `GET /api/runs/:id/usage-timeline[?host=<id>]` — ordered per-turn token
+/// series across every transcript the run produced (step results + fan-out
+/// items), labeled by step id.
+///
+/// An explicit `?host=<remote-id>` takes precedence over the resolver
+/// (unchanged proxy behavior). Otherwise dispatches on
+/// [`resolve_run_location`]: `Global`/`ProjectLocal` read the resolved
+/// store; `Host` proxies; `Unpersisted` has no transcripts anywhere, so it
+/// returns an empty (but 200 OK) series; `NotFound` → 404.
+async fn get_run_usage_timeline(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<RunDetailQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if let Some(host_id) = q.host.as_deref().filter(|h| *h != "local") {
+        return usage_timeline_from_host(&s, host_id, &id).await.map(Json);
+    }
+
+    match resolve_run_location(&s, &id).await {
+        RunLocation::Global => build_usage_timeline_json(&s.run_store, &id).map(Json),
+        RunLocation::ProjectLocal { path } => {
+            let store = RunStore::new(path.join(".rupu").join("runs"));
+            build_usage_timeline_json(&store, &id).map(Json)
+        }
+        RunLocation::Host { host_id } => {
+            usage_timeline_from_host(&s, &host_id, &id).await.map(Json)
+        }
+        RunLocation::Unpersisted { .. } => Ok(Json(
+            serde_json::to_value(Vec::<crate::usage::TurnPoint>::new())
+                .map_err(|e| ApiError::internal(e.to_string()))?,
+        )),
+        RunLocation::NotFound => Err(ApiError::not_found(format!("run {id} not found"))),
+    }
+}
+
+/// `GET /api/runs/:id/autoflow` — autoflow-history context for a run:
+/// which entity/claim/cycle produced it, prior cycles for the same entity,
+/// and (when known) which project/host it ran under.
+///
+/// 404 when the run has no autoflow-history trail — a plain, non-autoflow
+/// run. This is the caller's signal to not render an Autoflow panel at all,
+/// distinct from "run not found" (which the run-detail endpoints already
+/// cover).
+async fn get_run_autoflow(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    validate_id(&id)?;
+    let ctx = crate::api::run_resolve::autoflow_run_context(&s.global_dir, &id)
+        .ok_or_else(|| ApiError::not_found(format!("run {id} has no autoflow context")))?;
+
+    let prior_cycles: Vec<_> = ctx
+        .issue_ref
+        .as_deref()
+        .map(|iref| crate::api::run_resolve::entity_cycles(&s.global_dir, iref))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| c.cycle_id != ctx.cycle_id)
+        .collect();
+
+    let claim_store = rupu_workspace::AutoflowClaimStore {
+        root: s.global_dir.join("autoflows").join("claims"),
+    };
+    let claim = claim_store
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|c| c.last_run_id.as_deref() == Some(id.as_str()))
+        .map(crate::api::autoflow_claims::ClaimRow::from);
+
+    Ok(Json(serde_json::json!({
+        "repo_ref": ctx.repo_ref,
+        "issue_ref": ctx.issue_ref,
+        "entity": ctx.entity,
+        "workflow_name": ctx.workflow_name,
+        "status": ctx.status,
+        "failure": ctx.failure,
+        "cycle_id": ctx.cycle_id,
+        "workspace_path": ctx.workspace_path,
+        "host_id": ctx.host_id,
+        "claim": claim,
+        "prior_cycles": prior_cycles,
+    })))
 }
 
 /// Reject any `id` that could be used as a path-traversal vector.
@@ -1555,5 +1786,432 @@ mod tests {
         let Query(q2) = Query::<WorkflowRunsQuery>::try_from_uri(&uri2).unwrap();
         assert_eq!(q2.offset, Some(20));
         assert_eq!(q2.limit, Some(20));
+    }
+
+    // ── Location-aware run endpoints (T2) ───────────────────────────────
+
+    /// Register a workspace record `<global_dir>/workspaces/<id>.toml` whose
+    /// `path` points at `project_root` — mirrors `run_resolve.rs`'s test
+    /// helper of the same name (private to that module, so duplicated here).
+    fn register_workspace(tmp: &tempfile::TempDir, id: &str, project_root: &std::path::Path) {
+        std::fs::create_dir_all(tmp.path().join("workspaces")).unwrap();
+        std::fs::write(
+            tmp.path().join("workspaces").join(format!("{id}.toml")),
+            format!(
+                "id = \"{id}\"\npath = \"{}\"\ncreated_at = \"2026-01-01T00:00:00Z\"\n",
+                project_root.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Write a one-event autoflow cycle history file recording `run_id`
+    /// against `issue_ref`, optionally with a `CycleFailed` sibling event
+    /// (`failure_detail`) and/or a raw (untyped) `host_id` on the
+    /// `RunLaunched` event — mirrors `run_resolve.rs`'s test helpers
+    /// (private to that module, so a minimal version is duplicated here).
+    #[allow(clippy::too_many_arguments)]
+    fn write_cycle_with_run(
+        tmp: &tempfile::TempDir,
+        day: &str,
+        cycle_id: &str,
+        run_id: &str,
+        status: &str,
+        issue_ref: &str,
+        workflow: &str,
+        failure_detail: Option<&str>,
+        host_id: Option<&str>,
+    ) {
+        use rupu_runtime::{
+            AutoflowCycleEvent, AutoflowCycleEventKind, AutoflowCycleMode, AutoflowCycleRecord,
+        };
+
+        let mut cycle = AutoflowCycleRecord {
+            version: AutoflowCycleRecord::VERSION,
+            cycle_id: cycle_id.into(),
+            mode: AutoflowCycleMode::Tick,
+            worker_id: Some("worker_local".into()),
+            worker_name: Some("local".into()),
+            repo_filter: None,
+            started_at: format!("{day}T10:00:00Z"),
+            finished_at: format!("{day}T10:00:05Z"),
+            workflow_count: 1,
+            polled_event_count: 0,
+            webhook_event_count: 0,
+            ran_cycles: 1,
+            skipped_cycles: 0,
+            failed_cycles: usize::from(failure_detail.is_some()),
+            cleaned_claims: 0,
+            events: Vec::new(),
+        };
+        cycle.events.push(AutoflowCycleEvent {
+            kind: AutoflowCycleEventKind::RunLaunched,
+            issue_ref: Some(issue_ref.into()),
+            issue_display_ref: Some("42".into()),
+            repo_ref: Some("github:Section9Labs/rupu".into()),
+            source_ref: None,
+            workflow: Some(workflow.into()),
+            run_id: Some(run_id.into()),
+            wake_id: None,
+            wake_event_id: None,
+            status: Some(status.into()),
+            detail: None,
+        });
+        if let Some(detail) = failure_detail {
+            cycle.events.push(AutoflowCycleEvent {
+                kind: AutoflowCycleEventKind::CycleFailed,
+                issue_ref: Some(issue_ref.into()),
+                repo_ref: Some("github:Section9Labs/rupu".into()),
+                workflow: Some(workflow.into()),
+                detail: Some(detail.into()),
+                ..AutoflowCycleEvent::default()
+            });
+        }
+
+        let dir = tmp
+            .path()
+            .join("autoflows")
+            .join("history")
+            .join("cycles")
+            .join(day);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut value = serde_json::to_value(&cycle).unwrap();
+        if let Some(hid) = host_id {
+            value["events"][0]["host_id"] = serde_json::Value::String(hid.to_string());
+        }
+        std::fs::write(
+            dir.join(format!("{cycle_id}.json")),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_run_global_unchanged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .create(terminal_record("run_01GLOBAL"), "name: x\n")
+            .unwrap();
+
+        let resp = get_run(
+            State(s),
+            Path("run_01GLOBAL".into()),
+            Query(RunDetailQuery { host: None }),
+        )
+        .await
+        .expect("global run should be found exactly as before");
+        assert_eq!(resp.0["run"]["id"], serde_json::json!("run_01GLOBAL"));
+        assert_eq!(resp.0["run"]["status"], serde_json::json!("completed"));
+    }
+
+    #[tokio::test]
+    async fn get_run_unpersisted_returns_failed_record_not_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        write_cycle_with_run(
+            &tmp,
+            "2026-07-01",
+            "afc_unpersisted",
+            "run_01KWYZ2QY4XYZ",
+            "blocked",
+            "github:Section9Labs/rupu/issues/42",
+            "issue-supervisor-dispatch",
+            Some("401 invalid x-api-key"),
+            None,
+        );
+
+        let resp = get_run(
+            State(s),
+            Path("run_01KWYZ2QY4XYZ".into()),
+            Query(RunDetailQuery { host: None }),
+        )
+        .await
+        .expect("unpersisted autoflow run should synthesize a record, not 404");
+
+        let body = resp.0;
+        assert_eq!(body["run"]["status"], serde_json::json!("failed"));
+        assert_eq!(
+            body["run"]["error_message"],
+            serde_json::json!("401 invalid x-api-key")
+        );
+        assert_eq!(
+            body["run"]["workflow_name"],
+            serde_json::json!("issue-supervisor-dispatch")
+        );
+        assert_eq!(
+            body["run"]["cycle_id"],
+            serde_json::json!("afc_unpersisted")
+        );
+        assert_eq!(
+            body["run"]["issue_ref"],
+            serde_json::json!("github:Section9Labs/rupu/issues/42"),
+            "the synthesized record's issue_ref must be the resolver's full \
+             stable ref, not the bare display number"
+        );
+    }
+
+    /// FIX 2: a synthesized run whose status is NOT a terminal failure (here
+    /// `running`, from an `AutoflowClaimRecord`/history status that hasn't
+    /// failed) must not carry an `error_message` — showing one would
+    /// misrepresent an in-flight run as broken.
+    #[tokio::test]
+    async fn get_run_unpersisted_running_has_no_error_message() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        write_cycle_with_run(
+            &tmp,
+            "2026-07-01",
+            "afc_running",
+            "run_still_running",
+            "running",
+            "github:Section9Labs/rupu/issues/42",
+            "issue-supervisor-dispatch",
+            None,
+            None,
+        );
+
+        let resp = get_run(
+            State(s),
+            Path("run_still_running".into()),
+            Query(RunDetailQuery { host: None }),
+        )
+        .await
+        .expect("unpersisted running autoflow run should synthesize a record, not 404");
+
+        let body = resp.0;
+        assert_eq!(body["run"]["status"], serde_json::json!("running"));
+        assert!(
+            body["run"]["error_message"].is_null(),
+            "a synthesized non-failed record must not carry a failure message: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_run_project_local_reads_project_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_store = RunStore::new(proj.path().join(".rupu").join("runs"));
+        proj_store
+            .create(terminal_record("run_proj_x"), "name: wf\nsteps: []\n")
+            .unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let resp = get_run(
+            State(s),
+            Path("run_proj_x".into()),
+            Query(RunDetailQuery { host: None }),
+        )
+        .await
+        .expect("project-local run should be found via the resolver");
+        assert_eq!(resp.0["run"]["id"], serde_json::json!("run_proj_x"));
+        assert_eq!(resp.0["run"]["status"], serde_json::json!("completed"));
+    }
+
+    /// Fake `HostConnector` used only to exercise the `Host` proxy branch
+    /// without any real network. Only `get_run`/`proxy_get_json` are
+    /// exercised by these tests; every other method panics loudly if
+    /// accidentally called, rather than silently no-opping.
+    struct FakeHostConnector {
+        run_json: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::host::connector::HostConnector for FakeHostConnector {
+        async fn info(&self) -> Result<crate::host::connector::HostInfo, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn launch_run(
+            &self,
+            _req: crate::launcher::LaunchRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn launch_agent(
+            &self,
+            _req: crate::agent_launcher::AgentLaunchRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn start_session(
+            &self,
+            _req: crate::session_starter::SessionStartRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn send_session_turn(
+            &self,
+            _req: crate::session_sender::SendMessageRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn list_runs(
+            &self,
+            _params: RunListQuery,
+        ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn get_run(&self, _run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
+            Ok(self.run_json.clone())
+        }
+        async fn approve_run(&self, _run_id: &str, _mode: &str) -> Result<(), HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn reject_run(
+            &self,
+            _run_id: &str,
+            _reason: Option<&str>,
+        ) -> Result<(), HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn cancel_run(&self, _run_id: &str) -> Result<(), HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn stream_run_events(
+            &self,
+            _run_id: &str,
+        ) -> Result<crate::host::connector::EventByteStream, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn get_transcript(
+            &self,
+            _path: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            unimplemented!("not exercised by this test")
+        }
+        async fn proxy_get_json(
+            &self,
+            _path_and_query: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            Ok(self.run_json.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn get_run_host_proxies() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // History records this run as having run on host `host_fake` — the
+        // forward-looking `host_id` signal on an autoflow history event
+        // (see `run_resolve.rs`'s module doc). No current writer sets this;
+        // the test injects it directly to exercise the resolver's `Host`
+        // branch.
+        write_cycle_with_run(
+            &tmp,
+            "2026-07-03",
+            "afc_hostproxy",
+            "run_hostproxy",
+            "running",
+            "github:Section9Labs/rupu/issues/7",
+            "issue-supervisor-dispatch",
+            None,
+            Some("host_fake"),
+        );
+
+        let fake_run_json = serde_json::json!({
+            "run": { "id": "run_hostproxy", "status": "running" },
+            "steps": [],
+            "usage": {},
+        });
+        let fake: Arc<dyn crate::host::connector::HostConnector> = Arc::new(FakeHostConnector {
+            run_json: fake_run_json.clone(),
+        });
+
+        // `HostRegistry::resolve` only special-cases the literal id
+        // `"local"`; any other id is looked up in the `HostStore` and built
+        // via `build_connector`. A `HostTransport::Local` entry under a
+        // distinct id resolves to the SAME injected connector as
+        // `Host::local()` itself would — exactly the seam this test uses to
+        // inject a fake connector with zero real network.
+        let host_store = rupu_workspace::HostStore {
+            root: tmp.path().join("hosts"),
+        };
+        host_store
+            .save(&rupu_workspace::Host {
+                id: "host_fake".into(),
+                name: "fake".into(),
+                transport: rupu_workspace::HostTransport::Local,
+                token_hash: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                last_seen_at: None,
+            })
+            .unwrap();
+        let registry = Arc::new(crate::host::registry::HostRegistry::new(
+            host_store,
+            Arc::clone(&fake),
+        ));
+        let s = test_state(&tmp).with_hosts(registry);
+
+        let resp = get_run(
+            State(s),
+            Path("run_hostproxy".into()),
+            Query(RunDetailQuery { host: None }),
+        )
+        .await
+        .expect("host-resolved run should proxy, not 404");
+        assert_eq!(resp.0, fake_run_json);
+    }
+
+    #[tokio::test]
+    async fn autoflow_endpoint_returns_context() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+
+        write_cycle_with_run(
+            &tmp,
+            "2026-07-04",
+            "afc_ctx_old",
+            "run_old",
+            "complete",
+            "github:Section9Labs/rupu/issues/9",
+            "issue-supervisor-dispatch",
+            None,
+            None,
+        );
+        write_cycle_with_run(
+            &tmp,
+            "2026-07-05",
+            "afc_ctx_new",
+            "run_ctx",
+            "blocked",
+            "github:Section9Labs/rupu/issues/9",
+            "issue-supervisor-dispatch",
+            Some("boom"),
+            None,
+        );
+
+        let resp = get_run_autoflow(State(s), Path("run_ctx".into()))
+            .await
+            .expect("autoflow run should return a context, not 404");
+        let body = resp.0;
+        assert_eq!(body["cycle_id"], serde_json::json!("afc_ctx_new"));
+        assert_eq!(body["failure"], serde_json::json!("boom"));
+        assert_eq!(
+            body["issue_ref"],
+            serde_json::json!("github:Section9Labs/rupu/issues/9")
+        );
+        let prior = body["prior_cycles"].as_array().unwrap();
+        assert_eq!(
+            prior.len(),
+            1,
+            "the current cycle must not appear in its own prior list"
+        );
+        assert_eq!(prior[0]["cycle_id"], serde_json::json!("afc_ctx_old"));
+    }
+
+    #[tokio::test]
+    async fn autoflow_endpoint_404_for_non_autoflow_run() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .create(terminal_record("run_plain"), "name: x\n")
+            .unwrap();
+
+        let err = get_run_autoflow(State(s), Path("run_plain".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
     }
 }

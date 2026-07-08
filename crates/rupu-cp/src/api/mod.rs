@@ -15,6 +15,7 @@ pub mod hosts;
 pub mod projects;
 pub mod repo_scope;
 pub mod repos;
+pub mod run_resolve;
 pub mod run_streams;
 pub mod runs;
 pub mod sessions;

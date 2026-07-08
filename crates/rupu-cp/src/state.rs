@@ -1,6 +1,8 @@
 use rupu_orchestrator::runs::RunStore;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -40,6 +42,14 @@ pub struct AppState {
     /// read-only `rupu cp` works without a running daemon. `cp serve` replaces
     /// this with a fully-wired registry via [`AppState::with_hosts`].
     pub hosts: Arc<crate::host::registry::HostRegistry>,
+    /// Per-run memoization for [`crate::api::run_resolve::resolve_run_location`]
+    /// — see that function's doc comment for the TTL rationale. Keyed by
+    /// `run_id`; value is `(resolved_at, location)`. Shared (not per-request)
+    /// so repeated resolving-endpoint calls within one RunDetail page load
+    /// reuse the first resolution instead of re-walking every store (and,
+    /// worst case, re-probing every registered host) up to 4x.
+    pub run_location_cache:
+        Arc<Mutex<HashMap<String, (Instant, crate::api::run_resolve::RunLocation)>>>,
     /// Live tunnel connection registry. Shared across all WS handler tasks.
     pub node_registry: Arc<crate::node::NodeRegistry>,
     /// Mirror writer: streams artifact frames from tunnel nodes into the
@@ -109,6 +119,7 @@ impl AppState {
             generator: None,
             session_mutator: None,
             hosts,
+            run_location_cache: Arc::new(Mutex::new(HashMap::new())),
             node_registry,
             node_mirror,
             bind: "127.0.0.1:7878".to_string(),
