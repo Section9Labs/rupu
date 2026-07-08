@@ -1,5 +1,5 @@
 use crate::{
-    api::repo_scope::distinct_repo_workspaces,
+    api::{fs_safety, repo_scope::distinct_repo_workspaces},
     config_write::write_atomic_raw,
     error::{ApiError, ApiResult},
     state::AppState,
@@ -197,6 +197,12 @@ async fn disable_autoflow(
 /// - **Launcher-gated**: 501 on a read-only (`rupu cp`, no `cp serve`)
 ///   deploy — same "is this a `cp serve` deployment" marker every other
 ///   write-path gate in this crate uses (`api::hosts`, `api::config`).
+/// - **Name-validated**: `:name` must pass [`fs_safety::validate_name`] (bare
+///   file stem, no `/`, `.`, or `..`) before any path resolution or disk
+///   access, mirroring the guard on the sibling write endpoints in
+///   `api::workflows` (`write_workflow`, `create_workflow`,
+///   `delete_workflow`) — a traversal name is rejected outright rather than
+///   resolved against the workflows dir.
 /// - **Project-aware**: resolves `:name` to a workflow YAML path via
 ///   [`super::workflows::resolve_workflow_path`] — the same global-then-
 ///   registered-projects resolution `GET /api/workflows/:name` uses — so an
@@ -226,6 +232,12 @@ async fn set_autoflow_enabled(
     s.launcher.as_ref().ok_or_else(|| {
         ApiError::not_available("enabling/disabling an autoflow requires `rupu cp serve`")
     })?;
+
+    // Reject a path-traversal `:name` (e.g. `../../evil`) before it ever
+    // reaches `resolve_workflow_path` — mirrors the same guard the sibling
+    // write endpoints in `api::workflows` apply (`write_workflow`,
+    // `create_workflow`, `delete_workflow`).
+    fs_safety::validate_name(name)?;
 
     let path = super::workflows::resolve_workflow_path(s, name)
         .ok_or_else(|| ApiError::not_found(format!("autoflow {name} not found")))?;
@@ -661,6 +673,55 @@ mod tests {
             .await
             .expect_err("unknown name should 404");
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn enable_rejects_path_traversal_name_before_any_disk_access() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A file that a successful traversal *would* reach: sibling of the
+        // global dir, i.e. `<global_dir>/evil.yaml` via `../evil` from inside
+        // `<global_dir>/workflows/`.
+        let outside_target = tmp.path().join("evil.yaml");
+        std::fs::write(&outside_target, AUTOFLOW_ENABLED_FALSE).unwrap();
+        std::fs::create_dir_all(tmp.path().join("workflows")).unwrap();
+        let s = with_dummy_launcher(test_state(&tmp));
+
+        let err = enable_autoflow(State(s), Path("../evil".into()))
+            .await
+            .expect_err("traversal name must be rejected");
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::BAD_REQUEST,
+            "validate_name should reject the traversal name outright"
+        );
+
+        let on_disk = std::fs::read_to_string(&outside_target).unwrap();
+        assert_eq!(
+            on_disk, AUTOFLOW_ENABLED_FALSE,
+            "the out-of-tree file must be byte-for-byte untouched"
+        );
+        assert!(
+            !bak_path(&outside_target).exists(),
+            "no backup should be created — the guard must fire before any disk access"
+        );
+    }
+
+    #[tokio::test]
+    async fn disable_rejects_path_traversal_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside_target = tmp.path().join("evil.yaml");
+        std::fs::write(&outside_target, AUTOFLOW_ENABLED_TRUE).unwrap();
+        std::fs::create_dir_all(tmp.path().join("workflows")).unwrap();
+        let s = with_dummy_launcher(test_state(&tmp));
+
+        let err = disable_autoflow(State(s), Path("../evil".into()))
+            .await
+            .expect_err("traversal name must be rejected");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+
+        let on_disk = std::fs::read_to_string(&outside_target).unwrap();
+        assert_eq!(on_disk, AUTOFLOW_ENABLED_TRUE, "file must be untouched");
+        assert!(!bak_path(&outside_target).exists(), "no backup written");
     }
 
     #[tokio::test]
