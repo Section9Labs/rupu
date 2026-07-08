@@ -5,7 +5,10 @@
 //! half does the I/O and error-mapping.
 
 use crate::{
-    api::runs::{resolve_host, RunDetailQuery},
+    api::run_resolve::{resolve_run_location, RunLocation},
+    api::runs::{
+        resolve_host, run_not_found_or_internal, synthesize_unpersisted_run, RunDetailQuery,
+    },
     error::{ApiError, ApiResult},
     host::connector::HostConnectorError,
     state::AppState,
@@ -15,7 +18,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use rupu_orchestrator::{executor::Event, RunStoreError, Workflow};
+use rupu_orchestrator::{executor::Event, runs::RunStore, Workflow};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
@@ -26,40 +29,41 @@ pub fn routes() -> Router<AppState> {
     Router::new().route("/api/runs/:id/graph", get(run_graph))
 }
 
-/// `GET /api/runs/:id/graph[?host=<id>]` — DAG + step statuses + unit list for
-/// the given run.
-///
-/// Without `?host=` (or `?host=local`): reads from the local store (unchanged).
-/// With `?host=<remote-id>`: proxies to that host's `GET /api/runs/:id/graph`.
-/// Unknown host id → 404.
-async fn run_graph(
-    State(s): State<AppState>,
-    Path(id): Path<String>,
-    Query(q): Query<RunDetailQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let host_id = q.host.as_deref().unwrap_or("local");
-    if host_id != "local" {
-        let conn = resolve_host(&s, host_id)?;
-        let value = conn
-            .proxy_get_json(&format!("/api/runs/{id}/graph"))
-            .await
-            .map_err(|e| match e {
-                HostConnectorError::NotFound(m) => ApiError::not_found(m),
-                other => ApiError::internal(other.to_string()),
-            })?;
-        return Ok(Json(value));
-    }
-    // Local path: unchanged.
+/// Proxy `GET /api/runs/:id/graph` to a resolved host. Shared by the
+/// explicit `?host=` branch and the resolver's [`RunLocation::Host`] branch.
+async fn run_graph_from_host(
+    s: &AppState,
+    host_id: &str,
+    id: &str,
+) -> ApiResult<serde_json::Value> {
+    let conn = resolve_host(s, host_id)?;
+    conn.proxy_get_json(&format!("/api/runs/{id}/graph"))
+        .await
+        .map_err(|e| match e {
+            HostConnectorError::NotFound(m) => ApiError::not_found(m),
+            HostConnectorError::Unreachable(m) => {
+                ApiError::internal(format!("host {host_id} unreachable: {m}"))
+            }
+            other => ApiError::internal(other.to_string()),
+        })
+}
+
+/// Build the full run-graph response (`{run, workflow, step_results, units,
+/// usage}`) for a run in `store`. Shared by the `Global` and `ProjectLocal`
+/// branches of `run_graph`.
+fn build_run_graph_json(
+    store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+    id: &str,
+) -> ApiResult<serde_json::Value> {
     // 1. Verify the run exists (gives us the RunRecord too).
-    let run = s.run_store.load(&id).map_err(|e| match e {
-        RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
-        other => ApiError::internal(other.to_string()),
-    })?;
+    let run = store
+        .load(id)
+        .map_err(|e| run_not_found_or_internal(id, e))?;
 
     // 2. Load the workflow YAML snapshot saved at run-start.
-    let yaml = s
-        .run_store
-        .read_workflow_snapshot(&id)
+    let yaml = store
+        .read_workflow_snapshot(id)
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
     // 3. Parse the snapshot and build the DAG DTO.
@@ -79,8 +83,8 @@ async fn run_graph(
     };
 
     // 4. Step results and unit checkpoints — missing files = empty vecs.
-    let step_results = s.run_store.read_step_results(&id).unwrap_or_default();
-    let checkpoints = s.run_store.read_unit_checkpoints(&id).unwrap_or_default();
+    let step_results = store.read_step_results(id).unwrap_or_default();
+    let checkpoints = store.read_unit_checkpoints(id).unwrap_or_default();
 
     // 5. Merge in units that exist only in the event stream.
     //
@@ -94,18 +98,71 @@ async fn run_graph(
     // Precedence: durable checkpoints WIN (they are the terminal record).
     // We only synthesize units for `(step_id, index)` pairs not already
     // present in the checkpoints.
-    let units = merge_event_units(&id, &s, checkpoints);
+    let units = merge_event_units(id, store, checkpoints);
 
     // 6. Token/cost rollup for the run-detail header breakdown.
-    let usage = crate::usage::summarize_run(&s.run_store, &id, &s.pricing);
+    let usage = crate::usage::summarize_run(store, id, pricing);
 
-    Ok(Json(serde_json::json!({
+    Ok(serde_json::json!({
         "run": run,
         "workflow": dag,
         "step_results": step_results,
         "units": units,
         "usage": usage,
-    })))
+    }))
+}
+
+/// `GET /api/runs/:id/graph[?host=<id>]` — DAG + step statuses + unit list for
+/// the given run.
+///
+/// An explicit `?host=<remote-id>` takes precedence over the resolver
+/// (unchanged proxy behavior). Otherwise dispatches on
+/// [`resolve_run_location`]: `Global`/`ProjectLocal` build the graph from the
+/// resolved store; `Host` proxies; `Unpersisted` has no workflow snapshot to
+/// parse, so it returns a single-node/failed graph (mirrors the existing
+/// bare-agent-run fallback) so RunDetail still renders; `NotFound` → 404.
+async fn run_graph(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<RunDetailQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if let Some(host_id) = q.host.as_deref().filter(|h| *h != "local") {
+        return run_graph_from_host(&s, host_id, &id).await.map(Json);
+    }
+
+    match resolve_run_location(&s, &id).await {
+        RunLocation::Global => build_run_graph_json(&s.run_store, &s.pricing, &id).map(Json),
+        RunLocation::ProjectLocal { path } => {
+            let store = RunStore::new(path.join(".rupu").join("runs"));
+            build_run_graph_json(&store, &s.pricing, &id).map(Json)
+        }
+        RunLocation::Host { host_id } => run_graph_from_host(&s, &host_id, &id).await.map(Json),
+        RunLocation::Unpersisted {
+            cycle_id,
+            status,
+            failure,
+            workflow_name,
+            entity,
+        } => {
+            let run = synthesize_unpersisted_run(
+                &id,
+                &cycle_id,
+                status,
+                &failure,
+                &workflow_name,
+                entity.as_deref(),
+            );
+            let dag = unpersisted_run_dag(&workflow_name);
+            Ok(Json(serde_json::json!({
+                "run": run,
+                "workflow": dag,
+                "step_results": Vec::<serde_json::Value>::new(),
+                "units": Vec::<serde_json::Value>::new(),
+                "usage": crate::usage::UsageSummary::default(),
+            })))
+        }
+        RunLocation::NotFound => Err(ApiError::not_found(format!("run {id} not found"))),
+    }
 }
 
 /// Build the `units` response array: durable checkpoints first (these win),
@@ -114,7 +171,7 @@ async fn run_graph(
 /// frontend reads them uniformly.
 fn merge_event_units(
     id: &str,
-    s: &AppState,
+    store: &RunStore,
     checkpoints: Vec<rupu_orchestrator::runs::UnitCheckpoint>,
 ) -> Vec<serde_json::Value> {
     // Track every (step_id, index) already covered — checkpoints first.
@@ -130,7 +187,7 @@ fn merge_event_units(
         .collect();
 
     // Read and parse the event stream; tolerate a missing/garbled file.
-    let path = s.run_store.events_path(id);
+    let path = store.events_path(id);
     let file = match std::fs::File::open(&path) {
         Ok(f) => f,
         Err(_) => return out,
@@ -256,6 +313,25 @@ pub fn agent_run_dag(workflow_name: &str) -> StepDag {
             id: "agent".to_string(),
             kind: "step".to_string(),
             agent,
+            for_each: None,
+            parallel: None,
+            panelists: None,
+            gate: None,
+        }],
+    }
+}
+
+/// Synthesize a single-node [`StepDag`] for a [`RunLocation::Unpersisted`]
+/// run — an autoflow dispatch that failed before/without ever writing a
+/// workflow snapshot, so there is nothing to parse. Mirrors
+/// [`agent_run_dag`]'s fallback shape: one `step` node, labeled with the
+/// workflow name, so RunDetail still renders a graph instead of erroring.
+pub fn unpersisted_run_dag(workflow_name: &str) -> StepDag {
+    StepDag {
+        steps: vec![StepNodeDto {
+            id: "run".to_string(),
+            kind: "step".to_string(),
+            agent: Some(workflow_name.to_string()),
             for_each: None,
             parallel: None,
             panelists: None,

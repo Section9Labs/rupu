@@ -101,6 +101,14 @@ pub struct AutoflowRunContext {
     pub failure: Option<String>,
     pub workflow_name: String,
     pub entity: Option<String>,
+    /// The full stable issue ref (e.g. `github:Section9Labs/rupu/issues/42`),
+    /// independent of `entity`'s display-ref preference. `entity` is
+    /// whichever of `issue_display_ref`/`issue_ref` is set — often just a
+    /// short display number like `"42"` — so it's not a safe input to
+    /// [`entity_cycles`], which filters on the full ref. (Task 2's
+    /// `GET /api/runs/:id/autoflow` uses this field for the "prior cycles"
+    /// list.)
+    pub issue_ref: Option<String>,
 }
 
 // ── Resolver ───────────────────────────────────────────────────────────────
@@ -394,6 +402,7 @@ fn build_context(
             .issue_display_ref
             .clone()
             .or_else(|| matched.issue_ref.clone()),
+        issue_ref: matched.issue_ref.clone(),
     }
 }
 

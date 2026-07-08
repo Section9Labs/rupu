@@ -33,6 +33,16 @@ pub async fn tail_events_sse(
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
+/// An already-closed SSE stream for a run with no `events.jsonl` anywhere
+/// (`RunLocation::Unpersisted` — the dispatch failed before/without ever
+/// persisting a run directory). Returns a valid, empty 200 response rather
+/// than erroring: there is genuinely nothing to tail, which is distinct from
+/// a read failure.
+pub fn empty_events_sse() -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+    let stream = futures_util::stream::empty::<Result<SseEvent, Infallible>>();
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+}
+
 /// A `Stream` over a plain mpsc receiver — lets us return the merged
 /// multi-run event channel as a `Stream` without pulling in `tokio-stream`
 /// (mirrors the wrapper [`FileTailRunSource`] uses internally).
