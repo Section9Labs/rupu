@@ -431,4 +431,37 @@ describe('Settings page', () => {
 
     expect(await screen.findByText(/network failure/i)).toBeInTheDocument();
   });
+
+  // ── Redesign (T4): field grouping + namespaced Policy sections ──────────
+
+  it('General tab groups fields under section headings instead of one flat list', async () => {
+    vi.spyOn(api, 'getConfig').mockResolvedValue(MOCK_CONFIG);
+
+    render(
+      <MemoryRouter initialEntries={['/settings']}>
+        <Settings />
+      </MemoryRouter>,
+    );
+
+    await screen.findByLabelText('Default model');
+    expect(screen.getByText('Defaults')).toBeInTheDocument();
+    expect(screen.getByText('Runtime behavior')).toBeInTheDocument();
+  });
+
+  it('Policy tab groups keys under a namespace section heading', async () => {
+    vi.spyOn(api, 'getConfig').mockResolvedValue(MOCK_CONFIG);
+
+    render(
+      <MemoryRouter initialEntries={['/settings']}>
+        <Settings />
+      </MemoryRouter>,
+    );
+
+    await screen.findByLabelText('Default model');
+    fireEvent.click(screen.getByRole('button', { name: 'Policy' }));
+
+    // permission_mode and default_model are both root-level keys -> "general".
+    expect(screen.getByText('general')).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: /^permission_mode$/i })).toBeInTheDocument();
+  });
 });
