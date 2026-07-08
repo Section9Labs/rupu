@@ -266,6 +266,16 @@ export interface UnknownRunEvent extends RunEventBase {
   step_id?: string;
 }
 
+/**
+ * A `RunEvent` tagged with a `ts` (unix-ms). History rows from `GET
+ * /api/events` always carry this (the server injects it — see
+ * `crates/rupu-cp/src/api/events.rs`'s `recent_events` doc comment); live SSE
+ * frames from `subscribeEvents` do not, so callers merging the two streams
+ * (the Events page) stamp arrival time onto live frames themselves to get
+ * the same shape.
+ */
+export type TimedRunEvent = RunEvent & { ts: number };
+
 const KNOWN_EVENT_TYPES: ReadonlySet<KnownRunEvent['type']> = new Set([
   'run_started',
   'step_started',
@@ -1671,6 +1681,22 @@ export const api = {
     es.onmessage = (m) => onEvent(JSON.parse(m.data) as RunEvent);
     if (onError) es.onerror = onError;
     return () => es.close();
+  },
+
+  /**
+   * "Load history" counterpart to `subscribeEvents` — recent events
+   * aggregated from recent runs' `events.jsonl`, newest-first. This is what
+   * makes the Live Events page non-empty on load, before any live SSE frame
+   * has arrived. Pass `beforeTs` (a row's `ts`, unix-ms) to page backward
+   * through older history; omitting it returns the most recent page.
+   * See `GET /api/events` in `crates/rupu-cp/src/api/events.rs`.
+   */
+  getEvents(limit?: number, beforeTs?: number): Promise<TimedRunEvent[]> {
+    const q = new URLSearchParams();
+    if (limit != null) q.set('limit', String(limit));
+    if (beforeTs != null) q.set('before_ts', String(beforeTs));
+    const qs = q.toString();
+    return request<TimedRunEvent[]>(`/api/events${qs ? `?${qs}` : ''}`);
   },
 
   /**

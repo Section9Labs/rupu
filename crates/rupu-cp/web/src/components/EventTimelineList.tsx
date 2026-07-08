@@ -29,14 +29,16 @@ import { isKnownRunEvent, type KnownRunEvent, type RunEvent } from '../lib/api';
 import { formatDurationMs } from '../lib/time';
 import { type SeqEvent } from './RunEventFeed';
 
-interface Visual {
+export interface Visual {
   icon: LucideIcon;
   ring: string;
   iconColor: string;
   spin?: boolean;
 }
 
-const UNKNOWN_VISUAL: Visual = {
+// Exported so the grouped global timeline (EventTimeline.tsx) can render an
+// unrecognized event type with the same neutral fallback used here.
+export const UNKNOWN_VISUAL: Visual = {
   icon: Circle,
   ring: 'bg-surface ring-border',
   iconColor: 'text-ink-mute',
@@ -75,7 +77,11 @@ export function visualFor(ev: KnownRunEvent): Visual {
   }
 }
 
-function titleFor(ev: KnownRunEvent): string {
+// titleFor/detailFor are exported alongside visualFor so the grouped global
+// timeline (EventTimeline.tsx) can render single-row and group-summary rows
+// with the exact same title/detail text this per-run feed uses, without
+// duplicating the per-event-type copy.
+export function titleFor(ev: KnownRunEvent): string {
   switch (ev.type) {
     case 'run_started':
       return 'Run started';
@@ -92,7 +98,7 @@ function titleFor(ev: KnownRunEvent): string {
   }
 }
 
-function detailFor(ev: KnownRunEvent): string | undefined {
+export function detailFor(ev: KnownRunEvent): string | undefined {
   switch (ev.type) {
     case 'run_started':
       return ev.workflow_path;
