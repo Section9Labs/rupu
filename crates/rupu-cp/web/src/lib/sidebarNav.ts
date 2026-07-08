@@ -24,7 +24,7 @@ export type NavLeaf = {
 
 // String-literal union — keeps group ids type-safe and distinct from
 // any NavLeaf.to (the latter are paths starting with `/`).
-export type GroupID = 'runs' | 'observe' | 'security' | 'build' | 'fleet';
+export type GroupID = 'runs' | 'security' | 'build' | 'fleet';
 
 // One nav-group renders as a collapsible section header followed by
 // its `items`.
@@ -44,6 +44,7 @@ export type NavSection =
 export const sidebarNav: NavSection[] = [
   { kind: 'leaf', item: { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard, enabled: true } },
   { kind: 'leaf', item: { to: '/projects', label: 'Projects', icon: FolderGit2, enabled: true } },
+  { kind: 'leaf', item: { to: '/events', label: 'Live Events', icon: Radio, enabled: true } },
   { kind: 'divider' },
   { kind: 'group', group: {
     id: 'runs', label: 'Runs', items: [
@@ -51,11 +52,6 @@ export const sidebarNav: NavSection[] = [
       { to: '/runs/workflows', label: 'Workflows', icon: Workflow,      enabled: true },
       { to: '/runs/autoflows', label: 'Autoflows', icon: Repeat,        enabled: true },
       { to: '/sessions',       label: 'Sessions',  icon: MessageSquare, enabled: true },
-    ],
-  }},
-  { kind: 'group', group: {
-    id: 'observe', label: 'Observe', items: [
-      { to: '/events',   label: 'Live Events', icon: Radio,       enabled: true },
     ],
   }},
   { kind: 'group', group: {
