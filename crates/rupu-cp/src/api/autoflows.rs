@@ -1,11 +1,23 @@
-use crate::{api::repo_scope::distinct_repo_workspaces, error::ApiResult, state::AppState};
-use axum::{extract::State, routing::get, Json, Router};
+use crate::{
+    api::repo_scope::distinct_repo_workspaces,
+    config_write::write_atomic_raw,
+    error::{ApiError, ApiResult},
+    state::AppState,
+};
+use axum::{
+    extract::{Path, State},
+    routing::{get, post},
+    Json, Router,
+};
 use rupu_orchestrator::Workflow;
 use rupu_workspace::{RepoRegistryStore, WorkspaceStore};
 use serde::Serialize;
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/autoflows", get(list_autoflow_defs))
+    Router::new()
+        .route("/api/autoflows", get(list_autoflow_defs))
+        .route("/api/autoflows/:name/enable", post(enable_autoflow))
+        .route("/api/autoflows/:name/disable", post(disable_autoflow))
 }
 
 /// Slim DTO for a single autoflow-enabled workflow definition.
@@ -152,6 +164,172 @@ async fn list_autoflow_defs(State(s): State<AppState>) -> ApiResult<Json<Vec<Aut
     rows.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.scope.cmp(&b.scope)));
 
     Ok(Json(rows))
+}
+
+/// Response for `POST /api/autoflows/:name/enable` and `.../disable`.
+#[derive(Debug, Serialize)]
+pub(crate) struct SetEnabledResponse {
+    pub(crate) name: String,
+    pub(crate) enabled: bool,
+}
+
+/// `POST /api/autoflows/:name/enable` — flip `autoflow.enabled` to `true` in
+/// the on-disk workflow YAML. See [`set_autoflow_enabled`] for the shared
+/// implementation and its guarantees.
+async fn enable_autoflow(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<SetEnabledResponse>> {
+    set_autoflow_enabled(&s, &name, true).await
+}
+
+/// `POST /api/autoflows/:name/disable` — flip `autoflow.enabled` to `false`.
+/// See [`set_autoflow_enabled`].
+async fn disable_autoflow(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<SetEnabledResponse>> {
+    set_autoflow_enabled(&s, &name, false).await
+}
+
+/// Shared enable/disable implementation.
+///
+/// - **Launcher-gated**: 501 on a read-only (`rupu cp`, no `cp serve`)
+///   deploy — same "is this a `cp serve` deployment" marker every other
+///   write-path gate in this crate uses (`api::hosts`, `api::config`).
+/// - **Project-aware**: resolves `:name` to a workflow YAML path via
+///   [`super::workflows::resolve_workflow_path`] — the same global-then-
+///   registered-projects resolution `GET /api/workflows/:name` uses — so an
+///   autoflow defined only inside a registered project's `.rupu/workflows/`
+///   is reachable, not just global ones. 404 if no file resolves.
+/// - **Targeted edit, not a round-trip**: [`set_autoflow_enabled_in_yaml`]
+///   rewrites only the `enabled:` scalar line inside the `autoflow:` block
+///   (or inserts one, if the block omits it — `enabled` is `#[serde(default)]`
+///   in `rupu_orchestrator::Autoflow`) and leaves every other line — comments,
+///   key order, unrelated formatting — untouched. A `serde_yaml` round-trip
+///   was considered and rejected: it would re-serialize the *entire* file,
+///   silently dropping comments and normalizing key order/quoting on a
+///   definition an operator may hand-edit.
+/// - **Validated before write**: the candidate text must both
+///   [`Workflow::parse`] successfully AND still carry a `workflow.autoflow`
+///   block. Either failure rejects the request and leaves the on-disk file
+///   byte-for-byte untouched — the edit only ever touches disk via
+///   [`write_atomic_raw`], which is only called once validation passes.
+/// - **Backup + atomic**: persisted via [`write_atomic_raw`] (backup to
+///   `<path>.bak`, write-then-rename), not `config_write::write_atomic` —
+///   that helper's `validate_toml` gate would reject YAML outright.
+async fn set_autoflow_enabled(
+    s: &AppState,
+    name: &str,
+    enabled: bool,
+) -> ApiResult<Json<SetEnabledResponse>> {
+    s.launcher.as_ref().ok_or_else(|| {
+        ApiError::not_available("enabling/disabling an autoflow requires `rupu cp serve`")
+    })?;
+
+    let path = super::workflows::resolve_workflow_path(s, name)
+        .ok_or_else(|| ApiError::not_found(format!("autoflow {name} not found")))?;
+    let existing = std::fs::read_to_string(&path).map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // The file must already be an autoflow (not just any workflow) — mirrors
+    // the 404-on-unknown-autoflow contract even when a same-named plain
+    // workflow exists.
+    let existing_workflow =
+        Workflow::parse(&existing).map_err(|e| ApiError::internal(e.to_string()))?;
+    if existing_workflow.autoflow.is_none() {
+        return Err(ApiError::not_found(format!("autoflow {name} not found")));
+    }
+
+    let candidate = set_autoflow_enabled_in_yaml(&existing, enabled)
+        .map_err(|e| ApiError::bad_request(format!("could not edit autoflow YAML: {e}")))?;
+
+    // Validate the candidate before it ever touches disk: must parse AND
+    // still be an autoflow. Reject (file untouched) on either failure.
+    let parsed = Workflow::parse(&candidate).map_err(|e| {
+        ApiError::bad_request(format!("edit would produce an invalid workflow: {e}"))
+    })?;
+    if parsed.autoflow.as_ref().map(|a| a.enabled) != Some(enabled) {
+        return Err(ApiError::internal(
+            "edit did not produce the expected autoflow.enabled value",
+        ));
+    }
+
+    let path_for_write = path.clone();
+    tokio::task::spawn_blocking(move || write_atomic_raw(&path_for_write, &candidate))
+        .await
+        .map_err(|e| ApiError::internal(format!("autoflow write task panicked: {e}")))?
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    Ok(Json(SetEnabledResponse {
+        name: name.to_string(),
+        enabled,
+    }))
+}
+
+/// Rewrite just the `enabled:` scalar inside a workflow YAML's top-level
+/// `autoflow:` block, leaving every other line untouched. If the block has
+/// no `enabled:` key (legal — `Autoflow::enabled` is `#[serde(default)]`),
+/// inserts one as the block's first line, matching the indent unit of an
+/// existing sibling key (falling back to 2 spaces for an empty block).
+///
+/// Line-based rather than a `serde_yaml` parse+re-serialize so comments and
+/// unrelated formatting in the rest of the file survive untouched (see the
+/// doc comment on [`set_autoflow_enabled`] for why the round-trip approach
+/// was rejected).
+fn set_autoflow_enabled_in_yaml(yaml: &str, enabled: bool) -> Result<String, String> {
+    fn indent_of(line: &str) -> usize {
+        line.len() - line.trim_start().len()
+    }
+
+    let had_trailing_newline = yaml.ends_with('\n');
+    let mut lines: Vec<String> = yaml.lines().map(|l| l.to_string()).collect();
+
+    let autoflow_idx = lines
+        .iter()
+        .position(|l| l.trim_start() == "autoflow:" && indent_of(l) == 0)
+        .ok_or_else(|| "no top-level `autoflow:` key".to_string())?;
+
+    // Block extent: every line after `autoflow:` more-indented than it (or
+    // blank) belongs to the block; the first zero-indent non-blank line ends it.
+    let mut end = lines.len();
+    for (i, l) in lines.iter().enumerate().skip(autoflow_idx + 1) {
+        if l.trim().is_empty() {
+            continue;
+        }
+        if indent_of(l) == 0 {
+            end = i;
+            break;
+        }
+    }
+
+    let enabled_line_idx = lines[autoflow_idx + 1..end]
+        .iter()
+        .position(|l| l.trim_start().starts_with("enabled:"))
+        .map(|i| autoflow_idx + 1 + i);
+
+    match enabled_line_idx {
+        Some(idx) => {
+            let indent = " ".repeat(indent_of(&lines[idx]));
+            lines[idx] = format!("{indent}enabled: {enabled}");
+        }
+        None => {
+            let indent = lines[autoflow_idx + 1..end]
+                .iter()
+                .find(|l| !l.trim().is_empty())
+                .map(|l| indent_of(l))
+                .unwrap_or(2);
+            lines.insert(
+                autoflow_idx + 1,
+                format!("{}enabled: {enabled}", " ".repeat(indent)),
+            );
+        }
+    }
+
+    let mut out = lines.join("\n");
+    if had_trailing_newline {
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -369,5 +547,143 @@ mod tests {
         let names: std::collections::BTreeSet<&str> =
             rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, std::collections::BTreeSet::from(["alpha", "beta"]));
+    }
+
+    // ── enable/disable ───────────────────────────────────────────────────
+
+    use crate::launcher::{LaunchError, LaunchRequest, RunLauncher};
+    use std::sync::Arc;
+
+    /// This feature only ever checks `AppState.launcher.is_some()`; it never
+    /// calls `launch()`, so a launcher that panics if invoked doubles as an
+    /// assertion that the write path stays launcher-free.
+    struct DummyLauncher;
+
+    #[async_trait::async_trait]
+    impl RunLauncher for DummyLauncher {
+        async fn launch(&self, _req: LaunchRequest) -> Result<String, LaunchError> {
+            unreachable!("enable/disable must never invoke the launcher")
+        }
+    }
+
+    fn with_dummy_launcher(s: AppState) -> AppState {
+        s.with_launcher(Some(Arc::new(DummyLauncher) as Arc<dyn RunLauncher>))
+    }
+
+    const AUTOFLOW_ENABLED_TRUE: &str =
+        "name: nightly\nautoflow:\n  enabled: true\nsteps:\n  - id: s1\n    agent: ag\n    actions: []\n    prompt: p\n";
+    const AUTOFLOW_ENABLED_FALSE: &str =
+        "name: nightly\nautoflow:\n  enabled: false\nsteps:\n  - id: s1\n    agent: ag\n    actions: []\n    prompt: p\n";
+
+    /// Seed `<tmp>/workflows/<filename>` (the global workflows dir) with
+    /// `body`, returning its path.
+    fn seed_global_autoflow(
+        tmp: &tempfile::TempDir,
+        filename: &str,
+        body: &str,
+    ) -> std::path::PathBuf {
+        let dir = tmp.path().join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(filename);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn bak_path(path: &std::path::Path) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("{}.bak", path.display()))
+    }
+
+    #[tokio::test]
+    async fn disable_sets_autoflow_enabled_false_in_yaml() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = seed_global_autoflow(&tmp, "nightly.yaml", AUTOFLOW_ENABLED_TRUE);
+        let s = with_dummy_launcher(test_state(&tmp));
+
+        let resp = disable_autoflow(State(s), Path("nightly".into()))
+            .await
+            .expect("disable should succeed");
+        assert!(!resp.0.enabled);
+        assert_eq!(resp.0.name, "nightly");
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk.contains("enabled: false"),
+            "on-disk YAML should now be disabled: {on_disk}"
+        );
+        let parsed = Workflow::parse(&on_disk).expect("still Workflow::parse's");
+        assert!(!parsed.autoflow.expect("still an autoflow").enabled);
+
+        assert!(
+            bak_path(&path).exists(),
+            "a .bak of the prior content must exist"
+        );
+        assert_eq!(
+            std::fs::read_to_string(bak_path(&path)).unwrap(),
+            AUTOFLOW_ENABLED_TRUE
+        );
+    }
+
+    #[tokio::test]
+    async fn enable_sets_true() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = seed_global_autoflow(&tmp, "nightly.yaml", AUTOFLOW_ENABLED_FALSE);
+        let s = with_dummy_launcher(test_state(&tmp));
+
+        let resp = enable_autoflow(State(s), Path("nightly".into()))
+            .await
+            .expect("enable should succeed");
+        assert!(resp.0.enabled);
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let parsed = Workflow::parse(&on_disk).expect("still Workflow::parse's");
+        assert!(parsed.autoflow.expect("still an autoflow").enabled);
+    }
+
+    #[tokio::test]
+    async fn enable_requires_launcher() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_global_autoflow(&tmp, "nightly.yaml", AUTOFLOW_ENABLED_FALSE);
+        let s = test_state(&tmp); // no launcher installed — read-only deploy
+
+        let err = enable_autoflow(State(s), Path("nightly".into()))
+            .await
+            .expect_err("no launcher should be rejected");
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn enable_unknown_autoflow_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("workflows")).unwrap();
+        let s = with_dummy_launcher(test_state(&tmp));
+
+        let err = enable_autoflow(State(s), Path("does-not-exist".into()))
+            .await
+            .expect_err("unknown name should 404");
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn enable_invalid_result_rejected_file_untouched() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Flow-style `autoflow: {...}` is valid YAML — `Workflow::parse`
+        // accepts it — but the targeted line-based editor only recognizes
+        // block-style `autoflow:\n  enabled: ...`, so it must reject this
+        // rather than corrupt the file with a malformed insertion.
+        let body = "name: nightly\nautoflow: {enabled: false}\nsteps:\n  - id: s1\n    agent: ag\n    actions: []\n    prompt: p\n";
+        let path = seed_global_autoflow(&tmp, "nightly.yaml", body);
+        let s = with_dummy_launcher(test_state(&tmp));
+
+        let err = enable_autoflow(State(s), Path("nightly".into()))
+            .await
+            .expect_err("unsupported edit should be rejected");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, body, "rejected edit must leave the file untouched");
+        assert!(
+            !bak_path(&path).exists(),
+            "no backup should be created when the write never happens"
+        );
     }
 }
