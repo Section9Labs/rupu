@@ -20,7 +20,15 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function runStarted(runId: string, ts: number): RunStartedEvent & { ts: number } {
+// `pos` mirrors the field the real backend stamps onto every history row
+// (see `EventsCursor` / `recent_events` in crates/rupu-cp/src/api/events.rs)
+// — the 0-based line index within that event's own run's `events.jsonl`,
+// used together with `ts` and `run_id` to build the "load older" cursor.
+function runStarted(
+  runId: string,
+  ts: number,
+  pos = 0,
+): RunStartedEvent & { ts: number; pos: number } {
   return {
     type: 'run_started',
     run_id: runId,
@@ -28,6 +36,7 @@ function runStarted(runId: string, ts: number): RunStartedEvent & { ts: number }
     workflow_path: 'wf.yaml',
     started_at: new Date(ts).toISOString(),
     ts,
+    pos,
   };
 }
 
@@ -37,9 +46,9 @@ function runStarted(runId: string, ts: number): RunStartedEvent & { ts: number }
 // backend's ordering), so `hasMoreOlder` stays true and the "Load older
 // events" control renders.
 const FULL_PAGE_SIZE = 200;
-function fullHistoryPage(): (RunStartedEvent & { ts: number })[] {
+function fullHistoryPage(): (RunStartedEvent & { ts: number; pos: number })[] {
   return Array.from({ length: FULL_PAGE_SIZE }, (_, i) =>
-    runStarted(`run_hist_${FULL_PAGE_SIZE - i}`, (FULL_PAGE_SIZE - i) * 1000),
+    runStarted(`run_hist_${FULL_PAGE_SIZE - i}`, (FULL_PAGE_SIZE - i) * 1000, i),
   );
 }
 
@@ -86,6 +95,48 @@ describe('Events page', () => {
     expect(screen.getAllByText('Run started')).toHaveLength(1);
   });
 
+  it('an SSE replay of an already-loaded history event renders once, not twice', async () => {
+    // Reproduces the firehose's initial-drain: `FileTailRunSource::open`
+    // replays a currently-active run's entire `events.jsonl` from offset 0
+    // before tailing new appends (see `tail_all_events_sse`), so an active
+    // run's already-written event arrives BOTH via the history fetch AND as
+    // one of the first SSE frames — at two different `ts` (history uses
+    // file-mtime/own-ts, SSE stamps client arrival time), so a merge keyed
+    // on `ts` (or a fresh `seq`) can't recognize them as the same
+    // occurrence and renders it twice.
+    const historyEvent = runStarted('run_active', 5_000, 7);
+    vi.spyOn(api, 'getEvents').mockResolvedValue([historyEvent]);
+    let emit: ((e: RunEvent) => void) | undefined;
+    vi.spyOn(api, 'subscribeEvents').mockImplementation((onEvent) => {
+      emit = onEvent;
+      return () => {};
+    });
+
+    renderPage();
+    await waitFor(() => expect(api.getEvents).toHaveBeenCalled());
+    await screen.findByText('Run started');
+    expect(screen.getAllByText('Run started')).toHaveLength(1);
+    expect(screen.getByText(/^1 event$/)).toBeInTheDocument();
+
+    // The SAME occurrence, replayed via SSE: identical content, but no
+    // `ts`/`pos` (a raw SSE frame never carries either — see `identityOf`
+    // in Events.tsx).
+    expect(emit).toBeDefined();
+    emit?.({
+      type: 'run_started',
+      run_id: historyEvent.run_id,
+      event_version: historyEvent.event_version,
+      workflow_path: historyEvent.workflow_path,
+      started_at: historyEvent.started_at,
+    });
+
+    // Wait for a render this SSE frame definitely triggers (the connection
+    // badge), then assert the duplicate did NOT add a second row.
+    await waitFor(() => expect(screen.getByText('Live')).toBeInTheDocument());
+    expect(screen.getAllByText('Run started')).toHaveLength(1);
+    expect(screen.getByText(/^1 event$/)).toBeInTheDocument();
+  });
+
   it('shows the connection badge as live once an SSE frame arrives', async () => {
     vi.spyOn(api, 'getEvents').mockResolvedValue([]);
     let emit: ((e: RunEvent) => void) | undefined;
@@ -101,24 +152,29 @@ describe('Events page', () => {
     expect(await screen.findByText('Live')).toBeInTheDocument();
   });
 
-  it('lazy-loads older history using before_ts = the oldest loaded ts', async () => {
+  it('lazy-loads older history using the (ts, run_id, pos) cursor of the oldest loaded row', async () => {
     // jsdom reports zero layout geometry, so EventTimeline's bottom sentinel
     // (useInfiniteScroll) fires its auto-load-more check as soon as it's in
     // the DOM — the same underlying handler the visible "Load older events"
-    // button calls. Assert on the request this produces (right before_ts,
+    // button calls. Assert on the request this produces (right cursor,
     // older row rendered) rather than the trigger mechanism.
     const firstPage = fullHistoryPage();
-    const oldestTs = firstPage[firstPage.length - 1].ts;
+    const oldest = firstPage[firstPage.length - 1];
     vi.spyOn(api, 'getEvents')
       .mockResolvedValueOnce(firstPage) // full page → hasMoreOlder stays true
-      .mockResolvedValue([runStarted('run_older', oldestTs - 1000)]); // older page(s)
+      .mockResolvedValue([runStarted('run_older', oldest.ts - 1000)]); // older page(s)
     vi.spyOn(api, 'subscribeEvents').mockImplementation(() => () => {});
 
     renderPage();
     await waitFor(() => expect(api.getEvents).toHaveBeenCalledTimes(1));
 
     await waitFor(() => expect(screen.getByTitle('Open run run_older')).toBeInTheDocument());
-    expect(api.getEvents).toHaveBeenCalledWith(expect.any(Number), oldestTs);
+    // The oldest row's own ts/run_id/pos — not a fresh monotonic seq — must
+    // drive the next page's cursor (see `EventsCursor::Compound` in
+    // crates/rupu-cp/src/api/events.rs): this is what lets "load older"
+    // resume past a page boundary that lands mid-run at a shared fallback
+    // `ts` instead of permanently skipping the rest of that run's events.
+    expect(api.getEvents).toHaveBeenCalledWith(expect.any(Number), oldest.ts, oldest.run_id, oldest.pos);
   });
 
   it('a short first page (less than the page size) means no more older history', async () => {

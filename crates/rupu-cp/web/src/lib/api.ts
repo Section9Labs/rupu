@@ -267,14 +267,17 @@ export interface UnknownRunEvent extends RunEventBase {
 }
 
 /**
- * A `RunEvent` tagged with a `ts` (unix-ms). History rows from `GET
- * /api/events` always carry this (the server injects it — see
+ * A `RunEvent` tagged with a `ts` (unix-ms) and `pos` (0-based line index
+ * within its own run's `events.jsonl`). History rows from `GET /api/events`
+ * always carry both (the server injects them — see
  * `crates/rupu-cp/src/api/events.rs`'s `recent_events` doc comment); live SSE
  * frames from `subscribeEvents` do not, so callers merging the two streams
  * (the Events page) stamp arrival time onto live frames themselves to get
- * the same shape.
+ * the same shape. `pos` (together with `ts` and `run_id`) is what lets
+ * "load older" resume exactly where the last page left off even when many
+ * events share one run's fallback `ts` — see `getEvents`.
  */
-export type TimedRunEvent = RunEvent & { ts: number };
+export type TimedRunEvent = RunEvent & { ts: number; pos?: number };
 
 const KNOWN_EVENT_TYPES: ReadonlySet<KnownRunEvent['type']> = new Set([
   'run_started',
@@ -1687,14 +1690,28 @@ export const api = {
    * "Load history" counterpart to `subscribeEvents` — recent events
    * aggregated from recent runs' `events.jsonl`, newest-first. This is what
    * makes the Live Events page non-empty on load, before any live SSE frame
-   * has arrived. Pass `beforeTs` (a row's `ts`, unix-ms) to page backward
-   * through older history; omitting it returns the most recent page.
-   * See `GET /api/events` in `crates/rupu-cp/src/api/events.rs`.
+   * has arrived. Pass `beforeTs`/`beforeRunId`/`beforePos` (a row's
+   * `ts`/`run_id`/`pos`) to page backward through older history; omitting
+   * them returns the most recent page.
+   *
+   * All three cursor fields should be passed together (they're the
+   * `(ts, run_id, pos)` of the oldest row already loaded) — `ts` alone
+   * degrades to a strictly-less-than-`ts` filter that under-returns when
+   * many events share one run's fallback `ts` (see `EventsCursor` in
+   * `crates/rupu-cp/src/api/events.rs`); `run_id` + `pos` disambiguate
+   * those ties so no event is permanently skipped.
    */
-  getEvents(limit?: number, beforeTs?: number): Promise<TimedRunEvent[]> {
+  getEvents(
+    limit?: number,
+    beforeTs?: number,
+    beforeRunId?: string,
+    beforePos?: number,
+  ): Promise<TimedRunEvent[]> {
     const q = new URLSearchParams();
     if (limit != null) q.set('limit', String(limit));
     if (beforeTs != null) q.set('before_ts', String(beforeTs));
+    if (beforeRunId != null) q.set('before_run', beforeRunId);
+    if (beforePos != null) q.set('before_pos', String(beforePos));
     const qs = q.toString();
     return request<TimedRunEvent[]>(`/api/events${qs ? `?${qs}` : ''}`);
   },

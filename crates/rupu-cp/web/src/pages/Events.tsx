@@ -37,6 +37,51 @@ function tsOfEvent(ev: RunEvent): number | undefined {
   return typeof raw.ts === 'number' ? raw.ts : undefined;
 }
 
+/** The `pos` (0-based line index within its run's `events.jsonl`) a history
+ *  row carries — see `getEvents` / `EventsCursor` in
+ *  `crates/rupu-cp/src/api/events.rs`. Live SSE frames never have one. */
+function posOfEvent(ev: RunEvent): number | undefined {
+  const raw = ev as Record<string, unknown>;
+  return typeof raw.pos === 'number' ? raw.pos : undefined;
+}
+
+/** Deterministic JSON.stringify with sorted object keys, so two objects with
+ *  the same fields in a different order (or produced by different code
+ *  paths) stringify identically. Used only to build `identityOf` below. */
+function stableStringify(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(stableStringify).join(',')}]`;
+  if (v !== null && typeof v === 'object') {
+    const obj = v as Record<string, unknown>;
+    const keys = Object.keys(obj).sort();
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(v);
+}
+
+/**
+ * Stable content identity for an event — used to dedup the merged
+ * history + live list. The firehose's initial-drain replays a currently
+ * active run's already-written `events.jsonl` from offset 0 before tailing
+ * (see `FileTailRunSource::open` / `tail_all_events_sse`), so the SAME
+ * on-disk event occurrence arrives once via `getEvents` history and again
+ * via SSE — at two different `ts` (history uses file-mtime/own-ts, SSE
+ * stamps client arrival time), so `ts` can't be part of the identity.
+ * `pos` similarly is only ever present on history rows (SSE frames don't
+ * carry it), so it's excluded here too — the remaining fields (`type`,
+ * `run_id`, `step_id`, `index`/`unit_key`, etc.) are exactly the event's own
+ * payload and are identical between the two arrivals of the same
+ * occurrence.
+ */
+function identityOf(ev: RunEvent): string {
+  const raw = ev as Record<string, unknown>;
+  const rest: Record<string, unknown> = {};
+  for (const key of Object.keys(raw)) {
+    if (key === 'ts' || key === 'pos') continue;
+    rest[key] = raw[key];
+  }
+  return stableStringify(rest);
+}
+
 export default function Events() {
   const [events, setEvents] = useState<SeqEvent[]>([]);
   const [connection, setConnection] = useState<ConnectionState>('connecting');
@@ -49,6 +94,13 @@ export default function Events() {
   // must always see the latest list without re-subscribing to anything.
   const eventsRef = useRef<SeqEvent[]>([]);
   eventsRef.current = events;
+  // Content identities (see `identityOf`) of every event currently in
+  // `events` — lets history and live SSE dedup an already-active run's
+  // events that arrive via both paths (the SSE firehose replays a run's
+  // full `events.jsonl` from offset 0 before tailing new appends — see
+  // `FileTailRunSource::open` — so an active run's already-written events
+  // land once in the history fetch and again as the first frames on SSE).
+  const seenRef = useRef<Set<string>>(new Set());
 
   // Initial history load — so an idle page is never empty.
   useEffect(() => {
@@ -57,7 +109,14 @@ export default function Events() {
       .getEvents(PAGE_SIZE)
       .then((rows) => {
         if (cancelled) return;
-        const tagged = rows.map((ev) => ({ seq: ++seqRef.current, event: ev as RunEvent }));
+        seenRef.current = new Set();
+        const tagged: SeqEvent[] = [];
+        for (const ev of rows) {
+          const id = identityOf(ev);
+          if (seenRef.current.has(id)) continue; // defensive: guard against dup rows within one page too
+          seenRef.current.add(id);
+          tagged.push({ seq: ++seqRef.current, event: ev as RunEvent });
+        }
         setEvents(tagged);
         setHasMoreOlder(rows.length >= PAGE_SIZE);
         setHistoryError(null);
@@ -73,12 +132,18 @@ export default function Events() {
 
   // Live SSE — prepends on top of whatever history is loaded, independent
   // of the history fetch above (a slow history load doesn't block live
-  // events from starting to arrive).
+  // events from starting to arrive). Dedups against `seenRef` so the
+  // initial-drain replay of an already-active run's history (see comment on
+  // `seenRef`) doesn't render a second row for an event already loaded from
+  // history.
   useEffect(() => {
     setConnection('connecting');
     const unsubscribe = api.subscribeEvents(
       (ev) => {
         setConnection('live');
+        const id = identityOf(ev);
+        if (seenRef.current.has(id)) return; // same occurrence already rendered (history or an earlier SSE frame)
+        seenRef.current.add(id);
         const seq = ++seqRef.current;
         const tagged: SeqEvent = { seq, event: withArrivalTs(ev, Date.now()) };
         setEvents((prev) => [tagged, ...prev].slice(0, MAX_EVENTS));
@@ -104,16 +169,30 @@ export default function Events() {
   const loadOlder = useCallback(async () => {
     const current = eventsRef.current;
     if (current.length === 0) return;
-    const oldestTs = tsOfEvent(current[current.length - 1].event);
+    const oldest = current[current.length - 1].event;
+    const oldestTs = tsOfEvent(oldest);
     if (oldestTs == null) return;
+    // `pos` (+ `run_id`, already on every event) lets the backend resume
+    // exactly after the oldest-loaded row instead of at a `ts` boundary —
+    // without it, a run emitting more events than one page (all sharing
+    // that run's fallback `ts`) would have the rest permanently excluded by
+    // a `before_ts`-only cursor. See `EventsCursor` in
+    // crates/rupu-cp/src/api/events.rs.
+    const oldestPos = posOfEvent(oldest);
     setLoadingOlder(true);
     try {
-      const older = await api.getEvents(PAGE_SIZE, oldestTs);
+      const older = await api.getEvents(PAGE_SIZE, oldestTs, oldest.run_id, oldestPos);
       if (older.length === 0) {
         setHasMoreOlder(false);
         return;
       }
-      const tagged = older.map((ev) => ({ seq: ++seqRef.current, event: ev as RunEvent }));
+      const tagged: SeqEvent[] = [];
+      for (const ev of older) {
+        const id = identityOf(ev);
+        if (seenRef.current.has(id)) continue; // defensive: shouldn't happen with a compound cursor, but never double-render
+        seenRef.current.add(id);
+        tagged.push({ seq: ++seqRef.current, event: ev as RunEvent });
+      }
       setEvents((prev) => [...prev, ...tagged]);
       if (older.length < PAGE_SIZE) setHasMoreOlder(false);
     } catch {
