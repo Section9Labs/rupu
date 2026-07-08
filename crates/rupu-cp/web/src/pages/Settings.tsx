@@ -28,7 +28,7 @@
 //    `••• set` / `not set` (never a value), and which keys need a process
 //    restart to take effect.
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import {
   Activity,
   Cpu,
@@ -41,6 +41,7 @@ import {
   Workflow,
 } from 'lucide-react';
 import { api, ApiError, type ConfigRuntimeStatus, type ConfigView } from '../lib/api';
+import { cn } from '../lib/cn';
 import { TabBar, TabButton } from '../components/TabBar';
 import { Button } from '../components/ui/Button';
 import {
@@ -56,6 +57,7 @@ import {
   CpFieldTab,
   RawTab,
 } from '../components/ConfigEditor';
+import { FieldGroup, toggleInputCls } from '../components/settings/ConfigField';
 
 type SettingsTab =
   | 'general'
@@ -67,6 +69,21 @@ type SettingsTab =
   | 'raw'
   | 'policy'
   | 'runtime-status';
+
+// ---------------------------------------------------------------------------
+// Small status-tile primitive shared by the CP-Runtime and Runtime-status
+// tabs below — a labelled `dt`/`dd` pair on a subtle card background, instead
+// of the bare label-over-value stack the page used to render.
+// ---------------------------------------------------------------------------
+
+function InfoTile({ label, value, mono, wide }: { label: string; value: ReactNode; mono?: boolean; wide?: boolean }) {
+  return (
+    <div className={cn('rounded-lg border border-border bg-surface/40 px-3 py-2.5', wide && 'sm:col-span-2')}>
+      <dt className="text-note font-medium uppercase tracking-wide text-ink-mute">{label}</dt>
+      <dd className={cn('mt-1 text-sm text-ink', mono && 'font-mono break-all')}>{value}</dd>
+    </div>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // CP-Runtime tab — the shared `cp.max_workspace_bytes` field plus a read-only
@@ -84,42 +101,24 @@ function CpRuntimeTab({
   status,
 }: Omit<TabProps, 'eff'> & { status: ConfigRuntimeStatus }) {
   return (
-    <div className="space-y-6">
-      <div>
-        <CpFieldTab
-          prov={prov}
-          lockList={lockList}
-          fieldValue={fieldValue}
-          onChange={onChange}
-          onToggleLock={onToggleLock}
-        />
-      </div>
+    <div className="space-y-4">
+      <CpFieldTab
+        prov={prov}
+        lockList={lockList}
+        fieldValue={fieldValue}
+        onChange={onChange}
+        onToggleLock={onToggleLock}
+      />
 
-      <div className="border-t border-border pt-4">
-        <h3 className="mb-3 text-sm font-semibold text-ink">Runtime status</h3>
-        <dl className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <div>
-            <dt className="text-note font-medium uppercase tracking-wide text-ink-dim">Bind address</dt>
-            <dd className="mt-0.5 font-mono text-sm text-ink">{status.bind}</dd>
-          </div>
-          <div>
-            <dt className="text-note font-medium uppercase tracking-wide text-ink-dim">Bearer token</dt>
-            <dd className="mt-0.5 text-sm text-ink">
-              {status.token_set ? '••• set' : 'not configured'}
-            </dd>
-          </div>
+      <FieldGroup title="Runtime status" description="Read-only — reflects the running rupu cp serve process.">
+        <dl className="grid grid-cols-1 gap-3 py-3 sm:grid-cols-2">
+          <InfoTile label="Bind address" value={status.bind} mono />
+          <InfoTile label="Bearer token" value={status.token_set ? '••• set' : 'not configured'} />
           {status.restart_required_keys.length > 0 && (
-            <div className="sm:col-span-2">
-              <dt className="text-note font-medium uppercase tracking-wide text-ink-dim">
-                Requires restart to apply
-              </dt>
-              <dd className="mt-0.5 font-mono text-sm text-ink-dim">
-                {status.restart_required_keys.join(', ')}
-              </dd>
-            </div>
+            <InfoTile label="Requires restart to apply" value={status.restart_required_keys.join(', ')} mono wide />
           )}
         </dl>
-      </div>
+      </FieldGroup>
     </div>
   );
 }
@@ -127,6 +126,20 @@ function CpRuntimeTab({
 // ---------------------------------------------------------------------------
 // Policy tab
 // ---------------------------------------------------------------------------
+
+/** Group dotted keys by their top-level namespace (`autoflow.*`, `scm.*`, …)
+ *  so the consolidated lock list reads as sections instead of one long flat
+ *  list of unrelated keys. Root-level keys (no dot) fall into "general". */
+function groupPolicyKeys(keys: string[]): Array<[string, string[]]> {
+  const groups = new Map<string, string[]>();
+  for (const key of keys) {
+    const ns = key.includes('.') ? key.split('.')[0] : 'general';
+    const list = groups.get(ns) ?? [];
+    list.push(key);
+    groups.set(ns, list);
+  }
+  return Array.from(groups.entries()).sort(([a], [b]) => a.localeCompare(b));
+}
 
 function PolicyTab({
   keys,
@@ -149,37 +162,40 @@ function PolicyTab({
     return <EmptyTabState text="No resolved keys yet — nothing to lock." />;
   }
   return (
-    <div>
-      <p className="mb-3 text-sm text-ink-dim">
+    <div className="space-y-4">
+      <p className="text-sm text-ink-dim">
         Keys enforced by the GLOBAL policy lock — a locked key can never be overridden by a project
         layer. Consolidated view of every key from the General / Providers / Autoflow / SCM-Issues /
         Pricing / CP-Runtime tabs; toggling here is equivalent to the lock glyph on those tabs.
       </p>
-      <ul className="divide-y divide-border/60">
-        {keys.map((key) => (
-          <li key={key} className="flex items-center gap-2 py-2">
-            <input
-              id={`policy-lock-${key}`}
-              type="checkbox"
-              checked={locks.includes(key)}
-              onChange={() => onToggle(key)}
-              aria-label={key}
-              className="accent-brand-600"
-            />
-            <label htmlFor={`policy-lock-${key}`} className="font-mono text-sm text-ink">
-              {key}
-            </label>
-          </li>
-        ))}
-      </ul>
+
+      {groupPolicyKeys(keys).map(([ns, nsKeys]) => (
+        <FieldGroup key={ns} title={ns}>
+          {nsKeys.map((key) => (
+            <div key={key} className="flex items-center justify-between gap-3 py-2">
+              <label htmlFor={`policy-lock-${key}`} className="min-w-0 flex-1 truncate font-mono text-sm text-ink">
+                {key}
+              </label>
+              <input
+                id={`policy-lock-${key}`}
+                type="checkbox"
+                checked={locks.includes(key)}
+                onChange={() => onToggle(key)}
+                aria-label={key}
+                className={toggleInputCls}
+              />
+            </div>
+          ))}
+        </FieldGroup>
+      ))}
 
       {error && (
-        <div role="alert" className="mt-3 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
+        <div role="alert" className="rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
         </div>
       )}
 
-      <div className="mt-4 flex justify-end">
+      <div className="flex justify-end">
         <Button onClick={onSave} disabled={saving || !dirty}>
           {saving ? 'Saving…' : 'Save policy'}
         </Button>
@@ -196,14 +212,8 @@ function RuntimeStatusTab({ status }: { status: ConfigRuntimeStatus }) {
   return (
     <div className="space-y-4">
       <dl className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-        <div>
-          <dt className="text-note font-medium uppercase tracking-wide text-ink-dim">Bind address</dt>
-          <dd className="mt-0.5 font-mono text-sm text-ink">{status.bind}</dd>
-        </div>
-        <div>
-          <dt className="text-note font-medium uppercase tracking-wide text-ink-dim">CP bearer token</dt>
-          <dd className="mt-0.5 text-sm text-ink">{status.token_set ? '••• set' : 'not set'}</dd>
-        </div>
+        <InfoTile label="Bind address" value={status.bind} mono />
+        <InfoTile label="CP bearer token" value={status.token_set ? '••• set' : 'not set'} />
       </dl>
 
       {status.restart_required_keys.length > 0 ? (
@@ -471,6 +481,7 @@ export default function Settings() {
           <TabButton active={tab === 'scm'} onClick={() => setTab('scm')} icon={GitBranch} label="SCM / Issues" />
           <TabButton active={tab === 'pricing'} onClick={() => setTab('pricing')} icon={DollarSign} label="Pricing" />
           <TabButton active={tab === 'cp-runtime'} onClick={() => setTab('cp-runtime')} icon={Server} label="CP-Runtime" />
+          <div aria-hidden="true" className="mx-1 h-5 w-px shrink-0 bg-border" />
           <TabButton active={tab === 'raw'} onClick={() => setTab('raw')} icon={FileCode} label="Raw" />
           <TabButton active={tab === 'policy'} onClick={() => setTab('policy')} icon={LockIcon} label="Policy" />
           <TabButton

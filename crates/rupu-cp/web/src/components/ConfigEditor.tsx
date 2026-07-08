@@ -13,11 +13,18 @@
 //    renders read-only with a 🔒 + "enforced by global policy" note instead
 //    of an editable control. Pass `lockedReadOnly` down to opt into that mode
 //    (and omit `onToggleLock`, since there is nothing to toggle).
+//
+// The label + provenance-badge + input + lock-toggle row, the boolean toggle
+// switch, the field-group card, and the empty-tab state live in
+// `components/settings/ConfigField.tsx`; the Raw TOML tab lives in
+// `components/settings/RawEditor.tsx` (both T4 extractions — this file keeps
+// re-exporting their public names unchanged so existing imports don't move).
 
 import type { KeyProvenance } from '../lib/api';
-import { Chip } from './ui/Chip';
-import { Button } from './ui/Button';
-import CodeHighlight from './CodeHighlight';
+import { ConfigField, FieldGroup, EmptyTabState, type ConfigFieldProps } from './settings/ConfigField';
+
+export { EmptyTabState };
+export { RawTab } from './settings/RawEditor';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -33,7 +40,7 @@ export function getPath(obj: unknown, dotted: string): unknown {
   }, obj);
 }
 
-export function asRecord(v: unknown): Record<string, unknown> {
+function asRecord(v: unknown): Record<string, unknown> {
   return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
 }
 
@@ -42,146 +49,6 @@ export function sameSet(a: string[], b: string[]): boolean {
   if (a.length !== b.length) return false;
   const sa = new Set(a);
   return b.every((k) => sa.has(k));
-}
-
-export const SOURCE_CLASS: Record<KeyProvenance['source'], string> = {
-  global: 'bg-info-bg text-info ring-info/30',
-  project: 'bg-ok-bg text-ok ring-ok/30',
-  env: 'bg-warn-bg text-warn ring-warn/30',
-  default: 'bg-surface text-ink-mute ring-border',
-};
-
-export const fieldCls =
-  'w-full rounded-md border border-border bg-panel px-2.5 py-1.5 text-sm text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none disabled:opacity-60';
-export const labelCls = 'text-note font-medium text-ink-dim';
-
-export const RAW_TEXTAREA_CLS =
-  'mt-1 h-72 w-full resize-y rounded-md border border-border bg-panel px-2.5 py-1.5 font-mono text-ui ' +
-  'leading-relaxed text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none';
-
-// ---------------------------------------------------------------------------
-// ConfigField — one form row: label + provenance badge + typed input + lock
-// ---------------------------------------------------------------------------
-
-export interface ConfigFieldProps {
-  label: string;
-  dottedKey: string;
-  kind: 'text' | 'number' | 'boolean' | 'select';
-  value: unknown;
-  options?: string[];
-  placeholder?: string;
-  provenance?: KeyProvenance;
-  locked: boolean;
-  onChange: (key: string, value: unknown) => void;
-  /** Global-scope only: toggles this key on/off the GLOBAL policy lock list. */
-  onToggleLock?: (key: string) => void;
-  /** Project-scope only: a locked field renders read-only (no input, no
-   *  toggle button) with a 🔒 + "enforced by global policy" note. */
-  lockedReadOnly?: boolean;
-}
-
-export function ConfigField({
-  label,
-  dottedKey,
-  kind,
-  value,
-  options,
-  placeholder,
-  provenance,
-  locked,
-  onChange,
-  onToggleLock,
-  lockedReadOnly,
-}: ConfigFieldProps) {
-  const id = dottedKey;
-  const source = provenance?.source ?? 'default';
-  const readOnlyLocked = Boolean(lockedReadOnly) && locked;
-
-  return (
-    <div className="flex items-start gap-3 py-2.5 border-b border-border/60 last:border-b-0">
-      <div className="min-w-0 flex-1">
-        <div className="mb-1 flex items-center gap-2">
-          <label htmlFor={readOnlyLocked ? undefined : id} className={labelCls}>
-            {label}
-          </label>
-          <Chip className={SOURCE_CLASS[source]}>{source}</Chip>
-        </div>
-
-        {readOnlyLocked ? (
-          <p id={id} className="text-sm text-ink">
-            {value == null || value === '' ? '—' : String(value)}
-          </p>
-        ) : kind === 'boolean' ? (
-          <input
-            id={id}
-            type="checkbox"
-            checked={Boolean(value)}
-            onChange={(e) => onChange(dottedKey, e.target.checked)}
-            className="accent-brand-600"
-          />
-        ) : kind === 'select' ? (
-          <select
-            id={id}
-            value={typeof value === 'string' ? value : ''}
-            onChange={(e) => onChange(dottedKey, e.target.value === '' ? undefined : e.target.value)}
-            className={fieldCls}
-          >
-            <option value="">—</option>
-            {(options ?? []).map((o) => (
-              <option key={o} value={o}>
-                {o}
-              </option>
-            ))}
-          </select>
-        ) : (
-          <input
-            id={id}
-            type={kind === 'number' ? 'number' : 'text'}
-            value={value == null ? '' : String(value)}
-            placeholder={placeholder}
-            onChange={(e) => {
-              if (kind === 'number') {
-                const raw = e.target.value;
-                onChange(dottedKey, raw.trim() === '' ? undefined : Number(raw));
-              } else {
-                onChange(dottedKey, e.target.value === '' ? undefined : e.target.value);
-              }
-            }}
-            className={fieldCls}
-          />
-        )}
-      </div>
-
-      {readOnlyLocked ? (
-        <span
-          className="mt-5 shrink-0 inline-flex items-center gap-1 text-note text-ink-dim"
-          title="Enforced by global policy — cannot be overridden per-project"
-        >
-          <span aria-hidden="true">{'\u{1F512}' /* 🔒 */}</span>
-          enforced by global policy
-        </span>
-      ) : onToggleLock ? (
-        <button
-          type="button"
-          aria-label={locked ? `Unlock ${dottedKey}` : `Lock ${dottedKey}`}
-          aria-pressed={locked}
-          title={
-            locked
-              ? 'Enforced by global policy — click to unlock'
-              : 'Click to lock (enforce this key globally)'
-          }
-          onClick={() => onToggleLock(dottedKey)}
-          className="mt-5 shrink-0 text-sm leading-none hover:opacity-80"
-        >
-          {locked ? '\u{1F512}' /* 🔒 */ : '\u{1F513}' /* 🔓 */}
-        </button>
-      ) : null}
-    </div>
-  );
-}
-
-export function EmptyTabState({ text }: { text: string }) {
-  return <p className="py-8 text-center text-sm text-ink-dim">{text}</p>;
 }
 
 // ---------------------------------------------------------------------------
@@ -200,55 +67,61 @@ export interface TabProps {
 
 export function GeneralTab({ prov, lockList, fieldValue, onChange, onToggleLock, lockedReadOnly }: TabProps) {
   return (
-    <div>
-      <ConfigField
-        label="Default provider"
-        dottedKey="default_provider"
-        kind="text"
-        placeholder="anthropic"
-        value={fieldValue('default_provider')}
-        provenance={prov.default_provider}
-        locked={lockList.includes('default_provider')}
-        onChange={onChange}
-        onToggleLock={onToggleLock}
-        lockedReadOnly={lockedReadOnly}
-      />
-      <ConfigField
-        label="Default model"
-        dottedKey="default_model"
-        kind="text"
-        placeholder="claude-sonnet-4-6"
-        value={fieldValue('default_model')}
-        provenance={prov.default_model}
-        locked={lockList.includes('default_model')}
-        onChange={onChange}
-        onToggleLock={onToggleLock}
-        lockedReadOnly={lockedReadOnly}
-      />
-      <ConfigField
-        label="Permission mode"
-        dottedKey="permission_mode"
-        kind="select"
-        options={['ask', 'bypass', 'readonly']}
-        value={fieldValue('permission_mode')}
-        provenance={prov.permission_mode}
-        locked={lockList.includes('permission_mode')}
-        onChange={onChange}
-        onToggleLock={onToggleLock}
-        lockedReadOnly={lockedReadOnly}
-      />
-      <ConfigField
-        label="Log level"
-        dottedKey="log_level"
-        kind="select"
-        options={['trace', 'debug', 'info', 'warn', 'error']}
-        value={fieldValue('log_level')}
-        provenance={prov.log_level}
-        locked={lockList.includes('log_level')}
-        onChange={onChange}
-        onToggleLock={onToggleLock}
-        lockedReadOnly={lockedReadOnly}
-      />
+    <div className="space-y-4">
+      <FieldGroup title="Defaults" description="Fallbacks used when a run doesn't specify its own provider/model.">
+        <ConfigField
+          label="Default provider"
+          dottedKey="default_provider"
+          kind="text"
+          placeholder="anthropic"
+          value={fieldValue('default_provider')}
+          provenance={prov.default_provider}
+          locked={lockList.includes('default_provider')}
+          onChange={onChange}
+          onToggleLock={onToggleLock}
+          lockedReadOnly={lockedReadOnly}
+        />
+        <ConfigField
+          label="Default model"
+          dottedKey="default_model"
+          kind="text"
+          placeholder="claude-sonnet-4-6"
+          value={fieldValue('default_model')}
+          provenance={prov.default_model}
+          locked={lockList.includes('default_model')}
+          onChange={onChange}
+          onToggleLock={onToggleLock}
+          lockedReadOnly={lockedReadOnly}
+        />
+      </FieldGroup>
+
+      <FieldGroup title="Runtime behavior">
+        <ConfigField
+          label="Permission mode"
+          dottedKey="permission_mode"
+          kind="select"
+          options={['ask', 'bypass', 'readonly']}
+          help="Controls whether tool calls need approval before they run."
+          value={fieldValue('permission_mode')}
+          provenance={prov.permission_mode}
+          locked={lockList.includes('permission_mode')}
+          onChange={onChange}
+          onToggleLock={onToggleLock}
+          lockedReadOnly={lockedReadOnly}
+        />
+        <ConfigField
+          label="Log level"
+          dottedKey="log_level"
+          kind="select"
+          options={['trace', 'debug', 'info', 'warn', 'error']}
+          value={fieldValue('log_level')}
+          provenance={prov.log_level}
+          locked={lockList.includes('log_level')}
+          onChange={onChange}
+          onToggleLock={onToggleLock}
+          lockedReadOnly={lockedReadOnly}
+        />
+      </FieldGroup>
     </div>
   );
 }
@@ -274,10 +147,9 @@ export function ProvidersTab({ eff, prov, lockList, fieldValue, onChange, onTogg
     );
   }
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       {names.map((name) => (
-        <div key={name}>
-          <h3 className="mb-2 text-sm font-semibold text-ink">{name}</h3>
+        <FieldGroup key={name} title={name}>
           {PROVIDER_FIELDS.map((f) => {
             const dottedKey = `providers.${name}.${f.key}`;
             return (
@@ -295,7 +167,7 @@ export function ProvidersTab({ eff, prov, lockList, fieldValue, onChange, onTogg
               />
             );
           })}
-        </div>
+        </FieldGroup>
       ))}
     </div>
   );
@@ -303,100 +175,105 @@ export function ProvidersTab({ eff, prov, lockList, fieldValue, onChange, onTogg
 
 export function AutoflowTab({ prov, lockList, fieldValue, onChange, onToggleLock, lockedReadOnly }: TabProps) {
   return (
-    <div>
-      <ConfigField
-        label="Enabled"
-        dottedKey="autoflow.enabled"
-        kind="boolean"
-        value={fieldValue('autoflow.enabled')}
-        provenance={prov['autoflow.enabled']}
-        locked={lockList.includes('autoflow.enabled')}
-        onChange={onChange}
-        onToggleLock={onToggleLock}
-        lockedReadOnly={lockedReadOnly}
-      />
-      <ConfigField
-        label="Repo"
-        dottedKey="autoflow.repo"
-        kind="text"
-        placeholder="github:owner/repo"
-        value={fieldValue('autoflow.repo')}
-        provenance={prov['autoflow.repo']}
-        locked={lockList.includes('autoflow.repo')}
-        onChange={onChange}
-        onToggleLock={onToggleLock}
-        lockedReadOnly={lockedReadOnly}
-      />
-      <ConfigField
-        label="Checkout"
-        dottedKey="autoflow.checkout"
-        kind="select"
-        options={['worktree', 'in_place']}
-        value={fieldValue('autoflow.checkout')}
-        provenance={prov['autoflow.checkout']}
-        locked={lockList.includes('autoflow.checkout')}
-        onChange={onChange}
-        onToggleLock={onToggleLock}
-        lockedReadOnly={lockedReadOnly}
-      />
-      <ConfigField
-        label="Worktree root"
-        dottedKey="autoflow.worktree_root"
-        kind="text"
-        placeholder="~/.rupu/autoflows/worktrees"
-        value={fieldValue('autoflow.worktree_root')}
-        provenance={prov['autoflow.worktree_root']}
-        locked={lockList.includes('autoflow.worktree_root')}
-        onChange={onChange}
-        onToggleLock={onToggleLock}
-        lockedReadOnly={lockedReadOnly}
-      />
-      <ConfigField
-        label="Permission mode"
-        dottedKey="autoflow.permission_mode"
-        kind="select"
-        options={['ask', 'bypass', 'readonly']}
-        value={fieldValue('autoflow.permission_mode')}
-        provenance={prov['autoflow.permission_mode']}
-        locked={lockList.includes('autoflow.permission_mode')}
-        onChange={onChange}
-        onToggleLock={onToggleLock}
-        lockedReadOnly={lockedReadOnly}
-      />
-      <ConfigField
-        label="Strict templates"
-        dottedKey="autoflow.strict_templates"
-        kind="boolean"
-        value={fieldValue('autoflow.strict_templates')}
-        provenance={prov['autoflow.strict_templates']}
-        locked={lockList.includes('autoflow.strict_templates')}
-        onChange={onChange}
-        onToggleLock={onToggleLock}
-        lockedReadOnly={lockedReadOnly}
-      />
-      <ConfigField
-        label="Max active"
-        dottedKey="autoflow.max_active"
-        kind="number"
-        value={fieldValue('autoflow.max_active')}
-        provenance={prov['autoflow.max_active']}
-        locked={lockList.includes('autoflow.max_active')}
-        onChange={onChange}
-        onToggleLock={onToggleLock}
-        lockedReadOnly={lockedReadOnly}
-      />
-      <ConfigField
-        label="Cleanup after"
-        dottedKey="autoflow.cleanup_after"
-        kind="text"
-        placeholder="7d"
-        value={fieldValue('autoflow.cleanup_after')}
-        provenance={prov['autoflow.cleanup_after']}
-        locked={lockList.includes('autoflow.cleanup_after')}
-        onChange={onChange}
-        onToggleLock={onToggleLock}
-        lockedReadOnly={lockedReadOnly}
-      />
+    <div className="space-y-4">
+      <FieldGroup title="Repository & checkout">
+        <ConfigField
+          label="Enabled"
+          dottedKey="autoflow.enabled"
+          kind="boolean"
+          value={fieldValue('autoflow.enabled')}
+          provenance={prov['autoflow.enabled']}
+          locked={lockList.includes('autoflow.enabled')}
+          onChange={onChange}
+          onToggleLock={onToggleLock}
+          lockedReadOnly={lockedReadOnly}
+        />
+        <ConfigField
+          label="Repo"
+          dottedKey="autoflow.repo"
+          kind="text"
+          placeholder="github:owner/repo"
+          value={fieldValue('autoflow.repo')}
+          provenance={prov['autoflow.repo']}
+          locked={lockList.includes('autoflow.repo')}
+          onChange={onChange}
+          onToggleLock={onToggleLock}
+          lockedReadOnly={lockedReadOnly}
+        />
+        <ConfigField
+          label="Checkout"
+          dottedKey="autoflow.checkout"
+          kind="select"
+          options={['worktree', 'in_place']}
+          value={fieldValue('autoflow.checkout')}
+          provenance={prov['autoflow.checkout']}
+          locked={lockList.includes('autoflow.checkout')}
+          onChange={onChange}
+          onToggleLock={onToggleLock}
+          lockedReadOnly={lockedReadOnly}
+        />
+        <ConfigField
+          label="Worktree root"
+          dottedKey="autoflow.worktree_root"
+          kind="text"
+          placeholder="~/.rupu/autoflows/worktrees"
+          value={fieldValue('autoflow.worktree_root')}
+          provenance={prov['autoflow.worktree_root']}
+          locked={lockList.includes('autoflow.worktree_root')}
+          onChange={onChange}
+          onToggleLock={onToggleLock}
+          lockedReadOnly={lockedReadOnly}
+        />
+      </FieldGroup>
+
+      <FieldGroup title="Execution">
+        <ConfigField
+          label="Permission mode"
+          dottedKey="autoflow.permission_mode"
+          kind="select"
+          options={['ask', 'bypass', 'readonly']}
+          value={fieldValue('autoflow.permission_mode')}
+          provenance={prov['autoflow.permission_mode']}
+          locked={lockList.includes('autoflow.permission_mode')}
+          onChange={onChange}
+          onToggleLock={onToggleLock}
+          lockedReadOnly={lockedReadOnly}
+        />
+        <ConfigField
+          label="Strict templates"
+          dottedKey="autoflow.strict_templates"
+          kind="boolean"
+          value={fieldValue('autoflow.strict_templates')}
+          provenance={prov['autoflow.strict_templates']}
+          locked={lockList.includes('autoflow.strict_templates')}
+          onChange={onChange}
+          onToggleLock={onToggleLock}
+          lockedReadOnly={lockedReadOnly}
+        />
+        <ConfigField
+          label="Max active"
+          dottedKey="autoflow.max_active"
+          kind="number"
+          value={fieldValue('autoflow.max_active')}
+          provenance={prov['autoflow.max_active']}
+          locked={lockList.includes('autoflow.max_active')}
+          onChange={onChange}
+          onToggleLock={onToggleLock}
+          lockedReadOnly={lockedReadOnly}
+        />
+        <ConfigField
+          label="Cleanup after"
+          dottedKey="autoflow.cleanup_after"
+          kind="text"
+          placeholder="7d"
+          value={fieldValue('autoflow.cleanup_after')}
+          provenance={prov['autoflow.cleanup_after']}
+          locked={lockList.includes('autoflow.cleanup_after')}
+          onChange={onChange}
+          onToggleLock={onToggleLock}
+          lockedReadOnly={lockedReadOnly}
+        />
+      </FieldGroup>
     </div>
   );
 }
@@ -413,9 +290,8 @@ export function ScmTab({ eff, prov, lockList, fieldValue, onChange, onToggleLock
   const platforms = Object.keys(scm).filter((k) => k !== 'default').sort();
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h3 className="mb-2 text-sm font-semibold text-ink">Default SCM</h3>
+    <div className="space-y-4">
+      <FieldGroup title="Default SCM">
         <ConfigField
           label="Platform"
           dottedKey="scm.default.platform"
@@ -450,10 +326,9 @@ export function ScmTab({ eff, prov, lockList, fieldValue, onChange, onToggleLock
           onToggleLock={onToggleLock}
           lockedReadOnly={lockedReadOnly}
         />
-      </div>
+      </FieldGroup>
 
-      <div>
-        <h3 className="mb-2 text-sm font-semibold text-ink">Default issue tracker</h3>
+      <FieldGroup title="Default issue tracker">
         <ConfigField
           label="Tracker"
           dottedKey="issues.default.tracker"
@@ -477,16 +352,15 @@ export function ScmTab({ eff, prov, lockList, fieldValue, onChange, onToggleLock
           onToggleLock={onToggleLock}
           lockedReadOnly={lockedReadOnly}
         />
-      </div>
+      </FieldGroup>
 
       {platforms.length > 0 && (
-        <div>
-          <h3 className="mb-2 text-sm font-semibold text-ink">Per-platform overrides</h3>
+        <div className="space-y-4">
+          <h3 className="text-note font-semibold uppercase tracking-wide text-ink-mute">
+            Per-platform overrides
+          </h3>
           {platforms.map((platform) => (
-            <div key={platform} className="mb-4">
-              <h4 className="mb-1 text-note font-semibold uppercase tracking-wide text-ink-mute">
-                {platform}
-              </h4>
+            <FieldGroup key={platform} title={platform}>
               {SCM_PLATFORM_FIELDS.map((f) => {
                 const dottedKey = `scm.${platform}.${f.key}`;
                 return (
@@ -505,7 +379,7 @@ export function ScmTab({ eff, prov, lockList, fieldValue, onChange, onToggleLock
                   />
                 );
               })}
-            </div>
+            </FieldGroup>
           ))}
         </div>
       )}
@@ -513,7 +387,7 @@ export function ScmTab({ eff, prov, lockList, fieldValue, onChange, onToggleLock
   );
 }
 
-export function PricingRow({
+function PricingRow({
   dottedPrefix,
   prov,
   lockList,
@@ -578,17 +452,16 @@ export function PricingTab({ eff, prov, lockList, fieldValue, onChange, onToggle
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       {providerNames.map((provider) => {
         const models = asRecord(pricing[provider]);
         const modelNames = Object.keys(models).sort();
         if (modelNames.length === 0) return null;
         return (
-          <div key={provider}>
-            <h3 className="mb-2 text-sm font-semibold text-ink">{provider}</h3>
+          <div key={provider} className="space-y-3">
+            <h3 className="text-note font-semibold uppercase tracking-wide text-ink-mute">{provider}</h3>
             {modelNames.map((model) => (
-              <div key={model} className="mb-3">
-                <h4 className="mb-1 text-note font-semibold text-ink-mute">{model}</h4>
+              <FieldGroup key={model} title={model}>
                 <PricingRow
                   dottedPrefix={`pricing.${provider}.${model}`}
                   prov={prov}
@@ -598,20 +471,21 @@ export function PricingTab({ eff, prov, lockList, fieldValue, onChange, onToggle
                   onToggleLock={onToggleLock}
                   lockedReadOnly={lockedReadOnly}
                 />
-              </div>
+              </FieldGroup>
             ))}
           </div>
         );
       })}
 
       {Object.keys(agents).length > 0 && (
-        <div>
-          <h3 className="mb-2 text-sm font-semibold text-ink">Agent fallback pricing</h3>
+        <div className="space-y-3">
+          <h3 className="text-note font-semibold uppercase tracking-wide text-ink-mute">
+            Agent fallback pricing
+          </h3>
           {Object.keys(agents)
             .sort()
             .map((agent) => (
-              <div key={agent} className="mb-3">
-                <h4 className="mb-1 text-note font-semibold text-ink-mute">{agent}</h4>
+              <FieldGroup key={agent} title={agent}>
                 <PricingRow
                   dottedPrefix={`pricing.agents.${agent}`}
                   prov={prov}
@@ -621,7 +495,7 @@ export function PricingTab({ eff, prov, lockList, fieldValue, onChange, onToggle
                   onToggleLock={onToggleLock}
                   lockedReadOnly={lockedReadOnly}
                 />
-              </div>
+              </FieldGroup>
             ))}
         </div>
       )}
@@ -634,79 +508,20 @@ export function PricingTab({ eff, prov, lockList, fieldValue, onChange, onToggle
  *  per-project; the project Config tab uses this field-only tab as-is. */
 export function CpFieldTab({ prov, lockList, fieldValue, onChange, onToggleLock, lockedReadOnly }: Omit<TabProps, 'eff'>) {
   return (
-    <ConfigField
-      label="Max workspace bytes"
-      dottedKey="cp.max_workspace_bytes"
-      kind="number"
-      placeholder="default (10485760)"
-      value={fieldValue('cp.max_workspace_bytes')}
-      provenance={prov['cp.max_workspace_bytes']}
-      locked={lockList.includes('cp.max_workspace_bytes')}
-      onChange={onChange}
-      onToggleLock={onToggleLock}
-      lockedReadOnly={lockedReadOnly}
-    />
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Raw TOML tab
-// ---------------------------------------------------------------------------
-
-export function RawTab({
-  heading,
-  savedRaw,
-  draft,
-  onChangeDraft,
-  onSave,
-  saving,
-  error,
-  emptyPlaceholder,
-}: {
-  heading: React.ReactNode;
-  savedRaw: string;
-  draft: string;
-  onChangeDraft: (v: string) => void;
-  onSave: () => void;
-  saving: boolean;
-  error: string | null;
-  emptyPlaceholder?: string;
-}) {
-  const dirty = draft !== savedRaw;
-  return (
-    <div className="space-y-4">
-      <div>
-        <h3 className="mb-2 text-sm font-semibold text-ink">{heading}</h3>
-        <CodeHighlight code={savedRaw || (emptyPlaceholder ?? '# empty\n')} language="toml" />
-      </div>
-
-      <div>
-        <label htmlFor="raw-toml-editor" className={labelCls}>
-          Edit raw TOML
-        </label>
-        <textarea
-          id="raw-toml-editor"
-          value={draft}
-          onChange={(e) => onChangeDraft(e.target.value)}
-          spellCheck={false}
-          className={RAW_TEXTAREA_CLS}
-        />
-      </div>
-
-      {error && (
-        <div role="alert" className="rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {error}
-        </div>
-      )}
-
-      <div className="flex items-center justify-end gap-2">
-        <Button variant="secondary" onClick={() => onChangeDraft(savedRaw)} disabled={saving || !dirty}>
-          Reset
-        </Button>
-        <Button onClick={onSave} disabled={saving || !dirty}>
-          {saving ? 'Saving…' : 'Save'}
-        </Button>
-      </div>
-    </div>
+    <FieldGroup title="Workspace limits">
+      <ConfigField
+        label="Max workspace bytes"
+        dottedKey="cp.max_workspace_bytes"
+        kind="number"
+        placeholder="default (10485760)"
+        help="Upper bound on a cloned/checked-out workspace's on-disk size."
+        value={fieldValue('cp.max_workspace_bytes')}
+        provenance={prov['cp.max_workspace_bytes']}
+        locked={lockList.includes('cp.max_workspace_bytes')}
+        onChange={onChange}
+        onToggleLock={onToggleLock}
+        lockedReadOnly={lockedReadOnly}
+      />
+    </FieldGroup>
   );
 }

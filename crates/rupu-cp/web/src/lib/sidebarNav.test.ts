@@ -13,9 +13,21 @@ it('has a Security group with Coverage and Findings', () => {
   expect(security.items.map((i) => i.to)).toEqual(['/coverage', '/findings']);
 });
 
-it('Observe no longer contains Coverage or Findings', () => {
-  const observe = findGroup('observe');
-  expect(observe.items.map((i) => i.to)).toEqual(['/events']);
+it('has a top-level Live Events leaf right after Projects', () => {
+  const projectsIndex = sidebarNav.findIndex(
+    (s) => s.kind === 'leaf' && s.item.to === '/projects',
+  );
+  const nextSection = sidebarNav[projectsIndex + 1];
+  expect(nextSection.kind).toBe('leaf');
+  if (nextSection.kind === 'leaf') {
+    expect(nextSection.item.to).toBe('/events');
+    expect(nextSection.item.label).toBe('Live Events');
+  }
+});
+
+it('no longer has an Observe group', () => {
+  const observe = sidebarNav.find((s) => s.kind === 'group' && s.group.label === 'Observe');
+  expect(observe).toBeUndefined();
 });
 
 it('routes are unchanged (Coverage/Findings paths still present exactly once each)', () => {
