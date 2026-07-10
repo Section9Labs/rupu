@@ -72,6 +72,18 @@ struct Frontmatter {
     /// currently ignore this.
     #[serde(default, rename = "outputFormat")]
     output_format: Option<OutputFormat>,
+    /// JSON Schema for Anthropic structured outputs. When present,
+    /// `outputFormat: json` agents get a guaranteed schema-conforming
+    /// response via Anthropic's `output_config.format = {type:
+    /// "json_schema", schema: <this value>}`. Declared inline as a
+    /// YAML mapping so an agent stays a single self-contained `.md`
+    /// file; `serde_yaml` deserializes it straight into a JSON
+    /// `serde_json::Value`. `None` (default) preserves today's
+    /// prompt-driven-only `outputFormat: json` behavior — Anthropic
+    /// mandates a real schema for `format`, so no schema means no
+    /// `output_config.format` is emitted at all.
+    #[serde(default, rename = "outputSchema")]
+    output_schema: Option<serde_json::Value>,
     /// Anthropic-only soft cap on output tokens. The model
     /// self-paces toward this budget — distinct from `maxTurns`,
     /// which is a hard ceiling. Emitted as
@@ -140,6 +152,9 @@ pub struct AgentSpec {
     pub effort: Option<ThinkingLevel>,
     pub context_window: Option<ContextWindow>,
     pub output_format: Option<OutputFormat>,
+    /// JSON Schema for Anthropic structured outputs. See the
+    /// `outputSchema` frontmatter doc comment on `Frontmatter`.
+    pub output_schema: Option<serde_json::Value>,
     pub anthropic_task_budget: Option<u32>,
     pub anthropic_context_management: Option<ContextManagement>,
     pub anthropic_speed: Option<Speed>,
@@ -196,6 +211,7 @@ impl AgentSpec {
             effort: fm.effort,
             context_window: fm.context_window,
             output_format: fm.output_format,
+            output_schema: fm.output_schema,
             anthropic_task_budget: fm.anthropic_task_budget,
             anthropic_context_management: fm.anthropic_context_management,
             anthropic_speed: fm.anthropic_speed,

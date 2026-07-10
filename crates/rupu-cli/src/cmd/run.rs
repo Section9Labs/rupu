@@ -528,6 +528,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         effort: spec.effort,
         context_window: spec.context_window,
         output_format: spec.output_format,
+        output_schema: spec.output_schema.clone(),
         anthropic_task_budget: spec.anthropic_task_budget,
         anthropic_context_management: spec.anthropic_context_management,
         anthropic_speed: spec.anthropic_speed,

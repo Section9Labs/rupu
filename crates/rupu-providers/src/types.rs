@@ -132,6 +132,14 @@ pub struct LlmRequest {
     /// (with the right shape per their schema). `None` leaves the
     /// model free to choose. Other providers currently ignore this.
     pub output_format: Option<OutputFormat>,
+    /// JSON Schema for Anthropic structured outputs. When present,
+    /// Anthropic emits `output_config.format = {type: "json_schema",
+    /// schema: <this value>}`, which guarantees schema-conforming
+    /// output. Anthropic requires a real schema for `format` — there
+    /// is no schema-less JSON mode — so this is `None` unless the
+    /// agent declares an `outputSchema`. Other providers currently
+    /// ignore this.
+    pub output_schema: Option<serde_json::Value>,
     /// Anthropic-only soft cap on output tokens. Distinct from
     /// `max_tokens` (hard ceiling): the model self-paces toward this
     /// budget. Emitted as `output_config.task_budget`. Ignored by

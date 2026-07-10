@@ -362,6 +362,8 @@ struct SessionRecord {
     #[serde(default)]
     output_format: Option<ProviderOutputFormat>,
     #[serde(default)]
+    output_schema: Option<serde_json::Value>,
+    #[serde(default)]
     anthropic_task_budget: Option<u32>,
     #[serde(default)]
     anthropic_context_management: Option<ContextManagement>,
@@ -1371,6 +1373,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         effort: spec.effort,
         context_window: spec.context_window,
         output_format: spec.output_format,
+        output_schema: spec.output_schema.clone(),
         anthropic_task_budget: spec.anthropic_task_budget,
         anthropic_context_management: spec.anthropic_context_management,
         anthropic_speed: spec.anthropic_speed,
@@ -6741,6 +6744,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         effort: session.effort,
         context_window: session.context_window,
         output_format: session.output_format,
+        output_schema: session.output_schema.clone(),
         anthropic_task_budget: session.anthropic_task_budget,
         anthropic_context_management: session.anthropic_context_management,
         anthropic_speed: session.anthropic_speed,
@@ -8431,6 +8435,7 @@ mod tests {
             effort: None,
             context_window: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,

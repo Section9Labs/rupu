@@ -253,6 +253,7 @@ mod tests {
             context_window: None,
             task_type: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,

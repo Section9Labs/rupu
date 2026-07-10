@@ -329,6 +329,7 @@ self-contained.";
         context_window: None,
         task_type: None,
         output_format: None,
+        output_schema: None,
         anthropic_task_budget: None,
         anthropic_context_management: None,
         anthropic_speed: None,
@@ -559,6 +560,13 @@ pub struct AgentRunOpts {
     /// `output_config.format`; OpenAI emits as `response_format.type`;
     /// other providers ignore.
     pub output_format: Option<rupu_providers::types::OutputFormat>,
+    /// JSON Schema for Anthropic structured outputs. Threaded from
+    /// `AgentSpec::output_schema`. `Some` gets emitted as
+    /// `output_config.format = {type: "json_schema", schema}` by the
+    /// Anthropic provider; `None` preserves prompt-driven-only
+    /// `output_format` behavior (no schema-less mode exists). Ignored
+    /// by other providers.
+    pub output_schema: Option<serde_json::Value>,
     /// Anthropic-only soft cap on output tokens (model self-paces).
     /// Distinct from `max_turns` (hard ceiling). Ignored by other
     /// providers.
@@ -877,6 +885,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 context_window: opts.context_window,
                 task_type: None,
                 output_format: opts.output_format,
+                output_schema: opts.output_schema.clone(),
                 anthropic_task_budget: opts.anthropic_task_budget,
                 anthropic_context_management: opts.anthropic_context_management,
                 anthropic_speed: opts.anthropic_speed,
@@ -1434,6 +1443,7 @@ mod on_tool_call_tests {
             effort: None,
             context_window: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -1516,6 +1526,7 @@ mod on_tool_call_tests {
             effort: None,
             context_window: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -1590,6 +1601,7 @@ mod on_tool_call_tests {
             effort: None,
             context_window: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -2316,6 +2328,7 @@ mod compaction_tests {
             effort: None,
             context_window: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -2538,6 +2551,7 @@ mod pause_tests {
             effort: None,
             context_window: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
