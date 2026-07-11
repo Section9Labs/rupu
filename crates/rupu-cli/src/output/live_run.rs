@@ -152,6 +152,22 @@ pub struct ActiveFocus {
     pub last_event_at: Option<DateTime<Utc>>,
 }
 
+/// A navigable node in the live view's node-selection scope (Q1): the
+/// currently active step, or one of that step's fan-out units, keyed by
+/// index. The active step id is implicit — carried on
+/// [`ActiveFocus::step_id`] rather than duplicated here — so `NodeRef`
+/// only distinguishes "the step itself" from "one of its children".
+/// Becomes stale the instant the active step changes, which is why
+/// `apply` clears `selected` on every `StepStarted` (Q4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeRef {
+    /// The active step itself (the whole linear step, or the fan-out
+    /// step's own row rather than one of its units).
+    Step,
+    /// One fan-out unit of the active step, by index into `StepState::units`.
+    Unit { index: usize },
+}
+
 /// Pure, accumulating state for the live run view.
 #[derive(Debug, Clone)]
 pub struct LiveRunState {
@@ -169,6 +185,10 @@ pub struct LiveRunState {
     pub findings_count: Option<usize>,
     pub coverage_pct: Option<u8>,
     pub active: ActiveFocus,
+    /// Operator-driven node selection within the active step's navigable
+    /// set (Task 1: state + nav only — Task 2 wires this to focus/render).
+    /// `None` means auto-follow (today's default behavior, unchanged).
+    pub selected: Option<NodeRef>,
 }
 
 impl LiveRunState {
@@ -211,6 +231,7 @@ impl LiveRunState {
             findings_count: None,
             coverage_pct: None,
             active: ActiveFocus::default(),
+            selected: None,
         }
     }
 
@@ -235,6 +256,65 @@ impl LiveRunState {
             .unwrap_or(NodeStatus::Waiting)
     }
 
+    /// The ordered set of nodes the operator can navigate between (Q1
+    /// scope): the active step itself, followed by that step's fan-out
+    /// units in index order. Empty when no step is active yet. Only the
+    /// active step's own children are navigable — completed steps and
+    /// other steps' units are out of scope for this task.
+    fn navigable_nodes(&self) -> Vec<NodeRef> {
+        let Some(step_id) = self.active.step_id.as_deref() else {
+            return Vec::new();
+        };
+        let mut nodes = vec![NodeRef::Step];
+        if let Some(step) = self.steps.iter().find(|s| s.id == step_id) {
+            nodes.extend((0..step.units.len()).map(|index| NodeRef::Unit { index }));
+        }
+        nodes
+    }
+
+    /// Move the selection forward over [`Self::navigable_nodes`], wrapping
+    /// past the last node to the first (Q2). From `None`, the first press
+    /// seeds the selection to the first node rather than advancing past
+    /// it. A no-op when there is nothing to navigate (no active step).
+    pub fn select_next(&mut self) {
+        let nodes = self.navigable_nodes();
+        if nodes.is_empty() {
+            return;
+        }
+        self.selected = Some(match self.selected {
+            None => nodes[0],
+            Some(current) => {
+                let pos = nodes.iter().position(|n| *n == current).unwrap_or(0);
+                nodes[(pos + 1) % nodes.len()]
+            }
+        });
+    }
+
+    /// Move the selection backward over [`Self::navigable_nodes`],
+    /// wrapping before the first node to the last (Q2). Seeds from `None`
+    /// exactly like [`Self::select_next`].
+    pub fn select_prev(&mut self) {
+        let nodes = self.navigable_nodes();
+        if nodes.is_empty() {
+            return;
+        }
+        self.selected = Some(match self.selected {
+            None => nodes[0],
+            Some(current) => {
+                let pos = nodes.iter().position(|n| *n == current).unwrap_or(0);
+                let prev = if pos == 0 { nodes.len() - 1 } else { pos - 1 };
+                nodes[prev]
+            }
+        });
+    }
+
+    /// Release the operator's selection back to auto-follow (the
+    /// pre-selection default: the view tracks whichever unit most
+    /// recently started, per `UnitStarted`'s auto-focus assignment).
+    pub fn clear_selection(&mut self) {
+        self.selected = None;
+    }
+
     /// Apply a workflow step event, mutating step / run status.
     pub fn apply(&mut self, event: &WfEvent) {
         match event {
@@ -248,6 +328,11 @@ impl LiveRunState {
                 self.active.agent = agent.clone();
                 self.active.feed.clear();
                 self.active.last_event_at = None;
+                // A new active step means the old concurrency context (and
+                // any selection scoped to it) is gone (Q4). Auto-follow
+                // resumes; `UnitStarted`'s auto-focus assignment below is
+                // unaffected — it only applies when `selected` is `None`.
+                self.clear_selection();
                 if let Some(step) = self.step_mut(step_id) {
                     step.status = NodeStatus::Active;
                     if agent.is_some() {
@@ -1195,9 +1280,15 @@ impl Drop for AltScreenGuard {
 /// stops at a safe boundary, which flips [`LiveRunState::status`] via
 /// [`LiveRunState::apply`]). A failed request (already paused, or the
 /// run just reached a terminal state) is swallowed — the state already
-/// reflects reality, so no user-facing action is needed. Any other key,
-/// or a non-Press event (key-repeat/release under kitty-protocol
-/// terminals), is a no-op.
+/// reflects reality, so no user-facing action is needed.
+///
+/// `Down`/`j`/`Tab` and `Up`/`k`/`BackTab` (Shift-Tab) move the node
+/// selection over the active step's navigable set ([`LiveRunState::select_next`]
+/// / [`LiveRunState::select_prev`]); `a` releases the selection back to
+/// auto-follow ([`LiveRunState::clear_selection`]). These are state-only
+/// in this task — Task 2 wires the selection into the focus zone's
+/// rendering. Any other key, or a non-Press event (key-repeat/release
+/// under kitty-protocol terminals), is a no-op.
 fn handle_live_run_keypress(
     key: crossterm::event::KeyEvent,
     store: &rupu_orchestrator::RunStore,
@@ -1205,17 +1296,23 @@ fn handle_live_run_keypress(
     state: &mut LiveRunState,
 ) {
     use crossterm::event::{KeyCode, KeyEventKind};
-    if key.kind != KeyEventKind::Press || key.code != KeyCode::Esc {
+    if key.kind != KeyEventKind::Press {
         return;
     }
-    if crate::cmd::workflow::pause_with_store(store, run_id).is_ok() {
-        state.push_activity(
-            Utc::now(),
-            ActivityKind::Text,
-            format!(
-                "pause requested — will stop at next safe boundary (resume: rupu workflow resume {run_id})"
-            ),
-        );
+    match key.code {
+        KeyCode::Esc if crate::cmd::workflow::pause_with_store(store, run_id).is_ok() => {
+            state.push_activity(
+                Utc::now(),
+                ActivityKind::Text,
+                format!(
+                    "pause requested — will stop at next safe boundary (resume: rupu workflow resume {run_id})"
+                ),
+            );
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => state.select_next(),
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => state.select_prev(),
+        KeyCode::Char('a') => state.clear_selection(),
+        _ => {}
     }
 }
 
@@ -1606,6 +1703,7 @@ mod tests {
                 feed: Vec::new(),
                 last_event_at: Some(ts(31)),
             },
+            selected: None,
         }
     }
 
@@ -2353,5 +2451,188 @@ mod tests {
 
         assert!(state.active.feed.is_empty());
         assert_eq!(store.load("run_01ABC").unwrap().status, RunStatus::Running);
+    }
+
+    // -----------------------------------------------------------------
+    // Node-selection state + keyboard navigation (Task 1)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn nav_down_selects_first_concurrent_unit_then_next() {
+        // `fanout_state(true)` has the active "assess" step with 5 units
+        // (index 0..=4). The navigable set is [Step, Unit0, Unit1, ...].
+        let mut state = fanout_state(true);
+        assert_eq!(state.selected, None);
+
+        state.select_next();
+        assert_eq!(
+            state.selected,
+            Some(NodeRef::Step),
+            "first press seeds the selection to the first node (the step itself)"
+        );
+
+        state.select_next();
+        assert_eq!(state.selected, Some(NodeRef::Unit { index: 0 }));
+
+        state.select_next();
+        assert_eq!(state.selected, Some(NodeRef::Unit { index: 1 }));
+    }
+
+    #[test]
+    fn nav_wraps_at_ends() {
+        let mut state = fanout_state(true);
+        // 5 units on "assess" -> navigable set is [Step, Unit0..Unit4].
+        state.selected = Some(NodeRef::Unit { index: 4 });
+        state.select_next();
+        assert_eq!(
+            state.selected,
+            Some(NodeRef::Step),
+            "select_next past the last node wraps to the first"
+        );
+
+        state.selected = Some(NodeRef::Step);
+        state.select_prev();
+        assert_eq!(
+            state.selected,
+            Some(NodeRef::Unit { index: 4 }),
+            "select_prev before the first node wraps to the last"
+        );
+    }
+
+    #[test]
+    fn release_key_clears_selection_to_auto_follow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
+        store
+            .create(
+                minimal_run_record("run_01ABC", RunStatus::Running),
+                "name: sample\nsteps: []\n",
+            )
+            .unwrap();
+
+        let mut state = fanout_state(true);
+        state.selected = Some(NodeRef::Unit { index: 2 });
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        handle_live_run_keypress(key, &store, "run_01ABC", &mut state);
+
+        assert_eq!(state.selected, None);
+    }
+
+    #[test]
+    fn step_change_releases_selection() {
+        let mut state = fanout_state(true);
+        state.selected = Some(NodeRef::Unit { index: 1 });
+
+        state.apply(&WfEvent::StepStarted {
+            run_id: "run_01ABC".into(),
+            step_id: "report".into(),
+            kind: StepKind::Linear,
+            agent: Some("reporter".into()),
+            host: None,
+        });
+
+        assert_eq!(
+            state.selected, None,
+            "a new active step clears a selection scoped to the old step's concurrency context"
+        );
+    }
+
+    #[test]
+    fn esc_still_pauses_with_selection_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
+        store
+            .create(
+                minimal_run_record("run_01ABC", RunStatus::Running),
+                "name: sample\nsteps: []\n",
+            )
+            .unwrap();
+
+        let mut state = fanout_state(true);
+        state.selected = Some(NodeRef::Unit { index: 3 });
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        handle_live_run_keypress(key, &store, "run_01ABC", &mut state);
+
+        assert!(
+            state
+                .active
+                .feed
+                .iter()
+                .any(|line| line.text.contains("pause requested")),
+            "{:#?}",
+            state.active.feed
+        );
+        assert_eq!(
+            state.selected,
+            Some(NodeRef::Unit { index: 3 }),
+            "Esc must not touch an active selection"
+        );
+        let persisted = store.load("run_01ABC").unwrap();
+        assert_eq!(persisted.status, RunStatus::Paused);
+    }
+
+    #[test]
+    fn nav_ignored_when_no_concurrent_nodes() {
+        // A single linear step, active, with no fan-out units at all. The
+        // navigable set is just `[Step]` (len 1): nav selects the lone
+        // step on first press, and further presses are idempotent rather
+        // than a special-cased no-op — same algorithm, no branching.
+        let mut state = LiveRunState {
+            workflow_name: "w".into(),
+            run_id: "run_1".into(),
+            status: RunStatus::Running,
+            started_at: Some(ts(0)),
+            finished_at: None,
+            steps: vec![StepState {
+                id: "only".into(),
+                kind: StepKind::Linear,
+                agent: Some("solo-agent".into()),
+                status: NodeStatus::Working,
+                tokens_in: 0,
+                tokens_out: 0,
+                elapsed_secs: 0,
+                units: Vec::new(),
+                fanout_total: None,
+                panel_iter: None,
+                panel_findings: 0,
+            }],
+            tokens_in: 0,
+            tokens_out: 0,
+            cost: None,
+            findings_count: None,
+            coverage_pct: None,
+            active: ActiveFocus {
+                step_id: Some("only".into()),
+                unit_key: None,
+                agent: Some("solo-agent".into()),
+                active_unit_transcript: None,
+                feed: Vec::new(),
+                last_event_at: None,
+            },
+            selected: None,
+        };
+
+        state.select_next();
+        assert_eq!(
+            state.selected,
+            Some(NodeRef::Step),
+            "with no fan-out units, the lone step is the only navigable node"
+        );
+
+        state.select_next();
+        assert_eq!(
+            state.selected,
+            Some(NodeRef::Step),
+            "a single-node set is idempotent under further nav"
+        );
+
+        state.select_prev();
+        assert_eq!(state.selected, Some(NodeRef::Step));
     }
 }
