@@ -7,6 +7,25 @@ tools: [read_file, grep, glob, scm.prs.get, scm.prs.diff, issues.get]
 maxTurns: 10
 permissionMode: readonly
 outputFormat: json
+outputSchema:
+  type: object
+  additionalProperties: false
+  required: [findings]
+  properties:
+    findings:
+      type: array
+      items:
+        type: object
+        additionalProperties: false
+        required: [severity, title, body]
+        properties:
+          severity:
+            type: string
+            enum: [low, medium, high, critical]
+          title:
+            type: string
+          body:
+            type: string
 ---
 
 You are a maintainability-focused reviewer.

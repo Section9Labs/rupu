@@ -1249,26 +1249,31 @@ impl AnthropicClient {
         // what the official `@anthropic-ai/sdk` emits when the
         // matching SDK option is enabled.
 
-        // `output_config` carries `format` (and, in the future,
-        // `effort` / a redundant `task_budget`). For now we
-        // populate it with whichever fields the request specifies.
+        // `output_config` carries `task_budget` and, when the agent
+        // declares a schema, `format`. We deliberately do NOT map
+        // `request.output_format` on its own: Anthropic's
+        // structured-outputs API requires `output_config.format` to be
+        // an object of the shape `{"type": "json_schema", "schema":
+        // <full JSON Schema>}` — there is no schema-less JSON mode.
+        // The `OutputFormat` enum (`Json`/`Text`) carries no schema, so
+        // by itself there is nothing valid to send; emitting a bare
+        // string 400s every request ("output_config.format: Input does
+        // not match the expected shape"). `request.output_schema`
+        // (from the agent's `outputSchema` frontmatter) is what
+        // actually carries the schema, so `format` is only emitted
+        // when it is `Some`. Agents with `outputFormat: json` and no
+        // `outputSchema` keep today's prompt-driven-only behavior.
         let mut output_config = serde_json::Map::new();
-        if let Some(format) = request.output_format {
-            output_config.insert(
-                "format".to_string(),
-                serde_json::Value::String(
-                    match format {
-                        crate::types::OutputFormat::Json => "json",
-                        crate::types::OutputFormat::Text => "text",
-                    }
-                    .to_string(),
-                ),
-            );
-        }
         if let Some(budget) = request.anthropic_task_budget {
             output_config.insert(
                 "task_budget".to_string(),
                 serde_json::Value::Number(serde_json::Number::from(budget)),
+            );
+        }
+        if let Some(schema) = &request.output_schema {
+            output_config.insert(
+                "format".to_string(),
+                serde_json::json!({ "type": "json_schema", "schema": schema }),
             );
         }
         if !output_config.is_empty() {
@@ -1729,6 +1734,7 @@ mod tests {
             context_window: None,
             task_type: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -1814,6 +1820,7 @@ mod tests {
             context_window: None,
             task_type: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -1837,6 +1844,7 @@ mod tests {
             context_window: None,
             task_type: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -1868,6 +1876,7 @@ mod tests {
             context_window: None,
             task_type: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -1908,6 +1917,7 @@ mod tests {
             context_window: None,
             task_type: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -1942,6 +1952,7 @@ mod tests {
             context_window: None,
             task_type: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -1972,6 +1983,7 @@ mod tests {
             context_window: None,
             task_type: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -2001,6 +2013,7 @@ mod tests {
             context_window: None,
             task_type: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -2029,6 +2042,7 @@ mod tests {
             context_window: None,
             task_type: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -2097,6 +2111,7 @@ mod tests {
             context_window: None,
             task_type: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -2122,6 +2137,7 @@ mod tests {
             context_window: None,
             task_type: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -2145,6 +2161,7 @@ mod tests {
             context_window: None,
             task_type: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -2169,6 +2186,7 @@ mod tests {
             context_window: None,
             task_type: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -2193,6 +2211,7 @@ mod tests {
             context_window: None,
             task_type: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -2216,6 +2235,7 @@ mod tests {
             context_window: None,
             task_type: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -2239,6 +2259,7 @@ mod tests {
             context_window: None,
             task_type: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -2263,6 +2284,7 @@ mod tests {
             context_window: None,
             task_type: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -2291,6 +2313,7 @@ mod tests {
             context_window: None,
             task_type: None,
             output_format: None,
+            output_schema: None,
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
@@ -2658,7 +2681,13 @@ mod tests {
     }
 
     #[test]
-    fn build_body_emits_output_config_format_json() {
+    fn build_body_does_not_emit_output_config_format_for_schemaless_json() {
+        // Anthropic's structured-outputs API requires `output_config.format`
+        // to be a `{type: "json_schema", schema: ...}` object; our
+        // `OutputFormat` enum carries no schema, so we must not emit the
+        // field at all (a bare string 400s every request). An agent with
+        // only `output_format: Json` and no task_budget should therefore
+        // produce a request body with no `output_config` key whatsoever.
         let client = AnthropicClient::new("k".into());
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
@@ -2668,7 +2697,79 @@ mod tests {
             ..Default::default()
         };
         let body = client.build_request_body(&request, false);
-        assert_eq!(body["output_config"]["format"], "json");
+        assert!(
+            body.get("output_config").is_none(),
+            "expected no output_config, got: {:?}",
+            body.get("output_config")
+        );
+    }
+
+    #[test]
+    fn build_body_emits_output_config_format_json_schema_when_schema_present() {
+        // The real fix: an agent that declares `outputSchema` gets a
+        // correctly-shaped `output_config.format = {type: "json_schema",
+        // schema: <the schema>}` — the only shape Anthropic accepts.
+        let client = AnthropicClient::new("k".into());
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "findings": { "type": "array" } },
+            "required": ["findings"]
+        });
+        let request = LlmRequest {
+            model: "claude-sonnet-4-6".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 100,
+            output_format: Some(crate::types::OutputFormat::Json),
+            output_schema: Some(schema.clone()),
+            ..Default::default()
+        };
+        let body = client.build_request_body(&request, false);
+        assert_eq!(
+            body["output_config"]["format"],
+            serde_json::json!({ "type": "json_schema", "schema": schema })
+        );
+    }
+
+    #[test]
+    fn build_body_omits_output_config_format_when_schema_none_even_with_output_format_json() {
+        // Floor (#469): `outputFormat: json` alone is prompt-driven only.
+        // Without a schema there is nothing valid to send, so `format`
+        // must never appear even though `output_format` is `Json`.
+        let client = AnthropicClient::new("k".into());
+        let request = LlmRequest {
+            model: "claude-sonnet-4-6".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 100,
+            output_format: Some(crate::types::OutputFormat::Json),
+            output_schema: None,
+            ..Default::default()
+        };
+        let body = client.build_request_body(&request, false);
+        assert!(
+            body.get("output_config").is_none(),
+            "expected no output_config at all, got: {:?}",
+            body.get("output_config")
+        );
+    }
+
+    #[test]
+    fn build_body_output_config_carries_both_schema_format_and_task_budget() {
+        let client = AnthropicClient::new("k".into());
+        let schema = serde_json::json!({"type": "object"});
+        let request = LlmRequest {
+            model: "claude-sonnet-4-6".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 100,
+            output_schema: Some(schema.clone()),
+            anthropic_task_budget: Some(1500),
+            ..Default::default()
+        };
+        let body = client.build_request_body(&request, false);
+        assert_eq!(
+            body["output_config"]["format"],
+            serde_json::json!({ "type": "json_schema", "schema": schema })
+        );
+        assert_eq!(body["output_config"]["task_budget"], 1500);
     }
 
     #[test]
@@ -2732,7 +2833,11 @@ mod tests {
     }
 
     #[test]
-    fn build_body_combines_format_and_task_budget_into_one_output_config() {
+    fn build_body_output_config_carries_task_budget_only_even_with_output_format_set() {
+        // `output_format` is prompt-driven only (see comment above
+        // `output_config` construction) — it must never surface in the
+        // wire body, even when `anthropic_task_budget` is also set and
+        // legitimately populates `output_config`.
         let client = AnthropicClient::new("k".into());
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
@@ -2743,8 +2848,8 @@ mod tests {
             ..Default::default()
         };
         let body = client.build_request_body(&request, false);
-        assert_eq!(body["output_config"]["format"], "json");
         assert_eq!(body["output_config"]["task_budget"], 1500);
+        assert!(body["output_config"].get("format").is_none());
     }
 
     #[tokio::test]

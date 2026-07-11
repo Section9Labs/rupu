@@ -111,6 +111,58 @@ fn anthropic_feature_flags_default_to_none_when_omitted() {
 }
 
 #[test]
+fn parses_output_schema_mapping() {
+    let s = r#"---
+name: findings-bot
+outputFormat: json
+outputSchema:
+  type: object
+  properties:
+    findings:
+      type: array
+      items:
+        type: object
+        properties:
+          severity:
+            type: string
+          title:
+            type: string
+        required: [severity, title]
+  required: [findings]
+---
+body
+"#;
+    let spec = AgentSpec::parse(s).unwrap();
+    assert_eq!(
+        spec.output_schema,
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "severity": {"type": "string"},
+                            "title": {"type": "string"}
+                        },
+                        "required": ["severity", "title"]
+                    }
+                }
+            },
+            "required": ["findings"]
+        }))
+    );
+}
+
+#[test]
+fn output_schema_defaults_to_none_when_omitted() {
+    let s = "---\nname: hello\n---\nbody\n";
+    let spec = AgentSpec::parse(s).unwrap();
+    assert!(spec.output_schema.is_none());
+}
+
+#[test]
 fn rejects_invalid_output_format() {
     let s = "---\nname: x\noutputFormat: yaml\n---\nbody\n";
     assert!(
