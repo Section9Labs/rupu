@@ -524,6 +524,11 @@ impl LiveRunState {
             // counter; the CLI live view does not render it, so no
             // per-step state change is needed here.
             WfEvent::PanelRound { .. } => {}
+            // Dispatch-child rendering (attach as a selectable unit under
+            // the active step) is a follow-up task; this no-op arm only
+            // keeps this exhaustive match compiling now that the variants
+            // exist.
+            WfEvent::DispatchStarted { .. } | WfEvent::DispatchCompleted { .. } => {}
         }
     }
 
