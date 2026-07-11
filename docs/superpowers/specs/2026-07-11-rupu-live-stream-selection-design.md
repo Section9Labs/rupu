@@ -1,6 +1,6 @@
 # rupu — Live-view stream selection + sub-agent dispatch nodes
 
-Status: Draft (design) — pending review
+Status: Approved (design) — Q1–Q4 resolved 2026-07-11
 Date: 2026-07-11
 
 ## Context
@@ -62,9 +62,9 @@ Make **any concurrent live node user-selectable** in the three-zone view — the
 - **Plan 2 — Part B (dispatch nodes)**: orchestrator events + dispatcher emission + `live_run.rs::apply`; dispatched children become selectable nodes via Part A's cursor.
 Each is an independent PR; matt validates the TUI (alt-screen rendering + keys) at runtime before each merge — subagents cannot validate TUI rendering.
 
-## Open questions (resolve in plan)
+## Resolved design decisions (2026-07-11)
 
-- **Q1. Cursor scope:** does the cursor navigate only the *active* step's concurrent children, or *all* live nodes across the spine (including completed)? Recommendation: active step's children + the active linear step (the live-relevant set); completed nodes not navigable (their feed is in scrollback / the line-printer replay).
-- **Q2. Wrap vs clamp** at the ends of the node list. Recommendation: wrap (Tab-cycle feel).
-- **Q3. Dispatch node nesting:** a dispatched child that itself dispatches — render grandchildren as nested nodes now, or flat/best-effort? Recommendation: model depth-1 children fully; deeper nesting shows the child node but not a full grandchild sub-tree in v1 (its transcript still streams when selected).
-- **Q4. Selection persistence across step boundaries:** when the selected node's step completes and a new step starts, release to auto-follow or hold? Recommendation: release to auto-follow on step change (the selected concurrency context is gone).
+- **Q1. Cursor scope — RESOLVED:** the cursor navigates the **active step + its concurrent children** (the live-relevant set); completed nodes are not navigable (their feed is in scrollback / the line-printer replay).
+- **Q2. Ends — RESOLVED:** **wrap** around (Tab-cycle feel).
+- **Q3. Dispatch nesting — RESOLVED:** model **depth-1 children fully**; a child that itself dispatches shows the child node and streams its transcript when selected, but no full grandchild sub-tree in v1.
+- **Q4. Selection across step boundaries — RESOLVED:** **release to auto-follow** on step change (the selected concurrency context is gone).
