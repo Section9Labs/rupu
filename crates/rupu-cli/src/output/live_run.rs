@@ -74,6 +74,12 @@ pub struct UnitState {
     /// most-recently-started unit (auto-follow). `None` until the unit
     /// has started.
     pub transcript_path: Option<std::path::PathBuf>,
+    /// Correlation key for a dispatched sub-agent child (Part B, Task 2):
+    /// `Some(sub_run_id)` from `DispatchStarted`/`DispatchCompleted`.
+    /// `for_each`/`parallel` units are index-keyed and always leave this
+    /// `None` — only `apply`'s `Dispatch*` arms set it, to find the right
+    /// slot on `DispatchCompleted` without relying on index/order.
+    pub sub_run_id: Option<String>,
 }
 
 /// One line in the active agent's rolling activity feed.
@@ -524,6 +530,91 @@ impl LiveRunState {
             // counter; the CLI live view does not render it, so no
             // per-step state change is needed here.
             WfEvent::PanelRound { .. } => {}
+            WfEvent::DispatchStarted {
+                sub_run_id,
+                agent,
+                transcript_path,
+                ..
+            } => {
+                // Dispatch carries no `step_id` (it fires from inside the
+                // active step's tool loop, not a step boundary) — attach
+                // the child to whichever step is currently active. Nothing
+                // to attach to (no active step yet) is a no-op.
+                let Some(step_id) = self.active.step_id.clone() else {
+                    return;
+                };
+                // Re-focus on this child: its transcript drives the feed,
+                // same as `UnitStarted`'s auto-focus assignment, so
+                // auto-follow (no operator selection) still tracks the
+                // newest dispatched child by default.
+                let key = agent.clone().unwrap_or_else(|| sub_run_id.clone());
+                self.active.unit_key = Some(key.clone());
+                if agent.is_some() {
+                    self.active.agent = agent.clone();
+                }
+                self.active.active_unit_transcript = Some(transcript_path.clone());
+                self.active.feed.clear();
+                self.active.last_event_at = None;
+                if let Some(step) = self.step_mut(&step_id) {
+                    if !matches!(step.status, NodeStatus::Complete | NodeStatus::Failed) {
+                        step.status = NodeStatus::Working;
+                    }
+                    // Find-or-append by `sub_run_id` so a redelivered
+                    // `DispatchStarted` doesn't create a duplicate slot.
+                    let existing = step
+                        .units
+                        .iter_mut()
+                        .find(|u| u.sub_run_id.as_deref() == Some(sub_run_id.as_str()));
+                    match existing {
+                        Some(unit) => {
+                            unit.key = key;
+                            unit.status = NodeStatus::Working;
+                            unit.transcript_path = Some(transcript_path.clone());
+                        }
+                        None => {
+                            step.units.push(UnitState {
+                                key,
+                                status: NodeStatus::Working,
+                                tokens: 0,
+                                elapsed_secs: 0,
+                                transcript_path: Some(transcript_path.clone()),
+                                sub_run_id: Some(sub_run_id.clone()),
+                            });
+                        }
+                    }
+                }
+            }
+            WfEvent::DispatchCompleted {
+                sub_run_id,
+                success,
+                tokens_in,
+                tokens_out,
+                ..
+            } => {
+                let Some(step_id) = self.active.step_id.clone() else {
+                    return;
+                };
+                if let Some(step) = self.step_mut(&step_id) {
+                    if let Some(unit) = step
+                        .units
+                        .iter_mut()
+                        .find(|u| u.sub_run_id.as_deref() == Some(sub_run_id.as_str()))
+                    {
+                        unit.status = if *success {
+                            NodeStatus::Complete
+                        } else {
+                            NodeStatus::Failed
+                        };
+                        unit.tokens += tokens_in + tokens_out;
+                        step.tokens_in += tokens_in;
+                        step.tokens_out += tokens_out;
+                    }
+                    // No matching unit (e.g. `DispatchStarted` was missed)
+                    // — nothing to complete; graceful no-op.
+                }
+                self.tokens_in += tokens_in;
+                self.tokens_out += tokens_out;
+            }
         }
     }
 
@@ -647,6 +738,7 @@ fn ensure_unit_slot(units: &mut Vec<UnitState>, index: usize) {
             tokens: 0,
             elapsed_secs: 0,
             transcript_path: None,
+            sub_run_id: None,
         });
     }
 }
@@ -1690,6 +1782,7 @@ mod tests {
             tokens: 210_000,
             elapsed_secs: 12,
             transcript_path: Some(std::path::PathBuf::from("/runs/conf-manager.jsonl")),
+            sub_run_id: None,
         });
         units.push(UnitState {
             key: "tlb-agent".into(),
@@ -1697,6 +1790,7 @@ mod tests {
             tokens: 180_000,
             elapsed_secs: 11,
             transcript_path: Some(std::path::PathBuf::from("/runs/tlb-agent.jsonl")),
+            sub_run_id: None,
         });
         units.push(UnitState {
             key: "app-gw".into(),
@@ -1704,6 +1798,7 @@ mod tests {
             tokens: 120_000,
             elapsed_secs: 8,
             transcript_path: Some(std::path::PathBuf::from("/runs/app-gw.jsonl")),
+            sub_run_id: None,
         });
         units.push(UnitState {
             key: "rtc".into(),
@@ -1711,6 +1806,7 @@ mod tests {
             tokens: 0,
             elapsed_secs: 0,
             transcript_path: None,
+            sub_run_id: None,
         });
         units.push(UnitState {
             key: "auth".into(),
@@ -1718,6 +1814,7 @@ mod tests {
             tokens: 0,
             elapsed_secs: 0,
             transcript_path: None,
+            sub_run_id: None,
         });
         let assess = StepState {
             id: "assess".into(),
@@ -2115,6 +2212,195 @@ mod tests {
         assert_eq!(step.units[0].status, NodeStatus::Waiting);
     }
 
+    /// A fixture with the active focus redirected onto the linear
+    /// `report` step (empty `units`, `Waiting`) so dispatch children land
+    /// in a clean unit list distinct from `assess`'s pre-seeded fan-out
+    /// units — dispatch has no `for_each`/`parallel` index of its own, so
+    /// this exercises the plain "step whose agent dispatches sub-agents"
+    /// shape the feature targets.
+    fn dispatch_state() -> LiveRunState {
+        let mut state = fanout_state(true);
+        state.active.step_id = Some("report".into());
+        state.active.unit_key = None;
+        state.active.agent = None;
+        state.active.active_unit_transcript = None;
+        state
+    }
+
+    #[test]
+    fn apply_dispatch_started_adds_child_node_to_active_step() {
+        let mut state = dispatch_state();
+        let path = std::path::PathBuf::from("/runs/run_01ABC/sub_child.jsonl");
+        state.apply(&WfEvent::DispatchStarted {
+            run_id: "run_01ABC".into(),
+            sub_run_id: "sub_child".into(),
+            agent: Some("security-reviewer".into()),
+            transcript_path: path.clone(),
+        });
+        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
+        assert_eq!(step.units.len(), 1);
+        let unit = &step.units[0];
+        assert_eq!(unit.status, NodeStatus::Working);
+        assert_eq!(unit.transcript_path.as_ref(), Some(&path));
+        assert_eq!(unit.sub_run_id.as_deref(), Some("sub_child"));
+        assert_eq!(unit.key, "security-reviewer");
+        assert_eq!(step.status, NodeStatus::Working);
+        assert_eq!(state.active.active_unit_transcript.as_ref(), Some(&path));
+
+        // A redelivered `DispatchStarted` for the same `sub_run_id` is
+        // idempotent — it finds the existing slot instead of appending a
+        // duplicate, refreshing its transcript path.
+        let path2 = std::path::PathBuf::from("/runs/run_01ABC/sub_child_retry.jsonl");
+        state.apply(&WfEvent::DispatchStarted {
+            run_id: "run_01ABC".into(),
+            sub_run_id: "sub_child".into(),
+            agent: Some("security-reviewer".into()),
+            transcript_path: path2.clone(),
+        });
+        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
+        assert_eq!(step.units.len(), 1, "no duplicate slot on redelivery");
+        assert_eq!(step.units[0].transcript_path.as_ref(), Some(&path2));
+    }
+
+    #[test]
+    fn apply_dispatch_completed_marks_child_done_by_sub_run_id() {
+        let mut state = dispatch_state();
+        state.apply(&WfEvent::DispatchStarted {
+            run_id: "run_01ABC".into(),
+            sub_run_id: "sub_child".into(),
+            agent: Some("security-reviewer".into()),
+            transcript_path: std::path::PathBuf::from("/runs/run_01ABC/sub_child.jsonl"),
+        });
+        let run_in_before = state.tokens_in;
+        let run_out_before = state.tokens_out;
+        state.apply(&WfEvent::DispatchCompleted {
+            run_id: "run_01ABC".into(),
+            sub_run_id: "sub_child".into(),
+            success: true,
+            tokens_in: 500,
+            tokens_out: 120,
+        });
+        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
+        let unit = &step.units[0];
+        assert_eq!(unit.status, NodeStatus::Complete);
+        assert_eq!(unit.tokens, 620);
+        assert_eq!(step.tokens_in, 500);
+        assert_eq!(step.tokens_out, 120);
+        assert_eq!(state.tokens_in, run_in_before + 500);
+        assert_eq!(state.tokens_out, run_out_before + 120);
+
+        // Failure path marks Failed rather than Complete.
+        state.apply(&WfEvent::DispatchStarted {
+            run_id: "run_01ABC".into(),
+            sub_run_id: "sub_fail".into(),
+            agent: Some("other-agent".into()),
+            transcript_path: std::path::PathBuf::from("/runs/run_01ABC/sub_fail.jsonl"),
+        });
+        state.apply(&WfEvent::DispatchCompleted {
+            run_id: "run_01ABC".into(),
+            sub_run_id: "sub_fail".into(),
+            success: false,
+            tokens_in: 0,
+            tokens_out: 0,
+        });
+        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
+        let failed_unit = step
+            .units
+            .iter()
+            .find(|u| u.sub_run_id.as_deref() == Some("sub_fail"))
+            .unwrap();
+        assert_eq!(failed_unit.status, NodeStatus::Failed);
+    }
+
+    #[test]
+    fn apply_dispatch_completed_with_no_matching_unit_is_graceful() {
+        // `DispatchCompleted` with no prior `DispatchStarted` (e.g. the
+        // Started event was dropped/missed) must not panic and must
+        // leave the step's units untouched.
+        let mut state = dispatch_state();
+        state.apply(&WfEvent::DispatchCompleted {
+            run_id: "run_01ABC".into(),
+            sub_run_id: "sub_orphan".into(),
+            success: true,
+            tokens_in: 10,
+            tokens_out: 5,
+        });
+        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
+        assert!(step.units.is_empty());
+    }
+
+    #[test]
+    fn dispatch_child_is_navigable_and_selectable() {
+        let mut state = dispatch_state();
+        let path = std::path::PathBuf::from("/runs/run_01ABC/sub_child.jsonl");
+        state.apply(&WfEvent::DispatchStarted {
+            run_id: "run_01ABC".into(),
+            sub_run_id: "sub_child".into(),
+            agent: Some("security-reviewer".into()),
+            transcript_path: path.clone(),
+        });
+        assert_eq!(
+            state.navigable_nodes(),
+            vec![NodeRef::Step, NodeRef::Unit { index: 0 }]
+        );
+        // Pin the dispatch child (Part A's selection primitive) and
+        // confirm its transcript resolves — the Part A/B integration
+        // this task is meant to get "for free".
+        state.selected = Some(NodeRef::Unit { index: 0 });
+        assert_eq!(state.focused_transcript(None), Some(path));
+    }
+
+    #[test]
+    fn two_parallel_dispatch_children_get_distinct_slots() {
+        let mut state = dispatch_state();
+        let path_a = std::path::PathBuf::from("/runs/run_01ABC/sub_a.jsonl");
+        let path_b = std::path::PathBuf::from("/runs/run_01ABC/sub_b.jsonl");
+        state.apply(&WfEvent::DispatchStarted {
+            run_id: "run_01ABC".into(),
+            sub_run_id: "sub_a".into(),
+            agent: Some("agent-a".into()),
+            transcript_path: path_a,
+        });
+        state.apply(&WfEvent::DispatchStarted {
+            run_id: "run_01ABC".into(),
+            sub_run_id: "sub_b".into(),
+            agent: Some("agent-b".into()),
+            transcript_path: path_b,
+        });
+        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
+        assert_eq!(step.units.len(), 2);
+        assert_eq!(step.units[0].sub_run_id.as_deref(), Some("sub_a"));
+        assert_eq!(step.units[1].sub_run_id.as_deref(), Some("sub_b"));
+
+        // Complete the SECOND dispatched child first — matching must be
+        // by `sub_run_id`, not "the most recently touched index".
+        state.apply(&WfEvent::DispatchCompleted {
+            run_id: "run_01ABC".into(),
+            sub_run_id: "sub_b".into(),
+            success: true,
+            tokens_in: 10,
+            tokens_out: 5,
+        });
+        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
+        assert_eq!(step.units[0].status, NodeStatus::Working, "sub_a untouched");
+        assert_eq!(step.units[1].status, NodeStatus::Complete);
+
+        state.apply(&WfEvent::DispatchCompleted {
+            run_id: "run_01ABC".into(),
+            sub_run_id: "sub_a".into(),
+            success: false,
+            tokens_in: 0,
+            tokens_out: 0,
+        });
+        let step = state.steps.iter().find(|s| s.id == "report").unwrap();
+        assert_eq!(step.units[0].status, NodeStatus::Failed);
+        assert_eq!(
+            step.units[1].status,
+            NodeStatus::Complete,
+            "sub_b unaffected"
+        );
+    }
+
     #[test]
     fn add_active_tokens_sums_into_active_unit_and_totals() {
         let mut state = fanout_state(true);
@@ -2304,6 +2590,7 @@ mod tests {
                     tokens: 120_000,
                     elapsed_secs: 8,
                     transcript_path: None,
+                    sub_run_id: None,
                 });
             }
             steps.push(StepState {

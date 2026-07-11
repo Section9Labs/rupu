@@ -137,6 +137,30 @@ pub enum Event {
     StepPaused { run_id: String, step_id: String },
     /// A step resumed after a prior `StepPaused`.
     StepResumed { run_id: String, step_id: String },
+    /// A `dispatch_agent` tool call spawned a child agent run. Emitted
+    /// immediately after the child's sub-run directory is allocated (so
+    /// `sub_run_id` + `transcript_path` are already known) and before
+    /// the child's agent loop starts. Correlates to a later
+    /// `DispatchCompleted` by `sub_run_id` — dispatch carries no
+    /// `step_id`; the live view attaches the child to whichever step is
+    /// currently active (dispatch happens inside a running step's tool
+    /// loop).
+    DispatchStarted {
+        run_id: String,
+        sub_run_id: String,
+        agent: Option<String>,
+        transcript_path: PathBuf,
+    },
+    /// A dispatched child agent run finished. `tokens_in` / `tokens_out`
+    /// are the child run's totals (best-effort `0` if the child errored
+    /// before any usage was recorded).
+    DispatchCompleted {
+        run_id: String,
+        sub_run_id: String,
+        success: bool,
+        tokens_in: u64,
+        tokens_out: u64,
+    },
 }
 
 impl Event {
@@ -157,7 +181,9 @@ impl Event {
             | Event::RunPaused { run_id, .. }
             | Event::RunResumed { run_id, .. }
             | Event::StepPaused { run_id, .. }
-            | Event::StepResumed { run_id, .. } => run_id,
+            | Event::StepResumed { run_id, .. }
+            | Event::DispatchStarted { run_id, .. }
+            | Event::DispatchCompleted { run_id, .. } => run_id,
         }
     }
 }
@@ -355,6 +381,78 @@ mod tests {
         assert!(j.contains("step_resumed") || j.contains("StepResumed"));
         let back: Event = serde_json::from_str(&j).unwrap();
         assert!(matches!(back, Event::StepResumed { .. }));
+    }
+
+    #[test]
+    fn dispatch_started_round_trips() {
+        let ev = Event::DispatchStarted {
+            run_id: "run_parent".into(),
+            sub_run_id: "sub_child".into(),
+            agent: Some("security-reviewer".into()),
+            transcript_path: PathBuf::from("/runs/run_parent/sub_child.jsonl"),
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        assert!(
+            json.contains(r#""type":"dispatch_started""#),
+            "json: {json}"
+        );
+        assert!(json.contains(r#""sub_run_id":"sub_child""#), "json: {json}");
+
+        let back: Event = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.run_id(), "run_parent");
+        match back {
+            Event::DispatchStarted {
+                run_id,
+                sub_run_id,
+                agent,
+                transcript_path,
+            } => {
+                assert_eq!(run_id, "run_parent");
+                assert_eq!(sub_run_id, "sub_child");
+                assert_eq!(agent.as_deref(), Some("security-reviewer"));
+                assert_eq!(
+                    transcript_path,
+                    PathBuf::from("/runs/run_parent/sub_child.jsonl")
+                );
+            }
+            other => panic!("expected DispatchStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_completed_round_trips() {
+        let ev = Event::DispatchCompleted {
+            run_id: "run_parent".into(),
+            sub_run_id: "sub_child".into(),
+            success: true,
+            tokens_in: 12,
+            tokens_out: 34,
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        assert!(
+            json.contains(r#""type":"dispatch_completed""#),
+            "json: {json}"
+        );
+        assert!(json.contains(r#""sub_run_id":"sub_child""#), "json: {json}");
+
+        let back: Event = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.run_id(), "run_parent");
+        match back {
+            Event::DispatchCompleted {
+                run_id,
+                sub_run_id,
+                success,
+                tokens_in,
+                tokens_out,
+            } => {
+                assert_eq!(run_id, "run_parent");
+                assert_eq!(sub_run_id, "sub_child");
+                assert!(success);
+                assert_eq!(tokens_in, 12);
+                assert_eq!(tokens_out, 34);
+            }
+            other => panic!("expected DispatchCompleted, got {other:?}"),
+        }
     }
 
     #[test]

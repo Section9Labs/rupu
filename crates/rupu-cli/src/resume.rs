@@ -106,6 +106,23 @@ pub async fn resume_run(
     let mcp_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
 
     let mode_str = mode.unwrap_or("ask").to_string();
+
+    // Hoisted above the dispatcher build so `CliAgentDispatcher` can be
+    // handed a clone of the same sink and emit `DispatchStarted` /
+    // `DispatchCompleted` into the same `events.jsonl` the resumed run's
+    // opts carry.
+    let event_sink_for_resume = {
+        let runs_dir = global.join("runs");
+        let events_path = runs_dir.join(run_id).join("events.jsonl");
+        match rupu_orchestrator::executor::JsonlSink::create(&events_path) {
+            Ok(sink) => Some(Arc::new(sink) as Arc<dyn rupu_orchestrator::executor::EventSink>),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to open events.jsonl for resume; continuing without event sink");
+                None
+            }
+        }
+    };
+
     let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
         global.clone(),
         project_root.clone(),
@@ -115,6 +132,7 @@ pub async fn resume_run(
         mode_str.clone(),
         Arc::clone(&mcp_registry),
         Arc::clone(&store_arc),
+        event_sink_for_resume.clone(),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
@@ -135,17 +153,6 @@ pub async fn resume_run(
         prior_step_results,
         awaited_step_id.clone(),
     );
-    let event_sink_for_resume = {
-        let runs_dir = global.join("runs");
-        let events_path = runs_dir.join(run_id).join("events.jsonl");
-        match rupu_orchestrator::executor::JsonlSink::create(&events_path) {
-            Ok(sink) => Some(Arc::new(sink) as Arc<dyn rupu_orchestrator::executor::EventSink>),
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to open events.jsonl for resume; continuing without event sink");
-                None
-            }
-        }
-    };
 
     let opts = OrchestratorRunOpts {
         workflow,

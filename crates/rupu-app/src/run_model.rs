@@ -87,12 +87,39 @@ impl RunModel {
                 self.run_status = RunStatus::Failed;
                 self.active_step = None;
             }
+            // Pre-existing gap (unrelated to dispatch events): these two
+            // pairs were added to `Event` by the pause/resume work but
+            // never got arms here, so this match has been failing to
+            // compile since before this change (verified via `git stash`).
+            // Fixed here — same treatment as `rupu-cli`'s
+            // `live_run.rs::apply` — so `cargo build -p rupu-app` is green.
+            Event::RunPaused { .. } => {
+                self.run_status = RunStatus::Paused;
+            }
+            Event::RunResumed { .. } => {
+                self.run_status = RunStatus::Running;
+            }
+            Event::StepPaused { step_id, .. } => {
+                // No dedicated Paused glyph in `NodeStatus` yet; reuse
+                // Awaiting as the closest visual match, mirroring
+                // `live_run.rs`'s documented choice for the same gap.
+                self.nodes.insert(step_id.clone(), NodeStatus::Awaiting);
+            }
+            Event::StepResumed { step_id, .. } => {
+                self.nodes.insert(step_id.clone(), NodeStatus::Working);
+            }
             // Per-unit fan-out and panel-round events drive the CLI live view
             // only; the app's Graph view renders step-level status, so they're
             // a no-op here.
+            // Dispatch-child events (T1 of the live-stream-selection work)
+            // drive the CLI live view's fan-out child nodes; the app's
+            // Graph view renders step-level status only, so they're a
+            // no-op here too.
             Event::UnitStarted { .. }
             | Event::UnitCompleted { .. }
-            | Event::PanelRound { .. } => {}
+            | Event::PanelRound { .. }
+            | Event::DispatchStarted { .. }
+            | Event::DispatchCompleted { .. } => {}
         }
         self
     }

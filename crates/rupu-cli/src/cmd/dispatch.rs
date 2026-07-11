@@ -12,6 +12,7 @@
 
 use async_trait::async_trait;
 use rupu_agent::runner::{run_agent, AgentRunOpts, BypassDecider, PermissionDecider};
+use rupu_orchestrator::executor::{Event as OrchEvent, EventSink};
 use rupu_orchestrator::RunStore;
 use rupu_runtime::provider_factory;
 use rupu_tools::{AgentDispatcher, DispatchError, DispatchOutcome, ToolContext};
@@ -36,6 +37,12 @@ pub struct CliAgentDispatcher {
     /// would see `dispatcher: None` and fail with "no dispatcher".
     /// Populated by [`Self::new`] after Arc construction.
     self_dyn: OnceLock<Arc<dyn AgentDispatcher>>,
+    /// The parent run's event sink, if one is wired up. Lets `dispatch()`
+    /// emit `DispatchStarted`/`DispatchCompleted` so the live view can
+    /// render the child as a node under the active step. `None` in
+    /// contexts with no run-level events.jsonl (e.g. some test harnesses)
+    /// — emission is then a no-op and behavior is unchanged.
+    event_sink: Option<Arc<dyn EventSink>>,
 }
 
 impl std::fmt::Debug for CliAgentDispatcher {
@@ -61,6 +68,7 @@ impl CliAgentDispatcher {
         parent_mode_str: String,
         mcp_registry: Arc<rupu_scm::Registry>,
         run_store: Arc<RunStore>,
+        event_sink: Option<Arc<dyn EventSink>>,
     ) -> Arc<Self> {
         let arc = Arc::new(Self {
             global,
@@ -72,6 +80,7 @@ impl CliAgentDispatcher {
             mcp_registry,
             run_store,
             self_dyn: OnceLock::new(),
+            event_sink,
         });
         let dyn_arc: Arc<dyn AgentDispatcher> = arc.clone();
         let _ = arc.self_dyn.set(dyn_arc);
@@ -83,6 +92,32 @@ impl CliAgentDispatcher {
             .get()
             .expect("CliAgentDispatcher::new always populates self_dyn")
             .clone()
+    }
+
+    /// Best-effort `DispatchCompleted` emission — guards the `Option` and
+    /// never fails the child (or parent) run. Called from every exit
+    /// path of `dispatch()` reached after the matching `DispatchStarted`
+    /// was emitted.
+    fn emit_dispatch_completed(
+        &self,
+        parent_run_id: &str,
+        sub_run_id: &str,
+        success: bool,
+        tokens_in: u64,
+        tokens_out: u64,
+    ) {
+        if let Some(sink) = &self.event_sink {
+            sink.emit(
+                parent_run_id,
+                &OrchEvent::DispatchCompleted {
+                    run_id: parent_run_id.to_string(),
+                    sub_run_id: sub_run_id.to_string(),
+                    success,
+                    tokens_in,
+                    tokens_out,
+                },
+            );
+        }
     }
 }
 
@@ -107,6 +142,18 @@ impl AgentDispatcher for CliAgentDispatcher {
             .create_sub_run(parent_run_id, agent_name)
             .map_err(|e| DispatchError::RunStore(e.to_string()))?;
 
+        if let Some(sink) = &self.event_sink {
+            sink.emit(
+                parent_run_id,
+                &OrchEvent::DispatchStarted {
+                    run_id: parent_run_id.to_string(),
+                    sub_run_id: sub_run_id.clone(),
+                    agent: Some(agent_name.to_string()),
+                    transcript_path: transcript_path.clone(),
+                },
+            );
+        }
+
         let provider_name = spec.provider.clone().unwrap_or_else(|| "anthropic".into());
         let model = spec
             .model
@@ -121,7 +168,10 @@ impl AgentDispatcher for CliAgentDispatcher {
         .await
         {
             Ok((_resolved, p)) => p,
-            Err(e) => return Err(DispatchError::ProviderBuild(e.to_string())),
+            Err(e) => {
+                self.emit_dispatch_completed(parent_run_id, &sub_run_id, false, 0, 0);
+                return Err(DispatchError::ProviderBuild(e.to_string()));
+            }
         };
 
         let child_mode_str = spec
@@ -194,12 +244,24 @@ impl AgentDispatcher for CliAgentDispatcher {
         };
 
         let started = std::time::Instant::now();
-        let run_result = run_agent(opts)
-            .await
-            .map_err(|e| DispatchError::ChildRun(e.to_string()))?;
+        let run_result = match run_agent(opts).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.emit_dispatch_completed(parent_run_id, &sub_run_id, false, 0, 0);
+                return Err(DispatchError::ChildRun(e.to_string()));
+            }
+        };
         let duration_ms = started.elapsed().as_millis() as u64;
 
         let output = read_final_assistant_text(&transcript_path).unwrap_or_default();
+
+        self.emit_dispatch_completed(
+            parent_run_id,
+            &sub_run_id,
+            true,
+            run_result.total_tokens_in,
+            run_result.total_tokens_out,
+        );
 
         Ok(DispatchOutcome {
             agent: agent_name.to_string(),
@@ -288,5 +350,169 @@ mod tests {
         let path = dir.path().join("empty.jsonl");
         std::fs::write(&path, "").unwrap();
         assert_eq!(read_final_assistant_text(&path), None);
+    }
+
+    /// Records every emitted event as `(run_id, Event)` for assertion.
+    #[derive(Default)]
+    struct CapturingSink {
+        events: std::sync::Mutex<Vec<(String, OrchEvent)>>,
+    }
+
+    impl EventSink for CapturingSink {
+        fn emit(&self, run_id: &str, ev: &OrchEvent) {
+            self.events
+                .lock()
+                .unwrap()
+                .push((run_id.to_string(), ev.clone()));
+        }
+    }
+
+    /// Exercises `CliAgentDispatcher::dispatch()` end to end against the
+    /// `RUPU_MOCK_PROVIDER_SCRIPT` seam (the same test-only provider
+    /// factory hook `rupu-cli`'s own CLI integration tests use — see
+    /// `tests/cli_run.rs`) so the child's agent loop runs for real
+    /// without any network access. Asserts `DispatchStarted` lands
+    /// before `DispatchCompleted`, both carrying the same `sub_run_id`
+    /// as the returned `DispatchOutcome`, and that token counts flow
+    /// through to `DispatchCompleted`.
+    #[tokio::test]
+    async fn dispatch_emits_started_then_completed_with_matching_sub_run_id() {
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join("global");
+        std::fs::create_dir_all(global.join("agents")).unwrap();
+        std::fs::write(
+            global.join("agents/child.md"),
+            "---\nname: child\nprovider: anthropic\nmodel: claude-sonnet-4-6\nmaxTurns: 3\n---\nyou are a child agent.",
+        )
+        .unwrap();
+
+        let runs_dir = dir.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let run_store = Arc::new(RunStore::new(runs_dir));
+
+        let workspace_path = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+
+        let sink = Arc::new(CapturingSink::default());
+        let resolver = Arc::new(rupu_auth::KeychainResolver::new());
+        let mcp_registry = Arc::new(rupu_scm::Registry::default());
+
+        let dispatcher = CliAgentDispatcher::new(
+            global,
+            None,
+            "ws_test".into(),
+            workspace_path,
+            resolver,
+            "bypass".into(),
+            mcp_registry,
+            run_store,
+            Some(sink.clone() as Arc<dyn EventSink>),
+        );
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
+        );
+        let result = dispatcher
+            .dispatch("child", "do the thing".into(), "parent_run_1", 0)
+            .await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+
+        let outcome = result.expect("dispatch should succeed against the mock provider");
+
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            2,
+            "expected exactly Started + Completed, got {events:?}"
+        );
+
+        match &events[0] {
+            (
+                run_id,
+                OrchEvent::DispatchStarted {
+                    sub_run_id,
+                    agent,
+                    transcript_path,
+                    ..
+                },
+            ) => {
+                assert_eq!(run_id, "parent_run_1");
+                assert_eq!(sub_run_id, &outcome.sub_run_id);
+                assert_eq!(agent.as_deref(), Some("child"));
+                assert_eq!(transcript_path, &outcome.transcript_path);
+            }
+            other => panic!("expected DispatchStarted first, got {other:?}"),
+        }
+
+        match &events[1] {
+            (
+                run_id,
+                OrchEvent::DispatchCompleted {
+                    sub_run_id,
+                    success,
+                    tokens_in,
+                    tokens_out,
+                    ..
+                },
+            ) => {
+                assert_eq!(run_id, "parent_run_1");
+                assert_eq!(sub_run_id, &outcome.sub_run_id);
+                assert!(*success);
+                assert_eq!(*tokens_in, 1);
+                assert_eq!(*tokens_out, 1);
+            }
+            other => panic!("expected DispatchCompleted second, got {other:?}"),
+        }
+    }
+
+    /// `event_sink: None` (the harness other dispatch tests already use)
+    /// must not change `dispatch()`'s behavior — it's a pure no-op path.
+    #[tokio::test]
+    async fn dispatch_with_no_sink_still_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join("global");
+        std::fs::create_dir_all(global.join("agents")).unwrap();
+        std::fs::write(
+            global.join("agents/child.md"),
+            "---\nname: child\nprovider: anthropic\nmodel: claude-sonnet-4-6\nmaxTurns: 3\n---\nyou are a child agent.",
+        )
+        .unwrap();
+
+        let runs_dir = dir.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let run_store = Arc::new(RunStore::new(runs_dir));
+
+        let workspace_path = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+
+        let resolver = Arc::new(rupu_auth::KeychainResolver::new());
+        let mcp_registry = Arc::new(rupu_scm::Registry::default());
+
+        let dispatcher = CliAgentDispatcher::new(
+            global,
+            None,
+            "ws_test".into(),
+            workspace_path,
+            resolver,
+            "bypass".into(),
+            mcp_registry,
+            run_store,
+            None,
+        );
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
+        );
+        let result = dispatcher
+            .dispatch("child", "do the thing".into(), "parent_run_1", 0)
+            .await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+
+        assert!(
+            result.is_ok(),
+            "dispatch with no event sink should behave exactly as before"
+        );
     }
 }

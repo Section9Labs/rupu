@@ -2320,6 +2320,22 @@ pub(crate) async fn resume_run(
     let mcp_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
 
     let mode_str = mode.unwrap_or("ask").to_string();
+
+    // Hoisted above the dispatcher build (was created a few lines further
+    // down, right before `opts`) so `CliAgentDispatcher` can be handed a
+    // clone of the same sink and emit `DispatchStarted` / `DispatchCompleted`
+    // into the same `events.jsonl` the resumed run's opts carry.
+    let event_sink_for_resume = {
+        let events_path = global.join("runs").join(run_id).join("events.jsonl");
+        match rupu_orchestrator::executor::JsonlSink::create(&events_path) {
+            Ok(sink) => Some(Arc::new(sink) as Arc<dyn rupu_orchestrator::executor::EventSink>),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to open events.jsonl for resume; continuing without event sink");
+                None
+            }
+        }
+    };
+
     let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
         global.clone(),
         project_root.clone(),
@@ -2329,6 +2345,7 @@ pub(crate) async fn resume_run(
         mode_str.clone(),
         Arc::clone(&mcp_registry),
         Arc::clone(&store),
+        event_sink_for_resume.clone(),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
@@ -2395,17 +2412,6 @@ pub(crate) async fn resume_run(
         completed_units,
         reason,
         paused_step,
-    };
-
-    let event_sink_for_resume = {
-        let events_path = global.join("runs").join(run_id).join("events.jsonl");
-        match rupu_orchestrator::executor::JsonlSink::create(&events_path) {
-            Ok(sink) => Some(Arc::new(sink) as Arc<dyn rupu_orchestrator::executor::EventSink>),
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to open events.jsonl for resume; continuing without event sink");
-                None
-            }
-        }
     };
 
     // Clone the workflow for the live view before `opts` consumes it.
@@ -3548,6 +3554,21 @@ async fn execute_workflow_invocation(
         .write_run_envelope(&run_id, &run_envelope)
         .map_err(|e| anyhow::anyhow!("persist run envelope: {e}"))?;
 
+    // Hoisted above the dispatcher build (was created a few lines further
+    // down, right before `opts`) so `CliAgentDispatcher` can be handed a
+    // clone of the same sink and emit `DispatchStarted` / `DispatchCompleted`
+    // into the same `events.jsonl` this run's opts carry.
+    let event_sink_for_run = {
+        let events_path = runs_dir.join(&run_id).join("events.jsonl");
+        match rupu_orchestrator::executor::JsonlSink::create(&events_path) {
+            Ok(sink) => Some(Arc::new(sink) as Arc<dyn rupu_orchestrator::executor::EventSink>),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to create events.jsonl; continuing without event sink");
+                None
+            }
+        }
+    };
+
     let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
         global.clone(),
         ctx.project_root.clone(),
@@ -3557,6 +3578,7 @@ async fn execute_workflow_invocation(
         ctx.mode.clone(),
         Arc::clone(&mcp_registry),
         Arc::clone(&run_store),
+        event_sink_for_run.clone(),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
 
@@ -3585,17 +3607,6 @@ async fn execute_workflow_invocation(
     let body_for_resume = body.clone();
     let inputs_for_resume = inputs_map.clone();
     let strict_templates = ctx.strict_templates;
-
-    let event_sink_for_run = {
-        let events_path = runs_dir.join(&run_id).join("events.jsonl");
-        match rupu_orchestrator::executor::JsonlSink::create(&events_path) {
-            Ok(sink) => Some(Arc::new(sink) as Arc<dyn rupu_orchestrator::executor::EventSink>),
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to create events.jsonl; continuing without event sink");
-                None
-            }
-        }
-    };
 
     let unit_dispatcher = build_dispatcher_if_needed(
         &workflow,
