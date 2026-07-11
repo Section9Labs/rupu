@@ -67,6 +67,13 @@ pub struct UnitState {
     pub status: NodeStatus,
     pub tokens: u64,
     pub elapsed_secs: u64,
+    /// Transcript path set by this unit's `UnitStarted` event. Lets a
+    /// pinned selection (Task 2) resolve a fan-out unit's transcript
+    /// directly from `LiveRunState` rather than the live loop's
+    /// `active.active_unit_transcript`, which only ever tracks the
+    /// most-recently-started unit (auto-follow). `None` until the unit
+    /// has started.
+    pub transcript_path: Option<std::path::PathBuf>,
 }
 
 /// One line in the active agent's rolling activity feed.
@@ -152,6 +159,22 @@ pub struct ActiveFocus {
     pub last_event_at: Option<DateTime<Utc>>,
 }
 
+/// A navigable node in the live view's node-selection scope (Q1): the
+/// currently active step, or one of that step's fan-out units, keyed by
+/// index. The active step id is implicit — carried on
+/// [`ActiveFocus::step_id`] rather than duplicated here — so `NodeRef`
+/// only distinguishes "the step itself" from "one of its children".
+/// Becomes stale the instant the active step changes, which is why
+/// `apply` clears `selected` on every `StepStarted` (Q4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeRef {
+    /// The active step itself (the whole linear step, or the fan-out
+    /// step's own row rather than one of its units).
+    Step,
+    /// One fan-out unit of the active step, by index into `StepState::units`.
+    Unit { index: usize },
+}
+
 /// Pure, accumulating state for the live run view.
 #[derive(Debug, Clone)]
 pub struct LiveRunState {
@@ -169,6 +192,10 @@ pub struct LiveRunState {
     pub findings_count: Option<usize>,
     pub coverage_pct: Option<u8>,
     pub active: ActiveFocus,
+    /// Operator-driven node selection within the active step's navigable
+    /// set (Task 1: state + nav only — Task 2 wires this to focus/render).
+    /// `None` means auto-follow (today's default behavior, unchanged).
+    pub selected: Option<NodeRef>,
 }
 
 impl LiveRunState {
@@ -211,6 +238,7 @@ impl LiveRunState {
             findings_count: None,
             coverage_pct: None,
             active: ActiveFocus::default(),
+            selected: None,
         }
     }
 
@@ -235,6 +263,107 @@ impl LiveRunState {
             .unwrap_or(NodeStatus::Waiting)
     }
 
+    /// The ordered set of nodes the operator can navigate between (Q1
+    /// scope): the active step itself, followed by that step's fan-out
+    /// units in index order. Empty when no step is active yet. Only the
+    /// active step's own children are navigable — completed steps and
+    /// other steps' units are out of scope for this task.
+    fn navigable_nodes(&self) -> Vec<NodeRef> {
+        let Some(step_id) = self.active.step_id.as_deref() else {
+            return Vec::new();
+        };
+        let mut nodes = vec![NodeRef::Step];
+        if let Some(step) = self.steps.iter().find(|s| s.id == step_id) {
+            nodes.extend((0..step.units.len()).map(|index| NodeRef::Unit { index }));
+        }
+        nodes
+    }
+
+    /// Move the selection forward over [`Self::navigable_nodes`], wrapping
+    /// past the last node to the first (Q2). From `None`, the first press
+    /// seeds the selection to the first node rather than advancing past
+    /// it. A no-op when there is nothing to navigate (no active step).
+    pub fn select_next(&mut self) {
+        let nodes = self.navigable_nodes();
+        if nodes.is_empty() {
+            return;
+        }
+        self.selected = Some(match self.selected {
+            None => nodes[0],
+            Some(current) => {
+                let pos = nodes.iter().position(|n| *n == current).unwrap_or(0);
+                nodes[(pos + 1) % nodes.len()]
+            }
+        });
+    }
+
+    /// Move the selection backward over [`Self::navigable_nodes`],
+    /// wrapping before the first node to the last (Q2). Seeds from `None`
+    /// exactly like [`Self::select_next`].
+    pub fn select_prev(&mut self) {
+        let nodes = self.navigable_nodes();
+        if nodes.is_empty() {
+            return;
+        }
+        self.selected = Some(match self.selected {
+            None => nodes[0],
+            Some(current) => {
+                let pos = nodes.iter().position(|n| *n == current).unwrap_or(0);
+                let prev = if pos == 0 { nodes.len() - 1 } else { pos - 1 };
+                nodes[prev]
+            }
+        });
+    }
+
+    /// Release the operator's selection back to auto-follow (the
+    /// pre-selection default: the view tracks whichever unit most
+    /// recently started, per `UnitStarted`'s auto-focus assignment).
+    pub fn clear_selection(&mut self) {
+        self.selected = None;
+    }
+
+    /// Resolve the transcript path that should drive the focus feed this
+    /// tick.
+    ///
+    /// When the operator has pinned a node (`selected` is `Some`), that
+    /// node's own transcript wins over auto-follow: a [`NodeRef::Unit`]
+    /// resolves to that unit's `transcript_path` (set by its
+    /// `UnitStarted`); a [`NodeRef::Step`] resolves to
+    /// `active_step_transcript_path` (the caller's `run.json` read — the
+    /// same source linear-step auto-follow uses). A unit's
+    /// `transcript_path` is never cleared once set (`UnitCompleted`
+    /// doesn't touch it), so a pin on a unit that finishes keeps
+    /// resolving to the same path — the pin doesn't get yanked away mid-
+    /// review. Only a nav key (`select_next`/`select_prev`) or releasing
+    /// the pin (`clear_selection`, or the auto-clear on `StepStarted`)
+    /// changes the target.
+    ///
+    /// `selected: None` reproduces today's auto-follow precedence
+    /// exactly: the active fan-out unit's transcript
+    /// (`active.active_unit_transcript`, from the most recently started
+    /// `UnitStarted`) wins, falling back to `active_step_transcript_path`
+    /// for a linear step.
+    pub fn focused_transcript(
+        &self,
+        active_step_transcript_path: Option<std::path::PathBuf>,
+    ) -> Option<std::path::PathBuf> {
+        match self.selected {
+            Some(NodeRef::Unit { index }) => self
+                .active
+                .step_id
+                .as_deref()
+                .and_then(|step_id| self.steps.iter().find(|s| s.id == step_id))
+                .and_then(|step| step.units.get(index))
+                .and_then(|unit| unit.transcript_path.clone()),
+            Some(NodeRef::Step) => active_step_transcript_path,
+            None => self
+                .active
+                .active_unit_transcript
+                .clone()
+                .or(active_step_transcript_path),
+        }
+    }
+
     /// Apply a workflow step event, mutating step / run status.
     pub fn apply(&mut self, event: &WfEvent) {
         match event {
@@ -248,6 +377,11 @@ impl LiveRunState {
                 self.active.agent = agent.clone();
                 self.active.feed.clear();
                 self.active.last_event_at = None;
+                // A new active step means the old concurrency context (and
+                // any selection scoped to it) is gone (Q4). Auto-follow
+                // resumes; `UnitStarted`'s auto-focus assignment below is
+                // unaffected — it only applies when `selected` is `None`.
+                self.clear_selection();
                 if let Some(step) = self.step_mut(step_id) {
                     step.status = NodeStatus::Active;
                     if agent.is_some() {
@@ -318,6 +452,7 @@ impl LiveRunState {
                     let unit = &mut step.units[*index];
                     unit.key = unit_key.clone();
                     unit.status = NodeStatus::Working;
+                    unit.transcript_path = Some(transcript_path.clone());
                 }
             }
             WfEvent::UnitCompleted {
@@ -511,6 +646,7 @@ fn ensure_unit_slot(units: &mut Vec<UnitState>, index: usize) {
             status: NodeStatus::Waiting,
             tokens: 0,
             elapsed_secs: 0,
+            transcript_path: None,
         });
     }
 }
@@ -668,6 +804,16 @@ pub fn render_dashboard(state: &LiveRunState, now: DateTime<Utc>, width: usize) 
     }
     rows.push(meters);
 
+    // Keymap hint: only when the active step actually has more than one
+    // navigable node (the step itself plus at least one fan-out unit) —
+    // a single-step/no-selection run has nothing to select, so omit the
+    // hint rather than clutter the dashboard.
+    if state.navigable_nodes().len() > 1 {
+        let mut hint = String::new();
+        let _ = palette::write_colored(&mut hint, "↑↓/Tab select · a auto", DIM);
+        rows.push(hint);
+    }
+
     rows
 }
 
@@ -703,9 +849,27 @@ fn leader_line(
     buf
 }
 
+/// Cursor glyph rendered before a spine row's label when that row is the
+/// operator's pinned node ([`LiveRunState::selected`]). Applied to
+/// exactly one row per frame — the row matching `selected` — everything
+/// else renders unmarked, unchanged from before Task 2.
+const SELECTION_MARKER: &str = "▸ ";
+
+/// Prefix `label` with [`SELECTION_MARKER`] when `selected` is true for
+/// this row; otherwise return it unchanged.
+fn mark_selected(label: &str, selected: bool) -> String {
+    if selected {
+        format!("{SELECTION_MARKER}{label}")
+    } else {
+        label.to_string()
+    }
+}
+
 /// Render Zone 2: the heavy-edged git-graph spine. Walks the workflow
 /// steps and the live `LiveRunState`. The active fan-out step expands
 /// its units as branch rows; inactive fan-outs collapse to `done/total`.
+/// When [`LiveRunState::selected`] pins a node of the active step, that
+/// row (and only that row) is marked with [`SELECTION_MARKER`].
 pub fn render_graph(state: &LiveRunState, _workflow: &Workflow, width: usize) -> Vec<String> {
     let mut rows: Vec<String> = Vec::new();
     let total = state.steps.len();
@@ -720,6 +884,10 @@ pub fn render_graph(state: &LiveRunState, _workflow: &Workflow, width: usize) ->
 
         let glyph = node_glyph(step.status).to_string();
         let agent = step.agent.clone().unwrap_or_default();
+        // Only the active step carries a navigable selection (Q1 scope);
+        // `selected` is stale/meaningless for any other step.
+        let is_active_step = state.active.step_id.as_deref() == Some(step.id.as_str());
+        let step_selected = is_active_step && matches!(state.selected, Some(NodeRef::Step));
 
         match step.kind {
             StepKind::Panel => {
@@ -729,7 +897,7 @@ pub fn render_graph(state: &LiveRunState, _workflow: &Workflow, width: usize) ->
                 } else {
                     status_word(step.status)
                 };
-                let label = format!("{} · panel", step.id);
+                let label = mark_selected(&format!("{} · panel", step.id), step_selected);
                 rows.push(leader_line(
                     &glyph,
                     step.status,
@@ -749,7 +917,7 @@ pub fn render_graph(state: &LiveRunState, _workflow: &Workflow, width: usize) ->
                 } else {
                     "parallel"
                 };
-                let label = format!("{} · {kind_word}", step.id);
+                let label = mark_selected(&format!("{} · {kind_word}", step.id), step_selected);
 
                 if is_active && !step.units.is_empty() {
                     // Header line with the summary + total tokens.
@@ -775,10 +943,13 @@ pub fn render_graph(state: &LiveRunState, _workflow: &Workflow, width: usize) ->
                         let uglyph = node_glyph(unit.status);
                         let prefix = format!("{branch}{uglyph}");
                         let right = unit_right(unit);
+                        let unit_selected = is_active_step
+                            && matches!(state.selected, Some(NodeRef::Unit { index }) if index == ui);
+                        let unit_label = mark_selected(&unit.key, unit_selected);
                         rows.push(leader_line(
                             &prefix,
                             unit.status,
-                            &unit.key,
+                            &unit_label,
                             node_color(unit.status),
                             &right,
                             node_color(unit.status),
@@ -819,6 +990,7 @@ pub fn render_graph(state: &LiveRunState, _workflow: &Workflow, width: usize) ->
                 } else {
                     format!("{} · {agent}", step.id)
                 };
+                let label = mark_selected(&label, step_selected);
                 rows.push(leader_line(
                     &glyph,
                     step.status,
@@ -1195,9 +1367,15 @@ impl Drop for AltScreenGuard {
 /// stops at a safe boundary, which flips [`LiveRunState::status`] via
 /// [`LiveRunState::apply`]). A failed request (already paused, or the
 /// run just reached a terminal state) is swallowed — the state already
-/// reflects reality, so no user-facing action is needed. Any other key,
-/// or a non-Press event (key-repeat/release under kitty-protocol
-/// terminals), is a no-op.
+/// reflects reality, so no user-facing action is needed.
+///
+/// `Down`/`j`/`Tab` and `Up`/`k`/`BackTab` (Shift-Tab) move the node
+/// selection over the active step's navigable set ([`LiveRunState::select_next`]
+/// / [`LiveRunState::select_prev`]); `a` releases the selection back to
+/// auto-follow ([`LiveRunState::clear_selection`]). These are state-only
+/// in this task — Task 2 wires the selection into the focus zone's
+/// rendering. Any other key, or a non-Press event (key-repeat/release
+/// under kitty-protocol terminals), is a no-op.
 fn handle_live_run_keypress(
     key: crossterm::event::KeyEvent,
     store: &rupu_orchestrator::RunStore,
@@ -1205,17 +1383,23 @@ fn handle_live_run_keypress(
     state: &mut LiveRunState,
 ) {
     use crossterm::event::{KeyCode, KeyEventKind};
-    if key.kind != KeyEventKind::Press || key.code != KeyCode::Esc {
+    if key.kind != KeyEventKind::Press {
         return;
     }
-    if crate::cmd::workflow::pause_with_store(store, run_id).is_ok() {
-        state.push_activity(
-            Utc::now(),
-            ActivityKind::Text,
-            format!(
-                "pause requested — will stop at next safe boundary (resume: rupu workflow resume {run_id})"
-            ),
-        );
+    match key.code {
+        KeyCode::Esc if crate::cmd::workflow::pause_with_store(store, run_id).is_ok() => {
+            state.push_activity(
+                Utc::now(),
+                ActivityKind::Text,
+                format!(
+                    "pause requested — will stop at next safe boundary (resume: rupu workflow resume {run_id})"
+                ),
+            );
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => state.select_next(),
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => state.select_prev(),
+        KeyCode::Char('a') => state.clear_selection(),
+        _ => {}
     }
 }
 
@@ -1296,12 +1480,14 @@ pub async fn run_live_view(
                 }
             }
         }
-        let desired_transcript = state.active.active_unit_transcript.clone().or_else(|| {
-            store
-                .load(&run_id)
-                .ok()
-                .and_then(|r| r.active_step_transcript_path)
-        });
+        // `focused_transcript` folds in the operator's pinned selection
+        // (Task 2): `None` reproduces the precedence above verbatim,
+        // `Some(node)` resolves that node's own transcript instead.
+        let active_step_transcript_path = store
+            .load(&run_id)
+            .ok()
+            .and_then(|r| r.active_step_transcript_path);
+        let desired_transcript = state.focused_transcript(active_step_transcript_path);
         if let Some(path) = desired_transcript {
             let need_new = transcript_tailer
                 .as_ref()
@@ -1503,30 +1689,35 @@ mod tests {
             status: NodeStatus::Complete,
             tokens: 210_000,
             elapsed_secs: 12,
+            transcript_path: Some(std::path::PathBuf::from("/runs/conf-manager.jsonl")),
         });
         units.push(UnitState {
             key: "tlb-agent".into(),
             status: NodeStatus::Complete,
             tokens: 180_000,
             elapsed_secs: 11,
+            transcript_path: Some(std::path::PathBuf::from("/runs/tlb-agent.jsonl")),
         });
         units.push(UnitState {
             key: "app-gw".into(),
             status: NodeStatus::Working,
             tokens: 120_000,
             elapsed_secs: 8,
+            transcript_path: Some(std::path::PathBuf::from("/runs/app-gw.jsonl")),
         });
         units.push(UnitState {
             key: "rtc".into(),
             status: NodeStatus::Waiting,
             tokens: 0,
             elapsed_secs: 0,
+            transcript_path: None,
         });
         units.push(UnitState {
             key: "auth".into(),
             status: NodeStatus::Waiting,
             tokens: 0,
             elapsed_secs: 0,
+            transcript_path: None,
         });
         let assess = StepState {
             id: "assess".into(),
@@ -1606,6 +1797,7 @@ mod tests {
                 feed: Vec::new(),
                 last_event_at: Some(ts(31)),
             },
+            selected: None,
         }
     }
 
@@ -2111,6 +2303,7 @@ mod tests {
                     status: NodeStatus::Working,
                     tokens: 120_000,
                     elapsed_secs: 8,
+                    transcript_path: None,
                 });
             }
             steps.push(StepState {
@@ -2353,5 +2546,355 @@ mod tests {
 
         assert!(state.active.feed.is_empty());
         assert_eq!(store.load("run_01ABC").unwrap().status, RunStatus::Running);
+    }
+
+    // -----------------------------------------------------------------
+    // Node-selection state + keyboard navigation (Task 1)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn nav_down_selects_first_concurrent_unit_then_next() {
+        // `fanout_state(true)` has the active "assess" step with 5 units
+        // (index 0..=4). The navigable set is [Step, Unit0, Unit1, ...].
+        let mut state = fanout_state(true);
+        assert_eq!(state.selected, None);
+
+        state.select_next();
+        assert_eq!(
+            state.selected,
+            Some(NodeRef::Step),
+            "first press seeds the selection to the first node (the step itself)"
+        );
+
+        state.select_next();
+        assert_eq!(state.selected, Some(NodeRef::Unit { index: 0 }));
+
+        state.select_next();
+        assert_eq!(state.selected, Some(NodeRef::Unit { index: 1 }));
+    }
+
+    #[test]
+    fn nav_wraps_at_ends() {
+        let mut state = fanout_state(true);
+        // 5 units on "assess" -> navigable set is [Step, Unit0..Unit4].
+        state.selected = Some(NodeRef::Unit { index: 4 });
+        state.select_next();
+        assert_eq!(
+            state.selected,
+            Some(NodeRef::Step),
+            "select_next past the last node wraps to the first"
+        );
+
+        state.selected = Some(NodeRef::Step);
+        state.select_prev();
+        assert_eq!(
+            state.selected,
+            Some(NodeRef::Unit { index: 4 }),
+            "select_prev before the first node wraps to the last"
+        );
+    }
+
+    #[test]
+    fn release_key_clears_selection_to_auto_follow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
+        store
+            .create(
+                minimal_run_record("run_01ABC", RunStatus::Running),
+                "name: sample\nsteps: []\n",
+            )
+            .unwrap();
+
+        let mut state = fanout_state(true);
+        state.selected = Some(NodeRef::Unit { index: 2 });
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        handle_live_run_keypress(key, &store, "run_01ABC", &mut state);
+
+        assert_eq!(state.selected, None);
+    }
+
+    #[test]
+    fn step_change_releases_selection() {
+        let mut state = fanout_state(true);
+        state.selected = Some(NodeRef::Unit { index: 1 });
+
+        state.apply(&WfEvent::StepStarted {
+            run_id: "run_01ABC".into(),
+            step_id: "report".into(),
+            kind: StepKind::Linear,
+            agent: Some("reporter".into()),
+            host: None,
+        });
+
+        assert_eq!(
+            state.selected, None,
+            "a new active step clears a selection scoped to the old step's concurrency context"
+        );
+    }
+
+    #[test]
+    fn esc_still_pauses_with_selection_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
+        store
+            .create(
+                minimal_run_record("run_01ABC", RunStatus::Running),
+                "name: sample\nsteps: []\n",
+            )
+            .unwrap();
+
+        let mut state = fanout_state(true);
+        state.selected = Some(NodeRef::Unit { index: 3 });
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        handle_live_run_keypress(key, &store, "run_01ABC", &mut state);
+
+        assert!(
+            state
+                .active
+                .feed
+                .iter()
+                .any(|line| line.text.contains("pause requested")),
+            "{:#?}",
+            state.active.feed
+        );
+        assert_eq!(
+            state.selected,
+            Some(NodeRef::Unit { index: 3 }),
+            "Esc must not touch an active selection"
+        );
+        let persisted = store.load("run_01ABC").unwrap();
+        assert_eq!(persisted.status, RunStatus::Paused);
+    }
+
+    #[test]
+    fn nav_ignored_when_no_concurrent_nodes() {
+        // A single linear step, active, with no fan-out units at all. The
+        // navigable set is just `[Step]` (len 1): nav selects the lone
+        // step on first press, and further presses are idempotent rather
+        // than a special-cased no-op — same algorithm, no branching.
+        let mut state = LiveRunState {
+            workflow_name: "w".into(),
+            run_id: "run_1".into(),
+            status: RunStatus::Running,
+            started_at: Some(ts(0)),
+            finished_at: None,
+            steps: vec![StepState {
+                id: "only".into(),
+                kind: StepKind::Linear,
+                agent: Some("solo-agent".into()),
+                status: NodeStatus::Working,
+                tokens_in: 0,
+                tokens_out: 0,
+                elapsed_secs: 0,
+                units: Vec::new(),
+                fanout_total: None,
+                panel_iter: None,
+                panel_findings: 0,
+            }],
+            tokens_in: 0,
+            tokens_out: 0,
+            cost: None,
+            findings_count: None,
+            coverage_pct: None,
+            active: ActiveFocus {
+                step_id: Some("only".into()),
+                unit_key: None,
+                agent: Some("solo-agent".into()),
+                active_unit_transcript: None,
+                feed: Vec::new(),
+                last_event_at: None,
+            },
+            selected: None,
+        };
+
+        state.select_next();
+        assert_eq!(
+            state.selected,
+            Some(NodeRef::Step),
+            "with no fan-out units, the lone step is the only navigable node"
+        );
+
+        state.select_next();
+        assert_eq!(
+            state.selected,
+            Some(NodeRef::Step),
+            "a single-node set is idempotent under further nav"
+        );
+
+        state.select_prev();
+        assert_eq!(state.selected, Some(NodeRef::Step));
+    }
+
+    // -----------------------------------------------------------------
+    // Focus resolution + spine highlight + keymap hint (Task 2)
+    // -----------------------------------------------------------------
+
+    /// A single active linear step with no fan-out units — mirrors
+    /// `nav_ignored_when_no_concurrent_nodes`'s fixture (navigable set of
+    /// length 1: `[Step]` only).
+    fn solo_step_state() -> LiveRunState {
+        LiveRunState {
+            workflow_name: "w".into(),
+            run_id: "run_1".into(),
+            status: RunStatus::Running,
+            started_at: Some(ts(0)),
+            finished_at: None,
+            steps: vec![StepState {
+                id: "only".into(),
+                kind: StepKind::Linear,
+                agent: Some("solo-agent".into()),
+                status: NodeStatus::Working,
+                tokens_in: 0,
+                tokens_out: 0,
+                elapsed_secs: 0,
+                units: Vec::new(),
+                fanout_total: None,
+                panel_iter: None,
+                panel_findings: 0,
+            }],
+            tokens_in: 0,
+            tokens_out: 0,
+            cost: None,
+            findings_count: None,
+            coverage_pct: None,
+            active: ActiveFocus {
+                step_id: Some("only".into()),
+                unit_key: None,
+                agent: Some("solo-agent".into()),
+                active_unit_transcript: None,
+                feed: Vec::new(),
+                last_event_at: None,
+            },
+            selected: None,
+        }
+    }
+
+    #[test]
+    fn desired_transcript_follows_selection_when_pinned() {
+        // Pin unit 0 ("conf-manager") while auto-follow's own signals
+        // (the active-unit transcript AND the caller's active-step path)
+        // both point elsewhere — the pin must win over both.
+        let mut state = fanout_state(true);
+        state.active.active_unit_transcript = Some(std::path::PathBuf::from("/runs/app-gw.jsonl"));
+        state.selected = Some(NodeRef::Unit { index: 0 });
+
+        let resolved =
+            state.focused_transcript(Some(std::path::PathBuf::from("/runs/active_step.jsonl")));
+
+        assert_eq!(
+            resolved,
+            Some(std::path::PathBuf::from("/runs/conf-manager.jsonl"))
+        );
+    }
+
+    #[test]
+    fn desired_transcript_auto_follows_when_selection_none() {
+        // `selected: None` must reproduce today's precedence exactly:
+        // the active unit's transcript wins when present...
+        let mut state = fanout_state(true);
+        state.active.active_unit_transcript = Some(std::path::PathBuf::from("/runs/app-gw.jsonl"));
+        assert_eq!(state.selected, None);
+        assert_eq!(
+            state.focused_transcript(Some(std::path::PathBuf::from("/runs/active_step.jsonl"))),
+            Some(std::path::PathBuf::from("/runs/app-gw.jsonl"))
+        );
+
+        // ...falling back to the caller-supplied active-step path when
+        // there is no active-unit transcript (the linear-step case).
+        state.active.active_unit_transcript = None;
+        assert_eq!(
+            state.focused_transcript(Some(std::path::PathBuf::from("/runs/active_step.jsonl"))),
+            Some(std::path::PathBuf::from("/runs/active_step.jsonl"))
+        );
+    }
+
+    #[test]
+    fn pinned_completed_node_stays_focused() {
+        // Pin the in-flight "app-gw" unit (index 2)...
+        let mut state = fanout_state(true);
+        state.selected = Some(NodeRef::Unit { index: 2 });
+        assert_eq!(
+            state.focused_transcript(None),
+            Some(std::path::PathBuf::from("/runs/app-gw.jsonl"))
+        );
+
+        // ...then complete it. The pin must not auto-jump away: the same
+        // transcript stays the focus target until the operator moves the
+        // selection or releases it (`a`).
+        state.apply(&WfEvent::UnitCompleted {
+            run_id: "run_01ABC".into(),
+            step_id: "assess".into(),
+            index: 2,
+            unit_key: "app-gw".into(),
+            success: true,
+            tokens_in: 10,
+            tokens_out: 5,
+            host: None,
+        });
+
+        let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
+        assert_eq!(step.units[2].status, NodeStatus::Complete);
+        assert_eq!(
+            state.focused_transcript(None),
+            Some(std::path::PathBuf::from("/runs/app-gw.jsonl")),
+            "a pinned node's transcript must not change when it completes"
+        );
+    }
+
+    #[test]
+    fn render_graph_highlights_selected_node() {
+        // Selecting the active step itself marks only that step's row.
+        let mut state = fanout_state(true);
+        state.selected = Some(NodeRef::Step);
+        let rows = stripped(render_graph(&state, &empty_workflow(), 100));
+        let marked: Vec<&String> = rows
+            .iter()
+            .filter(|r| r.contains(SELECTION_MARKER))
+            .collect();
+        assert_eq!(marked.len(), 1, "{rows:#?}");
+        assert!(marked[0].contains("assess"), "{rows:#?}");
+
+        // Selecting a fan-out unit marks only that unit's row, and no
+        // other row (including the step header) carries the marker.
+        state.selected = Some(NodeRef::Unit { index: 1 });
+        let rows = stripped(render_graph(&state, &empty_workflow(), 100));
+        let marked: Vec<&String> = rows
+            .iter()
+            .filter(|r| r.contains(SELECTION_MARKER))
+            .collect();
+        assert_eq!(marked.len(), 1, "{rows:#?}");
+        assert!(marked[0].contains("tlb-agent"), "{rows:#?}");
+    }
+
+    #[test]
+    fn dashboard_shows_selection_keymap_hint() {
+        // The active "assess" step has 5 fan-out units -> navigable set
+        // of 6 nodes, so the hint should render.
+        let with_units = fanout_state(true);
+        assert!(with_units.navigable_nodes().len() > 1);
+        let rows = stripped(render_dashboard(&with_units, ts(0), 100));
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("select") && r.contains("auto")),
+            "{rows:#?}"
+        );
+
+        // A lone active step with no units has nothing to select -> the
+        // hint must be omitted to avoid cluttering single-step runs.
+        let solo = solo_step_state();
+        assert_eq!(solo.navigable_nodes().len(), 1);
+        let rows = stripped(render_dashboard(&solo, ts(0), 100));
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("select") && r.contains("auto")),
+            "{rows:#?}"
+        );
     }
 }
