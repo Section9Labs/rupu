@@ -278,13 +278,16 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         warn!(path = %pwd.display(), error = %err, "failed to auto-track checkout");
     }
 
-    // Provider build via CredentialResolver.
-    let resolver = rupu_auth::KeychainResolver::new();
+    // Provider build via CredentialResolver. Wrapped in an `Arc` so the
+    // same resolver instance can also be handed to `CliAgentDispatcher`
+    // below without a second construction; existing call sites that need
+    // `&dyn CredentialResolver` now go through `resolver.as_ref()`.
+    let resolver = Arc::new(rupu_auth::KeychainResolver::new());
 
     // Build the SCM/issue registry from the same resolver + config the
     // LLM provider factory uses. Cheap when no platforms are configured;
     // missing credentials are skipped with INFO logs.
-    let scm_registry = Arc::new(rupu_scm::Registry::discover(&resolver, &cfg).await);
+    let scm_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
 
     let provider_name = spec.provider.clone().unwrap_or_else(|| "anthropic".into());
     let oai_params = provider_factory::openai_compatible_params(&provider_name, &cfg.providers);
@@ -311,7 +314,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         &provider_name,
         &model,
         auth_hint,
-        &resolver,
+        resolver.as_ref(),
         &provider_config,
     )
     .await?;
@@ -438,30 +441,52 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         }
     };
 
+    let mode_str = match mode {
+        PermissionMode::Ask => "ask",
+        PermissionMode::Bypass => "bypass",
+        PermissionMode::Readonly => "readonly",
+    };
+
+    // Run-store, hoisted above the tool context so it can back both the
+    // dispatcher (below) and the run.json write further down — a single
+    // `RunStore` instance for the whole `run_inner` call, never two.
+    let runs_root = global.join("runs");
+    let run_store = Arc::new(rupu_orchestrator::RunStore::new(runs_root.clone()));
+
     // Build tool context now that the resolved workspace_path is known.
-    // No dispatcher is wired for bare `rupu run`; sub-agent dispatch
-    // is a workflow-runner-only feature today (orchestrator wires the
-    // dispatcher per-step). A `dispatch_agent` tool call from a bare
-    // `rupu run` therefore returns a clear error.
+    // Sub-agent dispatch is now wired for bare `rupu run` too, mirroring
+    // `rupu workflow run`: `parent_run_id` is this run's id, so any
+    // `dispatch_agent`/`dispatch_agents_parallel` tool call anchors its
+    // child sub-run(s) under `<run>/sub/`. No event sink is threaded
+    // through — bare `rupu run` uses the `LineStreamPrinter`, which
+    // renders dispatch children post-hoc from the parent transcript's
+    // tool_call/tool_result entries rather than tailing `events.jsonl`.
+    let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
+        global.clone(),
+        project_root.clone(),
+        ws.id.clone(),
+        workspace_path.clone(),
+        Arc::clone(&resolver),
+        mode_str.to_string(),
+        Arc::clone(&scm_registry),
+        Arc::clone(&run_store),
+        None,
+    );
+    let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
+
     let tool_context = ToolContext {
         workspace_path: workspace_path.clone(),
         bash_env_allowlist: bash_allowlist,
         bash_timeout_secs: bash_timeout,
-        dispatcher: None,
+        dispatcher: Some(dispatcher_dyn),
         dispatchable_agents: spec.dispatchable_agents.clone(),
-        parent_run_id: None,
+        parent_run_id: Some(run_id.clone()),
         depth: 0,
         coverage_writer: None,
         surface_tag: None,
         run_id: None,
         model: None,
         tool_mappings: None,
-    };
-
-    let mode_str = match mode {
-        PermissionMode::Ask => "ask",
-        PermissionMode::Bypass => "bypass",
-        PermissionMode::Readonly => "readonly",
     };
 
     let backend_id = "local_checkout".to_string();
@@ -647,8 +672,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // Write run.json so the run is observable via RunStore and the mirror
     // can carry final_output back to the central control-plane.
     {
-        let runs_root = global.join("runs");
-        let store = rupu_orchestrator::RunStore::new(runs_root);
+        let store = &run_store;
         let final_output = if success {
             Some(rupu_orchestrator::read_final_assistant_text(
                 &transcript_path,
