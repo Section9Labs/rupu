@@ -110,11 +110,13 @@
         <tr><td><code>auth</code></td><td><code>api-key</code> | <code>sso</code></td><td>resolver chooses</td><td>Optional auth-mode hint when a provider has both credentials.</td></tr>
         <tr><td><code>model</code></td><td>string</td><td>config default, else <code>claude-sonnet-4-6</code></td><td>Provider-specific model id. Not validated at parse time.</td></tr>
         <tr><td><code>tools</code></td><td>array&lt;string&gt;</td><td>built-in + discovered MCP tools</td><td>The agent's tool allowlist. Strongly recommended to declare explicitly.</td></tr>
+        <tr><td><code>dispatchableAgents</code></td><td>array&lt;string&gt;</td><td>none</td><td>Allowlist of child agent names this agent may spawn via <code class="inline">dispatch_agent</code> / <code class="inline">dispatch_agents_parallel</code>. A dispatch call fails if its target isn&rsquo;t listed.</td></tr>
         <tr><td><code>maxTurns</code></td><td>integer</td><td><code>50</code></td><td>Hard cap on model turns (not a token budget).</td></tr>
         <tr><td><code>permissionMode</code></td><td><code>ask</code> | <code>bypass</code> | <code>readonly</code></td><td><code>ask</code></td><td>Permission model for shell and write effects. CLI <code class="inline">--mode</code> overrides it.</td></tr>
         <tr><td><code>effort</code></td><td>string</td><td>provider default</td><td>Cross-provider reasoning level: <code class="inline">auto</code>, <code class="inline">minimal</code>, <code class="inline">low</code>, <code class="inline">medium</code>, <code class="inline">high</code>, <code class="inline">max</code>.</td></tr>
         <tr><td><code>contextWindow</code></td><td>string</td><td>model default</td><td>Cross-provider context tier: <code class="inline">default</code> or <code class="inline">1m</code>.</td></tr>
         <tr><td><code>outputFormat</code></td><td><code>text</code> | <code>json</code></td><td>free-form text</td><td>Hint for structured output; describe the JSON shape in the prompt too.</td></tr>
+        <tr><td><code>outputSchema</code></td><td>JSON Schema</td><td>none</td><td>Inline JSON Schema for a guaranteed schema-conforming result via the provider&rsquo;s structured-output mode (Anthropic). Absent &rArr; prompt-driven <code class="inline">outputFormat</code> only.</td></tr>
         <tr><td><code>anthropicOauthPrefix</code></td><td>bool</td><td>provider default</td><td>Anthropic SSO only — enables/disables the OAuth system prefix.</td></tr>
         <tr><td><code>anthropicTaskBudget</code></td><td>integer</td><td>none</td><td>Anthropic-only soft output budget, separate from <code class="inline">maxTurns</code>.</td></tr>
         <tr><td><code>anthropicContextManagement</code></td><td>string</td><td>none</td><td>Anthropic-only server-side pruning of older tool blocks (<code class="inline">tool_clearing</code>).</td></tr>
@@ -209,6 +211,91 @@ Do not edit code.</pre>
       <code class="inline">ask</code> cannot proceed in a non-interactive context, pass
       <code class="inline">--mode bypass</code> or <code class="inline">--mode readonly</code> explicitly there. The
       CLI <code class="inline">--mode</code> flag always overrides the value in the file.
+    </p>
+
+    <h2>Sub-agent dispatch</h2>
+    <p>
+      An agent can invoke <em>other</em> agents as tool calls in the middle of its own run, read their
+      results, and fold them back into its context before continuing. This is composition at the
+      <strong>agent layer</strong> — distinct from a <a class="link" href="/docs/workflows.html">workflow</a>,
+      which composes agents at the step layer. A writer agent can dispatch a reviewer mid-draft, revise against
+      the findings, and carry on, without the workflow author fanning out at the YAML level.
+    </p>
+    <p>Two built-in tools drive it:</p>
+    <ul>
+      <li><code class="inline">dispatch_agent</code> — run one child agent <strong>synchronously</strong>. The child
+        runs to completion in its own context; the parent receives the child's final text plus token and
+        duration accounting.</li>
+      <li><code class="inline">dispatch_agents_parallel</code> — fan out several children
+        <strong>concurrently</strong> and get back a map keyed by id, each with its own output. Reach for this
+        when N specialist reviews can run independently.</li>
+    </ul>
+    <p>
+      Dispatch is gated by a per-agent allowlist. The <code class="inline">dispatchableAgents:</code> frontmatter
+      field names exactly which children this agent may spawn; a dispatch call fails at invocation if its target
+      is not in the list (empty or absent means the agent can dispatch no one). The dispatch tools themselves
+      live in the built-in tool surface, so they are available when <code class="inline">tools:</code> is omitted
+      — but for a repo agent with an explicit allowlist, list them alongside
+      <code class="inline">dispatchableAgents:</code>.
+    </p>
+    <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="s">writer</span>
+<span class="k">tools</span>: <span class="v">[read_file, edit_file, dispatch_agent, dispatch_agents_parallel]</span>
+<span class="k">dispatchableAgents</span>: <span class="v">[security-reviewer, perf-reviewer]</span>
+<span class="c">---</span>
+
+Draft the change, then dispatch the reviewers on your diff.
+Revise against their findings before you finish.</pre>
+    <p>
+      Each child runs as its own agent: its own permission mode (a child is never widened by its parent), its own
+      JSONL transcript written under the parent run with a parent&rarr;child link, and its own token budget.
+      Sub-agent dispatch works in a bare <code class="inline">rupu run</code> as well as inside workflows. See
+      <a class="link" href="/docs/mcp.html">MCP &amp; tools</a> for the tool surface and
+      <a class="link" href="/docs/workflows.html">Workflows</a> for step-layer composition.
+    </p>
+
+    <h2>Structured outputs</h2>
+    <p>
+      By default an agent returns free-form text. Two frontmatter fields tighten that when a downstream step or
+      tool needs a predictable shape.
+    </p>
+    <p>
+      <code class="inline">outputFormat: json</code> is a <strong>hint</strong> — it asks the model to return
+      JSON (describe the shape in the prompt too). It is prompt-driven: nothing structurally guarantees the
+      result parses or matches a particular schema.
+    </p>
+    <p>
+      <code class="inline">outputSchema:</code> goes further. Declare a JSON Schema inline in the frontmatter and
+      rupu hands it to the provider's structured-output mode (Anthropic's
+      <code class="inline">output_config.format</code> with <code class="inline">type: json_schema</code>), which
+      returns a <strong>guaranteed schema-conforming</strong> object. Anthropic mandates a real schema for this
+      mode, so omitting <code class="inline">outputSchema:</code> keeps the prompt-driven-only behavior; other
+      providers currently ignore the schema.
+    </p>
+    <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="s">security-reviewer</span>
+<span class="k">outputFormat</span>: <span class="s">json</span>
+<span class="k">outputSchema</span>:
+  <span class="k">type</span>: <span class="s">object</span>
+  <span class="k">properties</span>:
+    <span class="k">findings</span>:
+      <span class="k">type</span>: <span class="s">array</span>
+      <span class="k">items</span>:
+        <span class="k">type</span>: <span class="s">object</span>
+        <span class="k">properties</span>:
+          <span class="k">severity</span>: <span class="v">{ type: string, enum: [low, medium, high, critical] }</span>
+          <span class="k">title</span>: <span class="v">{ type: string }</span>
+          <span class="k">body</span>: <span class="v">{ type: string }</span>
+        <span class="k">required</span>: <span class="v">[severity, title]</span>
+        <span class="k">additionalProperties</span>: <span class="v">false</span>
+  <span class="k">required</span>: <span class="v">[findings]</span>
+  <span class="k">additionalProperties</span>: <span class="v">false</span>
+<span class="c">---</span>
+
+Audit the diff and return your findings.</pre>
+    <p>
+      With a guaranteed shape, downstream <a class="link" href="/docs/workflows.html">workflow</a> steps can rely
+      on those fields in their template expressions instead of defensively parsing free text.
     </p>
 
     <h2>Providers &amp; models</h2>

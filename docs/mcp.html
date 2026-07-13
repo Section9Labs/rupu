@@ -100,7 +100,15 @@
       </tbody>
     </table>
     <p>
-      By default an agent gets all six. To narrow the surface, list names in the frontmatter
+      Two more built-ins let an agent <strong>call other agents as tools</strong>:
+      <code class="inline">dispatch_agent</code> (one child, synchronously) and
+      <code class="inline">dispatch_agents_parallel</code> (several at once). A parent folds the children's
+      outputs back into its own run — composition at the agent layer. Which children it may spawn is
+      gated by the parent's <code class="inline">dispatchableAgents:</code> allowlist. See
+      <a class="link" href="/docs/agents.html">Agents &rarr; Sub-agent dispatch</a>.
+    </p>
+    <p>
+      By default an agent gets all the built-ins. To narrow the surface, list names in the frontmatter
       <code class="inline">tools:</code> field — rupu builds a registry filtered to exactly those names, so the
       model is only ever told about the tools it is allowed to call.
     </p>
