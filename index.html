@@ -181,14 +181,21 @@
       <div class="dl-primary">
         <a class="btn primary" id="dl-btn" href="https://github.com/Section9Labs/rupu/releases" target="_blank" rel="noopener">Download for macOS</a>
       </div>
-      <div class="dl-sub" id="dl-sub">Apple Silicon · signed binary · <a class="link" href="https://github.com/Section9Labs/rupu/releases" target="_blank" rel="noopener">all releases</a></div>
+      <div class="dl-sub" id="dl-sub">macOS · Apple Silicon · signed binary · <a class="link" href="https://github.com/Section9Labs/rupu/releases" target="_blank" rel="noopener">all releases</a></div>
+
+      <div class="dl-or">then install it</div>
+      <div class="code-line">
+        <code id="dl-install">chmod +x rupu-darwin-arm64 &amp;&amp; sudo mv rupu-darwin-arm64 /usr/local/bin/rupu</code>
+        <button class="copy-btn" data-copy="#dl-install" type="button">Copy</button>
+      </div>
 
       <div class="dl-or">or build from source</div>
       <div class="code-line">
         <code id="dl-cargo">cargo install --git https://github.com/Section9Labs/rupu</code>
         <button class="copy-btn" data-copy="#dl-cargo" type="button">Copy</button>
       </div>
-      <p class="dl-sub">Then run <code class="inline">rupu init</code> and <code class="inline">rupu --help</code>. See the <a class="link" href="/docs/">docs</a> to get started.</p>
+
+      <p class="dl-sub">Then <code class="inline">rupu init</code> — and keep it current with <code class="inline">rupu update</code> (add <code class="inline">--channel beta</code> for early access). See the <a class="link" href="/docs/">docs</a>.</p>
     </div>
   </section>
 
@@ -234,9 +241,9 @@
     });
   });
 
-  // live "latest release" — the official Latest (the signed + notarized `-cli`
-  // release). /releases/latest returns the newest NON-prerelease, so it skips
-  // the `-build` prerelease stream and resolves to the current `-cli` tarball.
+  // live "latest release" — the stable channel. /releases/latest returns the
+  // newest NON-prerelease (i.e. the stable `v<X.Y.Z>` release, not `-beta`).
+  // Assets are the canonical `rupu-<os>-<arch>` bare binary (+ .sha256).
   (function () {
     var verEl = document.getElementById('dl-ver');
     var btn = document.getElementById('dl-btn');
@@ -246,15 +253,19 @@
       headers: { 'Accept': 'application/vnd.github+json' }
     }).then(function (r) { return r.ok ? r.json() : null; }).then(function (rel) {
       if (!rel) return;
-      var ver = (rel.tag_name || '').replace(/-(cli|build)$/, '');
+      var ver = (rel.tag_name || '').replace(/-(cli|build|beta)$/, '');
       verEl.textContent = ver ? 'Latest · ' + ver : 'Latest release';
-      // prefer the macOS (Apple Silicon) tarball; fall back to a bare binary.
-      var bin = (rel.assets || []).filter(function (a) { return /\.tar\.gz$/.test(a.name) && !/\.sha256$/.test(a.name); })[0]
-             || (rel.assets || []).filter(function (a) { return a.name === 'rupu'; })[0];
+      var assets = rel.assets || [];
+      // prefer the canonical macOS binary (rupu-darwin-arm64), then any bare
+      // rupu-<os>-<arch> binary, then the legacy .tar.gz, then a bare `rupu`.
+      var bin = assets.filter(function (a) { return a.name === 'rupu-darwin-arm64'; })[0]
+             || assets.filter(function (a) { return /^rupu-[a-z0-9_]+-[a-z0-9_]+$/i.test(a.name); })[0]
+             || assets.filter(function (a) { return /\.tar\.gz$/.test(a.name) && !/\.sha256$/.test(a.name); })[0]
+             || assets.filter(function (a) { return a.name === 'rupu'; })[0];
       if (bin) {
         btn.href = bin.browser_download_url;
         btn.removeAttribute('target');
-        if (sub) sub.innerHTML = 'macOS · Apple Silicon · signed &amp; notarized (' + ver + ') · <a class="link" href="' + rel.html_url + '" target="_blank" rel="noopener">all releases</a>';
+        if (sub) sub.innerHTML = 'macOS · Apple Silicon · signed binary (' + ver + ') · <a class="link" href="' + rel.html_url + '" target="_blank" rel="noopener">all releases</a>';
       } else {
         btn.href = rel.html_url;
       }

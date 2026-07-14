@@ -43,15 +43,15 @@
     <div class="callout"><strong>Prerequisites.</strong> macOS (Apple Silicon) for the prebuilt binary, or any platform with a Rust toolchain to build from source. A model-provider account (Anthropic, OpenAI, Gemini, or Copilot). Run the commands from inside a git repository you want rupu to work in.</div>
 
     <h2>1 &middot; Install</h2>
-    <p>Grab the latest signed macOS binary from the <a class="link" href="/#download">download</a> section (or the <a class="link" href="https://github.com/Section9Labs/rupu/releases" target="_blank" rel="noopener">releases page</a>), or build from source:</p>
-    <pre class="code"><span class="c"># prebuilt binary (macOS, Apple Silicon) — signed &amp; notarized</span>
-tar -xzf rupu-*-aarch64-apple-darwin.tar.gz
-chmod +x ./rupu &amp;&amp; sudo mv ./rupu /usr/local/bin/rupu
+    <p>Grab the latest signed macOS binary from the <a class="link" href="/#download">download</a> section (or the <a class="link" href="https://github.com/Section9Labs/rupu/releases" target="_blank" rel="noopener">releases page</a>) — each release ships a bare <code class="inline">rupu-&lt;os&gt;-&lt;arch&gt;</code> binary — or build from source:</p>
+    <pre class="code"><span class="c"># prebuilt binary (macOS, Apple Silicon) — signed</span>
+chmod +x rupu-darwin-arm64 &amp;&amp; sudo mv rupu-darwin-arm64 /usr/local/bin/rupu
 
 <span class="c"># …or from source (any platform with Rust)</span>
 cargo install --git https://github.com/Section9Labs/rupu
 
 rupu --version</pre>
+    <p>Already installed? Keep it current with <code class="inline">rupu update</code> — it self-updates in place and keeps a backup for <code class="inline">--rollback</code>. Add <code class="inline">--channel beta</code> for early-access prereleases.</p>
 
     <h2>2 &middot; Initialize &amp; connect a model</h2>
     <p><code class="inline">init</code> scaffolds <code class="inline">.rupu/</code> in the current repo with a set of starter agents and workflows; <code class="inline">auth login</code> connects a model provider (credentials are stored in your system keychain).</p>
