@@ -5,6 +5,7 @@
 //! [`cmd`], and returns an `ExitCode`. The binary's `main.rs` is a
 //! one-line wrapper that calls into here.
 
+pub mod build_info;
 pub mod cmd;
 pub mod cp_agent_launcher;
 pub mod cp_definition_generator;
