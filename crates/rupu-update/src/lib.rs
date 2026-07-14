@@ -12,6 +12,8 @@ pub use decide::{current_platform, decide, is_dev_exe, Decision};
 
 pub mod verify;
 
+pub mod install;
+
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
     #[error("unknown release channel: {0} (expected \"stable\" or \"beta\")")]
