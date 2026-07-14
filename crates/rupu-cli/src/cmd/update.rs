@@ -168,7 +168,8 @@ async fn run(args: UpdateArgs) -> anyhow::Result<ExitCode> {
             >
     };
     let apply = ElevatingApply;
-    let new = flow::install(&src, &ctx, args.force, &apply, dl).await?;
+    let check = rupu_update::CodesignCheck;
+    let new = flow::install(&src, &ctx, args.force, &apply, &check, dl).await?;
     println!("Updated rupu {} → {new} ({channel}).", ctx.current_version);
     Ok(ExitCode::SUCCESS)
 }
@@ -205,6 +206,21 @@ impl flow::ApplyStrategy for ElevatingApply {
         let sha = rupu_update::verify::sha256_hex(verified);
         let self_exe = std::env::current_exe().map_err(rupu_update::UpdateError::Io)?;
 
+        // Resolve the backup path in the USER (parent, unprivileged)
+        // context — same convention `DirectApply` uses — and pass it
+        // explicitly so the privileged step doesn't recompute
+        // `backup_dir()` under `sudo`'s (possibly root) `$HOME`. Without
+        // this, `rupu update --rollback` (run as the user afterward)
+        // looks in the user's `~/.rupu/backups` and never finds a
+        // backup the privileged step wrote under root's home.
+        let backup = rupu_update::install::backup_dir().join(format!(
+            "rupu-{}",
+            target
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("prev")
+        ));
+
         eprintln!("Elevating to install into {} …", dir.display());
         let status = std::process::Command::new("sudo")
             .arg(&self_exe)
@@ -215,15 +231,18 @@ impl flow::ApplyStrategy for ElevatingApply {
             .arg(target)
             .arg("--sha256")
             .arg(&sha)
+            .arg("--backup")
+            .arg(&backup)
             .status()
             .map_err(|e| rupu_update::UpdateError::Install(format!("sudo failed to start: {e}")))?;
         if !status.success() {
             return Err(rupu_update::UpdateError::Install(format!(
-                "privileged apply failed; run manually: sudo {} __apply-update --from {} --to {} --sha256 {}",
+                "privileged apply failed; run manually: sudo {} __apply-update --from {} --to {} --sha256 {} --backup {}",
                 self_exe.display(),
                 staged.display(),
                 target.display(),
-                sha
+                sha,
+                backup.display()
             )));
         }
         Ok(())
