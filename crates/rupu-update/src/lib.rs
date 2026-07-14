@@ -16,6 +16,9 @@ pub mod install;
 
 pub mod notice;
 
+pub mod github;
+pub use github::{download_bytes, releases_api_url, GithubReleaseSource};
+
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
     #[error("unknown release channel: {0} (expected \"stable\" or \"beta\")")]
