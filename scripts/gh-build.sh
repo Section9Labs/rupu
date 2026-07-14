@@ -110,6 +110,17 @@ echo "→ Hashing binary..."
 shasum -a 256 "$BIN" | tee "$BIN.sha256"
 BIN_SHA="$(awk '{print $1}' "$BIN.sha256")"
 
+# Stage the assets under their canonical platform names before upload.
+# GitHub derives an asset's NAME from the uploaded file's basename — the
+# `file#label` upload form sets only the display LABEL, not the name — and
+# `rupu update` resolves assets by NAME == `rupu-<os>-<arch>` (+ `.sha256`).
+# So the files we upload must literally be named that.
+STAGE_DIR="$(dirname "$BIN")"
+STAGED_BIN="$STAGE_DIR/$ASSET_NAME"
+STAGED_SHA="$STAGE_DIR/$ASSET_NAME.sha256"
+cp -f "$BIN" "$STAGED_BIN"
+printf '%s  %s\n' "$BIN_SHA" "$ASSET_NAME" > "$STAGED_SHA"
+
 # Common notes body, reused for both release upserts.
 NOTES_ROLLING="$(cat <<EOF
 Rolling ${CHANNEL} build of rupu — the tag floats; do not link to it from
@@ -171,8 +182,8 @@ publish_release() {
   fi
 
   echo "→ Uploading $ASSET_NAME → $tag..."
-  gh release upload "$tag" "$BIN#$ASSET_NAME" --clobber >/dev/null
-  gh release upload "$tag" "$BIN.sha256" --clobber >/dev/null
+  gh release upload "$tag" "$STAGED_BIN" --clobber >/dev/null
+  gh release upload "$tag" "$STAGED_SHA" --clobber >/dev/null
 }
 
 publish_release "$ROLLING_TAG" "rolling ${CHANNEL} build" "$NOTES_ROLLING"
