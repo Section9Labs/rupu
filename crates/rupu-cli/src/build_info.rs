@@ -22,6 +22,17 @@ pub fn version_line() -> String {
     format!("{} ({})", RELEASE_VERSION, RELEASE_CHANNEL.unwrap_or("dev"))
 }
 
+/// `version_line()`, memoized behind a `'static` reference. clap's
+/// `Command::version()` requires `impl IntoResettable<Str>`, which
+/// `String` doesn't satisfy (only `&'static str` does) — this computes
+/// the line once per process and hands back a `'static` borrow of that
+/// single copy, so `rupu --version` can print the channel/version
+/// without leaking a fresh allocation on every call.
+pub fn version_line_static() -> &'static str {
+    static CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CELL.get_or_init(version_line).as_str()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

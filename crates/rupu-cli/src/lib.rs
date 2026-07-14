@@ -23,6 +23,7 @@ pub mod resume;
 pub mod run_target;
 pub mod standalone_run_metadata;
 pub mod templates;
+pub mod update_notice;
 
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -50,7 +51,12 @@ use clap::{CommandFactory, Parser, Subcommand};
 use std::process::ExitCode;
 
 #[derive(Parser, Debug)]
-#[command(name = "rupu", version, about = "Agentic code-development CLI", long_about = None)]
+#[command(
+    name = "rupu",
+    version = build_info::version_line_static(),
+    about = "Agentic code-development CLI",
+    long_about = None
+)]
 pub struct Cli {
     /// Structured output format for commands that support tabular/report views.
     #[arg(long, global = true)]
@@ -245,6 +251,32 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         logging::init_to_file();
     } else {
         logging::init();
+    }
+
+    // Passive "update available" notice: interactive, non-structured
+    // invocations only, and never for `rupu update`/`rupu
+    // __apply-update` themselves (those already report update status
+    // directly).
+    let is_update_cmd = matches!(cli.command, Cmd::Update(_) | Cmd::ApplyUpdate(_));
+    if !is_update_cmd {
+        let structured = cli
+            .format
+            .map(|format| format != output::formats::OutputFormat::Table)
+            .unwrap_or(false);
+        let is_tty = update_notice::stderr_is_tty();
+        let cfg = cmd::update::load_cli_config();
+        let channel = cfg
+            .update
+            .channel
+            .clone()
+            .unwrap_or_else(|| "stable".to_string());
+        update_notice::maybe_print(
+            cfg.update.check,
+            &channel,
+            build_info::RELEASE_VERSION,
+            is_tty,
+            structured,
+        );
     }
 
     match cli.command {
