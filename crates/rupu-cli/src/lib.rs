@@ -175,6 +175,8 @@ pub enum Cmd {
     },
     /// Dial-home tunnel agent + node enrollment.
     Node(cmd::node::NodeArgs),
+    /// Download and install the latest release for the configured channel.
+    Update(cmd::update::UpdateArgs),
     /// Internal: remote workspace stage/collect helper (SSH workspace sync).
     #[command(name = "__workspace", hide = true)]
     Workspace {
@@ -266,6 +268,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Completions { action } => cmd::completions::handle(action).await,
         Cmd::Host { action } => cmd::host::handle(action).await,
         Cmd::Node(args) => cmd::node::handle(args).await,
+        Cmd::Update(args) => cmd::update::handle(args).await,
         Cmd::Workspace { action } => cmd::workspace_helper::handle(action).await,
     }
 }
@@ -334,6 +337,11 @@ fn ensure_output_format_supported(
         ),
         Cmd::Node(_) => output::formats::ensure_supported(
             "node",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
+        Cmd::Update(_) => output::formats::ensure_supported(
+            "update",
             format,
             &[output::formats::OutputFormat::Table],
         ),

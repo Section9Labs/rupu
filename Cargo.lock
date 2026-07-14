@@ -6474,6 +6474,7 @@ dependencies = [
  "rupu-scm",
  "rupu-tools",
  "rupu-transcript",
+ "rupu-update",
  "rupu-webhook",
  "rupu-workspace",
  "rustls",

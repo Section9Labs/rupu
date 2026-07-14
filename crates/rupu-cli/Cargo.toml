@@ -54,6 +54,7 @@ rupu-webhook = { path = "../rupu-webhook" }
 rupu-cp = { path = "../rupu-cp" }
 rupu-app-canvas = { path = "../rupu-app-canvas" }
 rupu-coverage = { path = "../rupu-coverage" }
+rupu-update = { path = "../rupu-update" }
 comfy-table.workspace = true
 indicatif.workspace = true
 owo-colors.workspace = true
