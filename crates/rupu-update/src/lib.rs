@@ -10,6 +10,8 @@ pub use select::{asset_for, select_latest};
 pub mod decide;
 pub use decide::{current_platform, decide, is_dev_exe, Decision};
 
+pub mod verify;
+
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
     #[error("unknown release channel: {0} (expected \"stable\" or \"beta\")")]
