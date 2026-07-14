@@ -1,6 +1,7 @@
 //! Subcommand handlers. Each module owns one verb.
 
 pub mod agent;
+pub mod apply_update;
 pub mod auth;
 pub mod autoflow;
 pub mod autoflow_runtime;

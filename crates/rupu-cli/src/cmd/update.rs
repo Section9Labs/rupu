@@ -10,10 +10,11 @@ use anyhow::Context;
 use clap::Args;
 use rupu_update::flow::{self, UpdateContext};
 use rupu_update::{github, Channel, Decision};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
 
+use crate::cmd::apply_update;
 use crate::paths;
 
 #[derive(Args, Debug)]
@@ -84,7 +85,7 @@ async fn run(args: UpdateArgs) -> anyhow::Result<ExitCode> {
         ));
         let bytes =
             std::fs::read(&bak).with_context(|| format!("read backup at {}", bak.display()))?;
-        rupu_update::install::swap_in_place(&bytes, &target, None)?;
+        apply_maybe_elevated(&bytes, &target)?;
         println!("Rolled back to {}", bak.display());
         return Ok(ExitCode::SUCCESS);
     }
@@ -166,10 +167,76 @@ async fn run(args: UpdateArgs) -> anyhow::Result<ExitCode> {
                 >,
             >
     };
-    let apply = flow::DirectApply;
+    let apply = ElevatingApply;
     let new = flow::install(&src, &ctx, args.force, &apply, dl).await?;
     println!("Updated rupu {} → {new} ({channel}).", ctx.current_version);
     Ok(ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
+// Elevation: swap in place directly when the install directory is
+// user-writable; otherwise stage the verified bytes and re-exec ourself
+// under `sudo` as `__apply-update`, which re-verifies the checksum before
+// the privileged swap.
+// ---------------------------------------------------------------------------
+
+pub struct ElevatingApply;
+
+impl flow::ApplyStrategy for ElevatingApply {
+    fn apply(&self, verified: &[u8], target: &Path) -> Result<(), rupu_update::UpdateError> {
+        let dir = target.parent().ok_or_else(|| {
+            rupu_update::UpdateError::Install("target has no parent directory".into())
+        })?;
+        if apply_update::dir_writable(dir) {
+            return flow::DirectApply.apply(verified, target);
+        }
+
+        // Stage the verified bytes outside the (unwritable) target dir,
+        // then re-exec ourself under sudo to do the actual swap.
+        let cache = rupu_update::install::backup_dir()
+            .parent()
+            .map(|p| p.join("cache").join("update"))
+            .ok_or_else(|| {
+                rupu_update::UpdateError::Install("could not derive cache dir".into())
+            })?;
+        std::fs::create_dir_all(&cache).map_err(rupu_update::UpdateError::Io)?;
+        let staged = cache.join("rupu.staged");
+        std::fs::write(&staged, verified).map_err(rupu_update::UpdateError::Io)?;
+        let sha = rupu_update::verify::sha256_hex(verified);
+        let self_exe = std::env::current_exe().map_err(rupu_update::UpdateError::Io)?;
+
+        eprintln!("Elevating to install into {} …", dir.display());
+        let status = std::process::Command::new("sudo")
+            .arg(&self_exe)
+            .arg("__apply-update")
+            .arg("--from")
+            .arg(&staged)
+            .arg("--to")
+            .arg(target)
+            .arg("--sha256")
+            .arg(&sha)
+            .status()
+            .map_err(|e| rupu_update::UpdateError::Install(format!("sudo failed to start: {e}")))?;
+        if !status.success() {
+            return Err(rupu_update::UpdateError::Install(format!(
+                "privileged apply failed; run manually: sudo {} __apply-update --from {} --to {} --sha256 {}",
+                self_exe.display(),
+                staged.display(),
+                target.display(),
+                sha
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Used by `--rollback`, which reuses the same elevation decision as a
+/// normal install (a rollback is just "swap this file back in").
+fn apply_maybe_elevated(bytes: &[u8], target: &Path) -> anyhow::Result<()> {
+    use flow::ApplyStrategy as _;
+    ElevatingApply
+        .apply(bytes, target)
+        .map_err(|e| anyhow::anyhow!(e))
 }
 
 #[cfg(test)]
