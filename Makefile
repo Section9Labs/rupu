@@ -116,7 +116,7 @@ bump:
 	git add Cargo.toml Cargo.lock; \
 	git commit -m "release: bump workspace to v$(VERSION)" >/dev/null; \
 	echo "→ committed: release: bump workspace to v$(VERSION)"; \
-	echo "   next:  make gh-build   (or push the branch + PR if you want CI to see the bump first)"
+	echo "   next:  make gh-beta   (or make gh-stable; or push the branch + PR if you want CI to see the bump first)"
 
 fmt:
 	cargo fmt --all -- --check
