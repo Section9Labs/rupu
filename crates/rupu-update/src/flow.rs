@@ -2,7 +2,7 @@ use crate::decide::{decide, is_dev_exe, Decision};
 use crate::install as install_mod;
 use crate::model::{Channel, ReleaseSource};
 use crate::select::{asset_for, select_latest};
-use crate::verify::verify_checksum;
+use crate::verify::{verify_checksum, BinaryCheck};
 use semver::Version;
 use std::path::{Path, PathBuf};
 
@@ -86,6 +86,7 @@ pub async fn install(
     ctx: &UpdateContext,
     force: bool,
     apply: &dyn ApplyStrategy,
+    check: &dyn BinaryCheck,
     download: impl Fn(
         String,
     ) -> std::pin::Pin<
@@ -114,6 +115,7 @@ pub async fn install(
     let bin_bytes = download(bin.url.clone()).await?;
     let sha_text = String::from_utf8_lossy(&download(sha.url.clone()).await?).into_owned();
     verify_checksum(&bin_bytes, &sha_text)?;
+    check.verify(&bin_bytes)?;
     apply.apply(&bin_bytes, &ctx.exe_path)?;
     Ok(latest.version.clone())
 }
@@ -123,6 +125,7 @@ mod tests {
     use super::*;
     use crate::model::Release;
     use crate::parse_releases;
+    use crate::verify::NoopBinaryCheck;
     use std::sync::Mutex;
 
     struct MockSrc(Vec<Release>);
@@ -187,7 +190,9 @@ mod tests {
                     >,
                 >
         };
-        let v = install(&src, &ctx, false, &cap, dl).await.unwrap();
+        let v = install(&src, &ctx, false, &cap, &NoopBinaryCheck, dl)
+            .await
+            .unwrap();
         assert_eq!(v.to_string(), "0.35.4-beta");
         assert_eq!(cap.0.lock().unwrap().as_deref(), Some(&b"NEWBIN"[..]));
     }
@@ -211,7 +216,7 @@ mod tests {
                 >
         };
         assert!(matches!(
-            install(&src, &ctx, false, &DirectApply, dl).await,
+            install(&src, &ctx, false, &DirectApply, &NoopBinaryCheck, dl).await,
             Err(crate::UpdateError::DevBuild(_))
         ));
     }

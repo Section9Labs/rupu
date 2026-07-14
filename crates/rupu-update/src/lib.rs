@@ -11,6 +11,7 @@ pub mod decide;
 pub use decide::{current_platform, decide, is_dev_exe, Decision};
 
 pub mod verify;
+pub use verify::{BinaryCheck, CodesignCheck, NoopBinaryCheck};
 
 pub mod install;
 
