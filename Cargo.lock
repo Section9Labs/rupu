@@ -6738,6 +6738,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rupu-update"
+version = "0.45.0"
+dependencies = [
+ "async-trait",
+ "reqwest 0.12.28",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rupu-webhook"
 version = "0.45.0"
 dependencies = [

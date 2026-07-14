@@ -4,6 +4,9 @@
 pub mod model;
 pub use model::{parse_releases, Asset, Channel, Release, ReleaseSource};
 
+pub mod select;
+pub use select::{asset_for, select_latest};
+
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
     #[error("unknown release channel: {0} (expected \"stable\" or \"beta\")")]
