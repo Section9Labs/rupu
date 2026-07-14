@@ -14,6 +14,8 @@ pub mod verify;
 
 pub mod install;
 
+pub mod notice;
+
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
     #[error("unknown release channel: {0} (expected \"stable\" or \"beta\")")]
