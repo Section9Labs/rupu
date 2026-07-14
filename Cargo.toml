@@ -19,6 +19,7 @@ members = [
     "crates/rupu-keychain-acl",
     "crates/rupu-cp",
     "crates/rupu-cli",
+    "crates/rupu-update",
 ]
 
 [workspace.package]
@@ -106,6 +107,7 @@ tiny_http = "0.12"
 webbrowser = "1"
 rand = "0.8"
 sha2 = "0.10"
+semver = "1"
 url = "2"
 
 # Object storage (bucket dead-drop transport for multi-host Slice 2b)

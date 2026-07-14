@@ -6474,6 +6474,7 @@ dependencies = [
  "rupu-scm",
  "rupu-tools",
  "rupu-transcript",
+ "rupu-update",
  "rupu-webhook",
  "rupu-workspace",
  "rustls",
@@ -6735,6 +6736,22 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "ulid",
+]
+
+[[package]]
+name = "rupu-update"
+version = "0.45.0"
+dependencies = [
+ "async-trait",
+ "reqwest 0.12.28",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

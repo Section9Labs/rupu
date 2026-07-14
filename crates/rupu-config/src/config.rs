@@ -47,6 +47,8 @@ pub struct Config {
     pub policy: crate::policy_config::PolicyConfig,
     #[serde(default)]
     pub cp: crate::policy_config::CpConfig,
+    #[serde(default)]
+    pub update: crate::update_config::UpdateConfig,
 }
 
 /// Terminal-output rendering preferences. Consumed by

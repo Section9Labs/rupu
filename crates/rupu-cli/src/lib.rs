@@ -5,6 +5,7 @@
 //! [`cmd`], and returns an `ExitCode`. The binary's `main.rs` is a
 //! one-line wrapper that calls into here.
 
+pub mod build_info;
 pub mod cmd;
 pub mod cp_agent_launcher;
 pub mod cp_definition_generator;
@@ -22,6 +23,7 @@ pub mod resume;
 pub mod run_target;
 pub mod standalone_run_metadata;
 pub mod templates;
+pub mod update_notice;
 
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -49,7 +51,12 @@ use clap::{CommandFactory, Parser, Subcommand};
 use std::process::ExitCode;
 
 #[derive(Parser, Debug)]
-#[command(name = "rupu", version, about = "Agentic code-development CLI", long_about = None)]
+#[command(
+    name = "rupu",
+    version = build_info::version_line_static(),
+    about = "Agentic code-development CLI",
+    long_about = None
+)]
 pub struct Cli {
     /// Structured output format for commands that support tabular/report views.
     #[arg(long, global = true)]
@@ -174,6 +181,12 @@ pub enum Cmd {
     },
     /// Dial-home tunnel agent + node enrollment.
     Node(cmd::node::NodeArgs),
+    /// Download and install the latest release for the configured channel.
+    Update(cmd::update::UpdateArgs),
+    /// Internal: privileged install step invoked by `rupu update` via
+    /// `sudo` when the install directory isn't user-writable.
+    #[command(name = "__apply-update", hide = true)]
+    ApplyUpdate(cmd::apply_update::ApplyUpdateArgs),
     /// Internal: remote workspace stage/collect helper (SSH workspace sync).
     #[command(name = "__workspace", hide = true)]
     Workspace {
@@ -240,6 +253,32 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         logging::init();
     }
 
+    // Passive "update available" notice: interactive, non-structured
+    // invocations only, and never for `rupu update`/`rupu
+    // __apply-update` themselves (those already report update status
+    // directly).
+    let is_update_cmd = matches!(cli.command, Cmd::Update(_) | Cmd::ApplyUpdate(_));
+    if !is_update_cmd {
+        let structured = cli
+            .format
+            .map(|format| format != output::formats::OutputFormat::Table)
+            .unwrap_or(false);
+        let is_tty = update_notice::stderr_is_tty();
+        let cfg = cmd::update::load_cli_config();
+        let channel = cfg
+            .update
+            .channel
+            .clone()
+            .unwrap_or_else(|| "stable".to_string());
+        update_notice::maybe_print(
+            cfg.update.check,
+            &channel,
+            build_info::RELEASE_VERSION,
+            is_tty,
+            structured,
+        );
+    }
+
     match cli.command {
         Cmd::Run { argv } => cmd::run::handle(argv).await,
         Cmd::Agent { action } => cmd::agent::handle(action, cli.format).await,
@@ -265,6 +304,8 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Completions { action } => cmd::completions::handle(action).await,
         Cmd::Host { action } => cmd::host::handle(action).await,
         Cmd::Node(args) => cmd::node::handle(args).await,
+        Cmd::Update(args) => cmd::update::handle(args).await,
+        Cmd::ApplyUpdate(args) => cmd::apply_update::handle(args),
         Cmd::Workspace { action } => cmd::workspace_helper::handle(action).await,
     }
 }
@@ -333,6 +374,16 @@ fn ensure_output_format_supported(
         ),
         Cmd::Node(_) => output::formats::ensure_supported(
             "node",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
+        Cmd::Update(_) => output::formats::ensure_supported(
+            "update",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
+        Cmd::ApplyUpdate(_) => output::formats::ensure_supported(
+            "__apply-update",
             format,
             &[output::formats::OutputFormat::Table],
         ),

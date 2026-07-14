@@ -1,4 +1,4 @@
-.PHONY: build release sign-dev sign-release run install sync gh-build bump fmt lint test gates app-smoke app-run cp cp-web clean help
+.PHONY: build release sign-dev sign-release run install sync gh-build gh-beta gh-stable bump fmt lint test gates app-smoke app-run cp cp-web clean help
 
 # Default target: a quick development build that's already code-signed
 # so the macOS keychain doesn't re-prompt on every iteration.
@@ -53,20 +53,37 @@ sync:
 		echo "   to update main:  git checkout main && git pull --ff-only"; \
 	fi
 
-# Build the release binary locally, then publish it to the rolling
-# `latest-build` GitHub release as a `gh release upload --clobber`
-# asset. Produces a stable URL — `https://github.com/Section9Labs/rupu/releases/tag/latest-build`
-# — that anyone can curl. The tag floats, so do NOT link it from
-# CHANGELOG or anywhere that needs a stable version anchor; use the
-# `v0.x.y-cli` tags for that.
+# Build + publish a channel release to GitHub via `scripts/gh-build.sh`.
+# Each target compiles `target/release/rupu` itself (rather than
+# depending on the plain `release` target) so RUPU_RELEASE_CHANNEL /
+# RUPU_RELEASE_VERSION are set in the environment FOR THE CARGO BUILD
+# STEP — that's what `option_env!` in crates/rupu-cli/src/build_info.rs
+# captures at compile time, so the resulting binary's `--version`
+# reports its own channel ("beta"/"stable") instead of "dev". The sign
+# step is the same `scripts/sign-dev.sh release` the plain `release`
+# target uses — the binary needs a local Developer ID signature before
+# it leaves the laptop (notarization is a separate, later step).
 #
-# `release` first because the binary needs to be signed before it
-# leaves the laptop. The release itself is unsigned-by-Apple in the
-# notarization sense — only `notarize-release.sh` does that — but
-# the local Developer ID signature is enough for `xattr -d
-# com.apple.quarantine` users.
-gh-build: release
-	@scripts/gh-build.sh
+# Publishes both a rolling tag (`latest-beta` / `latest-stable`,
+# force-moved every run) and a versioned tag (`v<X.Y.Z>-beta` /
+# `v<X.Y.Z>`) — see scripts/gh-build.sh's header for the full channel
+# semantics. `rupu update` resolves `[update].channel` against these
+# same two channels.
+gh-beta:
+	RUPU_RELEASE_CHANNEL=beta RUPU_RELEASE_VERSION="$(shell grep -E '^version = "[0-9]+\.[0-9]+\.[0-9]+' Cargo.toml | head -n1 | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+[^"]*)".*/\1/')-beta" cargo build --release -p rupu-cli
+	@scripts/sign-dev.sh release
+	@scripts/gh-build.sh beta
+
+gh-stable:
+	RUPU_RELEASE_CHANNEL=stable RUPU_RELEASE_VERSION="$(shell grep -E '^version = "[0-9]+\.[0-9]+\.[0-9]+' Cargo.toml | head -n1 | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+[^"]*)".*/\1/')" cargo build --release -p rupu-cli
+	@scripts/sign-dev.sh release
+	@scripts/gh-build.sh stable
+
+# Deprecated: betas used to be published to a rolling `latest-build` /
+# `v<X.Y.Z>-build` tag pair. That convention is retired in favor of the
+# explicit `beta`/`stable` channel names — this alias exists only so
+# muscle-memory `make gh-build` still does something reasonable.
+gh-build: gh-beta
 
 # Bump the workspace `[workspace.package].version` in Cargo.toml,
 # refresh Cargo.lock to match, and create a `release: bump workspace
@@ -99,7 +116,7 @@ bump:
 	git add Cargo.toml Cargo.lock; \
 	git commit -m "release: bump workspace to v$(VERSION)" >/dev/null; \
 	echo "→ committed: release: bump workspace to v$(VERSION)"; \
-	echo "   next:  make gh-build   (or push the branch + PR if you want CI to see the bump first)"
+	echo "   next:  make gh-beta   (or make gh-stable; or push the branch + PR if you want CI to see the bump first)"
 
 fmt:
 	cargo fmt --all -- --check
@@ -160,7 +177,9 @@ help:
 	@echo "  run            build + run target/debug/rupu (pass ARGS=...)"
 	@echo "  install        release + install to /usr/local/bin/rupu (sudo)"
 	@echo "  sync           git fetch origin; fast-forward main if checked out"
-	@echo "  gh-build       release + publish to \`latest-build\` (rolling) AND \`v<X.Y.Z>-build\`"
+	@echo "  gh-beta        build (channel=beta) + sign + publish \`latest-beta\` AND \`v<X.Y.Z>-beta\` (prerelease)"
+	@echo "  gh-stable      build (channel=stable) + sign + publish \`latest-stable\` AND \`v<X.Y.Z>\` (full release)"
+	@echo "  gh-build       deprecated alias for gh-beta (betas used to be tagged \`-build\`)"
 	@echo "  bump           bump workspace version + commit (usage: make bump VERSION=X.Y.Z)"
 	@echo "  fmt            cargo fmt --all -- --check"
 	@echo "  lint           cargo clippy --workspace --all-targets -D warnings"
