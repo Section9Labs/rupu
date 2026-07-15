@@ -81,10 +81,21 @@ structural grep).
   `ToolOutput.error` (not `Err` — tool-internal failures are inline per the
   `ToolOutput` contract) with an install hint:
   `ast-grep not found; install with 'brew install ast-grep' or 'cargo install ast-grep'`.
-- **Invalid pattern / unknown lang:** ast-grep exits non-zero → surface its
-  stderr as `ToolOutput.error`.
-- **No matches:** ast-grep exits 0 with empty stdout → return empty output
-  (grep-parity: empty, not an error).
+- **Exit-code semantics (verified against ast-grep 0.44.1):** exit `0` = matches
+  found, exit `1` = no matches (NOT an error), exit `2`+ = real failure —
+  identical to ripgrep. Treat `0` and `1` as success; `2`+ surfaces stderr in
+  `ToolOutput.error`.
+- **Invalid pattern / unknown lang:** ast-grep exits `2`+ → surface its stderr as
+  `ToolOutput.error`.
+- **No matches:** exit `1`, empty stdout → return empty output (grep-parity:
+  empty, not an error).
+- **Output shape:** `--json=stream` emits JSON-Lines (one object per match).
+  Each object carries `file` (absolute when the search path is absolute — we
+  strip the `workspace_path` prefix to relativize, like `grep`),
+  `range.start.line` / `range.start.column` (**0-based** — we add 1 to present
+  1-based `line:col`, matching ripgrep/grep-tool convention), and `text` (the
+  matched source, possibly multi-line — we take its first line for the compact
+  output).
 - **Non-UTF8 / parse failures on individual files:** ast-grep skips them; we pass
   through whatever it emits.
 
@@ -93,10 +104,16 @@ structural grep).
 - Unit tests mirror `grep.rs`'s tests: run `AstGrepTool` against a small fixture
   tree, assert on the reformatted output and on emitted coverage events.
 - **Guard:** tests skip (early-return, not fail) when `ast-grep` is not on
-  `PATH`. It is a new, not-yet-ubiquitous prerequisite; CI must not go red where
-  it is absent.
-- **Follow-up task (tracked in the plan):** install `ast-grep` in CI so the
-  guarded tests actually execute there.
+  `PATH`, mirroring `grep.rs`'s `skip_if_no_rg`. It is a new, not-yet-ubiquitous
+  prerequisite; a dev without it must not go red.
+- **CI note:** the repo has no PR-time test workflow (only a nightly
+  providers/scm live-smoke job); `rupu-tools` tests run on developer machines,
+  where `ast-grep` is present. No CI change is required. If a general test CI is
+  added later, provision `ast-grep` there so the guarded tests execute.
+- **Enumeration tests to update:** adding a tool changes fixed lists/counts in
+  `crates/rupu-agent/tests/tool_registry.rs` (`known_tools_returns_sorted_list`,
+  `to_tool_definitions_returns_all_default_tools` — count `8` → `9`). These must
+  be updated in the same change or they fail.
 
 ## Out of scope for v1 (YAGNI)
 
