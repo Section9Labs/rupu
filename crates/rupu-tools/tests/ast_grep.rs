@@ -66,9 +66,6 @@ async fn no_matches_returns_empty_stdout() {
 
 #[tokio::test]
 async fn missing_pattern_is_invalid_input() {
-    if skip_if_no_ast_grep() {
-        return;
-    }
     let tmp = assert_fs::TempDir::new().unwrap();
     let res = AstGrepTool
         .invoke(json!({ "lang": "rust" }), &ctx(tmp.path()))
@@ -78,9 +75,6 @@ async fn missing_pattern_is_invalid_input() {
 
 #[tokio::test]
 async fn missing_lang_is_invalid_input() {
-    if skip_if_no_ast_grep() {
-        return;
-    }
     let tmp = assert_fs::TempDir::new().unwrap();
     let res = AstGrepTool
         .invoke(json!({ "pattern": "fn $N() { $$$ }" }), &ctx(tmp.path()))

@@ -10,9 +10,13 @@
 //! Binary name is `ast-grep` only. We do NOT fall back to the `sg`
 //! alias: it collides with a system tool on macOS.
 //!
-//! Exit-code semantics (match ripgrep): 0 = matches, 1 = no matches
-//! (NOT an error), 2+ = real failure. We treat 0 and 1 as success;
-//! anything else surfaces stderr in `error`.
+//! Exit-code semantics: unlike ripgrep, ast-grep's exit code alone does
+//! not distinguish success from failure — a nonexistent `path` exits 1
+//! and a malformed `pattern` exits 0, each writing a diagnostic to
+//! stderr, while a legitimate match/no-match run leaves stderr empty.
+//! So we surface ANY non-empty stderr as `error`, on every exit code;
+//! otherwise 0/1 are success and 2+ is a generic failure. This keeps a
+//! bad path/pattern from being silently reported as "no matches".
 
 use crate::coverage_emit::{attribution_from, emit};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
@@ -133,7 +137,7 @@ when there are no matches."
         // failure is silently reported as "no matches".
         let trimmed_stderr = stderr.trim();
         let error = if !trimmed_stderr.is_empty() {
-            Some(stderr.clone())
+            Some(stderr)
         } else if matches!(out.status.code(), Some(0) | Some(1)) {
             None
         } else {
@@ -145,6 +149,8 @@ when there are no matches."
         // coverage events. `--json=stream` emits one JSON object per
         // match; line/column are 0-based, so we add 1.
         let mut stdout = String::new();
+        // A non-empty stderr suppresses match output by design (fail-loud): we
+        // prefer surfacing the diagnostic over returning partial results.
         if error.is_none() {
             let mut by_file: BTreeMap<String, Vec<u32>> = BTreeMap::new();
             for raw_line in raw_stdout.lines() {
