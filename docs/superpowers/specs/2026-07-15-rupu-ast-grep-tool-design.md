@@ -82,13 +82,18 @@ structural grep).
   `ToolOutput` contract) with an install hint:
   `ast-grep not found; install with 'brew install ast-grep' or 'cargo install ast-grep'`.
 - **Exit-code semantics (verified against ast-grep 0.44.1):** exit `0` = matches
-  found, exit `1` = no matches (NOT an error), exit `2`+ = real failure —
-  identical to ripgrep. Treat `0` and `1` as success; `2`+ surfaces stderr in
-  `ToolOutput.error`.
-- **Invalid pattern / unknown lang:** ast-grep exits `2`+ → surface its stderr as
-  `ToolOutput.error`.
-- **No matches:** exit `1`, empty stdout → return empty output (grep-parity:
-  empty, not an error).
+  found, exit `1` = no matches, exit `2`+ = a hard failure (e.g. unknown
+  `lang`). But — unlike ripgrep — the exit code alone does NOT distinguish
+  success from failure: a **nonexistent `path` exits `1`** (with stderr
+  `ERROR: <path>: No such file or directory`) and a **malformed `pattern` exits
+  `0`** (with stderr `Warning: Pattern contains an ERROR node…`). A legitimate
+  match or no-match run leaves **stderr empty**. Therefore the error rule is:
+  **any non-empty stderr is surfaced as `ToolOutput.error`, on every exit code;**
+  otherwise exit `0`/`1` are success and `2`+ is `"ast-grep failed"`. This
+  prevents a bad `path` or `pattern` from being silently reported as "no
+  matches" — the silent-noop failure this project forbids.
+- **No matches:** exit `1`, empty stdout, empty stderr → return empty output
+  (grep-parity: empty, not an error).
 - **Output shape:** `--json=stream` emits JSON-Lines (one object per match).
   Each object carries `file` (absolute when the search path is absolute — we
   strip the `workspace_path` prefix to relativize, like `grep`),
