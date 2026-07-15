@@ -5,8 +5,8 @@
 //! into a subset via the frontmatter `tools:` list ([`Self::filter_to`]).
 
 use rupu_tools::{
-    BashTool, DispatchAgentTool, DispatchAgentsParallelTool, EditFileTool, GlobTool, GrepTool,
-    ReadFileTool, Tool, WriteFileTool,
+    AstGrepTool, BashTool, DispatchAgentTool, DispatchAgentsParallelTool, EditFileTool, GlobTool,
+    GrepTool, ReadFileTool, Tool, WriteFileTool,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -78,6 +78,7 @@ pub fn default_tool_registry() -> ToolRegistry {
     r.insert("read_file", Arc::new(ReadFileTool));
     r.insert("write_file", Arc::new(WriteFileTool));
     r.insert("edit_file", Arc::new(EditFileTool));
+    r.insert("ast_grep", Arc::new(AstGrepTool));
     r.insert("grep", Arc::new(GrepTool));
     r.insert("glob", Arc::new(GlobTool));
     r.insert("dispatch_agent", Arc::new(DispatchAgentTool));
