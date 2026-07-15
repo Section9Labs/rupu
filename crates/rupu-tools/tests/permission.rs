@@ -9,6 +9,7 @@ fn readonly_denies_writers() {
     assert!(gate.allow_unconditionally("read_file"));
     assert!(gate.allow_unconditionally("grep"));
     assert!(gate.allow_unconditionally("glob"));
+    assert!(gate.allow_unconditionally("ast_grep"));
 }
 
 #[test]
@@ -53,4 +54,21 @@ fn unknown_tool_is_denied() {
     // Even bypass shouldn't whitelist a tool we don't know about.
     // The runtime would refuse to dispatch it, but the gate also says no.
     assert!(!gate.allow_unconditionally("unknown_tool"));
+}
+
+#[test]
+fn ast_grep_is_a_reader() {
+    for mode in [
+        PermissionMode::Ask,
+        PermissionMode::Bypass,
+        PermissionMode::Readonly,
+    ] {
+        let gate = PermissionGate::for_mode(mode);
+        assert!(
+            gate.allow_unconditionally("ast_grep"),
+            "ast_grep should be allowed under {mode:?}"
+        );
+        assert!(!gate.requires_decision("ast_grep"));
+        assert!(!gate.denied_outright("ast_grep"));
+    }
 }
