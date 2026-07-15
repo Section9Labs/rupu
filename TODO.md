@@ -222,3 +222,7 @@ Roadmap from `docs/superpowers/specs/2026-06-18-rupu-control-plane-design.md` (P
 ## Multi-host (fleet)
 
 - [ ] multi-host: make /api/runs/agents + /api/runs/autoflows host-aware (needs HostConnector::list_agent_runs/list_autoflow_runs)
+
+## Workspace-scope hardening for search tools (`grep` / `ast_grep` / `glob`)
+
+An agent-supplied `path` can escape the workspace: `ctx.workspace_path.join(p)` replaces the base when `p` is absolute (`"/etc"`) and walks upward on `"../.."`. **Why deferred:** it is a pre-existing property of `grep` (`crates/rupu-tools/src/grep.rs:71-75`), not introduced by `ast_grep` (which mirrors it at `crates/rupu-tools/src/ast_grep.rs`); impact is bounded (read-only tools, still permission-gated). **Prereqs:** none — the crate already has a `path_scope` module (`crates/rupu-tools/src/path_scope.rs`) used by read/write/edit for exactly this containment check. **What unblocks it:** apply a `path_scope`-style resolve-and-verify-under-`workspace_path` guard to all three search tools in one change, with a test that a `../..`/absolute `path` is rejected. Surfaced by the `ast_grep` final review (spec `docs/superpowers/specs/2026-07-15-rupu-ast-grep-tool-design.md`).
