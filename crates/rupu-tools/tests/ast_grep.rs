@@ -87,3 +87,45 @@ async fn missing_lang_is_invalid_input() {
         .await;
     assert!(res.is_err());
 }
+
+#[tokio::test]
+async fn nonexistent_path_surfaces_error() {
+    if skip_if_no_ast_grep() {
+        return;
+    }
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let out = AstGrepTool
+        .invoke(
+            json!({ "pattern": "fn $N() { $$$ }", "lang": "rust", "path": "does_not_exist_dir" }),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out.error.is_some(),
+        "bad path should surface an error, got: {:?}",
+        out
+    );
+    assert!(out.stdout.is_empty());
+}
+
+#[tokio::test]
+async fn malformed_pattern_surfaces_error() {
+    if skip_if_no_ast_grep() {
+        return;
+    }
+    let tmp = assert_fs::TempDir::new().unwrap();
+    tmp.child("x.rs").write_str("fn main() {}\n").unwrap();
+    let out = AstGrepTool
+        .invoke(
+            json!({ "pattern": "fn $N( { $$$", "lang": "rust" }),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out.error.is_some(),
+        "malformed pattern should surface an error, got: {:?}",
+        out
+    );
+}

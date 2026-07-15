@@ -126,15 +126,18 @@ when there are no matches."
         let raw_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
 
-        // ast-grep exit code: 0 = matches, 1 = no matches (success),
-        // 2+ = error. Mirror ripgrep handling.
-        let error = match out.status.code() {
-            Some(0) | Some(1) => None,
-            _ => Some(if stderr.is_empty() {
-                "ast-grep failed".into()
-            } else {
-                stderr
-            }),
+        // ast-grep exit code: 0 = matches, 1 = no matches (success), 2+ = error.
+        // BUT a bad `path` exits 1 and a malformed `pattern` exits 0 — both write a
+        // diagnostic to stderr while a legitimate run leaves stderr empty. So treat
+        // any non-empty stderr as a real error regardless of exit code, else the
+        // failure is silently reported as "no matches".
+        let trimmed_stderr = stderr.trim();
+        let error = if !trimmed_stderr.is_empty() {
+            Some(stderr.clone())
+        } else if matches!(out.status.code(), Some(0) | Some(1)) {
+            None
+        } else {
+            Some("ast-grep failed".into())
         };
 
         // On success, parse the JSON-Lines stream into compact
