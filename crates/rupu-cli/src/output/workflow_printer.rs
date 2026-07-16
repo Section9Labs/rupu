@@ -3811,6 +3811,7 @@ mod tests {
                 output: "ok".into(),
                 error: None,
                 duration_ms: 1,
+                structured: None,
             },
             &mut step,
             &mut printer,
@@ -4175,6 +4176,7 @@ mod tests {
             output: "{\"status\":\"ok\",\"items\":[1,2]}".into(),
             error: None,
             duration_ms: 7,
+            structured: None,
         };
         let focused_prefs = UiPrefs::resolve(
             &rupu_config::UiConfig::default(),
@@ -4205,6 +4207,7 @@ mod tests {
             output: "line1\nline2\nline3\nline4\nline5\nline6\n".into(),
             error: None,
             duration_ms: 7,
+            structured: None,
         };
         let prefs = UiPrefs::resolve(
             &rupu_config::UiConfig::default(),
