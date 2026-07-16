@@ -72,6 +72,54 @@ fn sanitize_messages_tool_names(mut value: serde_json::Value) -> serde_json::Val
     }
     value
 }
+
+/// Rewrite internal `Reasoning` blocks into Anthropic's own wire shape, and
+/// drop blocks that must never reach the wire.
+///
+/// `build_request_body` serializes `request.messages` with generic serde, which
+/// works only because our Text/ToolUse/ToolResult shapes coincide with
+/// Anthropic's. `Reasoning` is internal-only, so it is restored from its `raw`
+/// payload here — byte-exact, since the API rejects *modified* blocks (reading
+/// `text` is fine; it just never goes on the wire).
+///
+/// Blocks produced by another provider are dropped: a foreign continuity token
+/// (e.g. a Gemini `thoughtSignature`) is an alien wire format. Blocks from this
+/// provider are echoed regardless of model and regardless of whether their text
+/// is empty — thinking blocks are not origin-locked, they replay across models
+/// fine, and *stripping* them is what triggers ordering/signature 400s. The gate
+/// is the provider tag only; do not add a model check here.
+///
+/// `Unknown` blocks are dropped too: they serialize as `{"type":"Unknown"}`
+/// (pinned by a test in `types.rs`), which no provider accepts.
+fn restore_reasoning_blocks(messages: &mut serde_json::Value, self_tag: &str) {
+    let Some(msgs) = messages.as_array_mut() else {
+        return;
+    };
+    for msg in msgs.iter_mut() {
+        let Some(blocks) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        let mut restored = Vec::with_capacity(blocks.len());
+        for block in blocks.iter() {
+            match block.get("type").and_then(|v| v.as_str()) {
+                Some("reasoning") => {
+                    let same_provider =
+                        block.get("provider").and_then(|v| v.as_str()) == Some(self_tag);
+                    if same_provider {
+                        if let Some(raw) = block.get("raw") {
+                            restored.push(raw.clone());
+                        }
+                    }
+                    // else: foreign provider — drop.
+                }
+                Some("Unknown") => {} // never goes on the wire
+                _ => restored.push(block.clone()),
+            }
+        }
+        *blocks = restored;
+    }
+}
+
 /// Anthropic API version. Update when new SSE event types or features are needed.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 // ─────────────────────────────────────────────────────────────────────
@@ -1121,9 +1169,14 @@ impl AnthropicClient {
         // block's `name` to its wire-safe form. Internal state still uses
         // the canonical "scm.repos.list" form; only the wire payload sees
         // the escaped variant.
+        //
+        // Then restore internal `Reasoning` blocks to Anthropic's own wire
+        // shape (and drop `Unknown` blocks) — same post-process pattern, on the
+        // same serialized array.
         let messages_value: serde_json::Value =
             serde_json::to_value(&request.messages).unwrap_or_else(|_| serde_json::json!([]));
-        let messages_value = sanitize_messages_tool_names(messages_value);
+        let mut messages_value = sanitize_messages_tool_names(messages_value);
+        restore_reasoning_blocks(&mut messages_value, PROVIDER_TAG);
 
         let mut body = serde_json::json!({
             "model": request.model,
@@ -1220,11 +1273,19 @@ impl AnthropicClient {
         //   * `thinking.type: "enabled"` + `budget_tokens: <n>` — fixed
         //     budget. Must be >= 1024 (API minimum); we silently skip
         //     thinking when the clamped budget falls below that.
+        //   * `display: "summarized"` — opt in to readable thinking text.
+        //     Only ever set alongside "adaptive": `display` accepts exactly
+        //     "summarized" | "omitted" (there is no raw/full — the raw chain of
+        //     thought is not exposed on any Claude model), and the
+        //     budget_tokens path targets pre-4.6 models that predate it.
+        //     Without this, display defaults to "omitted" on Opus 4.7/4.8 and
+        //     Sonnet 5, whose thinking blocks then carry an empty text field.
         if let Some(level) = &request.thinking {
             use crate::model_tier::ThinkingLevel;
             match level {
                 ThinkingLevel::Auto => {
-                    body["thinking"] = serde_json::json!({ "type": "adaptive" });
+                    body["thinking"] =
+                        serde_json::json!({ "type": "adaptive", "display": "summarized" });
                 }
                 _ => {
                     let raw_budget = match level {
@@ -1252,7 +1313,7 @@ impl AnthropicClient {
             // budget is requested (see services/api/claude.ts:1609-1613 in
             // the reference). Without this the request fingerprints differently
             // and may be down-classified by the OAuth quota router.
-            body["thinking"] = serde_json::json!({ "type": "adaptive" });
+            body["thinking"] = serde_json::json!({ "type": "adaptive", "display": "summarized" });
         }
 
         // ── Optional output-shape / context / speed knobs ──────────────
@@ -2288,8 +2349,10 @@ mod tests {
     }
 
     #[test]
-    fn test_build_request_body_thinking_auto_emits_adaptive() {
-        // Auto → `thinking.type: "adaptive"` regardless of auth mode.
+    fn adaptive_thinking_requests_summarized_display() {
+        // Auto → `thinking.type: "adaptive"` regardless of auth mode, plus
+        // `display: "summarized"`. Without `display`, it defaults to "omitted"
+        // on Opus 4.7/4.8 + Sonnet 5 and every captured thinking text is empty.
         let client = AnthropicClient::new("test-key".into());
         let request = LlmRequest {
             model: "claude-opus-4-7".into(),
@@ -2309,7 +2372,230 @@ mod tests {
             anthropic_speed: None,
         };
         let body = client.build_request_body(&request, false);
-        assert_eq!(body["thinking"], serde_json::json!({ "type": "adaptive" }));
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({ "type": "adaptive", "display": "summarized" })
+        );
+    }
+
+    #[test]
+    fn oauth_implicit_adaptive_thinking_requests_summarized_display() {
+        // No explicit `thinking` level + OAuth + adaptive-capable model → the
+        // implicit claude-cli adaptive shape, which also opts into summaries.
+        let client = oauth_client();
+        let request = LlmRequest {
+            model: "claude-opus-4-7".into(),
+            system: None,
+            messages: vec![Message::user("hi")],
+            max_tokens: 8000,
+            tools: vec![],
+            cell_id: None,
+            trace_id: None,
+            thinking: None,
+            context_window: None,
+            task_type: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+        };
+        let body = client.build_request_body(&request, false);
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({ "type": "adaptive", "display": "summarized" })
+        );
+    }
+
+    #[test]
+    fn budget_tokens_thinking_does_not_set_display() {
+        // The budget_tokens path targets pre-4.6 models, which predate
+        // `display`; sending it there risks a 400 on every request.
+        let client = AnthropicClient::new("test-key".into());
+        let request = LlmRequest {
+            model: "claude-sonnet-4-6".into(),
+            system: None,
+            messages: vec![Message::user("hi")],
+            max_tokens: 32000,
+            tools: vec![],
+            cell_id: None,
+            trace_id: None,
+            thinking: Some(crate::model_tier::ThinkingLevel::High),
+            context_window: None,
+            task_type: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+        };
+        let body = client.build_request_body(&request, false);
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({ "type": "enabled", "budget_tokens": 10000 })
+        );
+        assert!(
+            body["thinking"].get("display").is_none(),
+            "budget_tokens path must not carry `display`; got: {}",
+            body["thinking"]
+        );
+    }
+
+    /// Build a request whose history carries a single assistant message with
+    /// `blocks`, so tests can assert the exact serialized `messages` payload.
+    fn request_with_assistant_blocks(blocks: Vec<ContentBlock>) -> LlmRequest {
+        LlmRequest {
+            model: "claude-opus-4-7".into(),
+            system: None,
+            messages: vec![
+                Message::user("hi"),
+                Message {
+                    role: Role::Assistant,
+                    content: blocks,
+                },
+            ],
+            max_tokens: 8000,
+            tools: vec![],
+            cell_id: None,
+            trace_id: None,
+            thinking: None,
+            context_window: None,
+            task_type: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+        }
+    }
+
+    /// Anthropic's real `thinking` wire block, as Task 2 captures it into `raw`.
+    fn anthropic_thinking_raw() -> serde_json::Value {
+        serde_json::json!({
+            "type": "thinking",
+            "thinking": "step one, then step two",
+            "signature": "sig-abc123",
+        })
+    }
+
+    #[test]
+    fn reasoning_block_is_restored_to_anthropic_wire_shape() {
+        let client = AnthropicClient::new("test-key".into());
+        let raw = anthropic_thinking_raw();
+        let request = request_with_assistant_blocks(vec![
+            ContentBlock::Reasoning {
+                text: Some("step one, then step two".into()),
+                provider: PROVIDER_TAG.into(),
+                model: "claude-opus-4-7".into(),
+                raw: raw.clone(),
+            },
+            ContentBlock::Text {
+                text: "the answer".into(),
+            },
+        ]);
+        let body = client.build_request_body(&request, false);
+        let content = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        // Byte-exact echo of `raw` — no internal fields on the wire.
+        assert_eq!(content[0], raw);
+        assert_eq!(
+            content[1],
+            serde_json::json!({ "type": "text", "text": "the answer" })
+        );
+        let wire = serde_json::to_string(&body).unwrap();
+        for leaked in ["provider", "\"reasoning\"", "\"model\":\"claude-opus-4-7\""] {
+            assert!(
+                !body["messages"].to_string().contains(leaked),
+                "internal field {leaked} leaked onto the wire: {wire}"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_provider_reasoning_block_is_dropped_from_request() {
+        // A Gemini thoughtSignature is an alien wire format; it must never
+        // reach Anthropic.
+        let client = AnthropicClient::new("test-key".into());
+        let request = request_with_assistant_blocks(vec![
+            ContentBlock::Reasoning {
+                text: Some("gemini thoughts".into()),
+                provider: "google_gemini".into(),
+                model: "gemini-3-pro".into(),
+                raw: serde_json::json!({ "thoughtSignature": "opaque-token" }),
+            },
+            ContentBlock::Text {
+                text: "the answer".into(),
+            },
+        ]);
+        let body = client.build_request_body(&request, false);
+        let content = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(
+            content,
+            &vec![serde_json::json!({ "type": "text", "text": "the answer" })]
+        );
+    }
+
+    #[test]
+    fn same_provider_different_model_reasoning_block_is_still_echoed() {
+        // Regression guard: the echo gate is the provider tag ONLY. Thinking
+        // blocks are not origin-locked — they replay across models fine, and
+        // *stripping* them is what triggers ordering/signature 400s. Do not
+        // reintroduce a model gate.
+        let client = AnthropicClient::new("test-key".into());
+        let raw = anthropic_thinking_raw();
+        let request = request_with_assistant_blocks(vec![ContentBlock::Reasoning {
+            text: Some("step one, then step two".into()),
+            // Captured under a *different* Anthropic model than the request's.
+            provider: PROVIDER_TAG.into(),
+            model: "claude-sonnet-4-6".into(),
+            raw: raw.clone(),
+        }]);
+        assert_ne!(request.model, "claude-sonnet-4-6");
+        let body = client.build_request_body(&request, false);
+        assert_eq!(body["messages"][1]["content"], serde_json::json!([raw]));
+    }
+
+    #[test]
+    fn empty_text_reasoning_block_is_still_echoed() {
+        // The `display: "omitted"` case: a thinking block with no readable
+        // text still carries a signature and must be passed back as received.
+        let client = AnthropicClient::new("test-key".into());
+        let raw = serde_json::json!({
+            "type": "thinking",
+            "thinking": "",
+            "signature": "sig-empty",
+        });
+        let request = request_with_assistant_blocks(vec![ContentBlock::Reasoning {
+            text: None,
+            provider: PROVIDER_TAG.into(),
+            model: "claude-opus-4-7".into(),
+            raw: raw.clone(),
+        }]);
+        let body = client.build_request_body(&request, false);
+        assert_eq!(body["messages"][1]["content"], serde_json::json!([raw]));
+    }
+
+    #[test]
+    fn unknown_block_is_dropped_from_request() {
+        // `ContentBlock::Unknown` serializes as `{"type":"Unknown"}` (pinned by
+        // a test in types.rs), which no provider accepts.
+        let client = AnthropicClient::new("test-key".into());
+        assert_eq!(
+            serde_json::to_value(ContentBlock::Unknown).unwrap()["type"],
+            "Unknown",
+            "Unknown's wire tag changed — restore_reasoning_blocks must follow"
+        );
+        let request = request_with_assistant_blocks(vec![
+            ContentBlock::Unknown,
+            ContentBlock::Text {
+                text: "the answer".into(),
+            },
+        ]);
+        let body = client.build_request_body(&request, false);
+        assert_eq!(
+            body["messages"][1]["content"],
+            serde_json::json!([{ "type": "text", "text": "the answer" }])
+        );
     }
 
     #[test]
