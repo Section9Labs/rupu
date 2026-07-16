@@ -23,160 +23,39 @@
 
 ---
 
-### Task 0: Lift `trigger_of` to `rupu-orchestrator`
+### Task 0: Lift trigger classification to `rupu-orchestrator` — ✅ COMPLETE (`5b23d6a`)
 
-**Why this exists:** Tasks 1 and 3 both need trigger classification, and the only copy today is `pub(crate) fn trigger_of` in `crates/rupu-cp/src/api/runs.rs:345` — invisible outside `rupu-cp`. Copying it into each caller would leave **three** identical definitions of "what counts as a cron trigger", and the dashboard's cycle grouping depends on that answer being consistent. Three copies will disagree eventually.
+**Status: DONE.** Recorded here as the interface contract for Tasks 1 and 3. Do not re-implement.
 
-It belongs in `rupu-orchestrator`: it is derived purely from `RunRecord.event` / `RunRecord.source_wake_id`, which are defined there. The classification is a domain question; only the rendering of it is presentation. Both `rupu-cp` and `rupu-cli` already depend on `rupu-orchestrator`.
+**Why it existed:** Tasks 1 and 3 both classify how a run was triggered, and the only copy lived at `pub(crate) fn trigger_of` in `crates/rupu-cp/src/api/runs.rs:345` — invisible outside `rupu-cp`. Copying it into each caller would have left three definitions of "what counts as a cron trigger", and the dashboard's cycle grouping depends on that answer being consistent.
 
-**Files:**
-- Modify: `crates/rupu-orchestrator/src/runs.rs` (add `RunTrigger` + `RunRecord::trigger()`)
-- Modify: `crates/rupu-cp/src/api/runs.rs:345` (delete the local fn; re-export or call through)
-- Test: `crates/rupu-orchestrator/src/runs.rs` (inline `#[cfg(test)] mod tests`)
+**What shipped — and what changed from the original plan.** This task was originally written to add a `RunTrigger` enum. It does not. Implementation surfaced two collisions:
 
-**Interfaces:**
-- Produces: `RunTrigger::{Manual, Cron, Event}`, `RunTrigger::as_str(&self) -> &'static str`, `RunRecord::trigger(&self) -> RunTrigger` — **consumed by Task 1 (rupu-cli) and Task 3 (summary_build.rs).**
+- `rupu_runtime::RunTrigger` (`crates/rupu-runtime/src/run_envelope.rs:39`) — a different, struct-shaped type (`{ source: RunTriggerSource, wake_id, event_id }`) already in wide use across `rupu-runtime` and `rupu-cli`.
+- `rupu_orchestrator::workflow::TriggerKind` (`crates/rupu-orchestrator/src/workflow.rs:142`) — already `enum { Manual, Cron, Event }` with `name()` returning the same three strings, **in this very crate**, re-exported at the crate root.
 
-- [ ] **Step 1: Write the failing test**
-
-Add to the `#[cfg(test)] mod tests` in `crates/rupu-orchestrator/src/runs.rs`:
+A third enum with identical variants would have been noise, so the enum was dropped. `rupu-orchestrator` gained exactly **one method and zero types**:
 
 ```rust
-    #[test]
-    fn trigger_is_event_when_a_vendor_event_is_attached() {
-        let mut r = RunRecord::default();
-        r.event = Some(serde_json::json!({"action": "opened"}));
-        assert_eq!(r.trigger(), RunTrigger::Event);
-        assert_eq!(r.trigger().as_str(), "event");
-    }
-
-    #[test]
-    fn trigger_is_cron_when_woken_from_the_durable_queue() {
-        let mut r = RunRecord::default();
-        r.source_wake_id = Some("wake_1".into());
-        assert_eq!(r.trigger(), RunTrigger::Cron);
-        assert_eq!(r.trigger().as_str(), "cron");
-    }
-
-    #[test]
-    fn trigger_is_manual_by_default() {
-        let r = RunRecord::default();
-        assert_eq!(r.trigger(), RunTrigger::Manual);
-        assert_eq!(r.trigger().as_str(), "manual");
-    }
-
-    #[test]
-    fn event_wins_over_wake_id() {
-        // An event-triggered run may also carry a wake id. Event is checked
-        // first in the original (api/runs.rs:345); preserve that precedence
-        // exactly — flipping it would silently re-bucket runs in the dashboard.
-        let mut r = RunRecord::default();
-        r.event = Some(serde_json::json!({}));
-        r.source_wake_id = Some("wake_1".into());
-        assert_eq!(r.trigger(), RunTrigger::Event);
-    }
-```
-
-- [ ] **Step 2: Run to verify it fails**
-
-Run: `cargo test -p rupu-orchestrator trigger_is_manual_by_default`
-Expected: FAIL — `cannot find type 'RunTrigger'`
-
-- [ ] **Step 3: Implement**
-
-Add to `crates/rupu-orchestrator/src/runs.rs`, near `RunStatus`:
-
-```rust
-/// How a run came to exist.
-///
-/// Derived from `RunRecord`'s provenance fields, so it lives beside them rather
-/// than in any one consumer. Both `rupu-cp` (dashboard cycle grouping, run
-/// lists) and `rupu-cli` (`rupu run list`) classify runs this way, and they
-/// must agree — three separate copies of this logic would drift.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunTrigger {
-    /// Dispatched directly by an operator.
-    Manual,
-    /// Woken from the durable wake queue (polled events / cron tick).
-    Cron,
-    /// Fired by an SCM/webhook event.
-    Event,
-}
-
-impl RunTrigger {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            RunTrigger::Manual => "manual",
-            RunTrigger::Cron => "cron",
-            RunTrigger::Event => "event",
-        }
-    }
-}
-
 impl RunRecord {
-    /// Classify this run's trigger provenance.
-    ///
-    /// Precedence is event-before-wake and is load-bearing: an event-triggered
-    /// run may also carry a `source_wake_id`, and flipping the order would
-    /// silently re-bucket those runs.
-    pub fn trigger(&self) -> RunTrigger {
-        if self.event.is_some() {
-            RunTrigger::Event
-        } else if self.source_wake_id.is_some() {
-            RunTrigger::Cron
-        } else {
-            RunTrigger::Manual
-        }
-    }
+    /// How this run came to exist: `"manual"` | `"cron"` | `"event"`.
+    pub fn trigger_str(&self) -> &'static str
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+`rupu-cp`'s `trigger_of` is now a one-line wrapper calling `r.trigger_str()`, so its callers (`RunListRow` at `api/runs.rs:456`, and `api/projects.rs:156`) read unchanged.
 
-Run: `cargo test -p rupu-orchestrator trigger`
-Expected: PASS (4 tests).
-
-**Note:** if `RunRecord` has no `Default` derive, build the fixtures with explicit field initialization instead. Do not add a `Default` impl solely for these tests.
-
-- [ ] **Step 5: Point `rupu-cp`'s existing callers at it**
-
-Replace the body of `crates/rupu-cp/src/api/runs.rs:345` so there is exactly one definition in the workspace:
+**Interface for Tasks 1 and 3 — use this exact shape:**
 
 ```rust
-/// Trigger provenance for the wire.
-///
-/// Thin wrapper over `RunRecord::trigger()` — kept so existing call sites read
-/// unchanged. The classification itself lives in `rupu-orchestrator`, beside the
-/// fields it reads.
-pub(crate) fn trigger_of(r: &RunRecord) -> &'static str {
-    r.trigger().as_str()
-}
+// Returns &'static str. There is NO enum. Do not add one.
+let t: &'static str = record.trigger_str();   // "manual" | "cron" | "event"
+if record.trigger_str() == "manual" { /* ... */ }
 ```
 
-- [ ] **Step 6: Verify nothing regressed**
+**Invariant that must survive:** precedence is **event-before-wake**. An event-triggered run may also carry a `source_wake_id`; flipping the order silently re-buckets those runs. Covered by `event_wins_over_wake_id` in `crates/rupu-orchestrator/src/runs.rs`.
 
-Run: `cargo test -p rupu-cp runs`
-Expected: PASS — `trigger_of`'s existing callers (`RunListRow`, `query_run_rows`) are unchanged and their tests still cover them.
-
-Run: `cargo clippy -p rupu-orchestrator -p rupu-cp --all-targets -- -D warnings`
-Expected: clean.
-
-- [ ] **Step 7: Commit**
-
-```bash
-cargo fmt -- crates/rupu-orchestrator/src/runs.rs crates/rupu-cp/src/api/runs.rs
-git add crates/rupu-orchestrator/src/runs.rs crates/rupu-cp/src/api/runs.rs
-git commit -m "refactor: lift trigger classification to rupu-orchestrator
-
-RunTrigger + RunRecord::trigger() live beside the fields they read
-(event / source_wake_id). rupu-cp's trigger_of becomes a thin wrapper so
-call sites read unchanged.
-
-Tasks 1 and 3 both need this classification. Copying it into each would
-leave three definitions of 'what counts as a cron trigger', and the
-dashboard's cycle grouping depends on that answer being consistent."
-```
+**Why no enum, recorded so nobody re-adds one:** the two sibling types above already occupy the name and the taxonomy. `rupu_runtime::RunTrigger` is what a launcher *declares* on a `RunEnvelope`; `trigger_str()` is what is *inferred* from a persisted `RunRecord`. They are not interchangeable — `trigger_str()` deliberately cannot express `Autoflow` / `IssueCommand`, because those are not derivable from `event` + `source_wake_id`.
 
 ---
 
@@ -318,12 +197,11 @@ struct RunListReport {
 }
 ```
 
-Trigger classification comes from `RunRecord::trigger()` (Task 0) — do **not**
-define a local copy:
-
-```rust
-use rupu_orchestrator::runs::RunTrigger;
-```
+Trigger classification comes from **`RunRecord::trigger_str()`** (Task 0), which
+returns `&'static str` — `"manual"` / `"cron"` / `"event"`. Do **not** define a
+local copy, and do **not** expect an enum: Task 0 deliberately added no new type,
+because `rupu_orchestrator::workflow::TriggerKind` and `rupu_runtime::RunTrigger`
+already exist and a third would be noise.
 
 - [ ] **Step 4: Run test to verify classify passes**
 
@@ -405,7 +283,7 @@ async fn list(
             status: r.status.as_str().to_string(),
             started_at: r.started_at.to_rfc3339(),
             finished_at: r.finished_at.map(|t| t.to_rfc3339()),
-            trigger: r.trigger().as_str(),
+            trigger: r.trigger_str(),
             workspace_id: r.workspace_id.clone(),
             parent_run_id: r.parent_run_id.clone(),
             awaiting_step_id: r.awaiting_step_id.clone(),
@@ -907,7 +785,7 @@ use crate::host::dashboard_summary::{
     TerminalBucket,
 };
 use chrono::{DateTime, Duration, Timelike, Utc};
-use rupu_orchestrator::runs::{RunRecord, RunStatus, RunTrigger};
+use rupu_orchestrator::runs::{RunRecord, RunStatus};
 use std::collections::BTreeMap;
 
 /// Truncate to the start of the UTC day — the bucket key.
@@ -985,7 +863,7 @@ pub fn build_summary(
                 workflow_name: r.workflow_name.clone(),
                 status: r.status.as_str().to_string(),
                 started_at: r.started_at,
-                trigger: r.trigger().as_str().to_string(),
+                trigger: r.trigger_str().to_string(),
                 cycle_id: cycle_of.get(r.id.as_str()).map(|c| c.to_string()),
             });
         }
@@ -1008,7 +886,7 @@ pub fn build_summary(
             }
         }
 
-        if r.trigger() == RunTrigger::Manual {
+        if r.trigger_str() == "manual" {
             recent_manual.push(RecentRun {
                 id: r.id.clone(),
                 workflow_name: r.workflow_name.clone(),
