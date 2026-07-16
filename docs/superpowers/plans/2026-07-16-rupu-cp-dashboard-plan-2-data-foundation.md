@@ -157,21 +157,29 @@ Add the DTOs near the bottom of the file:
 ```rust
 /// One run, carrying every field `rupu-cp`'s `RunListRow` needs.
 ///
-/// Contract note: `started_at` / `finished_at` are RFC-3339. The fan-out merge
-/// in rupu-cp sorts these fields with a **lexicographic string compare**
-/// (`sort_values_newest_first`), which is only correct for RFC-3339. Do not
-/// switch to a human-readable format here — `rupu workflow runs` does that
-/// (`%Y-%m-%d %H:%M:%S`) and its rows consequently cannot be merge-sorted
-/// against local ones.
+/// Contract note: `started_at` / `finished_at` are `DateTime<Utc>` serialized by
+/// serde, which emits RFC-3339 with a `Z` suffix. The fan-out merge in rupu-cp
+/// sorts these with a **lexicographic string compare**, so the format must
+/// byte-match rupu-cp's `RunListRow`. Two ways to break this, both silent:
+/// a human-readable format (`rupu workflow runs` uses `%Y-%m-%d %H:%M:%S`, and
+/// its rows consequently cannot be merge-sorted at all), or `.to_rfc3339()`,
+/// whose `+00:00` offset sorts before `Z`.
 #[derive(serde::Serialize)]
 struct RunListJsonRow {
     run_id: String,
     workflow_name: String,
     status: String,
-    /// RFC-3339.
-    started_at: String,
-    /// RFC-3339. `None` while the run is non-terminal.
-    finished_at: Option<String>,
+    /// Serialized by serde, NOT `.to_rfc3339()`.
+    ///
+    /// MUST byte-match how rupu-cp's `RunListRow` serializes this field: rupu-cp
+    /// merges local and remote rows with a LEXICOGRAPHIC compare on it
+    /// (`sort_values_newest_first`). serde emits `...Z`; `.to_rfc3339()` emits
+    /// `...+00:00`, and `'+'` (0x2B) sorts before `'Z'` (0x5A) — so a
+    /// to_rfc3339 row silently sorts as OLDER than it is. Do not "tidy" this
+    /// into a String.
+    started_at: chrono::DateTime<chrono::Utc>,
+    /// Same constraint as `started_at`. `None` while the run is non-terminal.
+    finished_at: Option<chrono::DateTime<chrono::Utc>>,
     /// `"manual"` | `"cron"` | `"event"` — mirrors `rupu-cp`'s `trigger_of`.
     trigger: &'static str,
     workspace_id: Option<String>,
@@ -281,8 +289,8 @@ async fn list(
             run_id: r.id.clone(),
             workflow_name: r.workflow_name.clone(),
             status: r.status.as_str().to_string(),
-            started_at: r.started_at.to_rfc3339(),
-            finished_at: r.finished_at.map(|t| t.to_rfc3339()),
+            started_at: r.started_at,
+            finished_at: r.finished_at,
             trigger: r.trigger_str(),
             workspace_id: r.workspace_id.clone(),
             parent_run_id: r.parent_run_id.clone(),
@@ -358,7 +366,9 @@ Wire it into `handle()`, alongside the existing `Pause`/`Resume` arms:
 
 - [ ] **Step 9: Verify end-to-end against the real store**
 
-Run: `cargo run -p rupu-cli -- run list --format json --limit 3 | head -c 400`
+Run: `cargo run -q -p rupu-cli -- --format json run list --limit 3 | head -c 400`
+
+**Note the flag order** — `--format` MUST precede `run`. `Cmd::Run` is `trailing_var_arg`, so it swallows everything after `run`; `rupu run list --format json` fails with `unexpected argument '--format' found`.
 Expected: JSON beginning `{"kind":"run_list","version":1,"rows":[` with RFC-3339 `started_at` values containing `T` and a `trigger` field on each row.
 
 Run: `cargo run -p rupu-cli -- run --help`
@@ -1273,7 +1283,7 @@ Replace `SshHostConnector::list_runs` (`ssh.rs:~1010` region) with:
         params: RunListQuery,
     ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
         let rows = self
-            .remote_json_rows(&["run", "list", "--format", "json", "--limit", "10000"])
+            .remote_json_rows(&["--format", "json", "run", "list", "--limit", "10000"])
             .await?;
 
         let mut out: Vec<serde_json::Value> = rows
@@ -1335,6 +1345,14 @@ fn run_list_row_to_wire(row: &serde_json::Value) -> Option<serde_json::Value> {
 }
 ```
 
+**CRITICAL — flag order.** `--format json` MUST come **before** `run`:
+`rupu --format json run list --limit 10000`. `Cmd::Run` is `trailing_var_arg`
+(`rupu-cli/src/lib.rs:79-83`), so it swallows everything after `run` before
+clap extracts global flags — `rupu run list --format json` fails outright with
+`unexpected argument '--format' found`. This differs from `list_sessions` /
+`list_autoflow_runs`, whose subcommands ARE real clap subcommands and so accept
+a trailing `--format json`. Do not copy their argument order.
+
 **Implementer note:** `remote_json_rows` is the existing helper `list_sessions` uses to build the ssh command, run it, and pull `.rows` out. Reuse it — do not build the command string by hand. Its `.get("rows")` contract already matches Task 1's report shape.
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -1353,7 +1371,7 @@ In `list_runs`, map the failure:
 
 ```rust
         let rows = match self
-            .remote_json_rows(&["run", "list", "--format", "json", "--limit", "10000"])
+            .remote_json_rows(&["--format", "json", "run", "list", "--limit", "10000"])
             .await
         {
             Ok(r) => r,
@@ -1513,7 +1531,7 @@ Add to `impl HostConnector for SshHostConnector`:
         // process with a full handshake (no ControlMaster multiplexing), so
         // this must stay coarse.
         let run_rows = self
-            .remote_json_rows(&["run", "list", "--format", "json", "--limit", "10000"])
+            .remote_json_rows(&["--format", "json", "run", "list", "--limit", "10000"])
             .await
             .map_err(|e| {
                 tracing::warn!(host_id = %self.host_id, error = %e, "dashboard_summary: run list failed");
