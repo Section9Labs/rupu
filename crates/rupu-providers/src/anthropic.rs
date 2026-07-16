@@ -106,8 +106,20 @@ fn restore_reasoning_blocks(messages: &mut serde_json::Value, self_tag: &str) {
                     let same_provider =
                         block.get("provider").and_then(|v| v.as_str()) == Some(self_tag);
                     if same_provider {
-                        if let Some(raw) = block.get("raw") {
-                            restored.push(raw.clone());
+                        // `raw` has no `skip_serializing_if`, so `block.get("raw")`
+                        // is always `Some` — a plain `if let` here would be
+                        // defensive in appearance only. Require `raw` to actually
+                        // look like a content block (an object with a `type`)
+                        // before echoing it: a `null`, scalar, or `{}` `raw` would
+                        // otherwise be pushed onto the wire as a malformed content
+                        // block and 400 the request.
+                        let raw = block.get("raw");
+                        let looks_like_block =
+                            raw.is_some_and(|r| r.is_object() && r.get("type").is_some());
+                        if looks_like_block {
+                            restored.push(raw.expect("checked Some above").clone());
+                        } else {
+                            debug!(raw = ?raw, "dropping reasoning block with malformed raw payload");
                         }
                     }
                     // else: foreign provider — drop.
@@ -1176,6 +1188,9 @@ impl AnthropicClient {
         let messages_value: serde_json::Value =
             serde_json::to_value(&request.messages).unwrap_or_else(|_| serde_json::json!([]));
         let mut messages_value = sanitize_messages_tool_names(messages_value);
+        // Must run after `sanitize_messages_tool_names`: restoring reasoning
+        // blocks last guarantees `raw` is echoed byte-exact and is never
+        // touched by the tool-name sanitizer's block-rewriting pass.
         restore_reasoning_blocks(&mut messages_value, PROVIDER_TAG);
 
         let mut body = serde_json::json!({
@@ -1312,7 +1327,17 @@ impl AnthropicClient {
             // OAuth requests to Opus / Sonnet 4-tier models when no explicit
             // budget is requested (see services/api/claude.ts:1609-1613 in
             // the reference). Without this the request fingerprints differently
-            // and may be down-classified by the OAuth quota router.
+            // and may be down-classified by the OAuth quota router (a 429, not
+            // a 400) — that fingerprinting warning is still true and load-bearing.
+            //
+            // The `display: "summarized"` addition below is an intentional,
+            // verified deviation from that pinned claude-cli shape (its wire
+            // shape is confirmed against the authoritative API reference, same
+            // as the `ThinkingLevel::Auto` arm above). Do NOT "restore" this to
+            // bare `{"type":"adaptive"}` to match claude-cli more closely: on
+            // Opus 4.7/4.8 and Sonnet 5, `display` defaults to "omitted", and
+            // without an explicit "summarized" here captured reasoning text
+            // comes back empty on those models.
             body["thinking"] = serde_json::json!({ "type": "adaptive", "display": "summarized" });
         }
 
@@ -2595,6 +2620,44 @@ mod tests {
         assert_eq!(
             body["messages"][1]["content"],
             serde_json::json!([{ "type": "text", "text": "the answer" }])
+        );
+    }
+
+    #[test]
+    fn malformed_raw_reasoning_block_is_dropped_from_request() {
+        // `raw` has no `skip_serializing_if`, so `block.get("raw")` is always
+        // `Some` — a `null`, scalar, or `{}` `raw` must still be rejected
+        // before being echoed, or it goes on the wire as a malformed content
+        // block and Anthropic 400s the request.
+        let client = AnthropicClient::new("test-key".into());
+        let request = request_with_assistant_blocks(vec![
+            ContentBlock::Reasoning {
+                text: Some("null raw".into()),
+                provider: PROVIDER_TAG.into(),
+                model: "claude-opus-4-7".into(),
+                raw: serde_json::Value::Null,
+            },
+            ContentBlock::Reasoning {
+                text: Some("scalar raw".into()),
+                provider: PROVIDER_TAG.into(),
+                model: "claude-opus-4-7".into(),
+                raw: serde_json::json!("not-a-block"),
+            },
+            ContentBlock::Reasoning {
+                text: Some("empty object raw".into()),
+                provider: PROVIDER_TAG.into(),
+                model: "claude-opus-4-7".into(),
+                raw: serde_json::json!({}),
+            },
+            ContentBlock::Text {
+                text: "the answer".into(),
+            },
+        ]);
+        let body = client.build_request_body(&request, false);
+        assert_eq!(
+            body["messages"][1]["content"],
+            serde_json::json!([{ "type": "text", "text": "the answer" }]),
+            "malformed `raw` reasoning blocks must be dropped, not echoed onto the wire"
         );
     }
 
