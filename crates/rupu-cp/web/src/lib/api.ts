@@ -1161,6 +1161,32 @@ export interface SourceSlice {
 }
 
 // ---------------------------------------------------------------------------
+// AST tree (CST viewer)
+// ---------------------------------------------------------------------------
+
+/** Mirrors `rupu_ast::AstNode`'s `camelCase` serde shape. */
+export interface AstNode {
+  kind: string;
+  named: boolean;
+  field?: string;
+  startLine: number;
+  startCol: number;
+  endLine: number;
+  endCol: number;
+  matched: boolean;
+  children: AstNode[];
+}
+
+/** Mirrors the backend's `GET /api/runs/:id/ast` response shape. */
+export interface AstResponse {
+  available: boolean;
+  language?: string;
+  root?: AstNode;
+  truncated?: boolean;
+  reason?: string;
+}
+
+// ---------------------------------------------------------------------------
 // List pagination
 // ---------------------------------------------------------------------------
 
@@ -1891,5 +1917,18 @@ export const api = {
     if (opts?.context != null) url += `&context=${opts.context}`;
     if (opts?.host) url += `&host=${encodeURIComponent(opts.host)}`;
     return request<SourceSlice>(url);
+  },
+  /** Fetch the CST subtree around a `path:line:col` for the AST-viewer
+   *  affordance. Mirrors `readSource`'s URL shape and remote-run semantics. */
+  readAst(
+    runId: string,
+    path: string,
+    line: number,
+    col: number,
+    opts?: { host?: string },
+  ): Promise<AstResponse> {
+    let url = `/api/runs/${encodeURIComponent(runId)}/ast?path=${encodeURIComponent(path)}&line=${line}&col=${col}`;
+    if (opts?.host) url += `&host=${encodeURIComponent(opts.host)}`;
+    return request<AstResponse>(url);
   },
 };

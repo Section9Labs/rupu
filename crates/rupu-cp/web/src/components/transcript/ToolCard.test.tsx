@@ -11,7 +11,7 @@ import { summarizeInput, parseAstGrepText } from './ToolCard';
 import ToolCard from './ToolCard';
 import type { ToolView, FindingView } from './transcriptView';
 import { api } from '../../lib/api';
-import type { SourceSlice } from '../../lib/api';
+import type { SourceSlice, AstResponse } from '../../lib/api';
 
 afterEach(() => {
   cleanup();
@@ -504,5 +504,86 @@ describe('AstGrepBody (via ToolCard)', () => {
     await waitFor(() =>
       expect(spy).toHaveBeenCalledWith('run-1', 'src/a.rs', 10, { host: undefined }),
     );
+  });
+
+  // -------------------------------------------------------------------------
+  // 6. Match header -> AstTree ("tree") wiring
+  // -------------------------------------------------------------------------
+
+  const AST_RESPONSE: AstResponse = {
+    available: true,
+    language: 'rust',
+    truncated: false,
+    root: {
+      kind: 'function_item',
+      named: true,
+      startLine: 10,
+      startCol: 3,
+      endLine: 10,
+      endCol: 15,
+      matched: true,
+      children: [],
+    },
+  };
+
+  it('clicking the tree button on a structured match mounts AstTree and calls api.readAst with file+line+col, when runId is provided', async () => {
+    const spy = vi.spyOn(api, 'readAst').mockResolvedValue(AST_RESPONSE);
+    render(<ToolCard tool={STRUCTURED_TV} runId="run-1" />);
+
+    const treeButton = screen.getByRole('button', { name: /^tree$/ });
+    treeButton.click();
+
+    await waitFor(() =>
+      expect(spy).toHaveBeenCalledWith('run-1', 'src/a.rs', 10, 3, { host: undefined }),
+    );
+    // AstTree eventually renders the fetched root node's kind.
+    await waitFor(() => expect(screen.getByText('function_item')).not.toBeNull());
+  });
+
+  it('no tree button on a structured match when runId is absent', () => {
+    render(<ToolCard tool={STRUCTURED_TV} />);
+    expect(screen.queryByRole('button', { name: /^tree$/ })).toBeNull();
+  });
+
+  it('source-preview and tree toggles are independent — both can be open at once', async () => {
+    vi.spyOn(api, 'readSource').mockResolvedValue(SLICE);
+    vi.spyOn(api, 'readAst').mockResolvedValue(AST_RESPONSE);
+    const { container } = render(<ToolCard tool={STRUCTURED_TV} runId="run-1" />);
+
+    screen.getByRole('button', { name: /src\/a\.rs:10:3/ }).click();
+    screen.getByRole('button', { name: /^tree$/ }).click();
+
+    await waitFor(() =>
+      expect(container.querySelector('[data-target="true"]')).not.toBeNull(),
+    );
+    await waitFor(() => expect(screen.getByText('function_item')).not.toBeNull());
+  });
+
+  it('clicking the tree button on a fallback (text-parsed) match calls api.readAst with file+line+col', async () => {
+    const spy = vi.spyOn(api, 'readAst').mockResolvedValue(AST_RESPONSE);
+    const tv: ToolView = {
+      tool: 'ast_grep',
+      kind: 'ast_grep',
+      input: { pattern: 'fn $NAME() {}' },
+      output: 'src/a.rs:10:3: fn foo() {}',
+    };
+    render(<ToolCard tool={tv} runId="run-1" />);
+
+    screen.getByRole('button', { name: /^tree$/ }).click();
+
+    await waitFor(() =>
+      expect(spy).toHaveBeenCalledWith('run-1', 'src/a.rs', 10, 3, { host: undefined }),
+    );
+  });
+
+  it('no tree button on a fallback (text-parsed) match when runId is absent', () => {
+    const tv: ToolView = {
+      tool: 'ast_grep',
+      kind: 'ast_grep',
+      input: { pattern: 'fn $NAME() {}' },
+      output: 'src/a.rs:10:3: fn foo() {}',
+    };
+    render(<ToolCard tool={tv} />);
+    expect(screen.queryByRole('button', { name: /^tree$/ })).toBeNull();
   });
 });
