@@ -39,8 +39,19 @@ Two latent bugs surfaced while mapping this:
    strictly-tagged enum with no catch-all. Thinking is enabled on every request, so a `thinking` block
    in a non-streaming response **fails to deserialize** ("unknown variant"). Streaming silently drops;
    non-streaming errors. `broker_client.rs:95` has the same strict-deserialize shape.
-2. **`local.rs:96-99`** (`extract_text_content`) drops `ToolUse`/`ToolResult` too, not just reasoning —
+2. **Block ordering in the stream accumulator.** `StreamAccumulator::into_response`
+   (`anthropic.rs:1477-1487`) inserts the accumulated text at **index 0**, ahead of every other block.
+   Its own comment says ordering is safe "for Phase 1 where the agent loop uses `response.text()` and
+   `response.tool_calls()` which don't depend on ordering" — that assumption **expires with this
+   change**. Anthropic requires thinking blocks first in an assistant turn, so a rebuilt
+   `[text, thinking, tool_use]` turn would 400. Text must be inserted after any leading reasoning
+   blocks, not at 0. Latent today, live the moment we echo.
+3. **`local.rs:96-99`** (`extract_text_content`) drops `ToolUse`/`ToolResult` too, not just reasoning —
    multi-turn tool loops are already lossy there. Out of scope; recorded as a known defect.
+4. **Non-streaming tool names skip `desanitize_anthropic_tool_name`.** The SSE path desanitizes the
+   `__dot__` escape (`anthropic.rs:1361`); the derive-based non-streaming path never did. Replacing
+   that derive with an explicit parse (below) must **preserve today's behavior verbatim** — fixing this
+   is a separate behavior change, out of scope, recorded here so the explicit parse isn't blamed for it.
 
 ### Why "summarized" and not "full"
 
@@ -74,10 +85,12 @@ back verbatim** on the next turn so multi-turn tool loops stay correct.
 Reasoning {
     /// Human-readable summary for the transcript/UI. `None` when the provider
     /// returns no readable text (redacted/encrypted blocks, or display="omitted").
+    /// Informational only — never the source of the echo.
     text: Option<String>,
-    /// Canonical tag of the provider that produced this block.
+    /// Canonical tag of the provider that produced this block. Gates the echo.
     provider: String,
-    /// Model that produced it. Continuity tokens are model-bound.
+    /// Model that produced it. Informational only (transcript/debugging);
+    /// deliberately NOT an echo gate — see "Echo rule".
     model: String,
     /// The provider's original block, echoed back verbatim to that provider.
     raw: serde_json::Value,
@@ -91,10 +104,29 @@ Plus a forward-compatibility catch-all so an unknown block type never fails a wh
 Unknown,
 ```
 
-**Echo rule:** a provider serializes `raw` verbatim **iff** `provider == <its own tag>` **and**
-`model == the model of the current request`; otherwise it drops the block. This mirrors API reality
-(Anthropic rejects tampered signatures; other models silently drop foreign thinking) and guarantees an
-Anthropic `signature` can never leak into a Gemini request. Canonical tags: `anthropic`,
+**Echo rule:** a provider serializes `raw` **verbatim** iff `provider == <its own tag>`; otherwise it
+drops the block. The gate is the **provider tag only — never the model**, and never the text.
+
+This is load-bearing and counter-intuitive, so it is grounded explicitly (Anthropic's replay contract,
+`claude-api` skill → `shared/model-migration.md`):
+
+- *"Regular thinking blocks aren't origin-locked — they replay across models fine (the server renders
+  them into the target model's prompt)."* So a same-provider/different-model echo is correct and
+  server-handled.
+- *"Don't strip regular thinking blocks either: removing them can trigger ordering/signature 400s."*
+  So model-gating the echo would **cause** the failure it appears to prevent. Stripping is the bug.
+- *"Pass each thinking block back exactly as received — including blocks whose `thinking` text is
+  empty."* So a block must be captured and echoed **even when its text is empty** (the default
+  `display: "omitted"` case) — the parser must never skip a block for having no readable text.
+- *"The API rejects blocks whose content has been modified, not blocks you have read."* Reading and
+  rendering the summary is explicitly fine; only editing/reconstructing is not — which is exactly why
+  `text` is informational and `raw` is what round-trips.
+- Fable 5 / Mythos 5 thinking is the one exception (replayed cross-model it is dropped from the prompt
+  server-side, before pricing). That is the server's business; the contract says do not build logic
+  depending on either outcome, so rupu does not special-case it.
+
+Cross-provider is the only mandatory drop: a foreign block is an alien wire format, so an Anthropic
+`signature` can never leak into a Gemini request. Canonical tags: `anthropic`,
 `google_gemini`, `openai_codex`, `openai_chat` (the shared `openai_wire` dialect — Copilot and
 OpenAI-compatible interoperate within it), `local`.
 
@@ -159,9 +191,12 @@ replacing the hardcoded `thinking: None` (`:1085`) with the turn's `reasoning_te
 - **Anthropic:** SSE fixture with `thinking` + `signature_delta` → a `Reasoning` block with the
   signature intact in `raw`; a `redacted_thinking` fixture → `text: None`, `data` preserved;
   **non-streaming fixture containing a thinking block deserializes** (regression test for latent bug
-  #1); request body carries `display: "summarized"` on the adaptive path and **not** on the
-  `budget_tokens` path; a `Reasoning` block in outgoing history is rewritten to `{"type":"thinking"}`
-  verbatim; a foreign-provider or foreign-model `Reasoning` block is dropped from the request.
+  #1); an **empty-text** thinking block is still captured and still echoed; request body carries
+  `display: "summarized"` on the adaptive path and **not** on the `budget_tokens` path; a `Reasoning`
+  block in outgoing history is rewritten to `{"type":"thinking"}` byte-identical to what arrived; a
+  **same-provider/different-model** block is still echoed (guards against reintroducing the
+  model-gate); a **foreign-provider** block is dropped; a rebuilt assistant turn keeps reasoning
+  blocks **ahead of** text/tool_use (guards the ordering fix below).
 - **Gemini:** `test_parse_response_skips_thinking` (`:1125`) currently **asserts the drop** — it flips
   to assert capture; this is a deliberate behavior change, not an extension. Plus `thoughtSignature`
   capture + echo.
@@ -173,7 +208,7 @@ replacing the hardcoded `thinking: None` (`:1085`) with the turn's `reasoning_te
 
 Each is an independent PR. Additive everywhere except the compile-forced arms, so each lands alone.
 
-- **Plan 1 — shared type + Anthropic + the latent non-streaming fix.** Adds `Reasoning`, `Unknown`,
+- **Plan 1 — shared type + Anthropic + latent fixes #1 and #2.** Adds `Reasoning`, `Unknown`,
   `ReasoningDelta`, `reasoning_text()`, the runner arm + `thinking` population, Anthropic both
   directions, `display: "summarized"`, and the explicit arms every other provider needs to compile
   (drop-only for now). After this PR, Anthropic reasoning is captured and rendered end-to-end.
@@ -190,7 +225,9 @@ Each is an independent PR. Additive everywhere except the compile-forced arms, s
   vocabulary, forcing Gemini thought-signatures and OpenAI reasoning items into fields whose semantics
   don't match. Rejected: Anthropic-shaped now + refactor later — migrates every `ContentBlock` match
   site twice.
-- **Echo scope — RESOLVED:** echo `raw` only when both the provider tag **and** the model match;
-  otherwise drop. Model-matching is cheap insurance against signature-verification 400s.
+- **Echo scope — RESOLVED:** gate the echo on the **provider tag only**. An earlier draft also
+  gated on the model as "cheap insurance against signature 400s"; the Anthropic replay contract says
+  the opposite — thinking blocks are not origin-locked, and *stripping* them is what triggers
+  ordering/signature 400s. Model-gating would have caused the failure it was meant to prevent.
 - **Wire coupling — RESOLVED:** `ContentBlock` serde is rupu-internal; Anthropic's incidental reliance
   on it for wire format is removed in both directions rather than preserved.
