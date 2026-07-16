@@ -240,17 +240,43 @@ pub(crate) fn parse_chat_completion(
             // Task 2 echoes back verbatim: DeepSeek REQUIRES reasoning_content
             // on tool-call turns and returns a 400 if it is stripped.
             // Reasoning precedes text, consistent with the other providers.
-            if let Some((field, value)) = choice.get("message").and_then(extract_reasoning_fields) {
-                let text = value.as_str().map(|s| s.to_string());
-                content.insert(
-                    0,
-                    ContentBlock::Reasoning {
-                        text,
-                        provider: PROVIDER_TAG.to_string(),
-                        model: model.clone(),
-                        raw: serde_json::json!({ field: value }),
-                    },
-                );
+            if let Some(message) = choice.get("message") {
+                if let Some((field, value)) = extract_reasoning_fields(message) {
+                    let text = value.as_str().map(|s| s.to_string());
+                    // OpenRouter sends `reasoning` (this same string field)
+                    // PLUS a structured `reasoning_details` array carrying the
+                    // real continuity tokens (`reasoning.encrypted`,
+                    // `signature`). OpenRouter's documented contract is that
+                    // the entire reasoning_details sequence must be replayed
+                    // verbatim and in order on the next turn — we do not
+                    // support that yet (out of scope, needs its own design).
+                    // Echoing the bare `reasoning` string back without
+                    // `reasoning_details` would be a partial, modified replay
+                    // of an order-sensitive sequence: worse than sending
+                    // nothing, which is what rupu does today. So when
+                    // `reasoning_details` is present we still capture the
+                    // text for the transcript, but leave `raw` empty so the
+                    // echo merge in `build_chat_request_body` contributes
+                    // nothing and the outgoing body is unchanged.
+                    let has_reasoning_details = message
+                        .get("reasoning_details")
+                        .map(|rd| !rd.is_null())
+                        .unwrap_or(false);
+                    let raw = if has_reasoning_details {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::json!({ field: value })
+                    };
+                    content.insert(
+                        0,
+                        ContentBlock::Reasoning {
+                            text,
+                            provider: PROVIDER_TAG.to_string(),
+                            model: model.clone(),
+                            raw,
+                        },
+                    );
+                }
             }
 
             if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
@@ -326,17 +352,19 @@ impl CompletionAccumulator {
         }
         let mut content = Vec::new();
         if !self.reasoning_text.is_empty() {
-            // Under the key this stream used — never renamed or normalized.
-            let field = self
-                .reasoning_field
-                .clone()
-                .unwrap_or_else(|| REASONING_FIELDS[0].to_string());
-            content.push(ContentBlock::Reasoning {
-                text: Some(self.reasoning_text.clone()),
-                provider: PROVIDER_TAG.to_string(),
-                model: self.model.clone(),
-                raw: serde_json::json!({ field: self.reasoning_text }),
-            });
+            // Only echo under the key this stream actually used. If reasoning
+            // text somehow accumulated without ever recording which field it
+            // arrived on, there is nothing safe to guess: dropping the block
+            // beats inventing or renaming a key, which is exactly the failure
+            // this module exists to prevent.
+            if let Some(field) = self.reasoning_field.clone() {
+                content.push(ContentBlock::Reasoning {
+                    text: Some(self.reasoning_text.clone()),
+                    provider: PROVIDER_TAG.to_string(),
+                    model: self.model.clone(),
+                    raw: serde_json::json!({ field: self.reasoning_text }),
+                });
+            }
         }
         if !self.text.is_empty() {
             content.push(ContentBlock::Text { text: self.text });
@@ -575,6 +603,40 @@ mod tests {
         // Recorded under the key it arrived on — NOT normalized to reasoning_content.
         assert_eq!(raw, &serde_json::json!({"reasoning": "vllm thoughts"}));
         assert!(raw.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn parse_captures_openrouter_reasoning_for_display_only_when_reasoning_details_present() {
+        // OpenRouter sends `reasoning` (a plain string, same shape as
+        // vLLM/Ollama) PLUS a structured `reasoning_details` array carrying
+        // the real continuity tokens. Its documented contract requires the
+        // entire reasoning_details sequence be replayed verbatim and in
+        // order on tool-call turns. We don't support replaying
+        // reasoning_details yet, so we capture the plain text for the
+        // transcript but leave `raw` empty — nothing to echo.
+        let json = serde_json::json!({
+            "id": "cmpl_or1",
+            "model": "openrouter/some-model",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "42",
+                    "reasoning": "step by step",
+                    "reasoning_details": [{
+                        "type": "reasoning.encrypted",
+                        "data": "enc-blob",
+                        "signature": "sig-abc"
+                    }]
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let resp = parse_chat_completion(&json).unwrap();
+
+        let (text, provider, _model, raw) = only_reasoning(&resp);
+        assert_eq!(text.as_deref(), Some("step by step"));
+        assert_eq!(provider, "openai_chat");
+        assert_eq!(raw, &serde_json::json!({}));
     }
 
     #[test]
@@ -843,6 +905,77 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_reasoning_with_details_is_not_echoed_to_the_wire() {
+        // Reuse the exact Reasoning block parsing an OpenRouter response
+        // would produce (raw == {}, see
+        // `parse_captures_openrouter_reasoning_for_display_only_when_reasoning_details_present`)
+        // in a tool-call turn. The outgoing body must carry no reasoning key
+        // at all — byte-identical to a turn with no reasoning block, since
+        // today rupu sends nothing to OpenRouter and a partial `reasoning`
+        // echo (without `reasoning_details`) would create a new,
+        // order-violating 400 that does not exist today.
+        let reasoning_block = ContentBlock::Reasoning {
+            text: Some("step by step".into()),
+            provider: PROVIDER_TAG.to_string(),
+            model: "openrouter/some-model".into(),
+            raw: serde_json::json!({}),
+        };
+
+        let body = build_chat_request_body(
+            &req(vec![assistant(vec![reasoning_block, tool_use()])]),
+            false,
+        );
+
+        let msg = only_assistant_msg(&body);
+        assert!(msg.get("reasoning").is_none());
+        assert!(msg.get("reasoning_content").is_none());
+        assert_eq!(
+            msg,
+            &serde_json::json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Oslo\"}"}
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn reasoning_without_reasoning_details_still_echoes_as_before() {
+        // vLLM (and any other backend that only ever sends `reasoning`) must
+        // not regress: the absence of `reasoning_details` means there is no
+        // OpenRouter-style order-sensitive contract to worry about, so the
+        // existing echo behavior stands end-to-end, parse through build.
+        let json = serde_json::json!({
+            "id": "cmpl_vllm",
+            "model": "qwen3-vllm",
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok", "reasoning": "vllm thoughts"},
+                "finish_reason": "stop"
+            }]
+        });
+        let resp = parse_chat_completion(&json).unwrap();
+        let (_text, _provider, _model, raw) = only_reasoning(&resp);
+        assert_eq!(raw, &serde_json::json!({"reasoning": "vllm thoughts"}));
+
+        let reasoning_block = resp
+            .content
+            .into_iter()
+            .find(|b| matches!(b, ContentBlock::Reasoning { .. }))
+            .expect("reasoning block");
+        let body = build_chat_request_body(
+            &req(vec![assistant(vec![reasoning_block, tool_use()])]),
+            false,
+        );
+        let msg = only_assistant_msg(&body);
+        assert_eq!(msg["reasoning"], serde_json::json!("vllm thoughts"));
+        assert!(msg.get("reasoning_content").is_none());
+    }
+
+    #[test]
     fn foreign_provider_reasoning_is_not_echoed() {
         // An Anthropic thinking signature must never reach a
         // chat-completions endpoint.
@@ -1025,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_reasoning_fields_are_all_echoed_verbatim() {
+    fn non_string_reasoning_value_is_echoed_verbatim() {
         // `raw` is echoed key-for-key, whatever it holds — including a
         // non-string value. Verbatim is the contract; we do not stringify.
         let body = build_chat_request_body(
