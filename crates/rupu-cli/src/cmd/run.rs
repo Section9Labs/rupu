@@ -289,7 +289,10 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // missing credentials are skipped with INFO logs.
     let scm_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
 
-    let provider_name = spec.provider.clone().unwrap_or_else(|| "anthropic".into());
+    let provider_name = provider_factory::resolve_provider_name(
+        spec.provider.as_deref(),
+        cfg.default_provider.as_deref(),
+    );
     let oai_params = provider_factory::openai_compatible_params(&provider_name, &cfg.providers);
     if !provider_factory::is_builtin_provider(&provider_name) && oai_params.is_none() {
         anyhow::bail!(
@@ -299,12 +302,11 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     }
     // For an openai-compatible provider, prefer its configured default_model
     // when the agent/spec didn't pin one.
-    let model = spec
-        .model
-        .clone()
-        .or_else(|| cfg.default_model.clone())
-        .or_else(|| oai_params.as_ref().map(|p| p.default_model.clone()))
-        .unwrap_or_else(|| "claude-sonnet-4-6".into());
+    let model = provider_factory::resolve_model(
+        spec.model.as_deref(),
+        cfg.default_model.as_deref(),
+        oai_params.as_ref().map(|p| p.default_model.as_str()),
+    );
     let auth_hint = spec.auth;
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,

@@ -2359,6 +2359,8 @@ pub(crate) async fn resume_run(
         system_prompt_suffix: None,
         dispatcher: Some(dispatcher_dyn),
         openai_compatible,
+        default_provider: cfg.default_provider.clone(),
+        default_model: cfg.default_model.clone(),
     });
 
     // A cooperatively-paused run may carry a persisted mid-step seed
@@ -3593,6 +3595,8 @@ async fn execute_workflow_invocation(
         system_prompt_suffix: ctx.system_prompt_suffix.clone(),
         dispatcher: Some(dispatcher_dyn),
         openai_compatible,
+        default_provider: cfg.default_provider.clone(),
+        default_model: cfg.default_model.clone(),
     });
 
     let workflow_for_resume = workflow.clone();

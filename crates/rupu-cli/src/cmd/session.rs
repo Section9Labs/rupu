@@ -1334,12 +1334,17 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     };
     let ws = rupu_workspace::upsert(&ws_store, &workspace_path)?;
 
-    let provider_name = spec.provider.clone().unwrap_or_else(|| "anthropic".into());
-    let model = spec
-        .model
-        .clone()
-        .or_else(|| cfg.default_model.clone())
-        .unwrap_or_else(|| "claude-sonnet-4-6".into());
+    let provider_name = provider_factory::resolve_provider_name(
+        spec.provider.as_deref(),
+        cfg.default_provider.as_deref(),
+    );
+    let model = provider_factory::resolve_model(
+        spec.model.as_deref(),
+        cfg.default_model.as_deref(),
+        provider_factory::openai_compatible_params(&provider_name, &cfg.providers)
+            .as_ref()
+            .map(|p| p.default_model.as_str()),
+    );
 
     let mode_str = match mode {
         PermissionMode::Ask => "ask",

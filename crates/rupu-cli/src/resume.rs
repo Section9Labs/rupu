@@ -146,6 +146,8 @@ pub async fn resume_run(
         system_prompt_suffix: None,
         dispatcher: Some(dispatcher_dyn),
         openai_compatible,
+        default_provider: cfg.default_provider.clone(),
+        default_model: cfg.default_model.clone(),
     });
 
     let resume = rupu_orchestrator::ResumeState::from_approval(

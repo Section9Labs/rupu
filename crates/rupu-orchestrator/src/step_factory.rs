@@ -62,6 +62,13 @@ pub struct DefaultStepFactory {
     /// `[providers.<name>] kind = "openai-compatible"` is declared.
     pub openai_compatible:
         std::collections::HashMap<String, provider_factory::OpenAiCompatibleParams>,
+    /// `default_provider` from `config.toml`. Used when a step's agent pins no
+    /// `provider:`. `None` falls back to `provider_factory::FALLBACK_PROVIDER`.
+    pub default_provider: Option<String>,
+    /// `default_model` from `config.toml`. Used when a step's agent pins no
+    /// `model:`. Threaded in so a workflow step resolves the same model
+    /// `rupu run` would for the same agent (ISSUES.md I-2).
+    pub default_model: Option<String>,
 }
 
 /// Resolve a step's agent spec from a `load_agent` result. On success the
@@ -173,15 +180,18 @@ impl StepFactory for DefaultStepFactory {
                 ))
             }
             None => {
-                provider_name = spec.provider.clone().unwrap_or_else(|| "anthropic".into());
+                provider_name = provider_factory::resolve_provider_name(
+                    spec.provider.as_deref(),
+                    self.default_provider.as_deref(),
+                );
                 let oai_params = self.openai_compatible.get(&provider_name).cloned();
                 // Prefer the agent's pinned model; for an openai-compatible
                 // provider fall back to its configured default_model.
-                model = spec
-                    .model
-                    .clone()
-                    .or_else(|| oai_params.as_ref().map(|p| p.default_model.clone()))
-                    .unwrap_or_else(|| "claude-sonnet-4-6".into());
+                model = provider_factory::resolve_model(
+                    spec.model.as_deref(),
+                    self.default_model.as_deref(),
+                    oai_params.as_ref().map(|p| p.default_model.as_str()),
+                );
                 let provider_config = provider_factory::ProviderConfig {
                     anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
                     openai_compatible: oai_params,
