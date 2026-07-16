@@ -157,7 +157,9 @@ pub(crate) fn estimate_tokens(messages: &[Message]) -> usize {
                 (name.len() + input_str.len()) / 4
             }
             ContentBlock::ToolResult { content, .. } => content.len() / 4,
-            ContentBlock::Reasoning { text, .. } => text.as_deref().map(str::len).unwrap_or(0) / 4,
+            // raw is what goes on the wire (thinking text + signature); text is
+            // only a display summary and is None when display is "omitted".
+            ContentBlock::Reasoning { raw, .. } => raw.to_string().len() / 4,
             ContentBlock::Unknown => 0,
         })
         .sum()
@@ -175,7 +177,9 @@ fn message_chars(m: &Message) -> usize {
                 name.len() + input_str.len()
             }
             ContentBlock::ToolResult { content, .. } => content.len(),
-            ContentBlock::Reasoning { text, .. } => text.as_deref().map(str::len).unwrap_or(0),
+            // raw is what goes on the wire (thinking text + signature); text is
+            // only a display summary and is None when display is "omitted".
+            ContentBlock::Reasoning { raw, .. } => raw.to_string().len(),
             ContentBlock::Unknown => 0,
         })
         .sum()

@@ -52,6 +52,10 @@ pub enum ContentBlock {
 
     /// Forward-compatibility catch-all: an unrecognized block type lands here
     /// instead of failing the whole turn's deserialization.
+    ///
+    /// This variant is never valid on any provider's wire — it serializes as
+    /// `{"type":"Unknown"}`, which no provider accepts. Each provider's
+    /// request builder must drop `Unknown` blocks before sending a request.
     #[serde(other)]
     Unknown,
 }
@@ -566,6 +570,16 @@ mod tests {
         let block: ContentBlock =
             serde_json::from_value(json).expect("unknown block must not error");
         assert_eq!(block, ContentBlock::Unknown);
+    }
+
+    #[test]
+    fn unknown_block_serializes_with_literal_unknown_tag() {
+        // Pins the wire contract: ContentBlock::Unknown is NOT deserialize-only,
+        // it round-trips to `{"type":"Unknown"}`. A later task's request builder
+        // relies on this exact literal tag to identify and drop Unknown blocks
+        // before they reach a provider (no provider accepts this tag).
+        let json = serde_json::to_value(&ContentBlock::Unknown).unwrap();
+        assert_eq!(json["type"], "Unknown");
     }
 
     #[test]
