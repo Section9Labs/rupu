@@ -1666,7 +1666,13 @@ Add to `impl HostConnector for SshHostConnector`:
                 }
             }
 
-            if trigger == "manual" {
+            // A run belonging to a cycle is grouped under that cycle in the
+            // feed even when it has no trigger provenance of its own — it must
+            // never ALSO leak into recent_manual, or the same run renders twice
+            // (once under its cycle, once standalone). That double-listing is
+            // the exact autoflow-flooding bug this redesign exists to fix.
+            // The local build_summary has the identical guard.
+            if trigger == "manual" && !cycle_of.contains_key(id) {
                 recent_manual.push(RecentRun {
                     id: id.to_string(),
                     workflow_name,
