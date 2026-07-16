@@ -274,3 +274,51 @@ async fn get_source_handles_empty_file_without_panicking() {
     assert_eq!(body["totalLines"], 0);
     assert_eq!(body["lines"].as_array().unwrap().len(), 0);
 }
+
+#[tokio::test]
+async fn get_source_clamps_context_to_bounded_window() {
+    use axum::http::StatusCode;
+
+    let global = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    // A file large enough (1000 lines) that an unclamped context=100000 would
+    // return the whole thing; with the [0,200] clamp the window is bounded to
+    // 2*200+1 = 401 lines.
+    let contents: String = (1..=1000).map(|i| format!("line{i}\n")).collect();
+    std::fs::write(workspace.path().join("big.rs"), contents).unwrap();
+
+    let run_store = RunStore::new(global.path().join("runs"));
+    run_store
+        .create(
+            seed_run("run_src_7", workspace.path()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+
+    let addr = spawn_server(global.path()).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{addr}/api/runs/run_src_7/source"))
+        .query(&[("path", "big.rs"), ("line", "500"), ("context", "100000")])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["available"], true);
+    let start = body["startLine"].as_u64().unwrap();
+    let end = body["endLine"].as_u64().unwrap();
+    let n_lines = body["lines"].as_array().unwrap().len() as u64;
+    // The window is bounded to at most 2*200+1 = 401 lines despite the huge
+    // requested context.
+    assert!(
+        end - start + 1 <= 401,
+        "window {start}..={end} exceeds the 401-line clamp"
+    );
+    assert!(n_lines <= 401, "{n_lines} lines exceeds the 401-line clamp");
+    // For line=500 with context clamped to 200: 300..=700 == 401 lines exactly.
+    assert_eq!(start, 300);
+    assert_eq!(end, 700);
+    assert_eq!(n_lines, 401);
+}

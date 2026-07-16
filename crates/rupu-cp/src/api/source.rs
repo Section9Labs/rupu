@@ -43,6 +43,12 @@ use std::path::{Path as FsPath, PathBuf};
 /// `available: false` instead of loading a potentially huge file into memory.
 const MAX_PREVIEW_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
 
+/// Hard cap on the caller's requested `?context=` (lines either side of the
+/// target). Per spec, `context` is clamped to `[0, 200]`, bounding the window
+/// to at most `2 * 200 + 1 = 401` lines regardless of what the client asks
+/// for.
+const MAX_CONTEXT_LINES: usize = 200;
+
 /// The human-readable reason returned for any remote-run request (an
 /// explicit `?host=<id>` that isn't `"local"`, or a resolved `RunLocation`
 /// that points at a remote host / has no local workspace).
@@ -300,7 +306,13 @@ async fn get_source(
     }
 
     let target = q.line.clamp(1, total);
-    let (start, end) = source_window(total, q.line, q.context);
+    // Clamp `context` to the spec's `[0, 200]` before windowing — otherwise a
+    // `?context=1000000` returns the entire (≤2 MiB) file as one JSON
+    // line-object per line, an unbounded response vs. the stated constraint.
+    // `source_window` only clamps the window to file bounds, not the caller's
+    // requested context. Default (20) is applied by serde; this only caps it.
+    let context = q.context.min(MAX_CONTEXT_LINES);
+    let (start, end) = source_window(total, q.line, context);
     let lines: Vec<SourceLine> = all_lines[start.saturating_sub(1)..end]
         .iter()
         .enumerate()
