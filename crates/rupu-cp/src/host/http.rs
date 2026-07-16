@@ -45,8 +45,16 @@ impl HttpHostConnector {
     /// `token`, when `Some`, is sent as `Authorization: Bearer <token>` on
     /// every request.
     pub fn new(base_url: String, token: Option<String>) -> Self {
+        // Bounded so one unreachable host cannot stall a fan-out on the OS TCP
+        // connect timeout. Fan-out is concurrent (join_all), so wall-clock is
+        // the slowest host — which must therefore be bounded.
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            client: reqwest::Client::new(),
+            client,
             base_url,
             token,
         }
@@ -400,6 +408,22 @@ impl HostConnector for HttpHostConnector {
             .proxy_get_json("/api/runs/autoflows/events?host=local&limit=10000")
             .await?;
         Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
+    /// GET the remote CP's `/api/dashboard?host=local&range=<wire form>` and
+    /// parse the response as a [`DashboardSummary`](crate::host::dashboard_summary::DashboardSummary).
+    ///
+    /// `host=local` scopes the remote CP to ITS OWN data — without it the
+    /// remote would fan out to its own remotes and a host registered on both
+    /// sides would be double-counted.
+    async fn dashboard_summary(
+        &self,
+        range: crate::host::dashboard_summary::DashboardRange,
+    ) -> Result<crate::host::dashboard_summary::DashboardSummary, HostConnectorError> {
+        let path = format!("/api/dashboard?host=local&range={}", range.as_str());
+        let v = self.proxy_get_json(&path).await?;
+        serde_json::from_value(v)
+            .map_err(|e| HostConnectorError::Invalid(format!("bad dashboard summary: {e}")))
     }
 
     /// POST the wire-encoded payload to the remote CP's `/api/workspace/stage`;
