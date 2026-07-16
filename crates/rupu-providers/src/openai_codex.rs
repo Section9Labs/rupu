@@ -89,6 +89,30 @@ fn reasoning_block_from_output(
     })
 }
 
+/// Whether `model` is a reasoning model — the only kind that accepts the
+/// Responses API's `reasoning` object or `include:
+/// ["reasoning.encrypted_content"]`.
+///
+/// Non-reasoning models are a supported and in fact DEFAULT configuration on
+/// this provider: `model_tier.rs` names `gpt-4.1` / `gpt-4.1-mini` as
+/// `ProviderId::OpenaiCodex`'s default and fast models. Sending either
+/// parameter to one is a hard `400 unsupported_parameter` ("'reasoning.summary'
+/// is not supported with this model"), so the gate is fail-closed: emit nothing
+/// unless the model is known to support it.
+///
+/// The `gpt-5` prefix is the same signal `build_request_body` already uses to
+/// decide `max_output_tokens`; the o-series is added on top. Deliberately NOT
+/// shared with that check — o-series models do accept `max_output_tokens`, so
+/// reusing this helper there would change its behavior.
+fn model_supports_reasoning(model: &str) -> bool {
+    if model.starts_with("gpt-5") {
+        return true;
+    }
+    // o-series (o1, o3, o4-mini, …): an `o` followed by a digit.
+    let mut chars = model.chars();
+    chars.next() == Some('o') && chars.next().is_some_and(|c| c.is_ascii_digit())
+}
+
 fn sanitize_openai_tool_name(name: &str) -> String {
     name.replace('.', TOOL_NAME_DOT_ESCAPE)
 }
@@ -293,17 +317,43 @@ impl OpenAiCodexClient {
             // Find the tag-matched block first without extracting `output`, so
             // the empty-array and unusable-raw cases stay distinguishable for
             // diagnostics.
-            let replay_raw = msg.content.iter().find_map(|b| match b {
+            let mut replay_blocks = msg.content.iter().filter_map(|b| match b {
                 ContentBlock::Reasoning { provider, raw, .. } if provider == PROVIDER_TAG => {
                     Some(raw)
                 }
                 _ => None,
             });
+            let replay_raw = replay_blocks.next();
+            // Parse inserts exactly one tag-matched block per turn, so a second
+            // one means the turn was assembled by something else and we'd be
+            // dropping wire items on the floor. Unreachable today; log rather
+            // than drop silently, consistent with the unusable-raw paths below.
+            let extra_replay_blocks = replay_blocks.count();
+            if extra_replay_blocks > 0 {
+                debug!(
+                    extra = extra_replay_blocks,
+                    "openai_responses turn carried more than one {PROVIDER_TAG:?} replay block; \
+                     replaying the first and ignoring the rest"
+                );
+            }
             if let Some(raw) = replay_raw {
                 match raw.get("output").and_then(|o| o.as_array()) {
                     Some(items) if !items.is_empty() => {
                         // `input` is a flat item list across the whole
                         // conversation, so the items go in as-is, in order.
+                        //
+                        // INVARIANT: a replayed `function_call` carries the
+                        // server's raw `call_id`, but its matching
+                        // `function_call_output` is still built below via
+                        // `normalize_tool_call_id(tool_use_id)`. The two agree
+                        // only while `call_id.len() <= 64` — normalize is the
+                        // identity below that. Server `call_id`s are ~30 chars,
+                        // so this holds today. If OpenAI ever emitted a longer
+                        // one, the replayed call and its output would reference
+                        // different ids and the request would 400 with "No tool
+                        // output found for function call ...". Fixing it means
+                        // normalizing the replayed item's `call_id` too, not
+                        // un-normalizing the output.
                         input.extend(items.iter().cloned());
                         // Skip the rebuild for this turn: re-emitting the
                         // ToolUse blocks would duplicate the function_call.
@@ -419,37 +469,44 @@ impl OpenAiCodexClient {
             body["tools"] = serde_json::json!(tools);
         }
 
-        // `summary: "auto"` is the analogue of Anthropic's display:"summarized"
-        // — without it `summary` comes back empty and the transcript has
-        // nothing readable. Requested unconditionally: reasoning capture must
-        // not depend on an explicit effort being set (the `Auto` path below
-        // deliberately sends no `effort` at all).
-        //
-        // NOTE: OpenAI may require organization verification before summaries
-        // are available on its latest reasoning models.
-        body["reasoning"] = serde_json::json!({ "summary": "auto" });
+        // Reasoning parameters go only to reasoning models. A non-reasoning
+        // model (gpt-4.1 & co — this provider's DEFAULT tier) hard-400s on
+        // either key regardless of what the agent asked for, so the gate is on
+        // the model, not on `thinking`.
+        if model_supports_reasoning(&request.model) {
+            // `summary: "auto"` is the analogue of Anthropic's
+            // display:"summarized" — without it `summary` comes back empty and
+            // the transcript has nothing readable. Not conditional on an
+            // explicit effort: reasoning capture must still happen on the
+            // `Auto` / unset paths (which the runner and step factory actually
+            // use), and those deliberately send no `effort` at all.
+            //
+            // NOTE: OpenAI may require organization verification before
+            // summaries are available on its latest reasoning models.
+            body["reasoning"] = serde_json::json!({ "summary": "auto" });
 
-        // `include: ["reasoning.encrypted_content"]` is now legacy (stateless
-        // mode returns encrypted_content by default) but is still accepted, and
-        // openai/codex sends it unconditionally — keep it for Azure/proxy
-        // backends that haven't adopted the new default.
-        body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
+            // `include: ["reasoning.encrypted_content"]` is now legacy
+            // (stateless mode returns encrypted_content by default) but is
+            // still accepted, and openai/codex sends it — keep it for
+            // Azure/proxy backends that haven't adopted the new default.
+            body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
 
-        // Reasoning effort for o-series and GPT-5.x. `Auto` omits the
-        // field so the server picks; OpenAI doesn't accept "auto" as a
-        // value but treats absence as adaptive.
-        if let Some(level) = &request.thinking {
-            use crate::model_tier::ThinkingLevel;
-            let effort = match level {
-                ThinkingLevel::Auto => None,
-                ThinkingLevel::Minimal => Some("minimal"),
-                ThinkingLevel::Low => Some("low"),
-                ThinkingLevel::Medium => Some("medium"),
-                ThinkingLevel::High => Some("high"),
-                ThinkingLevel::Max => Some("xhigh"),
-            };
-            if let Some(e) = effort {
-                body["reasoning"]["effort"] = serde_json::json!(e);
+            // Reasoning effort for o-series and GPT-5.x. `Auto` omits the
+            // field so the server picks; OpenAI doesn't accept "auto" as a
+            // value but treats absence as adaptive.
+            if let Some(level) = &request.thinking {
+                use crate::model_tier::ThinkingLevel;
+                let effort = match level {
+                    ThinkingLevel::Auto => None,
+                    ThinkingLevel::Minimal => Some("minimal"),
+                    ThinkingLevel::Low => Some("low"),
+                    ThinkingLevel::Medium => Some("medium"),
+                    ThinkingLevel::High => Some("high"),
+                    ThinkingLevel::Max => Some("xhigh"),
+                };
+                if let Some(e) = effort {
+                    body["reasoning"]["effort"] = serde_json::json!(e);
+                }
             }
         }
 
@@ -2100,6 +2157,98 @@ mod reasoning_capture_tests {
         assert_eq!(body["reasoning"]["summary"], "auto");
     }
 
+    // ---- model-conditional request shape ----
+    //
+    // `reasoning` / `include` are accepted only by reasoning models. gpt-4.1 is
+    // this provider's DEFAULT model (`model_tier.rs`), so sending either key
+    // unconditionally 400s every request on the default configuration.
+
+    #[test]
+    fn reasoning_model_with_auto_thinking_gets_reasoning_and_include() {
+        // `Auto` is the level the agent runner actually sets.
+        let request = LlmRequest {
+            model: "o3".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 100,
+            thinking: Some(ThinkingLevel::Auto),
+            ..Default::default()
+        };
+        let body = client().build_request_body(&request, false);
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(
+            body["include"],
+            serde_json::json!(["reasoning.encrypted_content"]),
+        );
+    }
+
+    #[test]
+    fn non_reasoning_model_without_thinking_gets_no_reasoning_params() {
+        // gpt-4.1 + thinking unset is what the orchestrator's step factory
+        // sends. Neither key may appear AT ALL — not even as null.
+        let request = LlmRequest {
+            model: "gpt-4.1".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 100,
+            thinking: None,
+            ..Default::default()
+        };
+        let body = client().build_request_body(&request, false);
+        assert!(
+            body.get("reasoning").is_none(),
+            "gpt-4.1 must carry no `reasoning` key: {body}",
+        );
+        assert!(
+            body.get("include").is_none(),
+            "gpt-4.1 must carry no `include` key: {body}",
+        );
+    }
+
+    #[test]
+    fn non_reasoning_model_ignores_explicit_thinking_level() {
+        // A non-reasoning model cannot use `reasoning` regardless of what the
+        // agent asked for, so an explicit effort is dropped rather than sent.
+        //
+        // This is a DELIBERATE behavior change: before the verbatim-replay
+        // work, an explicit effort WOULD have been sent to gpt-4.1 — which was
+        // already a guaranteed 400 (`unsupported_parameter`), just one only
+        // reachable by explicitly setting `thinking`. The gate is on the model,
+        // not on `thinking`, precisely so both paths are safe.
+        let request = LlmRequest {
+            model: "gpt-4.1".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 100,
+            thinking: Some(ThinkingLevel::High),
+            ..Default::default()
+        };
+        let body = client().build_request_body(&request, false);
+        assert!(
+            body.get("reasoning").is_none(),
+            "explicit effort must not resurrect `reasoning` on gpt-4.1: {body}",
+        );
+        assert!(
+            body.get("include").is_none(),
+            "explicit effort must not resurrect `include` on gpt-4.1: {body}",
+        );
+        // The non-reasoning path still gets max_output_tokens, unchanged.
+        assert_eq!(body["max_output_tokens"], 100);
+    }
+
+    #[test]
+    fn model_supports_reasoning_covers_gpt5_and_o_series() {
+        for m in ["gpt-5", "gpt-5.2", "gpt-5-mini", "o1", "o3", "o4-mini"] {
+            assert!(
+                model_supports_reasoning(m),
+                "{m} should be a reasoning model"
+            );
+        }
+        for m in ["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "omni"] {
+            assert!(
+                !model_supports_reasoning(m),
+                "{m} should NOT be a reasoning model",
+            );
+        }
+    }
+
     #[test]
     fn parse_captures_reasoning_item_verbatim() {
         let output = serde_json::json!([
@@ -2630,5 +2779,114 @@ mod reasoning_capture_tests {
             assert!(item.get("raw").is_none(), "{item}");
             assert!(item.get("model").is_none(), "{item}");
         }
+    }
+
+    /// End-to-end: real SSE capture → real `build_request_body` replay.
+    ///
+    /// This guards the SEAM between capture (Task 1) and replay (Task 2). Every
+    /// other test on either side hand-builds the value at the boundary, so the
+    /// two halves could drift apart while staying green.
+    ///
+    /// Replay is all-or-nothing per turn — the `continue` skips the rebuild for
+    /// `Text` blocks too — so correctness depends entirely on the capture
+    /// storing the WHOLE output array, `message` item included. Narrowing the
+    /// `output_item.done` arm to `reasoning | function_call` (a plausible "only
+    /// capture what we need" cleanup) would silently erase the model's own
+    /// prior answers from history: no 400, no error, no other test failing.
+    /// This one fails.
+    ///
+    /// Streaming is the live path — `parse_response` is `#[allow(dead_code)]`
+    /// — so this composes through `process_sse_event`.
+    #[test]
+    fn sse_capture_composes_into_verbatim_replay() {
+        let c = client();
+        let mut acc = ResponseAccumulator::new();
+
+        // A realistic turn: a text message, then reasoning, then a tool call.
+        let message_item = serde_json::json!({
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "on it", "annotations": []}],
+        });
+        let reasoning_item = serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": "planning"}],
+            "encrypted_content": "enc_abc",
+        });
+        let function_call_item = serde_json::json!({
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_xyz",
+            "name": "f",
+            "arguments": "{\"a\":1}",
+        });
+
+        for ev in [
+            serde_json::json!({"type": "response.created",
+                "response": {"id": "resp_1", "model": "gpt-5"}}),
+            serde_json::json!({"type": "response.output_item.added", "item": message_item}),
+            serde_json::json!({"type": "response.output_text.delta", "delta": "on it"}),
+            serde_json::json!({"type": "response.output_item.done", "item": message_item}),
+            serde_json::json!({"type": "response.output_item.done", "item": reasoning_item}),
+            serde_json::json!({"type": "response.output_item.added", "item": function_call_item}),
+            serde_json::json!({"type": "response.function_call_arguments.delta",
+                "delta": "{\"a\":1}"}),
+            serde_json::json!({"type": "response.output_item.done", "item": function_call_item}),
+        ] {
+            c.process_sse_event(&sse(&ev.to_string()), &mut acc, &mut |_| {})
+                .expect("sse event");
+        }
+
+        // The captured content goes STRAIGHT into the next request — no
+        // hand-building. This is the seam under test.
+        let response = acc.into_response().expect("response");
+        let request = request_with(vec![
+            Message::user("go"),
+            Message {
+                role: Role::Assistant,
+                content: response.content,
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_xyz".into(),
+                    content: "done".into(),
+                    is_error: false,
+                }],
+            },
+        ]);
+        let body = c.build_request_body(&request, true);
+        let input = body["input"].as_array().expect("input array");
+
+        // user, [message, reasoning, function_call] verbatim, function_call_output.
+        assert_eq!(input.len(), 5, "input items: {input:#?}");
+        assert_eq!(input[1], message_item, "message item must replay verbatim");
+        assert_eq!(
+            input[2], reasoning_item,
+            "reasoning item must replay verbatim"
+        );
+        assert_eq!(
+            input[3], function_call_item,
+            "function_call item must replay verbatim",
+        );
+
+        // Ids and the opaque blob survive the round trip intact.
+        assert_eq!(input[2]["encrypted_content"], "enc_abc");
+        assert_eq!(input[3]["call_id"], "call_xyz");
+        assert_eq!(input[4]["type"], "function_call_output");
+        assert_eq!(input[4]["call_id"], "call_xyz");
+
+        // The rebuild must not fire on top of the replay.
+        assert_eq!(
+            input
+                .iter()
+                .filter(|i| i["type"] == "function_call")
+                .count(),
+            1,
+            "function_call must not be duplicated: {input:#?}",
+        );
     }
 }
