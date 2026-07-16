@@ -104,9 +104,11 @@ pub struct Args {
 /// (agent-first AND flag-first).
 ///
 /// Reserved-name caveat (mirrors `cargo`'s reserved subcommand names):
-/// an agent literally named `pause` or `resume` cannot be launched via
-/// `rupu run pause`/`rupu run resume` — those tokens always resolve to
-/// the control actions below.
+/// an agent literally named `pause`, `resume`, or `list` cannot be launched
+/// via `rupu run pause`/`rupu run resume`/`rupu run list` — those tokens
+/// always resolve to the control actions below (`list` added alongside
+/// [`RunAction::List`], the JSON run-listing surface rupu-cp's SSH host
+/// connector shells out to).
 #[derive(Debug, PartialEq, Eq)]
 pub enum RunAction {
     /// Cooperatively pause a running standalone-agent or workflow run at
@@ -137,6 +139,15 @@ pub enum RunAction {
     /// Carries the raw argv so the caller can re-parse it into [`Args`]
     /// via [`parse_launch_args`].
     Launch(Vec<String>),
+    /// `rupu run list` — enumerate the run store as JSON.
+    ///
+    /// `list` is a reserved first token, like `pause` / `resume`: an agent
+    /// literally named `list` is unreachable via `rupu run list`. This is the
+    /// same accepted trade-off those two already carry.
+    List {
+        limit: usize,
+        status: Option<String>,
+    },
 }
 
 /// Wrapper so [`Args`] (a `clap::Args` flatten target, not itself a
@@ -203,11 +214,33 @@ pub fn classify(argv: Vec<String>) -> Result<RunAction, clap::Error> {
                 plain: parsed.plain,
             })
         }
+        Some("list") => {
+            #[derive(Parser, Debug)]
+            #[command(name = "rupu run list")]
+            struct ListArgsParser {
+                /// Return at most N runs, newest first.
+                #[arg(long, default_value_t = 10_000)]
+                limit: usize,
+                /// Filter by status (`running`, `completed`, `failed`, …).
+                #[arg(long)]
+                status: Option<String>,
+            }
+            let parsed = ListArgsParser::try_parse_from(
+                std::iter::once("rupu run list".to_string()).chain(argv.into_iter().skip(1)),
+            )?;
+            Ok(RunAction::List {
+                limit: parsed.limit,
+                status: parsed.status,
+            })
+        }
         _ => Ok(RunAction::Launch(argv)),
     }
 }
 
-pub async fn handle(argv: Vec<String>) -> ExitCode {
+pub async fn handle(
+    argv: Vec<String>,
+    global_format: Option<crate::output::formats::OutputFormat>,
+) -> ExitCode {
     match classify(argv) {
         Ok(RunAction::Launch(argv)) => match parse_launch_args(argv) {
             Ok(args) => match run_inner(args).await {
@@ -228,8 +261,125 @@ pub async fn handle(argv: Vec<String>) -> ExitCode {
             Ok(()) => ExitCode::from(0),
             Err(e) => crate::output::diag::fail(e),
         },
+        Ok(RunAction::List { limit, status }) => match list(limit, status, global_format).await {
+            Ok(()) => ExitCode::from(0),
+            Err(e) => crate::output::diag::fail(e),
+        },
         Err(e) => e.exit(),
     }
+}
+
+/// `rupu run list` — enumerate the run store.
+///
+/// Sorts **before** truncating. (`rupu workflow runs` does the reverse —
+/// `.take(limit)` on unsorted `store.list()` output — so a small `--limit`
+/// there returns an arbitrary subset rather than the newest N. Do not
+/// replicate that.)
+async fn list(
+    limit: usize,
+    status: Option<String>,
+    global_format: Option<crate::output::formats::OutputFormat>,
+) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+
+    let mut all: Vec<_> = store
+        .list()?
+        .into_iter()
+        .filter(|r| match &status {
+            None => true,
+            Some(s) => r.status.as_str() == s.as_str(),
+        })
+        .collect();
+
+    all.sort_by_key(|r| std::cmp::Reverse(r.started_at));
+    all.truncate(limit);
+
+    let rows: Vec<RunListJsonRow> = all
+        .iter()
+        .map(|r| RunListJsonRow {
+            run_id: r.id.clone(),
+            workflow_name: r.workflow_name.clone(),
+            status: r.status.as_str().to_string(),
+            started_at: r.started_at.to_rfc3339(),
+            finished_at: r.finished_at.map(|t| t.to_rfc3339()),
+            trigger: r.trigger_str(),
+            workspace_id: Some(r.workspace_id.clone()),
+            parent_run_id: r.parent_run_id.clone(),
+            awaiting_step_id: r.awaiting_step_id.clone(),
+            active_step_id: r.active_step_id.clone(),
+            error_message: r.error_message.clone(),
+        })
+        .collect();
+
+    let report = RunListReport {
+        kind: "run_list",
+        version: 1,
+        summary: RunListSummary {
+            count: rows.len(),
+            limit,
+            status_filter: status,
+        },
+        rows,
+    };
+
+    // `rupu run` has no table renderer for this view; JSON is the contract
+    // consumed by rupu-cp's SshHostConnector::list_runs.
+    match global_format.unwrap_or(crate::output::formats::OutputFormat::Table) {
+        crate::output::formats::OutputFormat::Json => {
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        _ => {
+            for row in &report.rows {
+                println!(
+                    "{}  {}  {}  {}",
+                    row.run_id, row.status, row.trigger, row.started_at
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One run, carrying every field `rupu-cp`'s `RunListRow` needs.
+///
+/// Contract note: `started_at` / `finished_at` are RFC-3339. The fan-out merge
+/// in rupu-cp sorts these fields with a **lexicographic string compare**
+/// (`sort_values_newest_first`), which is only correct for RFC-3339. Do not
+/// switch to a human-readable format here — `rupu workflow runs` does that
+/// (`%Y-%m-%d %H:%M:%S`) and its rows consequently cannot be merge-sorted
+/// against local ones.
+#[derive(serde::Serialize)]
+struct RunListJsonRow {
+    run_id: String,
+    workflow_name: String,
+    status: String,
+    /// RFC-3339.
+    started_at: String,
+    /// RFC-3339. `None` while the run is non-terminal.
+    finished_at: Option<String>,
+    /// `"manual"` | `"cron"` | `"event"` — mirrors `rupu-cp`'s `trigger_of`.
+    trigger: &'static str,
+    workspace_id: Option<String>,
+    parent_run_id: Option<String>,
+    awaiting_step_id: Option<String>,
+    active_step_id: Option<String>,
+    error_message: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct RunListSummary {
+    count: usize,
+    limit: usize,
+    status_filter: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct RunListReport {
+    kind: &'static str,
+    version: u8,
+    rows: Vec<RunListJsonRow>,
+    summary: RunListSummary,
 }
 
 pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
@@ -957,6 +1107,68 @@ impl PermissionDecider for AskDecider {
             Some(m) => m.suspend(do_prompt),
             None => do_prompt(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_routes_list_to_list_action() {
+        let action = classify(vec!["list".to_string()]).unwrap();
+        assert!(
+            matches!(action, RunAction::List { .. }),
+            "`rupu run list` must classify as List, not Launch"
+        );
+    }
+
+    #[test]
+    fn classify_list_accepts_limit_flag() {
+        let action = classify(vec![
+            "list".to_string(),
+            "--limit".to_string(),
+            "10".to_string(),
+        ])
+        .unwrap();
+        match action {
+            RunAction::List { limit, .. } => assert_eq!(limit, 10),
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_still_launches_bare_agent_name() {
+        let action = classify(vec!["my-agent".to_string()]).unwrap();
+        assert!(
+            matches!(action, RunAction::Launch(_)),
+            "a bare agent name must still Launch — `list` is the only new reserved token"
+        );
+    }
+
+    #[test]
+    fn run_list_row_serializes_rfc3339_and_trigger() {
+        let row = RunListJsonRow {
+            run_id: "run_01".into(),
+            workflow_name: "nightly".into(),
+            status: "completed".into(),
+            started_at: "2026-07-16T14:02:11Z".into(),
+            finished_at: Some("2026-07-16T14:09:02Z".into()),
+            trigger: "cron",
+            workspace_id: Some("ws_1".into()),
+            parent_run_id: None,
+            awaiting_step_id: None,
+            active_step_id: None,
+            error_message: None,
+        };
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["run_id"], "run_01");
+        assert_eq!(v["trigger"], "cron");
+        // RFC-3339 is required for the lexicographic merge sort in rupu-cp.
+        assert!(
+            v["started_at"].as_str().unwrap().contains('T'),
+            "started_at must be RFC-3339, not space-separated"
+        );
     }
 }
 
