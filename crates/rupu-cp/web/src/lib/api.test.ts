@@ -516,6 +516,65 @@ describe('api.readSource', () => {
 });
 
 // ---------------------------------------------------------------------------
+// AST tree
+// ---------------------------------------------------------------------------
+
+describe('api.readAst', () => {
+  it('builds the URL with encoded path, line, and col', async () => {
+    mockFetch(200, { available: true });
+    const fetchSpy = vi.mocked(fetch);
+    await api.readAst('run-1', 'src/foo/bar.rs', 42, 7);
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toBe('/api/runs/run-1/ast?path=src%2Ffoo%2Fbar.rs&line=42&col=7');
+  });
+
+  it('encodes the run id and appends host when given', async () => {
+    mockFetch(200, { available: true });
+    const fetchSpy = vi.mocked(fetch);
+    await api.readAst('run/1', 'a.rs', 5, 1, { host: 'h1' });
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toBe('/api/runs/run%2F1/ast?path=a.rs&line=5&col=1&host=h1');
+  });
+
+  it('omits host when not given', async () => {
+    mockFetch(200, { available: true });
+    const fetchSpy = vi.mocked(fetch);
+    await api.readAst('run-1', 'a.rs', 5, 1);
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).not.toContain('host=');
+  });
+
+  it('resolves the typed AstResponse on 200', async () => {
+    const payload = {
+      available: true,
+      language: 'rust',
+      truncated: false,
+      root: {
+        kind: 'source_file',
+        named: true,
+        startLine: 1,
+        startCol: 1,
+        endLine: 5,
+        endCol: 1,
+        matched: false,
+        children: [],
+      },
+    };
+    mockFetch(200, payload);
+    const result = await api.readAst('run-1', 'a.rs', 2, 1);
+    expect(result.available).toBe(true);
+    expect(result.root?.kind).toBe('source_file');
+  });
+
+  it('resolves available:false with a reason', async () => {
+    mockFetch(200, { available: false, reason: 'no syntax grammar' });
+    const result = await api.readAst('run-1', 'missing.txt', 1, 1);
+    expect(result.available).toBe(false);
+    expect(result.reason).toBe('no syntax grammar');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // URL encoding — paths with slashes / special chars
 // ---------------------------------------------------------------------------
 
