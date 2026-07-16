@@ -93,15 +93,26 @@ impl RunStatus {
     }
 }
 
-/// How a run came to exist.
+/// How a run came to exist, *inferred* from a persisted [`RunRecord`]'s
+/// `event` / `source_wake_id` fields.
 ///
 /// Derived from `RunRecord`'s provenance fields, so it lives beside them rather
 /// than in any one consumer. Both `rupu-cp` (dashboard cycle grouping, run
 /// lists) and `rupu-cli` (`rupu run list`) classify runs this way, and they
 /// must agree — three separate copies of this logic would drift.
+///
+/// Not to be confused with [`rupu_runtime::RunTrigger`]: that is a
+/// struct (`{ source: RunTriggerSource, wake_id, event_id }`) the launcher
+/// *declares* up front on a [`rupu_runtime::RunEnvelope`] before a run
+/// starts. `TriggerKind` is *inferred after the fact* by inspecting a
+/// `RunRecord` that already exists on disk. They read different data at
+/// different times and are not interchangeable — in particular
+/// `TriggerKind` deliberately cannot express `RunTriggerSource::Autoflow`
+/// or `RunTriggerSource::IssueCommand`, because neither is derivable from
+/// `event` / `source_wake_id` alone. Do not merge these two types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RunTrigger {
+pub enum TriggerKind {
     /// Dispatched directly by an operator.
     Manual,
     /// Woken from the durable wake queue (polled events / cron tick).
@@ -110,12 +121,12 @@ pub enum RunTrigger {
     Event,
 }
 
-impl RunTrigger {
+impl TriggerKind {
     pub fn as_str(&self) -> &'static str {
         match self {
-            RunTrigger::Manual => "manual",
-            RunTrigger::Cron => "cron",
-            RunTrigger::Event => "event",
+            TriggerKind::Manual => "manual",
+            TriggerKind::Cron => "cron",
+            TriggerKind::Event => "event",
         }
     }
 }
@@ -266,13 +277,13 @@ impl RunRecord {
     /// Precedence is event-before-wake and is load-bearing: an event-triggered
     /// run may also carry a `source_wake_id`, and flipping the order would
     /// silently re-bucket those runs.
-    pub fn trigger(&self) -> RunTrigger {
+    pub fn trigger_kind(&self) -> TriggerKind {
         if self.event.is_some() {
-            RunTrigger::Event
+            TriggerKind::Event
         } else if self.source_wake_id.is_some() {
-            RunTrigger::Cron
+            TriggerKind::Cron
         } else {
-            RunTrigger::Manual
+            TriggerKind::Manual
         }
     }
 }
@@ -1517,7 +1528,7 @@ mod tests {
     use chrono::Utc;
     use rupu_runtime::{
         ArtifactKind, ArtifactManifest, ArtifactRef, ExecutionRequest, RepoBinding, RunContext,
-        RunEnvelope, RunKind, RunTrigger as EnvelopeTrigger, RunTriggerSource, WorkflowBinding,
+        RunEnvelope, RunKind, RunTrigger, RunTriggerSource, WorkflowBinding,
     };
     use std::collections::BTreeMap;
     use tempfile::TempDir;
@@ -1603,7 +1614,7 @@ mod tests {
                 workspace_id: "ws_1".into(),
                 workspace_path: PathBuf::from("/tmp/proj"),
             }),
-            trigger: EnvelopeTrigger {
+            trigger: RunTrigger {
                 source: RunTriggerSource::WorkflowCli,
                 wake_id: None,
                 event_id: None,
@@ -2646,23 +2657,23 @@ mod tests {
     fn trigger_is_event_when_a_vendor_event_is_attached() {
         let mut r = sample_record("run_trigger_event");
         r.event = Some(serde_json::json!({"action": "opened"}));
-        assert_eq!(r.trigger(), RunTrigger::Event);
-        assert_eq!(r.trigger().as_str(), "event");
+        assert_eq!(r.trigger_kind(), TriggerKind::Event);
+        assert_eq!(r.trigger_kind().as_str(), "event");
     }
 
     #[test]
     fn trigger_is_cron_when_woken_from_the_durable_queue() {
         let mut r = sample_record("run_trigger_cron");
         r.source_wake_id = Some("wake_1".into());
-        assert_eq!(r.trigger(), RunTrigger::Cron);
-        assert_eq!(r.trigger().as_str(), "cron");
+        assert_eq!(r.trigger_kind(), TriggerKind::Cron);
+        assert_eq!(r.trigger_kind().as_str(), "cron");
     }
 
     #[test]
     fn trigger_is_manual_by_default() {
         let r = sample_record("run_trigger_manual");
-        assert_eq!(r.trigger(), RunTrigger::Manual);
-        assert_eq!(r.trigger().as_str(), "manual");
+        assert_eq!(r.trigger_kind(), TriggerKind::Manual);
+        assert_eq!(r.trigger_kind().as_str(), "manual");
     }
 
     #[test]
@@ -2673,6 +2684,6 @@ mod tests {
         let mut r = sample_record("run_trigger_both");
         r.event = Some(serde_json::json!({}));
         r.source_wake_id = Some("wake_1".into());
-        assert_eq!(r.trigger(), RunTrigger::Event);
+        assert_eq!(r.trigger_kind(), TriggerKind::Event);
     }
 }

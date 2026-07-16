@@ -339,11 +339,13 @@ async fn resume_run(
 
 /// Trigger provenance for the wire.
 ///
-/// Thin wrapper over `RunRecord::trigger()` — kept so existing call sites read
-/// unchanged. The classification itself lives in `rupu-orchestrator`, beside the
-/// fields it reads.
+/// Thin wrapper over `RunRecord::trigger_kind()` — kept so existing call sites
+/// read unchanged. The classification itself lives in `rupu-orchestrator`,
+/// beside the fields it reads. Not to be confused with
+/// `rupu_runtime::RunTrigger`, a different, struct-shaped type the launcher
+/// declares up front on a `RunEnvelope` — see the `TriggerKind` doc comment.
 pub(crate) fn trigger_of(r: &RunRecord) -> &'static str {
-    r.trigger().as_str()
+    r.trigger_kind().as_str()
 }
 
 // ── Host-aware helpers ────────────────────────────────────────────────────────
