@@ -23,6 +23,163 @@
 
 ---
 
+### Task 0: Lift `trigger_of` to `rupu-orchestrator`
+
+**Why this exists:** Tasks 1 and 3 both need trigger classification, and the only copy today is `pub(crate) fn trigger_of` in `crates/rupu-cp/src/api/runs.rs:345` — invisible outside `rupu-cp`. Copying it into each caller would leave **three** identical definitions of "what counts as a cron trigger", and the dashboard's cycle grouping depends on that answer being consistent. Three copies will disagree eventually.
+
+It belongs in `rupu-orchestrator`: it is derived purely from `RunRecord.event` / `RunRecord.source_wake_id`, which are defined there. The classification is a domain question; only the rendering of it is presentation. Both `rupu-cp` and `rupu-cli` already depend on `rupu-orchestrator`.
+
+**Files:**
+- Modify: `crates/rupu-orchestrator/src/runs.rs` (add `RunTrigger` + `RunRecord::trigger()`)
+- Modify: `crates/rupu-cp/src/api/runs.rs:345` (delete the local fn; re-export or call through)
+- Test: `crates/rupu-orchestrator/src/runs.rs` (inline `#[cfg(test)] mod tests`)
+
+**Interfaces:**
+- Produces: `RunTrigger::{Manual, Cron, Event}`, `RunTrigger::as_str(&self) -> &'static str`, `RunRecord::trigger(&self) -> RunTrigger` — **consumed by Task 1 (rupu-cli) and Task 3 (summary_build.rs).**
+
+- [ ] **Step 1: Write the failing test**
+
+Add to the `#[cfg(test)] mod tests` in `crates/rupu-orchestrator/src/runs.rs`:
+
+```rust
+    #[test]
+    fn trigger_is_event_when_a_vendor_event_is_attached() {
+        let mut r = RunRecord::default();
+        r.event = Some(serde_json::json!({"action": "opened"}));
+        assert_eq!(r.trigger(), RunTrigger::Event);
+        assert_eq!(r.trigger().as_str(), "event");
+    }
+
+    #[test]
+    fn trigger_is_cron_when_woken_from_the_durable_queue() {
+        let mut r = RunRecord::default();
+        r.source_wake_id = Some("wake_1".into());
+        assert_eq!(r.trigger(), RunTrigger::Cron);
+        assert_eq!(r.trigger().as_str(), "cron");
+    }
+
+    #[test]
+    fn trigger_is_manual_by_default() {
+        let r = RunRecord::default();
+        assert_eq!(r.trigger(), RunTrigger::Manual);
+        assert_eq!(r.trigger().as_str(), "manual");
+    }
+
+    #[test]
+    fn event_wins_over_wake_id() {
+        // An event-triggered run may also carry a wake id. Event is checked
+        // first in the original (api/runs.rs:345); preserve that precedence
+        // exactly — flipping it would silently re-bucket runs in the dashboard.
+        let mut r = RunRecord::default();
+        r.event = Some(serde_json::json!({}));
+        r.source_wake_id = Some("wake_1".into());
+        assert_eq!(r.trigger(), RunTrigger::Event);
+    }
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `cargo test -p rupu-orchestrator trigger_is_manual_by_default`
+Expected: FAIL — `cannot find type 'RunTrigger'`
+
+- [ ] **Step 3: Implement**
+
+Add to `crates/rupu-orchestrator/src/runs.rs`, near `RunStatus`:
+
+```rust
+/// How a run came to exist.
+///
+/// Derived from `RunRecord`'s provenance fields, so it lives beside them rather
+/// than in any one consumer. Both `rupu-cp` (dashboard cycle grouping, run
+/// lists) and `rupu-cli` (`rupu run list`) classify runs this way, and they
+/// must agree — three separate copies of this logic would drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunTrigger {
+    /// Dispatched directly by an operator.
+    Manual,
+    /// Woken from the durable wake queue (polled events / cron tick).
+    Cron,
+    /// Fired by an SCM/webhook event.
+    Event,
+}
+
+impl RunTrigger {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RunTrigger::Manual => "manual",
+            RunTrigger::Cron => "cron",
+            RunTrigger::Event => "event",
+        }
+    }
+}
+
+impl RunRecord {
+    /// Classify this run's trigger provenance.
+    ///
+    /// Precedence is event-before-wake and is load-bearing: an event-triggered
+    /// run may also carry a `source_wake_id`, and flipping the order would
+    /// silently re-bucket those runs.
+    pub fn trigger(&self) -> RunTrigger {
+        if self.event.is_some() {
+            RunTrigger::Event
+        } else if self.source_wake_id.is_some() {
+            RunTrigger::Cron
+        } else {
+            RunTrigger::Manual
+        }
+    }
+}
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cargo test -p rupu-orchestrator trigger`
+Expected: PASS (4 tests).
+
+**Note:** if `RunRecord` has no `Default` derive, build the fixtures with explicit field initialization instead. Do not add a `Default` impl solely for these tests.
+
+- [ ] **Step 5: Point `rupu-cp`'s existing callers at it**
+
+Replace the body of `crates/rupu-cp/src/api/runs.rs:345` so there is exactly one definition in the workspace:
+
+```rust
+/// Trigger provenance for the wire.
+///
+/// Thin wrapper over `RunRecord::trigger()` — kept so existing call sites read
+/// unchanged. The classification itself lives in `rupu-orchestrator`, beside the
+/// fields it reads.
+pub(crate) fn trigger_of(r: &RunRecord) -> &'static str {
+    r.trigger().as_str()
+}
+```
+
+- [ ] **Step 6: Verify nothing regressed**
+
+Run: `cargo test -p rupu-cp runs`
+Expected: PASS — `trigger_of`'s existing callers (`RunListRow`, `query_run_rows`) are unchanged and their tests still cover them.
+
+Run: `cargo clippy -p rupu-orchestrator -p rupu-cp --all-targets -- -D warnings`
+Expected: clean.
+
+- [ ] **Step 7: Commit**
+
+```bash
+cargo fmt -- crates/rupu-orchestrator/src/runs.rs crates/rupu-cp/src/api/runs.rs
+git add crates/rupu-orchestrator/src/runs.rs crates/rupu-cp/src/api/runs.rs
+git commit -m "refactor: lift trigger classification to rupu-orchestrator
+
+RunTrigger + RunRecord::trigger() live beside the fields they read
+(event / source_wake_id). rupu-cp's trigger_of becomes a thin wrapper so
+call sites read unchanged.
+
+Tasks 1 and 3 both need this classification. Copying it into each would
+leave three definitions of 'what counts as a cron trigger', and the
+dashboard's cycle grouping depends on that answer being consistent."
+```
+
+---
+
 ### Task 1: `rupu run list --format json` CLI surface
 
 **Why this exists:** The SSH fix (Task 5) must shell a CLI command that emits full `RunRecord` fields. `rupu run list --format json` does not exist today, and the only JSON run-listing surface (`rupu workflow runs`) omits `trigger` and `finished_at` and emits non-RFC-3339 timestamps. See spec §4.3.
@@ -159,22 +316,13 @@ struct RunListReport {
     rows: Vec<RunListJsonRow>,
     summary: RunListSummary,
 }
+```
 
-/// Trigger provenance, mirroring `rupu-cp`'s `api::runs::trigger_of`.
-///
-/// Deliberately duplicated rather than shared: `rupu-cp` does not depend on
-/// `rupu-cli`, and lifting this into `rupu-orchestrator` to share three lines
-/// would put a presentation concern in the domain crate. If a third caller
-/// appears, lift it then.
-fn trigger_of(r: &rupu_orchestrator::runs::RunRecord) -> &'static str {
-    if r.event.is_some() {
-        "event"
-    } else if r.source_wake_id.is_some() {
-        "cron"
-    } else {
-        "manual"
-    }
-}
+Trigger classification comes from `RunRecord::trigger()` (Task 0) — do **not**
+define a local copy:
+
+```rust
+use rupu_orchestrator::runs::RunTrigger;
 ```
 
 - [ ] **Step 4: Run test to verify classify passes**
@@ -257,7 +405,7 @@ async fn list(
             status: r.status.as_str().to_string(),
             started_at: r.started_at.to_rfc3339(),
             finished_at: r.finished_at.map(|t| t.to_rfc3339()),
-            trigger: trigger_of(r),
+            trigger: r.trigger().as_str(),
             workspace_id: r.workspace_id.clone(),
             parent_run_id: r.parent_run_id.clone(),
             awaiting_step_id: r.awaiting_step_id.clone(),
@@ -759,19 +907,8 @@ use crate::host::dashboard_summary::{
     TerminalBucket,
 };
 use chrono::{DateTime, Duration, Timelike, Utc};
-use rupu_orchestrator::runs::{RunRecord, RunStatus};
+use rupu_orchestrator::runs::{RunRecord, RunStatus, RunTrigger};
 use std::collections::BTreeMap;
-
-/// Trigger provenance. Mirrors `crate::api::runs::trigger_of`.
-fn trigger_of(r: &RunRecord) -> &'static str {
-    if r.event.is_some() {
-        "event"
-    } else if r.source_wake_id.is_some() {
-        "cron"
-    } else {
-        "manual"
-    }
-}
 
 /// Truncate to the start of the UTC day — the bucket key.
 fn day_key(t: DateTime<Utc>) -> DateTime<Utc> {
@@ -848,7 +985,7 @@ pub fn build_summary(
                 workflow_name: r.workflow_name.clone(),
                 status: r.status.as_str().to_string(),
                 started_at: r.started_at,
-                trigger: trigger_of(r).to_string(),
+                trigger: r.trigger().as_str().to_string(),
                 cycle_id: cycle_of.get(r.id.as_str()).map(|c| c.to_string()),
             });
         }
@@ -871,7 +1008,7 @@ pub fn build_summary(
             }
         }
 
-        if trigger_of(r) == "manual" {
+        if r.trigger() == RunTrigger::Manual {
             recent_manual.push(RecentRun {
                 id: r.id.clone(),
                 workflow_name: r.workflow_name.clone(),
@@ -972,7 +1109,13 @@ In `crates/rupu-cp/src/host/local.rs`, add to the `impl HostConnector for LocalH
     }
 ```
 
-**Implementer note:** `collect_cycle_rollups` and `count_open_findings` do not exist yet. Build them in this step from the existing sources — cycles come from the same autoflow-history path that `api/run_streams.rs` uses to construct `AutoflowCycleRow` (reuse it; do not re-derive), and findings from the path `api/findings.rs` uses for `.summary.total`. If `LocalHostConnector` lacks a `global_dir` field, thread it in from `AppState` at construction. Keep both helpers private to `local.rs`.
+**Implementer note — `collect_cycle_rollups` and `count_open_findings` do not exist yet; build them in this step. Reuse, do not re-derive:**
+
+- **Cycles:** `crates/rupu-cp/src/api/run_streams.rs:15` already imports `AutoflowCycleRecord` / `AutoflowHistoryStore`, and **`run_streams.rs:48` already has `impl From<AutoflowCycleRecord> for AutoflowCycleRow`**. Read the history through `AutoflowHistoryStore` exactly as `list_autoflow_runs` (`run_streams.rs:522`) does, then map each record to a `CycleRollup`. Do **not** write a second history-reading path, and do **not** re-parse the raw history JSON — `AutoflowCycleRecord` is already the parsed form.
+- **`CycleRun.status`:** leave `"unknown"` here. `build_summary` fills it in from the runs it already holds (see Step 3) — this helper must not do per-run store reads.
+- **Findings:** use whatever `crates/rupu-cp/src/api/findings.rs` already calls to produce `.summary.total`; call that function rather than re-walking the findings store.
+- If `LocalHostConnector` lacks a `global_dir` field, thread it in from `AppState` at construction.
+- Keep both helpers private to `local.rs`.
 
 - [ ] **Step 6: Verify**
 
