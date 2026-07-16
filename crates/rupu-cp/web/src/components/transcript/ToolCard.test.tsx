@@ -130,6 +130,42 @@ describe('summarizeInput', () => {
     const tv = makeToolView({ tool: 'some_tool', kind: 'generic', input: 'raw string' });
     expect(summarizeInput(tv)).toBe('raw string');
   });
+
+  it('ast_grep — returns pattern · lang when both present', () => {
+    const tv = makeToolView({
+      tool: 'ast_grep',
+      kind: 'ast_grep',
+      input: { pattern: 'impl $T for $S', lang: 'rust' },
+    });
+    expect(summarizeInput(tv)).toBe('impl $T for $S · rust');
+  });
+
+  it('ast_grep — returns only pattern when lang absent', () => {
+    const tv = makeToolView({
+      tool: 'ast_grep',
+      kind: 'ast_grep',
+      input: { pattern: 'impl $T for $S' },
+    });
+    expect(summarizeInput(tv)).toBe('impl $T for $S');
+  });
+
+  it('ast_grep — falls back to lang alone when pattern absent (mirrors grep)', () => {
+    const tv = makeToolView({
+      tool: 'ast_grep',
+      kind: 'ast_grep',
+      input: { lang: 'rust' },
+    });
+    expect(summarizeInput(tv)).toBe('rust');
+  });
+
+  it('ast_grep — returns empty string when both pattern and lang absent', () => {
+    const tv = makeToolView({
+      tool: 'ast_grep',
+      kind: 'ast_grep',
+      input: {},
+    });
+    expect(summarizeInput(tv)).toBe('');
+  });
 });
 
 // ---------------------------------------------------------------------------

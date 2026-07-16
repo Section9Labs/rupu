@@ -84,6 +84,13 @@ export function summarizeInput(tool: ToolView): string {
         return path;
       }
 
+      case 'ast_grep': {
+        const pattern = typeof rec.pattern === 'string' ? rec.pattern : '';
+        const lang    = typeof rec.lang    === 'string' ? rec.lang    : '';
+        if (pattern && lang) return `${pattern} · ${lang}`;
+        return pattern || lang;
+      }
+
       default: {
         // For generic/coverage/subrun/finding: try a single meaningful string
         // key in priority order.

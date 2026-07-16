@@ -15,7 +15,7 @@ export type TranscriptEvent =
   | { type: 'assistant_delta'; data: { content: string } }
   | { type: 'assistant_message'; data: { content: string; thinking?: string | null } }
   | { type: 'tool_call'; data: { call_id: string; tool: string; input: unknown } }
-  | { type: 'tool_result'; data: { call_id: string; output: string; error?: string | null; duration_ms: number } }
+  | { type: 'tool_result'; data: { call_id: string; output: string; error?: string | null; duration_ms: number; structured?: unknown } }
   | { type: 'file_edit'; data: Record<string, unknown> }
   | { type: 'command_run'; data: Record<string, unknown> }
   | { type: 'action_emitted'; data: Record<string, unknown> }
