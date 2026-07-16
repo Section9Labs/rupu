@@ -557,6 +557,8 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
                         }
                     }));
                 }
+                ContentBlock::Reasoning { .. } => { /* Plan 2: capture + echo thoughtSignature */ }
+                ContentBlock::Unknown => {}
             }
         }
 

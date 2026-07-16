@@ -2022,7 +2022,10 @@ impl SessionLiveUsageWriterState {
                 self.usage = next;
                 true
             }
-            StreamEvent::ToolUseStart { .. } | StreamEvent::InputJsonDelta(_) => false,
+            // Plan 2: reasoning deltas don't feed the live output-token estimate yet.
+            StreamEvent::ToolUseStart { .. }
+            | StreamEvent::InputJsonDelta(_)
+            | StreamEvent::ReasoningDelta(_) => false,
         }
     }
 
@@ -6052,6 +6055,13 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
                     rupu_providers::types::ContentBlock::ToolResult { content, .. } => {
                         content.len()
                     }
+                    rupu_providers::types::ContentBlock::Reasoning { raw, .. } => {
+                        // raw is what goes on the wire (thinking text + signature);
+                        // text is only a display summary and is None when display
+                        // is "omitted".
+                        raw.to_string().len()
+                    }
+                    rupu_providers::types::ContentBlock::Unknown => 0,
                 })
                 .sum::<usize>()
         })
@@ -6476,6 +6486,13 @@ async fn run_compact_request(
                     rupu_providers::types::ContentBlock::ToolResult { content, .. } => {
                         content.len()
                     }
+                    rupu_providers::types::ContentBlock::Reasoning { raw, .. } => {
+                        // raw is what goes on the wire (thinking text + signature);
+                        // text is only a display summary and is None when display
+                        // is "omitted".
+                        raw.to_string().len()
+                    }
+                    rupu_providers::types::ContentBlock::Unknown => 0,
                 })
                 .sum::<usize>()
         })

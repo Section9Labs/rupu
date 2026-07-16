@@ -192,6 +192,8 @@ fn emit_response_events(resp: &LlmResponse, on_event: &mut (dyn FnMut(StreamEven
                 on_event(StreamEvent::InputJsonDelta(input.to_string()));
             }
             ContentBlock::ToolResult { .. } => {}
+            ContentBlock::Reasoning { .. } => {}
+            ContentBlock::Unknown => {}
         }
     }
 }

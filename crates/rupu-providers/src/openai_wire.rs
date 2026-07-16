@@ -66,6 +66,8 @@ pub(crate) fn build_chat_request_body(request: &LlmRequest, stream: bool) -> ser
                             }));
                             continue;
                         }
+                        ContentBlock::Reasoning { .. } => { /* Plan 3: reasoning_content */ }
+                        ContentBlock::Unknown => {}
                     }
                 }
 

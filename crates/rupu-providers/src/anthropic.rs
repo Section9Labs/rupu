@@ -15,6 +15,9 @@ use crate::types::*;
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages?beta=true";
 
+/// Canonical provider tag stamped on Reasoning blocks and used as the echo gate.
+pub(crate) const PROVIDER_TAG: &str = "anthropic";
+
 // ── Tool-name sanitization (mirrors openai_codex.rs) ─────────────────────────
 //
 // Anthropic's `/v1/messages` endpoint validates each custom tool's `name`
@@ -69,6 +72,66 @@ fn sanitize_messages_tool_names(mut value: serde_json::Value) -> serde_json::Val
     }
     value
 }
+
+/// Rewrite internal `Reasoning` blocks into Anthropic's own wire shape, and
+/// drop blocks that must never reach the wire.
+///
+/// `build_request_body` serializes `request.messages` with generic serde, which
+/// works only because our Text/ToolUse/ToolResult shapes coincide with
+/// Anthropic's. `Reasoning` is internal-only, so it is restored from its `raw`
+/// payload here — byte-exact, since the API rejects *modified* blocks (reading
+/// `text` is fine; it just never goes on the wire).
+///
+/// Blocks produced by another provider are dropped: a foreign continuity token
+/// (e.g. a Gemini `thoughtSignature`) is an alien wire format. Blocks from this
+/// provider are echoed regardless of model and regardless of whether their text
+/// is empty — thinking blocks are not origin-locked, they replay across models
+/// fine, and *stripping* them is what triggers ordering/signature 400s. The gate
+/// is the provider tag only; do not add a model check here.
+///
+/// `Unknown` blocks are dropped too: they serialize as `{"type":"Unknown"}`
+/// (pinned by a test in `types.rs`), which no provider accepts.
+fn restore_reasoning_blocks(messages: &mut serde_json::Value, self_tag: &str) {
+    let Some(msgs) = messages.as_array_mut() else {
+        return;
+    };
+    for msg in msgs.iter_mut() {
+        let Some(blocks) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        let mut restored = Vec::with_capacity(blocks.len());
+        for block in blocks.iter() {
+            match block.get("type").and_then(|v| v.as_str()) {
+                Some("reasoning") => {
+                    let same_provider =
+                        block.get("provider").and_then(|v| v.as_str()) == Some(self_tag);
+                    if same_provider {
+                        // `raw` has no `skip_serializing_if`, so `block.get("raw")`
+                        // is always `Some` — a plain `if let` here would be
+                        // defensive in appearance only. Require `raw` to actually
+                        // look like a content block (an object with a `type`)
+                        // before echoing it: a `null`, scalar, or `{}` `raw` would
+                        // otherwise be pushed onto the wire as a malformed content
+                        // block and 400 the request.
+                        let raw = block.get("raw");
+                        let looks_like_block =
+                            raw.is_some_and(|r| r.is_object() && r.get("type").is_some());
+                        if looks_like_block {
+                            restored.push(raw.expect("checked Some above").clone());
+                        } else {
+                            debug!(raw = ?raw, "dropping reasoning block with malformed raw payload");
+                        }
+                    }
+                    // else: foreign provider — drop.
+                }
+                Some("Unknown") => {} // never goes on the wire
+                _ => restored.push(block.clone()),
+            }
+        }
+        *blocks = restored;
+    }
+}
+
 /// Anthropic API version. Update when new SSE event types or features are needed.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 // ─────────────────────────────────────────────────────────────────────
@@ -807,6 +870,21 @@ fn model_supports_adaptive_thinking(model: &str) -> bool {
     model.contains("-4-") || model.contains("-4.")
 }
 
+/// Whether a stream event counts as "content emitted" for `stream()`'s
+/// idle-stall guard. Once any of these fire, a stall can no longer be
+/// silently retried — retrying would duplicate already-streamed output.
+/// `ReasoningDelta` counts: thinking tokens are real generated output,
+/// just like text or tool-input deltas.
+fn stream_event_counts_as_emitted_content(ev: &StreamEvent) -> bool {
+    matches!(
+        ev,
+        StreamEvent::TextDelta(_)
+            | StreamEvent::ToolUseStart { .. }
+            | StreamEvent::InputJsonDelta(_)
+            | StreamEvent::ReasoningDelta(_)
+    )
+}
+
 impl AnthropicClient {
     /// One-shot, best-effort GET to `/api/claude_cli/bootstrap`. The
     /// reference Claude Code client makes this call once on session
@@ -1062,12 +1140,7 @@ impl AnthropicClient {
                         Some(chunk) => {
                             for event in parser.feed(&chunk)? {
                                 self.process_sse_event(&event, &mut accumulator, &mut |ev| {
-                                    if matches!(
-                                        ev,
-                                        StreamEvent::TextDelta(_)
-                                            | StreamEvent::ToolUseStart { .. }
-                                            | StreamEvent::InputJsonDelta(_)
-                                    ) {
+                                    if stream_event_counts_as_emitted_content(&ev) {
                                         emitted_content = true;
                                     }
                                     on_event(ev);
@@ -1108,9 +1181,17 @@ impl AnthropicClient {
         // block's `name` to its wire-safe form. Internal state still uses
         // the canonical "scm.repos.list" form; only the wire payload sees
         // the escaped variant.
+        //
+        // Then restore internal `Reasoning` blocks to Anthropic's own wire
+        // shape (and drop `Unknown` blocks) — same post-process pattern, on the
+        // same serialized array.
         let messages_value: serde_json::Value =
             serde_json::to_value(&request.messages).unwrap_or_else(|_| serde_json::json!([]));
-        let messages_value = sanitize_messages_tool_names(messages_value);
+        let mut messages_value = sanitize_messages_tool_names(messages_value);
+        // Must run after `sanitize_messages_tool_names`: restoring reasoning
+        // blocks last guarantees `raw` is echoed byte-exact and is never
+        // touched by the tool-name sanitizer's block-rewriting pass.
+        restore_reasoning_blocks(&mut messages_value, PROVIDER_TAG);
 
         let mut body = serde_json::json!({
             "model": request.model,
@@ -1207,11 +1288,19 @@ impl AnthropicClient {
         //   * `thinking.type: "enabled"` + `budget_tokens: <n>` — fixed
         //     budget. Must be >= 1024 (API minimum); we silently skip
         //     thinking when the clamped budget falls below that.
+        //   * `display: "summarized"` — opt in to readable thinking text.
+        //     Only ever set alongside "adaptive": `display` accepts exactly
+        //     "summarized" | "omitted" (there is no raw/full — the raw chain of
+        //     thought is not exposed on any Claude model), and the
+        //     budget_tokens path targets pre-4.6 models that predate it.
+        //     Without this, display defaults to "omitted" on Opus 4.7/4.8 and
+        //     Sonnet 5, whose thinking blocks then carry an empty text field.
         if let Some(level) = &request.thinking {
             use crate::model_tier::ThinkingLevel;
             match level {
                 ThinkingLevel::Auto => {
-                    body["thinking"] = serde_json::json!({ "type": "adaptive" });
+                    body["thinking"] =
+                        serde_json::json!({ "type": "adaptive", "display": "summarized" });
                 }
                 _ => {
                     let raw_budget = match level {
@@ -1238,8 +1327,18 @@ impl AnthropicClient {
             // OAuth requests to Opus / Sonnet 4-tier models when no explicit
             // budget is requested (see services/api/claude.ts:1609-1613 in
             // the reference). Without this the request fingerprints differently
-            // and may be down-classified by the OAuth quota router.
-            body["thinking"] = serde_json::json!({ "type": "adaptive" });
+            // and may be down-classified by the OAuth quota router (a 429, not
+            // a 400) — that fingerprinting warning is still true and load-bearing.
+            //
+            // The `display: "summarized"` addition below is an intentional,
+            // verified deviation from that pinned claude-cli shape (its wire
+            // shape is confirmed against the authoritative API reference, same
+            // as the `ThinkingLevel::Auto` arm above). Do NOT "restore" this to
+            // bare `{"type":"adaptive"}` to match claude-cli more closely: on
+            // Opus 4.7/4.8 and Sonnet 5, `display` defaults to "omitted", and
+            // without an explicit "summarized" here captured reasoning text
+            // comes back empty on those models.
+            body["thinking"] = serde_json::json!({ "type": "adaptive", "display": "summarized" });
         }
 
         // ── Optional output-shape / context / speed knobs ──────────────
@@ -1348,25 +1447,52 @@ impl AnthropicClient {
                         .get("type")
                         .and_then(|v| v.as_str())
                         .unwrap_or_default();
-                    if block_type == "tool_use" {
-                        let id = block
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        // Wire-form names may carry the __dot__ escape from
-                        // build_request_body's sanitization. Reverse it before
-                        // surfacing to the dispatcher / accumulator.
-                        let name = desanitize_anthropic_tool_name(
-                            block
-                                .get("name")
+                    match block_type {
+                        "tool_use" => {
+                            let id = block
+                                .get("id")
                                 .and_then(|v| v.as_str())
-                                .unwrap_or_default(),
-                        );
-                        acc.current_tool_id = Some(id.clone());
-                        acc.current_tool_name = Some(name.clone());
-                        acc.current_tool_input.clear();
-                        on_event(StreamEvent::ToolUseStart { id, name });
+                                .unwrap_or_default()
+                                .to_string();
+                            // Wire-form names may carry the __dot__ escape from
+                            // build_request_body's sanitization. Reverse it before
+                            // surfacing to the dispatcher / accumulator.
+                            let name = desanitize_anthropic_tool_name(
+                                block
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default(),
+                            );
+                            acc.current_tool_id = Some(id.clone());
+                            acc.current_tool_name = Some(name.clone());
+                            acc.current_tool_input.clear();
+                            on_event(StreamEvent::ToolUseStart { id, name });
+                        }
+                        "thinking" => {
+                            // Seed with any text present on the start event; deltas append.
+                            acc.current_reasoning_text = Some(
+                                block
+                                    .get("thinking")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            );
+                            acc.current_reasoning_signature = block
+                                .get("signature")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                        }
+                        "redacted_thinking" => {
+                            // Opaque and self-contained: no deltas follow. Push
+                            // immediately, preserving the block verbatim for the echo.
+                            acc.content_blocks.push(ContentBlock::Reasoning {
+                                text: None,
+                                provider: PROVIDER_TAG.to_string(),
+                                model: acc.model.clone(),
+                                raw: block.clone(),
+                            });
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1390,6 +1516,33 @@ impl AnthropicClient {
                                 on_event(StreamEvent::InputJsonDelta(json.to_string()));
                             }
                         }
+                        "thinking_delta" => {
+                            if let Some(t) = delta.get("thinking").and_then(|v| v.as_str()) {
+                                // Only append to a buffer that a `content_block_start`
+                                // of type "thinking" actually opened. Using
+                                // `get_or_insert_with` here would fabricate a buffer
+                                // for any future block type that also emits
+                                // `thinking_delta` but was dropped by the `_ => {}`
+                                // arm above — `content_block_stop` would then push a
+                                // `{"type":"thinking", ...}` raw block that was never
+                                // really opened, and Anthropic rejects that block when
+                                // it's echoed back verbatim.
+                                if let Some(buf) = acc.current_reasoning_text.as_mut() {
+                                    buf.push_str(t);
+                                    on_event(StreamEvent::ReasoningDelta(t.to_string()));
+                                }
+                            }
+                        }
+                        "signature_delta" => {
+                            if let Some(sig) = delta.get("signature").and_then(|v| v.as_str()) {
+                                // Signatures arrive whole, but append defensively rather
+                                // than overwrite: a truncated signature is rejected by
+                                // the API.
+                                acc.current_reasoning_signature
+                                    .get_or_insert_with(String::new)
+                                    .push_str(sig);
+                            }
+                        }
                         _ => {
                             debug!(delta_type, "unknown delta type");
                         }
@@ -1397,6 +1550,27 @@ impl AnthropicClient {
                 }
             }
             "content_block_stop" => {
+                // Finalize a pending thinking block. Reconstruct raw in Anthropic's
+                // own wire shape so it echoes back byte-identical to what arrived.
+                // Note the block is emitted even when the text is empty
+                // (display: "omitted") — it must still round-trip.
+                if let Some(text) = acc.current_reasoning_text.take() {
+                    let mut raw = serde_json::json!({ "type": "thinking", "thinking": text });
+                    if let Some(sig) = acc.current_reasoning_signature.take() {
+                        raw["signature"] = serde_json::Value::String(sig);
+                    }
+                    acc.content_blocks.push(ContentBlock::Reasoning {
+                        text: if text.is_empty() {
+                            None
+                        } else {
+                            Some(text.clone())
+                        },
+                        provider: PROVIDER_TAG.to_string(),
+                        model: acc.model.clone(),
+                        raw,
+                    });
+                }
+
                 // If we were accumulating a tool use, finalize it
                 if let (Some(id), Some(name)) =
                     (acc.current_tool_id.take(), acc.current_tool_name.take())
@@ -1450,10 +1624,12 @@ impl AnthropicClient {
 /// Accumulates SSE events into a complete LlmResponse.
 ///
 /// **Ordering limitation**: Text deltas are accumulated into a single text block
-/// placed at position 0. Tool use blocks follow. If the model interleaves text
-/// and tool_use blocks, the original ordering is not preserved. This is acceptable
-/// for Phase 1 where the agent loop uses `response.text()` and `response.tool_calls()`
-/// which don't depend on ordering.
+/// placed after any leading reasoning blocks; tool use blocks follow. If the model
+/// interleaves text and tool_use blocks, the original ordering is not preserved.
+/// That remains acceptable because the agent loop reads `response.text()` /
+/// `response.tool_calls()`, which don't depend on order — but reasoning-before-text
+/// *is* load-bearing: Anthropic requires thinking blocks first in an assistant turn
+/// and rejects a rebuilt turn that echoes them out of order.
 #[derive(Debug, Default)]
 struct StreamAccumulator {
     id: String,
@@ -1467,6 +1643,8 @@ struct StreamAccumulator {
     current_tool_id: Option<String>,
     current_tool_name: Option<String>,
     current_tool_input: String,
+    current_reasoning_text: Option<String>,
+    current_reasoning_signature: Option<String>,
 }
 
 impl StreamAccumulator {
@@ -1480,8 +1658,17 @@ impl StreamAccumulator {
         }
 
         if !self.text.is_empty() {
+            // Anthropic requires reasoning blocks first in an assistant turn,
+            // so text goes after any leading reasoning — not at index 0. (The
+            // old `insert(0, ..)` predates reasoning capture, when nothing
+            // depended on block order.)
+            let idx = self
+                .content_blocks
+                .iter()
+                .position(|b| !matches!(b, ContentBlock::Reasoning { .. }))
+                .unwrap_or(self.content_blocks.len());
             self.content_blocks
-                .insert(0, ContentBlock::Text { text: self.text });
+                .insert(idx, ContentBlock::Text { text: self.text });
         }
 
         Some(LlmResponse {
@@ -1498,22 +1685,87 @@ impl StreamAccumulator {
     }
 }
 
+/// Parse Anthropic's wire content blocks into rupu's internal representation.
+///
+/// Explicit rather than derived: `ContentBlock`'s serde is rupu's internal
+/// format, not Anthropic's wire format, and the two must not be coupled.
+fn parse_content_blocks(raw: Vec<serde_json::Value>, model: &str) -> Vec<ContentBlock> {
+    raw.into_iter()
+        .filter_map(|block| {
+            let block_type = block
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            match block_type {
+                "text" => Some(ContentBlock::Text {
+                    text: block
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                }),
+                "tool_use" => Some(ContentBlock::ToolUse {
+                    id: block
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    // NOTE: deliberately NOT desanitized — the derive path this
+                    // replaces never desanitized either, and changing that is a
+                    // separate behavior change (see spec, latent defect #4).
+                    name: block
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    input: block
+                        .get("input")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                }),
+                "thinking" | "redacted_thinking" => {
+                    let text = block
+                        .get("thinking")
+                        .and_then(|v| v.as_str())
+                        .filter(|t| !t.is_empty())
+                        .map(|t| t.to_string());
+                    Some(ContentBlock::Reasoning {
+                        text,
+                        provider: PROVIDER_TAG.to_string(),
+                        model: model.to_string(),
+                        raw: block,
+                    })
+                }
+                other => {
+                    debug!(block_type = other, "dropping unrecognized content block");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
 /// Anthropic API response (non-streaming).
+///
+/// `content` stays as raw JSON: `ContentBlock`'s derive is rupu's internal
+/// format and cannot represent Anthropic's `thinking` blocks, so the blocks
+/// are translated explicitly by `parse_content_blocks`.
 #[derive(Debug, Deserialize)]
 struct AnthropicResponse {
     id: String,
     model: String,
-    content: Vec<ContentBlock>,
+    content: Vec<serde_json::Value>,
     stop_reason: Option<StopReason>,
     usage: Usage,
 }
 
 impl AnthropicResponse {
     fn into_llm_response(self) -> LlmResponse {
+        let content = parse_content_blocks(self.content, &self.model);
         LlmResponse {
             id: self.id,
             model: self.model,
-            content: self.content,
+            content,
             stop_reason: self.stop_reason,
             usage: self.usage,
         }
@@ -2122,8 +2374,10 @@ mod tests {
     }
 
     #[test]
-    fn test_build_request_body_thinking_auto_emits_adaptive() {
-        // Auto → `thinking.type: "adaptive"` regardless of auth mode.
+    fn adaptive_thinking_requests_summarized_display() {
+        // Auto → `thinking.type: "adaptive"` regardless of auth mode, plus
+        // `display: "summarized"`. Without `display`, it defaults to "omitted"
+        // on Opus 4.7/4.8 + Sonnet 5 and every captured thinking text is empty.
         let client = AnthropicClient::new("test-key".into());
         let request = LlmRequest {
             model: "claude-opus-4-7".into(),
@@ -2143,7 +2397,268 @@ mod tests {
             anthropic_speed: None,
         };
         let body = client.build_request_body(&request, false);
-        assert_eq!(body["thinking"], serde_json::json!({ "type": "adaptive" }));
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({ "type": "adaptive", "display": "summarized" })
+        );
+    }
+
+    #[test]
+    fn oauth_implicit_adaptive_thinking_requests_summarized_display() {
+        // No explicit `thinking` level + OAuth + adaptive-capable model → the
+        // implicit claude-cli adaptive shape, which also opts into summaries.
+        let client = oauth_client();
+        let request = LlmRequest {
+            model: "claude-opus-4-7".into(),
+            system: None,
+            messages: vec![Message::user("hi")],
+            max_tokens: 8000,
+            tools: vec![],
+            cell_id: None,
+            trace_id: None,
+            thinking: None,
+            context_window: None,
+            task_type: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+        };
+        let body = client.build_request_body(&request, false);
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({ "type": "adaptive", "display": "summarized" })
+        );
+    }
+
+    #[test]
+    fn budget_tokens_thinking_does_not_set_display() {
+        // The budget_tokens path targets pre-4.6 models, which predate
+        // `display`; sending it there risks a 400 on every request.
+        let client = AnthropicClient::new("test-key".into());
+        let request = LlmRequest {
+            model: "claude-sonnet-4-6".into(),
+            system: None,
+            messages: vec![Message::user("hi")],
+            max_tokens: 32000,
+            tools: vec![],
+            cell_id: None,
+            trace_id: None,
+            thinking: Some(crate::model_tier::ThinkingLevel::High),
+            context_window: None,
+            task_type: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+        };
+        let body = client.build_request_body(&request, false);
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({ "type": "enabled", "budget_tokens": 10000 })
+        );
+        assert!(
+            body["thinking"].get("display").is_none(),
+            "budget_tokens path must not carry `display`; got: {}",
+            body["thinking"]
+        );
+    }
+
+    /// Build a request whose history carries a single assistant message with
+    /// `blocks`, so tests can assert the exact serialized `messages` payload.
+    fn request_with_assistant_blocks(blocks: Vec<ContentBlock>) -> LlmRequest {
+        LlmRequest {
+            model: "claude-opus-4-7".into(),
+            system: None,
+            messages: vec![
+                Message::user("hi"),
+                Message {
+                    role: Role::Assistant,
+                    content: blocks,
+                },
+            ],
+            max_tokens: 8000,
+            tools: vec![],
+            cell_id: None,
+            trace_id: None,
+            thinking: None,
+            context_window: None,
+            task_type: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+        }
+    }
+
+    /// Anthropic's real `thinking` wire block, as Task 2 captures it into `raw`.
+    fn anthropic_thinking_raw() -> serde_json::Value {
+        serde_json::json!({
+            "type": "thinking",
+            "thinking": "step one, then step two",
+            "signature": "sig-abc123",
+        })
+    }
+
+    #[test]
+    fn reasoning_block_is_restored_to_anthropic_wire_shape() {
+        let client = AnthropicClient::new("test-key".into());
+        let raw = anthropic_thinking_raw();
+        let request = request_with_assistant_blocks(vec![
+            ContentBlock::Reasoning {
+                text: Some("step one, then step two".into()),
+                provider: PROVIDER_TAG.into(),
+                model: "claude-opus-4-7".into(),
+                raw: raw.clone(),
+            },
+            ContentBlock::Text {
+                text: "the answer".into(),
+            },
+        ]);
+        let body = client.build_request_body(&request, false);
+        let content = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        // Byte-exact echo of `raw` — no internal fields on the wire.
+        assert_eq!(content[0], raw);
+        assert_eq!(
+            content[1],
+            serde_json::json!({ "type": "text", "text": "the answer" })
+        );
+        let wire = serde_json::to_string(&body).unwrap();
+        for leaked in ["provider", "\"reasoning\"", "\"model\":\"claude-opus-4-7\""] {
+            assert!(
+                !body["messages"].to_string().contains(leaked),
+                "internal field {leaked} leaked onto the wire: {wire}"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_provider_reasoning_block_is_dropped_from_request() {
+        // A Gemini thoughtSignature is an alien wire format; it must never
+        // reach Anthropic.
+        let client = AnthropicClient::new("test-key".into());
+        let request = request_with_assistant_blocks(vec![
+            ContentBlock::Reasoning {
+                text: Some("gemini thoughts".into()),
+                provider: "google_gemini".into(),
+                model: "gemini-3-pro".into(),
+                raw: serde_json::json!({ "thoughtSignature": "opaque-token" }),
+            },
+            ContentBlock::Text {
+                text: "the answer".into(),
+            },
+        ]);
+        let body = client.build_request_body(&request, false);
+        let content = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(
+            content,
+            &vec![serde_json::json!({ "type": "text", "text": "the answer" })]
+        );
+    }
+
+    #[test]
+    fn same_provider_different_model_reasoning_block_is_still_echoed() {
+        // Regression guard: the echo gate is the provider tag ONLY. Thinking
+        // blocks are not origin-locked — they replay across models fine, and
+        // *stripping* them is what triggers ordering/signature 400s. Do not
+        // reintroduce a model gate.
+        let client = AnthropicClient::new("test-key".into());
+        let raw = anthropic_thinking_raw();
+        let request = request_with_assistant_blocks(vec![ContentBlock::Reasoning {
+            text: Some("step one, then step two".into()),
+            // Captured under a *different* Anthropic model than the request's.
+            provider: PROVIDER_TAG.into(),
+            model: "claude-sonnet-4-6".into(),
+            raw: raw.clone(),
+        }]);
+        assert_ne!(request.model, "claude-sonnet-4-6");
+        let body = client.build_request_body(&request, false);
+        assert_eq!(body["messages"][1]["content"], serde_json::json!([raw]));
+    }
+
+    #[test]
+    fn empty_text_reasoning_block_is_still_echoed() {
+        // The `display: "omitted"` case: a thinking block with no readable
+        // text still carries a signature and must be passed back as received.
+        let client = AnthropicClient::new("test-key".into());
+        let raw = serde_json::json!({
+            "type": "thinking",
+            "thinking": "",
+            "signature": "sig-empty",
+        });
+        let request = request_with_assistant_blocks(vec![ContentBlock::Reasoning {
+            text: None,
+            provider: PROVIDER_TAG.into(),
+            model: "claude-opus-4-7".into(),
+            raw: raw.clone(),
+        }]);
+        let body = client.build_request_body(&request, false);
+        assert_eq!(body["messages"][1]["content"], serde_json::json!([raw]));
+    }
+
+    #[test]
+    fn unknown_block_is_dropped_from_request() {
+        // `ContentBlock::Unknown` serializes as `{"type":"Unknown"}` (pinned by
+        // a test in types.rs), which no provider accepts.
+        let client = AnthropicClient::new("test-key".into());
+        assert_eq!(
+            serde_json::to_value(ContentBlock::Unknown).unwrap()["type"],
+            "Unknown",
+            "Unknown's wire tag changed — restore_reasoning_blocks must follow"
+        );
+        let request = request_with_assistant_blocks(vec![
+            ContentBlock::Unknown,
+            ContentBlock::Text {
+                text: "the answer".into(),
+            },
+        ]);
+        let body = client.build_request_body(&request, false);
+        assert_eq!(
+            body["messages"][1]["content"],
+            serde_json::json!([{ "type": "text", "text": "the answer" }])
+        );
+    }
+
+    #[test]
+    fn malformed_raw_reasoning_block_is_dropped_from_request() {
+        // `raw` has no `skip_serializing_if`, so `block.get("raw")` is always
+        // `Some` — a `null`, scalar, or `{}` `raw` must still be rejected
+        // before being echoed, or it goes on the wire as a malformed content
+        // block and Anthropic 400s the request.
+        let client = AnthropicClient::new("test-key".into());
+        let request = request_with_assistant_blocks(vec![
+            ContentBlock::Reasoning {
+                text: Some("null raw".into()),
+                provider: PROVIDER_TAG.into(),
+                model: "claude-opus-4-7".into(),
+                raw: serde_json::Value::Null,
+            },
+            ContentBlock::Reasoning {
+                text: Some("scalar raw".into()),
+                provider: PROVIDER_TAG.into(),
+                model: "claude-opus-4-7".into(),
+                raw: serde_json::json!("not-a-block"),
+            },
+            ContentBlock::Reasoning {
+                text: Some("empty object raw".into()),
+                provider: PROVIDER_TAG.into(),
+                model: "claude-opus-4-7".into(),
+                raw: serde_json::json!({}),
+            },
+            ContentBlock::Text {
+                text: "the answer".into(),
+            },
+        ]);
+        let body = client.build_request_body(&request, false);
+        assert_eq!(
+            body["messages"][1]["content"],
+            serde_json::json!([{ "type": "text", "text": "the answer" }]),
+            "malformed `raw` reasoning blocks must be dropped, not echoed onto the wire"
+        );
     }
 
     #[test]
@@ -2900,5 +3415,517 @@ mod tests {
             AnthropicClient::with_url("bad-key".into(), format!("{}/v1/messages", server.url("")));
         let models = <AnthropicClient as crate::provider::LlmProvider>::list_models(&client).await;
         assert!(models.is_empty());
+    }
+
+    // ── Reasoning capture (Task 2) ───────────────────────────────────
+
+    fn sse(event_type: &str, data: &str) -> crate::sse::SseEvent {
+        crate::sse::SseEvent {
+            event_type: event_type.into(),
+            data: data.into(),
+        }
+    }
+
+    fn reasoning_acc() -> StreamAccumulator {
+        let mut acc = StreamAccumulator::new();
+        acc.id = "msg_think".into();
+        acc.model = "claude-opus-4-8".into();
+        acc
+    }
+
+    #[test]
+    fn stream_captures_thinking_block_with_signature() {
+        let client = AnthropicClient::new("test-key".into());
+        let mut acc = reasoning_acc();
+        let events = vec![
+            sse(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            ),
+            sse(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"let me think"}}"#,
+            ),
+            sse(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_xyz"}}"#,
+            ),
+            sse(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+        ];
+        for event in &events {
+            client
+                .process_sse_event(event, &mut acc, &mut |_| {})
+                .unwrap();
+        }
+
+        assert_eq!(acc.content_blocks.len(), 1);
+        match &acc.content_blocks[0] {
+            ContentBlock::Reasoning {
+                text,
+                provider,
+                model,
+                raw,
+            } => {
+                assert_eq!(text.as_deref(), Some("let me think"));
+                assert_eq!(provider, "anthropic");
+                assert_eq!(model, "claude-opus-4-8");
+                assert_eq!(
+                    *raw,
+                    serde_json::json!({
+                        "type": "thinking",
+                        "thinking": "let me think",
+                        "signature": "sig_xyz"
+                    })
+                );
+            }
+            other => panic!("expected Reasoning block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_captures_thinking_block_with_empty_text() {
+        // display:"omitted" -> a thinking block arrives with no thinking_delta,
+        // only a signature_delta. It MUST still produce a Reasoning block so it
+        // can be echoed back unchanged.
+        let client = AnthropicClient::new("test-key".into());
+        let mut acc = reasoning_acc();
+        let events = vec![
+            sse(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            ),
+            sse(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_only"}}"#,
+            ),
+            sse(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+        ];
+        for event in &events {
+            client
+                .process_sse_event(event, &mut acc, &mut |_| {})
+                .unwrap();
+        }
+
+        assert_eq!(
+            acc.content_blocks.len(),
+            1,
+            "empty-text block must not be skipped"
+        );
+        match &acc.content_blocks[0] {
+            ContentBlock::Reasoning { text, raw, .. } => {
+                assert_eq!(*text, None);
+                assert_eq!(
+                    *raw,
+                    serde_json::json!({
+                        "type": "thinking",
+                        "thinking": "",
+                        "signature": "sig_only"
+                    })
+                );
+            }
+            other => panic!("expected Reasoning block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_captures_redacted_thinking_block() {
+        let client = AnthropicClient::new("test-key".into());
+        let mut acc = reasoning_acc();
+        let events = vec![
+            sse(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"enc_abc123"}}"#,
+            ),
+            sse(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+        ];
+        for event in &events {
+            client
+                .process_sse_event(event, &mut acc, &mut |_| {})
+                .unwrap();
+        }
+
+        assert_eq!(acc.content_blocks.len(), 1);
+        match &acc.content_blocks[0] {
+            ContentBlock::Reasoning {
+                text,
+                provider,
+                raw,
+                ..
+            } => {
+                assert_eq!(*text, None);
+                assert_eq!(provider, "anthropic");
+                assert_eq!(
+                    *raw,
+                    serde_json::json!({"type": "redacted_thinking", "data": "enc_abc123"})
+                );
+            }
+            other => panic!("expected Reasoning block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_emits_reasoning_delta_events() {
+        let client = AnthropicClient::new("test-key".into());
+        let mut acc = reasoning_acc();
+        let mut events_received = Vec::new();
+        let events = vec![
+            sse(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            ),
+            sse(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"let me think"}}"#,
+            ),
+            sse(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+        ];
+        for event in &events {
+            client
+                .process_sse_event(event, &mut acc, &mut |se| {
+                    events_received.push(format!("{se:?}"));
+                })
+                .unwrap();
+        }
+
+        assert!(
+            events_received
+                .iter()
+                .any(|e| e.contains("ReasoningDelta") && e.contains("let me think")),
+            "expected a ReasoningDelta event, got {events_received:?}"
+        );
+        assert!(
+            !events_received.iter().any(|e| e.contains("TextDelta")),
+            "thinking content must not be emitted as TextDelta"
+        );
+    }
+
+    #[test]
+    fn thinking_delta_without_open_block_is_not_fabricated() {
+        // No `content_block_start` of type "thinking" precedes this delta
+        // (e.g. it followed a start type this parser doesn't recognize and
+        // dropped via the `_ => {}` arm). The accumulator must not fabricate
+        // a reasoning buffer for it — doing so would let `content_block_stop`
+        // push a `{"type":"thinking", ...}` raw block that was never really
+        // opened, which Anthropic rejects when echoed back.
+        let client = AnthropicClient::new("test-key".into());
+        let mut acc = reasoning_acc();
+        let mut events_received = Vec::new();
+        let events = vec![
+            sse(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"orphan"}}"#,
+            ),
+            sse(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+        ];
+        for event in &events {
+            client
+                .process_sse_event(event, &mut acc, &mut |se| {
+                    events_received.push(format!("{se:?}"));
+                })
+                .unwrap();
+        }
+
+        assert!(
+            acc.content_blocks.is_empty(),
+            "no Reasoning block should be fabricated for an unopened thinking buffer: {:?}",
+            acc.content_blocks
+        );
+        assert!(
+            !events_received.iter().any(|e| e.contains("ReasoningDelta")),
+            "no ReasoningDelta event should fire for an unopened block: {events_received:?}"
+        );
+    }
+
+    #[test]
+    fn reasoning_delta_counts_as_emitted_content_for_idle_guard() {
+        // Calls the actual production predicate used by `stream()`'s
+        // idle-stall guard (see `stream_event_counts_as_emitted_content`,
+        // wired in at the `for event in parser.feed(...)` loop) — not a
+        // hand-copied match arm. If `ReasoningDelta` were ever dropped from
+        // the production guard this test would fail: a stream that only
+        // produced thinking deltas before an idle gap has emitted content
+        // and must not be treated as a prefill stall and silently retried
+        // (which would duplicate the response).
+        assert!(stream_event_counts_as_emitted_content(
+            &StreamEvent::ReasoningDelta("thinking".into())
+        ));
+        // Sanity check the predicate isn't vacuously true for everything.
+        assert!(stream_event_counts_as_emitted_content(
+            &StreamEvent::TextDelta("hi".into())
+        ));
+        assert!(stream_event_counts_as_emitted_content(
+            &StreamEvent::ToolUseStart {
+                id: "toolu_1".into(),
+                name: "read_file".into(),
+            }
+        ));
+        assert!(stream_event_counts_as_emitted_content(
+            &StreamEvent::InputJsonDelta("{}".into())
+        ));
+        assert!(
+            !stream_event_counts_as_emitted_content(&StreamEvent::UsageSnapshot(Usage::default())),
+            "a bare usage snapshot carries no generated content"
+        );
+    }
+
+    #[test]
+    fn into_response_places_reasoning_before_text() {
+        // Anthropic requires thinking blocks first in an assistant turn.
+        let client = AnthropicClient::new("test-key".into());
+        let mut acc = reasoning_acc();
+        let events = vec![
+            sse(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            ),
+            sse(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"planning"}}"#,
+            ),
+            sse(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            sse(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}"#,
+            ),
+        ];
+        for event in &events {
+            client
+                .process_sse_event(event, &mut acc, &mut |_| {})
+                .unwrap();
+        }
+
+        let resp = acc.into_response().unwrap();
+        assert_eq!(resp.content.len(), 2);
+        assert!(
+            matches!(resp.content[0], ContentBlock::Reasoning { .. }),
+            "reasoning must come first, got {:?}",
+            resp.content
+        );
+        assert!(matches!(resp.content[1], ContentBlock::Text { .. }));
+        assert_eq!(resp.text(), Some("answer"));
+    }
+
+    #[test]
+    fn streaming_thinking_text_tool_use_interleaving_is_isolated() {
+        // Full streaming sequence: thinking, then text, then tool_use.
+        // `content_block_stop` finalizes reasoning and tool_use via two
+        // independent `if let` checks against accumulator state — this
+        // guards against a regression where the thinking block's stop event
+        // also resolves (or otherwise disturbs) a tool_use that hasn't even
+        // started yet, and against tool input getting corrupted by the
+        // unrelated reasoning block that preceded it.
+        let client = AnthropicClient::new("test-key".into());
+        let mut acc = reasoning_acc();
+
+        let thinking_events = vec![
+            sse(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            ),
+            sse(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"reasoning steps"}}"#,
+            ),
+            sse(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+        ];
+        for event in &thinking_events {
+            client
+                .process_sse_event(event, &mut acc, &mut |_| {})
+                .unwrap();
+        }
+        // The thinking block's own stop must not fabricate or resolve
+        // anything beyond the reasoning block itself — no tool_use exists
+        // yet at this point in the stream.
+        assert_eq!(
+            acc.content_blocks.len(),
+            1,
+            "thinking's content_block_stop must only emit the reasoning block: {:?}",
+            acc.content_blocks
+        );
+        assert!(matches!(
+            acc.content_blocks[0],
+            ContentBlock::Reasoning { .. }
+        ));
+
+        let rest_events = vec![
+            sse(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"here's the answer"}}"#,
+            ),
+            sse(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file"}}"#,
+            ),
+            sse(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/tmp/x\"}"}}"#,
+            ),
+            sse(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":2}"#,
+            ),
+        ];
+        for event in &rest_events {
+            client
+                .process_sse_event(event, &mut acc, &mut |_| {})
+                .unwrap();
+        }
+
+        let resp = acc.into_response().unwrap();
+        assert_eq!(
+            resp.content.len(),
+            3,
+            "expected exactly [Reasoning, Text, ToolUse], got {:?}",
+            resp.content
+        );
+        assert!(
+            matches!(resp.content[0], ContentBlock::Reasoning { .. }),
+            "reasoning must come first, got {:?}",
+            resp.content
+        );
+        assert!(matches!(resp.content[1], ContentBlock::Text { .. }));
+        match &resp.content[2] {
+            ContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "toolu_1");
+                assert_eq!(name, "read_file");
+                assert_eq!(input, &serde_json::json!({"path": "/tmp/x"}));
+            }
+            other => panic!("expected exactly one ToolUse block, got {other:?}"),
+        }
+        assert_eq!(
+            resp.content
+                .iter()
+                .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
+                .count(),
+            1,
+            "tool_use must be resolved exactly once, not duplicated by the thinking stop"
+        );
+    }
+
+    #[test]
+    fn non_streaming_response_with_thinking_block_deserializes() {
+        // Regression guard: this previously failed with "unknown variant".
+        let json = r#"{
+            "id": "msg_ns",
+            "model": "claude-opus-4-8",
+            "content": [
+                {"type": "thinking", "thinking": "deliberating", "signature": "sig_ns"},
+                {"type": "text", "text": "the answer"},
+                {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "/tmp/x"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 3}
+        }"#;
+        let response: AnthropicResponse =
+            serde_json::from_str(json).expect("thinking block must deserialize");
+        let llm = response.into_llm_response();
+
+        assert_eq!(llm.content.len(), 3);
+        match &llm.content[0] {
+            ContentBlock::Reasoning {
+                text,
+                provider,
+                model,
+                raw,
+            } => {
+                assert_eq!(text.as_deref(), Some("deliberating"));
+                assert_eq!(provider, "anthropic");
+                assert_eq!(model, "claude-opus-4-8");
+                assert_eq!(raw["signature"], "sig_ns");
+            }
+            other => panic!("expected Reasoning block, got {other:?}"),
+        }
+        assert_eq!(llm.text(), Some("the answer"));
+        assert_eq!(llm.tool_calls().len(), 1);
+        assert_eq!(llm.reasoning_text().as_deref(), Some("deliberating"));
+    }
+
+    #[test]
+    fn non_streaming_redacted_thinking_block_deserializes() {
+        let json = r#"{
+            "id": "msg_red",
+            "model": "claude-opus-4-8",
+            "content": [{"type": "redacted_thinking", "data": "enc_zzz"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }"#;
+        let llm = serde_json::from_str::<AnthropicResponse>(json)
+            .unwrap()
+            .into_llm_response();
+        match &llm.content[0] {
+            ContentBlock::Reasoning { text, raw, .. } => {
+                assert_eq!(*text, None);
+                assert_eq!(
+                    *raw,
+                    serde_json::json!({"type": "redacted_thinking", "data": "enc_zzz"})
+                );
+            }
+            other => panic!("expected Reasoning block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_streaming_thinking_block_with_empty_text_is_captured() {
+        // display:"omitted" — text is None but raw keeps the empty string so
+        // the block still echoes back unchanged.
+        let json = r#"{
+            "id": "msg_empty",
+            "model": "claude-opus-4-8",
+            "content": [{"type": "thinking", "thinking": "", "signature": "sig_e"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }"#;
+        let llm = serde_json::from_str::<AnthropicResponse>(json)
+            .unwrap()
+            .into_llm_response();
+        assert_eq!(llm.content.len(), 1, "empty-text block must not be dropped");
+        match &llm.content[0] {
+            ContentBlock::Reasoning { text, raw, .. } => {
+                assert_eq!(*text, None);
+                assert_eq!(raw["thinking"], "");
+                assert_eq!(raw["signature"], "sig_e");
+            }
+            other => panic!("expected Reasoning block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_streaming_unknown_block_type_is_dropped_not_fatal() {
+        let json = r#"{
+            "id": "msg_unk",
+            "model": "claude-opus-4-8",
+            "content": [
+                {"type": "some_future_block", "payload": 1},
+                {"type": "text", "text": "still here"}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }"#;
+        let llm = serde_json::from_str::<AnthropicResponse>(json)
+            .expect("unknown block must not fail the turn")
+            .into_llm_response();
+        assert_eq!(llm.content.len(), 1);
+        assert_eq!(llm.text(), Some("still here"));
     }
 }

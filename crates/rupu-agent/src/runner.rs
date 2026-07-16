@@ -157,6 +157,10 @@ pub(crate) fn estimate_tokens(messages: &[Message]) -> usize {
                 (name.len() + input_str.len()) / 4
             }
             ContentBlock::ToolResult { content, .. } => content.len() / 4,
+            // raw is what goes on the wire (thinking text + signature); text is
+            // only a display summary and is None when display is "omitted".
+            ContentBlock::Reasoning { raw, .. } => raw.to_string().len() / 4,
+            ContentBlock::Unknown => 0,
         })
         .sum()
 }
@@ -173,6 +177,10 @@ fn message_chars(m: &Message) -> usize {
                 name.len() + input_str.len()
             }
             ContentBlock::ToolResult { content, .. } => content.len(),
+            // raw is what goes on the wire (thinking text + signature); text is
+            // only a display summary and is None when display is "omitted".
+            ContentBlock::Reasoning { raw, .. } => raw.to_string().len(),
+            ContentBlock::Unknown => 0,
         })
         .sum()
 }
@@ -325,7 +333,17 @@ self-contained.";
         tools: vec![],
         cell_id: None,
         trace_id: None,
-        thinking: None,
+        // The history carried in this request (messages[..recent_start]) may
+        // contain `ContentBlock::Reasoning` blocks echoed back onto the wire
+        // as `thinking` blocks (see `restore_reasoning_blocks` in
+        // rupu-providers/src/anthropic.rs). Anthropic requires a `thinking`
+        // config to be present whenever thinking blocks appear in assistant
+        // history, or the request 400s. Setting `Auto` here matches the
+        // thinking configuration of the surrounding turns whose history this
+        // request carries, and keeps the api-key auth path consistent with
+        // OAuth, which already injects adaptive thinking on requests like
+        // this one (see `build_request_body` in anthropic.rs).
+        thinking: Some(rupu_providers::model_tier::ThinkingLevel::Auto),
         context_window: None,
         task_type: None,
         output_format: None,
@@ -931,6 +949,8 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                             }
                             StreamEvent::UsageSnapshot(_) => {}
                             StreamEvent::ToolUseStart { .. } | StreamEvent::InputJsonDelta(_) => {}
+                            // Plan 2: no live reasoning stream-to-stdout wiring yet.
+                            StreamEvent::ReasoningDelta(_) => {}
                         }
                     };
                     // Race the stream against the pause token. On pause the
@@ -1077,12 +1097,15 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             // Emit any text content as assistant_message events; collect
             // tool_use blocks for dispatch.
             let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
+            // Reasoning precedes text in an assistant turn, so compute it up
+            // front and attach it to the turn's first assistant message.
+            let mut turn_thinking = resp.reasoning_text();
             for block in &resp.content {
                 match block {
                     ContentBlock::Text { text } => {
                         writer.write(&Event::AssistantMessage {
                             content: text.clone(),
-                            thinking: None,
+                            thinking: turn_thinking.take(),
                         })?;
                     }
                     ContentBlock::ToolUse { id, name, input } => {
@@ -1098,7 +1121,22 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                         // those originate from the runtime feeding tool
                         // outputs back. Ignore if seen.
                     }
+                    ContentBlock::Reasoning { .. } => {
+                        // Readable text is consumed via `turn_thinking` above,
+                        // which rides on the turn's first assistant message.
+                    }
+                    ContentBlock::Unknown => {}
                 }
+            }
+
+            // A tool-only turn has no Text block to hang the reasoning on, but
+            // the reasoning is still worth recording — that is the turn where
+            // the model decided which tool to call.
+            if let Some(thinking) = turn_thinking.take() {
+                writer.write(&Event::AssistantMessage {
+                    content: String::new(),
+                    thinking: Some(thinking),
+                })?;
             }
 
             // Dispatch tool calls in order.
@@ -1878,6 +1916,13 @@ pub enum ScriptedTurn {
         tool_input: serde_json::Value,
         stop: StopReason,
     },
+    /// Replay an arbitrary block sequence verbatim. Use when a turn's exact
+    /// block shape matters — e.g. `Reasoning` before `Text`, or several `Text`
+    /// blocks in one turn — which the higher-level variants can't express.
+    AssistantBlocks {
+        content: Vec<ContentBlock>,
+        stop: StopReason,
+    },
     ProviderError(String),
 }
 
@@ -1927,6 +1972,17 @@ impl LlmProvider for MockProvider {
                 usage: Usage {
                     input_tokens,
                     output_tokens,
+                    ..Default::default()
+                },
+            }),
+            ScriptedTurn::AssistantBlocks { content, stop } => Ok(LlmResponse {
+                id: "mock".to_string(),
+                model: "mock-1".to_string(),
+                content,
+                stop_reason: Some(stop),
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
                     ..Default::default()
                 },
             }),
@@ -2439,6 +2495,45 @@ mod compaction_tests {
     }
 
     #[tokio::test]
+    async fn compact_messages_sets_thinking_on_summary_request() {
+        // The compaction summary request carries history that may contain
+        // `ContentBlock::Reasoning` blocks, which get echoed back onto the
+        // wire as `thinking` blocks by the Anthropic provider. Anthropic
+        // requires a `thinking` config whenever thinking blocks appear in
+        // assistant history, or the request 400s (this used to be `None`,
+        // which was fine only on the OAuth path, where the provider injects
+        // adaptive thinking regardless of the request's `thinking` field).
+        let dense_chunk = "x".repeat(1000);
+        let mut msgs = vec![text_msg(Role::User, &format!("task: {dense_chunk}"))];
+        for i in 0..5 {
+            msgs.push(text_msg(
+                Role::Assistant,
+                &format!("assistant {i}: {dense_chunk}"),
+            ));
+            msgs.push(text_msg(Role::User, &format!("user {i}: {dense_chunk}")));
+        }
+
+        let mut provider = CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "Summary of prior work.".to_string(),
+            stop: StopReason::EndTurn,
+            input_tokens: 500,
+            output_tokens: 10,
+        }]);
+
+        let result = compact_messages(&msgs, &mut provider, "mock-1", 1000, Some(80), 900).await;
+        result.expect("no provider error").expect("should compact");
+
+        let captured = provider.captured_requests();
+        assert_eq!(captured.len(), 1, "expected exactly one summary request");
+        assert_eq!(
+            captured[0].thinking,
+            Some(rupu_providers::model_tier::ThinkingLevel::Auto),
+            "compaction summary request must set thinking so echoed reasoning \
+             blocks in its history don't 400 on the api-key auth path"
+        );
+    }
+
+    #[tokio::test]
     async fn compact_messages_returns_none_for_tiny_history() {
         let msgs = vec![
             text_msg(Role::User, "task"),
@@ -2840,5 +2935,225 @@ mod pause_tests {
         assert_eq!(result.status, RunStatus::Ok);
         assert!(!result.paused, "a None pause token never pauses");
         assert_eq!(result.turns, 1);
+    }
+}
+
+#[cfg(test)]
+mod reasoning_tests {
+    use super::*;
+
+    fn reasoning(text: &str) -> ContentBlock {
+        ContentBlock::Reasoning {
+            text: Some(text.to_string()),
+            provider: "anthropic".into(),
+            model: "mock-1".into(),
+            raw: serde_json::json!({ "type": "thinking", "thinking": text }),
+        }
+    }
+
+    fn opts_for(
+        provider: Box<dyn LlmProvider>,
+        workspace: &std::path::Path,
+        transcript_path: PathBuf,
+    ) -> AgentRunOpts {
+        AgentRunOpts {
+            agent_name: "test-agent".into(),
+            agent_system_prompt: "test".into(),
+            agent_tools: None,
+            provider,
+            provider_name: "mock".into(),
+            model: "mock-1".into(),
+            run_id: "run_reasoning_test".into(),
+            workspace_id: "ws_test".into(),
+            workspace_path: workspace.to_path_buf(),
+            transcript_path,
+            max_turns: 5,
+            decider: Arc::new(BypassDecider),
+            tool_context: rupu_tools::ToolContext {
+                workspace_path: workspace.to_path_buf(),
+                ..Default::default()
+            },
+            user_message: "test prompt".into(),
+            initial_messages: Vec::new(),
+            turn_index_offset: 0,
+            mode_str: "bypass".into(),
+            no_stream: true,
+            suppress_stream_stdout: true,
+            mcp_registry: None,
+            effort: None,
+            context_window: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
+            step_id: "s1".into(),
+            on_tool_call: None,
+            on_stream_event: None,
+            concerns: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            scope_name: None,
+            surface_tag: None,
+            context_window_tokens: None,
+            compact_at_percent: None,
+            pause: None,
+        }
+    }
+
+    /// Every `AssistantMessage` the real run wrote, in transcript order, as
+    /// `(content, thinking)`. Reads the on-disk JSONL `run_agent` produced —
+    /// no re-derivation of production logic.
+    fn assistant_messages(path: &std::path::Path) -> Vec<(String, Option<String>)> {
+        let body = std::fs::read_to_string(path).expect("read transcript");
+        body.lines()
+            .filter_map(|l| serde_json::from_str::<Event>(l).ok())
+            .filter_map(|e| match e {
+                Event::AssistantMessage { content, thinking } => Some((content, thinking)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn assistant_message_carries_reasoning_text() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp.path().join("run.jsonl");
+
+        let provider = MockProvider::new(vec![ScriptedTurn::AssistantBlocks {
+            content: vec![
+                reasoning("thought"),
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
+            ],
+            stop: StopReason::EndTurn,
+        }]);
+        let opts = opts_for(Box::new(provider), tmp.path(), transcript_path.clone());
+        run_agent(opts).await.expect("run completes");
+
+        let msgs = assistant_messages(&transcript_path);
+        assert_eq!(
+            msgs.len(),
+            1,
+            "expected one assistant message, got {msgs:?}"
+        );
+        assert_eq!(msgs[0].0, "answer");
+        assert_eq!(
+            msgs[0].1.as_deref(),
+            Some("thought"),
+            "the turn's reasoning must ride on its assistant message"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_turn_still_records_thinking() {
+        // The turn that matters most: the model reasoned about which tool to
+        // call, then called it, emitting no text block at all. Without a
+        // post-loop flush that reasoning is silently dropped.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp.path().join("run.jsonl");
+
+        let provider = MockProvider::new(vec![
+            ScriptedTurn::AssistantBlocks {
+                content: vec![
+                    reasoning("planning"),
+                    ContentBlock::ToolUse {
+                        id: "call_read_1".into(),
+                        name: "read_file".into(),
+                        input: serde_json::json!({
+                            "path": tmp.path().to_str().unwrap_or("/tmp")
+                        }),
+                    },
+                ],
+                stop: StopReason::ToolUse,
+            },
+            ScriptedTurn::AssistantText {
+                text: "done".into(),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]);
+        let opts = opts_for(Box::new(provider), tmp.path(), transcript_path.clone());
+        run_agent(opts).await.expect("run completes");
+
+        let msgs = assistant_messages(&transcript_path);
+        assert_eq!(
+            msgs.len(),
+            2,
+            "the tool-only turn must still write an assistant message, got {msgs:?}"
+        );
+        assert_eq!(msgs[0].0, "", "a tool-only turn carries no text");
+        assert_eq!(
+            msgs[0].1.as_deref(),
+            Some("planning"),
+            "reasoning must survive a turn with no text block"
+        );
+        assert_eq!(msgs[1].0, "done");
+        assert_eq!(msgs[1].1, None, "the final turn had no reasoning");
+    }
+
+    #[tokio::test]
+    async fn assistant_message_thinking_is_none_without_reasoning() {
+        // Backward compatibility: a response with no reasoning behaves exactly
+        // as it does today.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp.path().join("run.jsonl");
+
+        let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "plain answer".into(),
+            stop: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }]);
+        let opts = opts_for(Box::new(provider), tmp.path(), transcript_path.clone());
+        run_agent(opts).await.expect("run completes");
+
+        let msgs = assistant_messages(&transcript_path);
+        assert_eq!(
+            msgs.len(),
+            1,
+            "expected one assistant message, got {msgs:?}"
+        );
+        assert_eq!(msgs[0].0, "plain answer");
+        assert_eq!(msgs[0].1, None, "no reasoning → no thinking field");
+    }
+
+    #[tokio::test]
+    async fn thinking_attaches_once_across_multiple_text_blocks() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp.path().join("run.jsonl");
+
+        let provider = MockProvider::new(vec![ScriptedTurn::AssistantBlocks {
+            content: vec![
+                reasoning("thought"),
+                ContentBlock::Text { text: "a".into() },
+                ContentBlock::Text { text: "b".into() },
+            ],
+            stop: StopReason::EndTurn,
+        }]);
+        let opts = opts_for(Box::new(provider), tmp.path(), transcript_path.clone());
+        run_agent(opts).await.expect("run completes");
+
+        let msgs = assistant_messages(&transcript_path);
+        assert_eq!(
+            msgs.len(),
+            2,
+            "expected two assistant messages, got {msgs:?}"
+        );
+        assert_eq!(msgs[0].0, "a");
+        assert_eq!(
+            msgs[0].1.as_deref(),
+            Some("thought"),
+            "the turn's first text block takes the reasoning"
+        );
+        assert_eq!(msgs[1].0, "b");
+        assert_eq!(
+            msgs[1].1, None,
+            "reasoning must not be duplicated per block"
+        );
     }
 }

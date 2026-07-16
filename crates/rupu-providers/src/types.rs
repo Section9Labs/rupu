@@ -29,6 +29,35 @@ pub enum ContentBlock {
         #[serde(default)]
         is_error: bool,
     },
+
+    /// Model reasoning/thinking, provider-agnostic.
+    ///
+    /// `raw` is the producing provider's original block, echoed back to that
+    /// provider **byte-exact** on the next turn. It is never parsed, edited, or
+    /// reconstructed — the API rejects modified blocks. `text` is the readable
+    /// summary for the transcript/UI only.
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        /// Canonical provider tag. Gates the echo: a provider emits `raw` iff
+        /// this matches its own tag. Deliberately NOT gated on `model` —
+        /// thinking blocks replay across models fine, and stripping them is
+        /// what triggers ordering/signature 400s.
+        provider: String,
+        /// Informational only (transcript/debugging). Never an echo gate.
+        model: String,
+        raw: serde_json::Value,
+    },
+
+    /// Forward-compatibility catch-all: an unrecognized block type lands here
+    /// instead of failing the whole turn's deserialization.
+    ///
+    /// This variant is never valid on any provider's wire — it serializes as
+    /// `{"type":"Unknown"}`, which no provider accepts. Each provider's
+    /// request builder must drop `Unknown` blocks before sending a request.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A conversation message.
@@ -214,6 +243,26 @@ impl LlmResponse {
             .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
             .collect()
     }
+
+    /// Concatenated readable reasoning for this turn, if any.
+    ///
+    /// Blocks with no readable text (redacted, or `display: "omitted"`) are
+    /// skipped here but still round-trip via their `raw` payload.
+    pub fn reasoning_text(&self) -> Option<String> {
+        let parts: Vec<&str> = self
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Reasoning { text: Some(t), .. } if !t.is_empty() => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n\n"))
+        }
+    }
 }
 
 /// Events emitted during streaming via the callback.
@@ -228,6 +277,8 @@ pub enum StreamEvent {
     ToolUseStart { id: String, name: String },
     /// A chunk of tool input JSON.
     InputJsonDelta(String),
+    /// A chunk of reasoning/thinking text.
+    ReasoningDelta(String),
 }
 
 #[cfg(test)]
@@ -467,5 +518,115 @@ mod tests {
         let json_err = serde_json::from_str::<i32>("not-a-number").unwrap_err();
         let e = ProviderError::from(json_err);
         assert!(matches!(e, ProviderError::Json(_)));
+    }
+
+    fn test_response(content: Vec<ContentBlock>) -> LlmResponse {
+        LlmResponse {
+            id: "msg_1".into(),
+            model: "m".into(),
+            content,
+            stop_reason: None,
+            usage: Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_tokens: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn reasoning_block_serde_round_trip() {
+        let block = ContentBlock::Reasoning {
+            text: Some("weighing options".into()),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            raw: serde_json::json!({"type": "thinking", "thinking": "weighing options", "signature": "abc123"}),
+        };
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "reasoning");
+        let back: ContentBlock = serde_json::from_value(json).unwrap();
+        assert_eq!(back, block);
+    }
+
+    #[test]
+    fn reasoning_block_round_trips_with_empty_text() {
+        // display:"omitted" returns thinking blocks whose text is empty; they must
+        // survive the round trip so they can be echoed back unchanged.
+        let block = ContentBlock::Reasoning {
+            text: None,
+            provider: "anthropic".into(),
+            model: "claude-opus-4-8".into(),
+            raw: serde_json::json!({"type": "thinking", "thinking": "", "signature": "sig"}),
+        };
+        let back: ContentBlock =
+            serde_json::from_value(serde_json::to_value(&block).unwrap()).unwrap();
+        assert_eq!(back, block);
+    }
+
+    #[test]
+    fn unknown_block_type_deserializes_instead_of_erroring() {
+        // Regression guard: a strict tagged enum used to fail the whole turn.
+        let json = serde_json::json!({"type": "some_future_block", "payload": 1});
+        let block: ContentBlock =
+            serde_json::from_value(json).expect("unknown block must not error");
+        assert_eq!(block, ContentBlock::Unknown);
+    }
+
+    #[test]
+    fn unknown_block_serializes_with_literal_unknown_tag() {
+        // Pins the wire contract: ContentBlock::Unknown is NOT deserialize-only,
+        // it round-trips to `{"type":"Unknown"}`. A later task's request builder
+        // relies on this exact literal tag to identify and drop Unknown blocks
+        // before they reach a provider (no provider accepts this tag).
+        let json = serde_json::to_value(&ContentBlock::Unknown).unwrap();
+        assert_eq!(json["type"], "Unknown");
+    }
+
+    #[test]
+    fn reasoning_does_not_leak_into_text_or_tool_calls() {
+        let resp = test_response(vec![
+            ContentBlock::Reasoning {
+                text: Some("hmm".into()),
+                provider: "anthropic".into(),
+                model: "m".into(),
+                raw: serde_json::json!({}),
+            },
+            ContentBlock::Text {
+                text: "answer".into(),
+            },
+        ]);
+        assert_eq!(resp.text(), Some("answer"));
+        assert!(resp.tool_calls().is_empty());
+    }
+
+    #[test]
+    fn reasoning_text_concatenates_blocks_and_skips_textless() {
+        let resp = test_response(vec![
+            ContentBlock::Reasoning {
+                text: Some("first".into()),
+                provider: "anthropic".into(),
+                model: "m".into(),
+                raw: serde_json::json!({}),
+            },
+            ContentBlock::Reasoning {
+                text: None, // redacted: opaque, nothing readable
+                provider: "anthropic".into(),
+                model: "m".into(),
+                raw: serde_json::json!({}),
+            },
+            ContentBlock::Reasoning {
+                text: Some("second".into()),
+                provider: "anthropic".into(),
+                model: "m".into(),
+                raw: serde_json::json!({}),
+            },
+        ]);
+        assert_eq!(resp.reasoning_text().as_deref(), Some("first\n\nsecond"));
+    }
+
+    #[test]
+    fn reasoning_text_is_none_without_reasoning_blocks() {
+        let resp = test_response(vec![ContentBlock::Text { text: "hi".into() }]);
+        assert_eq!(resp.reasoning_text(), None);
     }
 }
