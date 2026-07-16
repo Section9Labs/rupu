@@ -29,7 +29,7 @@ pub struct PermissionGate {
     mode: PermissionMode,
 }
 
-const KNOWN_READ_TOOLS: &[&str] = &["read_file", "grep", "glob"];
+const KNOWN_READ_TOOLS: &[&str] = &["read_file", "grep", "glob", "ast_grep"];
 const KNOWN_WRITE_TOOLS: &[&str] = &["bash", "write_file", "edit_file"];
 
 impl PermissionGate {

@@ -27,6 +27,8 @@ pub mod write_file;
 pub mod edit_file;
 // implemented in Task 22 (ripgrep delegate)
 pub mod grep;
+// structural (tree-sitter) search — delegates to the `ast-grep` binary.
+pub mod ast_grep;
 // implemented in Task 23 (recursive pattern matching)
 pub mod glob;
 // implemented in Task 24 (subprocess execution with timeout + env allowlist)
@@ -36,6 +38,7 @@ pub mod dispatch_agent;
 // sub-agent dispatch (spec 2026-05-08): fan-out parallel.
 pub mod dispatch_agents_parallel;
 
+pub use ast_grep::AstGrepTool;
 pub use bash::BashTool;
 pub use dispatch_agent::DispatchAgentTool;
 pub use dispatch_agents_parallel::DispatchAgentsParallelTool;

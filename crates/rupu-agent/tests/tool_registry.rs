@@ -29,6 +29,7 @@ fn known_tools_returns_sorted_list() {
     assert_eq!(
         names,
         vec![
+            "ast_grep",
             "bash",
             "dispatch_agent",
             "dispatch_agents_parallel",
@@ -54,12 +55,13 @@ fn registry_respects_agent_tools_filter() {
 fn to_tool_definitions_returns_all_default_tools() {
     let r = default_tool_registry();
     let defs = r.to_tool_definitions();
-    assert_eq!(defs.len(), 8);
+    assert_eq!(defs.len(), 9);
     let mut names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
     names.sort();
     assert_eq!(
         names,
         vec![
+            "ast_grep",
             "bash",
             "dispatch_agent",
             "dispatch_agents_parallel",
@@ -107,4 +109,10 @@ fn filtered_registry_tool_definitions_match_filter() {
     let mut names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
     names.sort();
     assert_eq!(names, vec!["bash", "read_file"]);
+}
+
+#[test]
+fn default_registry_contains_ast_grep() {
+    let r = default_tool_registry();
+    assert!(r.get("ast_grep").is_some());
 }
