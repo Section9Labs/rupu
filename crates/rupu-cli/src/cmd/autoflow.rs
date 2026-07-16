@@ -5848,6 +5848,7 @@ mod serve_heartbeat_tests {
                 output: "{\"status\":\"ok\",\"items\":[1,2]}".into(),
                 error: None,
                 duration_ms: 7,
+                structured: None,
             },
             LiveViewMode::Full,
         );
@@ -5877,6 +5878,7 @@ mod serve_heartbeat_tests {
                 output: "line1\nline2\nline3\nline4\nline5\nline6\n".into(),
                 error: None,
                 duration_ms: 9,
+                structured: None,
             },
             LiveViewMode::Compact,
         );

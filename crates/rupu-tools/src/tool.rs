@@ -197,6 +197,12 @@ pub struct ToolOutput {
     /// to `tool_result`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub derived: Option<DerivedEvent>,
+    /// Optional structured payload the runtime copies onto the emitted
+    /// `tool_result` event, in addition to `stdout`. Lets a tool ship
+    /// machine-rendered data (e.g. ast_grep matches + metavariables) to
+    /// the control plane without changing the text the agent reads.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub structured: Option<serde_json::Value>,
 }
 
 /// Tool-emitted side events that the transcript layer indexes

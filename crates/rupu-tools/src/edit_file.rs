@@ -97,7 +97,9 @@ impl Tool for EditFileTool {
         let byte_offset = text.find(i.old_string.as_str()).unwrap_or(0);
         let start_line = (text[..byte_offset].lines().count() as u32) + 1;
         let old_line_count = i.old_string.lines().count() as u32;
-        let end_line = (start_line + old_line_count).saturating_sub(1).max(start_line);
+        let end_line = (start_line + old_line_count)
+            .saturating_sub(1)
+            .max(start_line);
         let lines_changed = i.new_string.lines().count() as u32;
 
         let new_text = text.replacen(&i.old_string, &i.new_string, 1);
@@ -127,6 +129,7 @@ impl Tool for EditFileTool {
                 kind: "modify".into(),
                 diff: render_file_edit_diff(&i.path, Some(&text), Some(&new_text)),
             }),
+            structured: None,
         })
     }
 }
@@ -137,5 +140,6 @@ fn err_output(started: Instant, msg: String) -> ToolOutput {
         error: Some(msg),
         duration_ms: started.elapsed().as_millis() as u64,
         derived: None,
+        structured: None,
     }
 }

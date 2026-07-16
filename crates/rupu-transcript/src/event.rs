@@ -41,6 +41,11 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         error: Option<String>,
         duration_ms: u64,
+        /// Optional structured payload emitted alongside the human/LLM-facing
+        /// `output` string (e.g. ast_grep match + metavariable data). Additive
+        /// and backward compatible — absent on legacy transcripts.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        structured: Option<Value>,
     },
     FileEdit {
         path: String,
@@ -119,4 +124,54 @@ pub enum FileEditKind {
     Create,
     Modify,
     Delete,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_result_structured_roundtrips_and_is_omitted_when_none() {
+        // Present:
+        let e = Event::ToolResult {
+            call_id: "c1".into(),
+            output: "ok".into(),
+            error: None,
+            duration_ms: 5,
+            structured: Some(serde_json::json!({"tool":"ast_grep","matchCount":2})),
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("\"structured\""));
+        let back: Event = serde_json::from_str(&s).unwrap();
+        match back {
+            Event::ToolResult {
+                structured: Some(v),
+                ..
+            } => {
+                assert_eq!(v["matchCount"], 2);
+            }
+            _ => panic!("expected ToolResult with structured=Some"),
+        }
+
+        // Absent -> omitted from JSON, and old JSON without the field still parses.
+        let e2 = Event::ToolResult {
+            call_id: "c2".into(),
+            output: "ok".into(),
+            error: None,
+            duration_ms: 1,
+            structured: None,
+        };
+        let s2 = serde_json::to_string(&e2).unwrap();
+        assert!(!s2.contains("structured"));
+        let legacy =
+            r#"{"type":"tool_result","data":{"call_id":"c3","output":"x","duration_ms":0}}"#;
+        let parsed: Event = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(
+            parsed,
+            Event::ToolResult {
+                structured: None,
+                ..
+            }
+        ));
+    }
 }

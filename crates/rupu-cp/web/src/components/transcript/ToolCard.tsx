@@ -11,6 +11,9 @@
  *   • `glob`     → header + mono path list
  *   • `subrun`   → header + sub-run callout
  *   • `coverage` → header + StructuredView of parsed output / input
+ *   • `ast_grep` → header + AstGrepBody (group-by-file, metavar highlight +
+ *                  bindings table from `structured`, else a text-parse
+ *                  fallback via `parseAstGrepText`)
  *   • `generic`  → header + StructuredView (JSON) or pre (plain) + input args
  *
  * Error state: when `tool.error` is set a red-tinted block is shown instead
@@ -22,6 +25,9 @@
  * No `any`. Static Tailwind class strings only.
  */
 
+import { useState } from 'react';
+import type { ReactNode } from 'react';
+import { ChevronRight, ChevronDown } from 'lucide-react';
 import type { ToolView, FindingView } from './transcriptView';
 import FindingCard from './FindingCard';
 import DiffView from './DiffView';
@@ -84,6 +90,13 @@ export function summarizeInput(tool: ToolView): string {
         return path;
       }
 
+      case 'ast_grep': {
+        const pattern = typeof rec.pattern === 'string' ? rec.pattern : '';
+        const lang    = typeof rec.lang    === 'string' ? rec.lang    : '';
+        if (pattern && lang) return `${pattern} · ${lang}`;
+        return pattern || lang;
+      }
+
       default: {
         // For generic/coverage/subrun/finding: try a single meaningful string
         // key in priority order.
@@ -129,6 +142,134 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 /** True when the value is a non-trivial object (has at least one key). */
 function isNonTrivialObject(v: unknown): v is Record<string, unknown> {
   return isRecord(v) && Object.keys(v as Record<string, unknown>).length > 0;
+}
+
+// ---------------------------------------------------------------------------
+// ast_grep — structured payload types + defensive parser
+// ---------------------------------------------------------------------------
+
+interface AstGrepRange {
+  startLine: number;
+  startCol: number;
+  endLine: number;
+  endCol: number;
+}
+
+/** A single metavar binding: the bound text, plus a char-offset span into the
+ * match's `text` field (0-based, Unicode-scalar) when computable. */
+interface AstGrepBinding {
+  text: string;
+  textOffset?: { start: number; end: number };
+}
+
+interface AstGrepMatch {
+  file: string;
+  range?: AstGrepRange;
+  text?: string;
+  metaVars?: {
+    single?: Record<string, AstGrepBinding>;
+    multi?: Record<string, AstGrepBinding[]>;
+  };
+}
+
+interface AstGrepStructured {
+  pattern?: string;
+  lang?: string;
+  matchCount: number;
+  fileCount: number;
+  truncated: boolean;
+  matches: AstGrepMatch[];
+}
+
+/** Parse a single metavar binding `{ text, textOffset?: { start, end } }`. */
+function asAstGrepBinding(v: unknown): AstGrepBinding | null {
+  if (!isRecord(v) || typeof v.text !== 'string') return null;
+  const binding: AstGrepBinding = { text: v.text };
+  if (isRecord(v.textOffset) && typeof v.textOffset.start === 'number' && typeof v.textOffset.end === 'number') {
+    binding.textOffset = { start: v.textOffset.start, end: v.textOffset.end };
+  }
+  return binding;
+}
+
+/** Parse one match: `{ file, range?, text?, metaVars?: { single?, multi? } }`. */
+function asAstGrepMatch(v: unknown): AstGrepMatch | null {
+  if (!isRecord(v) || typeof v.file !== 'string') return null;
+  const match: AstGrepMatch = { file: v.file };
+  if (typeof v.text === 'string') match.text = v.text;
+
+  if (isRecord(v.range)) {
+    const r = v.range;
+    if (
+      typeof r.startLine === 'number' &&
+      typeof r.startCol === 'number' &&
+      typeof r.endLine === 'number' &&
+      typeof r.endCol === 'number'
+    ) {
+      match.range = { startLine: r.startLine, startCol: r.startCol, endLine: r.endLine, endCol: r.endCol };
+    }
+  }
+
+  if (isRecord(v.metaVars)) {
+    const single: Record<string, AstGrepBinding> = {};
+    if (isRecord(v.metaVars.single)) {
+      for (const [name, b] of Object.entries(v.metaVars.single)) {
+        const parsed = asAstGrepBinding(b);
+        if (parsed) single[name] = parsed;
+      }
+    }
+    const multi: Record<string, AstGrepBinding[]> = {};
+    if (isRecord(v.metaVars.multi)) {
+      for (const [name, arr] of Object.entries(v.metaVars.multi)) {
+        if (Array.isArray(arr)) {
+          const bindings = arr
+            .map(asAstGrepBinding)
+            .filter((b): b is AstGrepBinding => b !== null);
+          multi[name] = bindings;
+        }
+      }
+    }
+    match.metaVars = { single, multi };
+  }
+
+  return match;
+}
+
+/** Parse `tool.structured` into an `AstGrepStructured`, or null when the
+ * shape doesn't match (falls back to the text parser in that case). */
+function asAstGrepStructured(v: unknown): AstGrepStructured | null {
+  if (!isRecord(v) || !Array.isArray(v.matches)) return null;
+  const matches = v.matches
+    .map(asAstGrepMatch)
+    .filter((m): m is AstGrepMatch => m !== null);
+  return {
+    pattern: typeof v.pattern === 'string' ? v.pattern : undefined,
+    lang: typeof v.lang === 'string' ? v.lang : undefined,
+    matchCount: typeof v.matchCount === 'number' ? v.matchCount : matches.length,
+    fileCount:
+      typeof v.fileCount === 'number' ? v.fileCount : new Set(matches.map((m) => m.file)).size,
+    truncated: v.truncated === true,
+    matches,
+  };
+}
+
+/**
+ * Fallback parser for the compact `ast_grep` text output, used when
+ * `tool.structured` is absent (e.g. older runs). Parses `path:line:col: text`
+ * lines into per-file groups. Pure and exported for unit testing.
+ */
+export function parseAstGrepText(
+  output: string,
+): { file: string; matches: { line: number; col: number; text: string }[] }[] {
+  const byFile = new Map<string, { line: number; col: number; text: string }[]>();
+  for (const raw of output.split('\n')) {
+    if (!raw.trim()) continue;
+    const m = raw.match(/^(.*?):(\d+):(\d+): (.*)$/);
+    if (!m) continue;
+    const [, file, line, col, text] = m;
+    if (!byFile.has(file)) byFile.set(file, []);
+    byFile.get(file)!.push({ line: Number(line), col: Number(col), text });
+  }
+  return [...byFile.entries()].map(([file, matches]) => ({ file, matches }));
 }
 
 // ---------------------------------------------------------------------------
@@ -368,6 +509,217 @@ function GenericBody({ tool }: { tool: ToolView }) {
   );
 }
 
+/** Collapsible per-file group — chevron + file path + match-count badge,
+ * mirroring the disclosure pattern in `Turn.tsx`. Defaults open since the
+ * matches are the point of an ast_grep call. */
+function FileGroup({
+  file,
+  count,
+  children,
+}: {
+  file: string;
+  count: number;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(true);
+  return (
+    <div className="mb-1 rounded border border-border overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1.5 px-2 py-1 text-left bg-surface"
+      >
+        {open ? (
+          <ChevronDown size={11} className="shrink-0 text-ink-mute" />
+        ) : (
+          <ChevronRight size={11} className="shrink-0 text-ink-mute" />
+        )}
+        <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-ink">{file}</span>
+        <span className="shrink-0 text-meta text-ink-mute">
+          {count} match{count === 1 ? '' : 'es'}
+        </span>
+      </button>
+      {open && <div className="space-y-1 px-2 py-1">{children}</div>}
+    </div>
+  );
+}
+
+/** Collect [start,end,name] spans from single + multi metavar bindings,
+ * sorted by start offset (ready for sequential slicing). */
+function collectMetaVarSpans(
+  single: Record<string, AstGrepBinding> | undefined,
+  multi: Record<string, AstGrepBinding[]> | undefined,
+): { start: number; end: number; name: string }[] {
+  const spans: { start: number; end: number; name: string }[] = [];
+  for (const [name, b] of Object.entries(single ?? {})) {
+    if (b.textOffset) spans.push({ start: b.textOffset.start, end: b.textOffset.end, name });
+  }
+  for (const [name, arr] of Object.entries(multi ?? {})) {
+    for (const b of arr) {
+      if (b.textOffset) spans.push({ start: b.textOffset.start, end: b.textOffset.end, name });
+    }
+  }
+  return spans.sort((a, z) => a.start - z.start);
+}
+
+/** Renders a match's snippet with metavar bindings highlighted inline.
+ * Slices with `Array.from(text)` (a codepoint array) so indices align with
+ * the Rust side's char (Unicode-scalar) offsets rather than UTF-16 units. */
+function HighlightedMatch({
+  text,
+  single,
+  multi,
+}: {
+  text: string;
+  single?: Record<string, AstGrepBinding>;
+  multi?: Record<string, AstGrepBinding[]>;
+}) {
+  const chars = Array.from(text);
+  const spans = collectMetaVarSpans(single, multi);
+  const out: ReactNode[] = [];
+  let cursor = 0;
+  spans.forEach((s, i) => {
+    // Skip overlapping or out-of-range spans rather than corrupting the render.
+    if (s.start < cursor || s.end < s.start || s.end > chars.length) return;
+    if (s.start > cursor) out.push(<span key={`t${i}`}>{chars.slice(cursor, s.start).join('')}</span>);
+    out.push(
+      <span
+        key={`m${i}`}
+        className="rounded bg-warn-bg text-warn px-0.5"
+        title={`$${s.name}`}
+      >
+        {chars.slice(s.start, s.end).join('')}
+      </span>,
+    );
+    cursor = s.end;
+  });
+  if (cursor < chars.length) out.push(<span key="tail">{chars.slice(cursor).join('')}</span>);
+  return <code className="whitespace-pre-wrap">{out}</code>;
+}
+
+/** `$name = text` bindings table — single vars first, then multi (one row
+ * per captured element, indexed). Renders nothing when both maps are empty. */
+function MetaVarTable({
+  single,
+  multi,
+}: {
+  single?: Record<string, AstGrepBinding>;
+  multi?: Record<string, AstGrepBinding[]>;
+}) {
+  const singleEntries = Object.entries(single ?? {});
+  const multiEntries = Object.entries(multi ?? {});
+  if (singleEntries.length === 0 && multiEntries.length === 0) return null;
+  return (
+    <table className="mt-1 font-mono text-[10.5px] leading-snug">
+      <tbody>
+        {singleEntries.map(([name, b]) => (
+          <tr key={name}>
+            <td className="pr-2 align-top text-brand-700">${name}</td>
+            <td className="align-top text-ink-dim">{b.text}</td>
+          </tr>
+        ))}
+        {multiEntries.map(([name, arr]) =>
+          arr.map((b, i) => (
+            <tr key={`${name}-${i}`}>
+              <td className="pr-2 align-top text-brand-700">
+                ${name}[{i}]
+              </td>
+              <td className="align-top text-ink-dim">{b.text}</td>
+            </tr>
+          )),
+        )}
+      </tbody>
+    </table>
+  );
+}
+
+/** ast_grep — structured render (group-by-file, count badge, metavar
+ * highlight + bindings table) when `tool.structured` is present, else a
+ * text-parse fallback via `parseAstGrepText`. Never a raw blob. */
+function AstGrepBody({ tool }: { tool: ToolView }) {
+  if (tool.error) return null;
+
+  const structured = asAstGrepStructured(tool.structured);
+
+  if (structured) {
+    const byFile = new Map<string, AstGrepMatch[]>();
+    for (const m of structured.matches) {
+      const list = byFile.get(m.file) ?? [];
+      list.push(m);
+      byFile.set(m.file, list);
+    }
+    return (
+      <div className="px-3 py-2">
+        <div className="mb-1.5 flex flex-wrap items-center gap-1.5 text-meta text-ink-mute">
+          <span>
+            {structured.matchCount} match{structured.matchCount === 1 ? '' : 'es'} in{' '}
+            {structured.fileCount} file{structured.fileCount === 1 ? '' : 's'}
+          </span>
+          {structured.pattern && (
+            <Badge tone="neutral" className="font-mono">
+              {structured.pattern}
+            </Badge>
+          )}
+          {structured.lang && (
+            <Badge tone="neutral" className="font-mono">
+              {structured.lang}
+            </Badge>
+          )}
+          {structured.truncated && (
+            <Badge tone="amber">
+              showing first {structured.matches.length} of {structured.matchCount}
+            </Badge>
+          )}
+        </div>
+        {[...byFile.entries()].map(([file, ms]) => (
+          <FileGroup key={file} file={file} count={ms.length}>
+            {ms.map((m, i) => (
+              <div key={i} className="border-l-2 border-border pl-2 py-1">
+                {m.range && (
+                  <div className="text-meta text-ink-mute">
+                    {file}:{m.range.startLine}:{m.range.startCol}
+                  </div>
+                )}
+                <div className="font-mono text-[10.5px] text-ink">
+                  <HighlightedMatch
+                    text={m.text ?? ''}
+                    single={m.metaVars?.single}
+                    multi={m.metaVars?.multi}
+                  />
+                </div>
+                <MetaVarTable single={m.metaVars?.single} multi={m.metaVars?.multi} />
+              </div>
+            ))}
+          </FileGroup>
+        ))}
+      </div>
+    );
+  }
+
+  // Fallback: parse the compact `path:line:col: text` text output.
+  const groups = parseAstGrepText(tool.output ?? '');
+  const count = groups.reduce((n, g) => n + g.matches.length, 0);
+  return (
+    <div className="px-3 py-2">
+      <div className="mb-1.5 text-meta text-ink-mute">
+        {count} match{count === 1 ? '' : 'es'} in {groups.length} file{groups.length === 1 ? '' : 's'}
+      </div>
+      {groups.map((g) => (
+        <FileGroup key={g.file} file={g.file} count={g.matches.length}>
+          {g.matches.map((m, i) => (
+            <div key={i} className="whitespace-pre font-mono text-[10.5px] text-ink">
+              <span className="text-ink-mute">
+                {g.file}:{m.line}:{m.col}:{' '}
+              </span>
+              {m.text}
+            </div>
+          ))}
+        </FileGroup>
+      ))}
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Public component
 // ---------------------------------------------------------------------------
@@ -428,6 +780,7 @@ export default function ToolCard({
         <SubrunBody tool={tool} onOpenTranscript={onOpenTranscript} />
       )}
       {tool.kind === 'coverage' && <CoverageBody tool={tool} />}
+      {tool.kind === 'ast_grep' && <AstGrepBody tool={tool} />}
       {tool.kind === 'generic' && <GenericBody tool={tool} />}
 
       {/* Error block — shown when tool.error is set */}

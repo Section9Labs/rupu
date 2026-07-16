@@ -1435,6 +1435,7 @@ mod tests {
                 output: "ok".into(),
                 error: None,
                 duration_ms: 12,
+                structured: None,
             })
             .unwrap();
         writer
@@ -1454,6 +1455,7 @@ mod tests {
                 output: "ok".into(),
                 error: None,
                 duration_ms: 5,
+                structured: None,
             })
             .unwrap();
         writer
@@ -1475,6 +1477,7 @@ mod tests {
                 output: "https://github.com/Section9Labs/rupu-sandbox-gh/pull/10".into(),
                 error: None,
                 duration_ms: 20,
+                structured: None,
             })
             .unwrap();
         writer

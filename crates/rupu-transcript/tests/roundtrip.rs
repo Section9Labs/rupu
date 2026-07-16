@@ -55,12 +55,14 @@ fn roundtrip_tool_call_and_result() {
         output: "test result: ok. 12 passed".into(),
         error: None,
         duration_ms: 421,
+        structured: None,
     });
     assert_roundtrip(&Event::ToolResult {
         call_id: "call_2".into(),
         output: String::new(),
         error: Some("permission_denied".into()),
         duration_ms: 0,
+        structured: None,
     });
 }
 

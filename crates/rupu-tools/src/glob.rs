@@ -90,6 +90,7 @@ impl Tool for GlobTool {
             error: None,
             duration_ms: started.elapsed().as_millis() as u64,
             derived: None,
+            structured: None,
         })
     }
 }

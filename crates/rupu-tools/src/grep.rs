@@ -141,6 +141,7 @@ impl Tool for GrepTool {
             error,
             duration_ms: started.elapsed().as_millis() as u64,
             derived: None,
+            structured: None,
         })
     }
 }

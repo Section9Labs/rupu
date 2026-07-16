@@ -123,3 +123,68 @@ async fn malformed_pattern_surfaces_error() {
         out
     );
 }
+
+#[tokio::test]
+async fn emits_structured_payload_with_metavars() {
+    if skip_if_no_ast_grep() {
+        return;
+    }
+    let tmp = assert_fs::TempDir::new().unwrap();
+    tmp.child("s.rs")
+        .write_str("fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n")
+        .unwrap();
+    let out = AstGrepTool
+        .invoke(
+            json!({ "pattern": "fn $NAME($$$PARAMS) -> $RET { $$$ }", "lang": "rust" }),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap();
+
+    // stdout is still the compact text (unchanged LLM contract).
+    assert!(
+        out.stdout.contains("s.rs:1:1: fn add"),
+        "stdout: {}",
+        out.stdout
+    );
+
+    let s = out.structured.expect("structured payload present");
+    assert_eq!(s["tool"], "ast_grep");
+    assert_eq!(s["lang"], "rust");
+    assert_eq!(s["matchCount"], 1);
+    assert_eq!(s["fileCount"], 1);
+    assert_eq!(s["truncated"], false);
+    let m = &s["matches"][0];
+    assert_eq!(m["file"], "s.rs"); // workspace-relative
+    assert_eq!(m["range"]["startLine"], 1); // 1-based
+    assert_eq!(m["metaVars"]["single"]["NAME"]["text"], "add");
+    assert_eq!(m["metaVars"]["single"]["RET"]["text"], "i32");
+    // textOffset slices back to the binding text within the match text.
+    let text = m["text"].as_str().unwrap();
+    let chars: Vec<char> = text.chars().collect();
+    let o = &m["metaVars"]["single"]["NAME"]["textOffset"];
+    let (st, en) = (
+        o["start"].as_u64().unwrap() as usize,
+        o["end"].as_u64().unwrap() as usize,
+    );
+    assert_eq!(chars[st..en].iter().collect::<String>(), "add");
+    // multi metavar present.
+    assert!(m["metaVars"]["multi"]["PARAMS"].is_array());
+}
+
+#[tokio::test]
+async fn structured_is_none_on_error() {
+    if skip_if_no_ast_grep() {
+        return;
+    }
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let out = AstGrepTool
+        .invoke(
+            json!({ "pattern": "fn $N() { $$$ }", "lang": "rust", "path": "nope_dir" }),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap();
+    assert!(out.error.is_some());
+    assert!(out.structured.is_none());
+}

@@ -66,6 +66,7 @@ export type ToolKind =
   | 'terminal'
   | 'subrun'
   | 'coverage'
+  | 'ast_grep'
   | 'generic';
 
 export interface ToolView {
@@ -82,6 +83,8 @@ export interface ToolView {
   diff?: { path: string; editKind: string; diff: string };
   /** kind === 'terminal' (from the paired `command_run`). */
   terminal?: { command: string; cwd: string; exitCode: number };
+  /** kind === 'ast_grep' (from the paired `tool_result.data.structured`). */
+  structured?: unknown;
 }
 
 export interface TurnView {
@@ -192,6 +195,8 @@ function classify(tool: string): ToolKind {
     case 'dispatch_agent':
     case 'dispatch_agents_parallel':
       return 'subrun';
+    case 'ast_grep':
+      return 'ast_grep';
     default:
       return tool.startsWith('coverage_') ? 'coverage' : 'generic';
   }
@@ -291,6 +296,7 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
           if (error !== null) view.error = error;
           const durationMs = asNumber(data.duration_ms);
           if (durationMs !== null) view.durationMs = durationMs;
+          if (data.structured !== undefined) view.structured = data.structured;
         }
         // An unpaired result carries no tool_call to render against; ignore.
         break;

@@ -53,8 +53,7 @@ impl Tool for McpToolAdapter {
                 // Emit a FileTouchEvent for user-declared tool mappings so
                 // MCP/custom tools contribute to coverage even though they
                 // don't self-instrument like built-in tools do.
-                if let Some(event) =
-                    rupu_tools::coverage_emit::mapped_touch(ctx, self.name, &input)
+                if let Some(event) = rupu_tools::coverage_emit::mapped_touch(ctx, self.name, &input)
                 {
                     rupu_tools::coverage_emit::emit(ctx, event).await;
                 }
@@ -63,6 +62,7 @@ impl Tool for McpToolAdapter {
                     error: None,
                     duration_ms: 0,
                     derived: None,
+                    structured: None,
                 })
             }
             Err(e) => match e {

@@ -226,3 +226,29 @@ Roadmap from `docs/superpowers/specs/2026-06-18-rupu-control-plane-design.md` (P
 ## Workspace-scope hardening for search tools (`grep` / `ast_grep` / `glob`)
 
 An agent-supplied `path` can escape the workspace: `ctx.workspace_path.join(p)` replaces the base when `p` is absolute (`"/etc"`) and walks upward on `"../.."`. **Why deferred:** it is a pre-existing property of `grep` (`crates/rupu-tools/src/grep.rs:71-75`), not introduced by `ast_grep` (which mirrors it at `crates/rupu-tools/src/ast_grep.rs`); impact is bounded (read-only tools, still permission-gated). **Prereqs:** none — the crate already has a `path_scope` module (`crates/rupu-tools/src/path_scope.rs`) used by read/write/edit for exactly this containment check. **What unblocks it:** apply a `path_scope`-style resolve-and-verify-under-`workspace_path` guard to all three search tools in one change, with a test that a `../..`/absolute `path` is rejected. Surfaced by the `ast_grep` final review (spec `docs/superpowers/specs/2026-07-15-rupu-ast-grep-tool-design.md`).
+
+## CP rich tool-call rendering (initiative)
+
+**Goal:** no tool call in the CP transcript renders as an unstyled text blob. Every tool gets a purpose-built, parsed, highlighted renderer. `ast_grep` is the pilot; all other tools follow. Design arc lives in `docs/superpowers/specs/2026-07-16-cp-rich-tool-rendering-*` (four layered sub-projects).
+
+Today's baseline (`crates/rupu-cp/web/src/components/transcript/ToolCard.tsx`): only `diff`/`terminal`/`read`/`grep`/`glob`/`subrun`/`finding` have bespoke bodies, and `grep` itself is minimal (split-on-newline + count, no grouping/highlighting/links). `ast_grep` currently falls through to the generic `StructuredView` — an unstyled blob. That is the gap this initiative closes.
+
+### Sub-project 1 — `ast_grep` tool structured output *(enabler; spec/plan tracked separately)*
+- [ ] Emit structured match JSON (metavariable bindings + node ranges, from ast-grep `run --json`) from `crates/rupu-tools/src/ast_grep.rs` into the transcript, WITHOUT degrading the compact `path:line:col: match` text the LLM reads. Mechanism (extend `DerivedEvent` vs a new structured field on `tool_result` vs dual-format stdout) decided in the spec. Unblocks sub-projects 2 and 4.
+
+### Sub-project 2 — CP rich rendering framework + `ast_grep` pilot *(your directives #1 + #2)*
+- [ ] Per-tool renderer framework in `ToolCard.tsx` / `transcriptView.ts` classify(); `ast_grep` pilot body: group-by-file, collapsible, match-count badge, metavar-highlighted snippet, bindings table. Needs sub-project 1; no file access required.
+- [ ] Then rich renderers for the remaining tools (each its own task, tracked here):
+  - [ ] `grep` — upgrade the minimal `GrepBody` (group-by-file, highlight, count)
+  - [ ] `read_file` — line-numbered + syntax-highlighted body (register hljs grammars)
+  - [ ] `glob` — file-list with counts / grouping
+  - [ ] `bash` / `terminal` — audit `TerminalBlock` (exit-code emphasis, stderr styling)
+  - [ ] `write_file` / `edit_file` — audit `DiffView` coverage
+  - [ ] `dispatch_agent` / `dispatch_agents_parallel` — `SubrunBody` polish
+  - [ ] Generic fallback (`StructuredView`) — ensure any unclassified tool still renders structured, never a raw blob
+
+### Sub-project 3 — In-project file parser + CP source access *(your directive #3)*
+- [ ] Add an in-project file parser/read capability + a CP backend read/parse endpoint, so a `path:line` reference becomes a clickable → highlighted source preview. **Caveat (design in spec):** run workspaces can live on remote hosts (see the remote-transcript-gap note) — "where the source bytes come from" is part of this sub-project, not an afterthought. Builds the clickable-location affordance the CP lacks today (findings show location as a non-clickable chip).
+
+### Sub-project 4 — AST visualization *(the "C" payoff)*
+- [ ] Playground-style syntax-tree + pattern↔match view. Depends on sub-project 1 (metavariable data) and sub-project 3 (a real parser for full-file trees — ast-grep `run --json` gives the matched node + metavars, NOT a whole-file tree; `--debug-query=ast|cst` gives only the *pattern* tree). Explore `ast-grep outline --json` for a cheap file-structure sidebar as a stepping stone.

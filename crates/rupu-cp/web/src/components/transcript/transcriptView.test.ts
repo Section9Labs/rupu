@@ -195,6 +195,21 @@ describe('buildTranscriptView — tool kinds', () => {
   });
 });
 
+describe('buildTranscriptView — ast_grep tool kind + structured payload', () => {
+  it('classifies ast_grep as its own kind and carries structured payload', () => {
+    const events = [
+      RUN_START,
+      ASSISTANT,
+      { type: 'tool_call', data: { call_id: 'c1', tool: 'ast_grep', input: { pattern: 'impl $T for $S', lang: 'rust' } } },
+      { type: 'tool_result', data: { call_id: 'c1', output: 'a.rs:1:1: impl X for Y', duration_ms: 3, structured: { tool: 'ast_grep', matchCount: 1, matches: [] } } },
+    ];
+    const view = buildTranscriptView(events as unknown as TranscriptEvent[]);
+    const tool = view.turns.flatMap((t) => t.tools).find((x) => x.tool === 'ast_grep')!;
+    expect(tool.kind).toBe('ast_grep');
+    expect((tool.structured as { matchCount: number }).matchCount).toBe(1);
+  });
+});
+
 describe('buildTranscriptView — turn grouping', () => {
   it('groups tools under their preceding assistant message', () => {
     const finding: TranscriptEvent = {
