@@ -61,12 +61,16 @@ impl HttpHostConnector {
     }
 
     /// Like [`Self::new`], but bounds every request's connect + total time to
-    /// `timeout`. Used by the host-probe fallback
-    /// (`api::run_resolve::probe_hosts`) so a registered-but-unreachable
-    /// host fails fast instead of stalling on the OS's TCP connect timeout
-    /// (which can be minutes) — never used for the connector backing an
-    /// explicit `?host=<id>` request, which keeps `reqwest`'s default
-    /// (effectively unbounded) behavior.
+    /// a caller-chosen `timeout` rather than [`Self::new`]'s 5s/30s. Used by
+    /// the host-probe fallback (`api::run_resolve::probe_hosts`), which wants
+    /// to fail much faster than a normal request should.
+    ///
+    /// Both constructors are now bounded. [`Self::new`] used to keep
+    /// `reqwest`'s default (effectively unbounded) behavior, which made this
+    /// method the only fast-failing path; that stopped being true once
+    /// dashboard fan-out started calling every host concurrently, where
+    /// wall-clock is the slowest host and one unreachable box could stall the
+    /// whole page on the OS's TCP connect timeout.
     ///
     /// Falls back to an unbounded client if the `reqwest::ClientBuilder`
     /// itself fails to build (e.g. an invalid TLS config) — best-effort, not
