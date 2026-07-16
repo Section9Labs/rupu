@@ -59,6 +59,10 @@ pub fn build_summary(
         .collect();
     let cycles: Vec<CycleRollup> = cycles
         .iter()
+        // Match the run filter above: without this the 7d/30d control
+        // silently doesn't apply to the activity feed, and local would
+        // disagree with the SSH implementation (which does filter).
+        .filter(|c| in_range(c.started_at))
         .map(|c| {
             let mut c = c.clone();
             for run in c.runs.iter_mut() {
@@ -118,7 +122,10 @@ pub fn build_summary(
             }
         }
 
-        if r.trigger_str() == "manual" {
+        // A run belonging to a cycle is grouped under that cycle in the feed
+        // (see `cycle_of` above) even when it has no trigger provenance of
+        // its own — it must never also leak into recent_manual.
+        if r.trigger_str() == "manual" && !cycle_of.contains_key(r.id.as_str()) {
             recent_manual.push(RecentRun {
                 id: r.id.clone(),
                 workflow_name: r.workflow_name.clone(),
@@ -181,6 +188,7 @@ fn fill_bucket_grid(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::dashboard_summary::CycleRun;
 
     /// Explicit field initialization — `RunRecord` has no `Default` impl
     /// (deliberately: see `crates/rupu-orchestrator/src/runs.rs`), so the
@@ -308,5 +316,123 @@ mod tests {
             "only the manual run belongs in recent_manual"
         );
         assert_eq!(s.recent_manual[0].id, "r_manual");
+    }
+
+    #[test]
+    fn cycle_runs_get_their_status_joined_from_the_runs_in_hand() {
+        use rupu_orchestrator::runs::RunStatus::*;
+        let runs = vec![rec("r_ok", Completed, 5), rec("r_bad", Failed, 5)];
+        let cycles = vec![CycleRollup {
+            cycle_id: "cyc_1".into(),
+            worker_name: Some("nightly".into()),
+            started_at: chrono::Utc::now() - chrono::Duration::minutes(6),
+            finished_at: None,
+            ran: 2,
+            skipped: 0,
+            failed: 1,
+            // status starts "unknown" — collect_cycle_rollups does no per-run reads.
+            runs: vec![
+                CycleRun {
+                    run_id: "r_ok".into(),
+                    status: "unknown".into(),
+                },
+                CycleRun {
+                    run_id: "r_bad".into(),
+                    status: "unknown".into(),
+                },
+            ],
+        }];
+        let s = build_summary(&runs, &cycles, 0, DashboardRange::All, chrono::Utc::now());
+        let c = &s.cycles[0];
+        assert_eq!(
+            c.runs.iter().find(|r| r.run_id == "r_ok").unwrap().status,
+            "completed"
+        );
+        assert_eq!(
+            c.runs.iter().find(|r| r.run_id == "r_bad").unwrap().status,
+            "failed"
+        );
+    }
+
+    #[test]
+    fn a_cycle_run_we_cannot_resolve_stays_unknown_and_is_not_dropped() {
+        // A cycle whose run list silently shrank would disagree with its own
+        // `ran` count. Unresolvable runs must survive as "unknown".
+        let cycles = vec![CycleRollup {
+            cycle_id: "cyc_1".into(),
+            worker_name: None,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            ran: 1,
+            skipped: 0,
+            failed: 0,
+            runs: vec![CycleRun {
+                run_id: "r_gone".into(),
+                status: "unknown".into(),
+            }],
+        }];
+        let s = build_summary(&[], &cycles, 0, DashboardRange::All, chrono::Utc::now());
+        assert_eq!(s.cycles[0].runs.len(), 1, "the run must not be dropped");
+        assert_eq!(s.cycles[0].runs[0].status, "unknown");
+    }
+
+    #[test]
+    fn a_run_belonging_to_a_cycle_is_not_listed_as_a_manual_run() {
+        use rupu_orchestrator::runs::RunStatus::*;
+        // Cycle-owned runs are grouped under their cycle; only manual runs are
+        // listed individually. A cycle-owned run with no trigger provenance
+        // must not leak into recent_manual.
+        let runs = vec![rec("r_in_cycle", Completed, 5)];
+        let cycles = vec![CycleRollup {
+            cycle_id: "cyc_1".into(),
+            worker_name: None,
+            started_at: chrono::Utc::now() - chrono::Duration::minutes(6),
+            finished_at: None,
+            ran: 1,
+            skipped: 0,
+            failed: 0,
+            runs: vec![CycleRun {
+                run_id: "r_in_cycle".into(),
+                status: "unknown".into(),
+            }],
+        }];
+        let s = build_summary(&runs, &cycles, 0, DashboardRange::All, chrono::Utc::now());
+        assert!(
+            s.recent_manual.iter().all(|r| r.id != "r_in_cycle"),
+            "a run owned by a cycle must not also appear as a manual run"
+        );
+    }
+
+    #[test]
+    fn cycles_outside_the_range_are_excluded() {
+        let old = CycleRollup {
+            cycle_id: "old".into(),
+            worker_name: None,
+            started_at: chrono::Utc::now() - chrono::Duration::days(10),
+            finished_at: None,
+            ran: 1,
+            skipped: 0,
+            failed: 0,
+            runs: vec![],
+        };
+        let recent = CycleRollup {
+            cycle_id: "recent".into(),
+            worker_name: None,
+            started_at: chrono::Utc::now() - chrono::Duration::hours(1),
+            finished_at: None,
+            ran: 1,
+            skipped: 0,
+            failed: 0,
+            runs: vec![],
+        };
+        let s = build_summary(
+            &[],
+            &[old, recent],
+            0,
+            DashboardRange::Days7,
+            chrono::Utc::now(),
+        );
+        assert_eq!(s.cycles.len(), 1);
+        assert_eq!(s.cycles[0].cycle_id, "recent");
     }
 }

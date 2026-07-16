@@ -321,8 +321,23 @@ impl HostConnector for LocalHostConnector {
             .run_store
             .list()
             .map_err(|e| HostConnectorError::Invalid(format!("run store list failed: {e}")))?;
-        let cycles = collect_cycle_rollups(&self.global_dir).unwrap_or_default();
-        let findings_open = count_open_findings(&self.global_dir).unwrap_or(0);
+        let cycles = match collect_cycle_rollups(&self.global_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                // Degrade to empty, but never silently: an IO failure must not
+                // be indistinguishable from "this host has no cycles" (spec
+                // §4.1).
+                tracing::warn!(host_id = "local", error = %e, "dashboard_summary: collect_cycle_rollups failed; reporting no cycles");
+                Vec::new()
+            }
+        };
+        let findings_open = match count_open_findings(&self.global_dir) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(host_id = "local", error = %e, "dashboard_summary: count_open_findings failed; reporting zero open findings");
+                0
+            }
+        };
         Ok(crate::host::summary_build::build_summary(
             &runs,
             &cycles,
@@ -413,6 +428,47 @@ fn parse_rfc3339_or_now(s: &str) -> chrono::DateTime<chrono::Utc> {
 fn count_open_findings(global_dir: &std::path::Path) -> Result<u64, HostConnectorError> {
     let findings = crate::api::findings::collect_all_findings(global_dir);
     Ok(crate::api::findings::build_response(findings).summary.total as u64)
+}
+
+#[cfg(test)]
+mod dashboard_summary_tests {
+    use super::*;
+    use rupu_runtime::{
+        AutoflowCycleEvent, AutoflowCycleEventKind, AutoflowCycleMode, AutoflowCycleRecord,
+        AutoflowHistoryStore,
+    };
+
+    /// Fixture-backed: written through the real `AutoflowHistoryStore` API
+    /// (never hand-written JSON) so the fixture cannot drift from the
+    /// serializer `collect_cycle_rollups` reads back.
+    #[test]
+    fn collect_cycle_rollups_reads_a_fixture_written_by_the_real_store() {
+        let global = tempfile::tempdir().unwrap();
+        let store = AutoflowHistoryStore::new(global.path().join("autoflows").join("history"));
+
+        let started = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let mut record = AutoflowCycleRecord::new(AutoflowCycleMode::Serve, started);
+        record.worker_name = Some("nightly".to_string());
+        record.ran_cycles = 1;
+        record.events.push(AutoflowCycleEvent {
+            kind: AutoflowCycleEventKind::RunLaunched,
+            run_id: Some("run_abc".to_string()),
+            ..Default::default()
+        });
+        store.save(&record).unwrap();
+
+        let rollups = collect_cycle_rollups(global.path()).unwrap();
+        assert_eq!(rollups.len(), 1);
+        let rollup = &rollups[0];
+        assert_eq!(rollup.cycle_id, record.cycle_id);
+        assert_eq!(rollup.worker_name.as_deref(), Some("nightly"));
+        assert_eq!(rollup.runs.len(), 1, "the run id must be harvested");
+        assert_eq!(rollup.runs[0].run_id, "run_abc");
+        assert_eq!(
+            rollup.runs[0].status, "unknown",
+            "collect_cycle_rollups never does a per-run store read"
+        );
+    }
 }
 
 #[cfg(test)]
