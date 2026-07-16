@@ -30,6 +30,42 @@ use std::process::Stdio;
 use std::time::Instant;
 use tokio::process::Command;
 
+/// Cap on how many matches ride in the structured payload (transcript-size guard).
+const MAX_STRUCTURED_MATCHES: usize = 200;
+
+/// Map a byte offset within `text` to a char (Unicode-scalar) index.
+/// Returns None if the byte offset isn't a char boundary/in range.
+fn byte_to_char_idx(text: &str, byte_off: usize) -> Option<usize> {
+    if byte_off == text.len() {
+        return Some(text.chars().count());
+    }
+    text.char_indices().position(|(b, _)| b == byte_off)
+}
+
+/// Build the `textOffset` {start,end} (char indices into the match `text`)
+/// for a metavar node, from absolute byte offsets. Returns None if either
+/// endpoint can't be mapped.
+fn text_offset(match_text: &str, match_byte_start: u64, node: &Value) -> Option<serde_json::Value> {
+    let bo = node.get("range")?.get("byteOffset")?;
+    let ns = bo.get("start")?.as_u64()?;
+    let ne = bo.get("end")?.as_u64()?;
+    let rel_s = ns.checked_sub(match_byte_start)? as usize;
+    let rel_e = ne.checked_sub(match_byte_start)? as usize;
+    let cs = byte_to_char_idx(match_text, rel_s)?;
+    let ce = byte_to_char_idx(match_text, rel_e)?;
+    Some(serde_json::json!({ "start": cs, "end": ce }))
+}
+
+/// Convert one metavar node ({text, range}) into {text, textOffset?}.
+fn metavar_binding(match_text: &str, match_byte_start: u64, node: &Value) -> serde_json::Value {
+    let text = node.get("text").and_then(Value::as_str).unwrap_or("");
+    let mut obj = serde_json::json!({ "text": text });
+    if let Some(off) = text_offset(match_text, match_byte_start, node) {
+        obj["textOffset"] = off;
+    }
+    obj
+}
+
 #[derive(Deserialize)]
 struct Input {
     /// Structural pattern in ast-grep syntax. Metavariables: `$VAR`
@@ -150,10 +186,16 @@ when there are no matches."
         // coverage events. `--json=stream` emits one JSON object per
         // match; line/column are 0-based, so we add 1.
         let mut stdout = String::new();
+        // (declared before the `if error.is_none()` block so it's in scope at the end)
+        let mut structured: Option<serde_json::Value> = None;
         // A non-empty stderr suppresses match output by design (fail-loud): we
         // prefer surfacing the diagnostic over returning partial results.
         if error.is_none() {
             let mut by_file: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+            let mut matches_json: Vec<serde_json::Value> = Vec::new();
+            let mut total_matches: usize = 0;
+            let mut files_seen: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
             for raw_line in raw_stdout.lines() {
                 let obj: Value = match serde_json::from_str(raw_line) {
                     Ok(v) => v,
@@ -188,7 +230,64 @@ when there are no matches."
                     .unwrap_or_else(|_| raw_path.to_string());
 
                 stdout.push_str(&format!("{rel_path}:{line}:{col}: {snippet}\n"));
-                by_file.entry(rel_path).or_default().push(line);
+                by_file.entry(rel_path.clone()).or_default().push(line);
+
+                total_matches += 1;
+                files_seen.insert(rel_path.clone());
+                if matches_json.len() < MAX_STRUCTURED_MATCHES {
+                    let end = obj.get("range").and_then(|r| r.get("end"));
+                    let end_line = end
+                        .and_then(|e| e.get("line"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(line0)
+                        + 1;
+                    let end_col = end
+                        .and_then(|e| e.get("column"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(col0)
+                        + 1;
+                    let full_text = obj.get("text").and_then(Value::as_str).unwrap_or("");
+                    let match_byte_start = obj
+                        .get("range")
+                        .and_then(|r| r.get("byteOffset"))
+                        .and_then(|b| b.get("start"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+
+                    let mv = obj.get("metaVariables");
+                    let mut single = serde_json::Map::new();
+                    if let Some(s) = mv.and_then(|m| m.get("single")).and_then(Value::as_object) {
+                        for (name, node) in s {
+                            single.insert(
+                                name.clone(),
+                                metavar_binding(full_text, match_byte_start, node),
+                            );
+                        }
+                    }
+                    let mut multi = serde_json::Map::new();
+                    if let Some(s) = mv.and_then(|m| m.get("multi")).and_then(Value::as_object) {
+                        for (name, arr) in s {
+                            let items: Vec<serde_json::Value> = arr
+                                .as_array()
+                                .map(|a| {
+                                    a.iter()
+                                        .map(|node| {
+                                            metavar_binding(full_text, match_byte_start, node)
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            multi.insert(name.clone(), serde_json::Value::Array(items));
+                        }
+                    }
+
+                    matches_json.push(serde_json::json!({
+                        "file": rel_path,
+                        "range": { "startLine": line, "startCol": col, "endLine": end_line, "endCol": end_col },
+                        "text": full_text,
+                        "metaVars": { "single": single, "multi": multi },
+                    }));
+                }
             }
 
             for (path, matched_lines) in by_file {
@@ -207,6 +306,16 @@ when there are no matches."
                 )
                 .await;
             }
+
+            structured = Some(serde_json::json!({
+                "tool": "ast_grep",
+                "pattern": i.pattern,
+                "lang": i.lang,
+                "matchCount": total_matches,
+                "fileCount": files_seen.len(),
+                "truncated": total_matches > matches_json.len(),
+                "matches": matches_json,
+            }));
         }
 
         Ok(ToolOutput {
@@ -214,7 +323,7 @@ when there are no matches."
             error,
             duration_ms: started.elapsed().as_millis() as u64,
             derived: None,
-            structured: None,
+            structured,
         })
     }
 }
