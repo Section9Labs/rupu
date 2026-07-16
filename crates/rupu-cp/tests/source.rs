@@ -238,3 +238,39 @@ async fn get_source_soft_fails_for_oversize_file() {
     assert_eq!(body["available"], false);
     assert_eq!(body["reason"], "File too large to preview");
 }
+
+#[tokio::test]
+async fn get_source_handles_empty_file_without_panicking() {
+    use axum::http::StatusCode;
+
+    let global = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    // A genuinely empty (0-byte) file — common in real repos (.gitkeep, empty
+    // __init__.py, stub modules) and reachable by any valid in-workspace path.
+    std::fs::write(workspace.path().join("empty.rs"), "").unwrap();
+
+    let run_store = RunStore::new(global.path().join("runs"));
+    run_store
+        .create(
+            seed_run("run_src_6", workspace.path()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+
+    let addr = spawn_server(global.path()).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{addr}/api/runs/run_src_6/source"))
+        .query(&[("path", "empty.rs"), ("line", "1")])
+        .send()
+        .await
+        .unwrap();
+
+    // Must not panic (a 500/connection-reset would be the symptom) — a valid
+    // 200 with a well-formed, zero-line slice.
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["available"], true);
+    assert_eq!(body["totalLines"], 0);
+    assert_eq!(body["lines"].as_array().unwrap().len(), 0);
+}

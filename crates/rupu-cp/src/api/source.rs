@@ -279,11 +279,27 @@ async fn get_source(
 
     let all_lines: Vec<&str> = content.lines().collect();
     let total = all_lines.len();
-    let target = if total == 0 {
-        1
-    } else {
-        q.line.clamp(1, total)
-    };
+
+    // A genuinely empty (0-byte / no-newline-only) file is a valid, previewable
+    // file — just one with no lines. `source_window(0, ..)` returns `(1, 1)`
+    // (correct per spec), but slicing `all_lines[0..1]` on a zero-length Vec
+    // would panic, so short-circuit the empty case with a well-formed
+    // zero-line slice (`totalLines: 0`, `lines: []`, line markers all 0).
+    if total == 0 {
+        return Ok(Json(SourceSlice {
+            available: true,
+            path: Some(q.path),
+            language: detect_language(&resolved),
+            start_line: Some(0),
+            end_line: Some(0),
+            target_line: Some(0),
+            total_lines: Some(0),
+            lines: Some(Vec::new()),
+            reason: None,
+        }));
+    }
+
+    let target = q.line.clamp(1, total);
     let (start, end) = source_window(total, q.line, q.context);
     let lines: Vec<SourceLine> = all_lines[start.saturating_sub(1)..end]
         .iter()
