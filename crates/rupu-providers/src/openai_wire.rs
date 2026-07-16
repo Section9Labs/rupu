@@ -71,6 +71,7 @@ pub(crate) fn build_chat_request_body(request: &LlmRequest, stream: bool) -> ser
                 };
                 let mut text_parts = Vec::new();
                 let mut tool_calls = Vec::new();
+                let mut reasoning_fields = serde_json::Map::new();
 
                 for block in blocks {
                     match block {
@@ -94,7 +95,27 @@ pub(crate) fn build_chat_request_body(request: &LlmRequest, stream: bool) -> ser
                             }));
                             continue;
                         }
-                        ContentBlock::Reasoning { .. } => { /* Plan 3: reasoning_content */ }
+                        ContentBlock::Reasoning { provider, raw, .. }
+                            if provider == PROVIDER_TAG =>
+                        {
+                            // Echo back exactly the reasoning fields this
+                            // endpoint sent, under their original keys.
+                            // DeepSeek REQUIRES `reasoning_content` back on
+                            // tool-call turns (400 if stripped); backends that
+                            // don't want it ignore or drop it. We never invent
+                            // a field an endpoint didn't send, and never
+                            // rename between `reasoning_content`/`reasoning` —
+                            // that is what makes one shared code path safe
+                            // across servers with contradictory contracts.
+                            if let Some(obj) = raw.as_object() {
+                                reasoning_fields.extend(obj.clone());
+                            }
+                        }
+                        ContentBlock::Reasoning { .. } => {
+                            // Foreign provider (an Anthropic signature, a
+                            // Gemini part): an alien wire format that this
+                            // endpoint never sent and would reject. Drop it.
+                        }
                         ContentBlock::Unknown => {}
                     }
                 }
@@ -104,6 +125,13 @@ pub(crate) fn build_chat_request_body(request: &LlmRequest, stream: bool) -> ser
                         serde_json::json!({"role": role, "content": text_parts.join("\n")});
                     if !tool_calls.is_empty() {
                         msg_json["tool_calls"] = serde_json::json!(tool_calls);
+                    }
+                    // Sibling of `content`/`tool_calls` — the replay shape
+                    // DeepSeek documents. Merged inside the emit guard so
+                    // reasoning alone never resurrects an otherwise-empty
+                    // message, while a reasoning + tool_calls turn carries it.
+                    for (k, v) in reasoning_fields {
+                        msg_json[k] = v;
                     }
                     messages.push(msg_json);
                 }
@@ -708,6 +736,310 @@ mod tests {
         assert_eq!(text.as_deref(), Some("vllm thoughts"));
         assert_eq!(raw, &serde_json::json!({"reasoning": "vllm thoughts"}));
         assert!(raw.get("reasoning_content").is_none());
+    }
+
+    // ---- Echo (request-build) -------------------------------------------
+
+    use crate::types::Message;
+
+    fn req(messages: Vec<Message>) -> LlmRequest {
+        LlmRequest {
+            model: "deepseek-reasoner".into(),
+            messages,
+            max_tokens: 128,
+            ..Default::default()
+        }
+    }
+
+    /// An `openai_chat` reasoning block carrying `raw` verbatim.
+    fn reasoning(raw: serde_json::Value) -> ContentBlock {
+        ContentBlock::Reasoning {
+            text: Some("thinking".into()),
+            provider: PROVIDER_TAG.to_string(),
+            model: "deepseek-reasoner".into(),
+            raw,
+        }
+    }
+
+    fn tool_use() -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: "call_1".into(),
+            name: "get_weather".into(),
+            input: serde_json::json!({"city": "Oslo"}),
+        }
+    }
+
+    fn assistant(content: Vec<ContentBlock>) -> Message {
+        Message {
+            role: Role::Assistant,
+            content,
+        }
+    }
+
+    /// The lone assistant message in a built body, or panic.
+    fn only_assistant_msg(body: &serde_json::Value) -> &serde_json::Value {
+        let msgs = body["messages"].as_array().expect("messages array");
+        let mut found = None;
+        for m in msgs {
+            if m["role"] == "assistant" {
+                assert!(found.is_none(), "more than one assistant message: {body}");
+                found = Some(m);
+            }
+        }
+        found.unwrap_or_else(|| panic!("no assistant message in {body}"))
+    }
+
+    #[test]
+    fn assistant_message_echoes_reasoning_content_key() {
+        // The DeepSeek 400 case: reasoning + text + tool_calls on one turn.
+        // The reasoning must ride back as a SIBLING of content/tool_calls.
+        let body = build_chat_request_body(
+            &req(vec![
+                Message::user("weather in Oslo?"),
+                assistant(vec![
+                    reasoning(serde_json::json!({"reasoning_content": "thinking"})),
+                    ContentBlock::Text {
+                        text: "let me check".into(),
+                    },
+                    tool_use(),
+                ]),
+            ]),
+            false,
+        );
+
+        assert_eq!(
+            only_assistant_msg(&body),
+            &serde_json::json!({
+                "role": "assistant",
+                "content": "let me check",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Oslo\"}"}
+                }],
+                "reasoning_content": "thinking",
+            })
+        );
+    }
+
+    #[test]
+    fn assistant_message_echoes_under_the_original_key() {
+        // vLLM sent `reasoning`; it gets `reasoning` back. We never invent a
+        // field an endpoint did not send.
+        let body = build_chat_request_body(
+            &req(vec![assistant(vec![
+                reasoning(serde_json::json!({"reasoning": "vllm thoughts"})),
+                tool_use(),
+            ])]),
+            false,
+        );
+
+        let msg = only_assistant_msg(&body);
+        assert_eq!(msg["reasoning"], serde_json::json!("vllm thoughts"));
+        assert!(
+            msg.get("reasoning_content").is_none(),
+            "must not translate between field names: {msg}"
+        );
+    }
+
+    #[test]
+    fn foreign_provider_reasoning_is_not_echoed() {
+        // An Anthropic thinking signature must never reach a
+        // chat-completions endpoint.
+        let body = build_chat_request_body(
+            &req(vec![assistant(vec![
+                ContentBlock::Reasoning {
+                    text: Some("thinking".into()),
+                    provider: "anthropic".into(),
+                    model: "claude-sonnet-4".into(),
+                    raw: serde_json::json!({"type": "thinking", "signature": "abc123"}),
+                },
+                ContentBlock::Text {
+                    text: "hello".into(),
+                },
+            ])]),
+            false,
+        );
+
+        assert_eq!(
+            only_assistant_msg(&body),
+            &serde_json::json!({"role": "assistant", "content": "hello"})
+        );
+        assert!(!body.to_string().contains("abc123"));
+    }
+
+    #[test]
+    fn internal_fields_never_reach_the_wire() {
+        let body = build_chat_request_body(
+            &req(vec![assistant(vec![
+                reasoning(serde_json::json!({"reasoning_content": "thinking"})),
+                ContentBlock::Text {
+                    text: "hello".into(),
+                },
+            ])]),
+            false,
+        );
+
+        let msg = only_assistant_msg(&body);
+        // Only the echoed key — never the block's envelope.
+        for internal in ["provider", "model", "raw", "text", "type"] {
+            assert!(
+                msg.get(internal).is_none(),
+                "internal field {internal} leaked: {msg}"
+            );
+        }
+        let serialized = body.to_string();
+        assert!(!serialized.contains(PROVIDER_TAG));
+        assert!(!serialized.contains(r#""type":"reasoning""#));
+    }
+
+    #[test]
+    fn reasoning_only_assistant_turn_is_not_dropped() {
+        // Reasoning + tool_calls, no text: the message is still emitted (the
+        // guard sees tool_calls) and the reasoning rides along.
+        let body = build_chat_request_body(
+            &req(vec![assistant(vec![
+                reasoning(serde_json::json!({"reasoning_content": "need the weather"})),
+                tool_use(),
+            ])]),
+            false,
+        );
+
+        let msg = only_assistant_msg(&body);
+        assert_eq!(
+            msg["reasoning_content"],
+            serde_json::json!("need the weather")
+        );
+        assert_eq!(msg["content"], serde_json::json!(""));
+        assert_eq!(msg["tool_calls"].as_array().expect("tool_calls").len(), 1);
+    }
+
+    #[test]
+    fn reasoning_alone_does_not_resurrect_an_empty_message() {
+        // No text, no tool_calls: nothing to say. Reasoning alone must not
+        // conjure an assistant message that today's code would not emit.
+        let body = build_chat_request_body(
+            &req(vec![
+                Message::user("hi"),
+                assistant(vec![reasoning(
+                    serde_json::json!({"reasoning_content": "thinking"}),
+                )]),
+            ]),
+            false,
+        );
+
+        assert_eq!(
+            body["messages"],
+            serde_json::json!([{"role": "user", "content": "hi"}])
+        );
+    }
+
+    #[test]
+    fn reasoning_then_text_turn_bypasses_the_single_block_fast_path() {
+        // `[Reasoning, Text]` must fall through to the general blocks arm —
+        // the `[Text]` fast path must not swallow a reasoning-bearing turn.
+        let body = build_chat_request_body(
+            &req(vec![assistant(vec![
+                reasoning(serde_json::json!({"reasoning_content": "thinking"})),
+                ContentBlock::Text {
+                    text: "hello".into(),
+                },
+            ])]),
+            false,
+        );
+
+        assert_eq!(
+            only_assistant_msg(&body),
+            &serde_json::json!({
+                "role": "assistant",
+                "content": "hello",
+                "reasoning_content": "thinking",
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_block_is_not_echoed() {
+        let body = build_chat_request_body(
+            &req(vec![assistant(vec![
+                ContentBlock::Unknown,
+                ContentBlock::Text {
+                    text: "hello".into(),
+                },
+            ])]),
+            false,
+        );
+
+        assert_eq!(
+            only_assistant_msg(&body),
+            &serde_json::json!({"role": "assistant", "content": "hello"})
+        );
+    }
+
+    #[test]
+    fn no_reasoning_block_leaves_body_unchanged() {
+        // Backward compat: an endpoint that sends no reasoning sees exactly
+        // today's body.
+        let body = build_chat_request_body(
+            &req(vec![
+                Message::user("weather in Oslo?"),
+                assistant(vec![
+                    ContentBlock::Text {
+                        text: "let me check".into(),
+                    },
+                    tool_use(),
+                ]),
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: "sunny".into(),
+                        is_error: false,
+                    }],
+                },
+            ]),
+            false,
+        );
+
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "model": "deepseek-reasoner",
+                "max_tokens": 128,
+                "stream": false,
+                "messages": [
+                    {"role": "user", "content": "weather in Oslo?"},
+                    {
+                        "role": "assistant",
+                        "content": "let me check",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "get_weather", "arguments": "{\"city\":\"Oslo\"}"}
+                        }]
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn multiple_reasoning_fields_are_all_echoed_verbatim() {
+        // `raw` is echoed key-for-key, whatever it holds — including a
+        // non-string value. Verbatim is the contract; we do not stringify.
+        let body = build_chat_request_body(
+            &req(vec![assistant(vec![
+                reasoning(serde_json::json!({"reasoning_content": {"nested": 1}})),
+                tool_use(),
+            ])]),
+            false,
+        );
+
+        assert_eq!(
+            only_assistant_msg(&body)["reasoning_content"],
+            serde_json::json!({"nested": 1})
+        );
     }
 
     #[test]
