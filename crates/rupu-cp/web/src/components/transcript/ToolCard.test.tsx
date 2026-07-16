@@ -7,7 +7,7 @@
 
 import { it, expect, describe, afterEach } from 'vitest';
 import { render, screen, cleanup } from '@testing-library/react';
-import { summarizeInput } from './ToolCard';
+import { summarizeInput, parseAstGrepText } from './ToolCard';
 import ToolCard from './ToolCard';
 import type { ToolView, FindingView } from './transcriptView';
 
@@ -296,4 +296,131 @@ it('grep ToolView renders match count and lines', () => {
   };
   render(<ToolCard tool={tv} />);
   expect(screen.getByText(/2 matches/)).not.toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// 3. parseAstGrepText — pure fallback-parser unit tests
+// ---------------------------------------------------------------------------
+
+describe('parseAstGrepText', () => {
+  it('empty input returns []', () => {
+    expect(parseAstGrepText('')).toEqual([]);
+  });
+
+  it('whitespace-only input returns []', () => {
+    expect(parseAstGrepText('   \n  \n')).toEqual([]);
+  });
+
+  it('groups matches from two files', () => {
+    const output = [
+      'src/a.rs:10:3: fn foo() {}',
+      'src/a.rs:22:1: fn bar() {}',
+      'src/b.rs:5:8: fn baz() {}',
+    ].join('\n');
+    expect(parseAstGrepText(output)).toEqual([
+      {
+        file: 'src/a.rs',
+        matches: [
+          { line: 10, col: 3, text: 'fn foo() {}' },
+          { line: 22, col: 1, text: 'fn bar() {}' },
+        ],
+      },
+      {
+        file: 'src/b.rs',
+        matches: [{ line: 5, col: 8, text: 'fn baz() {}' }],
+      },
+    ]);
+  });
+
+  it('skips a non-matching line without throwing', () => {
+    const output = ['not a match line', 'src/a.rs:1:1: fn foo() {}'].join('\n');
+    expect(parseAstGrepText(output)).toEqual([
+      { file: 'src/a.rs', matches: [{ line: 1, col: 1, text: 'fn foo() {}' }] },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4. AstGrepBody — render smoke tests (via ToolCard dispatch)
+// ---------------------------------------------------------------------------
+
+describe('AstGrepBody (via ToolCard)', () => {
+  it('renders structured payload: count badge, group-by-file, metavar highlight + bindings table', () => {
+    const tv: ToolView = {
+      tool: 'ast_grep',
+      kind: 'ast_grep',
+      input: { pattern: 'fn $NAME() {}', lang: 'rust' },
+      output: 'src/a.rs:10:3: fn foo() {}',
+      structured: {
+        tool: 'ast_grep',
+        pattern: 'fn $NAME() {}',
+        lang: 'rust',
+        matchCount: 1,
+        fileCount: 1,
+        truncated: false,
+        matches: [
+          {
+            file: 'src/a.rs',
+            range: { startLine: 10, startCol: 3, endLine: 10, endCol: 15 },
+            text: 'fn foo() {}',
+            metaVars: {
+              single: { NAME: { text: 'foo', textOffset: { start: 3, end: 6 } } },
+              multi: {},
+            },
+          },
+        ],
+      },
+    };
+    render(<ToolCard tool={tv} />);
+    expect(screen.getByText(/1 match in 1 file/)).not.toBeNull();
+    expect(screen.getByText('src/a.rs')).not.toBeNull();
+    // Highlighted metavar span carries the binding's bound text and a $NAME title.
+    const highlighted = screen.getByTitle('$NAME');
+    expect(highlighted.textContent).toBe('foo');
+    // Bindings table renders "$NAME" and its bound text.
+    expect(screen.getByText('$NAME')).not.toBeNull();
+  });
+
+  it('renders truncated notice when structured.truncated is true', () => {
+    const tv: ToolView = {
+      tool: 'ast_grep',
+      kind: 'ast_grep',
+      input: { pattern: 'fn $NAME() {}', lang: 'rust' },
+      structured: {
+        matchCount: 500,
+        fileCount: 40,
+        truncated: true,
+        matches: [
+          { file: 'src/a.rs', range: { startLine: 1, startCol: 1, endLine: 1, endCol: 5 }, text: 'fn a() {}' },
+        ],
+      },
+    };
+    render(<ToolCard tool={tv} />);
+    expect(screen.getByText(/showing first 1 of 500/)).not.toBeNull();
+  });
+
+  it('falls back to parseAstGrepText grouping when structured is absent', () => {
+    const tv: ToolView = {
+      tool: 'ast_grep',
+      kind: 'ast_grep',
+      input: { pattern: 'fn $NAME() {}', lang: 'rust' },
+      output: 'src/a.rs:10:3: fn foo() {}\nsrc/b.rs:1:1: fn bar() {}',
+    };
+    render(<ToolCard tool={tv} />);
+    expect(screen.getByText(/2 matches in 2 files/)).not.toBeNull();
+    expect(screen.getByText('src/a.rs')).not.toBeNull();
+    expect(screen.getByText('src/b.rs')).not.toBeNull();
+  });
+
+  it('error ToolView suppresses the body (error block handles it)', () => {
+    const tv: ToolView = {
+      tool: 'ast_grep',
+      kind: 'ast_grep',
+      input: { pattern: 'fn $NAME() {}' },
+      error: 'ast-grep binary not found',
+    };
+    render(<ToolCard tool={tv} />);
+    expect(screen.getByText('Error')).not.toBeNull();
+    expect(screen.queryByText(/match/)).toBeNull();
+  });
 });
