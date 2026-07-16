@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::auth::{is_token_expired, save_provider_auth, AuthCredentials};
 use crate::error::ProviderError;
@@ -523,6 +523,28 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
             Role::Assistant => "model",
         };
 
+        // If this turn carries a verbatim parts replay from Gemini, send those
+        // parts back exactly as they arrived. This is what returns
+        // thoughtSignature on the exact part it was received on — Google
+        // requires it, and omitting it on the first functionCall part is a hard
+        // 400. Google's own SDKs replay the model's content the same way.
+        //
+        // The gate is the provider tag only: a foreign provider's block is an
+        // alien wire format and is ignored (falling back to the rebuild).
+        let replay = msg.content.iter().find_map(|b| match b {
+            ContentBlock::Reasoning { provider, raw, .. } if provider == PROVIDER_TAG => {
+                raw.get("parts").and_then(|p| p.as_array()).cloned()
+            }
+            _ => None,
+        });
+        if let Some(parts) = replay {
+            if !parts.is_empty() {
+                contents.push(serde_json::json!({"role": role, "parts": parts}));
+                continue;
+            }
+            debug!("gemini replay block had empty parts; rebuilding from blocks");
+        }
+
         let mut parts = Vec::new();
 
         for block in &msg.content {
@@ -560,7 +582,9 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
                         }
                     }));
                 }
-                ContentBlock::Reasoning { .. } => { /* Plan 2: capture + echo thoughtSignature */ }
+                // Either already consumed by the verbatim replay above, or a
+                // foreign provider's block, which is deliberately ignored.
+                ContentBlock::Reasoning { .. } => {}
                 ContentBlock::Unknown => {}
             }
         }
@@ -1123,6 +1147,185 @@ mod tests {
         // Tool result should have the function name resolved from the ToolUse
         let func_resp = &contents[1]["parts"][0]["functionResponse"];
         assert_eq!(func_resp["name"], "read_file");
+        assert_eq!(func_resp["response"]["output"], "file contents");
+    }
+
+    /// An assistant turn as Gemini's parse produces it: a replay block carrying
+    /// the verbatim parts, plus the ToolUse block rupu uses for dispatch.
+    fn replay_turn(parts: serde_json::Value) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Reasoning {
+                    text: None,
+                    provider: PROVIDER_TAG.to_string(),
+                    model: "gemini-3-pro-preview".to_string(),
+                    raw: serde_json::json!({ "parts": parts }),
+                },
+                ContentBlock::ToolUse {
+                    id: "gemini_tc_1".into(),
+                    name: "f".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn convert_messages_replays_stored_parts_verbatim() {
+        let stored = serde_json::json!([
+            {"functionCall": {"name": "f", "args": {"x": 1}}, "thoughtSignature": "sig_abc"}
+        ]);
+        let contents = convert_messages(&[replay_turn(stored.clone())]);
+
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["role"], "model");
+        // The stored parts go back on the wire byte-for-byte.
+        assert_eq!(contents[0]["parts"], stored);
+        // The functionCall appears exactly once — the ToolUse block must not be
+        // rebuilt into a second part on a turn that replays.
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts
+                .iter()
+                .filter(|p| p.get("functionCall").is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn convert_messages_replay_preserves_thought_signature_on_its_part() {
+        // Two parts, only the second signed: the signature must stay attached to
+        // the part it arrived on, not hoisted, moved, or reordered.
+        let stored = serde_json::json!([
+            {"thought": true, "text": "Let me think..."},
+            {"functionCall": {"name": "f", "args": {"x": 1}}, "thoughtSignature": "sig_abc"}
+        ]);
+        let contents = convert_messages(&[replay_turn(stored)]);
+
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["thought"], true);
+        assert!(parts[0].get("thoughtSignature").is_none());
+        assert_eq!(parts[1]["thoughtSignature"], "sig_abc");
+        assert_eq!(parts[1]["functionCall"]["name"], "f");
+    }
+
+    #[test]
+    fn convert_messages_falls_back_to_rebuild_without_reasoning_block() {
+        // Backward compat: no Reasoning block -> converts exactly as before.
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "calling".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "gemini_tc_1".into(),
+                    name: "f".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+            ],
+        }];
+        let contents = convert_messages(&messages);
+
+        assert_eq!(contents.len(), 1);
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "calling");
+        assert_eq!(parts[1]["functionCall"]["name"], "f");
+        assert_eq!(parts[1]["functionCall"]["args"]["x"], 1);
+    }
+
+    #[test]
+    fn convert_messages_drops_foreign_provider_reasoning_block() {
+        // An Anthropic thinking block is an alien wire format: never replay it,
+        // and never let its signature reach Gemini.
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Reasoning {
+                    text: Some("thinking...".into()),
+                    provider: "anthropic".to_string(),
+                    model: "claude-opus-4-6".to_string(),
+                    raw: serde_json::json!({
+                        "type": "thinking",
+                        "thinking": "thinking...",
+                        "signature": "anthropic_sig",
+                    }),
+                },
+                ContentBlock::ToolUse {
+                    id: "toolu_1".into(),
+                    name: "f".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+            ],
+        }];
+        let contents = convert_messages(&messages);
+
+        assert_eq!(contents.len(), 1);
+        let parts = contents[0]["parts"].as_array().unwrap();
+        // Rebuild path: only the ToolUse becomes a part.
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["functionCall"]["name"], "f");
+        let wire = serde_json::to_string(&contents).unwrap();
+        assert!(!wire.contains("anthropic_sig"));
+        assert!(!wire.contains("thinking"));
+    }
+
+    #[test]
+    fn convert_messages_ignores_replay_block_with_malformed_raw() {
+        // raw missing "parts", "parts" not an array, and an empty parts array all
+        // fall back to the rebuild rather than sending garbage.
+        for raw in [
+            serde_json::json!({}),
+            serde_json::json!({"parts": "not-an-array"}),
+            serde_json::json!({"parts": []}),
+        ] {
+            let messages = vec![Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Reasoning {
+                        text: None,
+                        provider: PROVIDER_TAG.to_string(),
+                        model: "gemini-3-pro-preview".to_string(),
+                        raw: raw.clone(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "gemini_tc_1".into(),
+                        name: "f".into(),
+                        input: serde_json::json!({"x": 1}),
+                    },
+                ],
+            }];
+            let contents = convert_messages(&messages);
+
+            assert_eq!(contents.len(), 1, "raw: {raw}");
+            let parts = contents[0]["parts"].as_array().unwrap();
+            assert_eq!(parts.len(), 1, "raw: {raw}");
+            assert_eq!(parts[0]["functionCall"]["name"], "f", "raw: {raw}");
+        }
+    }
+
+    #[test]
+    fn convert_messages_still_maps_tool_result_names_with_replay_present() {
+        // The tool_name_map pre-scan reads ToolUse blocks; a replaying assistant
+        // turn must not break the following user turn's functionResponse naming.
+        let stored = serde_json::json!([
+            {"functionCall": {"name": "f", "args": {"x": 1}}, "thoughtSignature": "sig_abc"}
+        ]);
+        let messages = vec![
+            replay_turn(stored),
+            Message::tool_result("gemini_tc_1", "file contents", false),
+        ];
+        let contents = convert_messages(&messages);
+
+        assert_eq!(contents.len(), 2);
+        assert_eq!(contents[0]["parts"][0]["thoughtSignature"], "sig_abc");
+        let func_resp = &contents[1]["parts"][0]["functionResponse"];
+        assert_eq!(func_resp["name"], "f");
         assert_eq!(func_resp["response"]["output"], "file contents");
     }
 
