@@ -30,6 +30,7 @@ import type { ReactNode } from 'react';
 import { ChevronRight, ChevronDown } from 'lucide-react';
 import type { ToolView, FindingView } from './transcriptView';
 import FindingCard from './FindingCard';
+import SourcePreview from './SourcePreview';
 import DiffView from './DiffView';
 import TerminalBlock from './TerminalBlock';
 import StructuredView from './StructuredView';
@@ -633,10 +634,105 @@ function MetaVarTable({
   );
 }
 
+/**
+ * One structured ast_grep match: its `file:line:col` header (a toggle button
+ * when `runId` is known, else plain text), the highlighted snippet + metavar
+ * table, and — when toggled open — an inline `SourcePreview` of the match's
+ * source line. Owns its own `open` state so each match toggles independently.
+ */
+function AstGrepMatchRow({
+  file,
+  match,
+  runId,
+  host,
+}: {
+  file: string;
+  match: AstGrepMatch;
+  runId?: string;
+  host?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const range = match.range;
+
+  return (
+    <div className="border-l-2 border-border pl-2 py-1">
+      {range && (
+        runId ? (
+          <button
+            type="button"
+            onClick={() => setOpen((v) => !v)}
+            className="text-meta font-mono text-ink-mute hover:text-brand-700 hover:underline"
+          >
+            {file}:{range.startLine}:{range.startCol}
+          </button>
+        ) : (
+          <div className="text-meta text-ink-mute">
+            {file}:{range.startLine}:{range.startCol}
+          </div>
+        )
+      )}
+      <div className="font-mono text-[10.5px] text-ink">
+        <HighlightedMatch
+          text={match.text ?? ''}
+          single={match.metaVars?.single}
+          multi={match.metaVars?.multi}
+        />
+      </div>
+      <MetaVarTable single={match.metaVars?.single} multi={match.metaVars?.multi} />
+      {open && range && runId && (
+        <SourcePreview runId={runId} path={file} line={range.startLine} host={host} />
+      )}
+    </div>
+  );
+}
+
+/** One fallback (text-parsed) ast_grep match: `file:line:col:` header (a
+ * toggle button when `runId` is known, else plain text) + the raw match
+ * text, with an inline `SourcePreview` when toggled open. */
+function AstGrepTextMatchRow({
+  file,
+  match,
+  runId,
+  host,
+}: {
+  file: string;
+  match: { line: number; col: number; text: string };
+  runId?: string;
+  host?: string;
+}) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div>
+      <div className="whitespace-pre font-mono text-[10.5px] text-ink">
+        {runId ? (
+          <button
+            type="button"
+            onClick={() => setOpen((v) => !v)}
+            className="text-ink-mute hover:text-brand-700 hover:underline"
+          >
+            {file}:{match.line}:{match.col}:{' '}
+          </button>
+        ) : (
+          <span className="text-ink-mute">
+            {file}:{match.line}:{match.col}:{' '}
+          </span>
+        )}
+        {match.text}
+      </div>
+      {open && runId && (
+        <SourcePreview runId={runId} path={file} line={match.line} host={host} />
+      )}
+    </div>
+  );
+}
+
 /** ast_grep — structured render (group-by-file, count badge, metavar
  * highlight + bindings table) when `tool.structured` is present, else a
- * text-parse fallback via `parseAstGrepText`. Never a raw blob. */
-function AstGrepBody({ tool }: { tool: ToolView }) {
+ * text-parse fallback via `parseAstGrepText`. Never a raw blob. Each match's
+ * `file:line[:col]` header is clickable when `runId` is known (threaded from
+ * `ToolCard`), toggling an inline `SourcePreview`. */
+function AstGrepBody({ tool, runId, host }: { tool: ToolView; runId?: string; host?: string }) {
   if (tool.error) return null;
 
   const structured = asAstGrepStructured(tool.structured);
@@ -674,21 +770,7 @@ function AstGrepBody({ tool }: { tool: ToolView }) {
         {[...byFile.entries()].map(([file, ms]) => (
           <FileGroup key={file} file={file} count={ms.length}>
             {ms.map((m, i) => (
-              <div key={i} className="border-l-2 border-border pl-2 py-1">
-                {m.range && (
-                  <div className="text-meta text-ink-mute">
-                    {file}:{m.range.startLine}:{m.range.startCol}
-                  </div>
-                )}
-                <div className="font-mono text-[10.5px] text-ink">
-                  <HighlightedMatch
-                    text={m.text ?? ''}
-                    single={m.metaVars?.single}
-                    multi={m.metaVars?.multi}
-                  />
-                </div>
-                <MetaVarTable single={m.metaVars?.single} multi={m.metaVars?.multi} />
-              </div>
+              <AstGrepMatchRow key={i} file={file} match={m} runId={runId} host={host} />
             ))}
           </FileGroup>
         ))}
@@ -707,12 +789,7 @@ function AstGrepBody({ tool }: { tool: ToolView }) {
       {groups.map((g) => (
         <FileGroup key={g.file} file={g.file} count={g.matches.length}>
           {g.matches.map((m, i) => (
-            <div key={i} className="whitespace-pre font-mono text-[10.5px] text-ink">
-              <span className="text-ink-mute">
-                {g.file}:{m.line}:{m.col}:{' '}
-              </span>
-              {m.text}
-            </div>
+            <AstGrepTextMatchRow key={i} file={g.file} match={m} runId={runId} host={host} />
           ))}
         </FileGroup>
       ))}
@@ -727,14 +804,23 @@ function AstGrepBody({ tool }: { tool: ToolView }) {
 export default function ToolCard({
   tool,
   onOpenTranscript,
+  runId,
+  host,
 }: {
   tool: ToolView;
   onOpenTranscript?: (path: string) => void;
+  /** Run id for the source-preview affordance (ast_grep match headers,
+   *  finding location chips). Threaded down from `TranscriptPanel` via
+   *  `Turn`. Absent → those references render as non-clickable text. */
+  runId?: string;
+  /** Remote host id to forward to `api.readSource`, mirroring the
+   *  transcript fetch's `host` plumbing. */
+  host?: string;
 }) {
   // Findings get their own full chrome — no outer header wrapper.
   if (tool.kind === 'finding') {
     const finding = tool.finding as FindingView;
-    return <FindingCard finding={finding} />;
+    return <FindingCard finding={finding} runId={runId} host={host} />;
   }
 
   const summary = summarizeInput(tool);
@@ -780,7 +866,7 @@ export default function ToolCard({
         <SubrunBody tool={tool} onOpenTranscript={onOpenTranscript} />
       )}
       {tool.kind === 'coverage' && <CoverageBody tool={tool} />}
-      {tool.kind === 'ast_grep' && <AstGrepBody tool={tool} />}
+      {tool.kind === 'ast_grep' && <AstGrepBody tool={tool} runId={runId} host={host} />}
       {tool.kind === 'generic' && <GenericBody tool={tool} />}
 
       {/* Error block — shown when tool.error is set */}

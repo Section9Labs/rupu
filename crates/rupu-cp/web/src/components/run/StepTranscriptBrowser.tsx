@@ -30,6 +30,8 @@ export default function StepTranscriptBrowser({
   stepId,
   units,
   initialUnitIndex,
+  runId,
+  host,
 }: {
   stepId: string;
   units: UnitView[];
@@ -39,6 +41,11 @@ export default function StepTranscriptBrowser({
    * filtered set. When undefined, keeps the default auto-select-first behavior.
    */
   initialUnitIndex?: number;
+  /** Run id, threaded straight through to `TranscriptPanel` for the
+   *  source-preview affordance — see `TranscriptPanel`'s `runId` doc. */
+  runId?: string;
+  /** Remote host id, threaded alongside `runId`. */
+  host?: string;
 }) {
   const colors = useThemeColors();
   const [filter, setFilter] = useState<Filter>('all');
@@ -164,6 +171,8 @@ export default function StepTranscriptBrowser({
             key={selectedUnit.transcriptPath}
             path={selectedUnit.transcriptPath}
             live={selectedUnit.state === 'running'}
+            runId={runId}
+            host={host}
           />
         )}
       </div>

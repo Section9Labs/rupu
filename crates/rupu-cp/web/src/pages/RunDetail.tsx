@@ -941,9 +941,17 @@ export default function RunDetail() {
                 stepId={selection.stepId}
                 units={selectedFanout.units}
                 initialUnitIndex={selection.unitIndex}
+                runId={id}
+                host={host}
               />
             ) : selection && selectedTranscriptPath ? (
-              <TranscriptPanel key={selectedTranscriptPath} path={selectedTranscriptPath} live={isRunning} />
+              <TranscriptPanel
+                key={selectedTranscriptPath}
+                path={selectedTranscriptPath}
+                live={isRunning}
+                runId={id}
+                host={host}
+              />
             ) : (
               <div className="flex h-full min-h-[120px] items-center justify-center rounded-xl border border-border bg-panel text-sm text-ink-dim">
                 {selection

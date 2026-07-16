@@ -5,24 +5,41 @@
  *   1. Severity hairline  — 1-px coloured bar at the very top (sev ramp)
  *   2. Card header row    — severity badge pill  +  scope chip  +  concern_id chip
  *   3. Title              — summary in severity-tinted bold
- *   4. Location chip      — file_path[:start-end] in mono (only when filePath present)
+ *   4. Location chip      — file_path[:start-end] in mono (only when filePath present);
+ *                           a clickable button toggling an inline `SourcePreview`
+ *                           when `runId` is known, else a plain non-clickable span.
  *   5. Rationale          — rendered via <Markdown>
  *   6. Code excerpt       — <pre> block (only when codeExcerpt present)
  *   7. References         — link list (only when references.length > 0)
  *
- * Props: { finding: FindingView }
+ * Props: { finding: FindingView, runId?: string, host?: string }
  * No `any`; static Tailwind class strings only.
  */
 
+import { useState } from 'react';
 import type { FindingView } from './transcriptView';
 import { SEVERITY_STYLE } from '../../lib/severity';
 import Markdown from './Markdown';
+import SourcePreview from './SourcePreview';
 
 // ---------------------------------------------------------------------------
 // Public component
 // ---------------------------------------------------------------------------
 
-export default function FindingCard({ finding }: { finding: FindingView }) {
+export default function FindingCard({
+  finding,
+  runId,
+  host,
+}: {
+  finding: FindingView;
+  /** Run id for the source-preview affordance on the location chip. Threaded
+   *  down from `TranscriptPanel` via `Turn`/`ToolCard`. Absent → the chip
+   *  renders as non-clickable text. */
+  runId?: string;
+  /** Remote host id to forward to `api.readSource`. */
+  host?: string;
+}) {
+  const [previewOpen, setPreviewOpen] = useState(false);
   const sev = finding.severity;
   const s = SEVERITY_STYLE[sev];
 
@@ -34,6 +51,7 @@ export default function FindingCard({ finding }: { finding: FindingView }) {
       location += `:${finding.lineRange[0]}-${finding.lineRange[1]}`;
     }
   }
+  const previewLine = finding.lineRange?.[0] ?? 1;
 
   return (
     <div className="border border-border rounded-lg bg-panel overflow-hidden shadow-sm my-1">
@@ -71,11 +89,24 @@ export default function FindingCard({ finding }: { finding: FindingView }) {
           {finding.summary}
         </p>
 
-        {/* 4. Location chip */}
+        {/* 4. Location chip — clickable when runId is known, else plain text */}
         {location && (
-          <span className="inline-flex items-center rounded bg-surface border border-border px-1.5 py-0.5 text-[10.5px] font-mono text-ink-dim break-all">
-            {location}
-          </span>
+          finding.filePath && runId ? (
+            <button
+              type="button"
+              onClick={() => setPreviewOpen((v) => !v)}
+              className="inline-flex items-center rounded bg-surface border border-border px-1.5 py-0.5 text-[10.5px] font-mono text-ink-dim break-all hover:text-brand-700 hover:underline"
+            >
+              {location}
+            </button>
+          ) : (
+            <span className="inline-flex items-center rounded bg-surface border border-border px-1.5 py-0.5 text-[10.5px] font-mono text-ink-dim break-all">
+              {location}
+            </span>
+          )
+        )}
+        {previewOpen && finding.filePath && runId && (
+          <SourcePreview runId={runId} path={finding.filePath} line={previewLine} host={host} />
         )}
 
         {/* 5. Rationale via Markdown */}

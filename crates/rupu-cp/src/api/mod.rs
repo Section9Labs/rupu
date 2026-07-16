@@ -19,6 +19,7 @@ pub mod run_resolve;
 pub mod run_streams;
 pub mod runs;
 pub mod sessions;
+pub mod source;
 pub mod transcript;
 pub mod usage;
 pub mod workers;
