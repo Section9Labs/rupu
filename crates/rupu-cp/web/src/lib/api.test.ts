@@ -456,6 +456,66 @@ describe('api.getTranscript', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Source preview
+// ---------------------------------------------------------------------------
+
+describe('api.readSource', () => {
+  it('builds the URL with encoded path and the given line', async () => {
+    mockFetch(200, { available: true });
+    const fetchSpy = vi.mocked(fetch);
+    await api.readSource('run-1', 'src/foo/bar.rs', 42);
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toBe('/api/runs/run-1/source?path=src%2Ffoo%2Fbar.rs&line=42');
+  });
+
+  it('encodes the run id and appends context + host when given', async () => {
+    mockFetch(200, { available: true });
+    const fetchSpy = vi.mocked(fetch);
+    await api.readSource('run/1', 'a.rs', 5, { context: 10, host: 'h1' });
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toBe('/api/runs/run%2F1/source?path=a.rs&line=5&context=10&host=h1');
+  });
+
+  it('omits context and host when not given', async () => {
+    mockFetch(200, { available: true });
+    const fetchSpy = vi.mocked(fetch);
+    await api.readSource('run-1', 'a.rs', 5);
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).not.toContain('context=');
+    expect(calledUrl).not.toContain('host=');
+  });
+
+  it('resolves the typed SourceSlice on 200', async () => {
+    const payload = {
+      available: true,
+      path: 'a.rs',
+      language: 'rust',
+      startLine: 1,
+      endLine: 3,
+      targetLine: 2,
+      totalLines: 10,
+      lines: [
+        { n: 1, text: 'fn main() {' },
+        { n: 2, text: '    println!("hi");' },
+        { n: 3, text: '}' },
+      ],
+    };
+    mockFetch(200, payload);
+    const result = await api.readSource('run-1', 'a.rs', 2);
+    expect(result.available).toBe(true);
+    expect(result.lines).toHaveLength(3);
+    expect(result.targetLine).toBe(2);
+  });
+
+  it('resolves available:false with a reason', async () => {
+    mockFetch(200, { available: false, reason: 'file not found on host' });
+    const result = await api.readSource('run-1', 'missing.rs', 1);
+    expect(result.available).toBe(false);
+    expect(result.reason).toBe('file not found on host');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // URL encoding — paths with slashes / special chars
 // ---------------------------------------------------------------------------
 

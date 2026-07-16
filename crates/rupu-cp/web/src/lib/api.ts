@@ -1144,6 +1144,23 @@ export interface ProjectCoverageRow {
 }
 
 // ---------------------------------------------------------------------------
+// Source preview
+// ---------------------------------------------------------------------------
+
+/** Mirrors the backend's `GET /api/runs/:id/source` response shape. */
+export interface SourceSlice {
+  available: boolean;
+  path?: string;
+  language?: string | null;
+  startLine?: number;
+  endLine?: number;
+  targetLine?: number;
+  totalLines?: number;
+  lines?: { n: number; text: string }[];
+  reason?: string;
+}
+
+// ---------------------------------------------------------------------------
 // List pagination
 // ---------------------------------------------------------------------------
 
@@ -1856,5 +1873,23 @@ export const api = {
     es.onmessage = (m) => onEvent(JSON.parse(m.data) as TranscriptEvent);
     if (onError) es.onerror = onError;
     return () => es.close();
+  },
+
+  // --- Source preview ---
+
+  /**
+   * Fetch a line-numbered slice of a source file around `line`, for the
+   * transcript drill-down's "view source" affordance.
+   */
+  readSource(
+    runId: string,
+    path: string,
+    line: number,
+    opts?: { context?: number; host?: string },
+  ): Promise<SourceSlice> {
+    let url = `/api/runs/${encodeURIComponent(runId)}/source?path=${encodeURIComponent(path)}&line=${line}`;
+    if (opts?.context != null) url += `&context=${opts.context}`;
+    if (opts?.host) url += `&host=${encodeURIComponent(opts.host)}`;
+    return request<SourceSlice>(url);
   },
 };
