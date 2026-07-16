@@ -93,6 +93,33 @@ impl RunStatus {
     }
 }
 
+/// How a run came to exist.
+///
+/// Derived from `RunRecord`'s provenance fields, so it lives beside them rather
+/// than in any one consumer. Both `rupu-cp` (dashboard cycle grouping, run
+/// lists) and `rupu-cli` (`rupu run list`) classify runs this way, and they
+/// must agree — three separate copies of this logic would drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunTrigger {
+    /// Dispatched directly by an operator.
+    Manual,
+    /// Woken from the durable wake queue (polled events / cron tick).
+    Cron,
+    /// Fired by an SCM/webhook event.
+    Event,
+}
+
+impl RunTrigger {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RunTrigger::Manual => "manual",
+            RunTrigger::Cron => "cron",
+            RunTrigger::Event => "event",
+        }
+    }
+}
+
 /// Identity + bookkeeping for one run. Persisted as `run.json`.
 ///
 /// Forward-compatibility note: PR 2 will populate `awaiting_step_id`
@@ -231,6 +258,23 @@ pub struct RunRecord {
     /// dispatched unit's output is retrievable centrally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_output: Option<String>,
+}
+
+impl RunRecord {
+    /// Classify this run's trigger provenance.
+    ///
+    /// Precedence is event-before-wake and is load-bearing: an event-triggered
+    /// run may also carry a `source_wake_id`, and flipping the order would
+    /// silently re-bucket those runs.
+    pub fn trigger(&self) -> RunTrigger {
+        if self.event.is_some() {
+            RunTrigger::Event
+        } else if self.source_wake_id.is_some() {
+            RunTrigger::Cron
+        } else {
+            RunTrigger::Manual
+        }
+    }
 }
 
 /// Workflow-step shape, persisted alongside the result so the
@@ -1473,7 +1517,7 @@ mod tests {
     use chrono::Utc;
     use rupu_runtime::{
         ArtifactKind, ArtifactManifest, ArtifactRef, ExecutionRequest, RepoBinding, RunContext,
-        RunEnvelope, RunKind, RunTrigger, RunTriggerSource, WorkflowBinding,
+        RunEnvelope, RunKind, RunTrigger as EnvelopeTrigger, RunTriggerSource, WorkflowBinding,
     };
     use std::collections::BTreeMap;
     use tempfile::TempDir;
@@ -1559,7 +1603,7 @@ mod tests {
                 workspace_id: "ws_1".into(),
                 workspace_path: PathBuf::from("/tmp/proj"),
             }),
-            trigger: RunTrigger {
+            trigger: EnvelopeTrigger {
                 source: RunTriggerSource::WorkflowCli,
                 wake_id: None,
                 event_id: None,
@@ -2596,5 +2640,39 @@ mod tests {
         let back_local: UnitCheckpoint =
             serde_json::from_value(val_local).expect("deserialize local");
         assert_eq!(back_local.host, None);
+    }
+
+    #[test]
+    fn trigger_is_event_when_a_vendor_event_is_attached() {
+        let mut r = sample_record("run_trigger_event");
+        r.event = Some(serde_json::json!({"action": "opened"}));
+        assert_eq!(r.trigger(), RunTrigger::Event);
+        assert_eq!(r.trigger().as_str(), "event");
+    }
+
+    #[test]
+    fn trigger_is_cron_when_woken_from_the_durable_queue() {
+        let mut r = sample_record("run_trigger_cron");
+        r.source_wake_id = Some("wake_1".into());
+        assert_eq!(r.trigger(), RunTrigger::Cron);
+        assert_eq!(r.trigger().as_str(), "cron");
+    }
+
+    #[test]
+    fn trigger_is_manual_by_default() {
+        let r = sample_record("run_trigger_manual");
+        assert_eq!(r.trigger(), RunTrigger::Manual);
+        assert_eq!(r.trigger().as_str(), "manual");
+    }
+
+    #[test]
+    fn event_wins_over_wake_id() {
+        // An event-triggered run may also carry a wake id. Event is checked
+        // first in the original (api/runs.rs:345); preserve that precedence
+        // exactly — flipping it would silently re-bucket runs in the dashboard.
+        let mut r = sample_record("run_trigger_both");
+        r.event = Some(serde_json::json!({}));
+        r.source_wake_id = Some("wake_1".into());
+        assert_eq!(r.trigger(), RunTrigger::Event);
     }
 }

@@ -337,19 +337,13 @@ async fn resume_run(
     Ok(resp)
 }
 
-/// Derive a trigger label from a [`RunRecord`].
+/// Trigger provenance for the wire.
 ///
-/// - `"event"` — an SCM/webhook event fired the run (`event` field is set).
-/// - `"cron"` — a polled-event / cron wake fired it (`source_wake_id` is set).
-/// - `"manual"` — direct / manual dispatch (neither field is set).
+/// Thin wrapper over `RunRecord::trigger()` — kept so existing call sites read
+/// unchanged. The classification itself lives in `rupu-orchestrator`, beside the
+/// fields it reads.
 pub(crate) fn trigger_of(r: &RunRecord) -> &'static str {
-    if r.event.is_some() {
-        "event"
-    } else if r.source_wake_id.is_some() {
-        "cron"
-    } else {
-        "manual"
-    }
+    r.trigger().as_str()
 }
 
 // ── Host-aware helpers ────────────────────────────────────────────────────────
