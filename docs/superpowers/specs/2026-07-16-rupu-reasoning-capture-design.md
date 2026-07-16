@@ -269,9 +269,14 @@ enforce validation... though performance may degrade."*).
 
 Gemini's parse stores the assistant turn's **original `parts` array verbatim** in a single
 `ContentBlock::Reasoning`'s opaque `raw`; `convert_messages` replays those parts verbatim instead of
-rebuilding them from blocks. Signatures therefore land on exactly the parts they arrived on,
-byte-exact, with **no change to the shared `ContentBlock`** — the meaning of `raw` is provider-private,
-so this stays inside `google_gemini.rs` and no other provider is touched.
+rebuilding them from blocks. Signatures therefore land on exactly the parts they arrived on: the
+`thoughtSignature` string and its association with a specific part are preserved exactly, though JSON
+object key *order* is not — `serde_json` (without `preserve_order`) re-sorts keys alphabetically on
+re-serialization, so `{"name":...,"args":...}` replays as `{"args":...,"name":...}`. This is
+near-certainly immaterial (key order carries no meaning to protobuf-JSON parsers) and would only
+matter if Google validated a signature over a canonical serialization of the part. **No change to the
+shared `ContentBlock`** — the meaning of `raw` is provider-private, so this stays inside
+`google_gemini.rs` and no other provider is touched.
 
 ```
 Reasoning { text: <thought summaries, for the transcript>,

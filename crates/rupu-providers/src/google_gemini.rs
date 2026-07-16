@@ -531,18 +531,32 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
         //
         // The gate is the provider tag only: a foreign provider's block is an
         // alien wire format and is ignored (falling back to the rebuild).
-        let replay = msg.content.iter().find_map(|b| match b {
-            ContentBlock::Reasoning { provider, raw, .. } if provider == PROVIDER_TAG => {
-                raw.get("parts").and_then(|p| p.as_array()).cloned()
-            }
+        // Find a google_gemini-tagged Reasoning block first (without extracting
+        // `parts` yet) so the empty-array and unusable-raw cases below can be
+        // told apart for diagnostics — `find_map` collapsing straight to
+        // `Option<Vec<Value>>` made them indistinguishable.
+        let gemini_reasoning_raw = msg.content.iter().find_map(|b| match b {
+            ContentBlock::Reasoning { provider, raw, .. } if provider == PROVIDER_TAG => Some(raw),
             _ => None,
         });
-        if let Some(parts) = replay {
-            if !parts.is_empty() {
-                contents.push(serde_json::json!({"role": role, "parts": parts}));
-                continue;
+        if let Some(raw) = gemini_reasoning_raw {
+            match raw.get("parts").and_then(|p| p.as_array()) {
+                Some(parts) if !parts.is_empty() => {
+                    contents.push(serde_json::json!({"role": role, "parts": parts}));
+                    continue;
+                }
+                Some(_) => {
+                    debug!("gemini replay block had empty parts; rebuilding from blocks");
+                }
+                None => {
+                    debug!(
+                        "gemini replay block tagged {PROVIDER_TAG:?} had unusable raw \
+                         (missing or non-array \"parts\"); rebuilding from blocks — \
+                         a first functionCall part will be sent without its \
+                         thoughtSignature and Google will hard-400"
+                    );
+                }
             }
-            debug!("gemini replay block had empty parts; rebuilding from blocks");
         }
 
         let mut parts = Vec::new();
@@ -810,6 +824,14 @@ fn process_gemini_sse(
                     let is_thought = part.get("thought").and_then(|t| t.as_bool()) == Some(true);
                     if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                         if is_thought {
+                            // Deliberately no "\n\n" separator here, unlike the
+                            // non-streaming join in parse_generate_content_response:
+                            // SSE commonly delivers a single thought summary
+                            // fragmented across chunks, and inserting a separator
+                            // per chunk would corrupt it into disjoint paragraphs.
+                            // Display-only (reasoning_text()) — raw["parts"] and
+                            // the replay path are unaffected either way. Do not
+                            // "fix" this to match the non-streaming path.
                             acc.thought_text.push_str(text);
                             on_event(StreamEvent::ReasoningDelta(text.to_string()));
                         } else {
@@ -1329,6 +1351,59 @@ mod tests {
         assert_eq!(func_resp["response"]["output"], "file contents");
     }
 
+    /// Guards the seam between `parse_generate_content_response` (which writes
+    /// `raw["parts"]`) and `convert_messages` (which reads `raw["parts"]`).
+    /// Every other test in this file drives only one half — Task 1's tests
+    /// assert `raw["parts"]` is written; Task 2's tests (e.g. `replay_turn`
+    /// above) hand-build the assistant `Message` and assert `raw["parts"]` is
+    /// read. Neither proves the two halves actually compose. If the internal
+    /// `"parts"` key inside `raw` were renamed in
+    /// `parse_generate_content_response` and only Task 1's tests were updated
+    /// to match, every other gemini test would stay green while every real
+    /// Gemini turn silently reverted to the rebuild path — reintroducing the
+    /// hard 400 in production, undetected. This test drives the real
+    /// functions back-to-back with no hand-built intermediate, so that rename
+    /// fails here.
+    #[test]
+    fn parse_then_convert_round_trips_thought_signature() {
+        let parts = serde_json::json!([
+            {"thought": true, "text": "I should call f."},
+            {"functionCall": {"name": "f", "args": {"x": 1}}, "thoughtSignature": "sig_abc"}
+        ]);
+        let json = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": parts},
+                "finishReason": "FUNCTION_CALLING"
+            }]
+        });
+
+        let resp = parse_generate_content_response(&json, "gemini-3-pro-preview").unwrap();
+
+        // Feed resp.content straight into a fresh Message — do NOT hand-build
+        // the assistant turn the way `replay_turn` does elsewhere in this file.
+        let message = Message {
+            role: Role::Assistant,
+            content: resp.content,
+        };
+
+        let contents = convert_messages(&[message]);
+
+        assert_eq!(contents.len(), 1);
+        let sent_parts = contents[0]["parts"].as_array().unwrap();
+        // The thoughtSignature reached the replayed functionCall part.
+        assert_eq!(sent_parts[1]["thoughtSignature"], "sig_abc");
+        assert_eq!(sent_parts[1]["functionCall"]["name"], "f");
+        // Exactly one functionCall — the rebuild path must not have also
+        // turned the parsed ToolUse block into a second, duplicate part.
+        assert_eq!(
+            sent_parts
+                .iter()
+                .filter(|p| p.get("functionCall").is_some())
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn test_parse_response_text() {
         let json = serde_json::json!({
@@ -1467,6 +1542,40 @@ mod tests {
         assert_eq!(tools.len(), 1);
         match tools[0] {
             ContentBlock::ToolUse { name, .. } => assert_eq!(name, "f"),
+            _ => panic!("expected ToolUse"),
+        }
+        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+    }
+
+    #[test]
+    fn parse_response_thought_part_with_function_call_still_yields_tool_use() {
+        // Non-streaming mirror of `sse_thought_part_with_function_call_still_yields_tool_use`.
+        // `parse_response_preserves_thought_signature_in_raw` only covers a
+        // functionCall part WITHOUT thought:true, so a refactor reintroducing a
+        // `continue` on thought:true in the non-streaming parse (but not the SSE
+        // one) would go green without this test.
+        let json = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "thought": true,
+                        "functionCall": {"name": "f", "args": {"x": 1}},
+                        "thoughtSignature": "sig_abc"
+                    }]
+                },
+                "finishReason": "FUNCTION_CALLING"
+            }]
+        });
+
+        let response = parse_generate_content_response(&json, "gemini-3-pro").unwrap();
+        let tools = response.tool_calls();
+        assert_eq!(tools.len(), 1);
+        match tools[0] {
+            ContentBlock::ToolUse { name, input, .. } => {
+                assert_eq!(name, "f");
+                assert_eq!(input["x"], 1);
+            }
             _ => panic!("expected ToolUse"),
         }
         assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
