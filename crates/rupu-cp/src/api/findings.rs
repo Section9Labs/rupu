@@ -116,7 +116,11 @@ fn scope_by_run_set(
 /// Pure transform over the collected findings: sort by severity (critical→info)
 /// then `declared_at` DESC, and tally the per-severity summary. Factored out of
 /// the handler so it can be unit-tested without a server.
-fn build_response(mut findings: Vec<FindingOut>) -> FindingsResponse {
+///
+/// `pub(crate)`: also called by `LocalHostConnector::dashboard_summary`
+/// (`host/local.rs`) to derive `findings_open` from `.summary.total` rather
+/// than re-walking the findings store.
+pub(crate) fn build_response(mut findings: Vec<FindingOut>) -> FindingsResponse {
     findings.sort_by(|a, b| {
         // Severity descending (critical first), then declared_at descending.
         severity_rank(b.record.severity)
@@ -139,9 +143,9 @@ fn build_response(mut findings: Vec<FindingOut>) -> FindingsResponse {
     FindingsResponse { findings, summary }
 }
 
-fn store(s: &AppState) -> WorkspaceStore {
+fn store_for(global_dir: &std::path::Path) -> WorkspaceStore {
     WorkspaceStore {
-        root: s.global_dir.join("workspaces"),
+        root: global_dir.join("workspaces"),
     }
 }
 
@@ -153,17 +157,20 @@ fn project_name(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-/// `GET /api/findings` — every finding across every registered workspace's
-/// coverage targets, tagged with provenance, plus a per-severity summary.
+/// Collect every finding across every registered workspace's coverage
+/// targets, tagged with provenance (`ws_id` / `project` / `target_id`) but
+/// WITHOUT the `RunStore` `workflow_name` join — `list_findings` does that
+/// join itself afterward, since it needs `AppState.run_store`.
+///
+/// `pub(crate)`: this is the one workspace/target walk. `list_findings` and
+/// `LocalHostConnector::dashboard_summary`'s open-findings count
+/// (`host/local.rs`) both call it rather than each re-implementing the walk.
 ///
 /// Tolerant by design: a workspace whose path is gone, or a target whose
-/// `findings.jsonl` is absent/unreadable, is skipped with a `warn!` rather than
-/// failing the whole request. A missing registry yields an empty response.
-async fn list_findings(
-    State(s): State<AppState>,
-    Query(q): Query<FindingsQuery>,
-) -> ApiResult<Json<FindingsResponse>> {
-    let workspaces = store(&s).list().unwrap_or_default();
+/// `findings.jsonl` is absent/unreadable, is skipped with a `warn!` rather
+/// than failing the caller.
+pub(crate) fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingOut> {
+    let workspaces = store_for(global_dir).list().unwrap_or_default();
 
     let mut out: Vec<FindingOut> = Vec::new();
     for w in &workspaces {
@@ -196,6 +203,20 @@ async fn list_findings(
             }
         }
     }
+    out
+}
+
+/// `GET /api/findings` — every finding across every registered workspace's
+/// coverage targets, tagged with provenance, plus a per-severity summary.
+///
+/// Tolerant by design: a workspace whose path is gone, or a target whose
+/// `findings.jsonl` is absent/unreadable, is skipped with a `warn!` rather than
+/// failing the whole request. A missing registry yields an empty response.
+async fn list_findings(
+    State(s): State<AppState>,
+    Query(q): Query<FindingsQuery>,
+) -> ApiResult<Json<FindingsResponse>> {
+    let mut out: Vec<FindingOut> = collect_all_findings(&s.global_dir);
 
     // Join `declared_by.run_id → workflow_name` via the RunStore. Load each
     // distinct run id once; a load error / NotFound leaves that id out of the
@@ -224,7 +245,11 @@ async fn list_findings(
     let run_ids: Option<HashSet<String>> = q.run_id.as_ref().map(|parent| {
         let mut set = HashSet::new();
         set.insert(parent.clone());
-        for cp in s.run_store.read_unit_checkpoints(parent).unwrap_or_default() {
+        for cp in s
+            .run_store
+            .read_unit_checkpoints(parent)
+            .unwrap_or_default()
+        {
             set.insert(cp.run_id);
         }
         set
@@ -373,9 +398,27 @@ mod tests {
     /// handler would after the RunStore join.
     fn mixed_findings() -> Vec<FindingOut> {
         vec![
-            finding_in("ws1", Some("wfA"), "a", Severity::Critical, "2026-01-01T00:00:00Z"),
-            finding_in("ws1", Some("wfB"), "b", Severity::High, "2026-01-02T00:00:00Z"),
-            finding_in("ws2", Some("wfA"), "c", Severity::Medium, "2026-01-03T00:00:00Z"),
+            finding_in(
+                "ws1",
+                Some("wfA"),
+                "a",
+                Severity::Critical,
+                "2026-01-01T00:00:00Z",
+            ),
+            finding_in(
+                "ws1",
+                Some("wfB"),
+                "b",
+                Severity::High,
+                "2026-01-02T00:00:00Z",
+            ),
+            finding_in(
+                "ws2",
+                Some("wfA"),
+                "c",
+                Severity::Medium,
+                "2026-01-03T00:00:00Z",
+            ),
             finding_in("ws2", None, "d", Severity::Low, "2026-01-04T00:00:00Z"),
         ]
     }
@@ -399,8 +442,7 @@ mod tests {
 
     #[test]
     fn ws_id_filter_scopes_findings_and_summary() {
-        let resp =
-            scope_by_run_set(mixed_findings(), &None, &Some("ws2".to_string()), &None);
+        let resp = scope_by_run_set(mixed_findings(), &None, &Some("ws2".to_string()), &None);
         let ids: Vec<&str> = resp.findings.iter().map(|f| f.record.id.as_str()).collect();
         assert_eq!(ids, vec!["c", "d"]);
         assert!(resp.findings.iter().all(|f| f.ws_id == "ws2"));
@@ -414,8 +456,7 @@ mod tests {
 
     #[test]
     fn workflow_filter_matches_attached_name_and_excludes_none() {
-        let resp =
-            scope_by_run_set(mixed_findings(), &None, &None, &Some("wfA".to_string()));
+        let resp = scope_by_run_set(mixed_findings(), &None, &None, &Some("wfA".to_string()));
         let ids: Vec<&str> = resp.findings.iter().map(|f| f.record.id.as_str()).collect();
         // "a" (ws1/wfA) + "c" (ws2/wfA); "b" is wfB, "d" is None — both excluded.
         assert_eq!(ids, vec!["a", "c"]);
@@ -439,8 +480,7 @@ mod tests {
             Severity::Info,
             "2026-01-01T00:00:00Z",
         )];
-        let resp =
-            scope_by_run_set(input, &None, &None, &Some("anything".to_string()));
+        let resp = scope_by_run_set(input, &None, &None, &Some("anything".to_string()));
         assert!(resp.findings.is_empty());
         assert_eq!(resp.summary.total, 0);
     }
@@ -457,8 +497,7 @@ mod tests {
     #[test]
     fn run_id_filter_scopes_findings_and_summary() {
         // A set of one parent id still matches top-level findings.
-        let resp =
-            scope_by_run_set(run_findings(), &run_set(&["runA"]), &None, &None);
+        let resp = scope_by_run_set(run_findings(), &run_set(&["runA"]), &None, &None);
         let ids: Vec<&str> = resp.findings.iter().map(|f| f.record.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b"]);
         assert!(resp
@@ -474,8 +513,7 @@ mod tests {
 
     #[test]
     fn run_id_filter_with_no_match_is_empty() {
-        let resp =
-            scope_by_run_set(run_findings(), &run_set(&["nope"]), &None, &None);
+        let resp = scope_by_run_set(run_findings(), &run_set(&["nope"]), &None, &None);
         assert!(resp.findings.is_empty());
         assert_eq!(resp.summary, FindingsSummary::default());
         assert_eq!(resp.summary.total, 0);

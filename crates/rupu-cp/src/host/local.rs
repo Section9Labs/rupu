@@ -13,6 +13,7 @@ use rupu_orchestrator::{
     runs::{CancelError, PauseError, RunStore},
     ApprovalError, RunStoreError,
 };
+use rupu_runtime::{AutoflowHistoryStore, AutoflowHistoryStoreError};
 
 use crate::{
     agent_launcher::{AgentLaunchRequest, AgentLauncher},
@@ -308,6 +309,110 @@ impl HostConnector for LocalHostConnector {
     async fn discard_workspace(&self, working_dir: &str) -> Result<(), HostConnectorError> {
         discard_from_dir(working_dir, &self.global_dir)
     }
+
+    /// Build this host's dashboard contribution from the local `RunStore`,
+    /// the autoflow cycle history, and the findings ledger — one round-trip,
+    /// no per-panel calls (see `dashboard_summary.rs` module docs).
+    async fn dashboard_summary(
+        &self,
+        range: crate::host::dashboard_summary::DashboardRange,
+    ) -> Result<crate::host::dashboard_summary::DashboardSummary, HostConnectorError> {
+        let runs = self
+            .run_store
+            .list()
+            .map_err(|e| HostConnectorError::Invalid(format!("run store list failed: {e}")))?;
+        let cycles = collect_cycle_rollups(&self.global_dir).unwrap_or_default();
+        let findings_open = count_open_findings(&self.global_dir).unwrap_or(0);
+        Ok(crate::host::summary_build::build_summary(
+            &runs,
+            &cycles,
+            findings_open,
+            range,
+            chrono::Utc::now(),
+        ))
+    }
+}
+
+// ── Dashboard summary helpers ────────────────────────────────────────────────
+
+/// Read this host's autoflow cycle history and roll each cycle into a
+/// [`CycleRollup`](crate::host::dashboard_summary::CycleRollup).
+///
+/// Reads through `AutoflowHistoryStore` exactly as
+/// `list_autoflow_runs` (`api/run_streams.rs`) does, and reuses
+/// `run_streams::harvest_run_ids` for the run-id extraction, so there is
+/// exactly one place that parses `AutoflowCycleRecord` and one place that
+/// harvests run ids from its events — no second history-reading path.
+///
+/// Each `CycleRun.status` is left `"unknown"` here: `build_summary` fills it
+/// in from the runs it already holds, so this helper never does a per-run
+/// store read (expanding a cycle costs zero extra reads).
+fn collect_cycle_rollups(
+    global_dir: &std::path::Path,
+) -> Result<Vec<crate::host::dashboard_summary::CycleRollup>, HostConnectorError> {
+    use crate::host::dashboard_summary::{CycleRollup, CycleRun};
+
+    let store_root = global_dir.join("autoflows").join("history");
+    let store = AutoflowHistoryStore::new(store_root);
+    let records = match store.list_recent(100) {
+        Ok(r) => r,
+        Err(AutoflowHistoryStoreError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Vec::new()
+        }
+        Err(e) => return Err(HostConnectorError::Invalid(e.to_string())),
+    };
+
+    Ok(records
+        .iter()
+        .map(|r| {
+            let started_at = parse_rfc3339_or_now(&r.started_at);
+            // `AutoflowCycleRecord::new` initializes `finished_at` equal to
+            // `started_at`; a worker overwrites it only once the cycle truly
+            // finishes. There is no separate "unfinished" sentinel field, so
+            // string equality is the only signal available here.
+            let finished_at = if r.finished_at == r.started_at {
+                None
+            } else {
+                Some(parse_rfc3339_or_now(&r.finished_at))
+            };
+            CycleRollup {
+                cycle_id: r.cycle_id.clone(),
+                worker_name: r.worker_name.clone(),
+                started_at,
+                finished_at,
+                ran: r.ran_cycles as u64,
+                skipped: r.skipped_cycles as u64,
+                failed: r.failed_cycles as u64,
+                runs: crate::api::run_streams::harvest_run_ids(r)
+                    .into_iter()
+                    .map(|run_id| CycleRun {
+                        run_id,
+                        status: "unknown".to_string(),
+                    })
+                    .collect(),
+            }
+        })
+        .collect())
+}
+
+/// Best-effort RFC-3339 parse; falls back to `now()` on a malformed
+/// timestamp rather than failing the whole dashboard summary over one bad
+/// history record.
+fn parse_rfc3339_or_now(s: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|e| {
+            tracing::warn!(value = %s, error = %e, "failed to parse cycle timestamp; using now()");
+            chrono::Utc::now()
+        })
+}
+
+/// Total open findings across every registered workspace, via the same
+/// collect-then-summarize path `GET /api/findings` uses (`api::findings`) —
+/// never a second workspace/target walk.
+fn count_open_findings(global_dir: &std::path::Path) -> Result<u64, HostConnectorError> {
+    let findings = crate::api::findings::collect_all_findings(global_dir);
+    Ok(crate::api::findings::build_response(findings).summary.total as u64)
 }
 
 #[cfg(test)]
