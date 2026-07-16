@@ -333,7 +333,17 @@ self-contained.";
         tools: vec![],
         cell_id: None,
         trace_id: None,
-        thinking: None,
+        // The history carried in this request (messages[..recent_start]) may
+        // contain `ContentBlock::Reasoning` blocks echoed back onto the wire
+        // as `thinking` blocks (see `restore_reasoning_blocks` in
+        // rupu-providers/src/anthropic.rs). Anthropic requires a `thinking`
+        // config to be present whenever thinking blocks appear in assistant
+        // history, or the request 400s. Setting `Auto` here matches the
+        // thinking configuration of the surrounding turns whose history this
+        // request carries, and keeps the api-key auth path consistent with
+        // OAuth, which already injects adaptive thinking on requests like
+        // this one (see `build_request_body` in anthropic.rs).
+        thinking: Some(rupu_providers::model_tier::ThinkingLevel::Auto),
         context_window: None,
         task_type: None,
         output_format: None,
@@ -2477,6 +2487,45 @@ mod compaction_tests {
         assert!(
             outcome.summarized_messages > 0,
             "summarized_messages must be > 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_messages_sets_thinking_on_summary_request() {
+        // The compaction summary request carries history that may contain
+        // `ContentBlock::Reasoning` blocks, which get echoed back onto the
+        // wire as `thinking` blocks by the Anthropic provider. Anthropic
+        // requires a `thinking` config whenever thinking blocks appear in
+        // assistant history, or the request 400s (this used to be `None`,
+        // which was fine only on the OAuth path, where the provider injects
+        // adaptive thinking regardless of the request's `thinking` field).
+        let dense_chunk = "x".repeat(1000);
+        let mut msgs = vec![text_msg(Role::User, &format!("task: {dense_chunk}"))];
+        for i in 0..5 {
+            msgs.push(text_msg(
+                Role::Assistant,
+                &format!("assistant {i}: {dense_chunk}"),
+            ));
+            msgs.push(text_msg(Role::User, &format!("user {i}: {dense_chunk}")));
+        }
+
+        let mut provider = CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "Summary of prior work.".to_string(),
+            stop: StopReason::EndTurn,
+            input_tokens: 500,
+            output_tokens: 10,
+        }]);
+
+        let result = compact_messages(&msgs, &mut provider, "mock-1", 1000, Some(80), 900).await;
+        result.expect("no provider error").expect("should compact");
+
+        let captured = provider.captured_requests();
+        assert_eq!(captured.len(), 1, "expected exactly one summary request");
+        assert_eq!(
+            captured[0].thinking,
+            Some(rupu_providers::model_tier::ThinkingLevel::Auto),
+            "compaction summary request must set thinking so echoed reasoning \
+             blocks in its history don't 400 on the api-key auth path"
         );
     }
 
