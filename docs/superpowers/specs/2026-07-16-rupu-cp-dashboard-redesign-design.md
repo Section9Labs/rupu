@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-16
 **Status:** Design
-**Scope:** `crates/rupu-cp` (Rust API + `web/` SPA), `crates/rupu-cp/src/host/` (connector trait + SSH impl)
+**Scope:** `crates/rupu-cp` (Rust API + `web/` SPA), `crates/rupu-cp/src/host/` (connector trait + SSH impl), `crates/rupu-cli` (new `run list --format json` — see §4.3)
 
 ## 1. Problem
 
@@ -113,7 +113,7 @@ async fn dashboard_summary(
 | `active` | `ActiveCounts` | `running`, `awaiting_approval`, `paused`, `pending` |
 | `terminal_buckets` | `Vec<TerminalBucket>` | `{ ts, completed, failed, rejected, cancelled }` |
 | `active_runs` | `Vec<ActiveRunBar>` | swimlane input: `{ run_id, workflow_name, status, started_at, trigger, cycle_id }` |
-| `cycles` | `Vec<CycleRollup>` | `{ cycle_id, worker_name, started_at, finished_at, ran, skipped, failed, run_ids }` |
+| `cycles` | `Vec<CycleRollup>` | `{ cycle_id, worker_name, started_at, finished_at, ran, skipped, failed, runs: Vec<CycleRun> }` |
 | `recent_manual` | `Vec<RecentRun>` | manual-trigger runs, individual |
 | `findings_open` | `u64` | |
 | `captured_at` | `DateTime<Utc>` | **freshness — see §5.4** |
@@ -161,13 +161,50 @@ Consequences, all permanent for the affected runs:
 A "runs on host X" panel built on this under-reports and cannot know it. This is the silently-degraded
 shape the project explicitly rejects.
 
-**Fix:** `SshHostConnector::list_runs` shells the remote CLI (`rupu run list --format json`) as the
-source of truth, consistent with how `list_sessions` and `list_autoflow_runs` already work. The
-mirror remains the backing store for `stream_run_events` — tailing is a genuinely different problem
-from listing, and the pump stays as-is for CP-launched runs.
+**Fix:** `SshHostConnector::list_runs` shells the remote CLI as the source of truth, consistent with
+how `list_sessions`, `list_autoflow_runs`, and `list_agent_runs` already work — all three shell
+`rupu … --format json`. The mirror remains the backing store for `stream_run_events`: tailing a known
+path on a live run is a genuinely different problem from enumerating the store, and the pump stays
+as-is for CP-launched runs.
+
+**Blocker: the CLI surface does not exist.** `rupu run list --format json` is not a command.
+`Cmd::Run` is not a clap subcommand — it is `trailing_var_arg` capturing tokens verbatim
+(`rupu-cli/src/lib.rs:79-83`) — and `--format json` is explicitly rejected for `rupu run`
+(`lib.rs:318-322`, `Table` only). The only run-listing surface that speaks JSON is
+`rupu workflow runs --format json`, and it is lossy in ways that are *wrong*, not merely blank:
+
+- **No `trigger`.** The row carries no `event` / `source_wake_id`, so `trigger_of` is not computable.
+  Hardcoding `"manual"` would mis-classify every autoflow run on an SSH host as manual, so it would
+  escape cycle grouping (§5.5) — the exact bug this redesign exists to fix.
+- **`started_at` is `"%Y-%m-%d %H:%M:%S"`** (`workflow.rs:1859`) — space-separated, no timezone, not
+  RFC-3339 — while every merge in the fan-out path does a **lexicographic string compare** on that
+  field. `' '` (0x20) sorts before `'T'` (0x54), so every SSH row would sort after every local row at
+  the same instant, silently.
+- No `finished_at` (only `duration_seconds`); `usage` is flat `total_tokens` + `cost_usd` rather than
+  a `UsageSummary`; `--limit` is applied *before* sorting (`workflow.rs:1827`), so a small limit
+  returns an arbitrary subset rather than the newest N.
+
+**Therefore plan 2 adds a real CLI surface first:** `rupu run list --format json`, emitting the full
+`RunRecord` fields CP needs — `trigger`, `finished_at`, RFC-3339 timestamps — versioned
+`kind: "run_list", version: 1` per the existing convention. The impedance mismatches are then fixed
+at the source rather than patched in a mapper.
+
+**Rejected: `cat`-ing remote `run.json` over `RemoteExec`.** It yields the complete `RunRecord` with
+no CLI change and has surface precedent (the pump `cat`s `run.json` to poll terminal status). But it
+makes `list_runs` the one method in `ssh.rs` not going through the CLI, and — decisively — it
+promotes `run.json`'s on-disk shape from an internal detail to a **remote wire format**, so any
+future store-layout change breaks remote listing silently on untouched hosts. The CLI's JSON contract
+is versioned precisely so it can evolve deliberately. Remains available as a later fallback if old
+hosts prove common; not built on speculation.
+
+**Version skew is a visible state, not a fallback path.** A remote host whose `rupu` predates the
+command renders **unavailable with a reason** — `builder-01 · needs rupu ≥ 0.49` — gated on
+`info().version`, reusing the freshness strip (§5.4) and the §4.1 rule that `Unsupported` never
+renders as `0`. No second listing path is carried.
 
 **Risk:** this changes what an SSH host reports and touches the launch-path pump's neighborhood.
-Requires a test against a real SSH host, not just a mock. Separable and revertable on its own.
+Requires a test against a real SSH host, not just a mock — a mock would happily fake the mirror the
+fix exists to stop trusting. Separable and revertable on its own.
 
 ## 5. Plan 1 — Ops dashboard (page)
 
@@ -301,6 +338,12 @@ cycle, so grouping N runs run-first would mean N history lookups. `AutoflowCycle
 (`api/run_streams.rs`) already carries `cycle_id`, `worker_name`, `ran_cycles`, `skipped_cycles`,
 `failed_cycles`, and a `run_ids` array. Pull from the cycle store and join outward.
 
+**`CycleRollup` carries `runs: Vec<CycleRun { run_id, status }>`, not a bare `run_ids: Vec<String>`.**
+The `+N clean` pill needs each run's status to decide what folds, and `AutoflowCycleRow` supplies
+only IDs. The status join happens server-side in `build_summary`, which already holds every run —
+making the client fetch a run per ID to learn its status would turn one expanded cycle into N
+requests. This is why the DTO diverges from `AutoflowCycleRow`'s shape rather than mirroring it.
+
 **The 10-row server cap is removed.** It exists only because the feed was ungrouped.
 
 ## 6. Plan 3 — Spend page
@@ -372,8 +415,13 @@ cleanliness. The page is validated in a browser before merge.
 
 | Plan | Scope | Depends on |
 |---|---|---|
-| 2 | `dashboard_summary()` across transports; SSH `list_runs` fix (own PR); fan-out in `/api/dashboard` | — |
+| 2 | `rupu run list --format json` in `rupu-cli` (§4.3); `dashboard_summary()` across transports; SSH `list_runs` fix (own PR); fan-out in `/api/dashboard` | — |
 | 1 | Ops page: swimlane, split status, cycle feed, attention row, freshness strip, SSE invalidation | 2 |
 | 3 | Spend page: pivots, outliers, unpriced gap | 2 |
 
 Plan 2 is the foundation and carries the risk. Plans 1 and 3 are independent of each other.
+
+**Scope note.** Plan 2 grew a `rupu-cli` task once it emerged that the CLI surface the SSH fix
+assumed does not exist (§4.3). It is the first task in plan 2 and blocks the SSH fix. Note that this
+lands in `rupu-cli`, which CLAUDE.md requires stay thin — a `run list` subcommand is arg parsing plus
+a `RunStore::list()` call and a serializer, so it stays within that rule.
