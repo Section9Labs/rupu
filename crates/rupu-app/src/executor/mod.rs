@@ -106,10 +106,16 @@ impl AppExecutor {
             mcp_registry: Arc::clone(&self.config.mcp_registry),
             system_prompt_suffix: None,
             dispatcher: None,
-            // TODO: thread config-declared openai-compatible providers here too
-            // (the GUI workflow path doesn't yet, so a custom provider like
-            // `oracle` fails loudly with "unknown provider" — same as before).
+            // TODO: the GUI path never loads a real `rupu_config::Config` (see
+            // `build_executor`, which passes `Config::default()`), so neither
+            // config-declared openai-compatible providers nor
+            // `default_provider` / `default_model` reach a step here. A custom
+            // provider like `oracle` still fails loudly with "unknown
+            // provider", and the defaults below stay `None` — both as before.
+            // Fixing this means loading the layered config in `build_executor`.
             openai_compatible: std::collections::HashMap::new(),
+            default_provider: None,
+            default_model: None,
         });
 
         let handle = self

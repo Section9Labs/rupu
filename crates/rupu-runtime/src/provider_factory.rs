@@ -88,6 +88,55 @@ pub fn openai_compatible_map(
         .collect()
 }
 
+/// Provider used when neither the agent nor the config names one.
+pub const FALLBACK_PROVIDER: &str = "anthropic";
+/// Model used when neither the agent, the config, nor the provider names one.
+pub const FALLBACK_MODEL: &str = "claude-sonnet-4-6";
+
+/// Treat `Some("")` as unset. `openai_compatible_params` yields an empty
+/// `default_model` when the config key is absent, and a blank frontmatter value
+/// is a typo rather than an intentional pin — neither should win a fallback.
+fn non_empty(v: Option<&str>) -> Option<&str> {
+    v.filter(|s| !s.trim().is_empty())
+}
+
+/// Resolve the provider name for a run: agent frontmatter `provider:` wins,
+/// then `default_provider` from `config.toml`, then [`FALLBACK_PROVIDER`].
+///
+/// The single resolution point for `rupu run`, `rupu session`, and workflow
+/// steps. Before this existed each call site hardcoded the fallback and
+/// `default_provider` was never read at all (ISSUES.md I-1).
+pub fn resolve_provider_name(spec_provider: Option<&str>, cfg_default: Option<&str>) -> String {
+    non_empty(spec_provider)
+        .or(non_empty(cfg_default))
+        .unwrap_or(FALLBACK_PROVIDER)
+        .to_string()
+}
+
+/// Resolve the model for a run: agent frontmatter `model:` wins, then
+/// `default_model` from `config.toml`, then the resolved provider's
+/// `[providers.<name>].default_model`, then [`FALLBACK_MODEL`].
+///
+/// The single resolution point for `rupu run`, `rupu session`, and workflow
+/// steps — the workflow path previously skipped `cfg.default_model`, so the
+/// same agent could resolve to a different model depending on how it was
+/// invoked (ISSUES.md I-2).
+///
+/// Note the global `default_model` is consulted *before* the provider-scoped
+/// one. That is the pre-existing `rupu run` order, preserved here deliberately;
+/// see ISSUES.md I-3 for why it is questionable.
+pub fn resolve_model(
+    spec_model: Option<&str>,
+    cfg_default: Option<&str>,
+    provider_default: Option<&str>,
+) -> String {
+    non_empty(spec_model)
+        .or(non_empty(cfg_default))
+        .or(non_empty(provider_default))
+        .unwrap_or(FALLBACK_MODEL)
+        .to_string()
+}
+
 /// True for provider names the factory builds directly (not openai-compatible).
 pub fn is_builtin_provider(name: &str) -> bool {
     matches!(

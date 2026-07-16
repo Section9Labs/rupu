@@ -147,7 +147,7 @@ impl Config {
                         "provider '{name}': kind=\"openai-compatible\" requires base_url"
                     )));
                 }
-                if p.default_model.as_deref().map_or(true, |m| m.is_empty()) {
+                if p.default_model.as_deref().is_none_or(|m| m.is_empty()) {
                     return Err(crate::layer::LayerError::Invalid(format!(
                         "provider '{name}': kind=\"openai-compatible\" requires default_model"
                     )));
