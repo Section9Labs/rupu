@@ -262,6 +262,9 @@ impl OpenAiCodexClient {
                             "output": normalize_function_call_output(content),
                         }));
                     }
+                    ContentBlock::Reasoning { .. } => { /* Plan 4: reasoning items + encrypted_content */
+                    }
+                    ContentBlock::Unknown => {}
                 }
             }
 

@@ -1270,9 +1270,15 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
 
     let effective_prompt = args.prompt_flag.clone().or_else(|| args.prompt.clone());
     let (run_target, user_message) = match args.target.as_deref() {
-        None => (None, effective_prompt.clone().unwrap_or_else(|| "go".into())),
+        None => (
+            None,
+            effective_prompt.clone().unwrap_or_else(|| "go".into()),
+        ),
         Some(s) => match crate::run_target::parse_run_target(s) {
-            Ok(t) => (Some(t), effective_prompt.clone().unwrap_or_else(|| "go".into())),
+            Ok(t) => (
+                Some(t),
+                effective_prompt.clone().unwrap_or_else(|| "go".into()),
+            ),
             Err(_) => {
                 let combined = match effective_prompt.as_deref() {
                     Some(p) => format!("{s} {p}"),
@@ -2011,7 +2017,10 @@ impl SessionLiveUsageWriterState {
                 self.usage = next;
                 true
             }
-            StreamEvent::ToolUseStart { .. } | StreamEvent::InputJsonDelta(_) => false,
+            // Plan 2: reasoning deltas don't feed the live output-token estimate yet.
+            StreamEvent::ToolUseStart { .. }
+            | StreamEvent::InputJsonDelta(_)
+            | StreamEvent::ReasoningDelta(_) => false,
         }
     }
 
@@ -6041,6 +6050,10 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
                     rupu_providers::types::ContentBlock::ToolResult { content, .. } => {
                         content.len()
                     }
+                    rupu_providers::types::ContentBlock::Reasoning { text, .. } => {
+                        text.as_deref().map(str::len).unwrap_or(0)
+                    }
+                    rupu_providers::types::ContentBlock::Unknown => 0,
                 })
                 .sum::<usize>()
         })
@@ -6465,6 +6478,10 @@ async fn run_compact_request(
                     rupu_providers::types::ContentBlock::ToolResult { content, .. } => {
                         content.len()
                     }
+                    rupu_providers::types::ContentBlock::Reasoning { text, .. } => {
+                        text.as_deref().map(str::len).unwrap_or(0)
+                    }
+                    rupu_providers::types::ContentBlock::Unknown => 0,
                 })
                 .sum::<usize>()
         })

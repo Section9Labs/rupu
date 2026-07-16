@@ -157,6 +157,8 @@ pub(crate) fn estimate_tokens(messages: &[Message]) -> usize {
                 (name.len() + input_str.len()) / 4
             }
             ContentBlock::ToolResult { content, .. } => content.len() / 4,
+            ContentBlock::Reasoning { text, .. } => text.as_deref().map(str::len).unwrap_or(0) / 4,
+            ContentBlock::Unknown => 0,
         })
         .sum()
 }
@@ -173,6 +175,8 @@ fn message_chars(m: &Message) -> usize {
                 name.len() + input_str.len()
             }
             ContentBlock::ToolResult { content, .. } => content.len(),
+            ContentBlock::Reasoning { text, .. } => text.as_deref().map(str::len).unwrap_or(0),
+            ContentBlock::Unknown => 0,
         })
         .sum()
 }
@@ -931,6 +935,8 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                             }
                             StreamEvent::UsageSnapshot(_) => {}
                             StreamEvent::ToolUseStart { .. } | StreamEvent::InputJsonDelta(_) => {}
+                            // Plan 2: no live reasoning stream-to-stdout wiring yet.
+                            StreamEvent::ReasoningDelta(_) => {}
                         }
                     };
                     // Race the stream against the pause token. On pause the
@@ -1098,6 +1104,10 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                         // those originate from the runtime feeding tool
                         // outputs back. Ignore if seen.
                     }
+                    ContentBlock::Reasoning { .. } => {
+                        // Task 4 populates AssistantMessage.thinking from these.
+                    }
+                    ContentBlock::Unknown => {}
                 }
             }
 
