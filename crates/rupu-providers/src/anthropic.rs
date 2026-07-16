@@ -810,6 +810,21 @@ fn model_supports_adaptive_thinking(model: &str) -> bool {
     model.contains("-4-") || model.contains("-4.")
 }
 
+/// Whether a stream event counts as "content emitted" for `stream()`'s
+/// idle-stall guard. Once any of these fire, a stall can no longer be
+/// silently retried — retrying would duplicate already-streamed output.
+/// `ReasoningDelta` counts: thinking tokens are real generated output,
+/// just like text or tool-input deltas.
+fn stream_event_counts_as_emitted_content(ev: &StreamEvent) -> bool {
+    matches!(
+        ev,
+        StreamEvent::TextDelta(_)
+            | StreamEvent::ToolUseStart { .. }
+            | StreamEvent::InputJsonDelta(_)
+            | StreamEvent::ReasoningDelta(_)
+    )
+}
+
 impl AnthropicClient {
     /// One-shot, best-effort GET to `/api/claude_cli/bootstrap`. The
     /// reference Claude Code client makes this call once on session
@@ -1065,13 +1080,7 @@ impl AnthropicClient {
                         Some(chunk) => {
                             for event in parser.feed(&chunk)? {
                                 self.process_sse_event(&event, &mut accumulator, &mut |ev| {
-                                    if matches!(
-                                        ev,
-                                        StreamEvent::TextDelta(_)
-                                            | StreamEvent::ToolUseStart { .. }
-                                            | StreamEvent::InputJsonDelta(_)
-                                            | StreamEvent::ReasoningDelta(_)
-                                    ) {
+                                    if stream_event_counts_as_emitted_content(&ev) {
                                         emitted_content = true;
                                     }
                                     on_event(ev);
@@ -1423,10 +1432,19 @@ impl AnthropicClient {
                         }
                         "thinking_delta" => {
                             if let Some(t) = delta.get("thinking").and_then(|v| v.as_str()) {
-                                acc.current_reasoning_text
-                                    .get_or_insert_with(String::new)
-                                    .push_str(t);
-                                on_event(StreamEvent::ReasoningDelta(t.to_string()));
+                                // Only append to a buffer that a `content_block_start`
+                                // of type "thinking" actually opened. Using
+                                // `get_or_insert_with` here would fabricate a buffer
+                                // for any future block type that also emits
+                                // `thinking_delta` but was dropped by the `_ => {}`
+                                // arm above — `content_block_stop` would then push a
+                                // `{"type":"thinking", ...}` raw block that was never
+                                // really opened, and Anthropic rejects that block when
+                                // it's echoed back verbatim.
+                                if let Some(buf) = acc.current_reasoning_text.as_mut() {
+                                    buf.push_str(t);
+                                    on_event(StreamEvent::ReasoningDelta(t.to_string()));
+                                }
                             }
                         }
                         "signature_delta" => {
@@ -3245,18 +3263,75 @@ mod tests {
     }
 
     #[test]
+    fn thinking_delta_without_open_block_is_not_fabricated() {
+        // No `content_block_start` of type "thinking" precedes this delta
+        // (e.g. it followed a start type this parser doesn't recognize and
+        // dropped via the `_ => {}` arm). The accumulator must not fabricate
+        // a reasoning buffer for it — doing so would let `content_block_stop`
+        // push a `{"type":"thinking", ...}` raw block that was never really
+        // opened, which Anthropic rejects when echoed back.
+        let client = AnthropicClient::new("test-key".into());
+        let mut acc = reasoning_acc();
+        let mut events_received = Vec::new();
+        let events = vec![
+            sse(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"orphan"}}"#,
+            ),
+            sse(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+        ];
+        for event in &events {
+            client
+                .process_sse_event(event, &mut acc, &mut |se| {
+                    events_received.push(format!("{se:?}"));
+                })
+                .unwrap();
+        }
+
+        assert!(
+            acc.content_blocks.is_empty(),
+            "no Reasoning block should be fabricated for an unopened thinking buffer: {:?}",
+            acc.content_blocks
+        );
+        assert!(
+            !events_received.iter().any(|e| e.contains("ReasoningDelta")),
+            "no ReasoningDelta event should fire for an unopened block: {events_received:?}"
+        );
+    }
+
+    #[test]
     fn reasoning_delta_counts_as_emitted_content_for_idle_guard() {
-        // A stream that only produced thinking deltas before an idle gap has
-        // emitted content — it must not be treated as a prefill stall and
-        // silently retried (which would duplicate the response).
-        let ev = StreamEvent::ReasoningDelta("thinking".into());
-        assert!(matches!(
-            ev,
-            StreamEvent::TextDelta(_)
-                | StreamEvent::ToolUseStart { .. }
-                | StreamEvent::InputJsonDelta(_)
-                | StreamEvent::ReasoningDelta(_)
+        // Calls the actual production predicate used by `stream()`'s
+        // idle-stall guard (see `stream_event_counts_as_emitted_content`,
+        // wired in at the `for event in parser.feed(...)` loop) — not a
+        // hand-copied match arm. If `ReasoningDelta` were ever dropped from
+        // the production guard this test would fail: a stream that only
+        // produced thinking deltas before an idle gap has emitted content
+        // and must not be treated as a prefill stall and silently retried
+        // (which would duplicate the response).
+        assert!(stream_event_counts_as_emitted_content(
+            &StreamEvent::ReasoningDelta("thinking".into())
         ));
+        // Sanity check the predicate isn't vacuously true for everything.
+        assert!(stream_event_counts_as_emitted_content(
+            &StreamEvent::TextDelta("hi".into())
+        ));
+        assert!(stream_event_counts_as_emitted_content(
+            &StreamEvent::ToolUseStart {
+                id: "toolu_1".into(),
+                name: "read_file".into(),
+            }
+        ));
+        assert!(stream_event_counts_as_emitted_content(
+            &StreamEvent::InputJsonDelta("{}".into())
+        ));
+        assert!(
+            !stream_event_counts_as_emitted_content(&StreamEvent::UsageSnapshot(Usage::default())),
+            "a bare usage snapshot carries no generated content"
+        );
     }
 
     #[test]
@@ -3297,6 +3372,106 @@ mod tests {
         );
         assert!(matches!(resp.content[1], ContentBlock::Text { .. }));
         assert_eq!(resp.text(), Some("answer"));
+    }
+
+    #[test]
+    fn streaming_thinking_text_tool_use_interleaving_is_isolated() {
+        // Full streaming sequence: thinking, then text, then tool_use.
+        // `content_block_stop` finalizes reasoning and tool_use via two
+        // independent `if let` checks against accumulator state — this
+        // guards against a regression where the thinking block's stop event
+        // also resolves (or otherwise disturbs) a tool_use that hasn't even
+        // started yet, and against tool input getting corrupted by the
+        // unrelated reasoning block that preceded it.
+        let client = AnthropicClient::new("test-key".into());
+        let mut acc = reasoning_acc();
+
+        let thinking_events = vec![
+            sse(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            ),
+            sse(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"reasoning steps"}}"#,
+            ),
+            sse(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+        ];
+        for event in &thinking_events {
+            client
+                .process_sse_event(event, &mut acc, &mut |_| {})
+                .unwrap();
+        }
+        // The thinking block's own stop must not fabricate or resolve
+        // anything beyond the reasoning block itself — no tool_use exists
+        // yet at this point in the stream.
+        assert_eq!(
+            acc.content_blocks.len(),
+            1,
+            "thinking's content_block_stop must only emit the reasoning block: {:?}",
+            acc.content_blocks
+        );
+        assert!(matches!(
+            acc.content_blocks[0],
+            ContentBlock::Reasoning { .. }
+        ));
+
+        let rest_events = vec![
+            sse(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"here's the answer"}}"#,
+            ),
+            sse(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file"}}"#,
+            ),
+            sse(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/tmp/x\"}"}}"#,
+            ),
+            sse(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":2}"#,
+            ),
+        ];
+        for event in &rest_events {
+            client
+                .process_sse_event(event, &mut acc, &mut |_| {})
+                .unwrap();
+        }
+
+        let resp = acc.into_response().unwrap();
+        assert_eq!(
+            resp.content.len(),
+            3,
+            "expected exactly [Reasoning, Text, ToolUse], got {:?}",
+            resp.content
+        );
+        assert!(
+            matches!(resp.content[0], ContentBlock::Reasoning { .. }),
+            "reasoning must come first, got {:?}",
+            resp.content
+        );
+        assert!(matches!(resp.content[1], ContentBlock::Text { .. }));
+        match &resp.content[2] {
+            ContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "toolu_1");
+                assert_eq!(name, "read_file");
+                assert_eq!(input, &serde_json::json!({"path": "/tmp/x"}));
+            }
+            other => panic!("expected exactly one ToolUse block, got {other:?}"),
+        }
+        assert_eq!(
+            resp.content
+                .iter()
+                .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
+                .count(),
+            1,
+            "tool_use must be resolved exactly once, not duplicated by the thinking stop"
+        );
     }
 
     #[test]
