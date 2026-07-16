@@ -139,8 +139,11 @@ export default function AstTree({ runId, path, line, col, host }: AstTreeProps) 
         if (!alive) return;
         setState({ status: 'loaded', response });
         if (response.root) {
-          const ancestors = findMatchedAncestorPaths(response.root, '0') ?? [];
-          setExpanded(new Set(ancestors));
+          // `null` means no node anywhere in the tree is matched — fall back
+          // to expanding the root so the user never sees a lone collapsed
+          // root row with no way to tell there's more beneath it.
+          const ancestors = findMatchedAncestorPaths(response.root, '0');
+          setExpanded(new Set(ancestors ?? ['0']));
         } else {
           setExpanded(new Set());
         }

@@ -172,6 +172,25 @@ describe('AstTree', () => {
     expect(screen.getByText(/tree truncated \(large file\)/i)).toBeInTheDocument();
   });
 
+  it('defaults the root to expanded when no node in the tree is matched', async () => {
+    const NO_MATCH_TREE: AstResponse = {
+      ...TREE,
+      root: {
+        ...TREE.root!,
+        matched: false,
+        children: TREE.root!.children.map((c) => ({ ...c, matched: false })),
+      },
+    };
+    vi.spyOn(api, 'readAst').mockResolvedValue(NO_MATCH_TREE);
+    render(<AstTree runId="r1" path="src/foo.rs" line={7} col={1} />);
+
+    await waitFor(() => expect(screen.getByText('source_file')).toBeInTheDocument());
+    // Root has no matched descendant, but is still auto-expanded so its
+    // named children are visible rather than a lone collapsed root row.
+    expect(screen.getByText('block')).toBeInTheDocument();
+    expect(screen.getByText('function_item')).toBeInTheDocument();
+  });
+
   it('re-fetches when path/line/col/runId change', async () => {
     const spy = vi.spyOn(api, 'readAst').mockResolvedValue(TREE);
     const { rerender } = render(<AstTree runId="r1" path="src/foo.rs" line={7} col={1} />);

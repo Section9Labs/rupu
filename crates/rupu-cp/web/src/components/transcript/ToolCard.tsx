@@ -31,6 +31,7 @@ import { ChevronRight, ChevronDown } from 'lucide-react';
 import type { ToolView, FindingView } from './transcriptView';
 import FindingCard from './FindingCard';
 import SourcePreview from './SourcePreview';
+import AstTree from './AstTree';
 import DiffView from './DiffView';
 import TerminalBlock from './TerminalBlock';
 import StructuredView from './StructuredView';
@@ -636,9 +637,11 @@ function MetaVarTable({
 
 /**
  * One structured ast_grep match: its `file:line:col` header (a toggle button
- * when `runId` is known, else plain text), the highlighted snippet + metavar
- * table, and — when toggled open — an inline `SourcePreview` of the match's
- * source line. Owns its own `open` state so each match toggles independently.
+ * when `runId` is known, else plain text), a sibling "tree" button, the
+ * highlighted snippet + metavar table, and — when toggled open — an inline
+ * `SourcePreview` and/or `AstTree` of the match's location. The source-preview
+ * and syntax-tree toggles use independent `useState`s so either, both, or
+ * neither can be open at once.
  */
 function AstGrepMatchRow({
   file,
@@ -652,24 +655,36 @@ function AstGrepMatchRow({
   host?: string;
 }) {
   const [open, setOpen] = useState(false);
+  const [treeOpen, setTreeOpen] = useState(false);
   const range = match.range;
 
   return (
     <div className="border-l-2 border-border pl-2 py-1">
       {range && (
-        runId ? (
-          <button
-            type="button"
-            onClick={() => setOpen((v) => !v)}
-            className="text-meta font-mono text-ink-mute hover:text-brand-700 hover:underline"
-          >
-            {file}:{range.startLine}:{range.startCol}
-          </button>
-        ) : (
-          <div className="text-meta text-ink-mute">
-            {file}:{range.startLine}:{range.startCol}
-          </div>
-        )
+        <div className="flex items-center gap-2">
+          {runId ? (
+            <button
+              type="button"
+              onClick={() => setOpen((v) => !v)}
+              className="text-meta font-mono text-ink-mute hover:text-brand-700 hover:underline"
+            >
+              {file}:{range.startLine}:{range.startCol}
+            </button>
+          ) : (
+            <div className="text-meta text-ink-mute">
+              {file}:{range.startLine}:{range.startCol}
+            </div>
+          )}
+          {runId && (
+            <button
+              type="button"
+              onClick={() => setTreeOpen((v) => !v)}
+              className="text-meta font-mono text-ink-mute hover:text-brand-700 hover:underline"
+            >
+              tree
+            </button>
+          )}
+        </div>
       )}
       <div className="font-mono text-[10.5px] text-ink">
         <HighlightedMatch
@@ -682,13 +697,20 @@ function AstGrepMatchRow({
       {open && range && runId && (
         <SourcePreview runId={runId} path={file} line={range.startLine} host={host} />
       )}
+      {treeOpen && range && runId && (
+        <AstTree runId={runId} path={file} line={range.startLine} col={range.startCol} host={host} />
+      )}
     </div>
   );
 }
 
 /** One fallback (text-parsed) ast_grep match: `file:line:col:` header (a
  * toggle button when `runId` is known, else plain text) + the raw match
- * text, with an inline `SourcePreview` when toggled open. */
+ * text + a sibling "tree" button, with an inline `SourcePreview` and/or
+ * `AstTree` when toggled open (independent `useState`s — either, both, or
+ * neither can be open). Text-parsed matches always carry a `col` from the
+ * `path:line:col:` regex, but `?? 1` guards the (defensive) case where it
+ * doesn't. */
 function AstGrepTextMatchRow({
   file,
   match,
@@ -701,6 +723,8 @@ function AstGrepTextMatchRow({
   host?: string;
 }) {
   const [open, setOpen] = useState(false);
+  const [treeOpen, setTreeOpen] = useState(false);
+  const col = match.col ?? 1;
 
   return (
     <div>
@@ -719,9 +743,21 @@ function AstGrepTextMatchRow({
           </span>
         )}
         {match.text}
+        {runId && (
+          <button
+            type="button"
+            onClick={() => setTreeOpen((v) => !v)}
+            className="ml-2 text-meta font-mono text-ink-mute hover:text-brand-700 hover:underline"
+          >
+            tree
+          </button>
+        )}
       </div>
       {open && runId && (
         <SourcePreview runId={runId} path={file} line={match.line} host={host} />
+      )}
+      {treeOpen && runId && (
+        <AstTree runId={runId} path={file} line={match.line} col={col} host={host} />
       )}
     </div>
   );
