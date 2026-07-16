@@ -5,13 +5,18 @@
  *   2. Smoke renders via testing-library (optional, per spec)
  */
 
-import { it, expect, describe, afterEach } from 'vitest';
-import { render, screen, cleanup } from '@testing-library/react';
+import { it, expect, describe, afterEach, vi } from 'vitest';
+import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import { summarizeInput, parseAstGrepText } from './ToolCard';
 import ToolCard from './ToolCard';
 import type { ToolView, FindingView } from './transcriptView';
+import { api } from '../../lib/api';
+import type { SourceSlice } from '../../lib/api';
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -422,5 +427,82 @@ describe('AstGrepBody (via ToolCard)', () => {
     render(<ToolCard tool={tv} />);
     expect(screen.getByText('Error')).not.toBeNull();
     expect(screen.queryByText(/match/)).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
+  // 5. Match header -> SourcePreview wiring
+  // -------------------------------------------------------------------------
+
+  const STRUCTURED_TV: ToolView = {
+    tool: 'ast_grep',
+    kind: 'ast_grep',
+    input: { pattern: 'fn $NAME() {}', lang: 'rust' },
+    structured: {
+      tool: 'ast_grep',
+      pattern: 'fn $NAME() {}',
+      lang: 'rust',
+      matchCount: 1,
+      fileCount: 1,
+      truncated: false,
+      matches: [
+        {
+          file: 'src/a.rs',
+          range: { startLine: 10, startCol: 3, endLine: 10, endCol: 15 },
+          text: 'fn foo() {}',
+        },
+      ],
+    },
+  };
+
+  const SLICE: SourceSlice = {
+    available: true,
+    path: 'src/a.rs',
+    language: 'rust',
+    startLine: 5,
+    endLine: 15,
+    targetLine: 10,
+    totalLines: 100,
+    lines: [{ n: 10, text: 'fn foo() {}' }],
+  };
+
+  it('clicking a structured match header mounts SourcePreview and calls api.readSource with file+line, when runId is provided', async () => {
+    const spy = vi.spyOn(api, 'readSource').mockResolvedValue(SLICE);
+    const { container } = render(<ToolCard tool={STRUCTURED_TV} runId="run-1" />);
+
+    const header = screen.getByRole('button', { name: /src\/a\.rs:10:3/ });
+    header.click();
+
+    await waitFor(() =>
+      expect(spy).toHaveBeenCalledWith('run-1', 'src/a.rs', 10, { host: undefined }),
+    );
+    // Mounted SourcePreview eventually renders its line-numbered slice with
+    // the target line emphasized (a marker only SourcePreview produces).
+    await waitFor(() =>
+      expect(container.querySelector('[data-target="true"]')).not.toBeNull(),
+    );
+  });
+
+  it('structured match header is non-clickable plain text when runId is absent', () => {
+    render(<ToolCard tool={STRUCTURED_TV} />);
+    expect(screen.queryByRole('button', { name: /src\/a\.rs:10:3/ })).toBeNull();
+    expect(screen.getByText(/src\/a\.rs:10:3/)).not.toBeNull();
+  });
+
+  it('fallback (text-parsed) match header is clickable and mounts SourcePreview when runId is provided', async () => {
+    const spy = vi.spyOn(api, 'readSource').mockResolvedValue(SLICE);
+    const tv: ToolView = {
+      tool: 'ast_grep',
+      kind: 'ast_grep',
+      input: { pattern: 'fn $NAME() {}' },
+      output: 'src/a.rs:10:3: fn foo() {}',
+    };
+    render(<ToolCard tool={tv} runId="run-1" />);
+
+    const header = screen.getByRole('button', { name: /src\/a\.rs:10:3:/ });
+    header.click();
+
+    await waitFor(() =>
+      expect(spy).toHaveBeenCalledWith('run-1', 'src/a.rs', 10, { host: undefined }),
+    );
   });
 });

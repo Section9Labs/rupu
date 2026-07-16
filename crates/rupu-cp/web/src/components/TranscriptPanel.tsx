@@ -22,14 +22,25 @@ export default function TranscriptPanel({
   path,
   live,
   host,
+  runId,
   embedded = false,
   onComplete,
 }: {
   path: string;
   live: boolean;
   /** Remote host id to forward to the backend transcript endpoints. When set,
-   *  appended as `&host=<id>` on both the fetch and the SSE stream URLs. */
+   *  appended as `&host=<id>` on both the fetch and the SSE stream URLs. Also
+   *  threaded down to the source-preview affordance (see `runId`). */
   host?: string;
+  /**
+   * The run's id, when known — threaded down through `Turn`/`ToolCard` to
+   * power the clickable `path:line` → `SourcePreview` affordance on ast_grep
+   * match headers and finding location chips (`GET /api/runs/:id/source`
+   * keys on this id). Absent in render contexts where no resolvable run id
+   * exists (e.g. the standalone agent-run transcript page) — those
+   * references degrade gracefully to non-clickable text.
+   */
+  runId?: string;
   /**
    * When true, hide the run-level header and usage footer chrome — render only
    * the turn/tool conversation body. Used inside a chat conversation, where each
@@ -189,6 +200,8 @@ export default function TranscriptPanel({
             turn={turn}
             defaultOpen={ti === view.turns.length - 1}
             onOpenTranscript={openTranscript}
+            runId={runId}
+            host={host}
           />
         ))}
       </div>

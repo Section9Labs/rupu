@@ -1,10 +1,15 @@
 // @vitest-environment jsdom
-import { afterEach, it, expect } from 'vitest';
-import { render, screen, cleanup } from '@testing-library/react';
+import { afterEach, it, expect, vi } from 'vitest';
+import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import FindingCard from './FindingCard';
 import type { FindingView } from './transcriptView';
+import { api } from '../../lib/api';
+import type { SourceSlice } from '../../lib/api';
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 const HIGH_FINDING: FindingView = {
   severity: 'high',
@@ -81,4 +86,43 @@ it('renders a critical finding with CRITICAL label', () => {
   };
   render(<FindingCard finding={finding} />);
   expect(screen.getByText('CRITICAL')).not.toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// Location chip -> SourcePreview wiring
+// ---------------------------------------------------------------------------
+
+const SLICE: SourceSlice = {
+  available: true,
+  path: 'crypto-svc/keyring.rs',
+  language: 'rust',
+  startLine: 22,
+  endLine: 62,
+  targetLine: 42,
+  totalLines: 100,
+  lines: [{ n: 42, text: 'const KEY: [u8;32] = [0x4a, 0x1f];' }],
+};
+
+it('location chip is a clickable button that mounts SourcePreview when runId is provided', async () => {
+  const spy = vi.spyOn(api, 'readSource').mockResolvedValue(SLICE);
+  const { container } = render(<FindingCard finding={HIGH_FINDING} runId="run-1" />);
+
+  const chip = screen.getByRole('button', { name: 'crypto-svc/keyring.rs:42-42' });
+  chip.click();
+
+  await waitFor(() =>
+    expect(spy).toHaveBeenCalledWith('run-1', 'crypto-svc/keyring.rs', 42, { host: undefined }),
+  );
+  // Mounted SourcePreview eventually renders its line-numbered slice with the
+  // target line emphasized (a marker only SourcePreview produces).
+  await waitFor(() =>
+    expect(container.querySelector('[data-target="true"]')).not.toBeNull(),
+  );
+});
+
+it('location chip is a non-clickable span when runId is absent', () => {
+  render(<FindingCard finding={HIGH_FINDING} />);
+  expect(screen.queryByRole('button', { name: /keyring\.rs/ })).toBeNull();
+  const chip = screen.getByText('crypto-svc/keyring.rs:42-42');
+  expect(chip.tagName.toLowerCase()).toBe('span');
 });

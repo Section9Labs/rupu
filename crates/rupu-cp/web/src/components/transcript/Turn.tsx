@@ -54,10 +54,17 @@ export default function Turn({
   turn,
   defaultOpen,
   onOpenTranscript,
+  runId,
+  host,
 }: {
   turn: TurnView;
   defaultOpen: boolean;
   onOpenTranscript?: (path: string) => void;
+  /** Run id threaded down to `ToolCard` for the source-preview affordance
+   *  (ast_grep match headers, finding location chips). */
+  runId?: string;
+  /** Remote host id, threaded alongside `runId`. */
+  host?: string;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   const [showThinking, setShowThinking] = useState(false);
@@ -145,7 +152,13 @@ export default function Turn({
 
           {/* Tools */}
           {turn.tools.map((tool, i) => (
-            <ToolCard key={i} tool={tool} onOpenTranscript={onOpenTranscript} />
+            <ToolCard
+              key={i}
+              tool={tool}
+              onOpenTranscript={onOpenTranscript}
+              runId={runId}
+              host={host}
+            />
           ))}
         </div>
       )}
