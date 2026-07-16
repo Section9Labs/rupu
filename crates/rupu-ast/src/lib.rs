@@ -81,6 +81,18 @@ pub enum AstError {
 /// ancestors above it, serialize (1-based, matched node flagged),
 /// capped at MAX_AST_NODES nodes.
 pub fn parse_slice(source: &str, lang: Lang, line: u32, col: u32) -> Result<AstSubtree, AstError> {
+    parse_slice_capped(source, lang, line, col, MAX_AST_NODES)
+}
+
+/// Same as [`parse_slice`] but with an explicit node cap (for testing the
+/// truncation path with a small budget).
+fn parse_slice_capped(
+    source: &str,
+    lang: Lang,
+    line: u32,
+    col: u32,
+    cap: usize,
+) -> Result<AstSubtree, AstError> {
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&lang.grammar())
@@ -89,8 +101,11 @@ pub fn parse_slice(source: &str, lang: Lang, line: u32, col: u32) -> Result<AstS
     let root = tree.root_node();
 
     // tree-sitter Point is 0-based (row, column-in-bytes). Convert the
-    // 1-based (line,col) target to a byte-ish point (col as char/byte is
-    // approximate; use row + best-effort column).
+    // 1-based (line,col) target to a 0-based point. `col` is passed straight
+    // through as `Point.column` (a BYTE offset), which is correct: `col`
+    // originates from ast-grep, which likewise reports byte-based tree-sitter
+    // columns — so no char/byte conversion is needed. Do NOT "fix" this to a
+    // char index.
     let target = tree_sitter::Point {
         row: line.saturating_sub(1) as usize,
         column: col.saturating_sub(1) as usize,
@@ -109,9 +124,10 @@ pub fn parse_slice(source: &str, lang: Lang, line: u32, col: u32) -> Result<AstS
         }
     }
 
-    let mut budget = MAX_AST_NODES;
+    let mut budget = cap;
     let mut truncated = false;
-    let node = serialize(ctx, None, matched_id, &mut budget, &mut truncated);
+    let node = serialize(ctx, None, matched_id, &mut budget, &mut truncated)
+        .expect("budget starts > 0 so the root node always serializes");
     Ok(AstSubtree {
         language: lang_name(lang).to_string(),
         root: node,
@@ -130,23 +146,27 @@ fn serialize(
     matched_id: usize,
     budget: &mut usize,
     truncated: &mut bool,
-) -> AstNode {
+) -> Option<AstNode> {
+    // Count THIS node against the budget at entry. If nothing is left, this
+    // node can't be emitted — flag truncation and drop it (and its subtree).
+    if *budget == 0 {
+        *truncated = true;
+        return None;
+    }
+    *budget -= 1;
+
     let start = node.start_position();
     let end = node.end_position();
     let mut children = Vec::new();
     let mut cursor = node.walk();
-    if node.child_count() > 0 && *budget > 0 {
-        for (i, child) in node.children(&mut cursor).enumerate() {
-            if *budget == 0 {
-                *truncated = true;
-                break;
-            }
-            *budget -= 1;
-            let fname = node.field_name_for_child(i as u32).map(|s| s.to_string());
-            children.push(serialize(child, fname, matched_id, budget, truncated));
+    for (i, child) in node.children(&mut cursor).enumerate() {
+        let fname = node.field_name_for_child(i as u32).map(|s| s.to_string());
+        match serialize(child, fname, matched_id, budget, truncated) {
+            Some(c) => children.push(c),
+            None => break, // budget exhausted; `truncated` already set
         }
     }
-    AstNode {
+    Some(AstNode {
         kind: node.kind().to_string(),
         named: node.is_named(),
         field,
@@ -156,7 +176,7 @@ fn serialize(
         end_col: end.column as u32 + 1,
         matched: node.id() == matched_id,
         children,
-    }
+    })
 }
 
 fn lang_name(l: Lang) -> &'static str {
@@ -219,6 +239,18 @@ mod tests {
                 "{lang:?} failed to parse"
             );
         }
+    }
+
+    #[test]
+    fn cap_truncates_and_flags() {
+        let src = "fn f() { let a = (1 + (2 + (3 + 4))); let b = 5; let c = 6; }";
+        let sub = parse_slice_capped(src, Lang::Rust, 1, 4, 5).unwrap();
+        assert!(sub.truncated, "small cap should truncate");
+        // total serialized nodes <= cap
+        fn count(n: &AstNode) -> usize {
+            1 + n.children.iter().map(count).sum::<usize>()
+        }
+        assert!(count(&sub.root) <= 5);
     }
 
     // test helper
