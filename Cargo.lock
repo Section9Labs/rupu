@@ -6410,7 +6410,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-ast"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
