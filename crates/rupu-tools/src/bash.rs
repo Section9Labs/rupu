@@ -137,6 +137,7 @@ impl Tool for BashTool {
                         stdout_bytes: out.stdout.len() as u64,
                         stderr_bytes: out.stderr.len() as u64,
                     }),
+                    structured: None,
                 })
             }
             Ok(Err(e)) => Ok(ToolOutput {
@@ -144,6 +145,7 @@ impl Tool for BashTool {
                 error: Some(format!("wait: {e}")),
                 duration_ms: started.elapsed().as_millis() as u64,
                 derived: None,
+                structured: None,
             }),
             Err(_elapsed) => {
                 // Timeout. The kill_on_drop above will SIGKILL when
@@ -153,6 +155,7 @@ impl Tool for BashTool {
                     error: Some(format!("timeout after {}s", ctx.bash_timeout_secs)),
                     duration_ms: started.elapsed().as_millis() as u64,
                     derived: None,
+                    structured: None,
                 })
             }
         }

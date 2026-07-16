@@ -270,6 +270,7 @@ impl Tool for DispatchAgentsParallelTool {
             error: None,
             duration_ms: started.elapsed().as_millis() as u64,
             derived: None,
+            structured: None,
         })
     }
 }
@@ -290,6 +291,7 @@ fn err_output(started: Instant, msg: String) -> ToolOutput {
         error: Some(msg),
         duration_ms: started.elapsed().as_millis() as u64,
         derived: None,
+        structured: None,
     }
 }
 

@@ -1118,6 +1118,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                             output: String::new(),
                             error: Some("permission_denied".into()),
                             duration_ms: 0,
+                            structured: None,
                         })?;
                         tool_results.push((
                             call_id,
@@ -1151,6 +1152,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                             output: String::new(),
                             error: Some(format!("unknown tool: {tool_name}")),
                             duration_ms: 0,
+                            structured: None,
                         })?;
                         tool_results.push((call_id, String::new(), Some("unknown_tool".into())));
                         continue;
@@ -1168,6 +1170,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                             output: clamped_stdout.clone(),
                             error: out.error.clone(),
                             duration_ms: started_tool.elapsed().as_millis() as u64,
+                            structured: out.structured.clone(),
                         })?;
                         if let Some(d) = out.derived.clone() {
                             match d {
@@ -1204,6 +1207,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                             output: String::new(),
                             error: Some(msg.clone()),
                             duration_ms: started_tool.elapsed().as_millis() as u64,
+                            structured: None,
                         })?;
                         tool_results.push((call_id, String::new(), Some(msg)));
                     }

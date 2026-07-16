@@ -103,6 +103,7 @@ when there are no matches."
                     ),
                     duration_ms: started.elapsed().as_millis() as u64,
                     derived: None,
+                    structured: None,
                 });
             }
         };
@@ -213,6 +214,7 @@ when there are no matches."
             error,
             duration_ms: started.elapsed().as_millis() as u64,
             derived: None,
+            structured: None,
         })
     }
 }

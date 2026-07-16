@@ -172,6 +172,7 @@ impl Tool for DispatchAgentTool {
                     error: None,
                     duration_ms: started.elapsed().as_millis() as u64,
                     derived: None,
+                    structured: None,
                 })
             }
             Err(e) => Ok(err_output(started, format!("dispatch failed: {e}"))),
@@ -185,6 +186,7 @@ fn err_output(started: Instant, msg: String) -> ToolOutput {
         error: Some(msg),
         duration_ms: started.elapsed().as_millis() as u64,
         derived: None,
+        structured: None,
     }
 }
 

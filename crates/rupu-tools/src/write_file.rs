@@ -85,6 +85,7 @@ impl Tool for WriteFileTool {
                 kind: kind.to_string(),
                 diff: render_file_edit_diff(&i.path, previous.as_deref(), Some(&i.content)),
             }),
+            structured: None,
         })
     }
 }
@@ -95,5 +96,6 @@ fn err_output(started: Instant, msg: String) -> ToolOutput {
         error: Some(msg),
         duration_ms: started.elapsed().as_millis() as u64,
         derived: None,
+        structured: None,
     }
 }

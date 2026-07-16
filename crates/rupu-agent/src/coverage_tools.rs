@@ -40,6 +40,7 @@ fn ok_output(text: impl Into<String>, elapsed: Instant) -> ToolOutput {
         error: None,
         duration_ms: elapsed.elapsed().as_millis() as u64,
         derived: None,
+        structured: None,
     }
 }
 
@@ -49,6 +50,7 @@ fn err_output(text: impl Into<String>, elapsed: Instant) -> ToolOutput {
         error: Some(text.into()),
         duration_ms: elapsed.elapsed().as_millis() as u64,
         derived: None,
+        structured: None,
     }
 }
 
@@ -118,8 +120,8 @@ impl Tool for CoverageMarkTool {
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let started = Instant::now();
-        let parsed: CoverageMarkInput = serde_json::from_value(input)
-            .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let parsed: CoverageMarkInput =
+            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let attribution = attribution_from_ctx(ctx);
         match coverage_mark(&self.paths, &self.catalog, attribution, parsed).await {
             Ok(out) => {
@@ -180,12 +182,12 @@ impl Tool for CoverageStatusTool {
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let started = Instant::now();
-        let parsed: CoverageStatusInput = serde_json::from_value(input)
-            .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let parsed: CoverageStatusInput =
+            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         match coverage_status(&self.paths, parsed) {
             Ok(assertions) => {
-                let text = serde_json::to_string_pretty(&assertions)
-                    .unwrap_or_else(|_| "[]".to_string());
+                let text =
+                    serde_json::to_string_pretty(&assertions).unwrap_or_else(|_| "[]".to_string());
                 Ok(ok_output(text, started))
             }
             Err(e) => Ok(err_output(e.to_string(), started)),
@@ -233,12 +235,12 @@ impl Tool for CoverageRemainingTool {
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let started = Instant::now();
-        let parsed: CoverageRemainingInput = serde_json::from_value(input)
-            .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let parsed: CoverageRemainingInput =
+            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         match coverage_remaining(&self.paths, &self.catalog, parsed) {
             Ok(items) => {
-                let text = serde_json::to_string_pretty(&items)
-                    .unwrap_or_else(|_| "[]".to_string());
+                let text =
+                    serde_json::to_string_pretty(&items).unwrap_or_else(|_| "[]".to_string());
                 Ok(ok_output(text, started))
             }
             Err(e) => Ok(err_output(e.to_string(), started)),
@@ -317,8 +319,8 @@ impl Tool for ReportFindingTool {
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let started = Instant::now();
-        let parsed: ReportFindingInput = serde_json::from_value(input)
-            .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let parsed: ReportFindingInput =
+            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let attribution = attribution_from_ctx(ctx);
         match report_finding(&self.paths, attribution, parsed) {
             Ok(out) => Ok(ok_output(format!("finding_id: {}", out.id), started)),
@@ -382,11 +384,10 @@ form if `form: 'full'`. Use when the catalog is too large to inline in the promp
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let started = Instant::now();
-        let parsed: CoverageConcernsSearchInput = serde_json::from_value(input)
-            .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let parsed: CoverageConcernsSearchInput =
+            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let results = coverage_concerns_search(&self.catalog, parsed);
-        let text = serde_json::to_string_pretty(&results)
-            .unwrap_or_else(|_| "[]".to_string());
+        let text = serde_json::to_string_pretty(&results).unwrap_or_else(|_| "[]".to_string());
         Ok(ok_output(text, started))
     }
 }
@@ -422,11 +423,10 @@ relevant concern and you need its full description, applicable_globs, or referen
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let started = Instant::now();
-        let parsed: CoverageConcernsDetailInput = serde_json::from_value(input)
-            .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let parsed: CoverageConcernsDetailInput =
+            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let out = coverage_concerns_detail(&self.catalog, parsed);
-        let text = serde_json::to_string_pretty(&out)
-            .unwrap_or_else(|_| "{}".to_string());
+        let text = serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string());
         Ok(ok_output(text, started))
     }
 }
@@ -462,12 +462,7 @@ pub fn register(
             catalog: catalog.clone(),
         }),
     );
-    registry.insert(
-        "report_finding",
-        Arc::new(ReportFindingTool {
-            paths,
-        }),
-    );
+    registry.insert("report_finding", Arc::new(ReportFindingTool { paths }));
     registry.insert(
         "coverage_concerns_search",
         Arc::new(CoverageConcernsSearchTool {
@@ -476,8 +471,6 @@ pub fn register(
     );
     registry.insert(
         "coverage_concerns_detail",
-        Arc::new(CoverageConcernsDetailTool {
-            catalog,
-        }),
+        Arc::new(CoverageConcernsDetailTool { catalog }),
     );
 }
