@@ -412,3 +412,72 @@ ever wired with a Copilot + OpenAI-compatible pair in the same fallback chain, a
 fallback — the one construction that breaks the safety invariant this design relies on ("an endpoint
 that never sends `reasoning_content` never receives one"). Check for this before wiring the router
 across mixed providers.
+
+---
+
+## openai_codex addendum (Plan 4) — 2026-07-16
+
+Researched against live OpenAI docs + the `openai-python` SDK types (Stainless-generated from OpenAI's
+OpenAPI spec) and `openai/codex` source. Two corrections to this spec's original Plan 4 line.
+
+### Correction 1: `include` is no longer required
+
+The spec said Plan 4 "needs `include: ["reasoning.encrypted_content"]` — with `store:false` and no
+`include` the API returns nothing echo-able." **Outdated.** The current guide: *"Stateless mode applies
+when `store` is `false`… The API still accepts the legacy `reasoning.encrypted_content` value in
+`include` for compatibility, but doesn't require it"* and *"Reasoning items in the response's `output`
+array include an `encrypted_content` property by default."*
+
+We send it anyway: `openai/codex` sends it unconditionally, it is explicitly still accepted, and it
+protects Azure/proxy backends that have not adopted the new default.
+
+### Correction 2: the real gap is `summary`, and the streaming drop is specific
+
+- **`summary` is empty unless requested** via `reasoning: {summary: "auto"|"concise"|"detailed"}`. This
+  is the exact analogue of Anthropic's `display: "summarized"` — without it we capture an opaque blob
+  and the transcript shows nothing readable. **Caveat: OpenAI may require organization verification
+  before summaries are available on its latest reasoning models** — an unverified org could see a 400.
+- **The streaming drop is precise:** `encrypted_content` arrives on `response.output_item.done` for the
+  reasoning item, *not* on the text deltas. rupu handles `output_item.added/done` but filters to
+  `function_call`, which is exactly where the encrypted content is lost.
+
+### Pairing 400s fire in BOTH directions, and the rule is undocumented
+
+- `"Item 'rs_...' of type 'reasoning' was provided without its required following item."`
+- `"'function_call' was provided without its required 'reasoning' item."`
+
+No official spec of when these fire exists; both community threads note the doc gap. The only recipe
+known to work is replaying **all** output items verbatim, in order, IDs intact (*"super particular"*
+about exact copied shapes including IDs and summaries).
+
+Unlike Anthropic (`signature`) and Gemini (`thoughtSignature`), the binding here is **structural** —
+item identity and adjacency — not cryptographic.
+
+### Decision — verbatim output replay (same pattern as Gemini)
+
+Store the assistant turn's **entire `output` items array verbatim** in one `ContentBlock::Reasoning`'s
+opaque `raw` (`{"output":[...]}`) and replay it into the next request's `input` instead of rebuilding
+from blocks. Pairing and IDs are preserved by construction, because we send back exactly what the
+server emitted. No shared-`ContentBlock` change; local to `openai_codex.rs`.
+
+Provider tag `openai_responses`, deliberately **distinct from Plan 3's `openai_chat`** — same vendor,
+different wire format; a payload from one must never be echoed to the other.
+
+`store: false` (already hardcoded) is correct and stays: ZDR orgs have `store` **silently forced** to
+false, so `store:true` + `previous_response_id` would fail to resolve prior state with no clean error.
+
+### Out of scope / unverified
+
+1. **`reasoning.effort` per-model validity.** Valid values are `none|minimal|low|medium|high|xhigh|max`
+   (SDK source), but *"not all reasoning models support every value"* — `minimal`/`xhigh` are not
+   universal (gpt-5 takes `minimal` not `xhigh`; gpt-5.5 the reverse). No live per-model matrix exists.
+   rupu also does not support `none`/`max`. Effort mapping untouched.
+2. **`store:true` + `previous_response_id`** as an alternative to echoing — different architecture.
+3. **Codex's ID-stripping divergence.** `openai/codex` strips `id` from every input item in stateless
+   mode (gated on its own `item_ids_enabled` flag). We keep IDs, matching the one documented-working
+   recipe for `api.openai.com`. Note `openai_codex.rs` targets **both** `api.openai.com/v1/responses`
+   and `chatgpt.com/backend-api/codex/responses`; the ChatGPT backend is **entirely undocumented as a
+   public API** and OpenAI makes no compatibility promise for it. Revisit if pairing 400s appear on the
+   ChatGPT backend specifically.
+4. Whether dropping *all* reasoning items uniformly (today's behavior) is tolerated or 400s across all
+   model/tool combos — undocumented; the inverse error suggests it can fire.
