@@ -456,8 +456,12 @@ async fn get_ast(
         )));
     };
 
-    let line = q.line.max(1) as u32;
-    let col = q.col.max(1) as u32;
+    // `as u32` truncates rather than saturates on a huge client-supplied
+    // `usize` — clamp into u32 range first so an absurd `?line=` doesn't wrap
+    // around to an arbitrary small value (same class of concern as
+    // `source_window`'s `saturating_add` guard against a huge `?context=`).
+    let line = q.line.max(1).min(u32::MAX as usize) as u32;
+    let col = q.col.max(1).min(u32::MAX as usize) as u32;
 
     match rupu_ast::parse_slice(&content, lang, line, col) {
         Ok(sub) => Ok(Json(AstResponse {
