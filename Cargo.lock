@@ -6560,6 +6560,7 @@ dependencies = [
  "object_store",
  "reqwest 0.12.28",
  "rupu-agent",
+ "rupu-ast",
  "rupu-config",
  "rupu-coverage",
  "rupu-orchestrator",

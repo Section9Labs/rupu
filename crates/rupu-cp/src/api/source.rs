@@ -213,7 +213,9 @@ pub fn detect_language(path: &FsPath) -> Option<&'static str> {
 }
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/runs/:id/source", get(get_source))
+    Router::new()
+        .route("/api/runs/:id/source", get(get_source))
+        .route("/api/runs/:id/ast", get(get_ast))
 }
 
 /// `GET /api/runs/:id/source?path=<rel>[&line=<n>][&context=<n>][&host=<id>]`
@@ -333,6 +335,140 @@ async fn get_source(
         lines: Some(lines),
         reason: None,
     }))
+}
+
+/// The human-readable reason returned for any remote-run `?ast` request —
+/// same policy as [`REMOTE_NOT_SUPPORTED`], worded for the AST endpoint.
+const AST_REMOTE_NOT_SUPPORTED: &str = "AST view is not available for remote-host runs yet.";
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AstResponse {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root: Option<rupu_ast::AstNode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl AstResponse {
+    fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            reason: Some(reason.into()),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AstQuery {
+    /// Path relative to the resolved run's `workspace_path`.
+    pub path: String,
+    /// 1-based target line. Defaults to `1`.
+    #[serde(default = "default_line")]
+    pub line: usize,
+    /// 1-based target column (byte offset within the line, matching
+    /// tree-sitter's `Point.column` convention — see
+    /// [`rupu_ast::parse_slice`]'s doc comment). Defaults to `1`.
+    #[serde(default = "default_col")]
+    pub col: usize,
+    /// When present and not `"local"`, this is a remote-host run — see
+    /// [`AST_REMOTE_NOT_SUPPORTED`].
+    #[serde(default)]
+    pub host: Option<String>,
+}
+
+fn default_col() -> usize {
+    1
+}
+
+/// `GET /api/runs/:id/ast?path=<rel>&line=<1-based>&col=<1-based>[&host=<id>]`
+///
+/// Mirrors [`get_source`]'s run-resolution / local-remote branch and
+/// [`resolve_under_workspace`] path guard exactly (same security boundary,
+/// same soft-fail-vs-400 split), then adds two more soft-fail steps specific
+/// to parsing: no [`rupu_ast::Lang`] mapped for the file's extension, or
+/// [`rupu_ast::parse_slice`] itself erroring (tree-sitter language-set
+/// failure or an empty parse). On success the response is filled from the
+/// returned [`rupu_ast::AstSubtree`].
+async fn get_ast(
+    Path(id): Path<String>,
+    Query(q): Query<AstQuery>,
+    State(s): State<AppState>,
+) -> ApiResult<Json<AstResponse>> {
+    validate_id(&id)?;
+
+    if q.host.as_deref().is_some_and(|h| h != "local") {
+        return Ok(Json(AstResponse::unavailable(AST_REMOTE_NOT_SUPPORTED)));
+    }
+
+    let workspace_path = match resolve_run_location(&s, &id).await {
+        RunLocation::Global => {
+            s.run_store
+                .load(&id)
+                .map_err(|e| run_not_found_or_internal(&id, e))?
+                .workspace_path
+        }
+        RunLocation::ProjectLocal { path } => {
+            let store = RunStore::new(path.join(".rupu").join("runs"));
+            store
+                .load(&id)
+                .map_err(|e| run_not_found_or_internal(&id, e))?
+                .workspace_path
+        }
+        RunLocation::Host { .. } => {
+            return Ok(Json(AstResponse::unavailable(AST_REMOTE_NOT_SUPPORTED)));
+        }
+        RunLocation::Unpersisted { .. } => {
+            return Ok(Json(AstResponse::unavailable(
+                "AST view is not available for this run.",
+            )));
+        }
+        RunLocation::NotFound => {
+            return Err(ApiError::not_found(format!("run {id} not found")));
+        }
+    };
+
+    let resolved = resolve_under_workspace(&workspace_path, &q.path)?;
+
+    if !resolved.is_file() {
+        return Ok(Json(AstResponse::unavailable("file not found")));
+    }
+
+    let meta = std::fs::metadata(&resolved).map_err(|e| ApiError::internal(e.to_string()))?;
+    if meta.len() > MAX_PREVIEW_BYTES {
+        return Ok(Json(AstResponse::unavailable("File too large to parse")));
+    }
+
+    let Some(lang) = rupu_ast::Lang::from_path(&resolved) else {
+        return Ok(Json(AstResponse::unavailable(
+            "No syntax grammar for this file type.",
+        )));
+    };
+
+    let Ok(content) = std::fs::read_to_string(&resolved) else {
+        return Ok(Json(AstResponse::unavailable(
+            "file is not valid UTF-8 text",
+        )));
+    };
+
+    let line = q.line.max(1) as u32;
+    let col = q.col.max(1) as u32;
+
+    match rupu_ast::parse_slice(&content, lang, line, col) {
+        Ok(sub) => Ok(Json(AstResponse {
+            available: true,
+            language: Some(sub.language),
+            root: Some(sub.root),
+            truncated: Some(sub.truncated),
+            reason: None,
+        })),
+        Err(_) => Ok(Json(AstResponse::unavailable("Could not parse file."))),
+    }
 }
 
 #[cfg(test)]
