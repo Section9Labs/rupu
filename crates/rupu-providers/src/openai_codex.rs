@@ -278,6 +278,51 @@ impl OpenAiCodexClient {
                 Role::Assistant => "assistant",
             };
 
+            // Replay the server's own output items verbatim. This is what keeps
+            // a reasoning item adjacent to its function_call with IDs intact —
+            // the Responses API 400s in BOTH directions on a broken pairing
+            // ("Item 'rs_...' of type 'reasoning' was provided without its
+            // required following item." and the inverse), and the adjacency rule
+            // is undocumented, so replaying exactly what arrived is the only
+            // recipe known to work.
+            //
+            // Gate on the provider tag only, never the model: a chat-completions
+            // (`openai_chat`) or Anthropic payload is a different wire format
+            // and must never be replayed here.
+            //
+            // Find the tag-matched block first without extracting `output`, so
+            // the empty-array and unusable-raw cases stay distinguishable for
+            // diagnostics.
+            let replay_raw = msg.content.iter().find_map(|b| match b {
+                ContentBlock::Reasoning { provider, raw, .. } if provider == PROVIDER_TAG => {
+                    Some(raw)
+                }
+                _ => None,
+            });
+            if let Some(raw) = replay_raw {
+                match raw.get("output").and_then(|o| o.as_array()) {
+                    Some(items) if !items.is_empty() => {
+                        // `input` is a flat item list across the whole
+                        // conversation, so the items go in as-is, in order.
+                        input.extend(items.iter().cloned());
+                        // Skip the rebuild for this turn: re-emitting the
+                        // ToolUse blocks would duplicate the function_call.
+                        continue;
+                    }
+                    Some(_) => {
+                        debug!("openai_responses replay block had empty output; rebuilding from blocks");
+                    }
+                    None => {
+                        debug!(
+                            "openai_responses replay block tagged {PROVIDER_TAG:?} had unusable raw \
+                             (missing or non-array \"output\"); rebuilding from blocks — a \
+                             function_call may be sent without its required reasoning item and \
+                             OpenAI will hard-400"
+                        );
+                    }
+                }
+            }
+
             // OpenAI Responses API: text goes in role messages, but
             // function_call and function_call_output are top-level input items
             let mut text_content: Vec<serde_json::Value> = Vec::new();
@@ -327,8 +372,9 @@ impl OpenAiCodexClient {
                             "output": normalize_function_call_output(content),
                         }));
                     }
-                    ContentBlock::Reasoning { .. } => { /* Plan 4: reasoning items + encrypted_content */
-                    }
+                    // Either already consumed by the verbatim replay above, or a
+                    // foreign provider's block, which is deliberately ignored.
+                    ContentBlock::Reasoning { .. } => {}
                     ContentBlock::Unknown => {}
                 }
             }
@@ -2373,5 +2419,216 @@ mod reasoning_capture_tests {
             .iter()
             .any(|b| matches!(b, ContentBlock::Reasoning { .. })),);
         assert_eq!(resp.text(), Some("hi"));
+    }
+
+    // ---- Task 2: replay reasoning items into `input` ----
+
+    /// The stored output items for an assistant turn that called one tool:
+    /// a reasoning item immediately followed by its function_call, exactly as
+    /// the Responses API emitted them.
+    fn stored_output() -> serde_json::Value {
+        serde_json::json!([
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "enc_abc",
+                "summary": [],
+            },
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "c1",
+                "name": "f",
+                "arguments": "{}",
+            },
+        ])
+    }
+
+    /// An assistant turn as Task 1's parse produces it: the verbatim replay
+    /// block plus the ToolUse block rupu uses for dispatch.
+    fn replay_turn(raw: serde_json::Value) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Reasoning {
+                    text: None,
+                    provider: PROVIDER_TAG.to_string(),
+                    model: "gpt-5".to_string(),
+                    raw,
+                },
+                ContentBlock::ToolUse {
+                    id: "c1".to_string(),
+                    name: "f".to_string(),
+                    input: serde_json::json!({}),
+                },
+            ],
+        }
+    }
+
+    fn request_with(messages: Vec<Message>) -> LlmRequest {
+        LlmRequest {
+            model: "gpt-5".into(),
+            messages,
+            max_tokens: 100,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn assistant_turn_replays_stored_output_items_verbatim() {
+        let request = request_with(vec![
+            Message::user("go"),
+            replay_turn(serde_json::json!({ "output": stored_output() })),
+        ]);
+        let body = client().build_request_body(&request, false);
+        let input = body["input"].as_array().expect("input array");
+
+        // The user message, then both stored items verbatim.
+        assert_eq!(input.len(), 3, "input items: {input:#?}");
+        assert_eq!(input[1], stored_output()[0]);
+        assert_eq!(input[2], stored_output()[1]);
+        // encrypted_content survived the round trip.
+        assert_eq!(input[1]["encrypted_content"], "enc_abc");
+
+        // The ToolUse block must NOT be rebuilt on top of the replay, or the
+        // function_call would be sent twice.
+        let function_calls = input
+            .iter()
+            .filter(|i| i["type"] == "function_call")
+            .count();
+        assert_eq!(function_calls, 1, "function_call must not be duplicated");
+    }
+
+    #[test]
+    fn replay_keeps_reasoning_adjacent_to_its_function_call() {
+        // The Responses API 400s in BOTH directions on a broken pairing, so
+        // the reasoning item must immediately precede its function_call
+        // exactly as the server emitted it.
+        let request = request_with(vec![
+            Message::user("go"),
+            replay_turn(serde_json::json!({ "output": stored_output() })),
+        ]);
+        let body = client().build_request_body(&request, false);
+        let input = body["input"].as_array().expect("input array");
+
+        let rs = input
+            .iter()
+            .position(|i| i["type"] == "reasoning")
+            .expect("reasoning item present");
+        let fc = input
+            .iter()
+            .position(|i| i["type"] == "function_call")
+            .expect("function_call item present");
+        assert_eq!(
+            fc,
+            rs + 1,
+            "reasoning must immediately precede function_call"
+        );
+    }
+
+    #[test]
+    fn replay_preserves_item_ids() {
+        // The pairing errors are expressed in terms of item IDs
+        // ("Item 'rs_...' ..."), so IDs must survive verbatim.
+        let request = request_with(vec![replay_turn(
+            serde_json::json!({ "output": stored_output() }),
+        )]);
+        let body = client().build_request_body(&request, false);
+        let input = body["input"].as_array().expect("input array");
+
+        assert_eq!(input[0]["id"], "rs_1");
+        assert_eq!(input[1]["id"], "fc_1");
+        assert_eq!(input[1]["call_id"], "c1");
+    }
+
+    #[test]
+    fn falls_back_to_rebuild_without_reasoning_block() {
+        // Backward compat: today's body, unchanged.
+        let request = request_with(vec![
+            Message::user("go"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "calling".into(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "c1".into(),
+                        name: "f".into(),
+                        input: serde_json::json!({"a": 1}),
+                    },
+                ],
+            },
+        ]);
+        let body = client().build_request_body(&request, false);
+        let input = body["input"].as_array().expect("input array");
+
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[1]["content"][0]["text"], "calling");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "c1");
+        assert_eq!(input[2]["arguments"], "{\"a\":1}");
+    }
+
+    #[test]
+    fn foreign_provider_reasoning_is_not_replayed() {
+        // `openai_chat` is Plan 3's chat-completions tag: same vendor, a
+        // DIFFERENT wire format. It must never cross into the Responses API.
+        for foreign in ["anthropic", "openai_chat", "google_gemini"] {
+            let mut turn = replay_turn(serde_json::json!({ "output": stored_output() }));
+            if let ContentBlock::Reasoning { provider, .. } = &mut turn.content[0] {
+                *provider = foreign.to_string();
+            }
+            let request = request_with(vec![turn]);
+            let body = client().build_request_body(&request, false);
+            let input = body["input"].as_array().expect("input array");
+
+            // Rebuilt from blocks: just the function_call, no replayed items.
+            assert_eq!(input.len(), 1, "{foreign}: {input:#?}");
+            assert_eq!(input[0]["type"], "function_call");
+            assert!(
+                !input.iter().any(|i| i["type"] == "reasoning"),
+                "{foreign}: foreign reasoning must not be replayed"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_raw_falls_back_to_rebuild() {
+        // raw missing "output", "output" not an array, and an empty array.
+        for raw in [
+            serde_json::json!({}),
+            serde_json::json!({ "output": "not-an-array" }),
+            serde_json::json!({ "output": [] }),
+        ] {
+            let request = request_with(vec![replay_turn(raw.clone())]);
+            let body = client().build_request_body(&request, false);
+            let input = body["input"].as_array().expect("input array");
+
+            assert_eq!(input.len(), 1, "raw {raw}: {input:#?}");
+            assert_eq!(input[0]["type"], "function_call");
+            assert_eq!(input[0]["call_id"], "c1");
+        }
+    }
+
+    #[test]
+    fn internal_fields_never_reach_the_wire() {
+        let request = request_with(vec![replay_turn(
+            serde_json::json!({ "output": stored_output() }),
+        )]);
+        let body = client().build_request_body(&request, false);
+        let wire = serde_json::to_string(&body).expect("serialize");
+
+        // No internal ContentBlock plumbing leaks into the request.
+        assert!(!wire.contains("\"provider\""), "{wire}");
+        assert!(!wire.contains("\"raw\""), "{wire}");
+        // "model" is a legitimate top-level request field, but the Reasoning
+        // block's own model must not ride along inside an input item.
+        for item in body["input"].as_array().expect("input array") {
+            assert!(item.get("provider").is_none(), "{item}");
+            assert!(item.get("raw").is_none(), "{item}");
+            assert!(item.get("model").is_none(), "{item}");
+        }
     }
 }
