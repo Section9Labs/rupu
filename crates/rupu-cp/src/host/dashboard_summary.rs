@@ -11,10 +11,16 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// The dashboard's time window. Mirrors the UI's segmented control.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// Deliberately NOT `Serialize`/`Deserialize`. The wire vocabulary is `"7d"` /
+/// `"30d"` / `"all"`, produced and consumed by `as_str()` and `parse()`. A serde
+/// derive would emit `"days7"` / `"days30"` instead — a second, disagreeing
+/// representation of the same value. Route every conversion through
+/// `parse()` / `as_str()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DashboardRange {
     Days7,
+    #[default]
     Days30,
     All,
 }
@@ -46,12 +52,6 @@ impl DashboardRange {
             Self::Days30 => "30d",
             Self::All => "all",
         }
-    }
-}
-
-impl Default for DashboardRange {
-    fn default() -> Self {
-        Self::Days30
     }
 }
 
