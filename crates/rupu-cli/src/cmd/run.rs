@@ -301,8 +301,8 @@ async fn list(
             run_id: r.id.clone(),
             workflow_name: r.workflow_name.clone(),
             status: r.status.as_str().to_string(),
-            started_at: r.started_at.to_rfc3339(),
-            finished_at: r.finished_at.map(|t| t.to_rfc3339()),
+            started_at: r.started_at,
+            finished_at: r.finished_at,
             trigger: r.trigger_str(),
             workspace_id: Some(r.workspace_id.clone()),
             parent_run_id: r.parent_run_id.clone(),
@@ -333,7 +333,10 @@ async fn list(
             for row in &report.rows {
                 println!(
                     "{}  {}  {}  {}",
-                    row.run_id, row.status, row.trigger, row.started_at
+                    row.run_id,
+                    row.status,
+                    row.trigger,
+                    row.started_at.to_rfc3339()
                 );
             }
         }
@@ -354,10 +357,17 @@ struct RunListJsonRow {
     run_id: String,
     workflow_name: String,
     status: String,
-    /// RFC-3339.
-    started_at: String,
-    /// RFC-3339. `None` while the run is non-terminal.
-    finished_at: Option<String>,
+    /// Serialized by serde, NOT by `.to_rfc3339()`.
+    ///
+    /// This MUST byte-match how `rupu-cp`'s `RunListRow` serializes the same
+    /// field, because rupu-cp merges local and remote rows with a
+    /// LEXICOGRAPHIC string compare on this value (`sort_values_newest_first`).
+    /// serde emits `...Z`; `.to_rfc3339()` emits `...+00:00`, and `'+'` (0x2B)
+    /// sorts before `'Z'` (0x5A) — so a `.to_rfc3339()` row silently sorts as
+    /// older than it is. Do not "tidy" this into a string.
+    started_at: chrono::DateTime<chrono::Utc>,
+    /// Same constraint as `started_at`. `None` while the run is non-terminal.
+    finished_at: Option<chrono::DateTime<chrono::Utc>>,
     /// `"manual"` | `"cron"` | `"event"` — mirrors `rupu-cp`'s `trigger_of`.
     trigger: &'static str,
     workspace_id: Option<String>,
@@ -1148,12 +1158,14 @@ mod tests {
 
     #[test]
     fn run_list_row_serializes_rfc3339_and_trigger() {
+        let started_at: chrono::DateTime<chrono::Utc> = "2026-07-16T14:02:11Z".parse().unwrap();
+        let finished_at: chrono::DateTime<chrono::Utc> = "2026-07-16T14:09:02Z".parse().unwrap();
         let row = RunListJsonRow {
             run_id: "run_01".into(),
             workflow_name: "nightly".into(),
             status: "completed".into(),
-            started_at: "2026-07-16T14:02:11Z".into(),
-            finished_at: Some("2026-07-16T14:09:02Z".into()),
+            started_at,
+            finished_at: Some(finished_at),
             trigger: "cron",
             workspace_id: Some("ws_1".into()),
             parent_run_id: None,
@@ -1168,6 +1180,37 @@ mod tests {
         assert!(
             v["started_at"].as_str().unwrap().contains('T'),
             "started_at must be RFC-3339, not space-separated"
+        );
+    }
+
+    #[test]
+    fn run_list_row_timestamps_match_rupu_cp_wire_format() {
+        // rupu-cp merges local + remote rows with a LEXICOGRAPHIC compare on
+        // started_at. If this emits `+00:00` while rupu-cp's RunListRow emits
+        // `Z`, every remote row sorts older than it is. Pin the format.
+        let t: chrono::DateTime<chrono::Utc> = "2026-07-16T07:00:59.397407Z".parse().unwrap();
+        let row = RunListJsonRow {
+            run_id: "run_01".into(),
+            workflow_name: "nightly".into(),
+            status: "completed".into(),
+            started_at: t,
+            finished_at: Some(t),
+            trigger: "cron",
+            workspace_id: Some("ws_1".into()),
+            parent_run_id: None,
+            awaiting_step_id: None,
+            active_step_id: None,
+            error_message: None,
+        };
+        let v = serde_json::to_value(&row).unwrap();
+        let started = v["started_at"].as_str().unwrap();
+        assert!(
+            started.ends_with('Z'),
+            "must serialize with a Z suffix, got {started}"
+        );
+        assert!(
+            !started.contains("+00:00"),
+            "must NOT use .to_rfc3339()'s +00:00 offset — it sorts before 'Z': {started}"
         );
     }
 }
