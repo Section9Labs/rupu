@@ -24,6 +24,71 @@ const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// of the agent runtime keeps using canonical (dotted) names.
 const TOOL_NAME_DOT_ESCAPE: &str = "__dot__";
 
+/// Canonical tag for the OpenAI Responses API wire format.
+///
+/// Deliberately distinct from `openai_wire`'s `openai_chat`: chat-completions
+/// and Responses are different wire formats, and a reasoning payload from one
+/// must never be echoed to the other.
+pub(crate) const PROVIDER_TAG: &str = "openai_responses";
+
+/// Concatenate the `summary_text` entries of any reasoning items in an
+/// `output` array. Display only — `raw` is what goes back on the wire.
+///
+/// A reasoning item with an empty `summary` yields nothing here but is still
+/// captured: an opaque `encrypted_content` blob is unreadable yet still
+/// echo-able, and dropping it would break reasoning↔function_call pairing.
+fn summary_text_from_output(items: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    for item in items {
+        if item["type"].as_str() != Some("reasoning") {
+            continue;
+        }
+        let Some(summary) = item.get("summary").and_then(|s| s.as_array()) else {
+            continue;
+        };
+        for entry in summary {
+            if let Some(text) = entry.get("text").and_then(|t| t.as_str()) {
+                out.push_str(text);
+            }
+        }
+    }
+    out
+}
+
+/// Build the verbatim-replay reasoning block for an assistant turn, if the
+/// turn produced any output items at all.
+///
+/// The whole `output` array is stored — not just reasoning items — because the
+/// Responses API 400s in BOTH directions on a broken pairing (`"Item 'rs_...'
+/// was provided without its required following item"` and `"'function_call'
+/// was provided without its required 'reasoning' item"`) and the adjacency rule
+/// is undocumented. Replaying exactly what the server emitted, in order, with
+/// IDs intact, is the only recipe known to work.
+fn reasoning_block_from_output(
+    raw_output: Vec<serde_json::Value>,
+    model: &str,
+    fallback_text: &str,
+) -> Option<ContentBlock> {
+    if raw_output.is_empty() {
+        return None;
+    }
+    let mut summary = summary_text_from_output(&raw_output);
+    if summary.is_empty() {
+        // Streamed turns can carry the summary only on the deltas.
+        summary.push_str(fallback_text);
+    }
+    Some(ContentBlock::Reasoning {
+        text: if summary.is_empty() {
+            None
+        } else {
+            Some(summary)
+        },
+        provider: PROVIDER_TAG.to_string(),
+        model: model.to_string(),
+        raw: serde_json::json!({ "output": raw_output }),
+    })
+}
+
 fn sanitize_openai_tool_name(name: &str) -> String {
     name.replace('.', TOOL_NAME_DOT_ESCAPE)
 }
@@ -308,6 +373,22 @@ impl OpenAiCodexClient {
             body["tools"] = serde_json::json!(tools);
         }
 
+        // `summary: "auto"` is the analogue of Anthropic's display:"summarized"
+        // — without it `summary` comes back empty and the transcript has
+        // nothing readable. Requested unconditionally: reasoning capture must
+        // not depend on an explicit effort being set (the `Auto` path below
+        // deliberately sends no `effort` at all).
+        //
+        // NOTE: OpenAI may require organization verification before summaries
+        // are available on its latest reasoning models.
+        body["reasoning"] = serde_json::json!({ "summary": "auto" });
+
+        // `include: ["reasoning.encrypted_content"]` is now legacy (stateless
+        // mode returns encrypted_content by default) but is still accepted, and
+        // openai/codex sends it unconditionally — keep it for Azure/proxy
+        // backends that haven't adopted the new default.
+        body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
+
         // Reasoning effort for o-series and GPT-5.x. `Auto` omits the
         // field so the server picks; OpenAI doesn't accept "auto" as a
         // value but treats absence as adaptive.
@@ -322,7 +403,7 @@ impl OpenAiCodexClient {
                 ThinkingLevel::Max => Some("xhigh"),
             };
             if let Some(e) = effort {
-                body["reasoning"] = serde_json::json!({ "effort": e });
+                body["reasoning"]["effort"] = serde_json::json!(e);
             }
         }
 
@@ -383,8 +464,20 @@ impl OpenAiCodexClient {
                     }
                 }
             }
+            "response.reasoning_summary_text.delta" => {
+                if let Some(delta) = data["delta"].as_str() {
+                    acc.reasoning_summary.push_str(delta);
+                    on_event(StreamEvent::ReasoningDelta(delta.to_string()));
+                }
+            }
             "response.output_item.done" => {
                 if let Some(item) = data.get("item") {
+                    // Capture every item type verbatim. `encrypted_content`
+                    // arrives here on the reasoning item — not on the text
+                    // deltas — so filtering to `function_call` (as this arm
+                    // used to) dropped it entirely.
+                    acc.raw_output.push(item.clone());
+
                     if item["type"].as_str() == Some("function_call") {
                         // Finalize tool call
                         if let (Some(id), Some(name)) =
@@ -817,9 +910,15 @@ fn parse_response(json: &serde_json::Value) -> Result<LlmResponse, ProviderError
 
     let mut content = Vec::new();
     let mut stop_reason = Some(StopReason::EndTurn);
+    let mut raw_output: Vec<serde_json::Value> = Vec::new();
 
     if let Some(output) = json.get("output").and_then(|o| o.as_array()) {
         for item in output {
+            // Capture every item verbatim, whatever its type — the replay has
+            // to reproduce the server's own array exactly (see
+            // `reasoning_block_from_output`).
+            raw_output.push(item.clone());
+
             match item["type"].as_str() {
                 Some("message") => {
                     if let Some(blocks) = item.get("content").and_then(|c| c.as_array()) {
@@ -849,6 +948,10 @@ fn parse_response(json: &serde_json::Value) -> Result<LlmResponse, ProviderError
                 _ => {}
             }
         }
+    }
+
+    if let Some(block) = reasoning_block_from_output(raw_output, &model, "") {
+        content.insert(0, block);
     }
 
     let status = json["status"].as_str().unwrap_or("completed");
@@ -901,6 +1004,10 @@ struct ResponseAccumulator {
     current_tool_id: Option<String>,
     current_tool_name: Option<String>,
     current_tool_input: String,
+    /// Every `response.output_item.done` item, verbatim and in arrival order.
+    raw_output: Vec<serde_json::Value>,
+    /// Streamed `reasoning_summary_text` deltas — display fallback only.
+    reasoning_summary: String,
 }
 
 impl ResponseAccumulator {
@@ -916,6 +1023,8 @@ impl ResponseAccumulator {
             current_tool_id: None,
             current_tool_name: None,
             current_tool_input: String::new(),
+            raw_output: Vec::new(),
+            reasoning_summary: String::new(),
         }
     }
 
@@ -928,6 +1037,12 @@ impl ResponseAccumulator {
             content.push(ContentBlock::Text { text: self.text });
         }
         content.extend(self.content_blocks);
+
+        if let Some(block) =
+            reasoning_block_from_output(self.raw_output, &self.model, &self.reasoning_summary)
+        {
+            content.insert(0, block);
+        }
 
         Some(LlmResponse {
             id: self.id,
@@ -1853,5 +1968,410 @@ mod tests {
         };
         let body = client.build_request_body(&request, false);
         assert!(body.get("text").is_none());
+    }
+}
+
+#[cfg(test)]
+mod reasoning_capture_tests {
+    use super::*;
+    use crate::model_tier::ThinkingLevel;
+    use crate::types::Message;
+
+    fn client() -> OpenAiCodexClient {
+        OpenAiCodexClient::new(
+            crate::auth::AuthCredentials::ApiKey { key: "k".into() },
+            None,
+        )
+        .unwrap()
+    }
+
+    fn sse(data: &str) -> crate::sse::SseEvent {
+        crate::sse::SseEvent {
+            event_type: "message".into(),
+            data: data.into(),
+        }
+    }
+
+    #[test]
+    fn request_includes_encrypted_content_and_summary() {
+        let request = LlmRequest {
+            model: "gpt-5".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 100,
+            thinking: Some(ThinkingLevel::High),
+            ..Default::default()
+        };
+        let body = client().build_request_body(&request, false);
+
+        assert_eq!(
+            body["include"],
+            serde_json::json!(["reasoning.encrypted_content"]),
+        );
+        // `summary: "auto"` is the analogue of Anthropic's
+        // display:"summarized" — without it the summary array comes back
+        // empty and the transcript shows nothing readable.
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        // The existing effort mapping is untouched.
+        assert_eq!(body["reasoning"]["effort"], "high");
+        // store:false is deliberate (ZDR orgs force it) and unchanged.
+        assert_eq!(body["store"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn request_sets_summary_even_without_explicit_effort() {
+        // ThinkingLevel::Auto omits `reasoning.effort` (server default);
+        // reasoning capture must not depend on an explicit effort.
+        let request = LlmRequest {
+            model: "gpt-5".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 100,
+            thinking: Some(ThinkingLevel::Auto),
+            ..Default::default()
+        };
+        let body = client().build_request_body(&request, false);
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert!(
+            body["reasoning"].get("effort").is_none(),
+            "Auto must not pin an effort: {}",
+            body["reasoning"],
+        );
+        assert_eq!(
+            body["include"],
+            serde_json::json!(["reasoning.encrypted_content"]),
+        );
+    }
+
+    #[test]
+    fn request_sets_summary_when_thinking_is_unset() {
+        let request = LlmRequest {
+            model: "gpt-5".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 100,
+            thinking: None,
+            ..Default::default()
+        };
+        let body = client().build_request_body(&request, false);
+        assert_eq!(body["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn parse_captures_reasoning_item_verbatim() {
+        let output = serde_json::json!([
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{"type": "summary_text", "text": "planning"}],
+                "encrypted_content": "enc_abc",
+            },
+            {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+        ]);
+        let json = serde_json::json!({
+            "id": "resp_1",
+            "model": "gpt-5",
+            "status": "completed",
+            "output": output,
+        });
+
+        let resp = parse_response(&json).expect("parse");
+
+        let reasoning: Vec<_> = resp
+            .content
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::Reasoning { .. }))
+            .collect();
+        assert_eq!(reasoning.len(), 1, "exactly one reasoning block");
+        match reasoning[0] {
+            ContentBlock::Reasoning {
+                text,
+                provider,
+                model,
+                raw,
+            } => {
+                assert_eq!(text.as_deref(), Some("planning"));
+                assert_eq!(provider, PROVIDER_TAG);
+                assert_eq!(model, "gpt-5");
+                // The FULL original output array, verbatim: both items,
+                // encrypted_content and ids intact.
+                assert_eq!(raw["output"], output);
+            }
+            _ => unreachable!(),
+        }
+
+        // The ToolUse block is still emitted as today.
+        let tools = resp.tool_calls();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
+    }
+
+    #[test]
+    fn parse_captures_reasoning_with_empty_summary() {
+        // Unverified orgs / summary-less responses: the item is still
+        // captured — an unreadable blob is still echo-able, and dropping
+        // it would break pairing.
+        let output = serde_json::json!([
+            {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "enc_abc"},
+        ]);
+        let json = serde_json::json!({
+            "id": "resp_1",
+            "model": "gpt-5",
+            "status": "completed",
+            "output": output,
+        });
+
+        let resp = parse_response(&json).expect("parse");
+        match &resp.content[0] {
+            ContentBlock::Reasoning { text, raw, .. } => {
+                assert!(text.is_none(), "no summary text to display");
+                assert_eq!(raw["output"], output);
+                assert_eq!(raw["output"][0]["encrypted_content"], "enc_abc");
+            }
+            other => panic!("expected Reasoning at index 0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_without_reasoning_items_still_stores_output_for_replay() {
+        // Pairing is enforced in BOTH directions ("'function_call' was
+        // provided without its required 'reasoning' item"), so a turn's
+        // output is stored whenever there are output items at all.
+        let output = serde_json::json!([
+            {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+        ]);
+        let json = serde_json::json!({
+            "id": "resp_1",
+            "model": "gpt-5",
+            "status": "completed",
+            "output": output,
+        });
+
+        let resp = parse_response(&json).expect("parse");
+        match &resp.content[0] {
+            ContentBlock::Reasoning { text, raw, .. } => {
+                assert!(text.is_none());
+                assert_eq!(raw["output"], output);
+            }
+            other => panic!("expected Reasoning at index 0, got {other:?}"),
+        }
+        assert_eq!(resp.tool_calls().len(), 1);
+    }
+
+    #[test]
+    fn parse_with_empty_output_emits_no_reasoning_block() {
+        let json = serde_json::json!({
+            "id": "resp_1",
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [],
+        });
+        let resp = parse_response(&json).expect("parse");
+        assert!(
+            !resp
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Reasoning { .. })),
+            "nothing to replay",
+        );
+    }
+
+    #[test]
+    fn parse_unknown_item_types_are_captured_for_replay() {
+        // Never filter: an item type we don't model still has to go back
+        // on the wire in order, or pairing breaks.
+        let output = serde_json::json!([
+            {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "e"},
+            {"type": "web_search_call", "id": "ws_1", "status": "completed"},
+        ]);
+        let json = serde_json::json!({
+            "id": "resp_1",
+            "model": "gpt-5",
+            "status": "completed",
+            "output": output,
+        });
+        let resp = parse_response(&json).expect("parse");
+        match &resp.content[0] {
+            ContentBlock::Reasoning { raw, .. } => assert_eq!(raw["output"], output),
+            other => panic!("expected Reasoning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sse_captures_reasoning_item_from_output_item_done() {
+        // THE streaming bug: `encrypted_content` arrives on
+        // response.output_item.done for the reasoning item, NOT on the
+        // text deltas. output_item.added/done used to be filtered to
+        // function_call, dropping the encrypted content entirely.
+        let c = client();
+        let mut acc = ResponseAccumulator::new();
+
+        c.process_sse_event(
+            &sse(r#"{"type":"response.created","response":{"id":"resp_9","model":"gpt-5"}}"#),
+            &mut acc,
+            &mut |_| {},
+        )
+        .unwrap();
+
+        c.process_sse_event(
+            &sse(
+                r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"planning"}],"encrypted_content":"enc_abc"}}"#,
+            ),
+            &mut acc,
+            &mut |_| {},
+        )
+        .unwrap();
+
+        c.process_sse_event(
+            &sse(
+                r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"c1","name":"f"}}"#,
+            ),
+            &mut acc,
+            &mut |_| {},
+        )
+        .unwrap();
+        c.process_sse_event(
+            &sse(r#"{"type":"response.function_call_arguments.delta","delta":"{}"}"#),
+            &mut acc,
+            &mut |_| {},
+        )
+        .unwrap();
+        c.process_sse_event(
+            &sse(
+                r#"{"type":"response.output_item.done","item":{"type":"function_call","id":"fc_1","call_id":"c1","name":"f","arguments":"{}"}}"#,
+            ),
+            &mut acc,
+            &mut |_| {},
+        )
+        .unwrap();
+
+        let resp = acc.into_response().expect("response");
+
+        match &resp.content[0] {
+            ContentBlock::Reasoning {
+                text,
+                provider,
+                model,
+                raw,
+            } => {
+                assert_eq!(provider, PROVIDER_TAG);
+                assert_eq!(model, "gpt-5");
+                // Summary came only from the done item, not from deltas.
+                assert_eq!(text.as_deref(), Some("planning"));
+                assert_eq!(
+                    raw["output"],
+                    serde_json::json!([
+                        {"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"planning"}],"encrypted_content":"enc_abc"},
+                        {"type":"function_call","id":"fc_1","call_id":"c1","name":"f","arguments":"{}"},
+                    ]),
+                );
+            }
+            other => panic!("expected Reasoning at index 0, got {other:?}"),
+        }
+
+        // Existing function_call handling stays intact.
+        assert_eq!(resp.tool_calls().len(), 1);
+    }
+
+    #[test]
+    fn sse_emits_reasoning_delta_from_summary_text_delta() {
+        let c = client();
+        let mut acc = ResponseAccumulator::new();
+        let mut events: Vec<StreamEvent> = Vec::new();
+
+        c.process_sse_event(
+            &sse(r#"{"type":"response.created","response":{"id":"resp_8","model":"gpt-5"}}"#),
+            &mut acc,
+            &mut |e| events.push(e),
+        )
+        .unwrap();
+        c.process_sse_event(
+            &sse(r#"{"type":"response.reasoning_summary_text.delta","delta":"plan"}"#),
+            &mut acc,
+            &mut |e| events.push(e),
+        )
+        .unwrap();
+        c.process_sse_event(
+            &sse(r#"{"type":"response.reasoning_summary_text.delta","delta":"ning"}"#),
+            &mut acc,
+            &mut |e| events.push(e),
+        )
+        .unwrap();
+
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ReasoningDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["plan", "ning"]);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta(_))),
+            "reasoning summary must never be emitted as assistant text",
+        );
+        assert_eq!(acc.text, "", "reasoning must not pollute the text block");
+        assert_eq!(acc.reasoning_summary, "planning");
+    }
+
+    #[test]
+    fn sse_reasoning_summary_deltas_do_not_duplicate_the_done_summary() {
+        // Deltas stream the same summary the done item carries whole.
+        // Prefer the done item's verbatim summary as the display text.
+        let c = client();
+        let mut acc = ResponseAccumulator::new();
+
+        c.process_sse_event(
+            &sse(r#"{"type":"response.created","response":{"id":"resp_7","model":"gpt-5"}}"#),
+            &mut acc,
+            &mut |_| {},
+        )
+        .unwrap();
+        c.process_sse_event(
+            &sse(r#"{"type":"response.reasoning_summary_text.delta","delta":"planning"}"#),
+            &mut acc,
+            &mut |_| {},
+        )
+        .unwrap();
+        c.process_sse_event(
+            &sse(
+                r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"planning"}],"encrypted_content":"e"}}"#,
+            ),
+            &mut acc,
+            &mut |_| {},
+        )
+        .unwrap();
+
+        let resp = acc.into_response().expect("response");
+        match &resp.content[0] {
+            ContentBlock::Reasoning { text, .. } => {
+                assert_eq!(text.as_deref(), Some("planning"));
+            }
+            other => panic!("expected Reasoning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sse_without_output_items_emits_no_reasoning_block() {
+        let c = client();
+        let mut acc = ResponseAccumulator::new();
+        c.process_sse_event(
+            &sse(r#"{"type":"response.created","response":{"id":"resp_6","model":"gpt-5"}}"#),
+            &mut acc,
+            &mut |_| {},
+        )
+        .unwrap();
+        c.process_sse_event(
+            &sse(r#"{"type":"response.output_text.delta","delta":"hi"}"#),
+            &mut acc,
+            &mut |_| {},
+        )
+        .unwrap();
+
+        let resp = acc.into_response().expect("response");
+        assert!(!resp
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Reasoning { .. })),);
+        assert_eq!(resp.text(), Some("hi"));
     }
 }
