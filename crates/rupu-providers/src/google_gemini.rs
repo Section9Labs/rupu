@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::auth::{is_token_expired, save_provider_auth, AuthCredentials};
 use crate::error::ProviderError;
@@ -20,6 +20,9 @@ const ANTIGRAVITY_ENDPOINT: &str = "https://daily-cloudcode-pa.sandbox.googleapi
 const AI_STUDIO_ENDPOINT: &str = "https://generativelanguage.googleapis.com";
 
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+
+/// Canonical provider tag stamped on Reasoning blocks; gates the replay.
+pub(crate) const PROVIDER_TAG: &str = "google_gemini";
 
 // Google's public CLI OAuth client IDs and secrets (same as Pi).
 // These are embedded in all CLI tools that use Google OAuth (safe to embed).
@@ -201,7 +204,7 @@ impl GoogleGeminiClient {
         }
 
         let resp_json: serde_json::Value = response.json().await?;
-        parse_generate_content_response(&resp_json)
+        parse_generate_content_response(&resp_json, &request.model)
     }
 
     /// Streaming send with SSE.
@@ -232,7 +235,7 @@ impl GoogleGeminiClient {
         }
 
         let mut parser = SseParser::new();
-        let mut acc = GeminiAccumulator::new();
+        let mut acc = GeminiAccumulator::new(&request.model);
         let mut bytes_stream = response.bytes_stream();
 
         use futures_util::StreamExt;
@@ -520,6 +523,42 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
             Role::Assistant => "model",
         };
 
+        // If this turn carries a verbatim parts replay from Gemini, send those
+        // parts back exactly as they arrived. This is what returns
+        // thoughtSignature on the exact part it was received on — Google
+        // requires it, and omitting it on the first functionCall part is a hard
+        // 400. Google's own SDKs replay the model's content the same way.
+        //
+        // The gate is the provider tag only: a foreign provider's block is an
+        // alien wire format and is ignored (falling back to the rebuild).
+        // Find a google_gemini-tagged Reasoning block first (without extracting
+        // `parts` yet) so the empty-array and unusable-raw cases below can be
+        // told apart for diagnostics — `find_map` collapsing straight to
+        // `Option<Vec<Value>>` made them indistinguishable.
+        let gemini_reasoning_raw = msg.content.iter().find_map(|b| match b {
+            ContentBlock::Reasoning { provider, raw, .. } if provider == PROVIDER_TAG => Some(raw),
+            _ => None,
+        });
+        if let Some(raw) = gemini_reasoning_raw {
+            match raw.get("parts").and_then(|p| p.as_array()) {
+                Some(parts) if !parts.is_empty() => {
+                    contents.push(serde_json::json!({"role": role, "parts": parts}));
+                    continue;
+                }
+                Some(_) => {
+                    debug!("gemini replay block had empty parts; rebuilding from blocks");
+                }
+                None => {
+                    debug!(
+                        "gemini replay block tagged {PROVIDER_TAG:?} had unusable raw \
+                         (missing or non-array \"parts\"); rebuilding from blocks — \
+                         a first functionCall part will be sent without its \
+                         thoughtSignature and Google will hard-400"
+                    );
+                }
+            }
+        }
+
         let mut parts = Vec::new();
 
         for block in &msg.content {
@@ -557,7 +596,9 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
                         }
                     }));
                 }
-                ContentBlock::Reasoning { .. } => { /* Plan 2: capture + echo thoughtSignature */ }
+                // Either already consumed by the verbatim replay above, or a
+                // foreign provider's block, which is deliberately ignored.
+                ContentBlock::Reasoning { .. } => {}
                 ContentBlock::Unknown => {}
             }
         }
@@ -573,10 +614,16 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
 // ── Response Parsing ─────────────────────────────────────────────────
 
 /// Parse a complete GenerateContentResponse into LlmResponse.
-fn parse_generate_content_response(json: &serde_json::Value) -> Result<LlmResponse, ProviderError> {
+fn parse_generate_content_response(
+    json: &serde_json::Value,
+    model: &str,
+) -> Result<LlmResponse, ProviderError> {
     let mut content = Vec::new();
     let mut stop_reason = Some(StopReason::EndTurn);
     let mut tool_call_counter: u32 = 0;
+    // The turn's parts, stored verbatim so `convert_messages` can replay them.
+    let mut raw_parts: Vec<serde_json::Value> = Vec::new();
+    let mut thought_text = String::new();
 
     if let Some(candidates) = json.get("candidates").and_then(|c| c.as_array()) {
         if let Some(candidate) = candidates.first() {
@@ -586,15 +633,27 @@ fn parse_generate_content_response(json: &serde_json::Value) -> Result<LlmRespon
                 .and_then(|p| p.as_array())
             {
                 for part in parts {
+                    // Every part is stored verbatim — it may carry a
+                    // thoughtSignature that has to return on this exact part.
+                    raw_parts.push(part.clone());
+
+                    let is_thought = part.get("thought").and_then(|t| t.as_bool()) == Some(true);
                     if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                        // Skip thinking parts (thought: true)
-                        if part.get("thought").and_then(|t| t.as_bool()) == Some(true) {
-                            continue;
+                        if is_thought {
+                            // A thought part's text is reasoning, not answer text:
+                            // collect it for the transcript, emit no Text block.
+                            if !thought_text.is_empty() {
+                                thought_text.push_str("\n\n");
+                            }
+                            thought_text.push_str(text);
+                        } else {
+                            content.push(ContentBlock::Text {
+                                text: text.to_string(),
+                            });
                         }
-                        content.push(ContentBlock::Text {
-                            text: text.to_string(),
-                        });
                     }
+                    // Checked even on a thought part: a part can carry both, and
+                    // the old `continue` here silently dropped the tool call.
                     if let Some(fc) = part.get("functionCall") {
                         let name = fc["name"].as_str().unwrap_or("").to_string();
                         let args = fc.get("args").cloned().unwrap_or(serde_json::json!({}));
@@ -616,6 +675,25 @@ fn parse_generate_content_response(json: &serde_json::Value) -> Result<LlmRespon
         }
     }
 
+    // Store the turn's parts verbatim so convert_messages can replay them. This is
+    // what carries thoughtSignature back on the exact part it arrived on — omitting
+    // it on the first functionCall part is a hard 400.
+    if !raw_parts.is_empty() {
+        content.insert(
+            0,
+            ContentBlock::Reasoning {
+                text: if thought_text.is_empty() {
+                    None
+                } else {
+                    Some(thought_text)
+                },
+                provider: PROVIDER_TAG.to_string(),
+                model: model.to_string(),
+                raw: serde_json::json!({ "parts": raw_parts }),
+            },
+        );
+    }
+
     let usage = if let Some(meta) = json.get("usageMetadata") {
         Usage {
             input_tokens: meta["promptTokenCount"].as_u64().unwrap_or(0) as u32,
@@ -628,7 +706,7 @@ fn parse_generate_content_response(json: &serde_json::Value) -> Result<LlmRespon
 
     Ok(LlmResponse {
         id: String::new(), // Gemini doesn't return a response ID in the same way
-        model: String::new(),
+        model: model.to_string(),
         content,
         stop_reason,
         usage,
@@ -656,10 +734,14 @@ struct GeminiAccumulator {
     input_tokens: u32,
     output_tokens: u32,
     tool_call_counter: u32,
+    /// Every streamed part, verbatim and in arrival order, for replay.
+    raw_parts: Vec<serde_json::Value>,
+    thought_text: String,
+    model: String,
 }
 
 impl GeminiAccumulator {
-    fn new() -> Self {
+    fn new(model: &str) -> Self {
         Self {
             text: String::new(),
             content_blocks: Vec::new(),
@@ -667,11 +749,14 @@ impl GeminiAccumulator {
             input_tokens: 0,
             output_tokens: 0,
             tool_call_counter: 0,
+            raw_parts: Vec::new(),
+            thought_text: String::new(),
+            model: model.to_string(),
         }
     }
 
     fn into_response(self) -> Option<LlmResponse> {
-        if self.text.is_empty() && self.content_blocks.is_empty() {
+        if self.text.is_empty() && self.content_blocks.is_empty() && self.raw_parts.is_empty() {
             return None;
         }
         let mut content = Vec::new();
@@ -680,9 +765,26 @@ impl GeminiAccumulator {
         }
         content.extend(self.content_blocks);
 
+        // Same verbatim-parts replay block as the non-streaming parse.
+        if !self.raw_parts.is_empty() {
+            content.insert(
+                0,
+                ContentBlock::Reasoning {
+                    text: if self.thought_text.is_empty() {
+                        None
+                    } else {
+                        Some(self.thought_text)
+                    },
+                    provider: PROVIDER_TAG.to_string(),
+                    model: self.model.clone(),
+                    raw: serde_json::json!({ "parts": self.raw_parts }),
+                },
+            );
+        }
+
         Some(LlmResponse {
             id: String::new(),
-            model: String::new(),
+            model: self.model,
             content,
             stop_reason: self.stop_reason,
             usage: Usage {
@@ -715,16 +817,31 @@ fn process_gemini_sse(
                 .and_then(|p| p.as_array())
             {
                 for part in parts {
-                    // Skip thinking parts
-                    if part.get("thought").and_then(|t| t.as_bool()) == Some(true) {
-                        continue;
-                    }
+                    // Every part is stored verbatim — it may carry a
+                    // thoughtSignature that has to return on this exact part.
+                    acc.raw_parts.push(part.clone());
 
+                    let is_thought = part.get("thought").and_then(|t| t.as_bool()) == Some(true);
                     if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                        acc.text.push_str(text);
-                        on_event(StreamEvent::TextDelta(text.to_string()));
+                        if is_thought {
+                            // Deliberately no "\n\n" separator here, unlike the
+                            // non-streaming join in parse_generate_content_response:
+                            // SSE commonly delivers a single thought summary
+                            // fragmented across chunks, and inserting a separator
+                            // per chunk would corrupt it into disjoint paragraphs.
+                            // Display-only (reasoning_text()) — raw["parts"] and
+                            // the replay path are unaffected either way. Do not
+                            // "fix" this to match the non-streaming path.
+                            acc.thought_text.push_str(text);
+                            on_event(StreamEvent::ReasoningDelta(text.to_string()));
+                        } else {
+                            acc.text.push_str(text);
+                            on_event(StreamEvent::TextDelta(text.to_string()));
+                        }
                     }
 
+                    // Checked even on a thought part: a part can carry both, and
+                    // the old `continue` here silently dropped the tool call.
                     if let Some(fc) = part.get("functionCall") {
                         let name = fc["name"].as_str().unwrap_or("").to_string();
                         let args = fc.get("args").cloned().unwrap_or(serde_json::json!({}));
@@ -1055,6 +1172,238 @@ mod tests {
         assert_eq!(func_resp["response"]["output"], "file contents");
     }
 
+    /// An assistant turn as Gemini's parse produces it: a replay block carrying
+    /// the verbatim parts, plus the ToolUse block rupu uses for dispatch.
+    fn replay_turn(parts: serde_json::Value) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Reasoning {
+                    text: None,
+                    provider: PROVIDER_TAG.to_string(),
+                    model: "gemini-3-pro-preview".to_string(),
+                    raw: serde_json::json!({ "parts": parts }),
+                },
+                ContentBlock::ToolUse {
+                    id: "gemini_tc_1".into(),
+                    name: "f".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn convert_messages_replays_stored_parts_verbatim() {
+        let stored = serde_json::json!([
+            {"functionCall": {"name": "f", "args": {"x": 1}}, "thoughtSignature": "sig_abc"}
+        ]);
+        let contents = convert_messages(&[replay_turn(stored.clone())]);
+
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["role"], "model");
+        // The stored parts go back on the wire byte-for-byte.
+        assert_eq!(contents[0]["parts"], stored);
+        // The functionCall appears exactly once — the ToolUse block must not be
+        // rebuilt into a second part on a turn that replays.
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts
+                .iter()
+                .filter(|p| p.get("functionCall").is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn convert_messages_replay_preserves_thought_signature_on_its_part() {
+        // Two parts, only the second signed: the signature must stay attached to
+        // the part it arrived on, not hoisted, moved, or reordered.
+        let stored = serde_json::json!([
+            {"thought": true, "text": "Let me think..."},
+            {"functionCall": {"name": "f", "args": {"x": 1}}, "thoughtSignature": "sig_abc"}
+        ]);
+        let contents = convert_messages(&[replay_turn(stored)]);
+
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["thought"], true);
+        assert!(parts[0].get("thoughtSignature").is_none());
+        assert_eq!(parts[1]["thoughtSignature"], "sig_abc");
+        assert_eq!(parts[1]["functionCall"]["name"], "f");
+    }
+
+    #[test]
+    fn convert_messages_falls_back_to_rebuild_without_reasoning_block() {
+        // Backward compat: no Reasoning block -> converts exactly as before.
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "calling".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "gemini_tc_1".into(),
+                    name: "f".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+            ],
+        }];
+        let contents = convert_messages(&messages);
+
+        assert_eq!(contents.len(), 1);
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "calling");
+        assert_eq!(parts[1]["functionCall"]["name"], "f");
+        assert_eq!(parts[1]["functionCall"]["args"]["x"], 1);
+    }
+
+    #[test]
+    fn convert_messages_drops_foreign_provider_reasoning_block() {
+        // An Anthropic thinking block is an alien wire format: never replay it,
+        // and never let its signature reach Gemini.
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Reasoning {
+                    text: Some("thinking...".into()),
+                    provider: "anthropic".to_string(),
+                    model: "claude-opus-4-6".to_string(),
+                    raw: serde_json::json!({
+                        "type": "thinking",
+                        "thinking": "thinking...",
+                        "signature": "anthropic_sig",
+                    }),
+                },
+                ContentBlock::ToolUse {
+                    id: "toolu_1".into(),
+                    name: "f".into(),
+                    input: serde_json::json!({"x": 1}),
+                },
+            ],
+        }];
+        let contents = convert_messages(&messages);
+
+        assert_eq!(contents.len(), 1);
+        let parts = contents[0]["parts"].as_array().unwrap();
+        // Rebuild path: only the ToolUse becomes a part.
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["functionCall"]["name"], "f");
+        let wire = serde_json::to_string(&contents).unwrap();
+        assert!(!wire.contains("anthropic_sig"));
+        assert!(!wire.contains("thinking"));
+    }
+
+    #[test]
+    fn convert_messages_ignores_replay_block_with_malformed_raw() {
+        // raw missing "parts", "parts" not an array, and an empty parts array all
+        // fall back to the rebuild rather than sending garbage.
+        for raw in [
+            serde_json::json!({}),
+            serde_json::json!({"parts": "not-an-array"}),
+            serde_json::json!({"parts": []}),
+        ] {
+            let messages = vec![Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Reasoning {
+                        text: None,
+                        provider: PROVIDER_TAG.to_string(),
+                        model: "gemini-3-pro-preview".to_string(),
+                        raw: raw.clone(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "gemini_tc_1".into(),
+                        name: "f".into(),
+                        input: serde_json::json!({"x": 1}),
+                    },
+                ],
+            }];
+            let contents = convert_messages(&messages);
+
+            assert_eq!(contents.len(), 1, "raw: {raw}");
+            let parts = contents[0]["parts"].as_array().unwrap();
+            assert_eq!(parts.len(), 1, "raw: {raw}");
+            assert_eq!(parts[0]["functionCall"]["name"], "f", "raw: {raw}");
+        }
+    }
+
+    #[test]
+    fn convert_messages_still_maps_tool_result_names_with_replay_present() {
+        // The tool_name_map pre-scan reads ToolUse blocks; a replaying assistant
+        // turn must not break the following user turn's functionResponse naming.
+        let stored = serde_json::json!([
+            {"functionCall": {"name": "f", "args": {"x": 1}}, "thoughtSignature": "sig_abc"}
+        ]);
+        let messages = vec![
+            replay_turn(stored),
+            Message::tool_result("gemini_tc_1", "file contents", false),
+        ];
+        let contents = convert_messages(&messages);
+
+        assert_eq!(contents.len(), 2);
+        assert_eq!(contents[0]["parts"][0]["thoughtSignature"], "sig_abc");
+        let func_resp = &contents[1]["parts"][0]["functionResponse"];
+        assert_eq!(func_resp["name"], "f");
+        assert_eq!(func_resp["response"]["output"], "file contents");
+    }
+
+    /// Guards the seam between `parse_generate_content_response` (which writes
+    /// `raw["parts"]`) and `convert_messages` (which reads `raw["parts"]`).
+    /// Every other test in this file drives only one half — Task 1's tests
+    /// assert `raw["parts"]` is written; Task 2's tests (e.g. `replay_turn`
+    /// above) hand-build the assistant `Message` and assert `raw["parts"]` is
+    /// read. Neither proves the two halves actually compose. If the internal
+    /// `"parts"` key inside `raw` were renamed in
+    /// `parse_generate_content_response` and only Task 1's tests were updated
+    /// to match, every other gemini test would stay green while every real
+    /// Gemini turn silently reverted to the rebuild path — reintroducing the
+    /// hard 400 in production, undetected. This test drives the real
+    /// functions back-to-back with no hand-built intermediate, so that rename
+    /// fails here.
+    #[test]
+    fn parse_then_convert_round_trips_thought_signature() {
+        let parts = serde_json::json!([
+            {"thought": true, "text": "I should call f."},
+            {"functionCall": {"name": "f", "args": {"x": 1}}, "thoughtSignature": "sig_abc"}
+        ]);
+        let json = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": parts},
+                "finishReason": "FUNCTION_CALLING"
+            }]
+        });
+
+        let resp = parse_generate_content_response(&json, "gemini-3-pro-preview").unwrap();
+
+        // Feed resp.content straight into a fresh Message — do NOT hand-build
+        // the assistant turn the way `replay_turn` does elsewhere in this file.
+        let message = Message {
+            role: Role::Assistant,
+            content: resp.content,
+        };
+
+        let contents = convert_messages(&[message]);
+
+        assert_eq!(contents.len(), 1);
+        let sent_parts = contents[0]["parts"].as_array().unwrap();
+        // The thoughtSignature reached the replayed functionCall part.
+        assert_eq!(sent_parts[1]["thoughtSignature"], "sig_abc");
+        assert_eq!(sent_parts[1]["functionCall"]["name"], "f");
+        // Exactly one functionCall — the rebuild path must not have also
+        // turned the parsed ToolUse block into a second, duplicate part.
+        assert_eq!(
+            sent_parts
+                .iter()
+                .filter(|p| p.get("functionCall").is_some())
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn test_parse_response_text() {
         let json = serde_json::json!({
@@ -1072,7 +1421,7 @@ mod tests {
             }
         });
 
-        let response = parse_generate_content_response(&json).unwrap();
+        let response = parse_generate_content_response(&json, "gemini-2.5-pro").unwrap();
         assert_eq!(response.text(), Some("The answer is 42."));
         assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
         assert_eq!(response.usage.input_tokens, 15);
@@ -1097,7 +1446,7 @@ mod tests {
             "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}
         });
 
-        let response = parse_generate_content_response(&json).unwrap();
+        let response = parse_generate_content_response(&json, "gemini-2.5-pro").unwrap();
         assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
         let tools = response.tool_calls();
         assert_eq!(tools.len(), 1);
@@ -1119,33 +1468,233 @@ mod tests {
             }]
         });
 
-        let response = parse_generate_content_response(&json).unwrap();
+        let response = parse_generate_content_response(&json, "gemini-2.5-pro").unwrap();
         assert_eq!(response.stop_reason, Some(StopReason::MaxTokens));
     }
 
+    /// Pull the single `Reasoning` block out of a response, or panic.
+    fn only_reasoning(response: &LlmResponse) -> (&Option<String>, &str, &serde_json::Value) {
+        let mut found = response.content.iter().filter_map(|b| match b {
+            ContentBlock::Reasoning {
+                text,
+                provider,
+                raw,
+                ..
+            } => Some((text, provider.as_str(), raw)),
+            _ => None,
+        });
+        let block = found.next().expect("expected a Reasoning block");
+        assert!(
+            found.next().is_none(),
+            "expected exactly one Reasoning block"
+        );
+        block
+    }
+
+    // Replaces the former `test_parse_response_skips_thinking`, which asserted the
+    // old drop behavior (`content.len() == 1`). Capturing thoughts is a deliberate
+    // behavior change.
     #[test]
-    fn test_parse_response_skips_thinking() {
+    fn parse_response_captures_thinking_as_reasoning_block() {
+        let parts = serde_json::json!([
+            {"thought": true, "text": "Let me think..."},
+            {"text": "The answer is 42."}
+        ]);
         let json = serde_json::json!({
             "candidates": [{
-                "content": {
-                    "role": "model",
-                    "parts": [
-                        {"thought": true, "text": "Let me think..."},
-                        {"text": "The answer is 42."}
-                    ]
-                },
+                "content": {"role": "model", "parts": parts},
                 "finishReason": "STOP"
             }]
         });
 
-        let response = parse_generate_content_response(&json).unwrap();
-        assert_eq!(response.content.len(), 1);
+        let response = parse_generate_content_response(&json, "gemini-3-pro").unwrap();
+
+        // Text blocks are unaffected: the thought part never becomes answer text.
         assert_eq!(response.text(), Some("The answer is 42."));
+
+        let (text, provider, raw) = only_reasoning(&response);
+        assert_eq!(text.as_deref(), Some("Let me think..."));
+        assert_eq!(provider, PROVIDER_TAG);
+        // The whole parts array is stored verbatim — including the thought part.
+        assert_eq!(raw["parts"], parts);
+    }
+
+    #[test]
+    fn parse_response_preserves_thought_signature_in_raw() {
+        let parts = serde_json::json!([
+            {"functionCall": {"name": "f", "args": {}}, "thoughtSignature": "sig_abc"}
+        ]);
+        let json = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": parts},
+                "finishReason": "FUNCTION_CALLING"
+            }]
+        });
+
+        let response = parse_generate_content_response(&json, "gemini-3-pro").unwrap();
+
+        let (_, _, raw) = only_reasoning(&response);
+        assert_eq!(raw["parts"][0]["thoughtSignature"], "sig_abc");
+        assert_eq!(raw["parts"], parts);
+
+        // The ToolUse block is still emitted exactly as today.
+        let tools = response.tool_calls();
+        assert_eq!(tools.len(), 1);
+        match tools[0] {
+            ContentBlock::ToolUse { name, .. } => assert_eq!(name, "f"),
+            _ => panic!("expected ToolUse"),
+        }
+        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+    }
+
+    #[test]
+    fn parse_response_thought_part_with_function_call_still_yields_tool_use() {
+        // Non-streaming mirror of `sse_thought_part_with_function_call_still_yields_tool_use`.
+        // `parse_response_preserves_thought_signature_in_raw` only covers a
+        // functionCall part WITHOUT thought:true, so a refactor reintroducing a
+        // `continue` on thought:true in the non-streaming parse (but not the SSE
+        // one) would go green without this test.
+        let json = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "thought": true,
+                        "functionCall": {"name": "f", "args": {"x": 1}},
+                        "thoughtSignature": "sig_abc"
+                    }]
+                },
+                "finishReason": "FUNCTION_CALLING"
+            }]
+        });
+
+        let response = parse_generate_content_response(&json, "gemini-3-pro").unwrap();
+        let tools = response.tool_calls();
+        assert_eq!(tools.len(), 1);
+        match tools[0] {
+            ContentBlock::ToolUse { name, input, .. } => {
+                assert_eq!(name, "f");
+                assert_eq!(input["x"], 1);
+            }
+            _ => panic!("expected ToolUse"),
+        }
+        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+    }
+
+    #[test]
+    fn parse_response_without_thoughts_still_stores_parts_for_replay() {
+        // Gemini 3 signs the first functionCall part even with no thought parts.
+        let parts = serde_json::json!([{"text": "The answer is 42."}]);
+        let json = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": parts},
+                "finishReason": "STOP"
+            }]
+        });
+
+        let response = parse_generate_content_response(&json, "gemini-3-pro").unwrap();
+
+        let (text, _, raw) = only_reasoning(&response);
+        assert_eq!(*text, None);
+        assert_eq!(raw["parts"], parts);
+    }
+
+    #[test]
+    fn parse_response_with_no_parts_emits_no_reasoning_block() {
+        let json = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": []},
+                "finishReason": "STOP"
+            }]
+        });
+
+        let response = parse_generate_content_response(&json, "gemini-3-pro").unwrap();
+        assert!(response
+            .content
+            .iter()
+            .all(|b| !matches!(b, ContentBlock::Reasoning { .. })));
+    }
+
+    #[test]
+    fn sse_captures_thought_parts_and_emits_reasoning_delta() {
+        let mut acc = GeminiAccumulator::new("gemini-3-pro");
+        let mut events = Vec::new();
+
+        let event = crate::sse::SseEvent {
+            event_type: "message".into(),
+            data:
+                r#"{"candidates":[{"content":{"parts":[{"thought":true,"text":"thinking..."}]}}]}"#
+                    .into(),
+        };
+        process_gemini_sse(&event, &mut acc, &mut |e| events.push(e)).unwrap();
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::ReasoningDelta(text) => assert_eq!(text, "thinking..."),
+            other => panic!("expected ReasoningDelta, got {other:?}"),
+        }
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::TextDelta(_))));
+    }
+
+    #[test]
+    fn sse_accumulates_all_parts_verbatim_across_chunks() {
+        let mut acc = GeminiAccumulator::new("gemini-3-pro");
+
+        let event1 = crate::sse::SseEvent {
+            event_type: "message".into(),
+            data: r#"{"candidates":[{"content":{"parts":[{"thought":true,"text":"hmm","thoughtSignature":"sig_1"}]}}]}"#.into(),
+        };
+        process_gemini_sse(&event1, &mut acc, &mut |_| {}).unwrap();
+
+        let event2 = crate::sse::SseEvent {
+            event_type: "message".into(),
+            data: r#"{"candidates":[{"content":{"parts":[{"text":"answer","thoughtSignature":"sig_2"}]},"finishReason":"STOP"}]}"#.into(),
+        };
+        process_gemini_sse(&event2, &mut acc, &mut |_| {}).unwrap();
+
+        let response = acc.into_response().unwrap();
+        let (text, provider, raw) = only_reasoning(&response);
+        assert_eq!(text.as_deref(), Some("hmm"));
+        assert_eq!(provider, PROVIDER_TAG);
+        assert_eq!(
+            raw["parts"],
+            serde_json::json!([
+                {"thought": true, "text": "hmm", "thoughtSignature": "sig_1"},
+                {"text": "answer", "thoughtSignature": "sig_2"}
+            ])
+        );
+        assert_eq!(response.text(), Some("answer"));
+    }
+
+    #[test]
+    fn sse_thought_part_with_function_call_still_yields_tool_use() {
+        // The old code `continue`d on thought:true before checking for a
+        // functionCall on the same part, silently losing the tool call.
+        let mut acc = GeminiAccumulator::new("gemini-3-pro");
+
+        let event = crate::sse::SseEvent {
+            event_type: "message".into(),
+            data: r#"{"candidates":[{"content":{"parts":[{"thought":true,"functionCall":{"name":"f","args":{"x":1}},"thoughtSignature":"sig_abc"}]},"finishReason":"FUNCTION_CALLING"}]}"#.into(),
+        };
+        process_gemini_sse(&event, &mut acc, &mut |_| {}).unwrap();
+
+        let response = acc.into_response().unwrap();
+        let tools = response.tool_calls();
+        assert_eq!(tools.len(), 1);
+        match tools[0] {
+            ContentBlock::ToolUse { name, input, .. } => {
+                assert_eq!(name, "f");
+                assert_eq!(input["x"], 1);
+            }
+            _ => panic!("expected ToolUse"),
+        }
     }
 
     #[test]
     fn test_sse_text_streaming() {
-        let mut acc = GeminiAccumulator::new();
+        let mut acc = GeminiAccumulator::new("gemini-2.5-pro");
         let mut events = Vec::new();
 
         let event1 = crate::sse::SseEvent {
@@ -1172,7 +1721,7 @@ mod tests {
 
     #[test]
     fn test_sse_function_call_streaming() {
-        let mut acc = GeminiAccumulator::new();
+        let mut acc = GeminiAccumulator::new("gemini-2.5-pro");
         let mut events = Vec::new();
 
         let event = crate::sse::SseEvent {
@@ -1347,7 +1896,7 @@ mod tests {
 
     #[test]
     fn test_process_gemini_sse_malformed_json_returns_error() {
-        let mut acc = GeminiAccumulator::new();
+        let mut acc = GeminiAccumulator::new("gemini-2.5-pro");
         let bad_event = crate::sse::SseEvent {
             event_type: "message".into(),
             data: "{ not valid json".into(),
@@ -1358,7 +1907,7 @@ mod tests {
 
     #[test]
     fn test_gemini_accumulator_empty_returns_none() {
-        let acc = GeminiAccumulator::new();
+        let acc = GeminiAccumulator::new("gemini-2.5-pro");
         assert!(acc.into_response().is_none());
     }
 }

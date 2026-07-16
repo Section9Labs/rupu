@@ -212,7 +212,8 @@ Each is an independent PR. Additive everywhere except the compile-forced arms, s
   `ReasoningDelta`, `reasoning_text()`, the runner arm + `thinking` population, Anthropic both
   directions, `display: "summarized"`, and the explicit arms every other provider needs to compile
   (drop-only for now). After this PR, Anthropic reasoning is captured and rendered end-to-end.
-- **Plan 2 — Gemini:** capture thoughts + thought-signature echo.
+- **Plan 2 — Gemini:** capture thoughts + thought-signature echo. **See "Gemini addendum" below — the
+  original one-line description assumed Anthropic's shape and was wrong.**
 - **Plan 3 — `openai_wire`:** `reasoning_content` for Copilot + OpenAI-compatible. Likely the widest
   real-model impact (DeepSeek-R1 / Qwen / GLM / local vLLM).
 - **Plan 4 — `openai_codex`:** `include: ["reasoning.encrypted_content"]` + reasoning-item parse.
@@ -231,3 +232,86 @@ Each is an independent PR. Additive everywhere except the compile-forced arms, s
   ordering/signature 400s. Model-gating would have caused the failure it was meant to prevent.
 - **Wire coupling — RESOLVED:** `ContentBlock` serde is rupu-internal; Anthropic's incidental reliance
   on it for wire format is removed in both directions rather than preserved.
+
+---
+
+## Gemini addendum (Plan 2) — 2026-07-16
+
+Researched against live Google docs + the `python-genai` SDK types before planning. The finding
+invalidates this spec's original Plan 2 assumption, so it is recorded here rather than silently fixed.
+
+### Gemini does not share Anthropic's shape
+
+| | Anthropic | Gemini (`generateContent`) |
+|---|---|---|
+| Reasoning | standalone `thinking` content block | a `part` with `thought: true` + `text` |
+| Signature | `signature` field **on the thinking block** | `thoughtSignature` field **on an arbitrary part** — sibling key to `functionCall`/`text` |
+| Echo | replay the block | *"You **must** return this signature in the exact part where it was received."* |
+
+Confirmed at the type level: `Part` carries **both** `thought: Optional[bool]` and
+`thought_signature: Optional[bytes]` (python-genai `types.py`). Which part is signed differs by
+family: **Gemini 3 always signs the first `functionCall` part**; **Gemini 2.5 signs the first part
+regardless of type**.
+
+So a standalone `ContentBlock::Reasoning` **structurally cannot carry** a Gemini signature — the
+signature belongs to a *sibling* part, not to the reasoning.
+
+### This is a live bug, not a missing feature
+
+*"If you omit a `thought_signature` for the first `functionCall` part in any step of the current turn,
+the request will fail with a 400 error."* rupu never parses signatures, so it cannot return them:
+**Gemini multi-turn function calling is already broken** — on Gemini 3 regardless of thinking config.
+Plan 2 is therefore primarily a bug fix. Note the asymmetry Anthropic does not have: omission is a
+hard 400 on `functionCall` parts, but only silent degradation elsewhere (*"The API does not strictly
+enforce validation... though performance may degrade."*).
+
+### Decision — verbatim parts replay (matt, 2026-07-16)
+
+Gemini's parse stores the assistant turn's **original `parts` array verbatim** in a single
+`ContentBlock::Reasoning`'s opaque `raw`; `convert_messages` replays those parts verbatim instead of
+rebuilding them from blocks. Signatures therefore land on exactly the parts they arrived on: the
+`thoughtSignature` string and its association with a specific part are preserved exactly, though JSON
+object key *order* is not — `serde_json` (without `preserve_order`) re-sorts keys alphabetically on
+re-serialization, so `{"name":...,"args":...}` replays as `{"args":...,"name":...}`. This is
+near-certainly immaterial (key order carries no meaning to protobuf-JSON parsers) and would only
+matter if Google validated a signature over a canonical serialization of the part. **No change to the
+shared `ContentBlock`** — the meaning of `raw` is provider-private, so this stays inside
+`google_gemini.rs` and no other provider is touched.
+
+```
+Reasoning { text: <thought summaries, for the transcript>,
+            provider: "google_gemini", model,
+            raw: { "parts": [ <original parts verbatim, signatures attached> ] } }
+```
+
+`Text`/`ToolUse` blocks are still emitted as today for rupu's own use (transcript, tool dispatch,
+`text()`, `tool_calls()`); the `Reasoning` block is additive and exists to carry the wire replay.
+
+Rejected: (a) an opaque `provider_meta` field on `ToolUse` — most honest data model, but 43 literal
+sites across 12 files, grows the shared type for one provider's quirk, and still misses text-part
+signatures (62 more sites); (b) a positional sidecar attaching to the next emitted part —
+`convert_messages` already skips empty `Text` blocks (`if !text.is_empty()`), so an empty `Text` would
+silently shift a signature onto the wrong part, whose behavior Google does not document.
+
+Accepted costs: the turn's text/args are stored twice (once as blocks, once inside `raw`); Gemini's
+wire rebuild ignores the block list for turns that carry a replay block. Streamed turns replay the
+parts as they arrived, so a fragmented text stream replays as several text parts rather than one —
+semantically equivalent, cosmetically noisier.
+
+### Explicitly UNVERIFIED (do not build logic depending on these)
+
+Google does not document these; the research found no authoritative statement:
+- **Cross-model signature replay.** Anthropic's blocks are explicitly not origin-locked; Google says
+  nothing. Community reports ("thought signature is not valid") suggest cross-model switching fails,
+  but no Googler confirmed. rupu does not special-case it.
+- Whether `includeThoughts: false` still yields signatures (strongly implied, never stated).
+- What happens if a signature is modified or attached to the wrong part.
+
+### Separate pre-existing Gemini bugs (NOT reasoning; out of Plan 2's scope, recorded here)
+
+1. **`thinkingLevel` + `thinkingBudget` are sent together** (`google_gemini.rs:353-357`). Per the docs
+   they **cannot coexist on Gemini 3** -> 400. Independent of reasoning capture.
+2. **Level values are sent uppercase** (`"MINIMAL"`/`"LOW"`/`"HIGH"`); the docs specify lowercase
+   `"minimal"|"low"|"medium"|"high"`. Unverified whether the API tolerates both.
+3. `usageMetadata.thoughtsTokenCount` is not read, so thinking tokens are unaccounted in `Usage`
+   (thoughts are billed as output tokens; `includeThoughts` changes visibility only, not billing).
