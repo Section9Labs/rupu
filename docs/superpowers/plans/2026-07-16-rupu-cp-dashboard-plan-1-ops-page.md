@@ -27,7 +27,7 @@
 
 **Files:**
 - Modify: `crates/rupu-cp/web/src/lib/api.ts`
-- Test: `crates/rupu-cp/web/src/lib/api.test.ts` (create if absent)
+- Test: `crates/rupu-cp/web/src/lib/api.test.ts` — **already exists** (added on main); ADD to it, do not create or overwrite it
 
 **Interfaces:**
 - Consumes: Plan 2 Task 7's `GET /api/dashboard?range=&host=` response
@@ -35,7 +35,7 @@
 
 - [ ] **Step 1: Write the failing test**
 
-Create `crates/rupu-cp/web/src/lib/api.test.ts`:
+**`crates/rupu-cp/web/src/lib/api.test.ts` already exists on main — append this test to it. Do NOT overwrite the file.**
 
 ```ts
 import { describe, it, expect, vi, afterEach } from 'vitest';
@@ -146,9 +146,11 @@ export interface CycleRollup {
   worker_name: string | null;
   started_at: string;
   finished_at: string | null;
-  ran: number;
-  skipped: number;
-  failed: number;
+  /** `null` = this host does not report the breakdown (SSH — the CLI's autoflow
+   *  history has no ran/skipped/failed fields). NOT zero: unknown is not "none". */
+  ran: number | null;
+  skipped: number | null;
+  failed: number | null;
   runs: CycleRun[];
   host_id?: string;
 }
@@ -166,12 +168,26 @@ export interface DashboardRecentRun {
 
 export interface DashboardResponse {
   hosts: HostFreshness[];
+  /**
+   * True when at least one host that DID report (`state === 'ok'`) omitted its
+   * open-findings count. When true, `findings_open` is a partial sum across only
+   * the hosts that reported it — **the UI must not present it as a fleet total**.
+   */
+  findings_partial: boolean;
   active: ActiveCounts;
   terminal_buckets: TerminalBucket[];
   active_runs: ActiveRunBar[];
   cycles: CycleRollup[];
   recent_manual: DashboardRecentRun[];
-  findings_open: number;
+  /** `null` when no reporting host supplied a count. NOT zero. */
+  findings_open: number | null;
+  /**
+   * RFC-3339. The OLDEST `captured_at` among reporting hosts — the honest
+   * staleness bound for the merged aggregate. Present at the TOP level because
+   * the server `#[serde(flatten)]`s a `DashboardSummary` into this response;
+   * `HttpHostConnector` re-parses this same body as a bare `DashboardSummary`.
+   */
+  captured_at: string;
 }
 ```
 
@@ -397,7 +413,10 @@ export function buildFeed(
  * problem. Anything unfinished or containing failures is signal.
  */
 export function isCycleInteresting(c: CycleRollup): boolean {
-  if (c.failed > 0) return true;
+  // `failed` is null when the host omits the breakdown — unknown is not "no
+  // failures", but it is also not evidence of one. Fall through to the
+  // finished/unfinished check rather than guessing either way.
+  if (c.failed !== null && c.failed > 0) return true;
   if (c.finished_at === null) return true; // still running
   return false;
 }
@@ -1375,7 +1394,10 @@ function CycleRow({ cycle }: { cycle: CycleRollup }) {
   // Clean runs fold behind a pill; `showClean` un-folds them. Hidden, never
   // lost — the count is always visible and always clickable.
   const [showClean, setShowClean] = useState(false);
-  const ok = Math.max(0, cycle.ran - cycle.failed);
+  // ran/failed are null when the host does not report the breakdown (SSH).
+  // Show what we know; never render a computed 0 from unknown inputs.
+  const ok =
+    cycle.ran !== null && cycle.failed !== null ? Math.max(0, cycle.ran - cycle.failed) : null;
   const { shown, cleanCount } = foldCleanRuns(cycle.runs);
   const visible = showClean ? cycle.runs : shown;
 
@@ -1390,11 +1412,14 @@ function CycleRow({ cycle }: { cycle: CycleRollup }) {
           {cycle.worker_name ?? cycle.cycle_id}
         </span>
         <span className="text-[rgb(var(--c-ink-dim))]">
-          {cycle.ran} runs · {ok} ok
-          {cycle.failed > 0 && (
+          {/* Fall back to the runs list when the host omits the breakdown —
+              it is the one count we always have. */}
+          {cycle.ran ?? cycle.runs.length} runs
+          {ok !== null && <> · {ok} ok</>}
+          {cycle.failed !== null && cycle.failed > 0 && (
             <span className="text-[rgb(var(--c-status-failed))]">, {cycle.failed} failed</span>
           )}
-          {cycle.skipped > 0 && <span>, {cycle.skipped} skipped</span>}
+          {cycle.skipped !== null && cycle.skipped > 0 && <span>, {cycle.skipped} skipped</span>}
         </span>
         <span className="ml-auto flex items-center gap-2">
           <TriggerChip trigger="cron" />
@@ -1493,10 +1518,14 @@ export function AttentionRow({
   active,
   failedInWindow,
   findingsOpen,
+  findingsPartial,
 }: {
   active: ActiveCounts;
   failedInWindow: number;
-  findingsOpen: number;
+  /** `null` = nobody reported. Render "—", never "0". */
+  findingsOpen: number | null;
+  /** True = the number below is a partial sum. Mark it; never imply completeness. */
+  findingsPartial: boolean;
 }) {
   const blocked = active.awaiting_approval + active.paused;
 
@@ -1533,8 +1562,13 @@ export function AttentionRow({
         to="/findings"
         className="rounded-lg border border-[rgb(var(--c-border))] bg-[rgb(var(--c-panel))] px-4 py-3"
       >
-        <div className="text-xs text-[rgb(var(--c-ink-dim))]">Open findings</div>
-        <div className="text-base tabular-nums text-[rgb(var(--c-ink-dim))]">{findingsOpen}</div>
+        <div className="text-xs text-[rgb(var(--c-ink-dim))]">
+          Open findings{findingsPartial && <span title="Some reporting hosts do not supply a findings count — this is a partial sum, not a fleet total."> (partial)</span>}
+        </div>
+        <div className="text-base tabular-nums text-[rgb(var(--c-ink-dim))]">
+          {/* `null` means nobody reported. "—" not "0": unknown is not none. */}
+          {findingsOpen === null ? '—' : `${findingsOpen}${findingsPartial ? '+' : ''}`}
+        </div>
       </Link>
     </div>
   );
@@ -1746,6 +1780,7 @@ export default function Dashboard() {
         active={data.active}
         failedInWindow={failedInWindow}
         findingsOpen={data.findings_open}
+        findingsPartial={data.findings_partial}
       />
 
       <Panel title="Live activity">
