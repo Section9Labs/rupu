@@ -18,7 +18,8 @@ use crate::{
     host::{
         connector::HostConnectorError,
         dashboard_summary::{
-            ActiveCounts, ActiveRunBar, CycleRollup, DashboardRange, RecentRun, TerminalBucket,
+            ActiveCounts, ActiveRunBar, CycleRollup, DashboardRange, DashboardSummary, RecentRun,
+            TerminalBucket,
         },
         summary_build,
     },
@@ -56,15 +57,18 @@ struct HostFreshness {
     reason: Option<String>,
 }
 
+/// The dashboard payload: one aggregate summary plus per-host reporting state.
+///
+/// `summary` is `#[serde(flatten)]`ed, so the wire form carries `DashboardSummary`'s
+/// fields at the top level. That is load-bearing: `HttpHostConnector::dashboard_summary`
+/// proxies this endpoint and parses the body as a bare `DashboardSummary`. Flattening
+/// makes remote-CP fan-out work BY CONSTRUCTION — serde ignores the extra `hosts` key —
+/// instead of via a mapper that can drift. Do not un-flatten this.
 #[derive(Serialize)]
 struct DashboardResponse {
     hosts: Vec<HostFreshness>,
-    active: ActiveCounts,
-    terminal_buckets: Vec<TerminalBucket>,
-    active_runs: Vec<ActiveRunBar>,
-    cycles: Vec<CycleRollup>,
-    recent_manual: Vec<RecentRun>,
-    findings_open: u64,
+    #[serde(flatten)]
+    summary: crate::host::dashboard_summary::DashboardSummary,
 }
 
 #[derive(serde::Deserialize)]
@@ -176,28 +180,35 @@ async fn get_dashboard(
     // Merge ONLY hosts that actually reported. A non-reporting host
     // contributes nothing rather than zeros — its state is carried in
     // `hosts` instead.
-    let mut resp = DashboardResponse {
-        hosts: Vec::new(),
-        active: ActiveCounts::default(),
-        terminal_buckets: Vec::new(),
-        active_runs: Vec::new(),
-        cycles: Vec::new(),
-        recent_manual: Vec::new(),
-        findings_open: 0,
-    };
+    let mut hosts = Vec::new();
+    let mut active = ActiveCounts::default();
+    let mut active_runs: Vec<ActiveRunBar> = Vec::new();
+    let mut cycles: Vec<CycleRollup> = Vec::new();
+    let mut recent_manual: Vec<RecentRun> = Vec::new();
+    let mut findings_open: u64 = 0;
     let mut bucket_merge: BTreeMap<DateTime<Utc>, TerminalBucket> = BTreeMap::new();
+    // The oldest `captured_at` among hosts that actually reported — the
+    // honest staleness bound for the merged aggregate ("this is at best this
+    // fresh"), not the newest, which would understate how stale the slowest
+    // host's contribution is. `None` until the first reporting host is seen;
+    // falls back to `Utc::now()` when no host reported at all.
+    let mut oldest_captured_at: Option<DateTime<Utc>> = None;
 
     for (freshness, summary) in results {
-        resp.hosts.push(freshness);
+        hosts.push(freshness);
         let Some(sum) = summary else { continue };
-        resp.active.running += sum.active.running;
-        resp.active.awaiting_approval += sum.active.awaiting_approval;
-        resp.active.paused += sum.active.paused;
-        resp.active.pending += sum.active.pending;
-        resp.findings_open += sum.findings_open;
-        resp.active_runs.extend(sum.active_runs);
-        resp.cycles.extend(sum.cycles);
-        resp.recent_manual.extend(sum.recent_manual);
+        oldest_captured_at = Some(match oldest_captured_at {
+            Some(oldest) => oldest.min(sum.captured_at),
+            None => sum.captured_at,
+        });
+        active.running += sum.active.running;
+        active.awaiting_approval += sum.active.awaiting_approval;
+        active.paused += sum.active.paused;
+        active.pending += sum.active.pending;
+        findings_open += sum.findings_open;
+        active_runs.extend(sum.active_runs);
+        cycles.extend(sum.cycles);
+        recent_manual.extend(sum.recent_manual);
         for b in sum.terminal_buckets {
             let e = bucket_merge.entry(b.ts).or_insert(TerminalBucket {
                 ts: b.ts,
@@ -224,12 +235,23 @@ async fn get_dashboard(
     // merged output is the only place that sees every host. Reuses
     // `summary_build::fill_bucket_grid` rather than a second "which days
     // exist" implementation.
-    resp.terminal_buckets = summary_build::fill_bucket_grid(bucket_merge, range, Utc::now());
-    resp.active_runs
-        .sort_by_key(|b| std::cmp::Reverse(b.started_at));
-    resp.cycles.sort_by_key(|c| std::cmp::Reverse(c.started_at));
-    resp.recent_manual
-        .sort_by_key(|r| std::cmp::Reverse(r.started_at));
+    let terminal_buckets = summary_build::fill_bucket_grid(bucket_merge, range, Utc::now());
+    active_runs.sort_by_key(|b| std::cmp::Reverse(b.started_at));
+    cycles.sort_by_key(|c| std::cmp::Reverse(c.started_at));
+    recent_manual.sort_by_key(|r| std::cmp::Reverse(r.started_at));
+
+    let resp = DashboardResponse {
+        hosts,
+        summary: DashboardSummary {
+            active,
+            terminal_buckets,
+            active_runs,
+            cycles,
+            recent_manual,
+            findings_open,
+            captured_at: oldest_captured_at.unwrap_or_else(Utc::now),
+        },
+    };
 
     Ok(Json(resp))
 }

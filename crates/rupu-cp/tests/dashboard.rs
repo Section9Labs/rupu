@@ -127,6 +127,37 @@ async fn dashboard_unknown_host_returns_404() {
 }
 
 #[tokio::test]
+async fn dashboard_body_parses_as_a_bare_dashboard_summary() {
+    // HttpHostConnector::dashboard_summary proxies this endpoint and parses the
+    // body as a bare DashboardSummary. If this ever stops holding, every HTTP
+    // host in a fan-out silently reports `offline`.
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn_server(dir.path()).await;
+    let body: serde_json::Value = reqwest::get(format!("{}/api/dashboard?range=30d", srv.base_url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let parsed: Result<rupu_cp::host::dashboard_summary::DashboardSummary, _> =
+        serde_json::from_value(body.clone());
+    assert!(
+        parsed.is_ok(),
+        "body must parse as DashboardSummary: {:?}",
+        parsed.err()
+    );
+    assert!(
+        body["captured_at"].is_string(),
+        "captured_at must be TOP-LEVEL, not nested"
+    );
+    assert!(
+        body["hosts"].is_array(),
+        "hosts[] must still be present alongside it"
+    );
+}
+
+#[tokio::test]
 async fn dashboard_scoped_to_host_local_returns_only_local() {
     let dir = tempfile::tempdir().unwrap();
     let srv = spawn_server_with_remote(dir.path(), "http://127.0.0.1:1/").await;
