@@ -75,92 +75,45 @@ pub struct TerminalBucket {
     pub cancelled: u64,
 }
 
-/// One bar in the live swimlane.
+/// Runs STARTED in a bucket, split by trigger. Same day-key alignment as
+/// [`TerminalBucket`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActiveRunBar {
+pub struct ThroughputBucket {
+    pub ts: DateTime<Utc>,
+    pub manual: u64,
+    pub cron: u64,
+    pub event: u64,
+}
+
+/// Scalar cycle summary — the one line of cycle numbers (spec §5.5). NOT a
+/// row array.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CycleCounts {
+    pub total: u64,
+    /// `None` when the host cannot report the ran/failed breakdown (SSH).
+    /// Never fabricate 0.
+    pub clean: Option<u64>,
+    pub with_failures: Option<u64>,
+}
+
+/// The "Active now" key point (spec §5.2): the longest currently-running run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveLongest {
     pub run_id: String,
     pub workflow_name: String,
-    /// `RunStatus::as_str()` form.
-    pub status: String,
-    pub started_at: DateTime<Utc>,
-    /// `"manual"` | `"cron"` | `"event"`.
-    pub trigger: String,
-    /// `None` for manual runs; set when the run belongs to an autoflow cycle.
-    pub cycle_id: Option<String>,
-    /// Which host this row came from. Set by the aggregation layer
-    /// (`api/dashboard.rs`), not by the connector — a connector does not know
-    /// the id it is registered under. `None` only if a row somehow reaches the
-    /// wire untagged; the merge always sets it. Mirrors what
-    /// `api/host_fanout.rs`'s `fan_out_via` does for every other fan-out view.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_id: Option<String>,
-}
-
-/// One run inside a cycle.
-///
-/// Carries `status`, not just an id, because the `+N clean` pill needs to know
-/// what folds. `AutoflowCycleRow` supplies only ids, so the status is joined
-/// server-side in `build_summary` — which already holds every run. Making the
-/// client fetch a run per id would turn one expanded cycle into N requests.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CycleRun {
-    pub run_id: String,
-    /// `RunStatus::as_str()` form. `"unknown"` when the cycle references a run
-    /// this host cannot resolve — never silently omitted, or the cycle's run
-    /// count would disagree with its own row.
-    pub status: String,
-}
-
-/// One autoflow cycle, collapsed. The activity feed's primary row.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CycleRollup {
-    pub cycle_id: String,
-    pub worker_name: Option<String>,
-    pub started_at: DateTime<Utc>,
-    pub finished_at: Option<DateTime<Utc>>,
-    /// `None` when this host cannot report the ran/skipped/failed breakdown
-    /// for this cycle — e.g. SSH, whose only source is `rupu autoflow
-    /// history`'s per-event stream, which carries no such rollup. `Some(0)`
-    /// is a genuine zero; `None` must never be presented as one.
-    pub ran: Option<u64>,
-    pub skipped: Option<u64>,
-    pub failed: Option<u64>,
-    pub runs: Vec<CycleRun>,
-    /// Which host this row came from. Set by the aggregation layer
-    /// (`api/dashboard.rs`), not by the connector — a connector does not know
-    /// the id it is registered under. `None` only if a row somehow reaches the
-    /// wire untagged; the merge always sets it. Mirrors what
-    /// `api/host_fanout.rs`'s `fan_out_via` does for every other fan-out view.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_id: Option<String>,
-}
-
-/// A manual-trigger run. Never grouped — always rendered individually.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecentRun {
-    pub id: String,
-    pub workflow_name: String,
-    pub status: String,
-    pub started_at: DateTime<Utc>,
-    pub finished_at: Option<DateTime<Utc>>,
-    pub trigger: String,
-    /// Which host this row came from. Set by the aggregation layer
-    /// (`api/dashboard.rs`), not by the connector — a connector does not know
-    /// the id it is registered under. `None` only if a row somehow reaches the
-    /// wire untagged; the merge always sets it. Mirrors what
-    /// `api/host_fanout.rs`'s `fan_out_via` does for every other fan-out view.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_id: Option<String>,
+    pub age_ms: u64,
 }
 
 /// One host's complete dashboard contribution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardSummary {
     pub active: ActiveCounts,
+    /// The single longest-running run, or None if nothing is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_longest: Option<ActiveLongest>,
     pub terminal_buckets: Vec<TerminalBucket>,
-    pub active_runs: Vec<ActiveRunBar>,
-    pub cycles: Vec<CycleRollup>,
-    pub recent_manual: Vec<RecentRun>,
+    pub throughput_buckets: Vec<ThroughputBucket>,
+    pub cycles: CycleCounts,
     /// `None` when this host does not report open-findings data at all (e.g.
     /// SSH — the CLI has no findings surface). `Some(0)` is a genuine zero;
     /// `None` must never be summed as one at the aggregation layer
@@ -195,13 +148,93 @@ mod tests {
     }
 
     #[test]
+    fn throughput_bucket_serializes_with_expected_field_names() {
+        let b = ThroughputBucket {
+            ts: chrono::Utc::now(),
+            manual: 3,
+            cron: 5,
+            event: 1,
+        };
+        let v = serde_json::to_value(&b).unwrap();
+        assert!(
+            v["ts"].as_str().unwrap().contains('T'),
+            "ts must be RFC-3339"
+        );
+        assert_eq!(v["manual"], 3);
+        assert_eq!(v["cron"], 5);
+        assert_eq!(v["event"], 1);
+    }
+
+    #[test]
+    fn cycle_counts_default_is_zero_total_and_none_breakdown() {
+        let c = CycleCounts::default();
+        assert_eq!(c.total, 0);
+        assert_eq!(c.clean, None);
+        assert_eq!(c.with_failures, None);
+    }
+
+    #[test]
+    fn cycle_counts_clean_none_never_serializes_as_zero() {
+        let c = CycleCounts {
+            total: 5,
+            clean: None,
+            with_failures: Some(2),
+        };
+        let v = serde_json::to_value(&c).unwrap();
+        // A host that cannot report the breakdown must serialize `clean` as
+        // null (or omit it) — never fabricate a 0.
+        assert!(
+            v.get("clean").is_none() || v["clean"].is_null(),
+            "clean: None must serialize as absent/null, never 0; got {v:?}"
+        );
+        assert_ne!(
+            v.get("clean").cloned().unwrap_or(serde_json::Value::Null),
+            serde_json::json!(0),
+            "clean: None must never be presented as a genuine zero"
+        );
+        assert_eq!(v["with_failures"], 2);
+        assert_eq!(v["total"], 5);
+    }
+
+    #[test]
+    fn cycle_counts_round_trips_through_json() {
+        let c = CycleCounts {
+            total: 10,
+            clean: Some(7),
+            with_failures: Some(3),
+        };
+        let v = serde_json::to_value(&c).unwrap();
+        let back: CycleCounts = serde_json::from_value(v).unwrap();
+        assert_eq!(back.total, 10);
+        assert_eq!(back.clean, Some(7));
+        assert_eq!(back.with_failures, Some(3));
+    }
+
+    #[test]
+    fn active_longest_round_trips_with_expected_field_names() {
+        let a = ActiveLongest {
+            run_id: "run-123".to_string(),
+            workflow_name: "nightly-scan".to_string(),
+            age_ms: 45_000,
+        };
+        let v = serde_json::to_value(&a).unwrap();
+        assert_eq!(v["run_id"], "run-123");
+        assert_eq!(v["workflow_name"], "nightly-scan");
+        assert_eq!(v["age_ms"], 45_000);
+        let back: ActiveLongest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.run_id, "run-123");
+        assert_eq!(back.workflow_name, "nightly-scan");
+        assert_eq!(back.age_ms, 45_000);
+    }
+
+    #[test]
     fn summary_serializes_captured_at_as_rfc3339() {
         let s = DashboardSummary {
             active: ActiveCounts::default(),
+            active_longest: None,
             terminal_buckets: vec![],
-            active_runs: vec![],
-            cycles: vec![],
-            recent_manual: vec![],
+            throughput_buckets: vec![],
+            cycles: CycleCounts::default(),
             findings_open: Some(0),
             captured_at: chrono::Utc::now(),
         };
@@ -210,5 +243,72 @@ mod tests {
             v["captured_at"].as_str().unwrap().contains('T'),
             "captured_at must be RFC-3339 — the freshness strip parses it"
         );
+    }
+
+    #[test]
+    fn summary_active_longest_none_is_omitted_from_wire() {
+        let s = DashboardSummary {
+            active: ActiveCounts::default(),
+            active_longest: None,
+            terminal_buckets: vec![],
+            throughput_buckets: vec![],
+            cycles: CycleCounts::default(),
+            findings_open: None,
+            captured_at: chrono::Utc::now(),
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(
+            v.get("active_longest").is_none(),
+            "active_longest: None must be omitted (skip_serializing_if), not null"
+        );
+        // findings_open has no such attribute in the spec — None still
+        // serializes, just as null.
+        assert!(v.get("findings_open").is_some());
+        assert!(v["findings_open"].is_null());
+    }
+
+    #[test]
+    fn summary_round_trips_through_json_with_active_longest_present() {
+        let s = DashboardSummary {
+            active: ActiveCounts {
+                running: 2,
+                awaiting_approval: 1,
+                paused: 0,
+                pending: 0,
+            },
+            active_longest: Some(ActiveLongest {
+                run_id: "run-abc".to_string(),
+                workflow_name: "deploy".to_string(),
+                age_ms: 120_000,
+            }),
+            terminal_buckets: vec![TerminalBucket {
+                ts: chrono::Utc::now(),
+                completed: 4,
+                failed: 1,
+                rejected: 0,
+                cancelled: 0,
+            }],
+            throughput_buckets: vec![ThroughputBucket {
+                ts: chrono::Utc::now(),
+                manual: 2,
+                cron: 3,
+                event: 0,
+            }],
+            cycles: CycleCounts {
+                total: 6,
+                clean: Some(4),
+                with_failures: Some(2),
+            },
+            findings_open: Some(3),
+            captured_at: chrono::Utc::now(),
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        let back: DashboardSummary = serde_json::from_value(v).unwrap();
+        assert_eq!(back.active.running, 2);
+        assert_eq!(back.active_longest.unwrap().run_id, "run-abc");
+        assert_eq!(back.terminal_buckets.len(), 1);
+        assert_eq!(back.throughput_buckets.len(), 1);
+        assert_eq!(back.cycles.total, 6);
+        assert_eq!(back.findings_open, Some(3));
     }
 }
