@@ -275,6 +275,11 @@ fn stub_dashboard_summary_body(captured_at: &str) -> serde_json::Value {
             "paused": 0,
             "pending": 0
         },
+        "active_longest": {
+            "run_id": "run_remote_1",
+            "workflow_name": "triage-wf",
+            "age_ms": 45_000
+        },
         "terminal_buckets": [
             {
                 "ts": "2026-07-15T00:00:00Z",
@@ -284,27 +289,19 @@ fn stub_dashboard_summary_body(captured_at: &str) -> serde_json::Value {
                 "cancelled": 0
             }
         ],
-        "active_runs": [
+        "throughput_buckets": [
             {
-                "run_id": "run_remote_1",
-                "workflow_name": "triage-wf",
-                "status": "running",
-                "started_at": "2026-07-16T00:00:00Z",
-                "trigger": "manual",
-                "cycle_id": null
+                "ts": "2026-07-15T00:00:00Z",
+                "manual": 2,
+                "cron": 1,
+                "event": 0
             }
         ],
-        "cycles": [],
-        "recent_manual": [
-            {
-                "id": "run_remote_1",
-                "workflow_name": "triage-wf",
-                "status": "running",
-                "started_at": "2026-07-16T00:00:00Z",
-                "finished_at": null,
-                "trigger": "manual"
-            }
-        ],
+        "cycles": {
+            "total": 4,
+            "clean": 3,
+            "with_failures": 1
+        },
         "findings_open": 4,
         "captured_at": captured_at
     })
@@ -346,8 +343,13 @@ async fn http_dashboard_summary_scopes_to_host_local_and_preserves_captured_at()
     assert_eq!(summary.active.awaiting_approval, 1);
     assert_eq!(summary.terminal_buckets.len(), 1);
     assert_eq!(summary.terminal_buckets[0].completed, 3);
-    assert_eq!(summary.active_runs.len(), 1);
-    assert_eq!(summary.active_runs[0].run_id, "run_remote_1");
+    assert_eq!(summary.throughput_buckets.len(), 1);
+    assert_eq!(summary.throughput_buckets[0].manual, 2);
+    assert_eq!(
+        summary.active_longest.as_ref().map(|a| a.run_id.as_str()),
+        Some("run_remote_1")
+    );
+    assert_eq!(summary.cycles.total, 4);
     assert_eq!(summary.findings_open, Some(4));
 }
 
@@ -418,11 +420,11 @@ async fn http_dashboard_summary_rejects_a_zeroed_body_when_no_host_reports_ok() 
             }
         ],
         "findings_partial": false,
+        "cycles_partial": false,
         "active": {"running": 0, "awaiting_approval": 0, "paused": 0, "pending": 0},
         "terminal_buckets": [],
-        "active_runs": [],
-        "cycles": [],
-        "recent_manual": [],
+        "throughput_buckets": [],
+        "cycles": {"total": 0, "clean": null, "with_failures": null},
         "findings_open": null,
         "captured_at": "2026-07-16T12:00:00Z"
     });

@@ -7,8 +7,8 @@
 #![deny(clippy::all)]
 
 use crate::host::dashboard_summary::{
-    ActiveCounts, ActiveRunBar, CycleRollup, DashboardRange, DashboardSummary, RecentRun,
-    TerminalBucket,
+    ActiveCounts, ActiveLongest, CycleCounts, DashboardRange, DashboardSummary, TerminalBucket,
+    ThroughputBucket,
 };
 use chrono::{DateTime, Duration, Timelike, Utc};
 use rupu_orchestrator::runs::{RunRecord, RunStatus};
@@ -16,9 +16,9 @@ use std::collections::BTreeMap;
 
 /// Truncate to the start of the UTC day — the bucket key.
 ///
-/// `pub(crate)` so every producer of a [`TerminalBucket`] (currently
-/// `build_summary` here and `SshHostConnector::dashboard_summary` in
-/// `host/ssh.rs`) truncates through this ONE function rather than each
+/// `pub(crate)` so every producer of a [`TerminalBucket`]/[`ThroughputBucket`]
+/// (currently `build_summary` here and `SshHostConnector::dashboard_summary`
+/// in `host/ssh.rs`) truncates through this ONE function rather than each
 /// hand-rolling its own day-boundary math — two truncations that drift by
 /// even a nanosecond would produce buckets that never merge (see
 /// `fill_bucket_grid`'s doc comment and the regression test in
@@ -29,6 +29,21 @@ pub(crate) fn day_key(t: DateTime<Utc>) -> DateTime<Utc> {
         .and_then(|t| t.with_second(0))
         .and_then(|t| t.with_nanosecond(0))
         .unwrap_or(t)
+}
+
+/// One cycle's rollup, reduced to exactly what [`build_summary`] needs for
+/// [`CycleCounts`]: range filtering (`started_at`) and the clean/with-failures
+/// split (`failed`).
+///
+/// This is deliberately NOT the wire DTO — there is no such thing any more
+/// (the old row-shaped `CycleRollup`/`CycleRun` in `dashboard_summary.rs` were
+/// deleted along with the swimlane/feed they served). `SshHostConnector`
+/// builds its own `CycleCounts` directly from history rows (it cannot report
+/// the clean/with-failures breakdown at all, so it never goes through this
+/// type); only `LocalHostConnector::collect_cycle_rollups` produces this.
+pub struct CycleRollup {
+    pub started_at: DateTime<Utc>,
+    pub failed: u64,
 }
 
 /// Build one host's dashboard contribution from its runs + cycles.
@@ -43,48 +58,11 @@ pub fn build_summary(
     let in_range = |t: DateTime<Utc>| since.map(|s| t >= s).unwrap_or(true);
 
     let mut active = ActiveCounts::default();
-    let mut active_runs = Vec::new();
-    let mut recent_manual = Vec::new();
-    let mut buckets: BTreeMap<DateTime<Utc>, TerminalBucket> = BTreeMap::new();
-
-    // Runs belonging to a cycle are grouped under it in the feed; only manual
-    // runs are listed individually (spec §5.5).
-    let cycle_of: std::collections::HashMap<&str, &str> = cycles
-        .iter()
-        .flat_map(|c| {
-            c.runs
-                .iter()
-                .map(move |r| (r.run_id.as_str(), c.cycle_id.as_str()))
-        })
-        .collect();
-
-    // Join each cycle's runs to their status. The `+N clean` pill needs it, and
-    // we already hold every run here — the client should not fetch N runs to
-    // expand one cycle.
-    let status_of: std::collections::HashMap<&str, &str> = runs
-        .iter()
-        .map(|r| (r.id.as_str(), r.status.as_str()))
-        .collect();
-    let cycles: Vec<CycleRollup> = cycles
-        .iter()
-        // Match the run filter above: without this the 7d/30d control
-        // silently doesn't apply to the activity feed, and local would
-        // disagree with the SSH implementation (which does filter).
-        .filter(|c| in_range(c.started_at))
-        .map(|c| {
-            let mut c = c.clone();
-            for run in c.runs.iter_mut() {
-                // "unknown" rather than dropping the run: a cycle whose run list
-                // silently shrank would disagree with its own `ran` count.
-                run.status = status_of
-                    .get(run.run_id.as_str())
-                    .copied()
-                    .unwrap_or("unknown")
-                    .to_string();
-            }
-            c
-        })
-        .collect();
+    let mut terminal_buckets: BTreeMap<DateTime<Utc>, TerminalBucket> = BTreeMap::new();
+    let mut throughput_buckets: BTreeMap<DateTime<Utc>, ThroughputBucket> = BTreeMap::new();
+    // The non-terminal run with the OLDEST started_at — the longest currently
+    // running, fleet-wide "what's stuck" key point (spec §5.2).
+    let mut longest: Option<&RunRecord> = None;
 
     for r in runs {
         if !in_range(r.started_at) {
@@ -98,27 +76,41 @@ pub fn build_summary(
             _ => {}
         }
 
-        // Non-terminal runs become swimlane bars. Paused is deliberately
-        // included: is_terminal() excludes it because a paused run expects a
-        // resume, so it is still live work.
+        // Non-terminal runs are candidates for `active_longest`. Paused is
+        // deliberately included: is_terminal() excludes it because a paused
+        // run expects a resume, so it is still live work.
         if !r.status.is_terminal() {
-            active_runs.push(ActiveRunBar {
-                run_id: r.id.clone(),
-                workflow_name: r.workflow_name.clone(),
-                status: r.status.as_str().to_string(),
-                started_at: r.started_at,
-                trigger: r.trigger_str().to_string(),
-                cycle_id: cycle_of.get(r.id.as_str()).map(|c| c.to_string()),
-                // Tagged by the aggregation layer (`api/dashboard.rs`), not
-                // here — this builder doesn't know which host id it's
-                // registered under.
-                host_id: None,
+            longest = Some(match longest {
+                // `cur` started at or before `r` — it is the same age or
+                // older, so it stays the longest-running candidate.
+                Some(cur) if cur.started_at <= r.started_at => cur,
+                _ => r,
             });
+        }
+
+        // Throughput: every run in range counts once, keyed by the day it
+        // STARTED and by trigger — unlike `terminal_buckets`, non-terminal
+        // (still-running) runs count here too, so the trend reflects load,
+        // not just outcomes.
+        let tkey = day_key(r.started_at);
+        let tb = throughput_buckets.entry(tkey).or_insert(ThroughputBucket {
+            ts: tkey,
+            manual: 0,
+            cron: 0,
+            event: 0,
+        });
+        match r.trigger_str() {
+            "cron" => tb.cron += 1,
+            "event" => tb.event += 1,
+            // "manual" is the only other value `trigger_str()` returns; treat
+            // anything unrecognized the same way rather than silently
+            // dropping it from every bucket.
+            _ => tb.manual += 1,
         }
 
         if r.status.is_terminal() {
             let key = day_key(r.started_at);
-            let b = buckets.entry(key).or_insert(TerminalBucket {
+            let b = terminal_buckets.entry(key).or_insert(TerminalBucket {
                 ts: key,
                 completed: 0,
                 failed: 0,
@@ -133,39 +125,37 @@ pub fn build_summary(
                 _ => {}
             }
         }
-
-        // A run belonging to a cycle is grouped under that cycle in the feed
-        // (see `cycle_of` above) even when it has no trigger provenance of
-        // its own — it must never also leak into recent_manual.
-        if r.trigger_str() == "manual" && !cycle_of.contains_key(r.id.as_str()) {
-            recent_manual.push(RecentRun {
-                id: r.id.clone(),
-                workflow_name: r.workflow_name.clone(),
-                status: r.status.as_str().to_string(),
-                started_at: r.started_at,
-                finished_at: r.finished_at,
-                trigger: "manual".to_string(),
-                // Tagged by the aggregation layer (`api/dashboard.rs`), not
-                // here — this builder doesn't know which host id it's
-                // registered under.
-                host_id: None,
-            });
-        }
     }
 
-    // Fill the bucket grid. Without this the trend area silently closes gaps
-    // and reads as continuous activity across days that had none.
-    let terminal_buckets = fill_bucket_grid(buckets, range, now);
+    let active_longest = longest.map(|r| ActiveLongest {
+        run_id: r.id.clone(),
+        workflow_name: r.workflow_name.clone(),
+        age_ms: (now - r.started_at).num_milliseconds().max(0) as u64,
+    });
 
-    active_runs.sort_by_key(|b| std::cmp::Reverse(b.started_at));
-    recent_manual.sort_by_key(|r| std::cmp::Reverse(r.started_at));
+    let cycles_in_range: Vec<&CycleRollup> =
+        cycles.iter().filter(|c| in_range(c.started_at)).collect();
+    // Local reads the real ran/failed breakdown from its own cycle history,
+    // so both `clean` and `with_failures` are always `Some` here — never a
+    // fabricated `None`. (SSH, which cannot report the breakdown, builds its
+    // own `CycleCounts` directly rather than going through this function.)
+    let cycles = CycleCounts {
+        total: cycles_in_range.len() as u64,
+        clean: Some(cycles_in_range.iter().filter(|c| c.failed == 0).count() as u64),
+        with_failures: Some(cycles_in_range.iter().filter(|c| c.failed > 0).count() as u64),
+    };
+
+    // Fill the bucket grids. Without this the trend areas silently close gaps
+    // and read as continuous activity across days that had none.
+    let terminal_buckets = fill_bucket_grid(terminal_buckets, range, now);
+    let throughput_buckets = fill_throughput_grid(throughput_buckets, range, now);
 
     DashboardSummary {
         active,
+        active_longest,
         terminal_buckets,
-        active_runs,
+        throughput_buckets,
         cycles,
-        recent_manual,
         findings_open,
         captured_at: now,
     }
@@ -235,10 +225,59 @@ pub(crate) fn fill_bucket_grid(
     out
 }
 
+/// [`ThroughputBucket`] analogue of [`fill_bucket_grid`] — same zero-fill and
+/// defence-in-depth day-key normalization discipline, kept as a separate
+/// function (rather than a generic) because the two bucket shapes have
+/// different fields to sum/zero. `pub(crate)` for the same reason:
+/// `api::dashboard`'s merged-fleet grid reuses this rather than re-deriving
+/// "which days exist" a second time.
+pub(crate) fn fill_throughput_grid(
+    buckets: BTreeMap<DateTime<Utc>, ThroughputBucket>,
+    range: DashboardRange,
+    now: DateTime<Utc>,
+) -> Vec<ThroughputBucket> {
+    let mut buckets: BTreeMap<DateTime<Utc>, ThroughputBucket> =
+        buckets
+            .into_iter()
+            .fold(BTreeMap::new(), |mut acc, (k, b)| {
+                let key = day_key(k);
+                let entry = acc.entry(key).or_insert(ThroughputBucket {
+                    ts: key,
+                    manual: 0,
+                    cron: 0,
+                    event: 0,
+                });
+                entry.manual += b.manual;
+                entry.cron += b.cron;
+                entry.event += b.event;
+                acc
+            });
+
+    let start = match range.since(now) {
+        Some(s) => day_key(s),
+        None => match buckets.keys().next() {
+            Some(k) => *k,
+            None => return Vec::new(),
+        },
+    };
+    let end = day_key(now);
+    let mut out = Vec::new();
+    let mut cursor = start;
+    while cursor <= end {
+        out.push(buckets.remove(&cursor).unwrap_or(ThroughputBucket {
+            ts: cursor,
+            manual: 0,
+            cron: 0,
+            event: 0,
+        }));
+        cursor += Duration::days(1);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::dashboard_summary::CycleRun;
 
     /// Explicit field initialization — `RunRecord` has no `Default` impl
     /// (deliberately: see `crates/rupu-orchestrator/src/runs.rs`), so the
@@ -360,11 +399,11 @@ mod tests {
     }
 
     #[test]
-    fn manual_runs_are_separated_from_cycle_runs() {
+    fn throughput_buckets_tally_by_trigger() {
         use rupu_orchestrator::runs::RunStatus::*;
-        let mut cron = rec("r_cron", Completed, 1);
+        let mut cron = rec("r_cron", Completed, 60);
         cron.source_wake_id = Some("wake_1".into());
-        let manual = rec("r_manual", Completed, 1);
+        let manual = rec("r_manual", Completed, 30);
         let s = build_summary(
             &[cron, manual],
             &[],
@@ -372,152 +411,127 @@ mod tests {
             DashboardRange::All,
             chrono::Utc::now(),
         );
-        assert_eq!(
-            s.recent_manual.len(),
-            1,
-            "only the manual run belongs in recent_manual"
-        );
-        assert_eq!(s.recent_manual[0].id, "r_manual");
+        let total_manual: u64 = s.throughput_buckets.iter().map(|b| b.manual).sum();
+        let total_cron: u64 = s.throughput_buckets.iter().map(|b| b.cron).sum();
+        let total_event: u64 = s.throughput_buckets.iter().map(|b| b.event).sum();
+        assert_eq!(total_manual, 1);
+        assert_eq!(total_cron, 1);
+        assert_eq!(total_event, 0);
     }
 
     #[test]
-    fn cycle_runs_get_their_status_joined_from_the_runs_in_hand() {
+    fn throughput_buckets_count_non_terminal_runs_too() {
         use rupu_orchestrator::runs::RunStatus::*;
-        let runs = vec![rec("r_ok", Completed, 5), rec("r_bad", Failed, 5)];
-        let cycles = vec![CycleRollup {
-            cycle_id: "cyc_1".into(),
-            worker_name: Some("nightly".into()),
-            started_at: chrono::Utc::now() - chrono::Duration::minutes(6),
-            finished_at: None,
-            ran: Some(2),
-            skipped: Some(0),
-            failed: Some(1),
-            // status starts "unknown" — collect_cycle_rollups does no per-run reads.
-            runs: vec![
-                CycleRun {
-                    run_id: "r_ok".into(),
-                    status: "unknown".into(),
-                },
-                CycleRun {
-                    run_id: "r_bad".into(),
-                    status: "unknown".into(),
-                },
-            ],
-            host_id: None,
-        }];
+        // Unlike terminal_buckets, a still-running run must still show up in
+        // throughput — the point of the panel is load, not just outcomes.
+        let s = build_summary(
+            &[rec("r1", Running, 5)],
+            &[],
+            Some(0),
+            DashboardRange::All,
+            chrono::Utc::now(),
+        );
+        let total_manual: u64 = s.throughput_buckets.iter().map(|b| b.manual).sum();
+        assert_eq!(total_manual, 1);
+        let terminal_total: u64 = s
+            .terminal_buckets
+            .iter()
+            .map(|b| b.completed + b.failed + b.rejected + b.cancelled)
+            .sum();
+        assert_eq!(
+            terminal_total, 0,
+            "a running run must never appear in terminal_buckets"
+        );
+    }
+
+    #[test]
+    fn throughput_grid_is_contiguous_so_charts_do_not_lie_about_gaps() {
+        use rupu_orchestrator::runs::RunStatus::*;
+        let runs = vec![
+            rec("a", Completed, 60 * 24 * 4),
+            rec("b", Completed, 60 * 24),
+        ];
         let s = build_summary(
             &runs,
-            &cycles,
-            Some(0),
-            DashboardRange::All,
-            chrono::Utc::now(),
-        );
-        let c = &s.cycles[0];
-        assert_eq!(
-            c.runs.iter().find(|r| r.run_id == "r_ok").unwrap().status,
-            "completed"
-        );
-        assert_eq!(
-            c.runs.iter().find(|r| r.run_id == "r_bad").unwrap().status,
-            "failed"
-        );
-    }
-
-    #[test]
-    fn a_cycle_run_we_cannot_resolve_stays_unknown_and_is_not_dropped() {
-        // A cycle whose run list silently shrank would disagree with its own
-        // `ran` count. Unresolvable runs must survive as "unknown".
-        let cycles = vec![CycleRollup {
-            cycle_id: "cyc_1".into(),
-            worker_name: None,
-            started_at: chrono::Utc::now(),
-            finished_at: None,
-            ran: Some(1),
-            skipped: Some(0),
-            failed: Some(0),
-            runs: vec![CycleRun {
-                run_id: "r_gone".into(),
-                status: "unknown".into(),
-            }],
-            host_id: None,
-        }];
-        let s = build_summary(
             &[],
-            &cycles,
-            Some(0),
-            DashboardRange::All,
-            chrono::Utc::now(),
-        );
-        assert_eq!(s.cycles[0].runs.len(), 1, "the run must not be dropped");
-        assert_eq!(s.cycles[0].runs[0].status, "unknown");
-    }
-
-    #[test]
-    fn a_run_belonging_to_a_cycle_is_not_listed_as_a_manual_run() {
-        use rupu_orchestrator::runs::RunStatus::*;
-        // Cycle-owned runs are grouped under their cycle; only manual runs are
-        // listed individually. A cycle-owned run with no trigger provenance
-        // must not leak into recent_manual.
-        let runs = vec![rec("r_in_cycle", Completed, 5)];
-        let cycles = vec![CycleRollup {
-            cycle_id: "cyc_1".into(),
-            worker_name: None,
-            started_at: chrono::Utc::now() - chrono::Duration::minutes(6),
-            finished_at: None,
-            ran: Some(1),
-            skipped: Some(0),
-            failed: Some(0),
-            runs: vec![CycleRun {
-                run_id: "r_in_cycle".into(),
-                status: "unknown".into(),
-            }],
-            host_id: None,
-        }];
-        let s = build_summary(
-            &runs,
-            &cycles,
-            Some(0),
-            DashboardRange::All,
-            chrono::Utc::now(),
-        );
-        assert!(
-            s.recent_manual.iter().all(|r| r.id != "r_in_cycle"),
-            "a run owned by a cycle must not also appear as a manual run"
-        );
-    }
-
-    #[test]
-    fn cycles_outside_the_range_are_excluded() {
-        let old = CycleRollup {
-            cycle_id: "old".into(),
-            worker_name: None,
-            started_at: chrono::Utc::now() - chrono::Duration::days(10),
-            finished_at: None,
-            ran: Some(1),
-            skipped: Some(0),
-            failed: Some(0),
-            runs: vec![],
-            host_id: None,
-        };
-        let recent = CycleRollup {
-            cycle_id: "recent".into(),
-            worker_name: None,
-            started_at: chrono::Utc::now() - chrono::Duration::hours(1),
-            finished_at: None,
-            ran: Some(1),
-            skipped: Some(0),
-            failed: Some(0),
-            runs: vec![],
-            host_id: None,
-        };
-        let s = build_summary(
-            &[],
-            &[old, recent],
             Some(0),
             DashboardRange::Days7,
             chrono::Utc::now(),
         );
-        assert_eq!(s.cycles.len(), 1);
-        assert_eq!(s.cycles[0].cycle_id, "recent");
+        assert!(
+            s.throughput_buckets.len() >= 4,
+            "expected a filled throughput grid, got {} buckets",
+            s.throughput_buckets.len()
+        );
+    }
+
+    #[test]
+    fn active_longest_picks_the_oldest_running_run() {
+        use rupu_orchestrator::runs::RunStatus::*;
+        let runs = vec![
+            rec("newer", Running, 5),
+            rec("older", Running, 50),
+            rec("done", Completed, 100),
+        ];
+        let s = build_summary(&runs, &[], Some(0), DashboardRange::All, chrono::Utc::now());
+        let al = s
+            .active_longest
+            .expect("two non-terminal runs in hand — expected an active_longest");
+        assert_eq!(al.run_id, "older");
+        assert!(al.age_ms > 0);
+    }
+
+    #[test]
+    fn active_longest_is_none_when_nothing_is_running() {
+        use rupu_orchestrator::runs::RunStatus::*;
+        let s = build_summary(
+            &[rec("done", Completed, 5)],
+            &[],
+            Some(0),
+            DashboardRange::All,
+            chrono::Utc::now(),
+        );
+        assert!(s.active_longest.is_none());
+    }
+
+    #[test]
+    fn cycle_counts_split_clean_vs_with_failures() {
+        let now = chrono::Utc::now();
+        let cycles = vec![
+            CycleRollup {
+                started_at: now - chrono::Duration::minutes(5),
+                failed: 0,
+            },
+            CycleRollup {
+                started_at: now - chrono::Duration::minutes(4),
+                failed: 0,
+            },
+            CycleRollup {
+                started_at: now - chrono::Duration::minutes(3),
+                failed: 2,
+            },
+        ];
+        let s = build_summary(&[], &cycles, Some(0), DashboardRange::All, now);
+        assert_eq!(s.cycles.total, 3);
+        assert_eq!(s.cycles.clean, Some(2));
+        assert_eq!(s.cycles.with_failures, Some(1));
+    }
+
+    #[test]
+    fn cycles_outside_the_range_are_excluded_from_counts() {
+        let now = chrono::Utc::now();
+        let old = CycleRollup {
+            started_at: now - chrono::Duration::days(10),
+            failed: 0,
+        };
+        let recent = CycleRollup {
+            started_at: now - chrono::Duration::hours(1),
+            failed: 0,
+        };
+        let s = build_summary(&[], &[old, recent], Some(0), DashboardRange::Days7, now);
+        assert_eq!(
+            s.cycles.total, 1,
+            "the 10-day-old cycle must fall outside the 7d range"
+        );
     }
 }

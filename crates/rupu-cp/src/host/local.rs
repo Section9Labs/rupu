@@ -347,22 +347,17 @@ impl HostConnector for LocalHostConnector {
 
 // ── Dashboard summary helpers ────────────────────────────────────────────────
 
-/// Read this host's autoflow cycle history and roll each cycle into a
-/// [`CycleRollup`](crate::host::dashboard_summary::CycleRollup).
-///
-/// Reads through `AutoflowHistoryStore` exactly as
-/// `list_autoflow_runs` (`api/run_streams.rs`) does, and reuses
-/// `run_streams::harvest_run_ids` for the run-id extraction, so there is
-/// exactly one place that parses `AutoflowCycleRecord` and one place that
-/// harvests run ids from its events — no second history-reading path.
-///
-/// Each `CycleRun.status` is left `"unknown"` here: `build_summary` fills it
-/// in from the runs it already holds, so this helper never does a per-run
-/// store read (expanding a cycle costs zero extra reads).
+/// Read this host's autoflow cycle history and reduce each cycle to a
+/// [`summary_build::CycleRollup`](crate::host::summary_build::CycleRollup) —
+/// just `started_at` (range filtering) and `failed` (the clean/with-failures
+/// split), which is all `build_summary` needs for [`CycleCounts`]
+/// (`dashboard_summary.rs`). Reads through `AutoflowHistoryStore` exactly as
+/// `list_autoflow_runs` (`api/run_streams.rs`) does — one place that parses
+/// `AutoflowCycleRecord`.
 fn collect_cycle_rollups(
     global_dir: &std::path::Path,
-) -> Result<Vec<crate::host::dashboard_summary::CycleRollup>, HostConnectorError> {
-    use crate::host::dashboard_summary::{CycleRollup, CycleRun};
+) -> Result<Vec<crate::host::summary_build::CycleRollup>, HostConnectorError> {
+    use crate::host::summary_build::CycleRollup;
 
     let store_root = global_dir.join("autoflows").join("history");
     let store = AutoflowHistoryStore::new(store_root);
@@ -376,37 +371,9 @@ fn collect_cycle_rollups(
 
     Ok(records
         .iter()
-        .map(|r| {
-            let started_at = parse_rfc3339_or_now(&r.started_at);
-            // `AutoflowCycleRecord::new` initializes `finished_at` equal to
-            // `started_at`; a worker overwrites it only once the cycle truly
-            // finishes. There is no separate "unfinished" sentinel field, so
-            // string equality is the only signal available here.
-            let finished_at = if r.finished_at == r.started_at {
-                None
-            } else {
-                Some(parse_rfc3339_or_now(&r.finished_at))
-            };
-            CycleRollup {
-                cycle_id: r.cycle_id.clone(),
-                worker_name: r.worker_name.clone(),
-                started_at,
-                finished_at,
-                ran: Some(r.ran_cycles as u64),
-                skipped: Some(r.skipped_cycles as u64),
-                failed: Some(r.failed_cycles as u64),
-                runs: crate::api::run_streams::harvest_run_ids(r)
-                    .into_iter()
-                    .map(|run_id| CycleRun {
-                        run_id,
-                        status: "unknown".to_string(),
-                    })
-                    .collect(),
-                // Tagged by the aggregation layer (`api/dashboard.rs`), not
-                // here — this connector doesn't know which host id it's
-                // registered under.
-                host_id: None,
-            }
+        .map(|r| CycleRollup {
+            started_at: parse_rfc3339_or_now(&r.started_at),
+            failed: r.failed_cycles as u64,
         })
         .collect())
 }
@@ -457,6 +424,7 @@ mod dashboard_summary_tests {
         let mut record = AutoflowCycleRecord::new(AutoflowCycleMode::Serve, started);
         record.worker_name = Some("nightly".to_string());
         record.ran_cycles = 1;
+        record.failed_cycles = 2;
         record.events.push(AutoflowCycleEvent {
             kind: AutoflowCycleEventKind::RunLaunched,
             run_id: Some("run_abc".to_string()),
@@ -467,13 +435,13 @@ mod dashboard_summary_tests {
         let rollups = collect_cycle_rollups(global.path()).unwrap();
         assert_eq!(rollups.len(), 1);
         let rollup = &rollups[0];
-        assert_eq!(rollup.cycle_id, record.cycle_id);
-        assert_eq!(rollup.worker_name.as_deref(), Some("nightly"));
-        assert_eq!(rollup.runs.len(), 1, "the run id must be harvested");
-        assert_eq!(rollup.runs[0].run_id, "run_abc");
         assert_eq!(
-            rollup.runs[0].status, "unknown",
-            "collect_cycle_rollups never does a per-run store read"
+            rollup.failed, 2,
+            "the failed-cycle count must be read back verbatim"
+        );
+        assert!(
+            (rollup.started_at - started).num_seconds().abs() < 2,
+            "started_at must round-trip through the real store"
         );
     }
 }

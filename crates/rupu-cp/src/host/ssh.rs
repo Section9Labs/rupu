@@ -1300,97 +1300,41 @@ impl HostConnector for SshHostConnector {
         let since = range.since(now);
         let in_range = |t: chrono::DateTime<chrono::Utc>| since.map(|s| t >= s).unwrap_or(true);
 
-        let cycles: Vec<CycleRollup> = cycle_rows
+        // CycleCounts: `total` is the count of history-derived cycles in
+        // range. `clean`/`with_failures` stay `None` — never read from
+        // `ran_cycles`/`skipped_cycles`/`failed_cycles` on these rows: those
+        // keys come from `history_rows_to_autoflow_cycles`, which hardcodes
+        // them to the JSON literal `0` because `rupu autoflow history`'s
+        // per-event stream carries no ran/skipped/failed rollup (confirmed by
+        // inspecting `--format json` output — event rows have no such fields
+        // at all). Reading them here would parse a fabricated zero, not a
+        // reported one; this host genuinely does not know the breakdown, so
+        // it must say so via `None`, not fabricate it (established during the
+        // final-review I4 fix).
+        let cycles_total = cycle_rows
             .iter()
-            .filter_map(|c| {
-                Some(CycleRollup {
-                    cycle_id: c.get("cycle_id")?.as_str()?.to_string(),
-                    worker_name: c
-                        .get("worker_name")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    started_at: c
-                        .get("started_at")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                        .map(|t| t.with_timezone(&chrono::Utc))?,
-                    finished_at: c
-                        .get("finished_at")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                        .map(|t| t.with_timezone(&chrono::Utc)),
-                    // Always `None`, never read from `ran_cycles`/`skipped_cycles`/
-                    // `failed_cycles` in `c`: those keys come from
-                    // `history_rows_to_autoflow_cycles`, which hardcodes them to
-                    // the JSON literal `0` because `rupu autoflow history`'s
-                    // per-event stream carries no ran/skipped/failed rollup
-                    // (confirmed by inspecting `--format json` output — event
-                    // rows have no such fields at all). Reading them here would
-                    // parse a fabricated zero, not a reported one; this host
-                    // genuinely does not know the breakdown, so it must say so.
-                    ran: None,
-                    skipped: None,
-                    failed: None,
-                    // Status is filled in below, once the run rows are indexed.
-                    runs: c
-                        .get("run_ids")
-                        .and_then(|v| v.as_array())
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|x| x.as_str())
-                                .map(|id| CycleRun {
-                                    run_id: id.to_string(),
-                                    status: "unknown".to_string(),
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    // Tagged by the aggregation layer (`api/dashboard.rs`),
-                    // not here — this connector doesn't know which host id
-                    // it's registered under.
-                    host_id: None,
-                })
+            .filter(|c| {
+                c.get("started_at")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|t| in_range(t.with_timezone(&chrono::Utc)))
+                    .unwrap_or(false)
             })
-            .filter(|c| in_range(c.started_at))
-            .collect();
-
-        // Index the CLI's run rows so each cycle's runs can carry a status —
-        // the `+N clean` pill needs it, and this costs no extra round-trip.
-        let status_of: std::collections::HashMap<&str, &str> = run_rows
-            .iter()
-            .filter_map(|r| {
-                Some((
-                    // `id`, NOT `run_id`: `rupu run list` emits `RunListRow`
-                    // verbatim and its field is `id`. Reading `run_id` here
-                    // yields an empty map and silently loses every status.
-                    r.get("id")?.as_str()?,
-                    r.get("status")?.as_str()?,
-                ))
-            })
-            .collect();
-        let mut cycles = cycles;
-        for c in cycles.iter_mut() {
-            for run in c.runs.iter_mut() {
-                if let Some(st) = status_of.get(run.run_id.as_str()) {
-                    run.status = st.to_string();
-                }
-            }
-        }
-
-        let cycle_of: std::collections::HashMap<String, String> = cycles
-            .iter()
-            .flat_map(|c| {
-                c.runs
-                    .iter()
-                    .map(|r| (r.run_id.clone(), c.cycle_id.clone()))
-            })
-            .collect();
+            .count() as u64;
 
         let mut active = ActiveCounts::default();
-        let mut active_runs = Vec::new();
-        let mut recent_manual = Vec::new();
-        let mut buckets: std::collections::BTreeMap<chrono::DateTime<chrono::Utc>, TerminalBucket> =
-            Default::default();
+        let mut terminal_buckets: std::collections::BTreeMap<
+            chrono::DateTime<chrono::Utc>,
+            TerminalBucket,
+        > = Default::default();
+        let mut throughput_buckets: std::collections::BTreeMap<
+            chrono::DateTime<chrono::Utc>,
+            ThroughputBucket,
+        > = Default::default();
+        // The non-terminal run with the OLDEST started_at, tracked as
+        // (run_id, workflow_name, started_at) so `age_ms` can be computed
+        // once at the end against a single `now`.
+        let mut longest: Option<(String, String, chrono::DateTime<chrono::Utc>)> = None;
 
         for row in &run_rows {
             let (Some(id), Some(status), Some(started)) = (
@@ -1428,17 +1372,14 @@ impl HostConnector for SshHostConnector {
 
             let terminal = matches!(status, "completed" | "failed" | "rejected" | "cancelled");
             if !terminal {
-                active_runs.push(ActiveRunBar {
-                    run_id: id.to_string(),
-                    workflow_name: workflow_name.clone(),
-                    status: status.to_string(),
-                    started_at,
-                    trigger: trigger.to_string(),
-                    cycle_id: cycle_of.get(id).cloned(),
-                    // Tagged by the aggregation layer (`api/dashboard.rs`),
-                    // not here — this connector doesn't know which host id
-                    // it's registered under.
-                    host_id: None,
+                longest = Some(match longest {
+                    // The current candidate started at or before this row —
+                    // it is the same age or older, so it stays the
+                    // longest-running candidate.
+                    Some((lid, lname, lstarted)) if lstarted <= started_at => {
+                        (lid, lname, lstarted)
+                    }
+                    _ => (id.to_string(), workflow_name.clone(), started_at),
                 });
             } else {
                 // Truncate to midnight-UTC through the SAME `day_key` the
@@ -1449,7 +1390,7 @@ impl HostConnector for SshHostConnector {
                 // silently dropped after merging with any other host's —
                 // see the regression test in `api::dashboard`.
                 let key = crate::host::summary_build::day_key(started_at);
-                let b = buckets.entry(key).or_insert(TerminalBucket {
+                let b = terminal_buckets.entry(key).or_insert(TerminalBucket {
                     ts: key,
                     completed: 0,
                     failed: 0,
@@ -1465,41 +1406,46 @@ impl HostConnector for SshHostConnector {
                 }
             }
 
-            // A run belonging to a cycle is grouped under that cycle in the
-            // feed even when it has no trigger provenance of its own — it must
-            // never ALSO leak into recent_manual, or the same run renders twice
-            // (once under its cycle, once standalone). That double-listing is
-            // the exact autoflow-flooding bug this redesign exists to fix.
-            // The local build_summary has the identical guard.
-            if trigger == "manual" && !cycle_of.contains_key(id) {
-                recent_manual.push(RecentRun {
-                    id: id.to_string(),
-                    workflow_name,
-                    status: status.to_string(),
-                    started_at,
-                    finished_at: row
-                        .get("finished_at")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                        .map(|t| t.with_timezone(&chrono::Utc)),
-                    trigger: "manual".to_string(),
-                    // Tagged by the aggregation layer (`api/dashboard.rs`),
-                    // not here — this connector doesn't know which host id
-                    // it's registered under.
-                    host_id: None,
-                });
+            // Throughput: every run in range counts once, keyed by the day it
+            // STARTED and by trigger — same day-key alignment as
+            // `terminal_buckets`, and matching the local connector: a
+            // still-running run counts here even though it never reaches
+            // `terminal_buckets`.
+            let tkey = crate::host::summary_build::day_key(started_at);
+            let tb = throughput_buckets.entry(tkey).or_insert(ThroughputBucket {
+                ts: tkey,
+                manual: 0,
+                cron: 0,
+                event: 0,
+            });
+            match trigger {
+                "cron" => tb.cron += 1,
+                "event" => tb.event += 1,
+                _ => tb.manual += 1,
             }
         }
 
-        active_runs.sort_by_key(|b| std::cmp::Reverse(b.started_at));
-        recent_manual.sort_by_key(|r| std::cmp::Reverse(r.started_at));
+        let active_longest = longest.map(|(run_id, workflow_name, started_at)| ActiveLongest {
+            run_id,
+            workflow_name,
+            age_ms: (now - started_at).num_milliseconds().max(0) as u64,
+        });
 
         Ok(DashboardSummary {
             active,
-            terminal_buckets: buckets.into_values().collect(),
-            active_runs,
-            cycles,
-            recent_manual,
+            active_longest,
+            // Deliberately NOT zero-filled here (unlike the local connector):
+            // this host emits only the days it actually saw activity for, and
+            // the fleet-wide zero-fill happens once, after the merge, in
+            // `api::dashboard::merge_dashboard_summaries` — the only place
+            // that has visibility into every host's range.
+            terminal_buckets: terminal_buckets.into_values().collect(),
+            throughput_buckets: throughput_buckets.into_values().collect(),
+            cycles: CycleCounts {
+                total: cycles_total,
+                clean: None,
+                with_failures: None,
+            },
             // Findings are not exposed by the CLI. `None`, NOT `Some(0)` —
             // this host does not report findings at all, and `Some(0)` would
             // be indistinguishable from a genuine zero-findings host once
@@ -2308,11 +2254,22 @@ mod tests {
 
         assert_eq!(s.active.running, 1);
         assert_eq!(s.active.awaiting_approval, 1);
+        let al = s
+            .active_longest
+            .expect("two non-terminal runs in hand — expected an active_longest");
         assert_eq!(
-            s.active_runs.len(),
-            2,
-            "both non-terminal runs become swimlane bars"
+            al.run_id, "r1",
+            "r1 started earlier (14:02:11 vs r2's 14:03:11) so it is the longest-running"
         );
+        let total_manual: u64 = s.throughput_buckets.iter().map(|b| b.manual).sum();
+        let total_cron: u64 = s.throughput_buckets.iter().map(|b| b.cron).sum();
+        assert_eq!(total_manual, 1, "r1 is manual-triggered");
+        assert_eq!(total_cron, 1, "r2 is cron-triggered");
+        assert_eq!(
+            s.cycles.clean, None,
+            "SSH cannot report the clean/with-failures breakdown — must stay None, never a fabricated 0"
+        );
+        assert_eq!(s.cycles.with_failures, None);
         assert!(
             s.captured_at >= before,
             "captured_at must be stamped when the host was actually read"
@@ -2394,6 +2351,13 @@ mod tests {
              fill-grid cursor and is silently dropped"
         );
         assert_eq!(s.terminal_buckets[0].completed, 1);
+
+        // The throughput bucket for the same run must be midnight-truncated
+        // too — the same C1-class bug (a non-midnight ts silently dropped at
+        // merge) applies equally to `throughput_buckets`.
+        assert_eq!(s.throughput_buckets.len(), 1);
+        assert_eq!(s.throughput_buckets[0].ts, expected_midnight);
+        assert_eq!(s.throughput_buckets[0].manual, 1);
     }
 
     #[test]

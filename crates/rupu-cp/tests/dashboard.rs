@@ -127,17 +127,14 @@ fn seed_autoflow_cycle_with_run(global_dir: &std::path::Path, run_id: &str) {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn dashboard_rows_are_tagged_with_their_host() {
-    // The swimlane groups lanes BY HOST and the activity feed renders a host
-    // chip per row (spec §5.2, §5.5). Without per-row host_id a fleet's runs
-    // all render as if they came from one place.
-    // Seed a run, hit /api/dashboard, and assert every row in active_runs /
-    // cycles / recent_manual carries host_id == "local".
+async fn dashboard_reflects_seeded_active_run_and_cycle_in_aggregate_fields() {
+    // The redesign replaced per-row lists (active_runs / cycles / recent_manual,
+    // each tagged with host_id) with aggregate-only key points: a seeded run
+    // must surface through `active`/`active_longest`/`throughput_buckets`, and
+    // a seeded cycle through `cycles.total` — never as a row array.
     let dir = tempfile::tempdir().unwrap();
 
-    // A standalone manual, non-terminal run: lands in BOTH active_runs (the
-    // swimlane) and recent_manual (the activity feed) — see
-    // `host::summary_build::build_summary`.
+    // A standalone manual, non-terminal run.
     let run_store = rupu_orchestrator::runs::RunStore::new(dir.path().join("runs"));
     run_store
         .create(
@@ -149,8 +146,7 @@ async fn dashboard_rows_are_tagged_with_their_host() {
         )
         .unwrap();
 
-    // A cycle referencing a *different* run id, so it doesn't fold the
-    // active run into a cycle (which would drop it out of recent_manual).
+    // A cycle referencing a *different* run id.
     seed_autoflow_cycle_with_run(dir.path(), "dash_cycle_run");
 
     let srv = spawn_server(dir.path()).await;
@@ -161,37 +157,38 @@ async fn dashboard_rows_are_tagged_with_their_host() {
         .await
         .unwrap();
 
-    let active_runs = body["active_runs"].as_array().expect("active_runs array");
-    assert!(
-        !active_runs.is_empty(),
-        "expected the seeded run to be active"
+    assert_eq!(
+        body["active"]["running"], 1,
+        "the seeded running run must be tallied into active.running: {body}"
     );
-    for row in active_runs {
-        assert_eq!(
-            row["host_id"], "local",
-            "active_runs row missing host_id: {row}"
-        );
-    }
 
-    let cycles = body["cycles"].as_array().expect("cycles array");
-    assert!(!cycles.is_empty(), "expected the seeded cycle to appear");
-    for row in cycles {
-        assert_eq!(row["host_id"], "local", "cycles row missing host_id: {row}");
-    }
-
-    let recent_manual = body["recent_manual"]
-        .as_array()
-        .expect("recent_manual array");
-    assert!(
-        !recent_manual.is_empty(),
-        "expected the seeded manual run to appear"
+    let active_longest = &body["active_longest"];
+    assert_eq!(
+        active_longest["run_id"], "dash_active_run",
+        "the only non-terminal run must be reported as active_longest: {body}"
     );
-    for row in recent_manual {
-        assert_eq!(
-            row["host_id"], "local",
-            "recent_manual row missing host_id: {row}"
-        );
-    }
+
+    assert!(
+        body["throughput_buckets"]
+            .as_array()
+            .expect("throughput_buckets array")
+            .iter()
+            .any(|b| b["manual"].as_u64().unwrap_or(0) >= 1),
+        "the seeded manual run must be tallied into a throughput bucket: {body}"
+    );
+
+    assert!(
+        body["cycles"]["total"].as_u64().unwrap_or(0) >= 1,
+        "the seeded cycle must be tallied into cycles.total: {body}"
+    );
+
+    // Neither the old row DTOs nor a per-row host_id concept exist any more.
+    assert!(body.get("active_runs").is_none());
+    assert!(body.get("recent_manual").is_none());
+    assert!(
+        body["cycles"].is_object(),
+        "cycles must be a scalar, not an array: {body}"
+    );
 }
 
 #[tokio::test]

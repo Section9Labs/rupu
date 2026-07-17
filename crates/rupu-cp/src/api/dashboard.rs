@@ -18,8 +18,8 @@ use crate::{
     host::{
         connector::HostConnectorError,
         dashboard_summary::{
-            ActiveCounts, ActiveRunBar, CycleRollup, DashboardRange, DashboardSummary, RecentRun,
-            TerminalBucket,
+            ActiveCounts, ActiveLongest, CycleCounts, DashboardRange, DashboardSummary,
+            TerminalBucket, ThroughputBucket,
         },
         summary_build,
     },
@@ -74,6 +74,13 @@ struct DashboardResponse {
     /// DID report it, never the fleet total — the UI must not present it as
     /// complete. See `DashboardSummary::findings_open`'s doc comment.
     findings_partial: bool,
+    /// Same "not reported ≠ 0" rule as `findings_partial`, for
+    /// `cycles.clean`/`cycles.with_failures`: true when at least one
+    /// reporting host contributed `None` for the breakdown (SSH, today — the
+    /// CLI's autoflow history has no ran/failed rollup). The merged
+    /// `cycles.total` (via the flatten) is always a complete sum regardless;
+    /// only the clean/with-failures split can be partial.
+    cycles_partial: bool,
     #[serde(flatten)]
     summary: crate::host::dashboard_summary::DashboardSummary,
 }
@@ -140,21 +147,7 @@ async fn get_dashboard(
                 }
             };
             match conn.dashboard_summary(range).await {
-                Ok(mut sum) => {
-                    // Tag every row with the host it came from — the
-                    // connector doesn't know the id it's registered under
-                    // (see `DashboardSummary`'s `host_id` doc comments), so
-                    // this is the one place with both the id and the rows in
-                    // scope. Mirrors `api/host_fanout.rs`'s `fan_out_via`.
-                    for r in sum.active_runs.iter_mut() {
-                        r.host_id = Some(host_id.clone());
-                    }
-                    for c in sum.cycles.iter_mut() {
-                        c.host_id = Some(host_id.clone());
-                    }
-                    for r in sum.recent_manual.iter_mut() {
-                        r.host_id = Some(host_id.clone());
-                    }
+                Ok(sum) => {
                     (
                         HostFreshness {
                             host_id,
@@ -213,37 +206,49 @@ async fn get_dashboard(
         }
     }
 
-    let (summary, findings_partial) = merge_dashboard_summaries(reported, range, Utc::now());
+    let (summary, findings_partial, cycles_partial) =
+        merge_dashboard_summaries(reported, range, Utc::now());
 
     Ok(Json(DashboardResponse {
         hosts,
         findings_partial,
+        cycles_partial,
         summary,
     }))
 }
 
 /// Merge every host's [`DashboardSummary`] that actually reported into one
 /// fleet-wide aggregate. Pulled out of the handler so the merge — the exact
-/// seam where a per-host `TerminalBucket` or `findings_open` either survives
-/// or silently vanishes — can be exercised directly with hand-built fixtures,
-/// without standing up an `AppState` + host registry.
+/// seam where a per-host `TerminalBucket`/`ThroughputBucket` or
+/// `findings_open`/`cycles` either survives or silently vanishes — can be
+/// exercised directly with hand-built fixtures, without standing up an
+/// `AppState` + host registry.
 ///
-/// Returns the merged summary plus `findings_partial`: true when at least one
-/// reporting host contributed `findings_open: None` (it reports successfully
-/// but does not expose findings — SSH, today), meaning the summed
-/// `findings_open` is partial, not the fleet total.
+/// Returns the merged summary, `findings_partial` (true when at least one
+/// reporting host contributed `findings_open: None` — it reports successfully
+/// but does not expose findings, SSH today — meaning the summed
+/// `findings_open` is partial, not the fleet total), and `cycles_partial`
+/// (the identical "not reported ≠ 0" rule applied to
+/// `cycles.clean`/`cycles.with_failures`).
 fn merge_dashboard_summaries(
     reported: Vec<DashboardSummary>,
     range: DashboardRange,
     now: DateTime<Utc>,
-) -> (DashboardSummary, bool) {
+) -> (DashboardSummary, bool, bool) {
     let mut active = ActiveCounts::default();
-    let mut active_runs: Vec<ActiveRunBar> = Vec::new();
-    let mut cycles: Vec<CycleRollup> = Vec::new();
-    let mut recent_manual: Vec<RecentRun> = Vec::new();
+    let mut active_longest: Option<ActiveLongest> = None;
+    let mut cycles_total: u64 = 0;
+    let mut cycles_clean: Option<u64> = None;
+    let mut cycles_with_failures: Option<u64> = None;
+    // Once a host reports `None` for a field, that field is pinned to `None`
+    // for the rest of the merge — a later `Some`-reporting host must never
+    // resurrect it into a truncated sum.
+    let mut clean_poisoned = false;
+    let mut with_failures_poisoned = false;
     let mut findings_open: Option<u64> = None;
     let mut findings_partial = false;
-    let mut bucket_merge: BTreeMap<DateTime<Utc>, TerminalBucket> = BTreeMap::new();
+    let mut terminal_merge: BTreeMap<DateTime<Utc>, TerminalBucket> = BTreeMap::new();
+    let mut throughput_merge: BTreeMap<DateTime<Utc>, ThroughputBucket> = BTreeMap::new();
     // The oldest `captured_at` among hosts that actually reported — the
     // honest staleness bound for the merged aggregate ("this is at best this
     // fresh"), not the newest, which would understate how stale the slowest
@@ -260,6 +265,36 @@ fn merge_dashboard_summaries(
         active.awaiting_approval += sum.active.awaiting_approval;
         active.paused += sum.active.paused;
         active.pending += sum.active.pending;
+
+        // The single longest-running run fleet-wide: max by age_ms across
+        // every host that has one.
+        if let Some(candidate) = sum.active_longest {
+            active_longest = Some(match active_longest {
+                Some(cur) if cur.age_ms >= candidate.age_ms => cur,
+                _ => candidate,
+            });
+        }
+
+        cycles_total += sum.cycles.total;
+        match sum.cycles.clean {
+            Some(n) if !clean_poisoned => cycles_clean = Some(cycles_clean.unwrap_or(0) + n),
+            Some(_) => {}
+            None => {
+                clean_poisoned = true;
+                cycles_clean = None;
+            }
+        }
+        match sum.cycles.with_failures {
+            Some(n) if !with_failures_poisoned => {
+                cycles_with_failures = Some(cycles_with_failures.unwrap_or(0) + n)
+            }
+            Some(_) => {}
+            None => {
+                with_failures_poisoned = true;
+                cycles_with_failures = None;
+            }
+        }
+
         match sum.findings_open {
             Some(n) => findings_open = Some(findings_open.unwrap_or(0) + n),
             // This host reported successfully but has no findings surface
@@ -267,11 +302,9 @@ fn merge_dashboard_summaries(
             // instead.
             None => findings_partial = true,
         }
-        active_runs.extend(sum.active_runs);
-        cycles.extend(sum.cycles);
-        recent_manual.extend(sum.recent_manual);
+
         for b in sum.terminal_buckets {
-            let e = bucket_merge.entry(b.ts).or_insert(TerminalBucket {
+            let e = terminal_merge.entry(b.ts).or_insert(TerminalBucket {
                 ts: b.ts,
                 completed: 0,
                 failed: 0,
@@ -283,37 +316,57 @@ fn merge_dashboard_summaries(
             e.rejected += b.rejected;
             e.cancelled += b.cancelled;
         }
+        for b in sum.throughput_buckets {
+            let e = throughput_merge.entry(b.ts).or_insert(ThroughputBucket {
+                ts: b.ts,
+                manual: 0,
+                cron: 0,
+                event: 0,
+            });
+            e.manual += b.manual;
+            e.cron += b.cron;
+            e.event += b.event;
+        }
     }
 
-    // Fill the merged bucket grid — zero-fill every day in `range`, not just
-    // days that had terminal runs. Without this the trend area silently
-    // closes gaps and reads as continuous activity across days that had
-    // none.
+    // Fill the merged bucket grids — zero-fill every day in `range`, not
+    // just days that had activity. Without this the trend areas silently
+    // close gaps and read as continuous activity across days that had none.
     //
     // This MUST happen here, after the merge: the local connector zero-fills
-    // its own grid but the SSH connector emits only days with runs, so a
-    // fleet with no local host would otherwise produce a holed grid. The
+    // its own grids but the SSH connector emits only days with activity, so
+    // a fleet with no local host would otherwise produce a holed grid. The
     // merged output is the only place that sees every host. Reuses
-    // `summary_build::fill_bucket_grid` rather than a second "which days
-    // exist" implementation — which also normalizes every bucket key through
-    // `day_key` (defence-in-depth), so a non-midnight `ts` from any producer
-    // merges instead of silently vanishing.
-    let terminal_buckets = summary_build::fill_bucket_grid(bucket_merge, range, now);
-    active_runs.sort_by_key(|b| std::cmp::Reverse(b.started_at));
-    cycles.sort_by_key(|c| std::cmp::Reverse(c.started_at));
-    recent_manual.sort_by_key(|r| std::cmp::Reverse(r.started_at));
+    // `summary_build::fill_bucket_grid`/`fill_throughput_grid` rather than a
+    // second "which days exist" implementation — which also normalizes every
+    // bucket key through `day_key` (defence-in-depth), so a non-midnight
+    // `ts` from any producer merges instead of silently vanishing.
+    let terminal_buckets = summary_build::fill_bucket_grid(terminal_merge, range, now);
+    let throughput_buckets = summary_build::fill_throughput_grid(throughput_merge, range, now);
+
+    // `Some(n)` only when at least one host reported this cycle count kind;
+    // with zero reporting hosts (or every reporting host contributing `None`)
+    // both stay `None` — the same "nothing to be partial about" rule
+    // `findings_open` follows.
+    let cycles_partial = clean_poisoned || with_failures_poisoned;
+    let cycles = CycleCounts {
+        total: cycles_total,
+        clean: cycles_clean,
+        with_failures: cycles_with_failures,
+    };
 
     (
         DashboardSummary {
             active,
+            active_longest,
             terminal_buckets,
-            active_runs,
+            throughput_buckets,
             cycles,
-            recent_manual,
             findings_open,
             captured_at: oldest_captured_at.unwrap_or(now),
         },
         findings_partial,
+        cycles_partial,
     )
 }
 
@@ -332,13 +385,22 @@ mod merge_tests {
         }
     }
 
+    fn throughput(ts: DateTime<Utc>, manual: u64, cron: u64, event: u64) -> ThroughputBucket {
+        ThroughputBucket {
+            ts,
+            manual,
+            cron,
+            event,
+        }
+    }
+
     fn empty_summary(captured_at: DateTime<Utc>) -> DashboardSummary {
         DashboardSummary {
             active: ActiveCounts::default(),
+            active_longest: None,
             terminal_buckets: vec![],
-            active_runs: vec![],
-            cycles: vec![],
-            recent_manual: vec![],
+            throughput_buckets: vec![],
+            cycles: CycleCounts::default(),
             findings_open: None,
             captured_at,
         }
@@ -349,7 +411,7 @@ mod merge_tests {
     /// bucket's non-midnight ts never matched a fill cursor and was silently dropped.
     /// Assert: exactly one bucket for that day, completed == local + ssh.
     #[test]
-    fn local_and_ssh_shaped_buckets_for_the_same_day_merge_into_one() {
+    fn local_and_ssh_shaped_terminal_buckets_for_the_same_day_merge_into_one() {
         let now = Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap();
         let day = Utc.with_ymd_and_hms(2026, 7, 15, 0, 0, 0).unwrap();
         // The local connector always stamps `ts` at midnight-UTC.
@@ -370,7 +432,7 @@ mod merge_tests {
             ..empty_summary(now)
         };
 
-        let (merged, findings_partial) =
+        let (merged, findings_partial, _cycles_partial) =
             merge_dashboard_summaries(vec![local, ssh], DashboardRange::Days7, now);
 
         let day_buckets: Vec<_> = merged
@@ -395,6 +457,152 @@ mod merge_tests {
         );
     }
 
+    /// The throughput analogue of the C1 seam test above: a local-shaped
+    /// (midnight ts) throughput bucket and an SSH-shaped (raw ts) throughput
+    /// bucket for the SAME day must merge into ONE bucket, summed field by
+    /// field.
+    #[test]
+    fn local_and_ssh_shaped_throughput_buckets_for_the_same_day_merge_into_one() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap();
+        let day = Utc.with_ymd_and_hms(2026, 7, 15, 0, 0, 0).unwrap();
+        let local = DashboardSummary {
+            throughput_buckets: vec![throughput(day, 2, 1, 0)],
+            ..empty_summary(now)
+        };
+        let ssh_raw_ts = Utc.with_ymd_and_hms(2026, 7, 15, 13, 47, 22).unwrap();
+        let ssh = DashboardSummary {
+            throughput_buckets: vec![throughput(ssh_raw_ts, 1, 0, 3)],
+            ..empty_summary(now)
+        };
+
+        let (merged, _findings_partial, _cycles_partial) =
+            merge_dashboard_summaries(vec![local, ssh], DashboardRange::Days7, now);
+
+        let day_buckets: Vec<_> = merged
+            .throughput_buckets
+            .iter()
+            .filter(|b| b.ts == day)
+            .collect();
+        assert_eq!(
+            day_buckets.len(),
+            1,
+            "local and ssh throughput buckets for the same day must merge into exactly one bucket, got {:?}",
+            merged.throughput_buckets
+        );
+        assert_eq!(day_buckets[0].manual, 3, "manual must be local(2) + ssh(1)");
+        assert_eq!(day_buckets[0].cron, 1, "cron must be local(1) + ssh(0)");
+        assert_eq!(day_buckets[0].event, 3, "event must be local(0) + ssh(3)");
+    }
+
+    #[test]
+    fn active_longest_merge_picks_the_max_age_across_hosts() {
+        let now = Utc::now();
+        let shorter = DashboardSummary {
+            active_longest: Some(ActiveLongest {
+                run_id: "run_short".into(),
+                workflow_name: "wf".into(),
+                age_ms: 5_000,
+            }),
+            ..empty_summary(now)
+        };
+        let longer = DashboardSummary {
+            active_longest: Some(ActiveLongest {
+                run_id: "run_long".into(),
+                workflow_name: "wf".into(),
+                age_ms: 500_000,
+            }),
+            ..empty_summary(now)
+        };
+        let (merged, _, _) =
+            merge_dashboard_summaries(vec![shorter, longer], DashboardRange::All, now);
+        let al = merged
+            .active_longest
+            .expect("at least one host reported active_longest");
+        assert_eq!(
+            al.run_id, "run_long",
+            "the merge must pick the max age_ms across every reporting host"
+        );
+        assert_eq!(al.age_ms, 500_000);
+    }
+
+    #[test]
+    fn active_longest_is_none_when_no_host_reports_one() {
+        let now = Utc::now();
+        let a = empty_summary(now);
+        let (merged, _, _) = merge_dashboard_summaries(vec![a], DashboardRange::All, now);
+        assert!(merged.active_longest.is_none());
+    }
+
+    /// A host reporting `Some` clean/with_failures plus a host reporting
+    /// `None` must merge to a `None` (never a truncated sum) and flag
+    /// `cycles_partial` — the same "not reported ≠ 0" rule as
+    /// `findings_open`.
+    #[test]
+    fn cycle_counts_merge_none_contributor_makes_the_merged_value_none_and_partial() {
+        let now = Utc::now();
+        let local = DashboardSummary {
+            cycles: CycleCounts {
+                total: 4,
+                clean: Some(3),
+                with_failures: Some(1),
+            },
+            ..empty_summary(now)
+        };
+        let ssh = DashboardSummary {
+            cycles: CycleCounts {
+                total: 2,
+                clean: None,
+                with_failures: None,
+            },
+            ..empty_summary(now)
+        };
+        let (merged, _findings_partial, cycles_partial) =
+            merge_dashboard_summaries(vec![local, ssh], DashboardRange::All, now);
+        assert_eq!(
+            merged.cycles.total, 6,
+            "total is always a complete sum regardless of the breakdown"
+        );
+        assert_eq!(
+            merged.cycles.clean, None,
+            "one host reported None for clean — the merge must never fabricate a truncated sum"
+        );
+        assert_eq!(merged.cycles.with_failures, None);
+        assert!(
+            cycles_partial,
+            "the ssh-shaped host omitted the breakdown; must be flagged partial"
+        );
+    }
+
+    #[test]
+    fn cycle_counts_merge_sums_when_every_host_reports() {
+        let now = Utc::now();
+        let a = DashboardSummary {
+            cycles: CycleCounts {
+                total: 3,
+                clean: Some(2),
+                with_failures: Some(1),
+            },
+            ..empty_summary(now)
+        };
+        let b = DashboardSummary {
+            cycles: CycleCounts {
+                total: 5,
+                clean: Some(4),
+                with_failures: Some(1),
+            },
+            ..empty_summary(now)
+        };
+        let (merged, _, cycles_partial) =
+            merge_dashboard_summaries(vec![a, b], DashboardRange::All, now);
+        assert_eq!(merged.cycles.total, 8);
+        assert_eq!(merged.cycles.clean, Some(6));
+        assert_eq!(merged.cycles.with_failures, Some(2));
+        assert!(
+            !cycles_partial,
+            "every host reported the full breakdown; must not be flagged partial"
+        );
+    }
+
     #[test]
     fn findings_open_sums_only_reporting_hosts_and_flags_partial() {
         let now = Utc::now();
@@ -406,7 +614,8 @@ mod merge_tests {
             findings_open: None,
             ..empty_summary(now)
         };
-        let (merged, partial) = merge_dashboard_summaries(vec![a, b], DashboardRange::All, now);
+        let (merged, partial, _cycles_partial) =
+            merge_dashboard_summaries(vec![a, b], DashboardRange::All, now);
         assert_eq!(
             merged.findings_open,
             Some(3),
@@ -421,12 +630,17 @@ mod merge_tests {
     #[test]
     fn findings_open_is_none_and_not_partial_when_no_host_reports_at_all() {
         let now = Utc::now();
-        let (merged, partial) = merge_dashboard_summaries(vec![], DashboardRange::All, now);
+        let (merged, partial, cycles_partial) =
+            merge_dashboard_summaries(vec![], DashboardRange::All, now);
         assert_eq!(merged.findings_open, None);
         assert!(
             !partial,
             "partial means 'a reporting host omitted findings' — with zero reporting hosts \
              there is nothing to be partial about (hosts[] already carries the full outage)"
+        );
+        assert!(
+            !cycles_partial,
+            "same rule for cycles_partial — nothing to be partial about with zero reporting hosts"
         );
     }
 }
