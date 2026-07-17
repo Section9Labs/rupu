@@ -1433,6 +1433,172 @@ unavailable-with-reason -- never as zero runs."
 
 ---
 
+### Task 5b: `rupu run show --format json` + SSH `get_run` fix
+
+> **Ships with Task 5 in the same PR.** Task 5 alone creates a worse state than it fixes: `list_runs` starts returning directly-started remote runs while `get_run` still reads the mirror, so the dashboard lists runs whose detail view 404s. The list and the detail must agree.
+
+**Files:**
+- Modify: `crates/rupu-cp/src/api/runs.rs` (`query_run_detail`: `pub(crate)` → `pub`)
+- Modify: `crates/rupu-cli/src/cmd/run.rs` (`RunAction::Show` + `classify` arm + handler)
+- Modify: `crates/rupu-cli/src/lib.rs` (format gate allows JSON on the `show` path)
+- Modify: `crates/rupu-cp/src/host/ssh.rs` (`get_run` shells the CLI)
+
+**Interfaces:**
+- Consumes: `rupu_cp::api::runs::query_run_detail(store, id, pricing) -> Result<serde_json::Value, RunStoreError>`
+- Produces: `{"kind":"run_show","version":1,"item":<query_run_detail output>}`, consumed by `SshHostConnector::get_run`
+
+**The key insight — no mapper.** `mirror_get_run` (`host/connector.rs:477`) already returns
+`query_run_detail(run_store, run_id, pricing)`. If `rupu run show` emits that same function's output
+verbatim, the remote path returns **byte-identical** data to the local path — correct by
+construction, not by a convention someone can later break. Do NOT hand-build a detail shape in
+`rupu-cli`; that is the lossy-mapper trap that produced the trigger and timestamp bugs earlier in
+this plan.
+
+`rupu-cli` already depends on `rupu-cp` (`rupu-cli/Cargo.toml:54`) and `rupu_cp::api` is already
+`pub mod`. Promoting one function to `pub` is the whole cost. This stays within CLAUDE.md's
+"rupu-cli is thin" rule: the subcommand is arg parsing plus delegation.
+
+- [ ] **Step 1: Write the failing test for `classify`**
+
+In `crates/rupu-cli/src/cmd/run.rs`'s test module:
+
+```rust
+    #[test]
+    fn classify_routes_show_to_show_action() {
+        let action = classify(vec!["show".to_string(), "run_abc".to_string()]).unwrap();
+        match action {
+            RunAction::Show { run_id } => assert_eq!(run_id, "run_abc"),
+            other => panic!("expected Show, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_still_launches_an_agent_named_like_a_verb_prefix() {
+        // `show` joins pause/resume/list as a reserved FIRST token, but a bare
+        // agent name must still Launch.
+        let action = classify(vec!["my-agent".to_string()]).unwrap();
+        assert!(matches!(action, RunAction::Launch(_)));
+    }
+```
+
+- [ ] **Step 2: Run it to verify it fails**
+
+Run: `cargo test -p rupu-cli classify_routes_show_to_show_action`
+Expected: FAIL — `no variant named 'Show'`
+
+- [ ] **Step 3: Implement**
+
+`query_run_detail` in `crates/rupu-cp/src/api/runs.rs` becomes `pub`, with a doc note:
+
+```rust
+/// Build one run's detail payload.
+///
+/// `pub` (not `pub(crate)`) because `rupu-cli`'s `run show` emits this
+/// function's output verbatim as its JSON contract. That is deliberate: SSH
+/// `get_run` shells `rupu run show` and returns the result, so the remote path
+/// yields byte-identical data to the local `mirror_get_run` path — which calls
+/// this same function. Hand-building a parallel detail shape in the CLI would
+/// let the two drift silently.
+pub fn query_run_detail(
+```
+
+In `crates/rupu-cli/src/cmd/run.rs`, add the variant, the `classify` arm (mirroring `pause` / `resume` / `list` — NOT a clap subcommand), and:
+
+```rust
+/// `rupu run show <id>` — one run's detail, as rupu-cp's wire shape.
+async fn show(
+    run_id: String,
+    global_format: Option<crate::output::formats::OutputFormat>,
+) -> anyhow::Result<()> {
+    let global = crate::paths::global_dir()?;
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let cfg = /* resolve PricingConfig the same way `list` does */;
+
+    // Emit rupu-cp's own detail payload verbatim — do NOT re-shape it here.
+    let item = rupu_cp::api::runs::query_run_detail(&store, &run_id, &cfg)
+        .map_err(|e| anyhow::anyhow!("run {run_id}: {e}"))?;
+
+    match global_format.unwrap_or(crate::output::formats::OutputFormat::Table) {
+        crate::output::formats::OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "kind": "run_show",
+                    "version": 1,
+                    "item": item,
+                }))?
+            );
+        }
+        _ => println!("{}", serde_json::to_string_pretty(&item)?),
+    }
+    Ok(())
+}
+```
+
+Extend the `lib.rs` format gate so JSON is allowed when `argv.first()` is `"list"` **or** `"show"`.
+
+- [ ] **Step 4: Run tests**
+
+Run: `cargo test -p rupu-cli classify_`
+Expected: PASS.
+
+- [ ] **Step 5: Fix SSH `get_run`**
+
+In `crates/rupu-cp/src/host/ssh.rs`:
+
+```rust
+    /// Fetch one run by shelling the remote CLI.
+    ///
+    /// Was: `mirror_get_run`, which only saw runs THIS process launched — so
+    /// after the `list_runs` fix the list would show runs whose detail 404'd.
+    /// The list and the detail must agree.
+    async fn get_run(&self, run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
+        // NOTE the flag order: `--format json` must precede `run`, because
+        // `Cmd::Run` is trailing_var_arg and swallows everything after it.
+        let v = self
+            .remote_json_item(&["--format", "json", "run", "show", run_id])
+            .await?;
+        Ok(v)
+    }
+```
+
+`remote_json_rows` extracts `.rows`; this contract uses `.item`. Add a sibling `remote_json_item`
+that extracts `.item`, reusing the same command-building and error mapping — do not duplicate that
+logic, and do not build the command string by hand.
+
+Map a failure the same way `list_runs` does: an old remote rupu lacking `run show` must yield
+`Unsupported` (rendered "unavailable with a reason"), never a silent `NotFound` that would look
+identical to "this run does not exist".
+
+- [ ] **Step 6: Test the SSH path**
+
+```rust
+    #[tokio::test]
+    async fn get_run_shells_rupu_run_show_not_the_mirror() {
+        // Mirror is EMPTY — before the fix this returned NotFound.
+        // Reuse the StubExec + make_conn fixtures from the list_runs tests.
+        let json = r#"{"kind":"run_show","version":1,"item":{"id":"run_a","status":"completed"}}"#;
+        // ... build stub, assert:
+        // - the returned value is the `item` payload (id == "run_a")
+        // - the command contains "run" + "show" + "json"
+    }
+```
+
+- [ ] **Step 7: Verify + commit**
+
+```bash
+cargo test -p rupu-cli classify_
+cargo test -p rupu-cp get_run_
+cargo test -p rupu-cp ssh
+cargo clippy -p rupu-cp --all-targets -- -D warnings 2>&1 | grep -cE '^error'   # must print 5
+rustfmt --edition 2021 crates/rupu-cli/src/cmd/run.rs
+rustfmt --edition 2021 crates/rupu-cp/src/host/ssh.rs
+rustfmt --edition 2021 crates/rupu-cp/src/api/runs.rs
+git diff --stat   # confirm ONLY intended files
+```
+
+---
+
 ### Task 6: `SshHostConnector::dashboard_summary()`
 
 **Files:**
