@@ -46,6 +46,12 @@ const VARS = {
   'sev.medium': '--c-sev-medium',
   'sev.low': '--c-sev-low',
   'sev.info': '--c-sev-info',
+  // Generic semantic-state blue. Exposed here (in addition to the
+  // Tailwind `info`/`info-bg` classes) because ThroughputChart needs a
+  // literal `rgb(…)` string for Recharts — it has no className surface to
+  // paint with. There is no dedicated "sky" token to match TriggerChip's
+  // `sky` tone exactly; `info` is the closest existing blue in the palette.
+  info: '--c-info',
 } as const;
 
 export type ColorKey = keyof typeof VARS;
@@ -73,6 +79,8 @@ export interface ThemeColors {
     rejected: string;
   };
   sev: { critical: string; high: string; medium: string; low: string; info: string };
+  /** Generic semantic-state blue — see the `VARS.info` comment. */
+  info: string;
   /** Resolved `rgb(…)` for any token key. */
   get: (key: ColorKey) => string;
   /** `rgb(… / a)` for any token key — for soft tints / translucent strokes. */
@@ -132,6 +140,7 @@ export function readThemeColors(): ThemeColors {
       low: get('sev.low'),
       info: get('sev.info'),
     },
+    info: get('info'),
     get,
     alpha,
   };
