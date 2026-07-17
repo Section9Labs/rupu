@@ -544,22 +544,112 @@ export interface SetAutoflowEnabledResponse {
 // Dashboard
 // ---------------------------------------------------------------------------
 
+/** The dashboard's time window. Mirrors the segmented control. */
+export type DashboardRange = '7d' | '30d' | 'all';
+
+/**
+ * One host's reporting state, for the freshness strip.
+ *
+ * `state` is three-valued on purpose. `offline` and `unavailable` must never be
+ * rendered as zeroed counts — a host that cannot report is not a host with no
+ * runs.
+ */
+export interface HostFreshness {
+  host_id: string;
+  name: string;
+  transport_kind: string;
+  state: 'ok' | 'offline' | 'unavailable';
+  /** RFC-3339. Present only when `state === 'ok'`. */
+  captured_at: string | null;
+  /** Cause when `state !== 'ok'`, e.g. "needs rupu >= 0.49". */
+  reason: string | null;
+}
+
+/** Live, non-terminal run counts — "is anything stuck right now". */
+export interface ActiveCounts {
+  running: number;
+  awaiting_approval: number;
+  paused: number;
+  pending: number;
+}
+
+/** One day-bucket of terminal outcomes, for the trend area. */
+export interface TerminalBucket {
+  ts: string;
+  completed: number;
+  failed: number;
+  rejected: number;
+  cancelled: number;
+}
+
+/** One bar in the live swimlane. */
+export interface ActiveRunBar {
+  run_id: string;
+  workflow_name: string;
+  status: RunStatusStr;
+  started_at: string;
+  trigger: 'manual' | 'cron' | 'event';
+  /** `null` for manual runs; set when the run belongs to an autoflow cycle. */
+  cycle_id: string | null;
+}
+
+/**
+ * One run inside a cycle. Carries `status`, not just an id, because the
+ * `+N clean` pill needs to know what folds. The server joins it — the client
+ * must not fetch a run per id to expand one cycle.
+ */
+export interface CycleRun {
+  run_id: string;
+  /** `'unknown'` when the host could not resolve the run. */
+  status: RunStatusStr | 'unknown';
+}
+
+/** One autoflow cycle, collapsed. The activity feed's primary row. */
+export interface CycleRollup {
+  cycle_id: string;
+  worker_name: string | null;
+  started_at: string;
+  finished_at: string | null;
+  /** `null` = this host does not report the breakdown (SSH — the CLI's autoflow
+   *  history has no ran/skipped/failed fields). NOT zero: unknown is not "none". */
+  ran: number | null;
+  skipped: number | null;
+  failed: number | null;
+  runs: CycleRun[];
+}
+
+/** A manual-trigger run. Never grouped. */
+export interface DashboardRecentRun {
+  id: string;
+  workflow_name: string;
+  status: RunStatusStr;
+  started_at: string;
+  finished_at: string | null;
+  trigger: 'manual' | 'cron' | 'event';
+}
+
 export interface DashboardResponse {
-  runs: {
-    total: number;
-    by_status: Record<RunStatusStr, number>;
-  };
-  recent_runs: Array<{
-    id: string;
-    workflow_name: string;
-    status: RunStatusStr;
-    started_at: string;
-    finished_at?: string | null;
-    usage: UsageSummary;
-  }>;
-  sessions: { total: number; active: number; archived: number };
-  workers: { total: number };
-  coverage: { targets: number; assertions: number };
+  hosts: HostFreshness[];
+  /**
+   * True when at least one host that DID report (`state === 'ok'`) omitted its
+   * open-findings count. When true, `findings_open` is a partial sum across only
+   * the hosts that reported it — **the UI must not present it as a fleet total**.
+   */
+  findings_partial: boolean;
+  active: ActiveCounts;
+  terminal_buckets: TerminalBucket[];
+  active_runs: ActiveRunBar[];
+  cycles: CycleRollup[];
+  recent_manual: DashboardRecentRun[];
+  /** `null` when no reporting host supplied a count. NOT zero. */
+  findings_open: number | null;
+  /**
+   * RFC-3339. The OLDEST `captured_at` among reporting hosts — the honest
+   * staleness bound for the merged aggregate. Present at the TOP level because
+   * the server `#[serde(flatten)]`s a `DashboardSummary` into this response;
+   * `HttpHostConnector` re-parses this same body as a bare `DashboardSummary`.
+   */
+  captured_at: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -1209,8 +1299,8 @@ function listQuery(params?: ListParams): string {
 
 export const api = {
   // --- Dashboard ---
-  getDashboard(): Promise<DashboardResponse> {
-    return request<DashboardResponse>('/api/dashboard');
+  getDashboard(range: DashboardRange = '30d'): Promise<DashboardResponse> {
+    return request<DashboardResponse>(`/api/dashboard?range=${range}`);
   },
 
   // --- Usage ---

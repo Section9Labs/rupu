@@ -35,18 +35,47 @@ afterEach(() => {
 describe('api.getDashboard', () => {
   it('resolves typed on 200 JSON', async () => {
     const payload = {
-      runs: { total: 3, by_status: { pending: 1, running: 1, completed: 1, failed: 0, awaiting_approval: 0, rejected: 0 } },
-      recent_runs: [{ id: 'r1', workflow_name: 'wf', status: 'running', started_at: '2026-01-01T00:00:00Z' }],
-      sessions: { total: 2, active: 1, archived: 1 },
-      workers: { total: 1 },
-      coverage: { targets: 5, assertions: 42 },
+      hosts: [
+        { host_id: 'local', name: 'local', transport_kind: 'local', state: 'ok', captured_at: '2026-01-01T00:00:00Z', reason: null },
+      ],
+      findings_partial: false,
+      active: { running: 1, awaiting_approval: 0, paused: 0, pending: 0 },
+      terminal_buckets: [],
+      active_runs: [],
+      cycles: [],
+      recent_manual: [{ id: 'r1', workflow_name: 'wf', status: 'running', started_at: '2026-01-01T00:00:00Z', finished_at: null, trigger: 'manual' }],
+      findings_open: 3,
+      captured_at: '2026-01-01T00:00:00Z',
     };
     mockFetch(200, payload);
 
     const result = await api.getDashboard();
-    expect(result.runs.total).toBe(3);
-    expect(result.recent_runs[0].id).toBe('r1');
-    expect(result.workers.total).toBe(1);
+    expect(result.hosts[0].host_id).toBe('local');
+    expect(result.recent_manual[0].id).toBe('r1');
+    expect(result.active.running).toBe(1);
+    expect(result.findings_open).toBe(3);
+  });
+
+  it('passes the range through as a query param', async () => {
+    mockFetch(200, {
+      hosts: [],
+      findings_partial: false,
+      active: { running: 0, awaiting_approval: 0, paused: 0, pending: 0 },
+      terminal_buckets: [],
+      active_runs: [],
+      cycles: [],
+      recent_manual: [],
+      findings_open: 0,
+      captured_at: '2026-01-01T00:00:00Z',
+    });
+    const fetchSpy = vi.mocked(fetch);
+
+    await api.getDashboard('7d');
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      expect.stringContaining('range=7d'),
+      expect.anything(),
+    );
   });
 });
 
