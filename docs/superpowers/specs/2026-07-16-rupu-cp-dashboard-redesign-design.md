@@ -33,16 +33,22 @@ the one list-ish view in CP that never learned about hosts, so every number on i
 
 **Goals**
 
-- Re-frame the dashboard as an operations surface: what is running, what is stuck, what needs me.
-- Group the run feed by autoflow cycle so a cycle reads as one event, not twelve.
+- Re-frame the dashboard as an operations surface answering glance-questions: what is running, what
+  is stuck, what needs me — as **key points and aggregate graphs, never per-item lists** (revised
+  2026-07-17). The list-and-drill-in job belongs to `/runs`.
+- Surface autoflow-vs-manual volume as a **throughput-by-trigger graph** — the day-one "autoflow
+  taking over the runs" complaint answered as a shape, not by grouping or filtering a feed.
 - Replace the status donut with a split that separates live state from outcome trend.
-- Make it live where liveness is actually available, and *visibly honest* where it is not.
+- **Load async, never lock** (revised 2026-07-17): every host and every panel loads independently; a
+  slow or dead host holds up nothing.
+- Be *visibly honest* about what cannot report — unavailable-with-reason, never a fabricated `0`.
 - Span local and remote hosts across all five transports, including SSH.
 - Give spend a dedicated page with room to answer attribution and anomaly questions.
 
 **Non-Goals**
 
-- No new frontend dependencies. `recharts`, `@xyflow/react`, and `@dagrejs/dagre` are already present.
+- No new frontend dependencies. `recharts` covers every graph on the page; `@xyflow/react` /
+  `@dagrejs/dagre` remain for run-detail views. No hand-rolled SVG / Gantt (the swimlane is removed).
 - No cross-host event firehose. It does not exist and this design does not invent one (see §5.3).
 - No SSH connection pooling / `ControlMaster` work. Called out as a constraint, deferred (§8).
 - No changes to `RunStatus` variants or `is_terminal()` semantics.
@@ -60,7 +66,8 @@ Plan 2 (foundation)     HostConnector::dashboard_summary()  ── new structure
 Plan 1 (ops page)       GET /api/dashboard?range=  ── fan_out_via() across hosts
                                     │
                                     ▼
-                        Dashboard.tsx  ── swimlane · split status · cycle feed
+                        Dashboard.tsx  ── key-point tiles · split status · throughput-by-trigger
+                                          (async per-host loading; no per-item lists)
                                           + SSE invalidation (local) / TTL poll (remote)
 
 Plan 3 (spend page)     GET /api/usage?group_by={model|workflow|host|project}
@@ -106,17 +113,24 @@ async fn dashboard_summary(
 }
 ```
 
-`DashboardSummary` carries everything one host contributes:
+`DashboardSummary` carries everything one host contributes. **All aggregate — no per-item row
+arrays** (revised 2026-07-17, §5): the first build's `active_runs` / `cycles` / `recent_manual`
+arrays fed a swimlane and a feed that are now removed. They were most of the payload and the entire
+"detailed table" problem; they are gone from the wire.
 
 | Field | Type | Notes |
 |---|---|---|
 | `active` | `ActiveCounts` | `running`, `awaiting_approval`, `paused`, `pending` |
-| `terminal_buckets` | `Vec<TerminalBucket>` | `{ ts, completed, failed, rejected, cancelled }` |
-| `active_runs` | `Vec<ActiveRunBar>` | swimlane input: `{ run_id, workflow_name, status, started_at, trigger, cycle_id }` |
-| `cycles` | `Vec<CycleRollup>` | `{ cycle_id, worker_name, started_at, finished_at, ran, skipped, failed, runs: Vec<CycleRun> }` |
-| `recent_manual` | `Vec<RecentRun>` | manual-trigger runs, individual |
-| `findings_open` | `u64` | |
+| `active_longest_ms` | `Option<u64>` | longest currently-running run's age, + its workflow name / run id, for the "Active now" key point (§5.2). `None` when nothing is running. |
+| `terminal_buckets` | `Vec<TerminalBucket>` | `{ ts, completed, failed, rejected, cancelled }` — the outcome trend (§5.3). `ts` day-key-aligned (C1). |
+| `throughput_buckets` | `Vec<ThroughputBucket>` | `{ ts, manual, cron, event }` — runs started per bucket by trigger, for §5.5. Same day-key alignment. |
+| `cycles` | `CycleCounts` | scalar `{ total: u64, clean: Option<u64>, with_failures: Option<u64> }` — the one line of cycle numbers (§5.5). `Option` where a host cannot report the breakdown (SSH). NOT a row array. |
+| `findings_open` | `Option<u64>` | `None` = this host does not report findings (SSH). Never `0`. |
 | `captured_at` | `DateTime<Utc>` | **freshness — see §5.4** |
+
+**Removed DTOs.** `ActiveRunBar`, `CycleRollup`, `CycleRun`, `RecentRun` — and the `host_id` tagging,
+the cycle→run status join, and the `recent_manual` cycle-exclusion guard that supported them — are
+deleted. They were correct for a feed that no longer exists.
 
 Per-transport implementation:
 
@@ -208,39 +222,56 @@ fix exists to stop trusting. Separable and revertable on its own.
 
 ## 5. Plan 1 — Ops dashboard (page)
 
+> **REVISED 2026-07-17 after operator review of the first build.** The first build shipped a
+> row-per-cycle **activity feed** and a per-run **swimlane**. Verdict: *"key points, not lists — this
+> is a detailed table, not a dashboard."* And it took ~10s to load because the fan-out blocked on an
+> unreachable SSH host. Two principles now govern §5, and they supersede the swimlane (old §5.2) and
+> the feed (old §5.5):
+>
+> 1. **Key points, not lists.** The dashboard shows *aggregate* signal — counts, rates, trends — and
+>    nothing per-item. The list-and-drill-in job already belongs to `/runs`; duplicating it on the
+>    dashboard costs load and attention and answers no glance-question. A per-run swimlane and a
+>    per-cycle feed are both *lists in disguise* and are removed.
+> 2. **Nothing locks on anything.** Every host and every panel loads independently and async. The
+>    page paints its frame immediately and fills in as data lands; one slow or dead host can never
+>    hold up another, nor the rest of the page. See the rewritten §5.4.
+
 ### 5.1 Composition
 
-Top to bottom:
+Every element is a number or an aggregate graph — **no per-item rows, bars, or feeds anywhere.**
 
 1. **Header** — range control (`7d`/`30d`/`all`, retained) + **per-host freshness strip** (§5.4).
-2. **Attention row** — the triage ribbon, weighted rather than four equal chips. `AwaitingApproval`
-   and `Paused` are the only states where the system is blocked *on the operator*; they carry real
-   visual weight. Failed-in-window sits beside them. Open findings demotes — it is a backlog, not an
-   interrupt. Chips remain links to the filtered list pages.
-3. **Live swimlane** (hero) — §5.2.
-4. **Split status** — §5.3.
-5. **Activity feed** — §5.5.
+2. **Key-point tiles** (§5.2) — the operator's glance-questions, each a number, most with a
+   sparkline. "Awaiting you" / "Paused" (blocked on the operator, loud when nonzero); "Failed"
+   (in-window, with trend); "Success rate"; "Active now" (count + longest-running — the one fact that
+   answers *is anything stuck*); "Open findings" (backlog).
+3. **Split status** (§5.3) — active counts + a terminal-outcome trend graph.
+4. **Throughput by trigger** (§5.5) — runs over time, stacked manual / cron / event. The graph that
+   answers the day-one complaint (*"autoflow taking over the runs"*) as a *shape*, not a filtered
+   list, plus a line of aggregate cycle numbers.
 
-### 5.2 Live swimlane (hero)
+Each of the four blocks is an independent async unit (§5.4). None awaits another.
 
-Each active run is a horizontal bar. X-axis is time; lanes group by host or by workflow (toggle).
-Bars are amber on `awaiting_approval`, red on failure, neutral on `running`.
+### 5.2 Key-point tiles
 
-Why this earns the hero slot: the split status tells you *how many*; the swimlane tells you *what is
-happening*. A run executing 40× longer than its median is visually obvious in a way no table makes
-it, and duration-outlier detection is not available from any other element on the page.
+The tiles replace the swimlane. The swimlane's *only* irreplaceable signal was duration-outlier
+detection — "is a run stuck". That is a **key point**, not a chart: surface it directly as
+`Active now: 3 · longest 2h14m — nightly-review →`, linking to `/runs` for the bars. Everything else
+the swimlane showed (which runs, on which host) is a list, and lists live on `/runs`.
 
-**Hand-rolled SVG.** Recharts has no Gantt. Okesu has precedent — its war-room case timeline is
-hand-rolled SVG, "no extra deps" (`web/src/components/investigations/CaseTimeline.tsx`).
+Each tile is a headline number, optionally over a **sparkline** of the same metric across the range,
+so the trend reads without a second chart. Tiles that mean *the system is blocked on you*
+(`AwaitingApproval`, `Paused`) take visual weight when nonzero — they are the only states where
+nothing moves until the operator acts. "Failed" carries a trend. "Open findings" stays quiet — a
+backlog, not an interrupt.
 
-**Percentile auto-fit.** Range is fit to the 5th/95th percentile of bar durations, not min/max, so a
-single 6-hour run does not crush the rest into 2% of the width. Lifted from Okesu's
-`timeline/scale.ts:autoFitRange`.
+Colors come from `colors.status.*` in `web/src/lib/useThemeColors.ts` — no new values. Sparklines use
+Recharts (already a dep); there is **no** hand-rolled SVG and no Gantt on this page anymore.
 
-**Bars do not animate.** They redraw on data arrival. Liveness is per-transport (§5.4): local bars
-update sub-second via SSE, SSH-host bars step forward on the poll tick. A smoothly-animating bar
-beside one that jumps in 10s increments reads as broken. Redraw-on-data implies no smoothness we do
-not have.
+**The `Option`/`null` discipline is load-bearing here.** `findings_open` and the per-host cycle
+counts are `Option<u64>` on the wire (§4.1). A tile renders `null` as an em-dash and a
+`findings_partial` total with a "(partial)" marker — never as `0`. A fabricated `0` on a key-point
+tile is exactly the silent-wrong-number this whole design rejects (§8).
 
 ### 5.3 Split status
 
@@ -259,37 +290,58 @@ Segmented-bar colors are **locked to the stacked-area palette** so the eye ties 
 history without a legend. Both consume `colors.status.*` from the existing
 `web/src/lib/useThemeColors.ts` — no new color values are introduced.
 
-### 5.4 Real-time — per-transport, and honest about it
+### 5.4 Loading — async per host, nothing locks
 
-**There is no cross-host event stream.** `/api/events/stream` requires `?run=` whenever `?host=`
-names a remote host (`api/events.rs:61-95`); the merged firehose is local-only. "Subscribe to the
-firehose and invalidate" is therefore a *local-only* capability. This design does not pretend
-otherwise.
+**This is the load-time fix, and it is a hard requirement, not a nicety.** The first build issued
+ONE `GET /api/dashboard` that fanned out server-side and awaited every host. An unreachable SSH host
+made the whole page hang ~10s (`?host=local` alone was 0.26s). A dashboard must never block on a
+remote host.
+
+**Per-host, client-orchestrated loading.** The page does NOT issue one blocking fan-out. Instead:
+
+1. **Enumerate hosts cheaply, no probe.** A fast endpoint returns the *registered* hosts from the
+   store (`HostRegistry::list_hosts()` — store read, no `info()`) — id, name, transport_kind. This is
+   instant even when a host is down. **`GET /api/hosts` must NOT be used for this** — it probes every
+   host via `info()` and takes the same ~10s (measured). The freshness strip renders immediately from
+   this list, every host in a `loading…` state.
+2. **Paint local first.** `GET /api/dashboard?host=local` (~0.26s) fills the tiles and graphs.
+3. **Each remote host in parallel, independently.** `GET /api/dashboard?host=<id>` per remote,
+   merged into the aggregate as each answers. A host that is slow or down holds up nothing — its
+   freshness flips `loading… → unavailable` on its own timeout (§8: SSH gets a bounded connect
+   timeout so this resolves in ~3s, not ~10s), while every other panel is already interactive.
+
+There is **no shared `await`** across hosts or across panels. One slow thing cannot lock another.
+
+**Client-side merge of per-host summaries — and why this is NOT the anti-pattern below.** With
+per-host loading, the client combines the arrived summaries: sum the active counts, concat the
+throughput/terminal buckets by day, take the oldest `captured_at`, OR the `findings_partial` flags.
+This is a small pure function over **already-correct, server-computed per-host summaries** — combining
+N right answers, not deriving aggregates from raw events. It is unit-tested with the same
+bucket-day-key discipline that the server merge uses (the C1 seam test). Keep the per-host
+`DashboardSummary` the single source of each host's numbers; the client only *combines*, never
+*computes*.
+
+**SSE stays an invalidation signal — for local only.** `/api/events/stream` requires `?run=` for any
+remote host (`api/events.rs:61-95`); there is no cross-host firehose. So SSE arrival marks the
+*local* slice dirty and re-fetches `?host=local`; remote hosts refresh on the reconciling poll. This
+is exactly why freshness is per-host (below) rather than one global "live" pill that would lie about
+the SSH host.
 
 | Transport | Mechanism | Liveness |
 |---|---|---|
-| Local | SSE invalidation | Sub-second |
-| HTTP | SSE, proxied end-to-end (`http.rs:327`) | Sub-second |
-| SSH | TTL poll, one `dashboard_summary()` per tick | Tick-bounded |
+| Local | SSE invalidation, re-fetch `?host=local` | Sub-second |
+| HTTP | independent `?host=<id>` fetch; SSE end-to-end where wired | Fetch-bounded |
+| SSH | independent `?host=<id>` fetch, bounded connect timeout (§8) | ≤ timeout |
 | Tunnel | none — `dashboard_summary()` is `Unsupported` (§4.1) | Renders unavailable |
 | Bucket | none — `dashboard_summary()` is `Unsupported` (§4.1) | Renders unavailable |
 
-Tunnel and Bucket are not polled, because a host that cannot report has nothing to poll *for*. They
-render as unavailable (§5.4, freshness strip) until they implement the method. Adding either later is
-purely additive: implement `dashboard_summary()`, and the host starts contributing on the SSH-style
-TTL cadence with no dashboard change.
-
-**SSE is an invalidation signal, not a data channel.** Every number on this page is an aggregate;
-the stream carries step-level events. Applying step deltas to aggregates client-side means
-reimplementing the Rust aggregation in TypeScript and keeping the two in agreement forever. They
-will drift, and the failure mode — a dashboard quietly showing wrong counts — is worse than one that
-is 10s stale.
-
-So: subscribe, ignore payloads for arithmetic, use *arrival* to mark the affected slice dirty, and
-refetch that aggregate from the server. The server stays the single source of truth for every number.
+Tunnel and Bucket are not fetched, because a host that cannot report has nothing to fetch *for*.
+They render as unavailable (freshness strip, below) until they implement `dashboard_summary()`;
+adding either later is purely additive.
 
 **Debounce is load-bearing, not an implementation detail.** An autoflow cycle firing twelve runs
-produces a burst; naive invalidation means twelve refetches. Dirty marks coalesce on a ~250ms timer,
+produces a burst of local SSE events; naive invalidation means twelve `?host=local` refetches. Dirty
+marks coalesce on a ~250ms timer,
 issuing one refetch per burst. This is the piece that decides whether the page feels fast or hammers
 the server.
 
@@ -313,38 +365,33 @@ local · live      builder-01 · 14s      bucket-west · offline      tunnel-a �
 `GET /api/hosts` already returns `{ id, name, transport_kind, status, version, active_run_count,
 last_seen_at }` and nothing consumes it. This is also the host-status view rupu lacks entirely today.
 
-### 5.5 Activity feed — cycle grouping
+### 5.5 Throughput by trigger — the graph that replaces the feed
 
-**One row per autoflow cycle**, collapsed by default:
+The first build answered *"autoflow is taking over the runs"* with a **cycle-grouped feed** — a list
+that fought the noise by folding it. The revised answer is a **graph that makes the noise legible**:
+runs started per time bucket, stacked by `trigger` (manual / cron / event). Autoflow-vs-manual
+proportion becomes a *shape* — "cron is 90% of today's volume" reads at a glance, with no rows to
+scan and nothing to expand. The thing that was drowning the list becomes one band in a chart.
 
-```
-▸ autoflow nightly-review · 12 runs · 10 ok, 2 failed · 3m ago       [cron] [builder-01]
-```
+Recharts stacked area/bar, colors from the existing `TriggerChip` palette (manual=neutral,
+cron=violet, event=sky) so the graph and any trigger chip elsewhere agree without a legend.
 
-Expandable to individual runs. **Manual runs always render individually** — they are never grouped.
-Inside an expanded cycle, clean runs fold behind a clickable `+N clean` pill (Okesu's
-`isInterestingTick` idiom, `EventTimeline.tsx:1113-1128`): hidden, never lost. Failures inside a
-cycle stay visible on their own.
+Beneath it, **one line of aggregate cycle numbers** — `N cycles · X clean · Y with failures` — the
+only cycle information a dashboard needs. The per-cycle detail, the per-run drill-in, the `+N clean`
+expansion: all of that is what `/runs` is for. A "see all →" link goes there.
 
-Rows carry `trigger` and `host_id` chips. `TriggerChip` already exists
-(`web/src/components/TriggerChip.tsx`; manual=neutral, cron=violet, event=sky).
+**Data shape: buckets, not rows.** This needs a `throughput` series (`{ ts, manual, cron, event }`
+per bucket) and three scalar cycle counts — NOT the `cycles[]` / `recent_manual[]` row arrays the
+first build shipped. Those arrays are removed from the wire (§4.1); shedding them is most of the
+payload and the entire "detailed table" problem at once. The trigger classification is
+`RunRecord::trigger_str()` (already shipped), bucketed the same way terminal outcomes already are.
 
-**Grouping is by cycle, not by outcome.** A cycle failing *as a cycle* is a real event;
-outcome-grouping scatters that across rows.
-
-**Join direction: cycle → runs, not run → cycle.** There is no `autoflow_id` on `RunRecord`. The
-linkage is a reverse index — `api/run_resolve.rs` reads autoflow *history* to map a run back to its
-cycle, so grouping N runs run-first would mean N history lookups. `AutoflowCycleRow`
-(`api/run_streams.rs`) already carries `cycle_id`, `worker_name`, `ran_cycles`, `skipped_cycles`,
-`failed_cycles`, and a `run_ids` array. Pull from the cycle store and join outward.
-
-**`CycleRollup` carries `runs: Vec<CycleRun { run_id, status }>`, not a bare `run_ids: Vec<String>`.**
-The `+N clean` pill needs each run's status to decide what folds, and `AutoflowCycleRow` supplies
-only IDs. The status join happens server-side in `build_summary`, which already holds every run —
-making the client fetch a run per ID to learn its status would turn one expanded cycle into N
-requests. This is why the DTO diverges from `AutoflowCycleRow`'s shape rather than mirroring it.
-
-**The 10-row server cap is removed.** It exists only because the feed was ungrouped.
+<!-- Superseded design retained below for provenance: the cycle→run status join that fed the
+     `+N clean` pill. The pill is gone with the feed; the join is no longer built. -->
+**(Removed — was: cycle→run status join for the `+N clean` pill.)**
+The `runs: Vec<CycleRun { run_id, status }>` join fed the expandable feed. The feed is gone, so the
+join is no longer built and `CycleRun` / `CycleRollup`'s row shape is no longer on the dashboard
+wire. `AutoflowHistoryStore` still supplies the three aggregate cycle counts (§5.5) directly.
 
 ## 6. Plan 3 — Spend page
 
@@ -384,20 +431,33 @@ it is local-only and wrong.
   the mirror is populated only on the launch path, which a mock would happily fake.
 
 **TypeScript (plans 1, 3).**
-- Aggregation and layout helpers are pure functions with co-located tests, following Okesu's
-  `cluster.ts` / `scale.ts` / `filter.ts` precedent: cycle grouping, `+N clean` folding, percentile
-  auto-fit, swimlane lane assignment.
-- Debounce coalescing: a 12-event burst issues exactly one refetch.
-- Freshness rendering: `Unsupported` / offline hosts render as unavailable, not zero.
+- The client-side per-host **merge** is a pure function with a co-located test — combining N
+  server-computed summaries: sum counts, group buckets by day-key (the C1 seam test — a local-shaped
+  and an SSH-shaped bucket for the same day merge into one), oldest `captured_at`, OR
+  `findings_partial`. It combines correct inputs; it never derives an aggregate from raw events.
+- Async loading: a dead/slow remote host never blocks local or another panel from rendering (mock a
+  host whose fetch hangs; assert local paints and the strip flips that host to `unavailable`).
+- Debounce coalescing: a 12-event local SSE burst issues exactly one `?host=local` refetch.
+- Key-point / freshness rendering: `Option`/`null` counts render as an em-dash and a partial total is
+  marked "(partial)" — `Unsupported` / offline hosts render as unavailable, never `0`.
 
 **Runtime validation.** Per CLAUDE.md, `cargo build` + `cargo test` cleanliness is not rendering
 cleanliness. The page is validated in a browser before merge.
 
 ## 8. Constraints & Deferred
 
-- **No SSH connection reuse.** Every call is a fresh handshake. Designed around (one aggregate call
-  per host per tick, TTL-cached) rather than fixed. `ControlMaster` multiplexing would materially
-  improve remote-host cadence and is the highest-value follow-up.
+- **SSH connect timeout must be bounded (revised 2026-07-17).** The first build left the SSH
+  `dashboard_summary` path unbounded, so an unreachable host stalled the dashboard ~10s on the OS
+  default connect timeout. Bound it (~3s connect) so a dead host's freshness resolves `loading… →
+  unavailable` quickly. This is the SSH analogue of the `HttpHostConnector` bound already shipped in
+  plan 2 (5s/30s). Combined with async per-host loading (§5.4), no host — bounded or not — blocks the
+  page; the bound only caps how long a `loading…` lingers.
+- **Cheap host enumeration (revised 2026-07-17).** The page needs the registered host list without
+  probing. `HostRegistry::list_hosts()` is a store read (no `info()`); expose it as a fast endpoint
+  (e.g. `GET /api/hosts?probe=false` or a dedicated route). `GET /api/hosts` as-is probes every host
+  and is itself ~10s against a dead host — it must not be on the dashboard's load path.
+- **No SSH connection reuse.** Every call is still a fresh handshake. `ControlMaster` multiplexing
+  would materially improve remote-host cadence and is the highest-value follow-up.
 - **No cross-host firehose.** Remote liveness is poll-bounded except HTTP. A per-host SSE multiplexer
   over `stream_run_events` is possible but out of scope.
 - **Tunnel / Bucket `dashboard_summary()`** ships as `Unsupported` and renders as unavailable.
@@ -415,11 +475,15 @@ cleanliness. The page is validated in a browser before merge.
 
 | Plan | Scope | Depends on |
 |---|---|---|
-| 2 | `rupu run list --format json` in `rupu-cli` (§4.3); `dashboard_summary()` across transports; SSH `list_runs` fix (own PR); fan-out in `/api/dashboard` | — |
-| 1 | Ops page: swimlane, split status, cycle feed, attention row, freshness strip, SSE invalidation | 2 |
+| 2 | `rupu run list --format json`; `dashboard_summary()` across transports; SSH `list_runs`/`get_run` fix (own PR); fan-out in `/api/dashboard` — **DONE (8/8), merged on branch** | — |
+| 2b | **Revision (2026-07-17):** reshape `DashboardSummary` to aggregate-only (drop `active_runs`/`cycles`/`recent_manual`; add `throughput_buckets`, `active_longest_ms`, scalar `CycleCounts`); bounded SSH connect timeout; cheap `list_hosts()` endpoint | 2 |
+| 1 | Ops page: **key-point tiles, split status, throughput-by-trigger graph, freshness strip, async per-host loading** (revised — no swimlane, no feed) | 2b |
 | 3 | Spend page: pivots, outliers, unpriced gap | 2 |
 
-Plan 2 is the foundation and carries the risk. Plans 1 and 3 are independent of each other.
+Plan 2 is done and merged on the branch. The 2026-07-17 operator review ("key points, not lists" +
+"nothing locks") adds **Plan 2b** (data-shape + load-path revision) ahead of a reworked Plan 1. Parts
+of the first Plan 1 build survive (freshness strip, attention/active tiles, terminal trend); the
+swimlane and activity feed — and the row arrays that fed them — are removed.
 
 **Scope note.** Plan 2 grew a `rupu-cli` task once it emerged that the CLI surface the SSH fix
 assumed does not exist (§4.3). It is the first task in plan 2 and blocks the SSH fix. Note that this
