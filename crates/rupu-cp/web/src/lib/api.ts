@@ -582,59 +582,67 @@ export interface TerminalBucket {
   cancelled: number;
 }
 
-/** One bar in the live swimlane. */
-export interface ActiveRunBar {
-  run_id: string;
-  workflow_name: string;
-  status: RunStatusStr;
-  started_at: string;
-  trigger: 'manual' | 'cron' | 'event';
-  /** `null` for manual runs; set when the run belongs to an autoflow cycle. */
-  cycle_id: string | null;
-  /** Which host this row came from — set server-side by the fan-out merge (`api/dashboard.rs`), not by the connector. */
-  host_id?: string;
+/** Runs STARTED in a bucket, split by trigger. Same day-key alignment as
+ *  `TerminalBucket`. Mirrors `ThroughputBucket` in
+ *  `rupu-cp/src/host/dashboard_summary.rs`. */
+export interface ThroughputBucket {
+  ts: string;
+  manual: number;
+  cron: number;
+  event: number;
 }
 
 /**
- * One run inside a cycle. Carries `status`, not just an id, because the
- * `+N clean` pill needs to know what folds. The server joins it — the client
- * must not fetch a run per id to expand one cycle.
+ * Scalar cycle summary — the one line of cycle numbers (spec §5.5), NOT a row
+ * array. Mirrors `CycleCounts` in `rupu-cp/src/host/dashboard_summary.rs`.
+ * `clean`/`with_failures` are `null` when a reporting host cannot supply the
+ * ran/failed breakdown (SSH today) — NEVER render `null` as a genuine 0.
  */
-export interface CycleRun {
+export interface CycleCounts {
+  total: number;
+  clean: number | null;
+  with_failures: number | null;
+}
+
+/** The "Active now" key point (spec §5.2): the single longest currently-
+ *  running run, fleet-wide. Mirrors `ActiveLongest` in
+ *  `rupu-cp/src/host/dashboard_summary.rs`. */
+export interface ActiveLongest {
   run_id: string;
-  /** `'unknown'` when the host could not resolve the run. */
-  status: RunStatusStr | 'unknown';
-}
-
-/** One autoflow cycle, collapsed. The activity feed's primary row. */
-export interface CycleRollup {
-  cycle_id: string;
-  worker_name: string | null;
-  started_at: string;
-  finished_at: string | null;
-  /** `null` = this host does not report the breakdown (SSH — the CLI's autoflow
-   *  history has no ran/skipped/failed fields). NOT zero: unknown is not "none". */
-  ran: number | null;
-  skipped: number | null;
-  failed: number | null;
-  runs: CycleRun[];
-  /** Which host this row came from — set server-side by the fan-out merge (`api/dashboard.rs`), not by the connector. */
-  host_id?: string;
-}
-
-/** A manual-trigger run. Never grouped. */
-export interface DashboardRecentRun {
-  id: string;
   workflow_name: string;
-  status: RunStatusStr;
-  started_at: string;
-  finished_at: string | null;
-  trigger: 'manual' | 'cron' | 'event';
-  /** Which host this row came from — set server-side by the fan-out merge (`api/dashboard.rs`), not by the connector. */
-  host_id?: string;
+  age_ms: number;
 }
 
-export interface DashboardResponse {
+/**
+ * One host's complete dashboard contribution — aggregate-only, no row
+ * arrays. Mirrors `DashboardSummary` in `rupu-cp/src/host/dashboard_summary.rs`.
+ */
+export interface DashboardSummary {
+  active: ActiveCounts;
+  /** The single longest-running run, or absent when nothing is running.
+   *  The server omits this key entirely when `None` (`skip_serializing_if`),
+   *  so treat it as optional rather than a nullable-but-always-present field. */
+  active_longest?: ActiveLongest | null;
+  terminal_buckets: TerminalBucket[];
+  throughput_buckets: ThroughputBucket[];
+  cycles: CycleCounts;
+  /** `null` when this host does not report open-findings data at all (e.g.
+   *  SSH — the CLI has no findings surface). `0` is a genuine zero; `null`
+   *  must never be rendered as one. */
+  findings_open: number | null;
+  /** RFC-3339. When this host's data was actually read. */
+  captured_at: string;
+}
+
+/**
+ * The dashboard payload: one fleet-wide aggregate (flattened at the top
+ * level) plus per-host reporting state. Mirrors `DashboardResponse` in
+ * `rupu-cp/src/api/dashboard.rs` — `summary` is `#[serde(flatten)]`ed there,
+ * so every `DashboardSummary` field (`active` / `active_longest` /
+ * `terminal_buckets` / `throughput_buckets` / `cycles` / `findings_open` /
+ * `captured_at`) lands directly on this type rather than nested.
+ */
+export interface DashboardResponse extends DashboardSummary {
   hosts: HostFreshness[];
   /**
    * True when at least one host that DID report (`state === 'ok'`) omitted its
@@ -642,20 +650,13 @@ export interface DashboardResponse {
    * the hosts that reported it — **the UI must not present it as a fleet total**.
    */
   findings_partial: boolean;
-  active: ActiveCounts;
-  terminal_buckets: TerminalBucket[];
-  active_runs: ActiveRunBar[];
-  cycles: CycleRollup[];
-  recent_manual: DashboardRecentRun[];
-  /** `null` when no reporting host supplied a count. NOT zero. */
-  findings_open: number | null;
   /**
-   * RFC-3339. The OLDEST `captured_at` among reporting hosts — the honest
-   * staleness bound for the merged aggregate. Present at the TOP level because
-   * the server `#[serde(flatten)]`s a `DashboardSummary` into this response;
-   * `HttpHostConnector` re-parses this same body as a bare `DashboardSummary`.
+   * Same "not reported ≠ 0" rule as `findings_partial`, applied to
+   * `cycles.clean`/`cycles.with_failures`: true when at least one reporting
+   * host contributed `null` for the breakdown. `cycles.total` is always a
+   * complete sum regardless — only the clean/with-failures split can be partial.
    */
-  captured_at: string;
+  cycles_partial: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -796,6 +797,19 @@ export interface HostView {
   capabilities?: HostCapabilities;
   active_run_count: number;
   last_seen_at?: string;
+}
+
+/**
+ * Store-only view of one registered host — no live health data, no probe.
+ * Mirrors `RegisteredHostView` from `rupu-cp/src/api/hosts.rs`. Backs
+ * `GET /api/hosts/registered`: a pure store read that returns promptly even
+ * when every registered remote is unreachable, for callers (the dashboard)
+ * that need the host list before deciding which ones to ask for data.
+ */
+export interface RegisteredHostView {
+  id: string;
+  name: string;
+  transport_kind: HostTransportKind;
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,8 +1319,14 @@ function listQuery(params?: ListParams): string {
 
 export const api = {
   // --- Dashboard ---
-  getDashboard(range: DashboardRange = '30d'): Promise<DashboardResponse> {
-    return request<DashboardResponse>(`/api/dashboard?range=${range}`);
+  /**
+   * `range` selects the trend window; `host` (optional) scopes the fan-out to
+   * one registered host id instead of every host — used to paint the local
+   * host first and merge remotes in as they answer.
+   */
+  getDashboard(range: DashboardRange = '30d', host?: string): Promise<DashboardResponse> {
+    const hostQs = host ? `&host=${encodeURIComponent(host)}` : '';
+    return request<DashboardResponse>(`/api/dashboard?range=${range}${hostQs}`);
   },
 
   // --- Usage ---
@@ -1708,6 +1728,15 @@ export const api = {
   /** List all registered hosts, each enriched with live health data. */
   getHosts(): Promise<HostView[]> {
     return request<HostView[]>('/api/hosts');
+  },
+  /**
+   * Probe-free host list — `id` / `name` / `transport_kind` only, no
+   * `info()` / `active_run_count()` round-trip. Returns promptly even when
+   * every registered remote is unreachable; the dashboard uses this to know
+   * which hosts to fan `getDashboard(range, hostId)` out to.
+   */
+  getRegisteredHosts(): Promise<RegisteredHostView[]> {
+    return request<RegisteredHostView[]>('/api/hosts/registered');
   },
   /** Register a new remote host. Requires `rupu cp serve` (501 if absent). */
   addHost(body: { name: string; base_url: string; token?: string }): Promise<HostView> {
