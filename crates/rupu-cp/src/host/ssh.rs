@@ -56,11 +56,28 @@ pub(crate) fn build_remote_command(argv: &[String]) -> String {
         .join(" ")
 }
 
+/// Connect timeout (seconds) for the short request/response ssh calls —
+/// `RemoteExec::run` and `RemoteExec::run_bytes`, which back
+/// `remote_json_rows` / `remote_json_item` / `remote_workflow` / `info` /
+/// `dashboard_summary`. Bounds a dead host to ~3s instead of stalling the
+/// dashboard fan-out — the SSH analogue of the HTTP connector's 5s/30s bound.
+pub(crate) const SHORT_CALL_CONNECT_TIMEOUT_SECS: u32 = 3;
+
+/// Connect timeout (seconds) for the launch-path pump's long-lived `tail -F`
+/// ssh (`RemoteExec::spawn_lines`, used only by `spawn_tail_pump`). That is a
+/// streaming connection meant to stay open for the run's duration, not a
+/// probe — it keeps the original, more generous bound rather than the
+/// tightened short-call one.
+pub(crate) const PUMP_CONNECT_TIMEOUT_SECS: u32 = 10;
+
 /// Build the args (after the `ssh` program) to run `remote_command` on `host`.
 ///
 /// Flags emitted:
 /// - `-o BatchMode=yes`  — fail fast on missing key rather than prompting
-/// - `-o ConnectTimeout=10` — don't hang indefinitely on unreachable hosts
+/// - `-o ConnectTimeout=<connect_timeout_secs>` — don't hang indefinitely on
+///   unreachable hosts. Callers pass [`SHORT_CALL_CONNECT_TIMEOUT_SECS`] for
+///   one-shot request/response calls and [`PUMP_CONNECT_TIMEOUT_SECS`] for the
+///   long-lived tail pump — see those constants' docs.
 /// - `-i <identity_file>` — if provided
 /// - `-p <port>` — if provided
 /// - `<host>` — always present
@@ -70,12 +87,13 @@ pub(crate) fn ssh_argv(
     port: Option<u16>,
     identity_file: Option<&Path>,
     remote_command: &str,
+    connect_timeout_secs: u32,
 ) -> Vec<String> {
     let mut argv: Vec<String> = vec![
         "-o".to_string(),
         "BatchMode=yes".to_string(),
         "-o".to_string(),
-        "ConnectTimeout=10".to_string(),
+        format!("ConnectTimeout={connect_timeout_secs}"),
     ];
     if let Some(id) = identity_file {
         argv.push("-i".to_string());
@@ -369,6 +387,7 @@ impl RemoteExec for SshExec {
             self.port,
             self.identity_file.as_deref(),
             remote_command,
+            SHORT_CALL_CONNECT_TIMEOUT_SECS,
         );
         let out = tokio::process::Command::new("ssh")
             .args(&argv)
@@ -390,6 +409,7 @@ impl RemoteExec for SshExec {
             self.port,
             self.identity_file.as_deref(),
             remote_command,
+            PUMP_CONNECT_TIMEOUT_SECS,
         );
         let mut child = tokio::process::Command::new("ssh")
             .args(&argv)
@@ -427,6 +447,7 @@ impl RemoteExec for SshExec {
             self.port,
             self.identity_file.as_deref(),
             remote_command,
+            SHORT_CALL_CONNECT_TIMEOUT_SECS,
         );
         let mut cmd = tokio::process::Command::new("ssh");
         cmd.args(&argv)
@@ -1565,6 +1586,7 @@ mod tests {
             Some(2222),
             Some(std::path::Path::new("/k/id")),
             "'true'",
+            SHORT_CALL_CONNECT_TIMEOUT_SECS,
         );
         // BatchMode present as two args: -o BatchMode=yes
         assert!(argv.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
@@ -1578,10 +1600,54 @@ mod tests {
 
     #[test]
     fn ssh_argv_omits_optional_flags() {
-        let argv = ssh_argv("edge", None, None, "'true'");
+        let argv = ssh_argv(
+            "edge",
+            None,
+            None,
+            "'true'",
+            SHORT_CALL_CONNECT_TIMEOUT_SECS,
+        );
         assert!(!argv.iter().any(|a| a == "-i"));
         assert!(!argv.iter().any(|a| a == "-p"));
         assert!(argv.iter().any(|a| a == "edge"));
+    }
+
+    /// R5: the short request/response calls (`run` / `run_bytes`, backing
+    /// `remote_json_rows` / `remote_json_item` / `remote_workflow` / `info`)
+    /// must carry a bounded `ConnectTimeout` so a dead host resolves in ~3s
+    /// instead of stalling the dashboard fan-out — the SSH analogue of the
+    /// HTTP connector's 5s/30s bound.
+    #[test]
+    fn ssh_argv_short_call_uses_tight_connect_timeout() {
+        let argv = ssh_argv(
+            "edge",
+            None,
+            None,
+            "'true'",
+            SHORT_CALL_CONNECT_TIMEOUT_SECS,
+        );
+        assert!(argv.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-o" && w[1] == "ConnectTimeout=3"),
+            "short-call argv must set ConnectTimeout=3, got: {argv:?}"
+        );
+    }
+
+    /// R5: the launch-path pump's long-lived `tail -F` ssh (`spawn_lines`,
+    /// called only from `spawn_tail_pump`) is a streaming connection meant to
+    /// stay open, not a probe — it must NOT be tightened to the short-call
+    /// bound. It keeps its own (more generous) connect timeout.
+    #[test]
+    fn ssh_argv_pump_call_does_not_use_short_call_timeout() {
+        let argv = ssh_argv("edge", None, None, "'tail -F x'", PUMP_CONNECT_TIMEOUT_SECS);
+        assert!(
+            !argv
+                .windows(2)
+                .any(|w| w[0] == "-o" && w[1] == "ConnectTimeout=3"),
+            "pump argv must not carry the tightened short-call ConnectTimeout, got: {argv:?}"
+        );
+        assert_eq!(PUMP_CONNECT_TIMEOUT_SECS, 10);
     }
 
     #[test]
