@@ -15,7 +15,15 @@ use rupu_orchestrator::runs::{RunRecord, RunStatus};
 use std::collections::BTreeMap;
 
 /// Truncate to the start of the UTC day — the bucket key.
-fn day_key(t: DateTime<Utc>) -> DateTime<Utc> {
+///
+/// `pub(crate)` so every producer of a [`TerminalBucket`] (currently
+/// `build_summary` here and `SshHostConnector::dashboard_summary` in
+/// `host/ssh.rs`) truncates through this ONE function rather than each
+/// hand-rolling its own day-boundary math — two truncations that drift by
+/// even a nanosecond would produce buckets that never merge (see
+/// `fill_bucket_grid`'s doc comment and the regression test in
+/// `api::dashboard`).
+pub(crate) fn day_key(t: DateTime<Utc>) -> DateTime<Utc> {
     t.with_hour(0)
         .and_then(|t| t.with_minute(0))
         .and_then(|t| t.with_second(0))
@@ -27,7 +35,7 @@ fn day_key(t: DateTime<Utc>) -> DateTime<Utc> {
 pub fn build_summary(
     runs: &[RunRecord],
     cycles: &[CycleRollup],
-    findings_open: u64,
+    findings_open: Option<u64>,
     range: DashboardRange,
     now: DateTime<Utc>,
 ) -> DashboardSummary {
@@ -162,10 +170,39 @@ pub fn build_summary(
 /// that logic would drift, and the failure is silent (a chart that closes a
 /// gap looks identical to one that had activity).
 pub(crate) fn fill_bucket_grid(
-    mut buckets: BTreeMap<DateTime<Utc>, TerminalBucket>,
+    buckets: BTreeMap<DateTime<Utc>, TerminalBucket>,
     range: DashboardRange,
     now: DateTime<Utc>,
 ) -> Vec<TerminalBucket> {
+    // Defence-in-depth: normalize every incoming key through `day_key` before
+    // it's used as a fill-grid cursor. This is the SAME invariant every
+    // producer is already supposed to uphold at construction time (see
+    // `day_key`'s doc comment) — re-asserting it here means a future third
+    // implementation that forgets to truncate can never reproduce the
+    // SSH-bucket-drop bug: a non-midnight key would simply never match a
+    // cursor and the whole bucket (and, in the `range=all` case, every OTHER
+    // host's buckets too, since `start` is derived from the earliest key)
+    // would silently vanish. Buckets that collide after normalization are
+    // summed, not overwritten.
+    let mut buckets: BTreeMap<DateTime<Utc>, TerminalBucket> =
+        buckets
+            .into_iter()
+            .fold(BTreeMap::new(), |mut acc, (k, b)| {
+                let key = day_key(k);
+                let entry = acc.entry(key).or_insert(TerminalBucket {
+                    ts: key,
+                    completed: 0,
+                    failed: 0,
+                    rejected: 0,
+                    cancelled: 0,
+                });
+                entry.completed += b.completed;
+                entry.failed += b.failed;
+                entry.rejected += b.rejected;
+                entry.cancelled += b.cancelled;
+                acc
+            });
+
     let start = match range.since(now) {
         Some(s) => day_key(s),
         // `All`: start at the earliest bucket we actually have.
@@ -247,7 +284,7 @@ mod tests {
             rec("r6", Completed, 6),
             rec("r7", Failed, 7),
         ];
-        let s = build_summary(&runs, &[], 0, DashboardRange::All, chrono::Utc::now());
+        let s = build_summary(&runs, &[], Some(0), DashboardRange::All, chrono::Utc::now());
         assert_eq!(s.active.running, 2);
         assert_eq!(s.active.awaiting_approval, 1);
         assert_eq!(s.active.paused, 1);
@@ -262,7 +299,7 @@ mod tests {
             rec("r2", Failed, 10),
             rec("r3", Running, 10),
         ];
-        let s = build_summary(&runs, &[], 0, DashboardRange::All, chrono::Utc::now());
+        let s = build_summary(&runs, &[], Some(0), DashboardRange::All, chrono::Utc::now());
         let completed: u64 = s.terminal_buckets.iter().map(|b| b.completed).sum();
         let failed: u64 = s.terminal_buckets.iter().map(|b| b.failed).sum();
         assert_eq!(completed, 1);
@@ -277,7 +314,13 @@ mod tests {
             rec("old", Completed, 60 * 24 * 10),
             rec("new", Completed, 5),
         ];
-        let s = build_summary(&runs, &[], 0, DashboardRange::Days7, chrono::Utc::now());
+        let s = build_summary(
+            &runs,
+            &[],
+            Some(0),
+            DashboardRange::Days7,
+            chrono::Utc::now(),
+        );
         let total: u64 = s.terminal_buckets.iter().map(|b| b.completed).sum();
         assert_eq!(
             total, 1,
@@ -294,7 +337,13 @@ mod tests {
             rec("a", Completed, 60 * 24 * 4),
             rec("b", Completed, 60 * 24),
         ];
-        let s = build_summary(&runs, &[], 0, DashboardRange::Days7, chrono::Utc::now());
+        let s = build_summary(
+            &runs,
+            &[],
+            Some(0),
+            DashboardRange::Days7,
+            chrono::Utc::now(),
+        );
         assert!(
             s.terminal_buckets.len() >= 4,
             "expected a filled bucket grid, got {} buckets",
@@ -311,7 +360,7 @@ mod tests {
         let s = build_summary(
             &[cron, manual],
             &[],
-            0,
+            Some(0),
             DashboardRange::All,
             chrono::Utc::now(),
         );
@@ -332,9 +381,9 @@ mod tests {
             worker_name: Some("nightly".into()),
             started_at: chrono::Utc::now() - chrono::Duration::minutes(6),
             finished_at: None,
-            ran: 2,
-            skipped: 0,
-            failed: 1,
+            ran: Some(2),
+            skipped: Some(0),
+            failed: Some(1),
             // status starts "unknown" — collect_cycle_rollups does no per-run reads.
             runs: vec![
                 CycleRun {
@@ -347,7 +396,13 @@ mod tests {
                 },
             ],
         }];
-        let s = build_summary(&runs, &cycles, 0, DashboardRange::All, chrono::Utc::now());
+        let s = build_summary(
+            &runs,
+            &cycles,
+            Some(0),
+            DashboardRange::All,
+            chrono::Utc::now(),
+        );
         let c = &s.cycles[0];
         assert_eq!(
             c.runs.iter().find(|r| r.run_id == "r_ok").unwrap().status,
@@ -368,15 +423,21 @@ mod tests {
             worker_name: None,
             started_at: chrono::Utc::now(),
             finished_at: None,
-            ran: 1,
-            skipped: 0,
-            failed: 0,
+            ran: Some(1),
+            skipped: Some(0),
+            failed: Some(0),
             runs: vec![CycleRun {
                 run_id: "r_gone".into(),
                 status: "unknown".into(),
             }],
         }];
-        let s = build_summary(&[], &cycles, 0, DashboardRange::All, chrono::Utc::now());
+        let s = build_summary(
+            &[],
+            &cycles,
+            Some(0),
+            DashboardRange::All,
+            chrono::Utc::now(),
+        );
         assert_eq!(s.cycles[0].runs.len(), 1, "the run must not be dropped");
         assert_eq!(s.cycles[0].runs[0].status, "unknown");
     }
@@ -393,15 +454,21 @@ mod tests {
             worker_name: None,
             started_at: chrono::Utc::now() - chrono::Duration::minutes(6),
             finished_at: None,
-            ran: 1,
-            skipped: 0,
-            failed: 0,
+            ran: Some(1),
+            skipped: Some(0),
+            failed: Some(0),
             runs: vec![CycleRun {
                 run_id: "r_in_cycle".into(),
                 status: "unknown".into(),
             }],
         }];
-        let s = build_summary(&runs, &cycles, 0, DashboardRange::All, chrono::Utc::now());
+        let s = build_summary(
+            &runs,
+            &cycles,
+            Some(0),
+            DashboardRange::All,
+            chrono::Utc::now(),
+        );
         assert!(
             s.recent_manual.iter().all(|r| r.id != "r_in_cycle"),
             "a run owned by a cycle must not also appear as a manual run"
@@ -415,9 +482,9 @@ mod tests {
             worker_name: None,
             started_at: chrono::Utc::now() - chrono::Duration::days(10),
             finished_at: None,
-            ran: 1,
-            skipped: 0,
-            failed: 0,
+            ran: Some(1),
+            skipped: Some(0),
+            failed: Some(0),
             runs: vec![],
         };
         let recent = CycleRollup {
@@ -425,15 +492,15 @@ mod tests {
             worker_name: None,
             started_at: chrono::Utc::now() - chrono::Duration::hours(1),
             finished_at: None,
-            ran: 1,
-            skipped: 0,
-            failed: 0,
+            ran: Some(1),
+            skipped: Some(0),
+            failed: Some(0),
             runs: vec![],
         };
         let s = build_summary(
             &[],
             &[old, recent],
-            0,
+            Some(0),
             DashboardRange::Days7,
             chrono::Utc::now(),
         );

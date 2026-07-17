@@ -420,12 +420,45 @@ impl HostConnector for HttpHostConnector {
     /// `host=local` scopes the remote CP to ITS OWN data — without it the
     /// remote would fan out to its own remotes and a host registered on both
     /// sides would be double-counted.
+    ///
+    /// The remote's `hosts[]` array (see `api::dashboard::DashboardResponse`)
+    /// is the ONLY place a remote CP records that its own local connector
+    /// failed to report — when that happens it still answers 200 with an
+    /// all-zero `DashboardSummary` and `captured_at: now()` (the honest
+    /// no-host-reported fallback `get_dashboard` falls back to). Parsing the
+    /// flattened body alone would accept that as a genuine "ok, live, 0 runs"
+    /// summary, indistinguishable from an idle host. So `hosts[]` is checked
+    /// FIRST: if present and none of its entries report `state == "ok"`, this
+    /// returns an error carrying the remote's own reason instead of the
+    /// zeroed data. `hosts[]` absent (an older/bare body, as in some test
+    /// fixtures) skips the check and parses the summary as before — the
+    /// flatten contract stays intact either way.
     async fn dashboard_summary(
         &self,
         range: crate::host::dashboard_summary::DashboardRange,
     ) -> Result<crate::host::dashboard_summary::DashboardSummary, HostConnectorError> {
         let path = format!("/api/dashboard?host=local&range={}", range.as_str());
         let v = self.proxy_get_json(&path).await?;
+
+        if let Some(hosts) = v.get("hosts").and_then(|h| h.as_array()) {
+            let any_ok = hosts
+                .iter()
+                .any(|h| h.get("state").and_then(|s| s.as_str()) == Some("ok"));
+            if !any_ok {
+                let reason = hosts
+                    .iter()
+                    .find_map(|h| h.get("reason").and_then(|r| r.as_str()))
+                    .unwrap_or("remote host did not report (no reason given)");
+                return Err(HostConnectorError::Unreachable(format!(
+                    "remote CP's local host did not report dashboard data: {reason}"
+                )));
+            }
+        }
+
+        // Deliberately parse `v` itself (not a `hosts`-stripped clone): the
+        // `#[serde(flatten)]` on `DashboardResponse::summary` is what makes
+        // this work by construction — serde ignores the extra `hosts` /
+        // `findings_partial` keys rather than a mapper that can drift.
         serde_json::from_value(v)
             .map_err(|e| HostConnectorError::Invalid(format!("bad dashboard summary: {e}")))
     }

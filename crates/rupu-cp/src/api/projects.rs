@@ -1,7 +1,7 @@
 use crate::{
     api::agents::AgentDto,
     api::autoflows::{scan_autoflow_defs, AutoflowDefRow},
-    api::runs::{trigger_of, RunListRow},
+    api::runs::RunListRow,
     api::workflows::{scan_workflow_names, WorkflowDto},
     error::{ApiError, ApiResult},
     state::AppState,
@@ -153,7 +153,7 @@ async fn get_project(
     for r in &runs {
         *by_status.entry(r.status.as_str()).or_insert(0) += 1;
         // "manual" → workflow surface; "cron"/"event" → autoflow surface.
-        match trigger_of(r) {
+        match r.trigger_str() {
             "manual" => workflow += 1,
             _ => autoflow += 1,
         }

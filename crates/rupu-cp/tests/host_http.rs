@@ -348,7 +348,7 @@ async fn http_dashboard_summary_scopes_to_host_local_and_preserves_captured_at()
     assert_eq!(summary.terminal_buckets[0].completed, 3);
     assert_eq!(summary.active_runs.len(), 1);
     assert_eq!(summary.active_runs[0].run_id, "run_remote_1");
-    assert_eq!(summary.findings_open, 4);
+    assert_eq!(summary.findings_open, Some(4));
 }
 
 /// Each `DashboardRange` variant maps to its wire form (`as_str()`) in the
@@ -390,4 +390,90 @@ async fn http_dashboard_summary_bad_body_maps_to_invalid() {
         c.dashboard_summary(DashboardRange::Days30).await,
         Err(HostConnectorError::Invalid(_))
     ));
+}
+
+/// The remote CP's own local host failed to report: it still answers 200
+/// with an all-zero `DashboardSummary` + a fresh `captured_at` (the
+/// no-host-reported fallback `api::dashboard::get_dashboard` produces when
+/// nothing reported), but its `hosts[]` array records the true state —
+/// `state: "offline"`, no `"ok"` entry anywhere.
+///
+/// Before the fix, `dashboard_summary` parsed the flattened body as a bare
+/// `DashboardSummary` and discarded `hosts[]` entirely, so this all-zero body
+/// came back as `Ok(summary)` — rendering on the outer CP as "ok, live, 0
+/// runs" instead of surfacing the outage. It must instead return an error
+/// carrying the remote's own reason.
+#[tokio::test]
+async fn http_dashboard_summary_rejects_a_zeroed_body_when_no_host_reports_ok() {
+    let server = httpmock::MockServer::start_async().await;
+    let body = serde_json::json!({
+        "hosts": [
+            {
+                "host_id": "local",
+                "name": "local",
+                "transport_kind": "local",
+                "state": "offline",
+                "captured_at": null,
+                "reason": "run store list failed: permission denied"
+            }
+        ],
+        "findings_partial": false,
+        "active": {"running": 0, "awaiting_approval": 0, "paused": 0, "pending": 0},
+        "terminal_buckets": [],
+        "active_runs": [],
+        "cycles": [],
+        "recent_manual": [],
+        "findings_open": null,
+        "captured_at": "2026-07-16T12:00:00Z"
+    });
+    server.mock(|when, then| {
+        when.method("GET").path("/api/dashboard");
+        then.status(200).json_body(body);
+    });
+
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let err = c
+        .dashboard_summary(DashboardRange::Days30)
+        .await
+        .expect_err(
+            "a body whose hosts[] shows no ok state must never be accepted as a real summary",
+        );
+    match err {
+        HostConnectorError::Unreachable(msg) | HostConnectorError::Unsupported(msg) => {
+            assert!(
+                msg.contains("permission denied"),
+                "the remote's own reason must be carried through, got: {msg}"
+            );
+        }
+        other => panic!("expected Unreachable/Unsupported carrying the reason, got {other:?}"),
+    }
+}
+
+/// `hosts[]` present, with at least one `state == "ok"` entry, must still
+/// parse normally — the check only rejects when NOTHING reported ok.
+#[tokio::test]
+async fn http_dashboard_summary_accepts_body_when_hosts_shows_ok() {
+    let server = httpmock::MockServer::start_async().await;
+    let mut body = stub_dashboard_summary_body("2026-07-16T12:00:00Z");
+    body["hosts"] = serde_json::json!([
+        {
+            "host_id": "local",
+            "name": "local",
+            "transport_kind": "local",
+            "state": "ok",
+            "captured_at": "2026-07-16T12:00:00Z",
+            "reason": null
+        }
+    ]);
+    server.mock(|when, then| {
+        when.method("GET").path("/api/dashboard");
+        then.status(200).json_body(body);
+    });
+
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let summary = c
+        .dashboard_summary(DashboardRange::Days30)
+        .await
+        .expect("a hosts[] entry reporting ok must parse normally");
+    assert_eq!(summary.active.running, 2);
 }

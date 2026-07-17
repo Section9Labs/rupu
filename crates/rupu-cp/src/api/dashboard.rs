@@ -67,6 +67,13 @@ struct HostFreshness {
 #[derive(Serialize)]
 struct DashboardResponse {
     hosts: Vec<HostFreshness>,
+    /// True when at least one host that successfully reported (`state ==
+    /// "ok"` in `hosts[]`) did not include an open-findings count (SSH,
+    /// today — the CLI has no findings surface). When true, `findings_open`
+    /// (below, via the flatten) is a partial sum across only the hosts that
+    /// DID report it, never the fleet total — the UI must not present it as
+    /// complete. See `DashboardSummary::findings_open`'s doc comment.
+    findings_partial: bool,
     #[serde(flatten)]
     summary: crate::host::dashboard_summary::DashboardSummary,
 }
@@ -177,26 +184,58 @@ async fn get_dashboard(
 
     let results = futures_util::future::join_all(futs).await;
 
-    // Merge ONLY hosts that actually reported. A non-reporting host
+    // Split into per-host freshness (always kept) and the summaries that
+    // actually reported (fed to the pure merge below). A non-reporting host
     // contributes nothing rather than zeros — its state is carried in
     // `hosts` instead.
     let mut hosts = Vec::new();
+    let mut reported = Vec::new();
+    for (freshness, summary) in results {
+        hosts.push(freshness);
+        if let Some(sum) = summary {
+            reported.push(sum);
+        }
+    }
+
+    let (summary, findings_partial) = merge_dashboard_summaries(reported, range, Utc::now());
+
+    Ok(Json(DashboardResponse {
+        hosts,
+        findings_partial,
+        summary,
+    }))
+}
+
+/// Merge every host's [`DashboardSummary`] that actually reported into one
+/// fleet-wide aggregate. Pulled out of the handler so the merge — the exact
+/// seam where a per-host `TerminalBucket` or `findings_open` either survives
+/// or silently vanishes — can be exercised directly with hand-built fixtures,
+/// without standing up an `AppState` + host registry.
+///
+/// Returns the merged summary plus `findings_partial`: true when at least one
+/// reporting host contributed `findings_open: None` (it reports successfully
+/// but does not expose findings — SSH, today), meaning the summed
+/// `findings_open` is partial, not the fleet total.
+fn merge_dashboard_summaries(
+    reported: Vec<DashboardSummary>,
+    range: DashboardRange,
+    now: DateTime<Utc>,
+) -> (DashboardSummary, bool) {
     let mut active = ActiveCounts::default();
     let mut active_runs: Vec<ActiveRunBar> = Vec::new();
     let mut cycles: Vec<CycleRollup> = Vec::new();
     let mut recent_manual: Vec<RecentRun> = Vec::new();
-    let mut findings_open: u64 = 0;
+    let mut findings_open: Option<u64> = None;
+    let mut findings_partial = false;
     let mut bucket_merge: BTreeMap<DateTime<Utc>, TerminalBucket> = BTreeMap::new();
     // The oldest `captured_at` among hosts that actually reported — the
     // honest staleness bound for the merged aggregate ("this is at best this
     // fresh"), not the newest, which would understate how stale the slowest
     // host's contribution is. `None` until the first reporting host is seen;
-    // falls back to `Utc::now()` when no host reported at all.
+    // falls back to `now` when no host reported at all.
     let mut oldest_captured_at: Option<DateTime<Utc>> = None;
 
-    for (freshness, summary) in results {
-        hosts.push(freshness);
-        let Some(sum) = summary else { continue };
+    for sum in reported {
         oldest_captured_at = Some(match oldest_captured_at {
             Some(oldest) => oldest.min(sum.captured_at),
             None => sum.captured_at,
@@ -205,7 +244,13 @@ async fn get_dashboard(
         active.awaiting_approval += sum.active.awaiting_approval;
         active.paused += sum.active.paused;
         active.pending += sum.active.pending;
-        findings_open += sum.findings_open;
+        match sum.findings_open {
+            Some(n) => findings_open = Some(findings_open.unwrap_or(0) + n),
+            // This host reported successfully but has no findings surface
+            // (SSH). Never fold it in as a zero — flag the aggregate partial
+            // instead.
+            None => findings_partial = true,
+        }
         active_runs.extend(sum.active_runs);
         cycles.extend(sum.cycles);
         recent_manual.extend(sum.recent_manual);
@@ -234,24 +279,138 @@ async fn get_dashboard(
     // fleet with no local host would otherwise produce a holed grid. The
     // merged output is the only place that sees every host. Reuses
     // `summary_build::fill_bucket_grid` rather than a second "which days
-    // exist" implementation.
-    let terminal_buckets = summary_build::fill_bucket_grid(bucket_merge, range, Utc::now());
+    // exist" implementation — which also normalizes every bucket key through
+    // `day_key` (defence-in-depth), so a non-midnight `ts` from any producer
+    // merges instead of silently vanishing.
+    let terminal_buckets = summary_build::fill_bucket_grid(bucket_merge, range, now);
     active_runs.sort_by_key(|b| std::cmp::Reverse(b.started_at));
     cycles.sort_by_key(|c| std::cmp::Reverse(c.started_at));
     recent_manual.sort_by_key(|r| std::cmp::Reverse(r.started_at));
 
-    let resp = DashboardResponse {
-        hosts,
-        summary: DashboardSummary {
+    (
+        DashboardSummary {
             active,
             terminal_buckets,
             active_runs,
             cycles,
             recent_manual,
             findings_open,
-            captured_at: oldest_captured_at.unwrap_or_else(Utc::now),
+            captured_at: oldest_captured_at.unwrap_or(now),
         },
-    };
+        findings_partial,
+    )
+}
 
-    Ok(Json(resp))
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn bucket(ts: DateTime<Utc>, completed: u64, failed: u64) -> TerminalBucket {
+        TerminalBucket {
+            ts,
+            completed,
+            failed,
+            rejected: 0,
+            cancelled: 0,
+        }
+    }
+
+    fn empty_summary(captured_at: DateTime<Utc>) -> DashboardSummary {
+        DashboardSummary {
+            active: ActiveCounts::default(),
+            terminal_buckets: vec![],
+            active_runs: vec![],
+            cycles: vec![],
+            recent_manual: vec![],
+            findings_open: None,
+            captured_at,
+        }
+    }
+
+    /// A local-shaped (midnight ts) bucket and an SSH-shaped bucket for the SAME
+    /// day must merge into ONE bucket carrying both counts. Before the fix the SSH
+    /// bucket's non-midnight ts never matched a fill cursor and was silently dropped.
+    /// Assert: exactly one bucket for that day, completed == local + ssh.
+    #[test]
+    fn local_and_ssh_shaped_buckets_for_the_same_day_merge_into_one() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap();
+        let day = Utc.with_ymd_and_hms(2026, 7, 15, 0, 0, 0).unwrap();
+        // The local connector always stamps `ts` at midnight-UTC.
+        let local = DashboardSummary {
+            terminal_buckets: vec![bucket(day, 3, 0)],
+            findings_open: Some(0),
+            ..empty_summary(now)
+        };
+        // The SSH-shaped bucket: same calendar day, but a raw (non-midnight)
+        // timestamp — exactly the shape the pre-fix `SshHostConnector` used
+        // to emit, and the shape `fill_bucket_grid`'s defence-in-depth
+        // normalization must still handle from any future non-conforming
+        // producer.
+        let ssh_raw_ts = Utc.with_ymd_and_hms(2026, 7, 15, 13, 47, 22).unwrap();
+        let ssh = DashboardSummary {
+            terminal_buckets: vec![bucket(ssh_raw_ts, 2, 1)],
+            findings_open: None,
+            ..empty_summary(now)
+        };
+
+        let (merged, findings_partial) =
+            merge_dashboard_summaries(vec![local, ssh], DashboardRange::Days7, now);
+
+        let day_buckets: Vec<_> = merged
+            .terminal_buckets
+            .iter()
+            .filter(|b| b.ts == day)
+            .collect();
+        assert_eq!(
+            day_buckets.len(),
+            1,
+            "local and ssh buckets for the same day must merge into exactly one bucket, got {:?}",
+            merged.terminal_buckets
+        );
+        assert_eq!(
+            day_buckets[0].completed, 5,
+            "completed must be local(3) + ssh(2)"
+        );
+        assert_eq!(day_buckets[0].failed, 1, "failed must be local(0) + ssh(1)");
+        assert!(
+            findings_partial,
+            "the ssh host reported None, so the merged findings_open must be flagged partial"
+        );
+    }
+
+    #[test]
+    fn findings_open_sums_only_reporting_hosts_and_flags_partial() {
+        let now = Utc::now();
+        let a = DashboardSummary {
+            findings_open: Some(3),
+            ..empty_summary(now)
+        };
+        let b = DashboardSummary {
+            findings_open: None,
+            ..empty_summary(now)
+        };
+        let (merged, partial) = merge_dashboard_summaries(vec![a, b], DashboardRange::All, now);
+        assert_eq!(
+            merged.findings_open,
+            Some(3),
+            "must sum only the Some contribution, never fabricate 0 for the host that reported None"
+        );
+        assert!(
+            partial,
+            "one host did not report findings; must be flagged partial"
+        );
+    }
+
+    #[test]
+    fn findings_open_is_none_and_not_partial_when_no_host_reports_at_all() {
+        let now = Utc::now();
+        let (merged, partial) = merge_dashboard_summaries(vec![], DashboardRange::All, now);
+        assert_eq!(merged.findings_open, None);
+        assert!(
+            !partial,
+            "partial means 'a reporting host omitted findings' — with zero reporting hosts \
+             there is nothing to be partial about (hosts[] already carries the full outage)"
+        );
+    }
 }

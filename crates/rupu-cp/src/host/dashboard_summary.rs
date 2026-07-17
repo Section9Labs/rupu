@@ -111,9 +111,13 @@ pub struct CycleRollup {
     pub worker_name: Option<String>,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
-    pub ran: u64,
-    pub skipped: u64,
-    pub failed: u64,
+    /// `None` when this host cannot report the ran/skipped/failed breakdown
+    /// for this cycle — e.g. SSH, whose only source is `rupu autoflow
+    /// history`'s per-event stream, which carries no such rollup. `Some(0)`
+    /// is a genuine zero; `None` must never be presented as one.
+    pub ran: Option<u64>,
+    pub skipped: Option<u64>,
+    pub failed: Option<u64>,
     pub runs: Vec<CycleRun>,
 }
 
@@ -136,7 +140,12 @@ pub struct DashboardSummary {
     pub active_runs: Vec<ActiveRunBar>,
     pub cycles: Vec<CycleRollup>,
     pub recent_manual: Vec<RecentRun>,
-    pub findings_open: u64,
+    /// `None` when this host does not report open-findings data at all (e.g.
+    /// SSH — the CLI has no findings surface). `Some(0)` is a genuine zero;
+    /// `None` must never be summed as one at the aggregation layer
+    /// (`api::dashboard` sums only `Some` values and flags the aggregate as
+    /// partial when any reporting host contributed `None`).
+    pub findings_open: Option<u64>,
     /// When this host's data was actually read. Drives the per-host freshness
     /// strip — a host 30s stale must not render as "live". Never synthesized
     /// at the aggregation layer; always set by the connector that read it.
@@ -172,7 +181,7 @@ mod tests {
             active_runs: vec![],
             cycles: vec![],
             recent_manual: vec![],
-            findings_open: 0,
+            findings_open: Some(0),
             captured_at: chrono::Utc::now(),
         };
         let v = serde_json::to_value(&s).unwrap();

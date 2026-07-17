@@ -306,6 +306,25 @@ pub async fn handle(
 /// the web UI reads `usage.input_tokens` unguarded, so the omission crashed
 /// the whole runs list for any remote SSH host. See
 /// `crates/rupu-cp/src/api/runs.rs`'s doc comment on `RunListRow`.
+///
+/// Deliberately does NOT delegate its filter/sort/truncate/build sequence to
+/// `rupu_cp::api::runs::query_run_rows` even though `query_run_rows` is now
+/// `pub` and does the same four steps: the two functions' status filters are
+/// different VOCABULARIES, not just different spellings of the same idea.
+/// `--status` here does an EXACT `RunStatus::as_str()` match (any of the 8
+/// values); `query_run_rows`'s `lifecycle` parameter is a 3-value GROUP
+/// (`active` | `completed` | `failed`, see `rupu_cp::api::runs::in_lifecycle`).
+/// Passing `--status` straight through as `lifecycle` would silently change
+/// behavior rather than just move code: `--status failed` would start
+/// matching `Rejected`/`Cancelled` runs too (folded into the `failed` group),
+/// and `--status running`/`paused`/`pending`/`awaiting_approval` would stop
+/// filtering at all, because `in_lifecycle`'s `_ => true` fallback treats any
+/// unrecognized group name as "no filter". Forcing a shared call here would
+/// require either narrowing `--status` to the 3 group names (a breaking CLI
+/// change) or reimplementing the exact-match filter locally anyway — which is
+/// exactly what this function already does. `RunListRow::with_usage` (the
+/// part that genuinely IS shared) is reused; only the filter predicate is
+/// not.
 async fn list(
     limit: usize,
     status: Option<String>,

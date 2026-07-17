@@ -337,15 +337,6 @@ async fn resume_run(
     Ok(resp)
 }
 
-/// Trigger provenance for the wire.
-///
-/// Thin wrapper over `RunRecord::trigger_str()` — kept so existing call sites
-/// read unchanged. The classification itself lives in `rupu-orchestrator`,
-/// beside the fields it reads.
-pub(crate) fn trigger_of(r: &RunRecord) -> &'static str {
-    r.trigger_str()
-}
-
 // ── Host-aware helpers ────────────────────────────────────────────────────────
 
 /// Upper-bound on rows fetched from each host during a fan-out list.
@@ -457,7 +448,7 @@ impl From<&RunRecord> for RunListRow {
             status: r.status,
             started_at: r.started_at,
             finished_at: r.finished_at,
-            trigger: trigger_of(r),
+            trigger: r.trigger_str(),
             usage: crate::usage::UsageSummary::default(),
             turns: 0,
             duration_ms: None,
@@ -500,7 +491,22 @@ impl RunListRow {
 /// optional `lifecycle` group, and the optional `worker_id` (pass `Some(id)`
 /// to scope results to a specific tunnel node; `None` returns all runs).
 /// Sorts newest-first and paginates.
-pub(crate) fn query_run_rows(
+///
+/// `pub` (not `pub(crate)`) so a consumer outside this crate CAN reuse it —
+/// but note `lifecycle` is a 3-value GROUP vocabulary (`"active"` |
+/// `"completed"` | `"failed"`, see `in_lifecycle` in this module), NOT the
+/// 8-value exact `RunStatus::as_str()` vocabulary (`running` / `pending` /
+/// `awaiting_approval` / `paused` / `completed` / `failed` / `rejected` /
+/// `cancelled`). `rupu-cli`'s `run list --status <exact-status>`
+/// (`crates/rupu-cli/src/cmd/run.rs`) deliberately does NOT delegate to this
+/// function for that reason: passing an exact status through as `lifecycle`
+/// would either silently redefine `"failed"` to include `rejected`/
+/// `cancelled`, or — for every status that isn't one of the three group
+/// names (`running`, `paused`, `pending`, `awaiting_approval`, `rejected`,
+/// `cancelled`) — silently no-op the filter entirely, since
+/// `in_lifecycle`'s `_ => true` fallback matches everything. See that
+/// module's doc comment on `list()` for the full reasoning.
+pub fn query_run_rows(
     store: &rupu_orchestrator::runs::RunStore,
     offset: usize,
     limit: usize,

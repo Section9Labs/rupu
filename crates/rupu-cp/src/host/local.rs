@@ -331,13 +331,10 @@ impl HostConnector for LocalHostConnector {
                 Vec::new()
             }
         };
-        let findings_open = match count_open_findings(&self.global_dir) {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!(host_id = "local", error = %e, "dashboard_summary: count_open_findings failed; reporting zero open findings");
-                0
-            }
-        };
+        // This host DOES report findings — `Some`, never the bare `None` a
+        // host that cannot report findings (e.g. SSH) sets. `count_open_findings`
+        // is infallible (see its doc comment).
+        let findings_open = Some(count_open_findings(&self.global_dir));
         Ok(crate::host::summary_build::build_summary(
             &runs,
             &cycles,
@@ -395,9 +392,9 @@ fn collect_cycle_rollups(
                 worker_name: r.worker_name.clone(),
                 started_at,
                 finished_at,
-                ran: r.ran_cycles as u64,
-                skipped: r.skipped_cycles as u64,
-                failed: r.failed_cycles as u64,
+                ran: Some(r.ran_cycles as u64),
+                skipped: Some(r.skipped_cycles as u64),
+                failed: Some(r.failed_cycles as u64),
                 runs: crate::api::run_streams::harvest_run_ids(r)
                     .into_iter()
                     .map(|run_id| CycleRun {
@@ -425,9 +422,15 @@ fn parse_rfc3339_or_now(s: &str) -> chrono::DateTime<chrono::Utc> {
 /// Total open findings across every registered workspace, via the same
 /// collect-then-summarize path `GET /api/findings` uses (`api::findings`) —
 /// never a second workspace/target walk.
-fn count_open_findings(global_dir: &std::path::Path) -> Result<u64, HostConnectorError> {
+///
+/// Infallible: `collect_all_findings` degrades per-workspace failures to a
+/// `tracing::warn!` + skip internally (see its doc comment) and always
+/// returns a bare `Vec`, so there is no error path for this to propagate.
+/// This host DOES report findings (unlike SSH), so the caller wraps the
+/// result in `Some`.
+fn count_open_findings(global_dir: &std::path::Path) -> u64 {
     let findings = crate::api::findings::collect_all_findings(global_dir);
-    Ok(crate::api::findings::build_response(findings).summary.total as u64)
+    crate::api::findings::build_response(findings).summary.total as u64
 }
 
 #[cfg(test)]

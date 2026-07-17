@@ -1283,7 +1283,14 @@ impl HostConnector for SshHostConnector {
                     self.host_id
                 ))
             })?;
-        let cycle_rows = self.list_autoflow_runs().await.unwrap_or_default();
+        let cycle_rows = self.list_autoflow_runs().await.unwrap_or_else(|e| {
+            // Degrade to empty, but never silently: an IO/remote failure must
+            // not be indistinguishable from "this host has no cycles" (spec
+            // §4.1). Matches `LocalHostConnector::dashboard_summary`'s
+            // `collect_cycle_rollups` failure handling.
+            tracing::warn!(host_id = %self.host_id, error = %e, "dashboard_summary: list_autoflow_runs failed; reporting no cycles");
+            Vec::new()
+        });
         // NOTE: `run_rows` are `RunListRow`-shaped (id / workflow_name / status /
         // started_at / finished_at / trigger / usage / turns / duration_ms).
         // `rupu run list` emits that type verbatim so remote == local by
@@ -1312,12 +1319,18 @@ impl HostConnector for SshHostConnector {
                         .and_then(|v| v.as_str())
                         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                         .map(|t| t.with_timezone(&chrono::Utc)),
-                    ran: c.get("ran_cycles").and_then(|v| v.as_u64()).unwrap_or(0),
-                    skipped: c
-                        .get("skipped_cycles")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    failed: c.get("failed_cycles").and_then(|v| v.as_u64()).unwrap_or(0),
+                    // Always `None`, never read from `ran_cycles`/`skipped_cycles`/
+                    // `failed_cycles` in `c`: those keys come from
+                    // `history_rows_to_autoflow_cycles`, which hardcodes them to
+                    // the JSON literal `0` because `rupu autoflow history`'s
+                    // per-event stream carries no ran/skipped/failed rollup
+                    // (confirmed by inspecting `--format json` output — event
+                    // rows have no such fields at all). Reading them here would
+                    // parse a fabricated zero, not a reported one; this host
+                    // genuinely does not know the breakdown, so it must say so.
+                    ran: None,
+                    skipped: None,
+                    failed: None,
                     // Status is filled in below, once the run rows are indexed.
                     runs: c
                         .get("run_ids")
@@ -1372,7 +1385,8 @@ impl HostConnector for SshHostConnector {
         let mut active = ActiveCounts::default();
         let mut active_runs = Vec::new();
         let mut recent_manual = Vec::new();
-        let mut buckets: std::collections::BTreeMap<String, TerminalBucket> = Default::default();
+        let mut buckets: std::collections::BTreeMap<chrono::DateTime<chrono::Utc>, TerminalBucket> =
+            Default::default();
 
         for row in &run_rows {
             let (Some(id), Some(status), Some(started)) = (
@@ -1419,9 +1433,16 @@ impl HostConnector for SshHostConnector {
                     cycle_id: cycle_of.get(id).cloned(),
                 });
             } else {
-                let key = started_at.format("%Y-%m-%d").to_string();
+                // Truncate to midnight-UTC through the SAME `day_key` the
+                // local connector and `fill_bucket_grid` use. Keying on a
+                // `String` day but stamping `ts` with the raw `started_at`
+                // (the pre-fix behavior) meant `ts` never equalled a
+                // midnight fill-grid cursor, so this host's buckets were
+                // silently dropped after merging with any other host's —
+                // see the regression test in `api::dashboard`.
+                let key = crate::host::summary_build::day_key(started_at);
                 let b = buckets.entry(key).or_insert(TerminalBucket {
-                    ts: started_at,
+                    ts: key,
                     completed: 0,
                     failed: 0,
                     rejected: 0,
@@ -1467,9 +1488,13 @@ impl HostConnector for SshHostConnector {
             active_runs,
             cycles,
             recent_manual,
-            // Findings are not exposed by the CLI; 0 here means "not reported by
-            // this host", and the aggregate sums only hosts that report.
-            findings_open: 0,
+            // Findings are not exposed by the CLI. `None`, NOT `Some(0)` —
+            // this host does not report findings at all, and `Some(0)` would
+            // be indistinguishable from a genuine zero-findings host once
+            // summed at the aggregation layer. `api::dashboard` sums only
+            // `Some` values and flags the aggregate `findings_partial` when
+            // any reporting host contributed `None`.
+            findings_open: None,
             captured_at: now,
         })
     }
@@ -2280,6 +2305,83 @@ mod tests {
             s.captured_at >= before,
             "captured_at must be stamped when the host was actually read"
         );
+        assert_eq!(
+            s.findings_open, None,
+            "SSH has no findings surface — this must be None, never a fabricated Some(0)"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_dashboard_summary_truncates_terminal_bucket_ts_to_midnight() {
+        // Regression test for the SSH-bucket-drop bug (C1): the connector used
+        // to key its bucket map by day-string but stamp `ts` with the RAW
+        // `started_at` of the first terminal run seen that day. `ts` then
+        // never equalled a midnight fill-grid cursor
+        // (`summary_build::fill_bucket_grid`), so this host's terminal counts
+        // were silently dropped after merging with any other host's
+        // (`api::dashboard::merge_dashboard_summaries`).
+        struct StubExec {
+            runs_json: String,
+        }
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                let stdout = if remote.contains("autoflow") {
+                    r#"{"kind":"autoflow_history","version":1,"rows":[]}"#.to_string()
+                } else {
+                    self.runs_json.clone()
+                };
+                Ok(RemoteOutput {
+                    stdout,
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!()
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!()
+            }
+        }
+
+        // A completed run at a raw, decidedly non-midnight timestamp.
+        let runs_json = r#"{"kind":"run_list","version":1,"rows":[
+            {"id":"r1","workflow_name":"w","status":"completed",
+             "started_at":"2026-07-15T13:47:22Z","finished_at":"2026-07-15T13:50:00Z","trigger":"manual",
+             "usage":{"input_tokens":0,"output_tokens":0,"cached_tokens":0,
+                      "total_tokens":0,"cost_usd":null,"priced":false,"runs":1},
+             "turns":0,"duration_ms":null}
+        ],"summary":{"count":1,"limit":10000,"status_filter":null}}"#;
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(StubExec {
+            runs_json: runs_json.into(),
+        }));
+
+        let s = conn
+            .dashboard_summary(crate::host::dashboard_summary::DashboardRange::Days30)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            s.terminal_buckets.len(),
+            1,
+            "expected exactly one terminal bucket, got {:?}",
+            s.terminal_buckets
+        );
+        let expected_midnight = "2026-07-15T00:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        assert_eq!(
+            s.terminal_buckets[0].ts, expected_midnight,
+            "bucket ts must be midnight-truncated, not the raw started_at \
+             (2026-07-15T13:47:22Z) — a non-midnight ts never matches a \
+             fill-grid cursor and is silently dropped"
+        );
+        assert_eq!(s.terminal_buckets[0].completed, 1);
     }
 
     #[test]
