@@ -1352,9 +1352,13 @@ impl HostConnector for SshHostConnector {
             chrono::DateTime<chrono::Utc>,
             ThroughputBucket,
         > = Default::default();
-        // The non-terminal run with the OLDEST started_at, tracked as
-        // (run_id, workflow_name, started_at) so `age_ms` can be computed
-        // once at the end against a single `now`.
+        // The RUNNING run with the OLDEST started_at, tracked as (run_id,
+        // workflow_name, started_at) so `age_ms` can be computed once at the
+        // end against a single `now`. Deliberately narrower than "every
+        // non-terminal row" — see the matching comment in
+        // `summary_build::build_summary`: this field pairs with
+        // `active.running` on the "Active now" tile, so an older
+        // awaiting/paused/pending row must never win it over a running one.
         let mut longest: Option<(String, String, chrono::DateTime<chrono::Utc>)> = None;
 
         for row in &run_rows {
@@ -1392,7 +1396,7 @@ impl HostConnector for SshHostConnector {
             }
 
             let terminal = matches!(status, "completed" | "failed" | "rejected" | "cancelled");
-            if !terminal {
+            if status == "running" {
                 longest = Some(match longest {
                     // The current candidate started at or before this row —
                     // it is the same age or older, so it stays the
@@ -1402,7 +1406,8 @@ impl HostConnector for SshHostConnector {
                     }
                     _ => (id.to_string(), workflow_name.clone(), started_at),
                 });
-            } else {
+            }
+            if terminal {
                 // Truncate to midnight-UTC through the SAME `day_key` the
                 // local connector and `fill_bucket_grid` use. Keying on a
                 // `String` day but stamping `ts` with the raw `started_at`
@@ -2291,14 +2296,18 @@ mod tests {
 
         // `run_id` here would silently zero out every row: `rupu run list`
         // emits `RunListRow` verbatim, whose id field is `id`, not `run_id`.
+        // r2 (awaiting_approval) is deliberately the OLDER of the two rows —
+        // this is the real-data regression: an older awaiting-approval run
+        // must never win `active_longest` over a younger running run, since
+        // this field pairs with `active.running` on the "Active now" tile.
         let runs_json = r#"{"kind":"run_list","version":1,"rows":[
             {"id":"r1","workflow_name":"w","status":"running",
-             "started_at":"2026-07-16T14:02:11Z","finished_at":null,"trigger":"manual",
+             "started_at":"2026-07-16T14:03:11Z","finished_at":null,"trigger":"manual",
              "usage":{"input_tokens":0,"output_tokens":0,"cached_tokens":0,
                       "total_tokens":0,"cost_usd":null,"priced":false,"runs":1},
              "turns":0,"duration_ms":null},
             {"id":"r2","workflow_name":"w","status":"awaiting_approval",
-             "started_at":"2026-07-16T14:03:11Z","finished_at":null,"trigger":"cron",
+             "started_at":"2026-07-16T14:02:11Z","finished_at":null,"trigger":"cron",
              "usage":{"input_tokens":0,"output_tokens":0,"cached_tokens":0,
                       "total_tokens":0,"cost_usd":null,"priced":false,"runs":1},
              "turns":0,"duration_ms":null}
@@ -2322,10 +2331,11 @@ mod tests {
         assert_eq!(s.active.awaiting_approval, 1);
         let al = s
             .active_longest
-            .expect("two non-terminal runs in hand — expected an active_longest");
+            .expect("one running run in hand — expected an active_longest");
         assert_eq!(
             al.run_id, "r1",
-            "r1 started earlier (14:02:11 vs r2's 14:03:11) so it is the longest-running"
+            "r1 is the only RUNNING row; r2 (awaiting_approval) is older but must \
+             never win active_longest — that field pairs with active.running"
         );
         let total_manual: u64 = s.throughput_buckets.iter().map(|b| b.manual).sum();
         let total_cron: u64 = s.throughput_buckets.iter().map(|b| b.cron).sum();

@@ -60,8 +60,12 @@ pub fn build_summary(
     let mut active = ActiveCounts::default();
     let mut terminal_buckets: BTreeMap<DateTime<Utc>, TerminalBucket> = BTreeMap::new();
     let mut throughput_buckets: BTreeMap<DateTime<Utc>, ThroughputBucket> = BTreeMap::new();
-    // The non-terminal run with the OLDEST started_at — the longest currently
-    // running, fleet-wide "what's stuck" key point (spec §5.2).
+    // The RUNNING run with the OLDEST started_at — pairs with `active.running`
+    // on the "Active now" tile (spec §5.2). Deliberately narrower than "every
+    // non-terminal run": an awaiting-approval/paused/pending run can be far
+    // older than any running run, and surfacing it here would read
+    // "0 running · longest 71d" — incoherent, and already covered by the
+    // "Awaiting you" tile (`active.awaiting_approval` etc).
     let mut longest: Option<&RunRecord> = None;
 
     for r in runs {
@@ -76,10 +80,10 @@ pub fn build_summary(
             _ => {}
         }
 
-        // Non-terminal runs are candidates for `active_longest`. Paused is
-        // deliberately included: is_terminal() excludes it because a paused
-        // run expects a resume, so it is still live work.
-        if !r.status.is_terminal() {
+        // Only RUNNING runs are candidates for `active_longest` — see the
+        // comment on `longest` above. Awaiting/paused/pending are excluded
+        // even though they are non-terminal.
+        if r.status == RunStatus::Running {
             longest = Some(match longest {
                 // `cur` started at or before `r` — it is the same age or
                 // older, so it stays the longest-running candidate.
@@ -492,6 +496,41 @@ mod tests {
             chrono::Utc::now(),
         );
         assert!(s.active_longest.is_none());
+    }
+
+    #[test]
+    fn active_longest_ignores_an_older_awaiting_approval_run() {
+        // Regression for the real-data bug: a 71-day-old awaiting_approval
+        // run must never win `active_longest` over a running run, no matter
+        // how much older it is — this field pairs with `active.running` on
+        // the "Active now" tile, and a stuck-awaiting run is a DIFFERENT key
+        // point already surfaced by "Awaiting you".
+        use rupu_orchestrator::runs::RunStatus::*;
+        let runs = vec![
+            rec("running_newer", Running, 5),
+            rec("awaiting_much_older", AwaitingApproval, 60 * 24 * 71),
+        ];
+        let s = build_summary(&runs, &[], Some(0), DashboardRange::All, chrono::Utc::now());
+        let al = s
+            .active_longest
+            .expect("one running run in hand — expected an active_longest");
+        assert_eq!(al.run_id, "running_newer");
+    }
+
+    #[test]
+    fn active_longest_is_none_when_only_awaiting_paused_or_pending_are_present() {
+        use rupu_orchestrator::runs::RunStatus::*;
+        let runs = vec![
+            rec("awaiting", AwaitingApproval, 10),
+            rec("paused", Paused, 20),
+            rec("pending", Pending, 30),
+        ];
+        let s = build_summary(&runs, &[], Some(0), DashboardRange::All, chrono::Utc::now());
+        assert!(
+            s.active_longest.is_none(),
+            "no run is Running, so active_longest must be None even though \
+             awaiting/paused/pending runs exist"
+        );
     }
 
     #[test]
