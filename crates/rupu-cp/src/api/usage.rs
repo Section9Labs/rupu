@@ -81,10 +81,19 @@ async fn get_usage(
         .filter(|r| r.started_at >= start && r.started_at <= end)
     {
         let paths = crate::usage::run_transcript_paths(&s.run_store, &r.id);
-        all_rows.extend(rupu_transcript::aggregate(
-            &paths,
-            rupu_transcript::TimeWindow::default(),
-        ));
+        let mut rows = rupu_transcript::aggregate(&paths, rupu_transcript::TimeWindow::default());
+        // Attribute each row to the run it came from: `r` is already in hand
+        // for this batch, so this is a free inline join — no re-load, no
+        // cache, no separate `attribute_rows` function needed. `host_id` is
+        // hardcoded "local" because this handler only ever reads the local
+        // run store; the remote fan-out (multi-host attribution) is a
+        // separate, later concern.
+        for row in &mut rows {
+            row.workflow = r.workflow_name.clone();
+            row.workspace_id = r.workspace_id.clone();
+            row.host_id = "local".to_string();
+        }
+        all_rows.extend(rows);
     }
 
     let summary = crate::usage::summarize(&all_rows, &s.pricing);
@@ -559,6 +568,211 @@ mod tests {
         // Last week (2026-06-22) has the run from 2026-06-24 → non-empty.
         assert!(!buckets[2].rows.is_empty());
         assert_eq!(buckets[2].rows[0].input_tokens, 3000);
+    }
+
+    /// Write a two-line transcript: `RunStart` (anchors provider/model/agent)
+    /// followed by one `Usage` event carrying `input_tokens`.
+    fn write_run_transcript(path: &std::path::Path, agent: &str, input_tokens: u32) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let start = rupu_transcript::Event::RunStart {
+            run_id: "r".into(),
+            workspace_id: "ws".into(),
+            agent: agent.into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            started_at: Utc::now(),
+            mode: rupu_transcript::RunMode::Ask,
+        };
+        let usage = rupu_transcript::Event::Usage {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            served_model: None,
+            input_tokens,
+            output_tokens: 0,
+            cached_tokens: 0,
+        };
+        let mut buf = Vec::new();
+        for ev in [&start, &usage] {
+            let mut line = serde_json::to_vec(ev).unwrap();
+            line.push(b'\n');
+            buf.extend(line);
+        }
+        std::fs::write(path, &buf).unwrap();
+    }
+
+    /// Register a run of `workflow_name` bound to `workspace_id`, with one
+    /// completed step whose transcript reports `input_tokens` of usage.
+    fn seed_workflow_run(
+        s: &AppState,
+        run_id: &str,
+        workflow_name: &str,
+        workspace_id: &str,
+        transcript_path: &std::path::Path,
+        input_tokens: u32,
+    ) {
+        let record = rupu_orchestrator::RunRecord {
+            id: run_id.into(),
+            workflow_name: workflow_name.into(),
+            status: rupu_orchestrator::RunStatus::Completed,
+            inputs: std::collections::BTreeMap::new(),
+            event: None,
+            workspace_id: workspace_id.into(),
+            workspace_path: std::path::PathBuf::from("/tmp/proj"),
+            transcript_dir: std::path::PathBuf::from("/tmp/proj/.rupu/transcripts"),
+            started_at: Utc::now(),
+            finished_at: None,
+            error_message: None,
+            awaiting_step_id: None,
+            approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            final_output: None,
+        };
+        s.run_store.create(record, "name: wf\n").unwrap();
+        write_run_transcript(transcript_path, "reviewer", input_tokens);
+        s.run_store
+            .append_step_result(
+                run_id,
+                &rupu_orchestrator::runs::StepResultRecord {
+                    step_id: "s1".into(),
+                    run_id: run_id.into(),
+                    transcript_path: transcript_path.to_path_buf(),
+                    output: String::new(),
+                    success: true,
+                    skipped: false,
+                    rendered_prompt: String::new(),
+                    kind: rupu_orchestrator::runs::StepKind::Linear,
+                    items: vec![],
+                    findings: vec![],
+                    iterations: 0,
+                    resolved: true,
+                    finished_at: Utc::now(),
+                },
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_usage_attributes_rows_to_workflow_inline_from_the_run_in_hand() {
+        // Two runs under two different workflows. Before attribution both
+        // rows' `workflow` field is blank and would collapse into a single
+        // bucket under GroupBy::Workflow — this is the failing case the
+        // inline join in `get_usage` must fix.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+
+        seed_workflow_run(
+            &s,
+            "run_1",
+            "nightly-review",
+            "ws_a",
+            &tmp.path().join("t1.jsonl"),
+            1000,
+        );
+        seed_workflow_run(
+            &s,
+            "run_2",
+            "hotfix",
+            "ws_b",
+            &tmp.path().join("t2.jsonl"),
+            500,
+        );
+
+        let Json(resp) = get_usage(
+            State(s),
+            Query(UsageQuery {
+                since: None,
+                until: None,
+                group_by: Some("workflow".into()),
+            }),
+        )
+        .await
+        .expect("handler should not error");
+
+        assert_eq!(
+            resp.breakdown.len(),
+            2,
+            "two distinct workflows must not collapse into one bucket: {:?}",
+            resp.breakdown
+        );
+        let nightly = resp
+            .breakdown
+            .iter()
+            .find(|r| r.workflow == "nightly-review")
+            .expect("nightly-review row present");
+        assert_eq!(nightly.input_tokens, 1000);
+        let hotfix = resp
+            .breakdown
+            .iter()
+            .find(|r| r.workflow == "hotfix")
+            .expect("hotfix row present");
+        assert_eq!(hotfix.input_tokens, 500);
+    }
+
+    #[tokio::test]
+    async fn get_usage_group_by_project_attributes_from_workspace_id_not_a_fallback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+
+        seed_workflow_run(
+            &s,
+            "run_1",
+            "nightly-review",
+            "ws_a",
+            &tmp.path().join("t1.jsonl"),
+            1000,
+        );
+        seed_workflow_run(
+            &s,
+            "run_2",
+            "hotfix",
+            "ws_b",
+            &tmp.path().join("t2.jsonl"),
+            500,
+        );
+
+        let Json(resp) = get_usage(
+            State(s),
+            Query(UsageQuery {
+                since: None,
+                until: None,
+                group_by: Some("project".into()),
+            }),
+        )
+        .await
+        .expect("handler should not error");
+
+        assert_eq!(resp.breakdown.len(), 2);
+        assert!(resp
+            .breakdown
+            .iter()
+            .any(|r| r.workspace_id == "ws_a" && r.input_tokens == 1000));
+        assert!(resp
+            .breakdown
+            .iter()
+            .any(|r| r.workspace_id == "ws_b" && r.input_tokens == 500));
     }
 
     #[tokio::test]
