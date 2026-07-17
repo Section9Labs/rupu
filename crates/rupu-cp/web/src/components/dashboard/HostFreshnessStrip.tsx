@@ -13,6 +13,20 @@ import type { HostFreshness } from '../../lib/api';
 /** Under this, a host reads as "live" rather than showing an age. */
 const LIVE_THRESHOLD_MS = 5_000;
 
+/**
+ * The wire `HostFreshness.state` (`ok` | `offline` | `unavailable`) is only
+ * three-valued because the SERVER never reports a host until it has already
+ * resolved. `useDashboardData`'s per-host state is FOUR-valued: it seeds every
+ * registered host as `loading` the instant the host list is known (so the
+ * strip can render immediately), before that host's own `getDashboard` call
+ * resolves to `ok`/`unavailable`. This type widens `state` to accept that
+ * fourth value so the strip can render it distinctly — never folded into
+ * `unavailable` (reads as dead) or `ok` (lies about freshness).
+ */
+export interface HostFreshnessEntry extends Omit<HostFreshness, 'state'> {
+  state: HostFreshness['state'] | 'loading';
+}
+
 function age(capturedAt: string, now: number): string {
   const ms = now - Date.parse(capturedAt);
   if (ms < LIVE_THRESHOLD_MS) return 'live';
@@ -21,7 +35,7 @@ function age(capturedAt: string, now: number): string {
   return `${Math.round(ms / 3_600_000)}h`;
 }
 
-export function HostFreshnessStrip({ hosts }: { hosts: HostFreshness[] }) {
+export function HostFreshnessStrip({ hosts }: { hosts: HostFreshnessEntry[] }) {
   // Ticks so ages advance between refetches.
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -33,14 +47,23 @@ export function HostFreshnessStrip({ hosts }: { hosts: HostFreshness[] }) {
     <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
       {hosts.map((h) => {
         const label =
-          h.state === 'ok' && h.captured_at ? age(h.captured_at, now) : h.state;
+          h.state === 'loading'
+            ? 'loading…'
+            : h.state === 'ok' && h.captured_at
+              ? age(h.captured_at, now)
+              : h.state;
         const isLive = label === 'live';
         const tone =
-          h.state === 'ok'
-            ? isLive
-              ? 'bg-[rgb(var(--c-status-running))]'
-              : 'bg-[rgb(var(--c-status-pending))]'
-            : 'bg-[rgb(var(--c-status-failed))]';
+          h.state === 'loading'
+            ? // Pulsing dot: this host has never actually reported, so it must
+              // not read as the same "known-stale" gray a resolved-but-not-live
+              // host gets below.
+              'bg-[rgb(var(--c-status-pending))] animate-pulse'
+            : h.state === 'ok'
+              ? isLive
+                ? 'bg-[rgb(var(--c-status-running))]'
+                : 'bg-[rgb(var(--c-status-pending))]'
+              : 'bg-[rgb(var(--c-status-failed))]';
         return (
           <span
             key={h.host_id}

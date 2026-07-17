@@ -52,4 +52,53 @@ describe('HostFreshnessStrip', () => {
     expect(screen.queryByText(/live/i)).not.toBeInTheDocument();
     expect(screen.getByText(/30s/)).toBeInTheDocument();
   });
+
+  // useDashboardData's per-host state is FOUR-valued (loading/ok/unavailable)
+  // because it seeds every registered host as 'loading' the instant the host
+  // list is known, before that host's own `getDashboard` call resolves. The
+  // wire `HostFreshness.state` is only three-valued (ok/offline/unavailable)
+  // because the SERVER never reports a host until it has already resolved.
+  // This strip must render that fourth state distinctly, not fold it into
+  // 'unavailable' (which would read as a dead host) or 'ok' (which would lie
+  // about freshness).
+  it('renders a loading host distinctly from ok, offline, and unavailable', () => {
+    render(
+      <HostFreshnessStrip
+        hosts={[
+          {
+            host_id: 'builder-01',
+            name: 'builder-01',
+            transport_kind: 'ssh',
+            state: 'loading',
+            captured_at: null,
+            reason: null,
+          },
+        ]}
+      />,
+    );
+    expect(screen.getByText(/loading/i)).toBeInTheDocument();
+    expect(screen.queryByText(/live/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/unavailable/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/offline/i)).not.toBeInTheDocument();
+  });
+
+  it('a loading host does not fabricate a captured_at age', () => {
+    render(
+      <HostFreshnessStrip
+        hosts={[
+          {
+            host_id: 'builder-01',
+            name: 'builder-01',
+            transport_kind: 'ssh',
+            state: 'loading',
+            captured_at: null,
+            reason: null,
+          },
+        ]}
+      />,
+    );
+    // No age string (e.g. "30s", "5m") should appear for a host that has
+    // never actually reported.
+    expect(screen.queryByText(/^\d+[sm]$/)).not.toBeInTheDocument();
+  });
 });
