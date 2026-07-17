@@ -1042,6 +1042,36 @@ impl HostConnector for SshHostConnector {
     /// after the `list_runs` fix (above) the list would show runs whose
     /// detail 404'd against the (still-empty, for a directly-started run)
     /// mirror. The list and the detail must agree.
+    ///
+    /// Error mapping is a two-way rule, and BOTH directions matter: *a thing
+    /// that cannot report is not a thing that is absent.*
+    ///
+    /// - A remote that cannot even parse `run show` (old rupu, no such
+    ///   subcommand) must never be reported as `NotFound` — that would
+    ///   silently hide a run that genuinely exists on that host behind a
+    ///   "no such run" message. This is the same failure mode `list_runs`
+    ///   guards against. Old-host stderr looks like our own format-gate
+    ///   rejecting the flag before the subcommand even runs, e.g.:
+    ///     `run does not support `--format json` (supported: `table`)`
+    ///   (from `output::formats::ensure_supported`, not clap — a message we
+    ///   control) — or, on hosts old enough to lack `run show` entirely, a
+    ///   "launch an agent named show" parse failure. Either way: `Unsupported`.
+    /// - Conversely, a remote that DID run `run show` and explicitly told us
+    ///   the run doesn't exist must not be flattened into "this host cannot
+    ///   report runs" — that hides a real 404 behind a capability complaint.
+    ///   Current-rupu not-found stderr looks like:
+    ///     `[error] run run_DOESNOTEXIST: run `run_DOESNOTEXIST` not found`
+    ///   Map that to `NotFound`.
+    ///
+    /// The two are told apart by sniffing the failure's message for
+    /// `"not found"` (case-insensitive) *and* the run id itself — both must
+    /// appear, so a message about some unrelated thing being not found (e.g.
+    /// an old host's classifier failing with "agent 'show' not found",
+    /// because it read `show` as an agent name) is not mistaken for "this
+    /// run does not exist" just because it happens to contain the words
+    /// "not found". Absence of that marker defaults to `Unsupported` — the
+    /// safe default, since a false `NotFound` (hiding a real run) is worse
+    /// than an occasional over-cautious `Unsupported`.
     async fn get_run(&self, run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
         // NOTE the flag order: `--format json` must precede `run`, because
         // `Cmd::Run` is trailing_var_arg and swallows everything after it —
@@ -1052,12 +1082,22 @@ impl HostConnector for SshHostConnector {
         {
             Ok(v) => Ok(v),
             Err(e) => {
-                // An old remote rupu has no `run show`; it parses as "launch
-                // an agent named show" and errors — the same failure mode
-                // `list_runs` guards against. Map to Unsupported, never
-                // NotFound: a NotFound here would be indistinguishable from
-                // "this run does not exist" when the actual cause may be a
-                // stale host that simply cannot report.
+                let message = e.to_string();
+                let message_lower = message.to_lowercase();
+                if message_lower.contains("not found") && message.contains(run_id) {
+                    // The remote ran `run show` and explicitly said the run
+                    // is absent — believe it.
+                    tracing::warn!(
+                        host_id = %self.host_id,
+                        run_id = %run_id,
+                        error = %e,
+                        "get_run: remote reported run not found"
+                    );
+                    return Err(HostConnectorError::NotFound(run_id.to_string()));
+                }
+                // Anything else (old host that can't parse `run show`,
+                // unreachable, malformed body): the host cannot report, not
+                // "the run is absent". Map to Unsupported, never NotFound.
                 tracing::warn!(
                     host_id = %self.host_id,
                     run_id = %run_id,
@@ -1762,6 +1802,77 @@ mod tests {
             matches!(err, HostConnectorError::Unsupported(_)),
             "an old-host failure must map to Unsupported, never NotFound — NotFound \
              would be indistinguishable from \"this run does not exist\": {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_run_maps_a_remote_not_found_to_not_found() {
+        // The remote explicitly said the run is absent — believe it. Reporting
+        // Unsupported here would claim the HOST is broken when it answered
+        // correctly.
+        struct StubExec;
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, _remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                Ok(RemoteOutput {
+                    stdout: String::new(),
+                    stderr: "[error] run run_x: run `run_x` not found".into(),
+                    success: false,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!("not used by get_run")
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!("not used by get_run")
+            }
+        }
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(StubExec));
+
+        let err = conn.get_run("run_x").await.unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::NotFound(_)),
+            "the remote explicitly reported the run as not found — this must \
+             surface as NotFound, not Unsupported: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_run_maps_an_old_host_to_unsupported_not_not_found() {
+        // An old rupu lacking `run show` must NOT look like "the run does not
+        // exist" — that would silently hide a run that is really there.
+        struct StubExec;
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, _remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                Ok(RemoteOutput {
+                    stdout: String::new(),
+                    stderr: "run does not support `--format json` (supported: `table`)".into(),
+                    success: false,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!("not used by get_run")
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!("not used by get_run")
+            }
+        }
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(StubExec));
+
+        let err = conn.get_run("run_x").await.unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Unsupported(_)),
+            "an old host's format-gate rejection must map to Unsupported, not \
+             NotFound — NotFound here would hide a run that really exists: {err:?}"
         );
     }
 
