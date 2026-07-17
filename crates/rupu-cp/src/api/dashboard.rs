@@ -1,16 +1,34 @@
+//! `GET /api/dashboard` — the ops-first dashboard, fanned out across every
+//! registered host.
+//!
+//! Was the one list-ish view in CP that never learned about hosts: it used to
+//! read `s.run_store` directly, so every number silently meant "local only"
+//! while the app has five transports (local / http / ssh / tunnel / bucket).
+//!
+//! The rule this whole endpoint turns on: **a host that cannot report is NOT a
+//! host with no runs.** A non-reporting host (offline, or `Unsupported` —
+//! the trait default for Tunnel/Bucket/too-old-SSH) contributes NOTHING to
+//! the aggregate; its state is carried in `hosts[]` as `offline` /
+//! `unavailable` with a human-readable reason. Collapsing a non-reporting
+//! host into zeroed counts would make an outage invisible.
+
 use crate::{
-    api::sessions::collect_sessions,
+    api::hosts::transport_fields,
     error::{ApiError, ApiResult},
+    host::{
+        connector::HostConnectorError,
+        dashboard_summary::{
+            ActiveCounts, ActiveRunBar, CycleRollup, DashboardRange, RecentRun, TerminalBucket,
+        },
+        summary_build,
+    },
     state::AppState,
 };
 use axum::{extract::State, routing::get, Json, Router};
 use chrono::{DateTime, Utc};
-use rupu_coverage::discover_targets;
-use rupu_orchestrator::runs::RunStatus;
-use rupu_workspace::worker_store::WorkerStore;
-use rupu_workspace::WorkspaceStore;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub fn routes() -> Router<AppState> {
     Router::new().route("/api/dashboard", get(get_dashboard))
@@ -20,160 +38,198 @@ pub fn routes() -> Router<AppState> {
 // DTOs
 // ---------------------------------------------------------------------------
 
+/// One host's reporting state, for the freshness strip.
+///
+/// `state` is deliberately three-valued. A host that cannot report is NOT a
+/// host with no runs, so `unavailable` and `offline` must never collapse into
+/// zeroed counts.
 #[derive(Serialize)]
-struct RunsSummary {
-    total: usize,
-    by_status: HashMap<&'static str, usize>,
-}
-
-#[derive(Serialize)]
-struct RecentRun {
-    id: String,
-    workflow_name: String,
-    status: &'static str,
-    started_at: DateTime<Utc>,
-    finished_at: Option<DateTime<Utc>>,
-    usage: crate::usage::UsageSummary,
-}
-
-#[derive(Serialize)]
-struct SessionsSummary {
-    total: usize,
-    active: usize,
-    archived: usize,
-}
-
-#[derive(Serialize)]
-struct WorkersSummary {
-    total: usize,
-}
-
-#[derive(Serialize)]
-struct CoverageSummary {
-    targets: usize,
-    assertions: usize,
+struct HostFreshness {
+    host_id: String,
+    name: String,
+    transport_kind: String,
+    /// `"ok"` | `"offline"` | `"unavailable"`.
+    state: &'static str,
+    /// Present only when `state == "ok"`.
+    captured_at: Option<DateTime<Utc>>,
+    /// Human-readable cause when `state != "ok"`, e.g. "needs rupu >= 0.49".
+    reason: Option<String>,
 }
 
 #[derive(Serialize)]
 struct DashboardResponse {
-    runs: RunsSummary,
-    recent_runs: Vec<RecentRun>,
-    sessions: SessionsSummary,
-    workers: WorkersSummary,
-    coverage: CoverageSummary,
+    hosts: Vec<HostFreshness>,
+    active: ActiveCounts,
+    terminal_buckets: Vec<TerminalBucket>,
+    active_runs: Vec<ActiveRunBar>,
+    cycles: Vec<CycleRollup>,
+    recent_manual: Vec<RecentRun>,
+    findings_open: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct DashboardQuery {
+    range: Option<String>,
+    host: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
 
-async fn get_dashboard(State(s): State<AppState>) -> ApiResult<Json<DashboardResponse>> {
-    // --- runs ----------------------------------------------------------------
-    let all_runs = s
-        .run_store
-        .list()
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-
-    // All eight RunStatus variants must always be present (even when 0).
-    let statuses: &[RunStatus] = &[
-        RunStatus::Pending,
-        RunStatus::Running,
-        RunStatus::Completed,
-        RunStatus::Failed,
-        RunStatus::AwaitingApproval,
-        RunStatus::Rejected,
-        RunStatus::Cancelled,
-        RunStatus::Paused,
-    ];
-    let mut by_status: HashMap<&'static str, usize> = statuses
-        .iter()
-        .map(|s| (s.as_str(), 0_usize))
-        .collect();
-    for run in &all_runs {
-        *by_status.entry(run.status.as_str()).or_insert(0) += 1;
-    }
-
-    let runs_summary = RunsSummary {
-        total: all_runs.len(),
-        by_status,
+async fn get_dashboard(
+    State(s): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<DashboardQuery>,
+) -> ApiResult<Json<DashboardResponse>> {
+    let range = match q.range.as_deref() {
+        None => DashboardRange::default(),
+        Some(r) => DashboardRange::parse(r).ok_or_else(|| {
+            ApiError::bad_request(format!("unknown range {r:?}; expected 7d | 30d | all"))
+        })?,
     };
 
-    // --- recent_runs (top 10 sorted descending by started_at) ---------------
-    // Defensive sort so this is correct regardless of RunStore::list() ordering.
-    let mut runs_sorted = all_runs.iter().collect::<Vec<_>>();
-    runs_sorted.sort_by_key(|r| std::cmp::Reverse(r.started_at));
-    let recent_runs: Vec<RecentRun> = runs_sorted
-        .into_iter()
-        .take(10)
-        .map(|r| RecentRun {
-            id: r.id.clone(),
-            workflow_name: r.workflow_name.clone(),
-            status: r.status.as_str(),
-            started_at: r.started_at,
-            finished_at: r.finished_at,
-            usage: crate::usage::summarize_run(&s.run_store, &r.id, &s.pricing),
-        })
-        .collect();
-
-    // --- sessions ------------------------------------------------------------
-    let sessions = collect_sessions(&s.global_dir, &s.pricing);
-    let active = sessions
-        .iter()
-        .filter(|v| v.get("scope").and_then(|s| s.as_str()) == Some("active"))
-        .count();
-    let archived = sessions
-        .iter()
-        .filter(|v| v.get("scope").and_then(|s| s.as_str()) == Some("archived"))
-        .count();
-    let sessions_summary = SessionsSummary {
-        total: sessions.len(),
-        active,
-        archived,
+    // Which hosts to ask: one named host, or every registered host.
+    // `HostRegistry` has no per-id lookup (`list_hosts()` is the only
+    // enumeration surface), so scope by filtering it rather than adding a
+    // registry method for this one caller.
+    let targets: Vec<_> = match q.host.as_deref() {
+        Some(id) => {
+            let found = s
+                .hosts
+                .list_hosts()
+                .into_iter()
+                .find(|h| h.id == id)
+                .ok_or_else(|| ApiError::not_found(format!("unknown host {id}")))?;
+            vec![found]
+        }
+        None => s.hosts.list_hosts(),
     };
 
-    // --- workers -------------------------------------------------------------
-    let worker_store = WorkerStore {
-        root: s.global_dir.join("autoflows").join("workers"),
-    };
-    let worker_count = worker_store
-        .list()
-        .map(|w| w.len())
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "dashboard: failed to list workers; using 0");
-            0
-        });
-
-    // --- coverage ------------------------------------------------------------
-    // Coverage lives per-PROJECT under each registered workspace's
-    // `<path>/.rupu/coverage/`. Aggregate target/assertion counts across the
-    // registry (cheap: discover only, no audit). A missing registry → zeros.
-    let workspace_store = WorkspaceStore {
-        root: s.global_dir.join("workspaces"),
-    };
-    let mut cov_targets = 0usize;
-    let mut cov_assertions = 0usize;
-    for w in workspace_store.list().unwrap_or_default() {
-        match discover_targets(std::path::Path::new(&w.path)) {
-            Ok(targets) => {
-                cov_assertions += targets.iter().map(|t| t.assertion_lines).sum::<usize>();
-                cov_targets += targets.len();
+    let futs = targets.into_iter().map(|h| {
+        let registry = Arc::clone(&s.hosts);
+        let host_id = h.id.clone();
+        let name = h.name.clone();
+        let (transport_kind, _base_url) = transport_fields(&h.transport);
+        async move {
+            let conn = match registry.resolve(&host_id) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(host_id = %host_id, error = %e, "dashboard: could not resolve host connector");
+                    return (
+                        HostFreshness {
+                            host_id,
+                            name,
+                            transport_kind,
+                            state: "offline",
+                            captured_at: None,
+                            reason: Some(e.to_string()),
+                        },
+                        None,
+                    );
+                }
+            };
+            match conn.dashboard_summary(range).await {
+                Ok(sum) => (
+                    HostFreshness {
+                        host_id,
+                        name,
+                        transport_kind,
+                        state: "ok",
+                        captured_at: Some(sum.captured_at),
+                        reason: None,
+                    },
+                    Some(sum),
+                ),
+                Err(HostConnectorError::Unsupported(_)) => (
+                    HostFreshness {
+                        host_id,
+                        name,
+                        transport_kind,
+                        state: "unavailable",
+                        captured_at: None,
+                        reason: Some(
+                            "host does not report dashboard data (needs a newer rupu)".into(),
+                        ),
+                    },
+                    None,
+                ),
+                Err(e) => {
+                    tracing::warn!(host_id = %host_id, error = %e, "dashboard_summary failed");
+                    (
+                        HostFreshness {
+                            host_id,
+                            name,
+                            transport_kind,
+                            state: "offline",
+                            captured_at: None,
+                            reason: Some(e.to_string()),
+                        },
+                        None,
+                    )
+                }
             }
-            Err(e) => {
-                tracing::warn!(ws_id = %w.id, error = %e, "dashboard: failed to discover coverage targets; skipping workspace");
-            }
+        }
+    });
+
+    let results = futures_util::future::join_all(futs).await;
+
+    // Merge ONLY hosts that actually reported. A non-reporting host
+    // contributes nothing rather than zeros — its state is carried in
+    // `hosts` instead.
+    let mut resp = DashboardResponse {
+        hosts: Vec::new(),
+        active: ActiveCounts::default(),
+        terminal_buckets: Vec::new(),
+        active_runs: Vec::new(),
+        cycles: Vec::new(),
+        recent_manual: Vec::new(),
+        findings_open: 0,
+    };
+    let mut bucket_merge: BTreeMap<DateTime<Utc>, TerminalBucket> = BTreeMap::new();
+
+    for (freshness, summary) in results {
+        resp.hosts.push(freshness);
+        let Some(sum) = summary else { continue };
+        resp.active.running += sum.active.running;
+        resp.active.awaiting_approval += sum.active.awaiting_approval;
+        resp.active.paused += sum.active.paused;
+        resp.active.pending += sum.active.pending;
+        resp.findings_open += sum.findings_open;
+        resp.active_runs.extend(sum.active_runs);
+        resp.cycles.extend(sum.cycles);
+        resp.recent_manual.extend(sum.recent_manual);
+        for b in sum.terminal_buckets {
+            let e = bucket_merge.entry(b.ts).or_insert(TerminalBucket {
+                ts: b.ts,
+                completed: 0,
+                failed: 0,
+                rejected: 0,
+                cancelled: 0,
+            });
+            e.completed += b.completed;
+            e.failed += b.failed;
+            e.rejected += b.rejected;
+            e.cancelled += b.cancelled;
         }
     }
 
-    Ok(Json(DashboardResponse {
-        runs: runs_summary,
-        recent_runs,
-        sessions: sessions_summary,
-        workers: WorkersSummary {
-            total: worker_count,
-        },
-        coverage: CoverageSummary {
-            targets: cov_targets,
-            assertions: cov_assertions,
-        },
-    }))
+    // Fill the merged bucket grid — zero-fill every day in `range`, not just
+    // days that had terminal runs. Without this the trend area silently
+    // closes gaps and reads as continuous activity across days that had
+    // none.
+    //
+    // This MUST happen here, after the merge: the local connector zero-fills
+    // its own grid but the SSH connector emits only days with runs, so a
+    // fleet with no local host would otherwise produce a holed grid. The
+    // merged output is the only place that sees every host. Reuses
+    // `summary_build::fill_bucket_grid` rather than a second "which days
+    // exist" implementation.
+    resp.terminal_buckets = summary_build::fill_bucket_grid(bucket_merge, range, Utc::now());
+    resp.active_runs
+        .sort_by_key(|b| std::cmp::Reverse(b.started_at));
+    resp.cycles.sort_by_key(|c| std::cmp::Reverse(c.started_at));
+    resp.recent_manual
+        .sort_by_key(|r| std::cmp::Reverse(r.started_at));
+
+    Ok(Json(resp))
 }

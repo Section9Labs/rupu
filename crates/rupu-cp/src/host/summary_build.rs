@@ -156,7 +156,12 @@ pub fn build_summary(
 }
 
 /// Emit a contiguous day-by-day grid, zero-filling days with no terminal runs.
-fn fill_bucket_grid(
+///
+/// `pub(crate)` so `api::dashboard`'s merged-fleet grid can reuse it rather
+/// than writing a second "which days exist" implementation — two copies of
+/// that logic would drift, and the failure is silent (a chart that closes a
+/// gap looks identical to one that had activity).
+pub(crate) fn fill_bucket_grid(
     mut buckets: BTreeMap<DateTime<Utc>, TerminalBucket>,
     range: DashboardRange,
     now: DateTime<Utc>,

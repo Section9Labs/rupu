@@ -57,7 +57,10 @@ pub struct HostView {
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 /// Decompose a `HostTransport` into the serialised kind string + optional URL.
-fn transport_fields(t: &HostTransport) -> (String, Option<String>) {
+///
+/// `pub(crate)` so `api::dashboard`'s freshness strip can reuse the same
+/// kind-string vocabulary instead of a second, potentially disagreeing match.
+pub(crate) fn transport_fields(t: &HostTransport) -> (String, Option<String>) {
     match t {
         HostTransport::Local => ("local".to_string(), None),
         HostTransport::HttpCp { base_url } => {
