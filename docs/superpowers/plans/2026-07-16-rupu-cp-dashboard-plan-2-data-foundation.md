@@ -1132,6 +1132,17 @@ unreachable host would stall the whole dashboard."
 
 > **This task is its own PR.** It is a behavior change to an existing shipped path, it is the highest-risk change in this plan, and it must be revertable alone.
 
+> **⚠️ SHIPPED — this section is partly superseded. Do not follow it literally.**
+> Commits `034bdf3` (list_runs) + `72dc534` (critical fix). **The `run_list_row_to_wire`
+> mapper shown below was DELETED.** It emitted 8 fields while `RunListRow` needs
+> `usage` / `turns` / `duration_ms`; the web UI types those non-optional and reads
+> `r.usage.input_tokens` unguarded under a single top-level ErrorBoundary, so one SSH
+> row blanked the entire app — a regression, since `mirror_list_runs` had included them.
+> The shipped design instead promotes `RunListRow` + `RunListRow::with_usage` to `pub`,
+> has `rupu run list` emit `Vec<RunListRow>` verbatim, and returns those rows unmodified
+> — remote == local **by construction, with no mapper**. Row id field is `id`, not
+> `run_id`. See also Task 5b (`rupu run show` + `get_run`), which ships in the same PR.
+
 **Files:**
 - Modify: `crates/rupu-cp/src/host/ssh.rs`
 - Test: `crates/rupu-cp/src/host/ssh.rs` (inline `#[cfg(test)] mod tests`)
