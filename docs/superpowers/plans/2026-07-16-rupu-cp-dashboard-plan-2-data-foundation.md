@@ -1704,6 +1704,10 @@ Add to `impl HostConnector for SshHostConnector`:
                 HostConnectorError::Unsupported
             })?;
         let cycle_rows = self.list_autoflow_runs().await.unwrap_or_default();
+        // NOTE: `run_rows` are `RunListRow`-shaped (id / workflow_name / status /
+        // started_at / finished_at / trigger / usage / turns / duration_ms).
+        // `rupu run list` emits that type verbatim so remote == local by
+        // construction; there is deliberately NO mapper. The id field is `id`.
 
         let now = chrono::Utc::now();
         let since = range.since(now);
@@ -1753,7 +1757,10 @@ Add to `impl HostConnector for SshHostConnector`:
             .iter()
             .filter_map(|r| {
                 Some((
-                    r.get("run_id")?.as_str()?,
+                    // `id`, NOT `run_id`: `rupu run list` emits `RunListRow`
+                    // verbatim and its field is `id`. Reading `run_id` here
+                    // yields an empty map and silently loses every status.
+                    r.get("id")?.as_str()?,
                     r.get("status")?.as_str()?,
                 ))
             })
@@ -1779,7 +1786,8 @@ Add to `impl HostConnector for SshHostConnector`:
 
         for row in &run_rows {
             let (Some(id), Some(status), Some(started)) = (
-                row.get("run_id").and_then(|v| v.as_str()),
+                // `id`, NOT `run_id` — see note above.
+                row.get("id").and_then(|v| v.as_str()),
                 row.get("status").and_then(|v| v.as_str()),
                 row.get("started_at").and_then(|v| v.as_str()),
             ) else {
