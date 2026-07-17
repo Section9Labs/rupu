@@ -18,9 +18,8 @@ use ulid::Ulid;
 use crate::{
     agent_launcher::AgentLaunchRequest,
     host::connector::{
-        mirror_get_run, mirror_stream_run_events, read_transcript_file, EventByteStream,
-        HostCapabilities, HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery,
-        MAX_WORKSPACE_BYTES,
+        mirror_stream_run_events, read_transcript_file, EventByteStream, HostCapabilities,
+        HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery, MAX_WORKSPACE_BYTES,
     },
     launcher::LaunchRequest,
     node::{
@@ -530,24 +529,26 @@ pub(crate) struct SshHostConnector {
     pub exec: Arc<dyn RemoteExec>,
     pub mirror: Arc<NodeMirror>,
     pub run_store: Arc<RunStore>,
-    pub pricing: rupu_config::PricingConfig,
 }
 
 impl SshHostConnector {
     /// Construct a new connector.
+    ///
+    /// No `pricing` parameter: `get_run` shells the remote CLI, which
+    /// resolves pricing from the *remote* host's own config — this
+    /// connector no longer computes usage/cost locally (that was
+    /// `mirror_get_run`'s job; see `get_run`'s doc comment).
     pub fn new(
         host_id: impl Into<String>,
         exec: Arc<dyn RemoteExec>,
         mirror: Arc<NodeMirror>,
         run_store: Arc<RunStore>,
-        pricing: rupu_config::PricingConfig,
     ) -> Self {
         Self {
             host_id: host_id.into(),
             exec,
             mirror,
             run_store,
-            pricing,
         }
     }
 
@@ -787,12 +788,12 @@ impl SshHostConnector {
         Ok(())
     }
 
-    /// Run a one-shot `rupu <argv...>` over ssh and return the `rows` array of
-    /// the CLI's `--format json` report. Used by the list-view connectors.
-    async fn remote_json_rows(
-        &self,
-        argv: &[&str],
-    ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+    /// Run a one-shot `rupu <argv...>` over ssh and return the parsed JSON
+    /// value of the CLI's `--format json` report. Shared command-building +
+    /// error-mapping for [`remote_json_rows`](Self::remote_json_rows)
+    /// (extracts `.rows`) and [`remote_json_item`](Self::remote_json_item)
+    /// (extracts `.item`).
+    async fn remote_json(&self, argv: &[&str]) -> Result<serde_json::Value, HostConnectorError> {
         let owned: Vec<String> = std::iter::once("rupu".to_string())
             .chain(argv.iter().map(|s| s.to_string()))
             .collect();
@@ -805,14 +806,35 @@ impl SshHostConnector {
         if !out.success {
             return Err(HostConnectorError::Unreachable(out.stderr));
         }
-        let parsed: serde_json::Value = serde_json::from_str(out.stdout.trim()).map_err(|e| {
+        serde_json::from_str(out.stdout.trim()).map_err(|e| {
             HostConnectorError::Remote(0, format!("parse `rupu {}` output: {e}", argv.join(" ")))
-        })?;
+        })
+    }
+
+    /// Run a one-shot `rupu <argv...>` over ssh and return the `rows` array of
+    /// the CLI's `--format json` report. Used by the list-view connectors.
+    async fn remote_json_rows(
+        &self,
+        argv: &[&str],
+    ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+        let parsed = self.remote_json(argv).await?;
         Ok(parsed
             .get("rows")
             .and_then(|r| r.as_array())
             .cloned()
             .unwrap_or_default())
+    }
+
+    /// Run a one-shot `rupu <argv...>` over ssh and return the `item` object
+    /// of the CLI's `--format json` report. Used by [`get_run`](Self::get_run).
+    async fn remote_json_item(
+        &self,
+        argv: &[&str],
+    ) -> Result<serde_json::Value, HostConnectorError> {
+        let parsed = self.remote_json(argv).await?;
+        parsed.get("item").cloned().ok_or_else(|| {
+            HostConnectorError::Remote(0, format!("rupu {} output missing `item`", argv.join(" ")))
+        })
     }
 }
 
@@ -1014,8 +1036,40 @@ impl HostConnector for SshHostConnector {
             .collect())
     }
 
+    /// Fetch one run by shelling the remote CLI.
+    ///
+    /// Was: `mirror_get_run`, which only saw runs THIS process launched — so
+    /// after the `list_runs` fix (above) the list would show runs whose
+    /// detail 404'd against the (still-empty, for a directly-started run)
+    /// mirror. The list and the detail must agree.
     async fn get_run(&self, run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
-        mirror_get_run(&self.run_store, &self.host_id, run_id, &self.pricing)
+        // NOTE the flag order: `--format json` must precede `run`, because
+        // `Cmd::Run` is trailing_var_arg and swallows everything after it —
+        // see `remote_json_rows`'s callers / cmd::run's module doc.
+        match self
+            .remote_json_item(&["--format", "json", "run", "show", run_id])
+            .await
+        {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                // An old remote rupu has no `run show`; it parses as "launch
+                // an agent named show" and errors — the same failure mode
+                // `list_runs` guards against. Map to Unsupported, never
+                // NotFound: a NotFound here would be indistinguishable from
+                // "this run does not exist" when the actual cause may be a
+                // stale host that simply cannot report.
+                tracing::warn!(
+                    host_id = %self.host_id,
+                    run_id = %run_id,
+                    error = %e,
+                    "get_run: remote `rupu run show` failed; host may predate the command"
+                );
+                Err(HostConnectorError::Unsupported(format!(
+                    "remote host {} does not support `rupu run show`: {e}",
+                    self.host_id
+                )))
+            }
+        }
     }
 
     async fn approve_run(&self, run_id: &str, mode: &str) -> Result<(), HostConnectorError> {
@@ -1490,13 +1544,8 @@ mod tests {
             &run_store,
         )));
         let exec: std::sync::Arc<dyn RemoteExec> = fake;
-        let conn = SshHostConnector::new(
-            "host_abc",
-            exec,
-            mirror,
-            std::sync::Arc::clone(&run_store),
-            rupu_config::PricingConfig::default(),
-        );
+        let conn =
+            SshHostConnector::new("host_abc", exec, mirror, std::sync::Arc::clone(&run_store));
         (conn, run_store, tmp)
     }
 
@@ -1624,6 +1673,95 @@ mod tests {
         assert!(
             cmd.contains("run") && cmd.contains("list") && cmd.contains("json"),
             "must shell `rupu run list --format json`: {cmd}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_run_shells_rupu_run_show_not_the_mirror() {
+        struct StubExec {
+            json: String,
+            last_cmd: std::sync::Mutex<String>,
+        }
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                *self.last_cmd.lock().unwrap() = remote.to_string();
+                Ok(RemoteOutput {
+                    stdout: self.json.clone(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!("not used by get_run")
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!("not used by get_run")
+            }
+        }
+
+        let json = r#"{"kind":"run_show","version":1,"item":{"id":"run_a","status":"completed"}}"#;
+        let stub = std::sync::Arc::new(StubExec {
+            json: json.into(),
+            last_cmd: std::sync::Mutex::new(String::new()),
+        });
+        // Mirror is EMPTY — before the fix this returned NotFound, because
+        // get_run read the mirror (populated only by `spawn_tail_pump`, which
+        // never saw this run).
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&stub));
+
+        let item = conn.get_run("run_a").await.unwrap();
+
+        assert_eq!(
+            item["id"], "run_a",
+            "must return the CLI's `item` payload, not the empty mirror"
+        );
+        assert_eq!(item["status"], "completed");
+
+        let cmd = stub.last_cmd.lock().unwrap().clone();
+        assert!(
+            cmd.contains("run") && cmd.contains("show") && cmd.contains("json"),
+            "must shell `rupu run show --format json`: {cmd}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_run_maps_old_host_failure_to_unsupported_not_not_found() {
+        struct FailExec;
+        #[async_trait::async_trait]
+        impl RemoteExec for FailExec {
+            async fn run(&self, _remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                // An old remote rupu has no `run show`; `classify` treats it as
+                // "launch an agent named show", which fails to load and exits
+                // nonzero.
+                Ok(RemoteOutput {
+                    stdout: String::new(),
+                    stderr: "error: agent 'show' not found".into(),
+                    success: false,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!("not used by get_run")
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!("not used by get_run")
+            }
+        }
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(FailExec));
+
+        let err = conn.get_run("run_a").await.unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Unsupported(_)),
+            "an old-host failure must map to Unsupported, never NotFound — NotFound \
+             would be indistinguishable from \"this run does not exist\": {err:?}"
         );
     }
 

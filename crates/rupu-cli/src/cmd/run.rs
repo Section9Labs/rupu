@@ -148,6 +148,11 @@ pub enum RunAction {
         limit: usize,
         status: Option<String>,
     },
+    /// `rupu run show <id>` — one run's detail, as rupu-cp's wire shape.
+    ///
+    /// `show` is a reserved first token, like `pause` / `resume` / `list`: an
+    /// agent literally named `show` is unreachable via `rupu run show`.
+    Show { run_id: String },
 }
 
 /// Wrapper so [`Args`] (a `clap::Args` flatten target, not itself a
@@ -233,6 +238,19 @@ pub fn classify(argv: Vec<String>) -> Result<RunAction, clap::Error> {
                 status: parsed.status,
             })
         }
+        Some("show") => {
+            #[derive(Parser, Debug)]
+            #[command(name = "rupu run show")]
+            struct ShowArgsParser {
+                run_id: String,
+            }
+            let parsed = ShowArgsParser::try_parse_from(
+                std::iter::once("rupu run show".to_string()).chain(argv.into_iter().skip(1)),
+            )?;
+            Ok(RunAction::Show {
+                run_id: parsed.run_id,
+            })
+        }
         _ => Ok(RunAction::Launch(argv)),
     }
 }
@@ -262,6 +280,10 @@ pub async fn handle(
             Err(e) => crate::output::diag::fail(e),
         },
         Ok(RunAction::List { limit, status }) => match list(limit, status, global_format).await {
+            Ok(()) => ExitCode::from(0),
+            Err(e) => crate::output::diag::fail(e),
+        },
+        Ok(RunAction::Show { run_id }) => match show(run_id, global_format).await {
             Ok(()) => ExitCode::from(0),
             Err(e) => crate::output::diag::fail(e),
         },
@@ -340,6 +362,47 @@ async fn list(
                 );
             }
         }
+    }
+    Ok(())
+}
+
+/// `rupu run show <id>` — one run's detail, as rupu-cp's wire shape.
+///
+/// Resolves `PricingConfig` global-only (no project layering), mirroring
+/// [`list`]'s global-only `RunStore` resolution and rupu-cp's own
+/// `load_pricing` (`crates/rupu-cp/src/lib.rs`): a missing/malformed
+/// `config.toml` falls back to `PricingConfig::default()` rather than
+/// failing the command.
+async fn show(
+    run_id: String,
+    global_format: Option<crate::output::formats::OutputFormat>,
+) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let global_cfg_path = global.join("config.toml");
+    let cfg = rupu_config::layer_files(Some(&global_cfg_path), None).unwrap_or_default();
+
+    // Emit rupu-cp's own detail payload verbatim — do NOT re-shape it here.
+    // See `query_run_detail`'s doc comment (crates/rupu-cp/src/api/runs.rs)
+    // for why: the SSH `get_run` path shells this exact command and returns
+    // the result, so byte-identical output here is what keeps the remote
+    // path in sync with the local `mirror_get_run` path (both call
+    // `query_run_detail`).
+    let item = rupu_cp::api::runs::query_run_detail(&store, &run_id, &cfg.pricing)
+        .map_err(|e| anyhow::anyhow!("run {run_id}: {e}"))?;
+
+    match global_format.unwrap_or(crate::output::formats::OutputFormat::Table) {
+        crate::output::formats::OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "kind": "run_show",
+                    "version": 1,
+                    "item": item,
+                }))?
+            );
+        }
+        _ => println!("{}", serde_json::to_string_pretty(&item)?),
     }
     Ok(())
 }
@@ -1154,6 +1217,23 @@ mod tests {
             matches!(action, RunAction::Launch(_)),
             "a bare agent name must still Launch — `list` is the only new reserved token"
         );
+    }
+
+    #[test]
+    fn classify_routes_show_to_show_action() {
+        let action = classify(vec!["show".to_string(), "run_abc".to_string()]).unwrap();
+        match action {
+            RunAction::Show { run_id } => assert_eq!(run_id, "run_abc"),
+            other => panic!("expected Show, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_still_launches_an_agent_named_like_a_verb_prefix() {
+        // `show` joins pause/resume/list as a reserved FIRST token, but a bare
+        // agent name must still Launch.
+        let action = classify(vec!["my-agent".to_string()]).unwrap();
+        assert!(matches!(action, RunAction::Launch(_)));
     }
 
     #[test]

@@ -528,7 +528,14 @@ pub(crate) fn query_run_rows(
 /// [`crate::host::local::LocalHostConnector`].
 ///
 /// Returns the `{ run, steps, usage }` JSON object `GET /api/runs/:id` produces.
-pub(crate) fn query_run_detail(
+///
+/// `pub` (not `pub(crate)`) because `rupu-cli`'s `run show` emits this
+/// function's output verbatim as its JSON contract. That is deliberate: SSH
+/// `get_run` shells `rupu run show` and returns the result, so the remote path
+/// yields byte-identical data to the local `mirror_get_run` path — which calls
+/// this same function. Hand-building a parallel detail shape in the CLI would
+/// let the two drift silently.
+pub fn query_run_detail(
     store: &rupu_orchestrator::runs::RunStore,
     id: &str,
     pricing: &rupu_config::PricingConfig,

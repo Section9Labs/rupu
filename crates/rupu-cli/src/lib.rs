@@ -316,10 +316,11 @@ fn ensure_output_format_supported(
 ) -> anyhow::Result<()> {
     match command {
         Cmd::Run { argv } => {
-            // `rupu run list` emits JSON (it is rupu-cp's SSH run-listing
-            // contract); every other `rupu run` form is Table-only.
+            // `rupu run list` / `rupu run show` emit JSON (they are rupu-cp's
+            // SSH run-listing / run-detail contracts); every other `rupu run`
+            // form is Table-only.
             let allowed: &[output::formats::OutputFormat] =
-                if argv.first().map(String::as_str) == Some("list") {
+                if matches!(argv.first().map(String::as_str), Some("list") | Some("show")) {
                     &[
                         output::formats::OutputFormat::Table,
                         output::formats::OutputFormat::Json,
