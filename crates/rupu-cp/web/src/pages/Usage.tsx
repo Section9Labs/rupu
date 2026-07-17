@@ -170,6 +170,13 @@ export default function Usage() {
                 ))}
               </div>
             </div>
+            {/* The headline above is fleet-wide (`/api/usage`, fans out across
+                hosts). This graph is fed by `/api/usage/timeline`, which has no
+                host fan-out — say so, or a multi-host operator reads the graph
+                as fleet-wide too. */}
+            <p className="mb-2 text-[10px] uppercase tracking-wide text-[rgb(var(--c-ink-mute))]">
+              local host only
+            </p>
             <UsageTimelineStacked buckets={timeline} metric={metric} />
           </section>
 
@@ -177,12 +184,15 @@ export default function Usage() {
             <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-[rgb(var(--c-ink-dim))]">
               Breakdown by {PIVOT_LABEL[pivot]}
             </h2>
-            <ModelBreakdownTable rows={data.breakdown} pivot={pivot} />
+            <ModelBreakdownTable rows={data.breakdown} pivot={pivot} hosts={data.hosts} />
           </section>
 
           <section className="rounded-lg border border-[rgb(var(--c-border))] bg-[rgb(var(--c-panel))] p-3">
             <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-[rgb(var(--c-ink-dim))]">
-              Cost outliers
+              Cost outliers{' '}
+              <span className="font-normal normal-case text-[rgb(var(--c-ink-mute))]">
+                (this host only)
+              </span>
             </h2>
             <OutlierPanel outliers={outliers} />
           </section>

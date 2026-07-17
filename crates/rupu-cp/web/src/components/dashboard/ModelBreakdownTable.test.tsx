@@ -79,3 +79,49 @@ describe('ModelBreakdownTable', () => {
     expect(screen.getByText(/No usage in this window/)).toBeInTheDocument();
   });
 });
+
+describe('ModelBreakdownTable host pivot', () => {
+  function hostRow(hostId: string, cost = 1): UsageBreakdownRow {
+    return {
+      provider: '',
+      model: '',
+      agent: '',
+      workflow: '',
+      host_id: hostId,
+      workspace_id: '',
+      input_tokens: 100,
+      output_tokens: 0,
+      cached_tokens: 0,
+      total_tokens: 100,
+      cost_usd: cost,
+      priced: true,
+      runs: 1,
+    };
+  }
+
+  it('maps host_id to the friendly host name when the hosts list has a match', () => {
+    render(
+      <ModelBreakdownTable
+        rows={[hostRow('host_01KWREMOTE')]}
+        pivot="host"
+        hosts={[
+          {
+            host_id: 'host_01KWREMOTE',
+            name: 'staging-box',
+            transport_kind: 'http_cp',
+            state: 'ok',
+            captured_at: null,
+            reason: null,
+          },
+        ]}
+      />,
+    );
+    expect(screen.getByText('staging-box')).toBeInTheDocument();
+    expect(screen.queryByText('host_01KWREMOTE')).not.toBeInTheDocument();
+  });
+
+  it('falls back to the raw host id when no matching host is found', () => {
+    render(<ModelBreakdownTable rows={[hostRow('host_unknown')]} pivot="host" hosts={[]} />);
+    expect(screen.getByText('host_unknown')).toBeInTheDocument();
+  });
+});

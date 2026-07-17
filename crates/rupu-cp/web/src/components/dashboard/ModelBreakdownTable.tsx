@@ -12,7 +12,7 @@
 // transform is exported for unit testing.
 
 import { formatCost, formatTokens, type UsageBreakdownRow } from '../../lib/usage';
-import type { Pivot } from '../../lib/api';
+import type { HostFreshness, Pivot } from '../../lib/api';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { assignModelColors, pivotLabel, OTHER_COLOR } from './modelColors';
 import { assignCategoricalColors } from '../usage/pivotColors';
@@ -110,9 +110,15 @@ export function toRows(input: UsageBreakdownRow[], pivot: Pivot = 'model'): Brea
 export default function ModelBreakdownTable({
   rows,
   pivot = 'model',
+  hosts,
 }: {
   rows: UsageBreakdownRow[];
   pivot?: Pivot;
+  /** `data.hosts` from `/api/usage`, for mapping a `host` pivot's raw
+   *  `host_id` rows to their friendly `name` for display. Optional — callers
+   *  that don't pivot by host (or don't have the host list handy) can omit
+   *  it, and rows fall back to the raw id. */
+  hosts?: HostFreshness[];
 }) {
   const theme = useThemeColors();
   const view = toRows(rows, pivot);
@@ -120,6 +126,14 @@ export default function ModelBreakdownTable({
   const colors = pivot === 'model' ? assignModelColors(labels) : assignCategoricalColors(labels, theme);
   const colorFor = (r: BreakdownRow) =>
     r.kind === 'others' ? OTHER_COLOR : colors.get(r.label) ?? OTHER_COLOR;
+
+  // Host pivot rows are keyed by raw `host_id` (see `pivotLabel`) — map to
+  // the friendly `name` for display only; the raw id stays the row/color key
+  // so dedup and the color assignment above are unaffected. Falls back to the
+  // raw id when the host isn't in the list (e.g. a host removed since).
+  const hostNameById = new Map((hosts ?? []).map((h) => [h.host_id, h.name]));
+  const displayLabel = (r: BreakdownRow): string =>
+    pivot === 'host' ? hostNameById.get(r.label) ?? r.label : r.label;
 
   if (view.rows.length === 0) {
     return <p className="text-xs text-ink-mute py-8 text-center">No usage in this window</p>;
@@ -160,7 +174,7 @@ export default function ModelBreakdownTable({
                     style={{ background: colorFor(r) }}
                   />
                   <span className="min-w-0">
-                    <span className="text-ink font-medium truncate block">{r.label}</span>
+                    <span className="text-ink font-medium truncate block">{displayLabel(r)}</span>
                     {r.provider && (
                       <span className="text-ink-mute text-meta truncate block">{r.provider}</span>
                     )}

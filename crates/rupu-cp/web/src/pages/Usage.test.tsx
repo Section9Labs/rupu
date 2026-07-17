@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import Usage from './Usage';
 import { api, type UsageResponse, type OutlierRun } from '../lib/api';
@@ -158,5 +158,69 @@ describe('Usage page', () => {
     renderUsage();
 
     expect(await screen.findByText(/Could not load usage/)).toBeInTheDocument();
+  });
+
+  it('labels the local-only timeline graph and outliers panel, and maps the host pivot to friendly names, on a multi-host fleet', async () => {
+    vi.spyOn(api, 'getUsage').mockResolvedValue(
+      usageResponse({
+        hosts: [
+          {
+            host_id: 'local',
+            name: 'local',
+            transport_kind: 'local',
+            state: 'ok',
+            captured_at: new Date().toISOString(),
+            reason: null,
+          },
+          {
+            host_id: 'host_01KWREMOTE',
+            name: 'staging-box',
+            transport_kind: 'http_cp',
+            state: 'ok',
+            captured_at: new Date().toISOString(),
+            reason: null,
+          },
+        ],
+        breakdown: [
+          {
+            provider: '',
+            model: '',
+            agent: '',
+            workflow: '',
+            host_id: 'host_01KWREMOTE',
+            workspace_id: '',
+            input_tokens: 1000,
+            output_tokens: 500,
+            cached_tokens: 0,
+            total_tokens: 1500,
+            cost_usd: 4.5,
+            priced: true,
+            runs: 3,
+          },
+        ],
+      }),
+    );
+    vi.spyOn(api, 'getUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getUsageOutliers').mockResolvedValue([]);
+
+    renderUsage();
+
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith('30d', 'model'));
+
+    // The timeline graph (local-only, no host fan-out) is labeled, distinct
+    // from the fleet-wide headline number above it.
+    expect(screen.getByText(/local host only/i)).toBeInTheDocument();
+    // The outliers panel (also local-only) is labeled too.
+    expect(screen.getByText(/this host only/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'host' }));
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith('30d', 'host'));
+
+    // The host-pivot breakdown row shows the friendly host name, not the raw
+    // id — scoped to the breakdown table since the freshness strip above
+    // also renders each host's `name`.
+    const table = await screen.findByRole('table');
+    expect(await within(table).findByText('staging-box')).toBeInTheDocument();
+    expect(within(table).queryByText('host_01KWREMOTE')).not.toBeInTheDocument();
   });
 });
