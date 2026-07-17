@@ -25,6 +25,14 @@ pub struct UsageRow {
     pub provider: String,
     pub model: String,
     pub agent: String,
+    /// Workflow name the run belongs to. Empty until a run-join populates it
+    /// (see `rupu-cp`'s attribution join, tracked separately).
+    pub workflow: String,
+    /// Host the run executed on. Empty until a run-join populates it.
+    pub host_id: String,
+    /// Workspace/project the run belongs to. Empty until a run-join
+    /// populates it.
+    pub workspace_id: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,

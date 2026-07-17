@@ -61,7 +61,14 @@ async fn get_usage(
 ) -> ApiResult<Json<UsageResponse>> {
     let (start, end) = resolve_window(q.since.as_deref(), q.until.as_deref(), Utc::now())
         .map_err(ApiError::bad_request)?;
-    let group_by = crate::usage::GroupBy::parse(q.group_by.as_deref().unwrap_or("model"));
+    let group_by = match q.group_by.as_deref() {
+        None => crate::usage::GroupBy::Model,
+        Some(g) => crate::usage::GroupBy::parse(g).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "unknown group_by {g:?}; expected provider | model | agent | workflow | host | project"
+            ))
+        })?,
+    };
 
     let runs = s
         .run_store
@@ -295,6 +302,7 @@ mod tests {
             output_tokens: output,
             cached_tokens: 0,
             runs: 1,
+            ..rupu_transcript::UsageRow::default()
         }
     }
 
@@ -573,6 +581,9 @@ mod tests {
         )
         .await
         .expect("handler should not error on empty store");
-        assert!(result.0.is_empty(), "expected empty timeline for empty store");
+        assert!(
+            result.0.is_empty(),
+            "expected empty timeline for empty store"
+        );
     }
 }

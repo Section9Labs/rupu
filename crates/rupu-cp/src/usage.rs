@@ -105,9 +105,7 @@ fn turns_and_duration(paths: &[PathBuf]) -> (u64, Option<u64>) {
         for ev in iter.flatten() {
             match ev {
                 Event::Usage { .. } => turns += 1,
-                Event::RunComplete {
-                    duration_ms: d, ..
-                } => duration_ms = Some(d),
+                Event::RunComplete { duration_ms: d, .. } => duration_ms = Some(d),
                 _ => {}
             }
         }
@@ -206,16 +204,34 @@ pub enum GroupBy {
     Provider,
     Model,
     Agent,
+    /// Needs a UsageRow -> RunRecord join; see `breakdown_joined`.
+    Workflow,
+    Host,
+    Project,
 }
 
 impl GroupBy {
-    /// Parse the `group_by` query param; defaults to `Model` on anything else.
-    pub fn parse(s: &str) -> Self {
+    /// Parse the `group_by` query param.
+    ///
+    /// Returns `None` on anything unknown. Deliberately NOT infallible: the
+    /// previous `_ => GroupBy::Model` fallthrough meant a typo silently
+    /// returned a model breakdown and the caller never learned their pivot was
+    /// ignored.
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "provider" => GroupBy::Provider,
-            "agent" => GroupBy::Agent,
-            _ => GroupBy::Model,
+            "provider" => Some(GroupBy::Provider),
+            "model" => Some(GroupBy::Model),
+            "agent" => Some(GroupBy::Agent),
+            "workflow" => Some(GroupBy::Workflow),
+            "host" => Some(GroupBy::Host),
+            "project" => Some(GroupBy::Project),
+            _ => None,
         }
+    }
+
+    /// Dimensions resolvable from a `UsageRow` alone, with no run join.
+    pub fn is_intrinsic(&self) -> bool {
+        matches!(self, GroupBy::Provider | GroupBy::Model | GroupBy::Agent)
     }
 }
 
@@ -225,6 +241,13 @@ pub struct UsageBreakdownRow {
     pub provider: String,
     pub model: String,
     pub agent: String,
+    /// Present when grouping by a joined dimension; empty otherwise.
+    #[serde(default)]
+    pub workflow: String,
+    #[serde(default)]
+    pub host_id: String,
+    #[serde(default)]
+    pub workspace_id: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
@@ -249,6 +272,9 @@ pub fn breakdown(
             GroupBy::Provider => row.provider.clone(),
             GroupBy::Model => row.model.clone(),
             GroupBy::Agent => row.agent.clone(),
+            GroupBy::Workflow => row.workflow.clone(),
+            GroupBy::Host => row.host_id.clone(),
+            GroupBy::Project => row.workspace_id.clone(),
         };
         let entry = groups.entry(key).or_insert_with(|| UsageBreakdownRow {
             provider: if group_by == GroupBy::Provider {
@@ -263,6 +289,21 @@ pub fn breakdown(
             },
             agent: if group_by == GroupBy::Agent {
                 row.agent.clone()
+            } else {
+                String::new()
+            },
+            workflow: if group_by == GroupBy::Workflow {
+                row.workflow.clone()
+            } else {
+                String::new()
+            },
+            host_id: if group_by == GroupBy::Host {
+                row.host_id.clone()
+            } else {
+                String::new()
+            },
+            workspace_id: if group_by == GroupBy::Project {
+                row.workspace_id.clone()
             } else {
                 String::new()
             },
@@ -357,6 +398,7 @@ mod tests {
             output_tokens: output,
             cached_tokens: cached,
             runs: 1,
+            ..UsageRow::default()
         }
     }
 
@@ -436,8 +478,24 @@ mod tests {
 
     #[test]
     fn rollup_sums_and_propagates_unpriced() {
-        let priced = UsageSummary { input_tokens: 10, output_tokens: 5, cached_tokens: 0, total_tokens: 15, cost_usd: Some(2.0), priced: true, runs: 1 };
-        let unpriced = UsageSummary { input_tokens: 20, output_tokens: 0, cached_tokens: 0, total_tokens: 20, cost_usd: None, priced: false, runs: 1 };
+        let priced = UsageSummary {
+            input_tokens: 10,
+            output_tokens: 5,
+            cached_tokens: 0,
+            total_tokens: 15,
+            cost_usd: Some(2.0),
+            priced: true,
+            runs: 1,
+        };
+        let unpriced = UsageSummary {
+            input_tokens: 20,
+            output_tokens: 0,
+            cached_tokens: 0,
+            total_tokens: 20,
+            cost_usd: None,
+            priced: false,
+            runs: 1,
+        };
         let r = rollup([priced, unpriced].into_iter());
         assert_eq!(r.input_tokens, 30);
         assert_eq!(r.output_tokens, 5);
@@ -490,13 +548,53 @@ mod tests {
     #[test]
     fn entity_rollup_folds_usage_and_counts() {
         let mut r = EntityRollup::default();
-        r.add(&UsageSummary { input_tokens: 10, output_tokens: 5, cached_tokens: 0, total_tokens: 15, cost_usd: Some(1.0), priced: true, runs: 1 }, Some("2026-01-02T00:00:00Z".into()));
-        r.add(&UsageSummary { input_tokens: 20, output_tokens: 0, cached_tokens: 0, total_tokens: 20, cost_usd: Some(2.0), priced: true, runs: 1 }, Some("2026-01-01T00:00:00Z".into()));
+        r.add(
+            &UsageSummary {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_tokens: 0,
+                total_tokens: 15,
+                cost_usd: Some(1.0),
+                priced: true,
+                runs: 1,
+            },
+            Some("2026-01-02T00:00:00Z".into()),
+        );
+        r.add(
+            &UsageSummary {
+                input_tokens: 20,
+                output_tokens: 0,
+                cached_tokens: 0,
+                total_tokens: 20,
+                cost_usd: Some(2.0),
+                priced: true,
+                runs: 1,
+            },
+            Some("2026-01-01T00:00:00Z".into()),
+        );
         assert_eq!(r.run_count, 2);
         assert_eq!(r.usage.input_tokens, 30);
         assert_eq!(r.usage.total_tokens, 35);
         assert!((r.usage.cost_usd.unwrap() - 3.0).abs() < 1e-9);
         assert_eq!(r.last_active.as_deref(), Some("2026-01-02T00:00:00Z"));
+    }
+
+    #[test]
+    fn group_by_parses_known_dimensions() {
+        assert_eq!(GroupBy::parse("model"), Some(GroupBy::Model));
+        assert_eq!(GroupBy::parse("provider"), Some(GroupBy::Provider));
+        assert_eq!(GroupBy::parse("agent"), Some(GroupBy::Agent));
+        assert_eq!(GroupBy::parse("workflow"), Some(GroupBy::Workflow));
+        assert_eq!(GroupBy::parse("host"), Some(GroupBy::Host));
+        assert_eq!(GroupBy::parse("project"), Some(GroupBy::Project));
+    }
+
+    #[test]
+    fn group_by_rejects_unknown_rather_than_defaulting() {
+        // A typo must not silently return a model breakdown — the caller would
+        // never learn their pivot was ignored.
+        assert_eq!(GroupBy::parse("workflw"), None);
+        assert_eq!(GroupBy::parse(""), None);
     }
 
     #[test]
