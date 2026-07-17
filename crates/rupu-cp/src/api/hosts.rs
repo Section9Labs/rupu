@@ -1,8 +1,13 @@
-//! `GET /api/hosts` · `POST /api/hosts` · `DELETE /api/hosts/:id`
+//! `GET /api/hosts` · `GET /api/hosts/registered` · `POST /api/hosts` ·
+//! `DELETE /api/hosts/:id`
 //!
-//! Exposes the `HostRegistry` over HTTP. The list endpoint probes every remote
+//! Exposes the `HostRegistry` over HTTP. `GET /api/hosts` probes every remote
 //! host concurrently and tolerates unreachable hosts: a failed `info()` call
 //! produces `status: "offline"` rather than failing the whole list.
+//! `GET /api/hosts/registered` is the probe-free counterpart: a pure store
+//! read (`id` / `name` / `transport_kind` only) that returns promptly even
+//! when every registered remote is dead — used by pages that need to know
+//! which hosts exist before deciding which ones to probe.
 
 #![deny(clippy::all)]
 
@@ -26,6 +31,7 @@ use serde::{Deserialize, Serialize};
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/hosts", get(list_hosts).post(add_host))
+        .route("/api/hosts/registered", get(list_registered_hosts))
         .route("/api/hosts/node", post(enroll_node_handler))
         .route("/api/hosts/ssh", post(add_ssh_host_handler))
         .route("/api/hosts/bucket", post(add_bucket_host_handler))
@@ -54,6 +60,19 @@ pub struct HostView {
     pub last_seen_at: Option<String>,
 }
 
+/// JSON view of one registered host, WITHOUT any live health data.
+///
+/// This is the store-only shape: `id` / `name` / `transport_kind`, nothing a
+/// probe (`connector.info()` / `active_run_count()`) could produce. Backs
+/// `GET /api/hosts/registered` — see that handler's doc comment.
+#[derive(Debug, Serialize)]
+pub struct RegisteredHostView {
+    pub id: String,
+    pub name: String,
+    /// `"local"`, `"http_cp"`, `"tunnel"`, `"ssh"`, or `"bucket"`.
+    pub transport_kind: String,
+}
+
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 /// Decompose a `HostTransport` into the serialised kind string + optional URL.
@@ -63,9 +82,7 @@ pub struct HostView {
 pub(crate) fn transport_fields(t: &HostTransport) -> (String, Option<String>) {
     match t {
         HostTransport::Local => ("local".to_string(), None),
-        HostTransport::HttpCp { base_url } => {
-            ("http_cp".to_string(), Some(base_url.clone()))
-        }
+        HostTransport::HttpCp { base_url } => ("http_cp".to_string(), Some(base_url.clone())),
         HostTransport::Tunnel { node_id } => ("tunnel".to_string(), Some(node_id.clone())),
         HostTransport::Ssh { host, port, .. } => {
             let addr = match port {
@@ -79,9 +96,7 @@ pub(crate) fn transport_fields(t: &HostTransport) -> (String, Option<String>) {
 }
 
 /// Ask a connector for its active-run count. Returns 0 on any error (best-effort).
-async fn active_run_count(
-    conn: &Arc<dyn crate::host::connector::HostConnector>,
-) -> usize {
+async fn active_run_count(conn: &Arc<dyn crate::host::connector::HostConnector>) -> usize {
     let q = RunListQuery {
         kind: RunKind::All,
         offset: 0,
@@ -92,6 +107,41 @@ async fn active_run_count(
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
+
+/// `GET /api/hosts/registered` — list all known hosts, no probe.
+///
+/// A dedicated route rather than a `?probe=false` branch on [`list_hosts`]:
+/// that handler already fans out per-host `info()` + `active_run_count()`
+/// futures and is about to grow more probe-related shape as the dashboard
+/// rework lands, so keeping this as its own small handler avoids threading a
+/// bool through that fan-out and keeps the "never probes" contract visible at
+/// the type level (`RegisteredHostView` simply has no field a probe could
+/// populate). It follows the existing precedent of literal sibling routes
+/// under `/api/hosts/*` (`/node`, `/ssh`, `/bucket`) living alongside the
+/// dynamic `/api/hosts/:id` — axum's router already resolves that ambiguity
+/// in favor of the literal segment.
+///
+/// Backed by [`HostRegistry::list_hosts`], a pure store read — no `info()`,
+/// no `active_run_count()`, no network I/O. Returns promptly even when a
+/// registered remote is completely unreachable. Local is always first.
+async fn list_registered_hosts(
+    State(s): State<AppState>,
+) -> ApiResult<Json<Vec<RegisteredHostView>>> {
+    let views = s
+        .hosts
+        .list_hosts()
+        .into_iter()
+        .map(|host| {
+            let (transport_kind, _base_url) = transport_fields(&host.transport);
+            RegisteredHostView {
+                id: host.id,
+                name: host.name,
+                transport_kind,
+            }
+        })
+        .collect();
+    Ok(Json(views))
+}
 
 /// `GET /api/hosts` — list all known hosts with live health data.
 ///
@@ -396,10 +446,7 @@ async fn add_bucket_host_handler(
 ///
 /// - 204 on success.
 /// - 400 when `id` is `"local"` (the local host cannot be removed).
-async fn remove_host(
-    State(s): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<StatusCode> {
+async fn remove_host(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<StatusCode> {
     if id == "local" {
         return Err(ApiError::bad_request(
             "cannot remove the built-in local host",
