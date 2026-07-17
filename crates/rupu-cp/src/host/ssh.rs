@@ -18,9 +18,9 @@ use ulid::Ulid;
 use crate::{
     agent_launcher::AgentLaunchRequest,
     host::connector::{
-        mirror_get_run, mirror_list_runs, mirror_stream_run_events, read_transcript_file,
-        EventByteStream, HostCapabilities, HostConnector, HostConnectorError, HostInfo,
-        RunListQuery, MAX_WORKSPACE_BYTES,
+        mirror_get_run, mirror_stream_run_events, read_transcript_file, EventByteStream,
+        HostCapabilities, HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery,
+        MAX_WORKSPACE_BYTES,
     },
     launcher::LaunchRequest,
     node::{
@@ -151,6 +151,24 @@ pub(crate) fn transcript_row_to_agent_run(row: &serde_json::Value) -> serde_json
         "turns": 0,
         "duration_ms": null,
     })
+}
+
+/// Map one `rupu run list --format json` row to the `RunListRow` wire shape.
+///
+/// Field renames only — the CLI contract (Task 1) was built to carry every
+/// field this needs, so nothing is synthesized or defaulted-to-wrong here.
+fn run_list_row_to_wire(row: &serde_json::Value) -> Option<serde_json::Value> {
+    let run_id = row.get("run_id")?.as_str()?;
+    Some(serde_json::json!({
+        "id": run_id,
+        "workflow_name": row.get("workflow_name").and_then(|v| v.as_str()).unwrap_or(""),
+        "status": row.get("status").and_then(|v| v.as_str()).unwrap_or("pending"),
+        "started_at": row.get("started_at").and_then(|v| v.as_str()).unwrap_or(""),
+        "finished_at": row.get("finished_at").cloned().unwrap_or(serde_json::Value::Null),
+        "trigger": row.get("trigger").and_then(|v| v.as_str()).unwrap_or("manual"),
+        "workspace_id": row.get("workspace_id").cloned().unwrap_or(serde_json::Value::Null),
+        "error_message": row.get("error_message").cloned().unwrap_or(serde_json::Value::Null),
+    }))
 }
 
 /// `rupu autoflow history` row → `AutoflowEventRow` wire shape
@@ -923,11 +941,77 @@ impl HostConnector for SshHostConnector {
         ))
     }
 
+    /// List runs by shelling the remote CLI.
+    ///
+    /// Was: `mirror_list_runs`. The mirror is populated only by
+    /// `spawn_tail_pump`, which runs solely on the launch path — so runs
+    /// started directly on the box, or launched by a PREVIOUS `cp serve`
+    /// process, were permanently invisible. Enumerating via the CLI is the
+    /// same pattern `list_sessions` / `list_autoflow_runs` / `list_agent_runs`
+    /// already use.
+    ///
+    /// `stream_run_events` still reads the mirror, deliberately: tailing a
+    /// known path on a live run is a different problem from enumerating.
     async fn list_runs(
         &self,
         params: RunListQuery,
     ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
-        mirror_list_runs(&self.run_store, &self.host_id, &params, &self.pricing)
+        let rows = match self
+            .remote_json_rows(&["--format", "json", "run", "list", "--limit", "10000"])
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // An old remote rupu has no `run list`; it parses as "launch an
+                // agent named list" and errors. Surface it as Unsupported so the
+                // freshness strip renders "needs a newer rupu" rather than
+                // silently reporting zero runs.
+                tracing::warn!(
+                    host_id = %self.host_id,
+                    error = %e,
+                    "list_runs: remote `rupu run list` failed; host may predate the command"
+                );
+                return Err(HostConnectorError::Unsupported(format!(
+                    "remote host {} does not support `rupu run list`: {e}",
+                    self.host_id
+                )));
+            }
+        };
+
+        let mut out: Vec<serde_json::Value> = rows
+            .iter()
+            .filter_map(run_list_row_to_wire)
+            .filter(|r| match params.kind {
+                RunKind::All => true,
+                // Workflow-only means manual-triggered only, mirroring
+                // query_run_rows' `event.is_none() && source_wake_id.is_none()`.
+                RunKind::Workflow => r["trigger"] == "manual",
+            })
+            .filter(|r| match params.lifecycle.as_deref() {
+                None => true,
+                Some("active") => !matches!(
+                    r["status"].as_str().unwrap_or(""),
+                    "completed" | "failed" | "rejected" | "cancelled"
+                ),
+                Some("completed") => r["status"] == "completed",
+                Some("failed") => r["status"] == "failed",
+                Some(_) => true,
+            })
+            .collect();
+
+        // The CLI already sorts newest-first, but re-sort so this is correct
+        // regardless of remote CLI version.
+        out.sort_by(|a, b| {
+            let ta = a["started_at"].as_str().unwrap_or("");
+            let tb = b["started_at"].as_str().unwrap_or("");
+            tb.cmp(ta)
+        });
+
+        Ok(out
+            .into_iter()
+            .skip(params.offset)
+            .take(params.limit)
+            .collect())
     }
 
     async fn get_run(&self, run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
@@ -1471,6 +1555,128 @@ mod tests {
         // Archived scope → adds --archived.
         conn.list_sessions(Some("archived")).await.unwrap();
         assert!(stub.last_cmd.lock().unwrap().contains("--archived"));
+    }
+
+    #[tokio::test]
+    async fn list_runs_shells_rupu_run_list_not_the_mirror() {
+        struct StubExec {
+            json: String,
+            last_cmd: std::sync::Mutex<String>,
+        }
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                *self.last_cmd.lock().unwrap() = remote.to_string();
+                Ok(RemoteOutput {
+                    stdout: self.json.clone(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!("not used by list_runs")
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!("not used by list_runs")
+            }
+        }
+
+        let json = r#"{"kind":"run_list","version":1,"rows":[
+            {"run_id":"run_a","workflow_name":"nightly","status":"completed",
+             "started_at":"2026-07-16T14:02:11Z","finished_at":"2026-07-16T14:09:02Z",
+             "trigger":"cron","workspace_id":"ws_1","parent_run_id":null,
+             "awaiting_step_id":null,"active_step_id":null,"error_message":null}
+        ],"summary":{"count":1,"limit":10000,"status_filter":null}}"#;
+        let stub = std::sync::Arc::new(StubExec {
+            json: json.into(),
+            last_cmd: std::sync::Mutex::new(String::new()),
+        });
+        // The mirror is EMPTY — this is the point. Before the fix, list_runs
+        // read the mirror and would return zero rows here.
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&stub));
+
+        let rows = conn
+            .list_runs(RunListQuery {
+                kind: RunKind::All,
+                offset: 0,
+                limit: 100,
+                lifecycle: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "must return the CLI's row, not the empty mirror"
+        );
+        assert_eq!(rows[0]["id"], "run_a");
+        assert_eq!(
+            rows[0]["trigger"], "cron",
+            "trigger must survive — cycle grouping depends on it"
+        );
+
+        let cmd = stub.last_cmd.lock().unwrap().clone();
+        assert!(
+            cmd.contains("run") && cmd.contains("list") && cmd.contains("json"),
+            "must shell `rupu run list --format json`: {cmd}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_runs_preserves_rfc3339_for_merge_sort() {
+        // rupu-cp's fan_out merge does a LEXICOGRAPHIC string compare on
+        // started_at. A space-separated timestamp (' ' = 0x20 < 'T' = 0x54)
+        // would sort every remote row after every local row at the same
+        // instant. Guard the format.
+        struct StubExec {
+            json: String,
+        }
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, _remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                Ok(RemoteOutput {
+                    stdout: self.json.clone(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!()
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!()
+            }
+        }
+        let json = r#"{"kind":"run_list","version":1,"rows":[
+            {"run_id":"run_a","workflow_name":"w","status":"completed",
+             "started_at":"2026-07-16T14:02:11Z","finished_at":null,"trigger":"manual",
+             "workspace_id":null,"parent_run_id":null,"awaiting_step_id":null,
+             "active_step_id":null,"error_message":null}
+        ],"summary":{"count":1,"limit":1,"status_filter":null}}"#;
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(StubExec { json: json.into() }));
+        let rows = conn
+            .list_runs(RunListQuery {
+                kind: RunKind::All,
+                offset: 0,
+                limit: 100,
+                lifecycle: None,
+            })
+            .await
+            .unwrap();
+        let started = rows[0]["started_at"].as_str().unwrap();
+        assert!(
+            started.contains('T'),
+            "started_at must stay RFC-3339: {started}"
+        );
     }
 
     #[test]
