@@ -87,6 +87,13 @@ pub struct ActiveRunBar {
     pub trigger: String,
     /// `None` for manual runs; set when the run belongs to an autoflow cycle.
     pub cycle_id: Option<String>,
+    /// Which host this row came from. Set by the aggregation layer
+    /// (`api/dashboard.rs`), not by the connector — a connector does not know
+    /// the id it is registered under. `None` only if a row somehow reaches the
+    /// wire untagged; the merge always sets it. Mirrors what
+    /// `api/host_fanout.rs`'s `fan_out_via` does for every other fan-out view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
 }
 
 /// One run inside a cycle.
@@ -119,6 +126,13 @@ pub struct CycleRollup {
     pub skipped: Option<u64>,
     pub failed: Option<u64>,
     pub runs: Vec<CycleRun>,
+    /// Which host this row came from. Set by the aggregation layer
+    /// (`api/dashboard.rs`), not by the connector — a connector does not know
+    /// the id it is registered under. `None` only if a row somehow reaches the
+    /// wire untagged; the merge always sets it. Mirrors what
+    /// `api/host_fanout.rs`'s `fan_out_via` does for every other fan-out view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
 }
 
 /// A manual-trigger run. Never grouped — always rendered individually.
@@ -130,6 +144,13 @@ pub struct RecentRun {
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub trigger: String,
+    /// Which host this row came from. Set by the aggregation layer
+    /// (`api/dashboard.rs`), not by the connector — a connector does not know
+    /// the id it is registered under. `None` only if a row somehow reaches the
+    /// wire untagged; the merge always sets it. Mirrors what
+    /// `api/host_fanout.rs`'s `fan_out_via` does for every other fan-out view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
 }
 
 /// One host's complete dashboard contribution.

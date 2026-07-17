@@ -140,17 +140,33 @@ async fn get_dashboard(
                 }
             };
             match conn.dashboard_summary(range).await {
-                Ok(sum) => (
-                    HostFreshness {
-                        host_id,
-                        name,
-                        transport_kind,
-                        state: "ok",
-                        captured_at: Some(sum.captured_at),
-                        reason: None,
-                    },
-                    Some(sum),
-                ),
+                Ok(mut sum) => {
+                    // Tag every row with the host it came from — the
+                    // connector doesn't know the id it's registered under
+                    // (see `DashboardSummary`'s `host_id` doc comments), so
+                    // this is the one place with both the id and the rows in
+                    // scope. Mirrors `api/host_fanout.rs`'s `fan_out_via`.
+                    for r in sum.active_runs.iter_mut() {
+                        r.host_id = Some(host_id.clone());
+                    }
+                    for c in sum.cycles.iter_mut() {
+                        c.host_id = Some(host_id.clone());
+                    }
+                    for r in sum.recent_manual.iter_mut() {
+                        r.host_id = Some(host_id.clone());
+                    }
+                    (
+                        HostFreshness {
+                            host_id,
+                            name,
+                            transport_kind,
+                            state: "ok",
+                            captured_at: Some(sum.captured_at),
+                            reason: None,
+                        },
+                        Some(sum),
+                    )
+                }
                 Err(HostConnectorError::Unsupported(_)) => (
                     HostFreshness {
                         host_id,

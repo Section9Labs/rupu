@@ -1345,6 +1345,10 @@ impl HostConnector for SshHostConnector {
                                 .collect()
                         })
                         .unwrap_or_default(),
+                    // Tagged by the aggregation layer (`api/dashboard.rs`),
+                    // not here — this connector doesn't know which host id
+                    // it's registered under.
+                    host_id: None,
                 })
             })
             .filter(|c| in_range(c.started_at))
@@ -1431,6 +1435,10 @@ impl HostConnector for SshHostConnector {
                     started_at,
                     trigger: trigger.to_string(),
                     cycle_id: cycle_of.get(id).cloned(),
+                    // Tagged by the aggregation layer (`api/dashboard.rs`),
+                    // not here — this connector doesn't know which host id
+                    // it's registered under.
+                    host_id: None,
                 });
             } else {
                 // Truncate to midnight-UTC through the SAME `day_key` the
@@ -1475,6 +1483,10 @@ impl HostConnector for SshHostConnector {
                         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                         .map(|t| t.with_timezone(&chrono::Utc)),
                     trigger: "manual".to_string(),
+                    // Tagged by the aggregation layer (`api/dashboard.rs`),
+                    // not here — this connector doesn't know which host id
+                    // it's registered under.
+                    host_id: None,
                 });
             }
         }

@@ -591,6 +591,8 @@ export interface ActiveRunBar {
   trigger: 'manual' | 'cron' | 'event';
   /** `null` for manual runs; set when the run belongs to an autoflow cycle. */
   cycle_id: string | null;
+  /** Which host this row came from — set server-side by the fan-out merge (`api/dashboard.rs`), not by the connector. */
+  host_id?: string;
 }
 
 /**
@@ -616,6 +618,8 @@ export interface CycleRollup {
   skipped: number | null;
   failed: number | null;
   runs: CycleRun[];
+  /** Which host this row came from — set server-side by the fan-out merge (`api/dashboard.rs`), not by the connector. */
+  host_id?: string;
 }
 
 /** A manual-trigger run. Never grouped. */
@@ -626,6 +630,8 @@ export interface DashboardRecentRun {
   started_at: string;
   finished_at: string | null;
   trigger: 'manual' | 'cron' | 'event';
+  /** Which host this row came from — set server-side by the fan-out merge (`api/dashboard.rs`), not by the connector. */
+  host_id?: string;
 }
 
 export interface DashboardResponse {

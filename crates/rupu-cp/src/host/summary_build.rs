@@ -109,6 +109,10 @@ pub fn build_summary(
                 started_at: r.started_at,
                 trigger: r.trigger_str().to_string(),
                 cycle_id: cycle_of.get(r.id.as_str()).map(|c| c.to_string()),
+                // Tagged by the aggregation layer (`api/dashboard.rs`), not
+                // here — this builder doesn't know which host id it's
+                // registered under.
+                host_id: None,
             });
         }
 
@@ -141,6 +145,10 @@ pub fn build_summary(
                 started_at: r.started_at,
                 finished_at: r.finished_at,
                 trigger: "manual".to_string(),
+                // Tagged by the aggregation layer (`api/dashboard.rs`), not
+                // here — this builder doesn't know which host id it's
+                // registered under.
+                host_id: None,
             });
         }
     }
@@ -395,6 +403,7 @@ mod tests {
                     status: "unknown".into(),
                 },
             ],
+            host_id: None,
         }];
         let s = build_summary(
             &runs,
@@ -430,6 +439,7 @@ mod tests {
                 run_id: "r_gone".into(),
                 status: "unknown".into(),
             }],
+            host_id: None,
         }];
         let s = build_summary(
             &[],
@@ -461,6 +471,7 @@ mod tests {
                 run_id: "r_in_cycle".into(),
                 status: "unknown".into(),
             }],
+            host_id: None,
         }];
         let s = build_summary(
             &runs,
@@ -486,6 +497,7 @@ mod tests {
             skipped: Some(0),
             failed: Some(0),
             runs: vec![],
+            host_id: None,
         };
         let recent = CycleRollup {
             cycle_id: "recent".into(),
@@ -496,6 +508,7 @@ mod tests {
             skipped: Some(0),
             failed: Some(0),
             runs: vec![],
+            host_id: None,
         };
         let s = build_summary(
             &[],

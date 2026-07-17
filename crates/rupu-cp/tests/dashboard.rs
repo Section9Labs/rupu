@@ -47,8 +47,152 @@ async fn spawn_server_with_remote(dir: &std::path::Path, mock_base_url: &str) ->
 }
 
 // ---------------------------------------------------------------------------
+// Seeders for the host_id tagging test (mirrors host_reads.rs /
+// federation_e2e.rs — helpers are duplicated per file, no shared
+// `tests/common/`).
+// ---------------------------------------------------------------------------
+
+/// Build a minimal, manually-triggered `RunRecord` (no `event`, no
+/// `source_wake_id` — see `RunRecord::trigger_str()` in
+/// `crates/rupu-orchestrator/src/runs.rs`).
+fn seed_run(
+    id: &str,
+    status: rupu_orchestrator::runs::RunStatus,
+) -> rupu_orchestrator::runs::RunRecord {
+    rupu_orchestrator::runs::RunRecord {
+        id: id.into(),
+        workflow_name: "dash-wf".into(),
+        status,
+        inputs: std::collections::BTreeMap::new(),
+        event: None,
+        workspace_id: "ws_dash".into(),
+        workspace_path: std::path::PathBuf::from("/tmp/dash-proj"),
+        transcript_dir: std::path::PathBuf::from("/tmp/dash-proj/.rupu/transcripts"),
+        started_at: chrono::Utc::now(),
+        finished_at: None,
+        error_message: None,
+        awaiting_step_id: None,
+        approval_prompt: None,
+        awaiting_since: None,
+        expires_at: None,
+        resume_requested_at: None,
+        resume_claimed_at: None,
+        resume_claimed_by: None,
+        resume_mode: None,
+        issue_ref: None,
+        issue: None,
+        parent_run_id: None,
+        backend_id: None,
+        worker_id: None,
+        artifact_manifest_path: None,
+        runner_pid: None,
+        source_wake_id: None,
+        active_step_id: None,
+        active_step_kind: None,
+        active_step_agent: None,
+        active_step_transcript_path: None,
+        final_output: None,
+    }
+}
+
+/// Seed a cycle with one `RunLaunched` event referencing `run_id`.
+///
+/// `collect_cycle_rollups` (`host/local.rs`) reads cycles via
+/// `AutoflowHistoryStore::list_recent`, which reads back only what `save()`
+/// wrote — NOT the separate append-only event log `append_cycle_event`
+/// writes to. The run ids it harvests (`run_streams::harvest_run_ids`) come
+/// from the in-memory `record.events` field, so the event must be pushed onto
+/// the record *before* `save()`, mirroring `host/local.rs`'s own
+/// `collect_cycle_rollups_reads_a_fixture_written_by_the_real_store` test.
+fn seed_autoflow_cycle_with_run(global_dir: &std::path::Path, run_id: &str) {
+    use rupu_runtime::{
+        AutoflowCycleEvent, AutoflowCycleEventKind, AutoflowCycleMode, AutoflowCycleRecord,
+        AutoflowHistoryStore,
+    };
+    let store_root = global_dir.join("autoflows").join("history");
+    let store = AutoflowHistoryStore::new(store_root);
+    let now = chrono::Utc::now();
+    let mut cycle = AutoflowCycleRecord::new(AutoflowCycleMode::Tick, now);
+    cycle.events.push(AutoflowCycleEvent {
+        kind: AutoflowCycleEventKind::RunLaunched,
+        workflow: Some("dash-wf".into()),
+        run_id: Some(run_id.into()),
+        ..Default::default()
+    });
+    store.save(&cycle).unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn dashboard_rows_are_tagged_with_their_host() {
+    // The swimlane groups lanes BY HOST and the activity feed renders a host
+    // chip per row (spec §5.2, §5.5). Without per-row host_id a fleet's runs
+    // all render as if they came from one place.
+    // Seed a run, hit /api/dashboard, and assert every row in active_runs /
+    // cycles / recent_manual carries host_id == "local".
+    let dir = tempfile::tempdir().unwrap();
+
+    // A standalone manual, non-terminal run: lands in BOTH active_runs (the
+    // swimlane) and recent_manual (the activity feed) — see
+    // `host::summary_build::build_summary`.
+    let run_store = rupu_orchestrator::runs::RunStore::new(dir.path().join("runs"));
+    run_store
+        .create(
+            seed_run(
+                "dash_active_run",
+                rupu_orchestrator::runs::RunStatus::Running,
+            ),
+            "name: dash-wf\nsteps: []\n",
+        )
+        .unwrap();
+
+    // A cycle referencing a *different* run id, so it doesn't fold the
+    // active run into a cycle (which would drop it out of recent_manual).
+    seed_autoflow_cycle_with_run(dir.path(), "dash_cycle_run");
+
+    let srv = spawn_server(dir.path()).await;
+    let body: serde_json::Value = reqwest::get(format!("{}/api/dashboard?range=all", srv.base_url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let active_runs = body["active_runs"].as_array().expect("active_runs array");
+    assert!(
+        !active_runs.is_empty(),
+        "expected the seeded run to be active"
+    );
+    for row in active_runs {
+        assert_eq!(
+            row["host_id"], "local",
+            "active_runs row missing host_id: {row}"
+        );
+    }
+
+    let cycles = body["cycles"].as_array().expect("cycles array");
+    assert!(!cycles.is_empty(), "expected the seeded cycle to appear");
+    for row in cycles {
+        assert_eq!(row["host_id"], "local", "cycles row missing host_id: {row}");
+    }
+
+    let recent_manual = body["recent_manual"]
+        .as_array()
+        .expect("recent_manual array");
+    assert!(
+        !recent_manual.is_empty(),
+        "expected the seeded manual run to appear"
+    );
+    for row in recent_manual {
+        assert_eq!(
+            row["host_id"], "local",
+            "recent_manual row missing host_id: {row}"
+        );
+    }
+}
 
 #[tokio::test]
 async fn dashboard_reports_per_host_freshness_and_never_zeroes_unavailable() {

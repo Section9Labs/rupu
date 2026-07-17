@@ -402,6 +402,10 @@ fn collect_cycle_rollups(
                         status: "unknown".to_string(),
                     })
                     .collect(),
+                // Tagged by the aggregation layer (`api/dashboard.rs`), not
+                // here — this connector doesn't know which host id it's
+                // registered under.
+                host_id: None,
             }
         })
         .collect())
