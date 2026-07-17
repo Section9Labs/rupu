@@ -1,55 +1,56 @@
-// Dashboard — operations-first.
+// Dashboard — operations-first, key points not lists (spec §5).
 //
 // Was spend-forward: the largest element on the page was cost and tokens. But a
 // dashboard you leave open in a tab is an ops monitor; spend is something you
 // review deliberately, on a cadence. Spend now lives at /usage with room to
 // answer attribution and anomaly questions (plan 3).
 //
-// Composition (spec §5.1): freshness strip → attention row → swimlane hero →
-// split status → activity feed.
+// Composition (final, per the composition-decision note in the P4 brief —
+// supersedes spec §5.1's split-status layout): header (range + freshness
+// strip) → KeyPointTiles → two graphs (outcomes trend + throughput) →
+// CycleSummaryLine. AttentionRow and ActiveStatusTiles are DROPPED: once
+// KeyPointTiles grew an awaiting/paused/failed/findings/active-now row, those
+// two components duplicated it outright. Three components showing the same
+// counts is the opposite of "key points, not lists."
+//
+// Each block renders from whatever has arrived: the freshness strip paints
+// the instant the host list is known (`hosts`, seeded `loading`), and the
+// KPI tiles / graphs / cycle line paint from `data` — which goes non-null as
+// soon as ONE host resolves — without waiting on every host. A hung remote
+// host therefore never blanks the page; it just sits in the strip reading
+// "loading" until it resolves or the reconciling poll gives up on it.
 
 import { useMemo, useState } from 'react';
 import { useDashboardData } from '../lib/dashboard/useDashboardData';
-import { HostFreshnessStrip } from '../components/dashboard/HostFreshnessStrip';
-import { AttentionRow } from '../components/dashboard/AttentionRow';
-import { ActiveStatusTiles } from '../components/dashboard/ActiveStatusTiles';
+import { HostFreshnessStrip, type HostFreshnessEntry } from '../components/dashboard/HostFreshnessStrip';
+import { KeyPointTiles } from '../components/dashboard/KeyPointTiles';
 import { TerminalTrend } from '../components/dashboard/TerminalTrend';
-import { Swimlane } from '../components/dashboard/Swimlane';
-import { ActivityFeed } from '../components/dashboard/ActivityFeed';
+import { ThroughputChart } from '../components/dashboard/ThroughputChart';
+import { CycleSummaryLine } from '../components/dashboard/CycleSummaryLine';
 import type { DashboardRange } from '../lib/api';
 
 const RANGES: DashboardRange[] = ['7d', '30d', 'all'];
 
-function Panel({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <section className="rounded-lg border border-[rgb(var(--c-border))] bg-[rgb(var(--c-panel))]">
-      <h2 className="border-b border-[rgb(var(--c-border))] px-3 py-2 text-xs font-medium uppercase tracking-wide text-[rgb(var(--c-ink-dim))]">
-        {title}
-      </h2>
-      <div className="p-3">{children}</div>
-    </section>
-  );
-}
-
 export default function Dashboard() {
   const [range, setRange] = useState<DashboardRange>('30d');
-  const { data, error, loading } = useDashboardData(range);
+  const { data, hosts, error } = useDashboardData(range);
 
-  const failedInWindow = useMemo(
-    () => (data?.terminal_buckets ?? []).reduce((s, b) => s + b.failed, 0),
-    [data],
+  // `useDashboardData`'s per-host state is keyed camelCase (`hostId` /
+  // `transportKind`) and carries the raw per-host `summary`; the strip wants
+  // the wire-shaped `HostFreshnessEntry` (snake_case, `captured_at` pulled
+  // out of that summary). This mapping is the seam between the two.
+  const freshnessHosts: HostFreshnessEntry[] = useMemo(
+    () =>
+      hosts.map((h) => ({
+        host_id: h.hostId,
+        name: h.name,
+        transport_kind: h.transportKind,
+        state: h.state,
+        captured_at: h.summary?.captured_at ?? null,
+        reason: h.reason ?? null,
+      })),
+    [hosts],
   );
-
-  if (loading && !data) {
-    return <div className="p-6 text-sm text-[rgb(var(--c-ink-mute))]">Loading…</div>;
-  }
-  if (!data) {
-    return (
-      <div className="p-6 text-sm text-[rgb(var(--c-status-failed))]">
-        Could not load dashboard: {error?.message}
-      </div>
-    );
-  }
 
   return (
     <div className="space-y-4 p-4">
@@ -57,13 +58,13 @@ export default function Dashboard() {
         <div>
           <h1 className="text-lg font-semibold text-[rgb(var(--c-ink))]">Dashboard</h1>
           <div className="mt-1">
-            <HostFreshnessStrip hosts={data.hosts} />
+            <HostFreshnessStrip hosts={freshnessHosts} />
           </div>
         </div>
         <div className="flex items-center gap-2">
           {/* Stale data is kept on a transient error rather than flashing an
               error state; surface it quietly instead. */}
-          {error && (
+          {error && data && (
             <span className="text-xs text-[rgb(var(--c-status-failed))]" title={error.message}>
               refresh failed — showing last good data
             </span>
@@ -92,29 +93,40 @@ export default function Dashboard() {
         </div>
       </header>
 
-      <AttentionRow
-        active={data.active}
-        failedInWindow={failedInWindow}
-        findingsOpen={data.findings_open}
-        findingsPartial={data.findings_partial}
-      />
+      {data ? (
+        <>
+          <KeyPointTiles
+            active={data.active}
+            activeLongest={data.active_longest}
+            terminalBuckets={data.terminal_buckets}
+            findingsOpen={data.findings_open}
+            findingsPartial={data.findings_partial}
+          />
 
-      <Panel title="Live activity">
-        <Swimlane bars={data.active_runs} />
-      </Panel>
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+            <section className="rounded-lg border border-[rgb(var(--c-border))] bg-[rgb(var(--c-panel))] p-3">
+              <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-[rgb(var(--c-ink-dim))]">
+                Outcomes over time
+              </h2>
+              <TerminalTrend buckets={data.terminal_buckets} />
+            </section>
+            <section className="rounded-lg border border-[rgb(var(--c-border))] bg-[rgb(var(--c-panel))] p-3">
+              <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-[rgb(var(--c-ink-dim))]">
+                Throughput by trigger
+              </h2>
+              <ThroughputChart buckets={data.throughput_buckets} />
+            </section>
+          </div>
 
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <Panel title="Active now">
-          <ActiveStatusTiles active={data.active} />
-        </Panel>
-        <Panel title="Outcomes over time">
-          <TerminalTrend buckets={data.terminal_buckets} />
-        </Panel>
-      </div>
-
-      <Panel title="Activity">
-        <ActivityFeed cycles={data.cycles} recentManual={data.recent_manual} />
-      </Panel>
+          <CycleSummaryLine cycles={data.cycles} cyclesPartial={data.cycles_partial} />
+        </>
+      ) : error ? (
+        <div className="p-6 text-sm text-[rgb(var(--c-status-failed))]">
+          Could not load dashboard: {error.message}
+        </div>
+      ) : (
+        <div className="p-6 text-sm text-[rgb(var(--c-ink-mute))]">Loading…</div>
+      )}
     </div>
   );
 }
