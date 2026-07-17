@@ -1258,6 +1258,222 @@ impl HostConnector for SshHostConnector {
         Ok(rows.iter().map(history_row_to_autoflow_event).collect())
     }
 
+    /// Build this host's dashboard contribution by shelling the remote CLI
+    /// exactly twice: `rupu run list` and `rupu autoflow history`. Every
+    /// `RemoteExec::run` spawns a fresh ssh process with a full handshake (no
+    /// ControlMaster multiplexing), so this deliberately stays coarse — no
+    /// per-panel round-trips.
+    ///
+    /// An old remote rupu without `run list` yields
+    /// [`HostConnectorError::Unsupported`], never zeroed data: a host that
+    /// cannot report is not a host with no runs.
+    async fn dashboard_summary(
+        &self,
+        range: crate::host::dashboard_summary::DashboardRange,
+    ) -> Result<crate::host::dashboard_summary::DashboardSummary, HostConnectorError> {
+        use crate::host::dashboard_summary::*;
+
+        let run_rows = self
+            .remote_json_rows(&["--format", "json", "run", "list", "--limit", "10000"])
+            .await
+            .map_err(|e| {
+                tracing::warn!(host_id = %self.host_id, error = %e, "dashboard_summary: run list failed");
+                HostConnectorError::Unsupported(format!(
+                    "remote host {} does not support `rupu run list`: {e}",
+                    self.host_id
+                ))
+            })?;
+        let cycle_rows = self.list_autoflow_runs().await.unwrap_or_default();
+        // NOTE: `run_rows` are `RunListRow`-shaped (id / workflow_name / status /
+        // started_at / finished_at / trigger / usage / turns / duration_ms).
+        // `rupu run list` emits that type verbatim so remote == local by
+        // construction; there is deliberately NO mapper. The id field is `id`.
+
+        let now = chrono::Utc::now();
+        let since = range.since(now);
+        let in_range = |t: chrono::DateTime<chrono::Utc>| since.map(|s| t >= s).unwrap_or(true);
+
+        let cycles: Vec<CycleRollup> = cycle_rows
+            .iter()
+            .filter_map(|c| {
+                Some(CycleRollup {
+                    cycle_id: c.get("cycle_id")?.as_str()?.to_string(),
+                    worker_name: c
+                        .get("worker_name")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    started_at: c
+                        .get("started_at")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|t| t.with_timezone(&chrono::Utc))?,
+                    finished_at: c
+                        .get("finished_at")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|t| t.with_timezone(&chrono::Utc)),
+                    ran: c.get("ran_cycles").and_then(|v| v.as_u64()).unwrap_or(0),
+                    skipped: c
+                        .get("skipped_cycles")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    failed: c.get("failed_cycles").and_then(|v| v.as_u64()).unwrap_or(0),
+                    // Status is filled in below, once the run rows are indexed.
+                    runs: c
+                        .get("run_ids")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str())
+                                .map(|id| CycleRun {
+                                    run_id: id.to_string(),
+                                    status: "unknown".to_string(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+            })
+            .filter(|c| in_range(c.started_at))
+            .collect();
+
+        // Index the CLI's run rows so each cycle's runs can carry a status —
+        // the `+N clean` pill needs it, and this costs no extra round-trip.
+        let status_of: std::collections::HashMap<&str, &str> = run_rows
+            .iter()
+            .filter_map(|r| {
+                Some((
+                    // `id`, NOT `run_id`: `rupu run list` emits `RunListRow`
+                    // verbatim and its field is `id`. Reading `run_id` here
+                    // yields an empty map and silently loses every status.
+                    r.get("id")?.as_str()?,
+                    r.get("status")?.as_str()?,
+                ))
+            })
+            .collect();
+        let mut cycles = cycles;
+        for c in cycles.iter_mut() {
+            for run in c.runs.iter_mut() {
+                if let Some(st) = status_of.get(run.run_id.as_str()) {
+                    run.status = st.to_string();
+                }
+            }
+        }
+
+        let cycle_of: std::collections::HashMap<String, String> = cycles
+            .iter()
+            .flat_map(|c| {
+                c.runs
+                    .iter()
+                    .map(|r| (r.run_id.clone(), c.cycle_id.clone()))
+            })
+            .collect();
+
+        let mut active = ActiveCounts::default();
+        let mut active_runs = Vec::new();
+        let mut recent_manual = Vec::new();
+        let mut buckets: std::collections::BTreeMap<String, TerminalBucket> = Default::default();
+
+        for row in &run_rows {
+            let (Some(id), Some(status), Some(started)) = (
+                // `id`, NOT `run_id` — see note above.
+                row.get("id").and_then(|v| v.as_str()),
+                row.get("status").and_then(|v| v.as_str()),
+                row.get("started_at").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let Ok(started_at) = chrono::DateTime::parse_from_rfc3339(started) else {
+                continue;
+            };
+            let started_at = started_at.with_timezone(&chrono::Utc);
+            if !in_range(started_at) {
+                continue;
+            }
+            let trigger = row
+                .get("trigger")
+                .and_then(|v| v.as_str())
+                .unwrap_or("manual");
+            let workflow_name = row
+                .get("workflow_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            match status {
+                "running" => active.running += 1,
+                "awaiting_approval" => active.awaiting_approval += 1,
+                "paused" => active.paused += 1,
+                "pending" => active.pending += 1,
+                _ => {}
+            }
+
+            let terminal = matches!(status, "completed" | "failed" | "rejected" | "cancelled");
+            if !terminal {
+                active_runs.push(ActiveRunBar {
+                    run_id: id.to_string(),
+                    workflow_name: workflow_name.clone(),
+                    status: status.to_string(),
+                    started_at,
+                    trigger: trigger.to_string(),
+                    cycle_id: cycle_of.get(id).cloned(),
+                });
+            } else {
+                let key = started_at.format("%Y-%m-%d").to_string();
+                let b = buckets.entry(key).or_insert(TerminalBucket {
+                    ts: started_at,
+                    completed: 0,
+                    failed: 0,
+                    rejected: 0,
+                    cancelled: 0,
+                });
+                match status {
+                    "completed" => b.completed += 1,
+                    "failed" => b.failed += 1,
+                    "rejected" => b.rejected += 1,
+                    "cancelled" => b.cancelled += 1,
+                    _ => {}
+                }
+            }
+
+            // A run belonging to a cycle is grouped under that cycle in the
+            // feed even when it has no trigger provenance of its own — it must
+            // never ALSO leak into recent_manual, or the same run renders twice
+            // (once under its cycle, once standalone). That double-listing is
+            // the exact autoflow-flooding bug this redesign exists to fix.
+            // The local build_summary has the identical guard.
+            if trigger == "manual" && !cycle_of.contains_key(id) {
+                recent_manual.push(RecentRun {
+                    id: id.to_string(),
+                    workflow_name,
+                    status: status.to_string(),
+                    started_at,
+                    finished_at: row
+                        .get("finished_at")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|t| t.with_timezone(&chrono::Utc)),
+                    trigger: "manual".to_string(),
+                });
+            }
+        }
+
+        active_runs.sort_by_key(|b| std::cmp::Reverse(b.started_at));
+        recent_manual.sort_by_key(|r| std::cmp::Reverse(r.started_at));
+
+        Ok(DashboardSummary {
+            active,
+            terminal_buckets: buckets.into_values().collect(),
+            active_runs,
+            cycles,
+            recent_manual,
+            // Findings are not exposed by the CLI; 0 here means "not reported by
+            // this host", and the aggregate sums only hosts that report.
+            findings_open: 0,
+            captured_at: now,
+        })
+    }
+
     // ── Workspace sync ─────────────────────────────────────────────────────────
     //
     // The wire-encoded payload/delta are shipped as raw stdin/stdout bytes to
@@ -1987,6 +2203,82 @@ mod tests {
         assert!(
             started.contains('T'),
             "started_at must stay RFC-3339: {started}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_dashboard_summary_sets_captured_at_and_tallies_active() {
+        struct StubExec {
+            runs_json: String,
+            cycles_json: String,
+            cmds: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                self.cmds.lock().unwrap().push(remote.to_string());
+                let stdout = if remote.contains("autoflow") {
+                    self.cycles_json.clone()
+                } else {
+                    self.runs_json.clone()
+                };
+                Ok(RemoteOutput {
+                    stdout,
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!()
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!()
+            }
+        }
+
+        // `run_id` here would silently zero out every row: `rupu run list`
+        // emits `RunListRow` verbatim, whose id field is `id`, not `run_id`.
+        let runs_json = r#"{"kind":"run_list","version":1,"rows":[
+            {"id":"r1","workflow_name":"w","status":"running",
+             "started_at":"2026-07-16T14:02:11Z","finished_at":null,"trigger":"manual",
+             "usage":{"input_tokens":0,"output_tokens":0,"cached_tokens":0,
+                      "total_tokens":0,"cost_usd":null,"priced":false,"runs":1},
+             "turns":0,"duration_ms":null},
+            {"id":"r2","workflow_name":"w","status":"awaiting_approval",
+             "started_at":"2026-07-16T14:03:11Z","finished_at":null,"trigger":"cron",
+             "usage":{"input_tokens":0,"output_tokens":0,"cached_tokens":0,
+                      "total_tokens":0,"cost_usd":null,"priced":false,"runs":1},
+             "turns":0,"duration_ms":null}
+        ],"summary":{"count":2,"limit":10000,"status_filter":null}}"#;
+        let cycles_json = r#"{"kind":"autoflow_history","version":1,"rows":[]}"#;
+
+        let stub = std::sync::Arc::new(StubExec {
+            runs_json: runs_json.into(),
+            cycles_json: cycles_json.into(),
+            cmds: std::sync::Mutex::new(Vec::new()),
+        });
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&stub));
+
+        let before = chrono::Utc::now();
+        let s = conn
+            .dashboard_summary(crate::host::dashboard_summary::DashboardRange::Days30)
+            .await
+            .unwrap();
+
+        assert_eq!(s.active.running, 1);
+        assert_eq!(s.active.awaiting_approval, 1);
+        assert_eq!(
+            s.active_runs.len(),
+            2,
+            "both non-terminal runs become swimlane bars"
+        );
+        assert!(
+            s.captured_at >= before,
+            "captured_at must be stamped when the host was actually read"
         );
     }
 
