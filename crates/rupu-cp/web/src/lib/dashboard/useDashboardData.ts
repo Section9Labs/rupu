@@ -83,15 +83,15 @@ export function coalesce(fn: () => void, ms: number): { trigger: () => void; can
  * ever reports a host AFTER it has resolved. This hook needs a fourth state
  * — `loading` — for the window between "we know this host exists" (from
  * `getRegisteredHosts()`) and "this host's `getDashboard` call resolved".
- * Rendering the freshness strip from THIS type (not `HostFreshness`) is a
- * decision the Dashboard page (P3) still needs to make; that page currently
- * expects the pre-reshape response shape and is out of scope here.
+ * The other three values are carried through VERBATIM from the matching
+ * entry in that resolved response's `hosts` array (see `fetchOneHost`) —
+ * a 200 response is not proof of health, `resp.hosts[].state` is.
  */
 export interface DashboardHostState {
   hostId: string;
   name: string;
   transportKind: string;
-  state: 'loading' | 'ok' | 'unavailable';
+  state: 'loading' | 'ok' | 'offline' | 'unavailable';
   summary?: DashboardSummary;
   /** Cause when `state !== 'ok'`; also set (without changing state) when a
    *  previously-`ok` host's refresh errors — see the stale-on-error note in
@@ -125,8 +125,36 @@ export function useDashboardData(range: DashboardRange) {
     api.getDashboard(rangeRef.current, hostId).then(
       (resp) => {
         if (genRef.current !== gen) return; // superseded by a newer bootstrap
+        // A resolved promise is NOT proof of health: the server answers a
+        // down remote host with HTTP 200 and a zeroed summary whose own
+        // `hosts[]` entry says `offline`/`unavailable`. That per-host entry
+        // is authoritative — never assume `ok` just because the call
+        // resolved. Only store `resp` as this host's summary when its own
+        // wire entry confirms `ok`; otherwise drop the summary entirely so
+        // its zeros/nulls (a fresh-looking `captured_at`, `findings_open:
+        // null`, ...) never reach the merge, the freshness strip, or the
+        // `findings_partial`/`cycles_partial` derivation below.
+        const wireHost = resp.hosts.find((h) => h.host_id === hostId);
         setHosts((prev) =>
-          prev.map((h) => (h.hostId === hostId ? { ...h, state: 'ok', summary: resp, reason: null } : h)),
+          prev.map((h) => {
+            if (h.hostId !== hostId) return h;
+            if (!wireHost) {
+              // Should never happen — the host we just asked about is
+              // missing from its own response. Fail closed rather than
+              // trust a summary with no corroborating per-host entry.
+              return { ...h, state: 'unavailable', summary: undefined, reason: 'host missing from response' };
+            }
+            if (wireHost.state !== 'ok') {
+              // Authoritative and immediate: the server confirmed this host
+              // is down, so this flips even a previously-`ok` host — unlike
+              // the `.catch` stale-on-error path below, which keeps
+              // last-good data on a mere failure to get an answer. Here we
+              // HAVE the answer, and it's "down". Never paint a fresh
+              // `captured_at` for it.
+              return { ...h, state: wireHost.state, summary: undefined, reason: wireHost.reason };
+            }
+            return { ...h, state: 'ok', summary: resp, reason: null };
+          }),
         );
       },
       (e: unknown) => {

@@ -4,7 +4,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import Dashboard from './Dashboard';
-import { api, type DashboardResponse, type DashboardSummary, type RegisteredHostView } from '../lib/api';
+import { api, type DashboardResponse, type RegisteredHostView } from '../lib/api';
 
 afterEach(() => {
   cleanup();
@@ -13,10 +13,13 @@ afterEach(() => {
 
 // `getDashboard` resolves `DashboardResponse` on the wire (`DashboardSummary`
 // flattened with `hosts` / `findings_partial` / `cycles_partial` — see
-// useDashboardData.test.ts, which this mirrors). The hook only reads the
-// `DashboardSummary` fields off it, but the mock's resolved type must still
-// match the real signature.
-function summary(overrides: Partial<DashboardSummary> = {}): DashboardResponse {
+// useDashboardData.test.ts, which this mirrors). The hook reads BOTH: the
+// flattened `DashboardSummary` fields, and `resp.hosts` to find its OWN
+// per-host entry and honor its authoritative `state` (a 200 response is not
+// proof of health). So the default here seeds a matching
+// `hosts: [{ host_id: hostId, state: 'ok', ... }]` entry for the healthy case.
+function summary(overrides: Partial<DashboardResponse> = {}, hostId = 'local'): DashboardResponse {
+  const captured_at = overrides.captured_at ?? new Date().toISOString();
   return {
     active: { running: 2, awaiting_approval: 1, paused: 0, pending: 0 },
     active_longest: null,
@@ -24,8 +27,8 @@ function summary(overrides: Partial<DashboardSummary> = {}): DashboardResponse {
     throughput_buckets: [],
     cycles: { total: 0, clean: 0, with_failures: 0 },
     findings_open: 3,
-    captured_at: new Date().toISOString(),
-    hosts: [],
+    captured_at,
+    hosts: [{ host_id: hostId, name: hostId, transport_kind: 'local', state: 'ok', captured_at, reason: null }],
     findings_partial: false,
     cycles_partial: false,
     ...overrides,
