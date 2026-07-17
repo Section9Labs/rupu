@@ -11,12 +11,18 @@ use rupu_orchestrator::runs::RunStore;
 use rupu_transcript::TimeWindow;
 use rupu_transcript::UsageRow;
 use rupu_transcript::{Event, JsonlReader};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Token + cost summary for a run, or any rollup of runs.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+///
+/// `Deserialize` is derived so `/api/usage`'s host fan-out can parse a
+/// remote CP's `summary` field straight off the wire and fold it into
+/// [`rollup`] alongside the local summary — the same struct is both the
+/// producer's and the aggregator's type, so there is no separate wire DTO to
+/// drift out of sync.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UsageSummary {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -233,10 +239,29 @@ impl GroupBy {
     pub fn is_intrinsic(&self) -> bool {
         matches!(self, GroupBy::Provider | GroupBy::Model | GroupBy::Agent)
     }
+
+    /// The wire form of this dimension — the exact string [`Self::parse`]
+    /// accepts for it. Used to forward the resolved `group_by` to a remote
+    /// host during `/api/usage` fan-out, so every host groups identically
+    /// even when the query omitted `group_by` (defaulted to `Model` locally).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GroupBy::Provider => "provider",
+            GroupBy::Model => "model",
+            GroupBy::Agent => "agent",
+            GroupBy::Workflow => "workflow",
+            GroupBy::Host => "host",
+            GroupBy::Project => "project",
+        }
+    }
 }
 
 /// One grouped line for the overview breakdown.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+///
+/// `Deserialize` is derived for the same reason as [`UsageSummary`]: a
+/// remote CP's `breakdown` array is parsed straight into this type during
+/// `/api/usage` host fan-out.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageBreakdownRow {
     pub provider: String,
     pub model: String,
@@ -587,6 +612,20 @@ mod tests {
         assert_eq!(GroupBy::parse("workflow"), Some(GroupBy::Workflow));
         assert_eq!(GroupBy::parse("host"), Some(GroupBy::Host));
         assert_eq!(GroupBy::parse("project"), Some(GroupBy::Project));
+    }
+
+    #[test]
+    fn group_by_as_str_round_trips_through_parse() {
+        for g in [
+            GroupBy::Provider,
+            GroupBy::Model,
+            GroupBy::Agent,
+            GroupBy::Workflow,
+            GroupBy::Host,
+            GroupBy::Project,
+        ] {
+            assert_eq!(GroupBy::parse(g.as_str()), Some(g));
+        }
     }
 
     #[test]
