@@ -1692,7 +1692,6 @@ Expected: FAIL — the current page calls `getDashboard()` with no range and ren
 // split status → activity feed.
 
 import { useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
 import { useDashboardData } from '../lib/dashboard/useDashboardData';
 import { HostFreshnessStrip } from '../components/dashboard/HostFreshnessStrip';
 import { AttentionRow } from '../components/dashboard/AttentionRow';
@@ -1767,12 +1766,12 @@ export default function Dashboard() {
               </button>
             ))}
           </div>
-          <Link
-            to="/usage"
-            className="rounded-md border border-[rgb(var(--c-border))] px-3 py-1 text-xs text-[rgb(var(--c-ink-dim))] hover:text-[rgb(var(--c-ink))]"
-          >
-            Spend →
-          </Link>
+          {/* NOTE: no "Spend →" link yet. `/usage` does not exist — plan 3 builds
+              it, and adds this link at the same time. Shipping a link to a 404 is
+              worse than shipping no link. Consequence, stated plainly: spend is
+              ABSENT from the dashboard between plan 1 and plan 3. That is a
+              temporary regression against the old spend-forward page, and it is
+              why plan 3 should follow closely. */}
         </div>
       </header>
 

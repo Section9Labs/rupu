@@ -783,6 +783,24 @@ export function OutlierPanel({ outliers }: { outliers: OutlierRun[] }) {
 }
 ```
 
+- [ ] **Step 4a: Add the Dashboard's "Spend →" link — plan 1 deliberately left it out**
+
+Plan 1 Task 6 omitted this link because `/usage` did not exist yet and a link to a 404 is worse
+than no link. **Spend is currently ABSENT from the dashboard** — this step ends that regression, so
+do not skip it. In `crates/rupu-cp/web/src/pages/Dashboard.tsx`'s header, beside the range control:
+
+```tsx
+          <Link
+            to="/usage"
+            className="rounded-md border border-[rgb(var(--c-border))] px-3 py-1 text-xs text-[rgb(var(--c-ink-dim))] hover:text-[rgb(var(--c-ink))]"
+          >
+            Spend →
+          </Link>
+```
+
+Add `import { Link } from 'react-router-dom';` to that file if absent. Verify the link resolves in
+a browser — that is the whole point of this step.
+
 - [ ] **Step 4: Implement the page and route**
 
 Create `crates/rupu-cp/web/src/pages/Usage.tsx` composing: header (range control + `PivotPicker`), `UnpricedBanner`, headline spend + `UsageTimelineStacked` (pivoted), `ModelBreakdownTable` (retitled to the active pivot), `OutlierPanel`. Add types + `api.getUsage(range, pivot)` / `api.getUsageOutliers(range)` to `api.ts`, and register the lazy route in `App.tsx` next to the existing ones:
