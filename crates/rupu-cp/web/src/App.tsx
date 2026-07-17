@@ -6,6 +6,7 @@ import Layout from './components/Layout';
 // All page-level routes are lazy-loaded so each page lands in its own chunk
 // and the main bundle only pays for the shell (Layout + router plumbing).
 const Dashboard         = React.lazy(() => import('./pages/Dashboard'));
+const Usage             = React.lazy(() => import('./pages/Usage'));
 const RunDetail         = React.lazy(() => import('./pages/RunDetail'));
 const Events            = React.lazy(() => import('./pages/Events'));
 const Coverage          = React.lazy(() => import('./pages/Coverage'));
@@ -49,6 +50,7 @@ export default function App() {
             <Route index element={<Navigate to="/dashboard" replace />} />
             {/* Pages — wrapped in Suspense so the eager Layout shell paints first */}
             <Route path="/dashboard" element={<Suspense fallback={<PageFallback />}><Dashboard /></Suspense>} />
+            <Route path="/usage" element={<Suspense fallback={<PageFallback />}><Usage /></Suspense>} />
             {/* Run-stream pages — static segments MUST precede the :id wildcard */}
             <Route path="/runs/agents"    element={<Suspense fallback={<PageFallback />}><AgentRuns /></Suspense>} />
             <Route path="/runs/workflows" element={<Suspense fallback={<PageFallback />}><WorkflowRuns /></Suspense>} />

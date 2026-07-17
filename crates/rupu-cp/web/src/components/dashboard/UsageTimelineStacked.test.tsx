@@ -7,7 +7,7 @@ import type { UsageBreakdownRow, UsageTimelineBucket } from '../../lib/usage';
 
 function brow(model: string, cost: number | null, tokens: number): UsageBreakdownRow {
   return {
-    provider: 'anthropic', model, agent: '',
+    provider: 'anthropic', model, agent: '', workflow: '', host_id: '', workspace_id: '',
     input_tokens: tokens, output_tokens: 0, cached_tokens: 0, total_tokens: tokens,
     cost_usd: cost, priced: cost !== null, runs: 1,
   };

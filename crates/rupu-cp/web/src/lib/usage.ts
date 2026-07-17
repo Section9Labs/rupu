@@ -14,10 +14,22 @@ export interface UsageSummary {
   runs: number;
 }
 
+/**
+ * One grouped line of the overview breakdown. Mirrors `UsageBreakdownRow` in
+ * `rupu-cp/src/usage.rs` exactly: `workflow` / `host_id` / `workspace_id` are
+ * always present on the wire (`#[serde(default)]` only affects
+ * *deserializing* a missing field — the server always serializes them, as
+ * `""` when the row wasn't grouped by that dimension). Only the field(s)
+ * matching the active `group_by` carry a non-empty identity; the rest are
+ * `""` for that row.
+ */
 export interface UsageBreakdownRow {
   provider: string;
   model: string;
   agent: string;
+  workflow: string;
+  host_id: string;
+  workspace_id: string;
   input_tokens: number;
   output_tokens: number;
   cached_tokens: number;
@@ -30,6 +42,18 @@ export interface UsageBreakdownRow {
 export interface UsageOverview {
   summary: UsageSummary;
   breakdown: UsageBreakdownRow[];
+}
+
+/**
+ * The models we could not price, named — mirrors `UnpricedGap` in
+ * `rupu-cp/src/api/usage.rs`. `UsageSummary.priced === false` says spend is
+ * partial but not by how much or because of what; this says exactly which
+ * models and how many token rows. A silent under-count on an attribution
+ * page is worse than no number.
+ */
+export interface UnpricedGap {
+  models: string[];
+  rows: number;
 }
 
 /** One time bucket of the usage timeline — a `YYYY-MM-DD` key (the day, or the

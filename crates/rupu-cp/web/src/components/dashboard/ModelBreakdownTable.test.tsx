@@ -10,6 +10,9 @@ function row(model: string, cost: number | null, tokens = 1000): UsageBreakdownR
     provider: 'anthropic',
     model,
     agent: '',
+    workflow: '',
+    host_id: '',
+    workspace_id: '',
     input_tokens: tokens,
     output_tokens: 0,
     cached_tokens: 0,
@@ -73,6 +76,6 @@ describe('ModelBreakdownTable', () => {
 
   it('renders an empty state with no rows', () => {
     render(<ModelBreakdownTable rows={[]} />);
-    expect(screen.getByText(/No model usage/)).toBeInTheDocument();
+    expect(screen.getByText(/No usage in this window/)).toBeInTheDocument();
   });
 });

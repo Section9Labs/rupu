@@ -1,12 +1,22 @@
-// All-models spend breakdown table. Top 6 priced models by cost, an `others (N)`
-// rollup for the rest, then unpriced models pinned below a divider (cost `—`,
-// never $0). Colors match the usage-timeline legend (shared `assignModelColors`).
+// Spend breakdown table for the active `/usage` pivot. Top 6 priced rows by
+// cost, an `others (N)` rollup for the rest, then unpriced rows pinned below a
+// divider (cost `—`, never $0).
+//
+// `pivot` (default `'model'`, preserving this component's original
+// model-only behavior) selects both the row label (`pivotLabel`) and the
+// color source: the model pivot keeps the dedicated `modelColors.ts` palette
+// (those colors are model IDENTITY, not an arbitrary category), every other
+// pivot uses the themed categorical ramp from `pivotColors.ts`.
 //
 // Pure presentational component (no recharts, no data fetching). The `toRows`
 // transform is exported for unit testing.
 
 import { formatCost, formatTokens, type UsageBreakdownRow } from '../../lib/usage';
-import { assignModelColors, modelLabel, OTHER_COLOR } from './modelColors';
+import type { Pivot } from '../../lib/api';
+import { useThemeColors } from '../../lib/useThemeColors';
+import { assignModelColors, pivotLabel, OTHER_COLOR } from './modelColors';
+import { assignCategoricalColors } from '../usage/pivotColors';
+import { PIVOT_LABEL } from '../usage/PivotPicker';
 
 const TOP_N = 6;
 
@@ -32,8 +42,10 @@ export interface BreakdownView {
 }
 
 /** Split priced / unpriced, sort priced by cost desc, roll the tail past TOP_N
- *  into an `others (N)` row, and pin unpriced rows last. */
-export function toRows(input: UsageBreakdownRow[]): BreakdownView {
+ *  into an `others (N)` row, and pin unpriced rows last. `pivot` (default
+ *  `'model'`) selects the row label; defaulting preserves this function's
+ *  original behavior for every existing call site. */
+export function toRows(input: UsageBreakdownRow[], pivot: Pivot = 'model'): BreakdownView {
   const priced = input
     .filter((r) => r.cost_usd !== null)
     .sort((a, b) => (b.cost_usd ?? 0) - (a.cost_usd ?? 0));
@@ -44,6 +56,12 @@ export function toRows(input: UsageBreakdownRow[]): BreakdownView {
   const unpricedTokens = unpriced.reduce((a, r) => a + r.total_tokens, 0);
   const share = (c: number) => (totalCost > 0 ? c / totalCost : 0);
 
+  // The provider sub-label under a row's name is only meaningful for the
+  // model pivot (which model belongs to which provider) — for every other
+  // pivot the label itself already IS `r.provider` or something orthogonal
+  // to it, and showing it again would just duplicate or confuse.
+  const subLabel = (r: UsageBreakdownRow) => (pivot === 'model' ? r.provider : '');
+
   const rows: BreakdownRow[] = [];
   const head = priced.slice(0, TOP_N);
   const tail = priced.slice(TOP_N);
@@ -51,9 +69,9 @@ export function toRows(input: UsageBreakdownRow[]): BreakdownView {
   for (const r of head) {
     const cost = r.cost_usd ?? 0;
     rows.push({
-      key: modelLabel(r),
-      label: modelLabel(r),
-      provider: r.provider,
+      key: pivotLabel(r, pivot),
+      label: pivotLabel(r, pivot),
+      provider: subLabel(r),
       tokens: r.total_tokens,
       cost,
       share: share(cost),
@@ -76,9 +94,9 @@ export function toRows(input: UsageBreakdownRow[]): BreakdownView {
 
   for (const r of unpriced) {
     rows.push({
-      key: `unpriced:${modelLabel(r)}`,
-      label: modelLabel(r),
-      provider: r.provider,
+      key: `unpriced:${pivotLabel(r, pivot)}`,
+      label: pivotLabel(r, pivot),
+      provider: subLabel(r),
       tokens: r.total_tokens,
       cost: null,
       share: null,
@@ -89,14 +107,22 @@ export function toRows(input: UsageBreakdownRow[]): BreakdownView {
   return { rows, totalCost, pricedTokens, unpricedTokens, hasUnpriced: unpriced.length > 0 };
 }
 
-export default function ModelBreakdownTable({ rows }: { rows: UsageBreakdownRow[] }) {
-  const view = toRows(rows);
-  const colors = assignModelColors(rows.map((r) => modelLabel(r)));
+export default function ModelBreakdownTable({
+  rows,
+  pivot = 'model',
+}: {
+  rows: UsageBreakdownRow[];
+  pivot?: Pivot;
+}) {
+  const theme = useThemeColors();
+  const view = toRows(rows, pivot);
+  const labels = rows.map((r) => pivotLabel(r, pivot));
+  const colors = pivot === 'model' ? assignModelColors(labels) : assignCategoricalColors(labels, theme);
   const colorFor = (r: BreakdownRow) =>
     r.kind === 'others' ? OTHER_COLOR : colors.get(r.label) ?? OTHER_COLOR;
 
   if (view.rows.length === 0) {
-    return <p className="text-xs text-ink-mute py-8 text-center">No model usage in this window</p>;
+    return <p className="text-xs text-ink-mute py-8 text-center">No usage in this window</p>;
   }
 
   // First row of the unpriced block — render a divider above it.
@@ -111,7 +137,7 @@ export default function ModelBreakdownTable({ rows }: { rows: UsageBreakdownRow[
       <table className="w-full table-fixed text-xs">
         <thead>
           <tr className="text-ink-mute text-meta uppercase tracking-wide">
-            <th className="text-left font-medium pb-2">Model</th>
+            <th className="text-left font-medium pb-2">{PIVOT_LABEL[pivot]}</th>
             <th className="text-right font-medium pb-2 w-14">Tokens</th>
             <th className="text-right font-medium pb-2 w-20">Cost</th>
             <th className="text-right font-medium pb-2 w-24">Share</th>

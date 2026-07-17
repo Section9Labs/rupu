@@ -9,8 +9,8 @@
 
 import type { TranscriptEvent, TranscriptResponse } from './transcript';
 export type { TranscriptEvent, TranscriptResponse } from './transcript';
-import type { UsageSummary, UsageOverview, UsageTimelineBucket } from './usage';
-export type { UsageSummary, UsageBreakdownRow, UsageOverview, UsageTimelineBucket } from './usage';
+import type { UsageSummary, UsageOverview, UsageTimelineBucket, UnpricedGap } from './usage';
+export type { UsageSummary, UsageBreakdownRow, UsageOverview, UsageTimelineBucket, UnpricedGap } from './usage';
 
 // ---------------------------------------------------------------------------
 // Error
@@ -657,6 +657,60 @@ export interface DashboardResponse extends DashboardSummary {
    * complete sum regardless — only the clean/with-failures split can be partial.
    */
   cycles_partial: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Usage (the /usage spend page)
+// ---------------------------------------------------------------------------
+
+/**
+ * The attribution dimension for `/api/usage?group_by=`. Mirrors `GroupBy` in
+ * `rupu-cp/src/usage.rs` exactly — an unrecognized value 400s server-side
+ * rather than silently falling back to a model breakdown.
+ */
+export type Pivot = 'model' | 'provider' | 'agent' | 'workflow' | 'host' | 'project';
+
+/**
+ * The full `GET /api/usage` response. Mirrors `UsageResponse` in
+ * `rupu-cp/src/api/usage.rs`: `summary` + `breakdown` (from `UsageOverview`)
+ * plus the named unpriced gap and per-host freshness that endpoint adds.
+ */
+export interface UsageResponse extends UsageOverview {
+  unpriced: UnpricedGap;
+  hosts: HostFreshness[];
+}
+
+/**
+ * One run flagged by `GET /api/usage/outliers` — costs far more than its
+ * workflow's own median. Mirrors `OutlierRun` in
+ * `rupu-cp/src/api/usage_outliers.rs`. Local-only: this endpoint does not fan
+ * out across hosts the way `/api/usage` does.
+ */
+export interface OutlierRun {
+  run_id: string;
+  workflow_name: string;
+  cost_usd: number;
+  baseline_usd: number;
+  ratio: number;
+  /** RFC-3339. */
+  started_at: string;
+}
+
+const USAGE_RANGE_DAYS: Record<'7d' | '30d', number> = { '7d': 7, '30d': 30 };
+
+/**
+ * Convert a `DashboardRange` into an explicit `since` bound for the
+ * `/api/usage*` endpoints, which have no `range` concept of their own — only
+ * raw `since`/`until`. `'all'` maps to the Unix epoch rather than omitting
+ * `since`: the server defaults an ABSENT `since` to "last 30 days"
+ * (`resolve_window` / `resolve_since` in the Rust handlers), which would
+ * silently narrow 'all' down to 30 days instead of broadening it.
+ *
+ * Exported for testing; `now` defaults to the real clock.
+ */
+export function usageRangeSince(range: DashboardRange, now: number = Date.now()): string {
+  if (range === 'all') return new Date(0).toISOString();
+  return new Date(now - USAGE_RANGE_DAYS[range] * 86_400_000).toISOString();
 }
 
 // ---------------------------------------------------------------------------
@@ -1330,13 +1384,16 @@ export const api = {
   },
 
   // --- Usage ---
-  getUsage(params?: { since?: string; until?: string; groupBy?: 'provider' | 'model' | 'agent' }): Promise<UsageOverview> {
-    const q = new URLSearchParams();
-    if (params?.since) q.set('since', params.since);
-    if (params?.until) q.set('until', params.until);
-    if (params?.groupBy) q.set('group_by', params.groupBy);
-    const qs = q.toString();
-    return request<UsageOverview>(`/api/usage${qs ? `?${qs}` : ''}`);
+  /**
+   * `range` + `pivot` drive the /usage page's attribution view: `pivot`
+   * forwards to `group_by` (an unknown value 400s server-side rather than
+   * silently defaulting to a model breakdown), and `host` optionally scopes
+   * to one registered host — same idiom as `getDashboard`.
+   */
+  getUsage(range: DashboardRange = '30d', pivot: Pivot = 'model', host?: string): Promise<UsageResponse> {
+    const q = new URLSearchParams({ since: usageRangeSince(range), group_by: pivot });
+    if (host) q.set('host', host);
+    return request<UsageResponse>(`/api/usage?${q.toString()}`);
   },
   /** Per-bucket usage timeline (chronological). `bucket` defaults to `day`. */
   getUsageTimeline(opts?: { since?: string; until?: string; bucket?: 'day' | 'week' }): Promise<UsageTimelineBucket[]> {
@@ -1346,6 +1403,16 @@ export const api = {
     if (opts?.bucket) q.set('bucket', opts.bucket);
     const qs = q.toString();
     return request<UsageTimelineBucket[]>(`/api/usage/timeline${qs ? `?${qs}` : ''}`);
+  },
+  /**
+   * Cost outliers — runs far above their workflow's own median. LOCAL-ONLY:
+   * `/api/usage/outliers` does not fan out across hosts (see the doc comment
+   * on `rupu-cp/src/api/usage_outliers.rs`), so this accepts single-host
+   * results and does not take a `host` param.
+   */
+  getUsageOutliers(range: DashboardRange = '30d'): Promise<OutlierRun[]> {
+    const q = new URLSearchParams({ since: usageRangeSince(range) });
+    return request<OutlierRun[]>(`/api/usage/outliers?${q.toString()}`);
   },
 
   // --- Runs ---

@@ -216,12 +216,53 @@ describe('api.getRun', () => {
 });
 
 describe('api.getUsage', () => {
-  it('requests /api/usage?group_by=model when grouped by model', async () => {
-    mockFetch(200, { summary: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: false, runs: 0 }, breakdown: [] });
+  const EMPTY_USAGE_RESPONSE = {
+    summary: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: false, runs: 0 },
+    breakdown: [],
+    unpriced: { models: [], rows: 0 },
+    hosts: [],
+  };
+
+  it('requests /api/usage with an explicit since + the pivot as group_by', async () => {
+    mockFetch(200, EMPTY_USAGE_RESPONSE);
     const fetchSpy = vi.mocked(fetch);
-    await api.getUsage({ groupBy: 'model' });
-    const calledUrl = (fetchSpy.mock.calls[0][0] as string);
-    expect(calledUrl).toBe('/api/usage?group_by=model');
+    await api.getUsage('30d', 'workflow');
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toMatch(/^\/api\/usage\?since=.+&group_by=workflow$/);
+  });
+
+  it('defaults to a 30-day window and the model pivot', async () => {
+    mockFetch(200, EMPTY_USAGE_RESPONSE);
+    const fetchSpy = vi.mocked(fetch);
+    await api.getUsage();
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toContain('group_by=model');
+  });
+
+  it('forwards an explicit host scope', async () => {
+    mockFetch(200, EMPTY_USAGE_RESPONSE);
+    const fetchSpy = vi.mocked(fetch);
+    await api.getUsage('7d', 'host', 'ssh1');
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toContain('host=ssh1');
+  });
+
+  it("'all' maps to the epoch, not an omitted since (which would default to 30 days server-side)", async () => {
+    mockFetch(200, EMPTY_USAGE_RESPONSE);
+    const fetchSpy = vi.mocked(fetch);
+    await api.getUsage('all', 'model');
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toContain(encodeURIComponent('1970-01-01T00:00:00.000Z'));
+  });
+});
+
+describe('api.getUsageOutliers', () => {
+  it('requests /api/usage/outliers with an explicit since bound', async () => {
+    mockFetch(200, []);
+    const fetchSpy = vi.mocked(fetch);
+    await api.getUsageOutliers('7d');
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toMatch(/^\/api\/usage\/outliers\?since=.+$/);
   });
 });
 

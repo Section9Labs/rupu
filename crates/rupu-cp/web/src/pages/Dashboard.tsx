@@ -21,6 +21,7 @@
 // "loading" until it resolves or the reconciling poll gives up on it.
 
 import { useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useDashboardData } from '../lib/dashboard/useDashboardData';
 import { HostFreshnessStrip, type HostFreshnessEntry } from '../components/dashboard/HostFreshnessStrip';
 import { KeyPointTiles } from '../components/dashboard/KeyPointTiles';
@@ -84,12 +85,15 @@ export default function Dashboard() {
               </button>
             ))}
           </div>
-          {/* NOTE: no "Spend →" link yet. `/usage` does not exist — plan 3 builds
-              it, and adds this link at the same time. Shipping a link to a 404 is
-              worse than shipping no link. Consequence, stated plainly: spend is
-              ABSENT from the dashboard between plan 1 and plan 3. That is a
-              temporary regression against the old spend-forward page, and it is
-              why plan 3 should follow closely. */}
+          {/* `/usage` now exists (plan 3, task 5) — this closes the "spend is
+              absent from the dashboard" regression the P4 rewrite deliberately
+              left open until the page it points to was real. */}
+          <Link
+            to="/usage"
+            className="rounded-md border border-[rgb(var(--c-border))] px-3 py-1 text-xs text-[rgb(var(--c-ink-dim))] hover:text-[rgb(var(--c-ink))]"
+          >
+            Spend →
+          </Link>
         </div>
       </header>
 
