@@ -428,21 +428,25 @@ async fn fan_out_list_runs(
     merged
 }
 
-/// Slim list DTO for `GET /api/runs` and `GET /api/runs/workflows`.
+/// One row of the runs list.
 ///
-/// The full record (including step results) is available at
-/// `GET /api/runs/:id`.
+/// `pub` (not `pub(crate)`) because `rupu-cli`'s `run list` emits `Vec<RunListRow>`
+/// verbatim as its JSON contract, and SSH `list_runs` returns those rows
+/// unmodified. That makes the remote path byte-identical to the local one by
+/// CONSTRUCTION. A hand-written mapper here previously omitted `usage` / `turns`
+/// / `duration_ms`, which the web UI reads unguarded — one such row blanked the
+/// entire app. Do not reintroduce a parallel shape.
 #[derive(serde::Serialize)]
-pub(crate) struct RunListRow {
-    pub(crate) id: String,
-    pub(crate) workflow_name: String,
-    pub(crate) status: RunStatus,
-    pub(crate) started_at: chrono::DateTime<chrono::Utc>,
-    pub(crate) finished_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub(crate) trigger: &'static str,
-    pub(crate) usage: crate::usage::UsageSummary,
-    pub(crate) turns: u64,
-    pub(crate) duration_ms: Option<u64>,
+pub struct RunListRow {
+    pub id: String,
+    pub workflow_name: String,
+    pub status: RunStatus,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub trigger: &'static str,
+    pub usage: crate::usage::UsageSummary,
+    pub turns: u64,
+    pub duration_ms: Option<u64>,
 }
 
 impl From<&RunRecord> for RunListRow {
@@ -464,7 +468,10 @@ impl From<&RunRecord> for RunListRow {
 impl RunListRow {
     /// Build a row with its usage summary, turn count, and duration filled from
     /// the run's transcripts (and the run record's wall-clock when available).
-    pub(crate) fn with_usage(
+    ///
+    /// `pub` for the same reason the struct is: `rupu-cli`'s `run list` calls
+    /// this directly to build its `Vec<RunListRow>` JSON contract.
+    pub fn with_usage(
         r: &RunRecord,
         store: &rupu_orchestrator::runs::RunStore,
         pricing: &rupu_config::PricingConfig,

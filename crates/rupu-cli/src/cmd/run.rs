@@ -297,6 +297,15 @@ pub async fn handle(
 /// `.take(limit)` on unsorted `store.list()` output — so a small `--limit`
 /// there returns an arbitrary subset rather than the newest N. Do not
 /// replicate that.)
+///
+/// Emits `rupu_cp::api::runs::RunListRow` verbatim (via
+/// [`rupu_cp::api::runs::RunListRow::with_usage`]) — do NOT hand-roll a
+/// parallel row shape here. A previous version of this command had its own
+/// `RunListJsonRow` that omitted `usage` / `turns` / `duration_ms`; the SSH
+/// host connector shells this command and returns its rows unmodified, and
+/// the web UI reads `usage.input_tokens` unguarded, so the omission crashed
+/// the whole runs list for any remote SSH host. See
+/// `crates/rupu-cp/src/api/runs.rs`'s doc comment on `RunListRow`.
 async fn list(
     limit: usize,
     status: Option<String>,
@@ -304,6 +313,11 @@ async fn list(
 ) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    // Resolve pricing exactly the way `show()` (above) does: global-only,
+    // falling back to defaults on a missing/malformed config.toml rather
+    // than failing the command.
+    let global_cfg_path = global.join("config.toml");
+    let cfg = rupu_config::layer_files(Some(&global_cfg_path), None).unwrap_or_default();
 
     let mut all: Vec<_> = store
         .list()?
@@ -317,21 +331,9 @@ async fn list(
     all.sort_by_key(|r| std::cmp::Reverse(r.started_at));
     all.truncate(limit);
 
-    let rows: Vec<RunListJsonRow> = all
+    let rows: Vec<rupu_cp::api::runs::RunListRow> = all
         .iter()
-        .map(|r| RunListJsonRow {
-            run_id: r.id.clone(),
-            workflow_name: r.workflow_name.clone(),
-            status: r.status.as_str().to_string(),
-            started_at: r.started_at,
-            finished_at: r.finished_at,
-            trigger: r.trigger_str(),
-            workspace_id: Some(r.workspace_id.clone()),
-            parent_run_id: r.parent_run_id.clone(),
-            awaiting_step_id: r.awaiting_step_id.clone(),
-            active_step_id: r.active_step_id.clone(),
-            error_message: r.error_message.clone(),
-        })
+        .map(|r| rupu_cp::api::runs::RunListRow::with_usage(r, &store, &cfg.pricing))
         .collect();
 
     let report = RunListReport {
@@ -355,8 +357,8 @@ async fn list(
             for row in &report.rows {
                 println!(
                     "{}  {}  {}  {}",
-                    row.run_id,
-                    row.status,
+                    row.id,
+                    row.status.as_str(),
                     row.trigger,
                     row.started_at.to_rfc3339()
                 );
@@ -407,39 +409,6 @@ async fn show(
     Ok(())
 }
 
-/// One run, carrying every field `rupu-cp`'s `RunListRow` needs.
-///
-/// Contract note: `started_at` / `finished_at` are RFC-3339. The fan-out merge
-/// in rupu-cp sorts these fields with a **lexicographic string compare**
-/// (`sort_values_newest_first`), which is only correct for RFC-3339. Do not
-/// switch to a human-readable format here — `rupu workflow runs` does that
-/// (`%Y-%m-%d %H:%M:%S`) and its rows consequently cannot be merge-sorted
-/// against local ones.
-#[derive(serde::Serialize)]
-struct RunListJsonRow {
-    run_id: String,
-    workflow_name: String,
-    status: String,
-    /// Serialized by serde, NOT by `.to_rfc3339()`.
-    ///
-    /// This MUST byte-match how `rupu-cp`'s `RunListRow` serializes the same
-    /// field, because rupu-cp merges local and remote rows with a
-    /// LEXICOGRAPHIC string compare on this value (`sort_values_newest_first`).
-    /// serde emits `...Z`; `.to_rfc3339()` emits `...+00:00`, and `'+'` (0x2B)
-    /// sorts before `'Z'` (0x5A) — so a `.to_rfc3339()` row silently sorts as
-    /// older than it is. Do not "tidy" this into a string.
-    started_at: chrono::DateTime<chrono::Utc>,
-    /// Same constraint as `started_at`. `None` while the run is non-terminal.
-    finished_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// `"manual"` | `"cron"` | `"event"` — mirrors `rupu-cp`'s `trigger_of`.
-    trigger: &'static str,
-    workspace_id: Option<String>,
-    parent_run_id: Option<String>,
-    awaiting_step_id: Option<String>,
-    active_step_id: Option<String>,
-    error_message: Option<String>,
-}
-
 #[derive(serde::Serialize)]
 struct RunListSummary {
     count: usize,
@@ -447,11 +416,20 @@ struct RunListSummary {
     status_filter: Option<String>,
 }
 
+/// Contract note: `rows` is `rupu_cp::api::runs::RunListRow`, whose
+/// `started_at` / `finished_at` serialize via serde (RFC-3339 with a `Z`
+/// suffix), NOT `.to_rfc3339()` (which emits `+00:00`). rupu-cp's fan-out
+/// merge sorts these fields with a LEXICOGRAPHIC string compare
+/// (`sort_values_newest_first`), and `'+'` (0x2B) sorts before `'Z'` (0x5A) —
+/// so a `.to_rfc3339()` row would silently sort as older than it is. Do not
+/// "tidy" this into a hand-formatted string; `rupu workflow runs` does that
+/// (`%Y-%m-%d %H:%M:%S`) and its rows consequently cannot be merge-sorted
+/// against local ones.
 #[derive(serde::Serialize)]
 struct RunListReport {
     kind: &'static str,
     version: u8,
-    rows: Vec<RunListJsonRow>,
+    rows: Vec<rupu_cp::api::runs::RunListRow>,
     summary: RunListSummary,
 }
 
@@ -1236,30 +1214,72 @@ mod tests {
         assert!(matches!(action, RunAction::Launch(_)));
     }
 
+    /// Build a `RunListRow` for tests without going through
+    /// `RunListRow::with_usage` (which needs a `RunStore` + transcripts on
+    /// disk) — `RunListRow::from(&RunRecord)` gives zeroed usage/turns/
+    /// duration, which is fine for the serialization-shape assertions here.
+    fn sample_row(
+        started_at: chrono::DateTime<chrono::Utc>,
+        finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> rupu_cp::api::runs::RunListRow {
+        let rec = rupu_orchestrator::RunRecord {
+            id: "run_01".into(),
+            workflow_name: "nightly".into(),
+            status: rupu_orchestrator::RunStatus::Completed,
+            inputs: Default::default(),
+            event: None,
+            workspace_id: "ws_1".into(),
+            workspace_path: std::path::PathBuf::new(),
+            transcript_dir: std::path::PathBuf::new(),
+            started_at,
+            finished_at,
+            final_output: None,
+            error_message: None,
+            awaiting_step_id: None,
+            approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+        };
+        rupu_cp::api::runs::RunListRow::from(&rec)
+    }
+
     #[test]
     fn run_list_row_serializes_rfc3339_and_trigger() {
         let started_at: chrono::DateTime<chrono::Utc> = "2026-07-16T14:02:11Z".parse().unwrap();
         let finished_at: chrono::DateTime<chrono::Utc> = "2026-07-16T14:09:02Z".parse().unwrap();
-        let row = RunListJsonRow {
-            run_id: "run_01".into(),
-            workflow_name: "nightly".into(),
-            status: "completed".into(),
-            started_at,
-            finished_at: Some(finished_at),
-            trigger: "cron",
-            workspace_id: Some("ws_1".into()),
-            parent_run_id: None,
-            awaiting_step_id: None,
-            active_step_id: None,
-            error_message: None,
-        };
+        let row = sample_row(started_at, Some(finished_at));
         let v = serde_json::to_value(&row).unwrap();
-        assert_eq!(v["run_id"], "run_01");
-        assert_eq!(v["trigger"], "cron");
+        assert_eq!(v["id"], "run_01");
+        // No trigger/event/source_wake_id set on the record → "manual".
+        assert_eq!(v["trigger"], "manual");
         // RFC-3339 is required for the lexicographic merge sort in rupu-cp.
         assert!(
             v["started_at"].as_str().unwrap().contains('T'),
             "started_at must be RFC-3339, not space-separated"
+        );
+        // usage/turns/duration_ms must be present (not omitted) — a row
+        // missing these blanks the whole web UI (it reads them unguarded).
+        assert!(v.get("usage").is_some(), "usage field must be present");
+        assert!(v.get("turns").is_some(), "turns field must be present");
+        assert!(
+            v.as_object().unwrap().contains_key("duration_ms"),
+            "duration_ms field must be present"
         );
     }
 
@@ -1268,20 +1288,14 @@ mod tests {
         // rupu-cp merges local + remote rows with a LEXICOGRAPHIC compare on
         // started_at. If this emits `+00:00` while rupu-cp's RunListRow emits
         // `Z`, every remote row sorts older than it is. Pin the format.
+        //
+        // `RunListRow.started_at` is `DateTime<Utc>` serialized by serde
+        // (which emits a `Z` suffix), not `.to_rfc3339()` (which emits
+        // `+00:00`) — so this should hold for free now that the CLI emits
+        // `rupu_cp::api::runs::RunListRow` directly instead of a hand-rolled
+        // parallel shape. Assert it still does.
         let t: chrono::DateTime<chrono::Utc> = "2026-07-16T07:00:59.397407Z".parse().unwrap();
-        let row = RunListJsonRow {
-            run_id: "run_01".into(),
-            workflow_name: "nightly".into(),
-            status: "completed".into(),
-            started_at: t,
-            finished_at: Some(t),
-            trigger: "cron",
-            workspace_id: Some("ws_1".into()),
-            parent_run_id: None,
-            awaiting_step_id: None,
-            active_step_id: None,
-            error_message: None,
-        };
+        let row = sample_row(t, Some(t));
         let v = serde_json::to_value(&row).unwrap();
         let started = v["started_at"].as_str().unwrap();
         assert!(

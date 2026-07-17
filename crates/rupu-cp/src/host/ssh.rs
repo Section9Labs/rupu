@@ -152,24 +152,6 @@ pub(crate) fn transcript_row_to_agent_run(row: &serde_json::Value) -> serde_json
     })
 }
 
-/// Map one `rupu run list --format json` row to the `RunListRow` wire shape.
-///
-/// Field renames only — the CLI contract (Task 1) was built to carry every
-/// field this needs, so nothing is synthesized or defaulted-to-wrong here.
-fn run_list_row_to_wire(row: &serde_json::Value) -> Option<serde_json::Value> {
-    let run_id = row.get("run_id")?.as_str()?;
-    Some(serde_json::json!({
-        "id": run_id,
-        "workflow_name": row.get("workflow_name").and_then(|v| v.as_str()).unwrap_or(""),
-        "status": row.get("status").and_then(|v| v.as_str()).unwrap_or("pending"),
-        "started_at": row.get("started_at").and_then(|v| v.as_str()).unwrap_or(""),
-        "finished_at": row.get("finished_at").cloned().unwrap_or(serde_json::Value::Null),
-        "trigger": row.get("trigger").and_then(|v| v.as_str()).unwrap_or("manual"),
-        "workspace_id": row.get("workspace_id").cloned().unwrap_or(serde_json::Value::Null),
-        "error_message": row.get("error_message").cloned().unwrap_or(serde_json::Value::Null),
-    }))
-}
-
 /// `rupu autoflow history` row → `AutoflowEventRow` wire shape
 /// (`/api/runs/autoflows/events`).
 pub(crate) fn history_row_to_autoflow_event(row: &serde_json::Value) -> serde_json::Value {
@@ -972,6 +954,15 @@ impl HostConnector for SshHostConnector {
     /// same pattern `list_sessions` / `list_autoflow_runs` / `list_agent_runs`
     /// already use.
     ///
+    /// Returns `remote_json_rows`' rows **verbatim** — no reshaping mapper.
+    /// `rupu run list` (Task 1) emits `rupu_cp::api::runs::RunListRow` JSON
+    /// directly, which is exactly the wire shape `/api/runs` needs (`id`,
+    /// `usage`, `turns`, `duration_ms`, …). A hand-written mapper here
+    /// previously (`run_list_row_to_wire`) dropped `usage`/`turns`/
+    /// `duration_ms` — fields the web UI reads unguarded — which crashed the
+    /// whole runs list for any host with a visible SSH run. Do not
+    /// reintroduce one; see `RunListRow`'s doc comment.
+    ///
     /// `stream_run_events` still reads the mirror, deliberately: tailing a
     /// known path on a live run is a different problem from enumerating.
     async fn list_runs(
@@ -1001,8 +992,7 @@ impl HostConnector for SshHostConnector {
         };
 
         let mut out: Vec<serde_json::Value> = rows
-            .iter()
-            .filter_map(run_list_row_to_wire)
+            .into_iter()
             .filter(|r| match params.kind {
                 RunKind::All => true,
                 // Workflow-only means manual-triggered only, mirroring
@@ -1674,11 +1664,16 @@ mod tests {
             }
         }
 
+        // RunListRow-shaped stub (the CLI's real `run list --format json`
+        // contract, since Task 5) — `id`, `usage`, `turns`, `duration_ms`,
+        // not the old lossy mapper's shape.
         let json = r#"{"kind":"run_list","version":1,"rows":[
-            {"run_id":"run_a","workflow_name":"nightly","status":"completed",
+            {"id":"run_a","workflow_name":"nightly","status":"completed",
              "started_at":"2026-07-16T14:02:11Z","finished_at":"2026-07-16T14:09:02Z",
-             "trigger":"cron","workspace_id":"ws_1","parent_run_id":null,
-             "awaiting_step_id":null,"active_step_id":null,"error_message":null}
+             "trigger":"cron",
+             "usage":{"input_tokens":100,"output_tokens":50,"cached_tokens":0,
+                      "total_tokens":150,"cost_usd":0.01,"priced":true,"runs":1},
+             "turns":3,"duration_ms":410000}
         ],"summary":{"count":1,"limit":10000,"status_filter":null}}"#;
         let stub = std::sync::Arc::new(StubExec {
             json: json.into(),
@@ -1714,6 +1709,72 @@ mod tests {
             cmd.contains("run") && cmd.contains("list") && cmd.contains("json"),
             "must shell `rupu run list --format json`: {cmd}"
         );
+    }
+
+    #[tokio::test]
+    async fn list_runs_rows_carry_usage_and_turns() {
+        // The web UI reads r.usage.input_tokens UNGUARDED and App.tsx has a
+        // single top-level ErrorBoundary — a row without `usage` blanks the
+        // whole app. These fields are not optional. Regression test for the
+        // deleted `run_list_row_to_wire` mapper, which omitted them.
+        struct StubExec {
+            json: String,
+        }
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, _remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                Ok(RemoteOutput {
+                    stdout: self.json.clone(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!("not used by list_runs")
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!("not used by list_runs")
+            }
+        }
+
+        let json = r#"{"kind":"run_list","version":1,"rows":[
+            {"id":"run_b","workflow_name":"deploy","status":"completed",
+             "started_at":"2026-07-16T09:00:00Z","finished_at":"2026-07-16T09:05:00Z",
+             "trigger":"manual",
+             "usage":{"input_tokens":1200,"output_tokens":800,"cached_tokens":100,
+                      "total_tokens":2000,"cost_usd":5.25,"priced":true,"runs":1},
+             "turns":7,"duration_ms":300000}
+        ],"summary":{"count":1,"limit":10000,"status_filter":null}}"#;
+        let stub = std::sync::Arc::new(StubExec { json: json.into() });
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&stub));
+
+        let rows = conn
+            .list_runs(RunListQuery {
+                kind: RunKind::All,
+                offset: 0,
+                limit: 100,
+                lifecycle: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !rows[0]["usage"].is_null(),
+            "usage must be present, not null/missing: {:?}",
+            rows[0]
+        );
+        assert_eq!(rows[0]["usage"]["input_tokens"], 1200);
+        assert_eq!(
+            rows[0]["turns"], 7,
+            "turns must be present and non-zero: {:?}",
+            rows[0]
+        );
+        assert_eq!(rows[0]["duration_ms"], 300000);
     }
 
     #[tokio::test]
@@ -1906,10 +1967,11 @@ mod tests {
             }
         }
         let json = r#"{"kind":"run_list","version":1,"rows":[
-            {"run_id":"run_a","workflow_name":"w","status":"completed",
+            {"id":"run_a","workflow_name":"w","status":"completed",
              "started_at":"2026-07-16T14:02:11Z","finished_at":null,"trigger":"manual",
-             "workspace_id":null,"parent_run_id":null,"awaiting_step_id":null,
-             "active_step_id":null,"error_message":null}
+             "usage":{"input_tokens":0,"output_tokens":0,"cached_tokens":0,
+                      "total_tokens":0,"cost_usd":null,"priced":false,"runs":1},
+             "turns":0,"duration_ms":null}
         ],"summary":{"count":1,"limit":1,"status_filter":null}}"#;
         let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(StubExec { json: json.into() }));
         let rows = conn
