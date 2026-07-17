@@ -2161,7 +2161,15 @@ async fn get_dashboard(
         }
     }
 
-    resp.terminal_buckets = bucket_merge.into_values().collect();
+    // Fill the merged bucket grid — zero-fill every day in `range`, not just
+    // days that had terminal runs. Without this the trend area silently closes
+    // gaps and reads as continuous activity across days that had none.
+    //
+    // This MUST happen here, after the merge: the local connector zero-fills its
+    // own grid (`summary_build::fill_bucket_grid`) but the SSH connector emits
+    // only days with runs, so a fleet with no local host would otherwise produce
+    // a holed grid. The merged output is the only place that sees every host.
+    resp.terminal_buckets = fill_merged_grid(bucket_merge, range, chrono::Utc::now());
     resp.active_runs.sort_by_key(|b| std::cmp::Reverse(b.started_at));
     resp.cycles.sort_by_key(|c| std::cmp::Reverse(c.started_at));
     resp.recent_manual.sort_by_key(|r| std::cmp::Reverse(r.started_at));
@@ -2169,6 +2177,13 @@ async fn get_dashboard(
     Ok(Json(resp))
 }
 ```
+
+**Implementer note — `fill_merged_grid`:** reuse the zero-filling logic rather than
+writing a second copy. `crates/rupu-cp/src/host/summary_build.rs` already has
+`fill_bucket_grid(BTreeMap<DateTime<Utc>, TerminalBucket>, DashboardRange, DateTime<Utc>)
+-> Vec<TerminalBucket>` doing exactly this; promote it to `pub(crate)` and call it. Two
+copies of "which days exist" will drift, and the failure is silent — a chart that closes
+a gap looks identical to one that had activity.
 
 **Implementer note:** `s.hosts.host_view(id)` may not exist — `list_hosts()` does. If not, filter `list_hosts()` by id and 404 when absent, rather than adding a registry method for one caller.
 
