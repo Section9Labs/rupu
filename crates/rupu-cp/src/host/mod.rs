@@ -9,9 +9,11 @@
 
 pub mod bucket;
 pub mod connector;
+pub mod dashboard_summary;
 pub mod http;
 pub mod local;
 pub mod registry;
 pub mod ssh;
+pub mod summary_build;
 pub mod tunnel;
 pub mod workspace_stage;

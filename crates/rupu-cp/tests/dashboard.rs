@@ -1,35 +1,75 @@
-/// Integration tests for `GET /api/dashboard`.
-use chrono::Utc;
-use rupu_config::PricingConfig;
-use rupu_coverage::CoveragePaths;
-use rupu_orchestrator::runs::{RunRecord, RunStatus, RunStore};
-use rupu_runtime::{WorkerCapabilities, WorkerKind, WorkerRecord};
-use rupu_workspace::worker_store::WorkerStore;
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+//! Integration tests for `GET /api/dashboard` (Task 7: fan-out across hosts).
+//!
+//! The endpoint now fans `dashboard_summary()` out across every registered
+//! host and merges only the hosts that actually reported. A host that cannot
+//! report (offline, or `Unsupported`) must surface in `hosts[]` as
+//! `offline` / `unavailable` rather than contributing zeroed counts.
 
 // ---------------------------------------------------------------------------
-// Seeding helpers (mirrors the patterns in endpoints.rs and runs.rs)
+// Spawn helpers (mirrors tests/host_reads.rs; helpers are duplicated per file
+// — there is no shared `tests/common/` module in this crate).
 // ---------------------------------------------------------------------------
 
-fn seed_run(id: &str, status: RunStatus, started_offset_secs: i64) -> RunRecord {
-    let started_at = Utc::now() - chrono::Duration::seconds(started_offset_secs);
-    let finished_at = if status.is_terminal() {
-        Some(started_at + chrono::Duration::seconds(1))
-    } else {
-        None
-    };
-    RunRecord {
+struct TestServer {
+    base_url: String,
+}
+
+/// Spin up a read-only local-only server.
+async fn spawn_server(dir: &std::path::Path) -> TestServer {
+    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    TestServer {
+        base_url: format!("http://{addr}"),
+    }
+}
+
+/// Spin up a server with one remote host pre-registered via the registry.
+async fn spawn_server_with_remote(dir: &std::path::Path, mock_base_url: &str) -> TestServer {
+    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    state
+        .hosts
+        .add_host("mock-remote", mock_base_url, None)
+        .expect("add_host should succeed");
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    TestServer {
+        base_url: format!("http://{addr}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Seeders for the host_id tagging test (mirrors host_reads.rs /
+// federation_e2e.rs — helpers are duplicated per file, no shared
+// `tests/common/`).
+// ---------------------------------------------------------------------------
+
+/// Build a minimal, manually-triggered `RunRecord` (no `event`, no
+/// `source_wake_id` — see `RunRecord::trigger_str()` in
+/// `crates/rupu-orchestrator/src/runs.rs`).
+fn seed_run(
+    id: &str,
+    status: rupu_orchestrator::runs::RunStatus,
+) -> rupu_orchestrator::runs::RunRecord {
+    rupu_orchestrator::runs::RunRecord {
         id: id.into(),
-        workflow_name: "dashboard-wf".into(),
+        workflow_name: "dash-wf".into(),
         status,
-        inputs: BTreeMap::from([("prompt".into(), "hello".into())]),
+        inputs: std::collections::BTreeMap::new(),
         event: None,
-        workspace_id: "ws_test".into(),
-        workspace_path: PathBuf::from("/tmp/test-proj"),
-        transcript_dir: PathBuf::from("/tmp/test-proj/.rupu/transcripts"),
-        started_at,
-        finished_at,
+        workspace_id: "ws_dash".into(),
+        workspace_path: std::path::PathBuf::from("/tmp/dash-proj"),
+        transcript_dir: std::path::PathBuf::from("/tmp/dash-proj/.rupu/transcripts"),
+        started_at: chrono::Utc::now(),
+        finished_at: None,
         error_message: None,
         awaiting_step_id: None,
         approval_prompt: None,
@@ -55,255 +95,227 @@ fn seed_run(id: &str, status: RunStatus, started_offset_secs: i64) -> RunRecord 
     }
 }
 
-fn seed_worker(store: &WorkerStore, id: &str) {
-    let worker = WorkerRecord {
-        version: WorkerRecord::VERSION,
-        worker_id: id.to_string(),
-        kind: WorkerKind::Cli,
-        name: "test-worker".to_string(),
-        host: "localhost".to_string(),
-        capabilities: WorkerCapabilities::default(),
-        registered_at: "2026-06-16T00:00:00Z".to_string(),
-        last_seen_at: "2026-06-16T01:00:00Z".to_string(),
+/// Seed a cycle with one `RunLaunched` event referencing `run_id`.
+///
+/// `collect_cycle_rollups` (`host/local.rs`) reads cycles via
+/// `AutoflowHistoryStore::list_recent`, which reads back only what `save()`
+/// wrote — NOT the separate append-only event log `append_cycle_event`
+/// writes to. The run ids it harvests (`run_streams::harvest_run_ids`) come
+/// from the in-memory `record.events` field, so the event must be pushed onto
+/// the record *before* `save()`, mirroring `host/local.rs`'s own
+/// `collect_cycle_rollups_reads_a_fixture_written_by_the_real_store` test.
+fn seed_autoflow_cycle_with_run(global_dir: &std::path::Path, run_id: &str) {
+    use rupu_runtime::{
+        AutoflowCycleEvent, AutoflowCycleEventKind, AutoflowCycleMode, AutoflowCycleRecord,
+        AutoflowHistoryStore,
     };
-    store.save(&worker).unwrap();
-}
-
-fn seed_coverage_target(workspace: &Path, target_id: &str, assertion_lines: usize) {
-    let paths = CoveragePaths::new(workspace, target_id);
-    paths.ensure_dir().unwrap();
-    let line = serde_json::json!({
-        "concern_id": "stride:spoofing",
-        "file_path": "src/auth.rs",
-        "status": "clean",
-        "evidence": { "summary": "ok", "line_ranges": [], "finding_ids": [] },
-        "run_id": "r1",
-        "model": "m",
-        "surface": "workflow",
-        "declared_at": "2026-06-16T00:00:00Z"
-    })
-    .to_string();
-    let content = format!("{line}\n").repeat(assertion_lines);
-    std::fs::write(&paths.concerns, content).unwrap();
-}
-
-/// Register a workspace TOML pointing at `path` so registry-driven aggregation
-/// (coverage tile) can discover its `.rupu/coverage/`.
-fn seed_workspace_toml(dir: &Path, id: &str, path: &Path) {
-    std::fs::create_dir_all(dir).unwrap();
-    let toml = format!(
-        "id = \"{id}\"\npath = \"{}\"\ncreated_at = \"2026-06-16T00:00:00Z\"\n",
-        path.to_str().unwrap()
-    );
-    std::fs::write(dir.join(format!("{id}.toml")), toml).unwrap();
-}
-
-fn minimal_session_json(id: &str) -> String {
-    serde_json::json!({
-        "session_id": id,
-        "agent_name": "foo",
-        "model": "claude-sonnet-4-6",
-        "status": "active",
-        "total_turns": 1,
-        "created_at": "2026-06-16T00:00:00Z",
-        "updated_at": "2026-06-16T01:00:00Z",
-        "active_run_id": null,
-        "target": null,
-    })
-    .to_string()
-}
-
-async fn spawn_server(
-    global: &Path,
-    workspace: &Path,
-) -> std::net::SocketAddr {
-    let state = rupu_cp::state::AppState::new(global.into(), PricingConfig::default())
-        .with_workspace_dir(workspace.into());
-    let app = rupu_cp::server::router(state, None);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+    let store_root = global_dir.join("autoflows").join("history");
+    let store = AutoflowHistoryStore::new(store_root);
+    let now = chrono::Utc::now();
+    let mut cycle = AutoflowCycleRecord::new(AutoflowCycleMode::Tick, now);
+    cycle.events.push(AutoflowCycleEvent {
+        kind: AutoflowCycleEventKind::RunLaunched,
+        workflow: Some("dash-wf".into()),
+        run_id: Some(run_id.into()),
+        ..Default::default()
     });
-    addr
+    store.save(&cycle).unwrap();
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Seed: 1 Running run + 1 Completed run, 1 active session, 1 worker,
-/// 1 coverage target with 3 assertion lines.
-/// Assert all dashboard fields are correctly aggregated.
 #[tokio::test]
-async fn dashboard_aggregate_correct_counts() {
-    let tmp = tempfile::tempdir().unwrap();
-    let global = tmp.path();
-    let workspace = tmp.path();
+async fn dashboard_reflects_seeded_active_run_and_cycle_in_aggregate_fields() {
+    // The redesign replaced per-row lists (active_runs / cycles / recent_manual,
+    // each tagged with host_id) with aggregate-only key points: a seeded run
+    // must surface through `active`/`active_longest`/`throughput_buckets`, and
+    // a seeded cycle through `cycles.total` — never as a row array.
+    let dir = tempfile::tempdir().unwrap();
 
-    // -- runs
-    let run_store = RunStore::new(global.join("runs"));
-    let run1 = seed_run("dash_run_01", RunStatus::Running, 100);
-    let run2 = seed_run("dash_run_02", RunStatus::Completed, 200);
-    // run2 is older (started_offset 200s ago) → should be second in recent_runs
+    // A standalone manual, non-terminal run.
+    let run_store = rupu_orchestrator::runs::RunStore::new(dir.path().join("runs"));
     run_store
-        .create(run1, "name: dashboard-wf\nsteps: []\n")
+        .create(
+            seed_run(
+                "dash_active_run",
+                rupu_orchestrator::runs::RunStatus::Running,
+            ),
+            "name: dash-wf\nsteps: []\n",
+        )
         .unwrap();
-    run_store
-        .create(run2, "name: dashboard-wf\nsteps: []\n")
-        .unwrap();
 
-    // -- active session
-    let sess_dir = global.join("sessions").join("dash_sess_1");
-    std::fs::create_dir_all(&sess_dir).unwrap();
-    std::fs::write(
-        sess_dir.join("session.json"),
-        minimal_session_json("dash_sess_1"),
-    )
-    .unwrap();
+    // A cycle referencing a *different* run id.
+    seed_autoflow_cycle_with_run(dir.path(), "dash_cycle_run");
 
-    // -- worker
-    let worker_store = WorkerStore {
-        root: global.join("autoflows").join("workers"),
-    };
-    seed_worker(&worker_store, "dash_worker_1");
-
-    // -- coverage (1 target, 3 assertion lines)
-    // The dashboard tile aggregates coverage across the registered workspaces,
-    // so register `workspace` (which holds the seeded `.rupu/coverage/`).
-    seed_coverage_target(workspace, "dash_target_1", 3);
-    seed_workspace_toml(&global.join("workspaces"), "ws_dash", workspace);
-
-    let addr = spawn_server(global, workspace).await;
-
-    let resp = reqwest::get(format!("http://{addr}/api/dashboard"))
+    let srv = spawn_server(dir.path()).await;
+    let body: serde_json::Value = reqwest::get(format!("{}/api/dashboard?range=all", srv.base_url))
+        .await
+        .unwrap()
+        .json()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "expected 200 from /api/dashboard");
 
-    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["active"]["running"], 1,
+        "the seeded running run must be tallied into active.running: {body}"
+    );
 
-    // runs
-    let runs = &body["runs"];
+    let active_longest = &body["active_longest"];
     assert_eq!(
-        runs["total"].as_u64(),
-        Some(2),
-        "runs.total should be 2; body={body}"
+        active_longest["run_id"], "dash_active_run",
+        "the only non-terminal run must be reported as active_longest: {body}"
     );
-    assert_eq!(
-        runs["by_status"]["running"].as_u64(),
-        Some(1),
-        "by_status.running should be 1"
-    );
-    assert_eq!(
-        runs["by_status"]["completed"].as_u64(),
-        Some(1),
-        "by_status.completed should be 1"
-    );
-    // All six status keys must be present even when zero
-    for key in &["failed", "awaiting_approval", "pending", "rejected"] {
-        assert!(
-            runs["by_status"].get(key).is_some(),
-            "by_status missing key '{key}'"
-        );
-        assert_eq!(
-            runs["by_status"][key].as_u64(),
-            Some(0),
-            "by_status.{key} should be 0"
-        );
-    }
 
-    // recent_runs — both runs returned, newest first
-    let recent = body["recent_runs"].as_array().expect("recent_runs should be array");
-    assert_eq!(recent.len(), 2, "expected 2 recent_runs");
-    // run1 started 100s ago → more recent → should be first
-    assert_eq!(
-        recent[0]["id"].as_str(),
-        Some("dash_run_01"),
-        "newest run should be first; got {:?}",
-        recent[0]["id"]
-    );
-    assert_eq!(
-        recent[1]["id"].as_str(),
-        Some("dash_run_02"),
-        "older run should be second"
-    );
-    // Each recent run has the required fields
-    assert!(recent[0]["workflow_name"].as_str().is_some());
-    assert!(recent[0]["status"].as_str().is_some());
-    assert!(recent[0]["started_at"].as_str().is_some());
-
-    // sessions
-    let sessions = &body["sessions"];
     assert!(
-        sessions["total"].as_u64().unwrap_or(0) >= 1,
-        "sessions.total should be >= 1"
+        body["throughput_buckets"]
+            .as_array()
+            .expect("throughput_buckets array")
+            .iter()
+            .any(|b| b["manual"].as_u64().unwrap_or(0) >= 1),
+        "the seeded manual run must be tallied into a throughput bucket: {body}"
     );
-    assert_eq!(sessions["active"].as_u64(), Some(1), "active sessions should be 1");
-    assert_eq!(sessions["archived"].as_u64(), Some(0), "archived sessions should be 0");
 
-    // workers
-    let workers = &body["workers"];
-    assert_eq!(workers["total"].as_u64(), Some(1), "workers.total should be 1");
+    assert!(
+        body["cycles"]["total"].as_u64().unwrap_or(0) >= 1,
+        "the seeded cycle must be tallied into cycles.total: {body}"
+    );
 
-    // coverage
-    let cov = &body["coverage"];
-    assert_eq!(cov["targets"].as_u64(), Some(1), "coverage.targets should be 1");
-    assert_eq!(
-        cov["assertions"].as_u64(),
-        Some(3),
-        "coverage.assertions should be 3"
+    // Neither the old row DTOs nor a per-row host_id concept exist any more.
+    assert!(body.get("active_runs").is_none());
+    assert!(body.get("recent_manual").is_none());
+    assert!(
+        body["cycles"].is_object(),
+        "cycles must be a scalar, not an array: {body}"
     );
 }
 
-/// Empty state: no runs / no sessions / no workers / no coverage.
-/// Dashboard must still return 200 with zero counts.
 #[tokio::test]
-async fn dashboard_empty_state_returns_zeros() {
-    let tmp = tempfile::tempdir().unwrap();
-    let addr = spawn_server(tmp.path(), tmp.path()).await;
+async fn dashboard_reports_per_host_freshness_and_never_zeroes_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn_server(dir.path()).await;
 
-    let resp = reqwest::get(format!("http://{addr}/api/dashboard"))
+    let body: serde_json::Value = reqwest::get(format!("{}/api/dashboard?range=30d", srv.base_url))
+        .await
+        .unwrap()
+        .json()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
 
-    let body: serde_json::Value = resp.json().await.unwrap();
-
-    assert_eq!(body["runs"]["total"].as_u64(), Some(0));
+    let hosts = body["hosts"].as_array().expect("hosts array required");
+    assert!(!hosts.is_empty(), "local must always appear");
+    let local = &hosts[0];
+    assert_eq!(local["host_id"], "local");
+    assert_eq!(local["state"], "ok");
     assert!(
-        body["recent_runs"].as_array().is_some_and(|a| a.is_empty()),
-        "recent_runs should be empty"
+        local["captured_at"].as_str().unwrap().contains('T'),
+        "captured_at must be RFC-3339 for the freshness strip"
     );
-    assert_eq!(body["sessions"]["total"].as_u64(), Some(0));
-    assert_eq!(body["workers"]["total"].as_u64(), Some(0));
-    assert_eq!(body["coverage"]["targets"].as_u64(), Some(0));
-    assert_eq!(body["coverage"]["assertions"].as_u64(), Some(0));
 }
 
-/// recent_runs capped at 10 even when more runs exist.
 #[tokio::test]
-async fn dashboard_recent_runs_capped_at_10() {
-    let tmp = tempfile::tempdir().unwrap();
-    let global = tmp.path();
+async fn dashboard_rejects_unknown_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn_server(dir.path()).await;
+    let resp = reqwest::get(format!("{}/api/dashboard?range=bogus", srv.base_url))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "an unparseable range must 400, not silently default"
+    );
+}
 
-    let run_store = RunStore::new(global.join("runs"));
-    for i in 0..15_u64 {
-        let run = seed_run(&format!("dash_cap_{i:02}"), RunStatus::Completed, i as i64 * 10);
-        run_store
-            .create(run, "name: dashboard-wf\nsteps: []\n")
+#[tokio::test]
+async fn dashboard_unavailable_host_renders_unavailable_not_zero() {
+    // A host that cannot report is NOT a host with no runs. Register an
+    // unreachable remote and assert it surfaces as a distinct state.
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn_server_with_remote(dir.path(), "http://127.0.0.1:1/").await;
+
+    let body: serde_json::Value = reqwest::get(format!("{}/api/dashboard?range=30d", srv.base_url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let hosts = body["hosts"].as_array().unwrap();
+    let remote = hosts
+        .iter()
+        .find(|h| h["host_id"] != "local")
+        .expect("the unreachable remote must still appear in the freshness strip");
+    assert_ne!(
+        remote["state"], "ok",
+        "an unreachable host must not report ok"
+    );
+    assert!(
+        remote["captured_at"].is_null(),
+        "an unreachable host has no captured_at — it never reported"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_unknown_host_returns_404() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn_server(dir.path()).await;
+    let resp = reqwest::get(format!("{}/api/dashboard?host=nope", srv.base_url))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "an unknown host id must 404");
+}
+
+#[tokio::test]
+async fn dashboard_body_parses_as_a_bare_dashboard_summary() {
+    // HttpHostConnector::dashboard_summary proxies this endpoint and parses the
+    // body as a bare DashboardSummary. If this ever stops holding, every HTTP
+    // host in a fan-out silently reports `offline`.
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn_server(dir.path()).await;
+    let body: serde_json::Value = reqwest::get(format!("{}/api/dashboard?range=30d", srv.base_url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let parsed: Result<rupu_cp::host::dashboard_summary::DashboardSummary, _> =
+        serde_json::from_value(body.clone());
+    assert!(
+        parsed.is_ok(),
+        "body must parse as DashboardSummary: {:?}",
+        parsed.err()
+    );
+    assert!(
+        body["captured_at"].is_string(),
+        "captured_at must be TOP-LEVEL, not nested"
+    );
+    assert!(
+        body["hosts"].is_array(),
+        "hosts[] must still be present alongside it"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_scoped_to_host_local_returns_only_local() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn_server_with_remote(dir.path(), "http://127.0.0.1:1/").await;
+
+    let body: serde_json::Value =
+        reqwest::get(format!("{}/api/dashboard?host=local", srv.base_url))
+            .await
+            .unwrap()
+            .json()
+            .await
             .unwrap();
-    }
 
-    let addr = spawn_server(global, global).await;
-
-    let resp = reqwest::get(format!("http://{addr}/api/dashboard"))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["runs"]["total"].as_u64(), Some(15), "runs.total should be 15");
-    let recent = body["recent_runs"].as_array().expect("recent_runs array");
-    assert_eq!(recent.len(), 10, "recent_runs should be capped at 10");
+    let hosts = body["hosts"].as_array().expect("hosts array required");
+    assert_eq!(
+        hosts.len(),
+        1,
+        "?host=local must not also probe the registered remote"
+    );
+    assert_eq!(hosts[0]["host_id"], "local");
 }

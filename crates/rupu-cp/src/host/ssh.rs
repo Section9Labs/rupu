@@ -18,9 +18,8 @@ use ulid::Ulid;
 use crate::{
     agent_launcher::AgentLaunchRequest,
     host::connector::{
-        mirror_get_run, mirror_list_runs, mirror_stream_run_events, read_transcript_file,
-        EventByteStream, HostCapabilities, HostConnector, HostConnectorError, HostInfo,
-        RunListQuery, MAX_WORKSPACE_BYTES,
+        mirror_stream_run_events, read_transcript_file, EventByteStream, HostCapabilities,
+        HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery, MAX_WORKSPACE_BYTES,
     },
     launcher::LaunchRequest,
     node::{
@@ -57,11 +56,28 @@ pub(crate) fn build_remote_command(argv: &[String]) -> String {
         .join(" ")
 }
 
+/// Connect timeout (seconds) for the short request/response ssh calls —
+/// `RemoteExec::run` and `RemoteExec::run_bytes`, which back
+/// `remote_json_rows` / `remote_json_item` / `remote_workflow` / `info` /
+/// `dashboard_summary`. Bounds a dead host to ~3s instead of stalling the
+/// dashboard fan-out — the SSH analogue of the HTTP connector's 5s/30s bound.
+pub(crate) const SHORT_CALL_CONNECT_TIMEOUT_SECS: u32 = 3;
+
+/// Connect timeout (seconds) for the launch-path pump's long-lived `tail -F`
+/// ssh (`RemoteExec::spawn_lines`, used only by `spawn_tail_pump`). That is a
+/// streaming connection meant to stay open for the run's duration, not a
+/// probe — it keeps the original, more generous bound rather than the
+/// tightened short-call one.
+pub(crate) const PUMP_CONNECT_TIMEOUT_SECS: u32 = 10;
+
 /// Build the args (after the `ssh` program) to run `remote_command` on `host`.
 ///
 /// Flags emitted:
 /// - `-o BatchMode=yes`  — fail fast on missing key rather than prompting
-/// - `-o ConnectTimeout=10` — don't hang indefinitely on unreachable hosts
+/// - `-o ConnectTimeout=<connect_timeout_secs>` — don't hang indefinitely on
+///   unreachable hosts. Callers pass [`SHORT_CALL_CONNECT_TIMEOUT_SECS`] for
+///   one-shot request/response calls and [`PUMP_CONNECT_TIMEOUT_SECS`] for the
+///   long-lived tail pump — see those constants' docs.
 /// - `-i <identity_file>` — if provided
 /// - `-p <port>` — if provided
 /// - `<host>` — always present
@@ -71,12 +87,13 @@ pub(crate) fn ssh_argv(
     port: Option<u16>,
     identity_file: Option<&Path>,
     remote_command: &str,
+    connect_timeout_secs: u32,
 ) -> Vec<String> {
     let mut argv: Vec<String> = vec![
         "-o".to_string(),
         "BatchMode=yes".to_string(),
         "-o".to_string(),
-        "ConnectTimeout=10".to_string(),
+        format!("ConnectTimeout={connect_timeout_secs}"),
     ];
     if let Some(id) = identity_file {
         argv.push("-i".to_string());
@@ -370,6 +387,7 @@ impl RemoteExec for SshExec {
             self.port,
             self.identity_file.as_deref(),
             remote_command,
+            SHORT_CALL_CONNECT_TIMEOUT_SECS,
         );
         let out = tokio::process::Command::new("ssh")
             .args(&argv)
@@ -391,6 +409,7 @@ impl RemoteExec for SshExec {
             self.port,
             self.identity_file.as_deref(),
             remote_command,
+            PUMP_CONNECT_TIMEOUT_SECS,
         );
         let mut child = tokio::process::Command::new("ssh")
             .args(&argv)
@@ -428,6 +447,7 @@ impl RemoteExec for SshExec {
             self.port,
             self.identity_file.as_deref(),
             remote_command,
+            SHORT_CALL_CONNECT_TIMEOUT_SECS,
         );
         let mut cmd = tokio::process::Command::new("ssh");
         cmd.args(&argv)
@@ -512,24 +532,26 @@ pub(crate) struct SshHostConnector {
     pub exec: Arc<dyn RemoteExec>,
     pub mirror: Arc<NodeMirror>,
     pub run_store: Arc<RunStore>,
-    pub pricing: rupu_config::PricingConfig,
 }
 
 impl SshHostConnector {
     /// Construct a new connector.
+    ///
+    /// No `pricing` parameter: `get_run` shells the remote CLI, which
+    /// resolves pricing from the *remote* host's own config — this
+    /// connector no longer computes usage/cost locally (that was
+    /// `mirror_get_run`'s job; see `get_run`'s doc comment).
     pub fn new(
         host_id: impl Into<String>,
         exec: Arc<dyn RemoteExec>,
         mirror: Arc<NodeMirror>,
         run_store: Arc<RunStore>,
-        pricing: rupu_config::PricingConfig,
     ) -> Self {
         Self {
             host_id: host_id.into(),
             exec,
             mirror,
             run_store,
-            pricing,
         }
     }
 
@@ -769,12 +791,12 @@ impl SshHostConnector {
         Ok(())
     }
 
-    /// Run a one-shot `rupu <argv...>` over ssh and return the `rows` array of
-    /// the CLI's `--format json` report. Used by the list-view connectors.
-    async fn remote_json_rows(
-        &self,
-        argv: &[&str],
-    ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+    /// Run a one-shot `rupu <argv...>` over ssh and return the parsed JSON
+    /// value of the CLI's `--format json` report. Shared command-building +
+    /// error-mapping for [`remote_json_rows`](Self::remote_json_rows)
+    /// (extracts `.rows`) and [`remote_json_item`](Self::remote_json_item)
+    /// (extracts `.item`).
+    async fn remote_json(&self, argv: &[&str]) -> Result<serde_json::Value, HostConnectorError> {
         let owned: Vec<String> = std::iter::once("rupu".to_string())
             .chain(argv.iter().map(|s| s.to_string()))
             .collect();
@@ -787,14 +809,35 @@ impl SshHostConnector {
         if !out.success {
             return Err(HostConnectorError::Unreachable(out.stderr));
         }
-        let parsed: serde_json::Value = serde_json::from_str(out.stdout.trim()).map_err(|e| {
+        serde_json::from_str(out.stdout.trim()).map_err(|e| {
             HostConnectorError::Remote(0, format!("parse `rupu {}` output: {e}", argv.join(" ")))
-        })?;
+        })
+    }
+
+    /// Run a one-shot `rupu <argv...>` over ssh and return the `rows` array of
+    /// the CLI's `--format json` report. Used by the list-view connectors.
+    async fn remote_json_rows(
+        &self,
+        argv: &[&str],
+    ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+        let parsed = self.remote_json(argv).await?;
         Ok(parsed
             .get("rows")
             .and_then(|r| r.as_array())
             .cloned()
             .unwrap_or_default())
+    }
+
+    /// Run a one-shot `rupu <argv...>` over ssh and return the `item` object
+    /// of the CLI's `--format json` report. Used by [`get_run`](Self::get_run).
+    async fn remote_json_item(
+        &self,
+        argv: &[&str],
+    ) -> Result<serde_json::Value, HostConnectorError> {
+        let parsed = self.remote_json(argv).await?;
+        parsed.get("item").cloned().ok_or_else(|| {
+            HostConnectorError::Remote(0, format!("rupu {} output missing `item`", argv.join(" ")))
+        })
     }
 }
 
@@ -923,15 +966,161 @@ impl HostConnector for SshHostConnector {
         ))
     }
 
+    /// List runs by shelling the remote CLI.
+    ///
+    /// Was: `mirror_list_runs`. The mirror is populated only by
+    /// `spawn_tail_pump`, which runs solely on the launch path — so runs
+    /// started directly on the box, or launched by a PREVIOUS `cp serve`
+    /// process, were permanently invisible. Enumerating via the CLI is the
+    /// same pattern `list_sessions` / `list_autoflow_runs` / `list_agent_runs`
+    /// already use.
+    ///
+    /// Returns `remote_json_rows`' rows **verbatim** — no reshaping mapper.
+    /// `rupu run list` (Task 1) emits `rupu_cp::api::runs::RunListRow` JSON
+    /// directly, which is exactly the wire shape `/api/runs` needs (`id`,
+    /// `usage`, `turns`, `duration_ms`, …). A hand-written mapper here
+    /// previously (`run_list_row_to_wire`) dropped `usage`/`turns`/
+    /// `duration_ms` — fields the web UI reads unguarded — which crashed the
+    /// whole runs list for any host with a visible SSH run. Do not
+    /// reintroduce one; see `RunListRow`'s doc comment.
+    ///
+    /// `stream_run_events` still reads the mirror, deliberately: tailing a
+    /// known path on a live run is a different problem from enumerating.
     async fn list_runs(
         &self,
         params: RunListQuery,
     ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
-        mirror_list_runs(&self.run_store, &self.host_id, &params, &self.pricing)
+        let rows = match self
+            .remote_json_rows(&["--format", "json", "run", "list", "--limit", "10000"])
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // An old remote rupu has no `run list`; it parses as "launch an
+                // agent named list" and errors. Surface it as Unsupported so the
+                // freshness strip renders "needs a newer rupu" rather than
+                // silently reporting zero runs.
+                tracing::warn!(
+                    host_id = %self.host_id,
+                    error = %e,
+                    "list_runs: remote `rupu run list` failed; host may predate the command"
+                );
+                return Err(HostConnectorError::Unsupported(format!(
+                    "remote host {} does not support `rupu run list`: {e}",
+                    self.host_id
+                )));
+            }
+        };
+
+        let mut out: Vec<serde_json::Value> = rows
+            .into_iter()
+            .filter(|r| match params.kind {
+                RunKind::All => true,
+                // Workflow-only means manual-triggered only, mirroring
+                // query_run_rows' `event.is_none() && source_wake_id.is_none()`.
+                RunKind::Workflow => r["trigger"] == "manual",
+            })
+            .filter(|r| match params.lifecycle.as_deref() {
+                None => true,
+                Some("active") => !matches!(
+                    r["status"].as_str().unwrap_or(""),
+                    "completed" | "failed" | "rejected" | "cancelled"
+                ),
+                Some("completed") => r["status"] == "completed",
+                Some("failed") => r["status"] == "failed",
+                Some(_) => true,
+            })
+            .collect();
+
+        // The CLI already sorts newest-first, but re-sort so this is correct
+        // regardless of remote CLI version.
+        out.sort_by(|a, b| {
+            let ta = a["started_at"].as_str().unwrap_or("");
+            let tb = b["started_at"].as_str().unwrap_or("");
+            tb.cmp(ta)
+        });
+
+        Ok(out
+            .into_iter()
+            .skip(params.offset)
+            .take(params.limit)
+            .collect())
     }
 
+    /// Fetch one run by shelling the remote CLI.
+    ///
+    /// Was: `mirror_get_run`, which only saw runs THIS process launched — so
+    /// after the `list_runs` fix (above) the list would show runs whose
+    /// detail 404'd against the (still-empty, for a directly-started run)
+    /// mirror. The list and the detail must agree.
+    ///
+    /// Error mapping is a two-way rule, and BOTH directions matter: *a thing
+    /// that cannot report is not a thing that is absent.*
+    ///
+    /// - A remote that cannot even parse `run show` (old rupu, no such
+    ///   subcommand) must never be reported as `NotFound` — that would
+    ///   silently hide a run that genuinely exists on that host behind a
+    ///   "no such run" message. This is the same failure mode `list_runs`
+    ///   guards against. Old-host stderr looks like our own format-gate
+    ///   rejecting the flag before the subcommand even runs, e.g.:
+    ///     `run does not support `--format json` (supported: `table`)`
+    ///   (from `output::formats::ensure_supported`, not clap — a message we
+    ///   control) — or, on hosts old enough to lack `run show` entirely, a
+    ///   "launch an agent named show" parse failure. Either way: `Unsupported`.
+    /// - Conversely, a remote that DID run `run show` and explicitly told us
+    ///   the run doesn't exist must not be flattened into "this host cannot
+    ///   report runs" — that hides a real 404 behind a capability complaint.
+    ///   Current-rupu not-found stderr looks like:
+    ///     `[error] run run_DOESNOTEXIST: run `run_DOESNOTEXIST` not found`
+    ///   Map that to `NotFound`.
+    ///
+    /// The two are told apart by sniffing the failure's message for
+    /// `"not found"` (case-insensitive) *and* the run id itself — both must
+    /// appear, so a message about some unrelated thing being not found (e.g.
+    /// an old host's classifier failing with "agent 'show' not found",
+    /// because it read `show` as an agent name) is not mistaken for "this
+    /// run does not exist" just because it happens to contain the words
+    /// "not found". Absence of that marker defaults to `Unsupported` — the
+    /// safe default, since a false `NotFound` (hiding a real run) is worse
+    /// than an occasional over-cautious `Unsupported`.
     async fn get_run(&self, run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
-        mirror_get_run(&self.run_store, &self.host_id, run_id, &self.pricing)
+        // NOTE the flag order: `--format json` must precede `run`, because
+        // `Cmd::Run` is trailing_var_arg and swallows everything after it —
+        // see `remote_json_rows`'s callers / cmd::run's module doc.
+        match self
+            .remote_json_item(&["--format", "json", "run", "show", run_id])
+            .await
+        {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let message = e.to_string();
+                let message_lower = message.to_lowercase();
+                if message_lower.contains("not found") && message.contains(run_id) {
+                    // The remote ran `run show` and explicitly said the run
+                    // is absent — believe it.
+                    tracing::warn!(
+                        host_id = %self.host_id,
+                        run_id = %run_id,
+                        error = %e,
+                        "get_run: remote reported run not found"
+                    );
+                    return Err(HostConnectorError::NotFound(run_id.to_string()));
+                }
+                // Anything else (old host that can't parse `run show`,
+                // unreachable, malformed body): the host cannot report, not
+                // "the run is absent". Map to Unsupported, never NotFound.
+                tracing::warn!(
+                    host_id = %self.host_id,
+                    run_id = %run_id,
+                    error = %e,
+                    "get_run: remote `rupu run show` failed; host may predate the command"
+                );
+                Err(HostConnectorError::Unsupported(format!(
+                    "remote host {} does not support `rupu run show`: {e}",
+                    self.host_id
+                )))
+            }
+        }
     }
 
     async fn approve_run(&self, run_id: &str, mode: &str) -> Result<(), HostConnectorError> {
@@ -1090,6 +1279,210 @@ impl HostConnector for SshHostConnector {
         Ok(rows.iter().map(history_row_to_autoflow_event).collect())
     }
 
+    /// Build this host's dashboard contribution by shelling the remote CLI
+    /// exactly twice: `rupu run list` and `rupu autoflow history`. Every
+    /// `RemoteExec::run` spawns a fresh ssh process with a full handshake (no
+    /// ControlMaster multiplexing), so this deliberately stays coarse — no
+    /// per-panel round-trips.
+    ///
+    /// An old remote rupu without `run list` yields
+    /// [`HostConnectorError::Unsupported`], never zeroed data: a host that
+    /// cannot report is not a host with no runs.
+    async fn dashboard_summary(
+        &self,
+        range: crate::host::dashboard_summary::DashboardRange,
+    ) -> Result<crate::host::dashboard_summary::DashboardSummary, HostConnectorError> {
+        use crate::host::dashboard_summary::*;
+
+        let run_rows = self
+            .remote_json_rows(&["--format", "json", "run", "list", "--limit", "10000"])
+            .await
+            .map_err(|e| {
+                tracing::warn!(host_id = %self.host_id, error = %e, "dashboard_summary: run list failed");
+                HostConnectorError::Unsupported(format!(
+                    "remote host {} does not support `rupu run list`: {e}",
+                    self.host_id
+                ))
+            })?;
+        let cycle_rows = self.list_autoflow_runs().await.unwrap_or_else(|e| {
+            // Degrade to empty, but never silently: an IO/remote failure must
+            // not be indistinguishable from "this host has no cycles" (spec
+            // §4.1). Matches `LocalHostConnector::dashboard_summary`'s
+            // `collect_cycle_rollups` failure handling.
+            tracing::warn!(host_id = %self.host_id, error = %e, "dashboard_summary: list_autoflow_runs failed; reporting no cycles");
+            Vec::new()
+        });
+        // NOTE: `run_rows` are `RunListRow`-shaped (id / workflow_name / status /
+        // started_at / finished_at / trigger / usage / turns / duration_ms).
+        // `rupu run list` emits that type verbatim so remote == local by
+        // construction; there is deliberately NO mapper. The id field is `id`.
+
+        let now = chrono::Utc::now();
+        let since = range.since(now);
+        let in_range = |t: chrono::DateTime<chrono::Utc>| since.map(|s| t >= s).unwrap_or(true);
+
+        // CycleCounts: `total` is the count of history-derived cycles in
+        // range. `clean`/`with_failures` stay `None` — never read from
+        // `ran_cycles`/`skipped_cycles`/`failed_cycles` on these rows: those
+        // keys come from `history_rows_to_autoflow_cycles`, which hardcodes
+        // them to the JSON literal `0` because `rupu autoflow history`'s
+        // per-event stream carries no ran/skipped/failed rollup (confirmed by
+        // inspecting `--format json` output — event rows have no such fields
+        // at all). Reading them here would parse a fabricated zero, not a
+        // reported one; this host genuinely does not know the breakdown, so
+        // it must say so via `None`, not fabricate it (established during the
+        // final-review I4 fix).
+        let cycles_total = cycle_rows
+            .iter()
+            .filter(|c| {
+                c.get("started_at")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|t| in_range(t.with_timezone(&chrono::Utc)))
+                    .unwrap_or(false)
+            })
+            .count() as u64;
+
+        let mut active = ActiveCounts::default();
+        let mut terminal_buckets: std::collections::BTreeMap<
+            chrono::DateTime<chrono::Utc>,
+            TerminalBucket,
+        > = Default::default();
+        let mut throughput_buckets: std::collections::BTreeMap<
+            chrono::DateTime<chrono::Utc>,
+            ThroughputBucket,
+        > = Default::default();
+        // The RUNNING run with the OLDEST started_at, tracked as (run_id,
+        // workflow_name, started_at) so `age_ms` can be computed once at the
+        // end against a single `now`. Deliberately narrower than "every
+        // non-terminal row" — see the matching comment in
+        // `summary_build::build_summary`: this field pairs with
+        // `active.running` on the "Active now" tile, so an older
+        // awaiting/paused/pending row must never win it over a running one.
+        let mut longest: Option<(String, String, chrono::DateTime<chrono::Utc>)> = None;
+
+        for row in &run_rows {
+            let (Some(id), Some(status), Some(started)) = (
+                // `id`, NOT `run_id` — see note above.
+                row.get("id").and_then(|v| v.as_str()),
+                row.get("status").and_then(|v| v.as_str()),
+                row.get("started_at").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let Ok(started_at) = chrono::DateTime::parse_from_rfc3339(started) else {
+                continue;
+            };
+            let started_at = started_at.with_timezone(&chrono::Utc);
+            if !in_range(started_at) {
+                continue;
+            }
+            let trigger = row
+                .get("trigger")
+                .and_then(|v| v.as_str())
+                .unwrap_or("manual");
+            let workflow_name = row
+                .get("workflow_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            match status {
+                "running" => active.running += 1,
+                "awaiting_approval" => active.awaiting_approval += 1,
+                "paused" => active.paused += 1,
+                "pending" => active.pending += 1,
+                _ => {}
+            }
+
+            let terminal = matches!(status, "completed" | "failed" | "rejected" | "cancelled");
+            if status == "running" {
+                longest = Some(match longest {
+                    // The current candidate started at or before this row —
+                    // it is the same age or older, so it stays the
+                    // longest-running candidate.
+                    Some((lid, lname, lstarted)) if lstarted <= started_at => {
+                        (lid, lname, lstarted)
+                    }
+                    _ => (id.to_string(), workflow_name.clone(), started_at),
+                });
+            }
+            if terminal {
+                // Truncate to midnight-UTC through the SAME `day_key` the
+                // local connector and `fill_bucket_grid` use. Keying on a
+                // `String` day but stamping `ts` with the raw `started_at`
+                // (the pre-fix behavior) meant `ts` never equalled a
+                // midnight fill-grid cursor, so this host's buckets were
+                // silently dropped after merging with any other host's —
+                // see the regression test in `api::dashboard`.
+                let key = crate::host::summary_build::day_key(started_at);
+                let b = terminal_buckets.entry(key).or_insert(TerminalBucket {
+                    ts: key,
+                    completed: 0,
+                    failed: 0,
+                    rejected: 0,
+                    cancelled: 0,
+                });
+                match status {
+                    "completed" => b.completed += 1,
+                    "failed" => b.failed += 1,
+                    "rejected" => b.rejected += 1,
+                    "cancelled" => b.cancelled += 1,
+                    _ => {}
+                }
+            }
+
+            // Throughput: every run in range counts once, keyed by the day it
+            // STARTED and by trigger — same day-key alignment as
+            // `terminal_buckets`, and matching the local connector: a
+            // still-running run counts here even though it never reaches
+            // `terminal_buckets`.
+            let tkey = crate::host::summary_build::day_key(started_at);
+            let tb = throughput_buckets.entry(tkey).or_insert(ThroughputBucket {
+                ts: tkey,
+                manual: 0,
+                cron: 0,
+                event: 0,
+            });
+            match trigger {
+                "cron" => tb.cron += 1,
+                "event" => tb.event += 1,
+                _ => tb.manual += 1,
+            }
+        }
+
+        let active_longest = longest.map(|(run_id, workflow_name, started_at)| ActiveLongest {
+            run_id,
+            workflow_name,
+            age_ms: (now - started_at).num_milliseconds().max(0) as u64,
+        });
+
+        Ok(DashboardSummary {
+            active,
+            active_longest,
+            // Deliberately NOT zero-filled here (unlike the local connector):
+            // this host emits only the days it actually saw activity for, and
+            // the fleet-wide zero-fill happens once, after the merge, in
+            // `api::dashboard::merge_dashboard_summaries` — the only place
+            // that has visibility into every host's range.
+            terminal_buckets: terminal_buckets.into_values().collect(),
+            throughput_buckets: throughput_buckets.into_values().collect(),
+            cycles: CycleCounts {
+                total: cycles_total,
+                clean: None,
+                with_failures: None,
+            },
+            // Findings are not exposed by the CLI. `None`, NOT `Some(0)` —
+            // this host does not report findings at all, and `Some(0)` would
+            // be indistinguishable from a genuine zero-findings host once
+            // summed at the aggregation layer. `api::dashboard` sums only
+            // `Some` values and flags the aggregate `findings_partial` when
+            // any reporting host contributed `None`.
+            findings_open: None,
+            captured_at: now,
+        })
+    }
+
     // ── Workspace sync ─────────────────────────────────────────────────────────
     //
     // The wire-encoded payload/delta are shipped as raw stdin/stdout bytes to
@@ -1198,6 +1591,7 @@ mod tests {
             Some(2222),
             Some(std::path::Path::new("/k/id")),
             "'true'",
+            SHORT_CALL_CONNECT_TIMEOUT_SECS,
         );
         // BatchMode present as two args: -o BatchMode=yes
         assert!(argv.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
@@ -1211,10 +1605,54 @@ mod tests {
 
     #[test]
     fn ssh_argv_omits_optional_flags() {
-        let argv = ssh_argv("edge", None, None, "'true'");
+        let argv = ssh_argv(
+            "edge",
+            None,
+            None,
+            "'true'",
+            SHORT_CALL_CONNECT_TIMEOUT_SECS,
+        );
         assert!(!argv.iter().any(|a| a == "-i"));
         assert!(!argv.iter().any(|a| a == "-p"));
         assert!(argv.iter().any(|a| a == "edge"));
+    }
+
+    /// R5: the short request/response calls (`run` / `run_bytes`, backing
+    /// `remote_json_rows` / `remote_json_item` / `remote_workflow` / `info`)
+    /// must carry a bounded `ConnectTimeout` so a dead host resolves in ~3s
+    /// instead of stalling the dashboard fan-out — the SSH analogue of the
+    /// HTTP connector's 5s/30s bound.
+    #[test]
+    fn ssh_argv_short_call_uses_tight_connect_timeout() {
+        let argv = ssh_argv(
+            "edge",
+            None,
+            None,
+            "'true'",
+            SHORT_CALL_CONNECT_TIMEOUT_SECS,
+        );
+        assert!(argv.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-o" && w[1] == "ConnectTimeout=3"),
+            "short-call argv must set ConnectTimeout=3, got: {argv:?}"
+        );
+    }
+
+    /// R5: the launch-path pump's long-lived `tail -F` ssh (`spawn_lines`,
+    /// called only from `spawn_tail_pump`) is a streaming connection meant to
+    /// stay open, not a probe — it must NOT be tightened to the short-call
+    /// bound. It keeps its own (more generous) connect timeout.
+    #[test]
+    fn ssh_argv_pump_call_does_not_use_short_call_timeout() {
+        let argv = ssh_argv("edge", None, None, "'tail -F x'", PUMP_CONNECT_TIMEOUT_SECS);
+        assert!(
+            !argv
+                .windows(2)
+                .any(|w| w[0] == "-o" && w[1] == "ConnectTimeout=3"),
+            "pump argv must not carry the tightened short-call ConnectTimeout, got: {argv:?}"
+        );
+        assert_eq!(PUMP_CONNECT_TIMEOUT_SECS, 10);
     }
 
     #[test]
@@ -1406,13 +1844,8 @@ mod tests {
             &run_store,
         )));
         let exec: std::sync::Arc<dyn RemoteExec> = fake;
-        let conn = SshHostConnector::new(
-            "host_abc",
-            exec,
-            mirror,
-            std::sync::Arc::clone(&run_store),
-            rupu_config::PricingConfig::default(),
-        );
+        let conn =
+            SshHostConnector::new("host_abc", exec, mirror, std::sync::Arc::clone(&run_store));
         (conn, run_store, tmp)
     }
 
@@ -1471,6 +1904,536 @@ mod tests {
         // Archived scope → adds --archived.
         conn.list_sessions(Some("archived")).await.unwrap();
         assert!(stub.last_cmd.lock().unwrap().contains("--archived"));
+    }
+
+    #[tokio::test]
+    async fn list_runs_shells_rupu_run_list_not_the_mirror() {
+        struct StubExec {
+            json: String,
+            last_cmd: std::sync::Mutex<String>,
+        }
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                *self.last_cmd.lock().unwrap() = remote.to_string();
+                Ok(RemoteOutput {
+                    stdout: self.json.clone(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!("not used by list_runs")
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!("not used by list_runs")
+            }
+        }
+
+        // RunListRow-shaped stub (the CLI's real `run list --format json`
+        // contract, since Task 5) — `id`, `usage`, `turns`, `duration_ms`,
+        // not the old lossy mapper's shape.
+        let json = r#"{"kind":"run_list","version":1,"rows":[
+            {"id":"run_a","workflow_name":"nightly","status":"completed",
+             "started_at":"2026-07-16T14:02:11Z","finished_at":"2026-07-16T14:09:02Z",
+             "trigger":"cron",
+             "usage":{"input_tokens":100,"output_tokens":50,"cached_tokens":0,
+                      "total_tokens":150,"cost_usd":0.01,"priced":true,"runs":1},
+             "turns":3,"duration_ms":410000}
+        ],"summary":{"count":1,"limit":10000,"status_filter":null}}"#;
+        let stub = std::sync::Arc::new(StubExec {
+            json: json.into(),
+            last_cmd: std::sync::Mutex::new(String::new()),
+        });
+        // The mirror is EMPTY — this is the point. Before the fix, list_runs
+        // read the mirror and would return zero rows here.
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&stub));
+
+        let rows = conn
+            .list_runs(RunListQuery {
+                kind: RunKind::All,
+                offset: 0,
+                limit: 100,
+                lifecycle: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "must return the CLI's row, not the empty mirror"
+        );
+        assert_eq!(rows[0]["id"], "run_a");
+        assert_eq!(
+            rows[0]["trigger"], "cron",
+            "trigger must survive — cycle grouping depends on it"
+        );
+
+        let cmd = stub.last_cmd.lock().unwrap().clone();
+        assert!(
+            cmd.contains("run") && cmd.contains("list") && cmd.contains("json"),
+            "must shell `rupu run list --format json`: {cmd}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_runs_rows_carry_usage_and_turns() {
+        // The web UI reads r.usage.input_tokens UNGUARDED and App.tsx has a
+        // single top-level ErrorBoundary — a row without `usage` blanks the
+        // whole app. These fields are not optional. Regression test for the
+        // deleted `run_list_row_to_wire` mapper, which omitted them.
+        struct StubExec {
+            json: String,
+        }
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, _remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                Ok(RemoteOutput {
+                    stdout: self.json.clone(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!("not used by list_runs")
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!("not used by list_runs")
+            }
+        }
+
+        let json = r#"{"kind":"run_list","version":1,"rows":[
+            {"id":"run_b","workflow_name":"deploy","status":"completed",
+             "started_at":"2026-07-16T09:00:00Z","finished_at":"2026-07-16T09:05:00Z",
+             "trigger":"manual",
+             "usage":{"input_tokens":1200,"output_tokens":800,"cached_tokens":100,
+                      "total_tokens":2000,"cost_usd":5.25,"priced":true,"runs":1},
+             "turns":7,"duration_ms":300000}
+        ],"summary":{"count":1,"limit":10000,"status_filter":null}}"#;
+        let stub = std::sync::Arc::new(StubExec { json: json.into() });
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&stub));
+
+        let rows = conn
+            .list_runs(RunListQuery {
+                kind: RunKind::All,
+                offset: 0,
+                limit: 100,
+                lifecycle: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !rows[0]["usage"].is_null(),
+            "usage must be present, not null/missing: {:?}",
+            rows[0]
+        );
+        assert_eq!(rows[0]["usage"]["input_tokens"], 1200);
+        assert_eq!(
+            rows[0]["turns"], 7,
+            "turns must be present and non-zero: {:?}",
+            rows[0]
+        );
+        assert_eq!(rows[0]["duration_ms"], 300000);
+    }
+
+    #[tokio::test]
+    async fn get_run_shells_rupu_run_show_not_the_mirror() {
+        struct StubExec {
+            json: String,
+            last_cmd: std::sync::Mutex<String>,
+        }
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                *self.last_cmd.lock().unwrap() = remote.to_string();
+                Ok(RemoteOutput {
+                    stdout: self.json.clone(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!("not used by get_run")
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!("not used by get_run")
+            }
+        }
+
+        let json = r#"{"kind":"run_show","version":1,"item":{"id":"run_a","status":"completed"}}"#;
+        let stub = std::sync::Arc::new(StubExec {
+            json: json.into(),
+            last_cmd: std::sync::Mutex::new(String::new()),
+        });
+        // Mirror is EMPTY — before the fix this returned NotFound, because
+        // get_run read the mirror (populated only by `spawn_tail_pump`, which
+        // never saw this run).
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&stub));
+
+        let item = conn.get_run("run_a").await.unwrap();
+
+        assert_eq!(
+            item["id"], "run_a",
+            "must return the CLI's `item` payload, not the empty mirror"
+        );
+        assert_eq!(item["status"], "completed");
+
+        let cmd = stub.last_cmd.lock().unwrap().clone();
+        assert!(
+            cmd.contains("run") && cmd.contains("show") && cmd.contains("json"),
+            "must shell `rupu run show --format json`: {cmd}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_run_maps_old_host_failure_to_unsupported_not_not_found() {
+        struct FailExec;
+        #[async_trait::async_trait]
+        impl RemoteExec for FailExec {
+            async fn run(&self, _remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                // An old remote rupu has no `run show`; `classify` treats it as
+                // "launch an agent named show", which fails to load and exits
+                // nonzero.
+                Ok(RemoteOutput {
+                    stdout: String::new(),
+                    stderr: "error: agent 'show' not found".into(),
+                    success: false,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!("not used by get_run")
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!("not used by get_run")
+            }
+        }
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(FailExec));
+
+        let err = conn.get_run("run_a").await.unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Unsupported(_)),
+            "an old-host failure must map to Unsupported, never NotFound — NotFound \
+             would be indistinguishable from \"this run does not exist\": {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_run_maps_a_remote_not_found_to_not_found() {
+        // The remote explicitly said the run is absent — believe it. Reporting
+        // Unsupported here would claim the HOST is broken when it answered
+        // correctly.
+        struct StubExec;
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, _remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                Ok(RemoteOutput {
+                    stdout: String::new(),
+                    stderr: "[error] run run_x: run `run_x` not found".into(),
+                    success: false,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!("not used by get_run")
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!("not used by get_run")
+            }
+        }
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(StubExec));
+
+        let err = conn.get_run("run_x").await.unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::NotFound(_)),
+            "the remote explicitly reported the run as not found — this must \
+             surface as NotFound, not Unsupported: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_run_maps_an_old_host_to_unsupported_not_not_found() {
+        // An old rupu lacking `run show` must NOT look like "the run does not
+        // exist" — that would silently hide a run that is really there.
+        struct StubExec;
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, _remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                Ok(RemoteOutput {
+                    stdout: String::new(),
+                    stderr: "run does not support `--format json` (supported: `table`)".into(),
+                    success: false,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!("not used by get_run")
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!("not used by get_run")
+            }
+        }
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(StubExec));
+
+        let err = conn.get_run("run_x").await.unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Unsupported(_)),
+            "an old host's format-gate rejection must map to Unsupported, not \
+             NotFound — NotFound here would hide a run that really exists: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_runs_preserves_rfc3339_for_merge_sort() {
+        // rupu-cp's fan_out merge does a LEXICOGRAPHIC string compare on
+        // started_at. A space-separated timestamp (' ' = 0x20 < 'T' = 0x54)
+        // would sort every remote row after every local row at the same
+        // instant. Guard the format.
+        struct StubExec {
+            json: String,
+        }
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, _remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                Ok(RemoteOutput {
+                    stdout: self.json.clone(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!()
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!()
+            }
+        }
+        let json = r#"{"kind":"run_list","version":1,"rows":[
+            {"id":"run_a","workflow_name":"w","status":"completed",
+             "started_at":"2026-07-16T14:02:11Z","finished_at":null,"trigger":"manual",
+             "usage":{"input_tokens":0,"output_tokens":0,"cached_tokens":0,
+                      "total_tokens":0,"cost_usd":null,"priced":false,"runs":1},
+             "turns":0,"duration_ms":null}
+        ],"summary":{"count":1,"limit":1,"status_filter":null}}"#;
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(StubExec { json: json.into() }));
+        let rows = conn
+            .list_runs(RunListQuery {
+                kind: RunKind::All,
+                offset: 0,
+                limit: 100,
+                lifecycle: None,
+            })
+            .await
+            .unwrap();
+        let started = rows[0]["started_at"].as_str().unwrap();
+        assert!(
+            started.contains('T'),
+            "started_at must stay RFC-3339: {started}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_dashboard_summary_sets_captured_at_and_tallies_active() {
+        struct StubExec {
+            runs_json: String,
+            cycles_json: String,
+            cmds: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                self.cmds.lock().unwrap().push(remote.to_string());
+                let stdout = if remote.contains("autoflow") {
+                    self.cycles_json.clone()
+                } else {
+                    self.runs_json.clone()
+                };
+                Ok(RemoteOutput {
+                    stdout,
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!()
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!()
+            }
+        }
+
+        // `run_id` here would silently zero out every row: `rupu run list`
+        // emits `RunListRow` verbatim, whose id field is `id`, not `run_id`.
+        // r2 (awaiting_approval) is deliberately the OLDER of the two rows —
+        // this is the real-data regression: an older awaiting-approval run
+        // must never win `active_longest` over a younger running run, since
+        // this field pairs with `active.running` on the "Active now" tile.
+        let runs_json = r#"{"kind":"run_list","version":1,"rows":[
+            {"id":"r1","workflow_name":"w","status":"running",
+             "started_at":"2026-07-16T14:03:11Z","finished_at":null,"trigger":"manual",
+             "usage":{"input_tokens":0,"output_tokens":0,"cached_tokens":0,
+                      "total_tokens":0,"cost_usd":null,"priced":false,"runs":1},
+             "turns":0,"duration_ms":null},
+            {"id":"r2","workflow_name":"w","status":"awaiting_approval",
+             "started_at":"2026-07-16T14:02:11Z","finished_at":null,"trigger":"cron",
+             "usage":{"input_tokens":0,"output_tokens":0,"cached_tokens":0,
+                      "total_tokens":0,"cost_usd":null,"priced":false,"runs":1},
+             "turns":0,"duration_ms":null}
+        ],"summary":{"count":2,"limit":10000,"status_filter":null}}"#;
+        let cycles_json = r#"{"kind":"autoflow_history","version":1,"rows":[]}"#;
+
+        let stub = std::sync::Arc::new(StubExec {
+            runs_json: runs_json.into(),
+            cycles_json: cycles_json.into(),
+            cmds: std::sync::Mutex::new(Vec::new()),
+        });
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&stub));
+
+        let before = chrono::Utc::now();
+        let s = conn
+            .dashboard_summary(crate::host::dashboard_summary::DashboardRange::Days30)
+            .await
+            .unwrap();
+
+        assert_eq!(s.active.running, 1);
+        assert_eq!(s.active.awaiting_approval, 1);
+        let al = s
+            .active_longest
+            .expect("one running run in hand — expected an active_longest");
+        assert_eq!(
+            al.run_id, "r1",
+            "r1 is the only RUNNING row; r2 (awaiting_approval) is older but must \
+             never win active_longest — that field pairs with active.running"
+        );
+        let total_manual: u64 = s.throughput_buckets.iter().map(|b| b.manual).sum();
+        let total_cron: u64 = s.throughput_buckets.iter().map(|b| b.cron).sum();
+        assert_eq!(total_manual, 1, "r1 is manual-triggered");
+        assert_eq!(total_cron, 1, "r2 is cron-triggered");
+        assert_eq!(
+            s.cycles.clean, None,
+            "SSH cannot report the clean/with-failures breakdown — must stay None, never a fabricated 0"
+        );
+        assert_eq!(s.cycles.with_failures, None);
+        assert!(
+            s.captured_at >= before,
+            "captured_at must be stamped when the host was actually read"
+        );
+        assert_eq!(
+            s.findings_open, None,
+            "SSH has no findings surface — this must be None, never a fabricated Some(0)"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_dashboard_summary_truncates_terminal_bucket_ts_to_midnight() {
+        // Regression test for the SSH-bucket-drop bug (C1): the connector used
+        // to key its bucket map by day-string but stamp `ts` with the RAW
+        // `started_at` of the first terminal run seen that day. `ts` then
+        // never equalled a midnight fill-grid cursor
+        // (`summary_build::fill_bucket_grid`), so this host's terminal counts
+        // were silently dropped after merging with any other host's
+        // (`api::dashboard::merge_dashboard_summaries`).
+        struct StubExec {
+            runs_json: String,
+        }
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                let stdout = if remote.contains("autoflow") {
+                    r#"{"kind":"autoflow_history","version":1,"rows":[]}"#.to_string()
+                } else {
+                    self.runs_json.clone()
+                };
+                Ok(RemoteOutput {
+                    stdout,
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!()
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!()
+            }
+        }
+
+        // A completed run at a raw, decidedly non-midnight timestamp.
+        let runs_json = r#"{"kind":"run_list","version":1,"rows":[
+            {"id":"r1","workflow_name":"w","status":"completed",
+             "started_at":"2026-07-15T13:47:22Z","finished_at":"2026-07-15T13:50:00Z","trigger":"manual",
+             "usage":{"input_tokens":0,"output_tokens":0,"cached_tokens":0,
+                      "total_tokens":0,"cost_usd":null,"priced":false,"runs":1},
+             "turns":0,"duration_ms":null}
+        ],"summary":{"count":1,"limit":10000,"status_filter":null}}"#;
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(StubExec {
+            runs_json: runs_json.into(),
+        }));
+
+        let s = conn
+            .dashboard_summary(crate::host::dashboard_summary::DashboardRange::Days30)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            s.terminal_buckets.len(),
+            1,
+            "expected exactly one terminal bucket, got {:?}",
+            s.terminal_buckets
+        );
+        let expected_midnight = "2026-07-15T00:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        assert_eq!(
+            s.terminal_buckets[0].ts, expected_midnight,
+            "bucket ts must be midnight-truncated, not the raw started_at \
+             (2026-07-15T13:47:22Z) — a non-midnight ts never matches a \
+             fill-grid cursor and is silently dropped"
+        );
+        assert_eq!(s.terminal_buckets[0].completed, 1);
+
+        // The throughput bucket for the same run must be midnight-truncated
+        // too — the same C1-class bug (a non-midnight ts silently dropped at
+        // merge) applies equally to `throughput_buckets`.
+        assert_eq!(s.throughput_buckets.len(), 1);
+        assert_eq!(s.throughput_buckets[0].ts, expected_midnight);
+        assert_eq!(s.throughput_buckets[0].manual, 1);
     }
 
     #[test]

@@ -22,8 +22,7 @@ impl RunLauncher for MockLauncher {
 
 /// Spawn a read-only CP server (no launcher). Backs tests that expect 501.
 async fn spawn_server(dir: &std::path::Path) -> std::net::SocketAddr {
-    let state =
-        rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
     let app = rupu_cp::server::router(state, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -36,9 +35,8 @@ async fn spawn_server(dir: &std::path::Path) -> std::net::SocketAddr {
 /// Spawn a CP server that has a mock launcher installed (`cp serve` mode).
 /// Backs tests that exercise write paths (POST /api/hosts).
 async fn spawn_server_serve(dir: &std::path::Path) -> std::net::SocketAddr {
-    let state =
-        rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default())
-            .with_launcher(Some(Arc::new(MockLauncher)));
+    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default())
+        .with_launcher(Some(Arc::new(MockLauncher)));
     let app = rupu_cp::server::router(state, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -171,7 +169,10 @@ async fn post_hosts_with_launcher_adds_host_and_appears_in_list() {
     assert_eq!(added["transport_kind"], "http_cp");
     assert_eq!(added["base_url"], "http://127.0.0.1:1");
 
-    let added_id = added["id"].as_str().expect("id should be a string").to_string();
+    let added_id = added["id"]
+        .as_str()
+        .expect("id should be a string")
+        .to_string();
     assert!(
         added_id.starts_with("host_"),
         "id should be a host_ ULID, got {added_id:?}"
@@ -328,7 +329,10 @@ async fn post_hosts_node_enrolls_and_appears_in_list() {
         "freshly enrolled node should be offline"
     );
 
-    let enrolled_id = host["id"].as_str().expect("host.id must be a string").to_string();
+    let enrolled_id = host["id"]
+        .as_str()
+        .expect("host.id must be a string")
+        .to_string();
     assert!(
         enrolled_id.starts_with("node_"),
         "tunnel host id must start with node_, got {enrolled_id:?}"
@@ -406,16 +410,24 @@ async fn post_hosts_ssh_with_launcher_adds_host_and_appears_in_list() {
 
     let added: serde_json::Value = post_resp.json().await.unwrap();
     assert_eq!(added["name"], "edge");
-    assert_eq!(added["transport_kind"], "ssh", "response must be ssh transport");
+    assert_eq!(
+        added["transport_kind"], "ssh",
+        "response must be ssh transport"
+    );
     // address field (base_url in HostView) carries host:port
-    let addr_field = added["base_url"].as_str().expect("base_url should be present");
+    let addr_field = added["base_url"]
+        .as_str()
+        .expect("base_url should be present");
     assert!(
         addr_field.contains("edge.example"),
         "base_url should contain the hostname, got {addr_field:?}"
     );
     assert_eq!(added["status"], "offline");
 
-    let added_id = added["id"].as_str().expect("id should be a string").to_string();
+    let added_id = added["id"]
+        .as_str()
+        .expect("id should be a string")
+        .to_string();
     assert!(
         added_id.starts_with("host_"),
         "id should be a host_ ULID, got {added_id:?}"
@@ -502,7 +514,10 @@ async fn post_hosts_bucket_with_launcher_adds_host_and_appears_in_list() {
     assert_eq!(added["base_url"], "s3://my-bucket/rupu");
     assert_eq!(added["status"], "offline");
 
-    let added_id = added["id"].as_str().expect("id should be a string").to_string();
+    let added_id = added["id"]
+        .as_str()
+        .expect("id should be a string")
+        .to_string();
     assert!(
         added_id.starts_with("host_"),
         "id should be a host_ ULID, got {added_id:?}"
@@ -518,7 +533,11 @@ async fn post_hosts_bucket_with_launcher_adds_host_and_appears_in_list() {
     assert_eq!(get_resp.status(), StatusCode::OK);
 
     let hosts: Vec<serde_json::Value> = get_resp.json().await.unwrap();
-    assert_eq!(hosts.len(), 2, "list should have local + the new bucket host");
+    assert_eq!(
+        hosts.len(),
+        2,
+        "list should have local + the new bucket host"
+    );
 
     let bucket_host = hosts
         .iter()
@@ -528,4 +547,90 @@ async fn post_hosts_bucket_with_launcher_adds_host_and_appears_in_list() {
     assert_eq!(bucket_host["transport_kind"], "bucket");
     assert_eq!(bucket_host["name"], "my-bucket");
     assert_eq!(bucket_host["status"], "offline");
+}
+
+// ── Task R6 — cheap, probe-free host list ──────────────────────────────────────
+
+/// `GET /api/hosts/registered` must return promptly and list every registered
+/// host WITHOUT calling `info()` on any of them.
+///
+/// Proof: register an SSH host pointing at a target that will never respond.
+/// `SshHostConnector::info()` shells out to `ssh -o BatchMode=yes -o
+/// ConnectTimeout=10 ...` (see `host_registry.rs`'s
+/// `ssh_host_resolves_reachable_false_when_ssh_unreachable`), so any code path
+/// that actually probes this host takes >= 10s to return `reachable: false`.
+/// A wrapping 2s timeout on the request plus a wall-clock assertion pins the
+/// endpoint to the fast, store-only path. The structural assertion (no
+/// `status`/`version`/`active_run_count` keys — fields only a probe could
+/// produce) backs up the timing assertion in case CI timing is ever flaky.
+#[tokio::test]
+async fn registered_hosts_lists_without_probing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state =
+        rupu_cp::state::AppState::new(tmp.path().into(), rupu_config::PricingConfig::default());
+
+    // Register directly on the registry (bypasses the launcher-gated
+    // POST /api/hosts/ssh — this test only cares about the read path).
+    let ssh_host = state
+        .hosts
+        .add_ssh_host(
+            "unreachable-ssh",
+            "nonexistent-rupu-test.invalid",
+            None,
+            None,
+        )
+        .expect("add_ssh_host should succeed");
+
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+    let started = std::time::Instant::now();
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client
+            .get(format!("http://{addr}/api/hosts/registered"))
+            .send(),
+    )
+    .await
+    .expect("GET /api/hosts/registered must not hang waiting on the unreachable SSH host")
+    .unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "expected a near-instant store read (no probe); took {elapsed:?}"
+    );
+
+    let hosts: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert_eq!(hosts.len(), 2, "local + the unreachable ssh host");
+    assert_eq!(hosts[0]["id"], "local", "local must always be first");
+
+    let remote = hosts
+        .iter()
+        .find(|h| h["id"] == ssh_host.id)
+        .expect("the unreachable ssh host must still be listed");
+    assert_eq!(remote["transport_kind"], "ssh");
+    assert_eq!(remote["name"], "unreachable-ssh");
+
+    // Structural guard: this is the store-only shape, not the probed one.
+    for h in &hosts {
+        assert!(
+            h.get("status").is_none(),
+            "must not include probe-derived status"
+        );
+        assert!(
+            h.get("version").is_none(),
+            "must not include probe-derived version"
+        );
+        assert!(
+            h.get("active_run_count").is_none(),
+            "must not include probe-derived active_run_count"
+        );
+    }
 }

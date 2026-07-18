@@ -45,20 +45,32 @@ impl HttpHostConnector {
     /// `token`, when `Some`, is sent as `Authorization: Bearer <token>` on
     /// every request.
     pub fn new(base_url: String, token: Option<String>) -> Self {
+        // Bounded so one unreachable host cannot stall a fan-out on the OS TCP
+        // connect timeout. Fan-out is concurrent (join_all), so wall-clock is
+        // the slowest host — which must therefore be bounded.
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            client: reqwest::Client::new(),
+            client,
             base_url,
             token,
         }
     }
 
     /// Like [`Self::new`], but bounds every request's connect + total time to
-    /// `timeout`. Used by the host-probe fallback
-    /// (`api::run_resolve::probe_hosts`) so a registered-but-unreachable
-    /// host fails fast instead of stalling on the OS's TCP connect timeout
-    /// (which can be minutes) — never used for the connector backing an
-    /// explicit `?host=<id>` request, which keeps `reqwest`'s default
-    /// (effectively unbounded) behavior.
+    /// a caller-chosen `timeout` rather than [`Self::new`]'s 5s/30s. Used by
+    /// the host-probe fallback (`api::run_resolve::probe_hosts`), which wants
+    /// to fail much faster than a normal request should.
+    ///
+    /// Both constructors are now bounded. [`Self::new`] used to keep
+    /// `reqwest`'s default (effectively unbounded) behavior, which made this
+    /// method the only fast-failing path; that stopped being true once
+    /// dashboard fan-out started calling every host concurrently, where
+    /// wall-clock is the slowest host and one unreachable box could stall the
+    /// whole page on the OS's TCP connect timeout.
     ///
     /// Falls back to an unbounded client if the `reqwest::ClientBuilder`
     /// itself fails to build (e.g. an invalid TLS config) — best-effort, not
@@ -400,6 +412,55 @@ impl HostConnector for HttpHostConnector {
             .proxy_get_json("/api/runs/autoflows/events?host=local&limit=10000")
             .await?;
         Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
+    /// GET the remote CP's `/api/dashboard?host=local&range=<wire form>` and
+    /// parse the response as a [`DashboardSummary`](crate::host::dashboard_summary::DashboardSummary).
+    ///
+    /// `host=local` scopes the remote CP to ITS OWN data — without it the
+    /// remote would fan out to its own remotes and a host registered on both
+    /// sides would be double-counted.
+    ///
+    /// The remote's `hosts[]` array (see `api::dashboard::DashboardResponse`)
+    /// is the ONLY place a remote CP records that its own local connector
+    /// failed to report — when that happens it still answers 200 with an
+    /// all-zero `DashboardSummary` and `captured_at: now()` (the honest
+    /// no-host-reported fallback `get_dashboard` falls back to). Parsing the
+    /// flattened body alone would accept that as a genuine "ok, live, 0 runs"
+    /// summary, indistinguishable from an idle host. So `hosts[]` is checked
+    /// FIRST: if present and none of its entries report `state == "ok"`, this
+    /// returns an error carrying the remote's own reason instead of the
+    /// zeroed data. `hosts[]` absent (an older/bare body, as in some test
+    /// fixtures) skips the check and parses the summary as before — the
+    /// flatten contract stays intact either way.
+    async fn dashboard_summary(
+        &self,
+        range: crate::host::dashboard_summary::DashboardRange,
+    ) -> Result<crate::host::dashboard_summary::DashboardSummary, HostConnectorError> {
+        let path = format!("/api/dashboard?host=local&range={}", range.as_str());
+        let v = self.proxy_get_json(&path).await?;
+
+        if let Some(hosts) = v.get("hosts").and_then(|h| h.as_array()) {
+            let any_ok = hosts
+                .iter()
+                .any(|h| h.get("state").and_then(|s| s.as_str()) == Some("ok"));
+            if !any_ok {
+                let reason = hosts
+                    .iter()
+                    .find_map(|h| h.get("reason").and_then(|r| r.as_str()))
+                    .unwrap_or("remote host did not report (no reason given)");
+                return Err(HostConnectorError::Unreachable(format!(
+                    "remote CP's local host did not report dashboard data: {reason}"
+                )));
+            }
+        }
+
+        // Deliberately parse `v` itself (not a `hosts`-stripped clone): the
+        // `#[serde(flatten)]` on `DashboardResponse::summary` is what makes
+        // this work by construction — serde ignores the extra `hosts` /
+        // `findings_partial` keys rather than a mapper that can drift.
+        serde_json::from_value(v)
+            .map_err(|e| HostConnectorError::Invalid(format!("bad dashboard summary: {e}")))
     }
 
     /// POST the wire-encoded payload to the remote CP's `/api/workspace/stage`;

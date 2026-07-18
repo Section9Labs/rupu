@@ -337,21 +337,6 @@ async fn resume_run(
     Ok(resp)
 }
 
-/// Derive a trigger label from a [`RunRecord`].
-///
-/// - `"event"` — an SCM/webhook event fired the run (`event` field is set).
-/// - `"cron"` — a polled-event / cron wake fired it (`source_wake_id` is set).
-/// - `"manual"` — direct / manual dispatch (neither field is set).
-pub(crate) fn trigger_of(r: &RunRecord) -> &'static str {
-    if r.event.is_some() {
-        "event"
-    } else if r.source_wake_id.is_some() {
-        "cron"
-    } else {
-        "manual"
-    }
-}
-
 // ── Host-aware helpers ────────────────────────────────────────────────────────
 
 /// Upper-bound on rows fetched from each host during a fan-out list.
@@ -434,21 +419,25 @@ async fn fan_out_list_runs(
     merged
 }
 
-/// Slim list DTO for `GET /api/runs` and `GET /api/runs/workflows`.
+/// One row of the runs list.
 ///
-/// The full record (including step results) is available at
-/// `GET /api/runs/:id`.
+/// `pub` (not `pub(crate)`) because `rupu-cli`'s `run list` emits `Vec<RunListRow>`
+/// verbatim as its JSON contract, and SSH `list_runs` returns those rows
+/// unmodified. That makes the remote path byte-identical to the local one by
+/// CONSTRUCTION. A hand-written mapper here previously omitted `usage` / `turns`
+/// / `duration_ms`, which the web UI reads unguarded — one such row blanked the
+/// entire app. Do not reintroduce a parallel shape.
 #[derive(serde::Serialize)]
-pub(crate) struct RunListRow {
-    pub(crate) id: String,
-    pub(crate) workflow_name: String,
-    pub(crate) status: RunStatus,
-    pub(crate) started_at: chrono::DateTime<chrono::Utc>,
-    pub(crate) finished_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub(crate) trigger: &'static str,
-    pub(crate) usage: crate::usage::UsageSummary,
-    pub(crate) turns: u64,
-    pub(crate) duration_ms: Option<u64>,
+pub struct RunListRow {
+    pub id: String,
+    pub workflow_name: String,
+    pub status: RunStatus,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub trigger: &'static str,
+    pub usage: crate::usage::UsageSummary,
+    pub turns: u64,
+    pub duration_ms: Option<u64>,
 }
 
 impl From<&RunRecord> for RunListRow {
@@ -459,7 +448,7 @@ impl From<&RunRecord> for RunListRow {
             status: r.status,
             started_at: r.started_at,
             finished_at: r.finished_at,
-            trigger: trigger_of(r),
+            trigger: r.trigger_str(),
             usage: crate::usage::UsageSummary::default(),
             turns: 0,
             duration_ms: None,
@@ -470,7 +459,10 @@ impl From<&RunRecord> for RunListRow {
 impl RunListRow {
     /// Build a row with its usage summary, turn count, and duration filled from
     /// the run's transcripts (and the run record's wall-clock when available).
-    pub(crate) fn with_usage(
+    ///
+    /// `pub` for the same reason the struct is: `rupu-cli`'s `run list` calls
+    /// this directly to build its `Vec<RunListRow>` JSON contract.
+    pub fn with_usage(
         r: &RunRecord,
         store: &rupu_orchestrator::runs::RunStore,
         pricing: &rupu_config::PricingConfig,
@@ -499,7 +491,22 @@ impl RunListRow {
 /// optional `lifecycle` group, and the optional `worker_id` (pass `Some(id)`
 /// to scope results to a specific tunnel node; `None` returns all runs).
 /// Sorts newest-first and paginates.
-pub(crate) fn query_run_rows(
+///
+/// `pub` (not `pub(crate)`) so a consumer outside this crate CAN reuse it —
+/// but note `lifecycle` is a 3-value GROUP vocabulary (`"active"` |
+/// `"completed"` | `"failed"`, see `in_lifecycle` in this module), NOT the
+/// 8-value exact `RunStatus::as_str()` vocabulary (`running` / `pending` /
+/// `awaiting_approval` / `paused` / `completed` / `failed` / `rejected` /
+/// `cancelled`). `rupu-cli`'s `run list --status <exact-status>`
+/// (`crates/rupu-cli/src/cmd/run.rs`) deliberately does NOT delegate to this
+/// function for that reason: passing an exact status through as `lifecycle`
+/// would either silently redefine `"failed"` to include `rejected`/
+/// `cancelled`, or — for every status that isn't one of the three group
+/// names (`running`, `paused`, `pending`, `awaiting_approval`, `rejected`,
+/// `cancelled`) — silently no-op the filter entirely, since
+/// `in_lifecycle`'s `_ => true` fallback matches everything. See that
+/// module's doc comment on `list()` for the full reasoning.
+pub fn query_run_rows(
     store: &rupu_orchestrator::runs::RunStore,
     offset: usize,
     limit: usize,
@@ -534,7 +541,14 @@ pub(crate) fn query_run_rows(
 /// [`crate::host::local::LocalHostConnector`].
 ///
 /// Returns the `{ run, steps, usage }` JSON object `GET /api/runs/:id` produces.
-pub(crate) fn query_run_detail(
+///
+/// `pub` (not `pub(crate)`) because `rupu-cli`'s `run show` emits this
+/// function's output verbatim as its JSON contract. That is deliberate: SSH
+/// `get_run` shells `rupu run show` and returns the result, so the remote path
+/// yields byte-identical data to the local `mirror_get_run` path — which calls
+/// this same function. Hand-building a parallel detail shape in the CLI would
+/// let the two drift silently.
+pub fn query_run_detail(
     store: &rupu_orchestrator::runs::RunStore,
     id: &str,
     pricing: &rupu_config::PricingConfig,

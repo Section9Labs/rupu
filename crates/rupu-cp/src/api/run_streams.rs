@@ -45,17 +45,26 @@ struct AutoflowCycleRow {
     host_id: Option<String>,
 }
 
+/// Harvest every distinct `run_id` embedded in a cycle record's events,
+/// sorted. Shared by `AutoflowCycleRow::from` and
+/// `LocalHostConnector::dashboard_summary`'s cycle-rollup builder
+/// (`host/local.rs`) so there is exactly one place that reads run ids out of
+/// an `AutoflowCycleRecord`.
+pub(crate) fn harvest_run_ids(r: &AutoflowCycleRecord) -> Vec<String> {
+    let mut run_ids: Vec<String> = r
+        .events
+        .iter()
+        .filter_map(|e| e.run_id.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    run_ids.sort();
+    run_ids
+}
+
 impl From<AutoflowCycleRecord> for AutoflowCycleRow {
     fn from(r: AutoflowCycleRecord) -> Self {
-        // Harvest every distinct run_id from the cycle's embedded event list.
-        let mut run_ids: Vec<String> = r
-            .events
-            .iter()
-            .filter_map(|e| e.run_id.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        run_ids.sort();
+        let run_ids = harvest_run_ids(&r);
 
         // Stringify the mode enum via serde's snake_case tag.
         let mode = serde_json::to_value(r.mode)

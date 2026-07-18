@@ -220,6 +220,22 @@ pub trait HostConnector: Send + Sync {
         ))
     }
 
+    /// Aggregate dashboard state for this host, in ONE round-trip.
+    ///
+    /// Deliberately coarse. SSH hosts pay a full ssh handshake per call — there
+    /// is no ControlMaster multiplexing in `RemoteExec::run` — so this must not
+    /// decompose into per-panel calls.
+    ///
+    /// The default is `Unsupported`, and callers MUST render that as
+    /// "unavailable", never as zero: a host that cannot report is not a host
+    /// with no runs.
+    async fn dashboard_summary(
+        &self,
+        _range: crate::host::dashboard_summary::DashboardRange,
+    ) -> Result<crate::host::dashboard_summary::DashboardSummary, HostConnectorError> {
+        Err(HostConnectorError::Unsupported("dashboard summary".into()))
+    }
+
     /// Stage a packed workspace on the host; returns the remote working dir.
     ///
     /// `payload` is a wire-encoded [`rupu_workspace::Payload`] (see

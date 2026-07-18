@@ -1,6 +1,14 @@
 // Per-model usage timeline — a stacked area chart. X = time bucket; one stacked
 // series per model. Metric is either spend ($) or tokens, toggled by the parent.
 //
+// Model-only by design, not by oversight: it is fed by `GET /api/usage/timeline`,
+// which has no `group_by` param and always groups server-side by model (see
+// `build_timeline` in `rupu-cp/src/api/usage.rs`) — every OTHER identity field
+// on its rows (`provider`/`agent`/`workflow`/`host_id`/`workspace_id`) is always
+// `""`. The /usage page's pivot picker therefore drives the breakdown TABLE
+// (`ModelBreakdownTable`, fed by `/api/usage?group_by=`, which genuinely varies
+// by pivot) and the headline number, not this graph.
+//
 // recharts is the only heavy import here; it is force-split into the `charts`
 // rollup chunk (see vite.config manualChunks), so it never lands in the main
 // bundle. The pure `toChartData` transform is exported for unit testing.

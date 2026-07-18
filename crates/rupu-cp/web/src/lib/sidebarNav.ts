@@ -1,5 +1,6 @@
 import type { LucideIcon } from 'lucide-react';
 import {
+  DollarSign,
   FolderGit2,
   LayoutDashboard,
   MessageSquare,
@@ -45,6 +46,7 @@ export const sidebarNav: NavSection[] = [
   { kind: 'leaf', item: { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard, enabled: true } },
   { kind: 'leaf', item: { to: '/projects', label: 'Projects', icon: FolderGit2, enabled: true } },
   { kind: 'leaf', item: { to: '/events', label: 'Live Events', icon: Radio, enabled: true } },
+  { kind: 'leaf', item: { to: '/usage', label: 'Usage', icon: DollarSign, enabled: true } },
   { kind: 'divider' },
   { kind: 'group', group: {
     id: 'runs', label: 'Runs', items: [

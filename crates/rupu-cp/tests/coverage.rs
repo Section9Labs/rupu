@@ -185,33 +185,3 @@ async fn get_coverage_returns_files_and_findings() {
     assert_eq!(findings[0]["severity"].as_str(), Some("high"));
     assert_eq!(findings[0]["summary"].as_str(), Some("thing"));
 }
-
-/// GET /api/dashboard coverage tile counts targets across the registry.
-#[tokio::test]
-async fn dashboard_coverage_counts_all_workspaces() {
-    let tmp = tempfile::tempdir().unwrap();
-    let proj_a = tmp.path().join("proj_a");
-    let proj_b = tmp.path().join("proj_b");
-    std::fs::create_dir_all(&proj_a).unwrap();
-    std::fs::create_dir_all(&proj_b).unwrap();
-
-    let ws_dir = tmp.path().join("workspaces");
-    seed_workspace_toml(&ws_dir, "ws_a", proj_a.to_str().unwrap());
-    seed_workspace_toml(&ws_dir, "ws_b", proj_b.to_str().unwrap());
-
-    seed_coverage_target(&proj_a, "tgt");
-    seed_coverage_target(&proj_b, "tgt");
-
-    let addr = spawn_server(tmp.path()).await;
-
-    let resp = reqwest::get(format!("http://{addr}/api/dashboard"))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(
-        body["coverage"]["targets"].as_u64().unwrap_or(0) >= 2,
-        "expected targets across both workspaces (>=2); got {:?}",
-        body["coverage"]["targets"]
-    );
-}

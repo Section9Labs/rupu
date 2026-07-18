@@ -33,20 +33,147 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('api.getDashboard', () => {
-  it('resolves typed on 200 JSON', async () => {
+  it('resolves typed on 200 JSON with the aggregate (non-list) shape', async () => {
     const payload = {
-      runs: { total: 3, by_status: { pending: 1, running: 1, completed: 1, failed: 0, awaiting_approval: 0, rejected: 0 } },
-      recent_runs: [{ id: 'r1', workflow_name: 'wf', status: 'running', started_at: '2026-01-01T00:00:00Z' }],
-      sessions: { total: 2, active: 1, archived: 1 },
-      workers: { total: 1 },
-      coverage: { targets: 5, assertions: 42 },
+      hosts: [
+        { host_id: 'local', name: 'local', transport_kind: 'local', state: 'ok', captured_at: '2026-01-01T00:00:00Z', reason: null },
+      ],
+      findings_partial: false,
+      cycles_partial: false,
+      active: { running: 1, awaiting_approval: 0, paused: 0, pending: 0 },
+      active_longest: { run_id: 'run-1', workflow_name: 'nightly-scan', age_ms: 45_000 },
+      terminal_buckets: [],
+      throughput_buckets: [{ ts: '2026-01-01T00:00:00Z', manual: 2, cron: 1, event: 0 }],
+      cycles: { total: 6, clean: 4, with_failures: 2 },
+      findings_open: 3,
+      captured_at: '2026-01-01T00:00:00Z',
     };
     mockFetch(200, payload);
 
     const result = await api.getDashboard();
-    expect(result.runs.total).toBe(3);
-    expect(result.recent_runs[0].id).toBe('r1');
-    expect(result.workers.total).toBe(1);
+    expect(result.hosts[0].host_id).toBe('local');
+    expect(result.active.running).toBe(1);
+    expect(result.active_longest?.run_id).toBe('run-1');
+    expect(result.throughput_buckets[0].cron).toBe(1);
+    expect(result.cycles.total).toBe(6);
+    expect(result.cycles_partial).toBe(false);
+    expect(result.findings_open).toBe(3);
+  });
+
+  it('round-trips cycles.clean/with_failures and findings_open as null — never fabricated as 0', async () => {
+    const payload = {
+      hosts: [],
+      findings_partial: false,
+      cycles_partial: true,
+      active: { running: 0, awaiting_approval: 0, paused: 0, pending: 0 },
+      terminal_buckets: [],
+      throughput_buckets: [],
+      cycles: { total: 2, clean: null, with_failures: null },
+      findings_open: null,
+      captured_at: '2026-01-01T00:00:00Z',
+    };
+    mockFetch(200, payload);
+
+    const result = await api.getDashboard();
+    expect(result.cycles.clean).toBeNull();
+    expect(result.cycles.with_failures).toBeNull();
+    expect(result.cycles_partial).toBe(true);
+    expect(result.findings_open).toBeNull();
+    expect(result.active_longest).toBeUndefined();
+  });
+
+  it('passes the range through as a query param', async () => {
+    mockFetch(200, {
+      hosts: [],
+      findings_partial: false,
+      cycles_partial: false,
+      active: { running: 0, awaiting_approval: 0, paused: 0, pending: 0 },
+      terminal_buckets: [],
+      throughput_buckets: [],
+      cycles: { total: 0, clean: 0, with_failures: 0 },
+      findings_open: 0,
+      captured_at: '2026-01-01T00:00:00Z',
+    });
+    const fetchSpy = vi.mocked(fetch);
+
+    await api.getDashboard('7d');
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      expect.stringContaining('range=7d'),
+      expect.anything(),
+    );
+  });
+
+  it('appends host as a query param when given', async () => {
+    mockFetch(200, {
+      hosts: [],
+      findings_partial: false,
+      cycles_partial: false,
+      active: { running: 0, awaiting_approval: 0, paused: 0, pending: 0 },
+      terminal_buckets: [],
+      throughput_buckets: [],
+      cycles: { total: 0, clean: 0, with_failures: 0 },
+      findings_open: 0,
+      captured_at: '2026-01-01T00:00:00Z',
+    });
+    const fetchSpy = vi.mocked(fetch);
+
+    await api.getDashboard('30d', 'local');
+
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toContain('range=30d');
+    expect(calledUrl).toContain('host=local');
+  });
+
+  it('omits the host query param when not given', async () => {
+    mockFetch(200, {
+      hosts: [],
+      findings_partial: false,
+      cycles_partial: false,
+      active: { running: 0, awaiting_approval: 0, paused: 0, pending: 0 },
+      terminal_buckets: [],
+      throughput_buckets: [],
+      cycles: { total: 0, clean: 0, with_failures: 0 },
+      findings_open: 0,
+      captured_at: '2026-01-01T00:00:00Z',
+    });
+    const fetchSpy = vi.mocked(fetch);
+
+    await api.getDashboard();
+
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).not.toContain('host=');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// api.getRegisteredHosts — probe-free host list (GET /api/hosts/registered)
+// ---------------------------------------------------------------------------
+
+describe('api.getRegisteredHosts', () => {
+  it('resolves typed RegisteredHostView[] on 200', async () => {
+    const payload = [
+      { id: 'local', name: 'local', transport_kind: 'local' },
+      { id: 'h1', name: 'staging', transport_kind: 'ssh' },
+    ];
+    mockFetch(200, payload);
+
+    const result = await api.getRegisteredHosts();
+    expect(result).toHaveLength(2);
+    expect(result[0].id).toBe('local');
+    expect(result[0].transport_kind).toBe('local');
+    expect(result[1].name).toBe('staging');
+    expect(result[1].transport_kind).toBe('ssh');
+  });
+
+  it('requests GET /api/hosts/registered with no query params', async () => {
+    mockFetch(200, []);
+    const fetchSpy = vi.mocked(fetch);
+
+    await api.getRegisteredHosts();
+
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toBe('/api/hosts/registered');
   });
 });
 
@@ -89,12 +216,53 @@ describe('api.getRun', () => {
 });
 
 describe('api.getUsage', () => {
-  it('requests /api/usage?group_by=model when grouped by model', async () => {
-    mockFetch(200, { summary: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: false, runs: 0 }, breakdown: [] });
+  const EMPTY_USAGE_RESPONSE = {
+    summary: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: false, runs: 0 },
+    breakdown: [],
+    unpriced: { models: [], rows: 0 },
+    hosts: [],
+  };
+
+  it('requests /api/usage with an explicit since + the pivot as group_by', async () => {
+    mockFetch(200, EMPTY_USAGE_RESPONSE);
     const fetchSpy = vi.mocked(fetch);
-    await api.getUsage({ groupBy: 'model' });
-    const calledUrl = (fetchSpy.mock.calls[0][0] as string);
-    expect(calledUrl).toBe('/api/usage?group_by=model');
+    await api.getUsage('30d', 'workflow');
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toMatch(/^\/api\/usage\?since=.+&group_by=workflow$/);
+  });
+
+  it('defaults to a 30-day window and the model pivot', async () => {
+    mockFetch(200, EMPTY_USAGE_RESPONSE);
+    const fetchSpy = vi.mocked(fetch);
+    await api.getUsage();
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toContain('group_by=model');
+  });
+
+  it('forwards an explicit host scope', async () => {
+    mockFetch(200, EMPTY_USAGE_RESPONSE);
+    const fetchSpy = vi.mocked(fetch);
+    await api.getUsage('7d', 'host', 'ssh1');
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toContain('host=ssh1');
+  });
+
+  it("'all' maps to the epoch, not an omitted since (which would default to 30 days server-side)", async () => {
+    mockFetch(200, EMPTY_USAGE_RESPONSE);
+    const fetchSpy = vi.mocked(fetch);
+    await api.getUsage('all', 'model');
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toContain(encodeURIComponent('1970-01-01T00:00:00.000Z'));
+  });
+});
+
+describe('api.getUsageOutliers', () => {
+  it('requests /api/usage/outliers with an explicit since bound', async () => {
+    mockFetch(200, []);
+    const fetchSpy = vi.mocked(fetch);
+    await api.getUsageOutliers('7d');
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toMatch(/^\/api\/usage\/outliers\?since=.+$/);
   });
 });
 

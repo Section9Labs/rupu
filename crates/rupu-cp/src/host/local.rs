@@ -13,6 +13,7 @@ use rupu_orchestrator::{
     runs::{CancelError, PauseError, RunStore},
     ApprovalError, RunStoreError,
 };
+use rupu_runtime::{AutoflowHistoryStore, AutoflowHistoryStoreError};
 
 use crate::{
     agent_launcher::{AgentLaunchRequest, AgentLauncher},
@@ -307,6 +308,141 @@ impl HostConnector for LocalHostConnector {
     /// or poll timeout), so `collect_workspace_delta` never ran.
     async fn discard_workspace(&self, working_dir: &str) -> Result<(), HostConnectorError> {
         discard_from_dir(working_dir, &self.global_dir)
+    }
+
+    /// Build this host's dashboard contribution from the local `RunStore`,
+    /// the autoflow cycle history, and the findings ledger — one round-trip,
+    /// no per-panel calls (see `dashboard_summary.rs` module docs).
+    async fn dashboard_summary(
+        &self,
+        range: crate::host::dashboard_summary::DashboardRange,
+    ) -> Result<crate::host::dashboard_summary::DashboardSummary, HostConnectorError> {
+        let runs = self
+            .run_store
+            .list()
+            .map_err(|e| HostConnectorError::Invalid(format!("run store list failed: {e}")))?;
+        let cycles = match collect_cycle_rollups(&self.global_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                // Degrade to empty, but never silently: an IO failure must not
+                // be indistinguishable from "this host has no cycles" (spec
+                // §4.1).
+                tracing::warn!(host_id = "local", error = %e, "dashboard_summary: collect_cycle_rollups failed; reporting no cycles");
+                Vec::new()
+            }
+        };
+        // This host DOES report findings — `Some`, never the bare `None` a
+        // host that cannot report findings (e.g. SSH) sets. `count_open_findings`
+        // is infallible (see its doc comment).
+        let findings_open = Some(count_open_findings(&self.global_dir));
+        Ok(crate::host::summary_build::build_summary(
+            &runs,
+            &cycles,
+            findings_open,
+            range,
+            chrono::Utc::now(),
+        ))
+    }
+}
+
+// ── Dashboard summary helpers ────────────────────────────────────────────────
+
+/// Read this host's autoflow cycle history and reduce each cycle to a
+/// [`summary_build::CycleRollup`](crate::host::summary_build::CycleRollup) —
+/// just `started_at` (range filtering) and `failed` (the clean/with-failures
+/// split), which is all `build_summary` needs for [`CycleCounts`]
+/// (`dashboard_summary.rs`). Reads through `AutoflowHistoryStore` exactly as
+/// `list_autoflow_runs` (`api/run_streams.rs`) does — one place that parses
+/// `AutoflowCycleRecord`.
+fn collect_cycle_rollups(
+    global_dir: &std::path::Path,
+) -> Result<Vec<crate::host::summary_build::CycleRollup>, HostConnectorError> {
+    use crate::host::summary_build::CycleRollup;
+
+    let store_root = global_dir.join("autoflows").join("history");
+    let store = AutoflowHistoryStore::new(store_root);
+    let records = match store.list_recent(100) {
+        Ok(r) => r,
+        Err(AutoflowHistoryStoreError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Vec::new()
+        }
+        Err(e) => return Err(HostConnectorError::Invalid(e.to_string())),
+    };
+
+    Ok(records
+        .iter()
+        .map(|r| CycleRollup {
+            started_at: parse_rfc3339_or_now(&r.started_at),
+            failed: r.failed_cycles as u64,
+        })
+        .collect())
+}
+
+/// Best-effort RFC-3339 parse; falls back to `now()` on a malformed
+/// timestamp rather than failing the whole dashboard summary over one bad
+/// history record.
+fn parse_rfc3339_or_now(s: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|e| {
+            tracing::warn!(value = %s, error = %e, "failed to parse cycle timestamp; using now()");
+            chrono::Utc::now()
+        })
+}
+
+/// Total open findings across every registered workspace, via the same
+/// collect-then-summarize path `GET /api/findings` uses (`api::findings`) —
+/// never a second workspace/target walk.
+///
+/// Infallible: `collect_all_findings` degrades per-workspace failures to a
+/// `tracing::warn!` + skip internally (see its doc comment) and always
+/// returns a bare `Vec`, so there is no error path for this to propagate.
+/// This host DOES report findings (unlike SSH), so the caller wraps the
+/// result in `Some`.
+fn count_open_findings(global_dir: &std::path::Path) -> u64 {
+    let findings = crate::api::findings::collect_all_findings(global_dir);
+    crate::api::findings::build_response(findings).summary.total as u64
+}
+
+#[cfg(test)]
+mod dashboard_summary_tests {
+    use super::*;
+    use rupu_runtime::{
+        AutoflowCycleEvent, AutoflowCycleEventKind, AutoflowCycleMode, AutoflowCycleRecord,
+        AutoflowHistoryStore,
+    };
+
+    /// Fixture-backed: written through the real `AutoflowHistoryStore` API
+    /// (never hand-written JSON) so the fixture cannot drift from the
+    /// serializer `collect_cycle_rollups` reads back.
+    #[test]
+    fn collect_cycle_rollups_reads_a_fixture_written_by_the_real_store() {
+        let global = tempfile::tempdir().unwrap();
+        let store = AutoflowHistoryStore::new(global.path().join("autoflows").join("history"));
+
+        let started = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let mut record = AutoflowCycleRecord::new(AutoflowCycleMode::Serve, started);
+        record.worker_name = Some("nightly".to_string());
+        record.ran_cycles = 1;
+        record.failed_cycles = 2;
+        record.events.push(AutoflowCycleEvent {
+            kind: AutoflowCycleEventKind::RunLaunched,
+            run_id: Some("run_abc".to_string()),
+            ..Default::default()
+        });
+        store.save(&record).unwrap();
+
+        let rollups = collect_cycle_rollups(global.path()).unwrap();
+        assert_eq!(rollups.len(), 1);
+        let rollup = &rollups[0];
+        assert_eq!(
+            rollup.failed, 2,
+            "the failed-cycle count must be read back verbatim"
+        );
+        assert!(
+            (rollup.started_at - started).num_seconds().abs() < 2,
+            "started_at must round-trip through the real store"
+        );
     }
 }
 

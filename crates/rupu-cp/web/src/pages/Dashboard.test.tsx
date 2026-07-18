@@ -1,97 +1,113 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
-import { afterEach, describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { api, type DashboardResponse, type UsageOverview, type UsageTimelineBucket, type FindingsResponse, type RunListRow } from '../lib/api';
-import type { UsageSummary } from '../lib/usage';
 import Dashboard from './Dashboard';
+import { api, type DashboardResponse, type RegisteredHostView } from '../lib/api';
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
 });
 
-const USAGE_SUMMARY: UsageSummary = {
-  input_tokens: 3000, output_tokens: 1000, cached_tokens: 0, total_tokens: 4000,
-  cost_usd: 12.5, priced: true, runs: 4,
-};
-
-const DASHBOARD: DashboardResponse = {
-  runs: {
-    total: 9,
-    by_status: {
-      running: 1, awaiting_approval: 2, paused: 0, pending: 0,
-      completed: 4, failed: 1, rejected: 1, cancelled: 0,
-    },
-  },
-  recent_runs: [
-    {
-      id: 'run-abc12345', workflow_name: 'nightly-scan', status: 'completed',
-      started_at: '2026-06-20T00:00:00Z', finished_at: '2026-06-20T00:05:00Z',
-      usage: USAGE_SUMMARY,
-    },
-  ],
-  sessions: { total: 3, active: 1, archived: 2 },
-  workers: { total: 2 },
-  coverage: { targets: 5, assertions: 40 },
-};
-
-const OVERVIEW: UsageOverview = {
-  summary: USAGE_SUMMARY,
-  breakdown: [
-    {
-      provider: 'anthropic', model: 'claude-opus', agent: '',
-      input_tokens: 3000, output_tokens: 1000, cached_tokens: 0, total_tokens: 4000,
-      cost_usd: 12.5, priced: true, runs: 4,
-    },
-  ],
-};
-
-const TIMELINE: UsageTimelineBucket[] = [
-  { bucket: '2026-06-19', rows: OVERVIEW.breakdown },
-  { bucket: '2026-06-20', rows: OVERVIEW.breakdown },
-];
-
-const FINDINGS: FindingsResponse = {
-  findings: [],
-  summary: { total: 7, critical: 1, high: 2, medium: 2, low: 1, info: 1 },
-};
-
-const RUNS: RunListRow[] = [
-  { id: 'r1', workflow_name: 'w', status: 'failed', started_at: new Date().toISOString(), trigger: 'manual', turns: 1, usage: USAGE_SUMMARY },
-];
-
-function mockApi() {
-  vi.spyOn(api, 'getDashboard').mockResolvedValue(DASHBOARD);
-  vi.spyOn(api, 'getUsage').mockResolvedValue(OVERVIEW);
-  vi.spyOn(api, 'getUsageTimeline').mockResolvedValue(TIMELINE);
-  vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
-  vi.spyOn(api, 'getRuns').mockResolvedValue(RUNS);
+// `getDashboard` resolves `DashboardResponse` on the wire (`DashboardSummary`
+// flattened with `hosts` / `findings_partial` / `cycles_partial` — see
+// useDashboardData.test.ts, which this mirrors). The hook reads BOTH: the
+// flattened `DashboardSummary` fields, and `resp.hosts` to find its OWN
+// per-host entry and honor its authoritative `state` (a 200 response is not
+// proof of health). So the default here seeds a matching
+// `hosts: [{ host_id: hostId, state: 'ok', ... }]` entry for the healthy case.
+function summary(overrides: Partial<DashboardResponse> = {}, hostId = 'local'): DashboardResponse {
+  const captured_at = overrides.captured_at ?? new Date().toISOString();
+  return {
+    active: { running: 2, awaiting_approval: 1, paused: 0, pending: 0 },
+    active_longest: null,
+    terminal_buckets: [],
+    throughput_buckets: [],
+    cycles: { total: 0, clean: 0, with_failures: 0 },
+    findings_open: 3,
+    captured_at,
+    hosts: [{ host_id: hostId, name: hostId, transport_kind: 'local', state: 'ok', captured_at, reason: null }],
+    findings_partial: false,
+    cycles_partial: false,
+    ...overrides,
+  };
 }
 
+const LOCAL_HOST: RegisteredHostView = { id: 'local', name: 'local', transport_kind: 'local' };
+
 describe('Dashboard', () => {
-  it('renders the triage ribbon, spend headline, breakdown, and recent runs', async () => {
-    mockApi();
-    render(<MemoryRouter><Dashboard /></MemoryRouter>);
+  it('renders the freshness strip from the host list and the key-point tiles from a mocked payload', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getDashboard').mockResolvedValue(summary());
+    vi.spyOn(api, 'subscribeEvents').mockReturnValue(() => {});
 
-    // Spend ($12.50) shows in the headline, the breakdown cost cell, and the footer.
-    await waitFor(() => expect(screen.getAllByText('$12.50').length).toBeGreaterThanOrEqual(1));
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
 
-    // Triage ribbon chips ("Running" / "Awaiting approval" also appear in the
-    // donut legend, so assert at least one match; "Open findings" is ribbon-only).
-    expect(screen.getAllByText('Running').length).toBeGreaterThanOrEqual(1);
-    expect(screen.getAllByText('Awaiting approval').length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByText('Open findings')).toBeInTheDocument();
-
-    // Breakdown model (also in the timeline legend) + recent run.
-    expect(screen.getAllByText('claude-opus').length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByText('nightly-scan')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('local')).toBeInTheDocument());
+    // Key-point tiles: awaiting-you count from the mocked payload.
+    await waitFor(() => expect(screen.getByTestId('tile-awaiting')).toHaveTextContent('1'));
+    expect(screen.getByTestId('tile-findings')).toHaveTextContent('3');
   });
 
-  it('passes a timeline fetch through the api client', async () => {
-    mockApi();
-    render(<MemoryRouter><Dashboard /></MemoryRouter>);
-    await waitFor(() => expect(api.getUsageTimeline).toHaveBeenCalled());
+  it('does not render any of the removed per-item surfaces (attention row, active-status tiles)', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getDashboard').mockResolvedValue(summary());
+    vi.spyOn(api, 'subscribeEvents').mockReturnValue(() => {});
+
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId('tile-awaiting')).toBeInTheDocument());
+    // AttentionRow's distinct "Blocked on you" label and ActiveStatusTiles'
+    // "Pending" tile must not appear — KeyPointTiles is the single count
+    // surface now.
+    expect(screen.queryByText(/Blocked on you/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/^Pending$/)).not.toBeInTheDocument();
+  });
+
+  it('renders a slow (still-loading) second host without blanking the page once local has data', async () => {
+    const SSH_HOST: RegisteredHostView = { id: 'ssh1', name: 'staging-box', transport_kind: 'ssh' };
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, SSH_HOST]);
+    vi.spyOn(api, 'getDashboard').mockImplementation((_range, host) => {
+      if (host === 'local') return Promise.resolve(summary());
+      return new Promise<DashboardResponse>(() => {}); // hangs forever
+    });
+    vi.spyOn(api, 'subscribeEvents').mockReturnValue(() => {});
+
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId('tile-awaiting')).toHaveTextContent('1'));
+    // Both hosts show in the freshness strip; the hung one reads as loading,
+    // not as an error, and does not block the tiles above from rendering.
+    expect(screen.getByText('local')).toBeInTheDocument();
+    expect(screen.getByText('staging-box')).toBeInTheDocument();
+    expect(screen.getByText(/loading/i)).toBeInTheDocument();
+  });
+
+  it('subscribes to the event stream for invalidation', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getDashboard').mockResolvedValue(summary());
+    const sub = vi.spyOn(api, 'subscribeEvents').mockReturnValue(() => {});
+
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(sub).toHaveBeenCalled());
   });
 });

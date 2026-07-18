@@ -373,7 +373,6 @@ impl HostRegistry {
                         exec,
                         Arc::clone(mir),
                         Arc::clone(store),
-                        self.pricing.clone(),
                     )))
                 }
                 _ => Err(HostConnectorError::Invalid(

@@ -9,8 +9,8 @@
 
 import type { TranscriptEvent, TranscriptResponse } from './transcript';
 export type { TranscriptEvent, TranscriptResponse } from './transcript';
-import type { UsageSummary, UsageOverview, UsageTimelineBucket } from './usage';
-export type { UsageSummary, UsageBreakdownRow, UsageOverview, UsageTimelineBucket } from './usage';
+import type { UsageSummary, UsageOverview, UsageTimelineBucket, UnpricedGap } from './usage';
+export type { UsageSummary, UsageBreakdownRow, UsageOverview, UsageTimelineBucket, UnpricedGap } from './usage';
 
 // ---------------------------------------------------------------------------
 // Error
@@ -544,22 +544,173 @@ export interface SetAutoflowEnabledResponse {
 // Dashboard
 // ---------------------------------------------------------------------------
 
-export interface DashboardResponse {
-  runs: {
-    total: number;
-    by_status: Record<RunStatusStr, number>;
-  };
-  recent_runs: Array<{
-    id: string;
-    workflow_name: string;
-    status: RunStatusStr;
-    started_at: string;
-    finished_at?: string | null;
-    usage: UsageSummary;
-  }>;
-  sessions: { total: number; active: number; archived: number };
-  workers: { total: number };
-  coverage: { targets: number; assertions: number };
+/** The dashboard's time window. Mirrors the segmented control. */
+export type DashboardRange = '7d' | '30d' | 'all';
+
+/**
+ * One host's reporting state, for the freshness strip.
+ *
+ * `state` is three-valued on purpose. `offline` and `unavailable` must never be
+ * rendered as zeroed counts — a host that cannot report is not a host with no
+ * runs.
+ */
+export interface HostFreshness {
+  host_id: string;
+  name: string;
+  transport_kind: string;
+  state: 'ok' | 'offline' | 'unavailable';
+  /** RFC-3339. Present only when `state === 'ok'`. */
+  captured_at: string | null;
+  /** Cause when `state !== 'ok'`, e.g. "needs rupu >= 0.49". */
+  reason: string | null;
+}
+
+/** Live, non-terminal run counts — "is anything stuck right now". */
+export interface ActiveCounts {
+  running: number;
+  awaiting_approval: number;
+  paused: number;
+  pending: number;
+}
+
+/** One day-bucket of terminal outcomes, for the trend area. */
+export interface TerminalBucket {
+  ts: string;
+  completed: number;
+  failed: number;
+  rejected: number;
+  cancelled: number;
+}
+
+/** Runs STARTED in a bucket, split by trigger. Same day-key alignment as
+ *  `TerminalBucket`. Mirrors `ThroughputBucket` in
+ *  `rupu-cp/src/host/dashboard_summary.rs`. */
+export interface ThroughputBucket {
+  ts: string;
+  manual: number;
+  cron: number;
+  event: number;
+}
+
+/**
+ * Scalar cycle summary — the one line of cycle numbers (spec §5.5), NOT a row
+ * array. Mirrors `CycleCounts` in `rupu-cp/src/host/dashboard_summary.rs`.
+ * `clean`/`with_failures` are `null` when a reporting host cannot supply the
+ * ran/failed breakdown (SSH today) — NEVER render `null` as a genuine 0.
+ */
+export interface CycleCounts {
+  total: number;
+  clean: number | null;
+  with_failures: number | null;
+}
+
+/** The "Active now" key point (spec §5.2): the single longest currently-
+ *  running run, fleet-wide. Mirrors `ActiveLongest` in
+ *  `rupu-cp/src/host/dashboard_summary.rs`. */
+export interface ActiveLongest {
+  run_id: string;
+  workflow_name: string;
+  age_ms: number;
+}
+
+/**
+ * One host's complete dashboard contribution — aggregate-only, no row
+ * arrays. Mirrors `DashboardSummary` in `rupu-cp/src/host/dashboard_summary.rs`.
+ */
+export interface DashboardSummary {
+  active: ActiveCounts;
+  /** The single longest-running run, or absent when nothing is running.
+   *  The server omits this key entirely when `None` (`skip_serializing_if`),
+   *  so treat it as optional rather than a nullable-but-always-present field. */
+  active_longest?: ActiveLongest | null;
+  terminal_buckets: TerminalBucket[];
+  throughput_buckets: ThroughputBucket[];
+  cycles: CycleCounts;
+  /** `null` when this host does not report open-findings data at all (e.g.
+   *  SSH — the CLI has no findings surface). `0` is a genuine zero; `null`
+   *  must never be rendered as one. */
+  findings_open: number | null;
+  /** RFC-3339. When this host's data was actually read. */
+  captured_at: string;
+}
+
+/**
+ * The dashboard payload: one fleet-wide aggregate (flattened at the top
+ * level) plus per-host reporting state. Mirrors `DashboardResponse` in
+ * `rupu-cp/src/api/dashboard.rs` — `summary` is `#[serde(flatten)]`ed there,
+ * so every `DashboardSummary` field (`active` / `active_longest` /
+ * `terminal_buckets` / `throughput_buckets` / `cycles` / `findings_open` /
+ * `captured_at`) lands directly on this type rather than nested.
+ */
+export interface DashboardResponse extends DashboardSummary {
+  hosts: HostFreshness[];
+  /**
+   * True when at least one host that DID report (`state === 'ok'`) omitted its
+   * open-findings count. When true, `findings_open` is a partial sum across only
+   * the hosts that reported it — **the UI must not present it as a fleet total**.
+   */
+  findings_partial: boolean;
+  /**
+   * Same "not reported ≠ 0" rule as `findings_partial`, applied to
+   * `cycles.clean`/`cycles.with_failures`: true when at least one reporting
+   * host contributed `null` for the breakdown. `cycles.total` is always a
+   * complete sum regardless — only the clean/with-failures split can be partial.
+   */
+  cycles_partial: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Usage (the /usage spend page)
+// ---------------------------------------------------------------------------
+
+/**
+ * The attribution dimension for `/api/usage?group_by=`. Mirrors `GroupBy` in
+ * `rupu-cp/src/usage.rs` exactly — an unrecognized value 400s server-side
+ * rather than silently falling back to a model breakdown.
+ */
+export type Pivot = 'model' | 'provider' | 'agent' | 'workflow' | 'host' | 'project';
+
+/**
+ * The full `GET /api/usage` response. Mirrors `UsageResponse` in
+ * `rupu-cp/src/api/usage.rs`: `summary` + `breakdown` (from `UsageOverview`)
+ * plus the named unpriced gap and per-host freshness that endpoint adds.
+ */
+export interface UsageResponse extends UsageOverview {
+  unpriced: UnpricedGap;
+  hosts: HostFreshness[];
+}
+
+/**
+ * One run flagged by `GET /api/usage/outliers` — costs far more than its
+ * workflow's own median. Mirrors `OutlierRun` in
+ * `rupu-cp/src/api/usage_outliers.rs`. Local-only: this endpoint does not fan
+ * out across hosts the way `/api/usage` does.
+ */
+export interface OutlierRun {
+  run_id: string;
+  workflow_name: string;
+  cost_usd: number;
+  baseline_usd: number;
+  ratio: number;
+  /** RFC-3339. */
+  started_at: string;
+}
+
+const USAGE_RANGE_DAYS: Record<'7d' | '30d', number> = { '7d': 7, '30d': 30 };
+
+/**
+ * Convert a `DashboardRange` into an explicit `since` bound for the
+ * `/api/usage*` endpoints, which have no `range` concept of their own — only
+ * raw `since`/`until`. `'all'` maps to the Unix epoch rather than omitting
+ * `since`: the server defaults an ABSENT `since` to "last 30 days"
+ * (`resolve_window` / `resolve_since` in the Rust handlers), which would
+ * silently narrow 'all' down to 30 days instead of broadening it.
+ *
+ * Exported for testing; `now` defaults to the real clock.
+ */
+export function usageRangeSince(range: DashboardRange, now: number = Date.now()): string {
+  if (range === 'all') return new Date(0).toISOString();
+  return new Date(now - USAGE_RANGE_DAYS[range] * 86_400_000).toISOString();
 }
 
 // ---------------------------------------------------------------------------
@@ -700,6 +851,19 @@ export interface HostView {
   capabilities?: HostCapabilities;
   active_run_count: number;
   last_seen_at?: string;
+}
+
+/**
+ * Store-only view of one registered host — no live health data, no probe.
+ * Mirrors `RegisteredHostView` from `rupu-cp/src/api/hosts.rs`. Backs
+ * `GET /api/hosts/registered`: a pure store read that returns promptly even
+ * when every registered remote is unreachable, for callers (the dashboard)
+ * that need the host list before deciding which ones to ask for data.
+ */
+export interface RegisteredHostView {
+  id: string;
+  name: string;
+  transport_kind: HostTransportKind;
 }
 
 // ---------------------------------------------------------------------------
@@ -1209,18 +1373,27 @@ function listQuery(params?: ListParams): string {
 
 export const api = {
   // --- Dashboard ---
-  getDashboard(): Promise<DashboardResponse> {
-    return request<DashboardResponse>('/api/dashboard');
+  /**
+   * `range` selects the trend window; `host` (optional) scopes the fan-out to
+   * one registered host id instead of every host — used to paint the local
+   * host first and merge remotes in as they answer.
+   */
+  getDashboard(range: DashboardRange = '30d', host?: string): Promise<DashboardResponse> {
+    const hostQs = host ? `&host=${encodeURIComponent(host)}` : '';
+    return request<DashboardResponse>(`/api/dashboard?range=${range}${hostQs}`);
   },
 
   // --- Usage ---
-  getUsage(params?: { since?: string; until?: string; groupBy?: 'provider' | 'model' | 'agent' }): Promise<UsageOverview> {
-    const q = new URLSearchParams();
-    if (params?.since) q.set('since', params.since);
-    if (params?.until) q.set('until', params.until);
-    if (params?.groupBy) q.set('group_by', params.groupBy);
-    const qs = q.toString();
-    return request<UsageOverview>(`/api/usage${qs ? `?${qs}` : ''}`);
+  /**
+   * `range` + `pivot` drive the /usage page's attribution view: `pivot`
+   * forwards to `group_by` (an unknown value 400s server-side rather than
+   * silently defaulting to a model breakdown), and `host` optionally scopes
+   * to one registered host — same idiom as `getDashboard`.
+   */
+  getUsage(range: DashboardRange = '30d', pivot: Pivot = 'model', host?: string): Promise<UsageResponse> {
+    const q = new URLSearchParams({ since: usageRangeSince(range), group_by: pivot });
+    if (host) q.set('host', host);
+    return request<UsageResponse>(`/api/usage?${q.toString()}`);
   },
   /** Per-bucket usage timeline (chronological). `bucket` defaults to `day`. */
   getUsageTimeline(opts?: { since?: string; until?: string; bucket?: 'day' | 'week' }): Promise<UsageTimelineBucket[]> {
@@ -1230,6 +1403,16 @@ export const api = {
     if (opts?.bucket) q.set('bucket', opts.bucket);
     const qs = q.toString();
     return request<UsageTimelineBucket[]>(`/api/usage/timeline${qs ? `?${qs}` : ''}`);
+  },
+  /**
+   * Cost outliers — runs far above their workflow's own median. LOCAL-ONLY:
+   * `/api/usage/outliers` does not fan out across hosts (see the doc comment
+   * on `rupu-cp/src/api/usage_outliers.rs`), so this accepts single-host
+   * results and does not take a `host` param.
+   */
+  getUsageOutliers(range: DashboardRange = '30d'): Promise<OutlierRun[]> {
+    const q = new URLSearchParams({ since: usageRangeSince(range) });
+    return request<OutlierRun[]>(`/api/usage/outliers?${q.toString()}`);
   },
 
   // --- Runs ---
@@ -1612,6 +1795,15 @@ export const api = {
   /** List all registered hosts, each enriched with live health data. */
   getHosts(): Promise<HostView[]> {
     return request<HostView[]>('/api/hosts');
+  },
+  /**
+   * Probe-free host list — `id` / `name` / `transport_kind` only, no
+   * `info()` / `active_run_count()` round-trip. Returns promptly even when
+   * every registered remote is unreachable; the dashboard uses this to know
+   * which hosts to fan `getDashboard(range, hostId)` out to.
+   */
+  getRegisteredHosts(): Promise<RegisteredHostView[]> {
+    return request<RegisteredHostView[]>('/api/hosts/registered');
   },
   /** Register a new remote host. Requires `rupu cp serve` (501 if absent). */
   addHost(body: { name: string; base_url: string; token?: string }): Promise<HostView> {

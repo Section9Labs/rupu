@@ -280,7 +280,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
     }
 
     match cli.command {
-        Cmd::Run { argv } => cmd::run::handle(argv).await,
+        Cmd::Run { argv } => cmd::run::handle(argv, cli.format).await,
         Cmd::Agent { action } => cmd::agent::handle(action, cli.format).await,
         Cmd::Workflow { action } => cmd::workflow::handle(action, cli.format).await,
         Cmd::Autoflow { action } => cmd::autoflow::handle(action, cli.format).await,
@@ -315,11 +315,21 @@ fn ensure_output_format_supported(
     format: output::formats::OutputFormat,
 ) -> anyhow::Result<()> {
     match command {
-        Cmd::Run { .. } => output::formats::ensure_supported(
-            "run",
-            format,
-            &[output::formats::OutputFormat::Table],
-        ),
+        Cmd::Run { argv } => {
+            // `rupu run list` / `rupu run show` emit JSON (they are rupu-cp's
+            // SSH run-listing / run-detail contracts); every other `rupu run`
+            // form is Table-only.
+            let allowed: &[output::formats::OutputFormat] =
+                if matches!(argv.first().map(String::as_str), Some("list") | Some("show")) {
+                    &[
+                        output::formats::OutputFormat::Table,
+                        output::formats::OutputFormat::Json,
+                    ]
+                } else {
+                    &[output::formats::OutputFormat::Table]
+                };
+            output::formats::ensure_supported("run", format, allowed)
+        }
         Cmd::Agent { action } => cmd::agent::ensure_output_format(action, format),
         Cmd::Workflow { action } => cmd::workflow::ensure_output_format(action, format),
         Cmd::Autoflow { action } => cmd::autoflow::ensure_output_format(action, format),

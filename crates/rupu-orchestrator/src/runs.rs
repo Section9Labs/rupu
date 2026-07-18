@@ -233,6 +233,33 @@ pub struct RunRecord {
     pub final_output: Option<String>,
 }
 
+impl RunRecord {
+    /// How this run came to exist: `"manual"` | `"cron"` | `"event"`.
+    ///
+    /// Lives here, beside the fields it reads, because both `rupu-cp` (run
+    /// lists, dashboard cycle grouping) and `rupu-cli` (`rupu run list`)
+    /// classify runs this way and MUST agree — separate copies would drift.
+    ///
+    /// Deliberately NOT an enum. `workflow::TriggerKind` in this crate is
+    /// already the manual/cron/event taxonomy (for a workflow YAML's
+    /// `trigger:` block), and `rupu_runtime::RunTrigger` is a third
+    /// trigger-shaped type. A fourth would be noise: the only consumers want
+    /// the wire string.
+    ///
+    /// Precedence is event-before-wake and is load-bearing: an
+    /// event-triggered run may also carry a `source_wake_id`, and flipping
+    /// the order would silently re-bucket those runs.
+    pub fn trigger_str(&self) -> &'static str {
+        if self.event.is_some() {
+            "event"
+        } else if self.source_wake_id.is_some() {
+            "cron"
+        } else {
+            "manual"
+        }
+    }
+}
+
 /// Workflow-step shape, persisted alongside the result so the
 /// printer can dispatch on it without re-inferring from items+findings.
 /// Older `step_results.jsonl` records lack this field; serde defaults
@@ -2596,5 +2623,36 @@ mod tests {
         let back_local: UnitCheckpoint =
             serde_json::from_value(val_local).expect("deserialize local");
         assert_eq!(back_local.host, None);
+    }
+
+    #[test]
+    fn trigger_is_event_when_a_vendor_event_is_attached() {
+        let mut r = sample_record("run_trigger_event");
+        r.event = Some(serde_json::json!({"action": "opened"}));
+        assert_eq!(r.trigger_str(), "event");
+    }
+
+    #[test]
+    fn trigger_is_cron_when_woken_from_the_durable_queue() {
+        let mut r = sample_record("run_trigger_cron");
+        r.source_wake_id = Some("wake_1".into());
+        assert_eq!(r.trigger_str(), "cron");
+    }
+
+    #[test]
+    fn trigger_is_manual_by_default() {
+        let r = sample_record("run_trigger_manual");
+        assert_eq!(r.trigger_str(), "manual");
+    }
+
+    #[test]
+    fn event_wins_over_wake_id() {
+        // An event-triggered run may also carry a wake id. Event is checked
+        // first in the original (api/runs.rs:345); preserve that precedence
+        // exactly — flipping it would silently re-bucket runs in the dashboard.
+        let mut r = sample_record("run_trigger_both");
+        r.event = Some(serde_json::json!({}));
+        r.source_wake_id = Some("wake_1".into());
+        assert_eq!(r.trigger_str(), "event");
     }
 }
