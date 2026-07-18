@@ -15,7 +15,10 @@ use std::process::ExitCode;
 use std::str::FromStr;
 
 use crate::cmd::apply_update;
+use crate::cmd::ui::UiPrefs;
+use crate::cmd::update_progress;
 use crate::paths;
+use indicatif::ProgressBar;
 
 #[derive(Args, Debug)]
 pub struct UpdateArgs {
@@ -139,11 +142,11 @@ async fn run(args: UpdateArgs) -> anyhow::Result<ExitCode> {
         }
         _ => {}
     }
+    let to = out
+        .latest
+        .clone()
+        .expect("check always sets latest when an asset exists");
     if !args.yes {
-        let to = out
-            .latest
-            .clone()
-            .expect("check always sets latest when an asset exists");
         eprint!(
             "Update rupu {} → {to} ({channel})? [y/N] ",
             ctx.current_version
@@ -158,8 +161,44 @@ async fn run(args: UpdateArgs) -> anyhow::Result<ExitCode> {
         }
     }
 
-    let dl = |url: String| {
-        Box::pin(async move { github::download_bytes(&url).await })
+    // Resolve UI prefs so the progress bar matches the configured theme.
+    // `resolve` also installs the active palette as a side effect — this
+    // command never otherwise initializes it (see `output::palette`).
+    let prefs = UiPrefs::resolve(&cfg.ui, false, None, None, None);
+    let progress = update_progress::UpdateProgress::start(
+        &ctx.current_version.to_string(),
+        &to.to_string(),
+        channel,
+        &prefs,
+    );
+    let dl_bar = progress.bar();
+    let themed = progress.themed();
+
+    let dl = move |url: String| {
+        let bar = dl_bar.clone();
+        Box::pin(async move {
+            // The `.sha256` sidecar is a few dozen bytes — download it
+            // quietly; the bar is for the binary only.
+            if url.ends_with(".sha256") {
+                return github::download_bytes(&url).await;
+            }
+            match bar {
+                Some(bar) => {
+                    let bytes = github::download_bytes_with_progress(&url, |done, total| {
+                        if let Some(total) = total {
+                            bar.set_length(total);
+                        }
+                        bar.set_position(done);
+                    })
+                    .await?;
+                    // Bytes are in; verify/sign/swap is not byte-measurable,
+                    // so the bar morphs into an indeterminate spinner.
+                    update_progress::switch_to_installing(&bar, themed);
+                    Ok(bytes)
+                }
+                None => github::download_bytes(&url).await,
+            }
+        })
             as std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<Vec<u8>, rupu_update::UpdateError>>
@@ -167,10 +206,10 @@ async fn run(args: UpdateArgs) -> anyhow::Result<ExitCode> {
                 >,
             >
     };
-    let apply = ElevatingApply;
+    let apply = ElevatingApply { pb: progress.bar() };
     let check = rupu_update::CodesignCheck;
     let new = flow::install(&src, &ctx, args.force, &apply, &check, dl).await?;
-    println!("Updated rupu {} → {new} ({channel}).", ctx.current_version);
+    progress.finish(&new.to_string(), channel);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -181,7 +220,11 @@ async fn run(args: UpdateArgs) -> anyhow::Result<ExitCode> {
 // the privileged swap.
 // ---------------------------------------------------------------------------
 
-pub struct ElevatingApply;
+pub struct ElevatingApply {
+    /// The live progress bar, if any — suspended around the `sudo` prompt
+    /// so the steady-tick spinner doesn't fight the password entry.
+    pub pb: Option<ProgressBar>,
+}
 
 impl flow::ApplyStrategy for ElevatingApply {
     fn apply(&self, verified: &[u8], target: &Path) -> Result<(), rupu_update::UpdateError> {
@@ -221,20 +264,28 @@ impl flow::ApplyStrategy for ElevatingApply {
                 .unwrap_or("prev")
         ));
 
-        eprintln!("Elevating to install into {} …", dir.display());
-        let status = std::process::Command::new("sudo")
-            .arg(&self_exe)
-            .arg("__apply-update")
-            .arg("--from")
-            .arg(&staged)
-            .arg("--to")
-            .arg(target)
-            .arg("--sha256")
-            .arg(&sha)
-            .arg("--backup")
-            .arg(&backup)
-            .status()
-            .map_err(|e| rupu_update::UpdateError::Install(format!("sudo failed to start: {e}")))?;
+        // Run the elevation prompt + swap with the progress bar suspended,
+        // so `sudo`'s password prompt owns the terminal cleanly.
+        let run = || {
+            eprintln!("Elevating to install into {} …", dir.display());
+            std::process::Command::new("sudo")
+                .arg(&self_exe)
+                .arg("__apply-update")
+                .arg("--from")
+                .arg(&staged)
+                .arg("--to")
+                .arg(target)
+                .arg("--sha256")
+                .arg(&sha)
+                .arg("--backup")
+                .arg(&backup)
+                .status()
+        };
+        let status = match &self.pb {
+            Some(pb) => pb.suspend(run),
+            None => run(),
+        }
+        .map_err(|e| rupu_update::UpdateError::Install(format!("sudo failed to start: {e}")))?;
         if !status.success() {
             return Err(rupu_update::UpdateError::Install(format!(
                 "privileged apply failed; run manually: sudo {} __apply-update --from {} --to {} --sha256 {} --backup {}",
@@ -253,7 +304,7 @@ impl flow::ApplyStrategy for ElevatingApply {
 /// normal install (a rollback is just "swap this file back in").
 fn apply_maybe_elevated(bytes: &[u8], target: &Path) -> anyhow::Result<()> {
     use flow::ApplyStrategy as _;
-    ElevatingApply
+    ElevatingApply { pb: None }
         .apply(bytes, target)
         .map_err(|e| anyhow::anyhow!(e))
 }
