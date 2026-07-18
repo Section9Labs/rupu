@@ -68,6 +68,16 @@ impl UpdateProgress {
         self.themed
     }
 
+    /// Clear the bar without a footer — for error paths, so a failed
+    /// update doesn't leave a stale "installing…" line behind. (indicatif
+    /// clears on drop today, but that rides on the crate's default finish
+    /// behavior; clear explicitly rather than depend on it.)
+    pub fn abandon(&self) {
+        if let Some(bar) = &self.bar {
+            bar.finish_and_clear();
+        }
+    }
+
     /// Clear the bar and print the two-line themed footer. When
     /// non-interactive, print the plain legacy success line instead so
     /// scripts still see a stable "Updated rupu …" message.
@@ -94,6 +104,15 @@ pub fn switch_to_installing(bar: &ProgressBar, themed: bool) {
         bar.set_style(style.tick_strings(SPINNER_FRAMES));
     }
     bar.set_message("installing…");
+}
+
+/// Switch the download bar to a length-less style: a spinner plus the
+/// running byte count. Used when the server sends no `Content-Length`, so
+/// the determinate `{bar}`/`{percent}` don't render as a stuck 0%.
+pub fn switch_to_indeterminate_download(bar: &ProgressBar, themed: bool) {
+    if let Ok(style) = ProgressStyle::with_template(&indeterminate_download_template(themed)) {
+        bar.set_style(style.tick_strings(SPINNER_FRAMES));
+    }
 }
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"];
@@ -168,6 +187,20 @@ fn installing_template(themed: bool) -> String {
     )
 }
 
+/// indicatif template for a download of unknown length (no `Content-Length`).
+fn indeterminate_download_template(themed: bool) -> String {
+    format!(
+        "  {{prefix}}\n  {}  {}",
+        paint("{spinner}", palette::BRAND, false, themed),
+        paint(
+            "{bytes} · {binary_bytes_per_sec}",
+            palette::DIM,
+            false,
+            themed
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +242,8 @@ mod tests {
         let _ = download_style(false);
         assert!(ProgressStyle::with_template(&installing_template(true)).is_ok());
         assert!(ProgressStyle::with_template(&installing_template(false)).is_ok());
+        assert!(ProgressStyle::with_template(&indeterminate_download_template(true)).is_ok());
+        assert!(ProgressStyle::with_template(&indeterminate_download_template(false)).is_ok());
     }
 
     #[test]

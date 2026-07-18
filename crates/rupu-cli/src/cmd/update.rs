@@ -184,9 +184,20 @@ async fn run(args: UpdateArgs) -> anyhow::Result<ExitCode> {
             }
             match bar {
                 Some(bar) => {
+                    // Configure the bar from the first progress tick, which
+                    // carries the authoritative length: determinate when the
+                    // server sent Content-Length, else a bytes-only spinner
+                    // (so it never renders as a stuck 0%).
+                    let mut configured = false;
                     let bytes = github::download_bytes_with_progress(&url, |done, total| {
-                        if let Some(total) = total {
-                            bar.set_length(total);
+                        if !configured {
+                            configured = true;
+                            match total {
+                                Some(total) => bar.set_length(total),
+                                None => {
+                                    update_progress::switch_to_indeterminate_download(&bar, themed)
+                                }
+                            }
                         }
                         bar.set_position(done);
                     })
@@ -208,7 +219,14 @@ async fn run(args: UpdateArgs) -> anyhow::Result<ExitCode> {
     };
     let apply = ElevatingApply { pb: progress.bar() };
     let check = rupu_update::CodesignCheck;
-    let new = flow::install(&src, &ctx, args.force, &apply, &check, dl).await?;
+    let new = match flow::install(&src, &ctx, args.force, &apply, &check, dl).await {
+        Ok(new) => new,
+        Err(e) => {
+            // Clear the live bar/spinner before the error surfaces on stderr.
+            progress.abandon();
+            return Err(e.into());
+        }
+    };
     progress.finish(&new.to_string(), channel);
     Ok(ExitCode::SUCCESS)
 }
