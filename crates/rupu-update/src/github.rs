@@ -55,11 +55,24 @@ impl ReleaseSource for GithubReleaseSource {
 
 /// Download `url` into memory (UA header, optional token, size cap + timeout).
 pub async fn download_bytes(url: &str) -> Result<Vec<u8>, crate::UpdateError> {
+    download_bytes_with_progress(url, |_, _| {}).await
+}
+
+/// Download `url` into memory, invoking `on_progress(downloaded, total)` as
+/// bytes arrive so callers can render a progress bar. `total` is the
+/// server-reported content length when the response advertises one (`None`
+/// otherwise). Same UA/token/size-cap/timeout semantics as [`download_bytes`];
+/// the cap is enforced against the running total while streaming rather than
+/// only after the whole body lands.
+pub async fn download_bytes_with_progress(
+    url: &str,
+    mut on_progress: impl FnMut(u64, Option<u64>),
+) -> Result<Vec<u8>, crate::UpdateError> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| crate::UpdateError::Network(e.to_string()))?;
-    let resp = req(&client, url)
+    let mut resp = req(&client, url)
         .send()
         .await
         .map_err(|e| crate::UpdateError::Network(e.to_string()))?;
@@ -70,23 +83,30 @@ pub async fn download_bytes(url: &str) -> Result<Vec<u8>, crate::UpdateError> {
             resp.status()
         )));
     }
-    if let Some(len) = resp.content_length() {
+    let total = resp.content_length();
+    if let Some(len) = total {
         if len > MAX_BYTES {
             return Err(crate::UpdateError::Network(format!(
                 "asset too large: {len} bytes"
             )));
         }
     }
-    let bytes = resp
-        .bytes()
+    let mut buf: Vec<u8> = Vec::with_capacity(total.unwrap_or(0) as usize);
+    on_progress(0, total);
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| crate::UpdateError::Network(e.to_string()))?;
-    if bytes.len() as u64 > MAX_BYTES {
-        return Err(crate::UpdateError::Network(
-            "asset exceeded size cap".into(),
-        ));
+        .map_err(|e| crate::UpdateError::Network(e.to_string()))?
+    {
+        buf.extend_from_slice(&chunk);
+        if buf.len() as u64 > MAX_BYTES {
+            return Err(crate::UpdateError::Network(
+                "asset exceeded size cap".into(),
+            ));
+        }
+        on_progress(buf.len() as u64, total);
     }
-    Ok(bytes.to_vec())
+    Ok(buf)
 }
 
 #[cfg(test)]

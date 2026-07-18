@@ -29,6 +29,7 @@ pub mod session;
 pub mod transcript;
 pub mod ui;
 pub mod update;
+pub mod update_progress;
 pub mod usage;
 pub(crate) mod usage_report;
 pub mod watch;
