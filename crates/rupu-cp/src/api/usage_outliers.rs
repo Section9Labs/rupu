@@ -21,7 +21,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Runs costing at least this many times their workflow's median are
@@ -36,6 +36,7 @@ pub fn routes() -> Router<AppState> {
 #[derive(Debug, Deserialize)]
 struct OutliersQuery {
     since: Option<String>,
+    until: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -122,27 +123,25 @@ pub fn find_outliers(runs: &[RunCost], threshold: f64) -> Vec<OutlierRun> {
     out
 }
 
-/// Resolve the `since` bound: absent → now − 30 days (mirrors `/api/usage`'s
-/// default window). A present-but-unparseable bound is an error (caller maps
-/// to 400) rather than a silent default.
-fn resolve_since(since: Option<&str>, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
-    match since {
-        Some(s) => DateTime::parse_from_rfc3339(s)
-            .map(|d| d.with_timezone(&Utc))
-            .map_err(|e| format!("invalid timestamp {s:?}: {e}")),
-        None => Ok(now - Duration::days(30)),
-    }
-}
-
-/// Build this host's `RunCost`s for every run started on/after `since`, using
-/// the same per-run cost path `/api/usage`'s summary uses
+/// Build this host's `RunCost`s for every run started within `[since, until]`,
+/// using the same per-run cost path `/api/usage`'s summary uses
 /// (`crate::usage::summarize_run`) — no second cost computation to drift out
 /// of sync with what `cost_usd` means everywhere else in the CP.
+///
+/// The window itself is resolved via `crate::api::usage::resolve_window`
+/// (Task W1) — reused, not re-derived, so this endpoint can't drift from
+/// `/api/usage`'s defaulting (`since` absent → now − 30 days; `until` absent →
+/// now) or its unparseable-bound → 400 behavior. NOTE: narrowing the window
+/// legitimately changes which runs feed the per-workflow median baseline
+/// below, so it can change which runs are flagged as outliers — that is
+/// intended, not a bug.
 async fn get_usage_outliers(
     State(s): State<AppState>,
     Query(q): Query<OutliersQuery>,
 ) -> ApiResult<Json<Vec<OutlierRun>>> {
-    let since = resolve_since(q.since.as_deref(), Utc::now()).map_err(ApiError::bad_request)?;
+    let (since, until) =
+        crate::api::usage::resolve_window(q.since.as_deref(), q.until.as_deref(), Utc::now())
+            .map_err(ApiError::bad_request)?;
 
     let runs = s
         .run_store
@@ -151,7 +150,7 @@ async fn get_usage_outliers(
 
     let run_costs: Vec<RunCost> = runs
         .iter()
-        .filter(|r| r.started_at >= since)
+        .filter(|r| r.started_at >= since && r.started_at <= until)
         .map(|r| {
             let summary = crate::usage::summarize_run(&s.run_store, &r.id, &s.pricing);
             RunCost {
@@ -222,19 +221,5 @@ mod tests {
             3.0,
         );
         assert!(out.is_empty());
-    }
-
-    #[test]
-    fn resolve_since_defaults_to_30_days() {
-        let now = DateTime::parse_from_rfc3339("2026-06-20T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let since = resolve_since(None, now).unwrap();
-        assert_eq!(since, now - Duration::days(30));
-    }
-
-    #[test]
-    fn resolve_since_rejects_garbage() {
-        assert!(resolve_since(Some("not-a-date"), Utc::now()).is_err());
     }
 }

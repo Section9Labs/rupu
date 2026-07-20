@@ -189,7 +189,12 @@ struct UsageResponse {
 /// Resolve the [since, until] window from optional RFC-3339 strings.
 /// Absent `since` → now − 30 days; absent `until` → now. A present-but-unparseable
 /// bound is an error (caller maps to 400) rather than a silent default.
-fn resolve_window(
+///
+/// `pub(crate)`: `crate::api::usage_outliers` reuses this exact window
+/// resolution (Task W1) rather than re-deriving its own, so `/api/usage/runs`
+/// and `/api/usage/outliers` can't drift apart on how `since`/`until` default
+/// or fail to parse.
+pub(crate) fn resolve_window(
     since: Option<&str>,
     until: Option<&str>,
     now: DateTime<Utc>,
@@ -664,10 +669,11 @@ struct UsageRunRow {
 #[derive(Debug, Deserialize)]
 struct UsageRunsQuery {
     since: Option<String>,
+    until: Option<String>,
     workspace_id: Option<String>,
 }
 
-/// `GET /api/usage/runs?since=&workspace_id=` — flat per-`(run × model)` rows.
+/// `GET /api/usage/runs?since=&until=&workspace_id=` — flat per-`(run × model)` rows.
 ///
 /// **Local-only**: reads `s.run_store` directly, exactly like
 /// `/api/usage/timeline` and `/api/usage/outliers` — no host fan-out. A
@@ -683,8 +689,8 @@ async fn get_usage_runs(
     State(s): State<AppState>,
     Query(q): Query<UsageRunsQuery>,
 ) -> ApiResult<Json<Vec<UsageRunRow>>> {
-    let (start, end) =
-        resolve_window(q.since.as_deref(), None, Utc::now()).map_err(ApiError::bad_request)?;
+    let (start, end) = resolve_window(q.since.as_deref(), q.until.as_deref(), Utc::now())
+        .map_err(ApiError::bad_request)?;
 
     let runs = s
         .run_store

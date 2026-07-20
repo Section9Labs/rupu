@@ -783,3 +783,187 @@ async fn usage_runs_since_excludes_a_run_started_before_the_bound() {
     );
     assert_eq!(rows[0]["run_id"], "run_recent");
 }
+
+#[tokio::test]
+async fn usage_runs_since_and_until_bound_the_window_on_both_ends() {
+    // Task W1: `/api/usage/runs` gains `until`. Three runs: one before
+    // `since`, one inside `[since, until]`, one after `until` — only the
+    // middle run must survive.
+    let dir = tempfile::tempdir().unwrap();
+    let before = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let inside = chrono::DateTime::parse_from_rfc3339("2026-06-15T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let after = chrono::DateTime::parse_from_rfc3339("2026-07-15T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    seed_run_with_usage(
+        dir.path(),
+        "run_before",
+        "wf",
+        "ws_a",
+        "anthropic",
+        "claude-sonnet-4-6",
+        1000,
+        0,
+        before,
+    );
+    seed_run_with_usage(
+        dir.path(),
+        "run_inside",
+        "wf",
+        "ws_a",
+        "anthropic",
+        "claude-sonnet-4-6",
+        2000,
+        0,
+        inside,
+    );
+    seed_run_with_usage(
+        dir.path(),
+        "run_after",
+        "wf",
+        "ws_a",
+        "anthropic",
+        "claude-sonnet-4-6",
+        3000,
+        0,
+        after,
+    );
+
+    let srv = spawn_server(dir.path()).await;
+    let body: serde_json::Value = reqwest::get(format!(
+        "{}/api/usage/runs?since=2026-06-01T00:00:00Z&until=2026-07-01T00:00:00Z",
+        srv.base_url
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let rows = body.as_array().expect("flat array of rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "runs before `since` and after `until` must both be excluded: {rows:?}"
+    );
+    assert_eq!(rows[0]["run_id"], "run_inside");
+}
+
+#[tokio::test]
+async fn usage_runs_unparseable_until_returns_400() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn_server(dir.path()).await;
+    let resp = reqwest::get(format!("{}/api/usage/runs?until=notadate", srv.base_url))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "an unparseable `until` must 400, not silently fall back to now"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Part D: `GET /api/usage/outliers?until=` (Task W1).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn usage_outliers_until_excludes_an_outlier_eligible_run_after_the_bound() {
+    // Three cheap baseline runs (~$0.3 each) inside the window establish the
+    // median. A spike run inside the window (~$3, 10x) must be flagged. An
+    // identical spike run started AFTER `until` must be excluded entirely —
+    // not flagged, and not folded into the baseline either.
+    let dir = tempfile::tempdir().unwrap();
+    let base_1 = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let base_2 = chrono::DateTime::parse_from_rfc3339("2026-06-02T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let base_3 = chrono::DateTime::parse_from_rfc3339("2026-06-03T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let spike_in_window = chrono::DateTime::parse_from_rfc3339("2026-06-10T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let spike_after_until = chrono::DateTime::parse_from_rfc3339("2026-07-15T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    for (i, ts) in [base_1, base_2, base_3].into_iter().enumerate() {
+        seed_run_with_usage(
+            dir.path(),
+            &format!("base_{i}"),
+            "wf",
+            "ws_a",
+            "anthropic",
+            "claude-sonnet-4-6",
+            100_000,
+            0,
+            ts,
+        );
+    }
+    seed_run_with_usage(
+        dir.path(),
+        "spike_in_window",
+        "wf",
+        "ws_a",
+        "anthropic",
+        "claude-sonnet-4-6",
+        1_000_000,
+        0,
+        spike_in_window,
+    );
+    seed_run_with_usage(
+        dir.path(),
+        "spike_after_until",
+        "wf",
+        "ws_a",
+        "anthropic",
+        "claude-sonnet-4-6",
+        1_000_000,
+        0,
+        spike_after_until,
+    );
+
+    let srv = spawn_server(dir.path()).await;
+    let body: serde_json::Value = reqwest::get(format!(
+        "{}/api/usage/outliers?since=2026-05-01T00:00:00Z&until=2026-07-01T00:00:00Z",
+        srv.base_url
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let rows = body.as_array().expect("flat array of outlier rows");
+    let ids: Vec<&str> = rows.iter().map(|r| r["run_id"].as_str().unwrap()).collect();
+    assert!(
+        ids.contains(&"spike_in_window"),
+        "the in-window spike must be flagged: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"spike_after_until"),
+        "the spike started after `until` must be excluded from the window entirely: {ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn usage_outliers_unparseable_until_returns_400() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn_server(dir.path()).await;
+    let resp = reqwest::get(format!(
+        "{}/api/usage/outliers?until=notadate",
+        srv.base_url
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "an unparseable `until` must 400, not silently fall back to now"
+    );
+}
