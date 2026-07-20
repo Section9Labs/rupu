@@ -47,6 +47,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   api,
   presetWindow,
+  windowFromDayRange,
   type DashboardRange,
   type OutlierRun,
   type UsageResponse,
@@ -77,19 +78,38 @@ export default function Usage() {
   // The `{since, until}` window driving every usage fetch below (Task W2) —
   // `range` is kept alongside purely for the 7/30/All button highlighting.
   // Held in state (not recomputed inline from `range` on every render) so
-  // its object identity is stable across renders that don't change it —
-  // `UsageTimeline`'s fetch effect keys off `window.since`/`window.until`,
-  // but other window-state holders may still key off identity, and a stable
-  // reference avoids any such surprise. A drag-selected custom window (Task
-  // W3) will set this to an arbitrary window without touching `range`.
-  const [window, setWindow] = useState<UsageWindow>(() => presetWindow('30d'));
+  // its object identity is stable across renders that don't change it.
+  // Named `usageWindow` (not `window`) to avoid shadowing the global
+  // `Window`. A drag-selected custom window (Task W3, `handleSelectRange`
+  // below) sets this to an arbitrary window without touching `range`;
+  // `isCustomWindow` tracks which of the two is currently active so the
+  // "custom" chip and the preset-button highlighting agree.
+  const [usageWindow, setUsageWindow] = useState<UsageWindow>(() => presetWindow('30d'));
+  const [isCustomWindow, setIsCustomWindow] = useState(false);
   const [pivot, setPivot] = useState<Pivot>('model');
   const [metric, setMetric] = useState<UsageMetric>('cost');
 
   const handleRangeChange = useCallback((r: DashboardRange) => {
     setRange(r);
-    setWindow(presetWindow(r));
+    setUsageWindow(presetWindow(r));
+    setIsCustomWindow(false);
   }, []);
+
+  // Task W3: a drag-select on the graph narrows the whole page to an
+  // arbitrary `{since, until}` window, exactly like a preset. `startDay`/
+  // `endDay` are the ordered day-bucket labels `UsageTimelineStacked`'s
+  // `useDragSelection` resolves a real drag to.
+  const handleSelectRange = useCallback((startDay: string, endDay: string) => {
+    setUsageWindow(windowFromDayRange(startDay, endDay));
+    setIsCustomWindow(true);
+  }, []);
+
+  // "custom · ×" chip's clear: return to the currently-highlighted preset's
+  // window without changing which preset is highlighted.
+  const clearCustomWindow = useCallback(() => {
+    setUsageWindow(presetWindow(range));
+    setIsCustomWindow(false);
+  }, [range]);
 
   const [data, setData] = useState<UsageResponse | null>(null);
   const [outliers, setOutliers] = useState<OutlierRun[]>([]);
@@ -117,11 +137,16 @@ export default function Usage() {
   }, [pivot]);
 
   // `/api/usage`: summary + the pivoted breakdown + the unpriced gap + host
-  // freshness. Re-fetches whenever the window OR the pivot changes.
+  // freshness. Re-fetches whenever the window OR the pivot changes. Depends
+  // on `usageWindow.since`/`usageWindow.until` (primitives), not the
+  // `usageWindow` object itself — `handleSelectRange` (and `presetWindow`)
+  // build a fresh window object each call, and keying off the object would
+  // risk a spurious refetch loop if that ever stopped being referentially
+  // stable (same primitive-deps pattern as `UsageTimeline`'s own effect).
   useEffect(() => {
     let cancelled = false;
     api
-      .getUsage(window, pivot)
+      .getUsage(usageWindow, pivot)
       .then((resp) => {
         if (cancelled) return;
         setData(resp);
@@ -134,13 +159,15 @@ export default function Usage() {
     return () => {
       cancelled = true;
     };
-  }, [window, pivot]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed off usageWindow's primitive fields, not the object itself; see comment above.
+  }, [usageWindow.since, usageWindow.until, pivot]);
 
-  // `/api/usage/outliers`: local-only, re-fetches on window.
+  // `/api/usage/outliers`: local-only, re-fetches on window (primitives —
+  // see the comment on the effect above).
   useEffect(() => {
     let cancelled = false;
     api
-      .getUsageOutliers(window)
+      .getUsageOutliers(usageWindow)
       .then((rows) => {
         if (!cancelled) setOutliers(rows);
       })
@@ -150,7 +177,8 @@ export default function Usage() {
     return () => {
       cancelled = true;
     };
-  }, [window]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed off usageWindow's primitive fields, not the object itself; see comment on the effect above.
+  }, [usageWindow.since, usageWindow.until]);
 
   const filter = useMemo<TimelineFilter>(
     () => ({ excludedKeys, excludedRunIds }),
@@ -193,6 +221,16 @@ export default function Usage() {
             </span>
           )}
           <PivotPicker value={pivot} onChange={setPivot} />
+          {isCustomWindow && (
+            <button
+              type="button"
+              onClick={clearCustomWindow}
+              className="rounded-full border border-[rgb(var(--c-border))] px-2 py-0.5 text-[10px] text-[rgb(var(--c-ink-mute))] hover:bg-[rgb(var(--c-surface))]"
+              title="Clear the drag-selected window and return to the active preset"
+            >
+              custom · ×
+            </button>
+          )}
           <div className="flex rounded-md border border-[rgb(var(--c-border))]">
             {RANGES.map((r) => (
               <button
@@ -200,7 +238,7 @@ export default function Usage() {
                 type="button"
                 onClick={() => handleRangeChange(r)}
                 className={`px-2 py-1 text-xs ${
-                  range === r
+                  !isCustomWindow && range === r
                     ? 'bg-[rgb(var(--c-surface))] text-[rgb(var(--c-ink))]'
                     : 'text-[rgb(var(--c-ink-mute))]'
                 }`}
@@ -222,7 +260,7 @@ export default function Usage() {
               passed in rather than computed inside that component (see its
               doc comment). */}
           <UsageTimeline
-            window={window}
+            usageWindow={usageWindow}
             pivot={pivot}
             metric={metric}
             onMetricChange={setMetric}
@@ -230,6 +268,7 @@ export default function Usage() {
             excludedCount={excludedCount}
             onReset={resetExclusions}
             onRunsLoaded={setRuns}
+            onSelectRange={handleSelectRange}
             hosts={data.hosts}
             headline={{
               costLabel: formatCost(data.summary.cost_usd),

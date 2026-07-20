@@ -28,7 +28,7 @@ const METRICS: UsageMetric[] = ['cost', 'tokens'];
 
 export default function UsageTimeline({
   workspaceId,
-  window,
+  usageWindow,
   pivot,
   metric,
   onMetricChange,
@@ -38,14 +38,17 @@ export default function UsageTimeline({
   hosts,
   headline,
   onRunsLoaded,
+  onSelectRange,
 }: {
   /** Scopes the fetch to one project's runs. Omitted on `/usage` — all
    *  local runs. */
   workspaceId?: string;
   /** The `{since, until}` window driving every fetch below — a preset
    *  (7d/30d/all) is just a window ending "now" (see `presetWindow`); a
-   *  future drag-selected custom window is the same shape. */
-  window: UsageWindow;
+   *  drag-selected custom window (Task W3, via `onSelectRange` below) is the
+   *  same shape. Named `usageWindow` (not `window`) to avoid shadowing the
+   *  global `Window`. */
+  usageWindow: UsageWindow;
   pivot: Pivot;
   metric: UsageMetric;
   onMetricChange: (m: UsageMetric) => void;
@@ -55,24 +58,34 @@ export default function UsageTimeline({
   hosts?: HostFreshness[];
   headline: { costLabel: string; subLabel: string };
   onRunsLoaded?: (rows: UsageRunRow[]) => void;
+  /**
+   * Marquee drag-select (Task W3) — pure passthrough to
+   * `UsageTimelineStacked`'s prop of the same name. The caller (which owns
+   * the `usageWindow` state) is responsible for converting the ordered
+   * `(startDay, endDay)` day-bucket labels into a `UsageWindow` (see
+   * `windowFromDayRange` in `../../lib/api`) and setting its state — this
+   * component has no window state of its own to update.
+   */
+  onSelectRange?: (startDay: string, endDay: string) => void;
 }) {
   const [runs, setRuns] = useState<UsageRunRow[]>([]);
 
   // `GET /api/usage/runs`: flat per-`(run × model)` rows behind the graph.
-  // Depends on `window.since`/`window.until` (primitives), not the `window`
-  // object itself — callers are free to pass a freshly-computed window on
-  // every render (a plain `presetWindow(...)` call is not memoized) without
-  // spuriously refetching just because the object reference changed. Pivot-
-  // and filter-independent regardless — every pivot switch or exclude
-  // toggle re-runs `buildTimeline` in memory, no refetch.
+  // Depends on `usageWindow.since`/`usageWindow.until` (primitives), not the
+  // `usageWindow` object itself — callers are free to pass a
+  // freshly-computed window on every render (a plain `presetWindow(...)`
+  // call is not memoized) without spuriously refetching just because the
+  // object reference changed. Pivot- and filter-independent regardless —
+  // every pivot switch or exclude toggle re-runs `buildTimeline` in memory,
+  // no refetch.
   useEffect(() => {
     let cancelled = false;
     // Called with exactly one argument when `workspaceId` is omitted (rather
     // than an explicit `undefined` second arg) so a caller-side spy
-    // assertion like `toHaveBeenCalledWith(window)` — matching how `/usage`
-    // itself called `getUsageRuns` before this component existed — still
-    // matches.
-    (workspaceId ? api.getUsageRuns(window, workspaceId) : api.getUsageRuns(window))
+    // assertion like `toHaveBeenCalledWith(usageWindow)` — matching how
+    // `/usage` itself called `getUsageRuns` before this component existed —
+    // still matches.
+    (workspaceId ? api.getUsageRuns(usageWindow, workspaceId) : api.getUsageRuns(usageWindow))
       .then((rows) => {
         if (cancelled) return;
         setRuns(rows);
@@ -86,8 +99,8 @@ export default function UsageTimeline({
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- onRunsLoaded is a caller-supplied callback, not a re-fetch trigger; `window` itself is intentionally omitted in favor of its primitive fields (see doc comment above).
-  }, [window.since, window.until, workspaceId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- onRunsLoaded is a caller-supplied callback, not a re-fetch trigger; `usageWindow` itself is intentionally omitted in favor of its primitive fields (see doc comment above).
+  }, [usageWindow.since, usageWindow.until, workspaceId]);
 
   const timeline = useMemo(() => buildTimeline(runs, pivot, filter, 'day'), [runs, pivot, filter]);
 
@@ -136,7 +149,13 @@ export default function UsageTimeline({
       <p className="mb-2 text-[10px] uppercase tracking-wide text-[rgb(var(--c-ink-mute))]">
         local host only
       </p>
-      <UsageTimelineStacked buckets={timeline} metric={metric} pivot={pivot} hosts={hosts} />
+      <UsageTimelineStacked
+        buckets={timeline}
+        metric={metric}
+        pivot={pivot}
+        hosts={hosts}
+        onSelectRange={onSelectRange}
+      />
     </section>
   );
 }

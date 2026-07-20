@@ -44,7 +44,7 @@ describe('UsageTimeline', () => {
 
     render(
       <UsageTimeline
-        window={presetWindow('30d', NOW)}
+        usageWindow={presetWindow('30d', NOW)}
         pivot="model"
         metric="cost"
         onMetricChange={() => {}}
@@ -65,7 +65,7 @@ describe('UsageTimeline', () => {
     render(
       <UsageTimeline
         workspaceId="ws_42"
-        window={presetWindow('7d', NOW)}
+        usageWindow={presetWindow('7d', NOW)}
         pivot="model"
         metric="cost"
         onMetricChange={() => {}}
@@ -87,7 +87,7 @@ describe('UsageTimeline', () => {
     render(
       <UsageTimeline
         workspaceId="ws_42"
-        window={presetWindow('7d', NOW)}
+        usageWindow={presetWindow('7d', NOW)}
         pivot="model"
         metric="cost"
         onMetricChange={() => {}}
@@ -108,7 +108,7 @@ describe('UsageTimeline', () => {
 
     render(
       <UsageTimeline
-        window={presetWindow('30d', NOW)}
+        usageWindow={presetWindow('30d', NOW)}
         pivot="model"
         metric="cost"
         onMetricChange={() => {}}
@@ -131,7 +131,7 @@ describe('UsageTimeline', () => {
 
     const { rerender } = render(
       <UsageTimeline
-        window={presetWindow('30d', NOW)}
+        usageWindow={presetWindow('30d', NOW)}
         pivot="model"
         metric="cost"
         onMetricChange={() => {}}
@@ -147,7 +147,7 @@ describe('UsageTimeline', () => {
 
     rerender(
       <UsageTimeline
-        window={presetWindow('30d', NOW)}
+        usageWindow={presetWindow('30d', NOW)}
         pivot="model"
         metric="cost"
         onMetricChange={() => {}}

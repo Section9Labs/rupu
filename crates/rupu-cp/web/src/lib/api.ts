@@ -747,6 +747,21 @@ export function presetWindow(range: DashboardRange, now: number = Date.now()): U
   return { since: usageRangeSince(range, now), until: new Date(now).toISOString() };
 }
 
+/**
+ * Build the `UsageWindow` for a drag-selected day-bucket range (Task W3) —
+ * `startDay`/`endDay` are `YYYY-MM-DD` bucket labels off the graph's x-axis,
+ * already ordered `startDay <= endDay` (see `resolveDragRange`). `since` is
+ * the very start of `startDay`; `until` is the very end of `endDay`
+ * (`23:59:59.999`) so the window is INCLUSIVE of every run on the last
+ * selected day, same "whole day" granularity the graph's own buckets use.
+ */
+export function windowFromDayRange(startDay: string, endDay: string): UsageWindow {
+  return {
+    since: `${startDay}T00:00:00.000Z`,
+    until: `${endDay}T23:59:59.999Z`,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Agents
 // ---------------------------------------------------------------------------

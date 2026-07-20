@@ -24,13 +24,14 @@
 // rollup chunk (see vite.config manualChunks), so it never lands in the main
 // bundle. The pure `toChartData` transform is exported for unit testing.
 
-import { Area, AreaChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
+import { Area, AreaChart, ReferenceArea, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import type { UsageTimelineBucket } from '../../lib/usage';
 import { formatCost, formatTokens } from '../../lib/usage';
 import { useThemeColors } from '../../lib/useThemeColors';
 import type { HostFreshness, Pivot } from '../../lib/api';
 import { assignModelColors, pivotLabel } from './modelColors';
 import { assignCategoricalColors } from '../usage/pivotColors';
+import { useDragSelection } from './useDragSelection';
 
 export type UsageMetric = 'cost' | 'tokens';
 
@@ -85,6 +86,7 @@ export default function UsageTimelineStacked({
   metric,
   pivot = 'model',
   hosts,
+  onSelectRange,
 }: {
   buckets: UsageTimelineBucket[];
   metric: UsageMetric;
@@ -97,8 +99,18 @@ export default function UsageTimelineStacked({
    *  falls back to the raw id when absent or unmatched. Ignored for every
    *  other pivot. */
   hosts?: HostFreshness[];
+  /**
+   * Marquee drag-select (Task W3) — called with the ordered `(startDay,
+   * endDay)` day-bucket labels once a real drag (not a plain click)
+   * finishes. Optional and INERT when omitted: the mouse handlers wired to
+   * the chart below no-op immediately (see `useDragSelection`), so callers
+   * that don't pass this prop (the dashboard's other consumers of this
+   * component) see no behavior change at all.
+   */
+  onSelectRange?: (startDay: string, endDay: string) => void;
 }) {
   const theme = useThemeColors();
+  const drag = useDragSelection(onSelectRange);
   const tooltipStyle: React.CSSProperties = {
     background: theme.panel,
     border: `1px solid ${theme.border}`,
@@ -134,7 +146,14 @@ export default function UsageTimelineStacked({
     <div>
       <div style={{ width: '100%', height: 240 }}>
         <ResponsiveContainer width="100%" height="100%">
-          <AreaChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <AreaChart
+            data={data}
+            margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
+            onMouseDown={drag.onMouseDown}
+            onMouseMove={drag.onMouseMove}
+            onMouseUp={drag.finalizeDrag}
+            onMouseLeave={drag.finalizeDrag}
+          >
             <XAxis dataKey="bucket" tickFormatter={bucketTick} tick={{ fontSize: 10, fill: theme.inkMute }} />
             <YAxis
               width={48}
@@ -145,6 +164,15 @@ export default function UsageTimelineStacked({
               contentStyle={tooltipStyle}
               formatter={(v, name) => [fmt(typeof v === 'number' ? v : 0), String(name)]}
             />
+            {drag.band && (
+              <ReferenceArea
+                x1={drag.band.start}
+                x2={drag.band.current}
+                fill={theme.alpha('brand.500', 0.15)}
+                fillOpacity={1}
+                stroke="none"
+              />
+            )}
             {models.map((m) => (
               <Area
                 key={m}

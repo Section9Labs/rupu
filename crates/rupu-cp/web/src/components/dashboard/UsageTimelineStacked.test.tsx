@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, cleanup } from '@testing-library/react';
 import UsageTimelineStacked, { toChartData } from './UsageTimelineStacked';
 import type { UsageBreakdownRow, UsageTimelineBucket } from '../../lib/usage';
@@ -146,5 +146,39 @@ describe('UsageTimelineStacked', () => {
     );
     expect(getByText('staging-box')).toBeInTheDocument();
     expect(queryByText('host_01KWREMOTE')).not.toBeInTheDocument();
+  });
+
+  // Task W3 — drag-select is inert when `onSelectRange` is not passed, so
+  // the dashboard's other consumers of this component (no such prop) are
+  // completely unaffected. Driving a real Recharts pixel-drag isn't
+  // reproducible in jsdom (no ResizeObserver-driven layout to compute
+  // `activeLabel` from), so the drag STATE MACHINE itself is covered by
+  // `useDragSelection.test.ts` via `renderHook`; these tests cover only that
+  // the component wires `onSelectRange` through without side effects at rest.
+  describe('drag-select wiring (Task W3)', () => {
+    it('renders no selection band before any drag, with or without onSelectRange', () => {
+      const { container: withoutHandler } = render(<UsageTimelineStacked buckets={BUCKETS} metric="cost" />);
+      expect(withoutHandler.querySelector('.recharts-reference-area')).toBeNull();
+
+      const { container: withHandler } = render(
+        <UsageTimelineStacked buckets={BUCKETS} metric="cost" onSelectRange={() => {}} />,
+      );
+      expect(withHandler.querySelector('.recharts-reference-area')).toBeNull();
+    });
+
+    it('does not call onSelectRange merely from mounting', () => {
+      const onSelectRange = vi.fn();
+      render(<UsageTimelineStacked buckets={BUCKETS} metric="cost" onSelectRange={onSelectRange} />);
+      expect(onSelectRange).not.toHaveBeenCalled();
+    });
+
+    it('renders the same legend/chart content whether or not onSelectRange is passed', () => {
+      const { container: withoutHandler } = render(<UsageTimelineStacked buckets={BUCKETS} metric="cost" />);
+      const { container: withHandler } = render(
+        <UsageTimelineStacked buckets={BUCKETS} metric="cost" onSelectRange={() => {}} />,
+      );
+      expect(withHandler.querySelectorAll('li').length).toBe(withoutHandler.querySelectorAll('li').length);
+      expect(withHandler.textContent).toBe(withoutHandler.textContent);
+    });
   });
 });

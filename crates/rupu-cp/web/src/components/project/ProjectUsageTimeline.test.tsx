@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 // ProjectUsageTimeline — the project-scoped mount of the shared spend-over-
 // time graph (Task U4). Replaces the per-run `UsageBarChart` in the Runs
-// tab: `getUsageRuns(window, wsId)` -> `buildTimeline` -> the SAME
+// tab: `getUsageRuns(usageWindow, wsId)` -> `buildTimeline` -> the SAME
 // `UsageTimeline` graph `/usage` uses, plus a local breakdown table (built
 // from `aggregateRuns`, since there is no `/api/usage?workspace_id=` to
 // source one from) with checkbox exclusion. No outlier panel — see the

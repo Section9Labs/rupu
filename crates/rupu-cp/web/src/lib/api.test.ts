@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { api, ApiError, presetWindow } from './api';
+import { api, ApiError, presetWindow, windowFromDayRange } from './api';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -243,6 +243,20 @@ describe('presetWindow', () => {
     const untilMs = new Date(w.until).getTime();
     expect(untilMs).toBeGreaterThanOrEqual(before);
     expect(untilMs).toBeLessThanOrEqual(after);
+  });
+});
+
+describe('windowFromDayRange', () => {
+  it('since is the start of startDay and until is the end of endDay, both RFC-3339', () => {
+    const w = windowFromDayRange('2026-07-10', '2026-07-14');
+    expect(w.since).toBe('2026-07-10T00:00:00.000Z');
+    expect(w.until).toBe('2026-07-14T23:59:59.999Z');
+  });
+
+  it('a single-day range still spans the whole day', () => {
+    const w = windowFromDayRange('2026-07-10', '2026-07-10');
+    expect(w.since).toBe('2026-07-10T00:00:00.000Z');
+    expect(w.until).toBe('2026-07-10T23:59:59.999Z');
   });
 });
 

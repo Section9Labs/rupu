@@ -5,7 +5,7 @@
 // uses, scoped to this project's `workspace_id`.
 //
 // This component owns its own range/pivot/metric/exclusion-filter state and
-// the `getUsageRuns(window, wsId)` fetch — there's no page-level state to
+// the `getUsageRuns(usageWindow, wsId)` fetch — there's no page-level state to
 // share it with here, unlike `/usage`, where pivot/filter are shared with a
 // breakdown table + outlier panel sourced from OTHER endpoints. That absence
 // is also why the breakdown table below is built from `aggregateRuns` over
@@ -21,7 +21,7 @@
 // misrepresent it as project-scoped. Deferred; see the U4 report for detail.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { presetWindow, type DashboardRange, type UsageRunRow, type UsageWindow } from '../../lib/api';
+import { presetWindow, windowFromDayRange, type DashboardRange, type UsageRunRow, type UsageWindow } from '../../lib/api';
 import { formatCost, formatTokens } from '../../lib/usage';
 import { aggregateRuns, type TimelineFilter } from '../../lib/usage/buildTimeline';
 import { PivotPicker, PIVOT_LABEL, type Pivot } from '../usage/PivotPicker';
@@ -43,16 +43,35 @@ export default function ProjectUsageTimeline({ wsId }: { wsId: string }) {
   // The `{since, until}` window driving the fetch below (Task W2) — `range`
   // is kept alongside purely for the 7/30/All button highlighting. Held in
   // state (not recomputed inline from `range` on every render) so its
-  // object identity is stable across renders that don't change it.
-  const [window, setWindow] = useState<UsageWindow>(() => presetWindow('30d'));
+  // object identity is stable across renders that don't change it. Named
+  // `usageWindow` (not `window`) to avoid shadowing the global `Window`.
+  // `isCustomWindow` tracks whether a drag-select (Task W3, via
+  // `handleSelectRange`) or a preset (`range`) is the active source.
+  const [usageWindow, setUsageWindow] = useState<UsageWindow>(() => presetWindow('30d'));
+  const [isCustomWindow, setIsCustomWindow] = useState(false);
   const [pivot, setPivot] = useState<Pivot>('model');
   const [metric, setMetric] = useState<UsageMetric>('cost');
   const [runs, setRuns] = useState<UsageRunRow[]>([]);
 
   const handleRangeChange = useCallback((r: DashboardRange) => {
     setRange(r);
-    setWindow(presetWindow(r));
+    setUsageWindow(presetWindow(r));
+    setIsCustomWindow(false);
   }, []);
+
+  // Task W3: a drag-select on the graph narrows the whole view to an
+  // arbitrary `{since, until}` window, exactly like a preset.
+  const handleSelectRange = useCallback((startDay: string, endDay: string) => {
+    setUsageWindow(windowFromDayRange(startDay, endDay));
+    setIsCustomWindow(true);
+  }, []);
+
+  // "custom · ×" chip's clear: return to the currently-highlighted preset's
+  // window without changing which preset is highlighted.
+  const clearCustomWindow = useCallback(() => {
+    setUsageWindow(presetWindow(range));
+    setIsCustomWindow(false);
+  }, [range]);
 
   const [excludedKeys, setExcludedKeys] = useState<Set<string>>(new Set());
   const [excludedRunIds, setExcludedRunIds] = useState<Set<string>>(new Set());
@@ -96,6 +115,16 @@ export default function ProjectUsageTimeline({ wsId }: { wsId: string }) {
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-end gap-2">
         <PivotPicker value={pivot} onChange={setPivot} />
+        {isCustomWindow && (
+          <button
+            type="button"
+            onClick={clearCustomWindow}
+            className="rounded-full border border-border px-2 py-0.5 text-[10px] text-ink-mute hover:bg-surface"
+            title="Clear the drag-selected window and return to the active preset"
+          >
+            custom · ×
+          </button>
+        )}
         <div className="flex rounded-md border border-border">
           {RANGES.map((r) => (
             <button
@@ -103,7 +132,7 @@ export default function ProjectUsageTimeline({ wsId }: { wsId: string }) {
               type="button"
               onClick={() => handleRangeChange(r)}
               className={`px-2 py-1 text-xs ${
-                range === r ? 'bg-surface text-ink' : 'text-ink-mute'
+                !isCustomWindow && range === r ? 'bg-surface text-ink' : 'text-ink-mute'
               }`}
             >
               {r}
@@ -114,7 +143,7 @@ export default function ProjectUsageTimeline({ wsId }: { wsId: string }) {
 
       <UsageTimeline
         workspaceId={wsId}
-        window={window}
+        usageWindow={usageWindow}
         pivot={pivot}
         metric={metric}
         onMetricChange={setMetric}
@@ -122,6 +151,7 @@ export default function ProjectUsageTimeline({ wsId }: { wsId: string }) {
         excludedCount={excludedCount}
         onReset={resetExclusions}
         onRunsLoaded={setRuns}
+        onSelectRange={handleSelectRange}
         headline={{
           costLabel: formatCost(sawPriced ? totalCost : null),
           subLabel: `${formatTokens(totalTokens)} tokens · ${totalRuns} runs${
