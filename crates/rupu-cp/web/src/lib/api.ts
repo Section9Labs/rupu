@@ -9,8 +9,15 @@
 
 import type { TranscriptEvent, TranscriptResponse } from './transcript';
 export type { TranscriptEvent, TranscriptResponse } from './transcript';
-import type { UsageSummary, UsageOverview, UsageTimelineBucket, UnpricedGap } from './usage';
-export type { UsageSummary, UsageBreakdownRow, UsageOverview, UsageTimelineBucket, UnpricedGap } from './usage';
+import type { UsageSummary, UsageOverview, UsageTimelineBucket, UnpricedGap, UsageRunRow } from './usage';
+export type {
+  UsageSummary,
+  UsageBreakdownRow,
+  UsageOverview,
+  UsageTimelineBucket,
+  UnpricedGap,
+  UsageRunRow,
+} from './usage';
 
 // ---------------------------------------------------------------------------
 // Error
@@ -1413,6 +1420,18 @@ export const api = {
   getUsageOutliers(range: DashboardRange = '30d'): Promise<OutlierRun[]> {
     const q = new URLSearchParams({ since: usageRangeSince(range) });
     return request<OutlierRun[]>(`/api/usage/outliers?${q.toString()}`);
+  },
+  /**
+   * Flat per-`(run × model)` usage rows — the finest grain the `/usage`
+   * page's interactive graph filters client-side (see `buildTimeline`). Like
+   * `getUsageOutliers`, LOCAL-ONLY: `/api/usage/runs` does not fan out across
+   * hosts, so this takes no `host` param. `workspaceId` (optional) scopes to
+   * one project's runs — what the Projects page's usage tab uses.
+   */
+  getUsageRuns(range: DashboardRange = '30d', workspaceId?: string): Promise<UsageRunRow[]> {
+    const q = new URLSearchParams({ since: usageRangeSince(range) });
+    if (workspaceId) q.set('workspace_id', workspaceId);
+    return request<UsageRunRow[]>(`/api/usage/runs?${q.toString()}`);
   },
 
   // --- Runs ---

@@ -56,6 +56,33 @@ export interface UnpricedGap {
   rows: number;
 }
 
+/**
+ * One flat `(run × model)` usage row — the finest grain the client needs to
+ * filter the `/usage` spend graph interactively. Mirrors `UsageRunRow` in
+ * `rupu-cp/src/api/usage.rs` exactly (`GET /api/usage/runs`, local-only —
+ * `host_id` is always `"local"` on this endpoint). `started_at` is
+ * `DateTime<Utc>` on the wire, serialized RFC-3339 with a `Z` suffix.
+ * `cost_usd` is priced server-side via the same `rupu_config::pricing::lookup`
+ * path `summarize`/`breakdown` use; `null` means genuinely unpriced — the
+ * client sums this value but never fabricates one.
+ */
+export interface UsageRunRow {
+  run_id: string;
+  started_at: string;
+  workflow_name: string;
+  agent: string;
+  provider: string;
+  model: string;
+  workspace_id: string;
+  host_id: string;
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number;
+  total_tokens: number;
+  cost_usd: number | null;
+  priced: boolean;
+}
+
 /** One time bucket of the usage timeline — a `YYYY-MM-DD` key (the day, or the
  *  ISO-Monday for week buckets) plus the per-model breakdown of every run whose
  *  `started_at` fell in that bucket. Mirrors rupu-cp's `UsageTimelineBucket`. */
