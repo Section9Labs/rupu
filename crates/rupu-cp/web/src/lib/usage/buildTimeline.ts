@@ -220,3 +220,43 @@ export function buildTimeline(
     return { bucket: bKey, rows: outRows };
   });
 }
+
+/**
+ * The date-independent counterpart of `buildTimeline`, feeding a project-
+ * scoped breakdown table (Task U4) where there is no `/api/usage?group_by=`
+ * server endpoint to source one from (that endpoint fans out across hosts
+ * and has no `workspace_id` filter). Groups every row by its pivot-key and
+ * sums, with no bucketing and — deliberately — no `TimelineFilter`: this is
+ * what the checkboxes in a breakdown table read to decide what's currently
+ * excluded, so filtering the input here would make an excluded row's own
+ * checkbox permanently unreachable. Same summing rules as `buildTimeline`
+ * (`null` cost sums as 0, `priced` false if any contributor is unpriced).
+ */
+export function aggregateRuns(rows: UsageRunRow[], pivot: Pivot): UsageBreakdownRow[] {
+  const byKey = new Map<string, Agg>();
+
+  for (const row of rows) {
+    const key = pivotKeyOf(row, pivot);
+    let agg = byKey.get(key);
+    if (!agg) {
+      agg = newAgg();
+      byKey.set(key, agg);
+    }
+
+    agg.input_tokens += row.input_tokens;
+    agg.output_tokens += row.output_tokens;
+    agg.cached_tokens += row.cached_tokens;
+    agg.total_tokens += row.total_tokens;
+    if (row.cost_usd == null) {
+      agg.sawUnpriced = true;
+    } else {
+      agg.sawPriced = true;
+      agg.costSum += row.cost_usd;
+    }
+    agg.runIds.add(row.run_id);
+  }
+
+  return [...byKey.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, agg]) => toBreakdownRow(pivot, key, agg));
+}

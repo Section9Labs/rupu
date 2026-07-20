@@ -24,20 +24,26 @@
 // once per `range`); `getUsage`/`getUsageOutliers` are unchanged from before
 // and still drive the headline number, the breakdown table's own summary
 // rollup, `UnpricedBanner`, and `HostFreshnessStrip`.
+//
+// The graph itself (Task U4) is now `<UsageTimeline>` — extracted so the
+// Projects page's Runs tab can mount the identical component, scoped by
+// `workspaceId`, instead of forking it. Pivot/metric/the exclusion filter
+// stay OWNED here (not inside `UsageTimeline`) because this page shares all
+// three with the breakdown table and outlier panel below.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { api, type DashboardRange, type OutlierRun, type UsageResponse, type UsageRunRow } from '../lib/api';
+import { api, type DashboardRange, type OutlierRun, type UsageResponse } from '../lib/api';
 import { formatCost, formatTokens } from '../lib/usage';
-import { buildTimeline, type TimelineFilter } from '../lib/usage/buildTimeline';
+import { type TimelineFilter } from '../lib/usage/buildTimeline';
 import { PivotPicker, PIVOT_LABEL, type Pivot } from '../components/usage/PivotPicker';
 import { UnpricedBanner } from '../components/usage/UnpricedBanner';
 import { OutlierPanel } from '../components/usage/OutlierPanel';
 import { HostFreshnessStrip } from '../components/dashboard/HostFreshnessStrip';
-import UsageTimelineStacked, { type UsageMetric } from '../components/dashboard/UsageTimelineStacked';
+import UsageTimeline from '../components/usage/UsageTimeline';
+import { type UsageMetric } from '../components/dashboard/UsageTimelineStacked';
 import ModelBreakdownTable from '../components/dashboard/ModelBreakdownTable';
 
 const RANGES: DashboardRange[] = ['7d', '30d', 'all'];
-const METRICS: UsageMetric[] = ['cost', 'tokens'];
 
 function toggleInSet(set: Set<string>, key: string): Set<string> {
   const next = new Set(set);
@@ -52,7 +58,6 @@ export default function Usage() {
   const [metric, setMetric] = useState<UsageMetric>('cost');
 
   const [data, setData] = useState<UsageResponse | null>(null);
-  const [runs, setRuns] = useState<UsageRunRow[]>([]);
   const [outliers, setOutliers] = useState<OutlierRun[]>([]);
   const [error, setError] = useState<Error | null>(null);
 
@@ -88,26 +93,6 @@ export default function Usage() {
     };
   }, [range, pivot]);
 
-  // `/api/usage/runs`: flat per-`(run × model)` rows behind the interactive
-  // graph. Pivot- and filter-independent — only re-fetches on range; every
-  // pivot switch or exclude toggle re-runs `buildTimeline` in memory below.
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .getUsageRuns(range)
-      .then((rows) => {
-        if (!cancelled) setRuns(rows);
-      })
-      .catch(() => {
-        // The graph is secondary to the summary/breakdown above; a failure
-        // here should not blank the whole page.
-        if (!cancelled) setRuns([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [range]);
-
   // `/api/usage/outliers`: local-only, re-fetches on range.
   useEffect(() => {
     let cancelled = false;
@@ -128,7 +113,6 @@ export default function Usage() {
     () => ({ excludedKeys, excludedRunIds }),
     [excludedKeys, excludedRunIds],
   );
-  const timeline = useMemo(() => buildTimeline(runs, pivot, filter, 'day'), [runs, pivot, filter]);
 
   const toggleKey = useCallback((key: string) => {
     setExcludedKeys((prev) => toggleInSet(prev, key));
@@ -184,57 +168,27 @@ export default function Usage() {
         <>
           <UnpricedBanner unpriced={data.unpriced} />
 
-          <section className="rounded-lg border border-[rgb(var(--c-border))] bg-[rgb(var(--c-panel))] p-3">
-            <div className="mb-2 flex flex-wrap items-start justify-between gap-2">
-              <div>
-                <h2 className="text-xs font-medium uppercase tracking-wide text-[rgb(var(--c-ink-dim))]">
-                  Spend over time
-                </h2>
-                <p className="mt-0.5 text-2xl font-semibold tabular-nums text-[rgb(var(--c-ink))]">
-                  {formatCost(data.summary.cost_usd)}
-                </p>
-                <p className="text-xs text-[rgb(var(--c-ink-mute))]">
-                  {formatTokens(data.summary.total_tokens)} tokens · {data.summary.runs} runs
-                  {!data.summary.priced && ' · partial (see banner above)'}
-                </p>
-              </div>
-              <div className="flex items-center gap-2">
-                {excludedCount > 0 && (
-                  <button
-                    type="button"
-                    onClick={resetExclusions}
-                    className="rounded-full border border-[rgb(var(--c-border))] px-2 py-0.5 text-[10px] text-[rgb(var(--c-ink-mute))] hover:bg-[rgb(var(--c-surface))]"
-                  >
-                    Excluded ({excludedCount}) · reset
-                  </button>
-                )}
-                <div className="flex rounded-md border border-[rgb(var(--c-border))]">
-                  {METRICS.map((m) => (
-                    <button
-                      key={m}
-                      type="button"
-                      onClick={() => setMetric(m)}
-                      className={`px-2 py-1 text-xs capitalize ${
-                        metric === m
-                          ? 'bg-[rgb(var(--c-surface))] text-[rgb(var(--c-ink))]'
-                          : 'text-[rgb(var(--c-ink-mute))]'
-                      }`}
-                    >
-                      {m}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </div>
-            {/* The headline above is fleet-wide (`/api/usage`, fans out across
-                hosts). This graph is fed by `/api/usage/runs`, which has no
-                host fan-out — say so, or a multi-host operator reads the graph
-                as fleet-wide too. */}
-            <p className="mb-2 text-[10px] uppercase tracking-wide text-[rgb(var(--c-ink-mute))]">
-              local host only
-            </p>
-            <UsageTimelineStacked buckets={timeline} metric={metric} pivot={pivot} hosts={data.hosts} />
-          </section>
+          {/* The headline here is fleet-wide (`/api/usage`, fans out across
+              hosts) — deliberately NOT derived from the local-only run rows
+              `UsageTimeline` fetches for the graph itself, which is why it's
+              passed in rather than computed inside that component (see its
+              doc comment). */}
+          <UsageTimeline
+            range={range}
+            pivot={pivot}
+            metric={metric}
+            onMetricChange={setMetric}
+            filter={filter}
+            excludedCount={excludedCount}
+            onReset={resetExclusions}
+            hosts={data.hosts}
+            headline={{
+              costLabel: formatCost(data.summary.cost_usd),
+              subLabel: `${formatTokens(data.summary.total_tokens)} tokens · ${data.summary.runs} runs${
+                !data.summary.priced ? ' · partial (see banner above)' : ''
+              }`,
+            }}
+          />
 
           <section className="rounded-lg border border-[rgb(var(--c-border))] bg-[rgb(var(--c-panel))] p-3">
             <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-[rgb(var(--c-ink-dim))]">

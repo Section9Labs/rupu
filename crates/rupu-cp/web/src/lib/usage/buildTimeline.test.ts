@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildTimeline } from './buildTimeline';
+import { buildTimeline, aggregateRuns } from './buildTimeline';
 import type { TimelineFilter } from './buildTimeline';
 import type { UsageRunRow } from '../usage';
 
@@ -234,5 +234,71 @@ describe('buildTimeline', () => {
 
   it('returns no buckets for an empty input', () => {
     expect(buildTimeline([], 'model', noFilter(), 'day')).toEqual([]);
+  });
+});
+
+describe('aggregateRuns', () => {
+  // `aggregateRuns` is the date-independent counterpart of `buildTimeline`
+  // used to feed a project-scoped breakdown table (Task U4): unlike
+  // `buildTimeline`, it takes no `TimelineFilter` — every row contributes —
+  // because the checkboxes it feeds are what LETS the caller build a filter
+  // in the first place; filtering here would make an excluded row's own
+  // checkbox permanently unreachable.
+
+  it('sums all rows for a pivot key regardless of day, ignoring bucketing entirely', () => {
+    const rows: UsageRunRow[] = [
+      row({ run_id: 'run_a', started_at: '2026-07-01T00:00:00Z', model: 'claude', total_tokens: 10, cost_usd: 1 }),
+      row({ run_id: 'run_b', started_at: '2026-07-09T00:00:00Z', model: 'claude', total_tokens: 20, cost_usd: 2 }),
+    ];
+
+    const out = aggregateRuns(rows, 'model');
+
+    expect(out).toHaveLength(1);
+    expect(out[0].model).toBe('claude');
+    expect(out[0].total_tokens).toBe(30);
+    expect(out[0].cost_usd).toBe(3);
+    expect(out[0].runs).toBe(2);
+  });
+
+  it('groups by the active pivot dimension, one row per distinct key', () => {
+    const rows: UsageRunRow[] = [
+      row({ run_id: 'run_a', workflow_name: 'nightly-scan', cost_usd: 1 }),
+      row({ run_id: 'run_b', workflow_name: 'pr-review', cost_usd: 2 }),
+    ];
+
+    const out = aggregateRuns(rows, 'workflow');
+
+    expect(out.map((r) => r.workflow).sort()).toEqual(['nightly-scan', 'pr-review']);
+    // Only the active pivot's identity field is populated, matching
+    // `buildTimeline`'s convention.
+    expect(out.every((r) => r.model === '')).toBe(true);
+  });
+
+  it('a null-cost row contributes 0 to the cost sum but its tokens still count, and priced becomes false', () => {
+    const rows: UsageRunRow[] = [
+      row({ run_id: 'run_a', model: 'claude', total_tokens: 10, cost_usd: 1, priced: true }),
+      row({ run_id: 'run_b', model: 'claude', total_tokens: 40, cost_usd: null, priced: false }),
+    ];
+
+    const out = aggregateRuns(rows, 'model');
+
+    expect(out[0].total_tokens).toBe(50);
+    expect(out[0].cost_usd).toBe(1);
+    expect(out[0].priced).toBe(false);
+  });
+
+  it('cost_usd is null when every contributing row is unpriced', () => {
+    const rows: UsageRunRow[] = [
+      row({ run_id: 'run_a', model: 'mystery', cost_usd: null, priced: false }),
+    ];
+
+    const out = aggregateRuns(rows, 'model');
+
+    expect(out[0].cost_usd).toBeNull();
+    expect(out[0].priced).toBe(false);
+  });
+
+  it('returns an empty array for empty input', () => {
+    expect(aggregateRuns([], 'model')).toEqual([]);
   });
 });

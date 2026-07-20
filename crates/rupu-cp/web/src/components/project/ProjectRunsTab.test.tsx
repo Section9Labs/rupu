@@ -73,6 +73,9 @@ function mockRuns(): void {
     if (params?.offset && params.offset > 0) return Promise.resolve([]);
     return Promise.resolve(ROWS);
   });
+  // ProjectUsageTimeline (Task U4) fetches independently of the run list
+  // above — mock it too so this test isn't tripped up by an unmocked call.
+  vi.spyOn(api, 'getUsageRuns').mockResolvedValue([]);
 }
 
 describe('ProjectRunsTab', () => {
