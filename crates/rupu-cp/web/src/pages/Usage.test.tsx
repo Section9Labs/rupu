@@ -105,7 +105,9 @@ describe('Usage page', () => {
 
     // The stacked-area legend renders the pivot key ('claude', the default
     // model pivot) once the run rows have been bucketed by buildTimeline.
-    await waitFor(() => expect(screen.getByText('claude')).toBeInTheDocument());
+    // The breakdown table (built from the same runs) renders it too, so
+    // assert on presence rather than a single unique match.
+    await waitFor(() => expect(screen.getAllByText('claude').length).toBeGreaterThan(0));
     expect(screen.queryByText(/No usage recorded yet/)).not.toBeInTheDocument();
   });
 
@@ -201,14 +203,11 @@ describe('Usage page', () => {
           { host_id: 'local', name: 'local', transport_kind: 'local', state: 'ok', captured_at: new Date().toISOString(), reason: null },
           { host_id: 'host_01KWREMOTE', name: 'staging-box', transport_kind: 'http_cp', state: 'ok', captured_at: new Date().toISOString(), reason: null },
         ],
-        breakdown: [
-          {
-            provider: '', model: '', agent: '', workflow: '', host_id: 'host_01KWREMOTE', workspace_id: '',
-            input_tokens: 1000, output_tokens: 500, cached_tokens: 0, total_tokens: 1500,
-            cost_usd: 4.5, priced: true, runs: 3,
-          },
-        ],
       }),
+      // The breakdown table is now built from these same run rows (Fix 1),
+      // not from `data.breakdown` above — the run needs the host id under
+      // test for the table's host-pivot mapping to have anything to map.
+      runs: [runRow({ host_id: 'host_01KWREMOTE' })],
     });
 
     renderUsage();
@@ -246,6 +245,39 @@ describe('Usage page', () => {
   }
 
   describe('interactive filtering', () => {
+    // Root-cause regression: the breakdown table used to be built from
+    // `data.breakdown` (fleet-wide, from `GET /api/usage`) while the graph
+    // was built from `getUsageRuns` — two different datasets that happened
+    // to agree in every other test in this file because both mocks were
+    // set up with matching model strings. Here they're deliberately made to
+    // disagree: `data.breakdown` names a model that appears in NO run row.
+    // If the table were still sourced from `data.breakdown`, it would show
+    // "nowhere-in-runs" (and toggling it would do nothing to the graph,
+    // which has no such series). After Fix 1 the table is built from the
+    // same run rows as the graph, so it must show "claude" instead, and
+    // toggling it must exclude it from both the table's own exclusion
+    // count and the graph's legend.
+    it('builds the breakdown table from the same run rows as the graph, not from data.breakdown', async () => {
+      mockAll({
+        usage: usageResponse({ breakdown: [modelBreakdown('nowhere-in-runs', 99)] }),
+        runs: [runRow({ model: 'claude' })],
+      });
+
+      renderUsage();
+
+      const table = await screen.findByRole('table');
+      expect(await within(table).findByText('claude')).toBeInTheDocument();
+      expect(within(table).queryByText('nowhere-in-runs')).not.toBeInTheDocument();
+
+      fireEvent.click(within(table).getByRole('checkbox', { name: 'claude' }));
+
+      expect(await screen.findByText('Excluded (1) · reset')).toBeInTheDocument();
+      // The sole run was `claude` — excluding it empties the graph entirely
+      // (proving the toggle reached `buildTimeline`'s shared row source,
+      // rather than a no-op key the graph never had).
+      await waitFor(() => expect(screen.getByText(/No usage recorded yet/)).toBeInTheDocument());
+    });
+
     it('toggling a breakdown row shows "Excluded (1)" and does not refetch getUsageRuns', async () => {
       mockAll({
         usage: usageResponse({ breakdown: [modelBreakdown('claude', 3), modelBreakdown('gpt', 1.5)] }),
@@ -320,13 +352,15 @@ describe('Usage page', () => {
 
       renderUsage();
       await waitFor(() => expect(api.getUsageRuns).toHaveBeenCalledTimes(1));
-      await waitFor(() => expect(screen.getByText('claude')).toBeInTheDocument());
+      // Both the graph legend and the (now run-sourced) breakdown table
+      // render "claude" — assert on presence, not a single unique match.
+      await waitFor(() => expect(screen.getAllByText('claude').length).toBeGreaterThan(0));
 
       fireEvent.click(screen.getByRole('button', { name: 'workflow' }));
 
       await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith('30d', 'workflow'));
-      await waitFor(() => expect(screen.getByText('nightly-scan')).toBeInTheDocument());
-      expect(screen.getByText('pr-review')).toBeInTheDocument();
+      await waitFor(() => expect(screen.getAllByText('nightly-scan').length).toBeGreaterThan(0));
+      expect(screen.getAllByText('pr-review').length).toBeGreaterThan(0);
       expect(api.getUsageRuns).toHaveBeenCalledTimes(1);
     });
   });

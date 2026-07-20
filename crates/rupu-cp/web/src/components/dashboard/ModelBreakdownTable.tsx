@@ -195,8 +195,17 @@ export default function ModelBreakdownTable({
   // so dedup and the color assignment above are unaffected. Falls back to the
   // raw id when the host isn't in the list (e.g. a host removed since).
   const hostNameById = new Map((hosts ?? []).map((h) => [h.host_id, h.name]));
-  const displayLabel = (r: BreakdownRow): string =>
-    pivot === 'host' ? hostNameById.get(r.label) ?? r.label : r.label;
+  // An empty pivot value (`rawKey === ''`, e.g. a run with a blank `agent`)
+  // is a genuine group — `aggregateRuns`/`buildTimeline` group by it via
+  // `pivotKeyOf`, and `excludedKeys.has('')` works to exclude it — but
+  // `pivotLabel`'s `'—'` fallback reads as a placeholder/error rather than a
+  // real bucket. Only relabel it here, in the selectable table: the graph
+  // legend's `'—'` and the non-selectable dashboard table are unaffected.
+  const displayLabel = (r: BreakdownRow): string => {
+    if (pivot === 'host') return hostNameById.get(r.label) ?? r.label;
+    if (selectable && r.kind !== 'others' && r.rawKey === '') return '(unattributed)';
+    return r.label;
+  };
 
   if (view.rows.length === 0) {
     return <p className="text-xs text-ink-mute py-8 text-center">No usage in this window</p>;
@@ -244,7 +253,12 @@ export default function ModelBreakdownTable({
                         aria-label={r.rawKey}
                         checked={!excluded}
                         onChange={() => onToggleKey?.(r.rawKey)}
-                        disabled={!r.rawKey}
+                        // Only the `others` rollup (which never appears in
+                        // selectable mode, since `showAll` is forced above)
+                        // has no single identity to toggle. A genuine
+                        // empty-key row (`rawKey === ''`) IS toggleable —
+                        // see the `displayLabel` comment above.
+                        disabled={r.kind === 'others'}
                       />
                     </td>
                   )}

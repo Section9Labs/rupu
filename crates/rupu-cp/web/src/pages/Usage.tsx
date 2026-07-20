@@ -22,8 +22,20 @@
 // a real ~1000x-cost outlier out of the graph is instant and the axis
 // rescales live. `getUsageRuns` itself is pivot/filter-independent (fetched
 // once per `range`); `getUsage`/`getUsageOutliers` are unchanged from before
-// and still drive the headline number, the breakdown table's own summary
-// rollup, `UnpricedBanner`, and `HostFreshnessStrip`.
+// and still drive the headline number, `UnpricedBanner`, and
+// `HostFreshnessStrip` — those stay fleet-wide and are labeled as such.
+//
+// TABLE/GRAPH SHARED SOURCE (bugfix): the breakdown table below is built
+// from `aggregateRuns(runs, pivot)` over the SAME flat run rows the graph's
+// `buildTimeline` consumes (handed back via `UsageTimeline`'s
+// `onRunsLoaded`) — NOT from `data.breakdown` (fleet-wide, top-6 + an
+// `others (N)` rollup, from `GET /api/usage`). The two datasets used to
+// diverge: a table row could name a pivot key the graph had never heard of
+// (toggling it did nothing), the top-6/others rollup permanently disabled
+// the rollup row's checkbox, and an empty pivot value rendered as an
+// inert "—". `aggregateRuns` — like `ProjectUsageTimeline`'s identical
+// pattern — has no top-N slicing and every row is a real, toggleable
+// group, so every table row now corresponds 1:1 to a graph series.
 //
 // The graph itself (Task U4) is now `<UsageTimeline>` — extracted so the
 // Projects page's Runs tab can mount the identical component, scoped by
@@ -32,9 +44,9 @@
 // three with the breakdown table and outlier panel below.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { api, type DashboardRange, type OutlierRun, type UsageResponse } from '../lib/api';
+import { api, type DashboardRange, type OutlierRun, type UsageResponse, type UsageRunRow } from '../lib/api';
 import { formatCost, formatTokens } from '../lib/usage';
-import { type TimelineFilter } from '../lib/usage/buildTimeline';
+import { aggregateRuns, type TimelineFilter } from '../lib/usage/buildTimeline';
 import { PivotPicker, PIVOT_LABEL, type Pivot } from '../components/usage/PivotPicker';
 import { UnpricedBanner } from '../components/usage/UnpricedBanner';
 import { OutlierPanel } from '../components/usage/OutlierPanel';
@@ -60,6 +72,15 @@ export default function Usage() {
   const [data, setData] = useState<UsageResponse | null>(null);
   const [outliers, setOutliers] = useState<OutlierRun[]>([]);
   const [error, setError] = useState<Error | null>(null);
+  // The flat per-run rows `UsageTimeline` fetches for the graph (Task U1),
+  // handed back via `onRunsLoaded` so the breakdown table below can be built
+  // from the SAME rows instead of `data.breakdown` (fleet-wide, from
+  // `GET /api/usage`) — see the file-header doc comment: two different
+  // datasets meant a table checkbox could toggle a key the graph had never
+  // heard of (no effect), get stuck disabled (the top-6/others rollup), or
+  // render as a bare "—" for an empty pivot value. Mirrors
+  // `ProjectUsageTimeline`'s `aggregateRuns(runs, pivot)` table.
+  const [runs, setRuns] = useState<UsageRunRow[]>([]);
 
   const [excludedKeys, setExcludedKeys] = useState<Set<string>>(new Set());
   const [excludedRunIds, setExcludedRunIds] = useState<Set<string>>(new Set());
@@ -127,6 +148,11 @@ export default function Usage() {
 
   const excludedCount = excludedKeys.size + excludedRunIds.size;
 
+  // Unfiltered breakdown for the table — every pivot key must stay
+  // clickable even while excluded, or there'd be no way to re-include it.
+  // Same convention as `ProjectUsageTimeline`.
+  const breakdown = useMemo(() => aggregateRuns(runs, pivot), [runs, pivot]);
+
   return (
     <div className="space-y-4 p-4">
       <header className="flex flex-wrap items-center justify-between gap-3">
@@ -181,6 +207,7 @@ export default function Usage() {
             filter={filter}
             excludedCount={excludedCount}
             onReset={resetExclusions}
+            onRunsLoaded={setRuns}
             hosts={data.hosts}
             headline={{
               costLabel: formatCost(data.summary.cost_usd),
@@ -195,7 +222,7 @@ export default function Usage() {
               Breakdown by {PIVOT_LABEL[pivot]}
             </h2>
             <ModelBreakdownTable
-              rows={data.breakdown}
+              rows={breakdown}
               pivot={pivot}
               hosts={data.hosts}
               selectable
