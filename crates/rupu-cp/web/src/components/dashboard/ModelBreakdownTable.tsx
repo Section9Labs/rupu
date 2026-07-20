@@ -8,6 +8,14 @@
 // (those colors are model IDENTITY, not an arbitrary category), every other
 // pivot uses the themed categorical ramp from `pivotColors.ts`.
 //
+// `selectable` (Task U3, the interactive `/usage` page) turns every row into
+// a checkbox that toggles its pivot-key in the caller's `excludedKeys` set —
+// feeding `buildTimeline`'s client-side filter so pulling an outlier model
+// out of the spend graph is instant, no refetch. Selectable mode shows EVERY
+// row (no top-6/others rollup — you need to see & toggle the tail, not just
+// the head) in a scrollable body; non-selectable callers (the dashboard
+// tiles) are completely unaffected — they don't pass the new props.
+//
 // Pure presentational component (no recharts, no data fetching). The `toRows`
 // transform is exported for unit testing.
 
@@ -21,7 +29,12 @@ import { PIVOT_LABEL } from '../usage/PivotPicker';
 const TOP_N = 6;
 
 /** A rendered table row — either a single model, the `others` rollup, or an
- *  unpriced model. `cost` is null for unpriced rows (rendered as `—`). */
+ *  unpriced model. `cost` is null for unpriced rows (rendered as `—`).
+ *  `rawKey` is the row's actual pivot-key value (e.g. the raw `model` /
+ *  `host_id` string, NOT the possibly-`'—'`-substituted display `label`) —
+ *  the same identity `buildTimeline`'s client-side filter excludes by. Empty
+ *  for the `others` rollup, which represents more than one key and so has no
+ *  single identity to toggle. */
 export interface BreakdownRow {
   key: string;
   label: string;
@@ -31,6 +44,31 @@ export interface BreakdownRow {
   /** Cost share of total priced spend, 0..1. `null` for unpriced rows. */
   share: number | null;
   kind: 'model' | 'others' | 'unpriced';
+  rawKey: string;
+}
+
+/**
+ * The row's actual pivot-key value for the active `pivot` — mirrors
+ * `pivotKeyOf` in `lib/usage/buildTimeline.ts` (same six-branch selection,
+ * different field names: `UsageBreakdownRow.workflow` vs
+ * `UsageRunRow.workflow_name`). This is what a toggle excludes by, so it must
+ * be the raw field, not `pivotLabel`'s display fallback to `'—'`.
+ */
+function pivotRawKey(row: UsageBreakdownRow, pivot: Pivot): string {
+  switch (pivot) {
+    case 'model':
+      return row.model;
+    case 'provider':
+      return row.provider;
+    case 'agent':
+      return row.agent;
+    case 'workflow':
+      return row.workflow;
+    case 'host':
+      return row.host_id;
+    case 'project':
+      return row.workspace_id;
+  }
 }
 
 export interface BreakdownView {
@@ -44,8 +82,15 @@ export interface BreakdownView {
 /** Split priced / unpriced, sort priced by cost desc, roll the tail past TOP_N
  *  into an `others (N)` row, and pin unpriced rows last. `pivot` (default
  *  `'model'`) selects the row label; defaulting preserves this function's
- *  original behavior for every existing call site. */
-export function toRows(input: UsageBreakdownRow[], pivot: Pivot = 'model'): BreakdownView {
+ *  original behavior for every existing call site. `opts.showAll` (Task U3's
+ *  interactive table) skips the TOP_N slicing entirely — every priced row
+ *  gets its own row and the `others` rollup never appears, because a row you
+ *  can't see is a row you can't toggle out of the graph. */
+export function toRows(
+  input: UsageBreakdownRow[],
+  pivot: Pivot = 'model',
+  opts?: { showAll?: boolean },
+): BreakdownView {
   const priced = input
     .filter((r) => r.cost_usd !== null)
     .sort((a, b) => (b.cost_usd ?? 0) - (a.cost_usd ?? 0));
@@ -63,8 +108,9 @@ export function toRows(input: UsageBreakdownRow[], pivot: Pivot = 'model'): Brea
   const subLabel = (r: UsageBreakdownRow) => (pivot === 'model' ? r.provider : '');
 
   const rows: BreakdownRow[] = [];
-  const head = priced.slice(0, TOP_N);
-  const tail = priced.slice(TOP_N);
+  const topN = opts?.showAll ? priced.length : TOP_N;
+  const head = priced.slice(0, topN);
+  const tail = priced.slice(topN);
 
   for (const r of head) {
     const cost = r.cost_usd ?? 0;
@@ -76,6 +122,7 @@ export function toRows(input: UsageBreakdownRow[], pivot: Pivot = 'model'): Brea
       cost,
       share: share(cost),
       kind: 'model',
+      rawKey: pivotRawKey(r, pivot),
     });
   }
 
@@ -89,6 +136,7 @@ export function toRows(input: UsageBreakdownRow[], pivot: Pivot = 'model'): Brea
       cost,
       share: share(cost),
       kind: 'others',
+      rawKey: '',
     });
   }
 
@@ -99,6 +147,7 @@ export function toRows(input: UsageBreakdownRow[], pivot: Pivot = 'model'): Brea
       provider: subLabel(r),
       tokens: r.total_tokens,
       cost: null,
+      rawKey: pivotRawKey(r, pivot),
       share: null,
       kind: 'unpriced',
     });
@@ -111,6 +160,9 @@ export default function ModelBreakdownTable({
   rows,
   pivot = 'model',
   hosts,
+  selectable = false,
+  excludedKeys,
+  onToggleKey,
 }: {
   rows: UsageBreakdownRow[];
   pivot?: Pivot;
@@ -119,9 +171,20 @@ export default function ModelBreakdownTable({
    *  that don't pivot by host (or don't have the host list handy) can omit
    *  it, and rows fall back to the raw id. */
   hosts?: HostFreshness[];
+  /** Task U3's interactive `/usage` page: turns every row into a checkbox
+   *  wired to `excludedKeys`/`onToggleKey`, and shows every row (no top-6
+   *  rollup) in a scrollable body. Default `false` leaves the dashboard's
+   *  read-only top-6 tiles exactly as they were. */
+  selectable?: boolean;
+  /** Pivot-keys (the `rawKey` identity, e.g. a raw `model`/`host_id` string)
+   *  currently excluded from the graph. Only read when `selectable`. */
+  excludedKeys?: Set<string>;
+  /** Called with a row's `rawKey` when its checkbox is toggled. Only wired
+   *  when `selectable`. */
+  onToggleKey?: (key: string) => void;
 }) {
   const theme = useThemeColors();
-  const view = toRows(rows, pivot);
+  const view = toRows(rows, pivot, { showAll: selectable });
   const labels = rows.map((r) => pivotLabel(r, pivot));
   const colors = pivot === 'model' ? assignModelColors(labels) : assignCategoricalColors(labels, theme);
   const colorFor = (r: BreakdownRow) =>
@@ -147,65 +210,89 @@ export default function ModelBreakdownTable({
       {/* table-fixed + sized number columns: with auto layout the table grew
           past `w-full` on the narrow card and the Share bar bled outside the
           card border. Fixed layout lets the Model name flex + truncate while
-          the numeric/Share columns keep their width — nothing overflows. */}
-      <table className="w-full table-fixed text-xs">
-        <thead>
-          <tr className="text-ink-mute text-meta uppercase tracking-wide">
-            <th className="text-left font-medium pb-2">{PIVOT_LABEL[pivot]}</th>
-            <th className="text-right font-medium pb-2 w-14">Tokens</th>
-            <th className="text-right font-medium pb-2 w-20">Cost</th>
-            <th className="text-right font-medium pb-2 w-24">Share</th>
-          </tr>
-        </thead>
-        <tbody>
-          {view.rows.map((r) => (
-            <tr
-              key={r.key}
-              className={
-                r.key === firstUnpricedKey
-                  ? 'border-t border-dashed border-border'
-                  : undefined
-              }
-            >
-              <td className="py-1.5 pr-2">
-                <div className="flex items-center gap-2 min-w-0">
-                  <span
-                    className="w-2.5 h-2.5 rounded-sm shrink-0"
-                    style={{ background: colorFor(r) }}
-                  />
-                  <span className="min-w-0">
-                    <span className="text-ink font-medium truncate block">{displayLabel(r)}</span>
-                    {r.provider && (
-                      <span className="text-ink-mute text-meta truncate block">{r.provider}</span>
-                    )}
-                  </span>
-                </div>
-              </td>
-              <td className="py-1.5 text-right tabular-nums text-ink-dim">{formatTokens(r.tokens)}</td>
-              <td className="py-1.5 text-right tabular-nums text-ink font-medium">
-                {r.cost === null ? '—' : formatCost(r.cost)}
-              </td>
-              <td className="py-1.5 pl-2">
-                {r.share === null ? (
-                  <span className="text-ink-mute text-meta italic block text-right">unpriced</span>
-                ) : (
-                  <div className="flex items-center gap-1.5 justify-end">
-                    <span className="text-ink-dim tabular-nums text-meta w-9 text-right">
-                      {(r.share * 100).toFixed(0)}%
-                    </span>
-                    <span className="h-1.5 rounded-full bg-surface w-12 overflow-hidden">
-                      <span
-                        className="block h-full rounded-full"
-                        style={{ width: `${Math.round(r.share * 100)}%`, background: colorFor(r) }}
-                      />
-                    </span>
-                  </div>
-                )}
-              </td>
+          the numeric/Share columns keep their width — nothing overflows.
+          Selectable mode shows every row (no top-6/others rollup), so it gets
+          a bounded, scrollable body instead of growing the page unbounded. */}
+      <div className={selectable ? 'max-h-80 overflow-y-auto' : undefined}>
+        <table className="w-full table-fixed text-xs">
+          <thead>
+            <tr className="text-ink-mute text-meta uppercase tracking-wide">
+              {selectable && <th className="w-6 pb-2" />}
+              <th className="text-left font-medium pb-2">{PIVOT_LABEL[pivot]}</th>
+              <th className="text-right font-medium pb-2 w-14">Tokens</th>
+              <th className="text-right font-medium pb-2 w-20">Cost</th>
+              <th className="text-right font-medium pb-2 w-24">Share</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {view.rows.map((r) => {
+              const excluded = selectable && !!excludedKeys?.has(r.rawKey);
+              return (
+                <tr
+                  key={r.key}
+                  className={[
+                    r.key === firstUnpricedKey ? 'border-t border-dashed border-border' : '',
+                    excluded ? 'opacity-40' : '',
+                  ]
+                    .filter(Boolean)
+                    .join(' ') || undefined}
+                >
+                  {selectable && (
+                    <td className="py-1.5 pr-1 align-middle">
+                      <input
+                        type="checkbox"
+                        aria-label={r.rawKey}
+                        checked={!excluded}
+                        onChange={() => onToggleKey?.(r.rawKey)}
+                        disabled={!r.rawKey}
+                      />
+                    </td>
+                  )}
+                  <td className="py-1.5 pr-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span
+                        className="w-2.5 h-2.5 rounded-sm shrink-0"
+                        style={{ background: colorFor(r) }}
+                      />
+                      <span className="min-w-0">
+                        <span
+                          className={`text-ink font-medium truncate block ${excluded ? 'line-through' : ''}`}
+                        >
+                          {displayLabel(r)}
+                        </span>
+                        {r.provider && (
+                          <span className="text-ink-mute text-meta truncate block">{r.provider}</span>
+                        )}
+                      </span>
+                    </div>
+                  </td>
+                  <td className="py-1.5 text-right tabular-nums text-ink-dim">{formatTokens(r.tokens)}</td>
+                  <td className="py-1.5 text-right tabular-nums text-ink font-medium">
+                    {r.cost === null ? '—' : formatCost(r.cost)}
+                  </td>
+                  <td className="py-1.5 pl-2">
+                    {r.share === null ? (
+                      <span className="text-ink-mute text-meta italic block text-right">unpriced</span>
+                    ) : (
+                      <div className="flex items-center gap-1.5 justify-end">
+                        <span className="text-ink-dim tabular-nums text-meta w-9 text-right">
+                          {(r.share * 100).toFixed(0)}%
+                        </span>
+                        <span className="h-1.5 rounded-full bg-surface w-12 overflow-hidden">
+                          <span
+                            className="block h-full rounded-full"
+                            style={{ width: `${Math.round(r.share * 100)}%`, background: colorFor(r) }}
+                          />
+                        </span>
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
 
       <div className="mt-3 pt-2 border-t border-border text-note text-ink-dim tabular-nums">
         Total: <span className="text-ink font-semibold">{formatCost(view.totalCost)}</span> (priced)

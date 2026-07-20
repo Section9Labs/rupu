@@ -12,17 +12,14 @@
 // no `Date.now()`, co-located test.
 //
 // --- Component-shape note (read before changing the pivot->field mapping) ---
-// `UsageTimelineStacked`'s `toChartData` derives each row's series key as
-// `r.model || r.provider || r.agent || '—'` — it has no notion of
-// `workflow`/`host_id`/`workspace_id` as series keys (it was built for the
-// model-only `/api/usage/timeline`; see its file-header comment). For
-// `pivot` values outside `{model, provider, agent}` (`workflow`/`host`/
-// `project`) we therefore ALSO mirror the pivot key into the row's `model`
-// field so the existing component still resolves distinct series — see
-// `toBreakdownRow` below. This does not change the meaning of `model` for
-// the `model`/`provider`/`agent` pivots (where the matching field alone is
-// populated, mirroring the "only the active group_by field is non-empty"
-// convention `UsageBreakdownRow` already documents).
+// `UsageTimelineStacked` now accepts an explicit `pivot` prop and derives its
+// series key via `pivotLabel(row, pivot)` (`components/dashboard/modelColors.ts`)
+// — the same helper `ModelBreakdownTable` already uses — instead of the old
+// `r.model || r.provider || r.agent` guess. So `toBreakdownRow` below sets
+// ONLY the field matching the active `pivot` (mirroring the "only the active
+// group_by field is non-empty" convention `UsageBreakdownRow` already
+// documents) — there is no more mirroring of the pivot key into `model` for
+// `workflow`/`host`/`project`.
 //
 // --- Grid note ---
 // `toChartData` maps buckets 1:1 into `AreaChart` data with a categorical
@@ -123,10 +120,8 @@ function newAgg(): Agg {
  * Build one output `UsageBreakdownRow` for a pivot-key's aggregate. Sets
  * ONLY the field matching `pivot` to `key` (mirroring the "only the active
  * group_by field is non-empty" convention documented on `UsageBreakdownRow`
- * elsewhere) — with one deliberate exception: for `workflow`/`host`/
- * `project` pivots, `model` is ALSO set to `key` so `UsageTimelineStacked`'s
- * `model || provider || agent` series-key derivation still resolves a
- * distinct series per pivot key. See the file-header note.
+ * elsewhere) — see the file-header note for why there is no longer a
+ * `model`-mirroring exception for `workflow`/`host`/`project`.
  *
  * `cost_usd`: `null` only when NO contributing row was priced (mirrors
  * `UsageSummary.cost_usd`'s documented meaning); otherwise the sum of the
@@ -161,15 +156,12 @@ function toBreakdownRow(pivot: Pivot, key: string, agg: Agg): UsageBreakdownRow 
       break;
     case 'workflow':
       out.workflow = key;
-      out.model = key;
       break;
     case 'host':
       out.host_id = key;
-      out.model = key;
       break;
     case 'project':
       out.workspace_id = key;
-      out.model = key;
       break;
   }
   return out;

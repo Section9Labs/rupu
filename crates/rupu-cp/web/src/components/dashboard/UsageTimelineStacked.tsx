@@ -1,13 +1,24 @@
-// Per-model usage timeline — a stacked area chart. X = time bucket; one stacked
-// series per model. Metric is either spend ($) or tokens, toggled by the parent.
+// Usage timeline — a stacked area chart. X = time bucket; one stacked series
+// per pivot key. Metric is either spend ($) or tokens, toggled by the parent.
 //
-// Model-only by design, not by oversight: it is fed by `GET /api/usage/timeline`,
-// which has no `group_by` param and always groups server-side by model (see
-// `build_timeline` in `rupu-cp/src/api/usage.rs`) — every OTHER identity field
-// on its rows (`provider`/`agent`/`workflow`/`host_id`/`workspace_id`) is always
-// `""`. The /usage page's pivot picker therefore drives the breakdown TABLE
-// (`ModelBreakdownTable`, fed by `/api/usage?group_by=`, which genuinely varies
-// by pivot) and the headline number, not this graph.
+// Stacks by whichever `pivot` dimension is active (default `'model'`,
+// preserving this component's original behavior for callers that don't pass
+// one). The series key comes from `pivotLabel` (`./modelColors.ts`) — the
+// same helper `ModelBreakdownTable` already uses to read the one identity
+// field a `UsageBreakdownRow` populates for the active `group_by` — so this
+// chart genuinely varies by pivot instead of only resolving
+// `model`/`provider`/`agent`. (Earlier, `GET /api/usage/timeline` had no
+// `group_by` of its own and always grouped by model server-side, so this
+// component only ever saw model-keyed rows; `buildTimeline` — the client-side
+// aggregation behind the interactive `/usage` graph — now buckets+stacks
+// arbitrary pivots itself, and used to work around this component's
+// model-only assumption by mirroring the pivot key into `model`. That
+// workaround is gone; this component resolves the real field directly.)
+//
+// `hosts` (optional) maps a `host` pivot's raw `host_id` keys to their
+// friendly `name` for the legend/tooltip — same idiom as
+// `ModelBreakdownTable`'s `hosts` prop. The raw `host_id` stays the actual
+// stacking/color key; only the rendered label changes.
 //
 // recharts is the only heavy import here; it is force-split into the `charts`
 // rollup chunk (see vite.config manualChunks), so it never lands in the main
@@ -17,38 +28,44 @@ import { Area, AreaChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'rec
 import type { UsageTimelineBucket } from '../../lib/usage';
 import { formatCost, formatTokens } from '../../lib/usage';
 import { useThemeColors } from '../../lib/useThemeColors';
-import { assignModelColors } from './modelColors';
+import type { HostFreshness, Pivot } from '../../lib/api';
+import { assignModelColors, pivotLabel } from './modelColors';
+import { assignCategoricalColors } from '../usage/pivotColors';
 
 export type UsageMetric = 'cost' | 'tokens';
 
-/** One row of the chart: the bucket label plus a numeric value per model key. */
+/** One row of the chart: the bucket label plus a numeric value per pivot key. */
 export interface ChartDatum {
   bucket: string;
-  [model: string]: number | string;
+  [key: string]: number | string;
 }
 
 export interface ChartData {
-  /** Sorted, stable list of model keys (one stacked series each). */
+  /** Sorted, stable list of pivot keys (one stacked series each). */
   models: string[];
   data: ChartDatum[];
 }
 
 /**
- * Flatten timeline buckets into recharts rows. Collect every model across all
- * buckets, then emit one datum per bucket with a value for *every* model (0 when
- * absent — required so the stacked areas line up). For `cost`, unpriced rows
- * (`cost_usd == null`) contribute 0; for `tokens` every row contributes.
+ * Flatten timeline buckets into recharts rows. Collect every pivot key across
+ * all buckets, then emit one datum per bucket with a value for *every* key (0
+ * when absent — required so the stacked areas line up). For `cost`, unpriced
+ * rows (`cost_usd == null`) contribute 0; for `tokens` every row contributes.
+ * `pivot` (default `'model'`) selects which `UsageBreakdownRow` field is the
+ * series key, via `pivotLabel`.
  */
-export function toChartData(buckets: UsageTimelineBucket[], metric: UsageMetric): ChartData {
-  const models = [
-    ...new Set(buckets.flatMap((b) => b.rows.map((r) => r.model || r.provider || r.agent || '—'))),
-  ].sort();
+export function toChartData(
+  buckets: UsageTimelineBucket[],
+  metric: UsageMetric,
+  pivot: Pivot = 'model',
+): ChartData {
+  const models = [...new Set(buckets.flatMap((b) => b.rows.map((r) => pivotLabel(r, pivot))))].sort();
 
   const data: ChartDatum[] = buckets.map((b) => {
     const datum: ChartDatum = { bucket: b.bucket };
     for (const m of models) datum[m] = 0;
     for (const r of b.rows) {
-      const key = r.model || r.provider || r.agent || '—';
+      const key = pivotLabel(r, pivot);
       const value = metric === 'cost' ? r.cost_usd ?? 0 : r.total_tokens;
       datum[key] = (datum[key] as number) + value;
     }
@@ -66,9 +83,20 @@ function bucketTick(b: string): string {
 export default function UsageTimelineStacked({
   buckets,
   metric,
+  pivot = 'model',
+  hosts,
 }: {
   buckets: UsageTimelineBucket[];
   metric: UsageMetric;
+  /** Which `UsageBreakdownRow` field to stack by. Defaults to `'model'`,
+   *  preserving this component's original model-only behavior for callers
+   *  that don't pass one. */
+  pivot?: Pivot;
+  /** `data.hosts` from `/api/usage` — maps a `host` pivot's raw `host_id`
+   *  series keys to their friendly `name` for the legend/tooltip. Optional;
+   *  falls back to the raw id when absent or unmatched. Ignored for every
+   *  other pivot. */
+  hosts?: HostFreshness[];
 }) {
   const theme = useThemeColors();
   const tooltipStyle: React.CSSProperties = {
@@ -79,7 +107,7 @@ export default function UsageTimelineStacked({
     fontSize: 11,
     padding: '6px 10px',
   };
-  const { models, data } = toChartData(buckets, metric);
+  const { models, data } = toChartData(buckets, metric, pivot);
 
   if (data.length === 0 || models.length === 0) {
     return (
@@ -90,8 +118,17 @@ export default function UsageTimelineStacked({
     );
   }
 
-  const colors = assignModelColors(models);
+  // Model IDENTITY keeps its own dedicated palette (`assignModelColors`);
+  // every other pivot has no identity of its own and uses the themed
+  // categorical ramp — same split `ModelBreakdownTable` makes.
+  const colors = pivot === 'model' ? assignModelColors(models) : assignCategoricalColors(models, theme);
   const fmt = (v: number) => (metric === 'cost' ? formatCost(v) : formatTokens(v));
+
+  // Host pivot rows are keyed by raw `host_id` (via `pivotLabel`) — map to
+  // the friendly `name` for display only; the raw id stays the stacking/color
+  // key so dedup and the color assignment above are unaffected.
+  const hostNameById = new Map((hosts ?? []).map((h) => [h.host_id, h.name]));
+  const displayLabel = (key: string): string => (pivot === 'host' ? hostNameById.get(key) ?? key : key);
 
   return (
     <div>
@@ -114,7 +151,7 @@ export default function UsageTimelineStacked({
                 type="monotone"
                 stackId="u"
                 dataKey={m}
-                name={m}
+                name={displayLabel(m)}
                 stroke={colors.get(m)}
                 fill={colors.get(m)}
                 fillOpacity={0.5}
@@ -124,12 +161,12 @@ export default function UsageTimelineStacked({
           </AreaChart>
         </ResponsiveContainer>
       </div>
-      {/* Legend — models → colors (stable). */}
+      {/* Legend — pivot keys → colors (stable). */}
       <ul className="mt-3 flex flex-wrap gap-x-4 gap-y-1.5">
         {models.map((m) => (
           <li key={m} className="flex items-center gap-1.5 text-note">
             <span className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ background: colors.get(m) }} />
-            <span className="text-ink-dim truncate max-w-[160px]">{m}</span>
+            <span className="text-ink-dim truncate max-w-[160px]">{displayLabel(m)}</span>
           </li>
         ))}
       </ul>

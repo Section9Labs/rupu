@@ -1,9 +1,13 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
-import { describe, it, expect } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { render, screen, cleanup, fireEvent } from '@testing-library/react';
 import ModelBreakdownTable, { toRows } from './ModelBreakdownTable';
 import type { UsageBreakdownRow } from '../../lib/usage';
+
+afterEach(() => {
+  cleanup();
+});
 
 function row(model: string, cost: number | null, tokens = 1000): UsageBreakdownRow {
   return {
@@ -123,5 +127,46 @@ describe('ModelBreakdownTable host pivot', () => {
   it('falls back to the raw host id when no matching host is found', () => {
     render(<ModelBreakdownTable rows={[hostRow('host_unknown')]} pivot="host" hosts={[]} />);
     expect(screen.getByText('host_unknown')).toBeInTheDocument();
+  });
+});
+
+describe('toRows with showAll (the interactive /usage table)', () => {
+  it('emits one row per key with no top-N rollup', () => {
+    const v = toRows(ROWS, 'model', { showAll: true });
+    const models = v.rows.filter((r) => r.kind === 'model');
+    const others = v.rows.filter((r) => r.kind === 'others');
+    expect(models).toHaveLength(8);
+    expect(others).toHaveLength(0);
+    expect(models.map((r) => r.label)).toContain('m8');
+  });
+});
+
+describe('ModelBreakdownTable selectable', () => {
+  it('shows every row (no others rollup) when selectable, unlike the default top-6 view', () => {
+    render(<ModelBreakdownTable rows={ROWS} selectable excludedKeys={new Set()} onToggleKey={() => {}} />);
+    expect(screen.queryByText(/others/)).not.toBeInTheDocument();
+    expect(screen.getByText('m8')).toBeInTheDocument();
+  });
+
+  it('calls onToggleKey with the row pivot key when its checkbox is clicked', () => {
+    const onToggleKey = vi.fn();
+    render(<ModelBreakdownTable rows={ROWS} selectable excludedKeys={new Set()} onToggleKey={onToggleKey} />);
+    fireEvent.click(screen.getByRole('checkbox', { name: 'm1' }));
+    expect(onToggleKey).toHaveBeenCalledWith('m1');
+  });
+
+  it('renders an excluded row unchecked and visibly muted', () => {
+    render(
+      <ModelBreakdownTable rows={ROWS} selectable excludedKeys={new Set(['m2'])} onToggleKey={() => {}} />,
+    );
+    const checkbox = screen.getByRole('checkbox', { name: 'm2' }) as HTMLInputElement;
+    expect(checkbox.checked).toBe(false);
+    // A non-excluded row's checkbox stays checked.
+    expect((screen.getByRole('checkbox', { name: 'm1' }) as HTMLInputElement).checked).toBe(true);
+  });
+
+  it('does not render checkboxes when not selectable', () => {
+    render(<ModelBreakdownTable rows={ROWS} />);
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
   });
 });

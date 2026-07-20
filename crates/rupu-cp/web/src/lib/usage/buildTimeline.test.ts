@@ -120,7 +120,7 @@ describe('buildTimeline', () => {
     expect(reviewer!.model).toBe('');
   });
 
-  it("pivot='workflow' also mirrors the key into `model` so the existing UsageTimelineStacked chart (which derives its series key from model||provider||agent) can still stack by workflow", () => {
+  it("pivot='workflow' stacks by the real `workflow` field only — no mirroring into `model`", () => {
     const rows: UsageRunRow[] = [
       row({ run_id: 'run_a', workflow_name: 'nightly-scan', total_tokens: 10, cost_usd: 1 }),
       row({ run_id: 'run_b', workflow_name: 'pr-review', total_tokens: 20, cost_usd: 2 }),
@@ -131,7 +131,40 @@ describe('buildTimeline', () => {
     expect(buckets[0].rows).toHaveLength(2);
     const nightly = buckets[0].rows.find((r) => r.workflow === 'nightly-scan');
     expect(nightly).toBeDefined();
-    expect(nightly!.model).toBe('nightly-scan');
+    // The old U2 workaround mirrored the pivot key into `model` so the chart
+    // component (which only knew model/provider/agent) could still resolve a
+    // series. `UsageTimelineStacked` now stacks by the real pivot field
+    // directly, so `model` stays blank per the "only the matching identity
+    // field is populated" convention every other pivot already follows.
+    expect(nightly!.model).toBe('');
+  });
+
+  it("pivot='host' populates only `host_id`, not `model`", () => {
+    const rows: UsageRunRow[] = [
+      row({ run_id: 'run_a', host_id: 'local', total_tokens: 10, cost_usd: 1 }),
+      row({ run_id: 'run_b', host_id: 'host_remote', total_tokens: 20, cost_usd: 2 }),
+    ];
+
+    const buckets = buildTimeline(rows, 'host', noFilter(), 'day');
+
+    expect(buckets[0].rows).toHaveLength(2);
+    const local = buckets[0].rows.find((r) => r.host_id === 'local');
+    expect(local).toBeDefined();
+    expect(local!.model).toBe('');
+  });
+
+  it("pivot='project' populates only `workspace_id`, not `model`", () => {
+    const rows: UsageRunRow[] = [
+      row({ run_id: 'run_a', workspace_id: 'ws_a', total_tokens: 10, cost_usd: 1 }),
+      row({ run_id: 'run_b', workspace_id: 'ws_b', total_tokens: 20, cost_usd: 2 }),
+    ];
+
+    const buckets = buildTimeline(rows, 'project', noFilter(), 'day');
+
+    expect(buckets[0].rows).toHaveLength(2);
+    const wsA = buckets[0].rows.find((r) => r.workspace_id === 'ws_a');
+    expect(wsA).toBeDefined();
+    expect(wsA!.model).toBe('');
   });
 
   it('a null-cost row adds 0 cost but its tokens still count; priced becomes false', () => {
