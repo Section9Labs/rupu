@@ -20,7 +20,7 @@
 // breakdown table (Task U4) without a second, duplicate fetch.
 
 import { useEffect, useMemo, useState } from 'react';
-import { api, type DashboardRange, type HostFreshness, type Pivot, type UsageRunRow } from '../../lib/api';
+import { api, type HostFreshness, type Pivot, type UsageRunRow, type UsageWindow } from '../../lib/api';
 import { buildTimeline, type TimelineFilter } from '../../lib/usage/buildTimeline';
 import UsageTimelineStacked, { type UsageMetric } from '../dashboard/UsageTimelineStacked';
 
@@ -28,7 +28,7 @@ const METRICS: UsageMetric[] = ['cost', 'tokens'];
 
 export default function UsageTimeline({
   workspaceId,
-  range,
+  window,
   pivot,
   metric,
   onMetricChange,
@@ -42,7 +42,10 @@ export default function UsageTimeline({
   /** Scopes the fetch to one project's runs. Omitted on `/usage` — all
    *  local runs. */
   workspaceId?: string;
-  range: DashboardRange;
+  /** The `{since, until}` window driving every fetch below — a preset
+   *  (7d/30d/all) is just a window ending "now" (see `presetWindow`); a
+   *  future drag-selected custom window is the same shape. */
+  window: UsageWindow;
   pivot: Pivot;
   metric: UsageMetric;
   onMetricChange: (m: UsageMetric) => void;
@@ -56,16 +59,20 @@ export default function UsageTimeline({
   const [runs, setRuns] = useState<UsageRunRow[]>([]);
 
   // `GET /api/usage/runs`: flat per-`(run × model)` rows behind the graph.
-  // Pivot- and filter-independent — only re-fetches on range/workspaceId;
-  // every pivot switch or exclude toggle re-runs `buildTimeline` in memory.
+  // Depends on `window.since`/`window.until` (primitives), not the `window`
+  // object itself — callers are free to pass a freshly-computed window on
+  // every render (a plain `presetWindow(...)` call is not memoized) without
+  // spuriously refetching just because the object reference changed. Pivot-
+  // and filter-independent regardless — every pivot switch or exclude
+  // toggle re-runs `buildTimeline` in memory, no refetch.
   useEffect(() => {
     let cancelled = false;
     // Called with exactly one argument when `workspaceId` is omitted (rather
     // than an explicit `undefined` second arg) so a caller-side spy
-    // assertion like `toHaveBeenCalledWith(range)` — matching how `/usage`
+    // assertion like `toHaveBeenCalledWith(window)` — matching how `/usage`
     // itself called `getUsageRuns` before this component existed — still
     // matches.
-    (workspaceId ? api.getUsageRuns(range, workspaceId) : api.getUsageRuns(range))
+    (workspaceId ? api.getUsageRuns(window, workspaceId) : api.getUsageRuns(window))
       .then((rows) => {
         if (cancelled) return;
         setRuns(rows);
@@ -79,8 +86,8 @@ export default function UsageTimeline({
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- onRunsLoaded is a caller-supplied callback, not a re-fetch trigger.
-  }, [range, workspaceId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- onRunsLoaded is a caller-supplied callback, not a re-fetch trigger; `window` itself is intentionally omitted in favor of its primitive fields (see doc comment above).
+  }, [window.since, window.until, workspaceId]);
 
   const timeline = useMemo(() => buildTimeline(runs, pivot, filter, 'day'), [runs, pivot, filter]);
 

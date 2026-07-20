@@ -1,21 +1,31 @@
 // @vitest-environment jsdom
 // ProjectUsageTimeline — the project-scoped mount of the shared spend-over-
 // time graph (Task U4). Replaces the per-run `UsageBarChart` in the Runs
-// tab: `getUsageRuns(range, wsId)` -> `buildTimeline` -> the SAME
+// tab: `getUsageRuns(window, wsId)` -> `buildTimeline` -> the SAME
 // `UsageTimeline` graph `/usage` uses, plus a local breakdown table (built
 // from `aggregateRuns`, since there is no `/api/usage?workspace_id=` to
 // source one from) with checkbox exclusion. No outlier panel — see the
 // component's own doc comment for why.
 
 import '@testing-library/jest-dom/vitest';
-import { afterEach, describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
-import { api, type UsageRunRow } from '../../lib/api';
+import { api, presetWindow, type UsageRunRow } from '../../lib/api';
 import ProjectUsageTimeline from './ProjectUsageTimeline';
+
+// Fixed clock so `presetWindow(...)` computed here (for assertions) and
+// inside `ProjectUsageTimeline` (driving the actual fetch) agree exactly.
+const FIXED_NOW = new Date('2026-07-16T12:00:00.000Z').getTime();
+
+beforeEach(() => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(FIXED_NOW);
+});
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 function runRow(overrides: Partial<UsageRunRow> = {}): UsageRunRow {
@@ -44,7 +54,7 @@ describe('ProjectUsageTimeline', () => {
 
     render(<ProjectUsageTimeline wsId="ws_42" />);
 
-    await waitFor(() => expect(spy).toHaveBeenCalledWith('30d', 'ws_42'));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'ws_42'));
     // "claude" renders both in the graph legend and the breakdown table row.
     await waitFor(() => expect(screen.getAllByText('claude').length).toBeGreaterThan(0));
   });
@@ -53,11 +63,11 @@ describe('ProjectUsageTimeline', () => {
     const spy = vi.spyOn(api, 'getUsageRuns').mockResolvedValue([runRow()]);
 
     render(<ProjectUsageTimeline wsId="ws_42" />);
-    await waitFor(() => expect(spy).toHaveBeenCalledWith('30d', 'ws_42'));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'ws_42'));
 
     fireEvent.click(screen.getByRole('button', { name: '7d' }));
 
-    await waitFor(() => expect(spy).toHaveBeenCalledWith('7d', 'ws_42'));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(presetWindow('7d', FIXED_NOW), 'ws_42'));
   });
 
   it('changing the pivot re-stacks the graph without refetching', async () => {

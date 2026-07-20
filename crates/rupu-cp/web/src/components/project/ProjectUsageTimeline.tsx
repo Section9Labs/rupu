@@ -5,7 +5,7 @@
 // uses, scoped to this project's `workspace_id`.
 //
 // This component owns its own range/pivot/metric/exclusion-filter state and
-// the `getUsageRuns(range, wsId)` fetch — there's no page-level state to
+// the `getUsageRuns(window, wsId)` fetch — there's no page-level state to
 // share it with here, unlike `/usage`, where pivot/filter are shared with a
 // breakdown table + outlier panel sourced from OTHER endpoints. That absence
 // is also why the breakdown table below is built from `aggregateRuns` over
@@ -21,7 +21,7 @@
 // misrepresent it as project-scoped. Deferred; see the U4 report for detail.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { type DashboardRange, type UsageRunRow } from '../../lib/api';
+import { presetWindow, type DashboardRange, type UsageRunRow, type UsageWindow } from '../../lib/api';
 import { formatCost, formatTokens } from '../../lib/usage';
 import { aggregateRuns, type TimelineFilter } from '../../lib/usage/buildTimeline';
 import { PivotPicker, PIVOT_LABEL, type Pivot } from '../usage/PivotPicker';
@@ -40,9 +40,19 @@ function toggleInSet(set: Set<string>, key: string): Set<string> {
 
 export default function ProjectUsageTimeline({ wsId }: { wsId: string }) {
   const [range, setRange] = useState<DashboardRange>('30d');
+  // The `{since, until}` window driving the fetch below (Task W2) — `range`
+  // is kept alongside purely for the 7/30/All button highlighting. Held in
+  // state (not recomputed inline from `range` on every render) so its
+  // object identity is stable across renders that don't change it.
+  const [window, setWindow] = useState<UsageWindow>(() => presetWindow('30d'));
   const [pivot, setPivot] = useState<Pivot>('model');
   const [metric, setMetric] = useState<UsageMetric>('cost');
   const [runs, setRuns] = useState<UsageRunRow[]>([]);
+
+  const handleRangeChange = useCallback((r: DashboardRange) => {
+    setRange(r);
+    setWindow(presetWindow(r));
+  }, []);
 
   const [excludedKeys, setExcludedKeys] = useState<Set<string>>(new Set());
   const [excludedRunIds, setExcludedRunIds] = useState<Set<string>>(new Set());
@@ -91,7 +101,7 @@ export default function ProjectUsageTimeline({ wsId }: { wsId: string }) {
             <button
               key={r}
               type="button"
-              onClick={() => setRange(r)}
+              onClick={() => handleRangeChange(r)}
               className={`px-2 py-1 text-xs ${
                 range === r ? 'bg-surface text-ink' : 'text-ink-mute'
               }`}
@@ -104,7 +114,7 @@ export default function ProjectUsageTimeline({ wsId }: { wsId: string }) {
 
       <UsageTimeline
         workspaceId={wsId}
-        range={range}
+        window={window}
         pivot={pivot}
         metric={metric}
         onMetricChange={setMetric}

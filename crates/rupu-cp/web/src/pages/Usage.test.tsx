@@ -1,14 +1,24 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import Usage from './Usage';
-import { api, type UsageResponse, type OutlierRun, type UsageRunRow } from '../lib/api';
+import { api, presetWindow, type UsageResponse, type OutlierRun, type UsageRunRow } from '../lib/api';
+
+// Fixed clock so `presetWindow(...)` computed here (for assertions) and
+// inside `Usage` (driving the actual fetch) agree on `until` exactly.
+const FIXED_NOW = new Date('2026-07-16T12:00:00.000Z').getTime();
+
+beforeEach(() => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(FIXED_NOW);
+});
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 function usageResponse(overrides: Partial<UsageResponse> = {}): UsageResponse {
@@ -91,8 +101,8 @@ describe('Usage page', () => {
 
     renderUsage();
 
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith('30d', 'model'));
-    await waitFor(() => expect(api.getUsageRuns).toHaveBeenCalledWith('30d'));
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model'));
+    await waitFor(() => expect(api.getUsageRuns).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW)));
     // Both the headline and the breakdown table's total render "$4.50" —
     // assert on presence, not a single unique match.
     await waitFor(() => expect(screen.getAllByText('$4.50').length).toBeGreaterThan(0));
@@ -115,11 +125,11 @@ describe('Usage page', () => {
     mockAll();
 
     renderUsage();
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith('30d', 'model'));
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model'));
 
     fireEvent.click(screen.getByRole('button', { name: 'workflow' }));
 
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith('30d', 'workflow'));
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'workflow'));
     expect(await screen.findByText('Breakdown by Workflow')).toBeInTheDocument();
   });
 
@@ -130,7 +140,7 @@ describe('Usage page', () => {
     await waitFor(() => expect(api.getUsageRuns).toHaveBeenCalledTimes(1));
 
     fireEvent.click(screen.getByRole('button', { name: 'workflow' }));
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith('30d', 'workflow'));
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'workflow'));
 
     // Give any stray effect a tick, then assert the runs fetch was never repeated.
     await waitFor(() => expect(screen.getByText('Breakdown by Workflow')).toBeInTheDocument());
@@ -177,13 +187,13 @@ describe('Usage page', () => {
     mockAll();
 
     renderUsage();
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith('30d', 'model'));
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model'));
 
     fireEvent.click(screen.getByRole('button', { name: '7d' }));
 
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith('7d', 'model'));
-    await waitFor(() => expect(api.getUsageOutliers).toHaveBeenCalledWith('7d'));
-    await waitFor(() => expect(api.getUsageRuns).toHaveBeenCalledWith('7d'));
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('7d', FIXED_NOW), 'model'));
+    await waitFor(() => expect(api.getUsageOutliers).toHaveBeenCalledWith(presetWindow('7d', FIXED_NOW)));
+    await waitFor(() => expect(api.getUsageRuns).toHaveBeenCalledWith(presetWindow('7d', FIXED_NOW)));
   });
 
   it('shows an error state without a prior successful load', async () => {
@@ -212,7 +222,7 @@ describe('Usage page', () => {
 
     renderUsage();
 
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith('30d', 'model'));
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model'));
 
     // The timeline graph (local-only, no host fan-out) is labeled, distinct
     // from the fleet-wide headline number above it.
@@ -221,7 +231,7 @@ describe('Usage page', () => {
     expect(screen.getByText(/this host only/i)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'host' }));
-    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith('30d', 'host'));
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'host'));
 
     // The host-pivot breakdown row shows the friendly host name, not the raw
     // id — scoped to the breakdown table since the freshness strip above
@@ -358,7 +368,7 @@ describe('Usage page', () => {
 
       fireEvent.click(screen.getByRole('button', { name: 'workflow' }));
 
-      await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith('30d', 'workflow'));
+      await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'workflow'));
       await waitFor(() => expect(screen.getAllByText('nightly-scan').length).toBeGreaterThan(0));
       expect(screen.getAllByText('pr-review').length).toBeGreaterThan(0);
       expect(api.getUsageRuns).toHaveBeenCalledTimes(1);

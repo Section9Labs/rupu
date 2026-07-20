@@ -44,7 +44,15 @@
 // three with the breakdown table and outlier panel below.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { api, type DashboardRange, type OutlierRun, type UsageResponse, type UsageRunRow } from '../lib/api';
+import {
+  api,
+  presetWindow,
+  type DashboardRange,
+  type OutlierRun,
+  type UsageResponse,
+  type UsageRunRow,
+  type UsageWindow,
+} from '../lib/api';
 import { formatCost, formatTokens } from '../lib/usage';
 import { aggregateRuns, type TimelineFilter } from '../lib/usage/buildTimeline';
 import { PivotPicker, PIVOT_LABEL, type Pivot } from '../components/usage/PivotPicker';
@@ -66,8 +74,22 @@ function toggleInSet(set: Set<string>, key: string): Set<string> {
 
 export default function Usage() {
   const [range, setRange] = useState<DashboardRange>('30d');
+  // The `{since, until}` window driving every usage fetch below (Task W2) —
+  // `range` is kept alongside purely for the 7/30/All button highlighting.
+  // Held in state (not recomputed inline from `range` on every render) so
+  // its object identity is stable across renders that don't change it —
+  // `UsageTimeline`'s fetch effect keys off `window.since`/`window.until`,
+  // but other window-state holders may still key off identity, and a stable
+  // reference avoids any such surprise. A drag-selected custom window (Task
+  // W3) will set this to an arbitrary window without touching `range`.
+  const [window, setWindow] = useState<UsageWindow>(() => presetWindow('30d'));
   const [pivot, setPivot] = useState<Pivot>('model');
   const [metric, setMetric] = useState<UsageMetric>('cost');
+
+  const handleRangeChange = useCallback((r: DashboardRange) => {
+    setRange(r);
+    setWindow(presetWindow(r));
+  }, []);
 
   const [data, setData] = useState<UsageResponse | null>(null);
   const [outliers, setOutliers] = useState<OutlierRun[]>([]);
@@ -95,11 +117,11 @@ export default function Usage() {
   }, [pivot]);
 
   // `/api/usage`: summary + the pivoted breakdown + the unpriced gap + host
-  // freshness. Re-fetches whenever the range OR the pivot changes.
+  // freshness. Re-fetches whenever the window OR the pivot changes.
   useEffect(() => {
     let cancelled = false;
     api
-      .getUsage(range, pivot)
+      .getUsage(window, pivot)
       .then((resp) => {
         if (cancelled) return;
         setData(resp);
@@ -112,13 +134,13 @@ export default function Usage() {
     return () => {
       cancelled = true;
     };
-  }, [range, pivot]);
+  }, [window, pivot]);
 
-  // `/api/usage/outliers`: local-only, re-fetches on range.
+  // `/api/usage/outliers`: local-only, re-fetches on window.
   useEffect(() => {
     let cancelled = false;
     api
-      .getUsageOutliers(range)
+      .getUsageOutliers(window)
       .then((rows) => {
         if (!cancelled) setOutliers(rows);
       })
@@ -128,7 +150,7 @@ export default function Usage() {
     return () => {
       cancelled = true;
     };
-  }, [range]);
+  }, [window]);
 
   const filter = useMemo<TimelineFilter>(
     () => ({ excludedKeys, excludedRunIds }),
@@ -176,7 +198,7 @@ export default function Usage() {
               <button
                 key={r}
                 type="button"
-                onClick={() => setRange(r)}
+                onClick={() => handleRangeChange(r)}
                 className={`px-2 py-1 text-xs ${
                   range === r
                     ? 'bg-[rgb(var(--c-surface))] text-[rgb(var(--c-ink))]'
@@ -200,7 +222,7 @@ export default function Usage() {
               passed in rather than computed inside that component (see its
               doc comment). */}
           <UsageTimeline
-            range={range}
+            window={window}
             pivot={pivot}
             metric={metric}
             onMetricChange={setMetric}

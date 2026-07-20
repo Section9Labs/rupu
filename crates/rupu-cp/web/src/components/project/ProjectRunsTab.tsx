@@ -274,7 +274,7 @@ export default function ProjectRunsTab({ wsId }: { wsId: string }) {
 
       {/* The spend-over-time graph — Task U4: the SAME `/usage` graph,
           scoped to this project's `workspace_id`. Independent data source
-          from the run list below (its own `getUsageRuns(range, wsId)`
+          from the run list below (its own `getUsageRuns(window, wsId)`
           fetch), so it renders regardless of the run-list's loading/filter
           state. */}
       <ProjectUsageTimeline wsId={wsId} />

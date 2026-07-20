@@ -3,7 +3,7 @@ import '@testing-library/jest-dom/vitest';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import UsageTimeline from './UsageTimeline';
-import { api, type UsageRunRow } from '../../lib/api';
+import { api, presetWindow, type UsageRunRow } from '../../lib/api';
 
 afterEach(() => {
   cleanup();
@@ -34,13 +34,17 @@ function noFilter() {
   return { excludedRunIds: new Set<string>(), excludedKeys: new Set<string>() };
 }
 
+// Fixed clock so two `presetWindow(...)` calls (one building the prop, one
+// building the assertion) produce byte-identical windows.
+const NOW = new Date('2026-07-16T12:00:00.000Z').getTime();
+
 describe('UsageTimeline', () => {
   it('fetches getUsageRuns with the given range and no workspaceId when omitted', async () => {
     const spy = vi.spyOn(api, 'getUsageRuns').mockResolvedValue([runRow()]);
 
     render(
       <UsageTimeline
-        range="30d"
+        window={presetWindow('30d', NOW)}
         pivot="model"
         metric="cost"
         onMetricChange={() => {}}
@@ -51,7 +55,7 @@ describe('UsageTimeline', () => {
       />,
     );
 
-    await waitFor(() => expect(spy).toHaveBeenCalledWith('30d'));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(presetWindow('30d', NOW)));
     expect(await screen.findByText('claude')).toBeInTheDocument();
   });
 
@@ -61,7 +65,7 @@ describe('UsageTimeline', () => {
     render(
       <UsageTimeline
         workspaceId="ws_42"
-        range="7d"
+        window={presetWindow('7d', NOW)}
         pivot="model"
         metric="cost"
         onMetricChange={() => {}}
@@ -72,7 +76,7 @@ describe('UsageTimeline', () => {
       />,
     );
 
-    await waitFor(() => expect(spy).toHaveBeenCalledWith('7d', 'ws_42'));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(presetWindow('7d', NOW), 'ws_42'));
   });
 
   it('calls onRunsLoaded with the fetched rows once loaded', async () => {
@@ -83,7 +87,7 @@ describe('UsageTimeline', () => {
     render(
       <UsageTimeline
         workspaceId="ws_42"
-        range="7d"
+        window={presetWindow('7d', NOW)}
         pivot="model"
         metric="cost"
         onMetricChange={() => {}}
@@ -104,7 +108,7 @@ describe('UsageTimeline', () => {
 
     render(
       <UsageTimeline
-        range="30d"
+        window={presetWindow('30d', NOW)}
         pivot="model"
         metric="cost"
         onMetricChange={() => {}}
@@ -127,7 +131,7 @@ describe('UsageTimeline', () => {
 
     const { rerender } = render(
       <UsageTimeline
-        range="30d"
+        window={presetWindow('30d', NOW)}
         pivot="model"
         metric="cost"
         onMetricChange={() => {}}
@@ -143,7 +147,7 @@ describe('UsageTimeline', () => {
 
     rerender(
       <UsageTimeline
-        range="30d"
+        window={presetWindow('30d', NOW)}
         pivot="model"
         metric="cost"
         onMetricChange={() => {}}

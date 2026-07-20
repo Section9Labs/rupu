@@ -720,6 +720,33 @@ export function usageRangeSince(range: DashboardRange, now: number = Date.now())
   return new Date(now - USAGE_RANGE_DAYS[range] * 86_400_000).toISOString();
 }
 
+/**
+ * An explicit `[since, until]` bound for the `/api/usage*` endpoints — the
+ * client-side source of truth for "what window am I looking at" (Task W2).
+ * A preset (7d/30d/all) is just a window that happens to end "now"; a
+ * drag-selected custom window (Task W3) is the same shape with different
+ * bounds. Every usage fetch takes one of these rather than a bare
+ * `DashboardRange`, so a custom window flows through the exact same code
+ * path a preset does.
+ */
+export interface UsageWindow {
+  /** RFC-3339. */
+  since: string;
+  /** RFC-3339. */
+  until: string;
+}
+
+/**
+ * Build the `UsageWindow` for a preset range, ending "now" (or the passed
+ * `now`, for deterministic tests). `'all'` keeps `since` at the epoch (see
+ * `usageRangeSince`'s doc comment) — unchanged behavior, just carried as an
+ * explicit `until` alongside it instead of an implicit "server defaults
+ * absent `until` to now".
+ */
+export function presetWindow(range: DashboardRange, now: number = Date.now()): UsageWindow {
+  return { since: usageRangeSince(range, now), until: new Date(now).toISOString() };
+}
+
 // ---------------------------------------------------------------------------
 // Agents
 // ---------------------------------------------------------------------------
@@ -1392,13 +1419,15 @@ export const api = {
 
   // --- Usage ---
   /**
-   * `range` + `pivot` drive the /usage page's attribution view: `pivot`
+   * `window` + `pivot` drive the /usage page's attribution view: `pivot`
    * forwards to `group_by` (an unknown value 400s server-side rather than
    * silently defaulting to a model breakdown), and `host` optionally scopes
-   * to one registered host — same idiom as `getDashboard`.
+   * to one registered host — same idiom as `getDashboard`. `window` defaults
+   * to the 30-day preset (via `presetWindow`) so existing callers that don't
+   * yet track a window keep working.
    */
-  getUsage(range: DashboardRange = '30d', pivot: Pivot = 'model', host?: string): Promise<UsageResponse> {
-    const q = new URLSearchParams({ since: usageRangeSince(range), group_by: pivot });
+  getUsage(window: UsageWindow = presetWindow('30d'), pivot: Pivot = 'model', host?: string): Promise<UsageResponse> {
+    const q = new URLSearchParams({ since: window.since, until: window.until, group_by: pivot });
     if (host) q.set('host', host);
     return request<UsageResponse>(`/api/usage?${q.toString()}`);
   },
@@ -1417,8 +1446,8 @@ export const api = {
    * on `rupu-cp/src/api/usage_outliers.rs`), so this accepts single-host
    * results and does not take a `host` param.
    */
-  getUsageOutliers(range: DashboardRange = '30d'): Promise<OutlierRun[]> {
-    const q = new URLSearchParams({ since: usageRangeSince(range) });
+  getUsageOutliers(window: UsageWindow = presetWindow('30d')): Promise<OutlierRun[]> {
+    const q = new URLSearchParams({ since: window.since, until: window.until });
     return request<OutlierRun[]>(`/api/usage/outliers?${q.toString()}`);
   },
   /**
@@ -1428,8 +1457,8 @@ export const api = {
    * hosts, so this takes no `host` param. `workspaceId` (optional) scopes to
    * one project's runs — what the Projects page's usage tab uses.
    */
-  getUsageRuns(range: DashboardRange = '30d', workspaceId?: string): Promise<UsageRunRow[]> {
-    const q = new URLSearchParams({ since: usageRangeSince(range) });
+  getUsageRuns(window: UsageWindow = presetWindow('30d'), workspaceId?: string): Promise<UsageRunRow[]> {
+    const q = new URLSearchParams({ since: window.since, until: window.until });
     if (workspaceId) q.set('workspace_id', workspaceId);
     return request<UsageRunRow[]>(`/api/usage/runs?${q.toString()}`);
   },
