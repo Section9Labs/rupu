@@ -250,7 +250,7 @@ export default function ModelBreakdownTable({
                     <td className="py-1.5 pr-1 align-middle">
                       <input
                         type="checkbox"
-                        aria-label={r.rawKey}
+                        aria-label={r.rawKey || '(unattributed)'}
                         checked={!excluded}
                         onChange={() => onToggleKey?.(r.rawKey)}
                         // Only the `others` rollup (which never appears in

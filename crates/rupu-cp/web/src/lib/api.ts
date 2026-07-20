@@ -1441,8 +1441,8 @@ export const api = {
    * to the 30-day preset (via `presetWindow`) so existing callers that don't
    * yet track a window keep working.
    */
-  getUsage(window: UsageWindow = presetWindow('30d'), pivot: Pivot = 'model', host?: string): Promise<UsageResponse> {
-    const q = new URLSearchParams({ since: window.since, until: window.until, group_by: pivot });
+  getUsage(win: UsageWindow = presetWindow('30d'), pivot: Pivot = 'model', host?: string): Promise<UsageResponse> {
+    const q = new URLSearchParams({ since: win.since, until: win.until, group_by: pivot });
     if (host) q.set('host', host);
     return request<UsageResponse>(`/api/usage?${q.toString()}`);
   },
@@ -1461,8 +1461,8 @@ export const api = {
    * on `rupu-cp/src/api/usage_outliers.rs`), so this accepts single-host
    * results and does not take a `host` param.
    */
-  getUsageOutliers(window: UsageWindow = presetWindow('30d')): Promise<OutlierRun[]> {
-    const q = new URLSearchParams({ since: window.since, until: window.until });
+  getUsageOutliers(win: UsageWindow = presetWindow('30d')): Promise<OutlierRun[]> {
+    const q = new URLSearchParams({ since: win.since, until: win.until });
     return request<OutlierRun[]>(`/api/usage/outliers?${q.toString()}`);
   },
   /**
@@ -1472,8 +1472,8 @@ export const api = {
    * hosts, so this takes no `host` param. `workspaceId` (optional) scopes to
    * one project's runs — what the Projects page's usage tab uses.
    */
-  getUsageRuns(window: UsageWindow = presetWindow('30d'), workspaceId?: string): Promise<UsageRunRow[]> {
-    const q = new URLSearchParams({ since: window.since, until: window.until });
+  getUsageRuns(win: UsageWindow = presetWindow('30d'), workspaceId?: string): Promise<UsageRunRow[]> {
+    const q = new URLSearchParams({ since: win.since, until: win.until });
     if (workspaceId) q.set('workspace_id', workspaceId);
     return request<UsageRunRow[]>(`/api/usage/runs?${q.toString()}`);
   },

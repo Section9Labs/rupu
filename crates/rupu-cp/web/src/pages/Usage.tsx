@@ -21,7 +21,7 @@
 // re-runs the memoized `buildTimeline` synchronously — no refetch, so pulling
 // a real ~1000x-cost outlier out of the graph is instant and the axis
 // rescales live. `getUsageRuns` itself is pivot/filter-independent (fetched
-// once per `range`); `getUsage`/`getUsageOutliers` are unchanged from before
+// once per `usageWindow`); `getUsage`/`getUsageOutliers` are unchanged from before
 // and still drive the headline number, `UnpricedBanner`, and
 // `HostFreshnessStrip` — those stay fleet-wide and are labeled as such.
 //
