@@ -4,13 +4,19 @@
 // Ported from pages/ProjectRuns.tsx (fetch / load-more rendering), reshaped
 // into a self-contained component keyed off the `wsId` prop. Rows render via
 // the shared SortableTable.
+//
+// The usage graph above the table is `ProjectUsageTimeline` (Task U4) — the
+// project-scoped mount of the SAME interactive spend-over-time graph
+// `/usage` uses, replacing the old per-run `UsageBarChart` (one bar per run,
+// stacked by token type). See that component's doc comment for why it owns
+// its own fetch/state rather than sharing this tab's `runs`/filter state.
 
 import { useCallback, useEffect, useState } from 'react';
 import { api, type RunListRow, type RunStatusStr } from '../../lib/api';
 import { StatusPill } from '../StatusPill';
 import { TriggerChip } from '../TriggerChip';
 import SortableTable, { type Column } from '../lists/SortableTable';
-import UsageBarChart from '../charts/UsageBarChart';
+import ProjectUsageTimeline from './ProjectUsageTimeline';
 import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
 import { formatDuration } from '../../lib/duration';
@@ -266,6 +272,13 @@ export default function ProjectRunsTab({ wsId }: { wsId: string }) {
         </div>
       </div>
 
+      {/* The spend-over-time graph — Task U4: the SAME `/usage` graph,
+          scoped to this project's `workspace_id`. Independent data source
+          from the run list below (its own `getUsageRuns(window, wsId)`
+          fetch), so it renders regardless of the run-list's loading/filter
+          state. */}
+      <ProjectUsageTimeline wsId={wsId} />
+
       {error && (
         <div className="rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
@@ -283,28 +296,13 @@ export default function ProjectRunsTab({ wsId }: { wsId: string }) {
       )}
 
       {runs !== null && filtered.length > 0 && (
-        <div className="space-y-4">
-          <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3">
-            <UsageBarChart
-              bars={filtered.map((r) => ({
-                id: r.id,
-                label: r.workflow_name,
-                to: `/runs/${encodeURIComponent(r.id)}`,
-                input_tokens: r.usage.input_tokens,
-                output_tokens: r.usage.output_tokens,
-                cached_tokens: r.usage.cached_tokens,
-                cost_usd: r.usage.cost_usd,
-              }))}
-            />
-          </div>
-          <SortableTable<RunListRow>
-            columns={RUN_COLUMNS}
-            rows={filtered}
-            rowKey={(r) => r.id}
-            rowHref={(r) => `/runs/${encodeURIComponent(r.id)}`}
-            initialSort={{ key: 'started', dir: 'desc' }}
-          />
-        </div>
+        <SortableTable<RunListRow>
+          columns={RUN_COLUMNS}
+          rows={filtered}
+          rowKey={(r) => r.id}
+          rowHref={(r) => `/runs/${encodeURIComponent(r.id)}`}
+          initialSort={{ key: 'started', dir: 'desc' }}
+        />
       )}
 
       {runs !== null && filtered.length > 0 && (

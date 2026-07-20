@@ -30,6 +30,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/usage", get(get_usage))
         .route("/api/usage/timeline", get(get_usage_timeline))
+        .route("/api/usage/runs", get(get_usage_runs))
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,7 +189,12 @@ struct UsageResponse {
 /// Resolve the [since, until] window from optional RFC-3339 strings.
 /// Absent `since` → now − 30 days; absent `until` → now. A present-but-unparseable
 /// bound is an error (caller maps to 400) rather than a silent default.
-fn resolve_window(
+///
+/// `pub(crate)`: `crate::api::usage_outliers` reuses this exact window
+/// resolution (Task W1) rather than re-deriving its own, so `/api/usage/runs`
+/// and `/api/usage/outliers` can't drift apart on how `since`/`until` default
+/// or fail to parse.
+pub(crate) fn resolve_window(
     since: Option<&str>,
     until: Option<&str>,
     now: DateTime<Utc>,
@@ -628,6 +634,112 @@ async fn get_usage_timeline(
         fill_start,
         end,
     )))
+}
+
+/// One flat `(run × model)` usage row — the finest grain the client needs to
+/// filter the `/usage` spend graph interactively (exclude a run or a
+/// pivot-key and every bucket it fed instantly rescales, client-side, with no
+/// refetch). Local-only, like `/api/usage/timeline` and `/api/usage/outliers`
+/// above: reads `s.run_store` directly, no host fan-out — `host_id` is always
+/// `"local"`.
+///
+/// `cost_usd` is priced HERE, server-side, with the SAME
+/// `rupu_config::pricing::lookup` path `summarize`/`breakdown` use — the
+/// client only ever sums a server-priced number, never prices client-side,
+/// so the two surfaces can't drift.
+#[derive(Debug, Serialize)]
+struct UsageRunRow {
+    run_id: String,
+    started_at: DateTime<Utc>,
+    workflow_name: String,
+    agent: String,
+    provider: String,
+    model: String,
+    workspace_id: String,
+    host_id: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+    total_tokens: u64,
+    /// `None` = unpriced. Never fabricated — mirrors `UsageBreakdownRow.cost_usd`.
+    cost_usd: Option<f64>,
+    priced: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageRunsQuery {
+    since: Option<String>,
+    until: Option<String>,
+    workspace_id: Option<String>,
+}
+
+/// `GET /api/usage/runs?since=&until=&workspace_id=` — flat per-`(run × model)` rows.
+///
+/// **Local-only**: reads `s.run_store` directly, exactly like
+/// `/api/usage/timeline` and `/api/usage/outliers` — no host fan-out. A
+/// multi-host fleet view is a follow-up (see the `?host=` fan-out on
+/// `/api/usage` for the pattern), not silently faked here.
+///
+/// Reuses `local_usage`'s exact per-run join (attribute each `UsageRow` to
+/// its `RunRecord` inline, no re-load) rather than re-deriving it, then
+/// flattens: one `UsageRunRow` per `UsageRow` a run produced, carrying that
+/// run's `run_id`/`started_at` and a per-row price from the SAME
+/// `rupu_config::pricing::lookup` path `summarize`/`breakdown` use.
+async fn get_usage_runs(
+    State(s): State<AppState>,
+    Query(q): Query<UsageRunsQuery>,
+) -> ApiResult<Json<Vec<UsageRunRow>>> {
+    let (start, end) = resolve_window(q.since.as_deref(), q.until.as_deref(), Utc::now())
+        .map_err(ApiError::bad_request)?;
+
+    let runs = s
+        .run_store
+        .list()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let mut out = Vec::new();
+    for r in runs.iter().filter(|r| {
+        r.started_at >= start
+            && r.started_at <= end
+            && q.workspace_id
+                .as_deref()
+                .is_none_or(|w| r.workspace_id == w)
+    }) {
+        let paths = crate::usage::run_transcript_paths(&s.run_store, &r.id);
+        let mut rows = rupu_transcript::aggregate(&paths, rupu_transcript::TimeWindow::default());
+        // Same inline attribution `local_usage` does above: `r` is already in
+        // hand for this batch, so no re-load/cache/separate join function.
+        for row in &mut rows {
+            row.workflow = r.workflow_name.clone();
+            row.workspace_id = r.workspace_id.clone();
+            row.host_id = "local".to_string();
+        }
+        for row in rows {
+            let priced_cost =
+                rupu_config::pricing::lookup(&s.pricing, &row.provider, &row.model, &row.agent)
+                    .map(|price| {
+                        price.cost_usd(row.input_tokens, row.output_tokens, row.cached_tokens)
+                    });
+            out.push(UsageRunRow {
+                run_id: r.id.clone(),
+                started_at: r.started_at,
+                workflow_name: row.workflow,
+                agent: row.agent,
+                provider: row.provider,
+                model: row.model,
+                workspace_id: row.workspace_id,
+                host_id: row.host_id,
+                input_tokens: row.input_tokens,
+                output_tokens: row.output_tokens,
+                cached_tokens: row.cached_tokens,
+                total_tokens: row.input_tokens + row.output_tokens,
+                priced: priced_cost.is_some(),
+                cost_usd: priced_cost,
+            });
+        }
+    }
+
+    Ok(Json(out))
 }
 
 #[cfg(test)]

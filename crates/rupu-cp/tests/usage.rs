@@ -480,3 +480,490 @@ async fn usage_group_by_host_tags_remote_rows_with_the_real_host_id_not_local() 
         "the remote's row must carry the REAL registered host id, not 'local': {host_ids:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Part C: `GET /api/usage/runs` — flat per-(run × model) rows (Task U1).
+// ---------------------------------------------------------------------------
+
+/// Write a two-line transcript (`RunStart` + one `Usage` event) for
+/// `provider`/`model`, reporting `input_tokens`/`output_tokens`.
+fn write_run_transcript_for(
+    path: &std::path::Path,
+    workspace_id: &str,
+    provider: &str,
+    model: &str,
+    input_tokens: u32,
+    output_tokens: u32,
+) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let start = rupu_transcript::Event::RunStart {
+        run_id: "r".into(),
+        workspace_id: workspace_id.into(),
+        agent: "reviewer".into(),
+        provider: provider.into(),
+        model: model.into(),
+        started_at: chrono::Utc::now(),
+        mode: rupu_transcript::RunMode::Ask,
+    };
+    let usage = rupu_transcript::Event::Usage {
+        provider: provider.into(),
+        model: model.into(),
+        served_model: None,
+        input_tokens,
+        output_tokens,
+        cached_tokens: 0,
+    };
+    let mut buf = Vec::new();
+    for ev in [&start, &usage] {
+        let mut line = serde_json::to_vec(ev).unwrap();
+        line.push(b'\n');
+        buf.extend(line);
+    }
+    std::fs::write(path, &buf).unwrap();
+}
+
+/// Register a completed run under `dir`'s run store, with one step whose
+/// transcript reports usage for `provider`/`model`. `started_at` is caller
+/// controlled so `?since` filtering can be exercised.
+#[allow(clippy::too_many_arguments)]
+fn seed_run_with_usage(
+    dir: &std::path::Path,
+    run_id: &str,
+    workflow_name: &str,
+    workspace_id: &str,
+    provider: &str,
+    model: &str,
+    input_tokens: u32,
+    output_tokens: u32,
+    started_at: chrono::DateTime<chrono::Utc>,
+) {
+    let run_store = rupu_orchestrator::runs::RunStore::new(dir.join("runs"));
+    let record = rupu_orchestrator::RunRecord {
+        id: run_id.into(),
+        workflow_name: workflow_name.into(),
+        status: rupu_orchestrator::RunStatus::Completed,
+        inputs: std::collections::BTreeMap::new(),
+        event: None,
+        workspace_id: workspace_id.into(),
+        workspace_path: std::path::PathBuf::from("/tmp/proj"),
+        transcript_dir: std::path::PathBuf::from("/tmp/proj/.rupu/transcripts"),
+        started_at,
+        finished_at: None,
+        error_message: None,
+        awaiting_step_id: None,
+        approval_prompt: None,
+        awaiting_since: None,
+        expires_at: None,
+        issue_ref: None,
+        issue: None,
+        parent_run_id: None,
+        backend_id: None,
+        worker_id: None,
+        artifact_manifest_path: None,
+        runner_pid: None,
+        source_wake_id: None,
+        active_step_id: None,
+        active_step_kind: None,
+        active_step_agent: None,
+        active_step_transcript_path: None,
+        resume_requested_at: None,
+        resume_claimed_at: None,
+        resume_claimed_by: None,
+        resume_mode: None,
+        final_output: None,
+    };
+    let transcript_path = dir.join(format!("{run_id}.jsonl"));
+    run_store.create(record, "name: wf\n").unwrap();
+    write_run_transcript_for(
+        &transcript_path,
+        workspace_id,
+        provider,
+        model,
+        input_tokens,
+        output_tokens,
+    );
+    run_store
+        .append_step_result(
+            run_id,
+            &rupu_orchestrator::runs::StepResultRecord {
+                step_id: "s1".into(),
+                run_id: run_id.into(),
+                transcript_path,
+                output: String::new(),
+                success: true,
+                skipped: false,
+                rendered_prompt: String::new(),
+                kind: rupu_orchestrator::runs::StepKind::Linear,
+                items: vec![],
+                findings: vec![],
+                iterations: 0,
+                resolved: true,
+                finished_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn usage_runs_returns_flat_per_run_rows_with_run_id_and_priced_cost() {
+    let dir = tempfile::tempdir().unwrap();
+    let started_1 = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let started_2 = chrono::DateTime::parse_from_rfc3339("2026-06-02T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    seed_run_with_usage(
+        dir.path(),
+        "run_1",
+        "nightly-review",
+        "ws_a",
+        "anthropic",
+        "claude-sonnet-4-6",
+        1_000_000,
+        0,
+        started_1,
+    );
+    seed_run_with_usage(
+        dir.path(),
+        "run_2",
+        "hotfix",
+        "ws_b",
+        "internal-vllm",
+        "llama-3-70b",
+        1000,
+        200,
+        started_2,
+    );
+
+    let srv = spawn_server(dir.path()).await;
+    // Explicit `since` (rather than relying on the default 30-day window) so
+    // this test is not sensitive to the gap between these fixed 2026-06
+    // timestamps and whatever `Utc::now()` the CI/dev clock reports.
+    let body: serde_json::Value = reqwest::get(format!(
+        "{}/api/usage/runs?since=2026-01-01T00:00:00Z",
+        srv.base_url
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let rows = body.as_array().expect("flat array of rows");
+    assert_eq!(rows.len(), 2, "one row per run: {rows:?}");
+
+    let r1 = rows
+        .iter()
+        .find(|r| r["run_id"] == "run_1")
+        .expect("run_1 row present");
+    assert_eq!(r1["workflow_name"], "nightly-review");
+    assert_eq!(r1["model"], "claude-sonnet-4-6");
+    assert_eq!(r1["provider"], "anthropic");
+    assert_eq!(r1["workspace_id"], "ws_a");
+    assert_eq!(r1["host_id"], "local");
+    assert_eq!(r1["input_tokens"].as_u64().unwrap(), 1_000_000);
+    assert_eq!(r1["priced"], true);
+    assert!(
+        (r1["cost_usd"].as_f64().unwrap() - 3.0).abs() < 1e-9,
+        "1M anthropic input tokens at $3/M: {r1:?}"
+    );
+    assert!(
+        r1["started_at"].as_str().unwrap().ends_with('Z'),
+        "started_at must be Z-suffixed RFC-3339, matching RunListRow: {r1:?}"
+    );
+
+    let r2 = rows
+        .iter()
+        .find(|r| r["run_id"] == "run_2")
+        .expect("run_2 row present");
+    assert_eq!(r2["workflow_name"], "hotfix");
+    assert_eq!(r2["model"], "llama-3-70b");
+    assert_eq!(r2["workspace_id"], "ws_b");
+    assert_eq!(r2["priced"], false);
+    assert!(
+        r2["cost_usd"].is_null(),
+        "unpriced row must report null cost, never a fabricated number: {r2:?}"
+    );
+    assert_eq!(r2["input_tokens"].as_u64().unwrap(), 1000);
+    assert_eq!(r2["output_tokens"].as_u64().unwrap(), 200);
+}
+
+#[tokio::test]
+async fn usage_runs_workspace_id_scopes_to_that_project_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = chrono::Utc::now();
+    seed_run_with_usage(
+        dir.path(),
+        "run_a",
+        "wf-a",
+        "ws_a",
+        "anthropic",
+        "claude-sonnet-4-6",
+        1000,
+        0,
+        now,
+    );
+    seed_run_with_usage(
+        dir.path(),
+        "run_b",
+        "wf-b",
+        "ws_b",
+        "anthropic",
+        "claude-sonnet-4-6",
+        2000,
+        0,
+        now,
+    );
+
+    let srv = spawn_server(dir.path()).await;
+    let body: serde_json::Value =
+        reqwest::get(format!("{}/api/usage/runs?workspace_id=ws_a", srv.base_url))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    let rows = body.as_array().expect("flat array of rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "workspace_id must scope out the other project's run: {rows:?}"
+    );
+    assert_eq!(rows[0]["run_id"], "run_a");
+    assert_eq!(rows[0]["workspace_id"], "ws_a");
+}
+
+#[tokio::test]
+async fn usage_runs_since_excludes_a_run_started_before_the_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let recent = chrono::DateTime::parse_from_rfc3339("2026-06-15T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    seed_run_with_usage(
+        dir.path(),
+        "run_old",
+        "wf",
+        "ws_a",
+        "anthropic",
+        "claude-sonnet-4-6",
+        1000,
+        0,
+        old,
+    );
+    seed_run_with_usage(
+        dir.path(),
+        "run_recent",
+        "wf",
+        "ws_a",
+        "anthropic",
+        "claude-sonnet-4-6",
+        2000,
+        0,
+        recent,
+    );
+
+    let srv = spawn_server(dir.path()).await;
+    let body: serde_json::Value = reqwest::get(format!(
+        "{}/api/usage/runs?since=2026-06-01T00:00:00Z",
+        srv.base_url
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let rows = body.as_array().expect("flat array of rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the run started before `since` must be excluded: {rows:?}"
+    );
+    assert_eq!(rows[0]["run_id"], "run_recent");
+}
+
+#[tokio::test]
+async fn usage_runs_since_and_until_bound_the_window_on_both_ends() {
+    // Task W1: `/api/usage/runs` gains `until`. Three runs: one before
+    // `since`, one inside `[since, until]`, one after `until` — only the
+    // middle run must survive.
+    let dir = tempfile::tempdir().unwrap();
+    let before = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let inside = chrono::DateTime::parse_from_rfc3339("2026-06-15T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let after = chrono::DateTime::parse_from_rfc3339("2026-07-15T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    seed_run_with_usage(
+        dir.path(),
+        "run_before",
+        "wf",
+        "ws_a",
+        "anthropic",
+        "claude-sonnet-4-6",
+        1000,
+        0,
+        before,
+    );
+    seed_run_with_usage(
+        dir.path(),
+        "run_inside",
+        "wf",
+        "ws_a",
+        "anthropic",
+        "claude-sonnet-4-6",
+        2000,
+        0,
+        inside,
+    );
+    seed_run_with_usage(
+        dir.path(),
+        "run_after",
+        "wf",
+        "ws_a",
+        "anthropic",
+        "claude-sonnet-4-6",
+        3000,
+        0,
+        after,
+    );
+
+    let srv = spawn_server(dir.path()).await;
+    let body: serde_json::Value = reqwest::get(format!(
+        "{}/api/usage/runs?since=2026-06-01T00:00:00Z&until=2026-07-01T00:00:00Z",
+        srv.base_url
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let rows = body.as_array().expect("flat array of rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "runs before `since` and after `until` must both be excluded: {rows:?}"
+    );
+    assert_eq!(rows[0]["run_id"], "run_inside");
+}
+
+#[tokio::test]
+async fn usage_runs_unparseable_until_returns_400() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn_server(dir.path()).await;
+    let resp = reqwest::get(format!("{}/api/usage/runs?until=notadate", srv.base_url))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "an unparseable `until` must 400, not silently fall back to now"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Part D: `GET /api/usage/outliers?until=` (Task W1).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn usage_outliers_until_excludes_an_outlier_eligible_run_after_the_bound() {
+    // Three cheap baseline runs (~$0.3 each) inside the window establish the
+    // median. A spike run inside the window (~$3, 10x) must be flagged. An
+    // identical spike run started AFTER `until` must be excluded entirely —
+    // not flagged, and not folded into the baseline either.
+    let dir = tempfile::tempdir().unwrap();
+    let base_1 = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let base_2 = chrono::DateTime::parse_from_rfc3339("2026-06-02T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let base_3 = chrono::DateTime::parse_from_rfc3339("2026-06-03T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let spike_in_window = chrono::DateTime::parse_from_rfc3339("2026-06-10T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let spike_after_until = chrono::DateTime::parse_from_rfc3339("2026-07-15T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    for (i, ts) in [base_1, base_2, base_3].into_iter().enumerate() {
+        seed_run_with_usage(
+            dir.path(),
+            &format!("base_{i}"),
+            "wf",
+            "ws_a",
+            "anthropic",
+            "claude-sonnet-4-6",
+            100_000,
+            0,
+            ts,
+        );
+    }
+    seed_run_with_usage(
+        dir.path(),
+        "spike_in_window",
+        "wf",
+        "ws_a",
+        "anthropic",
+        "claude-sonnet-4-6",
+        1_000_000,
+        0,
+        spike_in_window,
+    );
+    seed_run_with_usage(
+        dir.path(),
+        "spike_after_until",
+        "wf",
+        "ws_a",
+        "anthropic",
+        "claude-sonnet-4-6",
+        1_000_000,
+        0,
+        spike_after_until,
+    );
+
+    let srv = spawn_server(dir.path()).await;
+    let body: serde_json::Value = reqwest::get(format!(
+        "{}/api/usage/outliers?since=2026-05-01T00:00:00Z&until=2026-07-01T00:00:00Z",
+        srv.base_url
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let rows = body.as_array().expect("flat array of outlier rows");
+    let ids: Vec<&str> = rows.iter().map(|r| r["run_id"].as_str().unwrap()).collect();
+    assert!(
+        ids.contains(&"spike_in_window"),
+        "the in-window spike must be flagged: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"spike_after_until"),
+        "the spike started after `until` must be excluded from the window entirely: {ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn usage_outliers_unparseable_until_returns_400() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = spawn_server(dir.path()).await;
+    let resp = reqwest::get(format!(
+        "{}/api/usage/outliers?until=notadate",
+        srv.base_url
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "an unparseable `until` must 400, not silently fall back to now"
+    );
+}

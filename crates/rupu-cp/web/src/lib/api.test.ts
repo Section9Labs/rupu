@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { api, ApiError } from './api';
+import { api, ApiError, presetWindow, windowFromDayRange } from './api';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -215,6 +215,51 @@ describe('api.getRun', () => {
   });
 });
 
+describe('presetWindow', () => {
+  const FIXED_NOW = new Date('2026-07-16T12:00:00.000Z').getTime();
+
+  it("'7d' yields a since ~7 days before until, until == the fixed now", () => {
+    const w = presetWindow('7d', FIXED_NOW);
+    expect(w.until).toBe(new Date(FIXED_NOW).toISOString());
+    expect(new Date(w.until).getTime() - new Date(w.since).getTime()).toBe(7 * 86_400_000);
+  });
+
+  it("'30d' yields a since ~30 days before until", () => {
+    const w = presetWindow('30d', FIXED_NOW);
+    expect(w.until).toBe(new Date(FIXED_NOW).toISOString());
+    expect(new Date(w.until).getTime() - new Date(w.since).getTime()).toBe(30 * 86_400_000);
+  });
+
+  it("'all' keeps since at the epoch, until at now (unchanged behavior)", () => {
+    const w = presetWindow('all', FIXED_NOW);
+    expect(w.since).toBe(new Date(0).toISOString());
+    expect(w.until).toBe(new Date(FIXED_NOW).toISOString());
+  });
+
+  it('defaults `now` to Date.now() when omitted', () => {
+    const before = Date.now();
+    const w = presetWindow('7d');
+    const after = Date.now();
+    const untilMs = new Date(w.until).getTime();
+    expect(untilMs).toBeGreaterThanOrEqual(before);
+    expect(untilMs).toBeLessThanOrEqual(after);
+  });
+});
+
+describe('windowFromDayRange', () => {
+  it('since is the start of startDay and until is the end of endDay, both RFC-3339', () => {
+    const w = windowFromDayRange('2026-07-10', '2026-07-14');
+    expect(w.since).toBe('2026-07-10T00:00:00.000Z');
+    expect(w.until).toBe('2026-07-14T23:59:59.999Z');
+  });
+
+  it('a single-day range still spans the whole day', () => {
+    const w = windowFromDayRange('2026-07-10', '2026-07-10');
+    expect(w.since).toBe('2026-07-10T00:00:00.000Z');
+    expect(w.until).toBe('2026-07-10T23:59:59.999Z');
+  });
+});
+
 describe('api.getUsage', () => {
   const EMPTY_USAGE_RESPONSE = {
     summary: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: false, runs: 0 },
@@ -223,12 +268,12 @@ describe('api.getUsage', () => {
     hosts: [],
   };
 
-  it('requests /api/usage with an explicit since + the pivot as group_by', async () => {
+  it('requests /api/usage with an explicit since + until + the pivot as group_by', async () => {
     mockFetch(200, EMPTY_USAGE_RESPONSE);
     const fetchSpy = vi.mocked(fetch);
-    await api.getUsage('30d', 'workflow');
+    await api.getUsage(presetWindow('30d'), 'workflow');
     const calledUrl = fetchSpy.mock.calls[0][0] as string;
-    expect(calledUrl).toMatch(/^\/api\/usage\?since=.+&group_by=workflow$/);
+    expect(calledUrl).toMatch(/^\/api\/usage\?since=.+&until=.+&group_by=workflow$/);
   });
 
   it('defaults to a 30-day window and the model pivot', async () => {
@@ -237,12 +282,13 @@ describe('api.getUsage', () => {
     await api.getUsage();
     const calledUrl = fetchSpy.mock.calls[0][0] as string;
     expect(calledUrl).toContain('group_by=model');
+    expect(calledUrl).toContain('until=');
   });
 
   it('forwards an explicit host scope', async () => {
     mockFetch(200, EMPTY_USAGE_RESPONSE);
     const fetchSpy = vi.mocked(fetch);
-    await api.getUsage('7d', 'host', 'ssh1');
+    await api.getUsage(presetWindow('7d'), 'host', 'ssh1');
     const calledUrl = fetchSpy.mock.calls[0][0] as string;
     expect(calledUrl).toContain('host=ssh1');
   });
@@ -250,19 +296,54 @@ describe('api.getUsage', () => {
   it("'all' maps to the epoch, not an omitted since (which would default to 30 days server-side)", async () => {
     mockFetch(200, EMPTY_USAGE_RESPONSE);
     const fetchSpy = vi.mocked(fetch);
-    await api.getUsage('all', 'model');
+    await api.getUsage(presetWindow('all'), 'model');
     const calledUrl = fetchSpy.mock.calls[0][0] as string;
     expect(calledUrl).toContain(encodeURIComponent('1970-01-01T00:00:00.000Z'));
   });
 });
 
 describe('api.getUsageOutliers', () => {
-  it('requests /api/usage/outliers with an explicit since bound', async () => {
+  it('requests /api/usage/outliers with an explicit since + until bound', async () => {
     mockFetch(200, []);
     const fetchSpy = vi.mocked(fetch);
-    await api.getUsageOutliers('7d');
+    await api.getUsageOutliers(presetWindow('7d'));
     const calledUrl = fetchSpy.mock.calls[0][0] as string;
-    expect(calledUrl).toMatch(/^\/api\/usage\/outliers\?since=.+$/);
+    expect(calledUrl).toMatch(/^\/api\/usage\/outliers\?since=.+&until=.+$/);
+  });
+
+  it('defaults to a 30-day window when called with no args', async () => {
+    mockFetch(200, []);
+    const fetchSpy = vi.mocked(fetch);
+    await api.getUsageOutliers();
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toContain('until=');
+  });
+});
+
+describe('api.getUsageRuns', () => {
+  it('requests /api/usage/runs with both since and until', async () => {
+    mockFetch(200, []);
+    const fetchSpy = vi.mocked(fetch);
+    await api.getUsageRuns(presetWindow('7d'));
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toMatch(/^\/api\/usage\/runs\?since=.+&until=.+$/);
+  });
+
+  it('forwards an explicit workspaceId scope alongside since/until', async () => {
+    mockFetch(200, []);
+    const fetchSpy = vi.mocked(fetch);
+    await api.getUsageRuns(presetWindow('30d'), 'ws_42');
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toContain('workspace_id=ws_42');
+    expect(calledUrl).toContain('until=');
+  });
+
+  it('defaults to a 30-day window when called with no args', async () => {
+    mockFetch(200, []);
+    const fetchSpy = vi.mocked(fetch);
+    await api.getUsageRuns();
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toContain('until=');
   });
 });
 

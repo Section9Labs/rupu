@@ -9,8 +9,15 @@
 
 import type { TranscriptEvent, TranscriptResponse } from './transcript';
 export type { TranscriptEvent, TranscriptResponse } from './transcript';
-import type { UsageSummary, UsageOverview, UsageTimelineBucket, UnpricedGap } from './usage';
-export type { UsageSummary, UsageBreakdownRow, UsageOverview, UsageTimelineBucket, UnpricedGap } from './usage';
+import type { UsageSummary, UsageOverview, UsageTimelineBucket, UnpricedGap, UsageRunRow } from './usage';
+export type {
+  UsageSummary,
+  UsageBreakdownRow,
+  UsageOverview,
+  UsageTimelineBucket,
+  UnpricedGap,
+  UsageRunRow,
+} from './usage';
 
 // ---------------------------------------------------------------------------
 // Error
@@ -713,6 +720,48 @@ export function usageRangeSince(range: DashboardRange, now: number = Date.now())
   return new Date(now - USAGE_RANGE_DAYS[range] * 86_400_000).toISOString();
 }
 
+/**
+ * An explicit `[since, until]` bound for the `/api/usage*` endpoints — the
+ * client-side source of truth for "what window am I looking at" (Task W2).
+ * A preset (7d/30d/all) is just a window that happens to end "now"; a
+ * drag-selected custom window (Task W3) is the same shape with different
+ * bounds. Every usage fetch takes one of these rather than a bare
+ * `DashboardRange`, so a custom window flows through the exact same code
+ * path a preset does.
+ */
+export interface UsageWindow {
+  /** RFC-3339. */
+  since: string;
+  /** RFC-3339. */
+  until: string;
+}
+
+/**
+ * Build the `UsageWindow` for a preset range, ending "now" (or the passed
+ * `now`, for deterministic tests). `'all'` keeps `since` at the epoch (see
+ * `usageRangeSince`'s doc comment) — unchanged behavior, just carried as an
+ * explicit `until` alongside it instead of an implicit "server defaults
+ * absent `until` to now".
+ */
+export function presetWindow(range: DashboardRange, now: number = Date.now()): UsageWindow {
+  return { since: usageRangeSince(range, now), until: new Date(now).toISOString() };
+}
+
+/**
+ * Build the `UsageWindow` for a drag-selected day-bucket range (Task W3) —
+ * `startDay`/`endDay` are `YYYY-MM-DD` bucket labels off the graph's x-axis,
+ * already ordered `startDay <= endDay` (see `resolveDragRange`). `since` is
+ * the very start of `startDay`; `until` is the very end of `endDay`
+ * (`23:59:59.999`) so the window is INCLUSIVE of every run on the last
+ * selected day, same "whole day" granularity the graph's own buckets use.
+ */
+export function windowFromDayRange(startDay: string, endDay: string): UsageWindow {
+  return {
+    since: `${startDay}T00:00:00.000Z`,
+    until: `${endDay}T23:59:59.999Z`,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Agents
 // ---------------------------------------------------------------------------
@@ -1385,13 +1434,15 @@ export const api = {
 
   // --- Usage ---
   /**
-   * `range` + `pivot` drive the /usage page's attribution view: `pivot`
+   * `window` + `pivot` drive the /usage page's attribution view: `pivot`
    * forwards to `group_by` (an unknown value 400s server-side rather than
    * silently defaulting to a model breakdown), and `host` optionally scopes
-   * to one registered host — same idiom as `getDashboard`.
+   * to one registered host — same idiom as `getDashboard`. `window` defaults
+   * to the 30-day preset (via `presetWindow`) so existing callers that don't
+   * yet track a window keep working.
    */
-  getUsage(range: DashboardRange = '30d', pivot: Pivot = 'model', host?: string): Promise<UsageResponse> {
-    const q = new URLSearchParams({ since: usageRangeSince(range), group_by: pivot });
+  getUsage(win: UsageWindow = presetWindow('30d'), pivot: Pivot = 'model', host?: string): Promise<UsageResponse> {
+    const q = new URLSearchParams({ since: win.since, until: win.until, group_by: pivot });
     if (host) q.set('host', host);
     return request<UsageResponse>(`/api/usage?${q.toString()}`);
   },
@@ -1410,9 +1461,21 @@ export const api = {
    * on `rupu-cp/src/api/usage_outliers.rs`), so this accepts single-host
    * results and does not take a `host` param.
    */
-  getUsageOutliers(range: DashboardRange = '30d'): Promise<OutlierRun[]> {
-    const q = new URLSearchParams({ since: usageRangeSince(range) });
+  getUsageOutliers(win: UsageWindow = presetWindow('30d')): Promise<OutlierRun[]> {
+    const q = new URLSearchParams({ since: win.since, until: win.until });
     return request<OutlierRun[]>(`/api/usage/outliers?${q.toString()}`);
+  },
+  /**
+   * Flat per-`(run × model)` usage rows — the finest grain the `/usage`
+   * page's interactive graph filters client-side (see `buildTimeline`). Like
+   * `getUsageOutliers`, LOCAL-ONLY: `/api/usage/runs` does not fan out across
+   * hosts, so this takes no `host` param. `workspaceId` (optional) scopes to
+   * one project's runs — what the Projects page's usage tab uses.
+   */
+  getUsageRuns(win: UsageWindow = presetWindow('30d'), workspaceId?: string): Promise<UsageRunRow[]> {
+    const q = new URLSearchParams({ since: win.since, until: win.until });
+    if (workspaceId) q.set('workspace_id', workspaceId);
+    return request<UsageRunRow[]>(`/api/usage/runs?${q.toString()}`);
   },
 
   // --- Runs ---

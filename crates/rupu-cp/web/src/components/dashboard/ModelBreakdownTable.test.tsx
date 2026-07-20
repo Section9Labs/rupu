@@ -1,9 +1,13 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
-import { describe, it, expect } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { render, screen, cleanup, fireEvent, within } from '@testing-library/react';
 import ModelBreakdownTable, { toRows } from './ModelBreakdownTable';
 import type { UsageBreakdownRow } from '../../lib/usage';
+
+afterEach(() => {
+  cleanup();
+});
 
 function row(model: string, cost: number | null, tokens = 1000): UsageBreakdownRow {
   return {
@@ -123,5 +127,86 @@ describe('ModelBreakdownTable host pivot', () => {
   it('falls back to the raw host id when no matching host is found', () => {
     render(<ModelBreakdownTable rows={[hostRow('host_unknown')]} pivot="host" hosts={[]} />);
     expect(screen.getByText('host_unknown')).toBeInTheDocument();
+  });
+});
+
+describe('toRows with showAll (the interactive /usage table)', () => {
+  it('emits one row per key with no top-N rollup', () => {
+    const v = toRows(ROWS, 'model', { showAll: true });
+    const models = v.rows.filter((r) => r.kind === 'model');
+    const others = v.rows.filter((r) => r.kind === 'others');
+    expect(models).toHaveLength(8);
+    expect(others).toHaveLength(0);
+    expect(models.map((r) => r.label)).toContain('m8');
+  });
+});
+
+describe('ModelBreakdownTable selectable', () => {
+  it('shows every row (no others rollup) when selectable, unlike the default top-6 view', () => {
+    render(<ModelBreakdownTable rows={ROWS} selectable excludedKeys={new Set()} onToggleKey={() => {}} />);
+    expect(screen.queryByText(/others/)).not.toBeInTheDocument();
+    expect(screen.getByText('m8')).toBeInTheDocument();
+  });
+
+  it('calls onToggleKey with the row pivot key when its checkbox is clicked', () => {
+    const onToggleKey = vi.fn();
+    render(<ModelBreakdownTable rows={ROWS} selectable excludedKeys={new Set()} onToggleKey={onToggleKey} />);
+    fireEvent.click(screen.getByRole('checkbox', { name: 'm1' }));
+    expect(onToggleKey).toHaveBeenCalledWith('m1');
+  });
+
+  it('renders an excluded row unchecked and visibly muted', () => {
+    render(
+      <ModelBreakdownTable rows={ROWS} selectable excludedKeys={new Set(['m2'])} onToggleKey={() => {}} />,
+    );
+    const checkbox = screen.getByRole('checkbox', { name: 'm2' }) as HTMLInputElement;
+    expect(checkbox.checked).toBe(false);
+    // A non-excluded row's checkbox stays checked.
+    expect((screen.getByRole('checkbox', { name: 'm1' }) as HTMLInputElement).checked).toBe(true);
+  });
+
+  it('does not render checkboxes when not selectable', () => {
+    render(<ModelBreakdownTable rows={ROWS} />);
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+  });
+});
+
+// Regression coverage for the real-world interaction bugs: (a) stuck
+// checkboxes that can never be unchecked, (b) rows mislabeled "—", (c)
+// toggling a row with no effect on the graph. Root cause: a selectable
+// table must show EVERY row (no top-6/others rollup — already enforced by
+// `toRows(rows, pivot, { showAll: selectable })` above) and a genuinely
+// empty pivot value (`rawKey === ''`, e.g. a run with a blank `agent`) is a
+// REAL, toggleable group — `aggregateRuns`/`buildTimeline` group by it via
+// `pivotKeyOf`, and `excludedKeys.has('')` works — so it must never be
+// `disabled`, only the (non-existent-in-selectable-mode) `others` rollup may
+// be.
+describe('ModelBreakdownTable selectable — empty pivot key (Fix 2/3)', () => {
+  it('renders an enabled, checked checkbox for an empty-key row and toggles with the empty string', () => {
+    const rows = [...ROWS, row('', 2)];
+    const onToggleKey = vi.fn();
+    render(<ModelBreakdownTable rows={rows} selectable excludedKeys={new Set()} onToggleKey={onToggleKey} />);
+
+    // Legible label for the empty group, distinct from the raw "—" the
+    // non-selectable dashboard table / graph legend show.
+    const label = screen.getByText('(unattributed)');
+    const tr = label.closest('tr');
+    expect(tr).not.toBeNull();
+    const checkbox = within(tr as HTMLElement).getByRole('checkbox') as HTMLInputElement;
+
+    expect(checkbox).not.toBeDisabled();
+    expect(checkbox.checked).toBe(true);
+
+    fireEvent.click(checkbox);
+    expect(onToggleKey).toHaveBeenCalledWith('');
+  });
+
+  it('shows every row with no others rollup in selectable mode even with >6 priced rows', () => {
+    render(<ModelBreakdownTable rows={ROWS} selectable excludedKeys={new Set()} onToggleKey={() => {}} />);
+    expect(screen.queryByText(/others \(/)).not.toBeInTheDocument();
+    expect(screen.getAllByRole('checkbox').length).toBe(ROWS.length);
+    for (const checkbox of screen.getAllByRole('checkbox')) {
+      expect(checkbox).not.toBeDisabled();
+    }
   });
 });

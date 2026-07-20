@@ -1,4 +1,5 @@
-// Usage — the spend page (dashboard redesign plan 3, task 5).
+// Usage — the spend page (dashboard redesign plan 3, task 5; made interactive
+// in Task U3).
 //
 // The dashboard is ops-first and deliberately dropped spend into its own
 // page: an ops monitor left open in a tab is not where you review spend on a
@@ -11,44 +12,141 @@
 // The unpriced-spend gap is named and counted (`UnpricedBanner`) rather than
 // a bare '*' footnote — a silent under-count is worse than no number.
 //
-// Trend is not a separate section: `UsageTimelineStacked`, fed by
-// `/api/usage/timeline`, IS the trend view. That endpoint has no `group_by`
-// of its own and always groups by model server-side (see the doc comment on
-// `UsageTimelineStacked.tsx`), so the graph stays model-keyed regardless of
-// the active pivot; the pivot instead drives the headline attribution and
-// the breakdown table below, which is where all six dimensions genuinely
-// live (`/api/usage?group_by=`).
+// INTERACTIVE FILTERING (Task U3) is the payoff of U1 ('GET /api/usage/runs',
+// flat per-`(run × model)` rows) + U2 (`buildTimeline`, the pure client
+// aggregation): the graph is now fed by the flat run rows, bucketed+stacked
+// by the active pivot and filtered by two `Set<string>`s of excluded pivot
+// keys / run ids held in this component's state. Toggling a breakdown-table
+// checkbox or an outlier's exclude toggle mutates one of those sets, which
+// re-runs the memoized `buildTimeline` synchronously — no refetch, so pulling
+// a real ~1000x-cost outlier out of the graph is instant and the axis
+// rescales live. `getUsageRuns` itself is pivot/filter-independent (fetched
+// once per `usageWindow`); `getUsage`/`getUsageOutliers` are unchanged from before
+// and still drive the headline number, `UnpricedBanner`, and
+// `HostFreshnessStrip` — those stay fleet-wide and are labeled as such.
+//
+// TABLE/GRAPH SHARED SOURCE (bugfix): the breakdown table below is built
+// from `aggregateRuns(runs, pivot)` over the SAME flat run rows the graph's
+// `buildTimeline` consumes (handed back via `UsageTimeline`'s
+// `onRunsLoaded`) — NOT from `data.breakdown` (fleet-wide, top-6 + an
+// `others (N)` rollup, from `GET /api/usage`). The two datasets used to
+// diverge: a table row could name a pivot key the graph had never heard of
+// (toggling it did nothing), the top-6/others rollup permanently disabled
+// the rollup row's checkbox, and an empty pivot value rendered as an
+// inert "—". `aggregateRuns` — like `ProjectUsageTimeline`'s identical
+// pattern — has no top-N slicing and every row is a real, toggleable
+// group, so every table row now corresponds 1:1 to a graph series.
+//
+// The graph itself (Task U4) is now `<UsageTimeline>` — extracted so the
+// Projects page's Runs tab can mount the identical component, scoped by
+// `workspaceId`, instead of forking it. Pivot/metric/the exclusion filter
+// stay OWNED here (not inside `UsageTimeline`) because this page shares all
+// three with the breakdown table and outlier panel below.
 
-import { useEffect, useState } from 'react';
-import { api, usageRangeSince, type DashboardRange, type OutlierRun, type UsageResponse } from '../lib/api';
-import type { UsageTimelineBucket } from '../lib/usage';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  api,
+  presetWindow,
+  windowFromDayRange,
+  type DashboardRange,
+  type OutlierRun,
+  type UsageResponse,
+  type UsageRunRow,
+  type UsageWindow,
+} from '../lib/api';
 import { formatCost, formatTokens } from '../lib/usage';
+import { aggregateRuns, type TimelineFilter } from '../lib/usage/buildTimeline';
 import { PivotPicker, PIVOT_LABEL, type Pivot } from '../components/usage/PivotPicker';
 import { UnpricedBanner } from '../components/usage/UnpricedBanner';
 import { OutlierPanel } from '../components/usage/OutlierPanel';
 import { HostFreshnessStrip } from '../components/dashboard/HostFreshnessStrip';
-import UsageTimelineStacked, { type UsageMetric } from '../components/dashboard/UsageTimelineStacked';
+import UsageTimeline from '../components/usage/UsageTimeline';
+import { type UsageMetric } from '../components/dashboard/UsageTimelineStacked';
 import ModelBreakdownTable from '../components/dashboard/ModelBreakdownTable';
 
 const RANGES: DashboardRange[] = ['7d', '30d', 'all'];
-const METRICS: UsageMetric[] = ['cost', 'tokens'];
+
+function toggleInSet(set: Set<string>, key: string): Set<string> {
+  const next = new Set(set);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  return next;
+}
 
 export default function Usage() {
   const [range, setRange] = useState<DashboardRange>('30d');
+  // The `{since, until}` window driving every usage fetch below (Task W2) —
+  // `range` is kept alongside purely for the 7/30/All button highlighting.
+  // Held in state (not recomputed inline from `range` on every render) so
+  // its object identity is stable across renders that don't change it.
+  // Named `usageWindow` (not `window`) to avoid shadowing the global
+  // `Window`. A drag-selected custom window (Task W3, `handleSelectRange`
+  // below) sets this to an arbitrary window without touching `range`;
+  // `isCustomWindow` tracks which of the two is currently active so the
+  // "custom" chip and the preset-button highlighting agree.
+  const [usageWindow, setUsageWindow] = useState<UsageWindow>(() => presetWindow('30d'));
+  const [isCustomWindow, setIsCustomWindow] = useState(false);
   const [pivot, setPivot] = useState<Pivot>('model');
   const [metric, setMetric] = useState<UsageMetric>('cost');
 
+  const handleRangeChange = useCallback((r: DashboardRange) => {
+    setRange(r);
+    setUsageWindow(presetWindow(r));
+    setIsCustomWindow(false);
+  }, []);
+
+  // Task W3: a drag-select on the graph narrows the whole page to an
+  // arbitrary `{since, until}` window, exactly like a preset. `startDay`/
+  // `endDay` are the ordered day-bucket labels `UsageTimelineStacked`'s
+  // `useDragSelection` resolves a real drag to.
+  const handleSelectRange = useCallback((startDay: string, endDay: string) => {
+    setUsageWindow(windowFromDayRange(startDay, endDay));
+    setIsCustomWindow(true);
+  }, []);
+
+  // "custom · ×" chip's clear: return to the currently-highlighted preset's
+  // window without changing which preset is highlighted.
+  const clearCustomWindow = useCallback(() => {
+    setUsageWindow(presetWindow(range));
+    setIsCustomWindow(false);
+  }, [range]);
+
   const [data, setData] = useState<UsageResponse | null>(null);
-  const [timeline, setTimeline] = useState<UsageTimelineBucket[]>([]);
   const [outliers, setOutliers] = useState<OutlierRun[]>([]);
   const [error, setError] = useState<Error | null>(null);
+  // The flat per-run rows `UsageTimeline` fetches for the graph (Task U1),
+  // handed back via `onRunsLoaded` so the breakdown table below can be built
+  // from the SAME rows instead of `data.breakdown` (fleet-wide, from
+  // `GET /api/usage`) — see the file-header doc comment: two different
+  // datasets meant a table checkbox could toggle a key the graph had never
+  // heard of (no effect), get stuck disabled (the top-6/others rollup), or
+  // render as a bare "—" for an empty pivot value. Mirrors
+  // `ProjectUsageTimeline`'s `aggregateRuns(runs, pivot)` table.
+  const [runs, setRuns] = useState<UsageRunRow[]>([]);
+
+  const [excludedKeys, setExcludedKeys] = useState<Set<string>>(new Set());
+  const [excludedRunIds, setExcludedRunIds] = useState<Set<string>>(new Set());
+
+  // A pivot key is only meaningful under the dimension it was excluded from
+  // (a `model` value has nothing to say about a `workflow` grouping) — clear
+  // stale key exclusions on pivot switch so "Excluded (N)" never counts a key
+  // that can no longer match any row. Run-id exclusions are pivot-independent
+  // (a run's identity doesn't change), so they persist across pivot changes.
+  useEffect(() => {
+    setExcludedKeys(new Set());
+  }, [pivot]);
 
   // `/api/usage`: summary + the pivoted breakdown + the unpriced gap + host
-  // freshness. Re-fetches whenever the range OR the pivot changes.
+  // freshness. Re-fetches whenever the window OR the pivot changes. Depends
+  // on `usageWindow.since`/`usageWindow.until` (primitives), not the
+  // `usageWindow` object itself — `handleSelectRange` (and `presetWindow`)
+  // build a fresh window object each call, and keying off the object would
+  // risk a spurious refetch loop if that ever stopped being referentially
+  // stable (same primitive-deps pattern as `UsageTimeline`'s own effect).
   useEffect(() => {
     let cancelled = false;
     api
-      .getUsage(range, pivot)
+      .getUsage(usageWindow, pivot)
       .then((resp) => {
         if (cancelled) return;
         setData(resp);
@@ -61,32 +159,15 @@ export default function Usage() {
     return () => {
       cancelled = true;
     };
-  }, [range, pivot]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed off usageWindow's primitive fields, not the object itself; see comment above.
+  }, [usageWindow.since, usageWindow.until, pivot]);
 
-  // `/api/usage/timeline`: the trend graph. Pivot-independent (see the module
-  // doc comment) — only re-fetches on range.
+  // `/api/usage/outliers`: local-only, re-fetches on window (primitives —
+  // see the comment on the effect above).
   useEffect(() => {
     let cancelled = false;
     api
-      .getUsageTimeline({ since: usageRangeSince(range) })
-      .then((buckets) => {
-        if (!cancelled) setTimeline(buckets);
-      })
-      .catch(() => {
-        // The timeline is a secondary graph; a failure here should not blank
-        // the whole page when the summary/breakdown above loaded fine.
-        if (!cancelled) setTimeline([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [range]);
-
-  // `/api/usage/outliers`: local-only, re-fetches on range.
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .getUsageOutliers(range)
+      .getUsageOutliers(usageWindow)
       .then((rows) => {
         if (!cancelled) setOutliers(rows);
       })
@@ -96,7 +177,31 @@ export default function Usage() {
     return () => {
       cancelled = true;
     };
-  }, [range]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed off usageWindow's primitive fields, not the object itself; see comment on the effect above.
+  }, [usageWindow.since, usageWindow.until]);
+
+  const filter = useMemo<TimelineFilter>(
+    () => ({ excludedKeys, excludedRunIds }),
+    [excludedKeys, excludedRunIds],
+  );
+
+  const toggleKey = useCallback((key: string) => {
+    setExcludedKeys((prev) => toggleInSet(prev, key));
+  }, []);
+  const toggleRun = useCallback((runId: string) => {
+    setExcludedRunIds((prev) => toggleInSet(prev, runId));
+  }, []);
+  const resetExclusions = useCallback(() => {
+    setExcludedKeys(new Set());
+    setExcludedRunIds(new Set());
+  }, []);
+
+  const excludedCount = excludedKeys.size + excludedRunIds.size;
+
+  // Unfiltered breakdown for the table — every pivot key must stay
+  // clickable even while excluded, or there'd be no way to re-include it.
+  // Same convention as `ProjectUsageTimeline`.
+  const breakdown = useMemo(() => aggregateRuns(runs, pivot), [runs, pivot]);
 
   return (
     <div className="space-y-4 p-4">
@@ -116,14 +221,24 @@ export default function Usage() {
             </span>
           )}
           <PivotPicker value={pivot} onChange={setPivot} />
+          {isCustomWindow && (
+            <button
+              type="button"
+              onClick={clearCustomWindow}
+              className="rounded-full border border-[rgb(var(--c-border))] px-2 py-0.5 text-[10px] text-[rgb(var(--c-ink-mute))] hover:bg-[rgb(var(--c-surface))]"
+              title="Clear the drag-selected window and return to the active preset"
+            >
+              custom · ×
+            </button>
+          )}
           <div className="flex rounded-md border border-[rgb(var(--c-border))]">
             {RANGES.map((r) => (
               <button
                 key={r}
                 type="button"
-                onClick={() => setRange(r)}
+                onClick={() => handleRangeChange(r)}
                 className={`px-2 py-1 text-xs ${
-                  range === r
+                  !isCustomWindow && range === r
                     ? 'bg-[rgb(var(--c-surface))] text-[rgb(var(--c-ink))]'
                     : 'text-[rgb(var(--c-ink-mute))]'
                 }`}
@@ -139,52 +254,42 @@ export default function Usage() {
         <>
           <UnpricedBanner unpriced={data.unpriced} />
 
-          <section className="rounded-lg border border-[rgb(var(--c-border))] bg-[rgb(var(--c-panel))] p-3">
-            <div className="mb-2 flex flex-wrap items-start justify-between gap-2">
-              <div>
-                <h2 className="text-xs font-medium uppercase tracking-wide text-[rgb(var(--c-ink-dim))]">
-                  Spend over time
-                </h2>
-                <p className="mt-0.5 text-2xl font-semibold tabular-nums text-[rgb(var(--c-ink))]">
-                  {formatCost(data.summary.cost_usd)}
-                </p>
-                <p className="text-xs text-[rgb(var(--c-ink-mute))]">
-                  {formatTokens(data.summary.total_tokens)} tokens · {data.summary.runs} runs
-                  {!data.summary.priced && ' · partial (see banner above)'}
-                </p>
-              </div>
-              <div className="flex rounded-md border border-[rgb(var(--c-border))]">
-                {METRICS.map((m) => (
-                  <button
-                    key={m}
-                    type="button"
-                    onClick={() => setMetric(m)}
-                    className={`px-2 py-1 text-xs capitalize ${
-                      metric === m
-                        ? 'bg-[rgb(var(--c-surface))] text-[rgb(var(--c-ink))]'
-                        : 'text-[rgb(var(--c-ink-mute))]'
-                    }`}
-                  >
-                    {m}
-                  </button>
-                ))}
-              </div>
-            </div>
-            {/* The headline above is fleet-wide (`/api/usage`, fans out across
-                hosts). This graph is fed by `/api/usage/timeline`, which has no
-                host fan-out — say so, or a multi-host operator reads the graph
-                as fleet-wide too. */}
-            <p className="mb-2 text-[10px] uppercase tracking-wide text-[rgb(var(--c-ink-mute))]">
-              local host only
-            </p>
-            <UsageTimelineStacked buckets={timeline} metric={metric} />
-          </section>
+          {/* The headline here is fleet-wide (`/api/usage`, fans out across
+              hosts) — deliberately NOT derived from the local-only run rows
+              `UsageTimeline` fetches for the graph itself, which is why it's
+              passed in rather than computed inside that component (see its
+              doc comment). */}
+          <UsageTimeline
+            usageWindow={usageWindow}
+            pivot={pivot}
+            metric={metric}
+            onMetricChange={setMetric}
+            filter={filter}
+            excludedCount={excludedCount}
+            onReset={resetExclusions}
+            onRunsLoaded={setRuns}
+            onSelectRange={handleSelectRange}
+            hosts={data.hosts}
+            headline={{
+              costLabel: formatCost(data.summary.cost_usd),
+              subLabel: `${formatTokens(data.summary.total_tokens)} tokens · ${data.summary.runs} runs${
+                !data.summary.priced ? ' · partial (see banner above)' : ''
+              }`,
+            }}
+          />
 
           <section className="rounded-lg border border-[rgb(var(--c-border))] bg-[rgb(var(--c-panel))] p-3">
             <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-[rgb(var(--c-ink-dim))]">
               Breakdown by {PIVOT_LABEL[pivot]}
             </h2>
-            <ModelBreakdownTable rows={data.breakdown} pivot={pivot} hosts={data.hosts} />
+            <ModelBreakdownTable
+              rows={breakdown}
+              pivot={pivot}
+              hosts={data.hosts}
+              selectable
+              excludedKeys={excludedKeys}
+              onToggleKey={toggleKey}
+            />
           </section>
 
           <section className="rounded-lg border border-[rgb(var(--c-border))] bg-[rgb(var(--c-panel))] p-3">
@@ -194,7 +299,7 @@ export default function Usage() {
                 (this host only)
               </span>
             </h2>
-            <OutlierPanel outliers={outliers} />
+            <OutlierPanel outliers={outliers} excludedRunIds={excludedRunIds} onToggleRun={toggleRun} />
           </section>
         </>
       ) : error ? (
