@@ -25,6 +25,11 @@ pub struct ProjectRow {
     pub path: String,
     pub repo_remote: Option<String>,
     pub branch: Option<String>,
+    /// Repository landing-page URL derived from `repo_remote` (github/gitlab
+    /// only; `None` for an unrecognized host or no remote at all). Powers the
+    /// "View on repository" link in the identity header + Code tab.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_home_url: Option<String>,
     pub created_at: String,
     pub last_run_at: Option<String>,
     pub usage: crate::usage::UsageSummary,
@@ -63,6 +68,11 @@ fn project_row(w: &rupu_workspace::Workspace) -> ProjectRow {
         path: w.path.clone(),
         repo_remote: w.repo_remote.clone(),
         branch: w.initial_branch.clone(),
+        repo_home_url: w
+            .repo_remote
+            .as_deref()
+            .and_then(rupu_scm::weburl::parse_repo_remote)
+            .map(|r| r.home_url()),
         created_at: w.created_at.clone(),
         last_run_at: w.last_run_at.clone(),
         usage: crate::usage::UsageSummary::default(),
@@ -418,6 +428,35 @@ async fn project_autoflows(
 mod tests {
     use super::*;
 
+    fn ws(repo_remote: Option<&str>) -> rupu_workspace::Workspace {
+        rupu_workspace::Workspace {
+            id: "ws1".to_string(),
+            path: "/p".to_string(),
+            repo_remote: repo_remote.map(|s| s.to_string()),
+            initial_branch: Some("main".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_run_at: None,
+        }
+    }
+
+    #[test]
+    fn project_row_computes_repo_home_url_for_known_host() {
+        let row = project_row(&ws(Some("git@github.com:o/r.git")));
+        assert_eq!(row.repo_home_url.as_deref(), Some("https://github.com/o/r"));
+    }
+
+    #[test]
+    fn project_row_repo_home_url_is_none_without_remote() {
+        let row = project_row(&ws(None));
+        assert_eq!(row.repo_home_url, None);
+    }
+
+    #[test]
+    fn project_row_repo_home_url_is_none_for_unknown_host() {
+        let row = project_row(&ws(Some("git@bitbucket.org:o/r.git")));
+        assert_eq!(row.repo_home_url, None);
+    }
+
     #[test]
     fn project_detail_serializes_usage() {
         let detail = ProjectDetail {
@@ -427,6 +466,7 @@ mod tests {
                 path: "/p".into(),
                 repo_remote: None,
                 branch: None,
+                repo_home_url: None,
                 created_at: String::new(),
                 last_run_at: None,
                 usage: crate::usage::UsageSummary::default(),

@@ -5,6 +5,7 @@
 
 import { useState } from 'react';
 import { ChevronDown, ChevronRight } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import { normFindingSeverity, type FindingRecord } from '../../lib/api';
 import { cn } from '../../lib/cn';
 import { cweFromFinding } from '../../lib/cwe';
@@ -17,12 +18,16 @@ export interface FindingRowProps {
   project?: string;
   /** Optional provenance: source target id. */
   targetId?: string;
+  /** Owning workspace id. When present alongside `file_path` + `line_range`,
+   *  the location renders as a deep-link into that project's Code tab. */
+  wsId?: string;
 }
 
-export function FindingRow({ finding, project, targetId }: FindingRowProps) {
+export function FindingRow({ finding, project, targetId, wsId }: FindingRowProps) {
   const sev = normFindingSeverity(finding.severity);
   const s = SEVERITY_STYLE[sev];
   const [open, setOpen] = useState(false);
+  const navigate = useNavigate();
 
   const locationParts: string[] = [];
   if (finding.file_path) locationParts.push(finding.file_path);
@@ -68,7 +73,22 @@ export function FindingRow({ finding, project, targetId }: FindingRowProps) {
             <p className="text-sm text-ink leading-snug">{finding.summary}</p>
           )}
           <div className="mt-0.5 flex flex-wrap items-center gap-x-3 text-note text-ink-mute">
-            {location && <span className="font-mono break-all">{location}</span>}
+            {location &&
+              (finding.file_path && finding.line_range && wsId ? (
+                <button
+                  type="button"
+                  onClick={() =>
+                    navigate(
+                      `/projects/${encodeURIComponent(wsId)}/code?path=${encodeURIComponent(finding.file_path!)}&line=${finding.line_range![0]}`,
+                    )
+                  }
+                  className="font-mono break-all text-brand-700 hover:underline"
+                >
+                  {location}
+                </button>
+              ) : (
+                <span className="font-mono break-all">{location}</span>
+              ))}
             {cwe && (
               <a
                 href={cwe.url}
@@ -122,3 +142,5 @@ export function FindingRow({ finding, project, targetId }: FindingRowProps) {
     </div>
   );
 }
+
+export default FindingRow;

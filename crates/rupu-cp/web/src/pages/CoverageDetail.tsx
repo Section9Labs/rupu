@@ -192,7 +192,7 @@ export default function CoverageDetail({ tab = 'overview' }: { tab?: CoverageTab
             <div className="mb-3">
               <FindingMetrics summary={findingsSummary} />
             </div>
-            <FindingsTable findings={sortedFindings} />
+            <FindingsTable findings={sortedFindings} wsId={wsId} />
           </>
         )}
       </section>

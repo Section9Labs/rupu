@@ -991,6 +991,7 @@ export default function RunDetail() {
                       finding={f}
                       project={f.project}
                       targetId={f.target_id}
+                      wsId={f.ws_id}
                     />
                   ))}
                 </ListCard>

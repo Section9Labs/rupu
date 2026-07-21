@@ -8,6 +8,7 @@
 // lexically. The rows arrive backend-sorted (critical → info, newest first), so
 // no `initialSort` is supplied — the unsorted default preserves that order.
 
+import { useNavigate } from 'react-router-dom';
 import {
   normFindingSeverity,
   sevRank,
@@ -29,12 +30,21 @@ function location(f: FindingRecord): string {
 export function FindingsTable({
   findings,
   showProvenance = false,
+  wsId,
 }: {
   findings: FindingRecord[];
   /** Render Project / Target columns. Only set when `findings` are `FindingOut`
    *  (they carry the provenance keys). */
   showProvenance?: boolean;
+  /** Fallback owning workspace id, used when a row isn't a `FindingOut` (e.g.
+   *  the coverage-detail table, whose findings are plain `FindingRecord`s
+   *  already scoped to one project by the caller). Rows that ARE `FindingOut`
+   *  use their own `ws_id` instead. When resolved alongside `file_path` +
+   *  `line_range`, the location cell deep-links into that project's Code tab. */
+  wsId?: string;
 }) {
+  const navigate = useNavigate();
+
   const columns: Column<FindingRecord>[] = [
     {
       key: 'severity',
@@ -60,11 +70,24 @@ export function FindingsTable({
       sortValue: (f) => f.file_path ?? null,
       render: (f) => {
         const loc = location(f);
-        return loc ? (
-          <span className="font-mono text-note text-ink-mute break-all">{loc}</span>
-        ) : (
-          <span className="text-ink-mute">—</span>
-        );
+        if (!loc) return <span className="text-ink-mute">—</span>;
+        const rowWsId = (f as FindingOut).ws_id ?? wsId;
+        if (f.file_path && f.line_range && rowWsId) {
+          return (
+            <button
+              type="button"
+              onClick={() =>
+                navigate(
+                  `/projects/${encodeURIComponent(rowWsId)}/code?path=${encodeURIComponent(f.file_path!)}&line=${f.line_range![0]}`,
+                )
+              }
+              className="font-mono text-note break-all text-brand-700 hover:underline"
+            >
+              {loc}
+            </button>
+          );
+        }
+        return <span className="font-mono text-note text-ink-mute break-all">{loc}</span>;
       },
     },
     {
