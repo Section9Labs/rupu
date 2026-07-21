@@ -1357,6 +1357,29 @@ export interface ProjectCoverageRow {
 }
 
 // ---------------------------------------------------------------------------
+// Project code browsing
+// ---------------------------------------------------------------------------
+
+export interface TreeEntry {
+  name: string;
+  path: string;
+  kind: 'dir' | 'file';
+}
+export interface TreeResult {
+  path: string;
+  parent: string | null;
+  entries: TreeEntry[];
+}
+export interface FileContent {
+  available: boolean;
+  path?: string;
+  language?: string | null;
+  totalLines?: number;
+  lines?: { n: number; text: string }[];
+  reason?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Source preview
 // ---------------------------------------------------------------------------
 
@@ -2067,6 +2090,15 @@ export const api = {
   getProjectAssessedPct(wsId: string): Promise<ProjectAssessedPct> {
     return request<ProjectAssessedPct>(
       `/api/projects/${encodeURIComponent(wsId)}/coverage/assessed`,
+    );
+  },
+  getProjectTree(wsId: string, path?: string): Promise<TreeResult> {
+    const qs = path ? `?path=${encodeURIComponent(path)}` : '';
+    return request<TreeResult>(`/api/projects/${encodeURIComponent(wsId)}/tree${qs}`);
+  },
+  getProjectSource(wsId: string, path: string): Promise<FileContent> {
+    return request<FileContent>(
+      `/api/projects/${encodeURIComponent(wsId)}/source?path=${encodeURIComponent(path)}`,
     );
   },
 
