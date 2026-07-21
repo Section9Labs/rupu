@@ -8,6 +8,7 @@ import { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
   Activity,
+  Code2,
   GitBranch,
   GitFork,
   LayoutDashboard,
@@ -26,13 +27,14 @@ import { TabBar, TabButton } from '../components/TabBar';
 import ProjectOverviewTab from '../components/project/ProjectOverviewTab';
 import ProjectRunsTab from '../components/project/ProjectRunsTab';
 import ProjectFindingsTab from '../components/project/ProjectFindingsTab';
+import ProjectCodeTab from '../components/project/ProjectCodeTab';
 import ProjectSessionsTab from '../components/project/ProjectSessionsTab';
 import ProjectCoverageTab from '../components/project/ProjectCoverageTab';
 import ProjectConfigTab from '../components/project/ProjectConfigTab';
 import { relativeTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
 
-export type ProjectTab = 'overview' | 'runs' | 'findings' | 'sessions' | 'coverage' | 'config';
+export type ProjectTab = 'overview' | 'runs' | 'findings' | 'code' | 'sessions' | 'coverage' | 'config';
 
 // ---------------------------------------------------------------------------
 // Rollup tile
@@ -267,6 +269,12 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
             label="Findings"
           />
           <TabButton
+            active={tab === 'code'}
+            onClick={() => navigate(`/projects/${encodedId}/code`)}
+            icon={Code2}
+            label="Code"
+          />
+          <TabButton
             active={tab === 'sessions'}
             onClick={() => navigate(`/projects/${encodedId}/sessions`)}
             icon={MessageSquare}
@@ -293,6 +301,7 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
       )}
       {tab === 'runs' && <ProjectRunsTab wsId={p.ws_id} />}
       {tab === 'findings' && <ProjectFindingsTab wsId={p.ws_id} />}
+      {tab === 'code' && <ProjectCodeTab wsId={p.ws_id} />}
       {tab === 'sessions' && <ProjectSessionsTab wsId={p.ws_id} />}
       {tab === 'coverage' && <ProjectCoverageTab wsId={p.ws_id} />}
       {tab === 'config' && <ProjectConfigTab wsId={p.ws_id} />}
