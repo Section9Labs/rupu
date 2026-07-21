@@ -100,6 +100,40 @@ describe('UsageTimelineStacked', () => {
     const { getByText } = render(<UsageTimelineStacked buckets={[]} metric="cost" />);
     expect(getByText(/No usage recorded yet/)).toBeInTheDocument();
   });
+
+  describe('loading vs. genuinely empty (Task loading-ux)', () => {
+    it('shows a loading skeleton, not "No usage recorded yet", when loading=true with no buckets', () => {
+      const { queryByText, getByLabelText } = render(
+        <UsageTimelineStacked buckets={[]} metric="cost" loading />,
+      );
+      expect(queryByText(/No usage recorded yet/)).not.toBeInTheDocument();
+      expect(getByLabelText('Loading usage graph')).toBeInTheDocument();
+    });
+
+    it('the loading skeleton wins over real data when loading=true, even with non-empty buckets', () => {
+      const { queryByLabelText, queryByText } = render(
+        <UsageTimelineStacked buckets={BUCKETS} metric="cost" loading />,
+      );
+      // `loading` is the caller's authoritative "I haven't committed this
+      // render's data yet" signal — it wins regardless of whatever stale
+      // `buckets` happen to still be in props.
+      expect(queryByLabelText('Loading usage graph')).toBeInTheDocument();
+      expect(queryByText('alpha')).not.toBeInTheDocument();
+    });
+
+    it('shows "No usage recorded yet" once loading=false and buckets are genuinely empty', () => {
+      const { getByText, queryByLabelText } = render(
+        <UsageTimelineStacked buckets={[]} metric="cost" loading={false} />,
+      );
+      expect(getByText(/No usage recorded yet/)).toBeInTheDocument();
+      expect(queryByLabelText('Loading usage graph')).not.toBeInTheDocument();
+    });
+
+    it('defaults loading to false, so existing callers that never pass it are unaffected', () => {
+      const { getByText } = render(<UsageTimelineStacked buckets={[]} metric="cost" />);
+      expect(getByText(/No usage recorded yet/)).toBeInTheDocument();
+    });
+  });
   it('renders without crashing for 2 buckets × 2 models', () => {
     render(<UsageTimelineStacked buckets={BUCKETS} metric="tokens" />);
   });

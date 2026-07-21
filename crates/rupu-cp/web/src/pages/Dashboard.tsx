@@ -28,6 +28,7 @@ import { KeyPointTiles } from '../components/dashboard/KeyPointTiles';
 import { TerminalTrend } from '../components/dashboard/TerminalTrend';
 import { ThroughputChart } from '../components/dashboard/ThroughputChart';
 import { CycleSummaryLine } from '../components/dashboard/CycleSummaryLine';
+import { Spinner } from '../components/ui/Spinner';
 import type { DashboardRange } from '../lib/api';
 
 const RANGES: DashboardRange[] = ['7d', '30d', 'all'];
@@ -129,7 +130,9 @@ export default function Dashboard() {
           Could not load dashboard: {error.message}
         </div>
       ) : (
-        <div className="p-6 text-sm text-[rgb(var(--c-ink-mute))]">Loading…</div>
+        <div className="flex items-center justify-center p-6">
+          <Spinner size="md" label="Loading…" />
+        </div>
       )}
     </div>
   );
