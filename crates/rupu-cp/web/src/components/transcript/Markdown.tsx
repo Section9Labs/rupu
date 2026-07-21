@@ -2,8 +2,8 @@
  * Markdown — lightweight prose renderer used inside transcript turns.
  *
  * Renders markdown via react-markdown with rehype-highlight for fenced
- * code blocks.  Import a light GitHub theme so highlighted blocks look
- * clean against the rupu panel background.
+ * code blocks, styled by the shared theme-aware `codeHighlight.css` so blocks
+ * track the CP's light/dark theme and sit transparently on the panel.
  *
  * This file lives in the `transcript/` component tree, which is already
  * reached only through the lazy-loaded RunTranscript route.  The
@@ -16,9 +16,12 @@ import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import type { Components } from 'react-markdown';
 
-// Light GitHub-style syntax-highlight theme — no dark-mode switching needed
-// for the current rupu palette (light UI only).
-import 'highlight.js/styles/github.css';
+// Theme-aware highlight.js token palette (transparent background; light/dark
+// via [data-theme] on <html>). Replaces the old global
+// `highlight.js/styles/github.css`, whose `.hljs{background:#fff}` was a global
+// import that painted white boxes behind code in dark mode app-wide (incl. the
+// Code viewer). Covers rehype-highlight's `.hljs` fenced blocks here.
+import '../codeHighlight.css';
 
 // ---------------------------------------------------------------------------
 // Typed component map — no `any`; each key is a keyof JSX.IntrinsicElements

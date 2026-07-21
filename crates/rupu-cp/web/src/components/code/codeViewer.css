@@ -4,34 +4,21 @@
  * anchors one or more findings — a secondary "look here" cue alongside the
  * severity band, matching the aikido reference's inline-review-comment look.
  *
+ * It uses NATIVE `text-decoration: wavy underline`, so the wave is drawn only
+ * under the actual code glyphs — not across the full width of the (1fr) grid
+ * cell. (The previous implementation used a repeating linear-gradient
+ * background on the full-width cell, which rendered as a full-line row of
+ * dashes that read like a typo.)
+ *
  * Colour comes from `--squiggle-rgb`, an `--c-sev-*` triple set inline by
  * `CodeViewer` per line (the dominant severity when several findings stack),
- * so it themes automatically with light/dark like every other sev token —
- * no literal colour lives here, only the wave geometry.
+ * so it themes automatically with light/dark like every other sev token.
  */
 .finding-squiggle {
   --squiggle-rgb: var(--c-ink-mute);
-  display: inline-block;
-  background-repeat: repeat-x;
-  background-position: 0 100%;
-  background-size: 6px 3px;
-  padding-bottom: 2px;
-  background-image: linear-gradient(
-      135deg,
-      transparent 0%,
-      transparent 40%,
-      rgb(var(--squiggle-rgb) / 0.75) 40%,
-      rgb(var(--squiggle-rgb) / 0.75) 60%,
-      transparent 60%,
-      transparent 100%
-    ),
-    linear-gradient(
-      45deg,
-      transparent 0%,
-      transparent 40%,
-      rgb(var(--squiggle-rgb) / 0.75) 40%,
-      rgb(var(--squiggle-rgb) / 0.75) 60%,
-      transparent 60%,
-      transparent 100%
-    );
+  text-decoration-line: underline;
+  text-decoration-style: wavy;
+  text-decoration-color: rgb(var(--squiggle-rgb) / 0.85);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
 }

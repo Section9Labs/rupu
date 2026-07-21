@@ -75,11 +75,18 @@ export default function ProjectCodeTab({
           )}
         </div>
       )}
-      <div className="grid h-[calc(100vh-13rem)] min-h-[420px] grid-cols-[minmax(200px,280px)_1fr] gap-3 max-md:grid-cols-1">
-        <aside className="h-full overflow-y-auto rounded-md border border-border bg-surface">
+      {/* Flex (not grid) so the fixed container height propagates to the panes:
+          a grid with only `grid-cols` gives an auto (content-height) row, so
+          `h-full` children collapse to content and the code view grows to the
+          whole file instead of scrolling. Flex items stretch to the container
+          height by default, so each pane fills the viewport and scrolls
+          internally like an editor. The `12rem` offset (app header + project
+          header + tab bar) is an estimate — tune if it clips or leaves a gap. */}
+      <div className="flex h-[calc(100vh-12rem)] min-h-[480px] gap-3 max-md:h-auto max-md:flex-col">
+        <aside className="h-full w-[264px] shrink-0 overflow-y-auto rounded-md border border-border bg-surface max-md:h-64 max-md:w-full">
           <FileTree wsId={wsId} findings={findings} selectedPath={selected} onSelect={onSelect} />
         </aside>
-        <section className="h-full min-w-0">
+        <section className="h-full min-w-0 flex-1">
           {selected ? (
             <CodeViewer
               wsId={wsId}
@@ -88,7 +95,7 @@ export default function ProjectCodeTab({
               initialLine={selected === deepPath ? initialLine : undefined}
             />
           ) : (
-            <div className="flex h-40 items-center justify-center text-sm text-ink-dim">
+            <div className="flex h-full items-center justify-center rounded-md border border-border bg-panel text-sm text-ink-dim">
               Select a file to view its source and findings.
             </div>
           )}

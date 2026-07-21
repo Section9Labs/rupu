@@ -83,7 +83,6 @@ export default function CodeViewer({ wsId, path, findings, initialLine }: CodeVi
     () => findings.filter((f) => f.file_path === path),
     [findings, path],
   );
-  const grouped = useMemo(() => byLine(findingsForFile), [findingsForFile]);
 
   // Scroll the requested line into view once the file has loaded.
   useEffect(() => {
@@ -114,8 +113,36 @@ export default function CodeViewer({ wsId, path, findings, initialLine }: CodeVi
   const lang =
     file.language && HIGHLIGHTABLE_LANGUAGES.has(file.language) ? (file.language as Language) : null;
 
+  // A finding renders inline only when it anchors to a line that actually
+  // exists in the current file. Findings with no `line_range` (file/repo-scoped)
+  // or whose anchor points past the current end-of-file (the code shrank since
+  // the finding was made) can't sit on a line — but the navigator badge counts
+  // every finding for the file, so we must still show them or the viewer would
+  // silently render fewer findings than the tree advertises. They go in a
+  // "file-level findings" block at the top.
+  const total = file.lines.length;
+  const isAnchored = (f: FindingRecord) =>
+    !!f.line_range && f.line_range[0] >= 1 && f.line_range[0] <= total;
+  const anchoredFindings = findingsForFile.filter(isAnchored);
+  const unanchoredFindings = findingsForFile.filter((f) => !isAnchored(f));
+  const grouped = byLine(anchoredFindings);
+
   return (
     <div className="h-full overflow-auto rounded-md border border-border bg-panel text-[12px]">
+      {unanchoredFindings.length > 0 && (
+        <div className="border-b border-border bg-surface px-3 py-2">
+          <div className="mb-1 text-[11px] font-medium text-ink-mute">
+            File-level findings (not tied to a specific line)
+          </div>
+          {unanchoredFindings.map((f) => (
+            <InlineFindingCard
+              key={f.id}
+              finding={f}
+              stale={isFindingStale(f.evidence?.code_excerpt, file.lines!, f.line_range)}
+            />
+          ))}
+        </div>
+      )}
       <div className="font-mono">
         {file.lines.map((ln) => {
           const here = grouped.get(ln.n);
