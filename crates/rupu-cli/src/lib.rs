@@ -67,16 +67,13 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
-    /// One-shot agent run, or `pause`/`resume` a run by id. NOT a clap
-    /// `#[command(subcommand)]` — see `cmd::run`'s module doc for why:
-    /// nesting `pause`/`resume` as named subcommand variants alongside
-    /// the agent-run launcher broke flag-first invocations (`rupu run
-    /// --tmp <ref>`). Instead this captures its trailing tokens
-    /// verbatim (`trailing_var_arg` + `allow_hyphen_values`, so a
-    /// leading `--flag` is captured rather than rejected as an
-    /// unexpected argument of an argless variant) and hands them to
-    /// `cmd::run::classify` for the actual pause/resume-vs-launch
-    /// decision.
+    /// One-shot agent run, or pause/resume a run by id.
+    // Not a clap `#[command(subcommand)]`: nesting `pause`/`resume` as
+    // named subcommand variants alongside the agent-run launcher broke
+    // flag-first invocations (`rupu run --tmp <ref>`). See `cmd::run`'s
+    // module doc for the full root-cause writeup. Instead this captures
+    // its trailing tokens verbatim and hands them to `cmd::run::classify`
+    // for the actual pause/resume-vs-launch dispatch.
     Run {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
         argv: Vec<String>,
