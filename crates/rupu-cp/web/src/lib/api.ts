@@ -1386,6 +1386,13 @@ export interface FileContent {
   lines?: { n: number; text: string }[];
   reason?: string;
 }
+/** Mirrors the backend's `GET /api/projects/:ws_id/files` response shape —
+ *  a flat, sorted, workspace-relative list of every file in the project
+ *  (for project-wide search, vs. `getProjectTree`'s lazy per-dir listing). */
+export interface FileListResult {
+  files: string[];
+  truncated: boolean;
+}
 
 // ---------------------------------------------------------------------------
 // Source preview
@@ -2108,6 +2115,9 @@ export const api = {
     return request<FileContent>(
       `/api/projects/${encodeURIComponent(wsId)}/source?path=${encodeURIComponent(path)}`,
     );
+  },
+  getProjectFiles(wsId: string): Promise<FileListResult> {
+    return request<FileListResult>(`/api/projects/${encodeURIComponent(wsId)}/files`);
   },
 
   // --- Config (CP Settings) ---

@@ -54,6 +54,36 @@ describe('CodeViewer', () => {
     expect(screen.getByText('Also logs PII')).toBeInTheDocument();
   });
 
+  it('renders findings the navigator counts but that cannot anchor to a line (no line_range or out-of-range)', async () => {
+    vi.spyOn(api, 'getProjectSource').mockResolvedValue(FILE); // 3 lines
+    const fileScoped = {
+      id: 'f-file',
+      file_path: 'src/billing.rs',
+      line_range: null,
+      summary: 'Repo-wide secret handling',
+      severity: 'medium',
+      evidence: { rationale: 'no line', references: [] },
+    } as unknown as FindingRecord;
+    const outOfRange = {
+      id: 'f-oor',
+      file_path: 'src/billing.rs',
+      line_range: [999, 1000], // past EOF (file shrank since finding)
+      summary: 'Anchor past end of file',
+      severity: 'low',
+      evidence: { rationale: 'drifted', references: [] },
+    } as unknown as FindingRecord;
+    view(
+      <CodeViewer wsId="ws1" path="src/billing.rs" findings={[FINDING, fileScoped, outOfRange]} />,
+    );
+    // The anchored one still renders inline…
+    await waitFor(() => expect(screen.getByText('Missing tenant check')).toBeInTheDocument());
+    // …and the two that can't anchor still render (in the file-level block), so
+    // the viewer never shows fewer findings than the tree badge counts.
+    expect(screen.getByText('Repo-wide secret handling')).toBeInTheDocument();
+    expect(screen.getByText('Anchor past end of file')).toBeInTheDocument();
+    expect(screen.getByText(/File-level findings/)).toBeInTheDocument();
+  });
+
   it('shows a placeholder when the file is unavailable', async () => {
     vi.spyOn(api, 'getProjectSource').mockResolvedValue({ available: false, reason: 'file too large to display' });
     view(<CodeViewer wsId="ws1" path="x" findings={[]} />);

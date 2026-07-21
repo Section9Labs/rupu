@@ -28,4 +28,12 @@ describe('project code API', () => {
     await api.getProjectSource('ws1', 'src/main.rs');
     expect(fetchMock.mock.calls[0][0]).toBe('/api/projects/ws1/source?path=src%2Fmain.rs');
   });
+
+  it('getProjectFiles encodes ws_id and hits the flat files endpoint', async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(JSON.stringify({ files: [], truncated: false })));
+    await api.getProjectFiles('ws 1');
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/projects/ws%201/files');
+  });
 });

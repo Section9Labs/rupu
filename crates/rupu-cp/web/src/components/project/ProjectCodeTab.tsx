@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api, type FindingRecord } from '../../lib/api';
-import FileTree from '../code/FileTree';
+import FileNavigator from '../code/FileNavigator';
 import CodeViewer from '../code/CodeViewer';
 
 export interface ProjectCodeTabProps {
@@ -56,9 +56,17 @@ export default function ProjectCodeTab({
   };
 
   return (
-    <div>
+    // Flex COLUMN with the fixed height at this outer level (not just the
+    // two-pane row below): the optional repo-chip row above the panes is
+    // `shrink-0` and the two-pane row is `min-h-0 flex-1`, so the panes take
+    // exactly whatever height remains after the chip instead of the fixed
+    // height being applied to the panes alone and the chip adding on top of
+    // it (which could push the whole thing past the viewport and reintroduce
+    // page scroll). The `11rem` offset (app header + project header + tab
+    // bar) is an estimate — tune if it clips or leaves a gap.
+    <div className="flex h-[calc(100vh-11rem)] min-h-[480px] flex-col">
       {(repoHomeUrl || repoRemote) && (
-        <div className="mb-2 flex items-center gap-2 text-[12px] text-ink-dim">
+        <div className="mb-2 flex shrink-0 items-center gap-2 text-[12px] text-ink-dim">
           <span className="rounded bg-surface px-2 py-0.5 font-mono">
             {repoRemote?.replace(/^.*[:/]([^/]+\/[^/]+?)(?:\.git)?$/, '$1') ?? 'repo'}
             {branch ? ` · ${branch}` : ''}
@@ -75,11 +83,20 @@ export default function ProjectCodeTab({
           )}
         </div>
       )}
-      <div className="grid h-[calc(100vh-13rem)] min-h-[420px] grid-cols-[minmax(200px,280px)_1fr] gap-3 max-md:grid-cols-1">
-        <aside className="h-full overflow-y-auto rounded-md border border-border bg-surface">
-          <FileTree wsId={wsId} findings={findings} selectedPath={selected} onSelect={onSelect} />
+      {/* Flex (not grid) so the container height propagates to the panes: a
+          grid with only `grid-cols` gives an auto (content-height) row, so
+          `h-full` children collapse to content and the code view grows to
+          the whole file instead of scrolling. Flex items stretch to the
+          container height by default, so each pane fills the remaining
+          height and scrolls internally like an editor. `min-h-0` lets this
+          row shrink below its content's natural height inside the flex
+          column above — without it a flex child won't shrink past its
+          content size, which would blow through the fixed outer height. */}
+      <div className="flex min-h-0 flex-1 gap-3 max-md:flex-col max-md:overflow-visible">
+        <aside className="h-full w-[264px] shrink-0 overflow-y-auto rounded-md border border-border bg-surface max-md:h-64 max-md:w-full">
+          <FileNavigator wsId={wsId} findings={findings} selectedPath={selected} onSelect={onSelect} />
         </aside>
-        <section className="h-full min-w-0">
+        <section className="h-full min-w-0 flex-1">
           {selected ? (
             <CodeViewer
               wsId={wsId}
@@ -88,7 +105,7 @@ export default function ProjectCodeTab({
               initialLine={selected === deepPath ? initialLine : undefined}
             />
           ) : (
-            <div className="flex h-40 items-center justify-center text-sm text-ink-dim">
+            <div className="flex h-full items-center justify-center rounded-md border border-border bg-panel text-sm text-ink-dim">
               Select a file to view its source and findings.
             </div>
           )}
