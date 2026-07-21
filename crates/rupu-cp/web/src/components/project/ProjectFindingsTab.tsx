@@ -73,7 +73,7 @@ export default function ProjectFindingsTab({ wsId }: { wsId: string }) {
           No {activeSev} findings.
         </div>
       ) : (
-        <FindingsTable findings={rows} showProvenance />
+        <FindingsTable findings={rows} showProvenance wsId={wsId} />
       )}
     </div>
   );
