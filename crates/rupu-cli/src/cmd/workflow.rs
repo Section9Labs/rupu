@@ -242,12 +242,13 @@ pub enum Action {
         /// Workflow name (filename stem under `workflows/`).
         #[arg(add = ArgValueCompleter::new(workflow_names))]
         name: String,
-        /// Optional run-target. Accepts repo (`github:owner/repo`,
-        /// `gitlab:group/proj`), PR (`github:owner/repo#42`), or
-        /// issue (`github:owner/repo/issues/42`). Repo / PR targets
-        /// clone to a tmpdir for the run; issue targets pre-fetch
-        /// the issue payload and bind it as `{{ issue.* }}` in step
-        /// prompts.
+        /// Optional run-target: a repo, PR, or issue reference.
+        ///
+        /// Accepts repo (`github:owner/repo`, `gitlab:group/proj`), PR
+        /// (`github:owner/repo#42`), or issue
+        /// (`github:owner/repo/issues/42`). Repo / PR targets clone to
+        /// a tmpdir for the run; issue targets pre-fetch the issue
+        /// payload and bind it as `{{ issue.* }}` in step prompts.
         target: Option<String>,
         /// `KEY=VALUE` template inputs (repeatable).
         #[arg(long, value_parser = parse_kv)]
@@ -333,10 +334,9 @@ pub enum Action {
     },
     /// Cooperatively pause a running workflow run at its next safe boundary,
     /// leaving it non-terminal and resumable via `rupu workflow resume`.
-    ///
-    /// This is the primitive a remote transport (SSH) reaches over `ssh` the
-    /// same way it reaches `cancel`/`approve`/`reject` — see
-    /// `docs/superpowers/plans/2026-07-01-rupu-pause-resume-plan.md` Task 5.
+    // This is the primitive a remote transport (SSH) reaches over `ssh` the
+    // same way it reaches `cancel`/`approve`/`reject` — see
+    // `docs/superpowers/plans/2026-07-01-rupu-pause-resume-plan.md` Task 5.
     Pause {
         /// Full run id (`run_<ULID>`) as printed by
         /// `rupu workflow run`.
