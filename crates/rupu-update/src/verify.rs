@@ -86,12 +86,20 @@ impl BinaryCheck for CodesignCheck {
                 )));
             }
 
-            // Best-effort: quarantine may simply not be set on a
-            // freshly-written temp file; ignore any failure here.
+            // Best-effort: quarantine is essentially never set here (the
+            // updater fetches over its own HTTP client, so Gatekeeper adds no
+            // `com.apple.quarantine`), so `xattr -d` almost always exits
+            // non-zero with "No such xattr". We already ignore the exit
+            // status — but `.status()` inherits our stderr, which would leak
+            // that noise to the user's terminal on every update. Null the
+            // child's stdout/stderr so the best-effort removal is actually
+            // silent.
             let _ = std::process::Command::new("xattr")
                 .arg("-d")
                 .arg("com.apple.quarantine")
                 .arg(&tmp)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .status();
 
             let status = std::process::Command::new(&tmp).arg("--version").status()?;
