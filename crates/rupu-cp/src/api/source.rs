@@ -194,22 +194,59 @@ fn canonicalize_existing_prefix(p: &FsPath) -> Option<PathBuf> {
     }
 }
 
-/// Map a file extension to a syntax-highlighting language tag. `None` for
+/// Map a file extension (or, for a handful of well-known extension-less
+/// filenames, the filename itself) to a syntax-highlighting language tag
+/// matching one of the hljs grammars registered by the frontend's
+/// `CodeHighlight.tsx` (`HIGHLIGHTABLE_LANGUAGES`). `None` for
 /// unrecognized/absent extensions — the frontend falls back to plain text.
+///
+/// Extension matching is case-insensitive (`.RS`, `.Rs`, `.rs` all map to
+/// `rust`) since case conventions vary by platform/editor and this is purely
+/// a display hint, not a security boundary.
 pub fn detect_language(path: &FsPath) -> Option<&'static str> {
-    let ext = path.extension()?.to_str()?;
-    Some(match ext {
-        "rs" => "rust",
-        "py" => "python",
-        "ts" | "tsx" => "typescript",
-        "js" | "jsx" => "javascript",
-        "go" => "go",
-        "json" => "json",
-        "toml" => "toml",
-        "md" => "markdown",
-        "yaml" | "yml" => "yaml",
-        _ => return None,
-    })
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let lower = ext.to_ascii_lowercase();
+        if let Some(lang) = match lower.as_str() {
+            "rs" => Some("rust"),
+            "py" => Some("python"),
+            "ts" | "tsx" => Some("typescript"),
+            "js" | "jsx" => Some("javascript"),
+            "go" => Some("go"),
+            "json" => Some("json"),
+            "toml" => Some("toml"),
+            "md" => Some("markdown"),
+            "yaml" | "yml" => Some("yaml"),
+            "c" | "h" => Some("c"),
+            "cc" | "cpp" | "cxx" | "hpp" | "hh" => Some("cpp"),
+            "cs" => Some("csharp"),
+            "java" => Some("java"),
+            "kt" | "kts" => Some("kotlin"),
+            "swift" => Some("swift"),
+            "rb" => Some("ruby"),
+            "php" => Some("php"),
+            "sh" | "bash" | "zsh" => Some("bash"),
+            "sql" => Some("sql"),
+            "html" | "htm" | "xml" | "svg" => Some("xml"),
+            "css" => Some("css"),
+            "scss" => Some("scss"),
+            "less" => Some("less"),
+            "lua" => Some("lua"),
+            "r" => Some("r"),
+            "scala" => Some("scala"),
+            "pl" | "pm" => Some("perl"),
+            "dart" => Some("dart"),
+            "m" | "mm" => Some("objectivec"),
+            _ => None,
+        } {
+            return Some(lang);
+        }
+    }
+    // Extension-less well-known filenames.
+    match path.file_name().and_then(|n| n.to_str())? {
+        "Dockerfile" => Some("dockerfile"),
+        "Makefile" => Some("makefile"),
+        _ => None,
+    }
 }
 
 pub fn routes() -> Router<AppState> {
@@ -558,6 +595,85 @@ mod tests {
         assert_eq!(detect_language(std::path::Path::new("a.yml")), Some("yaml"));
         assert_eq!(detect_language(std::path::Path::new("a.bin")), None);
         assert_eq!(detect_language(std::path::Path::new("noext")), None);
+    }
+
+    #[test]
+    fn detect_language_maps_the_expanded_extension_set() {
+        let cases: &[(&str, &str)] = &[
+            ("a.c", "c"),
+            ("a.h", "c"),
+            ("a.cc", "cpp"),
+            ("a.cpp", "cpp"),
+            ("a.cxx", "cpp"),
+            ("a.hpp", "cpp"),
+            ("a.hh", "cpp"),
+            ("a.cs", "csharp"),
+            ("a.java", "java"),
+            ("a.kt", "kotlin"),
+            ("a.kts", "kotlin"),
+            ("a.swift", "swift"),
+            ("a.rb", "ruby"),
+            ("a.php", "php"),
+            ("a.sh", "bash"),
+            ("a.bash", "bash"),
+            ("a.zsh", "bash"),
+            ("a.sql", "sql"),
+            ("a.html", "xml"),
+            ("a.htm", "xml"),
+            ("a.xml", "xml"),
+            ("a.svg", "xml"),
+            ("a.css", "css"),
+            ("a.scss", "scss"),
+            ("a.less", "less"),
+            ("a.lua", "lua"),
+            ("a.r", "r"),
+            ("a.scala", "scala"),
+            ("a.pl", "perl"),
+            ("a.pm", "perl"),
+            ("a.dart", "dart"),
+            ("a.m", "objectivec"),
+            ("a.mm", "objectivec"),
+            ("a.toml", "toml"),
+            ("a.md", "markdown"),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                detect_language(std::path::Path::new(path)),
+                Some(*expected),
+                "path {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_language_is_case_insensitive() {
+        assert_eq!(detect_language(std::path::Path::new("a.RS")), Some("rust"));
+        assert_eq!(
+            detect_language(std::path::Path::new("A.Py")),
+            Some("python")
+        );
+        assert_eq!(
+            detect_language(std::path::Path::new("a.YML")),
+            Some("yaml")
+        );
+    }
+
+    #[test]
+    fn detect_language_recognizes_extensionless_well_known_filenames() {
+        assert_eq!(
+            detect_language(std::path::Path::new("Dockerfile")),
+            Some("dockerfile")
+        );
+        assert_eq!(
+            detect_language(std::path::Path::new("src/Dockerfile")),
+            Some("dockerfile")
+        );
+        assert_eq!(
+            detect_language(std::path::Path::new("Makefile")),
+            Some("makefile")
+        );
+        assert_eq!(detect_language(std::path::Path::new("dockerfile")), None);
+        assert_eq!(detect_language(std::path::Path::new("random")), None);
     }
 
     #[test]
