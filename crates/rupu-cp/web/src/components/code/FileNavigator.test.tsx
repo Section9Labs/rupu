@@ -125,6 +125,41 @@ describe('FileNavigator', () => {
     );
   });
 
+  it('recovers after toggling away and back mid-flight instead of getting stuck on the spinner', async () => {
+    vi.spyOn(api, 'getProjectTree').mockResolvedValue(ROOT);
+    let resolveFiles: (v: FileListResult) => void = () => {};
+    const pending = new Promise<FileListResult>((resolve) => {
+      resolveFiles = resolve;
+    });
+    // Every call returns the SAME (still-pending) promise, so "resolve the
+    // original fetch" below resolves whichever effect instance(s) are still
+    // listening — reproducing the real trigger without needing to assert an
+    // exact call count.
+    const filesSpy = vi.spyOn(api, 'getProjectFiles').mockReturnValue(pending);
+
+    render(<FileNavigator wsId="ws1" findings={FINDINGS} selectedPath={null} onSelect={() => {}} />);
+
+    // All mode + a search starts the lazy fetch, which is left unresolved.
+    fireEvent.change(screen.getByPlaceholderText('Filter files…'), { target: { value: 'deep' } });
+    await waitFor(() => expect(filesSpy).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getByText('Searching…')).toBeInTheDocument());
+
+    // Ordinary interaction, not an edge case: flip to Findings mode while
+    // the fetch is still in flight, then back to All — search text
+    // unchanged throughout.
+    fireEvent.click(screen.getByTestId('nav-mode-findings'));
+    fireEvent.click(screen.getByTestId('nav-mode-all'));
+
+    // Only now does the original (in-flight) request resolve.
+    resolveFiles!(ALL_FILES);
+
+    // Must converge to the loaded list, not get stuck on "Searching…".
+    await waitFor(() =>
+      expect(screen.getByTestId('nav-row-src/deep/nested/module.rs')).toBeInTheDocument(),
+    );
+    expect(screen.queryByText('Searching…')).not.toBeInTheDocument();
+  });
+
   it('selecting a row calls onSelect with the file path', async () => {
     vi.spyOn(api, 'getProjectTree').mockResolvedValue(ROOT);
     const onSelect = vi.fn();

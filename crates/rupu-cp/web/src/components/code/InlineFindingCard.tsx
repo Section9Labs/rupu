@@ -62,8 +62,7 @@ export default function InlineFindingCard({ finding, stale }: InlineFindingCardP
         <div className="border-t border-border px-3 py-2.5 text-[12px] text-ink-dim">
           {stale && (
             <div className="mb-2 rounded bg-warn-bg px-2 py-1 text-[11px] text-ink">
-              ⚠ The code may have changed since this finding was recorded — the line below is
-              where it was found.
+              ⚠ The code may have changed since this finding was recorded.
             </div>
           )}
           {finding.evidence?.rationale && (

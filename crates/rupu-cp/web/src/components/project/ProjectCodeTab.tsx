@@ -56,9 +56,17 @@ export default function ProjectCodeTab({
   };
 
   return (
-    <div>
+    // Flex COLUMN with the fixed height at this outer level (not just the
+    // two-pane row below): the optional repo-chip row above the panes is
+    // `shrink-0` and the two-pane row is `min-h-0 flex-1`, so the panes take
+    // exactly whatever height remains after the chip instead of the fixed
+    // height being applied to the panes alone and the chip adding on top of
+    // it (which could push the whole thing past the viewport and reintroduce
+    // page scroll). The `11rem` offset (app header + project header + tab
+    // bar) is an estimate — tune if it clips or leaves a gap.
+    <div className="flex h-[calc(100vh-11rem)] min-h-[480px] flex-col">
       {(repoHomeUrl || repoRemote) && (
-        <div className="mb-2 flex items-center gap-2 text-[12px] text-ink-dim">
+        <div className="mb-2 flex shrink-0 items-center gap-2 text-[12px] text-ink-dim">
           <span className="rounded bg-surface px-2 py-0.5 font-mono">
             {repoRemote?.replace(/^.*[:/]([^/]+\/[^/]+?)(?:\.git)?$/, '$1') ?? 'repo'}
             {branch ? ` · ${branch}` : ''}
@@ -75,14 +83,16 @@ export default function ProjectCodeTab({
           )}
         </div>
       )}
-      {/* Flex (not grid) so the fixed container height propagates to the panes:
-          a grid with only `grid-cols` gives an auto (content-height) row, so
-          `h-full` children collapse to content and the code view grows to the
-          whole file instead of scrolling. Flex items stretch to the container
-          height by default, so each pane fills the viewport and scrolls
-          internally like an editor. The `12rem` offset (app header + project
-          header + tab bar) is an estimate — tune if it clips or leaves a gap. */}
-      <div className="flex h-[calc(100vh-12rem)] min-h-[480px] gap-3 max-md:h-auto max-md:flex-col">
+      {/* Flex (not grid) so the container height propagates to the panes: a
+          grid with only `grid-cols` gives an auto (content-height) row, so
+          `h-full` children collapse to content and the code view grows to
+          the whole file instead of scrolling. Flex items stretch to the
+          container height by default, so each pane fills the remaining
+          height and scrolls internally like an editor. `min-h-0` lets this
+          row shrink below its content's natural height inside the flex
+          column above — without it a flex child won't shrink past its
+          content size, which would blow through the fixed outer height. */}
+      <div className="flex min-h-0 flex-1 gap-3 max-md:flex-col max-md:overflow-visible">
         <aside className="h-full w-[264px] shrink-0 overflow-y-auto rounded-md border border-border bg-surface max-md:h-64 max-md:w-full">
           <FileNavigator wsId={wsId} findings={findings} selectedPath={selected} onSelect={onSelect} />
         </aside>

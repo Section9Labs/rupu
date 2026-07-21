@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Loader2, Search } from 'lucide-react';
 import { api, type FindingRecord, type FileListResult } from '../../lib/api';
 import { SEVERITY_STYLE, type Severity } from '../../lib/severity';
@@ -109,28 +109,33 @@ export default function FileNavigator({ wsId, findings, selectedPath, onSelect }
   const query = search.trim();
   const needsAllFiles = mode === 'all' && query !== '';
 
-  // Guards the lazy fetch below with a ref (not state): `allFilesLoading` is
-  // *set inside* the effect, so if it were also a dependency, flipping it to
-  // `true` would re-run the effect — and React runs the previous effect's
-  // cleanup first, flipping `live` to `false` before the fetch even
-  // resolves, silently dropping the result. A ref sidesteps that without
-  // adding a self-referential dependency.
-  const requestedFor = useRef<string | null>(null);
-
   // Reset the cache when the project changes, so a different workspace's
   // search doesn't see a stale file list.
   useEffect(() => {
-    requestedFor.current = null;
     setAllFiles(null);
     setAllFilesErr(null);
   }, [wsId]);
 
   // Lazy fetch: only hit the flat project-files endpoint once the user
   // actually needs it (All mode + a non-empty search), and only once per
-  // workspace — cached in state for the rest of the session.
+  // workspace — cached in `allFiles` (state) for the rest of the session.
+  //
+  // `allFiles` (not a pre-fetch ref) is the *only* guard, and it's set only
+  // from inside the `if (live)` success branch. This is deliberate: an
+  // earlier version marked a ref as "requested" synchronously before the
+  // fetch resolved, so a torn-down request (e.g. the user flips to Findings
+  // mode and back to All+search while the fetch is in flight — an ordinary
+  // interaction, not an edge case) permanently blocked every future fetch,
+  // since the ref stayed marked even though no result was ever applied —
+  // the UI got stuck on "Searching…" until a full remount. Guarding on the
+  // state itself instead means a cancelled fetch (one whose `live` flag was
+  // flipped false by cleanup before it resolved) never marks anything as
+  // done, so the next time `needsAllFiles` becomes true this effect simply
+  // retries. `allFiles` is deliberately in the dependency array too: once a
+  // fetch *does* succeed, that state change reruns this effect, and the
+  // guard now short-circuits before starting another one.
   useEffect(() => {
-    if (!needsAllFiles || requestedFor.current === wsId) return;
-    requestedFor.current = wsId;
+    if (!needsAllFiles || allFiles !== null) return;
     let live = true;
     setAllFilesLoading(true);
     api
@@ -147,7 +152,7 @@ export default function FileNavigator({ wsId, findings, selectedPath, onSelect }
     return () => {
       live = false;
     };
-  }, [needsAllFiles, wsId]);
+  }, [needsAllFiles, wsId, allFiles]);
 
   // Distinct, sorted file paths that have at least one finding.
   const findingFiles = useMemo(() => {
