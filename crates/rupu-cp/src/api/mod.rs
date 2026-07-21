@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod autoflow_claims;
 pub mod autoflows;
+pub mod code;
 pub mod config;
 pub mod coverage;
 pub mod dashboard;

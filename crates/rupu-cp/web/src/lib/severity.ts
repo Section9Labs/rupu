@@ -29,6 +29,9 @@ export interface SeverityStyle {
   ring: string;
   /** Solid background for the 1-px hairline bar at the card top */
   bar: string;
+  /** Border-colour counterpart of `bar` — for the CodeViewer's left-edge
+   *  severity band (`border-l-2` + this class) and other border accents. */
+  barBorder: string;
   /** Display label (uppercase in practice; kept lower here so callers can case-transform) */
   label: string;
   /** Combined pill class string for inline badges (bg + text + ring) */
@@ -41,6 +44,7 @@ export const SEVERITY_STYLE: Record<Severity, SeverityStyle> = {
     bg: 'bg-sev-critical-bg',
     ring: 'ring-sev-critical/30',
     bar: 'bg-sev-critical',
+    barBorder: 'border-sev-critical',
     label: 'critical',
     pill: 'bg-sev-critical-bg text-sev-critical ring-sev-critical/30',
   },
@@ -49,6 +53,7 @@ export const SEVERITY_STYLE: Record<Severity, SeverityStyle> = {
     bg: 'bg-sev-high-bg',
     ring: 'ring-sev-high/30',
     bar: 'bg-sev-high',
+    barBorder: 'border-sev-high',
     label: 'high',
     pill: 'bg-sev-high-bg text-sev-high ring-sev-high/30',
   },
@@ -57,6 +62,7 @@ export const SEVERITY_STYLE: Record<Severity, SeverityStyle> = {
     bg: 'bg-sev-medium-bg',
     ring: 'ring-sev-medium/30',
     bar: 'bg-sev-medium',
+    barBorder: 'border-sev-medium',
     label: 'medium',
     pill: 'bg-sev-medium-bg text-sev-medium ring-sev-medium/30',
   },
@@ -65,6 +71,7 @@ export const SEVERITY_STYLE: Record<Severity, SeverityStyle> = {
     bg: 'bg-sev-low-bg',
     ring: 'ring-sev-low/30',
     bar: 'bg-sev-low',
+    barBorder: 'border-sev-low',
     label: 'low',
     pill: 'bg-sev-low-bg text-sev-low ring-sev-low/30',
   },
@@ -73,7 +80,15 @@ export const SEVERITY_STYLE: Record<Severity, SeverityStyle> = {
     bg: 'bg-sev-info-bg',
     ring: 'ring-sev-info/30',
     bar: 'bg-sev-info',
+    barBorder: 'border-sev-info',
     label: 'info',
     pill: 'bg-sev-info-bg text-sev-info ring-sev-info/30',
   },
 };
+
+/** Severity ordering for "worst first" sorts (e.g. picking the dominant
+ *  severity when multiple findings stack on one source line). Higher = more
+ *  severe. */
+export function severityRank(sev: Severity): number {
+  return { critical: 4, high: 3, medium: 2, low: 1, info: 0 }[sev] ?? 0;
+}

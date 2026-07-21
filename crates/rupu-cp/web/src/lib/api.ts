@@ -1033,6 +1033,11 @@ export interface FindingRecord {
   evidence: FindingEvidence;
   declared_by: unknown;
   declared_at: string;
+  /** Deep link to the finding's location on the SCM's web UI (e.g. a GitHub
+   *  permalink pinned to the commit the finding was recorded against). Wired
+   *  up in a later task — optional so consumers (`InlineFindingCard`) can
+   *  guard it now and pick it up automatically once populated. */
+  permalink?: string | null;
 }
 
 /** Severity rollup for a set of findings — matches the `GET /api/findings`
@@ -1321,6 +1326,9 @@ export interface ProjectRow {
   path: string;
   repo_remote?: string | null;
   branch?: string | null;
+  /** Repository landing-page URL derived from `repo_remote` (github/gitlab
+   *  only; absent for an unrecognized host or no remote). */
+  repo_home_url?: string | null;
   created_at: string;
   last_run_at?: string | null;
   usage: UsageSummary;
@@ -1354,6 +1362,29 @@ export interface ProjectCoverageRow {
   assertion_lines: number;
   has_catalog: boolean;
   findings: number;
+}
+
+// ---------------------------------------------------------------------------
+// Project code browsing
+// ---------------------------------------------------------------------------
+
+export interface TreeEntry {
+  name: string;
+  path: string;
+  kind: 'dir' | 'file';
+}
+export interface TreeResult {
+  path: string;
+  parent: string | null;
+  entries: TreeEntry[];
+}
+export interface FileContent {
+  available: boolean;
+  path?: string;
+  language?: string | null;
+  totalLines?: number;
+  lines?: { n: number; text: string }[];
+  reason?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -2067,6 +2098,15 @@ export const api = {
   getProjectAssessedPct(wsId: string): Promise<ProjectAssessedPct> {
     return request<ProjectAssessedPct>(
       `/api/projects/${encodeURIComponent(wsId)}/coverage/assessed`,
+    );
+  },
+  getProjectTree(wsId: string, path?: string): Promise<TreeResult> {
+    const qs = path ? `?path=${encodeURIComponent(path)}` : '';
+    return request<TreeResult>(`/api/projects/${encodeURIComponent(wsId)}/tree${qs}`);
+  },
+  getProjectSource(wsId: string, path: string): Promise<FileContent> {
+    return request<FileContent>(
+      `/api/projects/${encodeURIComponent(wsId)}/source?path=${encodeURIComponent(path)}`,
     );
   },
 

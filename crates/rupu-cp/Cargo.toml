@@ -43,6 +43,7 @@ rupu-runtime = { path = "../rupu-runtime" }
 rupu-coverage = { path = "../rupu-coverage" }
 rupu-transcript = { path = "../rupu-transcript" }
 rupu-ast = { path = "../rupu-ast" }
+rupu-scm = { path = "../rupu-scm" }
 
 [dev-dependencies]
 chrono.workspace = true

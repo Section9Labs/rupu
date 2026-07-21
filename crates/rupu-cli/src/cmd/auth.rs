@@ -42,10 +42,11 @@ pub enum Action {
     },
     /// Show configured providers + backend.
     Status,
-    /// Inspect or change the credential storage backend (OS keychain
-    /// vs chmod-600 JSON file). Use `--use file` if the macOS
-    /// keychain is dropping credentials between signed-binary
-    /// updates.
+    /// Inspect or change the credential storage backend.
+    ///
+    /// OS keychain (default) vs chmod-600 JSON file. Use `--use file`
+    /// if the macOS keychain is dropping credentials between
+    /// signed-binary updates.
     Backend {
         /// `keychain` (default on macOS / Linux with secret-service /
         /// Windows) or `file` (chmod-600 `~/.rupu/auth.json`).

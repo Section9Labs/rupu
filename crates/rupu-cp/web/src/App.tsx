@@ -89,6 +89,7 @@ export default function App() {
                 Definitions stays a standalone page. */}
             <Route path="/projects/:wsId/runs" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="runs" /></Suspense>} />
             <Route path="/projects/:wsId/findings" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="findings" /></Suspense>} />
+            <Route path="/projects/:wsId/code" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="code" /></Suspense>} />
             <Route path="/projects/:wsId/sessions" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="sessions" /></Suspense>} />
             <Route path="/projects/:wsId/coverage" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="coverage" /></Suspense>} />
             <Route path="/projects/:wsId/config" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="config" /></Suspense>} />

@@ -5,8 +5,11 @@
  * (`SourcePreview`).
  *
  * Uses highlight.js core with a fixed set of registered grammars to keep the
- * bundle lean, reusing the same GitHub light theme as the transcript
- * markdown renderer. `ini`'s grammar ships a built-in `toml` alias — TOML's
+ * bundle lean, styled by a local two-theme stylesheet (`codeHighlight.css`)
+ * keyed off `[data-hl-theme]` so it tracks the CP's light/dark theme, mirroring
+ * the GitHub light/dark hexes the transcript markdown renderer and the
+ * CodeMirror editor (`codeHighlightTheme.ts`) already use. `ini`'s grammar
+ * ships a built-in `toml` alias — TOML's
  * `key = value` / `[section]` syntax highlights correctly under it without
  * pulling in a dedicated TOML grammar/dependency. Highlighted markup is
  * injected via `dangerouslySetInnerHTML`; the input is trusted local
@@ -24,6 +27,7 @@
  *    no block wrapper, for `SourcePreview`'s line-numbered gutter layout.
  */
 
+import { useContext } from 'react';
 import hljs from 'highlight.js/lib/core';
 import yaml from 'highlight.js/lib/languages/yaml';
 import markdown from 'highlight.js/lib/languages/markdown';
@@ -35,9 +39,12 @@ import javascript from 'highlight.js/lib/languages/javascript';
 import go from 'highlight.js/lib/languages/go';
 import json from 'highlight.js/lib/languages/json';
 
-// Light GitHub-style theme — matches the transcript markdown renderer; the CP
-// is light-only so no dark-mode switching is needed.
-import 'highlight.js/styles/github.css';
+import { ThemeContext } from './theme/ThemeProvider';
+
+// Two-theme hljs token palette, selected at runtime via `[data-hl-theme]` —
+// replaces the old light-only `highlight.js/styles/github.css` import so this
+// component can switch with the CP's light/dark theme (see codeHighlight.css).
+import './codeHighlight.css';
 
 hljs.registerLanguage('yaml', yaml);
 hljs.registerLanguage('markdown', markdown);
@@ -119,6 +126,17 @@ export default function CodeHighlight({
   frontmatter = false,
   inline = false,
 }: CodeHighlightProps) {
+  // Provider-optional: read the theme from context when a <ThemeProvider> is
+  // present (the app path), falling back to the live `data-theme` attribute
+  // instead of throwing — mirrors `useThemeColors`/`CodeEditor`'s pattern so
+  // isolated tests and detached previews that render CodeHighlight without a
+  // provider (SourcePreview, AgentDetail, RawEditor, ...) keep working.
+  const themeCtx = useContext(ThemeContext);
+  const mode =
+    themeCtx?.mode ??
+    (typeof document !== 'undefined' && document.documentElement.dataset.theme === 'dark'
+      ? 'dark'
+      : 'light');
   let html: string;
   if (frontmatter) {
     const { frontmatter: fm, body } = splitFrontmatter(code);
@@ -135,12 +153,20 @@ export default function CodeHighlight({
   }
 
   if (inline) {
-    return <code className="hljs whitespace-pre font-mono" dangerouslySetInnerHTML={{ __html: html }} />;
+    return (
+      <code
+        className="hljs whitespace-pre font-mono"
+        data-hl-theme={mode}
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+    );
   }
 
+  // Covers both the whole-string mode and the `frontmatter` mode (agent `.md`
+  // definitions) — both render through this block wrapper.
   return (
     <pre className={PRE_CLASS}>
-      <code className="hljs" dangerouslySetInnerHTML={{ __html: html }} />
+      <code className="hljs" data-hl-theme={mode} dangerouslySetInnerHTML={{ __html: html }} />
     </pre>
   );
 }

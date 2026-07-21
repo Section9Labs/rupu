@@ -65,8 +65,9 @@ pub enum Action {
         #[arg(long, conflicts_with = "skip_events")]
         only_events: bool,
     },
-    /// Read-only inspection of event-triggered workflows: prints
-    /// each workflow's name, target event id, sources from
+    /// Read-only inspection of event-triggered workflows.
+    ///
+    /// Prints each workflow's name, target event id, sources from
     /// `[triggers].poll_sources`, and the most recent persisted
     /// cursor across those sources.
     Events {

@@ -4,10 +4,11 @@
 // Config). The active tab is driven by the `tab` prop, set per-route in
 // App.tsx.
 
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
   Activity,
+  Code2,
   GitBranch,
   GitFork,
   LayoutDashboard,
@@ -32,7 +33,14 @@ import ProjectConfigTab from '../components/project/ProjectConfigTab';
 import { relativeTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
 
-export type ProjectTab = 'overview' | 'runs' | 'findings' | 'sessions' | 'coverage' | 'config';
+// The Code tab's subtree (FileTree/CodeViewer/InlineFindingCard, which in turn
+// reaches the heavy `manualChunks.markdown` group via Markdown) is loaded via
+// React.lazy, mirroring CodeEditor.tsx/ExpressionField.tsx's Impl-splitting
+// pattern, so that code only ships to the browser once the Code tab is opened
+// rather than with every ProjectDetail chunk load.
+const ProjectCodeTab = lazy(() => import('../components/project/ProjectCodeTab'));
+
+export type ProjectTab = 'overview' | 'runs' | 'findings' | 'code' | 'sessions' | 'coverage' | 'config';
 
 // ---------------------------------------------------------------------------
 // Rollup tile
@@ -267,6 +275,12 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
             label="Findings"
           />
           <TabButton
+            active={tab === 'code'}
+            onClick={() => navigate(`/projects/${encodedId}/code`)}
+            icon={Code2}
+            label="Code"
+          />
+          <TabButton
             active={tab === 'sessions'}
             onClick={() => navigate(`/projects/${encodedId}/sessions`)}
             icon={MessageSquare}
@@ -293,6 +307,22 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
       )}
       {tab === 'runs' && <ProjectRunsTab wsId={p.ws_id} />}
       {tab === 'findings' && <ProjectFindingsTab wsId={p.ws_id} />}
+      {tab === 'code' && (
+        <Suspense
+          fallback={
+            <div className="flex h-40 items-center justify-center text-sm text-ink-dim">
+              Loading…
+            </div>
+          }
+        >
+          <ProjectCodeTab
+            wsId={p.ws_id}
+            repoHomeUrl={p.repo_home_url ?? null}
+            repoRemote={p.repo_remote ?? null}
+            branch={p.branch ?? null}
+          />
+        </Suspense>
+      )}
       {tab === 'sessions' && <ProjectSessionsTab wsId={p.ws_id} />}
       {tab === 'coverage' && <ProjectCoverageTab wsId={p.ws_id} />}
       {tab === 'config' && <ProjectConfigTab wsId={p.ws_id} />}
