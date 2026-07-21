@@ -1033,6 +1033,11 @@ export interface FindingRecord {
   evidence: FindingEvidence;
   declared_by: unknown;
   declared_at: string;
+  /** Deep link to the finding's location on the SCM's web UI (e.g. a GitHub
+   *  permalink pinned to the commit the finding was recorded against). Wired
+   *  up in a later task — optional so consumers (`InlineFindingCard`) can
+   *  guard it now and pick it up automatically once populated. */
+  permalink?: string | null;
 }
 
 /** Severity rollup for a set of findings — matches the `GET /api/findings`

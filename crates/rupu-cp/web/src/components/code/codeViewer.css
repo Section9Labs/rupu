@@ -1,0 +1,37 @@
+/* CodeViewer visual extras.
+ *
+ * `.finding-squiggle` draws a wavy underline beneath a source line that
+ * anchors one or more findings — a secondary "look here" cue alongside the
+ * severity band, matching the aikido reference's inline-review-comment look.
+ *
+ * Colour comes from `--squiggle-rgb`, an `--c-sev-*` triple set inline by
+ * `CodeViewer` per line (the dominant severity when several findings stack),
+ * so it themes automatically with light/dark like every other sev token —
+ * no literal colour lives here, only the wave geometry.
+ */
+.finding-squiggle {
+  --squiggle-rgb: var(--c-ink-mute);
+  display: inline-block;
+  background-repeat: repeat-x;
+  background-position: 0 100%;
+  background-size: 6px 3px;
+  padding-bottom: 2px;
+  background-image: linear-gradient(
+      135deg,
+      transparent 0%,
+      transparent 40%,
+      rgb(var(--squiggle-rgb) / 0.75) 40%,
+      rgb(var(--squiggle-rgb) / 0.75) 60%,
+      transparent 60%,
+      transparent 100%
+    ),
+    linear-gradient(
+      45deg,
+      transparent 0%,
+      transparent 40%,
+      rgb(var(--squiggle-rgb) / 0.75) 40%,
+      rgb(var(--squiggle-rgb) / 0.75) 60%,
+      transparent 60%,
+      transparent 100%
+    );
+}
