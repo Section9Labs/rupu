@@ -4,6 +4,7 @@
 //! containment primitive the run-scoped source endpoint uses — no path here
 //! ever escapes the workspace root.
 
+use crate::api::source::{detect_language, SourceLine};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use axum::{
@@ -119,8 +120,90 @@ async fn get_tree(
     Ok(Json(res))
 }
 
+/// Whole-file cap. Larger files soft-fail (the viewer shows a placeholder).
+const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+#[derive(Debug, Serialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FileContent {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_lines: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines: Option<Vec<SourceLine>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl FileContent {
+    fn unavailable(reason: impl Into<String>) -> Self {
+        FileContent {
+            available: false,
+            reason: Some(reason.into()),
+            ..Default::default()
+        }
+    }
+}
+
+/// Read a workspace-relative file whole (up to `MAX_FILE_BYTES`). Missing,
+/// oversized, non-file, or non-UTF-8 targets return `available:false` with a
+/// reason (HTTP 200) — only path-safety violations are hard errors.
+fn read_whole_file(workspace: &FsPath, rel: &str) -> Result<FileContent, ApiError> {
+    let file = crate::api::source::resolve_under_workspace(workspace, rel)?;
+    if !file.is_file() {
+        return Ok(FileContent::unavailable("file not found"));
+    }
+    let meta = match std::fs::metadata(&file) {
+        Ok(m) => m,
+        Err(_) => return Ok(FileContent::unavailable("file not found")),
+    };
+    if meta.len() > MAX_FILE_BYTES {
+        return Ok(FileContent::unavailable("file too large to display"));
+    }
+    let bytes = match std::fs::read(&file) {
+        Ok(b) => b,
+        Err(e) => return Ok(FileContent::unavailable(e.to_string())),
+    };
+    let text = match String::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(_) => return Ok(FileContent::unavailable("binary or non-UTF-8 file")),
+    };
+    let lines: Vec<SourceLine> = text
+        .lines()
+        .enumerate()
+        .map(|(i, l)| SourceLine {
+            n: i + 1,
+            text: l.to_string(),
+        })
+        .collect();
+    Ok(FileContent {
+        available: true,
+        path: Some(rel.to_string()),
+        language: detect_language(&file),
+        total_lines: Some(lines.len()),
+        lines: Some(lines),
+        reason: None,
+    })
+}
+
+async fn get_source(
+    Path(ws_id): Path<String>,
+    Query(q): Query<TreeQuery>,
+    State(s): State<AppState>,
+) -> ApiResult<Json<FileContent>> {
+    let w = load_workspace(&s, &ws_id)?;
+    let fc = read_whole_file(FsPath::new(&w.path), &q.path)?;
+    Ok(Json(fc))
+}
+
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/projects/:ws_id/tree", get(get_tree))
+    Router::new()
+        .route("/api/projects/:ws_id/tree", get(get_tree))
+        .route("/api/projects/:ws_id/source", get(get_source))
 }
 
 #[cfg(test)]
@@ -182,5 +265,52 @@ mod tests {
         let d = tmp_ws();
         let err = list_tree(d.path(), "README.md").unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn reads_whole_file_with_language_and_line_numbers() {
+        let d = tmp_ws();
+        let fc = read_whole_file(d.path(), "src/main.rs").unwrap();
+        assert!(fc.available);
+        assert_eq!(fc.path.as_deref(), Some("src/main.rs"));
+        assert_eq!(fc.language, Some("rust"));
+        assert_eq!(fc.total_lines, Some(1));
+        let lines = fc.lines.unwrap();
+        assert_eq!(lines[0].n, 1);
+        assert_eq!(lines[0].text, "fn main() {}");
+    }
+
+    #[test]
+    fn source_refuses_escape() {
+        let d = tmp_ws();
+        let err = read_whole_file(d.path(), "../secret").unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn source_soft_fails_on_missing_file() {
+        let d = tmp_ws();
+        let fc = read_whole_file(d.path(), "src/nope.rs").unwrap();
+        assert!(!fc.available);
+        assert!(fc.reason.is_some());
+        assert!(fc.lines.is_none());
+    }
+
+    #[test]
+    fn source_soft_fails_on_oversized_file() {
+        let d = tmp_ws();
+        let big = vec![b'a'; (MAX_FILE_BYTES + 1) as usize];
+        std::fs::write(d.path().join("big.bin"), &big).unwrap();
+        let fc = read_whole_file(d.path(), "big.bin").unwrap();
+        assert!(!fc.available);
+        assert!(fc.reason.as_deref().unwrap().contains("too large"));
+    }
+
+    #[test]
+    fn source_soft_fails_on_non_utf8() {
+        let d = tmp_ws();
+        std::fs::write(d.path().join("bin.dat"), [0xff, 0xfe, 0x00]).unwrap();
+        let fc = read_whole_file(d.path(), "bin.dat").unwrap();
+        assert!(!fc.available);
     }
 }
