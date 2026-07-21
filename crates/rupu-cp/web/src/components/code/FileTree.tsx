@@ -25,6 +25,13 @@ function rollup(findings: FindingRecord[], prefix: string, isDir: boolean) {
   return { worst, count: match.length };
 }
 
+/** Worst severity + count of findings on exactly one file (no folder
+ *  rollup). Shared by `FileTree`'s file-node badge and `FileNavigator`'s
+ *  flat findings/search lists, so both badge the same file the same way. */
+export function fileFindingSummary(findings: FindingRecord[], path: string) {
+  return rollup(findings, path, false);
+}
+
 function Badge({ node, findings }: { node: TreeEntry; findings: FindingRecord[] }) {
   const r = rollup(findings, node.path, node.kind === 'dir');
   if (!r) return null;
