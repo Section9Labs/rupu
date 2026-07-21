@@ -10,6 +10,7 @@ import { cn } from '../lib/cn';
 import CodeHighlight from '../components/CodeHighlight';
 import CodeEditor from '../components/CodeEditor';
 import AgentLauncherSheet from '../components/AgentLauncherSheet';
+import AgentUsageTimeline from '../components/agent/AgentUsageTimeline';
 import { Button } from '../components/ui/Button';
 
 export default function AgentDetailPage() {
@@ -146,6 +147,11 @@ export default function AgentDetailPage() {
           <p className="mt-2 text-sm text-ink-dim leading-snug">{agent.description}</p>
         )}
       </header>
+
+      <section className="mt-8">
+        <h2 className="mb-2 pl-1 text-sm font-semibold text-ink">Spend over time</h2>
+        <AgentUsageTimeline agent={name} />
+      </section>
 
       <section className="mt-8">
         <div className="mb-2 flex items-center justify-between pl-1">

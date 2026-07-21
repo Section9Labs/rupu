@@ -11,6 +11,7 @@ import { ListCard } from '../lists/ListCard';
 import { StatusPill } from '../StatusPill';
 import { TriggerChip } from '../TriggerChip';
 import { relativeTime } from '../../lib/time';
+import ProjectUsageTimeline from './ProjectUsageTimeline';
 
 // Top N recent runs shown inline; the "see all →" link covers the rest.
 const RECENT_LIMIT = 5;
@@ -53,6 +54,13 @@ export default function ProjectOverviewTab({
 
   return (
     <div className="space-y-6">
+      {/* The spend-over-time graph — same reused `/usage` graph
+          `ProjectRunsTab` mounts, scoped to this project's `workspace_id`.
+          Independent data source (its own `getUsageRuns` fetch), so it
+          renders regardless of the recent-runs/coverage/sessions state
+          above. */}
+      <ProjectUsageTimeline wsId={wsId} />
+
       {/* ── Recent runs ── */}
       <section>
         <SectionTitle title="Recent runs" href={`/projects/${encodedId}/runs`} />

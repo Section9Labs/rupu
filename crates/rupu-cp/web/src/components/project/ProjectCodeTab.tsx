@@ -75,11 +75,11 @@ export default function ProjectCodeTab({
           )}
         </div>
       )}
-      <div className="grid grid-cols-[minmax(200px,280px)_1fr] gap-3 max-md:grid-cols-1">
-        <aside className="max-h-[70vh] overflow-y-auto rounded-md border border-border bg-surface">
+      <div className="grid h-[calc(100vh-13rem)] min-h-[420px] grid-cols-[minmax(200px,280px)_1fr] gap-3 max-md:grid-cols-1">
+        <aside className="h-full overflow-y-auto rounded-md border border-border bg-surface">
           <FileTree wsId={wsId} findings={findings} selectedPath={selected} onSelect={onSelect} />
         </aside>
-        <section className="min-w-0">
+        <section className="h-full min-w-0">
           {selected ? (
             <CodeViewer
               wsId={wsId}

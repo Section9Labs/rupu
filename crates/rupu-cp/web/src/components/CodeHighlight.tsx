@@ -38,6 +38,30 @@ import typescript from 'highlight.js/lib/languages/typescript';
 import javascript from 'highlight.js/lib/languages/javascript';
 import go from 'highlight.js/lib/languages/go';
 import json from 'highlight.js/lib/languages/json';
+import c from 'highlight.js/lib/languages/c';
+import cpp from 'highlight.js/lib/languages/cpp';
+import csharp from 'highlight.js/lib/languages/csharp';
+import java from 'highlight.js/lib/languages/java';
+import kotlin from 'highlight.js/lib/languages/kotlin';
+import swift from 'highlight.js/lib/languages/swift';
+import ruby from 'highlight.js/lib/languages/ruby';
+import php from 'highlight.js/lib/languages/php';
+import bash from 'highlight.js/lib/languages/bash';
+import shell from 'highlight.js/lib/languages/shell';
+import sql from 'highlight.js/lib/languages/sql';
+import xml from 'highlight.js/lib/languages/xml';
+import css from 'highlight.js/lib/languages/css';
+import scss from 'highlight.js/lib/languages/scss';
+import less from 'highlight.js/lib/languages/less';
+import dockerfile from 'highlight.js/lib/languages/dockerfile';
+import makefile from 'highlight.js/lib/languages/makefile';
+import lua from 'highlight.js/lib/languages/lua';
+import r from 'highlight.js/lib/languages/r';
+import scala from 'highlight.js/lib/languages/scala';
+import perl from 'highlight.js/lib/languages/perl';
+import dart from 'highlight.js/lib/languages/dart';
+import objectivec from 'highlight.js/lib/languages/objectivec';
+import plaintext from 'highlight.js/lib/languages/plaintext';
 
 import { ThemeContext } from './theme/ThemeProvider';
 
@@ -56,8 +80,32 @@ hljs.registerLanguage('typescript', typescript);
 hljs.registerLanguage('javascript', javascript);
 hljs.registerLanguage('go', go);
 hljs.registerLanguage('json', json);
+hljs.registerLanguage('c', c);
+hljs.registerLanguage('cpp', cpp);
+hljs.registerLanguage('csharp', csharp);
+hljs.registerLanguage('java', java);
+hljs.registerLanguage('kotlin', kotlin);
+hljs.registerLanguage('swift', swift);
+hljs.registerLanguage('ruby', ruby);
+hljs.registerLanguage('php', php);
+hljs.registerLanguage('bash', bash);
+hljs.registerLanguage('shell', shell);
+hljs.registerLanguage('sql', sql);
+hljs.registerLanguage('xml', xml);
+hljs.registerLanguage('css', css);
+hljs.registerLanguage('scss', scss);
+hljs.registerLanguage('less', less);
+hljs.registerLanguage('dockerfile', dockerfile);
+hljs.registerLanguage('makefile', makefile);
+hljs.registerLanguage('lua', lua);
+hljs.registerLanguage('r', r);
+hljs.registerLanguage('scala', scala);
+hljs.registerLanguage('perl', perl);
+hljs.registerLanguage('dart', dart);
+hljs.registerLanguage('objectivec', objectivec);
+hljs.registerLanguage('plaintext', plaintext);
 
-type Language =
+export type Language =
   | 'yaml'
   | 'markdown'
   | 'toml'
@@ -66,11 +114,37 @@ type Language =
   | 'typescript'
   | 'javascript'
   | 'go'
-  | 'json';
+  | 'json'
+  | 'c'
+  | 'cpp'
+  | 'csharp'
+  | 'java'
+  | 'kotlin'
+  | 'swift'
+  | 'ruby'
+  | 'php'
+  | 'bash'
+  | 'shell'
+  | 'sql'
+  | 'xml'
+  | 'css'
+  | 'scss'
+  | 'less'
+  | 'dockerfile'
+  | 'makefile'
+  | 'lua'
+  | 'r'
+  | 'scala'
+  | 'perl'
+  | 'dart'
+  | 'objectivec'
+  | 'plaintext';
 
 /** Languages registered above — used by `SourcePreview` to guard against
  *  highlighting with a language hljs doesn't know about (falls back to
- *  plain, unhighlighted text). */
+ *  plain, unhighlighted text). Kept narrow (its original set) so
+ *  `SourcePreview`'s existing behaviour/tests are untouched; `CodeViewer`
+ *  (the Code tab) drives off the broader `HIGHLIGHTABLE_LANGUAGES` below. */
 export const SOURCE_PREVIEW_LANGUAGES: ReadonlySet<string> = new Set([
   'rust',
   'python',
@@ -78,6 +152,45 @@ export const SOURCE_PREVIEW_LANGUAGES: ReadonlySet<string> = new Set([
   'javascript',
   'go',
   'json',
+]);
+
+/** Every hljs grammar registered above — used by `CodeViewer` (the Code tab)
+ *  to decide whether a backend-detected `language` tag can be highlighted.
+ *  Any language not in this set falls back to plain, unhighlighted text. */
+export const HIGHLIGHTABLE_LANGUAGES: ReadonlySet<string> = new Set([
+  'yaml',
+  'markdown',
+  'toml',
+  'rust',
+  'python',
+  'typescript',
+  'javascript',
+  'go',
+  'json',
+  'c',
+  'cpp',
+  'csharp',
+  'java',
+  'kotlin',
+  'swift',
+  'ruby',
+  'php',
+  'bash',
+  'shell',
+  'sql',
+  'xml',
+  'css',
+  'scss',
+  'less',
+  'dockerfile',
+  'makefile',
+  'lua',
+  'r',
+  'scala',
+  'perl',
+  'dart',
+  'objectivec',
+  'plaintext',
 ]);
 
 // Matches a leading `---` … `---` frontmatter fence. The body capture keeps its
