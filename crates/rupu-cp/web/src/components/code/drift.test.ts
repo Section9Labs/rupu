@@ -34,9 +34,13 @@ describe('isFindingStale', () => {
     expect(isFindingStale('let x = 1;', lines(['only one line']), [5, 5])).toBe(true);
   });
 
-  it('detects a real change even when blank lines rearrange', () => {
-    const excerpt = 'let x = 1;\n\nlet y = 2;'; // blank interior line (line 3)
-    const changed = lines(['fn a() {}', '  let x = 1;', '  let y = 2;', '  extra();']); // lines 2-4 now non-blank/changed
-    expect(isFindingStale(excerpt, changed, [2, 4])).toBe(true);
+  it('detects drift when a recorded interior blank line no longer aligns', () => {
+    // Excerpt was recorded with a blank line between the two statements…
+    const excerpt = 'let x = 1;\n\nlet y = 2;';
+    // …but the file at [2,3] now has them adjacent (blank gone). Old filter-all-blanks
+    // logic collapsed both sides to ['let x = 1;','let y = 2;'] and reported NOT stale;
+    // positional compare sees want.length 3 vs have.length 2 → stale.
+    const file = lines(['fn a() {}', '  let x = 1;', '  let y = 2;', '}']);
+    expect(isFindingStale(excerpt, file, [2, 3])).toBe(true);
   });
 });
