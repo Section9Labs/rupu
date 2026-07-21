@@ -24,12 +24,11 @@ import { useCallback, useEffect, useMemo, useState, useTransition } from 'react'
 import { presetWindow, windowFromDayRange, type DashboardRange, type UsageRunRow, type UsageWindow } from '../../lib/api';
 import { formatCost, formatTokens } from '../../lib/usage';
 import { aggregateRuns, type TimelineFilter } from '../../lib/usage/buildTimeline';
-import { PivotPicker, PIVOT_LABEL, type Pivot } from '../usage/PivotPicker';
+import { PIVOT_LABEL, type Pivot } from '../usage/PivotPicker';
+import UsageRangeControls from '../usage/UsageRangeControls';
 import UsageTimeline from '../usage/UsageTimeline';
 import { type UsageMetric } from '../dashboard/UsageTimelineStacked';
 import ModelBreakdownTable from '../dashboard/ModelBreakdownTable';
-
-const RANGES: DashboardRange[] = ['7d', '30d', 'all'];
 
 function toggleInSet(set: Set<string>, key: string): Set<string> {
   const next = new Set(set);
@@ -122,33 +121,14 @@ export default function ProjectUsageTimeline({ wsId }: { wsId: string }) {
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-center justify-end gap-2">
-        <PivotPicker value={pivot} onChange={(p) => startTransition(() => setPivot(p))} />
-        {isCustomWindow && (
-          <button
-            type="button"
-            onClick={clearCustomWindow}
-            className="rounded-full border border-border px-2 py-0.5 text-[10px] text-ink-mute hover:bg-surface"
-            title="Clear the drag-selected window and return to the active preset"
-          >
-            custom · ×
-          </button>
-        )}
-        <div className="flex rounded-md border border-border">
-          {RANGES.map((r) => (
-            <button
-              key={r}
-              type="button"
-              onClick={() => handleRangeChange(r)}
-              className={`px-2 py-1 text-xs ${
-                !isCustomWindow && range === r ? 'bg-surface text-ink' : 'text-ink-mute'
-              }`}
-            >
-              {r}
-            </button>
-          ))}
-        </div>
-      </div>
+      <UsageRangeControls
+        range={range}
+        isCustomWindow={isCustomWindow}
+        onRangeChange={handleRangeChange}
+        onClearCustom={clearCustomWindow}
+        pivot={pivot}
+        onPivotChange={(p) => startTransition(() => setPivot(p))}
+      />
 
       <UsageTimeline
         workspaceId={wsId}
