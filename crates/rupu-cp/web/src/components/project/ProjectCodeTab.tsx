@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api, type FindingRecord } from '../../lib/api';
-import FileTree from '../code/FileTree';
+import FileNavigator from '../code/FileNavigator';
 import CodeViewer from '../code/CodeViewer';
 
 export interface ProjectCodeTabProps {
@@ -84,7 +84,7 @@ export default function ProjectCodeTab({
           header + tab bar) is an estimate — tune if it clips or leaves a gap. */}
       <div className="flex h-[calc(100vh-12rem)] min-h-[480px] gap-3 max-md:h-auto max-md:flex-col">
         <aside className="h-full w-[264px] shrink-0 overflow-y-auto rounded-md border border-border bg-surface max-md:h-64 max-md:w-full">
-          <FileTree wsId={wsId} findings={findings} selectedPath={selected} onSelect={onSelect} />
+          <FileNavigator wsId={wsId} findings={findings} selectedPath={selected} onSelect={onSelect} />
         </aside>
         <section className="h-full min-w-0 flex-1">
           {selected ? (
