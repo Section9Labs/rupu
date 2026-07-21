@@ -28,7 +28,7 @@ function rollup(findings: FindingRecord[], prefix: string, isDir: boolean) {
 function Badge({ node, findings }: { node: TreeEntry; findings: FindingRecord[] }) {
   const r = rollup(findings, node.path, node.kind === 'dir');
   if (!r) return null;
-  const style = SEVERITY_STYLE[r.worst];
+  const style = SEVERITY_STYLE[r.worst] ?? SEVERITY_STYLE.info;
   return (
     <span
       data-testid={`badge-${node.path}`}

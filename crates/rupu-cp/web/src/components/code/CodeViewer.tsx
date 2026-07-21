@@ -131,7 +131,7 @@ export default function CodeViewer({ wsId, path, findings, initialLine }: CodeVi
           const here = grouped.get(ln.n);
           const worst = here?.[0];
           const sev = worst ? ((worst.severity as Severity) ?? 'info') : null;
-          const style = sev ? SEVERITY_STYLE[sev] : null;
+          const style = worst ? (SEVERITY_STYLE[worst.severity as Severity] ?? SEVERITY_STYLE.info) : null;
           const isAnchorLine = initialLine === ln.n;
 
           return (

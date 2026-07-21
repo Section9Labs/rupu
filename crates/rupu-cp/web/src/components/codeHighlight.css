@@ -19,7 +19,7 @@
 [data-hl-theme='light'] .hljs-tag { color: #116329; }
 
 [data-hl-theme='dark'].hljs,
-[data-hl-theme='dark'] { color: #e6edf3; }
+[data-hl-theme='dark'] { color: rgb(var(--c-ink)); }
 [data-hl-theme='dark'] .hljs-keyword,
 [data-hl-theme='dark'] .hljs-type { color: #ff7b72; }
 [data-hl-theme='dark'] .hljs-string { color: #a5d6ff; }
