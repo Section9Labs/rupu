@@ -32,6 +32,7 @@ import type { HostFreshness, Pivot } from '../../lib/api';
 import { assignModelColors, pivotLabel } from './modelColors';
 import { assignCategoricalColors } from '../usage/pivotColors';
 import { useDragSelection } from './useDragSelection';
+import { Skeleton } from '../ui/Skeleton';
 
 export type UsageMetric = 'cost' | 'tokens';
 
@@ -87,6 +88,7 @@ export default function UsageTimelineStacked({
   pivot = 'model',
   hosts,
   onSelectRange,
+  loading = false,
 }: {
   buckets: UsageTimelineBucket[];
   metric: UsageMetric;
@@ -108,6 +110,17 @@ export default function UsageTimelineStacked({
    * component) see no behavior change at all.
    */
   onSelectRange?: (startDay: string, endDay: string) => void;
+  /**
+   * The caller hasn't heard back from its fetch yet — distinct from
+   * "loaded and genuinely empty" (`buckets` is `[]` AFTER the fetch
+   * resolved). Without this, an empty initial `buckets={[]}` while the
+   * request is in flight rendered the exact same "No usage recorded yet"
+   * copy as a real empty result, so a slow network read as "there's
+   * nothing here" instead of "still loading". Optional, defaults to
+   * `false` — every existing caller that doesn't track loading keeps its
+   * current behavior verbatim.
+   */
+  loading?: boolean;
 }) {
   const theme = useThemeColors();
   const drag = useDragSelection(onSelectRange);
@@ -120,6 +133,19 @@ export default function UsageTimelineStacked({
     padding: '6px 10px',
   };
   const { models, data } = toChartData(buckets, metric, pivot);
+
+  if (loading) {
+    return (
+      <div className="h-[240px] flex flex-col justify-end gap-2 p-2" aria-busy="true" aria-label="Loading usage graph">
+        <Skeleton className="h-[80%] w-full" />
+        <div className="flex gap-3">
+          <Skeleton className="h-3 w-16" />
+          <Skeleton className="h-3 w-20" />
+          <Skeleton className="h-3 w-12" />
+        </div>
+      </div>
+    );
+  }
 
   if (data.length === 0 || models.length === 0) {
     return (

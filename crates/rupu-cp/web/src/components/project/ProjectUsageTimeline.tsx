@@ -20,7 +20,7 @@
 // scope an outlier panel to, and rendering the fleet-wide list here would
 // misrepresent it as project-scoped. Deferred; see the U4 report for detail.
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, useTransition } from 'react';
 import { presetWindow, windowFromDayRange, type DashboardRange, type UsageRunRow, type UsageWindow } from '../../lib/api';
 import { formatCost, formatTokens } from '../../lib/usage';
 import { aggregateRuns, type TimelineFilter } from '../../lib/usage/buildTimeline';
@@ -52,6 +52,11 @@ export default function ProjectUsageTimeline({ wsId }: { wsId: string }) {
   const [pivot, setPivot] = useState<Pivot>('model');
   const [metric, setMetric] = useState<UsageMetric>('cost');
   const [runs, setRuns] = useState<UsageRunRow[]>([]);
+  // Task loading-ux: see the identical comment in `Usage.tsx` — pivot/filter
+  // changes recompute `UsageTimeline`'s graph in memory (no refetch),
+  // `isPending` marks that brief window so the shared graph can show a
+  // subtle "updating" cue instead of just snapping to the new shape.
+  const [isPending, startTransition] = useTransition();
 
   const handleRangeChange = useCallback((r: DashboardRange) => {
     setRange(r);
@@ -88,11 +93,15 @@ export default function ProjectUsageTimeline({ wsId }: { wsId: string }) {
   );
 
   const toggleKey = useCallback((key: string) => {
-    setExcludedKeys((prev) => toggleInSet(prev, key));
+    startTransition(() => {
+      setExcludedKeys((prev) => toggleInSet(prev, key));
+    });
   }, []);
   const resetExclusions = useCallback(() => {
-    setExcludedKeys(new Set());
-    setExcludedRunIds(new Set());
+    startTransition(() => {
+      setExcludedKeys(new Set());
+      setExcludedRunIds(new Set());
+    });
   }, []);
 
   const excludedCount = excludedKeys.size + excludedRunIds.size;
@@ -114,7 +123,7 @@ export default function ProjectUsageTimeline({ wsId }: { wsId: string }) {
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-end gap-2">
-        <PivotPicker value={pivot} onChange={setPivot} />
+        <PivotPicker value={pivot} onChange={(p) => startTransition(() => setPivot(p))} />
         {isCustomWindow && (
           <button
             type="button"
@@ -152,6 +161,7 @@ export default function ProjectUsageTimeline({ wsId }: { wsId: string }) {
         onReset={resetExclusions}
         onRunsLoaded={setRuns}
         onSelectRange={handleSelectRange}
+        pending={isPending}
         headline={{
           costLabel: formatCost(sawPriced ? totalCost : null),
           subLabel: `${formatTokens(totalTokens)} tokens · ${totalRuns} runs${

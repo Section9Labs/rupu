@@ -23,6 +23,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { api, type HostFreshness, type Pivot, type UsageRunRow, type UsageWindow } from '../../lib/api';
 import { buildTimeline, type TimelineFilter } from '../../lib/usage/buildTimeline';
 import UsageTimelineStacked, { type UsageMetric } from '../dashboard/UsageTimelineStacked';
+import { Spinner } from '../ui/Spinner';
 
 const METRICS: UsageMetric[] = ['cost', 'tokens'];
 
@@ -39,6 +40,7 @@ export default function UsageTimeline({
   headline,
   onRunsLoaded,
   onSelectRange,
+  pending,
 }: {
   /** Scopes the fetch to one project's runs. Omitted on `/usage` — all
    *  local runs. */
@@ -67,8 +69,28 @@ export default function UsageTimeline({
    * component has no window state of its own to update.
    */
   onSelectRange?: (startDay: string, endDay: string) => void;
+  /**
+   * An external "this is about to change" signal — e.g. the caller's own
+   * `useTransition` wrapping a pivot switch or a filter-exclusion toggle
+   * (both of which land here as props, not state, so THIS component can't
+   * start its own transition around them). OR'd together with the internal
+   * network-refetch flag below to decide whether to show the subtle
+   * "updating" affordance. Optional; omitting it just means the affordance
+   * only reacts to actual refetches (window/workspace changes), which is
+   * still correct — just less proactive.
+   */
+  pending?: boolean;
 }) {
-  const [runs, setRuns] = useState<UsageRunRow[]>([]);
+  // `null` = "haven't heard back from the fetch yet" — distinct from `[]`
+  // ("fetched, genuinely zero rows"). Without this distinction the graph
+  // below showed the exact same "No usage recorded yet" copy during the
+  // initial load as it did for a real empty result.
+  const [runs, setRuns] = useState<UsageRunRow[] | null>(null);
+  // True for the whole lifetime of the `getUsageRuns` request below —
+  // covers both the very first load and any later refetch triggered by a
+  // window/workspace change (drag-select, preset range button, or the
+  // Projects page switching project).
+  const [isFetching, setIsFetching] = useState(false);
 
   // `GET /api/usage/runs`: flat per-`(run × model)` rows behind the graph.
   // Depends on `usageWindow.since`/`usageWindow.until` (primitives), not the
@@ -80,6 +102,7 @@ export default function UsageTimeline({
   // no refetch.
   useEffect(() => {
     let cancelled = false;
+    setIsFetching(true);
     // Called with exactly one argument when `workspaceId` is omitted (rather
     // than an explicit `undefined` second arg) so a caller-side spy
     // assertion like `toHaveBeenCalledWith(usageWindow)` — matching how
@@ -93,8 +116,13 @@ export default function UsageTimeline({
       })
       .catch(() => {
         // The graph is secondary to whatever summary sits above it; a
-        // failure here should not blank the whole page.
+        // failure here should not blank the whole page. `[]` (not `null`)
+        // so a failed fetch still counts as "loaded" — an infinite skeleton
+        // would be worse than a quiet empty state.
         if (!cancelled) setRuns([]);
+      })
+      .finally(() => {
+        if (!cancelled) setIsFetching(false);
       });
     return () => {
       cancelled = true;
@@ -102,14 +130,23 @@ export default function UsageTimeline({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- onRunsLoaded is a caller-supplied callback, not a re-fetch trigger; `usageWindow` itself is intentionally omitted in favor of its primitive fields (see doc comment above).
   }, [usageWindow.since, usageWindow.until, workspaceId]);
 
-  const timeline = useMemo(() => buildTimeline(runs, pivot, filter, 'day'), [runs, pivot, filter]);
+  const isInitialLoad = runs === null;
+  const timeline = useMemo(() => buildTimeline(runs ?? [], pivot, filter, 'day'), [runs, pivot, filter]);
+  // Subtle "updating" affordance — only once the graph has shown real data
+  // at least once (the initial load gets the full skeleton via `loading`
+  // below instead, not this dimmed-overlay treatment).
+  const isUpdating = !isInitialLoad && (isFetching || !!pending);
 
   return (
     <section className="rounded-lg border border-[rgb(var(--c-border))] bg-[rgb(var(--c-panel))] p-3">
       <div className="mb-2 flex flex-wrap items-start justify-between gap-2">
         <div>
-          <h2 className="text-xs font-medium uppercase tracking-wide text-[rgb(var(--c-ink-dim))]">
+          <h2 className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-[rgb(var(--c-ink-dim))]">
             Spend over time
+            {/* Subtle "this is refreshing" cue — a ~0.3s window/filter
+                refetch should read as intentional, not a stall. Only shown
+                once the graph has already painted once (see `isUpdating`). */}
+            {isUpdating && <Spinner size="sm" label="updating" />}
           </h2>
           <p className="mt-0.5 text-2xl font-semibold tabular-nums text-[rgb(var(--c-ink))]">
             {headline.costLabel}
@@ -149,13 +186,21 @@ export default function UsageTimeline({
       <p className="mb-2 text-[10px] uppercase tracking-wide text-[rgb(var(--c-ink-mute))]">
         local host only
       </p>
-      <UsageTimelineStacked
-        buckets={timeline}
-        metric={metric}
-        pivot={pivot}
-        hosts={hosts}
-        onSelectRange={onSelectRange}
-      />
+      {/* `opacity-70` only kicks in once the graph has real data on screen
+          (see `isUpdating`) — a light dim rather than a full-page block, so
+          a ~0.3s window/pivot/filter update reads as intentional instead of
+          a stall. The initial load never dims; it gets the skeleton via
+          `loading` below instead. */}
+      <div className={isUpdating ? 'opacity-70 transition-opacity duration-200' : 'transition-opacity duration-200'}>
+        <UsageTimelineStacked
+          buckets={timeline}
+          metric={metric}
+          pivot={pivot}
+          hosts={hosts}
+          onSelectRange={onSelectRange}
+          loading={isInitialLoad}
+        />
+      </div>
     </section>
   );
 }

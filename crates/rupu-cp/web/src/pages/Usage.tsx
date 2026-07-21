@@ -43,7 +43,7 @@
 // stay OWNED here (not inside `UsageTimeline`) because this page shares all
 // three with the breakdown table and outlier panel below.
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, useTransition } from 'react';
 import {
   api,
   presetWindow,
@@ -63,6 +63,7 @@ import { HostFreshnessStrip } from '../components/dashboard/HostFreshnessStrip';
 import UsageTimeline from '../components/usage/UsageTimeline';
 import { type UsageMetric } from '../components/dashboard/UsageTimelineStacked';
 import ModelBreakdownTable from '../components/dashboard/ModelBreakdownTable';
+import { Spinner } from '../components/ui/Spinner';
 
 const RANGES: DashboardRange[] = ['7d', '30d', 'all'];
 
@@ -88,6 +89,12 @@ export default function Usage() {
   const [isCustomWindow, setIsCustomWindow] = useState(false);
   const [pivot, setPivot] = useState<Pivot>('model');
   const [metric, setMetric] = useState<UsageMetric>('cost');
+  // Task loading-ux: pivot switches and filter-exclusion toggles trigger a
+  // synchronous `buildTimeline` re-stack inside `UsageTimeline` (no
+  // network refetch — see the effect below) — `isPending` marks that brief
+  // recompute window so the graph can show a subtle "updating" cue instead
+  // of just snapping to the new shape.
+  const [isPending, startTransition] = useTransition();
 
   const handleRangeChange = useCallback((r: DashboardRange) => {
     setRange(r);
@@ -186,14 +193,20 @@ export default function Usage() {
   );
 
   const toggleKey = useCallback((key: string) => {
-    setExcludedKeys((prev) => toggleInSet(prev, key));
+    startTransition(() => {
+      setExcludedKeys((prev) => toggleInSet(prev, key));
+    });
   }, []);
   const toggleRun = useCallback((runId: string) => {
-    setExcludedRunIds((prev) => toggleInSet(prev, runId));
+    startTransition(() => {
+      setExcludedRunIds((prev) => toggleInSet(prev, runId));
+    });
   }, []);
   const resetExclusions = useCallback(() => {
-    setExcludedKeys(new Set());
-    setExcludedRunIds(new Set());
+    startTransition(() => {
+      setExcludedKeys(new Set());
+      setExcludedRunIds(new Set());
+    });
   }, []);
 
   const excludedCount = excludedKeys.size + excludedRunIds.size;
@@ -220,7 +233,7 @@ export default function Usage() {
               refresh failed — showing last good data
             </span>
           )}
-          <PivotPicker value={pivot} onChange={setPivot} />
+          <PivotPicker value={pivot} onChange={(p) => startTransition(() => setPivot(p))} />
           {isCustomWindow && (
             <button
               type="button"
@@ -269,6 +282,7 @@ export default function Usage() {
             onReset={resetExclusions}
             onRunsLoaded={setRuns}
             onSelectRange={handleSelectRange}
+            pending={isPending}
             hosts={data.hosts}
             headline={{
               costLabel: formatCost(data.summary.cost_usd),
@@ -307,7 +321,9 @@ export default function Usage() {
           Could not load usage: {error.message}
         </div>
       ) : (
-        <div className="p-6 text-sm text-[rgb(var(--c-ink-mute))]">Loading…</div>
+        <div className="flex items-center justify-center p-6">
+          <Spinner size="md" label="Loading…" />
+        </div>
       )}
     </div>
   );

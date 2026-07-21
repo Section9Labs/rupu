@@ -163,4 +163,97 @@ describe('UsageTimeline', () => {
     // No refetch — the exclusion is a pure client-side re-stack.
     expect(spy).toHaveBeenCalledTimes(1);
   });
+
+  describe('loading vs. genuinely empty (Task loading-ux)', () => {
+    it('shows a loading skeleton (not "No usage recorded yet") before the fetch resolves', () => {
+      // A promise that never resolves during this test — `runs` stays
+      // `null` (haven't heard back yet), which must render as loading, not
+      // as a real empty result.
+      vi.spyOn(api, 'getUsageRuns').mockReturnValue(new Promise(() => {}));
+
+      render(
+        <UsageTimeline
+          usageWindow={presetWindow('30d', NOW)}
+          pivot="model"
+          metric="cost"
+          onMetricChange={() => {}}
+          filter={noFilter()}
+          excludedCount={0}
+          onReset={() => {}}
+          headline={{ costLabel: '$0', subLabel: '' }}
+        />,
+      );
+
+      expect(screen.getByLabelText('Loading usage graph')).toBeInTheDocument();
+      expect(screen.queryByText(/No usage recorded yet/)).not.toBeInTheDocument();
+    });
+
+    it('shows "No usage recorded yet" once the fetch resolves with zero rows', async () => {
+      vi.spyOn(api, 'getUsageRuns').mockResolvedValue([]);
+
+      render(
+        <UsageTimeline
+          usageWindow={presetWindow('30d', NOW)}
+          pivot="model"
+          metric="cost"
+          onMetricChange={() => {}}
+          filter={noFilter()}
+          excludedCount={0}
+          onReset={() => {}}
+          headline={{ costLabel: '$0', subLabel: '' }}
+        />,
+      );
+
+      expect(await screen.findByText(/No usage recorded yet/)).toBeInTheDocument();
+      expect(screen.queryByLabelText('Loading usage graph')).not.toBeInTheDocument();
+    });
+
+    it('shows the "updating" cue while refetching after a window change, without re-showing the full loading skeleton', async () => {
+      let resolveSecond: (rows: UsageRunRow[]) => void = () => {};
+      const spy = vi
+        .spyOn(api, 'getUsageRuns')
+        .mockResolvedValueOnce([runRow()])
+        .mockImplementationOnce(() => new Promise((resolve) => { resolveSecond = resolve; }));
+
+      const { rerender } = render(
+        <UsageTimeline
+          usageWindow={presetWindow('30d', NOW)}
+          pivot="model"
+          metric="cost"
+          onMetricChange={() => {}}
+          filter={noFilter()}
+          excludedCount={0}
+          onReset={() => {}}
+          headline={{ costLabel: '$4.50', subLabel: '1.5k tokens · 1 runs' }}
+        />,
+      );
+
+      await screen.findByText('claude');
+      expect(screen.queryByLabelText('Loading usage graph')).not.toBeInTheDocument();
+
+      // A window change (e.g. a preset/drag-select) triggers a real refetch.
+      rerender(
+        <UsageTimeline
+          usageWindow={presetWindow('7d', NOW)}
+          pivot="model"
+          metric="cost"
+          onMetricChange={() => {}}
+          filter={noFilter()}
+          excludedCount={0}
+          onReset={() => {}}
+          headline={{ costLabel: '$4.50', subLabel: '1.5k tokens · 1 runs' }}
+        />,
+      );
+
+      await waitFor(() => expect(spy).toHaveBeenCalledTimes(2));
+      // Subtle "updating" cue near the header — not the full skeleton, and
+      // the previously-loaded graph content stays on screen underneath it.
+      expect(await screen.findByText('updating')).toBeInTheDocument();
+      expect(screen.queryByLabelText('Loading usage graph')).not.toBeInTheDocument();
+      expect(screen.getByText('claude')).toBeInTheDocument();
+
+      resolveSecond([runRow({ model: 'gpt' })]);
+      await waitFor(() => expect(screen.queryByText('updating')).not.toBeInTheDocument());
+    });
+  });
 });

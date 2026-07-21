@@ -2,6 +2,7 @@ import React, { Suspense } from 'react';
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import Layout from './components/Layout';
+import { Spinner } from './components/ui/Spinner';
 
 // All page-level routes are lazy-loaded so each page lands in its own chunk
 // and the main bundle only pays for the shell (Layout + router plumbing).
@@ -34,8 +35,8 @@ const RunTranscript     = React.lazy(() => import('./pages/RunTranscript'));
 
 function PageFallback() {
   return (
-    <div className="flex items-center justify-center h-48 text-ink-dim text-sm">
-      Loading…
+    <div className="flex items-center justify-center h-48">
+      <Spinner size="md" label="Loading…" />
     </div>
   );
 }
