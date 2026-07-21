@@ -1326,6 +1326,9 @@ export interface ProjectRow {
   path: string;
   repo_remote?: string | null;
   branch?: string | null;
+  /** Repository landing-page URL derived from `repo_remote` (github/gitlab
+   *  only; absent for an unrecognized host or no remote). */
+  repo_home_url?: string | null;
   created_at: string;
   last_run_at?: string | null;
   usage: UsageSummary;

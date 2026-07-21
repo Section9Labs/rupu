@@ -29,6 +29,13 @@ pub struct FindingOut {
     /// `RunStore` via `declared_by.run_id`. `None` when the run can't be
     /// resolved (e.g. an agent/session-local id with no `run.json`).
     pub workflow_name: Option<String>,
+    /// Deep link to the finding's location on the SCM's web UI (github/gitlab
+    /// blob URL at the recorded line range), derived from the owning
+    /// workspace's `repo_remote` + `initial_branch`. `None` when the
+    /// workspace has no remote, the host is unrecognized, or the finding has
+    /// no `file_path`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permalink: Option<String>,
     #[serde(flatten)]
     pub record: FindingRecord,
 }
@@ -193,11 +200,24 @@ pub(crate) fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingO
                 }
             };
             for record in records {
+                // `w` (the owning workspace) is already in hand for every
+                // finding in this loop — no separate lookup/memoization is
+                // needed, unlike a flat finding list without provenance.
+                let permalink = match (w.repo_remote.as_deref(), record.file_path.as_deref()) {
+                    (Some(remote), Some(path)) => rupu_scm::weburl::repo_permalink(
+                        remote,
+                        w.initial_branch.as_deref(),
+                        path,
+                        record.line_range,
+                    ),
+                    _ => None,
+                };
                 out.push(FindingOut {
                     ws_id: w.id.clone(),
                     project: project.clone(),
                     target_id: t.target_id.clone(),
                     workflow_name: None,
+                    permalink,
                     record,
                 });
             }
@@ -300,6 +320,7 @@ mod tests {
             project: "proj".to_string(),
             target_id: "tgt".to_string(),
             workflow_name: workflow_name.map(|s| s.to_string()),
+            permalink: None,
             record: FindingRecord {
                 id: id.to_string(),
                 file_path: Some("src/a.rs".to_string()),
@@ -545,6 +566,94 @@ mod tests {
         assert_eq!(resp.summary.high, 1);
         assert_eq!(resp.summary.medium, 1);
         assert_eq!(resp.summary.low, 0);
+    }
+
+    #[test]
+    fn permalink_built_from_github_remote() {
+        // Given a workspace remote + branch and a finding with file+lines,
+        // the FindingOut permalink is the github blob URL.
+        let url = rupu_scm::weburl::repo_permalink(
+            "git@github.com:o/r.git",
+            Some("main"),
+            "src/a.rs",
+            Some([17, 19]),
+        );
+        assert_eq!(
+            url.as_deref(),
+            Some("https://github.com/o/r/blob/main/src/a.rs#L17-L19")
+        );
+    }
+
+    /// End-to-end wiring check (not just the pure `repo_permalink` fn):
+    /// `collect_all_findings` reads a real on-disk workspace TOML with a
+    /// github `repo_remote` + `initial_branch`, discovers a coverage target
+    /// with one finding that has `file_path`/`line_range`, and the resulting
+    /// `FindingOut.permalink` is the exact github blob URL. Also covers the
+    /// negative case: a finding with no `file_path` gets `permalink: None`.
+    #[test]
+    fn collect_all_findings_computes_permalink_from_workspace_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        // Workspace record with a github remote + branch.
+        let ws = rupu_workspace::Workspace {
+            id: "ws1".to_string(),
+            path: repo.to_str().unwrap().to_string(),
+            repo_remote: Some("git@github.com:o/r.git".to_string()),
+            initial_branch: Some("main".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_run_at: None,
+        };
+        let workspaces_dir = global.join("workspaces");
+        std::fs::create_dir_all(&workspaces_dir).unwrap();
+        std::fs::write(
+            workspaces_dir.join("ws1.toml"),
+            toml::to_string(&ws).unwrap(),
+        )
+        .unwrap();
+
+        // One coverage target with two findings: one with file+lines (gets a
+        // permalink), one without a file_path (stays None).
+        let paths = CoveragePaths::new(&repo, "tgt1");
+        paths.ensure_dir().unwrap();
+        let with_loc = FindingRecord {
+            id: "fnd_with_loc".to_string(),
+            file_path: Some("src/a.rs".to_string()),
+            line_range: Some([17, 19]),
+            scope: FindingScope::Line,
+            summary: "s".to_string(),
+            severity: Severity::High,
+            concern_id: None,
+            evidence: FindingEvidence {
+                code_excerpt: None,
+                rationale: "r".to_string(),
+                references: vec![],
+            },
+            declared_by: attribution(),
+            declared_at: at("2026-01-01T00:00:00Z"),
+        };
+        let mut without_loc = with_loc.clone();
+        without_loc.id = "fnd_no_loc".to_string();
+        without_loc.file_path = None;
+        without_loc.line_range = None;
+
+        let jsonl = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&with_loc).unwrap(),
+            serde_json::to_string(&without_loc).unwrap()
+        );
+        std::fs::write(&paths.findings, jsonl).unwrap();
+
+        let out = collect_all_findings(global);
+        assert_eq!(out.len(), 2);
+        let by_id = |id: &str| out.iter().find(|f| f.record.id == id).unwrap();
+        assert_eq!(
+            by_id("fnd_with_loc").permalink.as_deref(),
+            Some("https://github.com/o/r/blob/main/src/a.rs#L17-L19")
+        );
+        assert_eq!(by_id("fnd_no_loc").permalink, None);
     }
 
     #[test]

@@ -40,4 +40,18 @@ describe('InlineFindingCard', () => {
     fireEvent.click(screen.getByRole('button', { name: /Missing tenant check/ }));
     expect(screen.getByText(/code may have changed/i)).toBeInTheDocument();
   });
+
+  it('renders a repository permalink when present', () => {
+    const f = {
+      ...FINDING,
+      permalink: 'https://github.com/o/r/blob/main/src/billing.rs#L17',
+    } as unknown as FindingRecord;
+    view(<InlineFindingCard finding={f} stale={false} />);
+    fireEvent.click(screen.getByRole('button', { name: /Missing tenant check/ }));
+    const link = screen.getByRole('link', { name: /view on repository/i });
+    expect(link).toHaveAttribute(
+      'href',
+      'https://github.com/o/r/blob/main/src/billing.rs#L17',
+    );
+  });
 });

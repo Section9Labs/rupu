@@ -315,7 +315,12 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
             </div>
           }
         >
-          <ProjectCodeTab wsId={p.ws_id} />
+          <ProjectCodeTab
+            wsId={p.ws_id}
+            repoHomeUrl={p.repo_home_url ?? null}
+            repoRemote={p.repo_remote ?? null}
+            branch={p.branch ?? null}
+          />
         </Suspense>
       )}
       {tab === 'sessions' && <ProjectSessionsTab wsId={p.ws_id} />}
