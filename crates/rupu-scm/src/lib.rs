@@ -15,6 +15,7 @@ pub mod event_connector;
 pub mod platform;
 pub mod registry;
 pub mod types;
+pub mod weburl;
 
 pub use clone::{clone_repo_ref, CloneError};
 pub use connectors::{IssueConnector, RepoConnector};
