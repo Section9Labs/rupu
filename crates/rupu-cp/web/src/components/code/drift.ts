@@ -23,12 +23,14 @@ export function isFindingStale(
     if (!ln) return true; // range runs past EOF → definitely drifted
     current.push(ln.text);
   }
-  const want = excerpt
-    .split('\n')
-    .map(norm)
-    .filter((l) => l.length > 0);
-  const have = current.map(norm).filter((l) => l.length > 0);
-  if (want.length === 0) return false;
-  // The excerpt must appear as a contiguous, in-order match of the range.
-  return want.join('\n') !== have.join('\n');
+  const want = excerpt.split('\n').map(norm);
+  const have = current.map(norm);
+  // Tolerate only a trailing newline/blank line, not interior blanks.
+  while (want.length > 0 && want[want.length - 1] === '') want.pop();
+  while (have.length > 0 && have[have.length - 1] === '') have.pop();
+  if (want.length !== have.length) return true;
+  for (let i = 0; i < want.length; i++) {
+    if (want[i] !== have[i]) return true;
+  }
+  return false;
 }

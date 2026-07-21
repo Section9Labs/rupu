@@ -27,9 +27,16 @@ describe('isFindingStale', () => {
 
   it('is not stale when lineRange is missing', () => {
     expect(isFindingStale('anything', file, null)).toBe(false);
+    expect(isFindingStale('anything', file, undefined)).toBe(false);
   });
 
   it('is stale when the range runs past the end of the file', () => {
     expect(isFindingStale('let x = 1;', lines(['only one line']), [5, 5])).toBe(true);
+  });
+
+  it('detects a real change even when blank lines rearrange', () => {
+    const excerpt = 'let x = 1;\n\nlet y = 2;'; // blank interior line (line 3)
+    const changed = lines(['fn a() {}', '  let x = 1;', '  let y = 2;', '  extra();']); // lines 2-4 now non-blank/changed
+    expect(isFindingStale(excerpt, changed, [2, 4])).toBe(true);
   });
 });
