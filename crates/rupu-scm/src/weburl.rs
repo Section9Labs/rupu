@@ -63,6 +63,53 @@ pub fn parse_repo_remote(remote: &str) -> Option<RepoWeb> {
     })
 }
 
+impl RepoWeb {
+    /// Repository landing page.
+    pub fn home_url(&self) -> String {
+        match self.platform {
+            Platform::Github => format!("https://{}/{}/{}", self.host, self.owner, self.repo),
+            Platform::Gitlab => format!("https://{}/{}/{}", self.host, self.owner, self.repo),
+        }
+    }
+
+    /// Web blob URL to a file (optionally a line range). Platform-specific
+    /// path prefix and line-fragment syntax:
+    ///   GitHub: `/blob/<branch>/<path>#L<a>-L<b>`
+    ///   GitLab: `/-/blob/<branch>/<path>#L<a>-<b>`
+    pub fn blob_url(&self, branch: &str, path: &str, line_range: Option<[u32; 2]>) -> String {
+        let base = match self.platform {
+            Platform::Github => format!(
+                "https://{}/{}/{}/blob/{}/{}",
+                self.host, self.owner, self.repo, branch, path
+            ),
+            Platform::Gitlab => format!(
+                "https://{}/{}/{}/-/blob/{}/{}",
+                self.host, self.owner, self.repo, branch, path
+            ),
+        };
+        match line_range {
+            None => base,
+            Some([a, b]) if a == b => format!("{base}#L{a}"),
+            Some([a, b]) => match self.platform {
+                Platform::Github => format!("{base}#L{a}-L{b}"),
+                Platform::Gitlab => format!("{base}#L{a}-{b}"),
+            },
+        }
+    }
+}
+
+/// Convenience: parse a remote and build a blob permalink in one call.
+/// `branch` defaults to `"main"` when `None`. Returns `None` for unknown hosts.
+pub fn repo_permalink(
+    remote: &str,
+    branch: Option<&str>,
+    path: &str,
+    line_range: Option<[u32; 2]>,
+) -> Option<String> {
+    let rw = parse_repo_remote(remote)?;
+    Some(rw.blob_url(branch.unwrap_or("main"), path, line_range))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +152,61 @@ mod tests {
         assert!(parse_repo_remote("git@bitbucket.org:x/y.git").is_none());
         assert!(parse_repo_remote("not a url").is_none());
         assert!(parse_repo_remote("").is_none());
+    }
+
+    #[test]
+    fn github_blob_url_with_range() {
+        let r = parse_repo_remote("git@github.com:o/r.git").unwrap();
+        assert_eq!(
+            r.blob_url("main", "src/a.rs", Some([17, 19])),
+            "https://github.com/o/r/blob/main/src/a.rs#L17-L19"
+        );
+    }
+
+    #[test]
+    fn github_blob_url_single_line() {
+        let r = parse_repo_remote("git@github.com:o/r.git").unwrap();
+        assert_eq!(
+            r.blob_url("main", "src/a.rs", Some([17, 17])),
+            "https://github.com/o/r/blob/main/src/a.rs#L17"
+        );
+    }
+
+    #[test]
+    fn gitlab_blob_url_uses_dash_blob_and_dash_range() {
+        let r = parse_repo_remote("https://gitlab.com/g/s/p.git").unwrap();
+        assert_eq!(
+            r.blob_url("dev", "a/b.rs", Some([3, 8])),
+            "https://gitlab.com/g/s/p/-/blob/dev/a/b.rs#L3-8"
+        );
+    }
+
+    #[test]
+    fn home_urls() {
+        assert_eq!(
+            parse_repo_remote("git@github.com:o/r.git")
+                .unwrap()
+                .home_url(),
+            "https://github.com/o/r"
+        );
+        assert_eq!(
+            parse_repo_remote("https://gitlab.com/g/p.git")
+                .unwrap()
+                .home_url(),
+            "https://gitlab.com/g/p"
+        );
+    }
+
+    #[test]
+    fn convenience_permalink_defaults_branch_to_main_and_none_on_unknown() {
+        assert_eq!(
+            repo_permalink("git@github.com:o/r.git", Some("dev"), "x.rs", Some([1, 1])),
+            Some("https://github.com/o/r/blob/dev/x.rs#L1".to_string())
+        );
+        assert_eq!(
+            repo_permalink("git@github.com:o/r.git", None, "x.rs", None),
+            Some("https://github.com/o/r/blob/main/x.rs".to_string())
+        );
+        assert_eq!(repo_permalink("bad", Some("main"), "x.rs", None), None);
     }
 }
