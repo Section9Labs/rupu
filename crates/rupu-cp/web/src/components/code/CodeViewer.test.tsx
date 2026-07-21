@@ -59,4 +59,33 @@ describe('CodeViewer', () => {
     view(<CodeViewer wsId="ws1" path="x" findings={[]} />);
     await waitFor(() => expect(screen.getByText(/too large/)).toBeInTheDocument());
   });
+
+  it('renders exactly one line-row per source line, with no phantom rows, for a multi-line Go-like file', async () => {
+    const GO_FILE: FileContent = {
+      available: true,
+      path: 'main.go',
+      language: 'go',
+      totalLines: 6,
+      lines: [
+        { n: 1, text: 'package main' },
+        { n: 2, text: '' },
+        { n: 3, text: 'import "fmt"' },
+        { n: 4, text: '' },
+        { n: 5, text: 'func main() {' },
+        { n: 6, text: '}' },
+      ],
+    };
+    vi.spyOn(api, 'getProjectSource').mockResolvedValue(GO_FILE);
+    view(<CodeViewer wsId="ws1" path="main.go" findings={[]} />);
+    await waitFor(() => expect(document.querySelectorAll('[data-line-row]')).toHaveLength(6));
+
+    const rows = Array.from(document.querySelectorAll('[data-line-row]'));
+    expect(rows.map((r) => r.getAttribute('data-line-row'))).toEqual(['1', '2', '3', '4', '5', '6']);
+    // Every row is a direct, single grid row — no nested block wrapper per
+    // line inflating the row count or adding stray empty rows between them.
+    for (const row of rows) {
+      expect(row.tagName).toBe('DIV');
+      expect(row.children).toHaveLength(2); // gutter cell + code cell only
+    }
+  });
 });

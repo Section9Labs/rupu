@@ -17,10 +17,10 @@
  * the backend's `reason`) / loaded.
  */
 
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { Loader2 } from 'lucide-react';
 import { api, type FileContent, type FindingRecord } from '../../lib/api';
-import CodeHighlight, { SOURCE_PREVIEW_LANGUAGES } from '../CodeHighlight';
+import CodeHighlight, { HIGHLIGHTABLE_LANGUAGES, type Language } from '../CodeHighlight';
 import { SEVERITY_STYLE, severityRank, type Severity } from '../../lib/severity';
 import { isFindingStale } from './drift';
 import InlineFindingCard from './InlineFindingCard';
@@ -39,14 +39,6 @@ type Load =
   | { state: 'loading' }
   | { state: 'error'; msg: string }
   | { state: 'loaded'; file: FileContent };
-
-type HighlightLanguage =
-  | 'rust'
-  | 'python'
-  | 'typescript'
-  | 'javascript'
-  | 'go'
-  | 'json';
 
 /** Group findings by their anchor line (`line_range[0]`); within a line,
  *  worst severity first so the band + stack order reflect the most severe
@@ -120,13 +112,11 @@ export default function CodeViewer({ wsId, path, findings, initialLine }: CodeVi
   }
 
   const lang =
-    file.language && SOURCE_PREVIEW_LANGUAGES.has(file.language)
-      ? (file.language as HighlightLanguage)
-      : null;
+    file.language && HIGHLIGHTABLE_LANGUAGES.has(file.language) ? (file.language as Language) : null;
 
   return (
-    <div className="overflow-x-auto rounded-md border border-border bg-panel text-[12px]">
-      <pre className="m-0 font-mono leading-5">
+    <div className="h-full overflow-auto rounded-md border border-border bg-panel text-[12px]">
+      <div className="font-mono">
         {file.lines.map((ln) => {
           const here = grouped.get(ln.n);
           const worst = here?.[0];
@@ -135,19 +125,20 @@ export default function CodeViewer({ wsId, path, findings, initialLine }: CodeVi
           const isAnchorLine = initialLine === ln.n;
 
           return (
-            <div key={ln.n}>
+            <Fragment key={ln.n}>
               <div
                 ref={isAnchorLine ? anchorRef : undefined}
+                data-line-row={ln.n}
                 data-finding-line={here ? ln.n : undefined}
-                className={`flex ${
+                className={`grid h-5 grid-cols-[4ch_1fr] leading-5 ${
                   style ? `${style.bg} border-l-2 ${style.barBorder}` : 'border-l-2 border-transparent'
                 }`}
               >
-                <span className="select-none pl-3 pr-3 text-right text-ink-mute" style={{ minWidth: '4ch' }}>
+                <span className="h-5 select-none pl-3 pr-3 text-right leading-5 text-ink-mute">
                   {ln.n}
                 </span>
                 <span
-                  className={here ? 'finding-squiggle min-w-0 flex-1' : 'min-w-0 flex-1'}
+                  className={`h-5 min-w-0 leading-5 ${here ? 'finding-squiggle' : ''}`}
                   style={sev ? ({ '--squiggle-rgb': `var(--c-sev-${sev})` } as CSSProperties) : undefined}
                 >
                   {lang ? (
@@ -168,10 +159,10 @@ export default function CodeViewer({ wsId, path, findings, initialLine }: CodeVi
                   ))}
                 </div>
               )}
-            </div>
+            </Fragment>
           );
         })}
-      </pre>
+      </div>
     </div>
   );
 }
