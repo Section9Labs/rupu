@@ -1,0 +1,31 @@
+/* Two-theme highlight.js token palette, selected at runtime via
+   [data-hl-theme]. Light mirrors GitHub-light; dark mirrors the GitHub-dark
+   hexes documented in codeHighlightTheme.ts so the editor and the source
+   viewer render identically. Base text/background come from --c-* tokens so
+   the block sits correctly in either theme. */
+.hljs {
+  color: rgb(var(--c-ink));
+  background: transparent;
+}
+[data-hl-theme='light'].hljs .hljs-keyword,
+[data-hl-theme='light'] .hljs-keyword,
+[data-hl-theme='light'] .hljs-type { color: #cf222e; }
+[data-hl-theme='light'] .hljs-string { color: #0a3069; }
+[data-hl-theme='light'] .hljs-comment { color: #6e7781; }
+[data-hl-theme='light'] .hljs-number { color: #0550ae; }
+[data-hl-theme='light'] .hljs-title,
+[data-hl-theme='light'] .hljs-title.function_ { color: #8250df; }
+[data-hl-theme='light'] .hljs-name,
+[data-hl-theme='light'] .hljs-tag { color: #116329; }
+
+[data-hl-theme='dark'].hljs,
+[data-hl-theme='dark'] { color: #e6edf3; }
+[data-hl-theme='dark'] .hljs-keyword,
+[data-hl-theme='dark'] .hljs-type { color: #ff7b72; }
+[data-hl-theme='dark'] .hljs-string { color: #a5d6ff; }
+[data-hl-theme='dark'] .hljs-comment { color: #8b949e; }
+[data-hl-theme='dark'] .hljs-number { color: #79c0ff; }
+[data-hl-theme='dark'] .hljs-title,
+[data-hl-theme='dark'] .hljs-title.function_ { color: #d2a8ff; }
+[data-hl-theme='dark'] .hljs-name,
+[data-hl-theme='dark'] .hljs-tag { color: #7ee787; }
