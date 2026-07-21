@@ -4,7 +4,7 @@
 // Config). The active tab is driven by the `tab` prop, set per-route in
 // App.tsx.
 
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
   Activity,
@@ -27,12 +27,18 @@ import { TabBar, TabButton } from '../components/TabBar';
 import ProjectOverviewTab from '../components/project/ProjectOverviewTab';
 import ProjectRunsTab from '../components/project/ProjectRunsTab';
 import ProjectFindingsTab from '../components/project/ProjectFindingsTab';
-import ProjectCodeTab from '../components/project/ProjectCodeTab';
 import ProjectSessionsTab from '../components/project/ProjectSessionsTab';
 import ProjectCoverageTab from '../components/project/ProjectCoverageTab';
 import ProjectConfigTab from '../components/project/ProjectConfigTab';
 import { relativeTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
+
+// The Code tab's subtree (FileTree/CodeViewer/InlineFindingCard, which in turn
+// reaches the heavy `manualChunks.markdown` group via Markdown) is loaded via
+// React.lazy, mirroring CodeEditor.tsx/ExpressionField.tsx's Impl-splitting
+// pattern, so that code only ships to the browser once the Code tab is opened
+// rather than with every ProjectDetail chunk load.
+const ProjectCodeTab = lazy(() => import('../components/project/ProjectCodeTab'));
 
 export type ProjectTab = 'overview' | 'runs' | 'findings' | 'code' | 'sessions' | 'coverage' | 'config';
 
@@ -301,7 +307,17 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
       )}
       {tab === 'runs' && <ProjectRunsTab wsId={p.ws_id} />}
       {tab === 'findings' && <ProjectFindingsTab wsId={p.ws_id} />}
-      {tab === 'code' && <ProjectCodeTab wsId={p.ws_id} />}
+      {tab === 'code' && (
+        <Suspense
+          fallback={
+            <div className="flex h-40 items-center justify-center text-sm text-ink-dim">
+              Loading…
+            </div>
+          }
+        >
+          <ProjectCodeTab wsId={p.ws_id} />
+        </Suspense>
+      )}
       {tab === 'sessions' && <ProjectSessionsTab wsId={p.ws_id} />}
       {tab === 'coverage' && <ProjectCoverageTab wsId={p.ws_id} />}
       {tab === 'config' && <ProjectConfigTab wsId={p.ws_id} />}
