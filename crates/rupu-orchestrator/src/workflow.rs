@@ -130,6 +130,26 @@ pub enum WorkflowParseError {
     HostEmpty { step: String },
     #[error("step `{step}`: `workspace: sync` is only valid on a remote step (`host:` or `distribute:`)")]
     WorkspaceSyncOnLocalStep { step: String },
+    #[error(
+        "step `{step}`: `branch:` is mutually exclusive with `for_each:`, `parallel:`, `panel:`, and the top-level `agent`/`prompt`"
+    )]
+    BranchMutuallyExclusive { step: String },
+    #[error("step `{step}`: `branch.condition` must not be empty")]
+    BranchEmptyCondition { step: String },
+    #[error("step `{step}`: branch id `{id}` appears in both `then:` and `else:`")]
+    BranchArmsOverlap { step: String, id: String },
+    #[error("step `{step}`: `branch.then`/`branch.else` must not target the branch step itself")]
+    BranchTargetsSelf { step: String },
+    #[error("step `{step}`: branch target `{target}` does not match any step id")]
+    BranchTargetUnknown { step: String, target: String },
+    #[error(
+        "step `{step}`: branch target `{target}` does not run after the branch step (must be a forward reference)"
+    )]
+    BranchTargetNotForward { step: String, target: String },
+    #[error(
+        "step `{step}`: `when:` is not allowed on a branch step; use the branch condition to gate routing"
+    )]
+    BranchWithWhen { step: String },
 }
 
 /// How a workflow gets kicked off. Manual is the existing behavior
@@ -584,6 +604,42 @@ pub struct PanelGate {
     pub max_iterations: u32,
 }
 
+/// Branch step block. Mutually exclusive with `for_each:`,
+/// `parallel:`, `panel:`, and the linear `agent`/`prompt`.
+///
+/// v1 semantics:
+/// - `condition` is a minijinja template rendered against the step
+///   context, truthy per the same rules as `when:`. Truthy dispatches
+///   the `then:` arm; falsy dispatches the `else:` arm.
+/// - `then`/`else` are each the COMPLETE, TRANSITIVE set of step ids
+///   in that arm — including the arm steps of any branch step nested
+///   inside it. The runner skips exactly the ids listed in the
+///   not-taken arm; a nested branch on a not-taken arm is itself
+///   skipped and so never gets a chance to populate its own
+///   sub-arms' skip-sets, meaning its arm steps must already appear
+///   in the outer arm's list or they'll run unskipped.
+/// - `when:` is not allowed on a branch step (see
+///   `WorkflowParseError::BranchWithWhen`). The runner evaluates
+///   `when:` before the branch block, so a falsy `when:` on a branch
+///   step would skip the branch step itself without its condition
+///   ever evaluating — neither arm gets added to the run's skip-set,
+///   so both arms run. Use the branch condition to gate routing
+///   instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Branch {
+    /// minijinja template rendered to decide which branch to take.
+    /// Truthy per the same rules as `when:`.
+    pub condition: String,
+    /// Step ids to dispatch when `condition:` is truthy.
+    #[serde(default)]
+    pub then: Vec<String>,
+    /// Step ids to dispatch when `condition:` is falsy. `else` is a
+    /// reserved word, hence the raw identifier.
+    #[serde(default)]
+    pub r#else: Vec<String>,
+}
+
 /// Optional approval gate on a step. When present and `required:
 /// true`, the runner persists `RunStatus::AwaitingApproval` and exits
 /// cleanly *before* dispatching the step. The operator approves with
@@ -728,6 +784,11 @@ pub struct Step {
     /// `parallel:`, and the linear `agent`/`prompt`. See [`Panel`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub panel: Option<Panel>,
+    /// Branch step block. Mutually exclusive with `for_each:`,
+    /// `parallel:`, `panel:`, and the linear `agent`/`prompt`. See
+    /// [`Branch`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<Branch>,
     /// Optional authoring metadata describing the structured output this
     /// step is expected to emit. Workflow-level `contracts.outputs.*`
     /// remain authoritative for runtime validation.
@@ -848,6 +909,7 @@ impl Workflow {
         validate_contracts(&wf)?;
         validate_autoflow(&wf)?;
         validate_template_refs(&wf)?;
+        validate_branch_targets(&wf)?;
         Ok(wf)
     }
 
@@ -965,11 +1027,54 @@ pub fn effective_workspace_mode(step: &Step, defaults: &WorkflowDefaults) -> Wor
         .unwrap_or(WorkspaceMode::None)
 }
 
-/// Validate per-step shape constraints. The four shapes (linear,
-/// `for_each:`, `parallel:`, `panel:`) are mutually exclusive, and
-/// each carries its own set of required fields.
+/// Validate per-step shape constraints. The five shapes (linear,
+/// `for_each:`, `parallel:`, `panel:`, `branch:`) are mutually
+/// exclusive, and each carries its own set of required fields.
 fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
-    if let Some(panel) = &step.panel {
+    if let Some(branch) = &step.branch {
+        // Branch step — top-level agent/prompt, for_each, parallel, and
+        // panel must all be absent (a branch step has no agent/prompt
+        // of its own; it only routes to other steps).
+        if step.agent.is_some()
+            || step.prompt.is_some()
+            || step.for_each.is_some()
+            || step.parallel.is_some()
+            || step.panel.is_some()
+        {
+            return Err(WorkflowParseError::BranchMutuallyExclusive {
+                step: step.id.clone(),
+            });
+        }
+        if step.when.is_some() {
+            // The runner evaluates `when:` BEFORE the branch block. A
+            // branch step with a falsy `when:` would be when:-skipped
+            // without the condition ever evaluating, so neither arm's
+            // skip-set gets populated and both arms run — a silent
+            // correctness bug. Reject outright rather than let authors
+            // hit that at runtime.
+            return Err(WorkflowParseError::BranchWithWhen {
+                step: step.id.clone(),
+            });
+        }
+        if branch.condition.trim().is_empty() {
+            return Err(WorkflowParseError::BranchEmptyCondition {
+                step: step.id.clone(),
+            });
+        }
+        for id in &branch.then {
+            if branch.r#else.contains(id) {
+                return Err(WorkflowParseError::BranchArmsOverlap {
+                    step: step.id.clone(),
+                    id: id.clone(),
+                });
+            }
+        }
+        if branch.then.contains(&step.id) || branch.r#else.contains(&step.id) {
+            return Err(WorkflowParseError::BranchTargetsSelf {
+                step: step.id.clone(),
+            });
+        }
+    } else if let Some(panel) = &step.panel {
         // Panel step — top-level agent/prompt, for_each, and parallel
         // must all be absent.
         if step.agent.is_some()
@@ -1051,7 +1156,10 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
     // (which is for_each-only — structurally exclusive with a linear host
     // step, but assert it for a clear message).
     if let Some(host) = &step.host {
-        let is_linear = step.panel.is_none() && step.parallel.is_none() && step.for_each.is_none();
+        let is_linear = step.panel.is_none()
+            && step.parallel.is_none()
+            && step.for_each.is_none()
+            && step.branch.is_none();
         if !is_linear || step.distribute.is_some() {
             return Err(WorkflowParseError::HostOnNonLinearStep {
                 step: step.id.clone(),
@@ -1158,6 +1266,35 @@ fn validate_contracts(wf: &Workflow) -> Result<(), WorkflowParseError> {
     Ok(())
 }
 
+/// Validate that every `branch:` step's `then`/`else` targets name a
+/// step that actually exists in the workflow, and that the target
+/// runs strictly *after* the branch step in declaration order (a
+/// branch can only route forward — routing to an earlier step isn't
+/// a supported loop construct and would never be reached by the
+/// linear runner).
+fn validate_branch_targets(wf: &Workflow) -> Result<(), WorkflowParseError> {
+    for (idx, step) in wf.steps.iter().enumerate() {
+        let Some(branch) = &step.branch else {
+            continue;
+        };
+        for target in branch.then.iter().chain(branch.r#else.iter()) {
+            let Some(target_idx) = wf.steps.iter().position(|s| &s.id == target) else {
+                return Err(WorkflowParseError::BranchTargetUnknown {
+                    step: step.id.clone(),
+                    target: target.clone(),
+                });
+            };
+            if target_idx <= idx {
+                return Err(WorkflowParseError::BranchTargetNotForward {
+                    step: step.id.clone(),
+                    target: target.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Known fields on `StepOutput` (see `templates::StepOutput`).
 /// Used by [`validate_template_refs`] to flag typos like
 /// `{{ steps.x.findngs }}` at parse time.
@@ -1254,6 +1391,9 @@ fn collect_templates_for_step(step: &Step) -> Vec<(&'static str, String)> {
         for sub in subs {
             out.push(("parallel.prompt", sub.prompt.clone()));
         }
+    }
+    if let Some(b) = &step.branch {
+        out.push(("branch.condition", b.condition.clone()));
     }
     out
 }
@@ -1539,6 +1679,31 @@ steps:
     }
 
     #[test]
+    fn host_rejected_on_branch() {
+        let yaml = r#"
+name: bad
+steps:
+  - id: gate
+    host: worker-1
+    branch:
+      condition: "true"
+      then: [a]
+      else: [b]
+  - id: a
+    agent: ag
+    prompt: p
+  - id: b
+    agent: ag
+    prompt: p
+"#;
+        let err = Workflow::parse(yaml).expect_err("branch + host invalid");
+        assert!(matches!(
+            err,
+            WorkflowParseError::HostOnNonLinearStep { .. }
+        ));
+    }
+
+    #[test]
     fn empty_host_rejected() {
         let yaml = r#"
 name: bad
@@ -1550,6 +1715,17 @@ steps:
 "#;
         let err = Workflow::parse(yaml).expect_err("empty host invalid");
         assert!(matches!(err, WorkflowParseError::HostEmpty { .. }));
+    }
+
+    #[test]
+    fn branch_struct_parses() {
+        let b: Branch = serde_yaml::from_str(
+            "condition: \"{{ steps.a.output }}\"\nthen: [x, y]\nelse: [z]\n",
+        )
+        .unwrap();
+        assert_eq!(b.condition, "{{ steps.a.output }}");
+        assert_eq!(b.then, vec!["x", "y"]);
+        assert_eq!(b.r#else, vec!["z"]);
     }
 }
 

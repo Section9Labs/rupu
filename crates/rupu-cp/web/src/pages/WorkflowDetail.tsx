@@ -11,6 +11,7 @@ import { api, ApiError, type AgentSummary, type WorkflowDetail } from '../lib/ap
 import { ScopeChip } from '../components/ScopeChip';
 import LauncherSheet from '../components/LauncherSheet';
 import { Button } from '../components/ui/Button';
+import { useWorkflowEditorUi } from '../hooks/useWorkflowEditorUi';
 
 // Lazy so the @xyflow/react canvas + CodeMirror (and the rest of the visual
 // editor) stay out of the main bundle — only fetched once the page mounts.
@@ -76,6 +77,7 @@ function readAutoflow(workflow: Record<string, unknown>): AutoflowInfo | null {
 export default function WorkflowDetailPage() {
   const { name = '' } = useParams<{ name: string }>();
   const navigate = useNavigate();
+  const workflowEditorUi = useWorkflowEditorUi();
 
   const [detail, setDetail] = useState<WorkflowDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -368,6 +370,7 @@ export default function WorkflowDetailPage() {
             onYamlChange={setDraftYaml}
             agents={agents}
             validity={validity}
+            workflowEditorUi={workflowEditorUi}
           />
         </Suspense>
       </div>

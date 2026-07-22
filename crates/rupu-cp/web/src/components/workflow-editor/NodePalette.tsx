@@ -11,6 +11,7 @@
 
 import type { DragEvent } from 'react';
 import type { StepKind } from '../../lib/workflowGraph';
+import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 
 /** dataTransfer key the canvas reads on drop. Exported so the canvas drop
  *  handler and the palette agree on one string. */
@@ -23,6 +24,7 @@ const KIND_COLOR: Record<StepKind, string> = {
   for_each: '#8b5cf6',
   parallel: '#9333ea',
   panel: '#f59e0b',
+  branch: '#16a34a',
 };
 
 interface PaletteItem {
@@ -40,6 +42,10 @@ const ITEMS: readonly PaletteItem[] = [
   { kind: 'panel', label: 'panel', sub: 'review+gate' },
 ];
 
+// branch is a newer, still-behind-flag kind — only offered from the palette
+// when `workflowEditorUi === 'next'` (see Props.workflowEditorUi below).
+const BRANCH_ITEM: PaletteItem = { kind: 'branch', label: 'branch', sub: 'if / then / else' };
+
 interface Props {
   /** Click-to-add (accessible baseline + keyboard path): add at canvas center. */
   onAdd: (kind: StepKind) => void;
@@ -47,9 +53,18 @@ interface Props {
   onDragStartKind: (kind: StepKind) => void;
   /** When paused (YAML unparseable) the whole dock is inert. */
   disabled?: boolean;
+  /** Workflow-editor-UI flag — the branch card renders only when 'next'.
+   *  Defaults to 'classic' (no branch card) for callers that don't thread it. */
+  workflowEditorUi?: WorkflowEditorUi;
 }
 
-export default function NodePalette({ onAdd, onDragStartKind, disabled = false }: Props) {
+export default function NodePalette({
+  onAdd,
+  onDragStartKind,
+  disabled = false,
+  workflowEditorUi = 'classic',
+}: Props) {
+  const items = workflowEditorUi === 'next' ? [...ITEMS, BRANCH_ITEM] : ITEMS;
   const handleDragStart = (kind: StepKind) => (e: DragEvent<HTMLButtonElement>) => {
     if (disabled) {
       e.preventDefault();
@@ -66,7 +81,7 @@ export default function NodePalette({ onAdd, onDragStartKind, disabled = false }
         Drag a card onto the canvas, or click to add at center.
       </div>
       <div className="flex flex-wrap gap-1.5">
-        {ITEMS.map((item) => {
+        {items.map((item) => {
           const color = KIND_COLOR[item.kind];
           return (
             <button

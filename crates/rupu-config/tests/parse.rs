@@ -98,6 +98,20 @@ fn cp_config_defaults_agent_authoring_ui_to_classic() {
 
 #[test]
 fn cp_config_accepts_next_agent_authoring_ui() {
-    let cfg: rupu_config::policy_config::CpConfig = toml::from_str("agent_authoring_ui = \"next\"").unwrap();
+    let cfg: rupu_config::policy_config::CpConfig =
+        toml::from_str("agent_authoring_ui = \"next\"").unwrap();
     assert_eq!(cfg.agent_authoring_ui, "next");
+}
+
+#[test]
+fn cp_config_defaults_workflow_editor_ui_to_classic() {
+    let cfg: rupu_config::policy_config::CpConfig = toml::from_str("").expect("empty [cp] parses");
+    assert_eq!(cfg.workflow_editor_ui, "classic");
+}
+
+#[test]
+fn cp_config_accepts_next_workflow_editor_ui() {
+    let cfg: rupu_config::policy_config::CpConfig =
+        toml::from_str("workflow_editor_ui = \"next\"").unwrap();
+    assert_eq!(cfg.workflow_editor_ui, "next");
 }

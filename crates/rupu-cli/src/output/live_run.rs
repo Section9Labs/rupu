@@ -779,6 +779,7 @@ fn overall_progress_fraction(state: &LiveRunState) -> f64 {
                 _ => 0.0,
             },
             StepKind::Linear => 0.0,
+            StepKind::Branch => 0.0,
         })
         .unwrap_or(0.0);
 
@@ -1066,7 +1067,7 @@ pub fn render_graph(state: &LiveRunState, _workflow: &Workflow, width: usize) ->
                     ));
                 }
             }
-            StepKind::Linear => {
+            StepKind::Linear | StepKind::Branch => {
                 let right = if matches!(step.status, NodeStatus::Complete) {
                     format!(
                         "{} {} ⇡{}",

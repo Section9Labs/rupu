@@ -543,6 +543,220 @@ steps:
 }
 
 #[test]
+fn rejects_branch_combined_with_agent_prompt_for_each_parallel_panel() {
+    let combos = [
+        "agent: a\n    prompt: hi",
+        "for_each: \"{{ inputs.items }}\"\n    agent: a\n    prompt: hi",
+        "parallel:\n      - { id: x, agent: a, prompt: y }",
+        "panel:\n      panelists: [reviewer-a]\n      subject: \"x\"",
+    ];
+    for combo in combos {
+        let s = format!(
+            r#"
+name: x
+steps:
+  - id: gate
+    actions: []
+    {combo}
+    branch:
+      condition: "{{{{ steps.gate.output }}}}"
+      then: [a]
+      else: [b]
+  - id: a
+    agent: ag
+    prompt: p
+  - id: b
+    agent: ag
+    prompt: p
+"#
+        );
+        let err = Workflow::parse(&s).unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "combo `{combo}` expected mutually-exclusive error, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn rejects_branch_with_empty_condition() {
+    let s = r#"
+name: x
+steps:
+  - id: gate
+    actions: []
+    branch:
+      condition: "   "
+      then: [a]
+      else: [b]
+  - id: a
+    agent: ag
+    prompt: p
+  - id: b
+    agent: ag
+    prompt: p
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("condition"),
+        "expected empty-condition error, got: {err}"
+    );
+}
+
+#[test]
+fn rejects_branch_with_when() {
+    // `when:` is evaluated before the branch block by the runner. A
+    // branch step with a falsy `when:` would be when:-skipped without
+    // ever populating either arm's skip-set, so both arms would run —
+    // a silent correctness bug. Reject `when:` on branch steps outright.
+    let s = r#"
+name: x
+steps:
+  - id: gate
+    actions: []
+    when: "true"
+    branch:
+      condition: "true"
+      then: [a]
+      else: [b]
+  - id: a
+    agent: ag
+    prompt: p
+  - id: b
+    agent: ag
+    prompt: p
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("when") && err.contains("not allowed") && err.contains("branch"),
+        "expected when-on-branch error, got: {err}"
+    );
+}
+
+#[test]
+fn rejects_branch_arms_overlap() {
+    let s = r#"
+name: x
+steps:
+  - id: gate
+    actions: []
+    branch:
+      condition: "{{ steps.gate.output }}"
+      then: [a, shared]
+      else: [b, shared]
+  - id: a
+    agent: ag
+    prompt: p
+  - id: b
+    agent: ag
+    prompt: p
+  - id: shared
+    agent: ag
+    prompt: p
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("shared"),
+        "expected arms-overlap error naming `shared`, got: {err}"
+    );
+}
+
+#[test]
+fn rejects_branch_targeting_self() {
+    let s = r#"
+name: x
+steps:
+  - id: gate
+    actions: []
+    branch:
+      condition: "{{ steps.gate.output }}"
+      then: [gate]
+      else: [b]
+  - id: b
+    agent: ag
+    prompt: p
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("gate"),
+        "expected self-target error naming `gate`, got: {err}"
+    );
+}
+
+#[test]
+fn accepts_valid_branch_step() {
+    let s = r#"
+name: x
+steps:
+  - id: gate
+    actions: []
+    branch:
+      condition: "true"
+      then: [a]
+      else: [b]
+  - id: a
+    agent: ag
+    prompt: p
+  - id: b
+    agent: ag
+    prompt: p
+"#;
+    let wf = Workflow::parse(s).expect("valid branch step should parse");
+    let branch = wf.steps[0].branch.as_ref().unwrap();
+    assert_eq!(branch.then, vec!["a".to_string()]);
+    assert_eq!(branch.r#else, vec!["b".to_string()]);
+    assert!(wf.steps[0].agent.is_none());
+    assert!(wf.steps[0].prompt.is_none());
+}
+
+#[test]
+fn rejects_branch_target_unknown() {
+    let s = r#"
+name: x
+steps:
+  - id: gate
+    actions: []
+    branch:
+      condition: "true"
+      then: [nope]
+      else: [b]
+  - id: b
+    agent: ag
+    prompt: p
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("nope"),
+        "expected BranchTargetUnknown naming `nope`, got: {err}"
+    );
+}
+
+#[test]
+fn rejects_branch_target_not_forward() {
+    let s = r#"
+name: x
+steps:
+  - id: before
+    agent: ag
+    prompt: p
+  - id: gate
+    actions: []
+    branch:
+      condition: "true"
+      then: [before]
+      else: [after]
+  - id: after
+    agent: ag
+    prompt: p
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("before"),
+        "expected BranchTargetNotForward naming `before`, got: {err}"
+    );
+}
+
+#[test]
 fn parses_notify_issue_field() {
     let s = r#"
 name: x
@@ -869,5 +1083,59 @@ steps:
     assert!(
         err.contains("steps.a.maxx_severity"),
         "expected when: lint to fire, got: {err}"
+    );
+}
+
+#[test]
+fn lint_validates_branch_condition_unknown_field() {
+    let s = r#"
+name: x
+steps:
+  - id: a
+    agent: w
+    actions: []
+    prompt: hi
+  - id: gate
+    actions: []
+    branch:
+      condition: "{{ steps.a.outupt }}"
+      then: [b]
+      else: [c]
+  - id: b
+    agent: w
+    prompt: p
+  - id: c
+    agent: w
+    prompt: p
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("steps.a.outupt") && err.contains("not a known step-output field"),
+        "expected branch.condition unknown-field lint to fire, got: {err}"
+    );
+}
+
+#[test]
+fn lint_rejects_branch_condition_forward_reference() {
+    let s = r#"
+name: x
+steps:
+  - id: gate
+    actions: []
+    branch:
+      condition: "{{ steps.b.output }}"
+      then: [a]
+      else: [b]
+  - id: a
+    agent: w
+    prompt: p
+  - id: b
+    agent: w
+    prompt: p
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("steps.b") && err.contains("forward reference"),
+        "expected branch.condition forward-ref lint to fire, got: {err}"
     );
 }

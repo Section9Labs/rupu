@@ -8,6 +8,7 @@
 import type { AgentSummary } from '../../lib/api';
 import type { GraphNode, PanelCfg, PanelGate, StepKind, StepNodeData, SubStep } from '../../lib/workflowGraph';
 import type { ExprContext } from '../../lib/workflowExpressions';
+import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 import ExpressionField from './ExpressionField';
 import { Button } from '../ui/Button';
 
@@ -21,6 +22,15 @@ interface StepFormProps {
   problems: string[];
   /** Vocabulary context for the expression editors (inputs + prior steps). */
   exprContext: StepExprContext;
+  /** Every node id currently in the graph — powers BranchFields' then/else
+   *  target pickers. Defaults to empty (no candidates) for callers that don't
+   *  thread it. */
+  allNodeIds?: string[];
+  /** Workflow-editor-UI flag — the "Branch (if)" kind option is only offered
+   *  in the Kind <select> when 'next', UNLESS the node being edited is
+   *  already a branch (an existing branch node must always be editable
+   *  regardless of the flag). Defaults to 'classic'. */
+  workflowEditorUi?: WorkflowEditorUi;
 }
 
 /** Build a full ExprContext for a single field from the shared step context. */
@@ -59,10 +69,26 @@ const KIND_LABELS: Record<StepKind, string> = {
   for_each: 'For-each',
   parallel: 'Parallel',
   panel: 'Panel',
+  branch: 'Branch (if)',
 };
 
-export default function StepForm({ node, agents, onChange, problems, exprContext }: StepFormProps) {
+export default function StepForm({
+  node,
+  agents,
+  onChange,
+  problems,
+  exprContext,
+  allNodeIds = [],
+  workflowEditorUi = 'classic',
+}: StepFormProps) {
   const d = node.data;
+
+  // The "branch" kind option is behind the flag — UNLESS the node being
+  // edited is already a branch, in which case it must always be selectable
+  // (an existing branch node is always fully editable regardless of the flag).
+  const kindOptions = (Object.keys(KIND_LABELS) as StepKind[]).filter(
+    (k) => k !== 'branch' || workflowEditorUi === 'next' || d.kind === 'branch',
+  );
 
   // Generic field patch — spread the old data so raw_passthrough and every
   // unedited field survive.
@@ -116,7 +142,7 @@ export default function StepForm({ node, agents, onChange, problems, exprContext
           aria-label="Step kind"
           className={fieldCls}
         >
-          {(Object.keys(KIND_LABELS) as StepKind[]).map((k) => (
+          {kindOptions.map((k) => (
             <option key={k} value={k}>
               {KIND_LABELS[k]}
             </option>
@@ -132,9 +158,15 @@ export default function StepForm({ node, agents, onChange, problems, exprContext
       )}
       {d.kind === 'parallel' && <ParallelFields d={d} agents={agents} patch={patch} exprContext={exprContext} />}
       {d.kind === 'panel' && <PanelFields d={d} agents={agents} patch={patch} exprContext={exprContext} />}
+      {d.kind === 'branch' && (
+        <BranchFields d={d} allNodeIds={allNodeIds} patch={patch} exprContext={exprContext} />
+      )}
 
-      {/* ── common: when / continue_on_error ───────────────────────── */}
-      {d.kind !== 'panel' && (
+      {/* ── common: when / continue_on_error / approval ─────────────── */}
+      {/* branch — like panel — hides this block: nodeToStepObject never reads
+         when/continue_on_error for branch (mirrors panel's exclusion), and
+         approval is mirrored off here the same way panel already excludes it. */}
+      {d.kind !== 'panel' && d.kind !== 'branch' && (
         <>
           <label className="block">
             <span className={labelCls}>When (optional)</span>
@@ -478,6 +510,95 @@ function PanelFields({
           </label>
         </div>
       )}
+    </div>
+  );
+}
+
+// ── branch ───────────────────────────────────────────────────────────────────
+
+function BranchFields({
+  d,
+  allNodeIds,
+  patch,
+  exprContext,
+}: {
+  d: StepNodeData;
+  allNodeIds: string[];
+  patch: (p: Partial<StepNodeData>) => void;
+  exprContext: StepExprContext;
+}) {
+  const thenTargets = d.thenTargets ?? [];
+  const elseTargets = d.elseTargets ?? [];
+  // Every other node in the graph is a valid then/else target; excludes the
+  // branch's own id (a self-target would be a self-loop).
+  const candidates = allNodeIds.filter((id) => id !== d.id);
+
+  function toggleThen(id: string, on: boolean): void {
+    const set = new Set(thenTargets);
+    if (on) set.add(id);
+    else set.delete(id);
+    patch({ thenTargets: [...set] });
+  }
+  function toggleElse(id: string, on: boolean): void {
+    const set = new Set(elseTargets);
+    if (on) set.add(id);
+    else set.delete(id);
+    patch({ elseTargets: [...set] });
+  }
+
+  return (
+    <div className="space-y-3">
+      <label className="block">
+        <span className={labelCls}>Condition</span>
+        <ExpressionField
+          value={d.condition ?? ''}
+          onChange={(v) => patch({ condition: v })}
+          context={fieldCtx(exprContext, {})}
+          ariaLabel="Branch condition"
+        />
+      </label>
+
+      <div>
+        <span className={labelCls}>Then (true)</span>
+        <div className="space-y-1.5 rounded-md border border-border bg-surface p-2.5">
+          {candidates.length === 0 ? (
+            <p className="text-ui text-ink-mute">No other steps available.</p>
+          ) : (
+            candidates.map((id) => (
+              <label key={id} className={checkLabelCls}>
+                <input
+                  type="checkbox"
+                  checked={thenTargets.includes(id)}
+                  onChange={(e) => toggleThen(id, e.target.checked)}
+                  aria-label={`Then target ${id}`}
+                />
+                <span className="font-mono">{id}</span>
+              </label>
+            ))
+          )}
+        </div>
+      </div>
+
+      <div>
+        <span className={labelCls}>Else (false)</span>
+        <div className="space-y-1.5 rounded-md border border-border bg-surface p-2.5">
+          {candidates.length === 0 ? (
+            <p className="text-ui text-ink-mute">No other steps available.</p>
+          ) : (
+            candidates.map((id) => (
+              <label key={id} className={checkLabelCls}>
+                <input
+                  type="checkbox"
+                  checked={elseTargets.includes(id)}
+                  onChange={(e) => toggleElse(id, e.target.checked)}
+                  aria-label={`Else target ${id}`}
+                />
+                <span className="font-mono">{id}</span>
+              </label>
+            ))
+          )}
+        </div>
+      </div>
     </div>
   );
 }

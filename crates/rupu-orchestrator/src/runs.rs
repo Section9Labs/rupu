@@ -273,6 +273,7 @@ pub enum StepKind {
     ForEach,
     Parallel,
     Panel,
+    Branch,
 }
 
 /// One entry in `step_results.jsonl`. Mirrors [`StepResult`] but with
@@ -2015,6 +2016,7 @@ mod tests {
             StepKind::ForEach,
             StepKind::Parallel,
             StepKind::Panel,
+            StepKind::Branch,
         ] {
             let mut rec = sample_step_result("k");
             rec.kind = kind;

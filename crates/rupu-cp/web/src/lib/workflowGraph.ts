@@ -13,7 +13,7 @@
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
-export type StepKind = 'step' | 'for_each' | 'parallel' | 'panel';
+export type StepKind = 'step' | 'for_each' | 'parallel' | 'panel' | 'branch';
 
 export interface SubStep {
   id: string;
@@ -51,6 +51,11 @@ export interface StepNodeData {
   max_parallel?: number;
   parallel?: SubStep[];
   panel?: PanelCfg;
+  // Branch fields (workflow.rs `Branch`: condition / then / else). A branch
+  // step carries no agent/prompt — routing is expressed entirely via these.
+  condition?: string;
+  thenTargets?: string[];
+  elseTargets?: string[];
   approvalRequired?: boolean;
   // Approval.prompt / Approval.timeout_seconds (workflow.rs Approval). Preserved
   // so they survive a load→save round-trip; `approvalRequired` stays a distinct
@@ -72,6 +77,10 @@ export interface GraphEdge {
   id: string;
   source: string;
   target: string;
+  // Set on branch-arm edges (yamlToGraph emits these from a `branch` node to
+  // each of its then/else targets); absent on chain/data-ref edges.
+  label?: string;
+  branch?: 'then' | 'else';
 }
 
 export interface WorkflowMeta {
@@ -153,14 +162,17 @@ function parseStepData(raw: unknown, i: number): StepNodeData {
   const o = asRecord(raw) ?? {};
   const id = asString(o.id) ?? `step-${i}`;
 
-  // Kind precedence: panel > parallel > for_each > step. A step matching none
-  // cleanly still becomes a plain `step` node carrying whatever it has.
+  // Kind precedence: panel > parallel > branch > for_each > step. A step
+  // matching none cleanly still becomes a plain `step` node carrying whatever
+  // it has. A branch step has no agent/prompt of its own.
   const panelRaw = asRecord(o.panel);
   const parallelRaw = asArray(o.parallel);
+  const branchRaw = asRecord(o.branch);
   const forEach = asString(o.for_each);
   let kind: StepKind = 'step';
   if (panelRaw) kind = 'panel';
   else if (parallelRaw) kind = 'parallel';
+  else if (branchRaw) kind = 'branch';
   else if (forEach !== undefined) kind = 'for_each';
 
   const data: StepNodeData = { id, kind };
@@ -180,6 +192,14 @@ function parseStepData(raw: unknown, i: number): StepNodeData {
   if (mp !== undefined) data.max_parallel = mp;
   if (parallelRaw) data.parallel = parallelRaw.map((s, j) => parseSubStep(s, j));
   if (panelRaw) data.panel = parsePanel(panelRaw);
+  if (branchRaw) {
+    const cond = asString(branchRaw.condition);
+    if (cond !== undefined) data.condition = cond;
+    const thenTargets = asStringArray(branchRaw.then);
+    if (thenTargets && thenTargets.length > 0) data.thenTargets = thenTargets;
+    const elseTargets = asStringArray(branchRaw.else);
+    if (elseTargets && elseTargets.length > 0) data.elseTargets = elseTargets;
+  }
 
   const approval = asRecord(o.approval);
   if (approval) {
@@ -213,6 +233,7 @@ const MODELLED_STEP_KEYS = new Set<string>([
   'max_parallel',
   'parallel',
   'panel',
+  'branch',
   'approval',
 ]);
 
@@ -224,7 +245,7 @@ const STEP_REF = /steps\.([A-Za-z0-9_-]+)/g;
  *  sub-step prompt, panel subject/prompt) for `steps.<id>` references and return
  *  the unique referenced ids. */
 export function extractStepRefs(data: StepNodeData): string[] {
-  const buckets: (string | undefined)[] = [data.prompt, data.for_each, data.when];
+  const buckets: (string | undefined)[] = [data.prompt, data.for_each, data.when, data.condition];
   if (data.parallel) for (const s of data.parallel) buckets.push(s.prompt);
   if (data.panel) buckets.push(data.panel.subject, data.panel.prompt);
 
@@ -259,11 +280,19 @@ export function yamlToGraph(obj: Record<string, unknown>): WorkflowGraph {
   const ids = new Set(nodes.map((n) => n.id));
   const edges: GraphEdge[] = [];
   const seen = new Set<string>();
-  const addEdge = (source: string, target: string): void => {
-    const key = `${source}->${target}`;
+  const addEdge = (source: string, target: string, opts?: { label?: string; branch?: 'then' | 'else' }): void => {
+    const label = opts?.label;
+    // Label is part of the dedupe key so a labeled branch-arm edge never
+    // collapses onto a plain chain/data-ref edge (or onto the other arm) that
+    // happens to connect the same pair of nodes.
+    const key = `${source}->${target}::${label ?? ''}`;
     if (source === target || seen.has(key)) return;
     seen.add(key);
-    edges.push({ id: key, source, target });
+    const id = opts?.branch ? `${source}->${target}:${opts.branch}` : `${source}->${target}`;
+    const e: GraphEdge = { id, source, target };
+    if (label !== undefined) e.label = label;
+    if (opts?.branch !== undefined) e.branch = opts.branch;
+    edges.push(e);
   };
 
   // (a) base chain edges for ordering, then (b) data-ref edges X->Y whenever Y
@@ -272,6 +301,18 @@ export function yamlToGraph(obj: Record<string, unknown>): WorkflowGraph {
   for (const n of nodes) {
     for (const ref of extractStepRefs(n.data)) {
       if (ids.has(ref)) addEdge(ref, n.id);
+    }
+  }
+
+  // (c) branch-arm edges: a `branch` node points at each of its then/else
+  // targets with a label so the renderer can draw true/false arms distinctly.
+  for (const n of nodes) {
+    if (n.data.kind !== 'branch') continue;
+    for (const t of n.data.thenTargets ?? []) {
+      if (ids.has(t)) addEdge(n.id, t, { label: 'true', branch: 'then' });
+    }
+    for (const t of n.data.elseTargets ?? []) {
+      if (ids.has(t)) addEdge(n.id, t, { label: 'false', branch: 'else' });
     }
   }
 
@@ -361,6 +402,12 @@ function nodeToStepObject(d: StepNodeData): Record<string, unknown> {
       po.gate = go;
     }
     o.panel = po;
+  } else if (d.kind === 'branch') {
+    const bo: Record<string, unknown> = {};
+    if (d.condition !== undefined) bo.condition = d.condition;
+    if (d.thenTargets && d.thenTargets.length > 0) bo.then = d.thenTargets;
+    if (d.elseTargets && d.elseTargets.length > 0) bo.else = d.elseTargets;
+    o.branch = bo;
   } else {
     // step / for_each
     if (d.agent) o.agent = d.agent;
@@ -465,6 +512,7 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
 
   const counts = new Map<string, number>();
   for (const n of g.nodes) counts.set(n.id, (counts.get(n.id) ?? 0) + 1);
+  const nodeIds = new Set(g.nodes.map((n) => n.id));
 
   for (const n of g.nodes) {
     const d = n.data;
@@ -486,6 +534,11 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
       const p = d.panel;
       if (!p || p.panelists.length === 0) add(n.id, 'panel needs at least one panelist');
       if (!p || !p.subject) add(n.id, 'panel needs a subject');
+    } else if (d.kind === 'branch') {
+      if (!d.condition) add(n.id, 'branch needs a condition');
+      for (const t of [...(d.thenTargets ?? []), ...(d.elseTargets ?? [])]) {
+        if (!nodeIds.has(t)) add(n.id, `branch target ${t} is not a known step`);
+      }
     }
     if ((counts.get(n.id) ?? 0) > 1) add(n.id, 'duplicate step id');
   }
@@ -493,7 +546,6 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
   // Reference checks: dangling refs (steps.X where X is not a node) and forward
   // refs (X runs AFTER the referencing node — only checkable when there's no
   // cycle, since order is otherwise undefined).
-  const nodeIds = new Set(g.nodes.map((n) => n.id));
   const sorted = topoSort(g.nodes, g.edges);
   const pos = 'order' in sorted ? new Map(sorted.order.map((n, i) => [n.id, i])) : undefined;
   for (const n of g.nodes) {

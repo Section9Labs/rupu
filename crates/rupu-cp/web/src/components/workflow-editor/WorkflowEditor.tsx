@@ -30,6 +30,7 @@ import {
   type WorkflowMeta,
 } from '../../lib/workflowGraph';
 import { autoLayout, reconcileFromYaml } from '../../lib/workflowLayout';
+import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 import CodeEditor from '../CodeEditor';
 import WorkflowEditorGraph from './WorkflowEditorGraph';
 import StepForm from './StepForm';
@@ -45,6 +46,10 @@ interface WorkflowEditorProps {
   agents: AgentSummary[];
   /** Live-validate result from the page (server-side parse check). */
   validity: { ok: boolean; error?: string } | null;
+  /** Workflow-editor-UI flag — threaded down to NodePalette (gates the branch
+   *  palette card) and StepForm (gates the "Branch (if)" kind option).
+   *  Defaults to 'classic' for callers that don't thread it. */
+  workflowEditorUi?: WorkflowEditorUi;
 }
 
 /** Parse `draftYaml` into a laid-out graph. A non-object document (or a parse
@@ -80,7 +85,13 @@ function hasYamlComments(text: string): boolean {
   return false;
 }
 
-export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validity }: WorkflowEditorProps) {
+export default function WorkflowEditor({
+  draftYaml,
+  onYamlChange,
+  agents,
+  validity,
+  workflowEditorUi = 'classic',
+}: WorkflowEditorProps) {
   const [graph, setGraph] = useState<WorkflowGraph>(() => seedGraph(draftYaml));
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [panelTab, setPanelTab] = useState<PanelTab>('settings');
@@ -294,6 +305,7 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
                 problemsById={problemsById}
                 onInvalidConnection={setConnError}
                 paused={paused}
+                workflowEditorUi={workflowEditorUi}
               />
             </div>
           }
@@ -359,6 +371,8 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
                   onChange={onStepChange}
                   problems={problemsById[selectedNode.id] ?? []}
                   exprContext={exprContext}
+                  allNodeIds={graph.nodes.map((n) => n.id)}
+                  workflowEditorUi={workflowEditorUi}
                 />
               ) : (
                 <p className="text-lead text-ink-dim">Select a node to edit its step.</p>
