@@ -10,6 +10,7 @@ pub mod embed;
 pub mod error;
 pub mod host;
 pub mod launcher;
+pub mod net;
 pub mod node;
 pub mod pagination;
 pub mod repos;
