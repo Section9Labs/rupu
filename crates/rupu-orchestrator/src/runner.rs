@@ -940,6 +940,28 @@ async fn run_steps_inner(
     for step in &opts.workflow.steps {
         // Resume: skip steps that already ran in the prior process.
         if already_done.contains(&step.id) {
+            // If the already-done step is a `branch:` step, reconstruct the
+            // not-taken arm's skip-set from its PERSISTED result BEFORE we
+            // `continue` past it. On resume `branch_skipped` starts empty and
+            // the branch arm below (which normally populates it) never runs
+            // for an already-done branch. Without this, a not-taken arm step
+            // that had not yet been reached when the run paused is neither in
+            // `already_done` nor in `branch_skipped`, so it would EXECUTE on
+            // resume — dispatching the agent the branch explicitly excluded.
+            // The branch's persisted result carries `output == "then"`/`"else"`
+            // (the taken arm); mirror the arm-selection logic in the branch
+            // arm below so taken/not-taken stays consistent.
+            if let Some(branch) = &step.branch {
+                let taken = step_results
+                    .iter()
+                    .find(|sr| sr.step_id == step.id)
+                    .map(|sr| sr.output.as_str());
+                match taken {
+                    Some("then") => branch_skipped.extend(branch.r#else.iter().cloned()),
+                    Some("else") => branch_skipped.extend(branch.then.iter().cloned()),
+                    _ => {}
+                }
+            }
             info!(step = %step.id, "resume: skipping already-completed step");
             continue;
         }

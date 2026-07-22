@@ -10,8 +10,10 @@ use async_trait::async_trait;
 use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
 use rupu_agent::AgentRunOpts;
 use rupu_orchestrator::executor::{Event, EventSink};
-use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, StepFactory};
-use rupu_orchestrator::Workflow;
+use rupu_orchestrator::runner::{
+    run_workflow, OrchestratorRunOpts, PauseReason, ResumeState, StepFactory,
+};
+use rupu_orchestrator::{StepKind, StepResult, Workflow};
 use rupu_providers::types::StopReason;
 use rupu_tools::ToolContext;
 
@@ -247,4 +249,88 @@ async fn branch_take_else_skips_then_arm() {
             if step_id == "arm_a" && reason.contains("not taken by branch"))
     });
     assert!(has_arm_a_skip, "arm_a should emit a branch StepSkipped");
+}
+
+// Regression: a run pauses AFTER a branch commits its arm (classify + route
+// already done) but BEFORE the not-taken arm is reached. On resume the
+// already-done branch step hits the resume-skip `continue` before the branch
+// arm that populates `branch_skipped`. If the skip-set is not reconstructed
+// from the branch's persisted result, the not-taken arm (`arm_b`, the `else`
+// arm) is neither already-done nor branch-skipped, so it EXECUTES on resume —
+// dispatching the agent the branch explicitly excluded. This proves the
+// not-taken arm stays skipped after resume.
+#[tokio::test]
+async fn resume_after_branch_keeps_not_taken_arm_skipped() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let sink: Arc<CollectSink> = Arc::new(CollectSink::default());
+    // Condition rendered "true" → the branch took the `then` arm (arm_a).
+    let wf = Workflow::parse(&WF_BRANCH.replace("CONDITION", "true")).unwrap();
+
+    // Simulate the prior process having completed `classify` and the `route`
+    // branch step (which committed `output == "then"`), then paused before
+    // reaching arm_a / arm_b. Only these two results are pre-seeded.
+    let prior_step_results = vec![
+        StepResult {
+            step_id: "classify".into(),
+            output: "classified".into(),
+            success: true,
+            skipped: false,
+            kind: StepKind::Linear,
+            ..Default::default()
+        },
+        StepResult {
+            step_id: "route".into(),
+            output: "then".into(),
+            success: true,
+            skipped: false,
+            kind: StepKind::Branch,
+            ..Default::default()
+        },
+    ];
+
+    let mut opts = opts_for(wf, &tmp, sink.clone());
+    opts.resume_from = Some(ResumeState {
+        run_id: "run_resume_branch".into(),
+        prior_step_results,
+        approved_step_id: String::new(),
+        completed_units: std::collections::BTreeMap::new(),
+        reason: PauseReason::Manual,
+        paused_step: None,
+    });
+
+    let res = run_workflow(opts).await.unwrap();
+
+    // The taken arm (arm_a) still runs on resume.
+    let arm_a = step(&res, "arm_a");
+    assert!(!arm_a.skipped, "taken arm_a should run after resume");
+    assert!(arm_a.success);
+
+    // The not-taken `else` arm (arm_b) MUST stay skipped after resume — the
+    // skip-set was reconstructed from `route`'s persisted `output == "then"`.
+    let arm_b = step(&res, "arm_b");
+    assert!(
+        arm_b.skipped,
+        "not-taken arm_b must remain skipped after resume, not execute"
+    );
+    assert_eq!(arm_b.output, "", "skipped arm has empty output");
+
+    // join reconverges seeing arm_b's empty output.
+    let join = step(&res, "join");
+    assert!(!join.skipped, "join should run after the branch on resume");
+    assert!(
+        join.rendered_prompt.contains("b=[]"),
+        "join should see arm_b's empty output, got: {}",
+        join.rendered_prompt
+    );
+
+    // The StepSkipped event for arm_b carries the branch reason on resume.
+    let events = sink.events.lock().unwrap();
+    let has_arm_b_skip = events.iter().any(|e| {
+        matches!(e, Event::StepSkipped { step_id, reason, .. }
+            if step_id == "arm_b" && reason.contains("not taken by branch"))
+    });
+    assert!(
+        has_arm_b_skip,
+        "arm_b should emit a branch StepSkipped after resume"
+    );
 }
