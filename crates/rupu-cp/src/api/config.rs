@@ -265,18 +265,37 @@ fn project_config_path(s: &AppState, id: &str) -> ApiResult<PathBuf> {
     Ok(candidate)
 }
 
+/// Quote a single key segment using the same canonical dotted-key encoding
+/// as `rupu_config::resolve`'s private `dotted()` (and the frontend's
+/// `quoteSegment` in `ConfigEditor.tsx`): a segment containing a `.` or a
+/// `"` is wrapped in double quotes with embedded `"` escaped as `\"`;
+/// anything else is emitted bare. Must stay in lockstep with those two so a
+/// pricing model key like `/raid/models/zai-org/GLM-5.2-FP8` produces the
+/// exact same dotted string here as it does in the resolved provenance map
+/// (and hence in `[policy].lock`, which the CP Settings pricing tab's
+/// per-field lock toggle can populate with a dotted/quoted key — see
+/// `resolve::dotted`'s doc comment).
+fn quote_key_segment(k: &str) -> String {
+    if k.contains('.') || k.contains('"') {
+        format!("\"{}\"", k.replace('"', "\\\""))
+    } else {
+        k.to_string()
+    }
+}
+
 /// Flatten a parsed TOML value to dotted leaf-key paths (tables recurse;
 /// scalars and arrays are leaves). Mirrors `rupu_config::resolve`'s private
-/// `flatten` helper, duplicated here because that one isn't exported — used
-/// only to check candidate project keys against the global lock list, not
-/// for the actual layered-merge semantics.
+/// `flatten` + `dotted` helpers, duplicated here because those aren't
+/// exported — used only to check candidate project keys against the global
+/// lock list, not for the actual layered-merge semantics.
 fn flatten_toml_keys(v: &toml::Value, prefix: &str, out: &mut Vec<String>) {
     if let toml::Value::Table(t) = v {
         for (k, vv) in t {
+            let qk = quote_key_segment(k);
             let key = if prefix.is_empty() {
-                k.clone()
+                qk
             } else {
-                format!("{prefix}.{k}")
+                format!("{prefix}.{qk}")
             };
             match vv {
                 toml::Value::Table(_) => flatten_toml_keys(vv, &key, out),
@@ -516,6 +535,50 @@ mod tests {
         assert!(err.1.contains("enforced by global policy"), "{}", err.1);
 
         // Nothing was written.
+        assert!(!proj.path().join(".rupu/config.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn put_project_rejects_locked_dotted_pricing_key() {
+        // The lock entry is a dotted key with a quoted model-id segment —
+        // exactly what the CP Settings pricing tab's per-field lock toggle
+        // would write (see `rupu_config::resolve::dotted`'s doc comment).
+        // `flatten_toml_keys` must quote the candidate's model segment the
+        // same way, or this early write-time rejection silently never fires
+        // for a locked pricing field (resolution-time enforcement would
+        // still hold, but the operator loses the clear write-time error).
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            r#"[pricing.oracle."/raid/models/zai-org/GLM-5.2-FP8"]
+input_per_mtok = 1.42
+output_per_mtok = 1.42
+cached_input_per_mtok = 0.82
+
+[policy]
+lock = ["pricing.oracle.\"/raid/models/zai-org/GLM-5.2-FP8\".input_per_mtok"]
+"#,
+        )
+        .unwrap();
+        let s = writable_state(&tmp);
+
+        let proj = tempfile::TempDir::new().unwrap();
+        register_workspace(&tmp, "ws_locked_pricing", proj.path());
+
+        let body = ConfigWriteBody {
+            raw: Some(
+                r#"[pricing.oracle."/raid/models/zai-org/GLM-5.2-FP8"]
+input_per_mtok = 5.0
+"#
+                .into(),
+            ),
+            patch: None,
+        };
+        let err = put_project(State(s), AxPath("ws_locked_pricing".into()), Json(body))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("enforced by global policy"), "{}", err.1);
         assert!(!proj.path().join(".rupu/config.toml").exists());
     }
 

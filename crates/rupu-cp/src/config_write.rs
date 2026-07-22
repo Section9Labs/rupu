@@ -132,13 +132,117 @@ pub fn apply_form_patch(
     Ok(doc.to_string())
 }
 
+/// Inverse of `rupu_config::resolve`'s private `dotted()` encoding (kept in
+/// lockstep with it, and with the frontend's `splitDottedKey` in
+/// `ConfigEditor.tsx`): split a dotted key path on `.`, except inside a
+/// `"…"`-quoted segment, where `\"` unescapes to `"`. A quoted segment must
+/// span the whole segment between separators — e.g.
+/// `pricing.oracle."/raid/models/zai-org/GLM-5.2-FP8".input_per_mtok` splits
+/// to `["pricing", "oracle", "/raid/models/zai-org/GLM-5.2-FP8",
+/// "input_per_mtok"]` — so a dotted model id round-trips through the write
+/// path instead of being torn apart on every embedded `.`.
+///
+/// **Strict-write, lenient-read asymmetry (deliberate):** this is the WRITE
+/// path's decoder, so it rejects anything that isn't an unambiguous encoding
+/// of a real config key — malformed quoting (an unterminated quote, or a `"`
+/// that doesn't span exactly one segment) AND any EMPTY segment (`.`, `a.`,
+/// `.x`, `a..b` are all `Err`, including a trailing separator's *implied*
+/// empty final segment — a real TOML key segment in a rupu config is never
+/// empty, so treating one as valid here would silently accept a key that can
+/// never correspond to an actual config field). This is intentionally
+/// stricter than the frontend's `splitDottedKey`, which stays lenient
+/// (never throws, degrades to a harmless failed `getPath` lookup) because it
+/// only ever renders a UI field — see that function's doc comment. Never
+/// silently drop a bogus segment either way; on the write side, refuse.
+fn split_dotted_key(dotted: &str) -> Result<Vec<String>, ConfigWriteError> {
+    let mut segments = Vec::new();
+    let mut chars = dotted.chars().peekable();
+    loop {
+        let mut seg = String::new();
+        // Whether this segment was terminated by consuming a `.` separator
+        // (as opposed to running out of input) — if so, the separator
+        // IMPLIES another segment follows (even if input is now exhausted,
+        // in which case that implied segment is empty and gets rejected
+        // below on the next iteration, rather than being silently dropped).
+        let mut separator_consumed = false;
+        if chars.peek() == Some(&'"') {
+            chars.next(); // consume opening quote
+            let mut closed = false;
+            while let Some(c) = chars.next() {
+                match c {
+                    '"' => {
+                        closed = true;
+                        break;
+                    }
+                    '\\' if chars.peek() == Some(&'"') => {
+                        chars.next();
+                        seg.push('"');
+                    }
+                    other => seg.push(other),
+                }
+            }
+            if !closed {
+                return Err(ConfigWriteError::Validate(format!(
+                    "malformed config key `{dotted}`: unterminated quoted segment"
+                )));
+            }
+            // A quoted segment must span the whole segment: the next char
+            // (if any) must be the `.` separator, never more content fused
+            // onto the closing quote.
+            match chars.peek() {
+                None => {}
+                Some('.') => {
+                    chars.next();
+                    separator_consumed = true;
+                }
+                Some(_) => {
+                    return Err(ConfigWriteError::Validate(format!(
+                        "malformed config key `{dotted}`: quoted segment must span the whole segment"
+                    )));
+                }
+            }
+        } else {
+            loop {
+                match chars.next() {
+                    Some('.') => {
+                        separator_consumed = true;
+                        break;
+                    }
+                    Some('"') => {
+                        return Err(ConfigWriteError::Validate(format!(
+                            "malformed config key `{dotted}`: stray `\"` mid-segment"
+                        )));
+                    }
+                    Some(c) => seg.push(c),
+                    None => break,
+                }
+            }
+        }
+        if seg.is_empty() {
+            return Err(ConfigWriteError::Validate(format!(
+                "malformed config key `{dotted}`: empty key segment"
+            )));
+        }
+        segments.push(seg);
+        if !separator_consumed {
+            break;
+        }
+    }
+    Ok(segments)
+}
+
 fn set_dotted(
     doc: &mut toml_edit::DocumentMut,
     dotted: &str,
     val: &serde_json::Value,
 ) -> Result<(), ConfigWriteError> {
     let item = json_to_toml_item(val)?;
-    let parts: Vec<&str> = dotted.split('.').collect();
+    let parts = split_dotted_key(dotted)?;
+    if parts.is_empty() {
+        return Err(ConfigWriteError::Validate(format!(
+            "malformed config key `{dotted}`: empty"
+        )));
+    }
     // Navigate/create intermediate tables.
     let mut cur = doc.as_table_mut();
     for p in &parts[..parts.len() - 1] {
@@ -154,7 +258,10 @@ fn set_dotted(
     // (`Key::fmt`) the key formatting on an existing entry, which strips any
     // leading comment attached to it. Index assignment (`entry(..).or_insert`
     // under the hood) only replaces the value, preserving key decor.
-    cur[parts[parts.len() - 1]] = item;
+    // toml_edit re-quotes/escapes the raw segment itself when serializing the
+    // key, so inserting it unescaped here (e.g. `/raid/models/zai-org/GLM-5.2-FP8`)
+    // still produces valid, round-trippable TOML.
+    cur[parts[parts.len() - 1].as_str()] = item;
     Ok(())
 }
 
@@ -256,6 +363,116 @@ mod tests {
         let out = apply_form_patch(existing, &patch).unwrap();
         assert!(out.contains("# my config"), "comment preserved: {out}");
         assert!(out.contains("default_model = \"sonnet\""));
+    }
+
+    #[test]
+    fn split_dotted_key_simple() {
+        assert_eq!(
+            split_dotted_key("autoflow.max_active").unwrap(),
+            vec!["autoflow".to_string(), "max_active".to_string()]
+        );
+        assert_eq!(
+            split_dotted_key("default_model").unwrap(),
+            vec!["default_model".to_string()]
+        );
+    }
+
+    #[test]
+    fn split_dotted_key_quoted_segment() {
+        let parts = split_dotted_key(
+            "pricing.oracle.\"/raid/models/zai-org/GLM-5.2-FP8\".input_per_mtok",
+        )
+        .unwrap();
+        assert_eq!(
+            parts,
+            vec![
+                "pricing".to_string(),
+                "oracle".to_string(),
+                "/raid/models/zai-org/GLM-5.2-FP8".to_string(),
+                "input_per_mtok".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_dotted_key_rejects_unterminated_quote() {
+        let err = split_dotted_key("pricing.oracle.\"unterminated").unwrap_err();
+        assert!(matches!(err, ConfigWriteError::Validate(_)));
+    }
+
+    #[test]
+    fn split_dotted_key_rejects_quote_mid_segment() {
+        let err = split_dotted_key("pricing.oracle.\"a\"b.input_per_mtok").unwrap_err();
+        assert!(matches!(err, ConfigWriteError::Validate(_)));
+    }
+
+    #[test]
+    fn split_dotted_key_rejects_empty_segments() {
+        // Every one of these implies at least one empty segment — a bare
+        // `.`, a leading/trailing separator, an internal double separator,
+        // or a quoted segment immediately followed by a trailing separator.
+        // None of these can ever be a real config key, so the write path
+        // must reject them outright rather than silently dropping the
+        // implied-empty segment (the bug this test set closes).
+        for bad in [".", "a.", ".x", "a..b", "\"x\"."] {
+            let err = split_dotted_key(bad)
+                .expect_err(&format!("expected Err for {bad:?}, got Ok"));
+            assert!(matches!(err, ConfigWriteError::Validate(_)), "{bad:?}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn form_patch_writes_dotted_model_key_as_raw_table_not_split() {
+        // A pricing patch key for a model id containing a literal `.`
+        // (quoted in the canonical dotted-key encoding) must land as ONE
+        // raw-segment table, not get torn into a bogus nested `GLM-5`/`2-FP8`
+        // table by a naive `split('.')`.
+        let existing = "default_model = \"opus\"\n";
+        let patch = serde_json::json!({
+            "pricing.oracle.\"/raid/models/zai-org/GLM-5.2-FP8\".input_per_mtok": 1.5
+        });
+        let out = apply_form_patch(existing, &patch).unwrap();
+        let parsed: toml::Value = toml::from_str(&out).expect("valid toml");
+        let val = parsed
+            .get("pricing")
+            .and_then(|v| v.get("oracle"))
+            .and_then(|v| v.get("/raid/models/zai-org/GLM-5.2-FP8"))
+            .and_then(|v| v.get("input_per_mtok"))
+            .and_then(|v| v.as_float())
+            .expect("dotted model key must round-trip intact");
+        assert_eq!(val, 1.5);
+        // No bogus split-table artifact.
+        assert!(
+            parsed
+                .get("pricing")
+                .and_then(|v| v.get("oracle"))
+                .and_then(|v| v.get("GLM-5"))
+                .is_none(),
+            "must not have split the model id into a `GLM-5` table: {out}"
+        );
+    }
+
+    #[test]
+    fn form_patch_simple_keys_unaffected() {
+        let existing = "default_model = \"opus\"\n";
+        let patch = serde_json::json!({ "autoflow.max_active": 3 });
+        let out = apply_form_patch(existing, &patch).unwrap();
+        let parsed: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(
+            parsed
+                .get("autoflow")
+                .and_then(|v| v.get("max_active"))
+                .and_then(|v| v.as_integer()),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn form_patch_rejects_malformed_dotted_key() {
+        let existing = "default_model = \"opus\"\n";
+        let patch = serde_json::json!({ "pricing.oracle.\"unterminated": 1.0 });
+        let err = apply_form_patch(existing, &patch).unwrap_err();
+        assert!(matches!(err, ConfigWriteError::Validate(_)));
     }
 
     #[test]

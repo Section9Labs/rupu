@@ -30,9 +30,94 @@ export { RawTab } from './settings/RawEditor';
 // Shared helpers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Canonical dotted-key encoding
+//
+// A config key SEGMENT can itself contain a `.` — the pricing model table
+// for a model id like `/raid/models/zai-org/GLM-5.2-FP8` produces a dotted
+// key `pricing.oracle."/raid/models/zai-org/GLM-5.2-FP8".input_per_mtok`.
+// Plain `dotted.split('.')` tears that segment in two. This encoding MUST
+// match `rupu_config::resolve`'s private `dotted()` and rupu-cp's
+// `config_write::split_dotted_key` byte-for-byte — the same string flows
+// from the resolved provenance map, through this UI's fieldValue/patch/lock
+// plumbing, to the PUT /api/config write path, unchanged.
+// ---------------------------------------------------------------------------
+
+/** Quote a single key segment: a segment containing a `.` or a `"` is
+ *  wrapped in double quotes with embedded `"` escaped as `\"` (TOML-quoted-
+ *  key style); anything else is emitted bare. */
+export function quoteSegment(s: string): string {
+  if (s.includes('.') || s.includes('"')) {
+    return `"${s.replace(/"/g, '\\"')}"`;
+  }
+  return s;
+}
+
+/** Quote-aware inverse of joining segments with `quoteSegment` + `.`: split
+ *  a dotted key path on `.`, except inside a `"…"`-quoted segment (where
+ *  `\"` unescapes to `"`). Malformed quoting (unterminated quote, or a `"`
+ *  that doesn't span the whole segment) falls back to a naive `split('.')`
+ *  rather than throwing — this only ever renders a UI field, so a bad key
+ *  string should degrade to "field doesn't resolve", never crash the page.
+ *
+ *  **Strict-write, lenient-read asymmetry (deliberate):** this is the
+ *  READ-side decoder (used to render a field's current value), so it stays
+ *  lenient — including on a string with an empty segment (a bare `.`, or a
+ *  leading/trailing/doubled separator: `'a.'` → `['a', '']`, `'.'` →
+ *  `['', '']`) rather than erroring, since a bogus key here just means a
+ *  field harmlessly fails to resolve. The rupu-cp WRITE path's
+ *  `config_write::split_dotted_key` is the opposite: it REJECTS any empty
+ *  segment outright, because accepting one there would let an edit persist
+ *  a config key that can never correspond to a real TOML field. Both are
+ *  intentional — see `split_dotted_key`'s doc comment. */
+export function splitDottedKey(dotted: string): string[] {
+  const segments: string[] = [];
+  let i = 0;
+  const n = dotted.length;
+  while (i <= n) {
+    if (dotted[i] === '"') {
+      let seg = '';
+      let j = i + 1;
+      let closed = false;
+      while (j < n) {
+        const c = dotted[j];
+        if (c === '"') {
+          closed = true;
+          j += 1;
+          break;
+        }
+        if (c === '\\' && dotted[j + 1] === '"') {
+          seg += '"';
+          j += 2;
+          continue;
+        }
+        seg += c;
+        j += 1;
+      }
+      if (!closed || (j < n && dotted[j] !== '.')) {
+        return dotted.split('.'); // malformed — best-effort fallback
+      }
+      segments.push(seg);
+      i = j + 1; // skip the '.' (or reach n+1 if this was the last segment)
+    } else {
+      const dot = dotted.indexOf('.', i);
+      if (dot === -1) {
+        segments.push(dotted.slice(i));
+        i = n + 1;
+      } else {
+        const seg = dotted.slice(i, dot);
+        if (seg.includes('"')) return dotted.split('.'); // malformed fallback
+        segments.push(seg);
+        i = dot + 1;
+      }
+    }
+  }
+  return segments;
+}
+
 /** Read a dotted-path value out of a loosely-typed JSON object. */
 export function getPath(obj: unknown, dotted: string): unknown {
-  return dotted.split('.').reduce<unknown>((acc, key) => {
+  return splitDottedKey(dotted).reduce<unknown>((acc, key) => {
     if (acc && typeof acc === 'object' && key in (acc as Record<string, unknown>)) {
       return (acc as Record<string, unknown>)[key];
     }
@@ -151,7 +236,11 @@ export function ProvidersTab({ eff, prov, lockList, fieldValue, onChange, onTogg
       {names.map((name) => (
         <FieldGroup key={name} title={name}>
           {PROVIDER_FIELDS.map((f) => {
-            const dottedKey = `providers.${name}.${f.key}`;
+            // `name` is a free-form `[providers.<name>]` table key (e.g. a
+            // provider alias like `azure.eastus`) — quote it the same way
+            // PricingTab quotes a model id, or a dotted alias reproduces the
+            // exact read-miss/write-corruption bug this file fixes.
+            const dottedKey = `providers.${quoteSegment(name)}.${f.key}`;
             return (
               <ConfigField
                 key={dottedKey}
@@ -362,7 +451,9 @@ export function ScmTab({ eff, prov, lockList, fieldValue, onChange, onToggleLock
           {platforms.map((platform) => (
             <FieldGroup key={platform} title={platform}>
               {SCM_PLATFORM_FIELDS.map((f) => {
-                const dottedKey = `scm.${platform}.${f.key}`;
+                // `platform` is a free-form `[scm.<platform>]` table key —
+                // quote it the same way, for the same reason as ProvidersTab.
+                const dottedKey = `scm.${quoteSegment(platform)}.${f.key}`;
                 return (
                   <ConfigField
                     key={dottedKey}
@@ -463,7 +554,7 @@ export function PricingTab({ eff, prov, lockList, fieldValue, onChange, onToggle
             {modelNames.map((model) => (
               <FieldGroup key={model} title={model}>
                 <PricingRow
-                  dottedPrefix={`pricing.${provider}.${model}`}
+                  dottedPrefix={`pricing.${quoteSegment(provider)}.${quoteSegment(model)}`}
                   prov={prov}
                   lockList={lockList}
                   fieldValue={fieldValue}
@@ -487,7 +578,7 @@ export function PricingTab({ eff, prov, lockList, fieldValue, onChange, onToggle
             .map((agent) => (
               <FieldGroup key={agent} title={agent}>
                 <PricingRow
-                  dottedPrefix={`pricing.agents.${agent}`}
+                  dottedPrefix={`pricing.agents.${quoteSegment(agent)}`}
                   prov={prov}
                   lockList={lockList}
                   fieldValue={fieldValue}
