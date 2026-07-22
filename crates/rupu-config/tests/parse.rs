@@ -89,3 +89,15 @@ fn empty_config_is_valid() {
     let cfg: Config = toml::from_str("").expect("parse");
     assert_eq!(cfg.default_provider, None);
 }
+
+#[test]
+fn cp_config_defaults_agent_authoring_ui_to_classic() {
+    let cfg: rupu_config::policy_config::CpConfig = toml::from_str("").expect("empty [cp] parses");
+    assert_eq!(cfg.agent_authoring_ui, "classic");
+}
+
+#[test]
+fn cp_config_accepts_next_agent_authoring_ui() {
+    let cfg: rupu_config::policy_config::CpConfig = toml::from_str("agent_authoring_ui = \"next\"").unwrap();
+    assert_eq!(cfg.agent_authoring_ui, "next");
+}

@@ -39,6 +39,11 @@ pub struct CpConfig {
     /// Defaults to 60.
     #[serde(default = "CpConfig::default_background_interval_secs")]
     pub cron_tick_interval_secs: u64,
+    /// Which agent-authoring UI the CP web app renders: "classic" (raw editor)
+    /// or "next" (the card-based Agent Builder). Defaults to classic so the new
+    /// UI is opt-in behind this flag.
+    #[serde(default = "CpConfig::default_agent_authoring_ui")]
+    pub agent_authoring_ui: String,
 }
 
 impl CpConfig {
@@ -48,6 +53,10 @@ impl CpConfig {
 
     fn default_background_interval_secs() -> u64 {
         60
+    }
+
+    fn default_agent_authoring_ui() -> String {
+        "classic".to_string()
     }
 }
 
@@ -59,6 +68,7 @@ impl Default for CpConfig {
             autoflow_reconcile_interval_secs: Self::default_background_interval_secs(),
             cron_tick_enabled: Self::default_true(),
             cron_tick_interval_secs: Self::default_background_interval_secs(),
+            agent_authoring_ui: Self::default_agent_authoring_ui(),
         }
     }
 }
