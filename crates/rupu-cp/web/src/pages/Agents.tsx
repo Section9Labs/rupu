@@ -9,27 +9,19 @@ import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import UsageBarChart from '../components/charts/UsageBarChart';
 import CodeEditor from '../components/CodeEditor';
-import AgentBuilder from '../components/agentBuilder/AgentBuilder';
 import { Button } from '../components/ui/Button';
 import { ScopeChip } from '../components/ScopeChip';
 import { formatTokens, formatCost } from '../lib/usage';
 import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 import { useAgentAuthoringUi } from '../hooks/useAgentAuthoringUi';
+import { NEW_AGENT_TEMPLATE } from '../lib/agentBuilder/agentSpec';
 
 const STEP = 20;
 
-const NEW_AGENT_TEMPLATE = `---
-name: my-agent
-description: A short description.
-provider: anthropic
-model: claude-sonnet-4-6
----
-
-You are a helpful agent. ...
-`;
-
 export default function Agents() {
+  const navigate = useNavigate();
+  const agentUi = useAgentAuthoringUi();
   const [agents, setAgents] = useState<AgentSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [visible, setVisible] = useState(STEP);
@@ -70,7 +62,10 @@ export default function Agents() {
             each one runs with.
           </p>
         </div>
-        <Button onClick={() => setCreateOpen(true)} className="shrink-0 gap-1.5">
+        <Button
+          onClick={() => (agentUi === 'next' ? navigate('/agents/new') : setCreateOpen(true))}
+          className="shrink-0 gap-1.5"
+        >
           <Plus size={14} />
           New agent
         </Button>
@@ -125,7 +120,6 @@ export default function Agents() {
 function NewAgentModal({ onClose }: { onClose: () => void }) {
   const navigate = useNavigate();
   const titleId = useId();
-  const agentUi = useAgentAuthoringUi();
   const [raw, setRaw] = useState(NEW_AGENT_TEMPLATE);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -135,7 +129,6 @@ function NewAgentModal({ onClose }: { onClose: () => void }) {
   const [models, setModels] = useState<ProviderModels[]>([]);
   const [genProvider, setGenProvider] = useState<string>('');
   const [generating, setGenerating] = useState(false);
-  const [agentNames, setAgentNames] = useState<string[]>([]);
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -156,28 +149,6 @@ function NewAgentModal({ onClose }: { onClose: () => void }) {
       })
       .catch(() => setMode('edit'));
   }, []);
-
-  useEffect(() => {
-    // Only the Agent Builder (next) UI has a Dispatch card that consumes
-    // `agentNames` — the classic Describe/Edit modal never reads it, so
-    // fetching here in classic mode is a spurious background request on the
-    // default path.
-    if (agentUi !== 'next') return;
-    let cancelled = false;
-    api
-      .getAgents()
-      .then((data) => {
-        if (cancelled) return;
-        setAgentNames(data.map((a) => a.name));
-      })
-      .catch(() => {
-        // Non-fatal — the Dispatch card's agent picker just has no
-        // suggestions if this fails.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [agentUi]);
 
   async function generate() {
     if (generating || !description.trim()) return;
@@ -211,40 +182,6 @@ function NewAgentModal({ onClose }: { onClose: () => void }) {
       setError(e instanceof Error ? e.message : 'Failed to create agent');
       setCreating(false);
     }
-  }
-
-  if (agentUi === 'next') {
-    return (
-      <div
-        className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4 pt-[4vh]"
-        onMouseDown={(e) => {
-          if (e.target === e.currentTarget) onClose();
-        }}
-      >
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby={titleId}
-          className="flex h-[90vh] w-full max-w-6xl flex-col overflow-hidden rounded-xl border border-border bg-panel shadow-card"
-          onMouseDown={(e) => e.stopPropagation()}
-        >
-          <h2 id={titleId} className="sr-only">
-            New agent
-          </h2>
-          <AgentBuilder
-            initialRaw={NEW_AGENT_TEMPLATE}
-            submitLabel="Create agent"
-            submitting={creating}
-            error={error}
-            onSubmit={createFrom}
-            onCancel={onClose}
-            aiModels={models}
-            onGenerate={api.generateAgent}
-            agentNames={agentNames}
-          />
-        </div>
-      </div>
-    );
   }
 
   return (

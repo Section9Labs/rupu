@@ -9,13 +9,15 @@
 // below.
 //
 // Card add is real HTML5 drag-and-drop (palette card -> `dragstart` sets
-// `text/card`; canvas -> `dragover`/`drop` calls `addCard`), ported from the
-// approved mockup, PLUS click-to-add as a fallback (same handler either way
-// — see the palette `onClick`). Canvas cards are also reorderable by
-// dragging their header (`text/reorder`, tracked via `dragCardId`/
-// `dragOverId` state rather than the mockup's manual DOM class toggling, so
-// drag-over highlighting stays declarative). Card remove is still a click
-// (✕ on the card header).
+// `text/card`), positional: dropping onto an existing canvas card inserts
+// BEFORE that card (the `.ab-drag-over` top line is the insertion cue);
+// dropping on empty canvas space appends. Click-to-add remains as a
+// fallback (same handler — see the palette `onClick`). Canvas cards are
+// also reorderable by dragging their header (`text/reorder`, tracked via
+// `dragCardId`/`dragOverId` state rather than the mockup's manual DOM class
+// toggling, so drag-over highlighting stays declarative). Newly landed
+// cards play the `ab-cardin` entrance animation (`enteredId`). Card remove
+// is still a click (✕ on the card header).
 import { useEffect, useState } from 'react';
 import {
   parseAgent,
@@ -203,6 +205,9 @@ export default function AgentBuilder({
   const [aiError, setAiError] = useState<string | null>(null);
   const [dragCardId, setDragCardId] = useState<string | null>(null);
   const [dragOverId, setDragOverId] = useState<string | null>(null);
+  // Card id that just landed on the canvas — plays the `ab-cardin`
+  // entrance animation once, cleared on animationend.
+  const [enteredId, setEnteredId] = useState<string | null>(null);
 
   // Keep the Raw-mode buffer in sync with card-mode edits (but not the other
   // way while the user is actively typing invalid intermediate YAML — see
@@ -235,8 +240,16 @@ export default function AgentBuilder({
     setDraft((d) => ({ ...d, ...p }));
   }
 
-  function addCard(id: string) {
-    setOrder((prev) => (prev.includes(id) ? prev : [...prev, id]));
+  // Add a palette card to the canvas — before `beforeId` when the drop
+  // landed on an existing card, appended otherwise.
+  function addCard(id: string, beforeId?: string) {
+    setOrder((prev) => {
+      if (prev.includes(id)) return prev;
+      const idx = beforeId ? prev.indexOf(beforeId) : -1;
+      if (idx === -1) return [...prev, id];
+      return [...prev.slice(0, idx), id, ...prev.slice(idx)];
+    });
+    setEnteredId(id);
   }
 
   function removeCard(id: string, meta: CardMeta) {
@@ -310,20 +323,23 @@ export default function AgentBuilder({
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <header className="flex items-center gap-3 border-b border-border bg-panel/80 px-4 py-2.5 backdrop-blur">
-        <div className="min-w-0">
-          <div className="text-lead font-semibold">Agent Builder</div>
+      <header className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-border bg-panel/80 px-5 py-3 backdrop-blur">
+        <div className="min-w-0 shrink-0">
+          <div className="text-lead font-semibold leading-tight">Agent Builder</div>
           <div className="text-meta uppercase tracking-wide text-ink-mute">.rupu/agents · card composer</div>
         </div>
-        <input
-          className="ab-txt mono w-56 font-semibold"
-          value={draft.name}
-          onChange={(e) => patch({ name: e.target.value })}
-          aria-label="agent name"
-        />
-        <ValidityBadge ok={validation.ok} />
-        <div className="ml-auto flex items-center gap-3">
+        <div className="flex min-w-0 flex-1 items-center gap-3">
+          <input
+            className="ab-txt mono h-9 w-full max-w-xs font-semibold"
+            value={draft.name}
+            onChange={(e) => patch({ name: e.target.value })}
+            aria-label="agent name"
+          />
+          <ValidityBadge ok={validation.ok} />
+        </div>
+        <div className="ml-auto flex shrink-0 items-center gap-2.5">
           <Segmented<Mode> options={modeOptions} value={mode} onChange={setMode} />
+          <span className="h-6 w-px bg-border" aria-hidden="true" />
           {onCancel && (
             <Button variant="secondary" size="sm" onClick={onCancel}>
               Cancel
@@ -354,46 +370,74 @@ export default function AgentBuilder({
         </div>
       )}
 
-      {mode === 'ai' && onGenerate && (
-        <div className="flex items-center gap-2.5 border-b border-border bg-brand-50 px-4 py-2.5">
-          <input
-            className="ab-txt flex-1"
-            placeholder="Describe the agent — e.g. “a read-only security reviewer for panel workflows”"
-            value={aiDescription}
-            onChange={(e) => setAiDescription(e.target.value)}
-            aria-label="describe the agent"
-          />
-          {aiModels && aiModels.length > 0 && (
-            <select
-              className="ab-sel"
-              value={aiProvider}
-              onChange={(e) => setAiProvider(e.target.value)}
-              aria-label="generation provider"
-            >
-              {aiModels.map((m) => (
-                <option key={m.provider} value={m.provider}>
-                  {m.provider} · {m.models[0]}
-                </option>
-              ))}
-            </select>
-          )}
-          <Button variant="primary" size="sm" disabled={aiBusy || !aiDescription.trim()} onClick={handleGenerate}>
-            {aiBusy ? 'Generating…' : 'Generate cards'}
-          </Button>
-          {aiError && (
-            <span className="text-note text-err" role="alert">
-              {aiError}
-            </span>
-          )}
-        </div>
-      )}
-
       {mode === 'raw' ? (
         <div className="min-h-0 flex-1 overflow-auto p-4">
           <CodeEditor value={rawText} onChange={handleRawChange} language="markdown" ariaLabel="raw agent definition" />
         </div>
+      ) : mode === 'ai' && onGenerate ? (
+        <div className="min-h-0 flex-1 overflow-auto">
+          <div className="mx-auto flex h-full w-full max-w-3xl flex-col gap-5 px-6 py-10">
+            <div>
+              <h3 className="text-xl font-semibold text-ink">Generate with AI</h3>
+              <p className="mt-1.5 max-w-xl text-ui leading-relaxed text-ink-dim">
+                Describe the agent you want — its job, tools, guardrails, output shape. The
+                generator drafts the full definition and drops you back into the card composer
+                to refine it.
+              </p>
+            </div>
+            <textarea
+              autoFocus
+              className="ab-txt min-h-[16rem] flex-1 resize-y text-[13.5px] leading-relaxed"
+              placeholder={
+                'e.g. “a read-only security reviewer for panel workflows — flags high/critical findings as JSON, bash + grep only, never edits files”'
+              }
+              value={aiDescription}
+              onChange={(e) => setAiDescription(e.target.value)}
+              onKeyDown={(e) => {
+                if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                  e.preventDefault();
+                  void handleGenerate();
+                }
+              }}
+              aria-label="describe the agent"
+            />
+            {aiError && (
+              <div className="rounded-lg border border-err/30 bg-err-bg px-3 py-2 text-note text-err" role="alert">
+                {aiError}
+              </div>
+            )}
+            <div className="flex flex-wrap items-center gap-3">
+              {aiModels && aiModels.length > 0 && (
+                <select
+                  className="ab-sel ab-compact"
+                  value={aiProvider}
+                  onChange={(e) => setAiProvider(e.target.value)}
+                  aria-label="generation provider"
+                >
+                  {aiModels.map((m) => (
+                    <option key={m.provider} value={m.provider}>
+                      {m.provider} · {m.models[0]}
+                    </option>
+                  ))}
+                </select>
+              )}
+              <span className="text-note text-ink-mute">⌘⏎ to generate</span>
+              <Button
+                variant="primary"
+                className="ml-auto"
+                disabled={aiBusy || !aiDescription.trim()}
+                onClick={handleGenerate}
+              >
+                {aiBusy ? 'Generating…' : 'Generate cards'}
+              </Button>
+            </div>
+          </div>
+        </div>
       ) : (
-        <div className="grid min-h-0 flex-1" style={{ gridTemplateColumns: '244px 1fr 400px' }}>
+        <div
+          className="grid min-h-0 flex-1"
+          style={{ gridTemplateColumns: '248px minmax(0,1fr) clamp(340px, 26vw, 460px)' }}
+        >
           {/* palette */}
           <div className="ab-palette">
             <div className="ab-colhead">
@@ -470,17 +514,30 @@ export default function AgentBuilder({
                   if (!meta) return null;
                   return (
                     <div
-                      className={cn('ab-card', dragOverId === id && 'ab-drag-over')}
+                      className={cn(
+                        'ab-card',
+                        dragOverId === id && 'ab-drag-over',
+                        enteredId === id && 'ab-enter',
+                      )}
                       key={id}
+                      onAnimationEnd={() => setEnteredId((cur) => (cur === id ? null : cur))}
                       onDragOver={(e) => {
-                        if (dragCardId && dragCardId !== id) {
+                        // Both a palette card (`text/card`) and a reorder drag
+                        // target this card: the drop inserts BEFORE it, cued by
+                        // the `.ab-drag-over` top line.
+                        if (e.dataTransfer.types.includes('text/card') || (dragCardId && dragCardId !== id)) {
                           e.preventDefault();
                           setDragOverId(id);
                         }
                       }}
                       onDragLeave={() => setDragOverId((cur) => (cur === id ? null : cur))}
                       onDrop={(e) => {
-                        if (dragCardId && dragCardId !== id) {
+                        const paletteId = e.dataTransfer.getData('text/card');
+                        if (paletteId && !activeIds.has(paletteId)) {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          addCard(paletteId, id);
+                        } else if (dragCardId && dragCardId !== id) {
                           e.preventDefault();
                           e.stopPropagation();
                           moveCardBefore(dragCardId, id);

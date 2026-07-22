@@ -17,6 +17,7 @@ const Findings          = React.lazy(() => import('./pages/Findings'));
 const Workflows         = React.lazy(() => import('./pages/Workflows'));
 const WorkflowDetail    = React.lazy(() => import('./pages/WorkflowDetail'));
 const Agents            = React.lazy(() => import('./pages/Agents'));
+const AgentNew          = React.lazy(() => import('./pages/AgentNew'));
 const AgentDetail       = React.lazy(() => import('./pages/AgentDetail'));
 const AutoflowsDefs     = React.lazy(() => import('./pages/AutoflowsDefs'));
 const Sessions          = React.lazy(() => import('./pages/Sessions'));
@@ -72,6 +73,8 @@ export default function App() {
             <Route path="/workflows" element={<Suspense fallback={<PageFallback />}><Workflows /></Suspense>} />
             <Route path="/workflows/:name" element={<Suspense fallback={<PageFallback />}><WorkflowDetail /></Suspense>} />
             <Route path="/agents" element={<Suspense fallback={<PageFallback />}><Agents /></Suspense>} />
+            {/* Static /agents/new MUST precede the :name wildcard */}
+            <Route path="/agents/new" element={<Suspense fallback={<PageFallback />}><AgentNew /></Suspense>} />
             <Route path="/agents/:name" element={<Suspense fallback={<PageFallback />}><AgentDetail /></Suspense>} />
             <Route path="/autoflows" element={<Suspense fallback={<PageFallback />}><AutoflowsDefs /></Suspense>} />
             <Route path="/sessions" element={<Suspense fallback={<PageFallback />}><Sessions /></Suspense>} />
