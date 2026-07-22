@@ -37,4 +37,23 @@ describe('NodePalette', () => {
     fireEvent.click(card);
     expect(onAdd).not.toHaveBeenCalled();
   });
+
+  it('with no workflowEditorUi prop (default classic) the branch card is absent', () => {
+    render(<NodePalette onAdd={() => {}} onDragStartKind={() => {}} />);
+    expect(screen.queryByRole('button', { name: 'Add branch node' })).not.toBeInTheDocument();
+  });
+
+  it("with workflowEditorUi='classic' the branch card is absent", () => {
+    render(<NodePalette onAdd={() => {}} onDragStartKind={() => {}} workflowEditorUi="classic" />);
+    expect(screen.queryByRole('button', { name: 'Add branch node' })).not.toBeInTheDocument();
+  });
+
+  it("with workflowEditorUi='next' the branch card renders and adds a branch node", () => {
+    const onAdd = vi.fn();
+    render(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} workflowEditorUi="next" />);
+    const card = screen.getByRole('button', { name: 'Add branch node' });
+    expect(card).toBeInTheDocument();
+    fireEvent.click(card);
+    expect(onAdd).toHaveBeenCalledWith('branch');
+  });
 });

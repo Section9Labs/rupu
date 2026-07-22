@@ -31,13 +31,15 @@ import {
 } from '@xyflow/react';
 import {
   canConnect,
+  type GraphEdge,
   type GraphNode,
   type StepKind,
   type StepNodeData,
   type WorkflowGraph,
 } from '../../lib/workflowGraph';
 import { autoLayout, NODE_W } from '../../lib/workflowLayout';
-import { useThemeColors } from '../../lib/useThemeColors';
+import { useThemeColors, type ThemeColors } from '../../lib/useThemeColors';
+import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 import EditableStepNode, { type NodeData } from './nodes/EditableStepNode';
 import NodePalette, { NODE_KIND_MIME } from './NodePalette';
 
@@ -93,6 +95,11 @@ function newNodeData(id: string, kind: StepKind): StepNodeData {
   const data: StepNodeData = { id, kind };
   if (kind === 'parallel') data.parallel = [];
   if (kind === 'panel') data.panel = { panelists: [], subject: '' };
+  if (kind === 'branch') {
+    data.condition = '';
+    data.thenTargets = [];
+    data.elseTargets = [];
+  }
   return data;
 }
 
@@ -163,9 +170,18 @@ export function applyInsertOnEdge(
   return { graph: { ...graph, nodes: [...graph.nodes, node], edges }, id };
 }
 
-/** Narrow an arbitrary dataTransfer string to a StepKind. */
-function asStepKind(v: string): StepKind | null {
-  return v === 'step' || v === 'for_each' || v === 'parallel' || v === 'panel' ? v : null;
+/** Narrow an arbitrary dataTransfer string to a StepKind. Exported for tests. */
+export function asStepKind(v: string): StepKind | null {
+  return v === 'step' || v === 'for_each' || v === 'parallel' || v === 'panel' || v === 'branch' ? v : null;
+}
+
+/** Edge accent color for a branch arm — green for the "then" (true) arm, red
+ *  for the "else" (false) arm; undefined (default edge styling) for plain
+ *  chain/data-ref edges. */
+function branchEdgeColor(branch: GraphEdge['branch'], colors: ThemeColors): string | undefined {
+  if (branch === 'then') return colors.status.done;
+  if (branch === 'else') return colors.status.failed;
+  return undefined;
 }
 
 // ── Component ────────────────────────────────────────────────────────────────
@@ -180,6 +196,10 @@ interface Props {
   /** When true the YAML is currently unparseable: keep the last good graph on
    *  screen but dim it, freeze interactions, and show a "graph paused" chip. */
   paused?: boolean;
+  /** Workflow-editor-UI flag — gates the branch palette card in NodePalette
+   *  ('next' only). Rendering an EXISTING branch node is always on regardless
+   *  of this flag; only the ability to ADD a new one from the palette is gated. */
+  workflowEditorUi?: WorkflowEditorUi;
 }
 
 export default function WorkflowEditorGraph(props: Props) {
@@ -198,6 +218,7 @@ function WorkflowEditorGraphInner({
   problemsById,
   onInvalidConnection,
   paused = false,
+  workflowEditorUi = 'classic',
 }: Props) {
   const colors = useThemeColors();
   const nodes = useMemo<Node<NodeData>[]>(
@@ -214,14 +235,24 @@ function WorkflowEditorGraphInner({
 
   const edges = useMemo<Edge[]>(
     () =>
-      graph.edges.map((e) => ({
-        id: e.id,
-        source: e.source,
-        target: e.target,
-        type: 'smoothstep',
-        markerEnd: { type: MarkerType.ArrowClosed },
-      })),
-    [graph.edges],
+      graph.edges.map((e) => {
+        const color = branchEdgeColor(e.branch, colors);
+        const edge: Edge = {
+          id: e.id,
+          source: e.source,
+          target: e.target,
+          type: 'smoothstep',
+          markerEnd: { type: MarkerType.ArrowClosed, color },
+        };
+        if (e.label !== undefined) edge.label = e.label;
+        if (color !== undefined) {
+          edge.style = { stroke: color };
+          edge.labelStyle = { fill: color, fontWeight: 600 };
+          edge.labelBgStyle = { fillOpacity: 0 };
+        }
+        return edge;
+      }),
+    [graph.edges, colors],
   );
 
   // Move (drag) + delete (Backspace/Delete) both arrive as node changes.
@@ -417,7 +448,12 @@ function WorkflowEditorGraphInner({
         </div>
       </div>
 
-      <NodePalette onAdd={addNode} onDragStartKind={() => {}} disabled={paused} />
+      <NodePalette
+        onAdd={addNode}
+        onDragStartKind={() => {}}
+        disabled={paused}
+        workflowEditorUi={workflowEditorUi}
+      />
 
       <div
         className={paused ? 'h-full w-full opacity-60 pointer-events-none' : 'h-full w-full'}

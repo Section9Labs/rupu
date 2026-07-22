@@ -27,7 +27,8 @@ export interface NodeData extends Record<string, unknown> {
 type EditableFlowNode = Node<NodeData, 'editable'>;
 
 // Per-kind accent → a THEMED palette token: step/blue (running), for_each/violet
-// (brand), parallel/purple (sev-critical), panel/amber (awaiting). Resolved from
+// (brand), parallel/purple (sev-critical), panel/amber (awaiting), branch/green
+// (done — a routing decision, distinct from every other kind). Resolved from
 // the hook at render so the kind coloring matches the rest of the UI and stays
 // legible on dark — the kind chips paint with an inline alpha tint of the accent
 // (no fixed `bg-*-50` classes that wash out on near-black).
@@ -36,6 +37,7 @@ const KIND_KEY: Record<StepKind, ColorKey> = {
   for_each: 'brand.500',
   parallel: 'sev.critical',
   panel: 'status.awaiting',
+  branch: 'status.done',
 };
 
 /** Inline style for a kind chip — soft accent tint bg + accent text. */
@@ -118,6 +120,42 @@ function PanelBody({ d, colors }: { d: StepNodeData; colors: ThemeColors }) {
   );
 }
 
+/** condition + then/else target summary — mirrors PanelBody's roll-up style.
+ *  A branch step carries no agent/prompt; routing is entirely condition + the
+ *  then/else target lists (edited via StepForm's BranchFields). */
+function BranchBody({ d, colors }: { d: StepNodeData; colors: ThemeColors }) {
+  const thenTargets = d.thenTargets ?? [];
+  const elseTargets = d.elseTargets ?? [];
+  return (
+    <>
+      <div className="mt-1.5 flex items-center gap-1.5">
+        <span className="rounded px-1.5 py-px text-meta font-medium" style={kindChipStyle(colors, 'branch')}>
+          branch
+        </span>
+      </div>
+      <div className="mt-1 truncate text-meta text-ink-mute">if: {d.condition || '(no condition)'}</div>
+      <div className="mt-1.5 flex flex-col gap-1">
+        <div className="flex items-center gap-1.5 rounded-[6px] border border-border bg-panel px-1.5 py-1">
+          <span className="text-meta font-medium" style={{ color: colors.status.done }}>
+            true
+          </span>
+          <span className="ml-auto truncate text-meta text-ink-mute">
+            {thenTargets.length > 0 ? thenTargets.join(', ') : '—'}
+          </span>
+        </div>
+        <div className="flex items-center gap-1.5 rounded-[6px] border border-border bg-panel px-1.5 py-1">
+          <span className="text-meta font-medium" style={{ color: colors.status.failed }}>
+            false
+          </span>
+          <span className="ml-auto truncate text-meta text-ink-mute">
+            {elseTargets.length > 0 ? elseTargets.join(', ') : '—'}
+          </span>
+        </div>
+      </div>
+    </>
+  );
+}
+
 function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
   const { node, problems } = data;
   const d = node.data;
@@ -158,11 +196,32 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
         <ParallelBody d={d} colors={colors} />
       ) : d.kind === 'panel' ? (
         <PanelBody d={d} colors={colors} />
+      ) : d.kind === 'branch' ? (
+        <BranchBody d={d} colors={colors} />
       ) : (
         <StepBody d={d} colors={colors} />
       )}
 
-      <Handle type="source" position={Position.Right} style={handleStyle} />
+      {/* branch nodes get TWO labeled source handles (one per arm) instead of
+          the single default source handle every other kind uses. */}
+      {d.kind === 'branch' ? (
+        <>
+          <Handle
+            type="source"
+            position={Position.Right}
+            id="then"
+            style={{ ...handleStyle, top: '38%', background: colors.status.done }}
+          />
+          <Handle
+            type="source"
+            position={Position.Right}
+            id="else"
+            style={{ ...handleStyle, top: '68%', background: colors.status.failed }}
+          />
+        </>
+      ) : (
+        <Handle type="source" position={Position.Right} style={handleStyle} />
+      )}
     </div>
   );
 }

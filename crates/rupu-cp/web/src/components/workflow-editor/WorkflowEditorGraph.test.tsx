@@ -13,8 +13,16 @@ import type { ReactNode } from 'react';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent } from '@testing-library/react';
 
+// ReactFlow's mock also serializes the `edges` prop it received into a data
+// attribute (JSON) so tests can assert on label/color without mounting the
+// real canvas — the mutation/derivation logic under test lives in the
+// component's `edges` useMemo, not in @xyflow/react itself.
 vi.mock('@xyflow/react', () => ({
-  ReactFlow: ({ children }: { children?: ReactNode }) => <div data-testid="rf">{children}</div>,
+  ReactFlow: ({ children, edges }: { children?: ReactNode; edges?: unknown[] }) => (
+    <div data-testid="rf" data-edges={JSON.stringify(edges ?? [])}>
+      {children}
+    </div>
+  ),
   ReactFlowProvider: ({ children }: { children?: ReactNode }) => <>{children}</>,
   Background: () => null,
   Controls: () => null,
@@ -30,6 +38,41 @@ vi.mock('@xyflow/react', () => ({
   }),
 }));
 
+// useThemeColors reads CSS custom properties via getComputedStyle, which
+// resolves to nothing under jsdom (no stylesheet loaded) — every token would
+// collapse to the same fallback and the true/false edge colors would be
+// indistinguishable. Mock it with fixed, distinct RGB strings so the branch
+// edge-color assertions below are meaningful.
+vi.mock('../../lib/useThemeColors', () => ({
+  useThemeColors: () => ({
+    bg: 'rgb(0 0 0)',
+    panel: 'rgb(0 0 0)',
+    surface: 'rgb(0 0 0)',
+    surfaceHover: 'rgb(0 0 0)',
+    border: 'rgb(0 0 0)',
+    ink: 'rgb(0 0 0)',
+    inkDim: 'rgb(0 0 0)',
+    inkMute: 'rgb(0 0 0)',
+    brand: { 500: 'rgb(0 0 0)', 600: 'rgb(0 0 0)', 700: 'rgb(0 0 0)' },
+    status: {
+      running: 'rgb(0 0 0)',
+      done: 'rgb(34 197 94)',
+      completed: 'rgb(0 0 0)',
+      failed: 'rgb(239 68 68)',
+      awaiting: 'rgb(0 0 0)',
+      paused: 'rgb(0 0 0)',
+      pending: 'rgb(0 0 0)',
+      skipped: 'rgb(0 0 0)',
+      cancelled: 'rgb(0 0 0)',
+      rejected: 'rgb(0 0 0)',
+    },
+    sev: { critical: 'rgb(0 0 0)', high: 'rgb(0 0 0)', medium: 'rgb(0 0 0)', low: 'rgb(0 0 0)', info: 'rgb(0 0 0)' },
+    info: 'rgb(0 0 0)',
+    get: () => 'rgb(0 0 0)',
+    alpha: () => 'rgb(0 0 0 / 0.1)',
+  }),
+}));
+
 import WorkflowEditorGraph, {
   applyConnect,
   applyDelete,
@@ -37,6 +80,7 @@ import WorkflowEditorGraph, {
   applyAddNodeAt,
   applyAddConnectedNext,
   applyInsertOnEdge,
+  asStepKind,
 } from './WorkflowEditorGraph';
 import type { WorkflowGraph } from '../../lib/workflowGraph';
 
@@ -176,11 +220,67 @@ describe('applyAddNode', () => {
     expect(added?.data.panel).toEqual({ panelists: [], subject: '' });
   });
 
+  it('branch default seeds an empty condition + empty then/else target lists', () => {
+    const { graph, id } = applyAddNode(makeGraph(), 'branch');
+    const added = graph.nodes.find((n) => n.id === id);
+    expect(added?.data.kind).toBe('branch');
+    expect(added?.data.condition).toBe('');
+    expect(added?.data.thenTargets).toEqual([]);
+    expect(added?.data.elseTargets).toEqual([]);
+  });
+
   it('generates an id that does not collide with existing nodes', () => {
     const g = makeGraph();
     g.nodes.push({ id: 'step-1', data: { id: 'step-1', kind: 'step' }, position: { x: 0, y: 0 } });
     const { id } = applyAddNode(g, 'step');
     expect(id).toBe('step-2');
+  });
+});
+
+describe('asStepKind', () => {
+  it('accepts branch alongside the other known kinds', () => {
+    expect(asStepKind('branch')).toBe('branch');
+    expect(asStepKind('step')).toBe('step');
+    expect(asStepKind('nonsense')).toBeNull();
+  });
+});
+
+describe('branch edge rendering', () => {
+  it('a labeled branch-arm edge passes its label + a color into the xyflow edge', () => {
+    const g = makeGraph();
+    g.nodes.push({
+      id: 'br',
+      data: { id: 'br', kind: 'branch', condition: 'inputs.ok', thenTargets: ['a'], elseTargets: ['b'] },
+      position: { x: 0, y: 0 },
+    });
+    g.edges.push(
+      { id: 'br->a:then', source: 'br', target: 'a', label: 'true', branch: 'then' },
+      { id: 'br->b:else', source: 'br', target: 'b', label: 'false', branch: 'else' },
+    );
+    render(
+      <WorkflowEditorGraph
+        graph={g}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+      />,
+    );
+    const raw = screen.getByTestId('rf').getAttribute('data-edges');
+    expect(raw).toBeTruthy();
+    const edges = JSON.parse(raw!) as Array<{ id: string; label?: string; style?: { stroke?: string } }>;
+    const thenEdge = edges.find((e) => e.id === 'br->a:then');
+    const elseEdge = edges.find((e) => e.id === 'br->b:else');
+    expect(thenEdge?.label).toBe('true');
+    expect(elseEdge?.label).toBe('false');
+    // Distinct colors for the two arms (both defined, and not equal to each other).
+    expect(thenEdge?.style?.stroke).toBeTruthy();
+    expect(elseEdge?.style?.stroke).toBeTruthy();
+    expect(thenEdge?.style?.stroke).not.toBe(elseEdge?.style?.stroke);
+    // The plain chain edge (a->b) carries no label.
+    const plain = edges.find((e) => e.id === 'a->b');
+    expect(plain?.label).toBeUndefined();
   });
 });
 

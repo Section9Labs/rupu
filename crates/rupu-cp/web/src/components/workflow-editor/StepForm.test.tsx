@@ -142,6 +142,97 @@ describe('StepForm', () => {
   });
 });
 
+describe('StepForm — branch (flag-gated)', () => {
+  it('the Kind select offers Branch (if) only when workflowEditorUi is next', () => {
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'step', agent: 'planner' })}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.queryByRole('option', { name: 'Branch (if)' })).not.toBeInTheDocument();
+  });
+
+  it('the Kind select offers Branch (if) when workflowEditorUi is next', () => {
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'step', agent: 'planner' })}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+        workflowEditorUi="next"
+      />,
+    );
+    expect(screen.getByRole('option', { name: 'Branch (if)' })).toBeInTheDocument();
+  });
+
+  it('an existing branch node always offers Branch (if), even with the flag off', () => {
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'branch', condition: 'inputs.ok' })}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.getByRole('option', { name: 'Branch (if)' })).toBeInTheDocument();
+    expect(screen.getByLabelText('Step kind')).toHaveValue('branch');
+  });
+
+  it('selecting a branch node shows the condition field + then/else pickers, and edits flow to node data', () => {
+    const spy = vi.fn();
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'branch', condition: '', thenTargets: [], elseTargets: [] })}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={spy}
+        allNodeIds={['s1', 'ok-path', 'fail-path']}
+      />,
+    );
+
+    // Condition field.
+    fireEvent.change(screen.getByLabelText('Branch condition'), {
+      target: { value: 'inputs.score > 0.5' },
+    });
+    expect(spy).toHaveBeenLastCalledWith(
+      expect.objectContaining({ kind: 'branch', condition: 'inputs.score > 0.5' }),
+    );
+
+    // Then/else pickers list every OTHER node id (not the branch's own id).
+    expect(screen.getByLabelText('Then target ok-path')).toBeInTheDocument();
+    expect(screen.getByLabelText('Else target fail-path')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Then target s1')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText('Then target ok-path'));
+    expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({ thenTargets: ['ok-path'] }));
+
+    fireEvent.click(screen.getByLabelText('Else target fail-path'));
+    expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({ elseTargets: ['fail-path'] }));
+  });
+
+  it('branch hides the when/continue_on_error/approval block', () => {
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'branch', condition: 'x' })}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.queryByLabelText('When condition')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Continue on error')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Require approval')).not.toBeInTheDocument();
+  });
+});
+
 describe('WorkflowSettingsForm', () => {
   it('editing the name emits a meta with rest preserved', () => {
     const spy = vi.fn();
