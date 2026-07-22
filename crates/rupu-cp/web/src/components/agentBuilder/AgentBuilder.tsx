@@ -1,22 +1,21 @@
-// AgentBuilder — the card-composer shell (Task 6 of the Agent Builder plan).
-// Palette (left) | canvas of active field cards (center) | live `.md`
+// AgentBuilder — the card-composer shell (Tasks 6-7 of the Agent Builder
+// plan). Palette (left) | canvas of active field cards (center) | live `.md`
 // preview (right), a header with the name field / mode toggle / validity
 // badge / submit, and a Cards / Raw / AI mode switch. Wires together the
 // pure model (`agentSpec.ts`, `validate.ts`), the static `CARD_REGISTRY`
-// (`fields.ts`), and the control primitives (`controls.tsx`) from earlier
-// tasks in this plan.
+// (`fields.ts`), and the control primitives (`controls.tsx`).
 //
-// Only Identity/Model/Prompt (this task's scope) render real card bodies;
-// every other `CARD_REGISTRY` entry renders a placeholder body but is fully
-// wired into the generic add/remove/palette machinery — Task 7 drops in the
-// remaining bodies by adding a `case` to `renderCardBody` below, nothing
-// else needs to change.
+// Every `CARD_REGISTRY` entry now renders a real card body via `renderCardBody`
+// below.
 //
-// Card add/remove is click-based (palette card -> click to add; canvas card
-// -> ✕ to remove), not full HTML5 drag-and-drop like the approved mockup.
-// Same end-user capability (compose/decompose the card set), far less
-// surface to get wrong under jsdom, and drag-reorder was never part of this
-// task's contract.
+// Card add is real HTML5 drag-and-drop (palette card -> `dragstart` sets
+// `text/card`; canvas -> `dragover`/`drop` calls `addCard`), ported from the
+// approved mockup, PLUS click-to-add as a fallback (same handler either way
+// — see the palette `onClick`). Canvas cards are also reorderable by
+// dragging their header (`text/reorder`, tracked via `dragCardId`/
+// `dragOverId` state rather than the mockup's manual DOM class toggling, so
+// drag-over highlighting stays declarative). Card remove is still a click
+// (✕ on the card header).
 import { useEffect, useState } from 'react';
 import {
   parseAgent,
@@ -29,6 +28,14 @@ import { Segmented } from './controls';
 import Identity from './cards/Identity';
 import Model from './cards/Model';
 import Prompt from './cards/Prompt';
+import Tools from './cards/Tools';
+import Permission from './cards/Permission';
+import Reasoning from './cards/Reasoning';
+import Context from './cards/Context';
+import Output from './cards/Output';
+import Dispatch from './cards/Dispatch';
+import Anthropic from './cards/Anthropic';
+import Concerns from './cards/Concerns';
 import CodeHighlight from '../CodeHighlight';
 import CodeEditor from '../CodeEditor';
 import { Button } from '../ui/Button';
@@ -77,7 +84,13 @@ function hasValue(v: unknown): boolean {
   return true;
 }
 
-function computeInitialOrder(draft: AgentDraft): string[] {
+// The set of card ids that "want" to be on the canvas for a given draft:
+// required cards, Model (on-by-default), and any card whose owned fields
+// (`CARD_FIELDS`) have a value — regardless of whether that value arrived
+// via a card edit, Raw-mode YAML, or AI generation. Shared by the initial
+// `useState` seed AND the reactive union effect below, so "what belongs on
+// the canvas for this draft" is computed exactly one way.
+function wantedCardIds(draft: AgentDraft): string[] {
   const byId = new Map(CARD_REGISTRY.map((c) => [c.id, c] as const));
   return CANVAS_ORDER.filter((id) => {
     const meta = byId.get(id);
@@ -89,13 +102,37 @@ function computeInitialOrder(draft: AgentDraft): string[] {
   });
 }
 
+function computeInitialOrder(draft: AgentDraft): string[] {
+  return wantedCardIds(draft);
+}
+
+// Insert any card ids that now "want" to be present (per `wantedCardIds`)
+// but aren't yet in `prev`, without disturbing the existing order — new
+// cards land just before `prompt` (if present) so the body still reads last.
+// Returns `prev` unchanged (same reference) when nothing is missing, so a
+// caller wiring this into a `setOrder` functional update never causes an
+// extra render/loop.
+function unionWantedCards(prev: string[], draft: AgentDraft): string[] {
+  const present = new Set(prev);
+  const toAdd = wantedCardIds(draft).filter((id) => !present.has(id));
+  if (toAdd.length === 0) return prev;
+  const promptIdx = prev.indexOf('prompt');
+  if (promptIdx === -1) return [...prev, ...toAdd];
+  return [...prev.slice(0, promptIdx), ...toAdd, ...prev.slice(promptIdx)];
+}
+
 const GROUPS: CardMeta['group'][] = ['Core', 'Runtime', 'Advanced'];
 
 function cardIcon(id: string): string {
   return id.slice(0, 2).toUpperCase();
 }
 
-function renderCardBody(id: string, draft: AgentDraft, patch: (p: Partial<AgentDraft>) => void) {
+function renderCardBody(
+  id: string,
+  draft: AgentDraft,
+  patch: (p: Partial<AgentDraft>) => void,
+  agentNames: string[] | undefined,
+) {
   switch (id) {
     case 'identity':
       return <Identity draft={draft} patch={patch} />;
@@ -103,6 +140,22 @@ function renderCardBody(id: string, draft: AgentDraft, patch: (p: Partial<AgentD
       return <Model draft={draft} patch={patch} />;
     case 'prompt':
       return <Prompt draft={draft} patch={patch} />;
+    case 'tools':
+      return <Tools draft={draft} patch={patch} />;
+    case 'permission':
+      return <Permission draft={draft} patch={patch} />;
+    case 'reasoning':
+      return <Reasoning draft={draft} patch={patch} />;
+    case 'context':
+      return <Context draft={draft} patch={patch} />;
+    case 'output':
+      return <Output draft={draft} patch={patch} />;
+    case 'dispatch':
+      return <Dispatch draft={draft} patch={patch} agentNames={agentNames} />;
+    case 'anthropic':
+      return <Anthropic draft={draft} patch={patch} />;
+    case 'concerns':
+      return <Concerns draft={draft} patch={patch} />;
     default:
       return <div className="ab-hint">Coming in the next task.</div>;
   }
@@ -132,6 +185,7 @@ export default function AgentBuilder({
   onCancel,
   aiModels,
   onGenerate,
+  agentNames,
 }: AgentBuilderProps) {
   const [draft, setDraft] = useState<AgentDraft>(() => parseAgent(initialRaw));
   const [order, setOrder] = useState<string[]>(() => computeInitialOrder(draft));
@@ -140,12 +194,26 @@ export default function AgentBuilder({
   const [aiDescription, setAiDescription] = useState('');
   const [aiBusy, setAiBusy] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
+  const [dragCardId, setDragCardId] = useState<string | null>(null);
+  const [dragOverId, setDragOverId] = useState<string | null>(null);
 
   // Keep the Raw-mode buffer in sync with card-mode edits (but not the other
   // way while the user is actively typing invalid intermediate YAML — see
   // handleRawChange).
   useEffect(() => {
     if (mode !== 'raw') setRawText(serializeAgent(draft));
+  }, [draft, mode]);
+
+  // Card order reacts to the draft, not just the initial mount: any field
+  // group populated in the draft — via a card edit, Raw-mode YAML, or AI
+  // generation — surfaces its card on the canvas once we're (back) in Cards
+  // mode. Cards the user explicitly removed stay removed because
+  // `removeCard` clears their owned fields, so they no longer "want" to be
+  // present. `unionWantedCards` returns the same array reference when
+  // nothing is missing, so this never loops.
+  useEffect(() => {
+    if (mode !== 'cards') return;
+    setOrder((prev) => unionWantedCards(prev, draft));
   }, [draft, mode]);
 
   function patch(p: Partial<AgentDraft>) {
@@ -165,6 +233,19 @@ export default function AgentBuilder({
       for (const f of fields) clear[f] = undefined;
       patch(clear);
     }
+  }
+
+  function moveCardBefore(dragId: string, targetId: string) {
+    if (dragId === targetId) return;
+    setOrder((prev) => {
+      const from = prev.indexOf(dragId);
+      const to = prev.indexOf(targetId);
+      if (from === -1 || to === -1) return prev;
+      const next = prev.slice();
+      next.splice(from, 1);
+      next.splice(next.indexOf(targetId), 0, dragId);
+      return next;
+    });
   }
 
   function handleRawChange(v: string) {
@@ -293,6 +374,12 @@ export default function AgentBuilder({
                         data-req={c.required ? 1 : 0}
                         role="button"
                         tabIndex={used ? -1 : 0}
+                        draggable={!used}
+                        onDragStart={(e) => {
+                          if (used) return;
+                          e.dataTransfer.setData('text/card', c.id);
+                          e.dataTransfer.effectAllowed = 'copy';
+                        }}
                         onClick={() => !used && addCard(c.id)}
                         onKeyDown={(e) => {
                           if (!used && (e.key === 'Enter' || e.key === ' ')) {
@@ -321,17 +408,60 @@ export default function AgentBuilder({
               <h2>Agent composition</h2>
               <span className="ab-cnt">{order.length} cards</span>
             </div>
-            <div className="ab-canvas">
+            <div
+              className="ab-canvas"
+              data-testid="ab-canvas-drop"
+              onDragOver={(e) => {
+                if (e.dataTransfer.types.includes('text/card')) e.preventDefault();
+              }}
+              onDrop={(e) => {
+                const id = e.dataTransfer.getData('text/card');
+                if (id && !activeIds.has(id)) {
+                  e.preventDefault();
+                  addCard(id);
+                }
+              }}
+            >
               <div className="ab-canvas-inner">
                 {order.length === 0 && (
-                  <div className="ab-dropzone ab-empty">Add field cards from the palette to compose the agent.</div>
+                  <div className="ab-dropzone ab-empty">Drag field cards here to compose the agent.</div>
                 )}
                 {order.map((id) => {
                   const meta = CARD_REGISTRY.find((c) => c.id === id);
                   if (!meta) return null;
                   return (
-                    <div className="ab-card" key={id}>
-                      <div className="ab-card-head">
+                    <div
+                      className={cn('ab-card', dragOverId === id && 'ab-drag-over')}
+                      key={id}
+                      onDragOver={(e) => {
+                        if (dragCardId && dragCardId !== id) {
+                          e.preventDefault();
+                          setDragOverId(id);
+                        }
+                      }}
+                      onDragLeave={() => setDragOverId((cur) => (cur === id ? null : cur))}
+                      onDrop={(e) => {
+                        if (dragCardId && dragCardId !== id) {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          moveCardBefore(dragCardId, id);
+                        }
+                        setDragOverId(null);
+                      }}
+                    >
+                      <div
+                        className="ab-card-head"
+                        draggable
+                        onDragStart={(e) => {
+                          setDragCardId(id);
+                          e.dataTransfer.effectAllowed = 'move';
+                          e.dataTransfer.setData('text/reorder', id);
+                        }}
+                        onDragEnd={() => {
+                          setDragCardId(null);
+                          setDragOverId(null);
+                        }}
+                      >
                         <span className="ab-grip" aria-hidden="true">
                           ⠿
                         </span>
@@ -349,7 +479,7 @@ export default function AgentBuilder({
                           </button>
                         )}
                       </div>
-                      <div className="ab-card-body">{renderCardBody(id, draft, patch)}</div>
+                      <div className="ab-card-body">{renderCardBody(id, draft, patch, agentNames)}</div>
                     </div>
                   );
                 })}

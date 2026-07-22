@@ -1,7 +1,7 @@
 // Prompt card — the markdown body. Verbatim, no templating: what's typed
 // here is exactly what follows the `---` frontmatter fence in the .md file.
 import { LabeledRow } from '../controls';
-import type { CardProps } from './Identity';
+import type { CardProps } from './types';
 
 export default function Prompt({ draft, patch }: CardProps) {
   return (

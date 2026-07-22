@@ -104,6 +104,28 @@ describe('validateAgentDraft', () => {
     );
   });
 
+  it('warns when body is empty or whitespace-only, without blocking submit', () => {
+    const empty = validDraft();
+    empty.body = '';
+    const { ok: okEmpty, warnings: warningsEmpty } = validateAgentDraft(empty);
+    expect(okEmpty).toBe(true);
+    expect(warningsEmpty).toContainEqual(
+      expect.objectContaining({ field: 'body', message: expect.stringContaining('system prompt (body) is empty') })
+    );
+
+    const whitespace = validDraft();
+    whitespace.body = '   \n  ';
+    const { ok: okWhitespace, warnings: warningsWhitespace } = validateAgentDraft(whitespace);
+    expect(okWhitespace).toBe(true);
+    expect(warningsWhitespace.some((w) => w.field === 'body')).toBe(true);
+  });
+
+  it('does not warn on body when non-empty', () => {
+    const d = validDraft();
+    const { warnings } = validateAgentDraft(d);
+    expect(warnings.some((w) => w.field === 'body')).toBe(false);
+  });
+
   it('is ok:true with no errors for a fully valid draft', () => {
     const d = validDraft();
     d.provider = 'anthropic';

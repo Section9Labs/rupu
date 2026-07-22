@@ -90,6 +90,10 @@ export function validateAgentDraft(d: AgentDraft): { ok: boolean; errors: FieldE
 
   if (d.concerns) checkConcernSeverities(d.concerns, errors);
 
+  if (!d.body || d.body.trim().length === 0) {
+    warnings.push({ field: 'body', message: 'system prompt (body) is empty — the server accepts this, but the agent has no instructions' });
+  }
+
   if (d.tools !== undefined) {
     if (d.tools.length === 0) {
       warnings.push({ field: 'tools', message: 'empty tools list grants the full default registry' });

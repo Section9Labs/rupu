@@ -4,7 +4,7 @@
 // omitting it is a valid, common choice (provider-default credential path).
 import { AUTH_MODES, PROVIDERS, type AgentDraft } from '../../../lib/agentBuilder/agentSpec';
 import { LabeledRow, Segmented } from '../controls';
-import type { CardProps } from './Identity';
+import type { CardProps } from './types';
 
 const PROVIDER_OPTIONS = PROVIDERS.map((p) => ({ label: p, value: p as string }));
 const AUTH_OPTIONS = [
