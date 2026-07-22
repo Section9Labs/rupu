@@ -94,10 +94,42 @@ fn unflatten(flat: &BTreeMap<Vec<String>, Value>) -> Result<Value, LayerError> {
 /// Dotted display form of a segment path — used for the public provenance
 /// map keys and for comparing against the (dotted) `[policy].lock` entries.
 /// This is purely informational: the merge itself keys off segment paths, so
-/// the theoretical ambiguity of joining segments that contain dots never
-/// affects which value wins.
+/// this encoding never affects which value wins.
+///
+/// Canonical encoding (matches `rupu_cp::config_write::split_dotted_key` and
+/// the frontend's `quoteSegment`/`splitDottedKey` in `ConfigEditor.tsx` —
+/// all three MUST stay in lockstep): segments are joined with `.`; a segment
+/// containing a `.` or a `"` is wrapped in double quotes with embedded `"`
+/// escaped as `\"` (TOML-quoted-key style). A segment with neither is
+/// emitted bare, so every existing simple key (`default_model`,
+/// `autoflow.max_active`, `cp.max_workspace_bytes`, …) is byte-identical to
+/// the old plain `join(".")` output — only a dotted segment like the
+/// `GLM-5.2-FP8` model id in `[pricing.oracle."…/GLM-5.2-FP8"]` changes,
+/// becoming `pricing.oracle."…/GLM-5.2-FP8"` instead of the ambiguous
+/// `pricing.oracle...GLM-5.2-FP8`.
+///
+/// Most `[policy].lock` entries are simple config-field paths (e.g.
+/// `permission_mode`, `autoflow.max_active`) with no dotted/quoted segment,
+/// and for those `is_locked`'s string comparison against `lock` is
+/// byte-identical to before. The CP Settings pricing tab's per-field lock
+/// toggle *can* add a dotted pricing key to the lock list (it sends whatever
+/// dotted key string the field is keyed on) — that stays correct too,
+/// because the frontend locks a field by writing this exact same canonical
+/// encoding into `[policy].lock` (see `ConfigEditor.tsx`'s `quoteSegment`),
+/// so the string `is_locked` compares against here was quoted the same way
+/// on the way in.
 fn dotted(parts: &[String]) -> String {
-    parts.join(".")
+    parts
+        .iter()
+        .map(|p| {
+            if p.contains('.') || p.contains('"') {
+                format!("\"{}\"", p.replace('"', "\\\""))
+            } else {
+                p.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 pub fn resolve(
@@ -316,8 +348,12 @@ mod tests {
             .expect("the dotted model key must survive intact");
         assert_eq!(mp.input_per_mtok, 1.42);
         assert_eq!(mp.cached_input_per_mtok, Some(0.82));
-        // The provenance display key retains the full (dotted) path.
-        assert!(r.provenance.keys().any(|k| k.contains("GLM-5.2-FP8")));
+        // The provenance display key retains the full path, with the dotted
+        // model segment quoted so it round-trips unambiguously through the
+        // rupu-cp write path and the frontend's matching split/quote helpers.
+        assert!(r
+            .provenance
+            .contains_key("pricing.oracle.\"/raid/models/zai-org/GLM-5.2-FP8\".input_per_mtok"));
     }
 
     #[test]
