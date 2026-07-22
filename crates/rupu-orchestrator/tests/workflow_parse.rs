@@ -661,7 +661,7 @@ steps:
   - id: gate
     actions: []
     branch:
-      condition: "{{ steps.gate.output }}"
+      condition: "true"
       then: [a]
       else: [b]
   - id: a
@@ -677,6 +677,53 @@ steps:
     assert_eq!(branch.r#else, vec!["b".to_string()]);
     assert!(wf.steps[0].agent.is_none());
     assert!(wf.steps[0].prompt.is_none());
+}
+
+#[test]
+fn rejects_branch_target_unknown() {
+    let s = r#"
+name: x
+steps:
+  - id: gate
+    actions: []
+    branch:
+      condition: "true"
+      then: [nope]
+      else: [b]
+  - id: b
+    agent: ag
+    prompt: p
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("nope"),
+        "expected BranchTargetUnknown naming `nope`, got: {err}"
+    );
+}
+
+#[test]
+fn rejects_branch_target_not_forward() {
+    let s = r#"
+name: x
+steps:
+  - id: before
+    agent: ag
+    prompt: p
+  - id: gate
+    actions: []
+    branch:
+      condition: "true"
+      then: [before]
+      else: [after]
+  - id: after
+    agent: ag
+    prompt: p
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("before"),
+        "expected BranchTargetNotForward naming `before`, got: {err}"
+    );
 }
 
 #[test]
@@ -1006,5 +1053,59 @@ steps:
     assert!(
         err.contains("steps.a.maxx_severity"),
         "expected when: lint to fire, got: {err}"
+    );
+}
+
+#[test]
+fn lint_validates_branch_condition_unknown_field() {
+    let s = r#"
+name: x
+steps:
+  - id: a
+    agent: w
+    actions: []
+    prompt: hi
+  - id: gate
+    actions: []
+    branch:
+      condition: "{{ steps.a.outupt }}"
+      then: [b]
+      else: [c]
+  - id: b
+    agent: w
+    prompt: p
+  - id: c
+    agent: w
+    prompt: p
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("steps.a.outupt") && err.contains("not a known step-output field"),
+        "expected branch.condition unknown-field lint to fire, got: {err}"
+    );
+}
+
+#[test]
+fn lint_rejects_branch_condition_forward_reference() {
+    let s = r#"
+name: x
+steps:
+  - id: gate
+    actions: []
+    branch:
+      condition: "{{ steps.b.output }}"
+      then: [a]
+      else: [b]
+  - id: a
+    agent: w
+    prompt: p
+  - id: b
+    agent: w
+    prompt: p
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("steps.b") && err.contains("forward reference"),
+        "expected branch.condition forward-ref lint to fire, got: {err}"
     );
 }

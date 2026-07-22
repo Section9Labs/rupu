@@ -140,6 +140,12 @@ pub enum WorkflowParseError {
     BranchArmsOverlap { step: String, id: String },
     #[error("step `{step}`: `branch.then`/`branch.else` must not target the branch step itself")]
     BranchTargetsSelf { step: String },
+    #[error("step `{step}`: branch target `{target}` does not match any step id")]
+    BranchTargetUnknown { step: String, target: String },
+    #[error(
+        "step `{step}`: branch target `{target}` does not run after the branch step (must be a forward reference)"
+    )]
+    BranchTargetNotForward { step: String, target: String },
 }
 
 /// How a workflow gets kicked off. Manual is the existing behavior
@@ -886,6 +892,7 @@ impl Workflow {
         validate_contracts(&wf)?;
         validate_autoflow(&wf)?;
         validate_template_refs(&wf)?;
+        validate_branch_targets(&wf)?;
         Ok(wf)
     }
 
@@ -1121,7 +1128,10 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
     // (which is for_each-only — structurally exclusive with a linear host
     // step, but assert it for a clear message).
     if let Some(host) = &step.host {
-        let is_linear = step.panel.is_none() && step.parallel.is_none() && step.for_each.is_none();
+        let is_linear = step.panel.is_none()
+            && step.parallel.is_none()
+            && step.for_each.is_none()
+            && step.branch.is_none();
         if !is_linear || step.distribute.is_some() {
             return Err(WorkflowParseError::HostOnNonLinearStep {
                 step: step.id.clone(),
@@ -1228,6 +1238,35 @@ fn validate_contracts(wf: &Workflow) -> Result<(), WorkflowParseError> {
     Ok(())
 }
 
+/// Validate that every `branch:` step's `then`/`else` targets name a
+/// step that actually exists in the workflow, and that the target
+/// runs strictly *after* the branch step in declaration order (a
+/// branch can only route forward — routing to an earlier step isn't
+/// a supported loop construct and would never be reached by the
+/// linear runner).
+fn validate_branch_targets(wf: &Workflow) -> Result<(), WorkflowParseError> {
+    for (idx, step) in wf.steps.iter().enumerate() {
+        let Some(branch) = &step.branch else {
+            continue;
+        };
+        for target in branch.then.iter().chain(branch.r#else.iter()) {
+            let Some(target_idx) = wf.steps.iter().position(|s| &s.id == target) else {
+                return Err(WorkflowParseError::BranchTargetUnknown {
+                    step: step.id.clone(),
+                    target: target.clone(),
+                });
+            };
+            if target_idx <= idx {
+                return Err(WorkflowParseError::BranchTargetNotForward {
+                    step: step.id.clone(),
+                    target: target.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Known fields on `StepOutput` (see `templates::StepOutput`).
 /// Used by [`validate_template_refs`] to flag typos like
 /// `{{ steps.x.findngs }}` at parse time.
@@ -1324,6 +1363,9 @@ fn collect_templates_for_step(step: &Step) -> Vec<(&'static str, String)> {
         for sub in subs {
             out.push(("parallel.prompt", sub.prompt.clone()));
         }
+    }
+    if let Some(b) = &step.branch {
+        out.push(("branch.condition", b.condition.clone()));
     }
     out
 }
@@ -1602,6 +1644,31 @@ steps:
       subject: "{{ inputs.x }}"
 "#;
         let err = Workflow::parse(yaml).expect_err("panel + host invalid");
+        assert!(matches!(
+            err,
+            WorkflowParseError::HostOnNonLinearStep { .. }
+        ));
+    }
+
+    #[test]
+    fn host_rejected_on_branch() {
+        let yaml = r#"
+name: bad
+steps:
+  - id: gate
+    host: worker-1
+    branch:
+      condition: "true"
+      then: [a]
+      else: [b]
+  - id: a
+    agent: ag
+    prompt: p
+  - id: b
+    agent: ag
+    prompt: p
+"#;
+        let err = Workflow::parse(yaml).expect_err("branch + host invalid");
         assert!(matches!(
             err,
             WorkflowParseError::HostOnNonLinearStep { .. }
