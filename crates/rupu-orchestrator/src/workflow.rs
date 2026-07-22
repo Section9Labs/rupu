@@ -130,6 +130,16 @@ pub enum WorkflowParseError {
     HostEmpty { step: String },
     #[error("step `{step}`: `workspace: sync` is only valid on a remote step (`host:` or `distribute:`)")]
     WorkspaceSyncOnLocalStep { step: String },
+    #[error(
+        "step `{step}`: `branch:` is mutually exclusive with `for_each:`, `parallel:`, `panel:`, and the top-level `agent`/`prompt`"
+    )]
+    BranchMutuallyExclusive { step: String },
+    #[error("step `{step}`: `branch.condition` must not be empty")]
+    BranchEmptyCondition { step: String },
+    #[error("step `{step}`: branch id `{id}` appears in both `then:` and `else:`")]
+    BranchArmsOverlap { step: String, id: String },
+    #[error("step `{step}`: `branch.then`/`branch.else` must not target the branch step itself")]
+    BranchTargetsSelf { step: String },
 }
 
 /// How a workflow gets kicked off. Manual is the existing behavior
@@ -993,11 +1003,43 @@ pub fn effective_workspace_mode(step: &Step, defaults: &WorkflowDefaults) -> Wor
         .unwrap_or(WorkspaceMode::None)
 }
 
-/// Validate per-step shape constraints. The four shapes (linear,
-/// `for_each:`, `parallel:`, `panel:`) are mutually exclusive, and
-/// each carries its own set of required fields.
+/// Validate per-step shape constraints. The five shapes (linear,
+/// `for_each:`, `parallel:`, `panel:`, `branch:`) are mutually
+/// exclusive, and each carries its own set of required fields.
 fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
-    if let Some(panel) = &step.panel {
+    if let Some(branch) = &step.branch {
+        // Branch step — top-level agent/prompt, for_each, parallel, and
+        // panel must all be absent (a branch step has no agent/prompt
+        // of its own; it only routes to other steps).
+        if step.agent.is_some()
+            || step.prompt.is_some()
+            || step.for_each.is_some()
+            || step.parallel.is_some()
+            || step.panel.is_some()
+        {
+            return Err(WorkflowParseError::BranchMutuallyExclusive {
+                step: step.id.clone(),
+            });
+        }
+        if branch.condition.trim().is_empty() {
+            return Err(WorkflowParseError::BranchEmptyCondition {
+                step: step.id.clone(),
+            });
+        }
+        for id in &branch.then {
+            if branch.r#else.contains(id) {
+                return Err(WorkflowParseError::BranchArmsOverlap {
+                    step: step.id.clone(),
+                    id: id.clone(),
+                });
+            }
+        }
+        if branch.then.contains(&step.id) || branch.r#else.contains(&step.id) {
+            return Err(WorkflowParseError::BranchTargetsSelf {
+                step: step.id.clone(),
+            });
+        }
+    } else if let Some(panel) = &step.panel {
         // Panel step — top-level agent/prompt, for_each, and parallel
         // must all be absent.
         if step.agent.is_some()

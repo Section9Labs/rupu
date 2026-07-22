@@ -543,6 +543,143 @@ steps:
 }
 
 #[test]
+fn rejects_branch_combined_with_agent_prompt_for_each_parallel_panel() {
+    let combos = [
+        "agent: a\n    prompt: hi",
+        "for_each: \"{{ inputs.items }}\"\n    agent: a\n    prompt: hi",
+        "parallel:\n      - { id: x, agent: a, prompt: y }",
+        "panel:\n      panelists: [reviewer-a]\n      subject: \"x\"",
+    ];
+    for combo in combos {
+        let s = format!(
+            r#"
+name: x
+steps:
+  - id: gate
+    actions: []
+    {combo}
+    branch:
+      condition: "{{{{ steps.gate.output }}}}"
+      then: [a]
+      else: [b]
+  - id: a
+    agent: ag
+    prompt: p
+  - id: b
+    agent: ag
+    prompt: p
+"#
+        );
+        let err = Workflow::parse(&s).unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "combo `{combo}` expected mutually-exclusive error, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn rejects_branch_with_empty_condition() {
+    let s = r#"
+name: x
+steps:
+  - id: gate
+    actions: []
+    branch:
+      condition: "   "
+      then: [a]
+      else: [b]
+  - id: a
+    agent: ag
+    prompt: p
+  - id: b
+    agent: ag
+    prompt: p
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("condition"),
+        "expected empty-condition error, got: {err}"
+    );
+}
+
+#[test]
+fn rejects_branch_arms_overlap() {
+    let s = r#"
+name: x
+steps:
+  - id: gate
+    actions: []
+    branch:
+      condition: "{{ steps.gate.output }}"
+      then: [a, shared]
+      else: [b, shared]
+  - id: a
+    agent: ag
+    prompt: p
+  - id: b
+    agent: ag
+    prompt: p
+  - id: shared
+    agent: ag
+    prompt: p
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("shared"),
+        "expected arms-overlap error naming `shared`, got: {err}"
+    );
+}
+
+#[test]
+fn rejects_branch_targeting_self() {
+    let s = r#"
+name: x
+steps:
+  - id: gate
+    actions: []
+    branch:
+      condition: "{{ steps.gate.output }}"
+      then: [gate]
+      else: [b]
+  - id: b
+    agent: ag
+    prompt: p
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("gate"),
+        "expected self-target error naming `gate`, got: {err}"
+    );
+}
+
+#[test]
+fn accepts_valid_branch_step() {
+    let s = r#"
+name: x
+steps:
+  - id: gate
+    actions: []
+    branch:
+      condition: "{{ steps.gate.output }}"
+      then: [a]
+      else: [b]
+  - id: a
+    agent: ag
+    prompt: p
+  - id: b
+    agent: ag
+    prompt: p
+"#;
+    let wf = Workflow::parse(s).expect("valid branch step should parse");
+    let branch = wf.steps[0].branch.as_ref().unwrap();
+    assert_eq!(branch.then, vec!["a".to_string()]);
+    assert_eq!(branch.r#else, vec!["b".to_string()]);
+    assert!(wf.steps[0].agent.is_none());
+    assert!(wf.steps[0].prompt.is_none());
+}
+
+#[test]
 fn parses_notify_issue_field() {
     let s = r#"
 name: x
