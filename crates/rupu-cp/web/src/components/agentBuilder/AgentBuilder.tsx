@@ -196,6 +196,9 @@ export default function AgentBuilder({
   const [mode, setMode] = useState<Mode>('cards');
   const [rawText, setRawText] = useState(() => serializeAgent(draft));
   const [aiDescription, setAiDescription] = useState('');
+  const [aiProvider, setAiProvider] = useState<string>(
+    () => aiModels?.find((m) => m.is_default)?.provider ?? aiModels?.[0]?.provider ?? '',
+  );
   const [aiBusy, setAiBusy] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
   const [dragCardId, setDragCardId] = useState<string | null>(null);
@@ -207,6 +210,14 @@ export default function AgentBuilder({
   useEffect(() => {
     if (mode !== 'raw') setRawText(serializeAgent(draft));
   }, [draft, mode]);
+
+  // `aiModels` may arrive asynchronously (the parent fetches it after
+  // mount), so re-derive the default provider whenever the list changes and
+  // the current selection isn't one of its entries.
+  useEffect(() => {
+    if (!aiModels || aiModels.length === 0) return;
+    setAiProvider((prev) => (aiModels.some((m) => m.provider === prev) ? prev : aiModels.find((m) => m.is_default)?.provider ?? aiModels[0].provider));
+  }, [aiModels]);
 
   // Card order reacts to the draft, not just the initial mount: any field
   // group populated in the draft — via a card edit, Raw-mode YAML, or AI
@@ -267,7 +278,12 @@ export default function AgentBuilder({
     setAiBusy(true);
     setAiError(null);
     try {
-      const result = await onGenerate({ description: aiDescription });
+      const sel = aiModels?.find((m) => m.provider === aiProvider);
+      const result = await onGenerate({
+        description: aiDescription,
+        provider: aiProvider || undefined,
+        model: sel?.models[0],
+      });
       const parsed = parseAgent(result.raw);
       setDraft(parsed);
       setOrder(computeInitialOrder(parsed));
@@ -340,7 +356,18 @@ export default function AgentBuilder({
             aria-label="describe the agent"
           />
           {aiModels && aiModels.length > 0 && (
-            <span className="text-meta text-ink-mute">{aiModels.length} model(s) available</span>
+            <select
+              className="ab-sel"
+              value={aiProvider}
+              onChange={(e) => setAiProvider(e.target.value)}
+              aria-label="generation provider"
+            >
+              {aiModels.map((m) => (
+                <option key={m.provider} value={m.provider}>
+                  {m.provider} · {m.models[0]}
+                </option>
+              ))}
+            </select>
           )}
           <Button variant="primary" size="sm" disabled={aiBusy || !aiDescription.trim()} onClick={handleGenerate}>
             {aiBusy ? 'Generating…' : 'Generate cards'}

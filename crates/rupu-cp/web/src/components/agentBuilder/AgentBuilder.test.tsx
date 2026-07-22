@@ -365,6 +365,87 @@ describe('AgentBuilder', () => {
     expect(screen.getByTestId('ab-yaml')).not.toHaveTextContent(/provider:/);
   });
 
+  it('AI tab: generates via onGenerate with the selected provider/model and repopulates cards', async () => {
+    const onGenerate = vi.fn().mockResolvedValue({
+      raw: '---\nname: gen-agent\nprovider: anthropic\n---\n\nbody',
+      provider: 'anthropic',
+      model: 'x',
+      attempts: 1,
+    });
+    render(
+      <AgentBuilder
+        initialRaw={SAMPLE_RAW}
+        submitLabel="Create agent"
+        submitting={false}
+        error={null}
+        onSubmit={vi.fn()}
+        onGenerate={onGenerate}
+        aiModels={[{ provider: 'anthropic', models: ['claude-sonnet-4-6'], is_default: true }]}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'AI' }));
+    fireEvent.change(screen.getByLabelText('generation provider'), { target: { value: 'anthropic' } });
+    fireEvent.change(screen.getByLabelText('describe the agent'), {
+      target: { value: 'a read-only security reviewer' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /generate/i }));
+
+    await screen.findByLabelText('agent name');
+    expect(onGenerate).toHaveBeenCalledWith({
+      description: 'a read-only security reviewer',
+      provider: 'anthropic',
+      model: 'claude-sonnet-4-6',
+    });
+    expect(screen.getByLabelText('agent name')).toHaveValue('gen-agent');
+    // Mode returned to Cards — the AI description bar is gone.
+    expect(screen.queryByLabelText('describe the agent')).not.toBeInTheDocument();
+  });
+
+  it('AI tab: shows the generate error when onGenerate rejects', async () => {
+    const onGenerate = vi.fn().mockRejectedValue(new Error('boom generate'));
+    render(
+      <AgentBuilder
+        initialRaw={SAMPLE_RAW}
+        submitLabel="Create agent"
+        submitting={false}
+        error={null}
+        onSubmit={vi.fn()}
+        onGenerate={onGenerate}
+        aiModels={[{ provider: 'anthropic', models: ['claude-sonnet-4-6'], is_default: true }]}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'AI' }));
+    fireEvent.change(screen.getByLabelText('describe the agent'), { target: { value: 'a thing' } });
+    fireEvent.click(screen.getByRole('button', { name: /generate/i }));
+    expect(await screen.findByText('boom generate')).toBeInTheDocument();
+  });
+
+  it('Raw round-trip: editing Raw and switching to Cards reflects the change, and card edits show in Raw', () => {
+    render(
+      <AgentBuilder
+        initialRaw={SAMPLE_RAW}
+        submitLabel="Create agent"
+        submitting={false}
+        error={null}
+        onSubmit={vi.fn()}
+      />,
+    );
+    // Raw -> Cards.
+    fireEvent.click(screen.getByRole('button', { name: 'Raw' }));
+    const editor = screen.getByTestId('code-editor') as HTMLTextAreaElement;
+    fireEvent.change(editor, {
+      target: { value: SAMPLE_RAW.replace('name: security-reviewer', 'name: from-raw') },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Cards' }));
+    expect(screen.getByLabelText('agent name')).toHaveValue('from-raw');
+
+    // Cards -> Raw.
+    fireEvent.change(screen.getByLabelText('agent name'), { target: { value: 'from-card' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Raw' }));
+    expect((screen.getByTestId('code-editor') as HTMLTextAreaElement).value).toContain('name: from-card');
+  });
+
   it('dragging a card header before another card reorders the canvas', () => {
     render(
       <AgentBuilder
