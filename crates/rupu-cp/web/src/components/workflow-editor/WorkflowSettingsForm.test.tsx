@@ -179,6 +179,31 @@ describe('WorkflowSettingsForm — next: Inputs card', () => {
     expect(last.rest.inputs).toBeUndefined();
   });
 
+  it('adding two rows before naming either keeps BOTH visible (blank-name collision regression)', () => {
+    const spy = vi.fn();
+    render(<Harness initial={metaWith({})} spy={spy} workflowEditorUi="next" />);
+
+    fireEvent.click(screen.getByRole('button', { name: '+ input' }));
+    fireEvent.click(screen.getByRole('button', { name: '+ input' }));
+
+    // Both blank rows must still be present in the DOM — previously the
+    // second row's blank name collided with the first in the name-keyed
+    // map and one row silently vanished on re-render.
+    expect(screen.getByLabelText('Input 1 name')).toBeInTheDocument();
+    expect(screen.getByLabelText('Input 2 name')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('Input 1 name'), { target: { value: 'alpha' } });
+    fireEvent.change(screen.getByLabelText('Input 2 name'), { target: { value: 'beta' } });
+
+    // Still both rows visible, now named distinctly.
+    expect(screen.getByLabelText('Input 1 name')).toHaveValue('alpha');
+    expect(screen.getByLabelText('Input 2 name')).toHaveValue('beta');
+
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as WorkflowMeta;
+    const inputs = last.rest.inputs as Record<string, unknown>;
+    expect(Object.keys(inputs).sort()).toEqual(['alpha', 'beta']);
+  });
+
   it('reads an existing inputs map back into rows', () => {
     render(
       <WorkflowSettingsForm

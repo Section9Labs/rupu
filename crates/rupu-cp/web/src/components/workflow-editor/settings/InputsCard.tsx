@@ -3,18 +3,38 @@
 // decides that; this component doesn't gate itself).
 //
 // An add/remove list of `InputModel` rows (name / type / required / default /
-// enum / description). Every change reads the CURRENT list fresh off `rest`
-// via `readInputs`, patches one row, and writes the whole list back via
-// `writeInputs` — never hand-building the name-keyed `inputs:` map here.
-// `writeInputs` is what turns the array into `{ <name>: { type: ... } }`.
+// enum / description).
+//
+// Rows are held in LOCAL state as `{ id, model }`, keyed by a client-side
+// `id` that is independent of `model.name`. This matters because `rest.inputs`
+// is a name-keyed map (see `writeInputs`): two rows both named `''` (e.g.
+// right after clicking "+ input" twice, before either is named) would
+// collide into a single map entry if the row list were recomputed from
+// `readInputs(rest)` on every render — the second row silently overwrites
+// the first. Keeping rows in local state means duplicate/blank names can
+// coexist in the editor; only at WRITE time do we fold them into the
+// name-keyed map, and blank-named rows are omitted from that map entirely
+// (rather than emitted under an empty-string key) so they stay editable in
+// the UI without polluting `rest.inputs`.
+//
+// `rows` is seeded from `readInputs(rest)` on mount and re-seeded ONLY when
+// `rest.inputs` changes from something this component didn't itself just
+// write (tracked via `lastWrittenInputsRef`) — e.g. a different workflow is
+// loaded into the form. This avoids clobbering in-progress edits (like a
+// still-blank row) on our own echoed-back `onRest` round-trip.
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { readInputs, writeInputs, type InputModel, type InputType } from '../../../lib/workflowMeta';
 import { Button } from '../../ui/Button';
 
 interface InputsCardProps {
   rest: Record<string, unknown>;
   onRest: (rest: Record<string, unknown>) => void;
+}
+
+interface Row {
+  id: string;
+  model: InputModel;
 }
 
 const fieldCls =
@@ -51,44 +71,74 @@ function defaultToText(v: unknown): string {
 }
 
 export default function InputsCard({ rest, onRest }: InputsCardProps) {
-  const inputs = readInputs(rest);
+  // Deterministic id generator (no Date.now()/Math.random()) — stable React
+  // keys and row addressing independent of `name`.
+  const idCounter = useRef(0);
+  function nextId(): string {
+    idCounter.current += 1;
+    return `input-row-${idCounter.current}`;
+  }
+
+  const [rows, setRows] = useState<Row[]>(() => readInputs(rest).map((model) => ({ id: nextId(), model })));
+  // Tracks the `rest.inputs` value this component itself last produced (via
+  // `commit` below), so the reconcile effect can tell "the parent echoed our
+  // own write back" (skip — would clobber blank/duplicate-name rows still
+  // being edited) apart from "a genuinely new `rest` arrived" (reseed).
+  const lastWrittenInputsRef = useRef<unknown>(rest.inputs);
+
+  useEffect(() => {
+    if (rest.inputs !== lastWrittenInputsRef.current) {
+      lastWrittenInputsRef.current = rest.inputs;
+      setRows(readInputs(rest).map((model) => ({ id: nextId(), model })));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rest.inputs]);
+
   // Pending "add enum value" text per row index — local UI state, never part
   // of the emitted meta (only a committed chip, via addEnumValue, is).
   const [pendingEnum, setPendingEnum] = useState<Record<number, string>>({});
 
-  function setInputs(next: InputModel[]): void {
-    onRest(writeInputs(rest, next));
+  /** Commit a new row list: update local editing state, then fold into the
+   *  name-keyed map and emit. Blank-named rows are dropped before
+   *  `writeInputs` so they never emit an empty-string key — they simply stay
+   *  visible/editable in `rows` until named. */
+  function commit(next: Row[]): void {
+    setRows(next);
+    const named = next.map((r) => r.model).filter((m) => m.name.trim() !== '');
+    const nextRest = writeInputs(rest, named);
+    lastWrittenInputsRef.current = nextRest.inputs;
+    onRest(nextRest);
   }
   function updateRow(i: number, p: Partial<InputModel>): void {
-    setInputs(inputs.map((row, j) => (j === i ? { ...row, ...p } : row)));
+    commit(rows.map((r, j) => (j === i ? { ...r, model: { ...r.model, ...p } } : r)));
   }
   function addRow(): void {
-    setInputs([...inputs, { name: '', type: 'string', required: false, enumValues: [] }]);
+    commit([...rows, { id: nextId(), model: { name: '', type: 'string', required: false, enumValues: [] } }]);
   }
   function removeRow(i: number): void {
-    setInputs(inputs.filter((_, j) => j !== i));
+    commit(rows.filter((_, j) => j !== i));
   }
   function addEnumValue(i: number): void {
     const v = (pendingEnum[i] ?? '').trim();
     if (v === '') return;
-    const row = inputs[i];
+    const row = rows[i].model;
     if (!row.enumValues.includes(v)) {
       updateRow(i, { enumValues: [...row.enumValues, v] });
     }
     setPendingEnum((prev) => ({ ...prev, [i]: '' }));
   }
   function removeEnumValue(i: number, v: string): void {
-    updateRow(i, { enumValues: inputs[i].enumValues.filter((x) => x !== v) });
+    updateRow(i, { enumValues: rows[i].model.enumValues.filter((x) => x !== v) });
   }
 
   return (
     <div className="wfx-card" data-testid="inputs-card">
       <div className="wfx-card-h">Inputs</div>
       <div className="wfx-card-b">
-        {inputs.length === 0 && <p className="text-ui text-ink-mute">No inputs declared.</p>}
+        {rows.length === 0 && <p className="text-ui text-ink-mute">No inputs declared.</p>}
 
-        {inputs.map((row, i) => (
-          <div key={i} className="wfx-inputrow">
+        {rows.map(({ id, model: row }, i) => (
+          <div key={id} className="wfx-inputrow">
             <div className="flex items-center gap-2">
               <input
                 type="text"
