@@ -394,6 +394,113 @@
 }
 
 /* ================================================================== */
+/* Flow Designer (next) editor — namespaced .wfx-*, nothing leaks.    */
+/* Behind `data.workflowEditorUi === 'next'` (EditableStepNode); the  */
+/* `classic` render path is untouched Tailwind/inline-style markup.   */
+/* Ported from the approved interactive mockup (flow-designer.html);  */
+/* colors come from the shared `--c-*` tokens (light + dark), same as */
+/* the Situation Room / Agent Builder blocks above/below.             */
+/* ================================================================== */
+
+/* ── node card shell ── */
+/* Width/min-height come from `editorNodeSize()` inline (shared with the
+ * dagre layout reservation — see workflowLayout.ts) so this card never
+ * grows past what the canvas reserved for it; nothing below sets `width`. */
+.wfx-node {
+  position: relative;
+  text-align: left;
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 12px;
+  background: rgb(var(--c-panel));
+  box-shadow: 0 2px 8px rgb(0 0 0 / .06);
+  cursor: grab;
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+.wfx-node.wfx-sel {
+  box-shadow: 0 0 0 2px rgb(var(--c-brand-500) / .3), 0 6px 20px rgb(var(--c-brand-500) / .14);
+}
+
+/* ── colored top-bar, by KIND (no run-state in the editor) ── */
+.wfx-bar {
+  position: absolute; left: 0; right: 0; top: 0; height: 3px;
+  border-radius: 12px 12px 0 0;
+}
+
+/* ── header: kindpill + mono id + problem dot ── */
+.wfx-head { display: flex; align-items: center; gap: 7px; padding: 9px 10px 6px; }
+.wfx-kindpill {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 8.5px; letter-spacing: .07em; text-transform: uppercase; font-weight: 700;
+  padding: 1px 6px; border-radius: 5px; white-space: nowrap; flex: none;
+}
+.wfx-nid {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px; font-weight: 650; color: rgb(var(--c-ink));
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.wfx-problem {
+  flex: none; width: 10px; height: 10px; border-radius: 50%;
+  background: rgb(var(--c-status-failed));
+}
+
+/* ── body: agent line / expr chips / port pills / gate chip ── */
+.wfx-body {
+  padding: 0 10px 9px; font-size: 10.5px; color: rgb(var(--c-ink-dim));
+  display: flex; flex-direction: column; gap: 5px;
+}
+.wfx-agent {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px; color: rgb(var(--c-brand-500));
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.wfx-meta { font-size: 9.5px; color: rgb(var(--c-ink-mute)); font-variant-numeric: tabular-nums; }
+.wfx-expr {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9.5px; color: rgb(var(--c-ink-mute));
+  background: rgb(var(--c-surface)); border: 1px solid rgb(var(--c-border)); border-radius: 6px;
+  padding: 3px 6px; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.wfx-ports { display: flex; flex-wrap: wrap; gap: 3px; }
+.wfx-port {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 8.5px; padding: 1px 6px; border-radius: 999px;
+  border: 1px solid rgb(var(--c-border)); color: rgb(var(--c-ink-dim));
+}
+.wfx-port-true  { color: rgb(var(--c-status-done));   border-color: rgb(var(--c-status-done) / .35);   background: rgb(var(--c-status-done) / .1); }
+.wfx-port-false { color: rgb(var(--c-status-failed)); border-color: rgb(var(--c-status-failed) / .35); background: rgb(var(--c-status-failed) / .1); }
+.wfx-gate {
+  align-self: flex-start;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px; color: rgb(var(--c-status-awaiting));
+  background: rgb(var(--c-status-awaiting) / .1); border: 1px solid rgb(var(--c-status-awaiting) / .25);
+  border-radius: 6px; padding: 2px 6px;
+}
+
+/* ── parallel sub-step rows ── */
+.wfx-sublist { display: flex; flex-direction: column; gap: 3px; }
+.wfx-subrow {
+  display: flex; align-items: center; gap: 6px;
+  border: 1px solid rgb(var(--c-border)); background: rgb(var(--c-surface));
+  border-radius: 6px; padding: 3px 6px;
+}
+.wfx-subid {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9.5px; color: rgb(var(--c-ink));
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.wfx-subagent {
+  margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px; color: rgb(var(--c-ink-mute));
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.wfx-empty { font-size: 9.5px; color: rgb(var(--c-ink-mute)); padding: 2px 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  .wfx-node { transition: none !important; }
+}
+
+/* ================================================================== */
 /* Agent Builder — the card-based agent composer (.rupu/agents/*.md). */
 /* Ported from the approved interactive mockup (agent-builder.html);  */
 /* colors come from the shared `--c-*` tokens (light + dark), same as */
