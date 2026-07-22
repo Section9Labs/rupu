@@ -44,6 +44,11 @@ pub struct CpConfig {
     /// UI is opt-in behind this flag.
     #[serde(default = "CpConfig::default_agent_authoring_ui")]
     pub agent_authoring_ui: String,
+    /// Which workflow-editor UI the CP web app renders: "classic" (raw editor)
+    /// or "next" (the visual branch-authoring UI). Defaults to classic so the new
+    /// UI is opt-in behind this flag.
+    #[serde(default = "CpConfig::default_workflow_editor_ui")]
+    pub workflow_editor_ui: String,
 }
 
 impl CpConfig {
@@ -58,6 +63,10 @@ impl CpConfig {
     fn default_agent_authoring_ui() -> String {
         "classic".to_string()
     }
+
+    fn default_workflow_editor_ui() -> String {
+        "classic".to_string()
+    }
 }
 
 impl Default for CpConfig {
@@ -69,6 +78,7 @@ impl Default for CpConfig {
             cron_tick_enabled: Self::default_true(),
             cron_tick_interval_secs: Self::default_background_interval_secs(),
             agent_authoring_ui: Self::default_agent_authoring_ui(),
+            workflow_editor_ui: Self::default_workflow_editor_ui(),
         }
     }
 }
