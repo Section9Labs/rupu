@@ -36,6 +36,7 @@ const AGG_POLL_MS = 15_000; // findings / projects / dashboard refresh cadence
 const SPARK_TICK_MS = 5_000; // events/min sampling window
 const SPARK_LEN = 16;
 const FRESH_MS = 2500;
+const STREAM_FINDINGS_CAP = 60; // most-recent findings merged into the stream
 
 interface EventItem {
   key: string;
@@ -239,7 +240,16 @@ export default function Events() {
     return out;
   }, [items]);
 
-  const findingCards = useMemo(() => findings.map(cardFromFinding), [findings]);
+  // The stream shows the most-recent findings only (getFindings can return
+  // hundreds across all projects); the roster + pulse still count the full set.
+  const findingCards = useMemo(
+    () =>
+      [...findings]
+        .sort((a, b) => Date.parse(b.declared_at) - Date.parse(a.declared_at))
+        .slice(0, STREAM_FINDINGS_CAP)
+        .map(cardFromFinding),
+    [findings],
+  );
 
   const cards = useMemo(
     () => [...eventCards, ...findingCards].sort((a, b) => b.ts - a.ts),

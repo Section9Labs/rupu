@@ -85,6 +85,10 @@ describe('cardFromFinding', () => {
     expect(c.code).toBe('if (invoice.orgId) {');
     expect(c.detail).toContain('truthiness');
     expect(c.ts).toBe(Date.parse('2026-07-21T10:00:00Z'));
+    // provenance for the Code-viewer deep link
+    expect(c.wsId).toBe('ws1');
+    expect(c.filePath).toBe('src/routes/billing.ts');
+    expect(c.fileLine).toBe(16);
   });
 
   it('an unknown severity falls back to info, and a missing file has no ref', () => {

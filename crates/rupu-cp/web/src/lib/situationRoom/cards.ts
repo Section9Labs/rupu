@@ -64,6 +64,12 @@ export interface StreamCard {
   severity?: FindingSeverity;
   fileRef?: string;
   code?: string;
+  /** Findings only: source location + provenance, so the card can deep-link to
+   *  the project Code viewer and (when present) the SCM permalink. */
+  wsId?: string;
+  filePath?: string;
+  fileLine?: number;
+  permalink?: string;
   /** Present on `await` cards — the run + reason an approval can act on. */
   approvable?: { runId: string; stepId?: string; reason: string };
 }
@@ -197,5 +203,9 @@ export function cardFromFinding(f: FindingOut): StreamCard {
     code: f.evidence?.code_excerpt ?? undefined,
     runId: undefined,
     projectName: f.project,
+    wsId: f.ws_id,
+    filePath: f.file_path ?? undefined,
+    fileLine: f.line_range?.[0],
+    permalink: f.permalink ?? undefined,
   };
 }
