@@ -284,6 +284,7 @@ describe('AgentBuilder', () => {
       />,
     );
     fireEvent.change(screen.getByLabelText('system prompt'), { target: { value: '' } });
+    expect(screen.getByText(/system prompt \(body\) is empty/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Create agent' })).not.toBeDisabled();
   });
 

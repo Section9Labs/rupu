@@ -216,6 +216,13 @@ describe('agentSpec', () => {
     expect(back.body.trimEnd()).toBe(d.body);
   });
 
+  it('repeated edit-save cycles are idempotent (no accumulating trailing blank lines)', () => {
+    const raw = '---\nname: a\n---\n\nfirst line.\n\ntrailing meaningful text.\n';
+    const oncePass = serializeAgent(parseAgent(raw));
+    const twicePass = serializeAgent(parseAgent(oncePass));
+    expect(twicePass).toBe(oncePass);
+  });
+
   it('never emits an unmodeled key from the frontmatter allowlist', () => {
     const d = emptyDraft();
     d.name = 'a';
@@ -280,8 +287,19 @@ describe('agentSpec', () => {
     expect(ANTHROPIC_SPEED).toContain('fast');
     expect(ANTHROPIC_CTX_MGMT).toContain('tool_clearing');
     expect(BUILTIN_TOOLS).toEqual(
-      expect.arrayContaining(['bash', 'read_file', 'write_file', 'edit_file', 'grep', 'glob'])
+      expect.arrayContaining([
+        'bash',
+        'read_file',
+        'write_file',
+        'edit_file',
+        'ast_grep',
+        'grep',
+        'glob',
+        'dispatch_agent',
+        'dispatch_agents_parallel',
+      ])
     );
+    expect(BUILTIN_TOOLS.length).toBe(9);
   });
 });
 

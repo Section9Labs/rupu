@@ -18,7 +18,17 @@ export const CONTEXT_WINDOWS = ['default', '1m'] as const;
 export const OUTPUT_FORMATS = ['text', 'json'] as const;
 export const ANTHROPIC_SPEED = ['fast'] as const;
 export const ANTHROPIC_CTX_MGMT = ['tool_clearing'] as const;
-export const BUILTIN_TOOLS = ['bash', 'read_file', 'write_file', 'edit_file', 'grep', 'glob'] as const;
+export const BUILTIN_TOOLS = [
+  'bash',
+  'read_file',
+  'write_file',
+  'edit_file',
+  'ast_grep',
+  'grep',
+  'glob',
+  'dispatch_agent',
+  'dispatch_agents_parallel',
+] as const;
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -187,7 +197,11 @@ export function serializeAgent(d: AgentDraft): string {
     }
   }
   const frontmatter = yaml.dump(obj).trimEnd();
-  return `---\n${frontmatter}\n---\n\n${d.body}\n`;
+  // Normalize trailing newlines before adding exactly one, so repeated
+  // parse/serialize round-trips are idempotent (`parseAgent` only strips
+  // leading newlines, never trailing — without this, each edit→save cycle
+  // would accumulate an extra trailing blank line: `x\n` -> `x\n\n` -> ...).
+  return `---\n${frontmatter}\n---\n\n${d.body.replace(/\n+$/, '')}\n`;
 }
 
 // ── Parse ───────────────────────────────────────────────────────────────

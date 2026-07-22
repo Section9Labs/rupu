@@ -158,6 +158,11 @@ function NewAgentModal({ onClose }: { onClose: () => void }) {
   }, []);
 
   useEffect(() => {
+    // Only the Agent Builder (next) UI has a Dispatch card that consumes
+    // `agentNames` — the classic Describe/Edit modal never reads it, so
+    // fetching here in classic mode is a spurious background request on the
+    // default path.
+    if (agentUi !== 'next') return;
     let cancelled = false;
     api
       .getAgents()
@@ -172,7 +177,7 @@ function NewAgentModal({ onClose }: { onClose: () => void }) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [agentUi]);
 
   async function generate() {
     if (generating || !description.trim()) return;

@@ -346,6 +346,14 @@ export default function AgentBuilder({
         </div>
       )}
 
+      {validation.warnings.length > 0 && (
+        <div className="border-b border-warn/30 bg-warn-bg px-4 py-2 text-note text-warn">
+          {validation.warnings.map((w, i) => (
+            <div key={`${w.field}-${i}`}>{w.message}</div>
+          ))}
+        </div>
+      )}
+
       {mode === 'ai' && onGenerate && (
         <div className="flex items-center gap-2.5 border-b border-border bg-brand-50 px-4 py-2.5">
           <input

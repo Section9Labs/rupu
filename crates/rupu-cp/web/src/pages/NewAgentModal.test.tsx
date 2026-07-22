@@ -80,7 +80,7 @@ describe('NewAgentModal describe mode', () => {
   });
 
   it('classic raw/describe UI renders when the flag is unset (default)', async () => {
-    vi.spyOn(api, 'getAgents').mockResolvedValue([]);
+    const getAgents = vi.spyOn(api, 'getAgents').mockResolvedValue([]);
     vi.spyOn(api, 'generateModels').mockResolvedValue([
       { provider: 'anthropic', models: ['claude-sonnet-4-6'], is_default: true },
     ]);
@@ -96,6 +96,13 @@ describe('NewAgentModal describe mode', () => {
     fireEvent.click(await screen.findByRole('button', { name: /edit raw/i }));
     expect(await screen.findByTestId('code-editor')).toBeInTheDocument();
     expect(screen.queryByLabelText(/agent name/i)).not.toBeInTheDocument();
+
+    // Classic mode's modal has no use for `agentNames` (only the Agent
+    // Builder's Dispatch card consumes it) — opening the classic modal must
+    // not trigger a spurious `getAgents` fetch. `Agents` (the page behind
+    // the modal) also calls `getAgents` for the list itself, so give the
+    // effects a tick to settle and assert it was called exactly that once.
+    await waitFor(() => expect(getAgents).toHaveBeenCalledTimes(1));
   });
 });
 
@@ -120,7 +127,7 @@ describe('NewAgentModal — Agent Builder (next flag)', () => {
   it('renders the Agent Builder instead of the classic UI and creates via createFrom', async () => {
     installLocalStorage();
     window.localStorage.setItem('rupu.cp.agentUi', 'next');
-    vi.spyOn(api, 'getAgents').mockResolvedValue([]);
+    const getAgents = vi.spyOn(api, 'getAgents').mockResolvedValue([]);
     vi.spyOn(api, 'generateModels').mockResolvedValue([
       { provider: 'anthropic', models: ['claude-sonnet-4-6'], is_default: true },
     ]);
@@ -141,6 +148,11 @@ describe('NewAgentModal — Agent Builder (next flag)', () => {
     const nameInput = await screen.findByLabelText(/agent name/i);
     expect(nameInput).toBeInTheDocument();
     expect(screen.queryByTestId('code-editor')).not.toBeInTheDocument();
+
+    // In 'next' mode the Dispatch card's agent picker needs `agentNames`, so
+    // the modal's mount effect must fetch it (in addition to the page-level
+    // `getAgents` call for the list itself).
+    await waitFor(() => expect(getAgents).toHaveBeenCalled());
 
     fireEvent.change(nameInput, { target: { value: 'my-cool-agent' } });
     fireEvent.click(screen.getByRole('button', { name: 'Create agent' }));
