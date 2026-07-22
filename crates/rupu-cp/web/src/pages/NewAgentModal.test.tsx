@@ -45,6 +45,7 @@ import Agents from './Agents';
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   navigateMock.mockReset();
 });
 

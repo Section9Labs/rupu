@@ -32,6 +32,23 @@ vi.mock('../components/CodeEditor', () => ({
 
 import AgentDetailPage from './AgentDetail';
 
+// jsdom's localStorage is unreliable under this Node version — install a
+// simple in-memory implementation we fully control (mirrors
+// NewAgentModal.test.tsx's `installLocalStorage`).
+function installLocalStorage() {
+  const store = new Map<string, string>();
+  vi.stubGlobal('localStorage', {
+    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+    setItem: (k: string, v: string) => store.set(k, String(v)),
+    removeItem: (k: string) => store.delete(k),
+    clear: () => store.clear(),
+    key: (i: number) => Array.from(store.keys())[i] ?? null,
+    get length() {
+      return store.size;
+    },
+  });
+}
+
 const RAW = `---\nname: reviewer\ndescription: Reviews code.\nprovider: anthropic\nmodel: claude-sonnet-4-6\n---\n\nYou review code.\n`;
 
 const AGENT: AgentDetail = {
@@ -49,6 +66,7 @@ const AGENT: AgentDetail = {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   navigateMock.mockReset();
 });
 
@@ -134,5 +152,46 @@ describe('AgentDetail edit/delete', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Delete reviewer' }));
     expect(delSpy).not.toHaveBeenCalled();
     expect(navigateMock).not.toHaveBeenCalled();
+  });
+
+  it('flag unset (default): Edit still shows the classic code editor, not the Agent Builder', async () => {
+    vi.spyOn(api, 'getAgent').mockResolvedValue(AGENT);
+    vi.spyOn(api, 'getConfig').mockResolvedValue({ cp: {} } as never);
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit definition' }));
+
+    expect(await screen.findByTestId('code-editor')).toBeInTheDocument();
+    expect(screen.queryByLabelText(/agent name/i)).not.toBeInTheDocument();
+  });
+});
+
+describe('AgentDetail — Agent Builder edit (next flag)', () => {
+  it('renders the Agent Builder seeded from agent.raw and saves via saveFrom', async () => {
+    installLocalStorage();
+    window.localStorage.setItem('rupu.cp.agentUi', 'next');
+    vi.spyOn(api, 'getAgent').mockResolvedValue(AGENT);
+    vi.spyOn(api, 'getConfig').mockResolvedValue({ cp: { agent_authoring_ui: 'next' } } as never);
+    const next = `${RAW}\nMore guidance.\n`;
+    const saveSpy = vi.spyOn(api, 'saveAgent').mockResolvedValue({ ...AGENT, raw: next });
+
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit definition' }));
+
+    // Agent Builder's name input is present, seeded from agent.raw; classic
+    // CodeEditor is not mounted.
+    const nameInput = (await screen.findByLabelText(/agent name/i)) as HTMLInputElement;
+    expect(nameInput.value).toBe('reviewer');
+    expect(screen.queryByTestId('code-editor')).not.toBeInTheDocument();
+
+    fireEvent.change(nameInput, { target: { value: 'reviewer-2' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(saveSpy).toHaveBeenCalled());
+    const [savedName, savedRaw] = saveSpy.mock.calls[0] as [string, string];
+    expect(savedName).toBe('reviewer');
+    expect(typeof savedRaw).toBe('string');
+    expect(savedRaw).toContain('name: reviewer-2');
   });
 });

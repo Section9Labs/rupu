@@ -9,13 +9,16 @@ import { api, type AgentDetail } from '../lib/api';
 import { cn } from '../lib/cn';
 import CodeHighlight from '../components/CodeHighlight';
 import CodeEditor from '../components/CodeEditor';
+import AgentBuilder from '../components/agentBuilder/AgentBuilder';
 import AgentLauncherSheet from '../components/AgentLauncherSheet';
 import AgentUsageTimeline from '../components/agent/AgentUsageTimeline';
 import { Button } from '../components/ui/Button';
+import { useAgentAuthoringUi } from '../hooks/useAgentAuthoringUi';
 
 export default function AgentDetailPage() {
   const { name = '' } = useParams<{ name: string }>();
   const navigate = useNavigate();
+  const agentUi = useAgentAuthoringUi();
 
   const [agent, setAgent] = useState<AgentDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -60,12 +63,12 @@ export default function AgentDetailPage() {
     setSaveError(null);
   }
 
-  async function save() {
+  async function saveFrom(raw: string) {
     if (!agent || saving) return;
     setSaving(true);
     setSaveError(null);
     try {
-      const updated = await api.saveAgent(name, draft);
+      const updated = await api.saveAgent(name, raw);
       setAgent(updated);
       setDraft(updated.raw);
       setEditing(false);
@@ -74,6 +77,10 @@ export default function AgentDetailPage() {
     } finally {
       setSaving(false);
     }
+  }
+
+  function save() {
+    return saveFrom(draft);
   }
 
   async function remove() {
@@ -170,7 +177,18 @@ export default function AgentDetailPage() {
           )}
         </div>
 
-        {editing ? (
+        {editing && agentUi === 'next' ? (
+          <div className="h-[80vh] overflow-hidden rounded-xl border border-border bg-panel shadow-card">
+            <AgentBuilder
+              initialRaw={agent.raw}
+              submitLabel="Save"
+              submitting={saving}
+              error={saveError}
+              onSubmit={saveFrom}
+              onCancel={cancelEdit}
+            />
+          </div>
+        ) : editing ? (
           <div className="space-y-3">
             <CodeEditor
               value={draft}
