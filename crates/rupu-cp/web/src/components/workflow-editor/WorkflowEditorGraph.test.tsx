@@ -32,13 +32,36 @@ vi.mock('@xyflow/react', () => ({
     </div>
   ),
   ReactFlowProvider: ({ children }: { children?: ReactNode }) => <>{children}</>,
-  Background: () => null,
+  // Serializes the props Background received into data attributes so tests can
+  // assert on variant/gap without mounting the real canvas-pattern renderer.
+  Background: ({
+    variant,
+    gap,
+    lineWidth,
+    size,
+    color,
+  }: {
+    variant?: string;
+    gap?: number;
+    lineWidth?: number;
+    size?: number;
+    color?: string;
+  }) => (
+    <div
+      data-testid="bg"
+      data-variant={variant}
+      data-gap={gap}
+      data-linewidth={lineWidth}
+      data-size={size}
+      data-color={color}
+    />
+  ),
   Controls: () => null,
   MiniMap: () => null,
   Handle: () => null,
   Position: { Top: 'top', Bottom: 'bottom', Left: 'left', Right: 'right' },
   MarkerType: { ArrowClosed: 'arrowclosed' },
-  BackgroundVariant: { Dots: 'dots' },
+  BackgroundVariant: { Dots: 'dots', Lines: 'lines', Cross: 'cross' },
   applyNodeChanges: (_changes: unknown, nodes: unknown) => nodes,
   useReactFlow: () => ({
     screenToFlowPosition: (p: { x: number; y: number }) => p,
@@ -187,6 +210,70 @@ describe('node projection', () => {
   });
 });
 
+describe('canvas backdrop (Task 3)', () => {
+  function bgAttrs(workflowEditorUi?: 'classic' | 'next') {
+    render(
+      <WorkflowEditorGraph
+        graph={makeGraph()}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi={workflowEditorUi}
+      />,
+    );
+    const bg = screen.getByTestId('bg');
+    return { variant: bg.getAttribute('data-variant'), gap: bg.getAttribute('data-gap') };
+  }
+
+  it('classic renders a Dots background with gap 16 (unchanged)', () => {
+    const { variant, gap } = bgAttrs('classic');
+    expect(variant).toBe('dots');
+    expect(gap).toBe('16');
+  });
+
+  it('defaults to Dots/gap 16 when the flag is unset', () => {
+    const { variant, gap } = bgAttrs(undefined);
+    expect(variant).toBe('dots');
+    expect(gap).toBe('16');
+  });
+
+  it('next renders a Lines background with gap 28', () => {
+    const { variant, gap } = bgAttrs('next');
+    expect(variant).toBe('lines');
+    expect(gap).toBe('28');
+  });
+
+  it('applies the wfx-canvas radial-wash class to the canvas container only when next', () => {
+    const { container, rerender } = render(
+      <WorkflowEditorGraph
+        graph={makeGraph()}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi="classic"
+      />,
+    );
+    expect(container.querySelector('.wfx-canvas')).not.toBeInTheDocument();
+
+    rerender(
+      <WorkflowEditorGraph
+        graph={makeGraph()}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi="next"
+      />,
+    );
+    expect(container.querySelector('.wfx-canvas')).toBeInTheDocument();
+  });
+});
+
 describe('applyConnect', () => {
   it('valid connection emits onChange with the new edge, not onInvalid', () => {
     const onChange = vi.fn();
@@ -320,6 +407,38 @@ describe('branch edge rendering', () => {
     // The plain chain edge (a->b) carries no label.
     const plain = edges.find((e) => e.id === 'a->b');
     expect(plain?.label).toBeUndefined();
+  });
+
+  it('next mode bumps the branch-arm stroke width and themes the plain edge too', () => {
+    const g = makeGraph();
+    g.nodes.push({
+      id: 'br',
+      data: { id: 'br', kind: 'branch', condition: 'inputs.ok', thenTargets: ['a'], elseTargets: ['b'] },
+      position: { x: 0, y: 0 },
+    });
+    g.edges.push({ id: 'br->a:then', source: 'br', target: 'a', label: 'true', branch: 'then' });
+    render(
+      <WorkflowEditorGraph
+        graph={g}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi="next"
+      />,
+    );
+    const raw = screen.getByTestId('rf').getAttribute('data-edges');
+    const edges = JSON.parse(raw!) as Array<{
+      id: string;
+      style?: { stroke?: string; strokeWidth?: number };
+    }>;
+    const thenEdge = edges.find((e) => e.id === 'br->a:then');
+    expect(thenEdge?.style?.strokeWidth).toBeGreaterThan(1.6);
+    // The plain chain edge (a->b, no branch) also gets a themed, bolder stroke in next mode.
+    const plain = edges.find((e) => e.id === 'a->b');
+    expect(plain?.style?.stroke).toBeTruthy();
+    expect(plain?.style?.strokeWidth).toBeTruthy();
   });
 });
 

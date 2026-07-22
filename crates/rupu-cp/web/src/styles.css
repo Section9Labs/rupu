@@ -496,8 +496,68 @@
 }
 .wfx-empty { font-size: 9.5px; color: rgb(var(--c-ink-mute)); padding: 2px 0; }
 
+/* ── canvas backdrop (Task 3) ── */
+/* Faint radial brand wash behind the grid-pattern <Background>. Applied to the
+ * canvas's outer container (WorkflowEditorGraph); ReactFlow's own inline
+ * background is set to transparent for `next` so this shows through. Same
+ * `--c-brand-500` value in light + dark, so one alpha works for both. */
+.wfx-canvas {
+  background: radial-gradient(120% 60% at 50% -10%, rgb(var(--c-brand-500) / .05), transparent 60%);
+}
+
+/* ── palette dock (Task 3) ── */
+/* Ported from the mockup's `.palette`/`.pcard`/`.pdot` — a row-style card
+ * (accent dot + label/sub) instead of the classic top-bar preview tile.
+ * Positioning (absolute bottom-left dock) stays on the Tailwind wrapper in
+ * NodePalette.tsx; these rules are the panel/card skin only. */
+.wfx-palette {
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 10px;
+  background: rgb(var(--c-panel) / .95);
+  box-shadow: 0 2px 8px rgb(0 0 0 / .06);
+  padding: 8px;
+}
+.wfx-palette-hint {
+  padding: 0 2px 6px;
+  font-size: 9.5px;
+  color: rgb(var(--c-ink-mute));
+}
+.wfx-palette-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: 22rem;
+}
+.wfx-pcard {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 9px;
+  background: rgb(var(--c-panel));
+  cursor: grab;
+  user-select: none;
+  text-align: left;
+  transition: border-color .15s ease;
+}
+.wfx-pcard:hover { border-color: rgb(var(--c-brand-500) / .5); }
+.wfx-pcard:active { cursor: grabbing; }
+.wfx-pcard:disabled { cursor: not-allowed; opacity: .5; }
+.wfx-pdot { width: 9px; height: 9px; border-radius: 3px; flex: none; }
+.wfx-pcard-text { min-width: 0; }
+.wfx-pl {
+  font-size: 11.5px; font-weight: 600; color: rgb(var(--c-ink));
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.wfx-pd {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px; color: rgb(var(--c-ink-mute)); margin-top: 1px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .wfx-node { transition: none !important; }
+  .wfx-node, .wfx-pcard { transition: none !important; }
 }
 
 /* ================================================================== */

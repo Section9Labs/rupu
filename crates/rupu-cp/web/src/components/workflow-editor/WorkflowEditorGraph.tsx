@@ -237,6 +237,7 @@ function WorkflowEditorGraphInner({
     () =>
       graph.edges.map((e) => {
         const color = branchEdgeColor(e.branch, colors);
+        const next = workflowEditorUi === 'next';
         const edge: Edge = {
           id: e.id,
           source: e.source,
@@ -246,13 +247,19 @@ function WorkflowEditorGraphInner({
         };
         if (e.label !== undefined) edge.label = e.label;
         if (color !== undefined) {
-          edge.style = { stroke: color };
+          // Branch (true/false) arm — colored stroke, a touch bolder for `next`
+          // (mirrors the mockup's `.edge.t-true`/`.edge.t-false`).
+          edge.style = next ? { stroke: color, strokeWidth: 2.5 } : { stroke: color };
           edge.labelStyle = { fill: color, fontWeight: 600 };
           edge.labelBgStyle = { fillOpacity: 0 };
+        } else if (next) {
+          // Plain chain/data-ref edge — themed muted stroke for `next` (mockup's
+          // `.edge`); classic leaves this edge with xyflow's default styling.
+          edge.style = { stroke: colors.alpha('inkMute', 0.5), strokeWidth: 1.6 };
         }
         return edge;
       }),
-    [graph.edges, colors],
+    [graph.edges, colors, workflowEditorUi],
   );
 
   // Move (drag) + delete (Backspace/Delete) both arrive as node changes.
@@ -387,7 +394,14 @@ function WorkflowEditorGraphInner({
   );
 
   return (
-    <div className="relative h-full min-h-[16rem] w-full overflow-hidden rounded-xl border border-border shadow-card">
+    <div
+      className={[
+        'relative h-full min-h-[16rem] w-full overflow-hidden rounded-xl border border-border shadow-card',
+        workflowEditorUi === 'next' ? 'wfx-canvas' : '',
+      ]
+        .join(' ')
+        .trim()}
+    >
       {/* "graph paused" chip — top-center, shown while YAML is unparseable */}
       {paused && (
         <div
@@ -476,9 +490,20 @@ function WorkflowEditorGraphInner({
         fitView
         fitViewOptions={{ padding: 0.2, maxZoom: 1.0 }}
         proOptions={{ hideAttribution: true }}
-        style={{ background: colors.bg }}
+        // `next` leaves this transparent so the `.wfx-canvas` radial wash on the
+        // outer container (set above) shows through behind the grid pattern.
+        style={{ background: workflowEditorUi === 'next' ? 'transparent' : colors.bg }}
       >
-        <Background variant={BackgroundVariant.Dots} gap={16} size={1} color={colors.alpha('inkMute', 0.25)} />
+        {workflowEditorUi === 'next' ? (
+          <Background
+            variant={BackgroundVariant.Lines}
+            gap={28}
+            lineWidth={1}
+            color={colors.alpha('inkMute', 0.12)}
+          />
+        ) : (
+          <Background variant={BackgroundVariant.Dots} gap={16} size={1} color={colors.alpha('inkMute', 0.25)} />
+        )}
         <MiniMap
           pannable
           zoomable

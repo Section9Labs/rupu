@@ -12,19 +12,34 @@
 import type { DragEvent } from 'react';
 import type { StepKind } from '../../lib/workflowGraph';
 import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
+import { useThemeColors, type ColorKey } from '../../lib/useThemeColors';
 
 /** dataTransfer key the canvas reads on drop. Exported so the canvas drop
  *  handler and the palette agree on one string. */
 export const NODE_KIND_MIME = 'application/rupu-node-kind';
 
 // Per-kind accent color — identical to EditableStepNode.KIND_COLOR so the
-// preview top-bar matches the real card.
+// preview top-bar matches the real card. Classic-only (`next` uses the themed
+// KIND_ACCENT below).
 const KIND_COLOR: Record<StepKind, string> = {
   step: '#1860f2',
   for_each: '#8b5cf6',
   parallel: '#9333ea',
   panel: '#f59e0b',
   branch: '#16a34a',
+};
+
+// `next` (instrument) look — per-kind accent resolved from the SAME themed
+// tokens EditableStepNode.KIND_KEY uses, so the palette dot matches the real
+// node's top-bar exactly (and stays legible on dark, unlike the fixed hexes
+// above). Duplicated here rather than imported: Task 3 only touches
+// NodePalette.tsx/WorkflowEditorGraph.tsx/styles.css.
+const KIND_ACCENT: Record<StepKind, ColorKey> = {
+  step: 'status.running',
+  for_each: 'brand.500',
+  parallel: 'sev.critical',
+  panel: 'status.awaiting',
+  branch: 'status.done',
 };
 
 interface PaletteItem {
@@ -65,6 +80,7 @@ export default function NodePalette({
   workflowEditorUi = 'classic',
 }: Props) {
   const items = workflowEditorUi === 'next' ? [...ITEMS, BRANCH_ITEM] : ITEMS;
+  const colors = useThemeColors();
   const handleDragStart = (kind: StepKind) => (e: DragEvent<HTMLButtonElement>) => {
     if (disabled) {
       e.preventDefault();
@@ -74,6 +90,47 @@ export default function NodePalette({
     e.dataTransfer.effectAllowed = 'move';
     onDragStartKind(kind);
   };
+
+  // "next" (instrument) look — a wholly separate render path so the classic
+  // markup below stays byte-identical. Ported from the mockup's `.palette`/
+  // `.pcard`/`.pdot` (row-style card: accent dot + label/sub), styled via the
+  // `.wfx-*` CSS block; only the outer dock position (bottom-left float) stays
+  // Tailwind, matching the classic dock's placement.
+  if (workflowEditorUi === 'next') {
+    return (
+      <div
+        data-ui="next"
+        className="pointer-events-auto absolute bottom-3 left-3 z-10 max-w-[calc(100%-1.5rem)]"
+      >
+        <div className="wfx-palette">
+          <div className="wfx-palette-hint">Drag a card onto the canvas, or click to add at center.</div>
+          <div className="wfx-palette-list">
+            {items.map((item) => {
+              const color = colors.get(KIND_ACCENT[item.kind]);
+              return (
+                <button
+                  key={item.kind}
+                  type="button"
+                  draggable={!disabled}
+                  disabled={disabled}
+                  onClick={() => onAdd(item.kind)}
+                  onDragStart={handleDragStart(item.kind)}
+                  aria-label={`Add ${item.label} node`}
+                  className="wfx-pcard"
+                >
+                  <span className="wfx-pdot" style={{ background: color }} />
+                  <div className="wfx-pcard-text">
+                    <div className="wfx-pl">{item.label}</div>
+                    <div className="wfx-pd">{item.sub}</div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="pointer-events-auto absolute bottom-3 left-3 z-10 max-w-[calc(100%-1.5rem)] rounded-lg border border-border bg-panel/95 px-2 py-2 shadow-card">
