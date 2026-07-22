@@ -77,4 +77,75 @@ describe('NewAgentModal describe mode', () => {
     await waitFor(() => expect(gen).toHaveBeenCalled());
     expect(await screen.findByDisplayValue(/name: drafted/)).toBeInTheDocument();
   });
+
+  it('classic raw/describe UI renders when the flag is unset (default)', async () => {
+    vi.spyOn(api, 'getAgents').mockResolvedValue([]);
+    vi.spyOn(api, 'generateModels').mockResolvedValue([
+      { provider: 'anthropic', models: ['claude-sonnet-4-6'], is_default: true },
+    ]);
+    vi.spyOn(api, 'getConfig').mockResolvedValue({ cp: {} } as never);
+
+    render(
+      <MemoryRouter>
+        <Agents />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: 'New agent' }));
+    fireEvent.click(await screen.findByRole('button', { name: /edit raw/i }));
+    expect(await screen.findByTestId('code-editor')).toBeInTheDocument();
+    expect(screen.queryByLabelText(/agent name/i)).not.toBeInTheDocument();
+  });
+});
+
+// jsdom's localStorage is unreliable under this Node version — install a
+// simple in-memory implementation we fully control (mirrors
+// ThemeProvider.test.tsx's `installLocalStorage`).
+function installLocalStorage() {
+  const store = new Map<string, string>();
+  vi.stubGlobal('localStorage', {
+    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+    setItem: (k: string, v: string) => store.set(k, String(v)),
+    removeItem: (k: string) => store.delete(k),
+    clear: () => store.clear(),
+    key: (i: number) => Array.from(store.keys())[i] ?? null,
+    get length() {
+      return store.size;
+    },
+  });
+}
+
+describe('NewAgentModal — Agent Builder (next flag)', () => {
+  it('renders the Agent Builder instead of the classic UI and creates via createFrom', async () => {
+    installLocalStorage();
+    window.localStorage.setItem('rupu.cp.agentUi', 'next');
+    vi.spyOn(api, 'getAgents').mockResolvedValue([]);
+    vi.spyOn(api, 'generateModels').mockResolvedValue([
+      { provider: 'anthropic', models: ['claude-sonnet-4-6'], is_default: true },
+    ]);
+    vi.spyOn(api, 'getConfig').mockResolvedValue({ cp: { agent_authoring_ui: 'next' } } as never);
+    const created = vi.spyOn(api, 'createAgent').mockResolvedValue({
+      name: 'my-cool-agent',
+    } as never);
+
+    render(
+      <MemoryRouter>
+        <Agents />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: 'New agent' }));
+
+    // Agent Builder's name input is present; the classic raw editor is not.
+    const nameInput = await screen.findByLabelText(/agent name/i);
+    expect(nameInput).toBeInTheDocument();
+    expect(screen.queryByTestId('code-editor')).not.toBeInTheDocument();
+
+    fireEvent.change(nameInput, { target: { value: 'my-cool-agent' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create agent' }));
+
+    await waitFor(() => expect(created).toHaveBeenCalled());
+    const raw = created.mock.calls[0][0] as string;
+    expect(raw).toContain('name: my-cool-agent');
+  });
 });
