@@ -381,7 +381,7 @@ export default function WorkflowEditor({
           )}
           {panelTab === 'settings' && (
             <div role="tabpanel" id="inspector-settings" aria-labelledby="inspector-tab-settings">
-              <WorkflowSettingsForm meta={graph.meta} onChange={onMetaChange} />
+              <WorkflowSettingsForm meta={graph.meta} onChange={onMetaChange} workflowEditorUi={workflowEditorUi} />
             </div>
           )}
           {panelTab === 'reference' && (

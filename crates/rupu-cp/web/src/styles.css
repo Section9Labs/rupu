@@ -560,6 +560,127 @@
   .wfx-node, .wfx-pcard { transition: none !important; }
 }
 
+/* ── Settings inspector authoring cards (Task 5): Trigger / Inputs ── */
+/* Ported from the mockup's `.card-sec`/`.sh`/`.sb` (card shell) and
+ * `.seg`/`.chip` (segmented control / removable chip). Behind
+ * `workflowEditorUi === 'next'` in WorkflowSettingsForm; the classic
+ * rest-chips form is untouched. Field controls inside these cards reuse the
+ * standard Tailwind field/label classes already used across StepForm /
+ * WorkflowSettingsForm — only the card chrome + segmented control + chip list
+ * are new, themed via the shared `--c-*` tokens (no new tokens added). */
+.wfx-card {
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 10px;
+  overflow: hidden;
+}
+.wfx-card + .wfx-card {
+  margin-top: 12px;
+}
+.wfx-card-h {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 11px;
+  background: rgb(var(--c-surface) / .6);
+  border-bottom: 1px solid rgb(var(--c-border));
+  font-size: 11px;
+  font-weight: 650;
+  color: rgb(var(--c-ink));
+}
+.wfx-card-b {
+  padding: 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+.wfx-seg {
+  display: inline-flex;
+  background: rgb(var(--c-surface));
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 8px;
+  padding: 2px;
+  flex-wrap: wrap;
+}
+.wfx-seg button {
+  appearance: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 5px 10px;
+  border-radius: 6px;
+  border: 0;
+  background: transparent;
+  color: rgb(var(--c-ink-dim));
+}
+.wfx-seg button[aria-pressed="true"] {
+  background: rgb(var(--c-panel));
+  color: rgb(var(--c-brand-500));
+  box-shadow: 0 1px 2px rgb(0 0 0 / .08);
+}
+.wfx-row-two {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.wfx-chiprow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.wfx-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  padding: 3px 7px;
+  border-radius: 6px;
+  background: rgb(var(--c-brand-500) / .1);
+  color: rgb(var(--c-brand-500));
+  border: 1px solid rgb(var(--c-brand-500) / .28);
+}
+.wfx-chip button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  opacity: .6;
+  padding: 0;
+  font-size: inherit;
+  line-height: 1;
+}
+.wfx-chip button:hover {
+  opacity: 1;
+}
+.wfx-addbtn {
+  appearance: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 5px 10px;
+  border-radius: 7px;
+  border: 1px dashed rgb(var(--c-brand-500) / .4);
+  background: rgb(var(--c-brand-500) / .08);
+  color: rgb(var(--c-brand-500));
+  align-self: flex-start;
+}
+.wfx-inputrow {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid rgb(var(--c-border));
+  background: rgb(var(--c-surface) / .5);
+  border-radius: 8px;
+  padding: 9px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wfx-card, .wfx-seg button, .wfx-chip button { transition: none !important; }
+}
+
 /* ================================================================== */
 /* Agent Builder — the card-based agent composer (.rupu/agents/*.md). */
 /* Ported from the approved interactive mockup (agent-builder.html);  */
