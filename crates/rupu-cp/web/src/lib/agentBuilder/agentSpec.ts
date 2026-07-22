@@ -30,6 +30,18 @@ export const BUILTIN_TOOLS = [
   'dispatch_agents_parallel',
 ] as const;
 
+// Starting definition for a brand-new agent — shared by the full-page Agent
+// Builder (/agents/new) and the classic New-agent modal.
+export const NEW_AGENT_TEMPLATE = `---
+name: my-agent
+description: A short description.
+provider: anthropic
+model: claude-sonnet-4-6
+---
+
+You are a helpful agent. ...
+`;
+
 // ── Types ───────────────────────────────────────────────────────────────
 
 export interface SchemaProp {

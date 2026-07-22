@@ -123,18 +123,15 @@ function installLocalStorage() {
   });
 }
 
-describe('NewAgentModal — Agent Builder (next flag)', () => {
-  it('renders the Agent Builder instead of the classic UI and creates via createFrom', async () => {
+describe('New agent — Agent Builder (next flag)', () => {
+  it('navigates to the full-page /agents/new instead of opening a modal', async () => {
     installLocalStorage();
     window.localStorage.setItem('rupu.cp.agentUi', 'next');
-    const getAgents = vi.spyOn(api, 'getAgents').mockResolvedValue([]);
+    vi.spyOn(api, 'getAgents').mockResolvedValue([]);
     vi.spyOn(api, 'generateModels').mockResolvedValue([
       { provider: 'anthropic', models: ['claude-sonnet-4-6'], is_default: true },
     ]);
     vi.spyOn(api, 'getConfig').mockResolvedValue({ cp: { agent_authoring_ui: 'next' } } as never);
-    const created = vi.spyOn(api, 'createAgent').mockResolvedValue({
-      name: 'my-cool-agent',
-    } as never);
 
     render(
       <MemoryRouter>
@@ -144,21 +141,8 @@ describe('NewAgentModal — Agent Builder (next flag)', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: 'New agent' }));
 
-    // Agent Builder's name input is present; the classic raw editor is not.
-    const nameInput = await screen.findByLabelText(/agent name/i);
-    expect(nameInput).toBeInTheDocument();
-    expect(screen.queryByTestId('code-editor')).not.toBeInTheDocument();
-
-    // In 'next' mode the Dispatch card's agent picker needs `agentNames`, so
-    // the modal's mount effect must fetch it (in addition to the page-level
-    // `getAgents` call for the list itself).
-    await waitFor(() => expect(getAgents).toHaveBeenCalled());
-
-    fireEvent.change(nameInput, { target: { value: 'my-cool-agent' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Create agent' }));
-
-    await waitFor(() => expect(created).toHaveBeenCalled());
-    const raw = created.mock.calls[0][0] as string;
-    expect(raw).toContain('name: my-cool-agent');
+    // No modal opens — the button routes to the dedicated full page.
+    expect(navigateMock).toHaveBeenCalledWith('/agents/new');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 });

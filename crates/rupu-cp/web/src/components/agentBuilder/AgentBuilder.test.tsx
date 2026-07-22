@@ -333,6 +333,43 @@ describe('AgentBuilder', () => {
     expect(screen.getByRole('button', { name: 'remove Reasoning card' })).toBeInTheDocument();
   });
 
+  it('dropping a palette card onto an existing canvas card inserts it before that card', () => {
+    render(
+      <AgentBuilder
+        initialRaw={SAMPLE_RAW}
+        submitLabel="Create agent"
+        submitting={false}
+        error={null}
+        onSubmit={vi.fn()}
+      />,
+    );
+    // Canvas at mount: [Identity, Permission, Prompt]. Drop Reasoning from
+    // the palette onto the Permission card — it must land BEFORE Permission,
+    // not at the end of the canvas.
+    const store = new Map<string, string>();
+    const dataTransfer = {
+      setData: (k: string, v: string) => store.set(k, v),
+      getData: (k: string) => store.get(k) ?? '',
+      get types() {
+        return Array.from(store.keys());
+      },
+      effectAllowed: '',
+      dropEffect: '',
+    };
+    const source = screen.getByLabelText('add Reasoning card');
+    const permissionCard = screen
+      .getByText('Permission', { selector: '.ab-ct' })
+      .closest('.ab-card') as HTMLElement;
+    fireEvent.dragStart(source, { dataTransfer });
+    fireEvent.dragOver(permissionCard, { dataTransfer });
+    fireEvent.drop(permissionCard, { dataTransfer });
+
+    const order = Array.from(document.querySelectorAll('.ab-card .ab-ct')).map(
+      (el) => el.textContent ?? '',
+    );
+    expect(order).toEqual(['Identity', 'Reasoning', 'Permission', 'Prompt']);
+  });
+
   it('removing the Model card sticks — no snap-back, config cleared from the preview', () => {
     const RAW_WITH_MODEL = SAMPLE_RAW.replace(
       'permissionMode: readonly',

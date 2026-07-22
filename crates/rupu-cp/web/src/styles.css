@@ -434,10 +434,11 @@
 .ab-dropzone.ab-over { border-color: rgb(var(--c-brand-500)); background: rgb(var(--c-brand-500)/.05); }
 
 /* ── one field card ── */
-.ab-card { border: 1px solid rgb(var(--c-border)); border-radius: 13px; background: rgb(var(--c-panel)); overflow: hidden; box-shadow: 0 1px 2px rgb(0 0 0/.04); }
+.ab-card { border: 1px solid rgb(var(--c-border)); border-radius: 13px; background: rgb(var(--c-panel)); overflow: hidden; box-shadow: 0 1px 2px rgb(0 0 0/.04); transition: border-color .15s, box-shadow .15s; }
 .ab-card.ab-enter { animation: ab-cardin .35s cubic-bezier(.2,.8,.2,1); }
 @keyframes ab-cardin { from { opacity: 0; transform: translateY(-8px) scale(.985); } to { opacity: 1; transform: none; } }
-.ab-card.ab-drag-over { border-color: rgb(var(--c-brand-500)/.6); box-shadow: 0 0 0 1px rgb(var(--c-brand-500)/.3); }
+/* insertion cue: the drop lands BEFORE this card — top line in the gap + soft ring */
+.ab-card.ab-drag-over { border-color: rgb(var(--c-brand-500)/.6); box-shadow: 0 -4px 0 0 rgb(var(--c-brand-500)/.75), 0 0 0 1px rgb(var(--c-brand-500)/.3); }
 .ab-card-head { display: flex; align-items: center; gap: 9px; padding: 11px 13px; border-bottom: 1px solid rgb(var(--c-border)); background: rgb(var(--c-surface)/.5); cursor: grab; }
 .ab-card-head .ab-ic { width: 24px; height: 24px; border-radius: 6px; flex: none; display: grid; place-items: center; background: rgb(var(--c-brand-50)); color: rgb(var(--c-brand-600)); border: 1px solid rgb(var(--c-brand-500)/.28); }
 .ab-card-head .ab-ic svg { width: 13px; height: 13px; }
@@ -459,12 +460,14 @@ input.ab-txt, textarea.ab-txt, select.ab-sel {
   border-radius: 8px; padding: 7px 10px; width: 100%;
 }
 input.ab-txt.mono, textarea.ab-txt.mono { font-family: ui-monospace, monospace; font-size: 12px; }
+select.ab-sel.ab-compact { width: auto; }
 .ab-card input:focus, .ab-card textarea:focus, .ab-card select:focus { outline: 2px solid rgb(var(--c-brand-500)); outline-offset: 1px; }
 textarea.ab-txt { resize: vertical; min-height: 64px; line-height: 1.5; }
 
 /* ── segmented control ── */
-.ab-seg { display: inline-flex; background: rgb(var(--c-surface)); border: 1px solid rgb(var(--c-border)); border-radius: 8px; padding: 2px; flex-wrap: wrap; }
-.ab-seg button { appearance: none; cursor: pointer; font: inherit; font-size: 11.5px; font-weight: 600; padding: 5px 11px; border-radius: 6px; border: 0; background: transparent; color: rgb(var(--c-ink-dim)); }
+/* NB: never flex-wrap here — a cramped header once stacked Cards/AI/Raw vertically. */
+.ab-seg { display: inline-flex; flex: none; background: rgb(var(--c-surface)); border: 1px solid rgb(var(--c-border)); border-radius: 8px; padding: 2px; }
+.ab-seg button { appearance: none; cursor: pointer; font: inherit; font-size: 11.5px; font-weight: 600; padding: 5px 11px; border-radius: 6px; border: 0; background: transparent; color: rgb(var(--c-ink-dim)); white-space: nowrap; }
 .ab-seg button[aria-pressed="true"] { background: rgb(var(--c-panel)); color: rgb(var(--c-ink)); box-shadow: 0 1px 2px rgb(0 0 0/.08); }
 .ab-seg.ab-brand button[aria-pressed="true"] { color: rgb(var(--c-brand-600)); }
 
