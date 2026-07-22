@@ -584,6 +584,29 @@ pub struct PanelGate {
     pub max_iterations: u32,
 }
 
+/// Branch step block. Mutually exclusive with `for_each:`,
+/// `parallel:`, `panel:`, and the linear `agent`/`prompt`. The
+/// runner renders `condition:` and dispatches the step ids listed in
+/// `then:` when it's truthy, or the ones in `else:` otherwise.
+///
+/// Adding this field is additive-only: a branch step currently falls
+/// through to the linear validation/dispatch path (Task 3 adds shape
+/// validation, Task 5 adds runner dispatch).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Branch {
+    /// minijinja template rendered to decide which branch to take.
+    /// Truthy per the same rules as `when:`.
+    pub condition: String,
+    /// Step ids to dispatch when `condition:` is truthy.
+    #[serde(default)]
+    pub then: Vec<String>,
+    /// Step ids to dispatch when `condition:` is falsy. `else` is a
+    /// reserved word, hence the raw identifier.
+    #[serde(default)]
+    pub r#else: Vec<String>,
+}
+
 /// Optional approval gate on a step. When present and `required:
 /// true`, the runner persists `RunStatus::AwaitingApproval` and exits
 /// cleanly *before* dispatching the step. The operator approves with
@@ -728,6 +751,11 @@ pub struct Step {
     /// `parallel:`, and the linear `agent`/`prompt`. See [`Panel`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub panel: Option<Panel>,
+    /// Branch step block. Mutually exclusive with `for_each:`,
+    /// `parallel:`, `panel:`, and the linear `agent`/`prompt`. See
+    /// [`Branch`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<Branch>,
     /// Optional authoring metadata describing the structured output this
     /// step is expected to emit. Workflow-level `contracts.outputs.*`
     /// remain authoritative for runtime validation.
@@ -1550,6 +1578,17 @@ steps:
 "#;
         let err = Workflow::parse(yaml).expect_err("empty host invalid");
         assert!(matches!(err, WorkflowParseError::HostEmpty { .. }));
+    }
+
+    #[test]
+    fn branch_struct_parses() {
+        let b: Branch = serde_yaml::from_str(
+            "condition: \"{{ steps.a.output }}\"\nthen: [x, y]\nelse: [z]\n",
+        )
+        .unwrap();
+        assert_eq!(b.condition, "{{ steps.a.output }}");
+        assert_eq!(b.then, vec!["x", "y"]);
+        assert_eq!(b.r#else, vec!["z"]);
     }
 }
 

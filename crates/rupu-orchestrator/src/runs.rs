@@ -273,6 +273,7 @@ pub enum StepKind {
     ForEach,
     Parallel,
     Panel,
+    Branch,
 }
 
 /// One entry in `step_results.jsonl`. Mirrors [`StepResult`] but with
