@@ -58,7 +58,18 @@ export function quoteSegment(s: string): string {
  *  `\"` unescapes to `"`). Malformed quoting (unterminated quote, or a `"`
  *  that doesn't span the whole segment) falls back to a naive `split('.')`
  *  rather than throwing — this only ever renders a UI field, so a bad key
- *  string should degrade to "field doesn't resolve", never crash the page. */
+ *  string should degrade to "field doesn't resolve", never crash the page.
+ *
+ *  **Strict-write, lenient-read asymmetry (deliberate):** this is the
+ *  READ-side decoder (used to render a field's current value), so it stays
+ *  lenient — including on a string with an empty segment (a bare `.`, or a
+ *  leading/trailing/doubled separator: `'a.'` → `['a', '']`, `'.'` →
+ *  `['', '']`) rather than erroring, since a bogus key here just means a
+ *  field harmlessly fails to resolve. The rupu-cp WRITE path's
+ *  `config_write::split_dotted_key` is the opposite: it REJECTS any empty
+ *  segment outright, because accepting one there would let an edit persist
+ *  a config key that can never correspond to a real TOML field. Both are
+ *  intentional — see `split_dotted_key`'s doc comment. */
 export function splitDottedKey(dotted: string): string[] {
   const segments: string[] = [];
   let i = 0;
@@ -225,7 +236,11 @@ export function ProvidersTab({ eff, prov, lockList, fieldValue, onChange, onTogg
       {names.map((name) => (
         <FieldGroup key={name} title={name}>
           {PROVIDER_FIELDS.map((f) => {
-            const dottedKey = `providers.${name}.${f.key}`;
+            // `name` is a free-form `[providers.<name>]` table key (e.g. a
+            // provider alias like `azure.eastus`) — quote it the same way
+            // PricingTab quotes a model id, or a dotted alias reproduces the
+            // exact read-miss/write-corruption bug this file fixes.
+            const dottedKey = `providers.${quoteSegment(name)}.${f.key}`;
             return (
               <ConfigField
                 key={dottedKey}
@@ -436,7 +451,9 @@ export function ScmTab({ eff, prov, lockList, fieldValue, onChange, onToggleLock
           {platforms.map((platform) => (
             <FieldGroup key={platform} title={platform}>
               {SCM_PLATFORM_FIELDS.map((f) => {
-                const dottedKey = `scm.${platform}.${f.key}`;
+                // `platform` is a free-form `[scm.<platform>]` table key —
+                // quote it the same way, for the same reason as ProvidersTab.
+                const dottedKey = `scm.${quoteSegment(platform)}.${f.key}`;
                 return (
                   <ConfigField
                     key={dottedKey}

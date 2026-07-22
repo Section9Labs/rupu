@@ -142,15 +142,29 @@ pub fn apply_form_patch(
 /// "input_per_mtok"]` — so a dotted model id round-trips through the write
 /// path instead of being torn apart on every embedded `.`.
 ///
-/// Malformed quoting (an unterminated quote, or a `"` that doesn't start
-/// exactly at a segment boundary) is a `Validate` error rather than a panic
-/// or a silently-wrong split — this only ever runs on operator-supplied
-/// patch keys from the write API.
+/// **Strict-write, lenient-read asymmetry (deliberate):** this is the WRITE
+/// path's decoder, so it rejects anything that isn't an unambiguous encoding
+/// of a real config key — malformed quoting (an unterminated quote, or a `"`
+/// that doesn't span exactly one segment) AND any EMPTY segment (`.`, `a.`,
+/// `.x`, `a..b` are all `Err`, including a trailing separator's *implied*
+/// empty final segment — a real TOML key segment in a rupu config is never
+/// empty, so treating one as valid here would silently accept a key that can
+/// never correspond to an actual config field). This is intentionally
+/// stricter than the frontend's `splitDottedKey`, which stays lenient
+/// (never throws, degrades to a harmless failed `getPath` lookup) because it
+/// only ever renders a UI field — see that function's doc comment. Never
+/// silently drop a bogus segment either way; on the write side, refuse.
 fn split_dotted_key(dotted: &str) -> Result<Vec<String>, ConfigWriteError> {
     let mut segments = Vec::new();
     let mut chars = dotted.chars().peekable();
     loop {
         let mut seg = String::new();
+        // Whether this segment was terminated by consuming a `.` separator
+        // (as opposed to running out of input) — if so, the separator
+        // IMPLIES another segment follows (even if input is now exhausted,
+        // in which case that implied segment is empty and gets rejected
+        // below on the next iteration, rather than being silently dropped).
+        let mut separator_consumed = false;
         if chars.peek() == Some(&'"') {
             chars.next(); // consume opening quote
             let mut closed = false;
@@ -179,6 +193,7 @@ fn split_dotted_key(dotted: &str) -> Result<Vec<String>, ConfigWriteError> {
                 None => {}
                 Some('.') => {
                     chars.next();
+                    separator_consumed = true;
                 }
                 Some(_) => {
                     return Err(ConfigWriteError::Validate(format!(
@@ -187,23 +202,29 @@ fn split_dotted_key(dotted: &str) -> Result<Vec<String>, ConfigWriteError> {
                 }
             }
         } else {
-            let mut ended_on_sep = false;
-            for c in chars.by_ref() {
-                if c == '.' {
-                    ended_on_sep = true;
-                    break;
+            loop {
+                match chars.next() {
+                    Some('.') => {
+                        separator_consumed = true;
+                        break;
+                    }
+                    Some('"') => {
+                        return Err(ConfigWriteError::Validate(format!(
+                            "malformed config key `{dotted}`: stray `\"` mid-segment"
+                        )));
+                    }
+                    Some(c) => seg.push(c),
+                    None => break,
                 }
-                if c == '"' {
-                    return Err(ConfigWriteError::Validate(format!(
-                        "malformed config key `{dotted}`: stray `\"` mid-segment"
-                    )));
-                }
-                seg.push(c);
             }
-            let _ = ended_on_sep;
+        }
+        if seg.is_empty() {
+            return Err(ConfigWriteError::Validate(format!(
+                "malformed config key `{dotted}`: empty key segment"
+            )));
         }
         segments.push(seg);
-        if chars.peek().is_none() {
+        if !separator_consumed {
             break;
         }
     }
@@ -383,6 +404,21 @@ mod tests {
     fn split_dotted_key_rejects_quote_mid_segment() {
         let err = split_dotted_key("pricing.oracle.\"a\"b.input_per_mtok").unwrap_err();
         assert!(matches!(err, ConfigWriteError::Validate(_)));
+    }
+
+    #[test]
+    fn split_dotted_key_rejects_empty_segments() {
+        // Every one of these implies at least one empty segment — a bare
+        // `.`, a leading/trailing separator, an internal double separator,
+        // or a quoted segment immediately followed by a trailing separator.
+        // None of these can ever be a real config key, so the write path
+        // must reject them outright rather than silently dropping the
+        // implied-empty segment (the bug this test set closes).
+        for bad in [".", "a.", ".x", "a..b", "\"x\"."] {
+            let err = split_dotted_key(bad)
+                .expect_err(&format!("expected Err for {bad:?}, got Ok"));
+            assert!(matches!(err, ConfigWriteError::Validate(_)), "{bad:?}: {err:?}");
+        }
     }
 
     #[test]

@@ -118,6 +118,15 @@ fn unflatten(flat: &BTreeMap<Vec<String>, Value>) -> Result<Value, LayerError> {
 /// encoding into `[policy].lock` (see `ConfigEditor.tsx`'s `quoteSegment`),
 /// so the string `is_locked` compares against here was quoted the same way
 /// on the way in.
+///
+/// This encoder never produces an empty segment (a real key segment is
+/// never `""`), so its output always round-trips cleanly through the
+/// decoders below. Those decoders deliberately differ on how they handle a
+/// malformed/empty-segment string they didn't produce themselves:
+/// `rupu_cp::config_write::split_dotted_key` (the WRITE path) rejects one
+/// outright (`Err`), while the frontend's `splitDottedKey` (read-only UI
+/// rendering) stays lenient and falls back to a naive split rather than
+/// throwing. See `split_dotted_key`'s doc comment for why.
 fn dotted(parts: &[String]) -> String {
     parts
         .iter()
