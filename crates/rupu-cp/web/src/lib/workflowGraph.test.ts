@@ -122,6 +122,61 @@ describe('yamlToGraph', () => {
     expect(pan.data.panel?.gate?.fix_with).toBe('f');
   });
 
+  it('classifies a branch step and parses condition/then/else', () => {
+    const g = yamlToGraph({
+      name: 'wf',
+      steps: [
+        { id: 'classify', agent: 'x', prompt: 'classify' },
+        {
+          id: 'route',
+          branch: { condition: '{{ steps.classify.output }}', then: ['arm_a'], else: ['arm_b'] },
+        },
+        { id: 'arm_a', agent: 'x', prompt: 'do a' },
+        { id: 'arm_b', agent: 'x', prompt: 'do b' },
+      ],
+    });
+    const route = g.nodes.find((n) => n.id === 'route');
+    expect(route?.data.kind).toBe('branch');
+    expect(route?.data.condition).toBe('{{ steps.classify.output }}');
+    expect(route?.data.thenTargets).toEqual(['arm_a']);
+    expect(route?.data.elseTargets).toEqual(['arm_b']);
+    expect(route?.data.agent).toBeUndefined();
+    expect(route?.data.prompt).toBeUndefined();
+  });
+
+  it('emits labeled then/else edges from a branch node without collapsing onto the chain edge', () => {
+    const g = yamlToGraph({
+      name: 'wf',
+      steps: [
+        { id: 'classify', agent: 'x', prompt: 'classify' },
+        { id: 'route', branch: { condition: 'c', then: ['arm_a'], else: ['arm_b'] } },
+        { id: 'arm_a', agent: 'x', prompt: 'do a' },
+        { id: 'arm_b', agent: 'x', prompt: 'do b' },
+      ],
+    });
+    // Chain edges (unlabeled): classify->route, route->arm_a, arm_a->arm_b.
+    // Branch edges (labeled): route->arm_a (then, overlapping the chain edge
+    // but NOT collapsed because the label is part of the dedupe key) and
+    // route->arm_b (else, a brand-new edge not on the chain).
+    const thenEdge = g.edges.find((e) => e.branch === 'then');
+    const elseEdge = g.edges.find((e) => e.branch === 'else');
+    expect(thenEdge).toMatchObject({ source: 'route', target: 'arm_a', label: 'true', branch: 'then' });
+    expect(elseEdge).toMatchObject({ source: 'route', target: 'arm_b', label: 'false', branch: 'else' });
+    // The plain chain edge route->arm_a still exists distinctly from the
+    // labeled then-edge (different ids, both present).
+    const plainRouteToArmA = g.edges.find((e) => e.source === 'route' && e.target === 'arm_a' && e.label === undefined);
+    expect(plainRouteToArmA).toBeDefined();
+    expect(thenEdge?.id).not.toBe(plainRouteToArmA?.id);
+  });
+
+  it('does not emit a branch-arm edge to a dangling target', () => {
+    const g = yamlToGraph({
+      name: 'wf',
+      steps: [{ id: 'route', branch: { condition: 'c', then: ['ghost'] } }],
+    });
+    expect(g.edges.some((e) => e.branch === 'then')).toBe(false);
+  });
+
   it('reads approvalRequired from approval.required', () => {
     const g = yamlToGraph({
       name: 'wf',
@@ -425,6 +480,50 @@ describe('graphToWorkflowObject', () => {
     expectRoundTrip(input);
   });
 
+  it('round-trips a branch step with condition/then/else', () => {
+    const input = {
+      name: 'wf',
+      steps: [
+        { id: 'classify', agent: 'x', prompt: 'classify' },
+        {
+          id: 'route',
+          branch: { condition: '{{ steps.classify.output }}', then: ['arm_a'], else: ['arm_b'] },
+        },
+        { id: 'arm_a', agent: 'x', prompt: 'do a' },
+        { id: 'arm_b', agent: 'x', prompt: 'do b' },
+      ],
+    };
+    expectRoundTrip(input);
+    const g = yamlToGraph(input);
+    const route = g.nodes.find((n) => n.id === 'route');
+    expect(route?.data.kind).toBe('branch');
+    expect(route?.data.condition).toBe('{{ steps.classify.output }}');
+    expect(route?.data.thenTargets).toEqual(['arm_a']);
+    expect(route?.data.elseTargets).toEqual(['arm_b']);
+  });
+
+  it('round-trips a branch step with only a then arm (else omitted, not emitted as empty array)', () => {
+    const input = {
+      name: 'wf',
+      steps: [
+        { id: 'route', branch: { condition: 'c', then: ['a'] } },
+        { id: 'a', agent: 'x', prompt: 'p' },
+      ],
+    };
+    expectRoundTrip(input);
+  });
+
+  it('round-trips a workflow with no branch step and preserves an unrelated unmodelled key in raw_passthrough', () => {
+    const input = {
+      name: 'wf',
+      steps: [{ id: 'a', agent: 'x', prompt: 'p', some_future_key: { nested: true } }],
+    };
+    const g = yamlToGraph(input);
+    expect(g.nodes[0].data.kind).toBe('step');
+    expect(g.nodes[0].data.raw_passthrough?.some_future_key).toEqual({ nested: true });
+    expectRoundTrip(input);
+  });
+
   it('round-trips approval.prompt and approval.timeout_seconds', () => {
     const input = {
       name: 'wf',
@@ -538,6 +637,43 @@ describe('validateGraph', () => {
     };
     const v = validateGraph(g);
     expect(v.A.some((m) => m.includes('steps.B') && m.includes('later'))).toBe(true);
+  });
+
+  it('flags a branch step missing a condition', () => {
+    const g = yamlToGraph({
+      name: 'wf',
+      steps: [
+        { id: 'route', branch: { then: ['a'] } },
+        { id: 'a', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(validateGraph(g).route).toEqual(expect.arrayContaining(['branch needs a condition']));
+  });
+
+  it('flags a branch then/else target that is not a known step id', () => {
+    const g = yamlToGraph({
+      name: 'wf',
+      steps: [{ id: 'route', branch: { condition: 'c', then: ['ghost'], else: ['also-ghost'] } }],
+    });
+    const v = validateGraph(g);
+    expect(v.route).toEqual(
+      expect.arrayContaining([
+        'branch target ghost is not a known step',
+        'branch target also-ghost is not a known step',
+      ]),
+    );
+  });
+
+  it('returns no problems for a clean branch step', () => {
+    const g = yamlToGraph({
+      name: 'wf',
+      steps: [
+        { id: 'route', branch: { condition: 'c', then: ['a'], else: ['b'] } },
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(validateGraph(g).route).toBeUndefined();
   });
 
   it('flags a reference to an unknown step', () => {
