@@ -16,7 +16,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
-  isKnownRunEvent,
   type DashboardResponse,
   type FindingOut,
   type FindingsSummary,
@@ -25,7 +24,7 @@ import {
 } from '../lib/api';
 import { type ConnectionState } from '../components/RunEventFeed';
 import { cardFromEvent, cardFromFinding, type StreamCard } from '../lib/situationRoom/cards';
-import { buildRoster, buildVitals, type RunActivity } from '../lib/situationRoom/roster';
+import { buildRoster, buildVitals, deriveActivity, reconcileActivity } from '../lib/situationRoom/roster';
 import PulseStrip from '../components/situationRoom/PulseStrip';
 import EventStream from '../components/situationRoom/EventStream';
 import ProjectRoster from '../components/situationRoom/ProjectRoster';
@@ -37,6 +36,8 @@ const SPARK_TICK_MS = 5_000; // events/min sampling window
 const SPARK_LEN = 16;
 const FRESH_MS = 2500;
 const STREAM_FINDINGS_CAP = 60; // most-recent findings merged into the stream
+const STALE_RUN_MS = 2 * 60_000; // silent this long + still live-looking → re-check run.json
+const STALE_RECHECK_MS = 60_000; // per-run floor between those re-checks
 
 interface EventItem {
   key: string;
@@ -74,31 +75,9 @@ function posOf(ev: RunEvent): number | undefined {
   return typeof raw.pos === 'number' ? raw.pos : undefined;
 }
 
-/** Latest state per run, folded from the (newest-first) event list — drives
- *  the roster's status + current action. */
-function deriveActivity(items: EventItem[]): Map<string, RunActivity> {
-  const out = new Map<string, RunActivity>();
-  for (const { ts, event } of items) {
-    const runId = event.run_id;
-    if (out.has(runId)) continue; // first hit = newest event for this run
-    let state: RunActivity['state'] = 'running';
-    let action: string | undefined;
-    if (isKnownRunEvent(event)) {
-      switch (event.type) {
-        case 'run_completed': state = 'done'; break;
-        case 'run_failed': state = 'failed'; break;
-        case 'step_awaiting_approval': state = 'awaiting'; action = `awaiting · ${event.step_id}`; break;
-        case 'step_started': action = event.agent ? `${event.agent} · ${event.step_id}` : event.step_id; break;
-        case 'step_working': action = event.note?.trim() || event.step_id; break;
-        case 'step_completed': action = event.step_id; break;
-        case 'panel_round': action = `${event.step_id} · round ${event.round}`; break;
-        default: break;
-      }
-    }
-    out.set(runId, { runId, state, action, ts });
-  }
-  return out;
-}
+/** Persisted `run.json` statuses that mean the run is over — used to stop
+ *  the lazy `getRun` resolution from re-checking a run that already ended. */
+const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'rejected']);
 
 export default function Events() {
   const [items, setItems] = useState<EventItem[]>([]);
@@ -112,6 +91,10 @@ export default function Events() {
   const [projects, setProjects] = useState<ProjectRow[]>([]);
   const [dashboard, setDashboard] = useState<DashboardResponse | null>(null);
   const [runToWs, setRunToWs] = useState<Map<string, string>>(new Map());
+  // Authoritative *terminal* run.json statuses (completed/failed/cancelled/
+  // rejected), learned via the same lazy getRun calls — reconciles runs whose
+  // event log ended mid-step so they don't spin forever.
+  const [runStatus, setRunStatus] = useState<Map<string, string>>(new Map());
   const [spark, setSpark] = useState<number[]>(() => Array(SPARK_LEN).fill(0));
   const [eventsPerMin, setEventsPerMin] = useState(0);
 
@@ -119,6 +102,7 @@ export default function Events() {
   const itemsRef = useRef<EventItem[]>([]);
   itemsRef.current = items;
   const requestedRunsRef = useRef<Set<string>>(new Set());
+  const statusCheckedRef = useRef<Map<string, number>>(new Map());
   const sparkCounterRef = useRef(0);
 
   // ── initial event history (so an idle page is never empty) ──
@@ -192,19 +176,52 @@ export default function Events() {
     return () => clearInterval(t);
   }, []);
 
-  // ── lazy run_id → workspace_id resolution (events carry no project) ──
+  // ── lazy run_id → workspace_id + terminal-status resolution ──
+  // Events carry no project, so each run is resolved once via GET
+  // /api/runs/:id. The same response's `status` (previously discarded) is
+  // kept when terminal: a run whose events.jsonl ended mid-step — every
+  // cancel before the store appended terminal events, or a crashed runner —
+  // never tells the stream it ended, so the persisted run.json status is
+  // the only closing signal. Runs that still look live after going silent
+  // are re-checked; `dashboard` is in the deps purely as a poll tick (it
+  // refreshes every AGG_POLL_MS) so the re-check fires even with no new
+  // events arriving.
   useEffect(() => {
-    const distinct = new Set(items.map((i) => i.event.run_id));
-    const missing = [...distinct].filter((r) => !runToWs.has(r) && !requestedRunsRef.current.has(r));
-    if (missing.length === 0) return;
-    for (const runId of missing.slice(0, 12)) {
-      requestedRunsRef.current.add(runId);
+    const now = Date.now();
+    const newestTs = new Map<string, number>();
+    for (const i of items) {
+      if (!newestTs.has(i.event.run_id)) newestTs.set(i.event.run_id, i.ts); // items are newest-first
+    }
+    const fetchRun = (runId: string) => {
       api.getRun(runId).then((res) => {
         const ws = res.run.workspace_id;
         if (ws) setRunToWs((prev) => new Map(prev).set(runId, ws));
+        const status = res.run.status;
+        if (typeof status === 'string' && TERMINAL_STATUSES.has(status)) {
+          setRunStatus((prev) => new Map(prev).set(runId, status));
+        }
       }).catch(() => {/* run may be gone; leave unattributed */});
+    };
+    let budget = 12;
+    for (const runId of newestTs.keys()) {
+      if (budget === 0) return;
+      if (runToWs.has(runId) || requestedRunsRef.current.has(runId)) continue;
+      requestedRunsRef.current.add(runId);
+      statusCheckedRef.current.set(runId, now);
+      fetchRun(runId);
+      budget -= 1;
     }
-  }, [items, runToWs]);
+    for (const [runId, ts] of newestTs) {
+      if (budget === 0) return;
+      if (runStatus.has(runId)) continue; // already known-terminal
+      if (now - ts < STALE_RUN_MS) continue; // still chatty — events will close it
+      const checked = statusCheckedRef.current.get(runId) ?? 0;
+      if (now - checked < STALE_RECHECK_MS) continue;
+      statusCheckedRef.current.set(runId, now);
+      fetchRun(runId);
+      budget -= 1;
+    }
+  }, [items, runToWs, runStatus, dashboard]);
 
   // ── load older event history (paged) ──
   const loadOlder = useCallback(async () => {
@@ -256,7 +273,10 @@ export default function Events() {
     [eventCards, findingCards],
   );
 
-  const activity = useMemo(() => deriveActivity(items), [items]);
+  const activity = useMemo(
+    () => reconcileActivity(deriveActivity(items), runStatus),
+    [items, runStatus],
+  );
   const roster = useMemo(
     () => buildRoster(projects, runToWs, activity, findings),
     [projects, runToWs, activity, findings],

@@ -1,10 +1,20 @@
-// buildRoster / findingsByWorkspace — the pure aggregation behind the project
-// roster. Guards: awaiting sorts above running above idle; findings attribute
-// to the right workspace; a project with no active run reads idle.
+// buildRoster / findingsByWorkspace / deriveActivity / reconcileActivity —
+// the pure aggregation behind the project roster. Guards: awaiting sorts
+// above running above idle; findings attribute to the right workspace; a
+// project with no active run reads idle; paused/cancelled/terminal runs
+// never spin forever.
 
 import { describe, it, expect } from 'vitest';
-import { buildRoster, findingsByWorkspace, projectsLive, buildVitals, type RunActivity } from './roster';
-import type { FindingOut, ProjectRow } from '../api';
+import {
+  buildRoster,
+  findingsByWorkspace,
+  projectsLive,
+  buildVitals,
+  deriveActivity,
+  reconcileActivity,
+  type RunActivity,
+} from './roster';
+import type { FindingOut, ProjectRow, RunEvent } from '../api';
 
 function project(ws: string, name: string, extra: Partial<ProjectRow> = {}): ProjectRow {
   return {
@@ -59,6 +69,91 @@ describe('buildRoster', () => {
     const activity = new Map<string, RunActivity>([['orphan', act('orphan', 'running', 100)]]);
     const roster = buildRoster(projects, new Map(), activity, []);
     expect(roster.every((r) => r.status === 'idle')).toBe(true);
+  });
+});
+
+describe('deriveActivity', () => {
+  // items are newest-first, matching the Events page's merged stream.
+  const item = (ts: number, event: RunEvent) => ({ ts, event });
+
+  it('folds the newest event per run; a mid-step run reads running', () => {
+    const m = deriveActivity([
+      item(300, { type: 'step_working', run_id: 'r1', step_id: 'audit', note: 'scanning' }),
+      item(200, { type: 'step_started', run_id: 'r1', step_id: 'audit', kind: 'linear', agent: 'sec' }),
+    ]);
+    expect(m.get('r1')?.state).toBe('running');
+    expect(m.get('r1')?.action).toBe('scanning');
+  });
+
+  it('run_completed with a cancelled status ends the run (no forever-spinner)', () => {
+    const m = deriveActivity([
+      item(400, { type: 'run_completed', run_id: 'r1', status: 'cancelled', finished_at: 'x' }),
+      item(300, { type: 'step_working', run_id: 'r1', step_id: 'audit', note: null }),
+    ]);
+    expect(m.get('r1')?.state).toBe('done');
+  });
+
+  it('paused runs read paused, not running; a resume flips them back', () => {
+    const paused = deriveActivity([
+      item(300, { type: 'run_paused', run_id: 'r1' }),
+      item(200, { type: 'step_working', run_id: 'r1', step_id: 'audit', note: null }),
+    ]);
+    expect(paused.get('r1')?.state).toBe('paused');
+
+    const stepPaused = deriveActivity([
+      item(300, { type: 'step_paused', run_id: 'r2', step_id: 'audit' }),
+    ]);
+    expect(stepPaused.get('r2')?.state).toBe('paused');
+
+    const resumed = deriveActivity([
+      item(400, { type: 'run_resumed', run_id: 'r1' }),
+      item(300, { type: 'run_paused', run_id: 'r1' }),
+    ]);
+    expect(resumed.get('r1')?.state).toBe('running');
+  });
+});
+
+describe('reconcileActivity', () => {
+  it('overrides a live-looking activity when the persisted run status is terminal', () => {
+    // The stuck-spinner case: a cancelled run whose events.jsonl ends
+    // mid-step (no terminal event was ever written) folds to 'running' —
+    // the authoritative run.json status must win.
+    const activity = new Map<string, RunActivity>([
+      ['r1', act('r1', 'running', 100, 'audit')],
+      ['r2', act('r2', 'awaiting', 200)],
+      ['r3', act('r3', 'running', 300, 'build')],
+    ]);
+    const out = reconcileActivity(activity, new Map([
+      ['r1', 'cancelled'],
+      ['r2', 'rejected'],
+    ]));
+    expect(out.get('r1')?.state).toBe('done');
+    expect(out.get('r2')?.state).toBe('failed');
+    // r3 has no terminal status — untouched.
+    expect(out.get('r3')?.state).toBe('running');
+    expect(out.get('r3')?.action).toBe('build');
+  });
+
+  it('never downgrades an already-terminal activity', () => {
+    const activity = new Map<string, RunActivity>([['r1', act('r1', 'done', 100)]]);
+    const out = reconcileActivity(activity, new Map([['r1', 'failed']]));
+    expect(out.get('r1')?.state).toBe('done');
+  });
+
+  it('paused activity with a terminal persisted status also closes', () => {
+    const activity = new Map<string, RunActivity>([['r1', act('r1', 'paused', 100)]]);
+    const out = reconcileActivity(activity, new Map([['r1', 'failed']]));
+    expect(out.get('r1')?.state).toBe('failed');
+  });
+
+  it('roster: paused runs do not count as live', () => {
+    const roster = buildRoster(
+      [project('ws1', 'billing-api')],
+      new Map([['rA', 'ws1']]),
+      new Map<string, RunActivity>([['rA', act('rA', 'paused', 100)]]),
+      [],
+    );
+    expect(roster[0].status).toBe('idle');
   });
 });
 
