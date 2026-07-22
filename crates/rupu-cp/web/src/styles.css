@@ -689,7 +689,7 @@
  * rather than duplicating card chrome; only the toggle switch, nested
  * sub-card, and lifecycle-ribbon rules are new. Same `--c-*` tokens as the
  * rest of the `.wfx-*` block — no new tokens added. */
-.wfx-card-h {
+.wfx-card-h--toggle {
   justify-content: space-between;
 }
 .wfx-toggle {

@@ -49,6 +49,21 @@ const labelCls = 'mb-1 block text-ui font-semibold uppercase tracking-wide text-
 
 const EMPTY_MODEL: AutoflowModel = { enabled: false, entity: 'issue', selector: {}, wake_on: [] };
 
+// Draft/base are only schema-valid for pull_request (rupu-orchestrator's
+// validate_autoflow rejects them for entity !== pull_request). Strip them
+// whenever the model's entity doesn't match — not just on the explicit UI
+// entity-switch — so hand-edited YAML (entity: issue with a leftover
+// selector.draft/base) can never round-trip back out through `commit()`.
+// Immutable: returns a new model, never mutates the input.
+function sanitizeForEntity(model: AutoflowModel): AutoflowModel {
+  if (model.entity === 'pull_request') return model;
+  if (model.selector.draft === undefined && model.selector.base === undefined) return model;
+  const selector = { ...model.selector };
+  delete selector.draft;
+  delete selector.base;
+  return { ...model, selector };
+}
+
 const ENTITY_OPTIONS: { value: AutoflowEntity; label: string }[] = [
   { value: 'issue', label: 'issue' },
   { value: 'pull_request', label: 'pull_request' },
@@ -67,13 +82,13 @@ const WORKSPACE_STRATEGY_OPTIONS: AutoflowWorkspaceStrategy[] = ['worktree', 'in
 type SelectorListField = 'labels_all' | 'labels_any' | 'labels_none' | 'authors';
 
 export default function AutoflowCard({ rest, onRest }: AutoflowCardProps) {
-  const [model, setModel] = useState<AutoflowModel>(() => readAutoflow(rest) ?? EMPTY_MODEL);
+  const [model, setModel] = useState<AutoflowModel>(() => sanitizeForEntity(readAutoflow(rest) ?? EMPTY_MODEL));
   const lastWrittenAutoflowRef = useRef<unknown>(rest.autoflow);
 
   useEffect(() => {
     if (rest.autoflow !== lastWrittenAutoflowRef.current) {
       lastWrittenAutoflowRef.current = rest.autoflow;
-      setModel(readAutoflow(rest) ?? EMPTY_MODEL);
+      setModel(sanitizeForEntity(readAutoflow(rest) ?? EMPTY_MODEL));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rest.autoflow]);
@@ -97,14 +112,7 @@ export default function AutoflowCard({ rest, onRest }: AutoflowCardProps) {
   }
 
   function setEntity(entity: AutoflowEntity): void {
-    // Draft/base are only schema-valid for pull_request — clear both on
-    // switch so an issue autoflow never carries stale values.
-    const selector = { ...model.selector };
-    if (entity !== 'pull_request') {
-      delete selector.draft;
-      delete selector.base;
-    }
-    commit({ ...model, entity, selector });
+    commit(sanitizeForEntity({ ...model, entity }));
   }
 
   function toggleState(s: AutoflowIssueState): void {
@@ -211,7 +219,7 @@ export default function AutoflowCard({ rest, onRest }: AutoflowCardProps) {
 
   return (
     <div className="wfx-card" data-testid="autoflow-card">
-      <div className="wfx-card-h">
+      <div className="wfx-card-h wfx-card-h--toggle">
         <span>Autoflow</span>
         <button
           type="button"

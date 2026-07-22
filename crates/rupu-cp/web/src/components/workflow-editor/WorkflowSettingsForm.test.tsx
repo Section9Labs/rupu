@@ -398,6 +398,37 @@ describe('WorkflowSettingsForm — next: Autoflow card + Lifecycle ribbon', () =
     expect(selector.labels_all).toEqual(['autoflow']);
   });
 
+  it('sanitizes a hand-edited entity=issue autoflow carrying stale draft/base on mount, before any edit', () => {
+    // Simulates YAML hand-edited to `entity: issue` while `selector.draft`/
+    // `selector.base` are left over from a prior pull_request config —
+    // readAutoflow passes them through verbatim, and the mount initializer
+    // must sanitize before the model ever reaches the UI or is echoed back.
+    const spy = vi.fn();
+    render(
+      <Harness
+        initial={metaWith({
+          autoflow: {
+            enabled: true,
+            entity: 'issue',
+            selector: { draft: 'exclude', base: 'main', states: ['open'] },
+          },
+        })}
+        spy={spy}
+        workflowEditorUi="next"
+      />,
+    );
+
+    // Edit an unrelated field — never touches draft/base or entity — to
+    // force a commit() that spreads model.selector into the emitted rest.
+    fireEvent.change(screen.getByLabelText('Autoflow reconcile every'), { target: { value: '10m' } });
+
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as WorkflowMeta;
+    const selector = (last.rest.autoflow as { selector: Record<string, unknown> }).selector;
+    expect(selector.states).toEqual(['open']);
+    expect(selector).not.toHaveProperty('draft');
+    expect(selector).not.toHaveProperty('base');
+  });
+
   it('an untouched load -> save round-trips rest.autoflow deep-equal', () => {
     const original = {
       enabled: true,
