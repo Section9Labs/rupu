@@ -33,53 +33,71 @@ pub struct Resolved {
     pub provenance: BTreeMap<String, KeyProvenance>,
 }
 
-/// Flatten a TOML table to dotted leaf keys → scalar/array values. Tables
-/// recurse; arrays and scalars are leaves (matching the "arrays replace"
-/// merge semantics of `layer_files`).
-fn flatten(prefix: &str, v: &Value, out: &mut BTreeMap<String, Value>) {
+/// Flatten a TOML table to leaf keys → scalar/array values, where each key is
+/// the list of raw key SEGMENTS from root to leaf. Tables recurse; arrays and
+/// scalars are leaves (matching the "arrays replace" merge semantics of
+/// `layer_files`).
+///
+/// The path is a `Vec<String>` of segments — never a dot-joined string —
+/// because a TOML key segment can itself contain a `.` (a quoted table name
+/// like `[pricing.<provider>."claude-3.5-sonnet"]` or
+/// `[pricing.oracle."…/GLM-5.2-FP8"]`). Dot-joining then dot-splitting such a
+/// segment silently tears it in two (`GLM-5.2-FP8` → `GLM-5` / `2-FP8`),
+/// corrupting the rebuilt config and making it fail to deserialize. Keeping
+/// segments intact round-trips any key through [`unflatten`] unchanged.
+fn flatten(prefix: &[String], v: &Value, out: &mut BTreeMap<Vec<String>, Value>) {
     match v {
         Value::Table(t) => {
             for (k, vv) in t {
-                let key = if prefix.is_empty() {
-                    k.clone()
-                } else {
-                    format!("{prefix}.{k}")
-                };
+                let mut key = prefix.to_vec();
+                key.push(k.clone());
                 flatten(&key, vv, out);
             }
         }
         other => {
-            out.insert(prefix.to_string(), other.clone());
+            out.insert(prefix.to_vec(), other.clone());
         }
     }
 }
 
-/// Rebuild a nested TOML table from dotted leaf keys.
+/// Rebuild a nested TOML table from segment-path leaf keys.
 ///
 /// Fallible: when the same top-level name appears as a scalar leaf in one
 /// layer and a table parent in another (e.g. global `default_model = "x"`
 /// vs project `[default_model]\nk = "y"`), the winners map holds both
-/// `"default_model"` and `"default_model.k"`. Rebuilding then tries to
+/// `["default_model"]` and `["default_model", "k"]`. Rebuilding then tries to
 /// descend through a scalar, which is a structural conflict — return a
 /// `LayerError` instead of panicking on user-editable config.
-fn unflatten(flat: &BTreeMap<String, Value>) -> Result<Value, LayerError> {
+fn unflatten(flat: &BTreeMap<Vec<String>, Value>) -> Result<Value, LayerError> {
     let mut root = toml::value::Table::new();
-    for (dotted, val) in flat {
+    for (parts, val) in flat {
+        if parts.is_empty() {
+            continue;
+        }
         let mut cur = &mut root;
-        let parts: Vec<&str> = dotted.split('.').collect();
         for p in &parts[..parts.len() - 1] {
             let entry = cur
-                .entry(p.to_string())
+                .entry(p.clone())
                 .or_insert_with(|| Value::Table(toml::value::Table::new()));
             cur = entry.as_table_mut().ok_or_else(|| {
                 LayerError::Invalid(format!(
-                    "config key `{dotted}` conflicts: `{p}` is used as both a value and a table"
+                    "config key `{}` conflicts: `{p}` is used as both a value and a table",
+                    parts.join(".")
                 ))
             })?;
         }
-        cur.insert(parts[parts.len() - 1].to_string(), val.clone());
+        cur.insert(parts[parts.len() - 1].clone(), val.clone());
     }
     Ok(Value::Table(root))
+}
+
+/// Dotted display form of a segment path — used for the public provenance
+/// map keys and for comparing against the (dotted) `[policy].lock` entries.
+/// This is purely informational: the merge itself keys off segment paths, so
+/// the theoretical ambiguity of joining segments that contain dots never
+/// affects which value wins.
+fn dotted(parts: &[String]) -> String {
+    parts.join(".")
 }
 
 pub fn resolve(
@@ -90,47 +108,60 @@ pub fn resolve(
     let g = read_optional_toml(global)?; // Option<Value>
     let p = read_optional_toml(project)?;
 
-    let mut fg = BTreeMap::new();
+    let mut fg: BTreeMap<Vec<String>, Value> = BTreeMap::new();
     if let Some(g) = &g {
-        flatten("", g, &mut fg);
+        flatten(&[], g, &mut fg);
     }
-    let mut fp = BTreeMap::new();
+    let mut fp: BTreeMap<Vec<String>, Value> = BTreeMap::new();
     if let Some(p) = &p {
-        flatten("", p, &mut fp);
+        flatten(&[], p, &mut fp);
     }
+    // Env overrides arrive keyed by dotted config path (simple keys — env never
+    // carries a dotted model id), so splitting them into segments is safe and
+    // lets them share the segment-path key space with `fg`/`fp`.
+    let fe: BTreeMap<Vec<String>, Value> = env
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.split('.').map(String::from).collect::<Vec<_>>(),
+                v.clone(),
+            )
+        })
+        .collect();
 
-    // Locks come from the GLOBAL layer only.
+    // Locks come from the GLOBAL layer only. `[policy].lock` is a two-segment key.
     let lock: Vec<String> = fg
         .iter()
-        .filter(|(k, _)| k.as_str() == "policy.lock")
+        .filter(|(k, _)| dotted(k) == "policy.lock")
         .filter_map(|(_, v)| v.as_array())
         .flat_map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)))
         .collect();
     let is_locked = |key: &str| lock.iter().any(|l| l == key);
 
-    let mut winners: BTreeMap<String, Value> = BTreeMap::new();
+    let mut winners: BTreeMap<Vec<String>, Value> = BTreeMap::new();
     let mut provenance: BTreeMap<String, KeyProvenance> = BTreeMap::new();
-    let all_keys: std::collections::BTreeSet<String> = fg
+    let all_keys: std::collections::BTreeSet<Vec<String>> = fg
         .keys()
         .chain(fp.keys())
-        .chain(env.keys())
+        .chain(fe.keys())
         .cloned()
         .collect();
 
     for key in all_keys {
-        let locked = is_locked(&key);
+        let key_dotted = dotted(&key);
+        let locked = is_locked(&key_dotted);
         // Precedence: locked ⇒ global wins if present; else env > project > global.
         let (val, source) = if locked {
             if let Some(v) = fg.get(&key) {
                 (Some(v.clone()), KeySource::Global)
-            } else if let Some(v) = env.get(&key) {
+            } else if let Some(v) = fe.get(&key) {
                 (Some(v.clone()), KeySource::Env)
             } else if let Some(v) = fp.get(&key) {
                 (Some(v.clone()), KeySource::Project)
             } else {
                 (None, KeySource::Default)
             }
-        } else if let Some(v) = env.get(&key) {
+        } else if let Some(v) = fe.get(&key) {
             (Some(v.clone()), KeySource::Env)
         } else if let Some(v) = fp.get(&key) {
             (Some(v.clone()), KeySource::Project)
@@ -140,8 +171,8 @@ pub fn resolve(
             (None, KeySource::Default)
         };
         if let Some(v) = val {
-            winners.insert(key.clone(), v);
-            provenance.insert(key, KeyProvenance { source, locked });
+            winners.insert(key, v);
+            provenance.insert(key_dotted, KeyProvenance { source, locked });
         }
     }
 
@@ -159,7 +190,8 @@ pub fn resolve(
     // the GLOBAL-derived enforced list and mark its provenance Global so no
     // consumer ever trusts a project-supplied lock list.
     config.policy.lock = lock.clone();
-    if winners.contains_key("policy.lock") || !lock.is_empty() {
+    let policy_lock_key = vec!["policy".to_string(), "lock".to_string()];
+    if winners.contains_key(&policy_lock_key) || !lock.is_empty() {
         provenance.insert(
             "policy.lock".to_string(),
             KeyProvenance {
@@ -254,6 +286,38 @@ mod tests {
         let g2 = write_toml(d.path(), "g2.toml", "default_model = \"x\"\n");
         let r2 = resolve(Some(&g2), None, &BTreeMap::new()).unwrap();
         assert_eq!(r2.config.cp.max_workspace_bytes, None);
+    }
+
+    #[test]
+    fn resolve_preserves_config_keys_containing_dots() {
+        // A `[pricing.<provider>."<model>"]` table name with a dot in it — a
+        // quoted model id like `GLM-5.2-FP8` — must survive provenance
+        // resolution. The old dot-join/dot-split flatten tore `GLM-5.2-FP8`
+        // into `GLM-5` / `2-FP8`, rebuilding a bogus nested `2-FP8` table that
+        // failed to deserialize ("unknown field `2-FP8`").
+        let d = tempfile::tempdir().unwrap();
+        let g = write_toml(
+            d.path(),
+            "g.toml",
+            "[pricing.oracle.\"/raid/models/zai-org/GLM-5.2-FP8\"]\n\
+             input_per_mtok = 1.42\n\
+             output_per_mtok = 1.42\n\
+             cached_input_per_mtok = 0.82\n",
+        );
+        let r = resolve(Some(&g), None, &BTreeMap::new())
+            .expect("dotted model key must resolve, not error");
+        let mp = r
+            .config
+            .pricing
+            .models
+            .get("oracle")
+            .and_then(|m| m.get("/raid/models/zai-org/GLM-5.2-FP8"))
+            .copied()
+            .expect("the dotted model key must survive intact");
+        assert_eq!(mp.input_per_mtok, 1.42);
+        assert_eq!(mp.cached_input_per_mtok, Some(0.82));
+        // The provenance display key retains the full (dotted) path.
+        assert!(r.provenance.keys().any(|k| k.contains("GLM-5.2-FP8")));
     }
 
     #[test]
