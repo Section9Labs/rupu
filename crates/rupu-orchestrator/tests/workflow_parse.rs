@@ -604,6 +604,36 @@ steps:
 }
 
 #[test]
+fn rejects_branch_with_when() {
+    // `when:` is evaluated before the branch block by the runner. A
+    // branch step with a falsy `when:` would be when:-skipped without
+    // ever populating either arm's skip-set, so both arms would run —
+    // a silent correctness bug. Reject `when:` on branch steps outright.
+    let s = r#"
+name: x
+steps:
+  - id: gate
+    actions: []
+    when: "true"
+    branch:
+      condition: "true"
+      then: [a]
+      else: [b]
+  - id: a
+    agent: ag
+    prompt: p
+  - id: b
+    agent: ag
+    prompt: p
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("when") && err.contains("not allowed") && err.contains("branch"),
+        "expected when-on-branch error, got: {err}"
+    );
+}
+
+#[test]
 fn rejects_branch_arms_overlap() {
     let s = r#"
 name: x

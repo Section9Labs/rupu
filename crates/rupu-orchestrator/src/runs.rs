@@ -1967,6 +1967,7 @@ mod tests {
             StepKind::ForEach,
             StepKind::Parallel,
             StepKind::Panel,
+            StepKind::Branch,
         ] {
             let mut rec = sample_step_result("k");
             rec.kind = kind;

@@ -146,6 +146,10 @@ pub enum WorkflowParseError {
         "step `{step}`: branch target `{target}` does not run after the branch step (must be a forward reference)"
     )]
     BranchTargetNotForward { step: String, target: String },
+    #[error(
+        "step `{step}`: `when:` is not allowed on a branch step; use the branch condition to gate routing"
+    )]
+    BranchWithWhen { step: String },
 }
 
 /// How a workflow gets kicked off. Manual is the existing behavior
@@ -601,13 +605,26 @@ pub struct PanelGate {
 }
 
 /// Branch step block. Mutually exclusive with `for_each:`,
-/// `parallel:`, `panel:`, and the linear `agent`/`prompt`. The
-/// runner renders `condition:` and dispatches the step ids listed in
-/// `then:` when it's truthy, or the ones in `else:` otherwise.
+/// `parallel:`, `panel:`, and the linear `agent`/`prompt`.
 ///
-/// Adding this field is additive-only: a branch step currently falls
-/// through to the linear validation/dispatch path (Task 3 adds shape
-/// validation, Task 5 adds runner dispatch).
+/// v1 semantics:
+/// - `condition` is a minijinja template rendered against the step
+///   context, truthy per the same rules as `when:`. Truthy dispatches
+///   the `then:` arm; falsy dispatches the `else:` arm.
+/// - `then`/`else` are each the COMPLETE, TRANSITIVE set of step ids
+///   in that arm — including the arm steps of any branch step nested
+///   inside it. The runner skips exactly the ids listed in the
+///   not-taken arm; a nested branch on a not-taken arm is itself
+///   skipped and so never gets a chance to populate its own
+///   sub-arms' skip-sets, meaning its arm steps must already appear
+///   in the outer arm's list or they'll run unskipped.
+/// - `when:` is not allowed on a branch step (see
+///   `WorkflowParseError::BranchWithWhen`). The runner evaluates
+///   `when:` before the branch block, so a falsy `when:` on a branch
+///   step would skip the branch step itself without its condition
+///   ever evaluating — neither arm gets added to the run's skip-set,
+///   so both arms run. Use the branch condition to gate routing
+///   instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Branch {
@@ -1025,6 +1042,17 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
             || step.panel.is_some()
         {
             return Err(WorkflowParseError::BranchMutuallyExclusive {
+                step: step.id.clone(),
+            });
+        }
+        if step.when.is_some() {
+            // The runner evaluates `when:` BEFORE the branch block. A
+            // branch step with a falsy `when:` would be when:-skipped
+            // without the condition ever evaluating, so neither arm's
+            // skip-set gets populated and both arms run — a silent
+            // correctness bug. Reject outright rather than let authors
+            // hit that at runtime.
+            return Err(WorkflowParseError::BranchWithWhen {
                 step: step.id.clone(),
             });
         }
