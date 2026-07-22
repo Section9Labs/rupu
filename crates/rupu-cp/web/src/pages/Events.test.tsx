@@ -144,6 +144,39 @@ describe('Live Events (Situation Room) page', () => {
     expect(await screen.findByText(/Beginning of history/i)).toBeInTheDocument();
   });
 
+  it('a run whose event log ended mid-step but whose run.json is terminal does not spin', async () => {
+    // The stuck-spinner regression: cancelled runs historically got no
+    // terminal event in events.jsonl, so the newest event is step_working →
+    // the roster spun forever. The lazy getRun resolution must consume the
+    // response's terminal status and close the activity.
+    vi.spyOn(api, 'getEvents').mockResolvedValue([
+      {
+        type: 'step_working', run_id: 'run_stuck', step_id: 'implement',
+        note: 'writing files', ts: 1_000, pos: 3,
+      } as never,
+    ]);
+    vi.spyOn(api, 'subscribeEvents').mockImplementation(() => () => {});
+    vi.spyOn(api, 'getProjects').mockResolvedValue([
+      {
+        ws_id: 'ws1', name: 'billing-api', path: '/repos/billing-api', repo_remote: null,
+        branch: 'main', repo_home_url: null, created_at: '2026-01-01T00:00:00Z',
+        last_run_at: null, usage: {}, run_count: 1, last_active: null,
+      } as never,
+    ]);
+    vi.spyOn(api, 'getRun').mockResolvedValue({
+      run: { id: 'run_stuck', workspace_id: 'ws1', status: 'cancelled' },
+    } as never);
+
+    renderPage();
+
+    // The run resolves to ws1 AND its terminal status closes the activity:
+    // the project card must read idle (0 live), not running.
+    await waitFor(() => expect(api.getRun).toHaveBeenCalledWith('run_stuck'));
+    expect((await screen.findAllByText('billing-api')).length).toBeGreaterThan(0);
+    await waitFor(() => expect(screen.getByText('idle')).toBeInTheDocument());
+    expect(screen.queryByText('writing files', { selector: '.sr-pcard *' })).not.toBeInTheDocument();
+  });
+
   it('a history-load failure does not block live events from arriving', async () => {
     vi.spyOn(api, 'getEvents').mockRejectedValue(new Error('boom'));
     let emit: ((e: RunEvent) => void) | undefined;

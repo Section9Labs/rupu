@@ -908,6 +908,17 @@ impl RunStore {
         // expires_at so subsequent reads don't re-expire.
         record.expires_at = None;
         self.update(record)?;
+        self.append_terminal_event(
+            &record.id,
+            &crate::executor::Event::RunFailed {
+                run_id: record.id.clone(),
+                error: record
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "approval expired".into()),
+                finished_at: now,
+            },
+        );
         Ok(true)
     }
 }
@@ -1052,6 +1063,14 @@ impl RunStore {
         record.awaiting_since = None;
         record.expires_at = None;
         self.update(&record)?;
+        self.append_terminal_event(
+            run_id,
+            &crate::executor::Event::RunCompleted {
+                run_id: run_id.to_string(),
+                status: RunStatus::Rejected,
+                finished_at: now,
+            },
+        );
         Ok(ApprovalDecision::Rejected {
             run_id: run_id.to_string(),
             step_id,
@@ -1238,6 +1257,28 @@ impl RunStore {
     /// task (no cooperative cancellation yet); the resume may run to
     /// completion. Cancelling a run owned by a *separate* process (e.g.
     /// `rupu run`) sends SIGTERM and stops it.
+    /// Best-effort append of a terminal event to the run's
+    /// `events.jsonl`. Store-side terminal transitions (cancel /
+    /// reject / approval expiry) happen when no runner process is
+    /// alive to emit the event — without this, live views tailing the
+    /// log (SSE firehose → Situation Room) never observe the
+    /// transition and show the run as running forever. Mirrors
+    /// `JsonlSink`'s contract: failures are logged, never propagated
+    /// (the persisted `run.json` flip above is the source of truth).
+    fn append_terminal_event(&self, run_id: &str, ev: &crate::executor::Event) {
+        use crate::executor::{EventSink, JsonlSink};
+        let path = self.run_dir(run_id).join("events.jsonl");
+        match JsonlSink::create(&path) {
+            Ok(sink) => sink.emit(run_id, ev),
+            Err(e) => tracing::warn!(
+                error = %e,
+                run_id,
+                path = %path.display(),
+                "failed to append terminal event to events.jsonl"
+            ),
+        }
+    }
+
     pub fn cancel(
         &self,
         run_id: &str,
@@ -1292,6 +1333,14 @@ impl RunStore {
                 record.active_step_transcript_path = None;
                 self.update(&record)
                     .map_err(|e| CancelError::Store(e.to_string()))?;
+                self.append_terminal_event(
+                    run_id,
+                    &crate::executor::Event::RunCompleted {
+                        run_id: run_id.to_string(),
+                        status: RunStatus::Cancelled,
+                        finished_at: now,
+                    },
+                );
                 Ok(CancelOutcome::MarkedCancelled { pid, was_running })
             }
         }
@@ -2489,6 +2538,81 @@ mod tests {
         let reloaded = store.load(&rec.id).unwrap();
         assert_eq!(reloaded.status, RunStatus::Rejected);
         assert!(reloaded.error_message.unwrap().contains("not now"));
+    }
+
+    // Store-side terminal transitions (cancel / reject / approval expiry)
+    // happen when no runner process is alive to emit a terminal event, so
+    // the store must append one to events.jsonl itself — otherwise live
+    // views tailing the log (SSE firehose → Situation Room) never observe
+    // the transition and show the run as running forever.
+    fn last_event(store: &RunStore, run_id: &str) -> crate::executor::Event {
+        let body = std::fs::read_to_string(store.run_dir(run_id).join("events.jsonl"))
+            .expect("events.jsonl should exist after a store-side terminal transition");
+        serde_json::from_str(body.lines().last().expect("at least one event line"))
+            .expect("terminal event line parses")
+    }
+
+    #[test]
+    fn cancel_running_appends_terminal_event() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_cancel_event");
+        rec.status = RunStatus::Running;
+        rec.runner_pid = None;
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        store.cancel(&rec.id, "matt", "stop it", now).unwrap();
+
+        match last_event(&store, &rec.id) {
+            crate::executor::Event::RunCompleted {
+                run_id, status, ..
+            } => {
+                assert_eq!(run_id, rec.id);
+                assert_eq!(status, RunStatus::Cancelled);
+            }
+            other => panic!("expected RunCompleted(cancelled), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_appends_terminal_event() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = awaiting_record("run_reject_event");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        store.reject(&rec.id, "matt", "not now", Utc::now()).unwrap();
+
+        match last_event(&store, &rec.id) {
+            crate::executor::Event::RunCompleted {
+                run_id, status, ..
+            } => {
+                assert_eq!(run_id, rec.id);
+                assert_eq!(status, RunStatus::Rejected);
+            }
+            other => panic!("expected RunCompleted(rejected), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expire_if_overdue_appends_terminal_event() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = awaiting_record("run_expire_event");
+        rec.expires_at = Some(Utc::now() - chrono::Duration::minutes(1));
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let mut loaded = store.load(&rec.id).unwrap();
+        assert!(store.expire_if_overdue(&mut loaded, Utc::now()).unwrap());
+
+        match last_event(&store, &rec.id) {
+            crate::executor::Event::RunFailed { run_id, error, .. } => {
+                assert_eq!(run_id, rec.id);
+                assert!(error.contains("approval expired"), "error: {error}");
+            }
+            other => panic!("expected RunFailed(expired), got {other:?}"),
+        }
     }
 
     #[test]

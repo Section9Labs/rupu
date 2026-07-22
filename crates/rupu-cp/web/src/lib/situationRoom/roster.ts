@@ -10,20 +10,82 @@
 // severity counts come straight from the findings list.
 
 import {
+  isKnownRunEvent,
   normFindingSeverity,
   type FindingOut,
   type FindingsSummary,
   type ProjectRow,
+  type RunEvent,
 } from '../api';
 
 /** Per-run live state, distilled from the event stream by the page. */
 export interface RunActivity {
   runId: string;
-  state: 'running' | 'awaiting' | 'done' | 'failed';
+  state: 'running' | 'awaiting' | 'paused' | 'done' | 'failed';
   /** Short human label of what the run is doing right now (agent · step). */
   action?: string;
   /** ms since epoch of the last event seen for this run. */
   ts: number;
+}
+
+/** Latest state per run, folded from the (newest-first) event list — drives
+ *  the roster's status + current action. The default for any mid-flight
+ *  event is `running`; pause/terminal events flip it. */
+export function deriveActivity(items: { ts: number; event: RunEvent }[]): Map<string, RunActivity> {
+  const out = new Map<string, RunActivity>();
+  for (const { ts, event } of items) {
+    const runId = event.run_id;
+    if (out.has(runId)) continue; // first hit = newest event for this run
+    let state: RunActivity['state'] = 'running';
+    let action: string | undefined;
+    if (isKnownRunEvent(event)) {
+      switch (event.type) {
+        case 'run_completed': state = 'done'; break;
+        case 'run_failed': state = 'failed'; break;
+        case 'step_awaiting_approval': state = 'awaiting'; action = `awaiting · ${event.step_id}`; break;
+        case 'run_paused': state = 'paused'; action = 'paused'; break;
+        case 'step_paused': state = 'paused'; action = `paused · ${event.step_id}`; break;
+        case 'step_started': action = event.agent ? `${event.agent} · ${event.step_id}` : event.step_id; break;
+        case 'step_working': action = event.note?.trim() || event.step_id; break;
+        case 'step_completed': action = event.step_id; break;
+        case 'step_resumed': action = event.step_id; break;
+        case 'panel_round': action = `${event.step_id} · round ${event.round}`; break;
+        default: break;
+      }
+    }
+    out.set(runId, { runId, state, action, ts });
+  }
+  return out;
+}
+
+const TERMINAL_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled', 'rejected']);
+
+/**
+ * Reconcile event-derived activity with the authoritative persisted run
+ * status (`run.json`, learned via `getRun`). Some runs' `events.jsonl` ends
+ * mid-step with no terminal event — historically every cancel did this (the
+ * store didn't append one), and a crashed runner still does — so a
+ * live-looking fold must yield to a terminal persisted status instead of
+ * spinning forever. Already-terminal activity is never rewritten: the event
+ * stream is fresher than a status fetched once per run.
+ */
+export function reconcileActivity(
+  activity: Map<string, RunActivity>,
+  persistedStatus: Map<string, string>,
+): Map<string, RunActivity> {
+  let out = activity;
+  for (const [runId, act] of activity) {
+    if (act.state === 'done' || act.state === 'failed') continue;
+    const status = persistedStatus.get(runId);
+    if (!status || !TERMINAL_RUN_STATUSES.has(status)) continue;
+    if (out === activity) out = new Map(activity);
+    out.set(runId, {
+      ...act,
+      state: status === 'completed' || status === 'cancelled' ? 'done' : 'failed',
+      action: undefined,
+    });
+  }
+  return out;
 }
 
 export interface SevCounts {
