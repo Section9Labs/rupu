@@ -8,15 +8,19 @@
 // the YAML tab. This branch must never be touched by future edits to the
 // `next` branch below it.
 //
-// `next` path (Task 5): an early return, BEFORE the classic markup, so the
-// classic branch stays untouched. `trigger`/`inputs` get dedicated authoring
-// cards (TriggerCard / InputsCard, under `./settings/`) instead of chips; any
-// OTHER advanced key still surfaces as a read-only chip below the cards.
+// `next` path (Task 5, extended Task 6): an early return, BEFORE the classic
+// markup, so the classic branch stays untouched. `trigger`/`inputs` get
+// dedicated authoring cards (TriggerCard / InputsCard, under `./settings/`)
+// instead of chips; `autoflow` gets an authoring card (AutoflowCard) plus a
+// read-only lifecycle viz below it (LifecycleRibbon). Any OTHER advanced key
+// still surfaces as a read-only chip below the cards.
 
 import type { WorkflowMeta } from '../../lib/workflowGraph';
 import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 import TriggerCard from './settings/TriggerCard';
 import InputsCard from './settings/InputsCard';
+import AutoflowCard from './settings/AutoflowCard';
+import LifecycleRibbon from './settings/LifecycleRibbon';
 
 interface WorkflowSettingsFormProps {
   meta: WorkflowMeta;
@@ -46,7 +50,7 @@ export default function WorkflowSettingsForm({
     const onRest = (rest: Record<string, unknown>): void => {
       patch({ rest });
     };
-    const restKeys = Object.keys(meta.rest).filter((k) => k !== 'trigger' && k !== 'inputs');
+    const restKeys = Object.keys(meta.rest).filter((k) => k !== 'trigger' && k !== 'inputs' && k !== 'autoflow');
 
     return (
       <div className="space-y-4" data-ui="next">
@@ -74,6 +78,8 @@ export default function WorkflowSettingsForm({
 
         <TriggerCard rest={meta.rest} onRest={onRest} />
         <InputsCard rest={meta.rest} onRest={onRest} />
+        <AutoflowCard rest={meta.rest} onRest={onRest} />
+        <LifecycleRibbon rest={meta.rest} />
 
         {restKeys.length > 0 && (
           <div className="rounded-md border border-border bg-surface px-3 py-2.5">

@@ -681,6 +681,136 @@
   .wfx-card, .wfx-seg button, .wfx-chip button { transition: none !important; }
 }
 
+/* ── Settings inspector authoring cards (Task 6): Autoflow + Lifecycle ── */
+/* Ported from the mockup's `.aftoggle`/`.switch` (enable toggle) and
+ * `.lifecycle`/`.lc-*` (read-only stage ribbon). Behind
+ * `workflowEditorUi === 'next'` in WorkflowSettingsForm, same as the Task 5
+ * cards above — reuses `.wfx-card`/`.wfx-card-h`/`.wfx-seg`/`.wfx-chip`
+ * rather than duplicating card chrome; only the toggle switch, nested
+ * sub-card, and lifecycle-ribbon rules are new. Same `--c-*` tokens as the
+ * rest of the `.wfx-*` block — no new tokens added. */
+.wfx-card-h {
+  justify-content: space-between;
+}
+.wfx-toggle {
+  display: inline-flex;
+  align-items: center;
+  appearance: none;
+  cursor: pointer;
+  border: 0;
+  background: transparent;
+  padding: 0;
+}
+.wfx-toggle-sw {
+  width: 30px;
+  height: 17px;
+  border-radius: 999px;
+  background: rgb(var(--c-ink-mute) / .3);
+  position: relative;
+  transition: background .15s ease;
+  flex: none;
+}
+.wfx-toggle.wfx-on .wfx-toggle-sw {
+  background: rgb(var(--c-status-awaiting));
+}
+.wfx-toggle-sw::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform .15s ease;
+}
+.wfx-toggle.wfx-on .wfx-toggle-sw::after {
+  transform: translateX(13px);
+}
+.wfx-subcard {
+  border: 1px solid rgb(var(--c-border));
+  background: rgb(var(--c-surface) / .35);
+  border-radius: 8px;
+  padding: 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.wfx-subcard-h {
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: rgb(var(--c-ink-dim));
+}
+.wfx-lc {
+  border: 1px solid rgb(var(--c-border));
+  background: rgb(var(--c-status-awaiting) / .05);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.wfx-lc-hint {
+  margin: 0;
+  font-size: 11px;
+  color: rgb(var(--c-ink-mute));
+}
+.wfx-lc-title {
+  font-size: 9px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: rgb(var(--c-status-awaiting));
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+.wfx-lc-flow {
+  display: flex;
+  align-items: stretch;
+}
+.wfx-lc-step {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid rgb(var(--c-border));
+  background: rgb(var(--c-panel));
+  border-radius: 8px;
+  padding: 6px 9px;
+}
+.wfx-lc-arrow {
+  display: flex;
+  align-items: center;
+  color: rgb(var(--c-ink-mute));
+  padding: 0 4px;
+  font-size: 12px;
+  flex: none;
+}
+.wfx-lc-h {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 8.5px;
+  text-transform: uppercase;
+  color: rgb(var(--c-ink-mute));
+}
+.wfx-lc-v {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: rgb(var(--c-ink));
+  margin-top: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wfx-lc-m {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px;
+  color: rgb(var(--c-brand-500));
+  margin-top: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wfx-toggle-sw, .wfx-toggle-sw::after { transition: none !important; }
+}
+
 /* ================================================================== */
 /* Agent Builder — the card-based agent composer (.rupu/agents/*.md). */
 /* Ported from the approved interactive mockup (agent-builder.html);  */
