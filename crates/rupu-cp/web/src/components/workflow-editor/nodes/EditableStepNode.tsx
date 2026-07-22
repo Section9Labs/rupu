@@ -16,12 +16,17 @@ import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { GraphNode, StepKind, StepNodeData } from '../../../lib/workflowGraph';
 import { editorNodeSize } from '../../../lib/workflowLayout';
 import { useThemeColors, type ColorKey, type ThemeColors } from '../../../lib/useThemeColors';
+import type { WorkflowEditorUi } from '../../../hooks/useWorkflowEditorUi';
 
 // Node data carried on the xyflow node. Exported so WorkflowEditorGraph projects
 // the exact same shape when it derives the flow `nodes`.
 export interface NodeData extends Record<string, unknown> {
   node: GraphNode;
   problems: string[];
+  /** Workflow-editor-UI flag, threaded through so the node can restyle itself
+   *  (Task 2+). Defaults to 'classic' when absent — no behavior/visual change
+   *  in this task beyond the `data-ui` marker. */
+  workflowEditorUi?: WorkflowEditorUi;
 }
 
 type EditableFlowNode = Node<NodeData, 'editable'>;
@@ -158,6 +163,7 @@ function BranchBody({ d, colors }: { d: StepNodeData; colors: ThemeColors }) {
 
 function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
   const { node, problems } = data;
+  const ui = data.workflowEditorUi ?? 'classic';
   const d = node.data;
   const colors = useThemeColors();
   const handleStyle = { background: colors.border, width: 7, height: 7, border: 'none' } as const;
@@ -167,6 +173,7 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
 
   return (
     <div
+      data-ui={ui}
       className={[
         'relative rounded-[10px] border bg-panel px-3 py-2 text-left shadow-card',
         selected ? 'ring-2 ring-brand-500' : '',

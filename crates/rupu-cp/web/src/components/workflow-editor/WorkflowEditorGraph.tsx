@@ -227,10 +227,10 @@ function WorkflowEditorGraphInner({
         id: node.id,
         type: 'editable',
         position: node.position,
-        data: { node, problems: problemsById[node.id] ?? [] },
+        data: { node, problems: problemsById[node.id] ?? [], workflowEditorUi },
         selected: node.id === selectedId,
       })),
-    [graph.nodes, problemsById, selectedId],
+    [graph.nodes, problemsById, selectedId, workflowEditorUi],
   );
 
   const edges = useMemo<Edge[]>(

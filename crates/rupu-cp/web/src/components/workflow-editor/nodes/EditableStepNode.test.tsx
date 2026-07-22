@@ -16,12 +16,18 @@ vi.mock('@xyflow/react', () => ({
 
 import EditableStepNode, { type NodeData } from './EditableStepNode';
 import type { GraphNode, StepNodeData } from '../../../lib/workflowGraph';
+import type { WorkflowEditorUi } from '../../../hooks/useWorkflowEditorUi';
 
 afterEach(cleanup);
 
-function renderNode(data: StepNodeData, problems: string[] = [], selected = false) {
+function renderNode(
+  data: StepNodeData,
+  problems: string[] = [],
+  selected = false,
+  workflowEditorUi?: WorkflowEditorUi,
+) {
   const node: GraphNode = { id: data.id, data, position: { x: 0, y: 0 } };
-  const props = { data: { node, problems }, selected } as unknown as NodeProps<
+  const props = { data: { node, problems, workflowEditorUi }, selected } as unknown as NodeProps<
     Node<NodeData, 'editable'>
   >;
   return render(<EditableStepNode {...props} />);
@@ -82,5 +88,15 @@ describe('EditableStepNode', () => {
   it('a for_each node shows the for_each expression', () => {
     renderNode({ id: 'each', kind: 'for_each', agent: 'a', for_each: 'inputs.files' });
     expect(screen.getByText(/for_each: inputs.files/)).toBeInTheDocument();
+  });
+
+  it('carries data-ui="next" on the outer node when workflowEditorUi is "next"', () => {
+    const { container } = renderNode({ id: 'x', kind: 'step' }, [], false, 'next');
+    expect(container.querySelector('[data-ui="next"]')).toBeInTheDocument();
+  });
+
+  it('defaults to data-ui="classic" when workflowEditorUi is unset', () => {
+    const { container } = renderNode({ id: 'x', kind: 'step' });
+    expect(container.querySelector('[data-ui="classic"]')).toBeInTheDocument();
   });
 });

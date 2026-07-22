@@ -18,8 +18,16 @@ import { render, screen, cleanup, fireEvent } from '@testing-library/react';
 // real canvas — the mutation/derivation logic under test lives in the
 // component's `edges` useMemo, not in @xyflow/react itself.
 vi.mock('@xyflow/react', () => ({
-  ReactFlow: ({ children, edges }: { children?: ReactNode; edges?: unknown[] }) => (
-    <div data-testid="rf" data-edges={JSON.stringify(edges ?? [])}>
+  ReactFlow: ({
+    children,
+    edges,
+    nodes,
+  }: {
+    children?: ReactNode;
+    edges?: unknown[];
+    nodes?: unknown[];
+  }) => (
+    <div data-testid="rf" data-edges={JSON.stringify(edges ?? [])} data-nodes={JSON.stringify(nodes ?? [])}>
       {children}
     </div>
   ),
@@ -145,6 +153,37 @@ describe('palette', () => {
       />,
     );
     expect(screen.getByRole('button', { name: '⊕ next' })).toBeEnabled();
+  });
+});
+
+describe('node projection', () => {
+  function projectedNodes(workflowEditorUi?: 'classic' | 'next') {
+    render(
+      <WorkflowEditorGraph
+        graph={makeGraph()}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi={workflowEditorUi}
+      />,
+    );
+    const raw = screen.getByTestId('rf').getAttribute('data-nodes');
+    expect(raw).toBeTruthy();
+    return JSON.parse(raw!) as Array<{ data: { workflowEditorUi?: string } }>;
+  }
+
+  it('threads workflowEditorUi="next" onto every projected node', () => {
+    const nodes = projectedNodes('next');
+    expect(nodes.length).toBeGreaterThan(0);
+    for (const n of nodes) expect(n.data.workflowEditorUi).toBe('next');
+  });
+
+  it('defaults to workflowEditorUi="classic" when the prop is unset', () => {
+    const nodes = projectedNodes(undefined);
+    expect(nodes.length).toBeGreaterThan(0);
+    for (const n of nodes) expect(n.data.workflowEditorUi).toBe('classic');
   });
 });
 
