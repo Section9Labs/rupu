@@ -931,10 +931,50 @@ async fn run_steps_inner(
         .and_then(|r| r.paused_step.as_ref())
         .map(|ps| ps.step_id.as_str());
 
+    // Step ids on branch arms that were NOT taken. Populated when a
+    // `branch:` step's condition renders (see the branch arm below); each
+    // such step is skipped-in-place when the loop reaches it, mirroring the
+    // `when:`-skip shape.
+    let mut branch_skipped: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
     for step in &opts.workflow.steps {
         // Resume: skip steps that already ran in the prior process.
         if already_done.contains(&step.id) {
             info!(step = %step.id, "resume: skipping already-completed step");
+            continue;
+        }
+
+        // Branch-skip: this step lies on a branch arm the runner did NOT
+        // take. Persist it as skipped (empty output) so downstream
+        // reconvergence and `when:` chains observe a real, skipped result —
+        // the same shape the `when:`-skip block produces below. Runs before
+        // this step's own `when:` / approval / dispatch.
+        if branch_skipped.contains(&step.id) {
+            info!(step = %step.id, "skipping (not taken by branch)");
+            if let Some(sink) = opts.event_sink.as_ref() {
+                sink.emit(
+                    run_id,
+                    &crate::executor::Event::StepSkipped {
+                        run_id: run_id.to_string(),
+                        step_id: step.id.clone(),
+                        reason: "not taken by branch".to_string(),
+                    },
+                );
+            }
+            let result = StepResult {
+                step_id: step.id.clone(),
+                rendered_prompt: String::new(),
+                run_id: String::new(),
+                transcript_path: PathBuf::new(),
+                output: String::new(),
+                success: false,
+                skipped: true,
+                kind: step_kind_for_run_record(step),
+                items: Vec::new(),
+                ..Default::default()
+            };
+            persist_step_result(opts, run_id, &result);
+            step_results.push(result);
             continue;
         }
 
@@ -1050,6 +1090,70 @@ async fn run_steps_inner(
                     fanout_completed_units: std::collections::BTreeMap::new(),
                 });
             }
+        }
+
+        // Branch step: render the condition, record which arm was taken,
+        // and mark every step on the OTHER (not-taken) arm as branch-skipped
+        // so the loop skips them when it reaches them. A branch dispatches no
+        // agent — it only routes — so it never goes through `run_linear_step`
+        // (which panics on the absent prompt) or the shared dispatch
+        // machinery below; it emits its own StepStarted/StepCompleted pair.
+        if let Some(branch) = &step.branch {
+            let branch_timer = std::time::Instant::now();
+            if let Some(sink) = opts.event_sink.as_ref() {
+                sink.emit(
+                    run_id,
+                    &crate::executor::Event::StepStarted {
+                        run_id: run_id.to_string(),
+                        step_id: step.id.clone(),
+                        kind: crate::runs::StepKind::Branch,
+                        agent: None,
+                        host: None,
+                    },
+                );
+            }
+            let take = render_when_expression(
+                &branch.condition,
+                &ctx,
+                render_mode(opts.strict_templates),
+            )
+            .map_err(|e| RunWorkflowError::Render {
+                step: step.id.clone(),
+                source: e,
+            })?;
+            let taken = if take { "then" } else { "else" };
+            // The arm NOT taken is skipped. `then`/`else` are validated
+            // (parse-time) to be forward references and non-overlapping.
+            if take {
+                branch_skipped.extend(branch.r#else.iter().cloned());
+            } else {
+                branch_skipped.extend(branch.then.iter().cloned());
+            }
+            info!(step = %step.id, arm = taken, "branch: took arm");
+            let result = StepResult {
+                step_id: step.id.clone(),
+                output: taken.to_string(),
+                success: true,
+                skipped: false,
+                kind: crate::runs::StepKind::Branch,
+                ..Default::default()
+            };
+            let duration_ms = branch_timer.elapsed().as_millis() as u64;
+            if let Some(sink) = opts.event_sink.as_ref() {
+                sink.emit(
+                    run_id,
+                    &crate::executor::Event::StepCompleted {
+                        run_id: run_id.to_string(),
+                        step_id: step.id.clone(),
+                        success: true,
+                        duration_ms,
+                        host: None,
+                    },
+                );
+            }
+            persist_step_result(opts, run_id, &result);
+            step_results.push(result);
+            continue;
         }
 
         let effective_continue_on_error =
@@ -1284,7 +1388,9 @@ fn base_context_for_step(
 }
 
 fn step_kind_for_run_record(step: &Step) -> crate::runs::StepKind {
-    if step.panel.is_some() {
+    if step.branch.is_some() {
+        crate::runs::StepKind::Branch
+    } else if step.panel.is_some() {
         crate::runs::StepKind::Panel
     } else if step.parallel.is_some() {
         crate::runs::StepKind::Parallel
