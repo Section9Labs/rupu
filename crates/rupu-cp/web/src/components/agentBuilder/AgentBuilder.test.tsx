@@ -163,10 +163,15 @@ describe('AgentBuilder', () => {
     expect(onSubmit.mock.calls[0][0]).toContain('name: raw-edited');
   });
 
-  it('renders the Identity/Model/Prompt card bodies by default', () => {
+  it('renders the Identity/Prompt card bodies by default, and Model when provider/model are set', () => {
+    // Model is not always-wanted (see "removing the Model card sticks"
+    // below) — it only surfaces when its owned fields have a value, same as
+    // every other non-required card. Seed `provider` here so this test can
+    // still assert its body renders.
+    const RAW_WITH_MODEL = SAMPLE_RAW.replace('permissionMode: readonly', 'permissionMode: readonly\nprovider: anthropic');
     render(
       <AgentBuilder
-        initialRaw={SAMPLE_RAW}
+        initialRaw={RAW_WITH_MODEL}
         submitLabel="Create agent"
         submitting={false}
         error={null}
@@ -325,5 +330,90 @@ describe('AgentBuilder', () => {
     fireEvent.dragStart(source, { dataTransfer });
     fireEvent.drop(screen.getByTestId('ab-canvas-drop'), { dataTransfer });
     expect(screen.getByRole('button', { name: 'remove Reasoning card' })).toBeInTheDocument();
+  });
+
+  it('removing the Model card sticks — no snap-back, config cleared from the preview', () => {
+    const RAW_WITH_MODEL = SAMPLE_RAW.replace(
+      'permissionMode: readonly',
+      'permissionMode: readonly\nprovider: anthropic\nmodel: claude-sonnet-4-6',
+    );
+    render(
+      <AgentBuilder
+        initialRaw={RAW_WITH_MODEL}
+        submitLabel="Create agent"
+        submitting={false}
+        error={null}
+        onSubmit={vi.fn()}
+      />,
+    );
+    // Model card is present at mount because provider/model are set.
+    expect(screen.getByRole('button', { name: 'remove Model card' })).toBeInTheDocument();
+    expect(screen.getByTestId('ab-yaml')).toHaveTextContent(/provider:/);
+    expect(screen.getByTestId('ab-yaml')).toHaveTextContent(/model:/);
+
+    fireEvent.click(screen.getByRole('button', { name: 'remove Model card' }));
+
+    // Card is gone and the fields are cleared from the live preview...
+    expect(screen.queryByRole('button', { name: 'remove Model card' })).not.toBeInTheDocument();
+    expect(screen.getByTestId('ab-yaml')).not.toHaveTextContent('provider:');
+    expect(screen.getByTestId('ab-yaml')).not.toHaveTextContent('model:');
+
+    // ...and it does not snap back on a later render (the reactive
+    // card-order effect must not re-add Model just because it's "always
+    // wanted" — it isn't, anymore).
+    expect(screen.queryByRole('button', { name: 'remove Model card' })).not.toBeInTheDocument();
+    expect(screen.getByTestId('ab-yaml')).not.toHaveTextContent(/provider:/);
+  });
+
+  it('dragging a card header before another card reorders the canvas', () => {
+    render(
+      <AgentBuilder
+        initialRaw={SAMPLE_RAW}
+        submitLabel="Create agent"
+        submitting={false}
+        error={null}
+        onSubmit={vi.fn()}
+      />,
+    );
+    // SAMPLE_RAW seeds Identity, Model (no, not anymore — see above test),
+    // Permission (permissionMode: readonly) and Prompt at mount. Add
+    // Reasoning so we have a well-separated pair of cards to reorder:
+    // canvas order becomes [identity, permission, prompt, reasoning].
+    fireEvent.click(screen.getByLabelText('add Reasoning card'));
+
+    function cardOrder(): string[] {
+      return Array.from(document.querySelectorAll('.ab-card .ab-ct')).map((el) => el.textContent ?? '');
+    }
+
+    const before = cardOrder();
+    expect(before).toEqual(['Identity', 'Permission', 'Prompt', 'Reasoning']);
+
+    const store = new Map<string, string>();
+    const dataTransfer = {
+      setData: (k: string, v: string) => store.set(k, v),
+      getData: (k: string) => store.get(k) ?? '',
+      get types() {
+        return Array.from(store.keys());
+      },
+      effectAllowed: '',
+      dropEffect: '',
+    };
+
+    // Drag the Reasoning header onto the Identity card — moveCardBefore
+    // should splice Reasoning to sit immediately before Identity. Scope to
+    // `.ab-ct` (the canvas card title span) since "Reasoning"/"Identity"
+    // also appear as palette entries.
+    const reasoningHeader = screen
+      .getByText('Reasoning', { selector: '.ab-ct' })
+      .closest('.ab-card-head') as HTMLElement;
+    const identityCard = screen.getByText('Identity', { selector: '.ab-ct' }).closest('.ab-card') as HTMLElement;
+    fireEvent.dragStart(reasoningHeader, { dataTransfer });
+    fireEvent.dragOver(identityCard, { dataTransfer });
+    fireEvent.drop(identityCard, { dataTransfer });
+
+    const after = cardOrder();
+    expect(after).toEqual(['Reasoning', 'Identity', 'Permission', 'Prompt']);
+    expect(after.indexOf('Reasoning')).toBeLessThan(after.indexOf('Identity'));
+    expect(after).not.toEqual(before);
   });
 });

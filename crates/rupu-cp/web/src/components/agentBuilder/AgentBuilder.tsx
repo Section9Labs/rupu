@@ -85,18 +85,22 @@ function hasValue(v: unknown): boolean {
 }
 
 // The set of card ids that "want" to be on the canvas for a given draft:
-// required cards, Model (on-by-default), and any card whose owned fields
+// required cards, and any card (including Model) whose owned fields
 // (`CARD_FIELDS`) have a value — regardless of whether that value arrived
 // via a card edit, Raw-mode YAML, or AI generation. Shared by the initial
 // `useState` seed AND the reactive union effect below, so "what belongs on
-// the canvas for this draft" is computed exactly one way.
+// the canvas for this draft" is computed exactly one way. Model is NOT
+// special-cased as always-wanted: doing so meant `removeCard('model')`
+// (which clears provider/auth/model) got immediately re-added by the next
+// reactive union pass, silently wiping the user's selection and snapping
+// the blank card back (see AgentBuilder.test.tsx "model card removal
+// sticks").
 function wantedCardIds(draft: AgentDraft): string[] {
   const byId = new Map(CARD_REGISTRY.map((c) => [c.id, c] as const));
   return CANVAS_ORDER.filter((id) => {
     const meta = byId.get(id);
     if (!meta) return false;
     if (meta.required) return true;
-    if (id === 'model') return true; // implemented + on-by-default in this task
     const fields = CARD_FIELDS[id];
     return fields ? fields.some((f) => hasValue(draft[f])) : false;
   });
