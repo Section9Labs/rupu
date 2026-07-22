@@ -43,14 +43,18 @@ describe('agentSpec', () => {
     d.name = 'x';
     d.effort = 'high';
     d.dispatchableAgents = ['code-reviewer'];
-    d.concerns = [{ kind: 'include', ref: 'owasp', overrides: ['mode=full'] }];
+    d.concerns = [
+      { kind: 'include', template: 'owasp', mode: 'full', overrides: [{ id: 'sql-injection' }] },
+    ];
     d.body = 'body text';
     const back = parseAgent(serializeAgent(d));
     expect(back.name).toBe('x');
     expect(back.effort).toBe('high');
     expect(back.dispatchableAgents).toEqual(['code-reviewer']);
-    expect(back.concerns?.[0]).toMatchObject({ kind: 'include', ref: 'owasp' });
-    expect(back.body).toBe('body text');
+    expect(back.concerns?.[0]).toMatchObject({ kind: 'include', template: 'owasp' });
+    // serializeAgent appends exactly one trailing `\n`; parseAgent now trims
+    // leading-only (never trailing), so that single newline survives.
+    expect(back.body).toBe('body text\n');
   });
 
   it('parse preserves unknown keys via passthrough and re-emits them', () => {
@@ -105,19 +109,62 @@ describe('agentSpec', () => {
     ]);
   });
 
-  it('serializes concerns: include and inline entries to the include/inline shape', () => {
+  it('serializes concerns: include and inline entries to the rupu-coverage schema shape', () => {
     const d = emptyDraft();
     d.name = 'a';
     d.concerns = [
-      { kind: 'include', ref: 'owasp', overrides: ['mode=full'] },
-      { kind: 'inline', ref: 'no-secrets', globs: '**/*.ts' },
+      {
+        kind: 'include',
+        template: 'owasp-top-10',
+        mode: 'full',
+        overrides: [{ id: 'sql-injection', severity: 'critical', applicableGlobs: ['src/**/*.ts'] }],
+      },
+      {
+        kind: 'inline',
+        id: 'no-secrets',
+        name: 'No hardcoded secrets',
+        description: 'Find hardcoded credentials.',
+        severity: 'high',
+        applicableGlobs: ['src/**'],
+      },
     ];
     const md = serializeAgent(d);
     const { frontmatter } = splitFm(md);
     const parsed = yaml.load(frontmatter) as Record<string, unknown>;
     expect(parsed.concerns).toEqual([
-      { include: 'owasp', overrides: ['mode=full'] },
-      { id: 'no-secrets', applicable_globs: '**/*.ts' },
+      {
+        include: 'owasp-top-10',
+        mode: 'full',
+        overrides: [{ id: 'sql-injection', severity: 'critical', applicable_globs: ['src/**/*.ts'] }],
+      },
+      {
+        id: 'no-secrets',
+        name: 'No hardcoded secrets',
+        description: 'Find hardcoded credentials.',
+        severity: 'high',
+        applicable_globs: ['src/**'],
+      },
+    ]);
+    expect(md).toContain('include:');
+    expect(md).toMatch(/overrides:\s*\n\s*- id: sql-injection/);
+    expect(md).toContain('id: no-secrets');
+    expect(md).toContain('name: No hardcoded secrets');
+    expect(md).toContain('description: Find hardcoded credentials.');
+  });
+
+  it('omits mode when auto/unset and omits empty optional sub-keys', () => {
+    const d = emptyDraft();
+    d.name = 'a';
+    d.concerns = [
+      { kind: 'include', template: 'owasp-top-10' },
+      { kind: 'inline', id: 'no-secrets', name: 'No secrets', description: 'desc' },
+    ];
+    const md = serializeAgent(d);
+    const { frontmatter } = splitFm(md);
+    const parsed = yaml.load(frontmatter) as Record<string, unknown>;
+    expect(parsed.concerns).toEqual([
+      { include: 'owasp-top-10' },
+      { id: 'no-secrets', name: 'No secrets', description: 'desc' },
     ]);
   });
 
@@ -125,13 +172,27 @@ describe('agentSpec', () => {
     const d = emptyDraft();
     d.name = 'a';
     d.concerns = [
-      { kind: 'include', ref: 'owasp' },
-      { kind: 'inline', ref: 'no-secrets', globs: '**/*.ts' },
+      { kind: 'include', template: 'owasp-top-10', overrides: [{ id: 'sql-injection' }] },
+      {
+        kind: 'inline',
+        id: 'no-secrets',
+        name: 'No hardcoded secrets',
+        description: 'Find hardcoded credentials.',
+        severity: 'high',
+        applicableGlobs: ['**/*.ts'],
+      },
     ];
     const back = parseAgent(serializeAgent(d));
     expect(back.concerns).toEqual([
-      { kind: 'include', ref: 'owasp' },
-      { kind: 'inline', ref: 'no-secrets', globs: '**/*.ts' },
+      { kind: 'include', template: 'owasp-top-10', overrides: [{ id: 'sql-injection' }] },
+      {
+        kind: 'inline',
+        id: 'no-secrets',
+        name: 'No hardcoded secrets',
+        description: 'Find hardcoded credentials.',
+        severity: 'high',
+        applicableGlobs: ['**/*.ts'],
+      },
     ]);
   });
 
@@ -140,7 +201,19 @@ describe('agentSpec', () => {
     d.name = 'a';
     d.body = 'line one\n\nline two with {{ not a template }}\n';
     const back = parseAgent(serializeAgent(d));
-    expect(back.body).toBe(d.body.replace(/\n+$/, ''));
+    expect(back.body).toContain('line two with {{ not a template }}');
+  });
+
+  it('strips only leading blank lines from the body, never trailing content', () => {
+    const d = emptyDraft();
+    d.name = 'a';
+    d.body = 'first line.\n\ntrailing meaningful text.';
+    const back = parseAgent(serializeAgent(d));
+    // Leading blank line introduced by splitFrontmatter's fence separator
+    // must be gone, and trailing non-whitespace text must survive intact.
+    expect(back.body.startsWith('\n')).toBe(false);
+    expect(back.body).toContain('trailing meaningful text.');
+    expect(back.body.trimEnd()).toBe(d.body);
   });
 
   it('never emits an unmodeled key from the frontmatter allowlist', () => {

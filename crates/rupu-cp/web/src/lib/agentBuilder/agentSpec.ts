@@ -28,12 +28,31 @@ export interface SchemaProp {
   enumValues?: string[];
 }
 
-export interface ConcernEntry {
-  kind: 'include' | 'inline';
-  ref: string;
-  overrides?: string[];
-  globs?: string;
+export type Severity = 'info' | 'low' | 'medium' | 'high' | 'critical';
+
+export interface InlineConcern {
+  kind: 'inline';
+  id: string;
+  name: string;
+  description: string;
+  severity?: Severity;
+  applicableGlobs?: string[];
 }
+
+export interface ConcernOverride {
+  id: string;
+  severity?: Severity;
+  applicableGlobs?: string[];
+}
+
+export interface IncludeConcern {
+  kind: 'include';
+  template: string;
+  mode?: 'full' | 'index' | 'auto';
+  overrides?: ConcernOverride[];
+}
+
+export type ConcernEntry = InlineConcern | IncludeConcern;
 
 export interface AgentDraft {
   name: string;
@@ -122,15 +141,26 @@ function schemaPropsToJsonSchema(props: SchemaProp[]): Record<string, unknown> {
   };
 }
 
+function overridesToYamlShape(overrides: ConcernOverride[]): unknown[] {
+  return overrides.map((o) => {
+    const out: Record<string, unknown> = { id: o.id };
+    if (o.severity) out.severity = o.severity;
+    if (o.applicableGlobs && o.applicableGlobs.length > 0) out.applicable_globs = o.applicableGlobs;
+    return out;
+  });
+}
+
 function concernsToYamlShape(entries: ConcernEntry[]): unknown[] {
   return entries.map((e) => {
     if (e.kind === 'include') {
-      const out: Record<string, unknown> = { include: e.ref };
-      if (e.overrides && e.overrides.length > 0) out.overrides = e.overrides;
+      const out: Record<string, unknown> = { include: e.template };
+      if (e.mode && e.mode !== 'auto') out.mode = e.mode;
+      if (e.overrides && e.overrides.length > 0) out.overrides = overridesToYamlShape(e.overrides);
       return out;
     }
-    const out: Record<string, unknown> = { id: e.ref };
-    if (e.globs) out.applicable_globs = e.globs;
+    const out: Record<string, unknown> = { id: e.id, name: e.name, description: e.description };
+    if (e.severity) out.severity = e.severity;
+    if (e.applicableGlobs && e.applicableGlobs.length > 0) out.applicable_globs = e.applicableGlobs;
     return out;
   });
 }
@@ -182,16 +212,37 @@ function jsonSchemaToSchemaProps(schema: unknown): SchemaProp[] | undefined {
   return props;
 }
 
+function yamlShapeToOverrides(raw: unknown): ConcernOverride[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  return raw.map((o): ConcernOverride => {
+    const ov = o as Record<string, unknown>;
+    const out: ConcernOverride = { id: String(ov.id ?? '') };
+    if (typeof ov.severity === 'string') out.severity = ov.severity as Severity;
+    if (Array.isArray(ov.applicable_globs)) out.applicableGlobs = ov.applicable_globs as string[];
+    return out;
+  });
+}
+
 function yamlShapeToConcerns(entries: unknown): ConcernEntry[] | undefined {
   if (!Array.isArray(entries)) return undefined;
   return entries.map((raw): ConcernEntry => {
     const e = raw as Record<string, unknown>;
     if (typeof e.include === 'string') {
-      const overrides = Array.isArray(e.overrides) ? (e.overrides as string[]) : undefined;
-      return { kind: 'include', ref: e.include, ...(overrides ? { overrides } : {}) };
+      const entry: IncludeConcern = { kind: 'include', template: e.include };
+      if (typeof e.mode === 'string') entry.mode = e.mode as IncludeConcern['mode'];
+      const overrides = yamlShapeToOverrides(e.overrides);
+      if (overrides) entry.overrides = overrides;
+      return entry;
     }
-    const globs = typeof e.applicable_globs === 'string' ? e.applicable_globs : undefined;
-    return { kind: 'inline', ref: String(e.id ?? ''), ...(globs ? { globs } : {}) };
+    const entry: InlineConcern = {
+      kind: 'inline',
+      id: String(e.id ?? ''),
+      name: String(e.name ?? ''),
+      description: String(e.description ?? ''),
+    };
+    if (typeof e.severity === 'string') entry.severity = e.severity as Severity;
+    if (Array.isArray(e.applicable_globs)) entry.applicableGlobs = e.applicable_globs as string[];
+    return entry;
   });
 }
 
@@ -205,9 +256,10 @@ export function parseAgent(raw: string): AgentDraft {
     // `serializeAgent` always separates the closing `---` fence from the body
     // with a blank line; `splitFrontmatter`'s regex only consumes one of
     // those newlines, leaving a leading blank line in the captured body.
-    // Strip leading/trailing blank lines so `parseAgent` inverts
-    // `serializeAgent` exactly.
-    body: body.replace(/^\n+/, '').replace(/\n+$/, ''),
+    // Mirrors `crates/rupu-agent/src/spec.rs:196-199`: trim ONLY leading
+    // newlines/`---`, never trailing — trailing content is preserved
+    // verbatim.
+    body: body.replace(/^\n+/, ''),
   };
 
   if (typeof fm.description === 'string') draft.description = fm.description;
