@@ -414,6 +414,9 @@ export interface AutoflowEventRow {
   status?: string | null;
   worker_name?: string | null;
   usage: UsageSummary;
+  /** Failure/error text for `cycle_failed` events. Absent for every other
+   *  kind (and on older server versions). */
+  detail?: string | null;
   /** Originating host id — `"local"` for local events; a remote host id for
    *  proxied events. Absent on older server versions (treat as `"local"`). */
   host_id?: string;

@@ -285,3 +285,93 @@ describe('AutoflowRuns host filter — server-driven (runs + cycles tabs)', () =
     expect(screen.queryByLabelText('Host filter')).not.toBeInTheDocument();
   });
 });
+
+describe('AutoflowRuns — Event column (cycle_failed detail + issue ref fallback)', () => {
+  it('a cycle_failed row with detail expands and shows the error text', async () => {
+    const failedEvent: AutoflowEventRow = {
+      event_id: 'evt-fail-1',
+      cycle_id: 'cyc-fail-1',
+      at: '2026-06-01T00:00:00Z',
+      kind: 'cycle_failed',
+      detail: 'workflow validation failed: missing step "build"',
+      usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: false, runs: 0 },
+    };
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([failedEvent]);
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('CYCLE FAILED')).toBeInTheDocument());
+    expect(screen.getByText('Event')).toBeInTheDocument();
+    expect(screen.queryByText(/missing step/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText('Expand row'));
+    expect(await screen.findByText(/missing step "build"/)).toBeInTheDocument();
+  });
+
+  it('issue ref renders via the issue_ref fallback when issue_display_ref is absent', async () => {
+    const failedEvent: AutoflowEventRow = {
+      event_id: 'evt-fail-2',
+      cycle_id: 'cyc-fail-2',
+      at: '2026-06-01T00:00:00Z',
+      kind: 'cycle_failed',
+      issue_display_ref: 'github:acme/widgets#7',
+      usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: false, runs: 0 },
+    };
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([failedEvent]);
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+
+    renderPage();
+
+    expect(await screen.findByText('github:acme/widgets#7')).toBeInTheDocument();
+  });
+
+  it('a run_launched row still shows its status/usage, with no Event-column detail row', async () => {
+    const launched: AutoflowEventRow = {
+      event_id: 'evt-launch-1',
+      cycle_id: 'cyc-launch-1',
+      at: '2026-06-01T00:00:00Z',
+      kind: 'run_launched',
+      workflow: 'fix-issue',
+      run_id: 'run-77',
+      status: 'running',
+      usage: { input_tokens: 120, output_tokens: 40, cached_tokens: 0, total_tokens: 160, cost_usd: 0.05, priced: true, runs: 1 },
+    };
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([launched]);
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+
+    renderPage();
+
+    expect(await screen.findByText('running')).toBeInTheDocument();
+    expect(screen.getByText('120')).toBeInTheDocument();
+
+    // Expanding a run row with no `detail` shows nothing.
+    fireEvent.click(screen.getByLabelText('Expand row'));
+    expect(screen.queryByText(/missing step/)).not.toBeInTheDocument();
+  });
+
+  it('a non-run event (no run_id) renders empty Run/Worker/Status/tokens/Cost cells, not dashes', async () => {
+    const failedEvent: AutoflowEventRow = {
+      event_id: 'evt-fail-3',
+      cycle_id: 'cyc-fail-3',
+      at: '2026-06-01T00:00:00Z',
+      kind: 'cycle_failed',
+      detail: 'boom',
+      issue_display_ref: 'github:acme/widgets#9',
+      usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: false, runs: 0 },
+    };
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([failedEvent]);
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('CYCLE FAILED')).toBeInTheDocument());
+
+    // No run row exists to render '—' placeholders for; none of the
+    // run-shaped cells should render a literal dash for this row.
+    expect(screen.queryByText('—')).not.toBeInTheDocument();
+  });
+});

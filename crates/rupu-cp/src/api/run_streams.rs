@@ -171,6 +171,11 @@ struct AutoflowEventRow {
     status: Option<String>,
     worker_name: Option<String>,
     usage: crate::usage::UsageSummary,
+    /// The on-disk event's `detail` field (the failure/error text for
+    /// `cycle_failed` events). Additive/optional — omitted from the wire
+    /// payload when absent so older clients see no shape change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     host_id: Option<String>,
 }
@@ -800,11 +805,16 @@ async fn list_autoflow_events(
             at: rec.at,
             kind: kind_to_snake_case(rec.event.kind),
             workflow: rec.event.workflow,
-            issue_display_ref: rec.event.issue_display_ref,
+            // `cycle_failed` events only ever populate `issue_ref` (no
+            // display-friendly variant is computed for them) — fall back so
+            // the UI still gets an issue reference to show. Mirrors
+            // `run_resolve.rs`'s `entity` field derivation.
+            issue_display_ref: rec.event.issue_display_ref.or(rec.event.issue_ref),
             run_id: rec.event.run_id,
             status: rec.event.status,
             worker_name: rec.worker_name,
             usage: crate::usage::UsageSummary::default(),
+            detail: rec.event.detail,
             host_id: None,
         })
         .collect();
@@ -865,6 +875,8 @@ async fn list_autoflow_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use rupu_runtime::{AutoflowCycleEvent, AutoflowCycleMode, AutoflowHistoryEventRecord};
     use std::fs;
 
     #[test]
@@ -1038,5 +1050,89 @@ mod tests {
         let rows = collect_standalone_runs(tmp.path());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].agent.as_deref(), Some("from-transcript"));
+    }
+
+    // ── A2: autoflow event DTO forwards detail + issue_ref fallback ────────────
+
+    fn cycle_failed_record(
+        detail: Option<&str>,
+        issue_ref: Option<&str>,
+    ) -> AutoflowHistoryEventRecord {
+        let cycle = AutoflowCycleRecord::new(AutoflowCycleMode::Tick, Utc::now());
+        let event = AutoflowCycleEvent {
+            kind: AutoflowCycleEventKind::CycleFailed,
+            issue_ref: issue_ref.map(str::to_owned),
+            issue_display_ref: None,
+            detail: detail.map(str::to_owned),
+            ..Default::default()
+        };
+        AutoflowHistoryEventRecord::from_cycle_event(&cycle, event, Utc::now())
+    }
+
+    #[test]
+    fn autoflow_event_row_forwards_detail_and_falls_back_issue_display_ref() {
+        let rec = cycle_failed_record(
+            Some("workflow validation failed: missing step"),
+            Some("github:acme/widgets#7"),
+        );
+        let row = AutoflowEventRow {
+            event_id: rec.event_id.clone(),
+            cycle_id: rec.cycle_id.clone(),
+            at: rec.at.clone(),
+            kind: kind_to_snake_case(rec.event.kind),
+            workflow: rec.event.workflow.clone(),
+            issue_display_ref: rec
+                .event
+                .issue_display_ref
+                .clone()
+                .or_else(|| rec.event.issue_ref.clone()),
+            run_id: rec.event.run_id.clone(),
+            status: rec.event.status.clone(),
+            worker_name: rec.worker_name.clone(),
+            usage: crate::usage::UsageSummary::default(),
+            detail: rec.event.detail.clone(),
+            host_id: None,
+        };
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            v["detail"],
+            serde_json::json!("workflow validation failed: missing step")
+        );
+        assert_eq!(
+            v["issue_display_ref"],
+            serde_json::json!("github:acme/widgets#7")
+        );
+    }
+
+    #[test]
+    fn autoflow_event_row_omits_detail_when_absent() {
+        let cycle = AutoflowCycleRecord::new(AutoflowCycleMode::Tick, Utc::now());
+        let event = AutoflowCycleEvent {
+            kind: AutoflowCycleEventKind::RunLaunched,
+            run_id: Some("run_x".into()),
+            ..Default::default()
+        };
+        let rec = AutoflowHistoryEventRecord::from_cycle_event(&cycle, event, Utc::now());
+        let row = AutoflowEventRow {
+            event_id: rec.event_id.clone(),
+            cycle_id: rec.cycle_id.clone(),
+            at: rec.at.clone(),
+            kind: kind_to_snake_case(rec.event.kind),
+            workflow: rec.event.workflow.clone(),
+            issue_display_ref: rec
+                .event
+                .issue_display_ref
+                .clone()
+                .or_else(|| rec.event.issue_ref.clone()),
+            run_id: rec.event.run_id.clone(),
+            status: rec.event.status.clone(),
+            worker_name: rec.worker_name.clone(),
+            usage: crate::usage::UsageSummary::default(),
+            detail: rec.event.detail.clone(),
+            host_id: None,
+        };
+        let s = serde_json::to_string(&row).unwrap();
+        assert!(!s.contains("\"detail\""));
+        assert_eq!(row.run_id.as_deref(), Some("run_x"));
     }
 }

@@ -20,6 +20,7 @@ import { SectionHeader } from '../../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import UsageChip from '../../components/UsageChip';
 import { Button } from '../../components/ui/Button';
+import { RUN_STATUS_STYLES } from '../../components/StatusPill';
 import { cn } from '../../lib/cn';
 import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
@@ -66,8 +67,28 @@ function KindBadge({ kind }: { kind: string }) {
   const cls = KIND_CLS[kind] ?? 'bg-surface text-ink ring-border';
   const label = KIND_LABEL[kind] ?? kind.replace(/_/g, ' ');
   return (
-    <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
+    <span className={cn('inline-flex items-center whitespace-nowrap rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
       {label}
+    </span>
+  );
+}
+
+// `cycle_failed` is a scheduling event, not a run outcome — it deliberately
+// borrows the shared StatusPill "failed" tone (rather than the plain KIND_CLS
+// treatment every other event kind uses) so it reads as visually distinct: a
+// worker-level failure, never mistaken for a run's own status.
+function CycleFailedPill() {
+  const s = RUN_STATUS_STYLES.failed;
+  const Icon = s.icon;
+  return (
+    <span
+      className={cn(
+        'inline-flex items-center gap-1 whitespace-nowrap rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5',
+        s.cls,
+      )}
+    >
+      <Icon size={10} />
+      CYCLE FAILED
     </span>
   );
 }
@@ -127,10 +148,18 @@ function eventHref(e: AutoflowEventRow): string | undefined {
   return `/runs/${encodeURIComponent(e.run_id)}${hostSuffix}`;
 }
 
+// A `run_id`-bearing event is a launched run — every other kind (awaiting /
+// failed signals) is a scheduling event with nothing to show in the
+// run-shaped columns (Run / Worker / Status / tokens / Cost): those render
+// empty rather than a wall of "—" placeholders.
+function isRunEvent(e: AutoflowEventRow): boolean {
+  return Boolean(e.run_id);
+}
+
 // ---------------------------------------------------------------------------
 // Runs (launched-run events) columns — mirrors WorkflowRuns' column set
 // (Workflow / Host / Status / token + cost breakdown / Started), plus the
-// autoflow-specific Kind, Issue Ref, and Worker columns.
+// autoflow-specific Event, Issue Ref, and Worker columns.
 // ---------------------------------------------------------------------------
 
 const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
@@ -139,27 +168,40 @@ const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
     header: 'Workflow',
     sortable: true,
     sortValue: (e) => e.workflow ?? KIND_LABEL[e.kind] ?? e.kind.replace(/_/g, ' '),
-    render: (e) => (
-      <span className="text-sm font-medium text-ink truncate">
-        {e.workflow ?? KIND_LABEL[e.kind] ?? e.kind.replace(/_/g, ' ')}
-      </span>
-    ),
+    render: (e) => {
+      const label = e.workflow ?? KIND_LABEL[e.kind] ?? e.kind.replace(/_/g, ' ');
+      const href = eventHref(e);
+      return href ? (
+        <Link to={href} className="text-sm font-medium text-ink truncate hover:underline">
+          {label}
+        </Link>
+      ) : (
+        <span className="text-sm font-medium text-ink truncate">{label}</span>
+      );
+    },
   },
   {
     key: 'run',
     header: 'Run',
-    render: (e) => (
-      <span className="text-note text-ink-mute font-mono">
-        {e.run_id ? shortId(e.run_id) : '—'}
-      </span>
-    ),
+    render: (e) => {
+      if (!e.run_id) return null;
+      const href = eventHref(e);
+      const text = shortId(e.run_id);
+      return href ? (
+        <Link to={href} className="text-note text-ink-mute font-mono hover:underline">
+          {text}
+        </Link>
+      ) : (
+        <span className="text-note text-ink-mute font-mono">{text}</span>
+      );
+    },
   },
   {
     key: 'kind',
-    header: 'Kind',
+    header: 'Event',
     sortable: true,
     sortValue: (e) => e.kind,
-    render: (e) => <KindBadge kind={e.kind} />,
+    render: (e) => (e.kind === 'cycle_failed' ? <CycleFailedPill /> : <KindBadge kind={e.kind} />),
   },
   {
     key: 'issue',
@@ -187,24 +229,28 @@ const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
     header: 'Worker',
     sortable: true,
     sortValue: (e) => e.worker_name ?? null,
-    render: (e) =>
-      e.worker_name ? (
+    render: (e) => {
+      if (!isRunEvent(e)) return null;
+      return e.worker_name ? (
         <span className="text-ink-dim">{e.worker_name}</span>
       ) : (
         <span className="text-ink-mute">—</span>
-      ),
+      );
+    },
   },
   {
     key: 'status',
     header: 'Status',
     sortable: true,
     sortValue: (e) => e.status ?? null,
-    render: (e) =>
-      e.status ? (
+    render: (e) => {
+      if (!isRunEvent(e)) return null;
+      return e.status ? (
         <span className="text-ink-dim">{e.status}</span>
       ) : (
         <span className="text-ink-mute">—</span>
-      ),
+      );
+    },
   },
   {
     key: 'in',
@@ -213,7 +259,10 @@ const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
     width: 'w-20',
     sortable: true,
     sortValue: (e) => e.usage.input_tokens,
-    render: (e) => <span className="text-ink-dim">{formatTokens(e.usage.input_tokens)}</span>,
+    render: (e) =>
+      isRunEvent(e) ? (
+        <span className="text-ink-dim">{formatTokens(e.usage.input_tokens)}</span>
+      ) : null,
   },
   {
     key: 'out',
@@ -222,7 +271,10 @@ const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
     width: 'w-20',
     sortable: true,
     sortValue: (e) => e.usage.output_tokens,
-    render: (e) => <span className="text-ink-dim">{formatTokens(e.usage.output_tokens)}</span>,
+    render: (e) =>
+      isRunEvent(e) ? (
+        <span className="text-ink-dim">{formatTokens(e.usage.output_tokens)}</span>
+      ) : null,
   },
   {
     key: 'cached',
@@ -231,12 +283,14 @@ const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
     width: 'w-20',
     sortable: true,
     sortValue: (e) => e.usage.cached_tokens,
-    render: (e) =>
-      e.usage.cached_tokens ? (
+    render: (e) => {
+      if (!isRunEvent(e)) return null;
+      return e.usage.cached_tokens ? (
         <span className="text-ink-dim">{formatTokens(e.usage.cached_tokens)}</span>
       ) : (
         <span className="text-ink-mute">—</span>
-      ),
+      );
+    },
   },
   {
     key: 'cost',
@@ -245,7 +299,10 @@ const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
     width: 'w-24',
     sortable: true,
     sortValue: (e) => e.usage.cost_usd,
-    render: (e) => <span className="text-ink font-medium">{formatCost(e.usage.cost_usd)}</span>,
+    render: (e) =>
+      isRunEvent(e) ? (
+        <span className="text-ink font-medium">{formatCost(e.usage.cost_usd)}</span>
+      ) : null,
   },
   {
     key: 'started',
@@ -257,6 +314,15 @@ const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
     render: (e) => <span className="text-ink-mute">{relativeTime(e.at)}</span>,
   },
 ];
+
+// Expandable detail for a `cycle_failed` (or any `detail`-bearing) event —
+// mirrors the Claims tab's `last_error` treatment: small mono text in the
+// failed tone, indented in the full-width detail row SortableTable renders
+// below the row. Rows without `detail` render nothing.
+function EventDetail(e: AutoflowEventRow) {
+  if (!e.detail) return null;
+  return <div className="pl-1 text-note font-mono text-err">{e.detail}</div>;
+}
 
 // ---------------------------------------------------------------------------
 // Cycles columns
@@ -686,8 +752,8 @@ export default function AutoflowRuns() {
               columns={EVENT_COLUMNS}
               rows={eventRows}
               rowKey={(e) => e.event_id}
-              rowHref={eventHref}
               initialSort={{ key: 'started', dir: 'desc' }}
+              renderDetail={EventDetail}
             />
             <div ref={eventsSentinelRef} className="py-2 text-center text-note text-ink-mute">
               {eventsLoading ? 'loading more…' : eventsHasMore ? 'scroll for more' : `— end of ${eventRows.length} —`}
