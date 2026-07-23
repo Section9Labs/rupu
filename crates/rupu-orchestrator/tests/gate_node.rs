@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use rupu_agent::runner::MockProvider;
 use rupu_agent::runner::{BypassDecider, ScriptedTurn, DEFAULT_MAX_TOKENS};
 use rupu_agent::AgentRunOpts;
+use rupu_mcp::{McpPermission, ToolDispatcher};
 use rupu_orchestrator::executor::JsonlSink;
 use rupu_orchestrator::runner::{
     run_reject_cleanup, run_workflow, OrchestratorRunOpts, ResumeState, StepFactory,
@@ -21,9 +22,13 @@ use rupu_orchestrator::{
     ApprovalDecision, ApprovalError, RunStatus, RunStore, StepKind, StepResult, Workflow,
 };
 use rupu_providers::types::StopReason;
-use rupu_tools::ToolContext;
+use rupu_scm::{
+    Branch, Comment, CreatePr, Diff, FileContent, Platform, Pr, PrFilter, PrRef, Registry,
+    RepoConnector, RepoRef, ScmError,
+};
+use rupu_tools::{PermissionMode, ToolContext};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// Panics if ever asked to dispatch an agent — a gate node never does.
@@ -179,6 +184,95 @@ impl StepFactory for FailFactory {
             pause: None,
         }
     }
+}
+
+/// Records every `comment_pr` call it receives (as `(PrRef, rendered body)`)
+/// so tests can assert on the exact templated value the dispatcher sent —
+/// everything else is `unimplemented!()`. Mirrors `RecordingConnector` in
+/// `tests/action_step.rs`.
+#[derive(Default)]
+struct RecordingConnector {
+    calls: Mutex<Vec<(PrRef, String)>>,
+    /// When `true`, `comment_pr` returns a `ScmError` instead of recording.
+    fail: bool,
+}
+
+#[async_trait]
+impl RepoConnector for RecordingConnector {
+    fn platform(&self) -> Platform {
+        Platform::Github
+    }
+    async fn list_repos(&self) -> Result<Vec<rupu_scm::Repo>, ScmError> {
+        unimplemented!()
+    }
+    async fn get_repo(&self, _r: &RepoRef) -> Result<rupu_scm::Repo, ScmError> {
+        unimplemented!()
+    }
+    async fn list_branches(&self, _r: &RepoRef) -> Result<Vec<Branch>, ScmError> {
+        unimplemented!()
+    }
+    async fn create_branch(
+        &self,
+        _r: &RepoRef,
+        _name: &str,
+        _from_sha: &str,
+    ) -> Result<Branch, ScmError> {
+        unimplemented!()
+    }
+    async fn read_file(
+        &self,
+        _r: &RepoRef,
+        _path: &str,
+        _ref_: Option<&str>,
+    ) -> Result<FileContent, ScmError> {
+        unimplemented!()
+    }
+    async fn list_prs(&self, _r: &RepoRef, _f: PrFilter) -> Result<Vec<Pr>, ScmError> {
+        unimplemented!()
+    }
+    async fn get_pr(&self, _p: &PrRef) -> Result<Pr, ScmError> {
+        unimplemented!()
+    }
+    async fn diff_pr(&self, _p: &PrRef) -> Result<Diff, ScmError> {
+        unimplemented!()
+    }
+    async fn comment_pr(&self, p: &PrRef, body: &str) -> Result<Comment, ScmError> {
+        if self.fail {
+            return Err(ScmError::BadRequest {
+                message: "boom: connector rejected the notify comment".into(),
+            });
+        }
+        self.calls.lock().unwrap().push((p.clone(), body.to_string()));
+        Ok(Comment {
+            id: "comment_1".into(),
+            author: "rupu-bot".into(),
+            body: body.to_string(),
+            created_at: chrono::Utc::now(),
+        })
+    }
+    async fn create_pr(&self, _r: &RepoRef, _opts: CreatePr) -> Result<Pr, ScmError> {
+        unimplemented!()
+    }
+    async fn clone_to(&self, _r: &RepoRef, _dir: &Path) -> Result<(), ScmError> {
+        unimplemented!()
+    }
+}
+
+/// Builds a `ToolDispatcher` wired to a single `RecordingConnector` on
+/// `Platform::Github`, returning both so tests can assert on recorded calls
+/// after the run. Mirrors `dispatcher_with_connector` in `tests/action_step.rs`.
+fn dispatcher_with_connector(fail: bool) -> (Arc<ToolDispatcher>, Arc<RecordingConnector>) {
+    let connector = Arc::new(RecordingConnector {
+        calls: Mutex::new(Vec::new()),
+        fail,
+    });
+    let mut reg = Registry::empty();
+    reg.insert_repo_connector(Platform::Github, connector.clone());
+    let dispatcher = Arc::new(ToolDispatcher::new(
+        Arc::new(reg),
+        McpPermission::new(PermissionMode::Bypass, vec!["*".into()]),
+    ));
+    (dispatcher, connector)
 }
 
 /// Read every event line out of a (flushed) `events.jsonl` file as raw JSON
@@ -1074,4 +1168,216 @@ async fn timeout_reject_records_via_timeout_not_human() {
 
     let record_final = store.load(&run_id).unwrap();
     assert_eq!(record_final.status, RunStatus::Rejected);
+}
+
+// ---------------------------------------------------------------------------
+// Plan 4, Task 1 — gate `notify:` hooks fire best-effort when a gate parks.
+// ---------------------------------------------------------------------------
+
+const WF_GATE_NOTIFY: &str = r#"
+name: gate-notify
+inputs:
+  env:
+    type: string
+    default: "prod"
+steps:
+  - id: gate
+    approval:
+      prompt: "Approve the deploy?"
+      notify:
+        - action: scm.prs.comment
+          with:
+            platform: github
+            owner: acme
+            repo: widget
+            number: 42
+            body: "gate parking for approval, env={{ inputs.env }}"
+"#;
+
+// Test 9 — notify fires exactly once when the gate actually parks.
+#[tokio::test]
+async fn notify_fires_when_gate_parks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let wf = Workflow::parse(WF_GATE_NOTIFY).unwrap();
+    let (dispatcher, connector) = dispatcher_with_connector(false);
+
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_gate_notify".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_GATE_NOTIFY.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: Some(dispatcher),
+        pause: None,
+    };
+
+    let res = run_workflow(opts).await.expect("a pause is Ok, not Err");
+    let awaiting = res.awaiting.clone().expect("gate must pause the run");
+    assert_eq!(awaiting.step_id, "gate");
+
+    let calls = connector.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "notify must fire exactly once on park");
+    assert_eq!(calls[0].0.number, 42);
+    assert_eq!(calls[0].0.repo.owner, "acme");
+    assert_eq!(calls[0].0.repo.repo, "widget");
+    assert_eq!(
+        calls[0].1, "gate parking for approval, env=prod",
+        "notify body must be rendered (templated), not the raw source"
+    );
+
+    let record = store.load(&res.run_id).unwrap();
+    assert_eq!(
+        record.status,
+        RunStatus::AwaitingApproval,
+        "notify firing must not change the park outcome"
+    );
+}
+
+// Test 10 — notify does NOT fire when the gate auto-approves.
+#[tokio::test]
+async fn notify_does_not_fire_on_auto_approve() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let yaml = r#"
+name: gate-notify-auto
+steps:
+  - id: gate
+    approval:
+      auto_approve: "true"
+      notify:
+        - action: scm.prs.comment
+          with:
+            platform: github
+            owner: acme
+            repo: widget
+            number: 42
+            body: "should never be sent"
+"#;
+    let wf = Workflow::parse(yaml).unwrap();
+    let (dispatcher, connector) = dispatcher_with_connector(false);
+
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_gate_notify_auto".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(yaml.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: Some(dispatcher),
+        pause: None,
+    };
+
+    let res = run_workflow(opts).await.expect("run completes");
+    assert!(res.awaiting.is_none(), "auto-approved gate must not pause");
+
+    let calls = connector.calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        0,
+        "notify must NOT fire when the gate auto-approves; got {calls:?}"
+    );
+
+    let record = store.load(&res.run_id).unwrap();
+    assert_eq!(record.status, RunStatus::Completed);
+}
+
+// Test 11 — a notify failure never blocks the park (best-effort).
+#[tokio::test]
+async fn notify_failure_does_not_block_the_park() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let wf = Workflow::parse(WF_GATE_NOTIFY).unwrap();
+    let (dispatcher, _connector) = dispatcher_with_connector(true);
+
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_gate_notify_fail".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_GATE_NOTIFY.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: Some(dispatcher),
+        pause: None,
+    };
+
+    let res = run_workflow(opts)
+        .await
+        .expect("a failing notify must never turn the park into an Err");
+    let awaiting = res.awaiting.clone().expect("gate must still pause");
+    assert_eq!(awaiting.step_id, "gate");
+
+    let record = store.load(&res.run_id).unwrap();
+    assert_eq!(
+        record.status,
+        RunStatus::AwaitingApproval,
+        "a notify error must not block the park"
+    );
+}
+
+// Test 12 — no action dispatcher wired: notify is skipped (warned), the gate
+// still parks normally rather than erroring.
+#[tokio::test]
+async fn notify_skips_gracefully_with_no_action_dispatcher() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let wf = Workflow::parse(WF_GATE_NOTIFY).unwrap();
+
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_gate_notify_no_dispatcher".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_GATE_NOTIFY.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+    };
+
+    let res = run_workflow(opts)
+        .await
+        .expect("no dispatcher must not error the run; notify is best-effort");
+    let awaiting = res.awaiting.clone().expect("gate must still pause");
+    assert_eq!(awaiting.step_id, "gate");
 }

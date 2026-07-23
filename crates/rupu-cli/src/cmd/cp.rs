@@ -60,6 +60,7 @@ pub async fn handle(action: Action) -> ExitCode {
             // claims/approves/resumes runs the web UI marked for resume.
             let store = Arc::new(RunStore::new(global_dir.join("runs")));
             let worker_id = format!("cp-serve-{}", std::process::id());
+            let gate_sweep_worker_id = format!("{worker_id}-gate-sweep");
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             tracing::info!(
                 worker_id = %worker_id,
@@ -134,6 +135,33 @@ pub async fn handle(action: Action) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+
+            // Gate sweep loop (Plan 4): periodically enforces gate
+            // `on_timeout` routing (approve/reject/fail) for overdue
+            // AwaitingApproval runs, runs the `on_reject` cleanup chain for
+            // web-initiated timeout-rejects, and reaps orphaned local runs
+            // whose runner process died — so a timed-out gate or a dead
+            // runner never wedges Live Events. Gated by
+            // `[cp].gate_sweep_enabled` (default: on); cadence from
+            // `[cp].gate_sweep_interval_secs` (default: 60s).
+            let gate_sweep_store = Arc::clone(&store);
+            let gate_sweep_hosts = rupu_workspace::HostStore { root: global_dir.join("hosts") };
+            let gate_sweep_exe = exe.clone();
+            let gate_sweep_handle = tokio::spawn(run_periodic_tick(
+                "gate-sweep",
+                cp_runtime_cfg.gate_sweep_enabled,
+                Duration::from_secs(cp_runtime_cfg.gate_sweep_interval_secs.max(1)),
+                shutdown_tx.subscribe(),
+                move || {
+                    let store = Arc::clone(&gate_sweep_store);
+                    let hosts = rupu_workspace::HostStore { root: gate_sweep_hosts.root.clone() };
+                    let exe = gate_sweep_exe.clone();
+                    let worker_id = gate_sweep_worker_id.clone();
+                    async move {
+                        run_gate_sweep(store, hosts, exe, worker_id).await;
+                    }
+                },
+            ));
             let launcher: Arc<dyn rupu_cp::launcher::RunLauncher> =
                 Arc::new(crate::cp_launcher::SubprocessLauncher { exe: exe.clone() });
 
@@ -200,6 +228,7 @@ pub async fn handle(action: Action) -> ExitCode {
             let _ = poller_handle.await;
             let _ = autoflow_reconcile_handle.await;
             let _ = cron_tick_handle.await;
+            let _ = gate_sweep_handle.await;
 
             serve_result
         }
@@ -257,6 +286,74 @@ async fn run_periodic_tick<F, Fut>(
             }
         }
         tick().await;
+    }
+}
+
+/// The IO action the gate sweep should take for a single run, decided by
+/// the pure [`sweep_decision`] classifier and mapped to store calls by
+/// [`run_gate_sweep`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepAction {
+    /// Do nothing beyond the mandatory `expire_if_overdue` call the IO
+    /// always makes for an `AwaitingApproval` run (which finalizes a
+    /// `Fail`/default timeout, or no-ops when the run isn't overdue).
+    Skip,
+    /// The gate timed out with `on_timeout: approve`: `expire_if_overdue`
+    /// leaves the record `AwaitingApproval` (untouched) and the IO spawns a
+    /// detached `rupu workflow approve <id>` to auto-approve + resume.
+    ExpireApprove,
+    /// The gate timed out with `on_timeout: reject`: `expire_if_overdue`
+    /// finalizes the run `Rejected` and the IO then runs the gate's
+    /// `on_reject` cleanup chain (`build_reject_cleanup_opts` +
+    /// `run_reject_cleanup`).
+    ExpireThenCleanupReject,
+    /// A `Running`/`Pending` run whose recorded local runner pid is dead:
+    /// the IO calls `reap_if_orphaned` to finalize it `Failed`.
+    Reap,
+}
+
+/// Pure per-run classifier for the cp-serve gate sweep (Plan 4). Split out
+/// from the IO tick body [`run_gate_sweep`] so its truth table is unit
+/// testable without a live store or daemon.
+///
+/// Contract split: for an `AwaitingApproval` run the IO layer ALWAYS calls
+/// `expire_if_overdue` first (safe: it no-ops when the run isn't overdue,
+/// and finalizes the `Fail`/default case on its own). This fn only
+/// classifies the POST-expire action — hence `Fail`/`None`/not-expired all
+/// map to `Skip` (the expire call already did the work). `is_remote` short
+/// circuits to `Skip` for every status: a run owned by a remote host is
+/// driven by that host's transport/sweep, and a dead *local* pid check is
+/// meaningless for it (mirrors the resume worker's `remote_workers` guard).
+fn sweep_decision(
+    status: rupu_orchestrator::RunStatus,
+    on_timeout: Option<rupu_orchestrator::TimeoutAction>,
+    expired: bool,
+    pid_alive: Option<bool>,
+    is_remote: bool,
+) -> SweepAction {
+    use rupu_orchestrator::{RunStatus, TimeoutAction};
+    if is_remote {
+        return SweepAction::Skip;
+    }
+    match status {
+        RunStatus::AwaitingApproval => {
+            if !expired {
+                return SweepAction::Skip;
+            }
+            match on_timeout {
+                Some(TimeoutAction::Reject) => SweepAction::ExpireThenCleanupReject,
+                Some(TimeoutAction::Approve) => SweepAction::ExpireApprove,
+                // Fail is finalized inside the mandatory expire call; None
+                // collapses to the same default. No extra post-action.
+                Some(TimeoutAction::Fail) | None => SweepAction::Skip,
+            }
+        }
+        RunStatus::Running | RunStatus::Pending => match pid_alive {
+            Some(false) => SweepAction::Reap,
+            // Alive, or unknown (no recorded pid): leave it be.
+            _ => SweepAction::Skip,
+        },
+        _ => SweepAction::Skip,
     }
 }
 
@@ -520,12 +617,330 @@ async fn run_resume_worker(
     }
 }
 
+/// One pass of the cp-serve gate sweep (Plan 4). For every run in the
+/// store it classifies the needed action via [`sweep_decision`] and maps it
+/// to store IO:
+///
+/// * `AwaitingApproval` (non-remote): resolve the gate's `on_timeout`, call
+///   `expire_if_overdue` (finalizes the `Fail`/default timeout, or no-ops
+///   when not overdue), then — per the decision — claim the resume lease
+///   and spawn a detached `rupu workflow approve <id>` (`on_timeout:
+///   approve`) or run the `on_reject` cleanup chain (`on_timeout: reject`).
+///   The claim (via [`RunStore::claim_resume`]) guards against the SAME run
+///   also being picked up by the web-approve `run_resume_worker` — both
+///   paths race on the same lease field regardless of which one requested
+///   the resume, so whichever claims first wins and the other backs off.
+/// * `Running`/`Pending` (non-remote) with a dead recorded runner pid:
+///   `reap_if_orphaned` finalizes it `Failed`.
+///
+/// Best-effort/fail-closed: every skip and every per-run error is logged and
+/// swallowed (`continue`) — one poisoned run never aborts the sweep. Runs
+/// owned by a remote host are skipped entirely (mirrors the resume worker's
+/// `remote_workers` guard); their real runner lives on another host.
+async fn run_gate_sweep(
+    store: Arc<RunStore>,
+    hosts: rupu_workspace::HostStore,
+    exe: std::path::PathBuf,
+    worker_id: String,
+) {
+    let now = chrono::Utc::now();
+
+    // Same remote-owner guard the resume worker uses: a run whose worker_id
+    // names a remote host (tunnel node_id / ssh host id / bucket host id) is
+    // driven by that host, not by this local sweep.
+    let remote_workers: HashSet<String> = hosts
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|h| match h.transport {
+            rupu_workspace::HostTransport::Tunnel { node_id } => Some(node_id),
+            rupu_workspace::HostTransport::Ssh { .. } => Some(h.id),
+            rupu_workspace::HostTransport::Bucket { .. } => Some(h.id),
+            _ => None,
+        })
+        .collect();
+
+    let runs = match store.list() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "gate sweep: RunStore::list failed");
+            return;
+        }
+    };
+
+    for mut rec in runs {
+        let run_id = rec.id.clone();
+        let is_remote = rec
+            .worker_id
+            .as_deref()
+            .map(|w| remote_workers.contains(w))
+            .unwrap_or(false);
+
+        match rec.status {
+            rupu_orchestrator::RunStatus::AwaitingApproval => {
+                if is_remote {
+                    tracing::debug!(run_id = %run_id, "gate sweep: skipping remote-host awaiting run");
+                    continue;
+                }
+                let expired = rec.expires_at.is_some_and(|exp| now > exp);
+                // Cheap short-circuit: a gate that isn't overdue yet needs no
+                // snapshot read / expire call (the decision would be `Skip`).
+                if !expired {
+                    continue;
+                }
+                let on_timeout = store.resolve_gate_timeout(&rec);
+                let decision = sweep_decision(rec.status, on_timeout, expired, None, is_remote);
+                // Capture the gate step id BEFORE expire_if_overdue clears it
+                // (the reject branch nulls awaiting_step_id).
+                let gate_step_id = rec.awaiting_step_id.clone();
+                let expire_res = store.expire_if_overdue(&mut rec, now, on_timeout);
+                let outcome = match expire_res {
+                    Ok(o) => o,
+                    Err(e) => {
+                        tracing::warn!(run_id = %run_id, error = %e, "gate sweep: expire_if_overdue failed");
+                        continue;
+                    }
+                };
+                match decision {
+                    SweepAction::Skip => {
+                        // Not overdue, or Fail/default already finalized inside
+                        // the expire call.
+                        if matches!(outcome, Some(rupu_orchestrator::TimeoutAction::Fail)) {
+                            tracing::info!(run_id = %run_id, "gate sweep: gate timed out → run failed");
+                        }
+                    }
+                    SweepAction::ExpireApprove => {
+                        // Claim the resume lease before spawning: the web
+                        // approve path's `run_resume_worker` also spawns
+                        // `workflow approve` for AwaitingApproval runs it
+                        // finds via `list_pending_resume`, and both paths
+                        // race on the SAME `resume_claimed_at` field
+                        // regardless of which one requested the resume — so
+                        // claiming here stops the sweep from re-spawning a
+                        // second approve for a run the resume worker (or a
+                        // prior sweep tick) already handed off.
+                        let claimed = match store.claim_resume(&run_id, &worker_id, now) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::warn!(run_id = %run_id, error = %e, "gate sweep: claim_resume failed");
+                                continue;
+                            }
+                        };
+                        if !claimed {
+                            tracing::info!(run_id = %run_id, "gate-sweep: approve already claimed for run_id, skipping");
+                            continue;
+                        }
+                        // expire left the record AwaitingApproval; hand off to a
+                        // detached `rupu workflow approve <id>`, which re-resolves
+                        // the on_timeout: approve policy and does the approve +
+                        // in-process resume in its own killable process (mirrors
+                        // the resume worker's detached spawn).
+                        let mut argv: Vec<&str> = vec!["workflow", "approve", &run_id];
+                        if let Some(m) = rec.resume_mode.as_deref() {
+                            argv.push("--mode");
+                            argv.push(m);
+                        }
+                        match std::process::Command::new(&exe).args(&argv).spawn() {
+                            Ok(_child) => {
+                                tracing::info!(run_id = %run_id, "gate sweep: on_timeout=approve → spawned detached workflow approve");
+                            }
+                            Err(e) => {
+                                tracing::error!(run_id = %run_id, error = %e, "gate sweep: failed to spawn workflow approve for on_timeout=approve");
+                            }
+                        }
+                        // The spawned child now owns the run (or the spawn
+                        // failed and we don't want to strand the lease
+                        // either way) — clear the marker/claim exactly like
+                        // the resume worker does after its own spawn.
+                        if let Err(ce) = store.clear_resume(&run_id, now) {
+                            tracing::warn!(run_id = %run_id, error = %ce, "gate sweep: clear_resume failed");
+                        }
+                    }
+                    SweepAction::ExpireThenCleanupReject => {
+                        // expire finalized the run Rejected. Run the same
+                        // on_reject cleanup chain the CLI reject path runs.
+                        if !matches!(outcome, Some(rupu_orchestrator::TimeoutAction::Reject)) {
+                            tracing::warn!(run_id = %run_id, "gate sweep: expected reject outcome for on_timeout=reject but got {outcome:?}; skipping cleanup");
+                            continue;
+                        }
+                        let step_id = gate_step_id.unwrap_or_default();
+                        let reason = rec
+                            .error_message
+                            .clone()
+                            .unwrap_or_else(|| "gate timed out (on_timeout: reject)".to_string());
+                        tracing::info!(run_id = %run_id, step_id = %step_id, "gate sweep: on_timeout=reject → run auto-rejected; running on_reject cleanup");
+                        if crate::cmd::workflow::cheap_on_reject_chain_len(&store, &run_id, &step_id)
+                            != Some(0)
+                        {
+                            match crate::resume::build_reject_cleanup_opts(
+                                &store,
+                                &run_id,
+                                &step_id,
+                                &reason,
+                                rec.resume_mode.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok((opts, chain_len)) => {
+                                    match rupu_orchestrator::runner::run_reject_cleanup(
+                                        opts, &step_id, &reason, "timeout",
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            tracing::info!(run_id = %run_id, chain_len, "gate sweep: on_reject cleanup chain executed");
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(run_id = %run_id, error = %e, "gate sweep: on_reject cleanup chain errored (run is already rejected)");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(run_id = %run_id, error = %e, "gate sweep: could not build on_reject cleanup opts (run is already rejected)");
+                                }
+                            }
+                        }
+                    }
+                    SweepAction::Reap => {
+                        tracing::warn!(run_id = %run_id, "gate sweep: unexpected Reap decision for AwaitingApproval run; skipping");
+                    }
+                }
+            }
+            rupu_orchestrator::RunStatus::Running | rupu_orchestrator::RunStatus::Pending => {
+                let pid_alive = rec.runner_pid.map(rupu_orchestrator::runs::pid_is_running);
+                let decision = sweep_decision(rec.status, None, false, pid_alive, is_remote);
+                match decision {
+                    SweepAction::Reap => match store.reap_if_orphaned(&mut rec, now) {
+                        Ok(true) => {
+                            tracing::warn!(run_id = %run_id, "gate sweep: reaped orphaned run (runner pid dead)");
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!(run_id = %run_id, error = %e, "gate sweep: reap_if_orphaned failed");
+                        }
+                    },
+                    _ => {
+                        if is_remote {
+                            tracing::debug!(run_id = %run_id, "gate sweep: skipping remote-host in-flight run");
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::run_periodic_tick;
+    use super::{run_periodic_tick, sweep_decision, SweepAction};
+    use rupu_orchestrator::{RunStatus, TimeoutAction};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// Plan 4 gate sweep: the pure classifier's full truth table. `expired`
+    /// only matters for `AwaitingApproval`; `pid_alive` only for
+    /// `Running`/`Pending`; `is_remote` short-circuits everything to `Skip`.
+    #[test]
+    fn sweep_decision_truth_table() {
+        // AwaitingApproval + expired: routed by on_timeout.
+        assert_eq!(
+            sweep_decision(
+                RunStatus::AwaitingApproval,
+                Some(TimeoutAction::Reject),
+                true,
+                None,
+                false
+            ),
+            SweepAction::ExpireThenCleanupReject
+        );
+        assert_eq!(
+            sweep_decision(
+                RunStatus::AwaitingApproval,
+                Some(TimeoutAction::Approve),
+                true,
+                None,
+                false
+            ),
+            SweepAction::ExpireApprove
+        );
+        assert_eq!(
+            sweep_decision(
+                RunStatus::AwaitingApproval,
+                Some(TimeoutAction::Fail),
+                true,
+                None,
+                false
+            ),
+            SweepAction::Skip
+        );
+        assert_eq!(
+            sweep_decision(RunStatus::AwaitingApproval, None, true, None, false),
+            SweepAction::Skip
+        );
+        // AwaitingApproval but not expired → Skip regardless of policy.
+        assert_eq!(
+            sweep_decision(
+                RunStatus::AwaitingApproval,
+                Some(TimeoutAction::Reject),
+                false,
+                None,
+                false
+            ),
+            SweepAction::Skip
+        );
+        // Remote-owned awaiting run: never touched by the local sweep.
+        assert_eq!(
+            sweep_decision(
+                RunStatus::AwaitingApproval,
+                Some(TimeoutAction::Reject),
+                true,
+                None,
+                true
+            ),
+            SweepAction::Skip
+        );
+
+        // Running/Pending: reap only a dead LOCAL pid.
+        assert_eq!(
+            sweep_decision(RunStatus::Running, None, false, Some(false), false),
+            SweepAction::Reap
+        );
+        assert_eq!(
+            sweep_decision(RunStatus::Pending, None, false, Some(false), false),
+            SweepAction::Reap
+        );
+        // Dead pid but remote-owned → Skip (local pid check is meaningless).
+        assert_eq!(
+            sweep_decision(RunStatus::Running, None, false, Some(false), true),
+            SweepAction::Skip
+        );
+        // Alive pid → Skip.
+        assert_eq!(
+            sweep_decision(RunStatus::Running, None, false, Some(true), false),
+            SweepAction::Skip
+        );
+        // No recorded pid (unknown liveness) → Skip.
+        assert_eq!(
+            sweep_decision(RunStatus::Running, None, false, None, false),
+            SweepAction::Skip
+        );
+
+        // Terminal / paused / other → always Skip.
+        for status in [
+            RunStatus::Completed,
+            RunStatus::Failed,
+            RunStatus::Rejected,
+            RunStatus::Cancelled,
+            RunStatus::Paused,
+        ] {
+            assert_eq!(
+                sweep_decision(status, Some(TimeoutAction::Reject), true, Some(false), false),
+                SweepAction::Skip
+            );
+        }
+    }
 
     /// T6 (dogfood-autoflows): the shared loop body must invoke the
     /// injected tick fn once per interval, N times over N intervals. No

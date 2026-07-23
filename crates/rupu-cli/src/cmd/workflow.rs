@@ -1836,7 +1836,7 @@ fn gate_on_timeout_for(
 /// failed (unreadable/unparseable snapshot, or the step id wasn't found);
 /// callers fall through to the heavy path so its existing warning fires
 /// rather than silently assuming there's no cleanup to do.
-fn cheap_on_reject_chain_len(
+pub(crate) fn cheap_on_reject_chain_len(
     store: &rupu_orchestrator::RunStore,
     run_id: &str,
     step_id: &str,
