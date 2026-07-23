@@ -57,13 +57,13 @@ describe('FileNavigator', () => {
     vi.spyOn(api, 'getProjectTree').mockResolvedValue(ROOT);
     render(<FileNavigator wsId="ws1" findings={FINDINGS} selectedPath={null} onSelect={() => {}} />);
     await waitFor(() => expect(screen.getByText('src')).toBeInTheDocument());
-    expect(screen.getByTestId('nav-mode-all')).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: 'All' })).toHaveAttribute('aria-pressed', 'true');
   });
 
   it('toggling to Findings mode shows only finding-bearing files, flat', async () => {
     vi.spyOn(api, 'getProjectTree').mockResolvedValue(ROOT);
     render(<FileNavigator wsId="ws1" findings={FINDINGS} selectedPath={null} onSelect={() => {}} />);
-    fireEvent.click(screen.getByTestId('nav-mode-findings'));
+    fireEvent.click(screen.getByRole('button', { name: 'Findings' }));
 
     expect(screen.getByTestId('nav-row-src/billing.rs')).toBeInTheDocument();
     expect(screen.getByTestId('nav-row-src/util.rs')).toBeInTheDocument();
@@ -74,14 +74,14 @@ describe('FileNavigator', () => {
   it('shows the empty-findings message when there are no findings', async () => {
     vi.spyOn(api, 'getProjectTree').mockResolvedValue(ROOT);
     render(<FileNavigator wsId="ws1" findings={[]} selectedPath={null} onSelect={() => {}} />);
-    fireEvent.click(screen.getByTestId('nav-mode-findings'));
+    fireEvent.click(screen.getByRole('button', { name: 'Findings' }));
     expect(screen.getByText('No findings in this project.')).toBeInTheDocument();
   });
 
   it('typing in search filters the Findings-mode list', async () => {
     vi.spyOn(api, 'getProjectTree').mockResolvedValue(ROOT);
     render(<FileNavigator wsId="ws1" findings={FINDINGS} selectedPath={null} onSelect={() => {}} />);
-    fireEvent.click(screen.getByTestId('nav-mode-findings'));
+    fireEvent.click(screen.getByRole('button', { name: 'Findings' }));
     fireEvent.change(screen.getByPlaceholderText('Filter files…'), { target: { value: 'billing' } });
 
     expect(screen.getByTestId('nav-row-src/billing.rs')).toBeInTheDocument();
@@ -147,8 +147,8 @@ describe('FileNavigator', () => {
     // Ordinary interaction, not an edge case: flip to Findings mode while
     // the fetch is still in flight, then back to All — search text
     // unchanged throughout.
-    fireEvent.click(screen.getByTestId('nav-mode-findings'));
-    fireEvent.click(screen.getByTestId('nav-mode-all'));
+    fireEvent.click(screen.getByRole('button', { name: 'Findings' }));
+    fireEvent.click(screen.getByRole('button', { name: 'All' }));
 
     // Only now does the original (in-flight) request resolve.
     resolveFiles!(ALL_FILES);
@@ -164,7 +164,7 @@ describe('FileNavigator', () => {
     vi.spyOn(api, 'getProjectTree').mockResolvedValue(ROOT);
     const onSelect = vi.fn();
     render(<FileNavigator wsId="ws1" findings={FINDINGS} selectedPath={null} onSelect={onSelect} />);
-    fireEvent.click(screen.getByTestId('nav-mode-findings'));
+    fireEvent.click(screen.getByRole('button', { name: 'Findings' }));
     fireEvent.click(screen.getByTestId('nav-row-src/billing.rs'));
     expect(onSelect).toHaveBeenCalledWith('src/billing.rs');
   });

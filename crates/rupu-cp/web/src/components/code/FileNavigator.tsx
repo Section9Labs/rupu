@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Loader2, Search } from 'lucide-react';
 import { api, type FindingRecord, type FileListResult } from '../../lib/api';
 import { SEVERITY_STYLE, type Severity } from '../../lib/severity';
+import { Segmented } from '../ui/Segmented';
 import FileTree, { fileFindingSummary } from './FileTree';
 
 export interface FileNavigatorProps {
@@ -21,31 +22,10 @@ function splitPath(path: string): { dir: string; base: string } {
   return i === -1 ? { dir: '', base: path } : { dir: path.slice(0, i), base: path.slice(i + 1) };
 }
 
-function ToggleButton({
-  active,
-  onClick,
-  children,
-  testId,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-  testId: string;
-}) {
-  return (
-    <button
-      type="button"
-      data-testid={testId}
-      aria-pressed={active}
-      onClick={onClick}
-      className={`rounded px-2 py-0.5 text-[11px] font-medium ${
-        active ? 'bg-panel text-ink ring-1 ring-border' : 'text-ink-dim hover:bg-surface-hover'
-      }`}
-    >
-      {children}
-    </button>
-  );
-}
+const MODE_OPTIONS = [
+  { value: 'all', label: 'All' },
+  { value: 'findings', label: 'Findings' },
+];
 
 function FlatFindingBadge({ findings, path }: { findings: FindingRecord[]; path: string }) {
   const r = fileFindingSummary(findings, path);
@@ -189,18 +169,13 @@ export default function FileNavigator({ wsId, findings, selectedPath, onSelect }
             className="w-full rounded border border-border bg-surface py-1 pl-6 pr-2 text-[12px] text-ink placeholder:text-ink-mute focus:outline-none focus:ring-1 focus:ring-border"
           />
         </div>
-        <div className="flex gap-1">
-          <ToggleButton testId="nav-mode-all" active={mode === 'all'} onClick={() => setMode('all')}>
-            All
-          </ToggleButton>
-          <ToggleButton
-            testId="nav-mode-findings"
-            active={mode === 'findings'}
-            onClick={() => setMode('findings')}
-          >
-            Findings
-          </ToggleButton>
-        </div>
+        <Segmented
+          ariaLabel="File view"
+          size="sm"
+          options={MODE_OPTIONS}
+          value={mode}
+          onChange={(v) => setMode(v as Mode)}
+        />
       </div>
 
       <div className="py-1">
