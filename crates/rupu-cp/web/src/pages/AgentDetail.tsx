@@ -13,6 +13,7 @@ import AgentBuilder from '../components/agentBuilder/AgentBuilder';
 import AgentLauncherSheet from '../components/AgentLauncherSheet';
 import AgentUsageTimeline from '../components/agent/AgentUsageTimeline';
 import { Button } from '../components/ui/Button';
+import { Spinner } from '../components/ui/Spinner';
 import { useAgentAuthoringUi } from '../hooks/useAgentAuthoringUi';
 
 export default function AgentDetailPage() {
@@ -110,7 +111,7 @@ export default function AgentDetailPage() {
     return (
       <div className="p-8">
         <BackLink />
-        <div className="mt-4 text-sm text-ink-dim">Loading…</div>
+        <div className="mt-4"><Spinner label="Loading…" /></div>
       </div>
     );
   }

@@ -24,6 +24,7 @@ import {
   type ProjectAssessedPct,
 } from '../lib/api';
 import { TabBar, TabButton } from '../components/TabBar';
+import { Spinner } from '../components/ui/Spinner';
 import ProjectOverviewTab from '../components/project/ProjectOverviewTab';
 import ProjectRunsTab from '../components/project/ProjectRunsTab';
 import ProjectFindingsTab from '../components/project/ProjectFindingsTab';
@@ -163,7 +164,9 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
   if (detail === null) {
     return (
       <div className="p-8">
-        <div className="text-sm text-ink-dim">Loading project…</div>
+        <div className="py-16 flex items-center justify-center">
+          <Spinner label="Loading project…" />
+        </div>
       </div>
     );
   }
@@ -310,8 +313,8 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
       {tab === 'code' && (
         <Suspense
           fallback={
-            <div className="flex h-40 items-center justify-center text-sm text-ink-dim">
-              Loading…
+            <div className="flex h-40 items-center justify-center">
+              <Spinner label="Loading…" />
             </div>
           }
         >

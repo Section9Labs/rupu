@@ -11,6 +11,7 @@ import { api, ApiError, type AgentSummary, type WorkflowDetail } from '../lib/ap
 import { ScopeChip } from '../components/ScopeChip';
 import LauncherSheet from '../components/LauncherSheet';
 import { Button } from '../components/ui/Button';
+import { Spinner } from '../components/ui/Spinner';
 import { useWorkflowEditorUi } from '../hooks/useWorkflowEditorUi';
 
 // Lazy so the @xyflow/react canvas + CodeMirror (and the rest of the visual
@@ -259,7 +260,7 @@ export default function WorkflowDetailPage() {
     return (
       <div className="p-8">
         <BackLink />
-        <div className="mt-4 text-sm text-ink-dim">Loading…</div>
+        <div className="mt-4"><Spinner label="Loading…" /></div>
       </div>
     );
   }
@@ -363,7 +364,11 @@ export default function WorkflowDetailPage() {
       {/* ── Unified editor shell (graph + live YAML + inspector) ──────── */}
       <div className="mt-6">
         <Suspense
-          fallback={<div className="py-12 text-center text-sm text-ink-dim">Loading editor…</div>}
+          fallback={
+            <div className="py-12 flex items-center justify-center">
+              <Spinner label="Loading editor…" />
+            </div>
+          }
         >
           <WorkflowEditor
             draftYaml={draftYaml}

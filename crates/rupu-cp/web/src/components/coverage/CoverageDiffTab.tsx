@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { api, type RunListEntry, type RunDiff } from '../../lib/api';
 import { SectionHeader } from '../lists/SectionHeader';
 import { ListCard } from '../lists/ListCard';
+import { Spinner } from '../ui/Spinner';
 
 export default function CoverageDiffTab({ target, wsId }: { target: string; wsId?: string }) {
   const [runs, setRuns] = useState<RunListEntry[] | null>(null);
@@ -48,7 +49,7 @@ export default function CoverageDiffTab({ target, wsId }: { target: string; wsId
   }, [target, wsId, base, compare, runs]);
 
   if (error) return <p className="mt-4 text-sm text-err">{error}</p>;
-  if (!runs) return <p className="mt-4 text-sm text-ink-dim">Loading…</p>;
+  if (!runs) return <div className="mt-4"><Spinner label="Loading…" /></div>;
   if (runs.length < 2)
     return (
       <p className="mt-4 text-sm text-ink-dim">

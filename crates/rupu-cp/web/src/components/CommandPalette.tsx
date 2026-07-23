@@ -20,7 +20,6 @@ import {
   FileText,
   FolderGit2,
   LayoutDashboard,
-  Loader2,
   MessageSquare,
   Radio,
   Repeat,
@@ -34,6 +33,7 @@ import {
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { cn } from '../lib/cn';
+import { Spinner } from './ui/Spinner';
 import { useHotkey } from '../lib/useHotkey';
 import { api } from '../lib/api';
 import { fuzzyScore } from '../lib/fuzzy';
@@ -311,7 +311,7 @@ export default function CommandPalette() {
             aria-expanded
             aria-autocomplete="list"
           />
-          {loading && <Loader2 size={14} className="animate-spin text-ink-mute" />}
+          {loading && <Spinner size="sm" />}
           <button
             onClick={() => setOpen(false)}
             className="p-1 text-ink-dim hover:text-ink rounded-md"
@@ -324,11 +324,7 @@ export default function CommandPalette() {
         <div className="max-h-[60vh] overflow-auto" role="listbox">
           {flat.length === 0 && (
             <div className="px-4 py-6 text-xs text-ink-mute flex items-center gap-2">
-              {loading ? (
-                <><Loader2 size={12} className="animate-spin" /> Searching…</>
-              ) : (
-                'No matches.'
-              )}
+              {loading ? <Spinner size="sm" label="Searching…" /> : 'No matches.'}
             </div>
           )}
 
