@@ -29,6 +29,7 @@ futures-util.workspace = true
 rupu-coverage = { path = "../rupu-coverage" }
 rupu-agent = { path = "../rupu-agent" }
 rupu-auth = { path = "../rupu-auth" }
+rupu-mcp = { path = "../rupu-mcp" }
 rupu-providers = { path = "../rupu-providers" }
 rupu-runtime = { path = "../rupu-runtime" }
 rupu-scm = { path = "../rupu-scm" }

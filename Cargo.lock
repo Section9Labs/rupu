@@ -6633,6 +6633,7 @@ dependencies = [
  "rupu-agent",
  "rupu-auth",
  "rupu-coverage",
+ "rupu-mcp",
  "rupu-providers",
  "rupu-runtime",
  "rupu-scm",
