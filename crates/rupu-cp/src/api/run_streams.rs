@@ -198,6 +198,16 @@ fn stringify_status(v: &serde_json::Value) -> Option<String> {
 /// Tolerant by design: a missing file, an IO error, an empty file, a corrupt
 /// first line, or a first line that isn't `run_start` all fall through to
 /// `(None, None)` rather than erroring the row.
+///
+/// `started_at` MUST be formatted with a `Z` suffix, NOT `.to_rfc3339()`'s
+/// `+00:00` — see `83c3494c` ("serialize run list timestamps with serde, not
+/// to_rfc3339()"). `AgentRunRow.started_at` mixes this transcript-derived
+/// value with session-branch rows whose `started_at` was serde-serialized
+/// from a `chrono::DateTime<Utc>` (which emits `Z`), and both
+/// `list_agent_runs`'s local sort and `host_fanout::sort_values_newest_first`
+/// merge them with a plain LEXICOGRAPHIC string compare. `'+'` (0x2B) sorts
+/// before `'Z'` (0x5A), so a `+00:00`-suffixed row silently sorts as older
+/// than it is. Do not "tidy" this back into `.to_rfc3339()`.
 fn read_transcript_run_start(path: &std::path::Path) -> (Option<String>, Option<String>) {
     let mut iter = match rupu_transcript::JsonlReader::iter(path) {
         Ok(it) => it,
@@ -206,7 +216,10 @@ fn read_transcript_run_start(path: &std::path::Path) -> (Option<String>, Option<
     match iter.next() {
         Some(Ok(rupu_transcript::Event::RunStart {
             agent, started_at, ..
-        })) => (Some(agent), Some(started_at.to_rfc3339())),
+        })) => (
+            Some(agent),
+            Some(started_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
+        ),
         _ => (None, None),
     }
 }
@@ -390,6 +403,33 @@ fn collect_session_runs_from_dir(root: &std::path::Path, out: &mut Vec<AgentRunR
     }
 }
 
+/// Collect every local agent-run row (standalone transcripts + active and
+/// archived session runs) and sort newest-first by `started_at`.
+///
+/// Extracted out of `list_agent_runs` so it's directly unit-testable: the
+/// standalone and session branches populate `started_at` from two different
+/// sources (a transcript's `run_start` line vs. a session.json field
+/// deserialized as a plain `String`), and both this sort AND
+/// `host_fanout::sort_values_newest_first`'s fan-out merge compare those
+/// strings LEXICOGRAPHICALLY. If the two sources ever disagree on timestamp
+/// format (e.g. one emits `+00:00`, the other `Z`), rows silently mis-order —
+/// see `read_transcript_run_start`'s doc comment and `83c3494c`.
+fn collect_and_sort_local_agent_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
+    let mut local_rows = collect_standalone_runs(global_dir);
+    collect_session_runs_from_dir(&global_dir.join("sessions"), &mut local_rows);
+    collect_session_runs_from_dir(&global_dir.join("sessions-archive"), &mut local_rows);
+
+    // Sort newest-first: rows with a timestamp sort before those without;
+    // ISO-8601 strings sort lexicographically.
+    local_rows.sort_by(|a, b| match (&b.started_at, &a.started_at) {
+        (Some(bt), Some(at)) => bt.cmp(at),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    local_rows
+}
+
 #[derive(Deserialize)]
 struct AgentRunsQuery {
     // Flat fields, NOT `#[serde(flatten)] PageQuery` — serde_urlencoded (axum
@@ -491,18 +531,7 @@ async fn list_agent_runs(
     }
 
     // ── Collect local runs ────────────────────────────────────────────────────
-    let mut local_rows = collect_standalone_runs(&s.global_dir);
-    collect_session_runs_from_dir(&s.global_dir.join("sessions"), &mut local_rows);
-    collect_session_runs_from_dir(&s.global_dir.join("sessions-archive"), &mut local_rows);
-
-    // Sort newest-first: rows with a timestamp sort before those without;
-    // ISO-8601 strings sort lexicographically.
-    local_rows.sort_by(|a, b| match (&b.started_at, &a.started_at) {
-        (Some(bt), Some(at)) => bt.cmp(at),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
-    });
+    let mut local_rows = collect_and_sort_local_agent_runs(&s.global_dir);
 
     // ── Local-only path ───────────────────────────────────────────────────────
     if host == "local" {
@@ -956,6 +985,36 @@ mod tests {
         .unwrap();
     }
 
+    /// Like `write_session_json`, but embeds one run entry — the shape
+    /// `collect_session_runs_from_dir` actually reads `started_at` from
+    /// (`SessionRunRecordDto`), for sort-order regression tests.
+    fn write_session_json_with_run(
+        global: &std::path::Path,
+        dirname: &str,
+        session_id: &str,
+        run_id: &str,
+        started_at: &str,
+    ) {
+        let dir = global.join(dirname).join(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        let session = serde_json::json!({
+            "agent_name": "session-agent",
+            "session_id": session_id,
+            "runs": [
+                {
+                    "run_id": run_id,
+                    "started_at": started_at,
+                    "status": "ok",
+                }
+            ],
+        });
+        fs::write(
+            dir.join("session.json"),
+            serde_json::to_string(&session).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn standalone_run_fills_agent_and_started_at_from_transcript_run_start() {
         let tmp = tempfile::tempdir().unwrap();
@@ -965,10 +1024,7 @@ mod tests {
         let rows = collect_standalone_runs(tmp.path());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].agent.as_deref(), Some("reviewer"));
-        assert_eq!(
-            rows[0].started_at.as_deref(),
-            Some("2026-01-01T00:00:00+00:00")
-        );
+        assert_eq!(rows[0].started_at.as_deref(), Some("2026-01-01T00:00:00Z"));
     }
 
     #[test]
@@ -1050,6 +1106,65 @@ mod tests {
         let rows = collect_standalone_runs(tmp.path());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].agent.as_deref(), Some("from-transcript"));
+    }
+
+    /// Regression for the timestamp-format sort bug fixed in `83c3494c`
+    /// ("serialize run list timestamps with serde, not to_rfc3339()") and
+    /// reintroduced here: `read_transcript_run_start` must emit a `Z` suffix,
+    /// matching the `Z` that session-branch rows already carry (their
+    /// `started_at` is whatever was serde-serialized to `session.json` on
+    /// disk), because both `list_agent_runs`'s local sort and
+    /// `host_fanout::sort_values_newest_first`'s fan-out merge order rows
+    /// with a plain LEXICOGRAPHIC string compare.
+    ///
+    /// A standalone (transcript-derived) row and a session row at the exact
+    /// SAME instant are the deterministic way to pin this: digit differences
+    /// anywhere in the date/time (even a single second) always decide a
+    /// lexicographic comparison before either string's offset suffix is
+    /// reached, so only an exact tie ever reaches the suffix — where `'+'`
+    /// (0x2B) sorting before `'Z'` (0x5A) used to make a `+00:00`-suffixed
+    /// row compare as strictly GREATER than (not equal to) an otherwise
+    /// identical `Z`-suffixed row. Under the old `.to_rfc3339()` output that
+    /// broke the stable sort's tie: the standalone row (inserted first, by
+    /// `collect_standalone_runs`) got pushed behind the session row despite
+    /// sharing its timestamp. With the `Z` fix the two compare as truly
+    /// equal, and the stable sort keeps the standalone row first (its
+    /// original position).
+    #[test]
+    fn standalone_and_session_rows_at_the_same_instant_are_not_misordered_by_timestamp_notation() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Standalone row: agent/started_at recovered from the transcript's
+        // run_start line via `read_transcript_run_start` (the code path this
+        // regression protects).
+        write_standalone_meta(tmp.path(), "run_tie_standalone", None, None);
+        write_transcript_run_start(
+            tmp.path(),
+            "run_tie_standalone",
+            "tie-agent",
+            "2026-03-01T10:05:00Z",
+        );
+        // Session row: started_at is whatever's on disk verbatim — the
+        // realistic shape is a serde-serialized `Z` string, at the SAME
+        // instant as the standalone row above.
+        write_session_json_with_run(
+            tmp.path(),
+            "sessions",
+            "sess_tie",
+            "run_tie_session",
+            "2026-03-01T10:05:00Z",
+        );
+
+        let rows = collect_and_sort_local_agent_runs(tmp.path());
+        assert_eq!(rows.len(), 2);
+        // Sanity: both rows genuinely share the same started_at string —
+        // this is a tie, not a "which is chronologically later" case.
+        assert_eq!(rows[0].started_at, rows[1].started_at);
+        // The stable sort must not reorder a tie: the standalone row,
+        // collected first, stays first. Under the old `.to_rfc3339()`
+        // (`+00:00`) output this assertion fails — the session row's `Z`
+        // suffix compares as greater, pushing the standalone row second.
+        assert_eq!(rows[0].run_id, "run_tie_standalone");
+        assert_eq!(rows[1].run_id, "run_tie_session");
     }
 
     // ── A2: autoflow event DTO forwards detail + issue_ref fallback ────────────
