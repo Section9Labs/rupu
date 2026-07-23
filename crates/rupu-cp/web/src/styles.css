@@ -496,6 +496,16 @@
   border-radius: 6px; padding: 2px 6px;
 }
 
+/* ── legacy inline-approval badge (Task 6): dashed ring, marks a `step` node
+   carrying `approval.required` inline rather than as a standalone gate node. */
+.wfx-approval-badge {
+  align-self: flex-start;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px; color: rgb(var(--c-status-paused));
+  background: rgb(var(--c-status-paused) / .1); border: 1px dashed rgb(var(--c-status-paused) / .5);
+  border-radius: 999px; padding: 1px 6px;
+}
+
 /* ── parallel sub-step rows ── */
 .wfx-sublist { display: flex; flex-direction: column; gap: 3px; }
 .wfx-subrow {

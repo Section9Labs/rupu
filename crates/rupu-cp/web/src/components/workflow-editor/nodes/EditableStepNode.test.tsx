@@ -90,6 +90,34 @@ describe('EditableStepNode', () => {
     expect(screen.getByText(/for_each: inputs.files/)).toBeInTheDocument();
   });
 
+  describe('legacy inline-approval badge (Task 6)', () => {
+    it('a step with approval.required shows the dashed gate badge', () => {
+      renderNode({ id: 'ship', kind: 'step', agent: 'x', approvalRequired: true });
+      expect(screen.getByLabelText('has an approval gate')).toBeInTheDocument();
+    });
+
+    it('a plain step (no inline approval) shows no badge', () => {
+      renderNode({ id: 'build', kind: 'step', agent: 'coder' });
+      expect(screen.queryByLabelText('has an approval gate')).not.toBeInTheDocument();
+    });
+
+    it('a standalone approval_gate node shows no badge (it IS the gate, not a legacy marker)', () => {
+      renderNode({ id: 'gate', kind: 'approval_gate', approvalRequired: true });
+      expect(screen.queryByLabelText('has an approval gate')).not.toBeInTheDocument();
+    });
+
+    it('next look: the badge renders as .wfx-approval-badge', () => {
+      const { container } = renderNode(
+        { id: 'ship', kind: 'step', agent: 'x', approvalRequired: true },
+        [],
+        false,
+        'next',
+      );
+      expect(container.querySelector('.wfx-approval-badge')).toBeInTheDocument();
+      expect(screen.getByLabelText('has an approval gate')).toBeInTheDocument();
+    });
+  });
+
   it('carries data-ui="next" on the outer node when workflowEditorUi is "next"', () => {
     const { container } = renderNode({ id: 'x', kind: 'step' }, [], false, 'next');
     expect(container.querySelector('[data-ui="next"]')).toBeInTheDocument();

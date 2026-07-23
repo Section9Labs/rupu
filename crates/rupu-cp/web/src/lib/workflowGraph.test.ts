@@ -6,6 +6,8 @@ import {
   topoSort,
   canConnect,
   validateGraph,
+  hasInlineApproval,
+  convertInlineApprovalToGate,
   type GraphNode,
   type GraphEdge,
   type StepNodeData,
@@ -740,5 +742,138 @@ describe('validateGraph', () => {
     };
     const v = validateGraph(g);
     expect(v.a.some((m) => m.includes('unknown step ghost'))).toBe(true);
+  });
+});
+
+// ── fold-in (review Minor): `with:` on a non-action step/for_each node ──────
+
+describe('nodeToStepObject — with: on a non-action node (fold-in)', () => {
+  it('round-trips a stray `with:` on a plain step instead of silently dropping it', () => {
+    // Schema-invalid on save (workflow.rs rejects `with:` without `action:`),
+    // but round-trip fidelity through the editor is the contract this module
+    // holds everywhere else (raw_passthrough) — a silent drop would be worse.
+    const input = {
+      name: 'wf',
+      steps: [{ id: 'a', agent: 'x', prompt: 'p', with: { stray: 'value' } }],
+    };
+    expectRoundTrip(input);
+  });
+});
+
+// ── hasInlineApproval / convertInlineApprovalToGate ─────────────────────────
+
+describe('hasInlineApproval', () => {
+  it('is true for a step with approval.required', () => {
+    expect(hasInlineApproval({ id: 'a', kind: 'step', agent: 'x', prompt: 'p', approvalRequired: true })).toBe(
+      true,
+    );
+  });
+
+  it('is true for a for_each with approval.required', () => {
+    expect(
+      hasInlineApproval({ id: 'a', kind: 'for_each', agent: 'x', prompt: 'p', approvalRequired: true }),
+    ).toBe(true);
+  });
+
+  it('is false without approval.required', () => {
+    expect(hasInlineApproval({ id: 'a', kind: 'step', agent: 'x', prompt: 'p' })).toBe(false);
+  });
+
+  it('is false for a standalone approval_gate node (not a legacy inline approval)', () => {
+    expect(hasInlineApproval({ id: 'a', kind: 'approval_gate', approvalRequired: true })).toBe(false);
+  });
+});
+
+describe('convertInlineApprovalToGate', () => {
+  it('inserts a new gate step before the agent step and strips the inline approval', () => {
+    const input = {
+      name: 'wf',
+      steps: [
+        {
+          id: 'ship',
+          agent: 'deployer',
+          prompt: 'deploy it',
+          approval: { required: true, prompt: 'ok to ship?', timeout_seconds: 300 },
+        },
+      ],
+    };
+    const g = yamlToGraph(input);
+    const next = convertInlineApprovalToGate(g, 'ship');
+
+    // the agent step no longer carries approval.
+    const agent = next.nodes.find((n) => n.id === 'ship');
+    expect(agent?.data.approvalRequired).toBeUndefined();
+    expect(agent?.data.approvalPrompt).toBeUndefined();
+    expect(agent?.data.approvalTimeoutSeconds).toBeUndefined();
+    expect(agent?.data.agent).toBe('deployer'); // untouched
+    expect(agent?.data.prompt).toBe('deploy it');
+
+    // a new gate step exists, carrying the prompt/timeout, and runs BEFORE the
+    // agent step in topo order.
+    const sorted = topoSort(next.nodes, next.edges);
+    expect('order' in sorted).toBe(true);
+    if (!('order' in sorted)) return;
+    const order = sorted.order.map((n) => n.id);
+    const gateId = order.find((id) => id !== 'ship');
+    expect(gateId).toBeDefined();
+    const gate = next.nodes.find((n) => n.id === gateId);
+    expect(gate?.data.kind).toBe('approval_gate');
+    expect(gate?.data.approvalRequired).toBe(true);
+    expect(gate?.data.approvalPrompt).toBe('ok to ship?');
+    expect(gate?.data.approvalTimeoutSeconds).toBe(300);
+    expect(order.indexOf(gateId!)).toBeLessThan(order.indexOf('ship'));
+
+    // round-trips to YAML: a standalone gate step then the (approval-free)
+    // agent step.
+    const res = graphToWorkflowObject(next);
+    expect('obj' in res).toBe(true);
+    if (!('obj' in res)) return;
+    const steps = (res.obj as { steps: Record<string, unknown>[] }).steps;
+    expect(steps).toHaveLength(2);
+    expect(steps[0]).toMatchObject({ id: gateId, approval: { required: true, prompt: 'ok to ship?' } });
+    expect(steps[0].agent).toBeUndefined();
+    expect(steps[1]).toMatchObject({ id: 'ship', agent: 'deployer', prompt: 'deploy it' });
+    expect(steps[1].approval).toBeUndefined();
+  });
+
+  it('rewires a predecessor edge onto the new gate instead of the agent step', () => {
+    const input = {
+      name: 'wf',
+      steps: [
+        { id: 'build', agent: 'x', prompt: 'build' },
+        { id: 'ship', agent: 'deployer', prompt: 'deploy {{ steps.build.output }}', approval: { required: true } },
+      ],
+    };
+    const g = yamlToGraph(input);
+    const next = convertInlineApprovalToGate(g, 'ship');
+    const gateId = next.nodes.find((n) => n.data.kind === 'approval_gate')!.id;
+
+    // build -> gate -> ship (build no longer points straight at ship).
+    expect(next.edges.some((e) => e.source === 'build' && e.target === gateId)).toBe(true);
+    expect(next.edges.some((e) => e.source === 'build' && e.target === 'ship')).toBe(false);
+    expect(next.edges.some((e) => e.source === gateId && e.target === 'ship')).toBe(true);
+  });
+
+  it('is a no-op for an unknown step id', () => {
+    const g = yamlToGraph({ name: 'wf', steps: [{ id: 'a', agent: 'x', prompt: 'p' }] });
+    expect(convertInlineApprovalToGate(g, 'ghost')).toBe(g);
+  });
+
+  it('is a no-op for a step without an inline approval', () => {
+    const g = yamlToGraph({ name: 'wf', steps: [{ id: 'a', agent: 'x', prompt: 'p' }] });
+    expect(convertInlineApprovalToGate(g, 'a')).toBe(g);
+  });
+
+  it('picks a non-colliding gate id if `<id>-gate` is already taken', () => {
+    const g = yamlToGraph({
+      name: 'wf',
+      steps: [
+        { id: 'ship-gate', agent: 'x', prompt: 'unrelated' },
+        { id: 'ship', agent: 'deployer', prompt: 'deploy', approval: { required: true } },
+      ],
+    });
+    const next = convertInlineApprovalToGate(g, 'ship');
+    const gate = next.nodes.find((n) => n.data.kind === 'approval_gate');
+    expect(gate?.id).toBe('ship-gate-1');
   });
 });

@@ -13,7 +13,7 @@
 
 import { memo } from 'react';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
-import type { GraphNode, StepKind, StepNodeData } from '../../../lib/workflowGraph';
+import { hasInlineApproval, type GraphNode, type StepKind, type StepNodeData } from '../../../lib/workflowGraph';
 import { editorNodeSize } from '../../../lib/workflowLayout';
 import { useThemeColors, type ThemeColors } from '../../../lib/useThemeColors';
 import type { WorkflowEditorUi } from '../../../hooks/useWorkflowEditorUi';
@@ -40,6 +40,26 @@ function kindChipStyle(colors: ThemeColors, kind: StepKind): React.CSSProperties
   return { background: colors.alpha(KIND_ACCENT[kind], 0.14), color: colors.get(KIND_ACCENT[kind]) };
 }
 
+/** dashed ring badge marking a legacy inline approval (agent step carrying
+ *  `approval.required` directly, rather than a standalone gate node) — a
+ *  render-only marker, no serialize-side effect (see `hasInlineApproval`). */
+function LegacyApprovalBadge({ colors }: { colors: ThemeColors }) {
+  return (
+    <span
+      className="ml-auto shrink-0 rounded-full border border-dashed px-1.5 py-px text-meta font-medium"
+      style={{
+        borderColor: colors.alpha('status.paused', 0.6),
+        color: colors.get('status.paused'),
+        background: colors.alpha('status.paused', 0.08),
+      }}
+      title="Inline approval gate — this step waits for human approval before it runs"
+      aria-label="has an approval gate"
+    >
+      gate
+    </span>
+  );
+}
+
 /** kind chip + agent chip — shared by step / for_each. */
 function StepBody({ d, colors }: { d: StepNodeData; colors: ThemeColors }) {
   return (
@@ -51,6 +71,7 @@ function StepBody({ d, colors }: { d: StepNodeData; colors: ThemeColors }) {
         <span className="truncate rounded bg-surface px-1.5 py-px text-meta text-ink-dim">
           {d.agent ?? '(no agent)'}
         </span>
+        {hasInlineApproval(d) && <LegacyApprovalBadge colors={colors} />}
       </div>
       {d.kind === 'for_each' && (
         <div className="mt-1 truncate text-meta text-ink-mute">for_each: {d.for_each ?? ''}</div>
@@ -196,6 +217,15 @@ function StepBodyNext({ d }: { d: StepNodeData }) {
     <>
       <div className="wfx-agent">▸ {d.agent ?? '(no agent)'}</div>
       {d.kind === 'for_each' && <div className="wfx-expr">for_each: {d.for_each ?? ''}</div>}
+      {hasInlineApproval(d) && (
+        <div
+          className="wfx-approval-badge"
+          title="Inline approval gate — this step waits for human approval before it runs"
+          aria-label="has an approval gate"
+        >
+          gate
+        </div>
+      )}
     </>
   );
 }

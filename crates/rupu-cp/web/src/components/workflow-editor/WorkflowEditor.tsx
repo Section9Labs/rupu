@@ -20,6 +20,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import yaml from 'js-yaml';
 import { api, type AgentSummary, type ToolSpec } from '../../lib/api';
 import {
+  convertInlineApprovalToGate,
   graphToWorkflowObject,
   topoSort,
   validateGraph,
@@ -364,6 +365,16 @@ export default function WorkflowEditor({
     [commit, graph],
   );
 
+  // "Convert to gate node" (StepForm) — a whole-graph transform (inserts a new
+  // node), so it can't go through onStepChange's single-node patch. Keeps the
+  // selected id pointed at the (now approval-free) agent step; the new gate
+  // just isn't selected.
+  const onConvertToGate = useCallback((): void => {
+    if (selectedId === null) return;
+    const next = convertInlineApprovalToGate(graph, selectedId);
+    if (next !== graph) commit(next);
+  }, [commit, graph, selectedId]);
+
   const selectedNode = selectedId ? graph.nodes.find((n) => n.id === selectedId) ?? null : null;
 
   // Expression-editor vocabulary for the selected node: declared input names +
@@ -600,6 +611,7 @@ export default function WorkflowEditor({
                   allNodeIds={graph.nodes.map((n) => n.id)}
                   workflowEditorUi={workflowEditorUi}
                   tools={tools}
+                  onConvertToGate={onConvertToGate}
                 />
               ) : (
                 <p className="text-lead text-ink-dim">Select a node to edit its step.</p>

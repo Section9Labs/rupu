@@ -403,6 +403,79 @@ describe('StepForm — approval gate body (Task 5)', () => {
   });
 });
 
+describe('StepForm — Convert to gate node button (Task 6)', () => {
+  it('renders when the step has an inline approval AND onConvertToGate is provided', () => {
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'step', agent: 'planner', approvalRequired: true })}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+        onConvertToGate={() => {}}
+      />,
+    );
+    expect(screen.getByRole('button', { name: 'Convert to gate node' })).toBeInTheDocument();
+  });
+
+  it('does not render without onConvertToGate (caller opted out)', () => {
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'step', agent: 'planner', approvalRequired: true })}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.queryByRole('button', { name: 'Convert to gate node' })).not.toBeInTheDocument();
+  });
+
+  it('does not render when the step has no inline approval, even with onConvertToGate provided', () => {
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'step', agent: 'planner' })}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+        onConvertToGate={() => {}}
+      />,
+    );
+    expect(screen.queryByRole('button', { name: 'Convert to gate node' })).not.toBeInTheDocument();
+  });
+
+  it('does not render on a standalone approval_gate node (it IS the gate already)', () => {
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'approval_gate', approvalRequired: true })}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+        onConvertToGate={() => {}}
+      />,
+    );
+    expect(screen.queryByRole('button', { name: 'Convert to gate node' })).not.toBeInTheDocument();
+  });
+
+  it('clicking it invokes onConvertToGate', () => {
+    const onConvertToGate = vi.fn();
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'step', agent: 'planner', approvalRequired: true })}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+        onConvertToGate={onConvertToGate}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Convert to gate node' }));
+    expect(onConvertToGate).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('StepForm — action body (Task 5)', () => {
   const TOOLS = [
     {

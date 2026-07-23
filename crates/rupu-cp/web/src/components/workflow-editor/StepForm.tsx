@@ -6,7 +6,15 @@
 // in an inline alert block at the top.
 
 import type { AgentSummary, ToolSpec } from '../../lib/api';
-import type { GraphNode, PanelCfg, PanelGate, StepKind, StepNodeData, SubStep } from '../../lib/workflowGraph';
+import {
+  hasInlineApproval,
+  type GraphNode,
+  type PanelCfg,
+  type PanelGate,
+  type StepKind,
+  type StepNodeData,
+  type SubStep,
+} from '../../lib/workflowGraph';
 import type { ExprContext } from '../../lib/workflowExpressions';
 import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 import ExpressionField from './ExpressionField';
@@ -35,6 +43,13 @@ interface StepFormProps {
    *  `with:` key/value editor (the selected tool's `input_schema.properties`).
    *  Defaults to empty for callers that don't thread it. */
   tools?: ToolSpec[];
+  /** Rewrite the SELECTED node's legacy inline approval (`hasInlineApproval`)
+   *  into a new standalone gate step inserted before it — the editor's wiring
+   *  of `convertInlineApprovalToGate` (a whole-graph transform, so StepForm
+   *  can't do it via the per-node `onChange` alone). Only invoked from the
+   *  "Convert to gate node" button, which itself only renders when
+   *  `hasInlineApproval(d)`. Omitted (or absent) → the button doesn't render. */
+  onConvertToGate?: () => void;
 }
 
 /** Build a full ExprContext for a single field from the shared step context. */
@@ -92,6 +107,7 @@ export default function StepForm({
   allNodeIds = [],
   workflowEditorUi = 'classic',
   tools = [],
+  onConvertToGate,
 }: StepFormProps) {
   const d = node.data;
 
@@ -225,7 +241,13 @@ export default function StepForm({
             Continue on error
           </label>
 
-          <ApprovalFields d={d} patch={patch} exprContext={exprContext} workflowEditorUi={workflowEditorUi} />
+          <ApprovalFields
+            d={d}
+            patch={patch}
+            exprContext={exprContext}
+            workflowEditorUi={workflowEditorUi}
+            onConvertToGate={onConvertToGate}
+          />
         </>
       )}
     </div>
@@ -899,6 +921,7 @@ function ApprovalFields({
   patch,
   exprContext,
   workflowEditorUi,
+  onConvertToGate,
 }: {
   d: StepNodeData;
   patch: (p: Partial<StepNodeData>) => void;
@@ -909,6 +932,11 @@ function ApprovalFields({
    *  orchestrator's `Approval.prompt` doc comment), so it's genuinely
    *  expression-capable; classic keeps today's plain input byte-identical. */
   workflowEditorUi: WorkflowEditorUi;
+  /** Threaded from StepForm — rewrites this legacy inline approval into a
+   *  standalone gate step. Renders the "Convert to gate node" button only when
+   *  provided AND `hasInlineApproval(d)` (i.e. `d.approvalRequired` is set —
+   *  this component only mounts for step/for_each, so that's the only gate). */
+  onConvertToGate?: () => void;
 }) {
   return (
     <div className="space-y-3">
@@ -959,6 +987,16 @@ function ApprovalFields({
               className={fieldCls}
             />
           </label>
+          {onConvertToGate && hasInlineApproval(d) && (
+            <div className="border-t border-border pt-3">
+              <Button variant="secondary" onClick={onConvertToGate} className="w-full">
+                Convert to gate node
+              </Button>
+              <p className="mt-1.5 text-note text-ink-mute">
+                Moves this approval onto a new standalone gate step inserted just before this one.
+              </p>
+            </div>
+          )}
         </div>
       )}
     </div>

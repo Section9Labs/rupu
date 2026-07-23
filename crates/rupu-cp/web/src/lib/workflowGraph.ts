@@ -464,6 +464,14 @@ function nodeToStepObject(d: StepNodeData): Record<string, unknown> {
     if (d.actions && d.actions.length > 0) o.actions = d.actions;
     if (d.for_each) o.for_each = d.for_each;
     if (d.max_parallel !== undefined) o.max_parallel = d.max_parallel;
+    // `with` is normally only meaningful alongside `action:` (see the action
+    // arm above), but it's in MODELLED_STEP_KEYS (so never falls into
+    // raw_passthrough either) — emit it here too so a step/for_each node that
+    // somehow carries one (e.g. hand-authored YAML with a stray `with:`)
+    // still round-trips instead of silently vanishing. Schema-invalid on save
+    // either way (workflow.rs rejects `with:` without `action:`), but dropping
+    // data silently is worse than a validation error the user can act on.
+    if (d.with !== undefined) o.with = d.with;
   }
 
   // Approval applies to any step kind. A gate NODE ALWAYS emits an `approval:`
@@ -629,4 +637,86 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
   }
 
   return out;
+}
+
+// ── convertInlineApprovalToGate ──────────────────────────────────────────────
+
+/** True for a "legacy inline approval": an agent-bearing step/for_each node
+ *  whose `approval.required` is set directly on it (workflow.rs `Approval` on
+ *  `Step`), rather than expressed as a standalone `approval_gate` node. This is
+ *  the shape the dashed-gate badge and the "Convert to gate node" affordance
+ *  both target. */
+export function hasInlineApproval(d: StepNodeData): boolean {
+  return (d.kind === 'step' || d.kind === 'for_each') && d.approvalRequired === true;
+}
+
+/** Node-box width + gap used to offset the new gate node so it doesn't render
+ *  on top of the agent step before the next auto-layout/relayout. Mirrors
+ *  `NODE_W` (210) + the `applyAddConnectedNext` gap (64) in workflowLayout /
+ *  WorkflowEditorGraph — duplicated as a literal rather than imported so this
+ *  module stays framework/layout-free (see the file-header comment). */
+const CONVERT_GATE_X_OFFSET = 274;
+
+/** Rewrite `stepId`'s inline `approval:` into a NEW standalone `approval_gate`
+ *  node inserted immediately before it: every edge that targeted `stepId` is
+ *  re-targeted at the new gate, and a gate→`stepId` edge is added, so the gate
+ *  always runs first regardless of node array order or layout position. The
+ *  agent step's `approval*` fields are cleared (moved onto the gate) — every
+ *  other field (agent/prompt/when/raw_passthrough/etc.) is untouched.
+ *
+ *  A no-op (returns `g` unchanged) when `stepId` doesn't name a node, or names
+ *  a node without an inline approval (see `hasInlineApproval`) — callers don't
+ *  need to guard before invoking this.
+ *
+ *  Pure graph transform, like `canConnect`/`applyConnect` — callers re-serialize
+ *  the result via `graphToWorkflowObject` + `yaml.dump` same as any other graph
+ *  edit. Powers the StepForm "Convert to gate node" button (Slice D Plan 3
+ *  Task 6); full auto-synthesis of a gate on EVERY legacy inline approval is
+ *  deferred (this is opt-in, one node at a time, from the editor). */
+export function convertInlineApprovalToGate(g: WorkflowGraph, stepId: string): WorkflowGraph {
+  const idx = g.nodes.findIndex((n) => n.id === stepId);
+  if (idx === -1) return g;
+  const node = g.nodes[idx];
+  if (!hasInlineApproval(node.data)) return g;
+
+  // Smallest-available `<stepId>-gate[-N]` id, so converting the same step
+  // twice (or a workflow that already has `<id>-gate`) never collides.
+  const existingIds = new Set(g.nodes.map((n) => n.id));
+  let gateId = `${stepId}-gate`;
+  for (let n = 1; existingIds.has(gateId); n++) gateId = `${stepId}-gate-${n}`;
+
+  const gateData: StepNodeData = { id: gateId, kind: 'approval_gate', approvalRequired: true };
+  if (node.data.approvalPrompt !== undefined) gateData.approvalPrompt = node.data.approvalPrompt;
+  if (node.data.approvalTimeoutSeconds !== undefined) {
+    gateData.approvalTimeoutSeconds = node.data.approvalTimeoutSeconds;
+  }
+
+  const strippedData: StepNodeData = { ...node.data };
+  delete strippedData.approvalRequired;
+  delete strippedData.approvalPrompt;
+  delete strippedData.approvalTimeoutSeconds;
+
+  const gateNode: GraphNode = {
+    id: gateId,
+    data: gateData,
+    position: { x: node.position.x, y: node.position.y },
+  };
+  const strippedNode: GraphNode = {
+    ...node,
+    data: strippedData,
+    position: { x: node.position.x + CONVERT_GATE_X_OFFSET, y: node.position.y },
+  };
+
+  const nodes = [...g.nodes];
+  nodes[idx] = strippedNode;
+  nodes.splice(idx, 0, gateNode);
+
+  const edges: GraphEdge[] = g.edges.map((e) => {
+    if (e.target !== stepId) return e;
+    const id = e.branch ? `${e.source}->${gateId}:${e.branch}` : `${e.source}->${gateId}`;
+    return { ...e, id, target: gateId };
+  });
+  edges.push({ id: `${gateId}->${stepId}`, source: gateId, target: stepId });
+
+  return { ...g, nodes, edges };
 }

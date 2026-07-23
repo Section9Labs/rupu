@@ -135,7 +135,7 @@ Split guidance (this is the largest task — the implementer MAY commit in two l
 
 ---
 
-### Task 6: Legacy inline-approval synthesized gate + sample + verification
+### Task 6: Legacy inline-approval synthesized gate + sample + verification (complete)
 
 **Files:**
 - Modify: `crates/rupu-cp/web/src/components/workflow-editor/` (parse: a legacy inline approval — agent+prompt+`approval.required`— renders as its normal agent node PLUS a visual "gate" affordance; the spec's "synthesized gate node + one-click extract to gate node" — SCOPE DECISION below), `lib/workflowGraph.ts`
@@ -144,10 +144,13 @@ Split guidance (this is the largest task — the implementer MAY commit in two l
 
 **Scope decision (keep it small):** the full "synthesized standalone gate node between two steps" for legacy inline approvals is a graph-topology change (inserting a node the YAML doesn't have) that risks the editor's round-trip fidelity. For Plan 3, ship the *lighter* version the spec allows: a legacy inline-approval agent node shows a **dashed gate badge/ring** (a visual marker that this step has a human gate) plus a StepForm **"Convert to gate node"** button that rewrites the YAML — moving the `approval:` block onto a new standalone gate step inserted before the agent step and stripping it from the agent step. The button's rewrite is a pure `workflowGraph`-level transform with a unit test (in → out YAML). No synthesized phantom node in the graph. Note the deferral of full auto-synthesis in the plan doc.
 
-- [ ] **Step 1: Failing test** — the convert transform: input YAML with an inline `approval: {required, prompt}` on an agent step → output YAML with a new gate step (carrying the prompt) immediately before it and the agent step's `approval:` removed. Unit-test the transform fn directly.
-- [ ] **Step 2: RED**, **Step 3: implement** the transform + the dashed-gate badge on inline-approval nodes + the StepForm button, **Step 4: green**.
-- [ ] **Step 5: Manual render verification** — `cargo run -p rupu-cli -- workflow show gate-demo --view full` and eyeball the canvas rows include a gate row; open both sample workflows in the editor (matt, at visual-check time). Full suite: `cargo test -p rupu-app-canvas -p rupu-cp`, `npm run test`, `tsc -b`, `npm run build`, `cargo clippy -p rupu-app-canvas -p rupu-cp 2>&1 | grep -c "^error"`.
-- [ ] **Step 6: Commit** — `feat(cp): dashed-gate badge + convert-to-gate for legacy inline approvals; docs`
+- [x] **Step 1: Failing test** — the convert transform: input YAML with an inline `approval: {required, prompt}` on an agent step → output YAML with a new gate step (carrying the prompt) immediately before it and the agent step's `approval:` removed. Unit-test the transform fn directly.
+- [x] **Step 2: RED**, **Step 3: implement** the transform + the dashed-gate badge on inline-approval nodes + the StepForm button, **Step 4: green**.
+- [x] **Step 5: Manual render verification** — `cargo run -p rupu-cli -- workflow show gate-demo --view full` and eyeball the canvas rows include a gate row; open both sample workflows in the editor (matt, at visual-check time). Full suite: `cargo test -p rupu-app-canvas -p rupu-cp`, `npm run test`, `tsc -b`, `npm run build`, `cargo clippy -p rupu-app-canvas -p rupu-cp 2>&1 | grep -c "^error"`.
+  - `gate-demo`/`action-demo` still parse cleanly (`rupu workflow show ... --view full`) and their canvas rows carry `gate · auto` / `action · scm.prs.create` metas. Editor visual open-up is left for matt's visual-check pass (GUI rendering can't be validated by subagents — see below).
+  - Full suite green: `npm run test` (1355 tests), `tsc -b` (clean), `npm run build` (clean); `cargo test -p rupu-app-canvas -p rupu-cp` green; `cargo clippy -p rupu-app-canvas -p rupu-cp 2>&1 | grep -c "^error"` → 3 (all from the pre-existing `host/ssh.rs` toolchain-artifact drift under the 1.95 Homebrew toolchain vs the pinned 1.88 — untouched by this task, out of scope per the plan's baseline note).
+- [x] **Step 6: Commit** — `feat(cp): dashed-gate badge + convert-to-gate for legacy inline approvals; docs`
+- [ ] **Visual-check flag:** the dashed-gate badge and the "Convert to gate node" button are rich UI — matt validates in the browser (both classic and `next`) before the PR merges.
 
 ---
 
