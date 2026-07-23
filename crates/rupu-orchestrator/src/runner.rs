@@ -163,6 +163,8 @@ pub enum RunWorkflowError {
         "pausing a workflow with a `workspace: sync` step is not supported (v1): let it run to completion instead"
     )]
     PauseWithWorkspaceSync,
+    #[error("step `{step}`: `action:` steps are not supported by this rupu version yet (Plan 2)")]
+    ActionStepsNotYetSupported { step: String },
 }
 
 /// Trait the orchestrator uses to construct per-unit [`AgentRunOpts`].
@@ -1178,6 +1180,15 @@ async fn run_steps_inner(
             continue;
         }
 
+        // Action steps parse (Plan 1) but execute in Plan 2. Fail loudly
+        // rather than silently no-op — a workflow that names one needs
+        // the newer binary.
+        if step.action.is_some() {
+            return Err(RunWorkflowError::ActionStepsNotYetSupported {
+                step: step.id.clone(),
+            });
+        }
+
         let effective_continue_on_error =
             step.continue_on_error.unwrap_or(workflow_default_continue);
         persist_active_step(opts, run_id, step, None);
@@ -1418,6 +1429,8 @@ fn step_kind_for_run_record(step: &Step) -> crate::runs::StepKind {
         crate::runs::StepKind::Parallel
     } else if step.for_each.is_some() {
         crate::runs::StepKind::ForEach
+    } else if step.action.is_some() {
+        crate::runs::StepKind::Action
     } else {
         crate::runs::StepKind::Linear
     }

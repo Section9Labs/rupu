@@ -1240,3 +1240,43 @@ steps:
 "#;
     assert!(Workflow::parse(yaml2).is_err());
 }
+
+#[test]
+fn action_step_parses() {
+    let yaml = r#"
+name: act
+steps:
+  - id: open_pr
+    action: scm.prs.create
+    with:
+      repo: "org/repo"
+      title: "{{ inputs.title }}"
+"#;
+    let wf = Workflow::parse(yaml).unwrap();
+    assert_eq!(wf.steps[0].action.as_deref(), Some("scm.prs.create"));
+    assert!(wf.steps[0].with.is_some());
+}
+
+#[test]
+fn action_step_rejects_agent_mixing() {
+    let yaml = r#"
+name: bad
+steps:
+  - id: x
+    action: issues.comment
+    agent: someone
+    prompt: "p"
+"#;
+    assert!(Workflow::parse(yaml).is_err());
+}
+
+#[test]
+fn action_step_rejects_empty_name() {
+    let yaml = r#"
+name: bad
+steps:
+  - id: x
+    action: ""
+"#;
+    assert!(Workflow::parse(yaml).is_err());
+}

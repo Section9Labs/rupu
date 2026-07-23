@@ -274,6 +274,7 @@ pub enum StepKind {
     Parallel,
     Panel,
     Branch,
+    Action,
 }
 
 /// One entry in `step_results.jsonl`. Mirrors [`StepResult`] but with

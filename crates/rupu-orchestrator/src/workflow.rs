@@ -154,6 +154,10 @@ pub enum WorkflowParseError {
     GateOnTimeoutWithoutTimeout { step: String },
     #[error("step `{step}`: on_reject step `{sub}` must be a plain agent or action step (no nested gates, fan-out, panel, or branch)")]
     GateOnRejectInvalidStep { step: String, sub: String },
+    #[error("step `{step}`: `action:` is mutually exclusive with agent/prompt/for_each/parallel/panel")]
+    ActionMutuallyExclusive { step: String },
+    #[error("step `{step}`: `action:` must name a tool (e.g. scm.prs.create)")]
+    ActionEmptyName { step: String },
 }
 
 /// How a workflow gets kicked off. Manual is the existing behavior
@@ -1109,6 +1113,7 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
             || step.for_each.is_some()
             || step.parallel.is_some()
             || step.panel.is_some()
+            || step.action.is_some()
         {
             return Err(WorkflowParseError::BranchMutuallyExclusive {
                 step: step.id.clone(),
@@ -1150,6 +1155,7 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
             || step.prompt.is_some()
             || step.for_each.is_some()
             || step.parallel.is_some()
+            || step.action.is_some()
         {
             return Err(WorkflowParseError::PanelMutuallyExclusive {
                 step: step.id.clone(),
@@ -1171,7 +1177,11 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
     } else if let Some(subs) = &step.parallel {
         // `parallel:` block — top-level agent/prompt and for_each must
         // be absent.
-        if step.agent.is_some() || step.prompt.is_some() || step.for_each.is_some() {
+        if step.agent.is_some()
+            || step.prompt.is_some()
+            || step.for_each.is_some()
+            || step.action.is_some()
+        {
             return Err(WorkflowParseError::ParallelMutuallyExclusive {
                 step: step.id.clone(),
             });
@@ -1211,6 +1221,22 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
             }
             validate_step_shape(sub)?; // linear (or Plan-2 action) rules apply
         }
+    } else if let Some(action) = &step.action {
+        if step.agent.is_some()
+            || step.prompt.is_some()
+            || step.for_each.is_some()
+            || step.parallel.is_some()
+            || step.panel.is_some()
+        {
+            return Err(WorkflowParseError::ActionMutuallyExclusive {
+                step: step.id.clone(),
+            });
+        }
+        if action.trim().is_empty() {
+            return Err(WorkflowParseError::ActionEmptyName {
+                step: step.id.clone(),
+            });
+        }
     } else {
         // Linear / for_each step — agent + prompt are required.
         if step.agent.is_none() {
@@ -1249,7 +1275,8 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
         let is_linear = step.panel.is_none()
             && step.parallel.is_none()
             && step.for_each.is_none()
-            && step.branch.is_none();
+            && step.branch.is_none()
+            && step.action.is_none();
         if !is_linear || step.distribute.is_some() {
             return Err(WorkflowParseError::HostOnNonLinearStep {
                 step: step.id.clone(),
