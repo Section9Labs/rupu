@@ -275,6 +275,7 @@ pub enum StepKind {
     Panel,
     Branch,
     Action,
+    ApprovalGate,
 }
 
 /// One entry in `step_results.jsonl`. Mirrors [`StepResult`] but with

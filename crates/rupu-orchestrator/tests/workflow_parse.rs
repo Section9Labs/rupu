@@ -1280,3 +1280,16 @@ steps:
 "#;
     assert!(Workflow::parse(yaml).is_err());
 }
+
+#[test]
+fn action_step_rejects_approval_mixing() {
+    let yaml = r#"
+name: bad
+steps:
+  - id: x
+    action: issues.comment
+    approval:
+      required: true
+"#;
+    assert!(Workflow::parse(yaml).is_err());
+}

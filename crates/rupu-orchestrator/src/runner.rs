@@ -1069,6 +1069,68 @@ async fn run_steps_inner(
             }
         }
 
+        // ── Approval GATE NODE (spec §4.1) ─────────────────────────────
+        // A standalone `approval:` step (no agent/prompt/for_each/parallel/
+        // panel/branch/action — see `is_approval_gate`). Distinct from the
+        // legacy inline `approval:` option handled just below, which stays
+        // on an agent-bearing step. Runs BEFORE that legacy check so a gate
+        // step never falls through to it (a gate step's `step.approval` is
+        // always `Some`, so it would otherwise also match the legacy block
+        // and pause twice).
+        if crate::workflow::is_approval_gate(step) {
+            let ap = step.approval.as_ref().expect("gate has approval");
+            let gate_suppressed = approved_step_id == Some(step.id.as_str());
+            let prompt = match &ap.prompt {
+                Some(t) => render_step_prompt(t, &ctx, render_mode(opts.strict_templates))
+                    .map_err(|e| RunWorkflowError::Render {
+                        step: step.id.clone(),
+                        source: e,
+                    })?,
+                None => format!(
+                    "Approve gate `{}` of workflow `{}`?",
+                    step.id, opts.workflow.name
+                ),
+            };
+
+            if gate_suppressed {
+                info!(step = %step.id, "gate: resuming with human approval");
+                emit_gate_resolved(opts, run_id, step, "human", step_results);
+                continue;
+            }
+            if let Some(expr) = &ap.auto_approve {
+                let truthy =
+                    render_when_expression(expr, &ctx, render_mode(opts.strict_templates))
+                        .map_err(|e| RunWorkflowError::Render {
+                            step: step.id.clone(),
+                            source: e,
+                        })?;
+                if truthy {
+                    info!(step = %step.id, "gate auto-approved");
+                    emit_gate_resolved(opts, run_id, step, "auto", step_results);
+                    continue;
+                }
+            }
+            info!(step = %step.id, "gate: pausing for approval");
+            if let Some(sink) = opts.event_sink.as_ref() {
+                sink.emit(
+                    run_id,
+                    &crate::executor::Event::StepAwaitingApproval {
+                        run_id: run_id.to_string(),
+                        step_id: step.id.clone(),
+                        reason: prompt.clone(),
+                    },
+                );
+            }
+            return Ok(InnerOutcome::Paused {
+                step_id: step.id.clone(),
+                prompt,
+                timeout_seconds: ap.timeout_seconds,
+                reason: PauseReason::Approval,
+                seed: Vec::new(),
+                fanout_completed_units: std::collections::BTreeMap::new(),
+            });
+        }
+
         // Approval gate: pause BEFORE dispatching the step. The
         // outer `run_workflow` flips the persisted RunRecord to
         // AwaitingApproval and exits cleanly. On resume the step's
@@ -1414,14 +1476,33 @@ fn base_context_for_step(
                     .unwrap_or_default(),
                 iterations: sr.iterations,
                 resolved: sr.resolved,
+                decision: gate_decision(sr),
             },
         );
     }
     ctx
 }
 
+/// Extract the `decision` field out of an approval-gate step's `output`
+/// JSON (spec §3.1: `{"decision": "approved"|"rejected", ...}`) so
+/// downstream templates can write `{{ steps.<id>.decision }}` instead of
+/// hand-parsing the JSON string. Empty for non-gate steps, or if a gate's
+/// `output` somehow fails to parse (defensive — the value is always
+/// produced by `emit_gate_resolved`, never author-supplied).
+fn gate_decision(sr: &StepResult) -> String {
+    if sr.kind != crate::runs::StepKind::ApprovalGate {
+        return String::new();
+    }
+    serde_json::from_str::<serde_json::Value>(&sr.output)
+        .ok()
+        .and_then(|v| v.get("decision").and_then(|d| d.as_str()).map(String::from))
+        .unwrap_or_default()
+}
+
 fn step_kind_for_run_record(step: &Step) -> crate::runs::StepKind {
-    if step.branch.is_some() {
+    if crate::workflow::is_approval_gate(step) {
+        crate::runs::StepKind::ApprovalGate
+    } else if step.branch.is_some() {
         crate::runs::StepKind::Branch
     } else if step.panel.is_some() {
         crate::runs::StepKind::Panel
@@ -1434,6 +1515,61 @@ fn step_kind_for_run_record(step: &Step) -> crate::runs::StepKind {
     } else {
         crate::runs::StepKind::Linear
     }
+}
+
+/// Record an approved gate node's result: `StepStarted` + `StepCompleted`
+/// events, a `StepResult` whose `output` is the decision JSON (spec §3.1),
+/// persisted like any other step. `via` is `"human"` (approve-resume) or
+/// `"auto"` (auto_approve truthy); Task 4 generalizes this to rejected
+/// decisions.
+fn emit_gate_resolved(
+    opts: &OrchestratorRunOpts,
+    run_id: &str,
+    step: &Step,
+    via: &str,
+    step_results: &mut Vec<StepResult>,
+) {
+    if let Some(sink) = opts.event_sink.as_ref() {
+        sink.emit(
+            run_id,
+            &crate::executor::Event::StepStarted {
+                run_id: run_id.to_string(),
+                step_id: step.id.clone(),
+                kind: crate::runs::StepKind::ApprovalGate,
+                agent: None,
+                host: None,
+            },
+        );
+    }
+    let output = serde_json::json!({
+        "decision": "approved",
+        "via": via,
+        "reason": serde_json::Value::Null,
+        "decided_at": chrono::Utc::now().to_rfc3339(),
+    })
+    .to_string();
+    let result = StepResult {
+        step_id: step.id.clone(),
+        output,
+        success: true,
+        skipped: false,
+        kind: crate::runs::StepKind::ApprovalGate,
+        ..Default::default()
+    };
+    if let Some(sink) = opts.event_sink.as_ref() {
+        sink.emit(
+            run_id,
+            &crate::executor::Event::StepCompleted {
+                run_id: run_id.to_string(),
+                step_id: step.id.clone(),
+                success: true,
+                duration_ms: 0,
+                host: None,
+            },
+        );
+    }
+    persist_step_result(opts, run_id, &result);
+    step_results.push(result);
 }
 
 fn persist_active_step(

@@ -156,6 +156,13 @@ pub struct StepOutput {
     /// above the threshold. Always `true` for non-panel steps.
     #[serde(skip_serializing_if = "is_true")]
     pub resolved: bool,
+    /// `"approved"` / `"rejected"` for an approval-gate step — parsed
+    /// out of `output`'s decision JSON (spec §3.1) so downstream
+    /// templates can write `{{ steps.merge_gate.decision }}` instead
+    /// of hand-parsing the JSON string. Empty for non-gate steps.
+    /// Always serialized — see `results` for rationale.
+    #[serde(default)]
+    pub decision: String,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -194,6 +201,7 @@ impl Default for StepOutput {
             // Non-panel steps that complete normally are "resolved";
             // panel steps overwrite this when they decide.
             resolved: true,
+            decision: String::new(),
         }
     }
 }

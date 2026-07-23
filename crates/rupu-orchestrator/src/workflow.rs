@@ -1227,6 +1227,7 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
             || step.for_each.is_some()
             || step.parallel.is_some()
             || step.panel.is_some()
+            || step.approval.is_some()
         {
             return Err(WorkflowParseError::ActionMutuallyExclusive {
                 step: step.id.clone(),
@@ -1425,6 +1426,7 @@ const STEP_OUTPUT_FIELDS: &[&str] = &[
     "max_severity",
     "iterations",
     "resolved",
+    "decision",
 ];
 
 /// Walk every templated string in the workflow and validate
