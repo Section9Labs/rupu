@@ -15,6 +15,7 @@ use rupu_runtime::{
     AutoflowCycleEventKind, AutoflowCycleRecord, AutoflowHistoryStore, AutoflowHistoryStoreError,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -183,6 +184,51 @@ fn stringify_status(v: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Read only the FIRST event line of a transcript `.jsonl` file and, if it is
+/// a `run_start` event, return its `(agent, started_at)`. Deliberately does
+/// NOT walk the rest of the file (that's `rupu_transcript::aggregate`'s job,
+/// for usage rollups) — this is a cheap peek used purely to backfill the
+/// standalone-run row's `agent`/`started_at` columns.
+///
+/// Tolerant by design: a missing file, an IO error, an empty file, a corrupt
+/// first line, or a first line that isn't `run_start` all fall through to
+/// `(None, None)` rather than erroring the row.
+fn read_transcript_run_start(path: &std::path::Path) -> (Option<String>, Option<String>) {
+    let mut iter = match rupu_transcript::JsonlReader::iter(path) {
+        Ok(it) => it,
+        Err(_) => return (None, None),
+    };
+    match iter.next() {
+        Some(Ok(rupu_transcript::Event::RunStart {
+            agent, started_at, ..
+        })) => (Some(agent), Some(started_at.to_rfc3339())),
+        _ => (None, None),
+    }
+}
+
+/// Resolve `session_id`'s `agent_name` by loading its `session.json` from
+/// either `<global>/sessions/<id>/` or `<global>/sessions-archive/<id>/`,
+/// caching the (possibly-absent) result so a session shared by multiple
+/// standalone rows is only read from disk once per request.
+fn lookup_session_agent_name(
+    global_dir: &std::path::Path,
+    session_id: &str,
+    cache: &mut HashMap<String, Option<String>>,
+) -> Option<String> {
+    if let Some(cached) = cache.get(session_id) {
+        return cached.clone();
+    }
+    let agent = [
+        global_dir.join("sessions").join(session_id),
+        global_dir.join("sessions-archive").join(session_id),
+    ]
+    .iter()
+    .find_map(|dir| try_load_session_for_runs(&dir.join("session.json")))
+    .and_then(|dto| dto.agent_name);
+    cache.insert(session_id.to_string(), agent.clone());
+    agent
+}
+
 /// Load all `*.meta.json` files from `<global>/transcripts/` and convert to
 /// `AgentRunRow`s with `source = "standalone"`.
 fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
@@ -202,6 +248,11 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
             return Vec::new();
         }
     };
+
+    // Per-request cache so a session.json shared by multiple standalone rows
+    // (all `trigger_source == "session_turn"` runs from the same session) is
+    // only read from disk once.
+    let mut session_cache: HashMap<String, Option<String>> = HashMap::new();
 
     let mut rows = Vec::new();
     for entry in entries.filter_map(|e| e.ok()) {
@@ -241,14 +292,30 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
             )
         };
 
+        // The standalone meta.json genuinely has no `agent`/`started_at`
+        // fields — recover them from the transcript's first line.
+        let (mut agent, started_at) = match &transcript_path {
+            Some(tp) => read_transcript_run_start(std::path::Path::new(tp)),
+            None => (None, None),
+        };
+
+        // For session-turn runs whose transcript didn't yield an agent
+        // (missing/corrupt transcript), fall back to the session's
+        // `agent_name`.
+        if agent.is_none() && dto.trigger_source.as_deref() == Some("session_turn") {
+            if let Some(session_id) = &dto.session_id {
+                agent = lookup_session_agent_name(global_dir, session_id, &mut session_cache);
+            }
+        }
+
         rows.push(AgentRunRow {
             run_id: dto.run_id,
             source: "standalone",
-            agent: None,
+            agent,
             session_id: dto.session_id,
             trigger_source: dto.trigger_source,
-            status: None,     // standalone meta does not carry run status
-            started_at: None, // standalone meta does not carry a started_at field
+            status: None, // standalone meta does not carry run status
+            started_at,
             transcript_path,
             usage: crate::usage::UsageSummary::default(),
             turns: 0,
@@ -798,6 +865,7 @@ async fn list_autoflow_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn agent_lifecycle_classifies() {
@@ -808,5 +876,167 @@ mod tests {
         assert!(agent_in_lifecycle(None, Some("completed"))); // standalone, no status → completed
         assert!(!agent_in_lifecycle(Some("running"), Some("completed")));
         assert!(agent_in_lifecycle(Some("running"), None)); // no filter → all
+    }
+
+    // ── A1: collect_standalone_runs fills agent + started_at ──────────────────
+
+    /// Write `<global>/transcripts/<run_id>.meta.json` + a matching
+    /// `.jsonl` transcript whose first line is (optionally) a `run_start`
+    /// event, or arbitrary text when `first_line` is `Some(garbage)`.
+    fn write_standalone_meta(
+        global: &std::path::Path,
+        run_id: &str,
+        session_id: Option<&str>,
+        trigger_source: Option<&str>,
+    ) {
+        let dir = global.join("transcripts");
+        fs::create_dir_all(&dir).unwrap();
+        let meta = serde_json::json!({
+            "run_id": run_id,
+            "session_id": session_id,
+            "trigger_source": trigger_source,
+        });
+        fs::write(
+            dir.join(format!("{run_id}.meta.json")),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_transcript_run_start(
+        global: &std::path::Path,
+        run_id: &str,
+        agent: &str,
+        started_at: &str,
+    ) {
+        let dir = global.join("transcripts");
+        fs::create_dir_all(&dir).unwrap();
+        let ev = rupu_transcript::Event::RunStart {
+            run_id: run_id.to_string(),
+            workspace_id: "ws".into(),
+            agent: agent.to_string(),
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            started_at: started_at.parse().unwrap(),
+            mode: rupu_transcript::RunMode::Ask,
+        };
+        let line = serde_json::to_string(&ev).unwrap();
+        fs::write(dir.join(format!("{run_id}.jsonl")), format!("{line}\n")).unwrap();
+    }
+
+    fn write_session_json(
+        global: &std::path::Path,
+        dirname: &str,
+        session_id: &str,
+        agent_name: &str,
+    ) {
+        let dir = global.join(dirname).join(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        let session = serde_json::json!({
+            "agent_name": agent_name,
+            "session_id": session_id,
+            "runs": [],
+        });
+        fs::write(
+            dir.join("session.json"),
+            serde_json::to_string(&session).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn standalone_run_fills_agent_and_started_at_from_transcript_run_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_standalone_meta(tmp.path(), "run_a", None, None);
+        write_transcript_run_start(tmp.path(), "run_a", "reviewer", "2026-01-01T00:00:00Z");
+
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent.as_deref(), Some("reviewer"));
+        assert_eq!(
+            rows[0].started_at.as_deref(),
+            Some("2026-01-01T00:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn standalone_run_missing_transcript_leaves_fields_none_without_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        // meta.json present, but no companion .jsonl at all.
+        write_standalone_meta(tmp.path(), "run_b", None, None);
+
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent, None);
+        assert_eq!(rows[0].started_at, None);
+    }
+
+    #[test]
+    fn standalone_run_corrupt_first_line_leaves_fields_none_without_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_standalone_meta(tmp.path(), "run_c", None, None);
+        let dir = tmp.path().join("transcripts");
+        fs::write(dir.join("run_c.jsonl"), "not json at all\n").unwrap();
+
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent, None);
+        assert_eq!(rows[0].started_at, None);
+    }
+
+    #[test]
+    fn session_turn_run_falls_back_to_session_json_agent_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        // meta references a session but the transcript itself has no usable
+        // run_start (missing entirely here) — the session_turn fallback should
+        // still resolve the agent from session.json.
+        write_standalone_meta(tmp.path(), "run_d", Some("sess_1"), Some("session_turn"));
+        write_session_json(tmp.path(), "sessions", "sess_1", "fixer");
+
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent.as_deref(), Some("fixer"));
+    }
+
+    #[test]
+    fn session_turn_run_checks_sessions_archive_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_standalone_meta(tmp.path(), "run_e", Some("sess_2"), Some("session_turn"));
+        write_session_json(tmp.path(), "sessions-archive", "sess_2", "archived-fixer");
+
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent.as_deref(), Some("archived-fixer"));
+    }
+
+    #[test]
+    fn two_session_turn_rows_sharing_a_session_both_resolve_from_one_session_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_standalone_meta(tmp.path(), "run_f1", Some("sess_3"), Some("session_turn"));
+        write_standalone_meta(tmp.path(), "run_f2", Some("sess_3"), Some("session_turn"));
+        write_session_json(tmp.path(), "sessions", "sess_3", "shared-agent");
+
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row.agent.as_deref(), Some("shared-agent"));
+        }
+    }
+
+    #[test]
+    fn transcript_agent_takes_priority_over_session_turn_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_standalone_meta(tmp.path(), "run_g", Some("sess_4"), Some("session_turn"));
+        write_transcript_run_start(
+            tmp.path(),
+            "run_g",
+            "from-transcript",
+            "2026-02-02T00:00:00Z",
+        );
+        write_session_json(tmp.path(), "sessions", "sess_4", "from-session");
+
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent.as_deref(), Some("from-transcript"));
     }
 }
