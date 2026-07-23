@@ -243,11 +243,22 @@ function WorkflowEditorGraphInner({
     [graph.nodes, problemsById, selectedId, workflowEditorUi],
   );
 
+  // Stable string key over (node id, kind) pairs only — NOT `graph.nodes`
+  // itself, whose array identity (and therefore the memo below) changes on
+  // every drag frame as positions update. Kind assignments change far less
+  // often than positions, so this key stays referentially stable across
+  // drags and lets the edges memo skip rebuilding all edge objects per frame.
+  const kindKey = graph.nodes.map((n) => `${n.id}:${n.data.kind}`).join('|');
+  const kindById = useMemo(
+    () => new Map(graph.nodes.map((n) => [n.id, n.data.kind])),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- kindKey is the intentional stable proxy for graph.nodes' (id, kind) pairs
+    [kindKey],
+  );
+
   const edges = useMemo<Edge[]>(() => {
     // source-node-id → kind, so every plain edge can theme itself off the
     // node it flows FROM (KIND_ACCENT is the same accent EditableStepNode
     // paints on that node's top-bar — the edge just carries it downstream).
-    const kindById = new Map(graph.nodes.map((n) => [n.id, n.data.kind]));
     return graph.edges.map((e) => {
       const branchColor = branchEdgeColor(e.branch, colors);
       const next = workflowEditorUi === 'next';
@@ -306,7 +317,7 @@ function WorkflowEditorGraphInner({
       }
       return edge;
     });
-  }, [graph.nodes, graph.edges, colors, workflowEditorUi]);
+  }, [graph.edges, kindById, colors, workflowEditorUi]);
 
   // Move (drag) + delete (Backspace/Delete) both arrive as node changes.
   const onNodesChange = useCallback(
