@@ -511,3 +511,105 @@ describe('AutoflowRuns — Event column (cycle_failed detail + issue ref fallbac
     expect(within(row as HTMLElement).queryByText('—')).not.toBeInTheDocument();
   });
 });
+
+// ── Amendment #1 (2026-07-23 feedback round): Find on every table ──────────
+
+describe('AutoflowRuns — Find', () => {
+  const EVENT_B: AutoflowEventRow = {
+    event_id: 'evt-2',
+    cycle_id: 'cyc-2',
+    at: '2026-06-02T00:00:00Z',
+    kind: 'run_launched',
+    workflow: 'lint-repo',
+    run_id: 'run-5',
+    issue_display_ref: 'acme/other#3',
+    worker_name: 'worker-2',
+    usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: false, runs: 1 },
+    host_id: 'local',
+  };
+
+  it('narrows the Runs tab by workflow, run id, issue ref, host id, or worker name', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([REMOTE_EVENT, EVENT_B]);
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('lint-repo')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByPlaceholderText('Find autoflows…'), { target: { value: 'lint' } });
+
+    await waitFor(() => expect(screen.queryByText('fix-issue')).not.toBeInTheDocument());
+    expect(screen.getByText('lint-repo')).toBeInTheDocument();
+  });
+
+  it('footer shows "N matches of M loaded" while a query is active on the Runs tab', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([REMOTE_EVENT, EVENT_B]);
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('lint-repo')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByPlaceholderText('Find autoflows…'), { target: { value: 'lint' } });
+
+    await waitFor(() => expect(screen.getByText('1 matches of 2 loaded')).toBeInTheDocument());
+  });
+
+  it('Esc clears the query', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([REMOTE_EVENT, EVENT_B]);
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('lint-repo')).toBeInTheDocument());
+
+    const input = screen.getByPlaceholderText('Find autoflows…') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: 'lint' } });
+    await waitFor(() => expect(screen.queryByText('fix-issue')).not.toBeInTheDocument());
+
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    await waitFor(() => expect(input.value).toBe(''));
+    expect(screen.getByText('fix-issue')).toBeInTheDocument();
+  });
+
+  it('narrows the Cycles tab by cycle id, host id, or worker name', async () => {
+    const CYCLE_B: AutoflowCycleRow = {
+      ...CYCLE,
+      cycle_id: 'cyc-99',
+      worker_name: 'worker-solo',
+    };
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([]);
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([CYCLE, CYCLE_B]);
+
+    renderPage();
+    fireEvent.click(screen.getByText('Cycles'));
+    await waitFor(() => expect(screen.getByText('worker-solo')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByPlaceholderText('Find autoflows…'), { target: { value: 'solo' } });
+
+    await waitFor(() => expect(screen.queryByText('worker-1')).not.toBeInTheDocument());
+    expect(screen.getByText('worker-solo')).toBeInTheDocument();
+  });
+
+  it('narrows the Claims tab by issue ref, workflow, repo, or owner', async () => {
+    const CLAIM_B: AutoflowClaim = {
+      ...CLAIM,
+      issue_ref: 'github:acme/other#3',
+      issue_display_ref: 'acme/other#3',
+      claim_owner: 'worker-2',
+    };
+    stubPage();
+    vi.spyOn(api, 'getAutoflowClaims').mockResolvedValue([CLAIM, CLAIM_B]);
+
+    renderPage();
+    fireEvent.click(screen.getByText('Claims'));
+    await waitFor(() => expect(screen.getByText('acme/other#3')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByPlaceholderText('Find autoflows…'), { target: { value: 'other' } });
+
+    await waitFor(() => expect(screen.queryByText('acme/widgets#42')).not.toBeInTheDocument());
+    expect(screen.getByText('acme/other#3')).toBeInTheDocument();
+  });
+});

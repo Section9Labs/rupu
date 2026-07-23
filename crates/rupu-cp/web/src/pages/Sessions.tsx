@@ -8,6 +8,11 @@
 // lib/sessionStatus — a distinct vocabulary from the run-status enum
 // `StatusPill` renders, so this page keeps its own dot+label rendering
 // rather than routing through StatusPill.
+//
+// Find (2026-07-23 operator feedback amendment #1): a `SearchInput` in the
+// FilterBar's search slot narrows the loaded rows client-side, live per
+// keystroke, over agent name / session id / host id — composing with (not
+// replacing) the Active/Archived pill above it.
 
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
@@ -18,6 +23,7 @@ import UsageBarChart from '../components/charts/UsageBarChart';
 import { Button } from '../components/ui/Button';
 import { FilterBar } from '../components/ui/FilterBar';
 import { FilterPills, type FilterPillOption } from '../components/ui/FilterPills';
+import { SearchInput } from '../components/ui/SearchInput';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
@@ -43,6 +49,7 @@ export default function Sessions() {
   // Row-action (archive/restore/delete) failures — kept separate from the
   // list-fetch error the hook owns, but shown in the same banner.
   const [actionError, setActionError] = useState<string | null>(null);
+  const [query, setQuery] = useState('');
 
   const { rows, loading, error, hasMore, sentinelRef, refresh, ended } = usePagedList<SessionSummary>({
     fetch: ({ offset, limit }) => {
@@ -52,6 +59,18 @@ export default function Sessions() {
     deps: [tab, hostFilter],
     poll: tab === 'active',
   });
+
+  // Find — case-insensitive substring across the fields this table actually
+  // renders: agent name (subject), session id, and host id. Composes with
+  // (narrows within) the Active/Archived pill above.
+  const q = query.trim().toLowerCase();
+  const visible = q
+    ? rows.filter((r) =>
+        [r.agent_name, r.session_id, r.host_id]
+          .filter((v): v is string => Boolean(v))
+          .some((v) => v.toLowerCase().includes(q)),
+      )
+    : rows;
 
   // Row-level archive / restore / delete — each refetches after success.
   async function handleRowArchive(id: string) {
@@ -109,6 +128,17 @@ export default function Sessions() {
       <div className="mb-5">
         <FilterBar
           filters={<FilterPills options={TAB_OPTIONS} value={tab} onChange={(v) => setTab(v as Tab)} />}
+          search={
+            <SearchInput
+              aria-label="Find sessions"
+              placeholder="Find sessions…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') setQuery('');
+              }}
+            />
+          }
           scope={<HostSelect allowAll ariaLabel="Host filter" value={hostFilter} onChange={setHostFilter} />}
         />
       </div>
@@ -128,11 +158,13 @@ export default function Sessions() {
               : 'Archived sessions appear here once an active conversation is closed.'
           }
         />
+      ) : visible.length === 0 ? (
+        <EmptyState title="No matches" hint={`No sessions match "${query}".`} />
       ) : (
         <div className="space-y-6">
-          {rows.some((s) => s.usage) && (
+          {visible.some((s) => s.usage) && (
             <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3">
-              <UsageBarChart bars={rows.filter((s) => s.usage).map((s) => {
+              <UsageBarChart bars={visible.filter((s) => s.usage).map((s) => {
                 const hostSuffix = s.host_id && s.host_id !== 'local'
                   ? `?host=${encodeURIComponent(s.host_id)}`
                   : '';
@@ -150,12 +182,18 @@ export default function Sessions() {
               header re-sorts client-side. */}
           <SortableTable<SessionSummary>
             columns={columns}
-            rows={rows}
+            rows={visible}
             rowKey={(s) => s.session_id}
           />
           {(loading || hasMore || ended) && (
             <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
-              {loading ? 'loading more…' : hasMore ? 'scroll for more' : `— end of ${rows.length} —`}
+              {q
+                ? `${visible.length} matches of ${rows.length} loaded`
+                : loading
+                  ? 'loading more…'
+                  : hasMore
+                    ? 'scroll for more'
+                    : `— end of ${rows.length} —`}
             </div>
           )}
         </div>
