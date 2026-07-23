@@ -1,10 +1,18 @@
 // HostSelect — a small dropdown that lists registered hosts via api.getHosts()
 // and emits the chosen host_id. Defaults to "local". Falls back to a single
 // "Local" option when the hosts fetch fails or has not resolved yet.
+//
+// Restyled internally onto `ui/Select`'s shared chrome (visual parity — same
+// classes, now sourced from one place) per the One Control Language kit.
 
 import { useEffect, useState } from 'react';
 import { api, type HostView } from '../lib/api';
-import { cn } from '../lib/cn';
+import { Select } from './ui/Select';
+
+/** Sentinel host-id meaning "fetch all hosts" (fan-out / no `?host=` param).
+ *  Was duplicated as a local `const ALL_HOSTS = '__all__'` in 4 list pages;
+ *  those migrate onto this export in Phase 2. */
+export const ALL_HOSTS = '__all__';
 
 interface Props {
   value: string;
@@ -31,17 +39,13 @@ export default function HostSelect({ value, onChange, disabled, className }: Pro
     };
   }, []);
 
-  const baseCls =
-    'rounded-md border border-border bg-panel px-2.5 py-1.5 text-lead text-ink ' +
-    'focus:border-brand-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
-
   return (
-    <select
+    <Select
       value={value}
       onChange={(e) => onChange(e.target.value)}
       disabled={disabled}
       aria-label="Host"
-      className={cn(baseCls, className)}
+      className={className}
     >
       {/* While loading or empty, keep a stable local option so the select is always usable. */}
       {!hosts || hosts.length === 0 ? (
@@ -54,6 +58,6 @@ export default function HostSelect({ value, onChange, disabled, className }: Pro
           </option>
         ))
       )}
-    </select>
+    </Select>
   );
 }

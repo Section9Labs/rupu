@@ -9,10 +9,16 @@
 
 import { cn } from '../lib/cn';
 
+// Token-only (dark-theme bug fix): `global` used to hardcode Tailwind's
+// static `indigo-50/700/200` palette, which doesn't adapt under
+// `[data-theme="dark"]` (unlike every other tone here, which resolves
+// through the themed `--c-*` CSS variables). `info` is the same semantic
+// "global" concept `settings/ConfigField.tsx`'s provenance badge already
+// uses, so this also keeps the two "global" affordances visually aligned.
 const SCOPE_CLS: Record<string, string> = {
   workspace: 'bg-surface text-ink ring-border',
   repository: 'bg-ok-bg text-ok ring-ok/30',
-  global: 'bg-indigo-50 text-indigo-700 ring-indigo-200',
+  global: 'bg-info-bg text-info ring-info/30',
 };
 
 export function ScopeChip({ scope }: { scope: string }) {

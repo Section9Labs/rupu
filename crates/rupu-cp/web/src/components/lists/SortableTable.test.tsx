@@ -121,4 +121,52 @@ describe('SortableTable', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Collapse row' }));
     expect(screen.queryByText('detail for Beta')).toBeNull();
   });
+
+  it('shrinks a fit column to its content on both th and td (w-[1%] + nowrap)', () => {
+    const columns: Column<Row>[] = [
+      { key: 'name', header: 'Name', render: (r) => <span>{r.name}</span> },
+      { key: 'cost', header: 'Cost', fit: true, align: 'right', render: (r) => <span>{r.cost}</span> },
+    ];
+    renderTable({ columns });
+    const th = screen.getAllByRole('columnheader')[1];
+    expect(th.className).toMatch(/w-\[1%\]/);
+    expect(th.className).toMatch(/whitespace-nowrap/);
+    expect(th.className).toMatch(/text-right/);
+
+    const costCell = within(screen.getAllByRole('row')[1]).getAllByRole('cell')[1];
+    expect(costCell.className).toMatch(/w-\[1%\]/);
+    expect(costCell.className).toMatch(/whitespace-nowrap/);
+    expect(costCell.className).toMatch(/tabular-nums/);
+  });
+
+  it('truncates a subject column via max-w-0 + inner truncate + a title tooltip', () => {
+    const columns: Column<Row>[] = [
+      {
+        key: 'name',
+        header: 'Name',
+        subject: true,
+        titleValue: (r) => r.name,
+        render: (r) => <span>{r.name}</span>,
+      },
+    ];
+    renderTable({ columns });
+    const nameCell = within(screen.getAllByRole('row')[1]).getAllByRole('cell')[0];
+    expect(nameCell.className).toMatch(/max-w-0/);
+    // The truncation wrapper is the cell's direct child (the caller's own
+    // rendered markup nests inside it).
+    const wrapper = nameCell.firstElementChild as HTMLElement;
+    expect(wrapper.className).toMatch(/truncate/);
+    expect(wrapper).toHaveAttribute('title', 'Beta');
+    expect(wrapper).toHaveTextContent('Beta');
+  });
+
+  it('falls back to the rendered string as the subject title when titleValue is omitted', () => {
+    const columns: Column<Row>[] = [
+      { key: 'name', header: 'Name', subject: true, render: (r) => r.name },
+    ];
+    renderTable({ columns });
+    const nameCell = within(screen.getAllByRole('row')[1]).getAllByRole('cell')[0];
+    const wrapper = nameCell.firstElementChild as HTMLElement;
+    expect(wrapper).toHaveAttribute('title', 'Beta');
+  });
 });

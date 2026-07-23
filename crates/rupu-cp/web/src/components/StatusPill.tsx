@@ -73,7 +73,7 @@ export function StatusPill({
   return (
     <span
       className={cn(
-        'inline-flex items-center gap-1 rounded ring-1 font-medium tabular-nums',
+        'inline-flex items-center gap-1 rounded ring-1 font-medium tabular-nums whitespace-nowrap',
         s.cls,
         size === 'xs'
           ? 'text-meta uppercase tracking-wide px-1.5 py-0.5'
