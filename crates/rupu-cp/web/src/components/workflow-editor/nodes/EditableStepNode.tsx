@@ -16,12 +16,17 @@ import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { GraphNode, StepKind, StepNodeData } from '../../../lib/workflowGraph';
 import { editorNodeSize } from '../../../lib/workflowLayout';
 import { useThemeColors, type ColorKey, type ThemeColors } from '../../../lib/useThemeColors';
+import type { WorkflowEditorUi } from '../../../hooks/useWorkflowEditorUi';
 
 // Node data carried on the xyflow node. Exported so WorkflowEditorGraph projects
 // the exact same shape when it derives the flow `nodes`.
 export interface NodeData extends Record<string, unknown> {
   node: GraphNode;
   problems: string[];
+  /** Workflow-editor-UI flag, threaded through so the node can restyle itself
+   *  (Task 2+). Defaults to 'classic' when absent — no behavior/visual change
+   *  in this task beyond the `data-ui` marker. */
+  workflowEditorUi?: WorkflowEditorUi;
 }
 
 type EditableFlowNode = Node<NodeData, 'editable'>;
@@ -156,8 +161,88 @@ function BranchBody({ d, colors }: { d: StepNodeData; colors: ThemeColors }) {
   );
 }
 
+// ── "next" (instrument) look — mockup-ported bodies ────────────────────────
+// Ported from flow-designer.html's `.node`/`.kindpill`/`.nid`/`.expr`/`.port`.
+// Namespaced `.wfx-*` (Task 2 — CSS block in styles.css). Same underlying
+// StepNodeData fields as the classic bodies above; only the markup/classes
+// differ, so both looks stay driven by the exact same data.
+
+/** mono agent line + optional for_each expr chip — next look for step/for_each. */
+function StepBodyNext({ d }: { d: StepNodeData }) {
+  return (
+    <>
+      <div className="wfx-agent">▸ {d.agent ?? '(no agent)'}</div>
+      {d.kind === 'for_each' && <div className="wfx-expr">for_each: {d.for_each ?? ''}</div>}
+    </>
+  );
+}
+
+/** sub-step count + stacked pill rows — next look for parallel. */
+function ParallelBodyNext({ d }: { d: StepNodeData }) {
+  const subs = d.parallel ?? [];
+  return (
+    <>
+      <div className="wfx-meta">
+        {subs.length} sub-step{subs.length === 1 ? '' : 's'}
+      </div>
+      <div className="wfx-sublist">
+        {subs.map((sub, i) => (
+          <div key={sub.id || i} className="wfx-subrow">
+            <span className="wfx-subid">{sub.id || `#${i}`}</span>
+            <span className="wfx-subagent">{sub.agent || '(no agent)'}</span>
+          </div>
+        ))}
+        {subs.length === 0 && <div className="wfx-empty">no sub-steps</div>}
+      </div>
+    </>
+  );
+}
+
+/** panelist port pills + optional gate chip — next look for panel. */
+function PanelBodyNext({ d }: { d: StepNodeData }) {
+  const panelists = d.panel?.panelists ?? [];
+  const gate = d.panel?.gate;
+  return (
+    <>
+      <div className="wfx-meta">
+        {panelists.length} panelist{panelists.length === 1 ? '' : 's'}
+      </div>
+      <div className="wfx-ports">
+        {panelists.map((p) => (
+          <span key={p} className="wfx-port">
+            {p}
+          </span>
+        ))}
+      </div>
+      {gate && (
+        <div className="wfx-gate">gate ≥ {gate.until_no_findings_at_severity_or_above ?? '—'}</div>
+      )}
+    </>
+  );
+}
+
+/** condition expr chip + true/false port pills — next look for branch. */
+function BranchBodyNext({ d }: { d: StepNodeData }) {
+  const thenTargets = d.thenTargets ?? [];
+  const elseTargets = d.elseTargets ?? [];
+  return (
+    <>
+      <div className="wfx-expr">if {d.condition || '(no condition)'}</div>
+      <div className="wfx-ports">
+        <span className="wfx-port wfx-port-true">
+          true{thenTargets.length > 0 ? ` → ${thenTargets.join(', ')}` : ''}
+        </span>
+        <span className="wfx-port wfx-port-false">
+          false{elseTargets.length > 0 ? ` → ${elseTargets.join(', ')}` : ''}
+        </span>
+      </div>
+    </>
+  );
+}
+
 function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
   const { node, problems } = data;
+  const ui = data.workflowEditorUi ?? 'classic';
   const d = node.data;
   const colors = useThemeColors();
   const handleStyle = { background: colors.border, width: 7, height: 7, border: 'none' } as const;
@@ -165,8 +250,70 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
   const box = editorNodeSize(d);
   const hasProblems = problems.length > 0;
 
+  // "next" (instrument) look — a wholly separate render path so the classic
+  // markup below stays byte-identical. Same data (`d`/`colors`/`box`/handles),
+  // new `.wfx-*` classes only.
+  if (ui === 'next') {
+    return (
+      <div
+        data-ui={ui}
+        className={['wfx-node', selected ? 'wfx-sel' : ''].join(' ').trim()}
+        style={{ borderColor: selected ? color : undefined, width: box.width, minHeight: box.height }}
+      >
+        <Handle type="target" position={Position.Left} style={handleStyle} />
+
+        {/* colored top-bar — by KIND (no run-state) */}
+        <div className="wfx-bar" style={{ background: color }} />
+
+        <div className="wfx-head">
+          <span className="wfx-kindpill" style={kindChipStyle(colors, d.kind)}>
+            {d.kind}
+          </span>
+          <span className="wfx-nid">{d.id}</span>
+          {hasProblems && (
+            <span className="wfx-problem" title={problems.join('\n')} aria-label="has problems" />
+          )}
+        </div>
+
+        <div className="wfx-body">
+          {d.kind === 'parallel' ? (
+            <ParallelBodyNext d={d} />
+          ) : d.kind === 'panel' ? (
+            <PanelBodyNext d={d} />
+          ) : d.kind === 'branch' ? (
+            <BranchBodyNext d={d} />
+          ) : (
+            <StepBodyNext d={d} />
+          )}
+        </div>
+
+        {/* branch nodes get TWO labeled source handles (one per arm) instead of
+            the single default source handle every other kind uses. */}
+        {d.kind === 'branch' ? (
+          <>
+            <Handle
+              type="source"
+              position={Position.Right}
+              id="then"
+              style={{ ...handleStyle, top: '38%', background: colors.status.done }}
+            />
+            <Handle
+              type="source"
+              position={Position.Right}
+              id="else"
+              style={{ ...handleStyle, top: '68%', background: colors.status.failed }}
+            />
+          </>
+        ) : (
+          <Handle type="source" position={Position.Right} style={handleStyle} />
+        )}
+      </div>
+    );
+  }
+
   return (
     <div
+      data-ui={ui}
       className={[
         'relative rounded-[10px] border bg-panel px-3 py-2 text-left shadow-card',
         selected ? 'ring-2 ring-brand-500' : '',
