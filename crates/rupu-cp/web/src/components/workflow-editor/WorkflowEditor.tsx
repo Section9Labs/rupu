@@ -70,7 +70,9 @@ function seedGraph(draftYaml: string): WorkflowGraph {
   return g;
 }
 
-type PanelTab = 'step' | 'settings' | 'reference';
+// 'blocks' is `next`-only (the palette-as-tab redesign) — classic never sets
+// or renders it; its default-tab logic below is gated on workflowEditorUi.
+type PanelTab = 'blocks' | 'step' | 'settings' | 'reference';
 
 /** localStorage flag: the canonical-rewrite notice has been shown once. */
 const REFORMAT_NOTICE_KEY = 'rupu.editor.reformatNoticeSeen';
@@ -152,7 +154,10 @@ export default function WorkflowEditor({
   // cards (the palette degrades to kind cards only).
   const [tools, setTools] = useState<ToolSpec[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [panelTab, setPanelTab] = useState<PanelTab>('settings');
+  // `next` defaults to the Blocks tab (the palette now lives there — Task
+  // "Flow Designer rail redesign"); classic keeps its old Settings default,
+  // since it has no Blocks tab to default to.
+  const [panelTab, setPanelTab] = useState<PanelTab>(workflowEditorUi === 'next' ? 'blocks' : 'settings');
   const [connError, setConnError] = useState<string | null>(null);
   // Transient notice (e.g. selection lost on rename), auto-dismissed.
   const [notice, setNotice] = useState<string | null>(null);
@@ -553,9 +558,6 @@ export default function WorkflowEditor({
         style={workflowEditorUi === 'next' ? ({ '--wfx-rail-w': `${railWidth}px` } as React.CSSProperties) : undefined}
       >
         {workflowEditorUi === 'next' && (
-          <div ref={paletteSlotRef} className="wfx-rail-palette-slot border-b border-border" />
-        )}
-        {workflowEditorUi === 'next' && (
           <div
             role="separator"
             aria-orientation="vertical"
@@ -571,22 +573,57 @@ export default function WorkflowEditor({
         )}
         <div className="border-b border-border p-3">
           <div role="tablist" aria-label="Inspector" className="inline-flex rounded-lg border border-border bg-panel p-0.5">
-            <PanelTabButton
-              active={panelTab === 'settings'}
-              onClick={() => setPanelTab('settings')}
-              tabId="inspector-tab-settings"
-              controls="inspector-settings"
-            >
-              Settings
-            </PanelTabButton>
-            <PanelTabButton
-              active={panelTab === 'step'}
-              onClick={() => setPanelTab('step')}
-              tabId="inspector-tab-step"
-              controls="inspector-step"
-            >
-              Step
-            </PanelTabButton>
+            {workflowEditorUi === 'next' && (
+              <PanelTabButton
+                active={panelTab === 'blocks'}
+                onClick={() => setPanelTab('blocks')}
+                tabId="inspector-tab-blocks"
+                controls="inspector-blocks"
+              >
+                Blocks
+              </PanelTabButton>
+            )}
+            {workflowEditorUi === 'next' ? (
+              // next order: Blocks · Step · Settings · Reference.
+              <>
+                <PanelTabButton
+                  active={panelTab === 'step'}
+                  onClick={() => setPanelTab('step')}
+                  tabId="inspector-tab-step"
+                  controls="inspector-step"
+                >
+                  Step
+                </PanelTabButton>
+                <PanelTabButton
+                  active={panelTab === 'settings'}
+                  onClick={() => setPanelTab('settings')}
+                  tabId="inspector-tab-settings"
+                  controls="inspector-settings"
+                >
+                  Settings
+                </PanelTabButton>
+              </>
+            ) : (
+              // classic order (unchanged): Settings · Step.
+              <>
+                <PanelTabButton
+                  active={panelTab === 'settings'}
+                  onClick={() => setPanelTab('settings')}
+                  tabId="inspector-tab-settings"
+                  controls="inspector-settings"
+                >
+                  Settings
+                </PanelTabButton>
+                <PanelTabButton
+                  active={panelTab === 'step'}
+                  onClick={() => setPanelTab('step')}
+                  tabId="inspector-tab-step"
+                  controls="inspector-step"
+                >
+                  Step
+                </PanelTabButton>
+              </>
+            )}
             <PanelTabButton
               active={panelTab === 'reference'}
               onClick={() => setPanelTab('reference')}
@@ -599,6 +636,15 @@ export default function WorkflowEditor({
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto p-4">
+          {panelTab === 'blocks' && (
+            <div role="tabpanel" id="inspector-blocks" aria-labelledby="inspector-tab-blocks">
+              {/* Portal target for the graphical NodePalette (`variant="rail"`,
+                  mounted by WorkflowEditorGraph) — only exists while this tab is
+                  active, so the palette occupies the FULL rail height instead of
+                  competing with the editor pane. */}
+              <div ref={paletteSlotRef} className="wfx-rail-palette-slot" />
+            </div>
+          )}
           {panelTab === 'step' && (
             <div role="tabpanel" id="inspector-step" aria-labelledby="inspector-tab-step">
               {selectedNode ? (
