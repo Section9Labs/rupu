@@ -216,6 +216,9 @@ describe('AgentRuns — agent subject cell', () => {
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([SESSION_ROW]);
 
     renderPage();
+    // Source pill defaults to Standalone — switch to All to see the
+    // session-sourced fixture row.
+    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
 
     await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
     expect(screen.getByText('session_turn')).toBeInTheDocument();
@@ -228,6 +231,7 @@ describe('AgentRuns — agent subject cell', () => {
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([SESSION_ROW]);
 
     renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
 
     const name = await screen.findByText('review-pr');
     expect(name).toHaveAttribute('title', 'review-pr');
@@ -272,6 +276,9 @@ describe('AgentRuns — status column', () => {
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([okRow]);
 
     renderPage();
+    // Source pill defaults to Standalone — switch to All to see the
+    // session-sourced fixture row.
+    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
 
     // "Completed" also names the (unrelated) lifecycle filter pill button, so
     // disambiguate by tag: the status pill is a <span>, the filter is a
@@ -292,6 +299,9 @@ describe('AgentRuns — status column', () => {
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([errorRow]);
 
     renderPage();
+    // Source pill defaults to Standalone — switch to All to see the
+    // session-sourced fixture row.
+    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
 
     const status = await screen.findByText('Failed');
     expect(status.closest('span')).toHaveClass('bg-status-failed/10');
@@ -333,5 +343,128 @@ describe('AgentRuns — kit loading/empty states', () => {
     renderPage();
 
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('network down'));
+  });
+});
+
+// ── Amendment #2 (2026-07-23 feedback round): Source FilterPills ───────────
+
+describe('AgentRuns — Source filter', () => {
+  it('defaults to Standalone: renders standalone rows, hides session rows', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW, SESSION_ROW]);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    expect(screen.queryByText('review-pr')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Standalone' })).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  it('clicking "Session" shows only session-sourced rows', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW, SESSION_ROW]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Session' }));
+
+    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+    expect(screen.queryByText('fix-bug')).not.toBeInTheDocument();
+  });
+
+  it('clicking "All" shows both standalone and session rows', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW, SESSION_ROW]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'All' }));
+
+    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+    expect(screen.getByText('fix-bug')).toBeInTheDocument();
+  });
+
+  it('regression: no run_id appears twice in the rendered table (the dedupe payload shape)', async () => {
+    stubDeps();
+    // The backend now dedupes a session-turn run's standalone-meta.json row
+    // and its session.json row into ONE merged row (see
+    // `dedupe_agent_runs_by_run_id` in run_streams.rs) before the wire ever
+    // carries it — this fixture is that already-merged shape (a single row
+    // sharing REMOTE_ROW's run_id), guarding against the frontend ever
+    // rendering it twice.
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW]);
+
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
+
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    // One header row + exactly one data row.
+    expect(screen.getAllByRole('row')).toHaveLength(2);
+  });
+});
+
+// ── Amendment #1 (2026-07-23 feedback round): Find on every table ──────────
+
+describe('AgentRuns — Find', () => {
+  it('typing narrows rows by agent name, run id, session id, or host id', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW, SESSION_ROW]);
+
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
+    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByPlaceholderText('Find agents…'), { target: { value: 'review' } });
+
+    await waitFor(() => expect(screen.queryByText('fix-bug')).not.toBeInTheDocument());
+    expect(screen.getByText('review-pr')).toBeInTheDocument();
+  });
+
+  it('footer shows "N matches of M loaded" while a query is active', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW, SESSION_ROW]);
+
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
+    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByPlaceholderText('Find agents…'), { target: { value: 'review' } });
+
+    await waitFor(() => expect(screen.getByText('1 matches of 2 loaded')).toBeInTheDocument());
+  });
+
+  it('Esc clears the query', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW, SESSION_ROW]);
+
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
+    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+
+    const input = screen.getByPlaceholderText('Find agents…') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: 'review' } });
+    await waitFor(() => expect(screen.queryByText('fix-bug')).not.toBeInTheDocument());
+
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    await waitFor(() => expect(input.value).toBe(''));
+    expect(screen.getByText('fix-bug')).toBeInTheDocument();
+  });
+
+  it('composes with the Source pill: searching within Standalone narrows just that subset', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW, SESSION_ROW]);
+
+    renderPage();
+    // Default Source is Standalone — fix-bug (standalone) is visible,
+    // review-pr (session) is not, regardless of the query below.
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByPlaceholderText('Find agents…'), { target: { value: 'review' } });
+
+    await waitFor(() => expect(screen.queryByText('fix-bug')).not.toBeInTheDocument());
+    expect(screen.queryByText('review-pr')).not.toBeInTheDocument();
   });
 });

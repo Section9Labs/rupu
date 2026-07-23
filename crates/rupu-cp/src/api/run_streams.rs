@@ -403,8 +403,112 @@ fn collect_session_runs_from_dir(root: &std::path::Path, out: &mut Vec<AgentRunR
     }
 }
 
+/// Dedupe `rows` by `run_id`, merging any row that was collected from BOTH
+/// `collect_standalone_runs` (`<global>/transcripts/*.meta.json`) and
+/// `collect_session_runs_from_dir` (`session.json`'s `runs[]` array).
+///
+/// A `trigger_source == "session_turn"` run is recorded on disk in BOTH
+/// places, so before this pass every such run_id appears twice in the
+/// concatenated list — 55 duplicate rows on the operator's data (2026-07-23
+/// feedback round). Merge rule:
+///   - Every field prefers whichever side has a non-`None` value.
+///   - When BOTH sides carry a value, the SESSION-derived value wins by
+///     default (sessions carry the real end-state, e.g. `status`) — EXCEPT
+///     `trigger_source`, where the STANDALONE value wins, because
+///     `collect_session_runs_from_dir` never sets it (there being no real
+///     conflict, standalone's value must simply survive the merge).
+///   - `source` is recomputed on the merged row rather than kept from
+///     whichever side happened to be seen first: `"session"` when the
+///     merged row carries a `session_id` (the run belongs to a session),
+///     else `"standalone"` — preserving the DTO's existing meaning of
+///     `source` for the one row that now represents both origins.
+///
+/// Rows are matched by `run_id`, EXCEPT an empty `run_id` (a defensively
+/// tolerated but never-expected shape from a corrupt `.meta.json` — see
+/// `StandaloneMetaDto`'s `#[serde(default)]`) never collides with anything,
+/// even another empty `run_id` row — merging those would silently fuse two
+/// unrelated broken records into one.
+///
+/// Preserves the first-seen order of non-colliding rows (stable).
+fn dedupe_agent_runs_by_run_id(rows: Vec<AgentRunRow>) -> Vec<AgentRunRow> {
+    let mut order: Vec<String> = Vec::with_capacity(rows.len());
+    let mut by_key: HashMap<String, AgentRunRow> = HashMap::with_capacity(rows.len());
+
+    for (idx, row) in rows.into_iter().enumerate() {
+        let key = if row.run_id.is_empty() {
+            format!("\u{0}empty#{idx}")
+        } else {
+            row.run_id.clone()
+        };
+        match by_key.remove(&key) {
+            Some(existing) => {
+                by_key.insert(key, merge_agent_run_rows(existing, row));
+                // `key` is already present in `order` from its first insertion.
+            }
+            None => {
+                order.push(key.clone());
+                by_key.insert(key, row);
+            }
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|k| by_key.remove(&k))
+        .collect()
+}
+
+/// Merge two `AgentRunRow`s that collided on the same `run_id` — see
+/// `dedupe_agent_runs_by_run_id`'s doc comment for the merge rule.
+fn merge_agent_run_rows(a: AgentRunRow, b: AgentRunRow) -> AgentRunRow {
+    // Identify the session-sourced side for the field-level tie-breaks
+    // below. In the realistic case exactly one of `a`/`b` is
+    // `source == "session"` (the other `"standalone"`) — a session-turn run
+    // colliding across the two collectors. If BOTH (or neither) happen to be
+    // tagged the same way (e.g. the same session recorded under both
+    // `sessions/` and `sessions-archive/`), there is no real
+    // session-vs-standalone distinction to make; `a` is treated as the
+    // "session" side arbitrarily so the merge stays deterministic.
+    let (session, standalone) = if b.source == "session" && a.source != "session" {
+        (b, a)
+    } else {
+        (a, b)
+    };
+
+    let session_id = session.session_id.or(standalone.session_id);
+    let source: &'static str = if session_id.is_some() {
+        "session"
+    } else {
+        "standalone"
+    };
+
+    AgentRunRow {
+        run_id: session.run_id, // == standalone.run_id (the dedupe key)
+        source,
+        agent: session.agent.or(standalone.agent),
+        session_id,
+        // Sessions never set `trigger_source` (see
+        // `collect_session_runs_from_dir`) — standalone's value must win or
+        // it's lost entirely on merge.
+        trigger_source: standalone.trigger_source.or(session.trigger_source),
+        // Standalone meta.json never sets `status` — session's real
+        // end-state wins whenever present.
+        status: session.status.or(standalone.status),
+        started_at: session.started_at.or(standalone.started_at),
+        transcript_path: session.transcript_path.or(standalone.transcript_path),
+        // Usage/turns/duration are filled in AFTER this merge (by
+        // `list_agent_runs`, keyed off the merged `transcript_path`) — the
+        // defaults carried by both operands here are inert.
+        usage: crate::usage::UsageSummary::default(),
+        turns: 0,
+        duration_ms: session.duration_ms.or(standalone.duration_ms),
+        host_id: session.host_id.or(standalone.host_id),
+    }
+}
+
 /// Collect every local agent-run row (standalone transcripts + active and
-/// archived session runs) and sort newest-first by `started_at`.
+/// archived session runs), dedupe by `run_id` (see
+/// `dedupe_agent_runs_by_run_id`), and sort newest-first by `started_at`.
 ///
 /// Extracted out of `list_agent_runs` so it's directly unit-testable: the
 /// standalone and session branches populate `started_at` from two different
@@ -418,6 +522,8 @@ fn collect_and_sort_local_agent_runs(global_dir: &std::path::Path) -> Vec<AgentR
     let mut local_rows = collect_standalone_runs(global_dir);
     collect_session_runs_from_dir(&global_dir.join("sessions"), &mut local_rows);
     collect_session_runs_from_dir(&global_dir.join("sessions-archive"), &mut local_rows);
+
+    let mut local_rows = dedupe_agent_runs_by_run_id(local_rows);
 
     // Sort newest-first: rows with a timestamp sort before those without;
     // ISO-8601 strings sort lexicographically.
@@ -1165,6 +1271,150 @@ mod tests {
         // suffix compares as greater, pushing the standalone row second.
         assert_eq!(rows[0].run_id, "run_tie_standalone");
         assert_eq!(rows[1].run_id, "run_tie_session");
+    }
+
+    // ── Amendment #2 (2026-07-23 feedback round): dedupe by run_id ─────────────
+
+    /// A session-turn run recorded in BOTH the standalone `.meta.json` AND
+    /// its session's `runs[]` array (the exact shape that produced 55
+    /// duplicate rows on the operator's data) collapses to ONE row, with
+    /// fields merged per `dedupe_agent_runs_by_run_id`'s documented rule.
+    #[test]
+    fn session_turn_run_present_in_both_sources_dedupes_to_one_merged_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Standalone side: agent resolved from the transcript, carries
+        // trigger_source, never sets status.
+        write_standalone_meta(
+            tmp.path(),
+            "run_dup",
+            Some("sess_dup"),
+            Some("session_turn"),
+        );
+        write_transcript_run_start(tmp.path(), "run_dup", "dup-agent", "2026-04-01T00:00:00Z");
+        // Session side: same run_id embedded in session.json's runs[], with
+        // a status (session.json's runs[] always has one) and a
+        // deliberately different agent name, to pin the tie-break.
+        write_session_json_with_run(
+            tmp.path(),
+            "sessions",
+            "sess_dup",
+            "run_dup",
+            "2026-04-01T00:00:05Z",
+        );
+
+        let rows = collect_and_sort_local_agent_runs(tmp.path());
+        assert_eq!(
+            rows.len(),
+            1,
+            "the two sources' run_dup rows must collapse to one"
+        );
+        let row = &rows[0];
+        assert_eq!(row.run_id, "run_dup");
+        // session_id present on the merged row ⇒ source recomputed as
+        // "session", regardless of which side inserted first.
+        assert_eq!(row.source, "session");
+        assert_eq!(row.session_id.as_deref(), Some("sess_dup"));
+        // trigger_source only the standalone side ever sets — it must
+        // survive the merge, not get clobbered by the session side's None.
+        assert_eq!(row.trigger_source.as_deref(), Some("session_turn"));
+        // status: only session.json's runs[] entries carry one
+        // (`write_session_json_with_run` sets `"ok"`) — session wins.
+        assert_eq!(row.status.as_deref(), Some("ok"));
+        // agent: both sides have a value here — session wins per the
+        // documented default tie-break.
+        assert_eq!(row.agent.as_deref(), Some("session-agent"));
+    }
+
+    /// Two rows from different sources with DIFFERENT run_ids are untouched
+    /// by the dedupe pass — no merging, no dropped rows.
+    #[test]
+    fn distinct_run_ids_across_sources_are_unaffected_by_dedupe() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_standalone_meta(tmp.path(), "run_solo_standalone", None, None);
+        write_transcript_run_start(
+            tmp.path(),
+            "run_solo_standalone",
+            "solo-agent",
+            "2026-04-02T00:00:00Z",
+        );
+        write_session_json_with_run(
+            tmp.path(),
+            "sessions",
+            "sess_solo",
+            "run_solo_session",
+            "2026-04-03T00:00:00Z",
+        );
+
+        let rows = collect_and_sort_local_agent_runs(tmp.path());
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|r| r.run_id == "run_solo_standalone"));
+        assert!(rows.iter().any(|r| r.run_id == "run_solo_session"));
+    }
+
+    /// Defensive edge case: a `run_id` that is empty (a corrupt/incomplete
+    /// `.meta.json` — see `StandaloneMetaDto`'s `#[serde(default)]`) must
+    /// NEVER collide with another empty-`run_id` row. Deduping those would
+    /// silently fuse two unrelated broken records into one.
+    #[test]
+    fn dedupe_never_merges_rows_sharing_an_empty_run_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("transcripts");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.meta.json"), r#"{"run_id":""}"#).unwrap();
+        fs::write(dir.join("b.meta.json"), r#"{"run_id":""}"#).unwrap();
+
+        let rows = collect_and_sort_local_agent_runs(tmp.path());
+        assert_eq!(rows.len(), 2);
+    }
+
+    /// Direct unit test of the merge helper itself (no filesystem), pinning
+    /// the exact field-by-field precedence documented on
+    /// `dedupe_agent_runs_by_run_id`.
+    #[test]
+    fn merge_agent_run_rows_applies_the_documented_precedence() {
+        fn row(
+            source: &'static str,
+            session_id: Option<&str>,
+            trigger_source: Option<&str>,
+            status: Option<&str>,
+            agent: Option<&str>,
+        ) -> AgentRunRow {
+            AgentRunRow {
+                run_id: "run_z".to_string(),
+                source,
+                agent: agent.map(str::to_string),
+                session_id: session_id.map(str::to_string),
+                trigger_source: trigger_source.map(str::to_string),
+                status: status.map(str::to_string),
+                started_at: None,
+                transcript_path: None,
+                usage: crate::usage::UsageSummary::default(),
+                turns: 0,
+                duration_ms: None,
+                host_id: None,
+            }
+        }
+
+        let standalone = row(
+            "standalone",
+            Some("sess_z"),
+            Some("session_turn"),
+            None,
+            Some("standalone-agent"),
+        );
+        let session = row(
+            "session",
+            Some("sess_z"),
+            None,
+            Some("ok"),
+            Some("session-agent"),
+        );
+
+        let merged = merge_agent_run_rows(standalone, session);
+        assert_eq!(merged.source, "session"); // session_id present
+        assert_eq!(merged.trigger_source.as_deref(), Some("session_turn")); // standalone wins
+        assert_eq!(merged.status.as_deref(), Some("ok")); // session wins
+        assert_eq!(merged.agent.as_deref(), Some("session-agent")); // session wins (default)
     }
 
     // ── A2: autoflow event DTO forwards detail + issue_ref fallback ────────────
