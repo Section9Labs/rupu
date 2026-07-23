@@ -736,6 +736,20 @@ pub fn is_approval_gate(step: &Step) -> bool {
         && step.action.is_none()
 }
 
+/// Resolve the `on_timeout` routing configured on `step_id`'s gate, if
+/// any. Returns `None` when `step_id` isn't found, isn't a gate NODE
+/// (`is_approval_gate`), or has no `on_timeout` set — every one of
+/// those collapses to the lazy-expiry path's default (`Fail`), the
+/// same as today's unconditional behavior for anything but an
+/// explicit gate-node timeout policy.
+pub fn gate_timeout_action(workflow: &Workflow, step_id: &str) -> Option<TimeoutAction> {
+    let step = workflow.steps.iter().find(|s| s.id == step_id)?;
+    if !is_approval_gate(step) {
+        return None;
+    }
+    step.approval.as_ref()?.on_timeout
+}
+
 /// Workflow-level defaults inherited by every step. A step's own
 /// override (when present) wins over the default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

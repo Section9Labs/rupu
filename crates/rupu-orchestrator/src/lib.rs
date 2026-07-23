@@ -45,10 +45,10 @@ pub use templates::{
     StepContext, StepOutput, SubResult,
 };
 pub use workflow::{
-    author_allowed, is_approval_gate, Approval, AuthorScope, Autoflow, AutoflowClaim,
-    AutoflowClaimKey, AutoflowEntity, AutoflowIssueState, AutoflowOutcomeRef, AutoflowSelector,
-    AutoflowWorkspace, AutoflowWorkspaceStrategy, ContractFormat, Contracts, DraftFilter, InputDef,
-    InputType, NotifyAction, Panel, PanelGate, Severity, SkipAction, Step, StepContract, SubStep,
-    TimeoutAction, Trigger, TriggerKind, Workflow, WorkflowDefaults, WorkflowOutputContract,
-    WorkflowParseError,
+    author_allowed, gate_timeout_action, is_approval_gate, Approval, AuthorScope, Autoflow,
+    AutoflowClaim, AutoflowClaimKey, AutoflowEntity, AutoflowIssueState, AutoflowOutcomeRef,
+    AutoflowSelector, AutoflowWorkspace, AutoflowWorkspaceStrategy, ContractFormat, Contracts,
+    DraftFilter, InputDef, InputType, NotifyAction, Panel, PanelGate, Severity, SkipAction, Step,
+    StepContract, SubStep, TimeoutAction, Trigger, TriggerKind, Workflow, WorkflowDefaults,
+    WorkflowOutputContract, WorkflowParseError,
 };
