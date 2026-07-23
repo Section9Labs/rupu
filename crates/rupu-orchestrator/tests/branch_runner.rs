@@ -296,6 +296,7 @@ async fn resume_after_branch_keeps_not_taken_arm_skipped() {
         completed_units: std::collections::BTreeMap::new(),
         reason: PauseReason::Manual,
         paused_step: None,
+        rejected_reason: None,
     });
 
     let res = run_workflow(opts).await.unwrap();

@@ -1782,6 +1782,75 @@ fn resolve_workflow_path(
     }
 }
 
+/// Read + parse a run's persisted workflow snapshot — no config/resolver/
+/// MCP-registry/dispatcher rebuild, just the YAML on disk. Shared by
+/// [`gate_on_timeout_for`] and [`cheap_on_reject_chain_len`] so callers on
+/// the same run don't each pay for their own read + parse.
+fn read_and_parse_workflow_snapshot(
+    store: &rupu_orchestrator::RunStore,
+    run_id: &str,
+) -> anyhow::Result<rupu_orchestrator::Workflow> {
+    let body = store
+        .read_workflow_snapshot(run_id)
+        .map_err(|e| anyhow::anyhow!("read workflow snapshot: {e}"))?;
+    rupu_orchestrator::Workflow::parse(&body)
+        .map_err(|e| anyhow::anyhow!("parse workflow snapshot: {e}"))
+}
+
+/// Resolve `record`'s gate `on_timeout` policy for the lazy-expiry
+/// checks the CLI does before an `approve` / the `runs` listing's
+/// sweep, by loading the run's persisted workflow snapshot.
+/// Best-effort — any failure (unreadable/unparseable snapshot, no
+/// awaiting step, step isn't a gate NODE, no `on_timeout` set)
+/// collapses to `None`, which `expire_if_overdue` treats as the
+/// default `Fail`.
+fn gate_on_timeout_for(
+    store: &rupu_orchestrator::RunStore,
+    record: &rupu_orchestrator::RunRecord,
+) -> Option<rupu_orchestrator::TimeoutAction> {
+    let step_id = record.awaiting_step_id.as_deref()?;
+    let workflow = match read_and_parse_workflow_snapshot(store, &record.id) {
+        Ok(wf) => wf,
+        Err(e) => {
+            eprintln!(
+                "warning: could not read workflow snapshot for run {} to resolve gate \
+                 on_timeout; defaulting to `fail`: {e}",
+                record.id
+            );
+            return None;
+        }
+    };
+    rupu_orchestrator::gate_timeout_action(&workflow, step_id)
+}
+
+/// Cheap pre-check for the reject-cleanup path (`rupu workflow reject`, the
+/// timeout-reject branch of `approve`, and the `runs` listing's lazy-expiry
+/// sweep): parse the run's persisted workflow snapshot only (no
+/// config/resolver/MCP-registry/dispatcher rebuild) and return the rejected
+/// step's `on_reject` chain length.
+///
+/// `Some(0)` means "definitely nothing to run" — a legacy inline-approval
+/// step, or a gate node with an empty (or absent) `on_reject:` — so the
+/// caller should skip [`crate::resume::build_reject_cleanup_opts`]'s heavy
+/// rebuild entirely and print nothing. `None` means the cheap parse itself
+/// failed (unreadable/unparseable snapshot, or the step id wasn't found);
+/// callers fall through to the heavy path so its existing warning fires
+/// rather than silently assuming there's no cleanup to do.
+fn cheap_on_reject_chain_len(
+    store: &rupu_orchestrator::RunStore,
+    run_id: &str,
+    step_id: &str,
+) -> Option<usize> {
+    let workflow = read_and_parse_workflow_snapshot(store, run_id).ok()?;
+    let step = workflow.steps.iter().find(|s| s.id == step_id)?;
+    Some(
+        step.approval
+            .as_ref()
+            .map(|a| a.on_reject.len())
+            .unwrap_or(0),
+    )
+}
+
 async fn runs(
     limit: usize,
     status_filter: Option<&str>,
@@ -1797,12 +1866,67 @@ async fn runs(
         .map_err(|e| anyhow::anyhow!("run-store list failed: {e}"))?;
 
     // Lazy expiry: any AwaitingApproval row whose expires_at is in
-    // the past gets transitioned to Failed and persisted before we
-    // render. Operators learn about expired runs the next time they
-    // look at the list.
+    // the past gets resolved per the gate's `on_timeout` policy
+    // (default `fail`) before we render. Operators learn about
+    // expired runs the next time they look at the list.
     let now = chrono::Utc::now();
     for r in &mut all {
-        let _ = store.expire_if_overdue(r, now);
+        let on_timeout = gate_on_timeout_for(&store, r);
+        let step_id_before_expiry = r.awaiting_step_id.clone();
+        match store.expire_if_overdue(r, now, on_timeout) {
+            Ok(Some(rupu_orchestrator::TimeoutAction::Approve)) => {
+                println!(
+                    "rupu: gate timed out with on_timeout: approve — \
+                     run `rupu workflow approve {}` to resume",
+                    r.id
+                );
+            }
+            Ok(Some(rupu_orchestrator::TimeoutAction::Reject)) => {
+                let step_id = step_id_before_expiry.unwrap_or_default();
+                let reason = r
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "approval expired".into());
+                println!(
+                    "rupu: gate timed out (on_timeout: reject) — run {} auto-rejected at step `{}`",
+                    r.id, step_id
+                );
+                if cheap_on_reject_chain_len(&store, &r.id, &step_id) != Some(0) {
+                    match crate::resume::build_reject_cleanup_opts(
+                        &store, &r.id, &step_id, &reason, None,
+                    )
+                    .await
+                    {
+                        Ok((opts, chain_len)) => {
+                            match rupu_orchestrator::runner::run_reject_cleanup(
+                                opts, &step_id, &reason, "timeout",
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    if chain_len > 0 {
+                                        println!("cleanup: {chain_len} step(s) executed");
+                                    }
+                                }
+                                Err(e) => eprintln!(
+                                    "warning: on_reject cleanup chain errored for run {}: {e}",
+                                    r.id
+                                ),
+                            }
+                        }
+                        Err(e) => eprintln!(
+                            "warning: could not load workflow for on_reject cleanup on run {}: {e} \
+                             (run is already correctly rejected)",
+                            r.id
+                        ),
+                    }
+                }
+            }
+            Ok(Some(rupu_orchestrator::TimeoutAction::Fail)) | Ok(None) => {}
+            Err(e) => {
+                eprintln!("warning: expiry check failed for run {}: {e}", r.id);
+            }
+        }
     }
 
     // Normalize the optional issue filter once. Accepts the same
@@ -2070,6 +2194,24 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
     let store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir));
     let approver = whoami::username();
 
+    // `store.approve()` treats a timed-out `on_timeout: approve` gate
+    // identically to an operator approve (it falls through and
+    // resumes normally) — it has no way to tell the caller that's
+    // what happened, so detect it here first purely to print a
+    // distinct message before making the same library call.
+    if let Ok(record) = store.load(run_id) {
+        let overdue = record.status == rupu_orchestrator::RunStatus::AwaitingApproval
+            && record.expires_at.is_some_and(|exp| chrono::Utc::now() > exp);
+        if overdue
+            && gate_on_timeout_for(&store, &record)
+                == Some(rupu_orchestrator::TimeoutAction::Approve)
+        {
+            println!(
+                "rupu: gate timed out with on_timeout: approve — auto-approving and resuming"
+            );
+        }
+    }
+
     // Library call replaces inline load + expire-check + status check
     // + mutate + update. Re-entering run_workflow stays in the CLI
     // because the TUI uses a different resume model.
@@ -2077,6 +2219,44 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
         Ok(rupu_orchestrator::ApprovalDecision::Approved { step_id, .. }) => step_id,
         Err(rupu_orchestrator::ApprovalError::Expired(msg)) => {
             anyhow::bail!("approval expired before it was acted on — {msg}");
+        }
+        Err(rupu_orchestrator::ApprovalError::ExpiredRejected { step_id, reason }) => {
+            // The gate's own `on_timeout: reject` policy fired before
+            // this operator approve landed — the store already
+            // finalized the run as `Rejected`. Report it and run the
+            // same `on_reject` cleanup chain a normal reject does.
+            println!(
+                "rupu: gate timed out (on_timeout: reject) — run {run_id} auto-rejected at step `{step_id}`"
+            );
+            if cheap_on_reject_chain_len(&store, run_id, &step_id) != Some(0) {
+                match crate::resume::build_reject_cleanup_opts(
+                    &store, run_id, &step_id, &reason, mode,
+                )
+                .await
+                {
+                    Ok((opts, chain_len)) => {
+                        match rupu_orchestrator::runner::run_reject_cleanup(
+                            opts, &step_id, &reason, "timeout",
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                if chain_len > 0 {
+                                    println!("cleanup: {chain_len} step(s) executed");
+                                }
+                            }
+                            Err(e) => eprintln!("warning: on_reject cleanup chain errored: {e}"),
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "warning: could not load workflow for on_reject cleanup: {e} \
+                             (run is already correctly rejected)"
+                        );
+                    }
+                }
+            }
+            return Ok(());
         }
         Err(rupu_orchestrator::ApprovalError::NotAwaiting(s)) => {
             anyhow::bail!(
@@ -2414,6 +2594,7 @@ pub(crate) async fn resume_run(
         completed_units,
         reason,
         paused_step,
+        rejected_reason: None,
     };
 
     // Clone the workflow for the live view before `opts` consumes it.
@@ -2527,28 +2708,96 @@ async fn reject(run_id: &str, reason: Option<&str>) -> anyhow::Result<()> {
     let approver = whoami::username();
     let reason_str = reason.unwrap_or("rejected by operator");
 
+    // `store.reject()` treats a gate that already timed out with
+    // `on_timeout: reject` identically to an explicit operator reject
+    // (both return `Ok(ApprovalDecision::Rejected { .. })`) — it has no
+    // way to tell this caller which one actually happened. Detect it
+    // here, before the library call, purely to attribute the gate
+    // output's `via` correctly (spec §3.1): "timeout" when the policy
+    // already fired, "human" for a genuine operator decision.
+    let via = if let Ok(record) = store.load(run_id) {
+        let overdue = record.status == rupu_orchestrator::RunStatus::AwaitingApproval
+            && record.expires_at.is_some_and(|exp| chrono::Utc::now() > exp);
+        if overdue
+            && gate_on_timeout_for(&store, &record)
+                == Some(rupu_orchestrator::TimeoutAction::Reject)
+        {
+            println!(
+                "rupu: gate timed out with on_timeout: reject — already auto-rejected"
+            );
+            "timeout"
+        } else {
+            "human"
+        }
+    } else {
+        "human"
+    };
+
     // Library call replaces inline load + expire-check + status check
     // + mutate + update.
-    match store.reject(run_id, &approver, reason_str, chrono::Utc::now()) {
-        Ok(rupu_orchestrator::ApprovalDecision::Rejected { .. }) => {}
-        Err(rupu_orchestrator::ApprovalError::Expired(msg)) => {
-            anyhow::bail!("approval expired before it was acted on — {msg}");
-        }
-        Err(rupu_orchestrator::ApprovalError::NotAwaiting(s)) => {
-            anyhow::bail!(
-                "run is `{s}`, not `awaiting_approval` — only paused runs can be rejected",
-            );
-        }
-        Err(rupu_orchestrator::ApprovalError::NotFound(id)) => {
-            anyhow::bail!(
-                "run not found: {id}\n  hint: \
-                 list paused runs with `rupu workflow runs --status awaiting_approval`"
-            );
-        }
-        Err(e) => return Err(anyhow::anyhow!("reject: {e}")),
-        Ok(other) => anyhow::bail!("unexpected decision: {other:?}"),
-    }
+    let (rejected_step_id, rejected_reason) =
+        match store.reject(run_id, &approver, reason_str, chrono::Utc::now()) {
+            Ok(rupu_orchestrator::ApprovalDecision::Rejected { step_id, reason, .. }) => {
+                (step_id, reason)
+            }
+            Err(rupu_orchestrator::ApprovalError::Expired(msg)) => {
+                anyhow::bail!("approval expired before it was acted on — {msg}");
+            }
+            Err(rupu_orchestrator::ApprovalError::NotAwaiting(s)) => {
+                anyhow::bail!(
+                    "run is `{s}`, not `awaiting_approval` — only paused runs can be rejected",
+                );
+            }
+            Err(rupu_orchestrator::ApprovalError::NotFound(id)) => {
+                anyhow::bail!(
+                    "run not found: {id}\n  hint: \
+                     list paused runs with `rupu workflow runs --status awaiting_approval`"
+                );
+            }
+            Err(e) => return Err(anyhow::anyhow!("reject: {e}")),
+            Ok(other) => anyhow::bail!("unexpected decision: {other:?}"),
+        };
     println!("rupu: run {run_id} marked rejected");
+
+    // The run is already correctly `Rejected` at this point (the library
+    // call above is what finalized it) — a cleanup-load failure is warned,
+    // never turned into a command error. `on_reject` chains are optional;
+    // most rejected gates have none.
+    if cheap_on_reject_chain_len(&store, run_id, &rejected_step_id) != Some(0) {
+        match crate::resume::build_reject_cleanup_opts(
+            &store,
+            run_id,
+            &rejected_step_id,
+            &rejected_reason,
+            None,
+        )
+        .await
+        {
+            Ok((opts, chain_len)) => {
+                match rupu_orchestrator::runner::run_reject_cleanup(
+                    opts,
+                    &rejected_step_id,
+                    &rejected_reason,
+                    via,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        if chain_len > 0 {
+                            println!("cleanup: {chain_len} step(s) executed");
+                        }
+                    }
+                    Err(e) => eprintln!("warning: on_reject cleanup chain errored: {e}"),
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: could not load workflow for on_reject cleanup: {e} \
+                     (run is already correctly rejected)"
+                );
+            }
+        }
+    }
     Ok(())
 }
 
