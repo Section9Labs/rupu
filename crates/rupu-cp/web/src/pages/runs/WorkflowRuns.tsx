@@ -10,6 +10,11 @@
 // Archived has no server-side pagination (`/api/runs/archived` returns
 // everything in one shot); the fetcher returns `[]` for any offset > 0 so
 // the hook settles as `ended` after that single page.
+//
+// Find (2026-07-23 operator feedback amendment #1): a `SearchInput` in the
+// FilterBar's search slot narrows the loaded rows client-side, live per
+// keystroke, over workflow name / run id / host id — composing with (not
+// replacing) the lifecycle/trigger pills above it.
 
 import { useCallback, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
@@ -20,6 +25,7 @@ import UsageBarChart from '../../components/charts/UsageBarChart';
 import { Button } from '../../components/ui/Button';
 import { FilterBar } from '../../components/ui/FilterBar';
 import { FilterPills, type FilterPillOption } from '../../components/ui/FilterPills';
+import { SearchInput } from '../../components/ui/SearchInput';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { ErrorBanner } from '../../components/ui/ErrorBanner';
 import { Spinner } from '../../components/ui/Spinner';
@@ -92,6 +98,7 @@ export default function WorkflowRuns() {
   // Row-action (archive/restore/delete) failures — kept separate from the
   // list-fetch error the hook owns, but shown in the same banner.
   const [actionError, setActionError] = useState<string | null>(null);
+  const [query, setQuery] = useState('');
 
   const fetchRows = useCallback(
     ({ offset, limit }: { offset: number; limit: number }): Promise<RunListRow[]> => {
@@ -117,6 +124,18 @@ export default function WorkflowRuns() {
     if (!archived && filter !== 'all' && r.trigger !== filter) return false;
     return true;
   });
+
+  // Find — case-insensitive substring across the fields this table actually
+  // renders: workflow name (subject), run id, and host id. Composes with
+  // (narrows within) the lifecycle/trigger pills above.
+  const q = query.trim().toLowerCase();
+  const visible = q
+    ? filtered.filter((r) =>
+        [r.workflow_name, r.id, r.host_id]
+          .filter((v): v is string => Boolean(v))
+          .some((v) => v.toLowerCase().includes(q)),
+      )
+    : filtered;
 
   const lifecycleValue: Lifecycle = archived ? 'archived' : tab;
   function handleLifecycleChange(v: string) {
@@ -228,6 +247,17 @@ export default function WorkflowRuns() {
               )}
             </>
           }
+          search={
+            <SearchInput
+              aria-label="Find runs"
+              placeholder="Find runs…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') setQuery('');
+              }}
+            />
+          }
           scope={
             !archived && (
               <HostSelect
@@ -256,10 +286,12 @@ export default function WorkflowRuns() {
               : 'Workflow runs will appear here once you dispatch one from the CLI, the desktop app, or a scheduled trigger.'
           }
         />
+      ) : visible.length === 0 ? (
+        <EmptyState title="No matches" hint={`No runs match "${query}".`} />
       ) : (
         <div className="space-y-6">
           <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
-            <UsageBarChart bars={filtered.map((r) => ({
+            <UsageBarChart bars={visible.map((r) => ({
               id: r.id, label: r.workflow_name, to: runHref(r),
               input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens,
               cached_tokens: r.usage.cached_tokens, cost_usd: r.usage.cost_usd,
@@ -267,14 +299,20 @@ export default function WorkflowRuns() {
           </div>
           <SortableTable<RunListRow>
             columns={columns}
-            rows={filtered}
+            rows={visible}
             rowKey={(r) => r.id}
             rowHref={runHref}
             initialSort={{ key: 'started', dir: 'desc' }}
           />
           {!archived && (loading || hasMore || ended) && (
             <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
-              {loading ? 'loading more…' : hasMore ? 'scroll for more' : `— end of ${filtered.length} —`}
+              {q
+                ? `${visible.length} matches of ${filtered.length} loaded`
+                : loading
+                  ? 'loading more…'
+                  : hasMore
+                    ? 'scroll for more'
+                    : `— end of ${filtered.length} —`}
             </div>
           )}
         </div>

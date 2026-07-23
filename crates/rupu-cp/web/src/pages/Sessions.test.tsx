@@ -260,3 +260,71 @@ describe('Sessions — kit loading/empty/error states', () => {
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('network down'));
   });
 });
+
+// ── Amendment #1 (2026-07-23 feedback round): Find on every table ──────────
+
+describe('Sessions — Find', () => {
+  const OTHER_SESSION: SessionSummary = {
+    ...REMOTE_SESSION,
+    session_id: 'sess-def456',
+    agent_name: 'review-pr',
+    host_id: 'local',
+  };
+
+  it('typing narrows rows by agent name, session id, or host id', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION, OTHER_SESSION]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByPlaceholderText('Find sessions…'), { target: { value: 'review' } });
+
+    await waitFor(() => expect(screen.queryByText('fix-bug')).not.toBeInTheDocument());
+    expect(screen.getByText('review-pr')).toBeInTheDocument();
+  });
+
+  it('footer shows "N matches of M loaded" while a query is active', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION, OTHER_SESSION]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByPlaceholderText('Find sessions…'), { target: { value: 'review' } });
+
+    await waitFor(() => expect(screen.getByText('1 matches of 2 loaded')).toBeInTheDocument());
+  });
+
+  it('Esc clears the query', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION, OTHER_SESSION]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+
+    const input = screen.getByPlaceholderText('Find sessions…') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: 'review' } });
+    await waitFor(() => expect(screen.queryByText('fix-bug')).not.toBeInTheDocument());
+
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    await waitFor(() => expect(input.value).toBe(''));
+    expect(screen.getByText('fix-bug')).toBeInTheDocument();
+  });
+
+  it('composes with the Active/Archived pill: query narrows within the active tab only', async () => {
+    stubDeps();
+    const activeSpy = vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByPlaceholderText('Find sessions…'), { target: { value: 'zzz-no-match' } });
+
+    await waitFor(() => expect(screen.getByText('No matches')).toBeInTheDocument());
+    // The query does not itself trigger a new server fetch — it stays
+    // client-side (Active/host params only).
+    expect(activeSpy).toHaveBeenCalledWith(expect.objectContaining({ scope: 'active' }));
+  });
+});

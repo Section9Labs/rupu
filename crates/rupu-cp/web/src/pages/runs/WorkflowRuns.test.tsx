@@ -355,3 +355,79 @@ describe('WorkflowRuns — row actions (ring buttons)', () => {
     await waitFor(() => expect(restoreSpy).toHaveBeenCalledWith('run_arch'));
   });
 });
+
+// ── Amendment #1 (2026-07-23 feedback round): Find on every table ──────────
+
+describe('WorkflowRuns — Find', () => {
+  it('typing narrows rows by workflow name, run id, or host id', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([
+      makeRun({ id: 'run_a', workflow_name: 'deploy-prod' }),
+      makeRun({ id: 'run_b', workflow_name: 'lint-repo' }),
+    ]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('lint-repo')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByPlaceholderText('Find runs…'), { target: { value: 'lint' } });
+
+    await waitFor(() => expect(screen.queryByText('deploy-prod')).not.toBeInTheDocument());
+    expect(screen.getByText('lint-repo')).toBeInTheDocument();
+  });
+
+  it('footer shows "N matches of M loaded" while a query is active', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([
+      makeRun({ id: 'run_a', workflow_name: 'deploy-prod' }),
+      makeRun({ id: 'run_b', workflow_name: 'lint-repo' }),
+    ]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('lint-repo')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByPlaceholderText('Find runs…'), { target: { value: 'lint' } });
+
+    await waitFor(() => expect(screen.getByText('1 matches of 2 loaded')).toBeInTheDocument());
+  });
+
+  it('Esc clears the query', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([
+      makeRun({ id: 'run_a', workflow_name: 'deploy-prod' }),
+      makeRun({ id: 'run_b', workflow_name: 'lint-repo' }),
+    ]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('lint-repo')).toBeInTheDocument());
+
+    const input = screen.getByPlaceholderText('Find runs…') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: 'lint' } });
+    await waitFor(() => expect(screen.queryByText('deploy-prod')).not.toBeInTheDocument());
+
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    await waitFor(() => expect(input.value).toBe(''));
+    expect(screen.getByText('deploy-prod')).toBeInTheDocument();
+  });
+
+  it('composes with the trigger pill: searching narrows within the active pill filter', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([
+      makeRun({ id: 'run_a', workflow_name: 'deploy-prod', trigger: 'manual' }),
+      makeRun({ id: 'run_b', workflow_name: 'deploy-staging', trigger: 'cron' }),
+    ]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('deploy-staging')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cron' }));
+    await waitFor(() => expect(screen.queryByText('deploy-prod')).not.toBeInTheDocument());
+
+    fireEvent.change(screen.getByPlaceholderText('Find runs…'), { target: { value: 'prod' } });
+
+    // "prod" matches "deploy-prod" (hidden by the Cron pill) but not the
+    // Cron-filtered "deploy-staging" row still loaded.
+    await waitFor(() => expect(screen.queryByText('deploy-staging')).not.toBeInTheDocument());
+    expect(screen.queryByText('deploy-prod')).not.toBeInTheDocument();
+  });
+});

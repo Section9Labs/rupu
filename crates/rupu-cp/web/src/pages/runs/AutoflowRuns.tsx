@@ -11,6 +11,12 @@
 // (fit/subject columns) applied to all three tables. Task A2's Event column,
 // `cycle_failed` detail expansion, and whole-row nav on run rows are
 // preserved verbatim.
+//
+// Find (2026-07-23 operator feedback amendment #1): one `SearchInput` in the
+// FilterBar's search slot narrows whichever tab (Runs/Cycles/Claims) is
+// currently active, client-side, over that tab's own searchable fields (see
+// `matchesAutoflowQuery` below) — composing with (not replacing) the host
+// scope select.
 
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
@@ -27,6 +33,7 @@ import UsageChip from '../../components/UsageChip';
 import { Button } from '../../components/ui/Button';
 import { FilterBar } from '../../components/ui/FilterBar';
 import { Segmented, type SegmentedOption } from '../../components/ui/Segmented';
+import { SearchInput } from '../../components/ui/SearchInput';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { ErrorBanner } from '../../components/ui/ErrorBanner';
 import { Spinner } from '../../components/ui/Spinner';
@@ -161,6 +168,12 @@ function eventHref(e: AutoflowEventRow): string | undefined {
 // empty rather than a wall of "—" placeholders.
 function isRunEvent(e: AutoflowEventRow): boolean {
   return Boolean(e.run_id);
+}
+
+/** Case-insensitive substring match of `query` against any of `fields`. */
+function matchesAutoflowQuery(query: string, fields: (string | null | undefined)[]): boolean {
+  if (!query) return true;
+  return fields.filter((v): v is string => Boolean(v)).some((v) => v.toLowerCase().includes(query));
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +486,7 @@ export default function AutoflowRuns() {
   const [tab, setTab] = useState<Tab>('runs');
   // Default to 'local' → fast server-side path; ALL_HOSTS → fan-out.
   const [hostFilter, setHostFilter] = useState<string>('local');
+  const [query, setQuery] = useState('');
 
   // The primary "Runs" (events) feed and the "Cycles" feed each get their own
   // usePagedList instance (independent pagination + sentinel), matching the
@@ -618,6 +632,30 @@ export default function AutoflowRuns() {
   const bannerError = tab === 'runs' ? events.error : tab === 'cycles' ? cycles.error : claims.error;
   const refreshing = events.loading || cycles.loading;
 
+  // Find — narrows whichever tab is active over ITS OWN searchable fields:
+  //   events (Runs tab): workflow/kind label (subject), run id, issue ref,
+  //     host id, worker name.
+  //   cycles: cycle id, host id, worker name (no single subject column — see
+  //     CYCLE_COLUMNS' comment).
+  //   claims: issue ref/display ref, workflow, repo ref, claim owner.
+  const q = query.trim().toLowerCase();
+  const visibleEvents = events.rows.filter((e) =>
+    matchesAutoflowQuery(q, [
+      e.workflow,
+      KIND_LABEL[e.kind] ?? e.kind,
+      e.run_id,
+      e.issue_display_ref,
+      e.host_id,
+      e.worker_name,
+    ]),
+  );
+  const visibleCycles = cycles.rows.filter((c) =>
+    matchesAutoflowQuery(q, [c.cycle_id, c.host_id, c.worker_name]),
+  );
+  const visibleClaims = claims.rows.filter((c) =>
+    matchesAutoflowQuery(q, [c.issue_display_ref, c.issue_ref, c.workflow, c.repo_ref, c.claim_owner]),
+  );
+
   return (
     <div className="p-8">
       <header className="flex items-center justify-between mb-6">
@@ -648,6 +686,17 @@ export default function AutoflowRuns() {
               ariaLabel="View"
             />
           }
+          search={
+            <SearchInput
+              aria-label="Find autoflows"
+              placeholder="Find autoflows…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') setQuery('');
+              }}
+            />
+          }
           scope={
             // Host filter — shown for runs and cycles tabs; claims are always local.
             tab !== 'claims' && (
@@ -669,22 +718,26 @@ export default function AutoflowRuns() {
             title="No autoflow activity yet"
             hint="Runs launched by the autoflow worker will appear here, each linking to its run graph."
           />
+        ) : visibleEvents.length === 0 ? (
+          <EmptyState title="No matches" hint={`No autoflow activity matches "${query}".`} />
         ) : (
           <section>
             <SortableTable<AutoflowEventRow>
               columns={EVENT_COLUMNS}
-              rows={events.rows}
+              rows={visibleEvents}
               rowKey={(e) => e.event_id}
               rowHref={eventHref}
               initialSort={{ key: 'started', dir: 'desc' }}
               renderDetail={EventDetail}
             />
             <div ref={events.sentinelRef} className="py-2 text-center text-note text-ink-mute">
-              {events.loading
-                ? 'loading more…'
-                : events.hasMore
-                  ? 'scroll for more'
-                  : `— end of ${events.rows.length} —`}
+              {q
+                ? `${visibleEvents.length} matches of ${events.rows.length} loaded`
+                : events.loading
+                  ? 'loading more…'
+                  : events.hasMore
+                    ? 'scroll for more'
+                    : `— end of ${events.rows.length} —`}
             </div>
           </section>
         )
@@ -698,21 +751,25 @@ export default function AutoflowRuns() {
             title="No autoflow cycles yet"
             hint="Autoflow scheduling cycles will appear here once the autoflow worker runs."
           />
+        ) : visibleCycles.length === 0 ? (
+          <EmptyState title="No matches" hint={`No autoflow cycles match "${query}".`} />
         ) : (
           <section>
             <SortableTable<AutoflowCycleRow>
               columns={CYCLE_COLUMNS}
-              rows={cycles.rows}
+              rows={visibleCycles}
               rowKey={(c) => c.cycle_id}
               initialSort={{ key: 'started', dir: 'desc' }}
               renderDetail={CycleDetail}
             />
             <div ref={cycles.sentinelRef} className="py-2 text-center text-note text-ink-mute">
-              {cycles.loading
-                ? 'loading more…'
-                : cycles.hasMore
-                  ? 'scroll for more'
-                  : `— end of ${cycles.rows.length} —`}
+              {q
+                ? `${visibleCycles.length} matches of ${cycles.rows.length} loaded`
+                : cycles.loading
+                  ? 'loading more…'
+                  : cycles.hasMore
+                    ? 'scroll for more'
+                    : `— end of ${cycles.rows.length} —`}
             </div>
           </section>
         )
@@ -725,14 +782,21 @@ export default function AutoflowRuns() {
           title="No active claims"
           hint="Issues the autoflow worker has leased will appear here, each with requeue and release controls."
         />
+      ) : visibleClaims.length === 0 ? (
+        <EmptyState title="No matches" hint={`No autoflow claims match "${query}".`} />
       ) : (
         <section>
           <SortableTable<AutoflowClaim>
             columns={claimColumns}
-            rows={claims.rows}
+            rows={visibleClaims}
             rowKey={(c) => c.issue_ref}
             initialSort={{ key: 'updated', dir: 'desc' }}
           />
+          {q && (
+            <div className="py-2 text-center text-note text-ink-mute">
+              {visibleClaims.length} matches of {claims.rows.length} loaded
+            </div>
+          )}
         </section>
       )}
     </div>

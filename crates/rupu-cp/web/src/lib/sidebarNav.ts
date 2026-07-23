@@ -64,8 +64,8 @@ export const sidebarNav: NavSection[] = [
   }},
   { kind: 'group', group: {
     id: 'build', label: 'Build', items: [
-      { to: '/workflows', label: 'Workflows', icon: Workflow, enabled: true },
       { to: '/agents',    label: 'Agents',    icon: Sparkles, enabled: true },
+      { to: '/workflows', label: 'Workflows', icon: Workflow, enabled: true },
       { to: '/autoflows', label: 'Autoflows', icon: Repeat,   enabled: true },
     ],
   }},

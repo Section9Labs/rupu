@@ -1,10 +1,21 @@
 // Agent run-stream page — standalone and session-bound agent runs.
 // No DAG graph (agent runs have no workflow DAG); shows transcript_path as text.
 // status and started_at are optional (standalone runs may lack them).
-// Three lifecycle pills (Running / Completed / Failed-Rejected), fetch/paginate/
-// poll machinery owned by the shared `usePagedList` hook. Running polls every
-// 5 s (page 0 only, spliced back over the head of the list — see
-// `usePagedList`'s doc comment for why that doesn't reset a scrolled view).
+// Three lifecycle pills (Running / Completed / Failed-Rejected) + a Source
+// pill group (All / Standalone / Session, defaulting to Standalone — an
+// agent-runs read is a standalone invocation by default; session work lives
+// on the Sessions page instead — 2026-07-23 operator feedback amendment #2)
+// + a Find search box, fetch/paginate/poll machinery owned by the shared
+// `usePagedList` hook. Running polls every 5 s (page 0 only, spliced back
+// over the head of the list — see `usePagedList`'s doc comment for why that
+// doesn't reset a scrolled view).
+//
+// Backend dedupe (`crates/rupu-cp/src/api/run_streams.rs`,
+// `dedupe_agent_runs_by_run_id`) already collapses a session-turn run's
+// standalone `.meta.json` row and its session.json `runs[]` row into ONE
+// merged row before this page ever sees it — the Source pill filters that
+// single merged row's `source` field, it does not need to dedupe anything
+// itself.
 
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
@@ -14,7 +25,8 @@ import SortableTable, { type Column } from '../../components/lists/SortableTable
 import UsageBarChart from '../../components/charts/UsageBarChart';
 import { Button } from '../../components/ui/Button';
 import { FilterBar } from '../../components/ui/FilterBar';
-import { FilterPills } from '../../components/ui/FilterPills';
+import { FilterPills, type FilterPillOption } from '../../components/ui/FilterPills';
+import { SearchInput } from '../../components/ui/SearchInput';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { ErrorBanner } from '../../components/ui/ErrorBanner';
 import { Spinner } from '../../components/ui/Spinner';
@@ -36,10 +48,23 @@ const LIFECYCLE_OPTIONS: { value: Tab; label: string }[] = [
   { value: 'failed', label: 'Failed / Rejected' },
 ];
 
+type SourceFilter = 'all' | 'standalone' | 'session';
+
+const SOURCE_OPTIONS: FilterPillOption[] = [
+  { value: 'all', label: 'All' },
+  { value: 'standalone', label: 'Standalone' },
+  { value: 'session', label: 'Session' },
+];
+
 export default function AgentRuns() {
   const [tab, setTab] = useState<Tab>('active');
+  // Default 'standalone' — an agent-runs read is a standalone invocation by
+  // default; session-bound runs live on the Sessions page instead (operator
+  // feedback, 2026-07-23 amendment #2).
+  const [sourceFilter, setSourceFilter] = useState<SourceFilter>('standalone');
   // Default to 'local' → fast server-side path; ALL_HOSTS → fan-out.
   const [hostFilter, setHostFilter] = useState<string>('local');
+  const [query, setQuery] = useState('');
 
   const { rows, loading, error, hasMore, sentinelRef, refresh } = usePagedList<AgentRunRow>({
     fetch: ({ offset, limit }) => {
@@ -50,15 +75,31 @@ export default function AgentRuns() {
     poll: tab === 'active',
   });
 
+  // Source pill — client-side (the wire payload already carries `source` per
+  // row; no extra server round-trip needed).
+  const bySource = rows.filter((r) => sourceFilter === 'all' || r.source === sourceFilter);
+
   // Sort newest-first where started_at is available; runs without it sink to
   // the bottom so that active/recent runs remain prominent. Feeds both the
   // usage chart (left-to-right order) and the table's initial sort.
-  const sorted = [...rows].sort((a, b) => {
+  const sorted = [...bySource].sort((a, b) => {
     if (!a.started_at && !b.started_at) return 0;
     if (!a.started_at) return 1;
     if (!b.started_at) return -1;
     return Date.parse(b.started_at) - Date.parse(a.started_at);
   });
+
+  // Find — case-insensitive substring across the fields this table actually
+  // renders: agent name (subject), run/session ids, and host id. Composes
+  // with (narrows within) the lifecycle + Source pills above.
+  const q = query.trim().toLowerCase();
+  const visible = q
+    ? sorted.filter((r) =>
+        [r.agent, r.run_id, r.session_id, r.host_id]
+          .filter((v): v is string => Boolean(v))
+          .some((v) => v.toLowerCase().includes(q)),
+      )
+    : sorted;
 
   return (
     <div className="p-8">
@@ -75,7 +116,26 @@ export default function AgentRuns() {
 
       <FilterBar
         filters={
-          <FilterPills options={LIFECYCLE_OPTIONS} value={tab} onChange={(v) => setTab(v as Tab)} />
+          <>
+            <FilterPills options={LIFECYCLE_OPTIONS} value={tab} onChange={(v) => setTab(v as Tab)} />
+            <FilterPills
+              label="Source"
+              options={SOURCE_OPTIONS}
+              value={sourceFilter}
+              onChange={(v) => setSourceFilter(v as SourceFilter)}
+            />
+          </>
+        }
+        search={
+          <SearchInput
+            aria-label="Find agents"
+            placeholder="Find agents…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') setQuery('');
+            }}
+          />
         }
         scope={<HostSelect allowAll ariaLabel="Host filter" value={hostFilter} onChange={setHostFilter} />}
       />
@@ -89,13 +149,19 @@ export default function AgentRuns() {
           </div>
         ) : sorted.length === 0 ? (
           <EmptyState
-            title="No agent runs yet"
-            hint="Standalone and session-bound agent invocations will appear here once they run."
+            title={rows.length > 0 ? 'No agent runs match this filter' : 'No agent runs yet'}
+            hint={
+              rows.length > 0
+                ? 'Try a different lifecycle, source, or host filter above.'
+                : 'Standalone and session-bound agent invocations will appear here once they run.'
+            }
           />
+        ) : visible.length === 0 ? (
+          <EmptyState title="No matches" hint={`No agent runs match "${query}".`} />
         ) : (
           <section>
             <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
-              <UsageBarChart bars={sorted.map((r) => {
+              <UsageBarChart bars={visible.map((r) => {
                 const hostSuffix = r.host_id && r.host_id !== 'local'
                   ? `&host=${encodeURIComponent(r.host_id)}`
                   : '';
@@ -112,12 +178,18 @@ export default function AgentRuns() {
             </div>
             <SortableTable<AgentRunRow>
               columns={AGENT_RUN_COLUMNS}
-              rows={sorted}
+              rows={visible}
               rowKey={(r) => r.run_id}
               initialSort={{ key: 'started', dir: 'desc' }}
             />
             <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
-              {loading ? 'loading more…' : hasMore ? 'scroll for more' : `— end of ${sorted.length} —`}
+              {q
+                ? `${visible.length} matches of ${sorted.length} loaded`
+                : loading
+                  ? 'loading more…'
+                  : hasMore
+                    ? 'scroll for more'
+                    : `— end of ${sorted.length} —`}
             </div>
           </section>
         )}
