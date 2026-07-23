@@ -2628,6 +2628,7 @@ pub(crate) async fn resume_run(
         strict_templates: false,
         event_sink: event_sink_for_resume,
         unit_dispatcher,
+        action_dispatcher: None,
         pause: Some(pause_token.clone()),
     };
 
@@ -3899,6 +3900,7 @@ async fn execute_workflow_invocation(
         strict_templates,
         event_sink: event_sink_for_run,
         unit_dispatcher,
+        action_dispatcher: None,
         pause: Some(pause_token.clone()),
     };
 
@@ -4078,6 +4080,7 @@ async fn execute_workflow_invocation(
                         strict_templates,
                         event_sink: resume_event_sink,
                         unit_dispatcher: resume_unit_dispatcher,
+                        action_dispatcher: None,
                         pause: Some(pause_token.clone()),
                     };
                     current_runner = tokio::spawn(run_workflow(resume_opts));

@@ -233,6 +233,7 @@ async fn rebuild_opts_from_disk(
         strict_templates: false,
         event_sink: event_sink_for_resume,
         unit_dispatcher: None,
+        action_dispatcher: None,
         pause: None,
     };
 

@@ -126,6 +126,12 @@ pub enum RunWorkflowError {
         #[source]
         source: RunError,
     },
+    #[error("action step {step} failed: {source}")]
+    Action {
+        step: String,
+        #[source]
+        source: rupu_mcp::McpError,
+    },
     #[error("input `{name}` is required but was not provided")]
     MissingRequiredInput { name: String },
     #[error("input `{name}`: value `{value}` is not in the declared `enum` ({allowed:?})")]
@@ -163,8 +169,10 @@ pub enum RunWorkflowError {
         "pausing a workflow with a `workspace: sync` step is not supported (v1): let it run to completion instead"
     )]
     PauseWithWorkspaceSync,
-    #[error("step `{step}`: `action:` steps are not supported by this rupu version yet (Plan 2)")]
-    ActionStepsNotYetSupported { step: String },
+    #[error(
+        "action step `{step}` requires runtime wiring — this entry point does not provide an SCM dispatcher"
+    )]
+    ActionDispatcherMissing { step: String },
 }
 
 /// Trait the orchestrator uses to construct per-unit [`AgentRunOpts`].
@@ -267,6 +275,15 @@ pub struct OrchestratorRunOpts {
     /// pause only at the step boundary — mid-unit fan-out pause/resume is not
     /// supported in v1 (same class of limitation as `workspace: sync`).
     pub pause: Option<CancellationToken>,
+    /// In-process MCP tool dispatcher for `action:` steps (spec §3.2). When
+    /// `Some`, a workflow's `action:` steps execute for real by calling the
+    /// dispatcher with the step's `with:` values (template-rendered first).
+    /// `None` ⇒ any `action:` step fails loudly with
+    /// [`RunWorkflowError::ActionDispatcherMissing`] — this entry point does
+    /// not provide an SCM dispatcher (e.g. a test harness that never
+    /// constructs one). Plan 2 wires this from `rupu-cli`; Plan 4's notify
+    /// hooks reuse the same [`execute_action_step`] helper this drives.
+    pub action_dispatcher: Option<Arc<rupu_mcp::ToolDispatcher>>,
 }
 
 /// Why a run paused. Threaded onto [`AwaitingInfo`] / [`ResumeState`] so the
@@ -1274,15 +1291,6 @@ async fn run_steps_inner(
             continue;
         }
 
-        // Action steps parse (Plan 1) but execute in Plan 2. Fail loudly
-        // rather than silently no-op — a workflow that names one needs
-        // the newer binary.
-        if step.action.is_some() {
-            return Err(RunWorkflowError::ActionStepsNotYetSupported {
-                step: step.id.clone(),
-            });
-        }
-
         let effective_continue_on_error =
             step.continue_on_error.unwrap_or(workflow_default_continue);
         persist_active_step(opts, run_id, step, None);
@@ -1351,6 +1359,25 @@ async fn run_steps_inner(
                 }
                 Ok(FanoutStepOutcome::Completed(sr)) => Ok(sr),
                 Err(e) => Err(e),
+            }
+        } else if step.action.is_some() {
+            // Action steps never pause mid-run — a single dispatcher call is
+            // either fast enough to run to completion or fails outright; no
+            // cooperative-pause checkpoint shape exists for it.
+            match opts.action_dispatcher.as_ref() {
+                Some(dispatcher) => {
+                    execute_action_step(
+                        dispatcher,
+                        step,
+                        &ctx,
+                        render_mode(opts.strict_templates),
+                        effective_continue_on_error,
+                    )
+                    .await
+                }
+                None => Err(RunWorkflowError::ActionDispatcherMissing {
+                    step: step.id.clone(),
+                }),
             }
         } else {
             // The linear path is the only other shape that pauses mid-step
@@ -1549,6 +1576,117 @@ fn step_kind_for_run_record(step: &Step) -> crate::runs::StepKind {
     }
 }
 
+/// Deep-walk `with:` (a step's action arguments) and render every JSON
+/// STRING leaf through the same template machinery `prompt:` uses
+/// ([`render_step_prompt`]) — objects and arrays recurse; numbers, bools,
+/// and null pass through unchanged. `None` (no `with:` block at all) becomes
+/// an empty object, a valid call for any tool whose schema has no required
+/// parameters.
+fn render_action_args(
+    with: Option<&serde_json::Value>,
+    ctx: &StepContext,
+    mode: RenderMode,
+) -> Result<serde_json::Value, RenderError> {
+    fn walk(
+        value: &serde_json::Value,
+        ctx: &StepContext,
+        mode: RenderMode,
+    ) -> Result<serde_json::Value, RenderError> {
+        match value {
+            serde_json::Value::String(s) => {
+                Ok(serde_json::Value::String(render_step_prompt(s, ctx, mode)?))
+            }
+            serde_json::Value::Array(items) => Ok(serde_json::Value::Array(
+                items
+                    .iter()
+                    .map(|item| walk(item, ctx, mode))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )),
+            serde_json::Value::Object(map) => {
+                let mut out = serde_json::Map::with_capacity(map.len());
+                for (key, val) in map {
+                    out.insert(key.clone(), walk(val, ctx, mode)?);
+                }
+                Ok(serde_json::Value::Object(out))
+            }
+            // Numbers, bools, null: no template surface, pass through as-is.
+            other => Ok(other.clone()),
+        }
+    }
+    match with {
+        None => Ok(serde_json::json!({})),
+        Some(v) => walk(v, ctx, mode),
+    }
+}
+
+/// Execute one `action:` step through the in-process MCP dispatcher: render
+/// `with:` against `ctx`, call `dispatcher.call(tool, args)`, and package the
+/// outcome into a `StepResult` (kind `Action`).
+///
+/// Shared by the main step loop and the `on_reject` cleanup mirror
+/// (`run_reject_cleanup`) — and, per Plan 4's design, will also be the call
+/// a gate's `notify:` hooks make. Deliberately carries **no** main-loop-only
+/// state (no event sink, no run-store persistence, no pause token): every
+/// caller owns emitting its own events and persisting the returned
+/// `StepResult` — this function only does the render + dispatch + package.
+///
+/// `continue_on_error` mirrors the linear step's failure handling exactly:
+/// a dispatcher error becomes `Ok(StepResult { success: false, .. })` when
+/// `true`, or `Err(RunWorkflowError::Action)` when `false`. A `with:`
+/// template-render failure always propagates as `Err` regardless of
+/// `continue_on_error` — same as every other step shape's render failures,
+/// which are treated as author/config errors, not runtime tool failures.
+async fn execute_action_step(
+    dispatcher: &rupu_mcp::ToolDispatcher,
+    step: &Step,
+    ctx: &StepContext,
+    mode: RenderMode,
+    continue_on_error: bool,
+) -> Result<StepResult, RunWorkflowError> {
+    let tool = step
+        .action
+        .as_deref()
+        .expect("execute_action_step called for a non-action step");
+    let args = render_action_args(step.with.as_ref(), ctx, mode).map_err(|e| {
+        RunWorkflowError::Render {
+            step: step.id.clone(),
+            source: e,
+        }
+    })?;
+    match dispatcher.call(tool, args).await {
+        Ok(output) => Ok(StepResult {
+            step_id: step.id.clone(),
+            output,
+            success: true,
+            skipped: false,
+            kind: crate::runs::StepKind::Action,
+            ..Default::default()
+        }),
+        Err(source) => {
+            if continue_on_error {
+                warn!(
+                    step = %step.id,
+                    error = %source,
+                    "action step failed but continue_on_error is set; proceeding"
+                );
+                Ok(StepResult {
+                    step_id: step.id.clone(),
+                    output: String::new(),
+                    success: false,
+                    skipped: false,
+                    kind: crate::runs::StepKind::Action,
+                    ..Default::default()
+                })
+            } else {
+                Err(RunWorkflowError::Action {
+                    step: step.id.clone(),
+                    source,
+                })
+            }
+        }
+    }
+}
+
 /// Record a resolved gate node's result: `StepStarted` + `StepCompleted`
 /// events, a `StepResult` whose `output` is the decision JSON (spec §3.1),
 /// persisted like any other step. `decision` is `"approved"` or
@@ -1693,20 +1831,85 @@ pub async fn run_reject_cleanup(
     let resolved_inputs = resolve_inputs(&opts.workflow, &opts.inputs)?;
     for step in &chain {
         if step.action.is_some() {
-            // Action steps parse but don't execute yet (Plan 2), same
-            // limitation `run_workflow`'s main loop enforces — but a
-            // cleanup chain never aborts the (already-terminal) run for
-            // it; record the step as a logged failure and continue.
-            warn!(
-                step = %step.id,
-                "on_reject: action steps are not runtime-supported yet (Plan 2); skipping"
+            // Action steps dispatch through the same `execute_action_step`
+            // helper the main loop uses (Plan 2) — but, matching the rest
+            // of this function's contract, a failure here is logged and the
+            // chain continues rather than aborting the (already-terminal)
+            // run: `execute_action_step` is called with
+            // `continue_on_error: true` unconditionally.
+            let ctx = base_context_for_step(
+                &resolved_inputs,
+                opts.event.as_ref(),
+                opts.issue.as_ref(),
+                &step_results,
             );
-            let result = StepResult {
-                step_id: step.id.clone(),
-                success: false,
-                skipped: false,
-                kind: crate::runs::StepKind::Action,
-                ..Default::default()
+            if let Some(sink) = opts.event_sink.as_ref() {
+                sink.emit(
+                    &run_id,
+                    &crate::executor::Event::StepStarted {
+                        run_id: run_id.clone(),
+                        step_id: step.id.clone(),
+                        kind: crate::runs::StepKind::Action,
+                        agent: None,
+                        host: None,
+                    },
+                );
+            }
+            let outcome = match opts.action_dispatcher.as_ref() {
+                Some(dispatcher) => {
+                    execute_action_step(
+                        dispatcher,
+                        step,
+                        &ctx,
+                        render_mode(opts.strict_templates),
+                        true,
+                    )
+                    .await
+                }
+                None => Err(RunWorkflowError::ActionDispatcherMissing {
+                    step: step.id.clone(),
+                }),
+            };
+            let result = match outcome {
+                Ok(result) => {
+                    if let Some(sink) = opts.event_sink.as_ref() {
+                        sink.emit(
+                            &run_id,
+                            &crate::executor::Event::StepCompleted {
+                                run_id: run_id.clone(),
+                                step_id: step.id.clone(),
+                                success: result.success,
+                                duration_ms: 0,
+                                host: None,
+                            },
+                        );
+                    }
+                    result
+                }
+                Err(e) => {
+                    warn!(
+                        step = %step.id,
+                        error = %e,
+                        "on_reject cleanup action step failed; continuing chain"
+                    );
+                    if let Some(sink) = opts.event_sink.as_ref() {
+                        sink.emit(
+                            &run_id,
+                            &crate::executor::Event::StepFailed {
+                                run_id: run_id.clone(),
+                                step_id: step.id.clone(),
+                                error: e.to_string(),
+                            },
+                        );
+                    }
+                    StepResult {
+                        step_id: step.id.clone(),
+                        success: false,
+                        skipped: false,
+                        kind: crate::runs::StepKind::Action,
+                        ..Default::default()
+                    }
+                }
             };
             persist_step_result(&opts, &run_id, &result);
             step_results.push(result);
@@ -3936,6 +4139,7 @@ mod tests {
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: Some(dispatcher),
+            action_dispatcher: None,
             pause: None,
         }
     }
@@ -4213,6 +4417,7 @@ steps:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
+            action_dispatcher: None,
             pause: None,
         };
 
@@ -4711,6 +4916,7 @@ steps:
             strict_templates: false,
             event_sink: Some(sink),
             unit_dispatcher: None,
+            action_dispatcher: None,
             pause: None,
         }
     }
@@ -5203,6 +5409,7 @@ steps:
             strict_templates: false,
             event_sink: Some(sink1.clone()),
             unit_dispatcher: Some(dispatcher1.clone()),
+            action_dispatcher: None,
             pause: Some(token),
         };
 
@@ -5303,6 +5510,7 @@ steps:
             strict_templates: false,
             event_sink: Some(sink2.clone()),
             unit_dispatcher: Some(dispatcher2.clone()),
+            action_dispatcher: None,
             pause: None,
         };
 

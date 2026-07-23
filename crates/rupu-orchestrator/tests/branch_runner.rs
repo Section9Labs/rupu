@@ -115,6 +115,7 @@ fn opts_for(wf: Workflow, tmp: &assert_fs::TempDir, sink: Arc<CollectSink>) -> O
         strict_templates: false,
         event_sink: Some(sink as Arc<dyn EventSink>),
         unit_dispatcher: None,
+        action_dispatcher: None,
         pause: None,
     }
 }
