@@ -1621,10 +1621,19 @@ fn emit_gate_result(
 /// caller that didn't wire it), persistence + event emission silently
 /// no-op (same as `run_workflow`'s in-memory mode) since there is no
 /// run id to key off of.
+///
+/// `via` is the gate output's decision provenance (spec §3.1): `"human"`
+/// for an operator-issued reject (`rupu workflow reject`), `"timeout"`
+/// for a gate's own `on_timeout: reject` policy firing (whether observed
+/// via `rupu workflow runs`'s lazy-expiry sweep or via an `approve` call
+/// that lands on an already-overdue `on_timeout: reject` gate). Callers
+/// must pass the value that matches how this rejection actually came
+/// about — it is persisted verbatim into the gate's `StepResult` output.
 pub async fn run_reject_cleanup(
     opts: OrchestratorRunOpts,
     rejected_step_id: &str,
     reason: &str,
+    via: &str,
 ) -> Result<(), RunWorkflowError> {
     let Some(gate) = opts.workflow.steps.iter().find(|s| s.id == rejected_step_id) else {
         return Ok(()); // legacy inline approval or unknown id — nothing to run
@@ -1664,7 +1673,7 @@ pub async fn run_reject_cleanup(
         &run_id,
         gate,
         "rejected",
-        "human",
+        via,
         Some(reason),
         &mut step_results,
     );

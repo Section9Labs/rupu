@@ -1279,18 +1279,26 @@ impl RunStore {
                 ));
             }
             Some(TimeoutAction::Reject) => {
-                // This marker-only path has no runtime available to
-                // run the gate's `on_reject` cleanup chain (that
-                // needs the full `OrchestratorRunOpts` wiring a CLI
-                // command builds) — log loudly rather than silently
-                // dropping it; a caller with a runtime (`rupu
-                // workflow runs` / `approve` / `reject`) will pick up
-                // the cleanup the next time it observes this run.
+                // This marker-only path finalizes the run `Rejected` but
+                // does NOT run the gate's `on_reject` cleanup chain —
+                // that needs the full `OrchestratorRunOpts` wiring only a
+                // CLI command builds (see `run_reject_cleanup` in
+                // `runner.rs`). That cleanup is currently orphaned for
+                // web-initiated decisions: once this call returns, the
+                // run is terminal, so `expire_if_overdue` no-ops for
+                // every future observer and `approve`/`reject` both
+                // return `NotAwaiting` — nothing will ever pick this
+                // chain up on its own. Per the "Deferred to later plans"
+                // section of
+                // docs/superpowers/plans/2026-07-23-rupu-gate-nodes-plan-1-schema-and-runner.md,
+                // Plan 4's cp-serve gate sweep (which consumes this same
+                // `expire_if_overdue` contract) is what will actually
+                // execute it for the web path.
                 tracing::warn!(
                     run_id,
-                    "gate timed out with on_timeout: reject; run auto-rejected but its \
-                     on_reject cleanup chain is deferred — no runtime available in this \
-                     marker-only resume-request path to run it"
+                    "on_reject cleanup is not executed on the web path yet (Plan 4): \
+                     run auto-rejected but its on_reject chain is orphaned until the \
+                     cp-serve gate sweep lands"
                 );
                 return Err(ApprovalError::ExpiredRejected {
                     step_id: step_id_before_expiry.unwrap_or_default(),

@@ -17,7 +17,9 @@ use rupu_orchestrator::executor::JsonlSink;
 use rupu_orchestrator::runner::{
     run_reject_cleanup, run_workflow, OrchestratorRunOpts, ResumeState, StepFactory,
 };
-use rupu_orchestrator::{ApprovalDecision, RunStatus, RunStore, StepKind, StepResult, Workflow};
+use rupu_orchestrator::{
+    ApprovalDecision, ApprovalError, RunStatus, RunStore, StepKind, StepResult, Workflow,
+};
 use rupu_providers::types::StopReason;
 use rupu_tools::ToolContext;
 use std::collections::BTreeMap;
@@ -659,7 +661,7 @@ async fn reject_runs_on_reject_cleanup_chain() {
         pause: None,
     };
 
-    run_reject_cleanup(opts2, &rejected_step_id, &reason)
+    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human")
         .await
         .expect("cleanup never errors");
 
@@ -781,7 +783,7 @@ async fn reject_cleanup_step_failure_does_not_change_terminal_outcome() {
         pause: None,
     };
 
-    run_reject_cleanup(opts2, &rejected_step_id, &reason)
+    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human")
         .await
         .expect("a failing cleanup step is logged, not returned as an error");
 
@@ -892,7 +894,7 @@ async fn reject_cleanup_with_empty_on_reject_dispatches_nothing() {
         pause: None,
     };
 
-    run_reject_cleanup(opts2, &rejected_step_id, &reason)
+    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human")
         .await
         .expect("empty on_reject is Ok without dispatching anything");
 
@@ -920,4 +922,142 @@ async fn reject_cleanup_with_empty_on_reject_dispatches_nothing() {
         Some("run_completed"),
         "events.jsonl must end with run_completed even for an empty cleanup chain; got {types:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Test 8 — a gate's own `on_timeout: reject` policy firing is recorded as
+// `via: "timeout"`, never `via: "human"` (spec §3.1). Mirrors the CLI's
+// `approve` command landing on an already-overdue `on_timeout: reject`
+// gate: `store.approve()` reports `ApprovalError::ExpiredRejected` and the
+// caller (here, and in `rupu workflow approve` / `rupu workflow runs`)
+// dispatches `run_reject_cleanup` with `via: "timeout"`.
+// ---------------------------------------------------------------------------
+
+const WF_GATE_TIMEOUT_REJECT: &str = r#"
+name: gate-timeout-reject
+steps:
+  - id: gate
+    approval:
+      prompt: "Approve the deploy?"
+      timeout_seconds: 60
+      on_timeout: reject
+      on_reject:
+        - id: notify_fail
+          agent: worker
+          prompt: "cleanup after timeout reject: {{ steps.gate.decision }}"
+"#;
+
+#[tokio::test]
+async fn timeout_reject_records_via_timeout_not_human() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let wf = Workflow::parse(WF_GATE_TIMEOUT_REJECT).unwrap();
+
+    // --- Phase 1: pause at the gate. ---
+    let opts1 = OrchestratorRunOpts {
+        workflow: wf.clone(),
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_gate_timeout_reject".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_GATE_TIMEOUT_REJECT.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        pause: None,
+    };
+    let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
+    let awaiting = res1.awaiting.clone().expect("must pause at the gate");
+    assert_eq!(awaiting.step_id, "gate");
+    let run_id = res1.run_id.clone();
+
+    // Force the gate overdue — mirrors a real clock tick landing after
+    // `timeout_seconds` elapses.
+    let mut record = store.load(&run_id).unwrap();
+    record.expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+    store.update(&record).unwrap();
+
+    // --- An operator's `approve` call lands on the now-overdue gate
+    // (mirrors `rupu workflow approve`): the gate's own `on_timeout:
+    // reject` policy already fired, so `store.approve()` reports
+    // `ExpiredRejected` rather than `Approved`. ---
+    let err = store
+        .approve(&run_id, "operator", chrono::Utc::now())
+        .expect_err("overdue on_timeout: reject gate must error ExpiredRejected");
+    let (rejected_step_id, reason) = match err {
+        ApprovalError::ExpiredRejected { step_id, reason } => (step_id, reason),
+        other => panic!("expected ExpiredRejected, got {other:?}"),
+    };
+    assert_eq!(rejected_step_id, "gate");
+
+    let record_after_reject = store.load(&run_id).unwrap();
+    assert_eq!(record_after_reject.status, RunStatus::Rejected);
+
+    // --- Cleanup: dispatch the on_reject chain with `via: "timeout"` —
+    // what the CLI's timeout-driven call sites pass. ---
+    let factory = Arc::new(EchoFactory::default());
+    let opts2 = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: record_after_reject.workspace_id.clone(),
+        workspace_path: record_after_reject.workspace_path.clone(),
+        transcript_dir: record_after_reject.transcript_dir.clone(),
+        factory: factory.clone(),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_GATE_TIMEOUT_REJECT.to_string()),
+        resume_from: Some(ResumeState::from_rejection(
+            run_id.clone(),
+            Vec::new(),
+            rejected_step_id.clone(),
+            reason.clone(),
+        )),
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        pause: None,
+    };
+
+    run_reject_cleanup(opts2, &rejected_step_id, &reason, "timeout")
+        .await
+        .expect("cleanup never errors");
+
+    let records = store.read_step_results(&run_id).unwrap();
+    let gate_record = records
+        .iter()
+        .find(|r| r.step_id == "gate")
+        .expect("gate result persisted");
+    let gate_output: serde_json::Value =
+        serde_json::from_str(&gate_record.output).expect("gate output is JSON");
+    assert_eq!(gate_output["decision"], "rejected");
+    assert_eq!(
+        gate_output["via"], "timeout",
+        "a policy-driven timeout reject must record via=timeout, never via=human"
+    );
+
+    let cleanup_record = records
+        .iter()
+        .find(|r| r.step_id == "notify_fail")
+        .expect("on_reject step result persisted");
+    assert!(cleanup_record.success);
+    assert!(
+        cleanup_record
+            .output
+            .contains("cleanup after timeout reject: rejected"),
+        "on_reject step should see steps.gate.decision == rejected; got {:?}",
+        cleanup_record.output
+    );
+
+    let record_final = store.load(&run_id).unwrap();
+    assert_eq!(record_final.status, RunStatus::Rejected);
 }

@@ -1863,7 +1863,7 @@ async fn runs(
                     .await
                 {
                     Ok((opts, chain_len)) => match rupu_orchestrator::runner::run_reject_cleanup(
-                        opts, &step_id, &reason,
+                        opts, &step_id, &reason, "timeout",
                     )
                     .await
                     {
@@ -2190,8 +2190,10 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
                 .await
             {
                 Ok((opts, chain_len)) => {
-                    match rupu_orchestrator::runner::run_reject_cleanup(opts, &step_id, &reason)
-                        .await
+                    match rupu_orchestrator::runner::run_reject_cleanup(
+                        opts, &step_id, &reason, "timeout",
+                    )
+                    .await
                     {
                         Ok(()) => println!("cleanup: {chain_len} step(s) executed"),
                         Err(e) => eprintln!("warning: on_reject cleanup chain errored: {e}"),
@@ -2656,6 +2658,31 @@ async fn reject(run_id: &str, reason: Option<&str>) -> anyhow::Result<()> {
     let approver = whoami::username();
     let reason_str = reason.unwrap_or("rejected by operator");
 
+    // `store.reject()` treats a gate that already timed out with
+    // `on_timeout: reject` identically to an explicit operator reject
+    // (both return `Ok(ApprovalDecision::Rejected { .. })`) — it has no
+    // way to tell this caller which one actually happened. Detect it
+    // here, before the library call, purely to attribute the gate
+    // output's `via` correctly (spec §3.1): "timeout" when the policy
+    // already fired, "human" for a genuine operator decision.
+    let via = if let Ok(record) = store.load(run_id) {
+        let overdue = record.status == rupu_orchestrator::RunStatus::AwaitingApproval
+            && record.expires_at.is_some_and(|exp| chrono::Utc::now() > exp);
+        if overdue
+            && gate_on_timeout_for(&store, &record)
+                == Some(rupu_orchestrator::TimeoutAction::Reject)
+        {
+            println!(
+                "rupu: gate timed out with on_timeout: reject — already auto-rejected"
+            );
+            "timeout"
+        } else {
+            "human"
+        }
+    } else {
+        "human"
+    };
+
     // Library call replaces inline load + expire-check + status check
     // + mutate + update.
     let (rejected_step_id, rejected_reason) =
@@ -2700,6 +2727,7 @@ async fn reject(run_id: &str, reason: Option<&str>) -> anyhow::Result<()> {
                 opts,
                 &rejected_step_id,
                 &rejected_reason,
+                via,
             )
             .await
             {
