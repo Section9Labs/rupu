@@ -238,6 +238,7 @@ async fn parent_step_dispatches_child_and_sees_its_output() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
 
@@ -401,6 +402,7 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
 

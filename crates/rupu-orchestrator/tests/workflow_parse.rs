@@ -1407,8 +1407,12 @@ steps:
   - id: open_pr
     action: scm.prs.create
     with:
-      repo: "org/repo"
+      owner: "org"
+      repo: "repo"
       title: "{{ inputs.title }}"
+      body: "opened by rupu"
+      head: "feature-branch"
+      base: "main"
 "#;
     let wf = Workflow::parse(yaml).unwrap();
     assert_eq!(wf.steps[0].action.as_deref(), Some("scm.prs.create"));
@@ -1450,4 +1454,104 @@ steps:
       required: true
 "#;
     assert!(Workflow::parse(yaml).is_err());
+}
+
+// --- Parse-time catalog validation (Plan 2, Task 1) ---
+//
+// `issues.comment`'s real arg struct (CommentIssueArgs, rupu-mcp
+// crates/rupu-mcp/src/tools/issues.rs) is:
+//   tracker: Option<String>  (optional)
+//   project: String          (required)
+//   number: u64              (required)
+//   body: String             (required)
+
+#[test]
+fn action_step_unknown_tool_fails_parse() {
+    let yaml = r#"
+name: bad
+steps:
+  - id: x
+    action: scm.prs.frobnicate
+"#;
+    let err = Workflow::parse(yaml).unwrap_err();
+    assert!(err.to_string().contains("scm.prs.frobnicate"), "got: {err}");
+}
+
+#[test]
+fn action_step_unknown_with_key_fails_parse() {
+    let yaml = r#"
+name: bad
+steps:
+  - id: x
+    action: issues.comment
+    with:
+      project: "acme/repo"
+      number: "7"
+      bodyy: "typo key"
+"#;
+    let err = Workflow::parse(yaml).unwrap_err();
+    assert!(err.to_string().contains("bodyy"), "got: {err}");
+}
+
+#[test]
+fn action_step_missing_required_key_fails_parse() {
+    // issues.comment requires `body`; this `with:` block omits it.
+    let yaml = r#"
+name: bad
+steps:
+  - id: x
+    action: issues.comment
+    with:
+      project: "acme/repo"
+      number: "7"
+"#;
+    assert!(Workflow::parse(yaml).is_err());
+}
+
+#[test]
+fn action_step_valid_with_templated_values_parses() {
+    // Values are templates rendered at runtime — parse validates KEYS only.
+    let yaml = r#"
+name: ok
+steps:
+  - id: seed
+    agent: a
+    prompt: p
+  - id: x
+    action: issues.comment
+    with:
+      project: "acme/repo"
+      number: "{{ event.payload.issue.number }}"
+      body: "{{ steps.seed.output }}"
+"#;
+    assert!(Workflow::parse(yaml).is_ok());
+}
+
+#[test]
+fn on_reject_action_entry_validates_against_catalog() {
+    let yaml = r#"
+name: bad
+steps:
+  - id: g
+    approval:
+      on_reject:
+        - id: c
+          action: nope.nope
+"#;
+    let err = Workflow::parse(yaml).unwrap_err();
+    assert!(err.to_string().contains("nope.nope"), "got: {err}");
+}
+
+#[test]
+fn notify_action_entry_validates_against_catalog() {
+    let yaml = r#"
+name: bad
+steps:
+  - id: g
+    approval:
+      notify:
+        - action: nope.nope
+"#;
+    let err = Workflow::parse(yaml).unwrap_err();
+    assert!(err.to_string().contains("nope.nope"), "got: {err}");
 }

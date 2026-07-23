@@ -230,6 +230,7 @@ async fn gate_auto_approve_completes_without_pausing() {
         strict_templates: false,
         event_sink: Some(sink.clone()),
         unit_dispatcher: None,
+        action_dispatcher: None,
         pause: None,
     };
 
@@ -306,6 +307,7 @@ async fn gate_without_auto_approve_parks_awaiting_approval() {
         strict_templates: false,
         event_sink: Some(sink.clone()),
         unit_dispatcher: None,
+        action_dispatcher: None,
         pause: None,
     };
 
@@ -369,6 +371,7 @@ async fn gate_approve_resume_continues_to_next_step() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
+        action_dispatcher: None,
         pause: None,
     };
     let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
@@ -415,6 +418,7 @@ async fn gate_approve_resume_continues_to_next_step() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
+        action_dispatcher: None,
         pause: None,
     };
 
@@ -489,6 +493,7 @@ async fn gate_as_last_step_approve_resume_completes_run() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
+        action_dispatcher: None,
         pause: None,
     };
     let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
@@ -532,6 +537,7 @@ async fn gate_as_last_step_approve_resume_completes_run() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
+        action_dispatcher: None,
         pause: None,
     };
 
@@ -598,6 +604,7 @@ async fn reject_runs_on_reject_cleanup_chain() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
+        action_dispatcher: None,
         pause: None,
     };
     let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
@@ -658,6 +665,7 @@ async fn reject_runs_on_reject_cleanup_chain() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
+        action_dispatcher: None,
         pause: None,
     };
 
@@ -741,6 +749,7 @@ async fn reject_cleanup_step_failure_does_not_change_terminal_outcome() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
+        action_dispatcher: None,
         pause: None,
     };
     let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
@@ -780,6 +789,7 @@ async fn reject_cleanup_step_failure_does_not_change_terminal_outcome() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
+        action_dispatcher: None,
         pause: None,
     };
 
@@ -838,6 +848,7 @@ async fn reject_cleanup_with_empty_on_reject_dispatches_nothing() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
+        action_dispatcher: None,
         pause: None,
     };
     let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
@@ -891,6 +902,7 @@ async fn reject_cleanup_with_empty_on_reject_dispatches_nothing() {
         strict_templates: false,
         event_sink: Some(sink.clone()),
         unit_dispatcher: None,
+        action_dispatcher: None,
         pause: None,
     };
 
@@ -971,6 +983,7 @@ async fn timeout_reject_records_via_timeout_not_human() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
+        action_dispatcher: None,
         pause: None,
     };
     let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
@@ -1025,6 +1038,7 @@ async fn timeout_reject_records_via_timeout_not_human() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
+        action_dispatcher: None,
         pause: None,
     };
 

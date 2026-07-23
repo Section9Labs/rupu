@@ -29,6 +29,7 @@ futures-util.workspace = true
 rupu-coverage = { path = "../rupu-coverage" }
 rupu-agent = { path = "../rupu-agent" }
 rupu-auth = { path = "../rupu-auth" }
+rupu-mcp = { path = "../rupu-mcp" }
 rupu-providers = { path = "../rupu-providers" }
 rupu-runtime = { path = "../rupu-runtime" }
 rupu-scm = { path = "../rupu-scm" }
@@ -39,3 +40,4 @@ rupu-transcript = { path = "../rupu-transcript" }
 tempfile.workspace = true
 assert_fs.workspace = true
 predicates.workspace = true
+rupu-scm = { path = "../rupu-scm", features = ["test-helpers"] }

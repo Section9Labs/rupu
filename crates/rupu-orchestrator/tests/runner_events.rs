@@ -124,6 +124,7 @@ async fn run_workflow_emits_run_and_step_events_in_order() {
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
 
@@ -211,6 +212,7 @@ steps:
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
 
@@ -268,6 +270,7 @@ steps:
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
 
@@ -445,6 +448,7 @@ steps:
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
 
@@ -499,6 +503,7 @@ async fn no_event_sink_does_not_emit_any_events() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
 
