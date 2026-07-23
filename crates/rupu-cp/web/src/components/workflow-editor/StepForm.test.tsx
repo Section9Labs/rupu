@@ -10,17 +10,28 @@ import { useState } from 'react';
 
 // Mock the CodeMirror-backed ExpressionField to a plain textarea so the form
 // tests stay stable (CodeMirror in jsdom is brittle). The mock preserves the
-// ariaLabel + value/onChange contract StepForm relies on.
+// ariaLabel + value/onChange contract StepForm relies on, and surfaces the
+// `size` prop as a `data-size` attribute so Task 5's size-threading tests can
+// assert on it without depending on the real (CSS-driven) implementation.
 vi.mock('./ExpressionField', () => ({
   default: ({
     value,
     onChange,
     ariaLabel,
+    size,
   }: {
     value: string;
     onChange: (v: string) => void;
     ariaLabel?: string;
-  }) => <textarea aria-label={ariaLabel} value={value} onChange={(e) => onChange(e.target.value)} />,
+    size?: 'default' | 'large';
+  }) => (
+    <textarea
+      aria-label={ariaLabel}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      data-size={size ?? 'default'}
+    />
+  ),
 }));
 
 import StepForm from './StepForm';
@@ -233,6 +244,70 @@ describe('StepForm — branch (flag-gated)', () => {
   });
 });
 
+describe('StepForm — roomier long-text fields (Task 5, next only)', () => {
+  it('classic: the Prompt field stays default-sized (no size prop threaded)', () => {
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'step', agent: 'planner' })}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.getByLabelText('Prompt')).toHaveAttribute('data-size', 'default');
+  });
+
+  it('next: the Prompt field is sized large', () => {
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'step', agent: 'planner' })}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+        workflowEditorUi="next"
+      />,
+    );
+    expect(screen.getByLabelText('Prompt')).toHaveAttribute('data-size', 'large');
+  });
+
+  it('next: a parallel sub-step prompt is sized large', () => {
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'parallel', parallel: [{ id: 'sub-1', agent: 'planner', prompt: '' }] })}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+        workflowEditorUi="next"
+      />,
+    );
+    expect(screen.getByLabelText('Sub-step 1 prompt')).toHaveAttribute('data-size', 'large');
+  });
+
+  it('next: the panel Subject and Prompt fields are sized large; classic stays default', () => {
+    const node = nodeWith({ kind: 'panel', panel: { panelists: [], subject: 'review' } });
+    const { rerender } = render(
+      <StepForm node={node} agents={AGENTS} problems={[]} exprContext={EXPR} onChange={() => {}} />,
+    );
+    expect(screen.getByLabelText('Panel subject')).toHaveAttribute('data-size', 'default');
+
+    rerender(
+      <StepForm
+        node={node}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+        workflowEditorUi="next"
+      />,
+    );
+    expect(screen.getByLabelText('Panel subject')).toHaveAttribute('data-size', 'large');
+    expect(screen.getByLabelText('Panel prompt')).toHaveAttribute('data-size', 'large');
+  });
+});
+
 describe('WorkflowSettingsForm', () => {
   it('editing the name emits a meta with rest preserved', () => {
     const spy = vi.fn();
@@ -242,5 +317,17 @@ describe('WorkflowSettingsForm', () => {
     expect(spy).toHaveBeenCalledWith(
       expect.objectContaining({ name: 'new', rest: { trigger: { cron: '* * * * *' } } }),
     );
+  });
+
+  it('classic: the description field keeps rows=3 (byte-identical)', () => {
+    const meta: WorkflowMeta = { name: 'wf', description: '', rest: {} };
+    render(<WorkflowSettingsForm meta={meta} onChange={() => {}} />);
+    expect(screen.getByLabelText('Workflow description')).toHaveAttribute('rows', '3');
+  });
+
+  it('next: the description field is roomier (rows=4)', () => {
+    const meta: WorkflowMeta = { name: 'wf', description: '', rest: {} };
+    render(<WorkflowSettingsForm meta={meta} onChange={() => {}} workflowEditorUi="next" />);
+    expect(screen.getByLabelText('Workflow description')).toHaveAttribute('rows', '4');
   });
 });

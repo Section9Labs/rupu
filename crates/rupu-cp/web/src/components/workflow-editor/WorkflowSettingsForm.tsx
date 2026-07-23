@@ -71,7 +71,7 @@ export default function WorkflowSettingsForm({
             value={meta.description ?? ''}
             onChange={(e) => patch({ description: e.target.value === '' ? undefined : e.target.value })}
             aria-label="Workflow description"
-            rows={3}
+            rows={4}
             className={`${fieldCls} resize-y`}
           />
         </label>

@@ -22,6 +22,13 @@ export interface ExpressionFieldProps {
   /** Resolved theme mode — injected by the wrapper so the imperative CodeMirror
    *  view picks the matching token colors and reconfigures on toggle. */
   theme?: Mode;
+  /** Sizing variant (Task 5, `next` UI only). 'large' gives a multiline field
+   *  (the prompt / subject editors) a taller floor height (`.wfx-ta-lg` —
+   *  ~10rem min-height) plus a manual vertical resize handle, via a class on
+   *  the field's shell — no CodeMirror internals change. Defaults to
+   *  'default' (today's compact sizing) for every caller that doesn't pass
+   *  it, so classic paths are byte-identical. */
+  size?: 'default' | 'large';
 }
 
 const ExpressionFieldImpl = lazy(() => import('./ExpressionFieldImpl'));
@@ -36,7 +43,7 @@ const FALLBACK_CLASS =
   'w-full resize-y bg-panel px-2.5 py-1.5 font-mono text-lead text-ink ' +
   'placeholder:text-ink-mute focus:outline-none';
 
-function Fallback({ value, onChange, multiline, ariaLabel, placeholder }: ExpressionFieldProps) {
+function Fallback({ value, onChange, multiline, ariaLabel, placeholder, size }: ExpressionFieldProps) {
   if (multiline) {
     return (
       <textarea
@@ -45,7 +52,7 @@ function Fallback({ value, onChange, multiline, ariaLabel, placeholder }: Expres
         aria-label={ariaLabel}
         placeholder={placeholder}
         spellCheck={false}
-        rows={4}
+        rows={size === 'large' ? 8 : 4}
         className={FALLBACK_CLASS}
       />
     );
@@ -67,8 +74,9 @@ export default function ExpressionField(props: ExpressionFieldProps) {
   // Provider-optional: fall back to undefined (the impl reads `data-theme`) so
   // the field renders in isolated tests without a ThemeProvider.
   const mode = useContext(ThemeContext)?.mode;
+  const shellClass = props.size === 'large' ? `${SHELL_CLASS} wfx-ta-lg` : SHELL_CLASS;
   return (
-    <div className={SHELL_CLASS}>
+    <div className={shellClass}>
       <Suspense fallback={<Fallback {...props} />}>
         <ExpressionFieldImpl {...props} theme={mode} />
       </Suspense>

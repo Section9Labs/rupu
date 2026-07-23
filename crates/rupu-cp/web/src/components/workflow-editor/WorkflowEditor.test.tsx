@@ -54,6 +54,24 @@ function renderEditor(draftYaml: string) {
   );
 }
 
+// jsdom's localStorage is unreliable under this Node version — install a
+// simple in-memory implementation we fully control (matches ThemeProvider.test.tsx).
+// Shared by the Task 2 (source toggle) and Task 5 (rail width) describe blocks
+// below, both of which persist to localStorage.
+function installLocalStorage() {
+  const store = new Map<string, string>();
+  vi.stubGlobal('localStorage', {
+    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+    setItem: (k: string, v: string) => store.set(k, String(v)),
+    removeItem: (k: string) => store.delete(k),
+    clear: () => store.clear(),
+    key: (i: number) => Array.from(store.keys())[i] ?? null,
+    get length() {
+      return store.size;
+    },
+  });
+}
+
 describe('WorkflowEditor live reconcile', () => {
   afterEach(() => {
     cleanup();
@@ -145,22 +163,6 @@ describe('WorkflowEditor live reconcile', () => {
 describe('WorkflowEditor source pane toggle (Task 2)', () => {
   const SOURCE_OPEN_KEY = 'rupu.editor.sourceOpen';
 
-  // jsdom's localStorage is unreliable under this Node version — install a
-  // simple in-memory implementation we fully control (matches ThemeProvider.test.tsx).
-  function installLocalStorage() {
-    const store = new Map<string, string>();
-    vi.stubGlobal('localStorage', {
-      getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
-      setItem: (k: string, v: string) => store.set(k, String(v)),
-      removeItem: (k: string) => store.delete(k),
-      clear: () => store.clear(),
-      key: (i: number) => Array.from(store.keys())[i] ?? null,
-      get length() {
-        return store.size;
-      },
-    });
-  }
-
   beforeEach(() => {
     installLocalStorage();
   });
@@ -232,5 +234,169 @@ describe('WorkflowEditor source pane toggle (Task 2)', () => {
     expect(screen.queryByTestId('code')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Show source' })).toBeInTheDocument();
     expect(screen.getByText('✓ valid')).toBeInTheDocument();
+  });
+
+  it('the bottom bar child order is note, toggle button, badge in BOTH the open and closed states (Task 2 minor fix)', () => {
+    render(
+      <WorkflowEditor
+        draftYaml={VALID}
+        onYamlChange={() => {}}
+        agents={[]}
+        validity={{ ok: true }}
+        workflowEditorUi="next"
+      />,
+    );
+
+    // Open (source visible) state.
+    let bar = screen.getByRole('button', { name: 'Hide source' }).parentElement!;
+    expect(bar.children).toHaveLength(3);
+    expect(bar.children[0].tagName).toBe('SPAN');
+    expect(bar.children[0]).toHaveTextContent('synced from graph');
+    expect(bar.children[1].tagName).toBe('BUTTON');
+    expect(bar.children[1]).toHaveTextContent('Hide source');
+    expect(bar.children[2].tagName).toBe('SPAN');
+    expect(bar.children[2]).toHaveTextContent('✓ valid');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Hide source' }));
+
+    // Closed (source hidden) state — same order.
+    bar = screen.getByRole('button', { name: 'Show source' }).parentElement!;
+    expect(bar.children).toHaveLength(3);
+    expect(bar.children[0].tagName).toBe('SPAN');
+    expect(bar.children[0]).toHaveTextContent('synced from graph');
+    expect(bar.children[1].tagName).toBe('BUTTON');
+    expect(bar.children[1]).toHaveTextContent('Show source');
+    expect(bar.children[2].tagName).toBe('SPAN');
+    expect(bar.children[2]).toHaveTextContent('✓ valid');
+  });
+});
+
+describe('WorkflowEditor resizable inspector rail (Task 5, next only)', () => {
+  const RAIL_WIDTH_KEY = 'rupu.editor.railWidth';
+
+  beforeEach(() => {
+    installLocalStorage();
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('classic: no resize-inspector separator; aside keeps the literal lg:w-80 sizing', () => {
+    const { container } = render(
+      <WorkflowEditor draftYaml={VALID} onYamlChange={() => {}} agents={[]} validity={null} />,
+    );
+    const aside = container.querySelector('aside')!;
+    expect(aside.className).toContain('lg:w-80');
+    expect(screen.queryByRole('separator', { name: 'Resize inspector' })).not.toBeInTheDocument();
+  });
+
+  it('next: aside exposes a vertical "Resize inspector" separator and drops lg:w-80', () => {
+    const { container } = render(
+      <WorkflowEditor
+        draftYaml={VALID}
+        onYamlChange={() => {}}
+        agents={[]}
+        validity={null}
+        workflowEditorUi="next"
+      />,
+    );
+    const aside = container.querySelector('aside')!;
+    expect(aside.className).not.toContain('lg:w-80');
+    const sep = screen.getByRole('separator', { name: 'Resize inspector' });
+    expect(sep).toHaveAttribute('aria-orientation', 'vertical');
+    expect(sep).toHaveAttribute('tabindex', '0');
+  });
+
+  it('next: defaults to 320px when localStorage is empty', () => {
+    render(
+      <WorkflowEditor
+        draftYaml={VALID}
+        onYamlChange={() => {}}
+        agents={[]}
+        validity={null}
+        workflowEditorUi="next"
+      />,
+    );
+    const sep = screen.getByRole('separator', { name: 'Resize inspector' });
+    const aside = sep.closest('aside')!;
+    expect(aside.style.getPropertyValue('--wfx-rail-w')).toBe('320px');
+    expect(sep).toHaveAttribute('aria-valuenow', '320');
+  });
+
+  it('next: ArrowLeft widens and ArrowRight narrows the rail by 16px, persisting each change', () => {
+    render(
+      <WorkflowEditor
+        draftYaml={VALID}
+        onYamlChange={() => {}}
+        agents={[]}
+        validity={null}
+        workflowEditorUi="next"
+      />,
+    );
+    const sep = screen.getByRole('separator', { name: 'Resize inspector' });
+    const aside = sep.closest('aside')!;
+
+    fireEvent.keyDown(sep, { key: 'ArrowLeft' });
+    expect(aside.style.getPropertyValue('--wfx-rail-w')).toBe('336px');
+    expect(localStorage.getItem(RAIL_WIDTH_KEY)).toBe('336');
+
+    fireEvent.keyDown(sep, { key: 'ArrowRight' });
+    fireEvent.keyDown(sep, { key: 'ArrowRight' });
+    expect(aside.style.getPropertyValue('--wfx-rail-w')).toBe('304px');
+    expect(localStorage.getItem(RAIL_WIDTH_KEY)).toBe('304');
+  });
+
+  it('next: clamps to [280, 640]', () => {
+    render(
+      <WorkflowEditor
+        draftYaml={VALID}
+        onYamlChange={() => {}}
+        agents={[]}
+        validity={null}
+        workflowEditorUi="next"
+      />,
+    );
+    const sep = screen.getByRole('separator', { name: 'Resize inspector' });
+    const aside = sep.closest('aside')!;
+
+    for (let i = 0; i < 30; i++) fireEvent.keyDown(sep, { key: 'ArrowRight' });
+    expect(aside.style.getPropertyValue('--wfx-rail-w')).toBe('280px');
+
+    for (let i = 0; i < 30; i++) fireEvent.keyDown(sep, { key: 'ArrowLeft' });
+    expect(aside.style.getPropertyValue('--wfx-rail-w')).toBe('640px');
+  });
+
+  it('next: honors a pre-seeded width from localStorage', () => {
+    localStorage.setItem(RAIL_WIDTH_KEY, '500');
+    render(
+      <WorkflowEditor
+        draftYaml={VALID}
+        onYamlChange={() => {}}
+        agents={[]}
+        validity={null}
+        workflowEditorUi="next"
+      />,
+    );
+    const sep = screen.getByRole('separator', { name: 'Resize inspector' });
+    const aside = sep.closest('aside')!;
+    expect(aside.style.getPropertyValue('--wfx-rail-w')).toBe('500px');
+  });
+
+  it('next: garbage localStorage falls back to the 320px default', () => {
+    localStorage.setItem(RAIL_WIDTH_KEY, 'not-a-number');
+    render(
+      <WorkflowEditor
+        draftYaml={VALID}
+        onYamlChange={() => {}}
+        agents={[]}
+        validity={null}
+        workflowEditorUi="next"
+      />,
+    );
+    const sep = screen.getByRole('separator', { name: 'Resize inspector' });
+    const aside = sep.closest('aside')!;
+    expect(aside.style.getPropertyValue('--wfx-rail-w')).toBe('320px');
   });
 });

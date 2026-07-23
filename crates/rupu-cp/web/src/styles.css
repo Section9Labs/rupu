@@ -836,6 +836,57 @@
   .wfx-toggle-sw, .wfx-toggle-sw::after { transition: none !important; }
 }
 
+/* ── Long-form text room (Task 5, `next` only) ── */
+/* Applied via `ExpressionField`'s `size="large"` prop on the multiline
+ * prompt/subject fields (StepForm, `next` only) — sets a floor height on the
+ * field's shell (CodeMirror sizes to content inside it, leaving the extra
+ * room visible) plus a manual vertical resize handle. `overflow: auto`
+ * overrides the shell's Tailwind `overflow-hidden` (same specificity, later
+ * in the cascade — the established pattern for `.wfx-*` classes layered over
+ * Tailwind utilities in this file) so a manually-grown box can scroll rather
+ * than clip. Never applied on classic paths or single-line fields. */
+.wfx-ta-lg {
+  min-height: 10rem;
+  resize: vertical;
+  overflow: auto;
+}
+
+/* ── Resizable inspector rail (Task 5, `next` only, lg+) ── */
+/* Width is state-driven (WorkflowEditor.tsx), persisted to localStorage.
+ * `--wfx-rail-w` is a LOCAL custom property set inline per render (not a
+ * theme token) — `.wfx-rail-sized` only reads it at the `lg` breakpoint so
+ * mobile stacking (`w-full`) is untouched below it. Classic keeps the literal
+ * `lg:w-80` Tailwind class and never gets `.wfx-rail-sized` or the handle. */
+@media (min-width: 1024px) {
+  .wfx-rail-sized {
+    width: var(--wfx-rail-w, 320px);
+  }
+}
+.wfx-rail-handle {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 6px;
+  height: 100%;
+  transform: translateX(-50%);
+  cursor: col-resize;
+  touch-action: none;
+  background: transparent;
+  transition: background-color .1s ease;
+}
+.wfx-rail-handle:hover {
+  background: rgb(var(--c-brand-500) / .25);
+}
+.wfx-rail-handle:focus-visible {
+  outline: none;
+  background: rgb(var(--c-brand-500) / .25);
+  box-shadow: 0 0 0 2px rgb(var(--c-brand-500) / .4);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wfx-rail-handle { transition: none !important; }
+}
+
 /* ================================================================== */
 /* Agent Builder — the card-based agent composer (.rupu/agents/*.md). */
 /* Ported from the approved interactive mockup (agent-builder.html);  */

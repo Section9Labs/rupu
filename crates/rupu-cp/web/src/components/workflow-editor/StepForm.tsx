@@ -154,10 +154,32 @@ export default function StepForm({
       </label>
 
       {(d.kind === 'step' || d.kind === 'for_each') && (
-        <LinearFields d={d} agents={agents} patch={patch} exprContext={exprContext} />
+        <LinearFields
+          d={d}
+          agents={agents}
+          patch={patch}
+          exprContext={exprContext}
+          workflowEditorUi={workflowEditorUi}
+        />
       )}
-      {d.kind === 'parallel' && <ParallelFields d={d} agents={agents} patch={patch} exprContext={exprContext} />}
-      {d.kind === 'panel' && <PanelFields d={d} agents={agents} patch={patch} exprContext={exprContext} />}
+      {d.kind === 'parallel' && (
+        <ParallelFields
+          d={d}
+          agents={agents}
+          patch={patch}
+          exprContext={exprContext}
+          workflowEditorUi={workflowEditorUi}
+        />
+      )}
+      {d.kind === 'panel' && (
+        <PanelFields
+          d={d}
+          agents={agents}
+          patch={patch}
+          exprContext={exprContext}
+          workflowEditorUi={workflowEditorUi}
+        />
+      )}
       {d.kind === 'branch' && (
         <BranchFields d={d} allNodeIds={allNodeIds} patch={patch} exprContext={exprContext} />
       )}
@@ -232,11 +254,13 @@ function LinearFields({
   agents,
   patch,
   exprContext,
+  workflowEditorUi,
 }: {
   d: StepNodeData;
   agents: AgentSummary[];
   patch: (p: Partial<StepNodeData>) => void;
   exprContext: StepExprContext;
+  workflowEditorUi: WorkflowEditorUi;
 }) {
   return (
     <>
@@ -253,6 +277,7 @@ function LinearFields({
           context={fieldCtx(exprContext, { isForEachPrompt: d.kind === 'for_each' })}
           multiline
           ariaLabel="Prompt"
+          size={workflowEditorUi === 'next' ? 'large' : undefined}
         />
       </label>
 
@@ -290,11 +315,13 @@ function ParallelFields({
   agents,
   patch,
   exprContext,
+  workflowEditorUi,
 }: {
   d: StepNodeData;
   agents: AgentSummary[];
   patch: (p: Partial<StepNodeData>) => void;
   exprContext: StepExprContext;
+  workflowEditorUi: WorkflowEditorUi;
 }) {
   const subs = d.parallel ?? [];
 
@@ -358,6 +385,7 @@ function ParallelFields({
               multiline
               ariaLabel={`Sub-step ${i + 1} prompt`}
               placeholder="prompt"
+              size={workflowEditorUi === 'next' ? 'large' : undefined}
             />
           </div>
         ))}
@@ -381,11 +409,13 @@ function PanelFields({
   agents,
   patch,
   exprContext,
+  workflowEditorUi,
 }: {
   d: StepNodeData;
   agents: AgentSummary[];
   patch: (p: Partial<StepNodeData>) => void;
   exprContext: StepExprContext;
+  workflowEditorUi: WorkflowEditorUi;
 }) {
   const panel: PanelCfg = d.panel ?? { panelists: [], subject: '' };
 
@@ -436,6 +466,7 @@ function PanelFields({
           context={fieldCtx(exprContext, { isPanelField: true })}
           multiline
           ariaLabel="Panel subject"
+          size={workflowEditorUi === 'next' ? 'large' : undefined}
         />
       </label>
 
@@ -447,6 +478,7 @@ function PanelFields({
           context={fieldCtx(exprContext, { isPanelField: true })}
           multiline
           ariaLabel="Panel prompt"
+          size={workflowEditorUi === 'next' ? 'large' : undefined}
         />
       </label>
 

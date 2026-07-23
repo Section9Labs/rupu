@@ -92,6 +92,41 @@ function readSourceOpen(): boolean {
  *  expands/collapses. Only mounted while the pane is open. */
 const SOURCE_PANE_ID = 'wf-source-editor';
 
+// ── inspector rail width (Task 5, `next` UI only, lg+ screens) ──────────────
+
+/** localStorage key for the persisted inspector-rail width (px, int). */
+const RAIL_WIDTH_KEY = 'rupu.editor.railWidth';
+const RAIL_WIDTH_DEFAULT = 320;
+const RAIL_WIDTH_MIN = 280;
+const RAIL_WIDTH_MAX = 640;
+
+function clampRailWidth(n: number): number {
+  return Math.min(RAIL_WIDTH_MAX, Math.max(RAIL_WIDTH_MIN, n));
+}
+
+/** Read the persisted rail width. Missing / garbage / out-of-range → the
+ *  default (280–640 clamp handles out-of-range; a non-finite parse falls back
+ *  to the default outright). */
+function readRailWidth(): number {
+  try {
+    if (typeof localStorage === 'undefined') return RAIL_WIDTH_DEFAULT;
+    const raw = localStorage.getItem(RAIL_WIDTH_KEY);
+    if (raw === null) return RAIL_WIDTH_DEFAULT;
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) ? clampRailWidth(n) : RAIL_WIDTH_DEFAULT;
+  } catch {
+    return RAIL_WIDTH_DEFAULT;
+  }
+}
+
+function persistRailWidth(n: number): void {
+  try {
+    localStorage.setItem(RAIL_WIDTH_KEY, String(Math.round(n)));
+  } catch {
+    /* localStorage unavailable (private mode / SSR) — skip persistence */
+  }
+}
+
 /** True if `text` contains a YAML comment — a line whose first non-space char is
  *  `#`, or an inline ` #`. A heuristic (may flag `#` inside a quoted scalar);
  *  used only to gate a one-time, dismissible notice, so over-warning is benign. */
@@ -142,6 +177,62 @@ export default function WorkflowEditor({
       }
       return next;
     });
+  }, []);
+
+  // Inspector-rail width (`next` UI only, lg+ screens, Task 5). Classic keeps
+  // the literal `lg:w-80` markup and never reads this state. A ref mirrors the
+  // latest width so the pointer-drag "up" handler (registered once per drag,
+  // outside React state) can persist the FINAL value without re-subscribing
+  // on every pointermove.
+  const [railWidth, setRailWidth] = useState<number>(() => readRailWidth());
+  const railWidthRef = useRef(railWidth);
+  railWidthRef.current = railWidth;
+  const asideRef = useRef<HTMLElement>(null);
+
+  const setRailWidthFromClientX = useCallback((clientX: number) => {
+    const el = asideRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    // The aside's right edge is fixed while dragging (only its left edge —
+    // i.e. its width — moves), so `rect.right - clientX` is the live width;
+    // dragging left (smaller clientX) widens the rail.
+    setRailWidth(clampRailWidth(rect.right - clientX));
+  }, []);
+
+  const onRailPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      const handle = e.currentTarget;
+      handle.setPointerCapture(e.pointerId);
+      const onMove = (ev: PointerEvent) => setRailWidthFromClientX(ev.clientX);
+      const onUp = (ev: PointerEvent) => {
+        handle.releasePointerCapture(ev.pointerId);
+        handle.removeEventListener('pointermove', onMove);
+        handle.removeEventListener('pointerup', onUp);
+        persistRailWidth(railWidthRef.current); // persist once, at drag end.
+      };
+      handle.addEventListener('pointermove', onMove);
+      handle.addEventListener('pointerup', onUp);
+    },
+    [setRailWidthFromClientX],
+  );
+
+  const onRailKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      setRailWidth((w) => {
+        const next = clampRailWidth(w + 16); // left widens, mirrors the drag direction.
+        persistRailWidth(next);
+        return next;
+      });
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      setRailWidth((w) => {
+        const next = clampRailWidth(w - 16);
+        persistRailWidth(next);
+        return next;
+      });
+    }
   }, []);
 
   // Keep the latest selectedId + graph readable inside the debounce timeout
@@ -350,6 +441,7 @@ export default function WorkflowEditor({
               />
             </div>
             <div className="flex items-center gap-2 border-t border-border bg-panel px-3 py-1.5">
+              <span className="text-note text-ink-mute">⟳ synced from graph</span>
               <button
                 type="button"
                 onClick={toggleSourceOpen}
@@ -359,7 +451,6 @@ export default function WorkflowEditor({
               >
                 Show source
               </button>
-              <span className="text-note text-ink-mute">⟳ synced from graph</span>
               <span className="ml-auto">
                 <ValidityBadge validity={validity} />
               </span>
@@ -419,9 +510,31 @@ export default function WorkflowEditor({
       </div>
 
       {/* ── RIGHT: inspector rail ─────────────────────────────────────────── */}
-      <aside className="flex w-full shrink-0 flex-col border-t border-border bg-panel lg:w-80 lg:border-l lg:border-t-0">
+      <aside
+        ref={workflowEditorUi === 'next' ? asideRef : undefined}
+        className={
+          workflowEditorUi === 'next'
+            ? 'relative flex w-full shrink-0 flex-col border-t border-border bg-panel wfx-rail-sized lg:border-l lg:border-t-0'
+            : 'flex w-full shrink-0 flex-col border-t border-border bg-panel lg:w-80 lg:border-l lg:border-t-0'
+        }
+        style={workflowEditorUi === 'next' ? ({ '--wfx-rail-w': `${railWidth}px` } as React.CSSProperties) : undefined}
+      >
         {workflowEditorUi === 'next' && (
           <div ref={paletteSlotRef} className="wfx-rail-palette-slot border-b border-border" />
+        )}
+        {workflowEditorUi === 'next' && (
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize inspector"
+            aria-valuenow={railWidth}
+            aria-valuemin={RAIL_WIDTH_MIN}
+            aria-valuemax={RAIL_WIDTH_MAX}
+            tabIndex={0}
+            onPointerDown={onRailPointerDown}
+            onKeyDown={onRailKeyDown}
+            className="wfx-rail-handle hidden lg:block"
+          />
         )}
         <div className="border-b border-border p-3">
           <div role="tablist" aria-label="Inspector" className="inline-flex rounded-lg border border-border bg-panel p-0.5">

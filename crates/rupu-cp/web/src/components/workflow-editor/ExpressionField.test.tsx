@@ -38,3 +38,26 @@ describe('ExpressionField (fallback)', () => {
     expect(field.tagName).toBe('INPUT');
   });
 });
+
+describe('ExpressionField size prop (Task 5, roomier long-text)', () => {
+  it('defaults to the compact shell — no .wfx-ta-lg marker', () => {
+    const { container } = render(
+      <ExpressionField value="" onChange={() => {}} context={CTX} multiline ariaLabel="Prompt" />,
+    );
+    expect(container.querySelector('.wfx-ta-lg')).not.toBeInTheDocument();
+  });
+
+  it('size="large" adds the .wfx-ta-lg marker to the field shell', () => {
+    const { container } = render(
+      <ExpressionField value="" onChange={() => {}} context={CTX} multiline ariaLabel="Prompt" size="large" />,
+    );
+    expect(container.querySelector('.wfx-ta-lg')).toBeInTheDocument();
+  });
+
+  it('size="large" also gives the Suspense-fallback textarea more rows', () => {
+    render(
+      <ExpressionField value="" onChange={() => {}} context={CTX} multiline ariaLabel="Prompt" size="large" />,
+    );
+    expect(screen.getByLabelText('Prompt')).toHaveAttribute('rows', '8');
+  });
+});
