@@ -804,6 +804,17 @@ export interface AgentDetail extends AgentSummary {
 }
 
 // ---------------------------------------------------------------------------
+// MCP tool catalog (workflow-step editor connector cards)
+// ---------------------------------------------------------------------------
+
+export interface ToolSpec {
+  name: string;
+  description: string;
+  input_schema: unknown;
+  kind: 'read' | 'write';
+}
+
+// ---------------------------------------------------------------------------
 // Workflows
 // ---------------------------------------------------------------------------
 
@@ -1702,6 +1713,12 @@ export const api = {
   },
   getAutoflowDefs(): Promise<AutoflowDefRow[]> {
     return request<AutoflowDefRow[]>('/api/autoflows');
+  },
+
+  // --- Tools (MCP catalog) ---
+  async getTools(): Promise<ToolSpec[]> {
+    const res = await request<{ tools: ToolSpec[] }>('/api/tools');
+    return res.tools;
   },
   /**
    * Enable or disable an autoflow — writes `autoflow.enabled` to the on-disk

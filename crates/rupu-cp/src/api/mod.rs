@@ -21,6 +21,7 @@ pub mod run_streams;
 pub mod runs;
 pub mod sessions;
 pub mod source;
+pub mod tools;
 pub mod transcript;
 pub mod usage;
 pub mod usage_outliers;
