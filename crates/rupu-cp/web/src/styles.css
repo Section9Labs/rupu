@@ -507,6 +507,19 @@
   background: radial-gradient(120% 60% at 50% -10%, rgb(var(--c-brand-500) / .05), transparent 60%);
 }
 
+/* ── edge animation (Task 1 round 2: kind-colored + animated edges) ── */
+/* Every `next` edge sets `animated: true` (WorkflowEditorGraph.tsx), which
+ * opts it into xyflow's built-in `.react-flow__edge.animated path` dash-flow
+ * (5px dash / 0.5s linear cycle, `@xyflow/react/dist/style.css`) — that
+ * default reads fine over the `.wfx-canvas` grid, so nothing to override
+ * there. This guard is the one thing that DOES need overriding: a global,
+ * live `prefers-reduced-motion` rule for the edge path itself, since xyflow
+ * ships no such guard out of the box. Global selector is safe here — it only
+ * ever turns an animation OFF, never on. */
+@media (prefers-reduced-motion: reduce) {
+  .react-flow__edge-path { animation: none !important; }
+}
+
 /* ── palette dock (Task 3) ── */
 /* Ported from the mockup's `.palette`/`.pcard`/`.pdot` — a row-style card
  * (accent dot + label/sub) instead of the classic top-bar preview tile.

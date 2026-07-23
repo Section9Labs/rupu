@@ -73,7 +73,9 @@ vi.mock('@xyflow/react', () => ({
 // resolves to nothing under jsdom (no stylesheet loaded) — every token would
 // collapse to the same fallback and the true/false edge colors would be
 // indistinguishable. Mock it with fixed, distinct RGB strings so the branch
-// edge-color assertions below are meaningful.
+// edge-color assertions below are meaningful. `get`/`alpha` are KEY-AWARE
+// (echo the key into the string) so kind-accent-driven styling (Task 1 round
+// 2) is assertable per StepKind without needing real CSS.
 vi.mock('../../lib/useThemeColors', () => ({
   useThemeColors: () => ({
     bg: 'rgb(0 0 0)',
@@ -99,8 +101,8 @@ vi.mock('../../lib/useThemeColors', () => ({
     },
     sev: { critical: 'rgb(0 0 0)', high: 'rgb(0 0 0)', medium: 'rgb(0 0 0)', low: 'rgb(0 0 0)', info: 'rgb(0 0 0)' },
     info: 'rgb(0 0 0)',
-    get: () => 'rgb(0 0 0)',
-    alpha: () => 'rgb(0 0 0 / 0.1)',
+    get: (key: string) => `rgb(${key})`,
+    alpha: (key: string, a: number) => `rgb(${key} / ${a})`,
   }),
 }));
 
@@ -114,6 +116,7 @@ import WorkflowEditorGraph, {
   asStepKind,
 } from './WorkflowEditorGraph';
 import type { WorkflowGraph } from '../../lib/workflowGraph';
+import { KIND_ACCENT } from './kindVisuals';
 
 afterEach(cleanup);
 
@@ -633,6 +636,149 @@ describe('branch edge rendering', () => {
     const labeled = edges.find((e) => e.id === 'a->b:extra');
     expect(labeled?.label).toBe('data-ref');
     expect(labeled?.labelBgStyle?.fill).toBeTruthy();
+  });
+});
+
+describe('kind-colored + animated edges (Task 1 round 2)', () => {
+  it('next plain edge: stroke + arrow marker both carry the SOURCE node kind accent, strokeWidth 2', () => {
+    const g = makeGraph();
+    // Source 'a' is a `step` node in makeGraph(); retype it `for_each` so the
+    // assertion actually exercises the per-kind lookup (not a coincidence with
+    // the default kind).
+    g.nodes[0] = { ...g.nodes[0], data: { ...g.nodes[0].data, kind: 'for_each' } };
+    render(
+      <WorkflowEditorGraph
+        graph={g}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi="next"
+      />,
+    );
+    const raw = screen.getByTestId('rf').getAttribute('data-edges');
+    const edges = JSON.parse(raw!) as Array<{
+      id: string;
+      style?: { stroke?: string; strokeWidth?: number };
+      markerEnd?: { color?: string };
+      animated?: boolean;
+    }>;
+    const plain = edges.find((e) => e.id === 'a->b');
+    const accentKey = KIND_ACCENT.for_each;
+    expect(plain?.style?.stroke).toBe(`rgb(${accentKey} / 0.55)`);
+    expect(plain?.style?.strokeWidth).toBe(2);
+    expect(plain?.markerEnd?.color).toBe(`rgb(${accentKey} / 0.55)`);
+    expect(plain?.animated).toBe(true);
+  });
+
+  it('next plain edge from a `step`-kind source uses the step accent, distinct from a `branch` source', () => {
+    const g = makeGraph(); // a, b both `step`
+    render(
+      <WorkflowEditorGraph
+        graph={g}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi="next"
+      />,
+    );
+    const raw = screen.getByTestId('rf').getAttribute('data-edges');
+    const edges = JSON.parse(raw!) as Array<{ id: string; style?: { stroke?: string } }>;
+    const plain = edges.find((e) => e.id === 'a->b');
+    expect(plain?.style?.stroke).toBe(`rgb(${KIND_ACCENT.step} / 0.55)`);
+  });
+
+  it('next branch-arm edges keep their existing chip/color/width styling and additionally gain animated: true', () => {
+    const g = makeGraph();
+    g.nodes.push({
+      id: 'br',
+      data: { id: 'br', kind: 'branch', condition: 'inputs.ok', thenTargets: ['a'], elseTargets: ['b'] },
+      position: { x: 0, y: 0 },
+    });
+    g.edges.push(
+      { id: 'br->a:then', source: 'br', target: 'a', label: 'true', branch: 'then' },
+      { id: 'br->b:else', source: 'br', target: 'b', label: 'false', branch: 'else' },
+    );
+    render(
+      <WorkflowEditorGraph
+        graph={g}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi="next"
+      />,
+    );
+    const raw = screen.getByTestId('rf').getAttribute('data-edges');
+    const edges = JSON.parse(raw!) as Array<{
+      id: string;
+      label?: string;
+      style?: { stroke?: string; strokeWidth?: number };
+      animated?: boolean;
+    }>;
+    const thenEdge = edges.find((e) => e.id === 'br->a:then');
+    const elseEdge = edges.find((e) => e.id === 'br->b:else');
+    // Unchanged from current `next` shape: label chip + full-strength status
+    // colors at 2.5 stroke width.
+    expect(thenEdge?.label).toBe('✓ then');
+    expect(elseEdge?.label).toBe('✕ else');
+    expect(thenEdge?.style?.stroke).toBe('rgb(34 197 94)');
+    expect(elseEdge?.style?.stroke).toBe('rgb(239 68 68)');
+    expect(thenEdge?.style?.strokeWidth).toBe(2.5);
+    // New: both arms are now animated too.
+    expect(thenEdge?.animated).toBe(true);
+    expect(elseEdge?.animated).toBe(true);
+  });
+
+  it('classic edges never carry an `animated` key, regardless of branch/plain', () => {
+    const g = makeGraph();
+    g.nodes.push({
+      id: 'br',
+      data: { id: 'br', kind: 'branch', condition: 'inputs.ok', thenTargets: ['a'], elseTargets: ['b'] },
+      position: { x: 0, y: 0 },
+    });
+    g.edges.push({ id: 'br->a:then', source: 'br', target: 'a', label: 'true', branch: 'then' });
+    render(
+      <WorkflowEditorGraph
+        graph={g}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi="classic"
+      />,
+    );
+    const raw = screen.getByTestId('rf').getAttribute('data-edges');
+    const edges = JSON.parse(raw!) as Array<{ id: string; animated?: boolean }>;
+    for (const e of edges) expect(e.animated).toBeUndefined();
+  });
+
+  it('classic plain edge styling is exactly today\'s shape (no kind-accent stroke, undefined marker color)', () => {
+    render(
+      <WorkflowEditorGraph
+        graph={makeGraph()}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi="classic"
+      />,
+    );
+    const raw = screen.getByTestId('rf').getAttribute('data-edges');
+    const edges = JSON.parse(raw!) as Array<{
+      id: string;
+      style?: { stroke?: string; strokeWidth?: number };
+      markerEnd?: { color?: string };
+    }>;
+    const plain = edges.find((e) => e.id === 'a->b');
+    expect(plain?.style).toBeUndefined();
+    expect(plain?.markerEnd?.color).toBeUndefined();
   });
 });
 
