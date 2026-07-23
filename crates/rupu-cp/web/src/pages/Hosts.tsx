@@ -4,7 +4,6 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Server } from 'lucide-react';
 import { api, type HostView, type HostTransportKind } from '../lib/api';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { SectionHeader } from '../components/lists/SectionHeader';
@@ -12,6 +11,9 @@ import { shortId } from '../lib/shortId';
 import { relativeTime } from '../lib/time';
 import { Chip } from '../components/ui/Chip';
 import { HostStatusBadge } from '../components/ui/HostStatusBadge';
+import { EmptyState } from '../components/ui/EmptyState';
+import { ErrorBanner } from '../components/ui/ErrorBanner';
+import { Spinner } from '../components/ui/Spinner';
 
 // ---------------------------------------------------------------------------
 // Transport visual tokens (status handled by HostStatusBadge)
@@ -83,9 +85,11 @@ function buildColumns(onRemove: (id: string) => void): Column<HostView>[] {
     {
       key: 'name',
       header: 'Name',
+      subject: true,
       sortable: true,
       // local pinned first (asc): prefix \x00 so it sorts before any real name.
       sortValue: (h) => (h.transport_kind === 'local' ? '\x00' + h.name : '\x01' + h.name),
+      titleValue: (h) => h.name,
       render: (h) => (
         <Link to={`/hosts/${encodeURIComponent(h.id)}`} className="block group">
           <div className="text-sm font-medium text-ink group-hover:text-brand-600 truncate">
@@ -98,6 +102,7 @@ function buildColumns(onRemove: (id: string) => void): Column<HostView>[] {
     {
       key: 'transport',
       header: 'Transport',
+      fit: true,
       sortable: true,
       sortValue: (h) => h.transport_kind,
       render: (h) => (
@@ -109,6 +114,7 @@ function buildColumns(onRemove: (id: string) => void): Column<HostView>[] {
     {
       key: 'status',
       header: 'Status',
+      fit: true,
       sortable: true,
       sortValue: (h) => h.status,
       render: (h) => <HostStatusBadge status={h.status} />,
@@ -116,6 +122,7 @@ function buildColumns(onRemove: (id: string) => void): Column<HostView>[] {
     {
       key: 'version',
       header: 'Version',
+      fit: true,
       render: (h) =>
         h.version ? (
           <span className="text-note text-ink-mute font-mono">{h.version}</span>
@@ -127,7 +134,7 @@ function buildColumns(onRemove: (id: string) => void): Column<HostView>[] {
       key: 'active_runs',
       header: 'Active runs',
       align: 'right',
-      width: 'w-24',
+      fit: true,
       sortable: true,
       sortValue: (h) => h.active_run_count,
       render: (h) =>
@@ -140,6 +147,7 @@ function buildColumns(onRemove: (id: string) => void): Column<HostView>[] {
     {
       key: 'last_seen',
       header: 'Last seen',
+      fit: true,
       sortable: true,
       sortValue: (h) => {
         if (!h.last_seen_at) return null;
@@ -156,7 +164,7 @@ function buildColumns(onRemove: (id: string) => void): Column<HostView>[] {
     {
       key: 'actions',
       header: '',
-      width: 'w-20',
+      fit: true,
       render: (h) =>
         h.transport_kind === 'local' ? null : (
           <button
@@ -624,21 +632,18 @@ export default function Hosts() {
       )}
 
       {/* Errors */}
-      {error && (
-        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {error}
-        </div>
-      )}
-      {removeError && (
-        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {removeError}
-        </div>
-      )}
+      {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
+      {removeError && <ErrorBanner className="mb-4">{removeError}</ErrorBanner>}
 
       {hosts === null ? (
-        <div className="text-sm text-ink-dim">Loading hosts…</div>
+        <div className="py-16 flex items-center justify-center">
+          <Spinner label="Loading hosts…" />
+        </div>
       ) : hosts.length === 0 ? (
-        <EmptyState />
+        <EmptyState
+          title="No hosts registered"
+          hint="The local host appears here automatically once the control plane starts. Add a remote host above to federate with another rupu CP deployment."
+        />
       ) : (
         <section>
           <SectionHeader tone="muted" label="Hosts" count={hosts.length} />
@@ -650,21 +655,6 @@ export default function Hosts() {
           />
         </section>
       )}
-    </div>
-  );
-}
-
-function EmptyState() {
-  return (
-    <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
-        <Server size={20} className="text-ink-mute" />
-      </div>
-      <h2 className="text-sm font-medium text-ink">No hosts registered</h2>
-      <p className="mt-1 text-xs text-ink-dim max-w-xs">
-        The local host appears here automatically once the control plane starts. Add a remote host
-        above to federate with another rupu CP deployment.
-      </p>
     </div>
   );
 }
