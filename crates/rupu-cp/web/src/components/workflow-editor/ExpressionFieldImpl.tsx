@@ -19,6 +19,7 @@ import {
   Decoration,
   ViewPlugin,
   drawSelection,
+  tooltips,
   type DecorationSet,
   type ViewUpdate,
 } from '@codemirror/view';
@@ -158,6 +159,20 @@ function makeCompletionSource(getContext: () => ExprContext) {
   };
 }
 
+/** Body-parented, viewport-fixed tooltip config — the completion popup would
+ *  otherwise render inside the editor DOM and get clipped by the inspector
+ *  rail's `overflow-y-auto` (matt's screenshot: dropdown cut off after one
+ *  row). `position: 'fixed'` makes CM's coordinates viewport-based so
+ *  body-parenting still tracks correctly, including on rail scroll. Exported
+ *  (not just inlined below) so it's independently testable — jsdom's
+ *  CodeMirror rendering is too limited to reliably assert the popup escapes
+ *  the DOM by mounting it, so tests assert this builder's output instead.
+ *  SSR/jsdom-safe: no-ops when `document` isn't available. */
+export function buildTooltipExtensions(): Extension[] {
+  if (typeof document === 'undefined') return [];
+  return [tooltips({ position: 'fixed', parent: document.body })];
+}
+
 // ── theme ─────────────────────────────────────────────────────────────────────
 
 // Mustache token colors per mode — the light hexes wash out on near-black, so
@@ -245,6 +260,7 @@ export default function ExpressionFieldImpl({
       closeBrackets(),
       mustacheHighlighter,
       autocompletion({ override: [makeCompletionSource(() => contextRef.current)] }),
+      ...buildTooltipExtensions(),
       keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap, ...completionKeymap]),
       makeExprTheme(mode === 'dark'),
       updateListener,

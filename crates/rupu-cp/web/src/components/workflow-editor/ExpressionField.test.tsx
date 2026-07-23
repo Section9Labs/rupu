@@ -10,6 +10,27 @@ import { render, screen, cleanup, fireEvent } from '@testing-library/react';
 import ExpressionField from './ExpressionField';
 import type { ExprContext } from '../../lib/workflowExpressions';
 
+// CodeMirror's completion tooltip in jsdom is too limited to reliably open
+// and inspect where it mounted (Suspense fallback replaces the real editor in
+// synchronous test renders anyway — see below). Instead we spy on
+// `tooltips()` itself and assert `buildTooltipExtensions()` — the small
+// exported builder ExpressionFieldImpl wires into its extensions array —
+// calls it with the body-parented, viewport-fixed config that escapes the
+// inspector rail's `overflow-y-auto` clipping.
+// NOTE: `./ExpressionFieldImpl` is intentionally NOT statically imported here
+// (even though the tooltip test below needs it) — the fallback/size-prop
+// tests above rely on it being unresolved at render time so the Suspense
+// FALLBACK mounts synchronously (per the file-header comment). Importing it
+// eagerly at module scope pre-warms the module cache and makes React.lazy's
+// dynamic import resolve before the assertions run, mounting the REAL
+// CodeMirror editor instead and breaking those tests. It's dynamically
+// imported instead, inside the one test that needs it, after every other
+// test in this file has already run.
+vi.mock('@codemirror/view', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@codemirror/view')>();
+  return { ...actual, tooltips: vi.fn(actual.tooltips) };
+});
+
 const CTX: ExprContext = {
   nodeKind: 'step',
   isForEachPrompt: false,
@@ -59,5 +80,30 @@ describe('ExpressionField size prop (Task 5, roomier long-text)', () => {
       <ExpressionField value="" onChange={() => {}} context={CTX} multiline ariaLabel="Prompt" size="large" />,
     );
     expect(screen.getByLabelText('Prompt')).toHaveAttribute('rows', '8');
+  });
+});
+
+describe('ExpressionFieldImpl tooltip config (Task 3, popup clipping fix)', () => {
+  it('configures a body-parented, viewport-fixed tooltip so the completion popup escapes the rail\'s overflow-y-auto clipping', async () => {
+    const { buildTooltipExtensions } = await import('./ExpressionFieldImpl');
+    const { tooltips } = await import('@codemirror/view');
+    vi.mocked(tooltips).mockClear();
+
+    buildTooltipExtensions();
+    expect(tooltips).toHaveBeenCalledWith({ position: 'fixed', parent: document.body });
+  });
+
+  it('is SSR/jsdom-safe: no-ops when document is unavailable', async () => {
+    const { buildTooltipExtensions } = await import('./ExpressionFieldImpl');
+    const { tooltips } = await import('@codemirror/view');
+    vi.mocked(tooltips).mockClear();
+
+    vi.stubGlobal('document', undefined);
+    try {
+      expect(buildTooltipExtensions()).toEqual([]);
+      expect(tooltips).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

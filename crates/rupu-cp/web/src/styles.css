@@ -1053,3 +1053,52 @@ pre.ab-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-
 @media (prefers-reduced-motion: reduce) {
   .ab-card.ab-enter { animation: none !important; }
 }
+
+/* ── CodeMirror completion tooltip (body-parented, `position: fixed`) ──
+   ExpressionFieldImpl configures `tooltips({ parent: document.body })` so the
+   expression-autocomplete popup escapes the inspector rail's
+   `overflow-y-auto` clipping. Because it's body-parented it renders OUTSIDE
+   any app container, so it must be themed here rather than via the editor's
+   scoped `EditorView.theme()` — but the `--c-*` tokens are set on
+   `:root`/`[data-theme]` (see the top of this file), which is an ancestor of
+   `document.body` either way, so `rgb(var(--c-*))` resolves correctly and
+   flips with the theme automatically. Scoped to `.cm-tooltip` /
+   `.cm-tooltip-autocomplete` only — the only CodeMirror-authored selectors in
+   this file today, so there's nothing existing to collide with; a shared
+   look across the expression editor and the YAML editor's own CM tooltips
+   (if any) is fine and desirable. */
+.cm-tooltip {
+  z-index: 60;
+  background: rgb(var(--c-panel));
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 8px;
+  color: rgb(var(--c-ink));
+  box-shadow: 0 8px 24px rgb(0 0 0 / .18), 0 2px 6px rgb(0 0 0 / .12);
+  overflow: hidden;
+}
+.cm-tooltip-autocomplete > ul {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  max-height: 16rem;
+  overflow-y: auto;
+}
+.cm-tooltip-autocomplete > ul > li {
+  padding: 4px 8px;
+}
+.cm-tooltip-autocomplete > ul > li[aria-selected] {
+  background: rgb(var(--c-brand-500) / .16);
+  color: rgb(var(--c-ink));
+}
+.cm-tooltip-autocomplete .cm-completionLabel {
+  color: rgb(var(--c-ink));
+}
+.cm-tooltip-autocomplete .cm-completionDetail {
+  font-style: normal;
+  color: rgb(var(--c-ink-mute));
+  margin-left: 6px;
+}
+.cm-tooltip-autocomplete .cm-completionMatchedText {
+  text-decoration: none;
+  color: rgb(var(--c-brand-600));
+  font-weight: 600;
+}
