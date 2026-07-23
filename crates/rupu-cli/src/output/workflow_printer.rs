@@ -827,7 +827,9 @@ fn replay_step_result_history(
     prefs: &UiPrefs,
 ) {
     match rec.kind {
-        StepKind::Linear | StepKind::Branch => replay_linear_step_history(state, rec, view_mode, prefs),
+        StepKind::Linear | StepKind::Branch | StepKind::Action => {
+            replay_linear_step_history(state, rec, view_mode, prefs)
+        }
         StepKind::ForEach | StepKind::Parallel | StepKind::Panel => {
             append_step_result_lines(state, rec, view_mode, prefs)
         }
@@ -1015,7 +1017,7 @@ fn append_step_result_lines(
     prefs: &UiPrefs,
 ) {
     match rec.kind {
-        StepKind::Linear | StepKind::Branch => {
+        StepKind::Linear | StepKind::Branch | StepKind::Action => {
             let status = if rec.success {
                 UiStatus::Complete
             } else {
@@ -1085,6 +1087,7 @@ fn append_step_result_lines(
                 StepKind::Panel => "panel",
                 StepKind::Linear => unreachable!(),
                 StepKind::Branch => unreachable!(),
+                StepKind::Action => unreachable!(),
             };
             state.push_tree_item(
                 status,
@@ -1136,6 +1139,7 @@ fn append_fanout_item_lines(
             StepKind::Parallel | StepKind::Panel => item.sub_id.clone(),
             StepKind::Linear => unreachable!(),
             StepKind::Branch => unreachable!(),
+            StepKind::Action => unreachable!(),
         };
         let status = if item.success {
             UiStatus::Complete
@@ -2681,7 +2685,7 @@ fn drain_step_results(
             StepKind::ForEach | StepKind::Parallel | StepKind::Panel => {
                 render_fanout_step(&rec, printer, view_mode);
             }
-            StepKind::Linear | StepKind::Branch => {
+            StepKind::Linear | StepKind::Branch | StepKind::Action => {
                 // Linear step — open a tailer if we have a transcript.
                 if rec.transcript_path.as_os_str().is_empty() || !rec.transcript_path.exists() {
                     // Header + immediate footer (nothing to stream).
@@ -2737,6 +2741,7 @@ fn render_fanout_step(
         StepKind::Parallel => printer.fanout_start(&rec.step_id, "parallel", rec.items.len()),
         StepKind::Linear => unreachable!("render_fanout_step called for linear step"),
         StepKind::Branch => unreachable!("render_fanout_step called for branch step"),
+        StepKind::Action => unreachable!("render_fanout_step called for action step"),
     };
 
     // Child frames at indent+1.
@@ -2770,6 +2775,7 @@ fn render_fanout_step(
         }
         StepKind::Linear => unreachable!(),
         StepKind::Branch => unreachable!(),
+        StepKind::Action => unreachable!(),
     }
 }
 
@@ -2826,6 +2832,7 @@ fn render_child_item(
         StepKind::Parallel | StepKind::Panel => item.sub_id.clone(),
         StepKind::Linear => unreachable!(),
         StepKind::Branch => unreachable!(),
+        StepKind::Action => unreachable!(),
     };
 
     if view_mode == LiveViewMode::Focused {
