@@ -449,12 +449,14 @@ function nodeToStepObject(d: StepNodeData): Record<string, unknown> {
     if (d.with !== undefined) o.with = d.with;
     if (d.when) o.when = d.when;
     if (d.continue_on_error === true) o.continue_on_error = true;
+    if (d.actions && d.actions.length > 0) o.actions = d.actions;
   } else if (d.kind === 'approval_gate') {
     // standalone gate NODE — its whole identity is the `approval:` block emitted
     // below; it carries no agent/prompt. `when` is still valid on a gate, so
     // preserve it (it lives in MODELLED_STEP_KEYS, i.e. never in raw_passthrough).
     if (d.when) o.when = d.when;
     if (d.continue_on_error === true) o.continue_on_error = true;
+    if (d.actions && d.actions.length > 0) o.actions = d.actions;
   } else {
     // step / for_each
     if (d.agent) o.agent = d.agent;
@@ -690,11 +692,27 @@ export function convertInlineApprovalToGate(g: WorkflowGraph, stepId: string): W
   if (node.data.approvalTimeoutSeconds !== undefined) {
     gateData.approvalTimeoutSeconds = node.data.approvalTimeoutSeconds;
   }
+  if (node.data.approvalAutoApprove !== undefined) {
+    gateData.approvalAutoApprove = node.data.approvalAutoApprove;
+  }
+  if (node.data.approvalOnTimeout !== undefined) {
+    gateData.approvalOnTimeout = node.data.approvalOnTimeout;
+  }
+  if (node.data.approvalNotify !== undefined) {
+    gateData.approvalNotify = node.data.approvalNotify;
+  }
+  if (node.data.approvalOnReject !== undefined) {
+    gateData.approvalOnReject = node.data.approvalOnReject;
+  }
 
   const strippedData: StepNodeData = { ...node.data };
   delete strippedData.approvalRequired;
   delete strippedData.approvalPrompt;
   delete strippedData.approvalTimeoutSeconds;
+  delete strippedData.approvalAutoApprove;
+  delete strippedData.approvalOnTimeout;
+  delete strippedData.approvalNotify;
+  delete strippedData.approvalOnReject;
 
   const gateNode: GraphNode = {
     id: gateId,

@@ -758,6 +758,19 @@ describe('nodeToStepObject — with: on a non-action node (fold-in)', () => {
     };
     expectRoundTrip(input);
   });
+
+  it('round-trips a non-empty `actions:` on an action node instead of silently dropping it', () => {
+    // `actions` is in MODELLED_STEP_KEYS (so it's excluded from raw_passthrough)
+    // and the action arm didn't emit it — an odd combo on hand-authored YAML,
+    // but round-trip fidelity must not lose data either way.
+    const input = {
+      name: 'wf',
+      steps: [
+        { id: 'a', action: 'github.create_pr', with: { title: 't' }, actions: ['read', 'write'] },
+      ],
+    };
+    expectRoundTrip(input);
+  });
 });
 
 // ── hasInlineApproval / convertInlineApprovalToGate ─────────────────────────
@@ -862,6 +875,65 @@ describe('convertInlineApprovalToGate', () => {
   it('is a no-op for a step without an inline approval', () => {
     const g = yamlToGraph({ name: 'wf', steps: [{ id: 'a', agent: 'x', prompt: 'p' }] });
     expect(convertInlineApprovalToGate(g, 'a')).toBe(g);
+  });
+
+  it('carries advanced approval fields (auto_approve/on_timeout/notify/on_reject) onto the new gate, leaving the agent step with no approval-derived fields', () => {
+    const input = {
+      name: 'wf',
+      steps: [
+        {
+          id: 'ship',
+          agent: 'deployer',
+          prompt: 'deploy it',
+          approval: {
+            required: true,
+            prompt: 'ok to ship?',
+            timeout_seconds: 300,
+            auto_approve: '{{ inputs.trusted }}',
+            on_timeout: 'reject',
+            notify: [{ slack: '#releases' }],
+            on_reject: [{ action: 'notify', with: { channel: 'oncall' } }],
+          },
+        },
+      ],
+    };
+    const g = yamlToGraph(input);
+    const next = convertInlineApprovalToGate(g, 'ship');
+
+    const agent = next.nodes.find((n) => n.id === 'ship');
+    expect(agent?.data.approvalRequired).toBeUndefined();
+    expect(agent?.data.approvalPrompt).toBeUndefined();
+    expect(agent?.data.approvalTimeoutSeconds).toBeUndefined();
+    expect(agent?.data.approvalAutoApprove).toBeUndefined();
+    expect(agent?.data.approvalOnTimeout).toBeUndefined();
+    expect(agent?.data.approvalNotify).toBeUndefined();
+    expect(agent?.data.approvalOnReject).toBeUndefined();
+
+    const gate = next.nodes.find((n) => n.data.kind === 'approval_gate');
+    expect(gate?.data.approvalPrompt).toBe('ok to ship?');
+    expect(gate?.data.approvalTimeoutSeconds).toBe(300);
+    expect(gate?.data.approvalAutoApprove).toBe('{{ inputs.trusted }}');
+    expect(gate?.data.approvalOnTimeout).toBe('reject');
+    expect(gate?.data.approvalNotify).toEqual([{ slack: '#releases' }]);
+    expect(gate?.data.approvalOnReject).toEqual([{ action: 'notify', with: { channel: 'oncall' } }]);
+
+    // serializes: gate owns the full approval block, the agent step has none.
+    const res = graphToWorkflowObject(next);
+    expect('obj' in res).toBe(true);
+    if (!('obj' in res)) return;
+    const steps = (res.obj as { steps: Record<string, unknown>[] }).steps;
+    const gateStep = steps.find((s) => s.id === gate?.id);
+    const agentStep = steps.find((s) => s.id === 'ship');
+    expect(gateStep?.approval).toEqual({
+      required: true,
+      prompt: 'ok to ship?',
+      timeout_seconds: 300,
+      auto_approve: '{{ inputs.trusted }}',
+      on_timeout: 'reject',
+      notify: [{ slack: '#releases' }],
+      on_reject: [{ action: 'notify', with: { channel: 'oncall' } }],
+    });
+    expect(agentStep?.approval).toBeUndefined();
   });
 
   it('picks a non-colliding gate id if `<id>-gate` is already taken', () => {
