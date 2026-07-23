@@ -1526,6 +1526,62 @@ impl RunStore {
         }
     }
 
+    /// Finalize `record` as `Failed` when it is stuck: `Pending` or
+    /// `Running` with a recorded `runner_pid` whose process is no
+    /// longer alive on this machine. This is the gate sweep's
+    /// counterpart to [`cancel`](Self::cancel) — cancel is an
+    /// operator-initiated terminal transition, this is a
+    /// crash-recovery one (the process that was supposed to run the
+    /// workflow died — killed, OOM'd, machine rebooted — without ever
+    /// getting a chance to mark the run terminal itself), so it needs
+    /// its own terminal-event append to avoid the same "Live Events
+    /// spins forever" bug class as `cancel`/`expire_if_overdue`.
+    ///
+    /// A `runner_pid: None` run in `Pending`/`Running` is deliberately
+    /// NOT reaped — that's the narrow window between a run being
+    /// created and the runner process writing its own pid back, and
+    /// treating it as orphaned would race a run that is in fact about
+    /// to start. Only a *dead recorded pid* counts as orphaned.
+    ///
+    /// Returns `Ok(true)` when it reaped the run, `Ok(false)` as a
+    /// no-op otherwise (including for `Paused` and any terminal
+    /// status).
+    pub fn reap_if_orphaned(
+        &self,
+        record: &mut RunRecord,
+        now: DateTime<Utc>,
+    ) -> Result<bool, RunStoreError> {
+        if !matches!(record.status, RunStatus::Pending | RunStatus::Running) {
+            return Ok(false);
+        }
+        let Some(pid) = record.runner_pid else {
+            return Ok(false);
+        };
+        if pid_is_running(pid) {
+            return Ok(false);
+        }
+        let error =
+            format!("runner process {pid} is no longer alive; run marked failed by the gate sweep");
+        record.status = RunStatus::Failed;
+        record.finished_at = Some(now);
+        record.error_message = Some(error.clone());
+        record.runner_pid = None;
+        record.active_step_id = None;
+        record.active_step_kind = None;
+        record.active_step_agent = None;
+        record.active_step_transcript_path = None;
+        self.update(record)?;
+        self.append_terminal_event(
+            &record.id,
+            &crate::executor::Event::RunFailed {
+                run_id: record.id.clone(),
+                error,
+                finished_at: now,
+            },
+        );
+        Ok(true)
+    }
+
     /// Cooperatively pause a `Pending`/`Running` run: flips the persisted
     /// record to the non-terminal [`RunStatus::Paused`] so `POST
     /// /api/runs/:id/resume` (or `rupu workflow resume`, which also drives
@@ -3002,6 +3058,102 @@ mod tests {
             }
             other => panic!("expected RunFailed(expired), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reap_if_orphaned_finalizes_dead_pid_running_run() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        // u32::MAX is not a valid pid on any supported platform (see
+        // `resume_blocked_by_live_runner_covers_all_cases` in
+        // rupu-cli/src/cmd/workflow.rs for the same convention).
+        let dead_pid = u32::MAX;
+        assert!(!pid_is_running(dead_pid));
+        let mut rec = sample_record("run_reap_dead_pid");
+        rec.status = RunStatus::Running;
+        rec.runner_pid = Some(dead_pid);
+        rec.active_step_id = Some("step_a".into());
+        rec.active_step_agent = Some("agent_a".into());
+        rec.active_step_transcript_path = Some(PathBuf::from("/tmp/step_a.jsonl"));
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let mut loaded = store.load(&rec.id).unwrap();
+        let reaped = store.reap_if_orphaned(&mut loaded, now).unwrap();
+        assert!(reaped);
+
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Failed);
+        assert!(reloaded.status.is_terminal());
+        assert_eq!(reloaded.finished_at, Some(now));
+        let err = reloaded.error_message.expect("error message set");
+        assert!(err.contains(&dead_pid.to_string()), "error: {err}");
+        assert!(reloaded.runner_pid.is_none());
+        assert!(reloaded.active_step_id.is_none());
+        assert!(reloaded.active_step_agent.is_none());
+        assert!(reloaded.active_step_transcript_path.is_none());
+
+        match last_event(&store, &rec.id) {
+            crate::executor::Event::RunFailed { run_id, error, .. } => {
+                assert_eq!(run_id, rec.id);
+                assert!(error.contains(&dead_pid.to_string()), "error: {error}");
+            }
+            other => panic!("expected RunFailed(orphan), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reap_if_orphaned_does_not_reap_live_self_pid() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_reap_live_pid");
+        rec.status = RunStatus::Running;
+        rec.runner_pid = Some(std::process::id());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let mut loaded = store.load(&rec.id).unwrap();
+        let reaped = store.reap_if_orphaned(&mut loaded, Utc::now()).unwrap();
+        assert!(!reaped);
+
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Running);
+    }
+
+    #[test]
+    fn reap_if_orphaned_does_not_reap_running_with_no_pid() {
+        // Mid-handoff guard: a Running run whose runner_pid hasn't been
+        // written yet is not an orphan.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_reap_no_pid");
+        rec.status = RunStatus::Running;
+        rec.runner_pid = None;
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let mut loaded = store.load(&rec.id).unwrap();
+        let reaped = store.reap_if_orphaned(&mut loaded, Utc::now()).unwrap();
+        assert!(!reaped);
+
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Running);
+    }
+
+    #[test]
+    fn reap_if_orphaned_does_not_reap_terminal_run() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_reap_terminal");
+        rec.status = RunStatus::Completed;
+        rec.finished_at = Some(Utc::now());
+        rec.runner_pid = Some(u32::MAX);
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let mut loaded = store.load(&rec.id).unwrap();
+        let reaped = store.reap_if_orphaned(&mut loaded, Utc::now()).unwrap();
+        assert!(!reaped);
+
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Completed);
     }
 
     #[test]
