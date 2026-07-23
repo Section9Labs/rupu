@@ -122,6 +122,29 @@ describe('SortableTable', () => {
     expect(screen.queryByText('detail for Beta')).toBeNull();
   });
 
+  it('is expandable per-row: a row whose renderDetail returns null gets NO chevron and IS link-wrapped by rowHref, while a row with detail content stays expandable', () => {
+    renderTable({
+      rowHref: (r) => `/things/${r.id}`,
+      // Beta (row 0) has detail; every other row (Alpha, Charlie, Delta)
+      // does not.
+      renderDetail: (r) => (r.name === 'Beta' ? <div>detail for {r.name}</div> : null),
+    });
+
+    // Beta: expandable — no link, has a chevron, expands to show its detail.
+    const rows = screen.getAllByRole('row').slice(1); // drop header row
+    const betaRow = rows[0];
+    expect(within(betaRow).queryByRole('link')).toBeNull();
+    expect(within(betaRow).getByRole('button', { name: 'Expand row' })).toBeInTheDocument();
+    fireEvent.click(within(betaRow).getByRole('button', { name: 'Expand row' }));
+    expect(screen.getByText('detail for Beta')).toBeInTheDocument();
+
+    // Alpha (row 1): no detail — link-wrapped by rowHref, no chevron button.
+    const alphaRow = rows[1];
+    expect(within(alphaRow).queryByRole('button', { name: 'Expand row' })).toBeNull();
+    const alphaLink = within(alphaRow).getAllByRole('link')[0] as HTMLAnchorElement;
+    expect(alphaLink).toHaveAttribute('href', '/things/a');
+  });
+
   it('shrinks a fit column to its content on both th and td (w-[1%] + nowrap)', () => {
     const columns: Column<Row>[] = [
       { key: 'name', header: 'Name', render: (r) => <span>{r.name}</span> },

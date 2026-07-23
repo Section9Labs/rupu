@@ -8,7 +8,7 @@
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import {
   api,
@@ -230,7 +230,7 @@ describe('AutoflowRuns host filter — server-driven (runs + cycles tabs)', () =
     expect(link).toHaveAttribute('href', '/runs/run-10?host=host_prod');
   });
 
-  it('the whole row is clickable, not just the Run cell — the Workflow cell links to the same /runs/:id', async () => {
+  it('the whole row is clickable, not just the Run/Workflow cells — a plain cell (Host) is also link-wrapped to the same /runs/:id', async () => {
     const eventWithRun: AutoflowEventRow = {
       event_id: 'evt-4',
       cycle_id: 'cyc-4',
@@ -246,7 +246,11 @@ describe('AutoflowRuns host filter — server-driven (runs + cycles tabs)', () =
 
     renderPage();
 
-    const link = await screen.findByRole('link', { name: /fix-issue/ });
+    // The Host cell has no special link handling of its own (it's a plain
+    // `<span>local</span>`) — SortableTable's rowHref wraps EVERY cell of a
+    // non-expandable row, so this proves the whole row is link-wrapped, not
+    // just cells that happen to render their own navigation.
+    const link = await screen.findByRole('link', { name: 'local' });
     expect(link).toHaveAttribute('href', '/runs/run-11');
   });
 
@@ -348,9 +352,11 @@ describe('AutoflowRuns — Event column (cycle_failed detail + issue ref fallbac
     expect(await screen.findByText('running')).toBeInTheDocument();
     expect(screen.getByText('120')).toBeInTheDocument();
 
-    // Expanding a run row with no `detail` shows nothing.
-    fireEvent.click(screen.getByLabelText('Expand row'));
-    expect(screen.queryByText(/missing step/)).not.toBeInTheDocument();
+    // No `detail` on this event → the row is NOT expandable (no chevron);
+    // it falls through to rowHref's per-row link-wrapping instead.
+    expect(screen.queryByLabelText('Expand row')).not.toBeInTheDocument();
+    const link = await screen.findByRole('link', { name: 'running' });
+    expect(link).toHaveAttribute('href', '/runs/run-77');
   });
 
   it('a non-run event (no run_id) renders empty Run/Worker/Status/tokens/Cost cells, not dashes', async () => {
@@ -370,8 +376,12 @@ describe('AutoflowRuns — Event column (cycle_failed detail + issue ref fallbac
     renderPage();
     await waitFor(() => expect(screen.getByText('CYCLE FAILED')).toBeInTheDocument());
 
-    // No run row exists to render '—' placeholders for; none of the
-    // run-shaped cells should render a literal dash for this row.
-    expect(screen.queryByText('—')).not.toBeInTheDocument();
+    // Scope to this row specifically (not the whole document — the Issue
+    // Ref column elsewhere in the table is allowed its own '—' fallback):
+    // none of the run-shaped cells (Run/Worker/Status/tokens/Cost) should
+    // render a literal dash for a non-run event.
+    const row = screen.getByText('CYCLE FAILED').closest('tr');
+    expect(row).not.toBeNull();
+    expect(within(row as HTMLElement).queryByText('—')).not.toBeInTheDocument();
   });
 });

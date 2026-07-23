@@ -168,33 +168,22 @@ const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
     header: 'Workflow',
     sortable: true,
     sortValue: (e) => e.workflow ?? KIND_LABEL[e.kind] ?? e.kind.replace(/_/g, ' '),
-    render: (e) => {
-      const label = e.workflow ?? KIND_LABEL[e.kind] ?? e.kind.replace(/_/g, ' ');
-      const href = eventHref(e);
-      return href ? (
-        <Link to={href} className="text-sm font-medium text-ink truncate hover:underline">
-          {label}
-        </Link>
-      ) : (
-        <span className="text-sm font-medium text-ink truncate">{label}</span>
-      );
-    },
+    // Plain content — row-level navigation is `rowHref` (SortableTable
+    // link-wraps the whole row for non-expandable rows); an inline <Link>
+    // here would nest an <a> inside SortableTable's own <a>.
+    render: (e) => (
+      <span className="text-sm font-medium text-ink truncate">
+        {e.workflow ?? KIND_LABEL[e.kind] ?? e.kind.replace(/_/g, ' ')}
+      </span>
+    ),
   },
   {
     key: 'run',
     header: 'Run',
-    render: (e) => {
-      if (!e.run_id) return null;
-      const href = eventHref(e);
-      const text = shortId(e.run_id);
-      return href ? (
-        <Link to={href} className="text-note text-ink-mute font-mono hover:underline">
-          {text}
-        </Link>
-      ) : (
-        <span className="text-note text-ink-mute font-mono">{text}</span>
-      );
-    },
+    render: (e) =>
+      e.run_id ? (
+        <span className="text-note text-ink-mute font-mono">{shortId(e.run_id)}</span>
+      ) : null,
   },
   {
     key: 'kind',
@@ -752,6 +741,7 @@ export default function AutoflowRuns() {
               columns={EVENT_COLUMNS}
               rows={eventRows}
               rowKey={(e) => e.event_id}
+              rowHref={eventHref}
               initialSort={{ key: 'started', dir: 'desc' }}
               renderDetail={EventDetail}
             />

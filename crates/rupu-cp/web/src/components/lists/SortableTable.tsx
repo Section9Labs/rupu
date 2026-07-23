@@ -96,15 +96,29 @@ export default function SortableTable<T>({
   rowKey: (row: T) => string;
   initialSort?: SortSpec;
   rowHref?: (row: T) => string | undefined;
-  /** When provided, each row gets a leading expand chevron that toggles a
-   *  full-width detail panel below it (for evidence / nested concerns / etc).
-   *  Expandable rows are never link-wrapped (`rowHref` is ignored). */
+  /** Per-row: return the detail-panel content for a row, or `null` (or
+   *  `false`) when that particular row has nothing to expand. A row is
+   *  expandable (gets the leading chevron + toggles a full-width detail
+   *  panel below it) iff this returns non-null for it; `rowHref` link-wraps
+   *  every OTHER row exactly as it would without `renderDetail` at all — the
+   *  two are mutually exclusive per row, not table-global. Consumers whose
+   *  `renderDetail` always returns content (the common case — evidence /
+   *  nested-concern panels) see no behavior change: every row is
+   *  expandable, so `rowHref` never applies, same as before. */
   renderDetail?: (row: T) => React.ReactNode;
 }) {
   const [sort, setSort] = useState<SortSpec | null>(initialSort ?? null);
   const [open, setOpen] = useState<ReadonlySet<string>>(new Set());
-  const expandable = Boolean(renderDetail);
-  const totalCols = columns.length + (expandable ? 1 : 0);
+  // Whether the table has the detail-panel FEATURE at all (reserves the
+  // leading chevron column in the header and every row, for grid
+  // alignment) — distinct from whether any GIVEN row is expandable.
+  const hasDetailFeature = Boolean(renderDetail);
+  const totalCols = columns.length + (hasDetailFeature ? 1 : 0);
+
+  /** Non-null/non-false detail content means this row is expandable. */
+  function isDetailContent(node: React.ReactNode): boolean {
+    return node !== null && node !== undefined && node !== false;
+  }
 
   function toggleOpen(key: string) {
     setOpen((prev) => {
@@ -150,7 +164,7 @@ export default function SortableTable<T>({
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b border-border text-meta uppercase tracking-wide text-ink-mute">
-            {expandable && <th scope="col" className="w-8" aria-label="Expand" />}
+            {hasDetailFeature && <th scope="col" className="w-8" aria-label="Expand" />}
             {columns.map((col) => {
               const active = sort?.key === col.key;
               const dir = active ? sort?.dir : undefined;
@@ -194,24 +208,29 @@ export default function SortableTable<T>({
         <tbody className="divide-y divide-border">
           {sorted.map((row) => {
             const key = rowKey(row);
-            // Expandable tables never link-wrap rows (the chevron is the row's
-            // interaction); plain tables honour rowHref.
-            const href = expandable ? undefined : rowHref?.(row);
-            const isOpen = expandable && open.has(key);
+            // A row is expandable iff renderDetail returns non-null content
+            // for IT specifically — not table-global. Rows without detail
+            // fall through to rowHref, exactly as if renderDetail were absent.
+            const detailContent = renderDetail?.(row);
+            const isRowExpandable = hasDetailFeature && isDetailContent(detailContent);
+            const href = isRowExpandable ? undefined : rowHref?.(row);
+            const isOpen = isRowExpandable && open.has(key);
             return (
               <Fragment key={key}>
                 <tr className="hover:bg-bg/60 transition-colors">
-                  {expandable && (
+                  {hasDetailFeature && (
                     <td className="w-8 pl-3 align-middle">
-                      <button
-                        type="button"
-                        onClick={() => toggleOpen(key)}
-                        aria-expanded={isOpen}
-                        aria-label={isOpen ? 'Collapse row' : 'Expand row'}
-                        className="flex h-5 w-5 items-center justify-center rounded text-ink-mute hover:bg-bg hover:text-ink-dim"
-                      >
-                        {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                      </button>
+                      {isRowExpandable && (
+                        <button
+                          type="button"
+                          onClick={() => toggleOpen(key)}
+                          aria-expanded={isOpen}
+                          aria-label={isOpen ? 'Collapse row' : 'Expand row'}
+                          className="flex h-5 w-5 items-center justify-center rounded text-ink-mute hover:bg-bg hover:text-ink-dim"
+                        >
+                          {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                        </button>
+                      )}
                     </td>
                   )}
                   {columns.map((col) => {
@@ -237,7 +256,7 @@ export default function SortableTable<T>({
                 {isOpen && (
                   <tr className="bg-bg/40">
                     <td colSpan={totalCols} className="px-4 py-3">
-                      {renderDetail?.(row)}
+                      {detailContent}
                     </td>
                   </tr>
                 )}
