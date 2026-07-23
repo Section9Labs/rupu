@@ -125,8 +125,10 @@ const BLOCK_CATALOG: Record<
   approval_gate: {
     kind: 'approval_gate',
     label: 'gate',
-    what: 'Pauses the run for a human approve/reject decision before continuing; can auto-approve from an expression.',
-    requiredFields: ['prompt'],
+    what:
+      'Pauses the run for a human approve/reject decision before continuing; can auto-approve from an expression. ' +
+      'Every field on `approval:` is optional (including prompt: — the approval message shown to approvers) — only the block\'s presence is required.',
+    requiredFields: [],
     example: '- id: ship_gate\n  approval:\n    prompt: "Approve to continue?"\n    timeout_seconds: 86400\n    on_timeout: reject',
   },
 };
@@ -209,11 +211,15 @@ interface NodeDetailProps {
   what: string;
   requiredFields: SchemaField[];
   /** Shown INSTEAD of the required-fields list when it's empty (a connector
-   *  with no `required[]` in its schema — never shown for blocks, which
-   *  always have at least one required field). */
+   *  with no `required[]` in its schema, or a block with no required fields
+   *  at all — e.g. the gate, whose `approval:` block is entirely optional). */
   noSchemaNote?: string;
   example: string;
   onAdd: () => void;
+  /** Mirrors the rail's `disabled` (YAML unparseable / graph paused) — the
+   *  chips and filter already respect it; the CTA must too, or it looks live
+   *  while silently no-op-ing. */
+  disabled?: boolean;
 }
 
 /** The Blocks-tab detail card (rail variant only): title + kind badge, blurb,
@@ -230,6 +236,7 @@ function NodeDetail({
   noSchemaNote,
   example,
   onAdd,
+  disabled = false,
 }: NodeDetailProps) {
   return (
     <div className="wfx-palette-detail" role="region" aria-label={`${title} details`}>
@@ -263,7 +270,7 @@ function NodeDetail({
         noSchemaNote && <p className="wfx-detail-note">{noSchemaNote}</p>
       )}
       <pre className="wfx-detail-example">{example}</pre>
-      <button type="button" className="wfx-detail-addbtn" onClick={onAdd}>
+      <button type="button" className="wfx-detail-addbtn" onClick={onAdd} disabled={disabled}>
         Add to canvas
       </button>
     </div>
@@ -463,6 +470,7 @@ export default function NodePalette({
             requiredFields={selectedBlock.requiredFields.map((name) => ({ name }))}
             example={selectedBlock.example}
             onAdd={() => commitAdd(selectedBlock.kind)}
+            disabled={disabled}
           />
         )}
         {selectedTool && (
@@ -476,6 +484,7 @@ export default function NodePalette({
             noSchemaNote="No required parameters declared — parameters come from the tool schema."
             example={`action: ${selectedTool.name}\nwith: { … }`}
             onAdd={() => commitAdd('action', { action: selectedTool.name })}
+            disabled={disabled}
           />
         )}
       </div>

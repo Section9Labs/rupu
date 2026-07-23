@@ -805,6 +805,8 @@
   align-self: flex-start;
 }
 .wfx-detail-addbtn:hover { background: rgb(var(--c-brand-600)); }
+.wfx-detail-addbtn:disabled { cursor: not-allowed; opacity: .5; }
+.wfx-detail-addbtn:disabled:hover { background: rgb(var(--c-brand-500)); }
 
 @media (prefers-reduced-motion: reduce) {
   .wfx-palette-filter, .wfx-detail-addbtn { transition: none !important; }

@@ -189,6 +189,33 @@ describe('NodePalette', () => {
       expect(detail.querySelector('pre')).toHaveTextContent('agent: code-reviewer');
     });
 
+    it('the gate block has NO required fields (approval: is entirely optional per workflow.rs) — no `*` list renders', () => {
+      render(
+        <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" workflowEditorUi="next" />,
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'Add gate node' }));
+      const detail = screen.getByRole('region', { name: 'gate details' });
+      expect(detail.querySelector('.wfx-detail-reqs')).not.toBeInTheDocument();
+      expect(detail.querySelectorAll('.wfx-detail-req-star').length).toBe(0);
+      expect(detail).toHaveTextContent(/optional/i);
+    });
+
+    it('the Add-to-canvas button respects `disabled` (paused editor) instead of silently no-op-ing', () => {
+      const onAdd = vi.fn();
+      // Select a card while enabled, then flip the whole rail `disabled`
+      // (mirrors the editor pausing on unparseable YAML while a card is
+      // already selected) — the CTA must disable along with everything else.
+      const { rerender } = render(
+        <NodePalette onAdd={onAdd} onDragStartKind={() => {}} variant="rail" />,
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'Add parallel node' }));
+      rerender(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} variant="rail" disabled />);
+      const cta = screen.getByRole('button', { name: 'Add to canvas' });
+      expect(cta).toBeDisabled();
+      fireEvent.click(cta);
+      expect(onAdd).not.toHaveBeenCalled();
+    });
+
     it('"Add to canvas" calls onAdd with the selected block kind and clears the selection', () => {
       const onAdd = vi.fn();
       render(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} variant="rail" />);
