@@ -29,7 +29,7 @@ use crate::workflow::{
 use async_trait::async_trait;
 use rupu_agent::{run_agent, AgentRunOpts, RunError, RunResult};
 use rupu_providers::types::Message;
-use rupu_transcript::{Event, JsonlReader};
+use rupu_transcript::{Event, JsonlReader, JsonlWriter};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1372,6 +1372,7 @@ async fn run_steps_inner(
                         &ctx,
                         render_mode(opts.strict_templates),
                         effective_continue_on_error,
+                        &opts.transcript_dir,
                     )
                     .await
                 }
@@ -1636,12 +1637,29 @@ fn render_action_args(
 /// template-render failure always propagates as `Err` regardless of
 /// `continue_on_error` — same as every other step shape's render failures,
 /// which are treated as author/config errors, not runtime tool failures.
+///
+/// Writes exactly one audit-trail transcript line at a fresh path under
+/// `transcript_dir` — an `Event::ActionEmitted` record, the same envelope
+/// shape agent-run transcripts already carry for this event (see
+/// `output/workflow_printer.rs` / `output/live_run.rs`, which render it
+/// today with no production writer yet). `allowed` is `false` only for a
+/// `McpError::PermissionDenied` (the call never reached the connector);
+/// any other dispatch error still reached the connector, so `allowed:
+/// true, applied: false`. The line is written once, after the dispatch
+/// call resolves and before the `continue_on_error` branch, so both the
+/// tolerated-failure and hard-abort paths get the same audit record. No
+/// `run_start` preamble: `JsonlReader`'s `read_transcript_run_start` /
+/// `JsonlReader::summary` both tolerate (rather than error on) a first
+/// line that isn't `RunStart` — an action step has no
+/// agent/provider/model to put in one anyway, so a bare single-line file
+/// is the correct shape, not a gap.
 async fn execute_action_step(
     dispatcher: &rupu_mcp::ToolDispatcher,
     step: &Step,
     ctx: &StepContext,
     mode: RenderMode,
     continue_on_error: bool,
+    transcript_dir: &Path,
 ) -> Result<StepResult, RunWorkflowError> {
     let tool = step
         .action
@@ -1653,13 +1671,44 @@ async fn execute_action_step(
             source: e,
         }
     })?;
-    match dispatcher.call(tool, args).await {
+
+    let transcript_path = transcript_dir.join(format!("run_{}.jsonl", Ulid::new()));
+    let call_result = dispatcher.call(tool, args.clone()).await;
+
+    let (allowed, applied, reason) = match &call_result {
+        Ok(_) => (true, true, None),
+        Err(rupu_mcp::McpError::PermissionDenied { reason, .. }) => {
+            (false, false, Some(reason.clone()))
+        }
+        Err(e) => (true, false, Some(e.to_string())),
+    };
+    match JsonlWriter::create(&transcript_path) {
+        Ok(mut writer) => {
+            if let Err(e) = writer.write(&Event::ActionEmitted {
+                kind: tool.to_string(),
+                payload: args,
+                allowed,
+                applied,
+                reason,
+            }) {
+                warn!(step = %step.id, error = %e, "failed to write action audit transcript line");
+            } else if let Err(e) = writer.flush() {
+                warn!(step = %step.id, error = %e, "failed to flush action audit transcript");
+            }
+        }
+        Err(e) => {
+            warn!(step = %step.id, error = %e, "failed to create action audit transcript file");
+        }
+    }
+
+    match call_result {
         Ok(output) => Ok(StepResult {
             step_id: step.id.clone(),
             output,
             success: true,
             skipped: false,
             kind: crate::runs::StepKind::Action,
+            transcript_path,
             ..Default::default()
         }),
         Err(source) => {
@@ -1675,6 +1724,7 @@ async fn execute_action_step(
                     success: false,
                     skipped: false,
                     kind: crate::runs::StepKind::Action,
+                    transcript_path,
                     ..Default::default()
                 })
             } else {
@@ -1832,11 +1882,18 @@ pub async fn run_reject_cleanup(
     for step in &chain {
         if step.action.is_some() {
             // Action steps dispatch through the same `execute_action_step`
-            // helper the main loop uses (Plan 2) — but, matching the rest
-            // of this function's contract, a failure here is logged and the
-            // chain continues rather than aborting the (already-terminal)
-            // run: `execute_action_step` is called with
-            // `continue_on_error: true` unconditionally.
+            // helper the main loop uses (Plan 2). `continue_on_error:
+            // false` here so a dispatcher failure comes back as `Err`
+            // (matching the main loop's own default) — the `Err` arm
+            // below is what actually implements this function's
+            // never-abort contract: it logs, emits `StepFailed` with the
+            // real error, records a failed `StepResult`, and the `for`
+            // loop continues to the next cleanup step regardless. Passing
+            // `true` here would have silently swallowed the error inside
+            // `execute_action_step` itself (an `Ok(StepResult { success:
+            // false })` with no error string anywhere), so the chain
+            // still continues either way — this just makes sure the real
+            // error reaches `StepFailed` instead of being discarded.
             let ctx = base_context_for_step(
                 &resolved_inputs,
                 opts.event.as_ref(),
@@ -1855,6 +1912,7 @@ pub async fn run_reject_cleanup(
                     },
                 );
             }
+            let step_timer = std::time::Instant::now();
             let outcome = match opts.action_dispatcher.as_ref() {
                 Some(dispatcher) => {
                     execute_action_step(
@@ -1862,7 +1920,8 @@ pub async fn run_reject_cleanup(
                         step,
                         &ctx,
                         render_mode(opts.strict_templates),
-                        true,
+                        false,
+                        &opts.transcript_dir,
                     )
                     .await
                 }
@@ -1870,6 +1929,7 @@ pub async fn run_reject_cleanup(
                     step: step.id.clone(),
                 }),
             };
+            let duration_ms = step_timer.elapsed().as_millis() as u64;
             let result = match outcome {
                 Ok(result) => {
                     if let Some(sink) = opts.event_sink.as_ref() {
@@ -1879,7 +1939,7 @@ pub async fn run_reject_cleanup(
                                 run_id: run_id.clone(),
                                 step_id: step.id.clone(),
                                 success: result.success,
-                                duration_ms: 0,
+                                duration_ms,
                                 host: None,
                             },
                         );
@@ -4142,6 +4202,44 @@ mod tests {
             action_dispatcher: None,
             pause: None,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // `render_action_args` — array-value template rendering
+    // -----------------------------------------------------------------------
+
+    /// An action step's `with:` array values must render each element
+    /// through the same template machinery a string `with:` value gets —
+    /// `walk`'s `Value::Array` arm recurses per-item rather than skipping
+    /// arrays wholesale. Mirrors `issues.create`'s `labels:
+    /// Option<Vec<String>>` schema param (`crates/rupu-mcp/src/tools/
+    /// issues.rs`), the catalog tool with an array-typed field.
+    #[test]
+    fn render_action_args_renders_templates_inside_array_values() {
+        let prior = vec![StepResult {
+            step_id: "seed".into(),
+            output: "bug-report".into(),
+            success: true,
+            skipped: false,
+            kind: crate::runs::StepKind::Linear,
+            ..Default::default()
+        }];
+        let ctx = base_context_for_step(&BTreeMap::new(), None, None, &prior);
+        let with = serde_json::json!({
+            "project": "acme/widget",
+            "title": "found an issue",
+            "body": "auto-filed",
+            "labels": ["{{ steps.seed.output }}", "static"],
+        });
+
+        let rendered = render_action_args(Some(&with), &ctx, RenderMode::Permissive)
+            .expect("array-valued with: renders");
+
+        assert_eq!(rendered["labels"][0], "bug-report");
+        assert_eq!(
+            rendered["labels"][1], "static",
+            "non-template array elements pass through unchanged"
+        );
     }
 
     // -----------------------------------------------------------------------

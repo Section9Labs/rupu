@@ -2528,6 +2528,7 @@ pub(crate) async fn resume_run(
         event_sink_for_resume.clone(),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
+    let action_dispatcher = crate::resume::action_dispatcher_for(&mcp_registry, &mode_str);
     let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
     let factory = Arc::new(DefaultStepFactory {
         workflow: workflow.clone(),
@@ -2628,7 +2629,7 @@ pub(crate) async fn resume_run(
         strict_templates: false,
         event_sink: event_sink_for_resume,
         unit_dispatcher,
-        action_dispatcher: None,
+        action_dispatcher: Some(action_dispatcher),
         pause: Some(pause_token.clone()),
     };
 
@@ -3833,6 +3834,12 @@ async fn execute_workflow_invocation(
         event_sink_for_run.clone(),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
+    // Shared across this run's initial `opts` AND the inline
+    // approve-resume `resume_opts` built further down this function —
+    // same registry + mode the `DefaultStepFactory` below carries, so
+    // agent steps and action steps see identical permissions across a
+    // pause/resume boundary too.
+    let action_dispatcher = crate::resume::action_dispatcher_for(&mcp_registry, &ctx.mode);
 
     let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
     let factory = Arc::new(DefaultStepFactory {
@@ -3900,7 +3907,7 @@ async fn execute_workflow_invocation(
         strict_templates,
         event_sink: event_sink_for_run,
         unit_dispatcher,
-        action_dispatcher: None,
+        action_dispatcher: Some(Arc::clone(&action_dispatcher)),
         pause: Some(pause_token.clone()),
     };
 
@@ -4080,7 +4087,7 @@ async fn execute_workflow_invocation(
                         strict_templates,
                         event_sink: resume_event_sink,
                         unit_dispatcher: resume_unit_dispatcher,
-                        action_dispatcher: None,
+                        action_dispatcher: Some(Arc::clone(&action_dispatcher)),
                         pause: Some(pause_token.clone()),
                     };
                     current_runner = tokio::spawn(run_workflow(resume_opts));

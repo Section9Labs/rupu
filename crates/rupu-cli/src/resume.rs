@@ -10,10 +10,32 @@
 //! handler scope can call it identically to the `approve` subcommand.
 
 use crate::paths;
+use rupu_mcp::{McpPermission, ToolDispatcher};
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, OrchestratorRunResult};
 use rupu_orchestrator::{DefaultStepFactory, RunStore, Workflow};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// Build the `action_dispatcher` every `OrchestratorRunOpts` construction
+/// site wires: an in-process MCP `ToolDispatcher` over the same SCM
+/// `Registry` and permission mode the run's `DefaultStepFactory` already
+/// carries for agent-step tool calls, so an `action:` step sees exactly
+/// the same allow/deny surface a `tools:`-using agent step would.
+/// `parse_mode_for_runtime` (rupu-agent) is reused rather than
+/// duplicated — it is the same mode string → `PermissionMode` mapping
+/// `run_agent` applies to its own tool registry.
+pub fn action_dispatcher_for(
+    registry: &Arc<rupu_scm::Registry>,
+    mode_str: &str,
+) -> Arc<ToolDispatcher> {
+    Arc::new(ToolDispatcher::new(
+        Arc::clone(registry),
+        McpPermission::new(
+            rupu_agent::runner::parse_mode_for_runtime(mode_str),
+            vec!["*".into()],
+        ),
+    ))
+}
 
 /// Result of a successful [`resume_run`], carrying everything the caller
 /// needs to render the post-resume status (re-pause vs completion) without
@@ -201,6 +223,7 @@ async fn rebuild_opts_from_disk(
         event_sink_for_resume.clone(),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
+    let action_dispatcher = action_dispatcher_for(&mcp_registry, &mode_str);
     let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
     let factory = Arc::new(DefaultStepFactory {
         workflow: workflow.clone(),
@@ -233,7 +256,7 @@ async fn rebuild_opts_from_disk(
         strict_templates: false,
         event_sink: event_sink_for_resume,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_dispatcher: Some(action_dispatcher),
         pause: None,
     };
 

@@ -229,6 +229,21 @@ fn event_types_for_step(path: &std::path::Path, step: &str) -> Vec<String> {
         .collect()
 }
 
+/// Parse a step's own transcript file (`StepResult::transcript_path`) into
+/// its JSONL lines as raw `serde_json::Value`s, so tests can assert on the
+/// audit-trail `action_emitted` envelope without depending on `Event`'s
+/// full field list.
+fn read_transcript_lines(path: &std::path::Path) -> Vec<serde_json::Value> {
+    let body = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("action step transcript at {path:?} must exist: {e}"));
+    body.lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("transcript line must be valid JSON: {e}; line: {line}"))
+        })
+        .collect()
+}
+
 const WF_ACTION_HAPPY: &str = r#"
 name: action-happy
 steps:
@@ -311,6 +326,23 @@ async fn happy_path_action_step_dispatches_through_tool_dispatcher() {
         types.contains(&"step_completed".to_string()),
         "got {types:?}"
     );
+
+    // The action step wrote exactly one audit-trail transcript line at
+    // its own `transcript_path`, matching the `action_emitted` envelope
+    // shape agent-run transcripts already use for this event.
+    assert!(
+        comment.transcript_path.exists(),
+        "action step's transcript_path must exist: {:?}",
+        comment.transcript_path
+    );
+    let lines = read_transcript_lines(&comment.transcript_path);
+    assert_eq!(lines.len(), 1, "exactly one audit line; got {lines:?}");
+    let data = &lines[0]["data"];
+    assert_eq!(lines[0]["type"], "action_emitted");
+    assert_eq!(data["kind"], "scm.prs.comment");
+    assert_eq!(data["applied"], true);
+    assert_eq!(data["allowed"], true);
+    assert_eq!(data["payload"]["body"], "done: hello world");
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +503,24 @@ steps:
     assert_eq!(comment.step_id, "comment");
     assert_eq!(comment.kind, StepKind::Action);
     assert!(!comment.success, "the connector error must be recorded as a failure");
+
+    // Failure case: the audit line still gets written (exactly once),
+    // with `applied: false` and the connector's error string carried in
+    // the envelope's `reason` field — the only field this shape has for
+    // an error string, matching the `output/workflow_printer.rs` /
+    // `output/live_run.rs` consumers already reading it that way.
+    assert!(comment.transcript_path.exists());
+    let lines = read_transcript_lines(&comment.transcript_path);
+    assert_eq!(lines.len(), 1, "exactly one audit line; got {lines:?}");
+    let data = &lines[0]["data"];
+    assert_eq!(lines[0]["type"], "action_emitted");
+    assert_eq!(data["kind"], "scm.prs.comment");
+    assert_eq!(data["applied"], false);
+    assert_eq!(data["allowed"], true, "the call reached the connector; only permission denial sets allowed:false");
+    assert!(
+        data["reason"].as_str().unwrap_or_default().contains("boom"),
+        "reason must carry the connector's error string; got {data:?}"
+    );
 
     let after = &res.step_results[1];
     assert_eq!(after.step_id, "after");
