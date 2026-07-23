@@ -853,6 +853,18 @@ async fn reject_cleanup_with_empty_on_reject_dispatches_nothing() {
 
     let record_after_reject = store.load(&run_id).unwrap();
 
+    // Wire a real JsonlSink at the same path production uses
+    // (`<runs_dir>/<run_id>/events.jsonl` — see `rupu-cli`'s reject/resume
+    // call sites), so this test exercises the same layering the CLI's
+    // live reject path does: `store.reject()` already appended a
+    // terminal `RunCompleted` to this file before `run_reject_cleanup`
+    // is ever called, and `emit_gate_result` (task 4) unconditionally
+    // emits the gate's own `StepStarted`/`StepCompleted` through this
+    // sink even though `on_reject` is empty — the exact case task 4
+    // fixed the trailing re-append for.
+    let events_path = store.root.join(&run_id).join("events.jsonl");
+    let sink = Arc::new(JsonlSink::create(&events_path).expect("create jsonl sink"));
+
     // PanicFactory proves nothing is ever dispatched — an empty on_reject
     // chain must not call the factory at all.
     let opts2 = OrchestratorRunOpts {
@@ -875,7 +887,7 @@ async fn reject_cleanup_with_empty_on_reject_dispatches_nothing() {
         )),
         run_id_override: None,
         strict_templates: false,
-        event_sink: None,
+        event_sink: Some(sink.clone()),
         unit_dispatcher: None,
         pause: None,
     };
@@ -897,4 +909,15 @@ async fn reject_cleanup_with_empty_on_reject_dispatches_nothing() {
 
     let record_final = store.load(&run_id).unwrap();
     assert_eq!(record_final.status, RunStatus::Rejected);
+
+    // The behavioral contract task 4 locks in: even with an empty
+    // on_reject chain, events.jsonl's LAST line is a terminal
+    // `run_completed` — never the gate's own trailing `step_completed`
+    // that `emit_gate_result` unconditionally emits through the sink.
+    let types = read_event_types(&events_path);
+    assert_eq!(
+        types.last().map(String::as_str),
+        Some("run_completed"),
+        "events.jsonl must end with run_completed even for an empty cleanup chain; got {types:?}"
+    );
 }

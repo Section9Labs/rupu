@@ -1832,31 +1832,31 @@ pub async fn run_reject_cleanup(
 
     // 5. `RunStore::reject` already appended a terminal `RunCompleted`
     //    event before this function ran (step 1 doc comment above), but
+    //    `emit_gate_result` (step 2 above) unconditionally emits the
+    //    gate's own `StepStarted`/`StepCompleted` events after that, and
     //    every cleanup step dispatched in the loop above appends its own
-    //    `StepStarted`/`StepCompleted`/`StepFailed` events AFTER that —
-    //    so `events.jsonl` ends with step events, not a terminal one.
-    //    Newest-event-fold consumers (Situation Room's live event stream)
-    //    fold the log by treating its last event as the run's current
-    //    state; with a step event trailing, a rejected run would briefly
-    //    render as "active" until a fresh terminal event lands. Re-append
-    //    the same `RunCompleted(Rejected)` event here — after the chain —
-    //    so the log ends closed. This is a deliberate duplicate: it is
-    //    NOT deduped downstream, it is simply an accepted trailing marker
+    //    `StepStarted`/`StepCompleted`/`StepFailed` events on top of
+    //    those — so `events.jsonl` ends with step events, not a terminal
+    //    one, even when the chain is empty. Newest-event-fold consumers
+    //    (Situation Room's live event stream) fold the log by treating
+    //    its last event as the run's current state; with a step event
+    //    trailing, a rejected run would briefly render as "active" until
+    //    a fresh terminal event lands. Re-append the same
+    //    `RunCompleted(Rejected)` event here — after the chain — so the
+    //    log ends closed. This is a deliberate duplicate: it is NOT
+    //    deduped downstream, it is simply an accepted trailing marker
     //    that keeps the log's last line authoritative. Skipped silently
-    //    when the chain never dispatched a step (nothing trails the
-    //    original terminal event) or when `opts.run_store` is `None`
-    //    (in-memory runs have no `events.jsonl` to close).
-    if !chain.is_empty() {
-        if let Some(store) = &opts.run_store {
-            store.append_terminal_event(
-                &run_id,
-                &crate::executor::Event::RunCompleted {
-                    run_id: run_id.clone(),
-                    status: crate::runs::RunStatus::Rejected,
-                    finished_at: chrono::Utc::now(),
-                },
-            );
-        }
+    //    only when `opts.run_store` is `None` (in-memory runs have no
+    //    `events.jsonl` to close).
+    if let Some(store) = &opts.run_store {
+        store.append_terminal_event(
+            &run_id,
+            &crate::executor::Event::RunCompleted {
+                run_id: run_id.clone(),
+                status: crate::runs::RunStatus::Rejected,
+                finished_at: chrono::Utc::now(),
+            },
+        );
     }
 
     Ok(())
