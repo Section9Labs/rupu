@@ -74,6 +74,24 @@ type PanelTab = 'step' | 'settings' | 'reference';
 /** localStorage flag: the canonical-rewrite notice has been shown once. */
 const REFORMAT_NOTICE_KEY = 'rupu.editor.reformatNoticeSeen';
 
+/** localStorage flag: whether the YAML source pane is open (`next` UI only).
+ *  Missing / garbage / '1' → open; only an explicit '0' collapses it. */
+const SOURCE_OPEN_KEY = 'rupu.editor.sourceOpen';
+
+function readSourceOpen(): boolean {
+  try {
+    if (typeof localStorage === 'undefined') return true;
+    return localStorage.getItem(SOURCE_OPEN_KEY) !== '0';
+  } catch {
+    return true;
+  }
+}
+
+/** id shared between the source-toggle button's `aria-controls` and the YAML
+ *  editor's wrapping container, so assistive tech can locate the pane it
+ *  expands/collapses. Only mounted while the pane is open. */
+const SOURCE_PANE_ID = 'wf-source-editor';
+
 /** True if `text` contains a YAML comment — a line whose first non-space char is
  *  `#`, or an inline ` #`. A heuristic (may flag `#` inside a quoted scalar);
  *  used only to gate a one-time, dismissible notice, so over-warning is benign. */
@@ -110,6 +128,21 @@ export default function WorkflowEditor({
   // ref wouldn't trigger the re-render that hands it down.
   const [paletteSlot, setPaletteSlot] = useState<HTMLElement | null>(null);
   const paletteSlotRef = useCallback((el: HTMLElement | null) => setPaletteSlot(el), []);
+
+  // YAML source pane visibility (`next` UI only, Task 2). Classic always shows
+  // the SplitPane and never reads/writes this state.
+  const [sourceOpen, setSourceOpen] = useState<boolean>(() => readSourceOpen());
+  const toggleSourceOpen = useCallback(() => {
+    setSourceOpen((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem(SOURCE_OPEN_KEY, next ? '1' : '0');
+      } catch {
+        /* localStorage unavailable (private mode / SSR) — skip persistence */
+      }
+      return next;
+    });
+  }, []);
 
   // Keep the latest selectedId + graph readable inside the debounce timeout
   // WITHOUT adding them to the effect deps (which would re-arm the timer on every
@@ -301,9 +334,9 @@ export default function WorkflowEditor({
 
       {/* ── LEFT / MAIN: graph over YAML, resizable ───────────────────────── */}
       <div className="min-h-0 min-w-0 flex-1">
-        <SplitPane
-          top={
-            <div className="h-full overflow-hidden p-3">
+        {workflowEditorUi === 'next' && !sourceOpen ? (
+          <div className="flex h-full min-h-0 flex-col">
+            <div className="min-h-0 flex-1 overflow-hidden p-3">
               <WorkflowEditorGraph
                 graph={graph}
                 onChange={commit}
@@ -313,29 +346,76 @@ export default function WorkflowEditor({
                 onInvalidConnection={setConnError}
                 paused={paused}
                 workflowEditorUi={workflowEditorUi}
-                paletteContainer={workflowEditorUi === 'next' ? paletteSlot : undefined}
+                paletteContainer={paletteSlot}
               />
             </div>
-          }
-          bottom={
-            <div className="flex h-full min-h-0 flex-col">
-              <div className="min-h-0 flex-1 overflow-auto p-3">
-                <CodeEditor
-                  value={draftYaml}
-                  onChange={onYamlChange}
-                  language="yaml"
-                  ariaLabel="Workflow YAML editor"
+            <div className="flex items-center gap-2 border-t border-border bg-panel px-3 py-1.5">
+              <button
+                type="button"
+                onClick={toggleSourceOpen}
+                aria-expanded={false}
+                aria-controls={SOURCE_PANE_ID}
+                className="rounded px-1.5 py-0.5 text-note font-medium text-ink-dim hover:bg-surface-hover hover:text-ink"
+              >
+                Show source
+              </button>
+              <span className="text-note text-ink-mute">⟳ synced from graph</span>
+              <span className="ml-auto">
+                <ValidityBadge validity={validity} />
+              </span>
+            </div>
+          </div>
+        ) : (
+          <SplitPane
+            top={
+              <div className="h-full overflow-hidden p-3">
+                <WorkflowEditorGraph
+                  graph={graph}
+                  onChange={commit}
+                  selectedId={selectedId}
+                  onSelect={handleSelect}
+                  problemsById={problemsById}
+                  onInvalidConnection={setConnError}
+                  paused={paused}
+                  workflowEditorUi={workflowEditorUi}
+                  paletteContainer={workflowEditorUi === 'next' ? paletteSlot : undefined}
                 />
               </div>
-              <div className="flex items-center gap-2 border-t border-border bg-panel px-3 py-1.5">
-                <span className="text-note text-ink-mute">⟳ synced from graph</span>
-                <span className="ml-auto">
-                  <ValidityBadge validity={validity} />
-                </span>
+            }
+            bottom={
+              <div className="flex h-full min-h-0 flex-col">
+                <div
+                  className="min-h-0 flex-1 overflow-auto p-3"
+                  {...(workflowEditorUi === 'next' ? { id: SOURCE_PANE_ID } : {})}
+                >
+                  <CodeEditor
+                    value={draftYaml}
+                    onChange={onYamlChange}
+                    language="yaml"
+                    ariaLabel="Workflow YAML editor"
+                  />
+                </div>
+                <div className="flex items-center gap-2 border-t border-border bg-panel px-3 py-1.5">
+                  <span className="text-note text-ink-mute">⟳ synced from graph</span>
+                  {workflowEditorUi === 'next' && (
+                    <button
+                      type="button"
+                      onClick={toggleSourceOpen}
+                      aria-expanded={true}
+                      aria-controls={SOURCE_PANE_ID}
+                      className="rounded px-1.5 py-0.5 text-note font-medium text-ink-dim hover:bg-surface-hover hover:text-ink"
+                    >
+                      Hide source
+                    </button>
+                  )}
+                  <span className="ml-auto">
+                    <ValidityBadge validity={validity} />
+                  </span>
+                </div>
               </div>
-            </div>
-          }
-        />
+            }
+          />
+        )}
       </div>
 
       {/* ── RIGHT: inspector rail ─────────────────────────────────────────── */}

@@ -7,7 +7,7 @@
 // thin stubs. Fake timers drive the 250ms debounce deterministically.
 
 import '@testing-library/jest-dom/vitest';
-import { afterEach, describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, act, fireEvent } from '@testing-library/react';
 import type { WorkflowGraph } from '../../lib/workflowGraph';
 
@@ -139,5 +139,98 @@ describe('WorkflowEditor live reconcile', () => {
     rerender(<WorkflowEditor draftYaml={VALID} onYamlChange={() => {}} agents={[]} validity={null} />);
     act(() => vi.advanceTimersByTime(250));
     expect(screen.getByTestId('graph')).toHaveAttribute('data-paused', 'false');
+  });
+});
+
+describe('WorkflowEditor source pane toggle (Task 2)', () => {
+  const SOURCE_OPEN_KEY = 'rupu.editor.sourceOpen';
+
+  // jsdom's localStorage is unreliable under this Node version — install a
+  // simple in-memory implementation we fully control (matches ThemeProvider.test.tsx).
+  function installLocalStorage() {
+    const store = new Map<string, string>();
+    vi.stubGlobal('localStorage', {
+      getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+      setItem: (k: string, v: string) => store.set(k, String(v)),
+      removeItem: (k: string) => store.delete(k),
+      clear: () => store.clear(),
+      key: (i: number) => Array.from(store.keys())[i] ?? null,
+      get length() {
+        return store.size;
+      },
+    });
+  }
+
+  beforeEach(() => {
+    installLocalStorage();
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('classic: no source toggle button, YAML editor always present', () => {
+    render(
+      <WorkflowEditor draftYaml={VALID} onYamlChange={() => {}} agents={[]} validity={{ ok: true }} />,
+    );
+    expect(screen.queryByRole('button', { name: /source/i })).not.toBeInTheDocument();
+    expect(screen.getByTestId('code')).toBeInTheDocument();
+  });
+
+  it('next: a "Hide source" toggle is present by default, editor mounted', () => {
+    render(
+      <WorkflowEditor
+        draftYaml={VALID}
+        onYamlChange={() => {}}
+        agents={[]}
+        validity={{ ok: true }}
+        workflowEditorUi="next"
+      />,
+    );
+    expect(screen.getByRole('button', { name: 'Hide source' })).toBeInTheDocument();
+    expect(screen.getByTestId('code')).toBeInTheDocument();
+  });
+
+  it('next: clicking "Hide source" removes the YAML editor from the DOM, keeps the validity badge, flips the button label, and persists to localStorage; clicking again restores it', () => {
+    render(
+      <WorkflowEditor
+        draftYaml={VALID}
+        onYamlChange={() => {}}
+        agents={[]}
+        validity={{ ok: true }}
+        workflowEditorUi="next"
+      />,
+    );
+    expect(screen.getByText('✓ valid')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Hide source' }));
+
+    expect(screen.queryByTestId('code')).not.toBeInTheDocument();
+    expect(screen.getByText('✓ valid')).toBeInTheDocument(); // badge stays visible
+    expect(screen.getByRole('button', { name: 'Show source' })).toBeInTheDocument();
+    expect(localStorage.getItem(SOURCE_OPEN_KEY)).toBe('0');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show source' }));
+
+    expect(screen.getByTestId('code')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Hide source' })).toBeInTheDocument();
+    expect(localStorage.getItem(SOURCE_OPEN_KEY)).toBe('1');
+  });
+
+  it('next: initial state honors a pre-seeded "0" in localStorage (starts closed)', () => {
+    localStorage.setItem(SOURCE_OPEN_KEY, '0');
+    render(
+      <WorkflowEditor
+        draftYaml={VALID}
+        onYamlChange={() => {}}
+        agents={[]}
+        validity={{ ok: true }}
+        workflowEditorUi="next"
+      />,
+    );
+    expect(screen.queryByTestId('code')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Show source' })).toBeInTheDocument();
+    expect(screen.getByText('✓ valid')).toBeInTheDocument();
   });
 });
