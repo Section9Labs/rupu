@@ -11,7 +11,18 @@
 import '@testing-library/jest-dom/vitest';
 import type { ReactNode } from 'react';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, fireEvent } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, act } from '@testing-library/react';
+
+// Captures the `onEdgesChange` callback ReactFlow's mock last received so
+// tests can invoke it directly to simulate xyflow's own select/remove
+// EdgeChange events (real @xyflow/react can't mount under jsdom — no
+// ResizeObserver/layout APIs — so this is the only way to exercise the
+// component's onEdgesChange handler). `vi.hoisted` so the same object is
+// visible both inside the mock factory (hoisted above imports by vi.mock)
+// and in the test bodies below.
+const rfCapture = vi.hoisted(() => ({
+  onEdgesChange: undefined as ((changes: unknown[]) => void) | undefined,
+}));
 
 // ReactFlow's mock also serializes the `edges` prop it received into a data
 // attribute (JSON) so tests can assert on label/color without mounting the
@@ -22,15 +33,20 @@ vi.mock('@xyflow/react', () => ({
     children,
     edges,
     nodes,
+    onEdgesChange,
   }: {
     children?: ReactNode;
     edges?: unknown[];
     nodes?: unknown[];
-  }) => (
-    <div data-testid="rf" data-edges={JSON.stringify(edges ?? [])} data-nodes={JSON.stringify(nodes ?? [])}>
-      {children}
-    </div>
-  ),
+    onEdgesChange?: (changes: unknown[]) => void;
+  }) => {
+    rfCapture.onEdgesChange = onEdgesChange;
+    return (
+      <div data-testid="rf" data-edges={JSON.stringify(edges ?? [])} data-nodes={JSON.stringify(nodes ?? [])}>
+        {children}
+      </div>
+    );
+  },
   ReactFlowProvider: ({ children }: { children?: ReactNode }) => <>{children}</>,
   // Serializes the props Background received into data attributes so tests can
   // assert on variant/gap without mounting the real canvas-pattern renderer.
@@ -109,6 +125,7 @@ vi.mock('../../lib/useThemeColors', () => ({
 import WorkflowEditorGraph, {
   applyConnect,
   applyDelete,
+  applyRemoveEdges,
   applyAddNode,
   applyAddNodeAt,
   applyAddConnectedNext,
@@ -385,6 +402,126 @@ describe('applyConnect', () => {
     expect(onChange).not.toHaveBeenCalled();
     expect(onInvalid).not.toHaveBeenCalled();
   });
+
+  describe('drawn from a branch node arm handle', () => {
+    function graphWithBranch(): WorkflowGraph {
+      const g = makeGraph();
+      g.nodes.push({
+        id: 'br',
+        data: { id: 'br', kind: 'branch', condition: 'inputs.ok' },
+        position: { x: 0, y: 0 },
+      });
+      return g;
+    }
+
+    it('sourceHandle "else" from a branch node: edge carries branch/label + else target appended', () => {
+      const onChange = vi.fn();
+      const onInvalid = vi.fn();
+      const g = graphWithBranch();
+
+      applyConnect(g, { source: 'br', target: 'a', sourceHandle: 'else' }, onChange, onInvalid);
+
+      expect(onInvalid).not.toHaveBeenCalled();
+      expect(onChange).toHaveBeenCalledTimes(1);
+      const next = onChange.mock.calls[0][0] as WorkflowGraph;
+      expect(next.edges).toContainEqual({
+        id: 'br->a:else',
+        source: 'br',
+        target: 'a',
+        branch: 'else',
+        label: 'false',
+      });
+      const br = next.nodes.find((n) => n.id === 'br');
+      expect(br?.data.elseTargets).toEqual(['a']);
+      expect(br?.data.thenTargets ?? []).toEqual([]);
+    });
+
+    it('sourceHandle "then" from a branch node: edge carries branch/label + then target appended', () => {
+      const onChange = vi.fn();
+      const onInvalid = vi.fn();
+      const g = graphWithBranch();
+
+      applyConnect(g, { source: 'br', target: 'b', sourceHandle: 'then' }, onChange, onInvalid);
+
+      expect(onChange).toHaveBeenCalledTimes(1);
+      const next = onChange.mock.calls[0][0] as WorkflowGraph;
+      expect(next.edges).toContainEqual({
+        id: 'br->b:then',
+        source: 'br',
+        target: 'b',
+        branch: 'then',
+        label: 'true',
+      });
+      const br = next.nodes.find((n) => n.id === 'br');
+      expect(br?.data.thenTargets).toEqual(['b']);
+    });
+
+    it('does not duplicate the target if the arm list already contains it', () => {
+      const onChange = vi.fn();
+      const onInvalid = vi.fn();
+      const g = graphWithBranch();
+      const br = g.nodes.find((n) => n.id === 'br')!;
+      br.data.thenTargets = ['b'];
+
+      applyConnect(g, { source: 'br', target: 'b', sourceHandle: 'then' }, onChange, onInvalid);
+
+      const next = onChange.mock.calls[0][0] as WorkflowGraph;
+      expect(next.nodes.find((n) => n.id === 'br')?.data.thenTargets).toEqual(['b']);
+    });
+
+    it('a non-branch source with a "then"/"else"-shaped handle id is NOT treated as an arm (plain edge)', () => {
+      const onChange = vi.fn();
+      const onInvalid = vi.fn();
+      const g = makeGraph(); // 'a' is a plain `step` node, not `branch`
+
+      applyConnect(g, { source: 'a', target: 'b', sourceHandle: 'then' }, onChange, onInvalid);
+
+      // 'a'->'b' already exists in makeGraph(), so this would normally be
+      // rejected as a duplicate — proving the arm branch was NOT taken (it
+      // would have produced a DIFFERENT id `a->b:then` and succeeded).
+      expect(onChange).not.toHaveBeenCalled();
+      expect(onInvalid).toHaveBeenCalledWith(expect.stringContaining('already connected'));
+    });
+
+    it('a branch source with no sourceHandle (or null) falls back to a plain edge, unchanged behavior', () => {
+      const onChange = vi.fn();
+      const onInvalid = vi.fn();
+      const g = graphWithBranch();
+
+      applyConnect(g, { source: 'br', target: 'a', sourceHandle: null }, onChange, onInvalid);
+
+      expect(onChange).toHaveBeenCalledTimes(1);
+      const next = onChange.mock.calls[0][0] as WorkflowGraph;
+      expect(next.edges).toContainEqual({ id: 'br->a', source: 'br', target: 'a' });
+      expect(next.nodes.find((n) => n.id === 'br')?.data.thenTargets ?? []).toEqual([]);
+      expect(next.nodes.find((n) => n.id === 'br')?.data.elseTargets ?? []).toEqual([]);
+    });
+
+    it('end-to-end: the graph applyConnect produces, re-rendered, anchors at the drawn arm handle', () => {
+      // Proves the two fixes compose: applyConnect tags the new edge with
+      // `branch: 'else'`, and the edges memo derives `sourceHandle` from
+      // `branch` alone — so a hand-drawn arm connection anchors correctly on
+      // the very next render, with no extra field needed on GraphEdge.
+      const onChange = vi.fn();
+      const g = graphWithBranch();
+      applyConnect(g, { source: 'br', target: 'a', sourceHandle: 'else' }, onChange, () => {});
+      const next = onChange.mock.calls[0][0] as WorkflowGraph;
+
+      render(
+        <WorkflowEditorGraph
+          graph={next}
+          onChange={() => {}}
+          selectedId={null}
+          onSelect={() => {}}
+          problemsById={{}}
+          onInvalidConnection={() => {}}
+        />,
+      );
+      const raw = screen.getByTestId('rf').getAttribute('data-edges');
+      const edges = JSON.parse(raw!) as Array<{ id: string; sourceHandle?: string }>;
+      expect(edges.find((e) => e.id === 'br->a:else')?.sourceHandle).toBe('else');
+    });
+  });
 });
 
 describe('applyDelete', () => {
@@ -392,6 +529,62 @@ describe('applyDelete', () => {
     const next = applyDelete(makeGraph(), 'a');
     expect(next.nodes.map((n) => n.id)).toEqual(['b']);
     expect(next.edges).toHaveLength(0);
+  });
+});
+
+describe('applyRemoveEdges', () => {
+  it('removes a plain chain edge; node data is untouched', () => {
+    const g = makeGraph();
+    const next = applyRemoveEdges(g, new Set(['a->b']));
+    expect(next.edges).toHaveLength(0);
+    expect(next.nodes).toEqual(g.nodes);
+  });
+
+  it('removing an id that names no edge is a no-op copy', () => {
+    const g = makeGraph();
+    const next = applyRemoveEdges(g, new Set(['no->such']));
+    expect(next.edges).toEqual(g.edges);
+  });
+
+  it('removing a branch-arm edge also drops its target from the branch node\'s arm list', () => {
+    const g = makeGraph();
+    g.nodes.push({
+      id: 'br',
+      data: { id: 'br', kind: 'branch', condition: 'inputs.ok', thenTargets: ['a'], elseTargets: ['b'] },
+      position: { x: 0, y: 0 },
+    });
+    g.edges.push(
+      { id: 'br->a:then', source: 'br', target: 'a', label: 'true', branch: 'then' },
+      { id: 'br->b:else', source: 'br', target: 'b', label: 'false', branch: 'else' },
+    );
+
+    const next = applyRemoveEdges(g, new Set(['br->a:then']));
+
+    expect(next.edges.some((e) => e.id === 'br->a:then')).toBe(false);
+    expect(next.edges.some((e) => e.id === 'br->b:else')).toBe(true);
+    const br = next.nodes.find((n) => n.id === 'br');
+    expect(br?.data.thenTargets).toEqual([]);
+    expect(br?.data.elseTargets).toEqual(['b']);
+  });
+
+  it('removing both branch arms in one call clears both lists', () => {
+    const g = makeGraph();
+    g.nodes.push({
+      id: 'br',
+      data: { id: 'br', kind: 'branch', condition: 'inputs.ok', thenTargets: ['a'], elseTargets: ['b'] },
+      position: { x: 0, y: 0 },
+    });
+    g.edges.push(
+      { id: 'br->a:then', source: 'br', target: 'a', label: 'true', branch: 'then' },
+      { id: 'br->b:else', source: 'br', target: 'b', label: 'false', branch: 'else' },
+    );
+
+    const next = applyRemoveEdges(g, new Set(['br->a:then', 'br->b:else']));
+
+    expect(next.edges).toHaveLength(1); // only the plain a->b chain edge remains
+    const br = next.nodes.find((n) => n.id === 'br');
+    expect(br?.data.thenTargets).toEqual([]);
+    expect(br?.data.elseTargets).toEqual([]);
   });
 });
 
@@ -471,6 +664,36 @@ describe('branch edge rendering', () => {
     // The plain chain edge (a->b) carries no label.
     const plain = edges.find((e) => e.id === 'a->b');
     expect(plain?.label).toBeUndefined();
+  });
+
+  it('anchors each branch-arm edge at its OWN handle — else at "else", then at "then" (not both at the default first handle)', () => {
+    const g = makeGraph();
+    g.nodes.push({
+      id: 'br',
+      data: { id: 'br', kind: 'branch', condition: 'inputs.ok', thenTargets: ['a'], elseTargets: ['b'] },
+      position: { x: 0, y: 0 },
+    });
+    g.edges.push(
+      { id: 'br->a:then', source: 'br', target: 'a', label: 'true', branch: 'then' },
+      { id: 'br->b:else', source: 'br', target: 'b', label: 'false', branch: 'else' },
+    );
+    render(
+      <WorkflowEditorGraph
+        graph={g}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+      />,
+    );
+    const raw = screen.getByTestId('rf').getAttribute('data-edges');
+    const edges = JSON.parse(raw!) as Array<{ id: string; sourceHandle?: string }>;
+    expect(edges.find((e) => e.id === 'br->a:then')?.sourceHandle).toBe('then');
+    expect(edges.find((e) => e.id === 'br->b:else')?.sourceHandle).toBe('else');
+    // A plain chain edge (no branch arm — every non-branch kind has a single,
+    // unlabeled default source handle) carries no sourceHandle at all.
+    expect(edges.find((e) => e.id === 'a->b')?.sourceHandle).toBeUndefined();
   });
 
   it('next mode bumps the branch-arm stroke width and themes the plain edge too', () => {
@@ -779,6 +1002,138 @@ describe('kind-colored + animated edges (Task 1 round 2)', () => {
     const plain = edges.find((e) => e.id === 'a->b');
     expect(plain?.style).toBeUndefined();
     expect(plain?.markerEnd?.color).toBeUndefined();
+  });
+});
+
+describe('edge selection + deletion (onEdgesChange)', () => {
+  function renderGraph(opts: { graph?: WorkflowGraph; workflowEditorUi?: 'classic' | 'next' } = {}) {
+    const onChange = vi.fn();
+    const graph = opts.graph ?? makeGraph();
+    render(
+      <WorkflowEditorGraph
+        graph={graph}
+        onChange={onChange}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi={opts.workflowEditorUi}
+      />,
+    );
+    return { onChange, graph };
+  }
+
+  function currentEdges() {
+    const raw = screen.getByTestId('rf').getAttribute('data-edges');
+    expect(raw).toBeTruthy();
+    return JSON.parse(raw!) as Array<{
+      id: string;
+      selected?: boolean;
+      style?: { stroke?: string; strokeWidth?: number };
+    }>;
+  }
+
+  function graphWithBranch(): WorkflowGraph {
+    const g = makeGraph();
+    g.nodes.push({
+      id: 'br',
+      data: { id: 'br', kind: 'branch', condition: 'inputs.ok', thenTargets: ['a'], elseTargets: ['b'] },
+      position: { x: 0, y: 0 },
+    });
+    g.edges.push(
+      { id: 'br->a:then', source: 'br', target: 'a', label: 'true', branch: 'then' },
+      { id: 'br->b:else', source: 'br', target: 'b', label: 'false', branch: 'else' },
+    );
+    return g;
+  }
+
+  it('a select change marks the edge selected; a matching deselect clears it', () => {
+    renderGraph();
+    expect(currentEdges().find((e) => e.id === 'a->b')?.selected).toBeUndefined();
+
+    act(() => {
+      rfCapture.onEdgesChange?.([{ type: 'select', id: 'a->b', selected: true }]);
+    });
+    expect(currentEdges().find((e) => e.id === 'a->b')?.selected).toBe(true);
+
+    act(() => {
+      rfCapture.onEdgesChange?.([{ type: 'select', id: 'a->b', selected: false }]);
+    });
+    expect(currentEdges().find((e) => e.id === 'a->b')?.selected).toBeUndefined();
+  });
+
+  it('unselected edges never carry a `selected` key (classic shape preserved)', () => {
+    renderGraph({ workflowEditorUi: 'classic' });
+    for (const e of currentEdges()) expect(e.selected).toBeUndefined();
+  });
+
+  it('a remove change for a chain edge filters it out of the graph passed to onChange', () => {
+    const { onChange } = renderGraph();
+    act(() => {
+      rfCapture.onEdgesChange?.([{ type: 'remove', id: 'a->b' }]);
+    });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    const next = onChange.mock.calls[0][0] as WorkflowGraph;
+    expect(next.edges.find((e) => e.id === 'a->b')).toBeUndefined();
+  });
+
+  it('removing a selected edge prunes it from the selection set', () => {
+    renderGraph();
+    act(() => {
+      rfCapture.onEdgesChange?.([{ type: 'select', id: 'a->b', selected: true }]);
+    });
+    expect(currentEdges().find((e) => e.id === 'a->b')?.selected).toBe(true);
+
+    act(() => {
+      rfCapture.onEdgesChange?.([{ type: 'remove', id: 'a->b' }]);
+    });
+    // The (unchanged, mocked) `graph` prop still carries the edge, but its
+    // selection was pruned — proves the internal selectedEdgeIds state, not
+    // just the parent's graph, dropped the removed id.
+    expect(currentEdges().find((e) => e.id === 'a->b')?.selected).toBeUndefined();
+  });
+
+  it('removing a branch-arm edge drops the target from the branch node\'s arm list AND the edge itself', () => {
+    const { onChange } = renderGraph({ graph: graphWithBranch() });
+    act(() => {
+      rfCapture.onEdgesChange?.([{ type: 'remove', id: 'br->a:then' }]);
+    });
+    expect(onChange).toHaveBeenCalledTimes(1);
+    const next = onChange.mock.calls[0][0] as WorkflowGraph;
+    expect(next.edges.find((e) => e.id === 'br->a:then')).toBeUndefined();
+    expect(next.nodes.find((n) => n.id === 'br')?.data.thenTargets).toEqual([]);
+  });
+
+  it('next mode: selecting a plain edge bumps its inline stroke width and alpha', () => {
+    renderGraph({ workflowEditorUi: 'next' });
+    const before = currentEdges().find((e) => e.id === 'a->b');
+    act(() => {
+      rfCapture.onEdgesChange?.([{ type: 'select', id: 'a->b', selected: true }]);
+    });
+    const after = currentEdges().find((e) => e.id === 'a->b');
+    expect(after?.selected).toBe(true);
+    expect(after?.style?.strokeWidth ?? 0).toBeGreaterThan(before?.style?.strokeWidth ?? 0);
+    expect(after?.style?.stroke).not.toBe(before?.style?.stroke);
+  });
+
+  it('next mode: selecting a branch-arm edge bumps its stroke width beyond the default 2.5', () => {
+    renderGraph({ graph: graphWithBranch(), workflowEditorUi: 'next' });
+    act(() => {
+      rfCapture.onEdgesChange?.([{ type: 'select', id: 'br->a:then', selected: true }]);
+    });
+    const edge = currentEdges().find((e) => e.id === 'br->a:then');
+    expect(edge?.selected).toBe(true);
+    expect(edge?.style?.strokeWidth).toBeGreaterThan(2.5);
+  });
+
+  it('classic mode: a branch-arm edge carries no inline strokeWidth bump on select (byte-identical style object shape otherwise)', () => {
+    renderGraph({ graph: graphWithBranch(), workflowEditorUi: 'classic' });
+    act(() => {
+      rfCapture.onEdgesChange?.([{ type: 'select', id: 'br->a:then', selected: true }]);
+    });
+    const edge = currentEdges().find((e) => e.id === 'br->a:then');
+    expect(edge?.selected).toBe(true);
+    expect(edge?.style?.strokeWidth).toBeUndefined();
   });
 });
 
