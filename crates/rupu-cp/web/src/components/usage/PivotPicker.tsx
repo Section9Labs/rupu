@@ -33,10 +33,12 @@ export function PivotPicker({ value, onChange }: { value: Pivot; onChange: (p: P
     <Segmented
       ariaLabel="Pivot"
       size="sm"
-      // Raw lowercase value as the label — Segmented's `capitalize` class
-      // renders it Title-Case visually (parity with the pre-kit markup:
-      // `{p}` + a `capitalize` Tailwind class) while keeping the accessible
-      // name/DOM text lowercase, which existing consumer tests assert on.
+      // Raw lowercase value as the label — opting into Segmented's
+      // `capitalize` prop renders it Title-Case visually (parity with the
+      // pre-kit markup: `{p}` + a `capitalize` Tailwind class) while keeping
+      // the accessible name/DOM text lowercase, which existing consumer
+      // tests assert on.
+      capitalize
       options={PIVOTS.map((p) => ({ value: p, label: p }))}
       value={value}
       onChange={(v) => onChange(v as Pivot)}

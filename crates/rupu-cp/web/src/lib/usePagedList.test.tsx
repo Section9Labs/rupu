@@ -79,6 +79,33 @@ describe('usePagedList', () => {
     expect(screen.getByTestId('hasMore').textContent).toBe('false');
   });
 
+  // REGRESSION (coordinator review, Task B fix 1): `useInfiniteScroll` fires
+  // its rAF-driven `checkAndLoad()` as soon as the sentinel mounts, gated
+  // only on its own internal refs — nothing tells it the initial fetch is
+  // still in flight. A consumer that mounts the sentinel unconditionally
+  // (this harness does — no `hidden while loading` caller discipline) while
+  // page 0 is still resolving used to fire a SECOND concurrent offset-0
+  // fetch, which appended (not replaced) on top of the first and
+  // permanently duplicated page 0. Confirmed this test FAILS (settles at 45
+  // rows, not 25) against the hook with a bare `hasMore` passed to
+  // `useInfiniteScroll`, and PASSES with `hasMore && !loading`.
+  it('does not duplicate page 0 when the sentinel mounts while the initial fetch is still in flight', async () => {
+    const dataset = Array.from({ length: 25 }, (_, i) => `r${i}`);
+    const fetchFn = ({ offset, limit }: { offset: number; limit: number }) =>
+      new Promise<string[]>((resolve) => {
+        setTimeout(() => resolve(dataset.slice(offset, offset + limit)), 25);
+      });
+
+    render(<ScrollHarness fetch={fetchFn} />);
+
+    await waitFor(() => expect(screen.getByTestId('ended').textContent).toBe('true'), {
+      timeout: 3000,
+    });
+    // The buggy hook settles at 45 (20 duplicated + 20 + 5 remainder short
+    // page) — it never self-corrects once the duplicate lands.
+    expect(screen.getByTestId('count').textContent).toBe('25');
+  });
+
   it('resets rows and re-fetches from offset 0 when deps changes (by index)', async () => {
     const onCall = vi.fn();
     const { rerender } = render(

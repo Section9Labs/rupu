@@ -53,4 +53,21 @@ describe('Segmented', () => {
     render(<Segmented options={OPTIONS} value="a" onChange={vi.fn()} />);
     expect(screen.getByRole('button', { name: 'Alpha' }).className).toMatch(/whitespace-nowrap/);
   });
+
+  it('does not apply capitalize by default', () => {
+    const lower = [{ value: 'x', label: 'workflow' }];
+    render(<Segmented options={lower} value="x" onChange={vi.fn()} />);
+    expect(screen.getByRole('button', { name: 'workflow' }).className).not.toMatch(/capitalize/);
+  });
+
+  it('opts into a capitalize text-transform via the `capitalize` prop, without changing the accessible name', () => {
+    const lower = [{ value: 'x', label: 'workflow' }];
+    render(<Segmented options={lower} value="x" onChange={vi.fn()} capitalize />);
+    // The accessible name/DOM text stays the raw lowercase label —
+    // `text-transform: capitalize` only affects rendering, never the
+    // accessible name computation.
+    const btn = screen.getByRole('button', { name: 'workflow' });
+    expect(btn.className).toMatch(/\bcapitalize\b/);
+    expect(btn).toHaveTextContent('workflow');
+  });
 });

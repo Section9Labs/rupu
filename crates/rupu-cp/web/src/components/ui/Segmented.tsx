@@ -24,9 +24,23 @@ export interface SegmentedProps {
   onChange: (value: string) => void;
   size?: SegmentedSize;
   ariaLabel?: string;
+  /** Renders each option label with a `capitalize` transform. Opt-in (off by
+   *  default) — added for `PivotPicker`, which passes raw lowercase pivot
+   *  values (`model`, `workflow`, …) as labels so existing consumer tests
+   *  asserting on the (lowercase) accessible name keep passing, while still
+   *  rendering Title-Case visually. `text-transform` doesn't change the
+   *  accessible name/DOM text, only the rendering — safe either way. */
+  capitalize?: boolean;
 }
 
-export function Segmented({ options, value, onChange, size = 'md', ariaLabel }: SegmentedProps) {
+export function Segmented({
+  options,
+  value,
+  onChange,
+  size = 'md',
+  ariaLabel,
+  capitalize = false,
+}: SegmentedProps) {
   return (
     <div
       role="group"
@@ -42,12 +56,8 @@ export function Segmented({ options, value, onChange, size = 'md', ariaLabel }: 
             aria-pressed={active}
             onClick={() => onChange(opt.value)}
             className={cn(
-              // `capitalize` is a no-op for callers who already pass
-              // Title-Case labels; PivotPicker relies on it to render raw
-              // lowercase pivot values (`model`, `workflow`, …) visually
-              // capitalized while keeping the accessible name/DOM text
-              // lowercase (existing tests assert on the lowercase name).
-              'rounded font-medium capitalize transition-colors whitespace-nowrap',
+              'rounded font-medium transition-colors whitespace-nowrap',
+              capitalize && 'capitalize',
               SIZE_CLS[size],
               active ? 'bg-surface text-ink font-semibold' : 'text-ink-dim hover:text-ink',
             )}

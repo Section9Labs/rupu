@@ -107,7 +107,17 @@ export function usePagedList<T>({
     });
   }, [loadPage]);
 
-  const { sentinelRef } = useInfiniteScroll({ hasMore, loadMore });
+  // `useInfiniteScroll` fires its rAF-driven `checkAndLoad()` as soon as the
+  // sentinel mounts, gated only on ITS OWN internal loading ref — it has no
+  // idea an initial/reset fetch (`loadFirstPage`, driven by `loading` here)
+  // is already in flight. Passing raw `hasMore` in means a consumer that
+  // mounts the sentinel while page 0 is still loading (any real network
+  // latency) fires a SECOND concurrent offset-0 fetch, which appends
+  // (replace:false) on top of the first and permanently duplicates page 0 —
+  // it never self-corrects. Gating on `!loading` too closes that window;
+  // consumers MAY mount the sentinel unconditionally (even before the first
+  // page resolves) — the hook is safe either way.
+  const { sentinelRef } = useInfiniteScroll({ hasMore: hasMore && !loading, loadMore });
 
   // Opt-in 5s poll of page 0 only. Splices the fresh head back over
   // `rowsRef.current` without touching anything the user has already
