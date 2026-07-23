@@ -55,20 +55,60 @@ const NODE_TYPES: NodeTypes = { editable: EditableStepNode };
 
 /** Validate + apply a drawn connection. Valid → onChange with the new edge
  *  appended; invalid → onInvalid(reason) and NO onChange. Missing endpoints are
- *  ignored. */
+ *  ignored.
+ *
+ *  Branch arms: `EditableStepNode` gives every `branch`-kind node TWO source
+ *  handles, `id="then"` / `id="else"` (both the `next` and classic render
+ *  paths). When the drawn connection originates from one of those handles AND
+ *  the source node really is a `branch`, the new edge is tagged
+ *  `branch: <arm>` + the matching `label` (mirrors `yamlToGraph`'s own
+ *  `{label:'true'|'false', branch:'then'|'else'}` emission exactly, so the id
+ *  scheme (`source->target:arm`) and dedupe key line up) AND `target` is
+ *  appended to the source node's `thenTargets`/`elseTargets` — the exact
+ *  mirror of `applyRemoveEdges`' strip. Those arrays, not the edges array,
+ *  are what `graphToWorkflowObject` reads to emit `branch.then`/`branch.else`,
+ *  so without the append a hand-drawn branch-arm edge would vanish on the
+ *  next YAML round-trip. Any other `sourceHandle` (including `null`, the
+ *  every-other-kind default single source handle) falls back to today's
+ *  plain-edge behavior. */
 export function applyConnect(
   graph: WorkflowGraph,
-  conn: { source: string | null; target: string | null },
+  conn: { source: string | null; target: string | null; sourceHandle?: string | null },
   onChange: (g: WorkflowGraph) => void,
   onInvalid: (reason: string) => void,
 ): void {
-  const { source, target } = conn;
+  const { source, target, sourceHandle } = conn;
   if (!source || !target) return;
   const res = canConnect(source, target, { edges: graph.edges });
   if (!res.ok) {
     onInvalid(res.reason);
     return;
   }
+
+  const sourceNode = graph.nodes.find((n) => n.id === source);
+  const isArmHandle = sourceHandle === 'then' || sourceHandle === 'else';
+  const arm: 'then' | 'else' | undefined =
+    sourceNode?.data.kind === 'branch' && isArmHandle ? sourceHandle : undefined;
+
+  if (arm) {
+    const id = `${source}->${target}:${arm}`;
+    const label = arm === 'then' ? 'true' : 'false';
+    const edges = [...graph.edges, { id, source, target, branch: arm, label }];
+    const nodes = graph.nodes.map((n) => {
+      if (n.id !== source) return n;
+      if (arm === 'then') {
+        const list = n.data.thenTargets ?? [];
+        if (list.includes(target)) return n;
+        return { ...n, data: { ...n.data, thenTargets: [...list, target] } };
+      }
+      const list = n.data.elseTargets ?? [];
+      if (list.includes(target)) return n;
+      return { ...n, data: { ...n.data, elseTargets: [...list, target] } };
+    });
+    onChange({ ...graph, nodes, edges });
+    return;
+  }
+
   const id = `${source}->${target}`;
   onChange({ ...graph, edges: [...graph.edges, { id, source, target }] });
 }
@@ -326,6 +366,16 @@ function WorkflowEditorGraphInner({
         type: 'smoothstep',
         markerEnd: { type: MarkerType.ArrowClosed, color: markerColor },
       };
+      // Anchor the edge at the branch node's matching arm handle.
+      // `EditableStepNode` gives every `branch`-kind node TWO source handles,
+      // `id="then"` (green, top) / `id="else"` (red, below) — both the `next`
+      // and classic render paths use those exact ids. Without this, xyflow
+      // falls back to the FIRST source handle it finds for every edge from
+      // that node (always "then"/green), so a correctly-derived else-arm
+      // edge still visually draws from the green dot. `branch` and the
+      // handle id are the same two literal strings by construction, so this
+      // is a pure derivation, not a new field to keep in sync.
+      if (e.branch) edge.sourceHandle = e.branch;
       // Only set `selected` when true, so an unselected edge's emitted shape
       // stays byte-identical to before edge selection existed (classic tests
       // assert exact edge shapes).

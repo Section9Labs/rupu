@@ -402,6 +402,126 @@ describe('applyConnect', () => {
     expect(onChange).not.toHaveBeenCalled();
     expect(onInvalid).not.toHaveBeenCalled();
   });
+
+  describe('drawn from a branch node arm handle', () => {
+    function graphWithBranch(): WorkflowGraph {
+      const g = makeGraph();
+      g.nodes.push({
+        id: 'br',
+        data: { id: 'br', kind: 'branch', condition: 'inputs.ok' },
+        position: { x: 0, y: 0 },
+      });
+      return g;
+    }
+
+    it('sourceHandle "else" from a branch node: edge carries branch/label + else target appended', () => {
+      const onChange = vi.fn();
+      const onInvalid = vi.fn();
+      const g = graphWithBranch();
+
+      applyConnect(g, { source: 'br', target: 'a', sourceHandle: 'else' }, onChange, onInvalid);
+
+      expect(onInvalid).not.toHaveBeenCalled();
+      expect(onChange).toHaveBeenCalledTimes(1);
+      const next = onChange.mock.calls[0][0] as WorkflowGraph;
+      expect(next.edges).toContainEqual({
+        id: 'br->a:else',
+        source: 'br',
+        target: 'a',
+        branch: 'else',
+        label: 'false',
+      });
+      const br = next.nodes.find((n) => n.id === 'br');
+      expect(br?.data.elseTargets).toEqual(['a']);
+      expect(br?.data.thenTargets ?? []).toEqual([]);
+    });
+
+    it('sourceHandle "then" from a branch node: edge carries branch/label + then target appended', () => {
+      const onChange = vi.fn();
+      const onInvalid = vi.fn();
+      const g = graphWithBranch();
+
+      applyConnect(g, { source: 'br', target: 'b', sourceHandle: 'then' }, onChange, onInvalid);
+
+      expect(onChange).toHaveBeenCalledTimes(1);
+      const next = onChange.mock.calls[0][0] as WorkflowGraph;
+      expect(next.edges).toContainEqual({
+        id: 'br->b:then',
+        source: 'br',
+        target: 'b',
+        branch: 'then',
+        label: 'true',
+      });
+      const br = next.nodes.find((n) => n.id === 'br');
+      expect(br?.data.thenTargets).toEqual(['b']);
+    });
+
+    it('does not duplicate the target if the arm list already contains it', () => {
+      const onChange = vi.fn();
+      const onInvalid = vi.fn();
+      const g = graphWithBranch();
+      const br = g.nodes.find((n) => n.id === 'br')!;
+      br.data.thenTargets = ['b'];
+
+      applyConnect(g, { source: 'br', target: 'b', sourceHandle: 'then' }, onChange, onInvalid);
+
+      const next = onChange.mock.calls[0][0] as WorkflowGraph;
+      expect(next.nodes.find((n) => n.id === 'br')?.data.thenTargets).toEqual(['b']);
+    });
+
+    it('a non-branch source with a "then"/"else"-shaped handle id is NOT treated as an arm (plain edge)', () => {
+      const onChange = vi.fn();
+      const onInvalid = vi.fn();
+      const g = makeGraph(); // 'a' is a plain `step` node, not `branch`
+
+      applyConnect(g, { source: 'a', target: 'b', sourceHandle: 'then' }, onChange, onInvalid);
+
+      // 'a'->'b' already exists in makeGraph(), so this would normally be
+      // rejected as a duplicate — proving the arm branch was NOT taken (it
+      // would have produced a DIFFERENT id `a->b:then` and succeeded).
+      expect(onChange).not.toHaveBeenCalled();
+      expect(onInvalid).toHaveBeenCalledWith(expect.stringContaining('already connected'));
+    });
+
+    it('a branch source with no sourceHandle (or null) falls back to a plain edge, unchanged behavior', () => {
+      const onChange = vi.fn();
+      const onInvalid = vi.fn();
+      const g = graphWithBranch();
+
+      applyConnect(g, { source: 'br', target: 'a', sourceHandle: null }, onChange, onInvalid);
+
+      expect(onChange).toHaveBeenCalledTimes(1);
+      const next = onChange.mock.calls[0][0] as WorkflowGraph;
+      expect(next.edges).toContainEqual({ id: 'br->a', source: 'br', target: 'a' });
+      expect(next.nodes.find((n) => n.id === 'br')?.data.thenTargets ?? []).toEqual([]);
+      expect(next.nodes.find((n) => n.id === 'br')?.data.elseTargets ?? []).toEqual([]);
+    });
+
+    it('end-to-end: the graph applyConnect produces, re-rendered, anchors at the drawn arm handle', () => {
+      // Proves the two fixes compose: applyConnect tags the new edge with
+      // `branch: 'else'`, and the edges memo derives `sourceHandle` from
+      // `branch` alone — so a hand-drawn arm connection anchors correctly on
+      // the very next render, with no extra field needed on GraphEdge.
+      const onChange = vi.fn();
+      const g = graphWithBranch();
+      applyConnect(g, { source: 'br', target: 'a', sourceHandle: 'else' }, onChange, () => {});
+      const next = onChange.mock.calls[0][0] as WorkflowGraph;
+
+      render(
+        <WorkflowEditorGraph
+          graph={next}
+          onChange={() => {}}
+          selectedId={null}
+          onSelect={() => {}}
+          problemsById={{}}
+          onInvalidConnection={() => {}}
+        />,
+      );
+      const raw = screen.getByTestId('rf').getAttribute('data-edges');
+      const edges = JSON.parse(raw!) as Array<{ id: string; sourceHandle?: string }>;
+      expect(edges.find((e) => e.id === 'br->a:else')?.sourceHandle).toBe('else');
+    });
+  });
 });
 
 describe('applyDelete', () => {
@@ -544,6 +664,36 @@ describe('branch edge rendering', () => {
     // The plain chain edge (a->b) carries no label.
     const plain = edges.find((e) => e.id === 'a->b');
     expect(plain?.label).toBeUndefined();
+  });
+
+  it('anchors each branch-arm edge at its OWN handle — else at "else", then at "then" (not both at the default first handle)', () => {
+    const g = makeGraph();
+    g.nodes.push({
+      id: 'br',
+      data: { id: 'br', kind: 'branch', condition: 'inputs.ok', thenTargets: ['a'], elseTargets: ['b'] },
+      position: { x: 0, y: 0 },
+    });
+    g.edges.push(
+      { id: 'br->a:then', source: 'br', target: 'a', label: 'true', branch: 'then' },
+      { id: 'br->b:else', source: 'br', target: 'b', label: 'false', branch: 'else' },
+    );
+    render(
+      <WorkflowEditorGraph
+        graph={g}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+      />,
+    );
+    const raw = screen.getByTestId('rf').getAttribute('data-edges');
+    const edges = JSON.parse(raw!) as Array<{ id: string; sourceHandle?: string }>;
+    expect(edges.find((e) => e.id === 'br->a:then')?.sourceHandle).toBe('then');
+    expect(edges.find((e) => e.id === 'br->b:else')?.sourceHandle).toBe('else');
+    // A plain chain edge (no branch arm — every non-branch kind has a single,
+    // unlabeled default source handle) carries no sourceHandle at all.
+    expect(edges.find((e) => e.id === 'a->b')?.sourceHandle).toBeUndefined();
   });
 
   it('next mode bumps the branch-arm stroke width and themes the plain edge too', () => {
