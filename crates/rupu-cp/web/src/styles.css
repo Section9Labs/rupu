@@ -632,11 +632,12 @@
   .wfx-node, .wfx-pcard { transition: none !important; }
 }
 
-/* ── inspector-rail palette dock (Task 1) ── */
+/* ── inspector-rail palette dock (Blocks tab) ── */
 /* The `next`-only rail placement: same `.wfx-pcard`/`.wfx-picon` skin as the
- * float dock above, laid out as a compact non-absolute 2-col grid sized for
- * the ~320px inspector aside. Sits inside a slot div (WorkflowEditor.tsx)
- * above the Settings/Step/Reference tabs. */
+ * float dock above, laid out as a dense non-absolute 3-col grid — the palette
+ * now owns the FULL rail height (it's a tab, not a slot competing with the
+ * editor pane), so it can afford to be denser than the old 2-col cramped
+ * version. Sits inside the Blocks tabpanel (WorkflowEditor.tsx). */
 .wfx-palette-rail {
   padding: 10px 12px 12px;
 }
@@ -650,10 +651,164 @@
 }
 .wfx-palette-rail-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
+}
+.wfx-palette-rail-grid .wfx-pcard {
+  width: 100%;
+  padding: 6px 6px;
+  gap: 5px;
+}
+.wfx-palette-rail-grid .wfx-pl { font-size: 10px; }
+
+/* Tighter connector chips in the rail specifically (the float dock's chips
+ * stay at their original, roomier size). */
+.wfx-palette-rail .wfx-palette-group { gap: 4px; }
+.wfx-palette-rail .wfx-palette-connectors .wfx-pcard { padding: 5px 7px; gap: 5px; }
+.wfx-palette-rail .wfx-palette-connectors .wfx-pl { font-size: 10px; }
+
+/* Filter field at the top of the rail palette — substring-filters block
+ * labels + tool names. Same input skin as other `.wfx-*` field controls in
+ * this file (bordered, token-colored, no arbitrary hex). */
+.wfx-palette-filter {
+  display: block;
+  width: 100%;
+  margin: 0 0 8px;
+  padding: 5px 8px;
+  font: inherit;
+  font-size: 11px;
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 7px;
+  background: rgb(var(--c-panel));
+  color: rgb(var(--c-ink));
+}
+.wfx-palette-filter::placeholder { color: rgb(var(--c-ink-mute)); }
+.wfx-palette-filter:focus {
+  outline: none;
+  border-color: rgb(var(--c-brand-500) / .5);
+  box-shadow: 0 0 0 2px rgb(var(--c-brand-500) / .15);
+}
+.wfx-palette-filter:disabled { cursor: not-allowed; opacity: .5; }
+
+/* Selected chip (Blocks tab: a block kind or connector tool picked for the
+ * detail card below) — a brand-tinted ring distinguishing it from hover. */
+.wfx-pcard-selected {
+  border-color: rgb(var(--c-brand-500) / .6);
+  background: rgb(var(--c-brand-500) / .08);
+}
+
+/* ── Blocks-tab detail card ── */
+/* Rendered below the grid/connector chips when a block or connector is
+ * `selected` (rail variant only). Title + kind badge, blurb, `*`-marked
+ * required fields, a short example, and the primary "Add to canvas" CTA. */
+.wfx-palette-detail {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgb(var(--c-border));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.wfx-detail-h {
+  display: flex;
+  align-items: center;
   gap: 6px;
 }
-.wfx-palette-rail-grid .wfx-pcard { width: 100%; }
+.wfx-detail-title {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  font-weight: 650;
+  color: rgb(var(--c-ink));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wfx-detail-badge {
+  margin-left: auto;
+  flex: none;
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+}
+.wfx-detail-blurb {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: rgb(var(--c-ink-dim));
+}
+.wfx-detail-reqs {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.wfx-detail-req {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px;
+  font-size: 10.5px;
+  color: rgb(var(--c-ink));
+}
+.wfx-detail-req code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  color: rgb(var(--c-brand-500));
+  background: rgb(var(--c-brand-500) / .1);
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+.wfx-detail-req-star {
+  color: rgb(var(--c-sev-critical));
+  font-weight: 700;
+}
+.wfx-detail-req-meta {
+  color: rgb(var(--c-ink-mute));
+  font-size: 10px;
+}
+.wfx-detail-note {
+  margin: 0;
+  font-size: 10.5px;
+  font-style: italic;
+  color: rgb(var(--c-ink-mute));
+}
+.wfx-detail-example {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.5;
+  color: rgb(var(--c-ink-dim));
+  background: rgb(var(--c-surface) / .6);
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 7px;
+  padding: 8px;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+.wfx-detail-addbtn {
+  appearance: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 650;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 0;
+  background: rgb(var(--c-brand-500));
+  color: #fff;
+  align-self: flex-start;
+}
+.wfx-detail-addbtn:hover { background: rgb(var(--c-brand-600)); }
+
+@media (prefers-reduced-motion: reduce) {
+  .wfx-palette-filter, .wfx-detail-addbtn { transition: none !important; }
+}
 
 /* ── Settings inspector authoring cards (Task 5): Trigger / Inputs ── */
 /* Ported from the mockup's `.card-sec`/`.sh`/`.sb` (card shell) and
