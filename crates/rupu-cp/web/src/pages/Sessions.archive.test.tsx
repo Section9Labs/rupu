@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
-// Sessions — archive/restore/delete row actions.
+// Sessions — archive/restore/delete row actions, now rendered via the kit's
+// `Button` `ring`/`ring-danger` variants (same handlers/confirmations).
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -60,7 +61,10 @@ describe('Sessions row archive/delete', () => {
 
     renderPage();
 
-    fireEvent.click(await screen.findByRole('button', { name: /archive session/i }));
+    const archiveBtn = await screen.findByRole('button', { name: /archive session/i });
+    // Rendered via the kit ring-button idiom (compact ring pill).
+    expect(archiveBtn.className).toMatch(/ring-1/);
+    fireEvent.click(archiveBtn);
 
     await waitFor(() => expect(archive).toHaveBeenCalledWith('sess-abc123'));
     // Archive must NOT gate behind window.confirm.
@@ -75,7 +79,9 @@ describe('Sessions row archive/delete', () => {
 
     renderPage();
 
-    fireEvent.click(await screen.findByRole('button', { name: /delete session/i }));
+    const deleteBtn = await screen.findByRole('button', { name: /delete session/i });
+    expect(deleteBtn.className).toMatch(/ring-1/);
+    fireEvent.click(deleteBtn);
 
     expect(window.confirm).toHaveBeenCalled();
     await waitFor(() => expect(del).toHaveBeenCalledWith('sess-abc123'));

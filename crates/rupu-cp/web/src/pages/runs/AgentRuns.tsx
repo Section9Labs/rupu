@@ -1,134 +1,59 @@
 // Agent run-stream page — standalone and session-bound agent runs.
 // No DAG graph (agent runs have no workflow DAG); shows transcript_path as text.
 // status and started_at are optional (standalone runs may lack them).
-// Three tabs (Running / Completed / Failed-Rejected) with independent fetches.
-// Running polls every 5 s (unpaginated); Completed/Failed paginate (no poll) —
-// keeping paginated history off the poll loop avoids the scroll-reset flicker.
+// Three lifecycle pills (Running / Completed / Failed-Rejected), fetch/paginate/
+// poll machinery owned by the shared `usePagedList` hook. Running polls every
+// 5 s (page 0 only, spliced back over the head of the list — see
+// `usePagedList`'s doc comment for why that doesn't reset a scrolled view).
 
-import { useCallback, useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Inbox, RefreshCw } from 'lucide-react';
-import { api, type AgentRunRow, type HostView } from '../../lib/api';
+import { RefreshCw } from 'lucide-react';
+import { api, type AgentRunRow, type RunStatusStr } from '../../lib/api';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import UsageBarChart from '../../components/charts/UsageBarChart';
 import { Button } from '../../components/ui/Button';
+import { FilterBar } from '../../components/ui/FilterBar';
+import { FilterPills } from '../../components/ui/FilterPills';
+import { EmptyState } from '../../components/ui/EmptyState';
+import { ErrorBanner } from '../../components/ui/ErrorBanner';
+import { Spinner } from '../../components/ui/Spinner';
+import { Badge } from '../../components/ui/Badge';
+import { StatusPill } from '../../components/StatusPill';
+import HostSelect, { ALL_HOSTS } from '../../components/HostSelect';
 import { cn } from '../../lib/cn';
+import { shortId } from '../../lib/shortId';
 import { relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
 import { formatDuration } from '../../lib/duration';
-import { useInfiniteScroll } from '../../lib/useInfiniteScroll';
-
-const PAGE = 20;
-/** Sentinel select value meaning "fetch all hosts" (fan-out / no ?host= param). */
-const ALL_HOSTS = '__all__';
+import { usePagedList } from '../../lib/usePagedList';
 
 type Tab = 'active' | 'completed' | 'failed';
 
-const TABS: { id: Tab; label: string }[] = [
-  { id: 'active', label: 'Running' },
-  { id: 'completed', label: 'Completed' },
-  { id: 'failed', label: 'Failed / Rejected' },
+const LIFECYCLE_OPTIONS: { value: Tab; label: string }[] = [
+  { value: 'active', label: 'Running' },
+  { value: 'completed', label: 'Completed' },
+  { value: 'failed', label: 'Failed / Rejected' },
 ];
-
-function shortId(id: string): string {
-  return id.length > 10 ? `${id.slice(0, 8)}…` : id;
-}
-
-const SOURCE_CLS: Record<string, string> = {
-  standalone: 'bg-surface text-ink ring-border',
-  session:    'bg-sky-50 text-sky-700 ring-sky-200',
-};
-
-function SourceChip({ source }: { source: string }) {
-  const cls = SOURCE_CLS[source] ?? 'bg-surface text-ink ring-border';
-  return (
-    <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
-      {source}
-    </span>
-  );
-}
-
-// Render the raw status string as a simple badge — AgentRunRow.status is a
-// free-form string (not RunStatusStr), so we map known values to colors
-// and fall back to neutral for unknown ones.
-const STATUS_CLS: Record<string, string> = {
-  running:           'bg-status-running/10 text-status-running ring-status-running/30',
-  completed:         'bg-ok-bg text-ok ring-ok/30',
-  failed:            'bg-err-bg text-err ring-err/30',
-  awaiting_approval: 'bg-warn-bg text-warn ring-warn/30',
-  rejected:          'bg-err-bg text-err ring-err/30',
-  pending:           'bg-surface text-ink ring-border',
-};
-
-function StatusBadge({ status }: { status: string }) {
-  const cls = STATUS_CLS[status] ?? 'bg-surface text-ink ring-border';
-  return (
-    <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium px-1.5 py-0.5', cls)}>
-      {status}
-    </span>
-  );
-}
 
 export default function AgentRuns() {
   const [tab, setTab] = useState<Tab>('active');
-  const [agentRuns, setAgentRuns] = useState<AgentRunRow[] | null>(null);
-  const [hasMore, setHasMore] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [refreshing, setRefreshing] = useState(false);
   // Default to 'local' → fast server-side path; ALL_HOSTS → fan-out.
   const [hostFilter, setHostFilter] = useState<string>('local');
-  const [hosts, setHosts] = useState<HostView[] | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    api.getHosts().then((hs) => { if (!cancelled) setHosts(hs); }).catch(() => { if (!cancelled) setHosts([]); });
-    return () => { cancelled = true; };
-  }, []);
-
-  // Page-0 fetch (and the 5 s poll on the active tab). Reset on tab/host change.
-  // Active: fetch ALL in one call (unpaginated) → poll never resets a scrolled
-  // list. Completed/Failed: page-0 only; loadMore appends.
-  const refresh = useCallback(async () => {
-    setRefreshing(true);
-    try {
-      const limit = tab === 'active' ? 200 : PAGE;
+  const { rows, loading, error, hasMore, sentinelRef, refresh } = usePagedList<AgentRunRow>({
+    fetch: ({ offset, limit }) => {
       const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
-      const data = await api.getAgentRuns({ lifecycle: tab, limit, host });
-      setAgentRuns(data);
-      setHasMore(tab !== 'active' && data.length >= PAGE);
-      setError(null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load agent runs');
-    } finally {
-      setRefreshing(false);
-    }
-  }, [tab, hostFilter]);
-
-  useEffect(() => {
-    setAgentRuns(null); // show loading on tab/host switch
-    void refresh();
-    if (tab === 'active') {
-      const t = window.setInterval(() => void refresh(), 5000);
-      return () => window.clearInterval(t);
-    }
-    return () => {};
-  }, [tab, hostFilter, refresh]);
-
-  const loadMore = async () => {
-    if (tab === 'active') return; // active is unpaginated
-    const current = agentRuns ?? [];
-    const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
-    const next = await api.getAgentRuns({ lifecycle: tab, offset: current.length, limit: PAGE, host });
-    if (next.length === 0) { setHasMore(false); return; }
-    setAgentRuns([...current, ...next]);
-    if (next.length < PAGE) setHasMore(false);
-  };
-
-  const { sentinelRef, loading } = useInfiniteScroll({ hasMore, loadMore });
+      return api.getAgentRuns({ lifecycle: tab, offset, limit, host });
+    },
+    deps: [tab, hostFilter],
+    poll: tab === 'active',
+  });
 
   // Sort newest-first where started_at is available; runs without it sink to
-  // the bottom so that active/recent runs remain prominent.
-  const sorted = [...(agentRuns ?? [])].sort((a, b) => {
+  // the bottom so that active/recent runs remain prominent. Feeds both the
+  // usage chart (left-to-right order) and the table's initial sort.
+  const sorted = [...rows].sort((a, b) => {
     if (!a.started_at && !b.started_at) return 0;
     if (!a.started_at) return 1;
     if (!b.started_at) return -1;
@@ -142,89 +67,61 @@ export default function AgentRuns() {
           <h1 className="text-2xl font-semibold text-ink">Agent Runs</h1>
           <p className="mt-1 text-sm text-ink-dim">Standalone and session-bound agent invocations.</p>
         </div>
-        <Button variant="secondary" onClick={() => void refresh()} className="gap-1.5">
-          <RefreshCw size={12} className={cn(refreshing && 'animate-spin')} />
+        <Button variant="secondary" onClick={() => refresh()} className="gap-1.5">
+          <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
           Refresh
         </Button>
       </header>
 
-      {/* Lifecycle tabs */}
-      <div className="flex items-center gap-2 mb-4">
-        {TABS.map((t) => (
-          <button
-            key={t.id}
-            onClick={() => setTab(t.id)}
-            className={cn(
-              'text-xs font-medium px-3 py-1.5 rounded-md border transition-colors',
-              tab === t.id
-                ? 'bg-brand-600 text-white border-brand-600'
-                : 'bg-panel text-ink-dim border-border hover:bg-surface-hover',
-            )}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
+      <FilterBar
+        filters={
+          <FilterPills options={LIFECYCLE_OPTIONS} value={tab} onChange={(v) => setTab(v as Tab)} />
+        }
+        scope={<HostSelect allowAll ariaLabel="Host filter" value={hostFilter} onChange={setHostFilter} />}
+      />
 
-      {/* Host filter — drives server-side fetch scope. */}
-      <div className="flex items-center gap-2 mb-5">
-        <select
-          value={hostFilter}
-          onChange={(e) => setHostFilter(e.target.value)}
-          aria-label="Host filter"
-          className="text-xs font-medium px-2 py-1 rounded-md border border-border bg-panel text-ink-dim focus:outline-none focus:border-brand-500"
-        >
-          <option value="local">This host</option>
-          <option value={ALL_HOSTS}>All hosts</option>
-          {(hosts ?? [])
-            .filter((h) => h.transport_kind !== 'local')
-            .map((h) => (
-              <option key={h.id} value={h.id}>{h.name}</option>
-            ))}
-        </select>
-      </div>
+      <div className="mt-5">
+        {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
-      {error && (
-        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {error}
-        </div>
-      )}
-
-      {agentRuns === null ? (
-        <div className="text-sm text-ink-dim">Loading agent runs…</div>
-      ) : sorted.length === 0 ? (
-        <AgentRunsEmpty />
-      ) : (
-        <section>
-          <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
-            <UsageBarChart bars={sorted.map((r) => {
-              const hostSuffix = r.host_id && r.host_id !== 'local'
-                ? `&host=${encodeURIComponent(r.host_id)}`
-                : '';
-              return {
-                id: r.run_id,
-                label: r.agent ?? r.run_id,
-                to: r.transcript_path
-                  ? `/transcript?path=${encodeURIComponent(r.transcript_path)}&live=${isRunning(r.status) ? 1 : 0}${hostSuffix}`
-                  : undefined,
-                input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens,
-                cached_tokens: r.usage.cached_tokens, cost_usd: r.usage.cost_usd,
-              };
-            })} />
+        {loading && rows.length === 0 ? (
+          <div className="py-16 flex items-center justify-center">
+            <Spinner label="Loading agent runs…" />
           </div>
-          <SortableTable<AgentRunRow>
-            columns={AGENT_RUN_COLUMNS}
-            rows={sorted}
-            rowKey={(r) => r.run_id}
-            initialSort={{ key: 'started', dir: 'desc' }}
+        ) : sorted.length === 0 ? (
+          <EmptyState
+            title="No agent runs yet"
+            hint="Standalone and session-bound agent invocations will appear here once they run."
           />
-          {tab !== 'active' && hasMore && (
-            <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
-              {loading ? 'loading more…' : 'scroll for more'}
+        ) : (
+          <section>
+            <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
+              <UsageBarChart bars={sorted.map((r) => {
+                const hostSuffix = r.host_id && r.host_id !== 'local'
+                  ? `&host=${encodeURIComponent(r.host_id)}`
+                  : '';
+                return {
+                  id: r.run_id,
+                  label: r.agent ?? r.run_id,
+                  to: r.transcript_path
+                    ? `/transcript?path=${encodeURIComponent(r.transcript_path)}&live=${isRunning(r.status) ? 1 : 0}${hostSuffix}`
+                    : undefined,
+                  input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens,
+                  cached_tokens: r.usage.cached_tokens, cost_usd: r.usage.cost_usd,
+                };
+              })} />
             </div>
-          )}
-        </section>
-      )}
+            <SortableTable<AgentRunRow>
+              columns={AGENT_RUN_COLUMNS}
+              rows={sorted}
+              rowKey={(r) => r.run_id}
+              initialSort={{ key: 'started', dir: 'desc' }}
+            />
+            <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
+              {loading ? 'loading more…' : hasMore ? 'scroll for more' : `— end of ${sorted.length} —`}
+            </div>
+          </section>
+        )}
+      </div>
     </div>
   );
 }
@@ -234,15 +131,40 @@ function isRunning(status: string | null | undefined): boolean {
   return status === 'running' || status === 'awaiting_approval';
 }
 
+// Session-branch agent-run rows carry the CLI's own wire vocabulary
+// (`"ok" | "error" | "aborted"` — see rupu-cp's api/run_streams.rs /
+// api/sessions.rs), NOT the run-status lexicon `StatusPill` speaks
+// (`RunStatusStr`). Standalone rows already use the run lexicon directly.
+// Map the CLI vocabulary onto it before rendering so a session row's "ok"
+// doesn't hit StatusPill's unknown-status fallback (neutral tone, AlertCircle
+// icon) instead of the green Completed pill it actually means. Statuses
+// already in the run lexicon pass through unchanged.
+function normalizeAgentRunStatus(s: string): RunStatusStr {
+  switch (s) {
+    case 'ok':
+      return 'completed';
+    case 'error':
+      return 'failed';
+    case 'aborted':
+      return 'cancelled';
+    default:
+      return s as RunStatusStr;
+  }
+}
+
 const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
   {
     key: 'agent',
     header: 'Agent',
+    subject: true,
     sortable: true,
     sortValue: (r) => r.agent ?? null,
+    titleValue: (r) => r.agent ?? r.run_id,
     render: (r) => (
       <div className="min-w-0">
-        <span className="text-sm font-medium text-ink">{r.agent ?? '—'}</span>
+        <span className="block truncate text-sm font-medium text-ink" title={r.agent ?? undefined}>
+          {r.agent ?? '—'}
+        </span>
         {(r.trigger_source || r.session_id) && (
           <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5">
             {r.trigger_source && (
@@ -269,6 +191,7 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
   {
     key: 'run',
     header: 'Run',
+    fit: true,
     // Agent runs are NOT in the workflow run-store (/api/runs/:id would 404), so
     // the Run id links to the transcript view — matching the page's pre-table
     // behavior. No transcript_path → render the id as plain text.
@@ -292,6 +215,7 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
   {
     key: 'host',
     header: 'Host',
+    fit: true,
     sortable: true,
     sortValue: (r) => r.host_id ?? 'local',
     render: (r) => (
@@ -301,22 +225,33 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
   {
     key: 'source',
     header: 'Source',
+    fit: true,
     sortable: true,
     sortValue: (r) => r.source,
-    render: (r) => <SourceChip source={r.source} />,
+    render: (r) => (
+      <Badge tone={r.source === 'session' ? 'sky' : 'neutral'} className="uppercase tracking-wide">
+        {r.source}
+      </Badge>
+    ),
   },
   {
     key: 'status',
     header: 'Status',
+    fit: true,
     sortable: true,
     sortValue: (r) => r.status ?? null,
-    render: (r) => (r.status ? <StatusBadge status={r.status} /> : <span className="text-ink-mute">—</span>),
+    render: (r) =>
+      r.status ? (
+        <StatusPill status={normalizeAgentRunStatus(r.status)} />
+      ) : (
+        <span className="text-ink-mute">—</span>
+      ),
   },
   {
     key: 'in',
     header: 'In',
+    fit: true,
     align: 'right',
-    width: 'w-20',
     sortable: true,
     sortValue: (r) => r.usage.input_tokens,
     render: (r) => <span className="text-ink-dim">{formatTokens(r.usage.input_tokens)}</span>,
@@ -324,8 +259,8 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
   {
     key: 'out',
     header: 'Out',
+    fit: true,
     align: 'right',
-    width: 'w-20',
     sortable: true,
     sortValue: (r) => r.usage.output_tokens,
     render: (r) => <span className="text-ink-dim">{formatTokens(r.usage.output_tokens)}</span>,
@@ -333,8 +268,8 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
   {
     key: 'cached',
     header: 'Cached',
+    fit: true,
     align: 'right',
-    width: 'w-20',
     sortable: true,
     sortValue: (r) => r.usage.cached_tokens,
     render: (r) =>
@@ -347,8 +282,8 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
   {
     key: 'cost',
     header: 'Cost',
+    fit: true,
     align: 'right',
-    width: 'w-24',
     sortable: true,
     sortValue: (r) => r.usage.cost_usd,
     render: (r) => <span className="text-ink font-medium">{formatCost(r.usage.cost_usd)}</span>,
@@ -356,8 +291,8 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
   {
     key: 'duration',
     header: 'Duration',
+    fit: true,
     align: 'right',
-    width: 'w-24',
     sortable: true,
     sortValue: (r) => r.duration_ms ?? null,
     render: (r) => <span className="text-ink-dim">{formatDuration(r.duration_ms)}</span>,
@@ -365,8 +300,8 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
   {
     key: 'turns',
     header: 'Turns',
+    fit: true,
     align: 'right',
-    width: 'w-16',
     sortable: true,
     sortValue: (r) => r.turns,
     render: (r) => <span className="text-ink">{r.turns ? String(r.turns) : '—'}</span>,
@@ -374,8 +309,8 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
   {
     key: 'started',
     header: 'Started',
+    fit: true,
     align: 'right',
-    width: 'w-28',
     sortable: true,
     sortValue: (r) => (r.started_at ? Date.parse(r.started_at) : null),
     render: (r) => (
@@ -383,17 +318,3 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
     ),
   },
 ];
-
-function AgentRunsEmpty() {
-  return (
-    <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
-        <Inbox size={20} className="text-ink-mute" />
-      </div>
-      <h2 className="text-sm font-medium text-ink">No agent runs yet</h2>
-      <p className="mt-1 text-xs text-ink-dim max-w-xs">
-        Standalone and session-bound agent invocations will appear here once they run.
-      </p>
-    </div>
-  );
-}

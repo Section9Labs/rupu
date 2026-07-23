@@ -19,10 +19,28 @@ export interface Column<T> {
   align?: 'left' | 'right';
   /** Tailwind width class, e.g. `'w-24'`. */
   width?: string;
+  /** Table-rules §5.1/§5.3: shrink this column to its content
+   *  (`width:1%; white-space:nowrap` on both `<th>` and `<td>`) instead of
+   *  letting it stretch. Use on every label/number/time column so the ONE
+   *  `subject` column is the only thing that flexes. Combine with
+   *  `align:'right'` for numbers/times (adds `tabular-nums`). */
+  fit?: boolean;
   sortable?: boolean;
   /** Raw comparable value for this column. Required for `sortable` columns —
    *  use the underlying number/string, never the formatted display string. */
   sortValue?: (row: T) => string | number | null;
+  /** Table-rules §5.1: marks the ONE flexible truncating column per table
+   *  (the workflow/agent/file/… subject). Its `<td>` gets the
+   *  `max-width:0` + inner `truncate` treatment instead of pushing the row
+   *  wider than the table. Requires `titleValue` (or a plain-string
+   *  `render`) so the full value is still available via the `title` tooltip
+   *  attribute when truncated. */
+  subject?: boolean;
+  /** Plain-text form of this column's value, used for the subject column's
+   *  `title` tooltip when `render` returns markup rather than a bare
+   *  string. Falls back to `render(row)` itself when it happens to already
+   *  be a string. */
+  titleValue?: (row: T) => string;
   render: (row: T) => React.ReactNode;
 }
 
@@ -35,6 +53,34 @@ function compare(a: string | number | null, b: string | number | null): number {
   // nulls/undefined always sort LAST (handled by caller before applying dir).
   if (typeof a === 'number' && typeof b === 'number') return a - b;
   return String(a).localeCompare(String(b), undefined, { sensitivity: 'base' });
+}
+
+/** Table-rules §5.1: the subject column's cell content, wrapped so a long
+ *  value truncates with an ellipsis instead of stretching the row (paired
+ *  with the `max-w-0` class on the `<td>` itself — see `cellClass` below).
+ *  The `title` attribute carries the untruncated value: `titleValue` when
+ *  given, else the rendered content itself if it happens to already be a
+ *  plain string. */
+function renderCellContent<T>(col: Column<T>, row: T): React.ReactNode {
+  const content = col.render(row);
+  if (!col.subject) return content;
+  const title = col.titleValue ? col.titleValue(row) : typeof content === 'string' ? content : undefined;
+  return (
+    <span className="block truncate" title={title}>
+      {content}
+    </span>
+  );
+}
+
+/** Shared alignment/fit/subject classes for a column's `<td>` (and, minus
+ *  the subject truncation, its `<th>`). */
+function cellClass<T>(col: Column<T>): string {
+  return cn(
+    col.align === 'right' ? 'text-right tabular-nums' : 'text-left',
+    col.fit && 'w-[1%] whitespace-nowrap',
+    col.subject && 'max-w-0',
+    col.width,
+  );
 }
 
 export default function SortableTable<T>({
@@ -50,15 +96,29 @@ export default function SortableTable<T>({
   rowKey: (row: T) => string;
   initialSort?: SortSpec;
   rowHref?: (row: T) => string | undefined;
-  /** When provided, each row gets a leading expand chevron that toggles a
-   *  full-width detail panel below it (for evidence / nested concerns / etc).
-   *  Expandable rows are never link-wrapped (`rowHref` is ignored). */
+  /** Per-row: return the detail-panel content for a row, or `null` (or
+   *  `false`) when that particular row has nothing to expand. A row is
+   *  expandable (gets the leading chevron + toggles a full-width detail
+   *  panel below it) iff this returns non-null for it; `rowHref` link-wraps
+   *  every OTHER row exactly as it would without `renderDetail` at all — the
+   *  two are mutually exclusive per row, not table-global. Consumers whose
+   *  `renderDetail` always returns content (the common case — evidence /
+   *  nested-concern panels) see no behavior change: every row is
+   *  expandable, so `rowHref` never applies, same as before. */
   renderDetail?: (row: T) => React.ReactNode;
 }) {
   const [sort, setSort] = useState<SortSpec | null>(initialSort ?? null);
   const [open, setOpen] = useState<ReadonlySet<string>>(new Set());
-  const expandable = Boolean(renderDetail);
-  const totalCols = columns.length + (expandable ? 1 : 0);
+  // Whether the table has the detail-panel FEATURE at all (reserves the
+  // leading chevron column in the header and every row, for grid
+  // alignment) — distinct from whether any GIVEN row is expandable.
+  const hasDetailFeature = Boolean(renderDetail);
+  const totalCols = columns.length + (hasDetailFeature ? 1 : 0);
+
+  /** Non-null/non-false detail content means this row is expandable. */
+  function isDetailContent(node: React.ReactNode): boolean {
+    return node !== null && node !== undefined && node !== false;
+  }
 
   function toggleOpen(key: string) {
     setOpen((prev) => {
@@ -104,7 +164,7 @@ export default function SortableTable<T>({
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b border-border text-meta uppercase tracking-wide text-ink-mute">
-            {expandable && <th scope="col" className="w-8" aria-label="Expand" />}
+            {hasDetailFeature && <th scope="col" className="w-8" aria-label="Expand" />}
             {columns.map((col) => {
               const active = sort?.key === col.key;
               const dir = active ? sort?.dir : undefined;
@@ -120,11 +180,7 @@ export default function SortableTable<T>({
                   key={col.key}
                   aria-sort={ariaSort}
                   scope="col"
-                  className={cn(
-                    'px-4 py-2 font-medium',
-                    col.align === 'right' ? 'text-right' : 'text-left',
-                    col.width,
-                  )}
+                  className={cn('px-4 py-2 font-medium', cellClass(col))}
                 >
                   {col.sortable ? (
                     <button
@@ -152,31 +208,33 @@ export default function SortableTable<T>({
         <tbody className="divide-y divide-border">
           {sorted.map((row) => {
             const key = rowKey(row);
-            // Expandable tables never link-wrap rows (the chevron is the row's
-            // interaction); plain tables honour rowHref.
-            const href = expandable ? undefined : rowHref?.(row);
-            const isOpen = expandable && open.has(key);
+            // A row is expandable iff renderDetail returns non-null content
+            // for IT specifically — not table-global. Rows without detail
+            // fall through to rowHref, exactly as if renderDetail were absent.
+            const detailContent = renderDetail?.(row);
+            const isRowExpandable = hasDetailFeature && isDetailContent(detailContent);
+            const href = isRowExpandable ? undefined : rowHref?.(row);
+            const isOpen = isRowExpandable && open.has(key);
             return (
               <Fragment key={key}>
                 <tr className="hover:bg-bg/60 transition-colors">
-                  {expandable && (
+                  {hasDetailFeature && (
                     <td className="w-8 pl-3 align-middle">
-                      <button
-                        type="button"
-                        onClick={() => toggleOpen(key)}
-                        aria-expanded={isOpen}
-                        aria-label={isOpen ? 'Collapse row' : 'Expand row'}
-                        className="flex h-5 w-5 items-center justify-center rounded text-ink-mute hover:bg-bg hover:text-ink-dim"
-                      >
-                        {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                      </button>
+                      {isRowExpandable && (
+                        <button
+                          type="button"
+                          onClick={() => toggleOpen(key)}
+                          aria-expanded={isOpen}
+                          aria-label={isOpen ? 'Collapse row' : 'Expand row'}
+                          className="flex h-5 w-5 items-center justify-center rounded text-ink-mute hover:bg-bg hover:text-ink-dim"
+                        >
+                          {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                        </button>
+                      )}
                     </td>
                   )}
                   {columns.map((col) => {
-                    const alignCls = cn(
-                      col.align === 'right' ? 'text-right tabular-nums' : 'text-left',
-                      col.width,
-                    );
+                    const alignCls = cellClass(col);
                     // When the whole row is a link, each cell wraps its content in
                     // a block <Link> so the entire row is clickable (and every cell
                     // is a navigation target) without nesting anchors. Pages that
@@ -185,12 +243,12 @@ export default function SortableTable<T>({
                     return href ? (
                       <td key={col.key} className={alignCls}>
                         <Link to={href} className="block px-4 py-2.5 align-middle">
-                          {col.render(row)}
+                          {renderCellContent(col, row)}
                         </Link>
                       </td>
                     ) : (
                       <td key={col.key} className={cn('px-4 py-2.5 align-middle', alignCls)}>
-                        {col.render(row)}
+                        {renderCellContent(col, row)}
                       </td>
                     );
                   })}
@@ -198,7 +256,7 @@ export default function SortableTable<T>({
                 {isOpen && (
                   <tr className="bg-bg/40">
                     <td colSpan={totalCols} className="px-4 py-3">
-                      {renderDetail?.(row)}
+                      {detailContent}
                     </td>
                   </tr>
                 )}

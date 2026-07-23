@@ -12,11 +12,19 @@
 // dimensions (which range is active, whether a custom drag-window is
 // active, the active pivot) are owned by the caller, exactly as they were
 // before extraction.
+//
+// The 7d/30d/All picker is reimplemented internally on `ui/Segmented` (One
+// Control Language kit) — props and visual result unchanged.
 
 import { type DashboardRange } from '../../lib/api';
+import { Segmented } from '../ui/Segmented';
 import { PivotPicker, type Pivot } from './PivotPicker';
 
-const RANGES: DashboardRange[] = ['7d', '30d', 'all'];
+const RANGE_OPTIONS: { value: DashboardRange; label: string }[] = [
+  { value: '7d', label: '7d' },
+  { value: '30d', label: '30d' },
+  { value: 'all', label: 'All' },
+];
 
 export default function UsageRangeControls({
   range,
@@ -46,20 +54,16 @@ export default function UsageRangeControls({
           custom · ×
         </button>
       )}
-      <div className="flex rounded-md border border-border">
-        {RANGES.map((r) => (
-          <button
-            key={r}
-            type="button"
-            onClick={() => onRangeChange(r)}
-            className={`px-2 py-1 text-xs ${
-              !isCustomWindow && range === r ? 'bg-surface text-ink' : 'text-ink-mute'
-            }`}
-          >
-            {r}
-          </button>
-        ))}
-      </div>
+      <Segmented
+        ariaLabel="Range"
+        size="sm"
+        options={RANGE_OPTIONS}
+        // No preset reads as active while a custom drag-window is in effect
+        // (matches the pre-extraction behavior) — `'__custom__'` matches
+        // none of RANGE_OPTIONS' values.
+        value={isCustomWindow ? '__custom__' : range}
+        onChange={(v) => onRangeChange(v as DashboardRange)}
+      />
     </div>
   );
 }

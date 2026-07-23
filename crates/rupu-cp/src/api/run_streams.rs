@@ -15,6 +15,7 @@ use rupu_runtime::{
     AutoflowCycleEventKind, AutoflowCycleRecord, AutoflowHistoryStore, AutoflowHistoryStoreError,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -170,6 +171,11 @@ struct AutoflowEventRow {
     status: Option<String>,
     worker_name: Option<String>,
     usage: crate::usage::UsageSummary,
+    /// The on-disk event's `detail` field (the failure/error text for
+    /// `cycle_failed` events). Additive/optional — omitted from the wire
+    /// payload when absent so older clients see no shape change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     host_id: Option<String>,
 }
@@ -181,6 +187,64 @@ fn stringify_status(v: &serde_json::Value) -> Option<String> {
         serde_json::Value::Null => None,
         other => Some(other.to_string()),
     }
+}
+
+/// Read only the FIRST event line of a transcript `.jsonl` file and, if it is
+/// a `run_start` event, return its `(agent, started_at)`. Deliberately does
+/// NOT walk the rest of the file (that's `rupu_transcript::aggregate`'s job,
+/// for usage rollups) — this is a cheap peek used purely to backfill the
+/// standalone-run row's `agent`/`started_at` columns.
+///
+/// Tolerant by design: a missing file, an IO error, an empty file, a corrupt
+/// first line, or a first line that isn't `run_start` all fall through to
+/// `(None, None)` rather than erroring the row.
+///
+/// `started_at` MUST be formatted with a `Z` suffix, NOT `.to_rfc3339()`'s
+/// `+00:00` — see `83c3494c` ("serialize run list timestamps with serde, not
+/// to_rfc3339()"). `AgentRunRow.started_at` mixes this transcript-derived
+/// value with session-branch rows whose `started_at` was serde-serialized
+/// from a `chrono::DateTime<Utc>` (which emits `Z`), and both
+/// `list_agent_runs`'s local sort and `host_fanout::sort_values_newest_first`
+/// merge them with a plain LEXICOGRAPHIC string compare. `'+'` (0x2B) sorts
+/// before `'Z'` (0x5A), so a `+00:00`-suffixed row silently sorts as older
+/// than it is. Do not "tidy" this back into `.to_rfc3339()`.
+fn read_transcript_run_start(path: &std::path::Path) -> (Option<String>, Option<String>) {
+    let mut iter = match rupu_transcript::JsonlReader::iter(path) {
+        Ok(it) => it,
+        Err(_) => return (None, None),
+    };
+    match iter.next() {
+        Some(Ok(rupu_transcript::Event::RunStart {
+            agent, started_at, ..
+        })) => (
+            Some(agent),
+            Some(started_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
+        ),
+        _ => (None, None),
+    }
+}
+
+/// Resolve `session_id`'s `agent_name` by loading its `session.json` from
+/// either `<global>/sessions/<id>/` or `<global>/sessions-archive/<id>/`,
+/// caching the (possibly-absent) result so a session shared by multiple
+/// standalone rows is only read from disk once per request.
+fn lookup_session_agent_name(
+    global_dir: &std::path::Path,
+    session_id: &str,
+    cache: &mut HashMap<String, Option<String>>,
+) -> Option<String> {
+    if let Some(cached) = cache.get(session_id) {
+        return cached.clone();
+    }
+    let agent = [
+        global_dir.join("sessions").join(session_id),
+        global_dir.join("sessions-archive").join(session_id),
+    ]
+    .iter()
+    .find_map(|dir| try_load_session_for_runs(&dir.join("session.json")))
+    .and_then(|dto| dto.agent_name);
+    cache.insert(session_id.to_string(), agent.clone());
+    agent
 }
 
 /// Load all `*.meta.json` files from `<global>/transcripts/` and convert to
@@ -202,6 +266,11 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
             return Vec::new();
         }
     };
+
+    // Per-request cache so a session.json shared by multiple standalone rows
+    // (all `trigger_source == "session_turn"` runs from the same session) is
+    // only read from disk once.
+    let mut session_cache: HashMap<String, Option<String>> = HashMap::new();
 
     let mut rows = Vec::new();
     for entry in entries.filter_map(|e| e.ok()) {
@@ -241,14 +310,30 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
             )
         };
 
+        // The standalone meta.json genuinely has no `agent`/`started_at`
+        // fields — recover them from the transcript's first line.
+        let (mut agent, started_at) = match &transcript_path {
+            Some(tp) => read_transcript_run_start(std::path::Path::new(tp)),
+            None => (None, None),
+        };
+
+        // For session-turn runs whose transcript didn't yield an agent
+        // (missing/corrupt transcript), fall back to the session's
+        // `agent_name`.
+        if agent.is_none() && dto.trigger_source.as_deref() == Some("session_turn") {
+            if let Some(session_id) = &dto.session_id {
+                agent = lookup_session_agent_name(global_dir, session_id, &mut session_cache);
+            }
+        }
+
         rows.push(AgentRunRow {
             run_id: dto.run_id,
             source: "standalone",
-            agent: None,
+            agent,
             session_id: dto.session_id,
             trigger_source: dto.trigger_source,
-            status: None,     // standalone meta does not carry run status
-            started_at: None, // standalone meta does not carry a started_at field
+            status: None, // standalone meta does not carry run status
+            started_at,
             transcript_path,
             usage: crate::usage::UsageSummary::default(),
             turns: 0,
@@ -316,6 +401,33 @@ fn collect_session_runs_from_dir(root: &std::path::Path, out: &mut Vec<AgentRunR
             }
         }
     }
+}
+
+/// Collect every local agent-run row (standalone transcripts + active and
+/// archived session runs) and sort newest-first by `started_at`.
+///
+/// Extracted out of `list_agent_runs` so it's directly unit-testable: the
+/// standalone and session branches populate `started_at` from two different
+/// sources (a transcript's `run_start` line vs. a session.json field
+/// deserialized as a plain `String`), and both this sort AND
+/// `host_fanout::sort_values_newest_first`'s fan-out merge compare those
+/// strings LEXICOGRAPHICALLY. If the two sources ever disagree on timestamp
+/// format (e.g. one emits `+00:00`, the other `Z`), rows silently mis-order —
+/// see `read_transcript_run_start`'s doc comment and `83c3494c`.
+fn collect_and_sort_local_agent_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
+    let mut local_rows = collect_standalone_runs(global_dir);
+    collect_session_runs_from_dir(&global_dir.join("sessions"), &mut local_rows);
+    collect_session_runs_from_dir(&global_dir.join("sessions-archive"), &mut local_rows);
+
+    // Sort newest-first: rows with a timestamp sort before those without;
+    // ISO-8601 strings sort lexicographically.
+    local_rows.sort_by(|a, b| match (&b.started_at, &a.started_at) {
+        (Some(bt), Some(at)) => bt.cmp(at),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    local_rows
 }
 
 #[derive(Deserialize)]
@@ -419,18 +531,7 @@ async fn list_agent_runs(
     }
 
     // ── Collect local runs ────────────────────────────────────────────────────
-    let mut local_rows = collect_standalone_runs(&s.global_dir);
-    collect_session_runs_from_dir(&s.global_dir.join("sessions"), &mut local_rows);
-    collect_session_runs_from_dir(&s.global_dir.join("sessions-archive"), &mut local_rows);
-
-    // Sort newest-first: rows with a timestamp sort before those without;
-    // ISO-8601 strings sort lexicographically.
-    local_rows.sort_by(|a, b| match (&b.started_at, &a.started_at) {
-        (Some(bt), Some(at)) => bt.cmp(at),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
-    });
+    let mut local_rows = collect_and_sort_local_agent_runs(&s.global_dir);
 
     // ── Local-only path ───────────────────────────────────────────────────────
     if host == "local" {
@@ -733,11 +834,16 @@ async fn list_autoflow_events(
             at: rec.at,
             kind: kind_to_snake_case(rec.event.kind),
             workflow: rec.event.workflow,
-            issue_display_ref: rec.event.issue_display_ref,
+            // `cycle_failed` events only ever populate `issue_ref` (no
+            // display-friendly variant is computed for them) — fall back so
+            // the UI still gets an issue reference to show. Mirrors
+            // `run_resolve.rs`'s `entity` field derivation.
+            issue_display_ref: rec.event.issue_display_ref.or(rec.event.issue_ref),
             run_id: rec.event.run_id,
             status: rec.event.status,
             worker_name: rec.worker_name,
             usage: crate::usage::UsageSummary::default(),
+            detail: rec.event.detail,
             host_id: None,
         })
         .collect();
@@ -798,6 +904,9 @@ async fn list_autoflow_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use rupu_runtime::{AutoflowCycleEvent, AutoflowCycleMode, AutoflowHistoryEventRecord};
+    use std::fs;
 
     #[test]
     fn agent_lifecycle_classifies() {
@@ -808,5 +917,337 @@ mod tests {
         assert!(agent_in_lifecycle(None, Some("completed"))); // standalone, no status → completed
         assert!(!agent_in_lifecycle(Some("running"), Some("completed")));
         assert!(agent_in_lifecycle(Some("running"), None)); // no filter → all
+    }
+
+    // ── A1: collect_standalone_runs fills agent + started_at ──────────────────
+
+    /// Write `<global>/transcripts/<run_id>.meta.json` + a matching
+    /// `.jsonl` transcript whose first line is (optionally) a `run_start`
+    /// event, or arbitrary text when `first_line` is `Some(garbage)`.
+    fn write_standalone_meta(
+        global: &std::path::Path,
+        run_id: &str,
+        session_id: Option<&str>,
+        trigger_source: Option<&str>,
+    ) {
+        let dir = global.join("transcripts");
+        fs::create_dir_all(&dir).unwrap();
+        let meta = serde_json::json!({
+            "run_id": run_id,
+            "session_id": session_id,
+            "trigger_source": trigger_source,
+        });
+        fs::write(
+            dir.join(format!("{run_id}.meta.json")),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_transcript_run_start(
+        global: &std::path::Path,
+        run_id: &str,
+        agent: &str,
+        started_at: &str,
+    ) {
+        let dir = global.join("transcripts");
+        fs::create_dir_all(&dir).unwrap();
+        let ev = rupu_transcript::Event::RunStart {
+            run_id: run_id.to_string(),
+            workspace_id: "ws".into(),
+            agent: agent.to_string(),
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            started_at: started_at.parse().unwrap(),
+            mode: rupu_transcript::RunMode::Ask,
+        };
+        let line = serde_json::to_string(&ev).unwrap();
+        fs::write(dir.join(format!("{run_id}.jsonl")), format!("{line}\n")).unwrap();
+    }
+
+    fn write_session_json(
+        global: &std::path::Path,
+        dirname: &str,
+        session_id: &str,
+        agent_name: &str,
+    ) {
+        let dir = global.join(dirname).join(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        let session = serde_json::json!({
+            "agent_name": agent_name,
+            "session_id": session_id,
+            "runs": [],
+        });
+        fs::write(
+            dir.join("session.json"),
+            serde_json::to_string(&session).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Like `write_session_json`, but embeds one run entry — the shape
+    /// `collect_session_runs_from_dir` actually reads `started_at` from
+    /// (`SessionRunRecordDto`), for sort-order regression tests.
+    fn write_session_json_with_run(
+        global: &std::path::Path,
+        dirname: &str,
+        session_id: &str,
+        run_id: &str,
+        started_at: &str,
+    ) {
+        let dir = global.join(dirname).join(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        let session = serde_json::json!({
+            "agent_name": "session-agent",
+            "session_id": session_id,
+            "runs": [
+                {
+                    "run_id": run_id,
+                    "started_at": started_at,
+                    "status": "ok",
+                }
+            ],
+        });
+        fs::write(
+            dir.join("session.json"),
+            serde_json::to_string(&session).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn standalone_run_fills_agent_and_started_at_from_transcript_run_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_standalone_meta(tmp.path(), "run_a", None, None);
+        write_transcript_run_start(tmp.path(), "run_a", "reviewer", "2026-01-01T00:00:00Z");
+
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent.as_deref(), Some("reviewer"));
+        assert_eq!(rows[0].started_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn standalone_run_missing_transcript_leaves_fields_none_without_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        // meta.json present, but no companion .jsonl at all.
+        write_standalone_meta(tmp.path(), "run_b", None, None);
+
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent, None);
+        assert_eq!(rows[0].started_at, None);
+    }
+
+    #[test]
+    fn standalone_run_corrupt_first_line_leaves_fields_none_without_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_standalone_meta(tmp.path(), "run_c", None, None);
+        let dir = tmp.path().join("transcripts");
+        fs::write(dir.join("run_c.jsonl"), "not json at all\n").unwrap();
+
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent, None);
+        assert_eq!(rows[0].started_at, None);
+    }
+
+    #[test]
+    fn session_turn_run_falls_back_to_session_json_agent_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        // meta references a session but the transcript itself has no usable
+        // run_start (missing entirely here) — the session_turn fallback should
+        // still resolve the agent from session.json.
+        write_standalone_meta(tmp.path(), "run_d", Some("sess_1"), Some("session_turn"));
+        write_session_json(tmp.path(), "sessions", "sess_1", "fixer");
+
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent.as_deref(), Some("fixer"));
+    }
+
+    #[test]
+    fn session_turn_run_checks_sessions_archive_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_standalone_meta(tmp.path(), "run_e", Some("sess_2"), Some("session_turn"));
+        write_session_json(tmp.path(), "sessions-archive", "sess_2", "archived-fixer");
+
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent.as_deref(), Some("archived-fixer"));
+    }
+
+    #[test]
+    fn two_session_turn_rows_sharing_a_session_both_resolve_from_one_session_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_standalone_meta(tmp.path(), "run_f1", Some("sess_3"), Some("session_turn"));
+        write_standalone_meta(tmp.path(), "run_f2", Some("sess_3"), Some("session_turn"));
+        write_session_json(tmp.path(), "sessions", "sess_3", "shared-agent");
+
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row.agent.as_deref(), Some("shared-agent"));
+        }
+    }
+
+    #[test]
+    fn transcript_agent_takes_priority_over_session_turn_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_standalone_meta(tmp.path(), "run_g", Some("sess_4"), Some("session_turn"));
+        write_transcript_run_start(
+            tmp.path(),
+            "run_g",
+            "from-transcript",
+            "2026-02-02T00:00:00Z",
+        );
+        write_session_json(tmp.path(), "sessions", "sess_4", "from-session");
+
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent.as_deref(), Some("from-transcript"));
+    }
+
+    /// Regression for the timestamp-format sort bug fixed in `83c3494c`
+    /// ("serialize run list timestamps with serde, not to_rfc3339()") and
+    /// reintroduced here: `read_transcript_run_start` must emit a `Z` suffix,
+    /// matching the `Z` that session-branch rows already carry (their
+    /// `started_at` is whatever was serde-serialized to `session.json` on
+    /// disk), because both `list_agent_runs`'s local sort and
+    /// `host_fanout::sort_values_newest_first`'s fan-out merge order rows
+    /// with a plain LEXICOGRAPHIC string compare.
+    ///
+    /// A standalone (transcript-derived) row and a session row at the exact
+    /// SAME instant are the deterministic way to pin this: digit differences
+    /// anywhere in the date/time (even a single second) always decide a
+    /// lexicographic comparison before either string's offset suffix is
+    /// reached, so only an exact tie ever reaches the suffix — where `'+'`
+    /// (0x2B) sorting before `'Z'` (0x5A) used to make a `+00:00`-suffixed
+    /// row compare as strictly GREATER than (not equal to) an otherwise
+    /// identical `Z`-suffixed row. Under the old `.to_rfc3339()` output that
+    /// broke the stable sort's tie: the standalone row (inserted first, by
+    /// `collect_standalone_runs`) got pushed behind the session row despite
+    /// sharing its timestamp. With the `Z` fix the two compare as truly
+    /// equal, and the stable sort keeps the standalone row first (its
+    /// original position).
+    #[test]
+    fn standalone_and_session_rows_at_the_same_instant_are_not_misordered_by_timestamp_notation() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Standalone row: agent/started_at recovered from the transcript's
+        // run_start line via `read_transcript_run_start` (the code path this
+        // regression protects).
+        write_standalone_meta(tmp.path(), "run_tie_standalone", None, None);
+        write_transcript_run_start(
+            tmp.path(),
+            "run_tie_standalone",
+            "tie-agent",
+            "2026-03-01T10:05:00Z",
+        );
+        // Session row: started_at is whatever's on disk verbatim — the
+        // realistic shape is a serde-serialized `Z` string, at the SAME
+        // instant as the standalone row above.
+        write_session_json_with_run(
+            tmp.path(),
+            "sessions",
+            "sess_tie",
+            "run_tie_session",
+            "2026-03-01T10:05:00Z",
+        );
+
+        let rows = collect_and_sort_local_agent_runs(tmp.path());
+        assert_eq!(rows.len(), 2);
+        // Sanity: both rows genuinely share the same started_at string —
+        // this is a tie, not a "which is chronologically later" case.
+        assert_eq!(rows[0].started_at, rows[1].started_at);
+        // The stable sort must not reorder a tie: the standalone row,
+        // collected first, stays first. Under the old `.to_rfc3339()`
+        // (`+00:00`) output this assertion fails — the session row's `Z`
+        // suffix compares as greater, pushing the standalone row second.
+        assert_eq!(rows[0].run_id, "run_tie_standalone");
+        assert_eq!(rows[1].run_id, "run_tie_session");
+    }
+
+    // ── A2: autoflow event DTO forwards detail + issue_ref fallback ────────────
+
+    fn cycle_failed_record(
+        detail: Option<&str>,
+        issue_ref: Option<&str>,
+    ) -> AutoflowHistoryEventRecord {
+        let cycle = AutoflowCycleRecord::new(AutoflowCycleMode::Tick, Utc::now());
+        let event = AutoflowCycleEvent {
+            kind: AutoflowCycleEventKind::CycleFailed,
+            issue_ref: issue_ref.map(str::to_owned),
+            issue_display_ref: None,
+            detail: detail.map(str::to_owned),
+            ..Default::default()
+        };
+        AutoflowHistoryEventRecord::from_cycle_event(&cycle, event, Utc::now())
+    }
+
+    #[test]
+    fn autoflow_event_row_forwards_detail_and_falls_back_issue_display_ref() {
+        let rec = cycle_failed_record(
+            Some("workflow validation failed: missing step"),
+            Some("github:acme/widgets#7"),
+        );
+        let row = AutoflowEventRow {
+            event_id: rec.event_id.clone(),
+            cycle_id: rec.cycle_id.clone(),
+            at: rec.at.clone(),
+            kind: kind_to_snake_case(rec.event.kind),
+            workflow: rec.event.workflow.clone(),
+            issue_display_ref: rec
+                .event
+                .issue_display_ref
+                .clone()
+                .or_else(|| rec.event.issue_ref.clone()),
+            run_id: rec.event.run_id.clone(),
+            status: rec.event.status.clone(),
+            worker_name: rec.worker_name.clone(),
+            usage: crate::usage::UsageSummary::default(),
+            detail: rec.event.detail.clone(),
+            host_id: None,
+        };
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            v["detail"],
+            serde_json::json!("workflow validation failed: missing step")
+        );
+        assert_eq!(
+            v["issue_display_ref"],
+            serde_json::json!("github:acme/widgets#7")
+        );
+    }
+
+    #[test]
+    fn autoflow_event_row_omits_detail_when_absent() {
+        let cycle = AutoflowCycleRecord::new(AutoflowCycleMode::Tick, Utc::now());
+        let event = AutoflowCycleEvent {
+            kind: AutoflowCycleEventKind::RunLaunched,
+            run_id: Some("run_x".into()),
+            ..Default::default()
+        };
+        let rec = AutoflowHistoryEventRecord::from_cycle_event(&cycle, event, Utc::now());
+        let row = AutoflowEventRow {
+            event_id: rec.event_id.clone(),
+            cycle_id: rec.cycle_id.clone(),
+            at: rec.at.clone(),
+            kind: kind_to_snake_case(rec.event.kind),
+            workflow: rec.event.workflow.clone(),
+            issue_display_ref: rec
+                .event
+                .issue_display_ref
+                .clone()
+                .or_else(|| rec.event.issue_ref.clone()),
+            run_id: rec.event.run_id.clone(),
+            status: rec.event.status.clone(),
+            worker_name: rec.worker_name.clone(),
+            usage: crate::usage::UsageSummary::default(),
+            detail: rec.event.detail.clone(),
+            host_id: None,
+        };
+        let s = serde_json::to_string(&row).unwrap();
+        assert!(!s.contains("\"detail\""));
+        assert_eq!(row.run_id.as_deref(), Some("run_x"));
     }
 }
