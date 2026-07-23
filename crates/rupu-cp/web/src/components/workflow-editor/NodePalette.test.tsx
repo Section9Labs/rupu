@@ -70,11 +70,12 @@ describe('NodePalette', () => {
     it('renders the .wfx-palette dock with a .wfx-pcard per item and a .wfx-picon accent icon', () => {
       const { container } = render(<NodePalette onAdd={() => {}} onDragStartKind={() => {}} workflowEditorUi="next" />);
       expect(container.querySelector('.wfx-palette')).toBeInTheDocument();
-      // next also offers the branch card (step/for_each/parallel/panel/branch = 5).
+      // next offers the branch + gate cards too
+      // (step/for_each/parallel/panel/branch/gate = 6).
       const cards = container.querySelectorAll('.wfx-pcard');
-      expect(cards.length).toBe(5);
+      expect(cards.length).toBe(6);
       const icons = container.querySelectorAll('.wfx-picon');
-      expect(icons.length).toBe(5);
+      expect(icons.length).toBe(6);
       for (const icon of icons) expect(icon.tagName.toLowerCase()).toBe('svg');
       // no classic markers leak into the next look.
       expect(container.querySelector('.rounded-lg.border.border-border.bg-panel\\/95')).not.toBeInTheDocument();
@@ -98,7 +99,51 @@ describe('NodePalette', () => {
       const { container } = render(<NodePalette onAdd={() => {}} onDragStartKind={() => {}} workflowEditorUi="next" />);
       const branchCard = screen.getByRole('button', { name: 'Add branch node' });
       expect(branchCard).toHaveClass('wfx-pcard');
-      expect(container.querySelectorAll('.wfx-pcard').length).toBe(5);
+      expect(container.querySelectorAll('.wfx-pcard').length).toBe(6);
+    });
+  });
+
+  describe('gate + connector cards (Task 5, next only)', () => {
+    const TOOLS = [
+      { name: 'scm.prs.create', description: 'Open a PR', input_schema: {}, kind: 'write' as const },
+      { name: 'scm.prs.comment', description: 'Comment on a PR', input_schema: {}, kind: 'write' as const },
+      { name: 'issues.comment', description: 'Comment on an issue', input_schema: {}, kind: 'write' as const },
+    ];
+
+    it('next offers a static Gate card that adds an approval_gate node', () => {
+      const onAdd = vi.fn();
+      render(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} workflowEditorUi="next" />);
+      const card = screen.getByRole('button', { name: 'Add gate node' });
+      expect(card).toBeInTheDocument();
+      fireEvent.click(card);
+      expect(onAdd).toHaveBeenCalledWith('approval_gate');
+    });
+
+    it('classic shows neither the Gate card nor any connector card', () => {
+      render(<NodePalette onAdd={() => {}} onDragStartKind={() => {}} tools={TOOLS} />);
+      expect(screen.queryByRole('button', { name: 'Add gate node' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Add scm.prs.create action' })).not.toBeInTheDocument();
+    });
+
+    it('next renders one connector card per tool, grouped by prefix', () => {
+      const { container } = render(
+        <NodePalette onAdd={() => {}} onDragStartKind={() => {}} workflowEditorUi="next" tools={TOOLS} />,
+      );
+      for (const t of TOOLS) {
+        expect(screen.getByRole('button', { name: `Add ${t.name} action` })).toBeInTheDocument();
+      }
+      // grouped by first dotted segment: scm (2) + issues (1) = 2 groups.
+      const labels = [...container.querySelectorAll('.wfx-palette-group-label')].map((n) => n.textContent);
+      expect(labels).toEqual(['scm', 'issues']);
+    });
+
+    it('clicking a connector card adds an action node seeded with that tool name', () => {
+      const onAdd = vi.fn();
+      render(
+        <NodePalette onAdd={onAdd} onDragStartKind={() => {}} workflowEditorUi="next" tools={TOOLS} />,
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'Add scm.prs.create action' }));
+      expect(onAdd).toHaveBeenCalledWith('action', { action: 'scm.prs.create' });
     });
   });
 

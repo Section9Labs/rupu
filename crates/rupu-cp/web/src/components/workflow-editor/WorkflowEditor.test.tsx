@@ -11,22 +11,31 @@ import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, act, fireEvent } from '@testing-library/react';
 import type { WorkflowGraph } from '../../lib/workflowGraph';
 
+// `onSelect` is surfaced as a per-node "select-<id>" button so tests can drive
+// selection (needed by the Task 6 convert-to-gate wiring test below) without
+// mounting @xyflow/react.
 vi.mock('./WorkflowEditorGraph', () => ({
   default: ({
     graph,
     paused,
     paletteContainer,
+    onSelect,
   }: {
     graph: WorkflowGraph;
     paused?: boolean;
     paletteContainer?: HTMLElement | null;
+    onSelect?: (id: string | null) => void;
   }) => (
     <div
       data-testid="graph"
       data-paused={paused ? 'true' : 'false'}
       data-ids={graph.nodes.map((n) => n.id).join(',')}
       data-palette-container={paletteContainer ? 'set' : 'none'}
-    />
+    >
+      {graph.nodes.map((n) => (
+        <button key={n.id} onClick={() => onSelect?.(n.id)}>{`select-${n.id}`}</button>
+      ))}
+    </div>
   ),
 }));
 
@@ -41,7 +50,15 @@ vi.mock('./SplitPane', () => ({
   ),
 }));
 
-vi.mock('./StepForm', () => ({ default: () => <div /> }));
+// Surfaces the selected node id + `onConvertToGate` so the Task 6 wiring test
+// below can drive the button without a real StepForm mount.
+vi.mock('./StepForm', () => ({
+  default: ({ node, onConvertToGate }: { node?: { id: string }; onConvertToGate?: () => void }) => (
+    <div data-testid="stepform" data-node-id={node?.id ?? ''}>
+      {onConvertToGate && <button onClick={onConvertToGate}>Convert to gate node</button>}
+    </div>
+  ),
+}));
 vi.mock('./WorkflowSettingsForm', () => ({ default: () => <div /> }));
 
 import WorkflowEditor from './WorkflowEditor';
@@ -398,5 +415,37 @@ describe('WorkflowEditor resizable inspector rail (Task 5, next only)', () => {
     const sep = screen.getByRole('separator', { name: 'Resize inspector' });
     const aside = sep.closest('aside')!;
     expect(aside.style.getPropertyValue('--wfx-rail-w')).toBe('320px');
+  });
+});
+
+describe('WorkflowEditor — Convert to gate node wiring (Task 6)', () => {
+  afterEach(cleanup);
+
+  it('selecting a legacy inline-approval step, then clicking Convert to gate node, emits YAML with a new gate step before it', () => {
+    const yamlWithApproval =
+      'name: wf\nsteps:\n' +
+      '  - id: ship\n    agent: deployer\n    prompt: deploy it\n' +
+      '    approval:\n      required: true\n      prompt: ok to ship?\n';
+    const onYamlChange = vi.fn();
+    render(
+      <WorkflowEditor draftYaml={yamlWithApproval} onYamlChange={onYamlChange} agents={[]} validity={null} />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'select-ship' }));
+    expect(screen.getByTestId('stepform')).toHaveAttribute('data-node-id', 'ship');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Convert to gate node' }));
+
+    expect(onYamlChange).toHaveBeenCalledTimes(1);
+    const emitted = onYamlChange.mock.calls[0][0] as string;
+    // a new gate step (id `ship-gate`) precedes `ship` in the emitted YAML, and
+    // carries the moved-over prompt; `ship` no longer has `approval:`.
+    const gateIdx = emitted.indexOf('ship-gate');
+    const shipIdx = emitted.indexOf('id: ship\n');
+    expect(gateIdx).toBeGreaterThan(-1);
+    expect(shipIdx).toBeGreaterThan(-1);
+    expect(gateIdx).toBeLessThan(shipIdx);
+    expect(emitted).toContain('ok to ship?');
+    expect(emitted.slice(shipIdx)).not.toContain('approval');
   });
 });

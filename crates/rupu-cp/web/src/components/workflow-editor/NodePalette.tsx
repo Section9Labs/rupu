@@ -10,7 +10,8 @@
 // coloring stays static at the Tailwind scanner level.
 
 import type { DragEvent } from 'react';
-import type { StepKind } from '../../lib/workflowGraph';
+import type { StepKind, StepNodeData } from '../../lib/workflowGraph';
+import type { ToolSpec } from '../../lib/api';
 import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { KIND_ACCENT, KIND_ICON } from './kindVisuals';
@@ -18,6 +19,11 @@ import { KIND_ACCENT, KIND_ICON } from './kindVisuals';
 /** dataTransfer key the canvas reads on drop. Exported so the canvas drop
  *  handler and the palette agree on one string. */
 export const NODE_KIND_MIME = 'application/rupu-node-kind';
+
+/** dataTransfer key carrying a JSON `Partial<StepNodeData>` seed — set by
+ *  connector ACTION cards so the dropped node arrives pre-filled with the tool
+ *  name. Absent for the plain kind cards (whose drop yields a bare node). */
+export const NODE_SEED_MIME = 'application/rupu-node-seed';
 
 // Per-kind accent color — classic-only fixed hex, matching the real card's
 // classic top-bar. `next` uses the themed `KIND_ACCENT` imported from
@@ -28,6 +34,10 @@ const KIND_COLOR: Record<StepKind, string> = {
   parallel: '#9333ea',
   panel: '#f59e0b',
   branch: '#16a34a',
+  // gate/action are `next`-only cards — these classic hexes exist only to
+  // satisfy the exhaustive Record; the classic dock never renders them.
+  approval_gate: '#a855f7',
+  action: '#0ea5e9',
 };
 
 interface PaletteItem {
@@ -45,24 +55,56 @@ const ITEMS: readonly PaletteItem[] = [
   { kind: 'panel', label: 'panel', sub: 'review+gate' },
 ];
 
-// branch is a newer, still-behind-flag kind — only offered from the palette
-// when `workflowEditorUi === 'next'` (see Props.workflowEditorUi below).
+// branch + gate are newer, still-behind-flag kinds — only offered from the
+// palette when `workflowEditorUi === 'next'` (see Props.workflowEditorUi below).
 const BRANCH_ITEM: PaletteItem = { kind: 'branch', label: 'branch', sub: 'if / then / else' };
+const GATE_ITEM: PaletteItem = { kind: 'approval_gate', label: 'gate', sub: 'human approval' };
+
+/** One connector-action card: a tool from the MCP catalog. Dropping/clicking it
+ *  adds an `action` node seeded with `{ action: <tool name> }`. */
+interface ConnectorGroup {
+  /** the dotted-prefix heading (e.g. `scm`, `issues`, `github`). */
+  label: string;
+  tools: ToolSpec[];
+}
+
+/** Group the tool catalog by its first dotted segment (`scm.prs.create` → `scm`,
+ *  `issues.comment` → `issues`, `github.*`/`gitlab.*` → per-platform). Groups
+ *  and the tools within them keep catalog order so the dock is deterministic. */
+function groupConnectors(tools: ToolSpec[]): ConnectorGroup[] {
+  const groups: ConnectorGroup[] = [];
+  const byLabel = new Map<string, ConnectorGroup>();
+  for (const t of tools) {
+    const label = t.name.split('.')[0] || 'other';
+    let g = byLabel.get(label);
+    if (!g) {
+      g = { label, tools: [] };
+      byLabel.set(label, g);
+      groups.push(g);
+    }
+    g.tools.push(t);
+  }
+  return groups;
+}
 
 interface Props {
-  /** Click-to-add (accessible baseline + keyboard path): add at canvas center. */
-  onAdd: (kind: StepKind) => void;
+  /** Click-to-add (accessible baseline + keyboard path): add at canvas center.
+   *  `seed` pre-fills kind-specific fields (connector cards seed `action`). */
+  onAdd: (kind: StepKind, seed?: Partial<StepNodeData>) => void;
   /** Drag start: lets the parent track the in-flight kind for drop feedback. */
   onDragStartKind: (kind: StepKind) => void;
   /** When paused (YAML unparseable) the whole dock is inert. */
   disabled?: boolean;
-  /** Workflow-editor-UI flag — the branch card renders only when 'next'.
-   *  Defaults to 'classic' (no branch card) for callers that don't thread it. */
+  /** Workflow-editor-UI flag — the branch/gate + connector cards render only
+   *  when 'next'. Defaults to 'classic' (kind cards only) for callers that
+   *  don't thread it. */
   workflowEditorUi?: WorkflowEditorUi;
   /** 'float' (default): the classic/next floating dock, unchanged. 'rail': a
    *  compact, non-absolute block for the inspector rail (Task 1) — same cards,
    *  themed accent, no drag-hint copy, sub-text moved to a `title` tooltip. */
   variant?: 'float' | 'rail';
+  /** MCP tool catalog — grouped into connector ACTION cards (`next` only). */
+  tools?: ToolSpec[];
 }
 
 export default function NodePalette({
@@ -71,18 +113,59 @@ export default function NodePalette({
   disabled = false,
   workflowEditorUi = 'classic',
   variant = 'float',
+  tools,
 }: Props) {
-  const items = workflowEditorUi === 'next' ? [...ITEMS, BRANCH_ITEM] : ITEMS;
+  const items = workflowEditorUi === 'next' ? [...ITEMS, BRANCH_ITEM, GATE_ITEM] : ITEMS;
+  // Connector cards are `next`-only (classic dock stays byte-stable).
+  const connectorGroups = workflowEditorUi === 'next' && tools ? groupConnectors(tools) : [];
   const colors = useThemeColors();
-  const handleDragStart = (kind: StepKind) => (e: DragEvent<HTMLButtonElement>) => {
-    if (disabled) {
-      e.preventDefault();
-      return;
-    }
-    e.dataTransfer.setData(NODE_KIND_MIME, kind);
-    e.dataTransfer.effectAllowed = 'move';
-    onDragStartKind(kind);
-  };
+  const handleDragStart =
+    (kind: StepKind, seed?: Partial<StepNodeData>) => (e: DragEvent<HTMLButtonElement>) => {
+      if (disabled) {
+        e.preventDefault();
+        return;
+      }
+      e.dataTransfer.setData(NODE_KIND_MIME, kind);
+      if (seed) e.dataTransfer.setData(NODE_SEED_MIME, JSON.stringify(seed));
+      e.dataTransfer.effectAllowed = 'move';
+      onDragStartKind(kind);
+    };
+
+  // Shared connector-card section (both the `next` float dock and the rail),
+  // rendered after the kind cards. Each card drops an `action` node seeded with
+  // its tool name. Nothing renders in classic (connectorGroups is empty).
+  const connectorSection =
+    connectorGroups.length > 0 ? (
+      <div className="wfx-palette-connectors">
+        {connectorGroups.map((group) => {
+          const Icon = KIND_ICON.action;
+          const color = colors.get(KIND_ACCENT.action);
+          return (
+            <div key={group.label} className="wfx-palette-group">
+              <div className="wfx-palette-group-label">{group.label}</div>
+              {group.tools.map((tool) => (
+                <button
+                  key={tool.name}
+                  type="button"
+                  draggable={!disabled}
+                  disabled={disabled}
+                  onClick={() => onAdd('action', { action: tool.name })}
+                  onDragStart={handleDragStart('action', { action: tool.name })}
+                  aria-label={`Add ${tool.name} action`}
+                  title={tool.description || tool.name}
+                  className="wfx-pcard"
+                >
+                  <Icon className="wfx-picon" size={14} strokeWidth={2} style={{ color }} aria-hidden />
+                  <div className="wfx-pcard-text">
+                    <div className="wfx-pl font-mono">{tool.name}</div>
+                  </div>
+                </button>
+              ))}
+            </div>
+          );
+        })}
+      </div>
+    ) : null;
 
   // Inspector-rail dock (Task 1) — compact, non-absolute block meant to sit
   // inside the ~320px aside above the tabs. Reuses the themed `.wfx-pcard`/
@@ -118,6 +201,7 @@ export default function NodePalette({
             );
           })}
         </div>
+        {connectorSection}
       </div>
     );
   }
@@ -159,6 +243,7 @@ export default function NodePalette({
               );
             })}
           </div>
+          {connectorSection}
         </div>
       </div>
     );

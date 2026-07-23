@@ -20,7 +20,7 @@
 //! ```
 
 use crate::node_status::NodeStatus;
-use rupu_orchestrator::Workflow;
+use rupu_orchestrator::{is_approval_gate, Workflow};
 use serde::{Deserialize, Serialize};
 
 /// One row of the git-graph rendering. The GPUI renderer paints
@@ -107,7 +107,11 @@ where
             rows.push(spine_only());
         }
 
-        if let Some(panel) = &step.panel {
+        if is_approval_gate(step) {
+            emit_gate_step(&mut rows, step, &status_lookup);
+        } else if step.action.is_some() {
+            emit_action_step(&mut rows, step, &status_lookup);
+        } else if let Some(panel) = &step.panel {
             emit_panel_step(&mut rows, &step.id, &panel.panelists, &status_lookup);
         } else if let Some(subs) = &step.parallel {
             emit_parallel_step(&mut rows, &step.id, subs, &status_lookup);
@@ -264,6 +268,58 @@ fn emit_linear_step<F: Fn(&str) -> NodeStatus>(
         cells.push(GraphCell::Space(2));
         cells.push(GraphCell::Meta(meta));
     }
+    rows.push(GraphRow {
+        cells,
+        anchor: Some((step_id.to_string(), status)),
+    });
+}
+
+/// Emit a single standalone-approval-gate row: `● <step_id>   gate[ · auto]`.
+fn emit_gate_step<F: Fn(&str) -> NodeStatus>(
+    rows: &mut Vec<GraphRow>,
+    step: &rupu_orchestrator::Step,
+    status_lookup: &F,
+) {
+    let step_id = &step.id;
+    let status = status_lookup(step_id);
+    let mut meta = String::from("gate");
+    let is_auto = step
+        .approval
+        .as_ref()
+        .and_then(|a| a.auto_approve.as_ref())
+        .is_some();
+    if is_auto {
+        meta.push_str(" · auto");
+    }
+    let cells = vec![
+        GraphCell::Bullet(status),
+        GraphCell::Space(2),
+        GraphCell::Label(step_id.to_string()),
+        GraphCell::Space(2),
+        GraphCell::Meta(meta),
+    ];
+    rows.push(GraphRow {
+        cells,
+        anchor: Some((step_id.to_string(), status)),
+    });
+}
+
+/// Emit a single action-step row: `● <step_id>   action · <tool>`.
+fn emit_action_step<F: Fn(&str) -> NodeStatus>(
+    rows: &mut Vec<GraphRow>,
+    step: &rupu_orchestrator::Step,
+    status_lookup: &F,
+) {
+    let step_id = &step.id;
+    let status = status_lookup(step_id);
+    let meta = format!("action · {}", step.action.as_deref().unwrap_or("?"));
+    let cells = vec![
+        GraphCell::Bullet(status),
+        GraphCell::Space(2),
+        GraphCell::Label(step_id.to_string()),
+        GraphCell::Space(2),
+        GraphCell::Meta(meta),
+    ];
     rows.push(GraphRow {
         cells,
         anchor: Some((step_id.to_string(), status)),

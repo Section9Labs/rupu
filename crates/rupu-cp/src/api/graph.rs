@@ -265,8 +265,9 @@ pub struct StepDag {
 pub struct StepNodeDto {
     /// Matches the `id:` in the workflow YAML.
     pub id: String,
-    /// `"step"` | `"for_each"` | `"parallel"` | `"panel"` — precedence:
-    /// parallel > panel > for_each > step.
+    /// `"step"` | `"for_each"` | `"parallel"` | `"panel"` | `"action"` |
+    /// `"gate"` — precedence: parallel > panel > gate > action > for_each >
+    /// step.
     pub kind: String,
     /// Agent name for linear / `for_each` steps.
     pub agent: Option<String>,
@@ -278,6 +279,16 @@ pub struct StepNodeDto {
     pub panelists: Option<Vec<String>>,
     /// Gate configuration, populated when the panel step has a `gate:`.
     pub gate: Option<GateDto>,
+    /// Connector action tool name (`action:` on the step), populated only
+    /// for `kind == "action"`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub action: Option<String>,
+    /// Approval-gate configuration, populated only for `kind == "gate"`
+    /// (a standalone `approval:` gate NODE — see
+    /// [`rupu_orchestrator::is_approval_gate`]). Distinct from [`GateDto`],
+    /// which is the panel step's iteration-loop gate.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub approval_gate: Option<ApprovalGateDto>,
 }
 
 /// Mirrors [`rupu_orchestrator::SubStep`] — one branch inside a
@@ -299,6 +310,22 @@ pub struct GateDto {
     pub fix_with: String,
 }
 
+/// Approval-gate configuration for a `kind == "gate"` node — mirrors the
+/// relevant subset of [`rupu_orchestrator::Approval`]. Distinct from
+/// [`GateDto`] (the panel step's iteration-loop gate); this is the
+/// standalone `approval:` gate NODE (see
+/// [`rupu_orchestrator::is_approval_gate`]).
+#[derive(Debug, Serialize)]
+pub struct ApprovalGateDto {
+    /// Whether the gate has an `auto_approve:` expression configured (the
+    /// expression itself isn't exposed — the UI only needs to know one
+    /// exists).
+    pub auto_approve: bool,
+    /// Whether the gate has one or more `on_reject:` cleanup steps.
+    pub has_on_reject: bool,
+    pub timeout_seconds: Option<u64>,
+}
+
 // ── Mapper ───────────────────────────────────────────────────────────────
 
 /// Synthesize a single-node [`StepDag`] for a bare agent run (no workflow).
@@ -318,6 +345,8 @@ pub fn agent_run_dag(workflow_name: &str) -> StepDag {
             parallel: None,
             panelists: None,
             gate: None,
+            action: None,
+            approval_gate: None,
         }],
     }
 }
@@ -337,6 +366,8 @@ pub fn unpersisted_run_dag(workflow_name: &str) -> StepDag {
             parallel: None,
             panelists: None,
             gate: None,
+            action: None,
+            approval_gate: None,
         }],
     }
 }
@@ -350,7 +381,7 @@ pub fn to_step_dag(wf: &Workflow) -> StepDag {
 }
 
 fn map_step(step: &rupu_orchestrator::Step) -> StepNodeDto {
-    // Kind precedence: parallel > panel > for_each > step
+    // Kind precedence: parallel > panel > gate > action > for_each > step
     if let Some(subs) = &step.parallel {
         let parallel = subs
             .iter()
@@ -367,6 +398,8 @@ fn map_step(step: &rupu_orchestrator::Step) -> StepNodeDto {
             parallel: Some(parallel),
             panelists: None,
             gate: None,
+            action: None,
+            approval_gate: None,
         };
     }
 
@@ -387,6 +420,41 @@ fn map_step(step: &rupu_orchestrator::Step) -> StepNodeDto {
             parallel: None,
             panelists: Some(panel.panelists.clone()),
             gate,
+            action: None,
+            approval_gate: None,
+        };
+    }
+
+    if rupu_orchestrator::is_approval_gate(step) {
+        let approval_gate = step.approval.as_ref().map(|a| ApprovalGateDto {
+            auto_approve: a.auto_approve.is_some(),
+            has_on_reject: !a.on_reject.is_empty(),
+            timeout_seconds: a.timeout_seconds,
+        });
+        return StepNodeDto {
+            id: step.id.clone(),
+            kind: "gate".to_string(),
+            agent: None,
+            for_each: None,
+            parallel: None,
+            panelists: None,
+            gate: None,
+            action: None,
+            approval_gate,
+        };
+    }
+
+    if step.action.is_some() {
+        return StepNodeDto {
+            id: step.id.clone(),
+            kind: "action".to_string(),
+            agent: None,
+            for_each: None,
+            parallel: None,
+            panelists: None,
+            gate: None,
+            action: step.action.clone(),
+            approval_gate: None,
         };
     }
 
@@ -399,6 +467,8 @@ fn map_step(step: &rupu_orchestrator::Step) -> StepNodeDto {
             parallel: None,
             panelists: None,
             gate: None,
+            action: None,
+            approval_gate: None,
         };
     }
 
@@ -411,6 +481,8 @@ fn map_step(step: &rupu_orchestrator::Step) -> StepNodeDto {
         parallel: None,
         panelists: None,
         gate: None,
+        action: None,
+        approval_gate: None,
     }
 }
 
@@ -432,6 +504,44 @@ mod tests {
             "started_at": "2026-06-30T21:07:19Z",
         }))
         .expect("run record from json")
+    }
+
+    #[test]
+    fn map_step_gate_step_yields_gate_kind() {
+        let step: rupu_orchestrator::Step = serde_json::from_value(serde_json::json!({
+            "id": "approve",
+            "approval": {
+                "required": true,
+                "auto_approve": "false",
+                "timeout_seconds": 3600,
+                "on_reject": [
+                    {"id": "cleanup", "agent": "cleanup-agent", "prompt": "clean up"}
+                ],
+            },
+        }))
+        .expect("gate step from json");
+
+        let dto = map_step(&step);
+        assert_eq!(dto.kind, "gate");
+        assert_eq!(dto.action, None);
+        let gate = dto.approval_gate.expect("approval_gate populated for a gate node");
+        assert!(gate.auto_approve);
+        assert!(gate.has_on_reject);
+        assert_eq!(gate.timeout_seconds, Some(3600));
+    }
+
+    #[test]
+    fn map_step_action_step_yields_action_kind() {
+        let step: rupu_orchestrator::Step = serde_json::from_value(serde_json::json!({
+            "id": "create_pr",
+            "action": "scm.prs.create",
+        }))
+        .expect("action step from json");
+
+        let dto = map_step(&step);
+        assert_eq!(dto.kind, "action");
+        assert_eq!(dto.action.as_deref(), Some("scm.prs.create"));
+        assert!(dto.approval_gate.is_none());
     }
 
     #[test]

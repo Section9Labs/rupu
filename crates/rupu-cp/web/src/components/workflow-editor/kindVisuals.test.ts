@@ -7,7 +7,7 @@ import { KIND_ACCENT, KIND_ICON } from './kindVisuals';
 import type { StepKind } from '../../lib/workflowGraph';
 import type { ColorKey } from '../../lib/useThemeColors';
 
-const KINDS: StepKind[] = ['step', 'for_each', 'parallel', 'panel', 'branch'];
+const KINDS: StepKind[] = ['step', 'for_each', 'parallel', 'panel', 'branch', 'approval_gate', 'action'];
 
 const EXPECTED_ACCENT: Record<StepKind, ColorKey> = {
   step: 'status.running',
@@ -15,6 +15,8 @@ const EXPECTED_ACCENT: Record<StepKind, ColorKey> = {
   parallel: 'sev.critical',
   panel: 'status.awaiting',
   branch: 'status.done',
+  approval_gate: 'status.paused',
+  action: 'sev.info',
 };
 
 describe('kindVisuals', () => {

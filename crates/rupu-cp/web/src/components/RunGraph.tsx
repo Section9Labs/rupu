@@ -1,7 +1,8 @@
 // RunGraph (v2) — a read-only @xyflow/react canvas for a run's step DAG.
 //
-// Four custom node types (step / parallel / fanout / panel) painted from a
-// `RunGraphModel`, positioned by the pre-computed dagre layout. The active
+// Six custom node types (step / parallel / fanout / panel / gate / action)
+// painted from a `RunGraphModel`, positioned by the pre-computed dagre
+// layout. The active
 // frontier animates: the edge INTO a running node gets blue marching-ants,
 // the edge into an awaiting node an amber dashed flow; all others are static.
 //
@@ -30,11 +31,13 @@ import StepNode from './graph/StepNode';
 import ParallelNode from './graph/ParallelNode';
 import FanoutNode from './graph/FanoutNode';
 import PanelLoopNode from './graph/PanelLoopNode';
+import GateNode from './graph/GateNode';
+import ActionNode from './graph/ActionNode';
 
 import '@xyflow/react/dist/style.css';
 
 // Map the model's step kind → a registered React Flow node type.
-type FlowKind = 'step' | 'parallel' | 'fanout' | 'panel';
+type FlowKind = 'step' | 'parallel' | 'fanout' | 'panel' | 'gate' | 'action';
 
 function flowKind(kind: StepNodeDto['kind']): FlowKind {
   switch (kind) {
@@ -44,6 +47,10 @@ function flowKind(kind: StepNodeDto['kind']): FlowKind {
       return 'fanout';
     case 'panel':
       return 'panel';
+    case 'gate':
+      return 'gate';
+    case 'action':
+      return 'action';
     default:
       return 'step';
   }
@@ -56,6 +63,8 @@ const NODE_TYPES: NodeTypes = {
   parallel: ParallelNode,
   fanout: FanoutNode,
   panel: PanelLoopNode,
+  gate: GateNode,
+  action: ActionNode,
 };
 
 interface NodeData extends Record<string, unknown> {
