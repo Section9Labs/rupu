@@ -245,26 +245,50 @@ function WorkflowEditorGraphInner({
   const edges = useMemo<Edge[]>(
     () =>
       graph.edges.map((e) => {
-        const color = branchEdgeColor(e.branch, colors);
+        const branchColor = branchEdgeColor(e.branch, colors);
         const next = workflowEditorUi === 'next';
+        // Plain (non-branch) edges get a muted tinted arrowhead in `next`
+        // (classic leaves the marker color undefined → xyflow's default).
+        const markerColor = branchColor ?? (next ? colors.alpha('inkMute', 0.5) : undefined);
         const edge: Edge = {
           id: e.id,
           source: e.source,
           target: e.target,
           type: 'smoothstep',
-          markerEnd: { type: MarkerType.ArrowClosed, color },
+          markerEnd: { type: MarkerType.ArrowClosed, color: markerColor },
         };
         if (e.label !== undefined) edge.label = e.label;
-        if (color !== undefined) {
+        if (branchColor !== undefined) {
           // Branch (true/false) arm — colored stroke, a touch bolder for `next`
           // (mirrors the mockup's `.edge.t-true`/`.edge.t-false`).
-          edge.style = next ? { stroke: color, strokeWidth: 2.5 } : { stroke: color };
-          edge.labelStyle = { fill: color, fontWeight: 600 };
-          edge.labelBgStyle = { fillOpacity: 0 };
+          edge.style = next ? { stroke: branchColor, strokeWidth: 2.5 } : { stroke: branchColor };
+          edge.labelStyle = { fill: branchColor, fontWeight: 600 };
+          if (next) {
+            // Semantic label chip: ✓ then / ✕ else, filled with a soft tint of
+            // the arm's own accent (status.done / status.failed).
+            const isThen = e.branch === 'then';
+            edge.label = isThen ? '✓ then' : '✕ else';
+            edge.labelBgStyle = {
+              fill: colors.alpha(isThen ? 'status.done' : 'status.failed', 0.12),
+            };
+            edge.labelBgPadding = [6, 3];
+            edge.labelBgBorderRadius = 6;
+          } else {
+            edge.labelBgStyle = { fillOpacity: 0 };
+          }
         } else if (next) {
           // Plain chain/data-ref edge — themed muted stroke for `next` (mockup's
           // `.edge`); classic leaves this edge with xyflow's default styling.
           edge.style = { stroke: colors.alpha('inkMute', 0.5), strokeWidth: 1.6 };
+          if (e.label !== undefined) {
+            // Non-branch edges that carry a label (none produced by
+            // yamlToGraph today, but the renderer stays generic) get a
+            // neutral brand-tinted chip instead of the branch-arm colors.
+            edge.labelStyle = { fill: colors.inkDim, fontWeight: 600 };
+            edge.labelBgStyle = { fill: colors.alpha('brand.500', 0.12) };
+            edge.labelBgPadding = [6, 3];
+            edge.labelBgBorderRadius = 6;
+          }
         }
         return edge;
       }),

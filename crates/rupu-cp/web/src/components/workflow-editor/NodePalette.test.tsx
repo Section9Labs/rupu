@@ -67,13 +67,15 @@ describe('NodePalette', () => {
   });
 
   describe('next (instrument) look', () => {
-    it('renders the .wfx-palette dock with a .wfx-pcard per item and a .wfx-pdot accent', () => {
+    it('renders the .wfx-palette dock with a .wfx-pcard per item and a .wfx-picon accent icon', () => {
       const { container } = render(<NodePalette onAdd={() => {}} onDragStartKind={() => {}} workflowEditorUi="next" />);
       expect(container.querySelector('.wfx-palette')).toBeInTheDocument();
       // next also offers the branch card (step/for_each/parallel/panel/branch = 5).
       const cards = container.querySelectorAll('.wfx-pcard');
       expect(cards.length).toBe(5);
-      expect(container.querySelectorAll('.wfx-pdot').length).toBe(5);
+      const icons = container.querySelectorAll('.wfx-picon');
+      expect(icons.length).toBe(5);
+      for (const icon of icons) expect(icon.tagName.toLowerCase()).toBe('svg');
       // no classic markers leak into the next look.
       expect(container.querySelector('.rounded-lg.border.border-border.bg-panel\\/95')).not.toBeInTheDocument();
     });
@@ -115,12 +117,12 @@ describe('NodePalette', () => {
       expect(container.querySelector('.wfx-palette')).not.toBeInTheDocument();
     });
 
-    it('rail cards are .wfx-pcard with a .wfx-pdot accent, same as the float next look', () => {
+    it('rail cards are .wfx-pcard with a .wfx-picon accent icon, same as the float next look', () => {
       const { container } = render(
         <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" />,
       );
       expect(container.querySelectorAll('.wfx-pcard').length).toBe(4);
-      expect(container.querySelectorAll('.wfx-pdot').length).toBe(4);
+      expect(container.querySelectorAll('.wfx-picon').length).toBe(4);
     });
 
     it('clicking a rail card still fires onAdd with that kind', () => {

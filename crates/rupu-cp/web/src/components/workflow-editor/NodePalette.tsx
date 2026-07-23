@@ -12,34 +12,22 @@
 import type { DragEvent } from 'react';
 import type { StepKind } from '../../lib/workflowGraph';
 import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
-import { useThemeColors, type ColorKey } from '../../lib/useThemeColors';
+import { useThemeColors } from '../../lib/useThemeColors';
+import { KIND_ACCENT, KIND_ICON } from './kindVisuals';
 
 /** dataTransfer key the canvas reads on drop. Exported so the canvas drop
  *  handler and the palette agree on one string. */
 export const NODE_KIND_MIME = 'application/rupu-node-kind';
 
-// Per-kind accent color — identical to EditableStepNode.KIND_COLOR so the
-// preview top-bar matches the real card. Classic-only (`next` uses the themed
-// KIND_ACCENT below).
+// Per-kind accent color — classic-only fixed hex, matching the real card's
+// classic top-bar. `next` uses the themed `KIND_ACCENT` imported from
+// kindVisuals above (shared with EditableStepNode).
 const KIND_COLOR: Record<StepKind, string> = {
   step: '#1860f2',
   for_each: '#8b5cf6',
   parallel: '#9333ea',
   panel: '#f59e0b',
   branch: '#16a34a',
-};
-
-// `next` (instrument) look — per-kind accent resolved from the SAME themed
-// tokens EditableStepNode.KIND_KEY uses, so the palette dot matches the real
-// node's top-bar exactly (and stays legible on dark, unlike the fixed hexes
-// above). Duplicated here rather than imported: Task 3 only touches
-// NodePalette.tsx/WorkflowEditorGraph.tsx/styles.css.
-const KIND_ACCENT: Record<StepKind, ColorKey> = {
-  step: 'status.running',
-  for_each: 'brand.500',
-  parallel: 'sev.critical',
-  panel: 'status.awaiting',
-  branch: 'status.done',
 };
 
 interface PaletteItem {
@@ -98,7 +86,7 @@ export default function NodePalette({
 
   // Inspector-rail dock (Task 1) — compact, non-absolute block meant to sit
   // inside the ~320px aside above the tabs. Reuses the themed `.wfx-pcard`/
-  // `.wfx-pdot` skin (same accent-dot-per-kind look as the `next` float dock)
+  // `.wfx-picon` skin (same accent-tinted kind icon as the `next` float dock)
   // in a 2-col grid; the one-line "what this is" tagline drops to a `title`
   // tooltip instead of a second text row to stay compact. Same onAdd/
   // onDragStart wiring as every other variant.
@@ -109,6 +97,7 @@ export default function NodePalette({
         <div className="wfx-palette-rail-grid">
           {items.map((item) => {
             const color = colors.get(KIND_ACCENT[item.kind]);
+            const Icon = KIND_ICON[item.kind];
             return (
               <button
                 key={item.kind}
@@ -121,7 +110,7 @@ export default function NodePalette({
                 title={item.sub}
                 className="wfx-pcard"
               >
-                <span className="wfx-pdot" style={{ background: color }} />
+                <Icon className="wfx-picon" size={14} strokeWidth={2} style={{ color }} aria-hidden />
                 <div className="wfx-pcard-text">
                   <div className="wfx-pl">{item.label}</div>
                 </div>
@@ -135,9 +124,9 @@ export default function NodePalette({
 
   // "next" (instrument) look — a wholly separate render path so the classic
   // markup below stays byte-identical. Ported from the mockup's `.palette`/
-  // `.pcard`/`.pdot` (row-style card: accent dot + label/sub), styled via the
-  // `.wfx-*` CSS block; only the outer dock position (bottom-left float) stays
-  // Tailwind, matching the classic dock's placement.
+  // `.pcard` (row-style card: accent-tinted kind icon + label/sub), styled via
+  // the `.wfx-*` CSS block; only the outer dock position (bottom-left float)
+  // stays Tailwind, matching the classic dock's placement.
   if (workflowEditorUi === 'next') {
     return (
       <div
@@ -149,6 +138,7 @@ export default function NodePalette({
           <div className="wfx-palette-list">
             {items.map((item) => {
               const color = colors.get(KIND_ACCENT[item.kind]);
+              const Icon = KIND_ICON[item.kind];
               return (
                 <button
                   key={item.kind}
@@ -160,7 +150,7 @@ export default function NodePalette({
                   aria-label={`Add ${item.label} node`}
                   className="wfx-pcard"
                 >
-                  <span className="wfx-pdot" style={{ background: color }} />
+                  <Icon className="wfx-picon" size={14} strokeWidth={2} style={{ color }} aria-hidden />
                   <div className="wfx-pcard-text">
                     <div className="wfx-pl">{item.label}</div>
                     <div className="wfx-pd">{item.sub}</div>

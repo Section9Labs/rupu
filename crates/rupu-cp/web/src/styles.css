@@ -429,10 +429,12 @@
 /* ── header: kindpill + mono id + problem dot ── */
 .wfx-head { display: flex; align-items: center; gap: 7px; padding: 9px 10px 6px; }
 .wfx-kindpill {
+  display: flex; align-items: center; gap: 3px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 8.5px; letter-spacing: .07em; text-transform: uppercase; font-weight: 700;
   padding: 1px 6px; border-radius: 5px; white-space: nowrap; flex: none;
 }
+.wfx-kindicon { flex: none; }
 .wfx-nid {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px; font-weight: 650; color: rgb(var(--c-ink));
@@ -544,7 +546,7 @@
 .wfx-pcard:hover { border-color: rgb(var(--c-brand-500) / .5); }
 .wfx-pcard:active { cursor: grabbing; }
 .wfx-pcard:disabled { cursor: not-allowed; opacity: .5; }
-.wfx-pdot { width: 9px; height: 9px; border-radius: 3px; flex: none; }
+.wfx-picon { flex: none; }
 .wfx-pcard-text { min-width: 0; }
 .wfx-pl {
   font-size: 11.5px; font-weight: 600; color: rgb(var(--c-ink));
@@ -561,7 +563,7 @@
 }
 
 /* ── inspector-rail palette dock (Task 1) ── */
-/* The `next`-only rail placement: same `.wfx-pcard`/`.wfx-pdot` skin as the
+/* The `next`-only rail placement: same `.wfx-pcard`/`.wfx-picon` skin as the
  * float dock above, laid out as a compact non-absolute 2-col grid sized for
  * the ~320px inspector aside. Sits inside a slot div (WorkflowEditor.tsx)
  * above the Settings/Step/Reference tabs. */
