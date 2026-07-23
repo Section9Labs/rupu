@@ -2414,6 +2414,7 @@ pub(crate) async fn resume_run(
         completed_units,
         reason,
         paused_step,
+        rejected_reason: None,
     };
 
     // Clone the workflow for the live view before `opts` consumes it.
@@ -2529,26 +2530,62 @@ async fn reject(run_id: &str, reason: Option<&str>) -> anyhow::Result<()> {
 
     // Library call replaces inline load + expire-check + status check
     // + mutate + update.
-    match store.reject(run_id, &approver, reason_str, chrono::Utc::now()) {
-        Ok(rupu_orchestrator::ApprovalDecision::Rejected { .. }) => {}
-        Err(rupu_orchestrator::ApprovalError::Expired(msg)) => {
-            anyhow::bail!("approval expired before it was acted on — {msg}");
-        }
-        Err(rupu_orchestrator::ApprovalError::NotAwaiting(s)) => {
-            anyhow::bail!(
-                "run is `{s}`, not `awaiting_approval` — only paused runs can be rejected",
-            );
-        }
-        Err(rupu_orchestrator::ApprovalError::NotFound(id)) => {
-            anyhow::bail!(
-                "run not found: {id}\n  hint: \
-                 list paused runs with `rupu workflow runs --status awaiting_approval`"
-            );
-        }
-        Err(e) => return Err(anyhow::anyhow!("reject: {e}")),
-        Ok(other) => anyhow::bail!("unexpected decision: {other:?}"),
-    }
+    let (rejected_step_id, rejected_reason) =
+        match store.reject(run_id, &approver, reason_str, chrono::Utc::now()) {
+            Ok(rupu_orchestrator::ApprovalDecision::Rejected { step_id, reason, .. }) => {
+                (step_id, reason)
+            }
+            Err(rupu_orchestrator::ApprovalError::Expired(msg)) => {
+                anyhow::bail!("approval expired before it was acted on — {msg}");
+            }
+            Err(rupu_orchestrator::ApprovalError::NotAwaiting(s)) => {
+                anyhow::bail!(
+                    "run is `{s}`, not `awaiting_approval` — only paused runs can be rejected",
+                );
+            }
+            Err(rupu_orchestrator::ApprovalError::NotFound(id)) => {
+                anyhow::bail!(
+                    "run not found: {id}\n  hint: \
+                     list paused runs with `rupu workflow runs --status awaiting_approval`"
+                );
+            }
+            Err(e) => return Err(anyhow::anyhow!("reject: {e}")),
+            Ok(other) => anyhow::bail!("unexpected decision: {other:?}"),
+        };
     println!("rupu: run {run_id} marked rejected");
+
+    // The run is already correctly `Rejected` at this point (the library
+    // call above is what finalized it) — a cleanup-load failure is warned,
+    // never turned into a command error. `on_reject` chains are optional;
+    // most rejected gates have none.
+    match crate::resume::build_reject_cleanup_opts(
+        &store,
+        run_id,
+        &rejected_step_id,
+        &rejected_reason,
+        None,
+    )
+    .await
+    {
+        Ok((opts, chain_len)) => {
+            match rupu_orchestrator::runner::run_reject_cleanup(
+                opts,
+                &rejected_step_id,
+                &rejected_reason,
+            )
+            .await
+            {
+                Ok(()) => println!("cleanup: {chain_len} step(s) executed"),
+                Err(e) => eprintln!("warning: on_reject cleanup chain errored: {e}"),
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: could not load workflow for on_reject cleanup: {e} \
+                 (run is already correctly rejected)"
+            );
+        }
+    }
     Ok(())
 }
 

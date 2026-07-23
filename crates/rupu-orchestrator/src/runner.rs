@@ -452,6 +452,13 @@ pub struct ResumeState {
     /// persisted transcript (role-alternation-safe). `None` for approval and
     /// step-boundary pauses.
     pub paused_step: Option<PausedStep>,
+    /// The operator's rejection reason, when this `ResumeState` was built by
+    /// [`ResumeState::from_rejection`]. `None` for every other constructor.
+    /// Not consulted by [`run_reject_cleanup`] itself (its caller already
+    /// has the reason as a plain `&str` argument) — carried here so a
+    /// caller that only holds the `ResumeState` (e.g. a future cp-serve
+    /// reject worker) doesn't need to thread the reason through separately.
+    pub rejected_reason: Option<String>,
 }
 
 /// A linear step that paused mid-run, carried on [`ResumeState`] so the
@@ -481,6 +488,31 @@ impl ResumeState {
             completed_units: std::collections::BTreeMap::new(),
             reason: PauseReason::Approval,
             paused_step: None,
+            rejected_reason: None,
+        }
+    }
+
+    /// Resume context carrying the run id + prior step results for
+    /// [`run_reject_cleanup`] to persist against — the same disk state
+    /// `from_approval` carries for approve-resume, plus the operator's
+    /// rejection reason. Not a "pause" in the [`PauseReason`] sense (a
+    /// rejected gate is terminal, never re-entering [`run_workflow`]'s
+    /// main loop), so `reason` stays `PauseReason::Approval` — no new
+    /// pause-reason variant is introduced for rejection.
+    pub fn from_rejection(
+        run_id: String,
+        prior_step_results: Vec<StepResult>,
+        rejected_step_id: String,
+        reason: String,
+    ) -> Self {
+        Self {
+            run_id,
+            prior_step_results,
+            approved_step_id: rejected_step_id,
+            completed_units: std::collections::BTreeMap::new(),
+            reason: PauseReason::Approval,
+            paused_step: None,
+            rejected_reason: Some(reason),
         }
     }
 }
@@ -1094,7 +1126,7 @@ async fn run_steps_inner(
 
             if gate_suppressed {
                 info!(step = %step.id, "gate: resuming with human approval");
-                emit_gate_resolved(opts, run_id, step, "human", step_results);
+                emit_gate_result(opts, run_id, step, "approved", "human", None, step_results);
                 continue;
             }
             if let Some(expr) = &ap.auto_approve {
@@ -1106,7 +1138,7 @@ async fn run_steps_inner(
                         })?;
                 if truthy {
                     info!(step = %step.id, "gate auto-approved");
-                    emit_gate_resolved(opts, run_id, step, "auto", step_results);
+                    emit_gate_result(opts, run_id, step, "approved", "auto", None, step_results);
                     continue;
                 }
             }
@@ -1517,16 +1549,21 @@ fn step_kind_for_run_record(step: &Step) -> crate::runs::StepKind {
     }
 }
 
-/// Record an approved gate node's result: `StepStarted` + `StepCompleted`
+/// Record a resolved gate node's result: `StepStarted` + `StepCompleted`
 /// events, a `StepResult` whose `output` is the decision JSON (spec §3.1),
-/// persisted like any other step. `via` is `"human"` (approve-resume) or
-/// `"auto"` (auto_approve truthy); Task 4 generalizes this to rejected
-/// decisions.
-fn emit_gate_resolved(
+/// persisted like any other step. `decision` is `"approved"` or
+/// `"rejected"`; `via` is `"human"` (approve-resume / operator reject) or
+/// `"auto"` (auto_approve truthy — always paired with `decision:
+/// "approved"`); `reason` is the operator's rejection reason (`Some` only
+/// for a rejected decision, `None` otherwise, matching spec §3.1's
+/// `"reason": null` for approvals).
+fn emit_gate_result(
     opts: &OrchestratorRunOpts,
     run_id: &str,
     step: &Step,
+    decision: &str,
     via: &str,
+    reason: Option<&str>,
     step_results: &mut Vec<StepResult>,
 ) {
     if let Some(sink) = opts.event_sink.as_ref() {
@@ -1542,9 +1579,9 @@ fn emit_gate_resolved(
         );
     }
     let output = serde_json::json!({
-        "decision": "approved",
+        "decision": decision,
         "via": via,
-        "reason": serde_json::Value::Null,
+        "reason": reason,
         "decided_at": chrono::Utc::now().to_rfc3339(),
     })
     .to_string();
@@ -1570,6 +1607,229 @@ fn emit_gate_resolved(
     }
     persist_step_result(opts, run_id, &result);
     step_results.push(result);
+}
+
+/// Execute a rejected gate's `on_reject` chain (spec §4.1). Called by
+/// the rejecting process AFTER `RunStore::reject` finalized the run.
+/// Failures inside the chain are logged per-step (`continue`), never
+/// returned — the run is already terminal.
+///
+/// `opts.resume_from` carries the run id + prior step results this
+/// cleanup persists against — built via [`ResumeState::from_rejection`]
+/// the same way approve-resume's `opts.resume_from` carries
+/// [`ResumeState::from_approval`]'s. When `resume_from` is `None` (a
+/// caller that didn't wire it), persistence + event emission silently
+/// no-op (same as `run_workflow`'s in-memory mode) since there is no
+/// run id to key off of.
+pub async fn run_reject_cleanup(
+    opts: OrchestratorRunOpts,
+    rejected_step_id: &str,
+    reason: &str,
+) -> Result<(), RunWorkflowError> {
+    let Some(gate) = opts.workflow.steps.iter().find(|s| s.id == rejected_step_id) else {
+        return Ok(()); // legacy inline approval or unknown id — nothing to run
+    };
+    if !crate::workflow::is_approval_gate(gate) {
+        return Ok(());
+    }
+    let chain = gate
+        .approval
+        .as_ref()
+        .map(|a| a.on_reject.clone())
+        .unwrap_or_default();
+
+    // 1. Prior results + run id come from `opts.resume_from` (the CLI
+    //    reject path builds it with `ResumeState::from_rejection` after
+    //    reading `step_results.jsonl` back — the same loader
+    //    approve-resume uses; see `crates/rupu-cli/src/resume.rs`). This
+    //    mirrors how `run_workflow` itself pulls `run_id` +
+    //    `prior_step_results` off `opts.resume_from` at its own top
+    //    (~line 519).
+    let run_id = opts
+        .resume_from
+        .as_ref()
+        .map(|r| r.run_id.clone())
+        .unwrap_or_default();
+    let mut step_results: Vec<StepResult> = opts
+        .resume_from
+        .as_ref()
+        .map(|r| r.prior_step_results.clone())
+        .unwrap_or_default();
+
+    // 2. The gate's own rejected result, recorded BEFORE the chain runs
+    //    (a `via`/`decision` variant of Task 3's now-generalized
+    //    `emit_gate_result`).
+    emit_gate_result(
+        &opts,
+        &run_id,
+        gate,
+        "rejected",
+        "human",
+        Some(reason),
+        &mut step_results,
+    );
+
+    // 3. Dispatch each on_reject step through the same per-step
+    //    machinery `run_workflow`'s linear arm uses (StepStarted event →
+    //    factory build_opts_for_step → agent run → StepCompleted /
+    //    StepFailed event → persist_step_result → push). Mirrored inline
+    //    rather than extracted into a shared helper: `run_linear_step`
+    //    (~1726, now further down this file) also carries host-redirect,
+    //    cooperative-pause, and resume-seed logic that a terminal cleanup
+    //    chain never needs (cleanup steps always run local, uninterrupted,
+    //    fresh — no host:, no opts.pause, no mid-step resume-seed), so
+    //    extracting a shared helper would either drag that machinery along
+    //    unused or require new plumbing on `run_linear_step` itself. The
+    //    subset actually needed here is small enough to mirror directly.
+    let resolved_inputs = resolve_inputs(&opts.workflow, &opts.inputs)?;
+    for step in &chain {
+        if step.action.is_some() {
+            // Action steps parse but don't execute yet (Plan 2), same
+            // limitation `run_workflow`'s main loop enforces — but a
+            // cleanup chain never aborts the (already-terminal) run for
+            // it; record the step as a logged failure and continue.
+            warn!(
+                step = %step.id,
+                "on_reject: action steps are not runtime-supported yet (Plan 2); skipping"
+            );
+            let result = StepResult {
+                step_id: step.id.clone(),
+                success: false,
+                skipped: false,
+                kind: crate::runs::StepKind::Action,
+                ..Default::default()
+            };
+            persist_step_result(&opts, &run_id, &result);
+            step_results.push(result);
+            continue;
+        }
+
+        let ctx = base_context_for_step(
+            &resolved_inputs,
+            opts.event.as_ref(),
+            opts.issue.as_ref(),
+            &step_results,
+        );
+        let agent_name = step.agent.as_deref().unwrap_or_default();
+        let prompt = step.prompt.as_deref().unwrap_or_default();
+        let step_run_id = format!("run_{}", Ulid::new());
+        let transcript_path = opts.transcript_dir.join(format!("{step_run_id}.jsonl"));
+
+        if let Some(sink) = opts.event_sink.as_ref() {
+            sink.emit(
+                &run_id,
+                &crate::executor::Event::StepStarted {
+                    run_id: run_id.clone(),
+                    step_id: step.id.clone(),
+                    kind: crate::runs::StepKind::Linear,
+                    agent: step.agent.clone(),
+                    host: step.host.clone(),
+                },
+            );
+        }
+
+        let rendered = match render_step_prompt(prompt, &ctx, render_mode(opts.strict_templates))
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    step = %step.id,
+                    error = %e,
+                    "on_reject cleanup step: prompt render failed; continuing chain"
+                );
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        &run_id,
+                        &crate::executor::Event::StepFailed {
+                            run_id: run_id.clone(),
+                            step_id: step.id.clone(),
+                            error: e.to_string(),
+                        },
+                    );
+                }
+                let result = StepResult {
+                    step_id: step.id.clone(),
+                    success: false,
+                    skipped: false,
+                    kind: crate::runs::StepKind::Linear,
+                    ..Default::default()
+                };
+                persist_step_result(&opts, &run_id, &result);
+                step_results.push(result);
+                continue;
+            }
+        };
+
+        let step_timer = std::time::Instant::now();
+        let outcome = dispatch_one(
+            &opts.factory,
+            &step.id,
+            agent_name,
+            rendered.clone(),
+            step_run_id.clone(),
+            opts.workspace_id.clone(),
+            opts.workspace_path.clone(),
+            transcript_path.clone(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        let duration_ms = step_timer.elapsed().as_millis() as u64;
+
+        let success = match outcome {
+            Ok(_) => true,
+            Err(e) => {
+                warn!(
+                    step = %step.id,
+                    error = %e,
+                    "on_reject cleanup step failed; continuing chain"
+                );
+                false
+            }
+        };
+        if let Some(sink) = opts.event_sink.as_ref() {
+            if success {
+                sink.emit(
+                    &run_id,
+                    &crate::executor::Event::StepCompleted {
+                        run_id: run_id.clone(),
+                        step_id: step.id.clone(),
+                        success: true,
+                        duration_ms,
+                        host: None,
+                    },
+                );
+            } else {
+                sink.emit(
+                    &run_id,
+                    &crate::executor::Event::StepFailed {
+                        run_id: run_id.clone(),
+                        step_id: step.id.clone(),
+                        error: "cleanup step failed".to_string(),
+                    },
+                );
+            }
+        }
+        let output = read_final_assistant_text(&transcript_path, success, &step_run_id, &step.id);
+        let result = StepResult {
+            step_id: step.id.clone(),
+            rendered_prompt: rendered,
+            run_id: step_run_id,
+            transcript_path,
+            output,
+            success,
+            skipped: false,
+            kind: crate::runs::StepKind::Linear,
+            ..Default::default()
+        };
+        persist_step_result(&opts, &run_id, &result);
+        step_results.push(result);
+    }
+
+    // 4. Cleanup never changes the terminal status — `RunStore::reject`
+    //    already finalized it before this function was called.
+    Ok(())
 }
 
 fn persist_active_step(
@@ -4214,6 +4474,7 @@ steps:
             completed_units: std::collections::BTreeMap::new(),
             reason: PauseReason::Approval,
             paused_step: None,
+            rejected_reason: None,
         });
         let err = run_workflow(opts)
             .await
@@ -4489,6 +4750,7 @@ steps:
                 step_id: "solo".into(),
                 seed_messages: awaiting.resume_seed,
             }),
+            rejected_reason: None,
         });
 
         let res2 = run_workflow(opts2).await.expect("resume completes");
@@ -4581,6 +4843,7 @@ steps:
             completed_units: std::collections::BTreeMap::new(),
             reason: PauseReason::Manual,
             paused_step: None,
+            rejected_reason: None,
         });
 
         let res2 = run_workflow(opts2).await.expect("resume completes");
@@ -4708,6 +4971,7 @@ steps:
                 step_id: "solo".into(),
                 seed_messages: seed.clone(),
             }),
+            rejected_reason: None,
         });
 
         run_workflow(opts).await.expect("resume completes");
@@ -4780,6 +5044,7 @@ steps:
                 step_id: "solo".into(),
                 seed_messages: seed.clone(),
             }),
+            rejected_reason: None,
         });
 
         run_workflow(opts).await.expect("resume completes");
@@ -4993,6 +5258,7 @@ steps:
                 completed_units,
                 reason: PauseReason::Manual,
                 paused_step: None,
+                rejected_reason: None,
             }),
             run_id_override: None,
             strict_templates: false,
@@ -5157,6 +5423,7 @@ steps:
             completed_units,
             reason: PauseReason::Manual,
             paused_step: None,
+            rejected_reason: None,
         });
 
         let res2 = run_workflow(opts2).await.expect("resume completes");

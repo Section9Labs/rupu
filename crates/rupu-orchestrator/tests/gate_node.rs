@@ -14,8 +14,10 @@ use rupu_agent::runner::MockProvider;
 use rupu_agent::runner::{BypassDecider, ScriptedTurn, DEFAULT_MAX_TOKENS};
 use rupu_agent::AgentRunOpts;
 use rupu_orchestrator::executor::JsonlSink;
-use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, ResumeState, StepFactory};
-use rupu_orchestrator::{RunStatus, RunStore, StepKind, StepResult, Workflow};
+use rupu_orchestrator::runner::{
+    run_reject_cleanup, run_workflow, OrchestratorRunOpts, ResumeState, StepFactory,
+};
+use rupu_orchestrator::{ApprovalDecision, RunStatus, RunStore, StepKind, StepResult, Workflow};
 use rupu_providers::types::StopReason;
 use rupu_tools::ToolContext;
 use std::collections::BTreeMap;
@@ -67,6 +69,71 @@ impl StepFactory for EchoFactory {
             input_tokens: 1,
             output_tokens: 1,
         }]);
+        AgentRunOpts {
+            agent_name: agent_name.to_string(),
+            agent_system_prompt: "test".into(),
+            agent_tools: None,
+            provider: Box::new(provider),
+            provider_name: "mock".into(),
+            model: "mock-1".into(),
+            run_id,
+            workspace_id,
+            workspace_path,
+            transcript_path,
+            max_turns: 5,
+            decider: Arc::new(BypassDecider),
+            tool_context: ToolContext::default(),
+            user_message: rendered_prompt,
+            initial_messages: Vec::new(),
+            turn_index_offset: 0,
+            mode_str: "bypass".into(),
+            no_stream: true,
+            suppress_stream_stdout: true,
+            mcp_registry: None,
+            effort: None,
+            context_window: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
+            step_id: String::new(),
+            on_tool_call,
+            on_stream_event: None,
+            concerns: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            context_window_tokens: None,
+            compact_at_percent: None,
+            scope_name: None,
+            surface_tag: None,
+            pause: None,
+        }
+    }
+}
+
+/// Always fails its agent run with a `ProviderError` — used by test 6 to
+/// prove an `on_reject` cleanup step's failure doesn't derail the chain or
+/// the run's terminal `Rejected` status.
+struct FailFactory;
+#[async_trait]
+impl StepFactory for FailFactory {
+    async fn build_opts_for_step(
+        &self,
+        _step_id: &str,
+        agent_name: &str,
+        rendered_prompt: String,
+        run_id: String,
+        workspace_id: String,
+        workspace_path: PathBuf,
+        transcript_path: PathBuf,
+        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+    ) -> AgentRunOpts {
+        let provider = MockProvider::new(vec![ScriptedTurn::ProviderError(
+            "simulated on_reject cleanup failure".into(),
+        )]);
         AgentRunOpts {
             agent_name: agent_name.to_string(),
             agent_system_prompt: "test".into(),
@@ -485,4 +552,348 @@ async fn gate_as_last_step_approve_resume_completes_run() {
     let record_final = store.load(&run_id).unwrap();
     assert_eq!(record_final.status, RunStatus::Completed);
     assert!(record_final.finished_at.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Test 5 — reject with cleanup: the gate's own rejected result is recorded,
+// the on_reject chain dispatches through the same step-factory machinery,
+// and the run stays terminally Rejected.
+// ---------------------------------------------------------------------------
+
+const WF_GATE_REJECT: &str = r#"
+name: gate-reject
+steps:
+  - id: gate
+    approval:
+      prompt: "Approve the deploy?"
+      on_reject:
+        - id: notify_fail
+          agent: worker
+          prompt: "cleanup after reject: {{ steps.gate.decision }}"
+"#;
+
+#[tokio::test]
+async fn reject_runs_on_reject_cleanup_chain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let wf = Workflow::parse(WF_GATE_REJECT).unwrap();
+
+    // --- Phase 1: pause at the gate. ---
+    let opts1 = OrchestratorRunOpts {
+        workflow: wf.clone(),
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_gate_reject".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_GATE_REJECT.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        pause: None,
+    };
+    let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
+    let awaiting = res1.awaiting.clone().expect("must pause at the gate");
+    assert_eq!(awaiting.step_id, "gate");
+    let run_id = res1.run_id.clone();
+
+    // --- Operator rejects (mirrors `rupu workflow reject`): the library
+    // call finalizes the run BEFORE any cleanup runs. ---
+    let decision = store
+        .reject(&run_id, "operator", "not today", chrono::Utc::now())
+        .expect("reject succeeds");
+    let (rejected_step_id, reason) = match decision {
+        ApprovalDecision::Rejected {
+            step_id, reason, ..
+        } => (step_id, reason),
+        other => panic!("expected Rejected, got {other:?}"),
+    };
+    assert_eq!(rejected_step_id, "gate");
+
+    let record_after_reject = store.load(&run_id).unwrap();
+    assert_eq!(record_after_reject.status, RunStatus::Rejected);
+    assert!(record_after_reject
+        .error_message
+        .as_deref()
+        .unwrap_or_default()
+        .contains(&reason));
+
+    // --- Cleanup: dispatch the on_reject chain. ---
+    let prior_records = store.read_step_results(&run_id).unwrap();
+    let prior_step_results: Vec<StepResult> =
+        prior_records.iter().map(StepResult::from).collect();
+    assert!(
+        prior_step_results.is_empty(),
+        "the gate never completed, so no prior step results exist yet"
+    );
+
+    let factory = Arc::new(EchoFactory::default());
+    let opts2 = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: record_after_reject.workspace_id.clone(),
+        workspace_path: record_after_reject.workspace_path.clone(),
+        transcript_dir: record_after_reject.transcript_dir.clone(),
+        factory: factory.clone(),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_GATE_REJECT.to_string()),
+        resume_from: Some(ResumeState::from_rejection(
+            run_id.clone(),
+            prior_step_results,
+            rejected_step_id.clone(),
+            reason.clone(),
+        )),
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        pause: None,
+    };
+
+    run_reject_cleanup(opts2, &rejected_step_id, &reason)
+        .await
+        .expect("cleanup never errors");
+
+    // The on_reject step actually dispatched through the factory.
+    assert_eq!(
+        factory.seen.lock().unwrap().clone(),
+        vec!["notify_fail".to_string()]
+    );
+
+    let records = store.read_step_results(&run_id).unwrap();
+    assert_eq!(records.len(), 2, "gate + on_reject step both persisted");
+
+    let gate_record = records
+        .iter()
+        .find(|r| r.step_id == "gate")
+        .expect("gate result persisted");
+    assert_eq!(gate_record.kind, StepKind::ApprovalGate);
+    assert!(gate_record.success);
+    let gate_output: serde_json::Value =
+        serde_json::from_str(&gate_record.output).expect("gate output is JSON");
+    assert_eq!(gate_output["decision"], "rejected");
+    assert_eq!(gate_output["via"], "human");
+
+    let cleanup_record = records
+        .iter()
+        .find(|r| r.step_id == "notify_fail")
+        .expect("on_reject step result persisted");
+    assert!(cleanup_record.success);
+    assert!(
+        cleanup_record.output.contains("cleanup after reject: rejected"),
+        "on_reject step should see steps.gate.decision == rejected; got {:?}",
+        cleanup_record.output
+    );
+
+    // The terminal status set by `RunStore::reject` is untouched by cleanup.
+    let record_final = store.load(&run_id).unwrap();
+    assert_eq!(record_final.status, RunStatus::Rejected);
+}
+
+// ---------------------------------------------------------------------------
+// Test 6 — a failing on_reject step doesn't change the terminal outcome.
+// ---------------------------------------------------------------------------
+
+const WF_GATE_REJECT_FAILING_CLEANUP: &str = r#"
+name: gate-reject-failing-cleanup
+steps:
+  - id: gate
+    approval:
+      prompt: "Approve the deploy?"
+      on_reject:
+        - id: notify_fail
+          agent: worker
+          prompt: "cleanup after reject"
+"#;
+
+#[tokio::test]
+async fn reject_cleanup_step_failure_does_not_change_terminal_outcome() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let wf = Workflow::parse(WF_GATE_REJECT_FAILING_CLEANUP).unwrap();
+
+    let opts1 = OrchestratorRunOpts {
+        workflow: wf.clone(),
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_gate_reject_fail".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_GATE_REJECT_FAILING_CLEANUP.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        pause: None,
+    };
+    let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
+    let run_id = res1.run_id.clone();
+
+    let decision = store
+        .reject(&run_id, "operator", "no", chrono::Utc::now())
+        .expect("reject succeeds");
+    let (rejected_step_id, reason) = match decision {
+        ApprovalDecision::Rejected {
+            step_id, reason, ..
+        } => (step_id, reason),
+        other => panic!("expected Rejected, got {other:?}"),
+    };
+
+    let record_after_reject = store.load(&run_id).unwrap();
+
+    let opts2 = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: record_after_reject.workspace_id.clone(),
+        workspace_path: record_after_reject.workspace_path.clone(),
+        transcript_dir: record_after_reject.transcript_dir.clone(),
+        factory: Arc::new(FailFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_GATE_REJECT_FAILING_CLEANUP.to_string()),
+        resume_from: Some(ResumeState::from_rejection(
+            run_id.clone(),
+            Vec::new(),
+            rejected_step_id.clone(),
+            reason.clone(),
+        )),
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        pause: None,
+    };
+
+    run_reject_cleanup(opts2, &rejected_step_id, &reason)
+        .await
+        .expect("a failing cleanup step is logged, not returned as an error");
+
+    let records = store.read_step_results(&run_id).unwrap();
+    let cleanup_record = records
+        .iter()
+        .find(|r| r.step_id == "notify_fail")
+        .expect("on_reject step result persisted even on failure");
+    assert!(
+        !cleanup_record.success,
+        "the cleanup step's own failure must be recorded"
+    );
+
+    // The run's terminal status is exactly what `RunStore::reject` set —
+    // a failing cleanup step never touches it.
+    let record_final = store.load(&run_id).unwrap();
+    assert_eq!(record_final.status, RunStatus::Rejected);
+}
+
+// ---------------------------------------------------------------------------
+// Test 7 — a gate with an EMPTY on_reject: cleanup is a true no-op.
+// ---------------------------------------------------------------------------
+
+const WF_GATE_REJECT_EMPTY: &str = r#"
+name: gate-reject-empty
+steps:
+  - id: gate
+    approval:
+      prompt: "Approve the deploy?"
+"#;
+
+#[tokio::test]
+async fn reject_cleanup_with_empty_on_reject_dispatches_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let wf = Workflow::parse(WF_GATE_REJECT_EMPTY).unwrap();
+
+    let opts1 = OrchestratorRunOpts {
+        workflow: wf.clone(),
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_gate_reject_empty".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_GATE_REJECT_EMPTY.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        pause: None,
+    };
+    let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
+    let run_id = res1.run_id.clone();
+
+    let decision = store
+        .reject(&run_id, "operator", "no thanks", chrono::Utc::now())
+        .expect("reject succeeds");
+    let (rejected_step_id, reason) = match decision {
+        ApprovalDecision::Rejected {
+            step_id, reason, ..
+        } => (step_id, reason),
+        other => panic!("expected Rejected, got {other:?}"),
+    };
+
+    let record_after_reject = store.load(&run_id).unwrap();
+
+    // PanicFactory proves nothing is ever dispatched — an empty on_reject
+    // chain must not call the factory at all.
+    let opts2 = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: record_after_reject.workspace_id.clone(),
+        workspace_path: record_after_reject.workspace_path.clone(),
+        transcript_dir: record_after_reject.transcript_dir.clone(),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_GATE_REJECT_EMPTY.to_string()),
+        resume_from: Some(ResumeState::from_rejection(
+            run_id.clone(),
+            Vec::new(),
+            rejected_step_id.clone(),
+            reason.clone(),
+        )),
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        pause: None,
+    };
+
+    run_reject_cleanup(opts2, &rejected_step_id, &reason)
+        .await
+        .expect("empty on_reject is Ok without dispatching anything");
+
+    // Only the gate's own (pre-existing, since Task 3 doesn't record a
+    // rejected gate result outside of Task 4) result set is untouched by
+    // an empty chain: still just the terminal record, no new steps.
+    let records = store.read_step_results(&run_id).unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "an empty on_reject still records the gate's own rejected result, nothing else"
+    );
+    assert_eq!(records[0].step_id, "gate");
+
+    let record_final = store.load(&run_id).unwrap();
+    assert_eq!(record_final.status, RunStatus::Rejected);
 }
