@@ -5,10 +5,13 @@
 
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Inbox, ShieldCheck, ShieldOff } from 'lucide-react';
+import { ShieldCheck, ShieldOff } from 'lucide-react';
 import { api, type CoverageSummary } from '../lib/api';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
+import { EmptyState } from '../components/ui/EmptyState';
+import { ErrorBanner } from '../components/ui/ErrorBanner';
+import { Spinner } from '../components/ui/Spinner';
 import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 
@@ -83,16 +86,17 @@ export default function Coverage() {
         </p>
       </header>
 
-      {error && (
-        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {error}
-        </div>
-      )}
+      {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
       {targets === null ? (
-        <div className="text-sm text-ink-dim">Loading coverage…</div>
+        <div className="py-16 flex items-center justify-center">
+          <Spinner label="Loading coverage…" />
+        </div>
       ) : all.length === 0 ? (
-        <EmptyState />
+        <EmptyState
+          title="No coverage data"
+          hint="Run an assessment workflow to start recording coverage assertions and findings."
+        />
       ) : (
         <div className="space-y-8">
           {windowedGroups
@@ -165,17 +169,19 @@ function CoverageGroupTable({
     {
       key: 'target',
       header: 'Target',
+      subject: true,
       sortable: true,
       sortValue: (t) => t.target_id,
+      titleValue: (t) => t.target_id,
       render: (t) => (
-        <span className="font-mono text-sm font-medium text-ink truncate block">{t.target_id}</span>
+        <span className="font-mono text-sm font-medium text-ink">{t.target_id}</span>
       ),
     },
     {
       key: 'assertions',
       header: 'Assertions',
       align: 'right',
-      width: 'w-56',
+      fit: true,
       sortable: true,
       sortValue: (t) => t.assertion_lines,
       render: (t) => {
@@ -197,7 +203,7 @@ function CoverageGroupTable({
       key: 'findings',
       header: 'Findings',
       align: 'right',
-      width: 'w-28',
+      fit: true,
       sortable: true,
       sortValue: (t) => t.findings,
       render: (t) => <FindingsBadge count={t.findings} hasFindings={t.findings > 0} />,
@@ -206,7 +212,7 @@ function CoverageGroupTable({
       key: 'catalog',
       header: 'Catalog',
       align: 'right',
-      width: 'w-24',
+      fit: true,
       render: (t) => <CatalogBadge present={t.has_catalog} />,
     },
   ];
@@ -251,19 +257,5 @@ function FindingsBadge({ count, hasFindings }: { count: number; hasFindings: boo
     >
       {count} finding{count !== 1 ? 's' : ''}
     </span>
-  );
-}
-
-function EmptyState() {
-  return (
-    <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
-        <Inbox size={20} className="text-ink-mute" />
-      </div>
-      <h2 className="text-sm font-medium text-ink">No coverage data</h2>
-      <p className="mt-1 text-xs text-ink-dim max-w-xs">
-        Run an assessment workflow to start recording coverage assertions and findings.
-      </p>
-    </div>
   );
 }
