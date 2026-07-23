@@ -1782,6 +1782,21 @@ fn resolve_workflow_path(
     }
 }
 
+/// Read + parse a run's persisted workflow snapshot — no config/resolver/
+/// MCP-registry/dispatcher rebuild, just the YAML on disk. Shared by
+/// [`gate_on_timeout_for`] and [`cheap_on_reject_chain_len`] so callers on
+/// the same run don't each pay for their own read + parse.
+fn read_and_parse_workflow_snapshot(
+    store: &rupu_orchestrator::RunStore,
+    run_id: &str,
+) -> anyhow::Result<rupu_orchestrator::Workflow> {
+    let body = store
+        .read_workflow_snapshot(run_id)
+        .map_err(|e| anyhow::anyhow!("read workflow snapshot: {e}"))?;
+    rupu_orchestrator::Workflow::parse(&body)
+        .map_err(|e| anyhow::anyhow!("parse workflow snapshot: {e}"))
+}
+
 /// Resolve `record`'s gate `on_timeout` policy for the lazy-expiry
 /// checks the CLI does before an `approve` / the `runs` listing's
 /// sweep, by loading the run's persisted workflow snapshot.
@@ -1794,8 +1809,8 @@ fn gate_on_timeout_for(
     record: &rupu_orchestrator::RunRecord,
 ) -> Option<rupu_orchestrator::TimeoutAction> {
     let step_id = record.awaiting_step_id.as_deref()?;
-    let body = match store.read_workflow_snapshot(&record.id) {
-        Ok(body) => body,
+    let workflow = match read_and_parse_workflow_snapshot(store, &record.id) {
+        Ok(wf) => wf,
         Err(e) => {
             eprintln!(
                 "warning: could not read workflow snapshot for run {} to resolve gate \
@@ -1805,18 +1820,35 @@ fn gate_on_timeout_for(
             return None;
         }
     };
-    let workflow = match rupu_orchestrator::Workflow::parse(&body) {
-        Ok(wf) => wf,
-        Err(e) => {
-            eprintln!(
-                "warning: could not parse workflow snapshot for run {} to resolve gate \
-                 on_timeout; defaulting to `fail`: {e}",
-                record.id
-            );
-            return None;
-        }
-    };
     rupu_orchestrator::gate_timeout_action(&workflow, step_id)
+}
+
+/// Cheap pre-check for the reject-cleanup path (`rupu workflow reject`, the
+/// timeout-reject branch of `approve`, and the `runs` listing's lazy-expiry
+/// sweep): parse the run's persisted workflow snapshot only (no
+/// config/resolver/MCP-registry/dispatcher rebuild) and return the rejected
+/// step's `on_reject` chain length.
+///
+/// `Some(0)` means "definitely nothing to run" — a legacy inline-approval
+/// step, or a gate node with an empty (or absent) `on_reject:` — so the
+/// caller should skip [`crate::resume::build_reject_cleanup_opts`]'s heavy
+/// rebuild entirely and print nothing. `None` means the cheap parse itself
+/// failed (unreadable/unparseable snapshot, or the step id wasn't found);
+/// callers fall through to the heavy path so its existing warning fires
+/// rather than silently assuming there's no cleanup to do.
+fn cheap_on_reject_chain_len(
+    store: &rupu_orchestrator::RunStore,
+    run_id: &str,
+    step_id: &str,
+) -> Option<usize> {
+    let workflow = read_and_parse_workflow_snapshot(store, run_id).ok()?;
+    let step = workflow.steps.iter().find(|s| s.id == step_id)?;
+    Some(
+        step.approval
+            .as_ref()
+            .map(|a| a.on_reject.len())
+            .unwrap_or(0),
+    )
 }
 
 async fn runs(
@@ -1859,25 +1891,35 @@ async fn runs(
                     "rupu: gate timed out (on_timeout: reject) — run {} auto-rejected at step `{}`",
                     r.id, step_id
                 );
-                match crate::resume::build_reject_cleanup_opts(&store, &r.id, &step_id, &reason, None)
-                    .await
-                {
-                    Ok((opts, chain_len)) => match rupu_orchestrator::runner::run_reject_cleanup(
-                        opts, &step_id, &reason, "timeout",
+                if cheap_on_reject_chain_len(&store, &r.id, &step_id) != Some(0) {
+                    match crate::resume::build_reject_cleanup_opts(
+                        &store, &r.id, &step_id, &reason, None,
                     )
                     .await
                     {
-                        Ok(()) => println!("cleanup: {chain_len} step(s) executed"),
+                        Ok((opts, chain_len)) => {
+                            match rupu_orchestrator::runner::run_reject_cleanup(
+                                opts, &step_id, &reason, "timeout",
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    if chain_len > 0 {
+                                        println!("cleanup: {chain_len} step(s) executed");
+                                    }
+                                }
+                                Err(e) => eprintln!(
+                                    "warning: on_reject cleanup chain errored for run {}: {e}",
+                                    r.id
+                                ),
+                            }
+                        }
                         Err(e) => eprintln!(
-                            "warning: on_reject cleanup chain errored for run {}: {e}",
+                            "warning: could not load workflow for on_reject cleanup on run {}: {e} \
+                             (run is already correctly rejected)",
                             r.id
                         ),
-                    },
-                    Err(e) => eprintln!(
-                        "warning: could not load workflow for on_reject cleanup on run {}: {e} \
-                         (run is already correctly rejected)",
-                        r.id
-                    ),
+                    }
                 }
             }
             Ok(Some(rupu_orchestrator::TimeoutAction::Fail)) | Ok(None) => {}
@@ -2186,24 +2228,32 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
             println!(
                 "rupu: gate timed out (on_timeout: reject) — run {run_id} auto-rejected at step `{step_id}`"
             );
-            match crate::resume::build_reject_cleanup_opts(&store, run_id, &step_id, &reason, mode)
+            if cheap_on_reject_chain_len(&store, run_id, &step_id) != Some(0) {
+                match crate::resume::build_reject_cleanup_opts(
+                    &store, run_id, &step_id, &reason, mode,
+                )
                 .await
-            {
-                Ok((opts, chain_len)) => {
-                    match rupu_orchestrator::runner::run_reject_cleanup(
-                        opts, &step_id, &reason, "timeout",
-                    )
-                    .await
-                    {
-                        Ok(()) => println!("cleanup: {chain_len} step(s) executed"),
-                        Err(e) => eprintln!("warning: on_reject cleanup chain errored: {e}"),
+                {
+                    Ok((opts, chain_len)) => {
+                        match rupu_orchestrator::runner::run_reject_cleanup(
+                            opts, &step_id, &reason, "timeout",
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                if chain_len > 0 {
+                                    println!("cleanup: {chain_len} step(s) executed");
+                                }
+                            }
+                            Err(e) => eprintln!("warning: on_reject cleanup chain errored: {e}"),
+                        }
                     }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "warning: could not load workflow for on_reject cleanup: {e} \
-                         (run is already correctly rejected)"
-                    );
+                    Err(e) => {
+                        eprintln!(
+                            "warning: could not load workflow for on_reject cleanup: {e} \
+                             (run is already correctly rejected)"
+                        );
+                    }
                 }
             }
             return Ok(());
@@ -2713,33 +2763,39 @@ async fn reject(run_id: &str, reason: Option<&str>) -> anyhow::Result<()> {
     // call above is what finalized it) — a cleanup-load failure is warned,
     // never turned into a command error. `on_reject` chains are optional;
     // most rejected gates have none.
-    match crate::resume::build_reject_cleanup_opts(
-        &store,
-        run_id,
-        &rejected_step_id,
-        &rejected_reason,
-        None,
-    )
-    .await
-    {
-        Ok((opts, chain_len)) => {
-            match rupu_orchestrator::runner::run_reject_cleanup(
-                opts,
-                &rejected_step_id,
-                &rejected_reason,
-                via,
-            )
-            .await
-            {
-                Ok(()) => println!("cleanup: {chain_len} step(s) executed"),
-                Err(e) => eprintln!("warning: on_reject cleanup chain errored: {e}"),
+    if cheap_on_reject_chain_len(&store, run_id, &rejected_step_id) != Some(0) {
+        match crate::resume::build_reject_cleanup_opts(
+            &store,
+            run_id,
+            &rejected_step_id,
+            &rejected_reason,
+            None,
+        )
+        .await
+        {
+            Ok((opts, chain_len)) => {
+                match rupu_orchestrator::runner::run_reject_cleanup(
+                    opts,
+                    &rejected_step_id,
+                    &rejected_reason,
+                    via,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        if chain_len > 0 {
+                            println!("cleanup: {chain_len} step(s) executed");
+                        }
+                    }
+                    Err(e) => eprintln!("warning: on_reject cleanup chain errored: {e}"),
+                }
             }
-        }
-        Err(e) => {
-            eprintln!(
-                "warning: could not load workflow for on_reject cleanup: {e} \
-                 (run is already correctly rejected)"
-            );
+            Err(e) => {
+                eprintln!(
+                    "warning: could not load workflow for on_reject cleanup: {e} \
+                     (run is already correctly rejected)"
+                );
+            }
         }
     }
     Ok(())

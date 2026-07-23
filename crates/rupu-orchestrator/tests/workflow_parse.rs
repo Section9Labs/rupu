@@ -1242,6 +1242,164 @@ steps:
 }
 
 #[test]
+fn inline_approval_rejects_auto_approve() {
+    let yaml = r#"
+name: bad
+steps:
+  - id: deploy
+    agent: deployer
+    prompt: "deploy"
+    approval:
+      required: true
+      auto_approve: "{{ true }}"
+"#;
+    let err = Workflow::parse(yaml).unwrap_err();
+    assert!(err.to_string().contains("auto_approve"), "got: {err}");
+}
+
+#[test]
+fn inline_approval_rejects_on_timeout() {
+    let yaml = r#"
+name: bad
+steps:
+  - id: deploy
+    agent: deployer
+    prompt: "deploy"
+    approval:
+      required: true
+      timeout_seconds: 60
+      on_timeout: approve
+"#;
+    let err = Workflow::parse(yaml).unwrap_err();
+    assert!(err.to_string().contains("on_timeout"), "got: {err}");
+}
+
+#[test]
+fn inline_approval_rejects_notify() {
+    let yaml = r#"
+name: bad
+steps:
+  - id: deploy
+    agent: deployer
+    prompt: "deploy"
+    approval:
+      required: true
+      notify:
+        - action: issues.comment
+          with:
+            body: "awaiting approval"
+"#;
+    let err = Workflow::parse(yaml).unwrap_err();
+    assert!(err.to_string().contains("notify"), "got: {err}");
+}
+
+#[test]
+fn inline_approval_rejects_on_reject() {
+    let yaml = r#"
+name: bad
+steps:
+  - id: deploy
+    agent: deployer
+    prompt: "deploy"
+    approval:
+      required: true
+      on_reject:
+        - id: cleanup
+          agent: cleaner
+          prompt: "clean up"
+"#;
+    let err = Workflow::parse(yaml).unwrap_err();
+    assert!(err.to_string().contains("on_reject"), "got: {err}");
+}
+
+#[test]
+fn inline_approval_plain_fields_still_parse() {
+    let yaml = r#"
+name: ok
+steps:
+  - id: deploy
+    agent: deployer
+    prompt: "deploy"
+    approval:
+      required: true
+      prompt: "Approve the deploy?"
+      timeout_seconds: 3600
+"#;
+    let wf = Workflow::parse(yaml).unwrap();
+    assert!(!is_approval_gate(&wf.steps[0]));
+    let ap = wf.steps[0].approval.as_ref().unwrap();
+    assert!(ap.required);
+    assert_eq!(ap.timeout_seconds, Some(3600));
+}
+
+#[test]
+fn gate_on_reject_sub_rejects_host() {
+    let yaml = r#"
+name: bad
+steps:
+  - id: g
+    approval:
+      on_reject:
+        - id: cleanup
+          agent: cleaner
+          prompt: "clean up"
+          host: worker-1
+"#;
+    let err = Workflow::parse(yaml).unwrap_err();
+    assert!(err.to_string().contains("host"), "got: {err}");
+}
+
+#[test]
+fn gate_on_reject_sub_rejects_when() {
+    let yaml = r#"
+name: bad
+steps:
+  - id: g
+    approval:
+      on_reject:
+        - id: cleanup
+          agent: cleaner
+          prompt: "clean up"
+          when: "{{ true }}"
+"#;
+    let err = Workflow::parse(yaml).unwrap_err();
+    assert!(err.to_string().contains("when"), "got: {err}");
+}
+
+#[test]
+fn gate_node_rejects_host() {
+    let yaml = r#"
+name: bad
+steps:
+  - id: g
+    approval:
+      prompt: "approve?"
+    host: worker-1
+"#;
+    let err = Workflow::parse(yaml).unwrap_err();
+    assert!(err.to_string().contains("host"), "got: {err}");
+}
+
+#[test]
+fn gate_on_reject_sub_id_collides_with_top_level_step() {
+    let yaml = r#"
+name: bad
+steps:
+  - id: cleanup
+    agent: someone
+    prompt: "p"
+  - id: g
+    approval:
+      on_reject:
+        - id: cleanup
+          agent: cleaner
+          prompt: "clean up"
+"#;
+    let err = Workflow::parse(yaml).unwrap_err();
+    assert!(err.to_string().contains("cleanup"), "got: {err}");
+}
+
+#[test]
 fn action_step_parses() {
     let yaml = r#"
 name: act

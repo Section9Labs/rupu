@@ -154,6 +154,14 @@ pub enum WorkflowParseError {
     GateOnTimeoutWithoutTimeout { step: String },
     #[error("step `{step}`: on_reject step `{sub}` must be a plain agent or action step (no nested gates, fan-out, panel, or branch)")]
     GateOnRejectInvalidStep { step: String, sub: String },
+    #[error("step `{step}`: on_reject step `{sub}` may not set `{field}` (cleanup sub-steps always run inline, unconditionally)")]
+    GateOnRejectUnsupportedField {
+        step: String,
+        sub: String,
+        field: &'static str,
+    },
+    #[error("step `{step}`: approval.{field} is only valid on a standalone approval gate step (remove agent/prompt to make this a gate node)")]
+    GateFieldsOnInlineApproval { step: String, field: &'static str },
     #[error("step `{step}`: `action:` is mutually exclusive with agent/prompt/for_each/parallel/panel")]
     ActionMutuallyExclusive { step: String },
     #[error("step `{step}`: `action:` must name a tool (e.g. scm.prs.create)")]
@@ -684,8 +692,9 @@ pub struct Approval {
     pub timeout_seconds: Option<u64>,
     /// Minijinja expression evaluated when the gate is reached (same
     /// context as `prompt:`). Truthy ⇒ the gate resolves as approved
-    /// (`via: auto`) without pausing. Only meaningful on a gate NODE
-    /// (standalone `approval:` step); ignored on the legacy inline option.
+    /// (`via: auto`) without pausing. Only valid on a gate NODE
+    /// (standalone `approval:` step); rejected at parse time on the
+    /// legacy inline option (agent/prompt alongside `approval:`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_approve: Option<String>,
     /// What a timed-out gate resolves to. Requires `timeout_seconds`.
@@ -1233,6 +1242,23 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
                     sub: sub.id.clone(),
                 });
             }
+            // Cleanup sub-steps run inline, unconditionally, right after the
+            // reject decision — `host:` (fleet placement) and `when:`
+            // (conditional skip) don't have a sensible meaning there.
+            if sub.host.is_some() {
+                return Err(WorkflowParseError::GateOnRejectUnsupportedField {
+                    step: step.id.clone(),
+                    sub: sub.id.clone(),
+                    field: "host",
+                });
+            }
+            if sub.when.is_some() {
+                return Err(WorkflowParseError::GateOnRejectUnsupportedField {
+                    step: step.id.clone(),
+                    sub: sub.id.clone(),
+                    field: "when",
+                });
+            }
             validate_step_shape(sub)?; // linear (or Plan-2 action) rules apply
         }
     } else if let Some(action) = &step.action {
@@ -1268,6 +1294,41 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
         }
     }
 
+    // The legacy inline `approval:` (alongside agent/prompt, or on a
+    // for_each step) only ever supported the plain
+    // required/prompt/timeout_seconds fields. Gate-routing fields are
+    // meaningful only on a standalone gate NODE; reject them here so an
+    // author who sets them on an inline step gets a clear parse-time
+    // error instead of the field silently doing nothing.
+    if let Some(ap) = &step.approval {
+        if !is_approval_gate(step) {
+            if ap.auto_approve.is_some() {
+                return Err(WorkflowParseError::GateFieldsOnInlineApproval {
+                    step: step.id.clone(),
+                    field: "auto_approve",
+                });
+            }
+            if ap.on_timeout.is_some() {
+                return Err(WorkflowParseError::GateFieldsOnInlineApproval {
+                    step: step.id.clone(),
+                    field: "on_timeout",
+                });
+            }
+            if !ap.notify.is_empty() {
+                return Err(WorkflowParseError::GateFieldsOnInlineApproval {
+                    step: step.id.clone(),
+                    field: "notify",
+                });
+            }
+            if !ap.on_reject.is_empty() {
+                return Err(WorkflowParseError::GateFieldsOnInlineApproval {
+                    step: step.id.clone(),
+                    field: "on_reject",
+                });
+            }
+        }
+    }
+
     // Validate distribute: only valid on for_each steps, and hosts must be non-empty.
     if let Some(dist) = &step.distribute {
         if step.for_each.is_none() {
@@ -1291,7 +1352,8 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
             && step.parallel.is_none()
             && step.for_each.is_none()
             && step.branch.is_none()
-            && step.action.is_none();
+            && step.action.is_none()
+            && !is_approval_gate(step);
         if !is_linear || step.distribute.is_some() {
             return Err(WorkflowParseError::HostOnNonLinearStep {
                 step: step.id.clone(),

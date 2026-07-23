@@ -2399,6 +2399,8 @@ mod tests {
             StepKind::Parallel,
             StepKind::Panel,
             StepKind::Branch,
+            StepKind::Action,
+            StepKind::ApprovalGate,
         ] {
             let mut rec = sample_step_result("k");
             rec.kind = kind;
