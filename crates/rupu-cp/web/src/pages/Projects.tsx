@@ -2,10 +2,13 @@
 // Each row is a project card that links to /projects/:wsId for the overview.
 
 import { useEffect, useState } from 'react';
-import { FolderGit2, GitBranch, GitFork } from 'lucide-react';
+import { GitBranch, GitFork } from 'lucide-react';
 import { api, type ProjectRow } from '../lib/api';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import UsageBarChart from '../components/charts/UsageBarChart';
+import { EmptyState } from '../components/ui/EmptyState';
+import { ErrorBanner } from '../components/ui/ErrorBanner';
+import { Spinner } from '../components/ui/Spinner';
 import { formatTokens, formatCost } from '../lib/usage';
 import { relativeTime } from '../lib/time';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
@@ -52,17 +55,20 @@ export default function Projects() {
         </p>
       </header>
 
-      {error && (
-        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {error}
+      {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
+
+      {projects === null && !error && (
+        <div className="py-16 flex items-center justify-center">
+          <Spinner label="Loading projects…" />
         </div>
       )}
 
-      {projects === null && !error && (
-        <div className="text-sm text-ink-dim">Loading projects…</div>
+      {projects !== null && projects.length === 0 && (
+        <EmptyState
+          title="No projects yet"
+          hint="No projects yet — run an agent against a directory to register it as a project."
+        />
       )}
-
-      {projects !== null && projects.length === 0 && <ProjectsEmpty />}
 
       {projects !== null && projects.length > 0 && (
         <>
@@ -106,13 +112,16 @@ const PROJECT_COLUMNS: Column<ProjectRow>[] = [
   {
     key: 'name',
     header: 'Name',
+    subject: true,
     sortable: true,
     sortValue: (p) => p.name,
+    titleValue: (p) => p.name,
     render: (p) => <span className="text-sm font-semibold text-ink">{p.name}</span>,
   },
   {
     key: 'path',
     header: 'Path',
+    fit: true,
     sortable: true,
     sortValue: (p) => p.path,
     render: (p) => (
@@ -122,6 +131,7 @@ const PROJECT_COLUMNS: Column<ProjectRow>[] = [
   {
     key: 'branch',
     header: 'Branch',
+    fit: true,
     sortable: true,
     sortValue: (p) => p.branch ?? null,
     render: (p) => (
@@ -147,7 +157,7 @@ const PROJECT_COLUMNS: Column<ProjectRow>[] = [
     key: 'runs',
     header: 'Runs',
     align: 'right',
-    width: 'w-20',
+    fit: true,
     sortable: true,
     sortValue: (p) => p.run_count,
     render: (p) => <span className="text-ink">{p.run_count ? String(p.run_count) : '—'}</span>,
@@ -156,7 +166,7 @@ const PROJECT_COLUMNS: Column<ProjectRow>[] = [
     key: 'tokens',
     header: 'Tokens',
     align: 'right',
-    width: 'w-24',
+    fit: true,
     sortable: true,
     sortValue: (p) => p.usage?.total_tokens ?? null,
     render: (p) => (
@@ -167,7 +177,7 @@ const PROJECT_COLUMNS: Column<ProjectRow>[] = [
     key: 'cost',
     header: 'Cost',
     align: 'right',
-    width: 'w-24',
+    fit: true,
     sortable: true,
     sortValue: (p) => p.usage?.cost_usd ?? null,
     render: (p) => (
@@ -178,7 +188,7 @@ const PROJECT_COLUMNS: Column<ProjectRow>[] = [
     key: 'last_active',
     header: 'Last active',
     align: 'right',
-    width: 'w-28',
+    fit: true,
     sortable: true,
     sortValue: (p) => {
       const t = projectLastActive(p);
@@ -190,17 +200,3 @@ const PROJECT_COLUMNS: Column<ProjectRow>[] = [
     },
   },
 ];
-
-function ProjectsEmpty() {
-  return (
-    <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
-        <FolderGit2 size={20} className="text-ink-mute" />
-      </div>
-      <h2 className="text-sm font-medium text-ink">No projects yet</h2>
-      <p className="mt-1 text-xs text-ink-dim max-w-xs">
-        No projects yet — run an agent against a directory to register it as a project.
-      </p>
-    </div>
-  );
-}
