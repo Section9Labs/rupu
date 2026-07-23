@@ -29,7 +29,7 @@
 - Consumes: `Approval.notify: Vec<NotifyAction>` (`NotifyAction { action: String, with: serde_json::Value }`, workflow.rs:736), `opts.action_dispatcher: Option<Arc<ToolDispatcher>>` (runner.rs:286), `execute_action_step` (runner.rs:1656, state-free), `render_action_args`, the in-scope `ctx`/`render_mode`/`opts.transcript_dir`.
 - Produces: a `fire_notify_hooks(opts, step_id, notify: &[NotifyAction], ctx, mode)` helper (or an inline loop) that, for each notify entry, synthesizes a throwaway `Step { id: format!("{step_id}.notify"), action: Some(n.action.clone()), with: Some(n.with.clone()), ..Default::default() }` and calls `execute_action_step(dispatcher, &synth, ctx, mode, /*continue_on_error*/ true, opts.transcript_dir...)` — matching execute_action_step's REAL current signature (read it: recon shows `(dispatcher, step, ctx, mode, continue_on_error) -> Result<StepResult, RunWorkflowError>` possibly with a transcript arg; match exactly). Errors are logged (`tracing::warn!`) and swallowed. Guarded: `if let Some(d) = opts.action_dispatcher.as_ref()` — else `tracing::warn!` "notify skipped: no action dispatcher" and continue. Fires ONLY on the actual-park path (after `auto_approve` resolves falsy / is absent), NOT when the gate auto-approves or is resume-suppressed.
 
-- [ ] **Step 1: Failing test** (extend `gate_node.rs`, reuse the fake-connector + dispatcher harness from `action_step.rs`)
+- [x] **Step 1: Failing test** (extend `gate_node.rs`, reuse the fake-connector + dispatcher harness from `action_step.rs`)
 
 ```rust
 // notify fires on park: a gate with notify: [{ action: issues.comment, with: {..} }]
@@ -44,10 +44,10 @@
 // call → run still parks AwaitingApproval (best-effort).
 ```
 
-- [ ] **Step 2: RED** — `cargo test -p rupu-orchestrator --test gate_node notify 2>&1 | tail -5` (notify never fires today).
-- [ ] **Step 3: Implement** the guarded best-effort loop in the gate block's park path. Read the gate block fully first — the `auto_approve` check, the `gate_suppressed` (resume) check, and the `StepAwaitingApproval` emit are all there; notify goes after the auto-approve/suppress early-exits and before (or right at) the awaiting emit.
-- [ ] **Step 4: GREEN** — `cargo test -p rupu-orchestrator` (gate_node + lib green; 4 flakes excepted), `cargo build --workspace`.
-- [ ] **Step 5: Commit** — `feat(orchestrator): gate notify hooks fire best-effort when a gate parks`
+- [x] **Step 2: RED** — `cargo test -p rupu-orchestrator --test gate_node notify 2>&1 | tail -5` (notify never fires today).
+- [x] **Step 3: Implement** the guarded best-effort loop in the gate block's park path. Read the gate block fully first — the `auto_approve` check, the `gate_suppressed` (resume) check, and the `StepAwaitingApproval` emit are all there; notify goes after the auto-approve/suppress early-exits and before (or right at) the awaiting emit.
+- [x] **Step 4: GREEN** — `cargo test -p rupu-orchestrator` (gate_node + lib green; 4 flakes excepted), `cargo build --workspace`.
+- [x] **Step 5: Commit** — `feat(orchestrator): gate notify hooks fire best-effort when a gate parks`
 
 ---
 
@@ -61,7 +61,7 @@
 - Consumes: `pid_is_running(pid) -> bool` (runs.rs:1695), `RunStatus`, `append_terminal_event` (runs.rs:1448), the `TimeoutAction::Fail` arm's field mutations (runs.rs:934-954) as the template.
 - Produces: `pub fn reap_if_orphaned(&self, record: &mut RunRecord, now: DateTime<Utc>) -> Result<bool, RunStoreError>` — returns `Ok(true)` and finalizes when `record.status` is `Running` (and/or `Pending`) AND `record.runner_pid` is `Some(pid)` AND `!pid_is_running(pid)`; else `Ok(false)`. Finalization: status → `Failed`, `finished_at = Some(now)`, `error_message = Some("runner process <pid> is no longer alive; run marked failed by the gate sweep")`, clear `runner_pid`/active-step fields (mirror cancel's field clears), `self.update(record)?`, then `append_terminal_event(&record.id, &Event::RunFailed { run_id, error, finished_at: now })`. A run with `runner_pid: None` in Running state (e.g. legitimately mid-handoff) is NOT reaped (returns false) — only a *dead recorded pid* is an orphan, to avoid racing a run between spawn and pid-write.
 
-- [ ] **Step 1: Failing tests**
+- [x] **Step 1: Failing tests**
 
 ```rust
 // reap_if_orphaned: Running + runner_pid = a definitely-dead pid (e.g. use
@@ -75,8 +75,8 @@
 ```
 (For the dead-pid case: the existing tests use a known-free pid; check how `cancel_running_*` tests fabricate pids and reuse that approach — do NOT actually kill anything.)
 
-- [ ] **Step 2: RED**, **Step 3: implement**, **Step 4: GREEN** — `cargo test -p rupu-orchestrator --lib reap 2>&1 | tail`.
-- [ ] **Step 5: Commit** — `feat(orchestrator): RunStore::reap_if_orphaned finalizes dead-pid runs as Failed`
+- [x] **Step 2: RED**, **Step 3: implement**, **Step 4: GREEN** — `cargo test -p rupu-orchestrator --lib reap 2>&1 | tail`.
+- [x] **Step 5: Commit** — `feat(orchestrator): RunStore::reap_if_orphaned finalizes dead-pid runs as Failed`
 
 ---
 
@@ -95,9 +95,9 @@
   - Every branch: log what it did; per-run errors are logged and swallowed (`continue`), never abort the sweep.
 - Extract the *decision* (not the IO) into a testable pure fn where practical, e.g. `fn sweep_decision(status: RunStatus, on_timeout: Option<TimeoutAction>, pid_alive: Option<bool>, is_remote: bool) -> SweepAction` where `SweepAction ∈ {Skip, ExpireThenCleanupReject, ExpireApprove, Reap}` — unit-test its truth table; the tick body maps `SweepAction` to the IO calls above.
 
-- [ ] **Step 1: Failing tests** — (a) `CpConfig` parse test: `gate_sweep_enabled` defaults true, `gate_sweep_interval_secs` defaults 60, both override from TOML (mirror the cron_tick test in `crates/rupu-config/tests/parse.rs`). (b) `sweep_decision` truth table: AwaitingApproval+Reject→ExpireThenCleanupReject; +Approve→ExpireApprove; +Fail/None→Skip; Running+dead-local-pid→Reap; Running+dead-pid-but-remote→Skip; Running+alive→Skip; terminal→Skip.
-- [ ] **Step 2: RED**, **Step 3: implement** (config flags + `sweep_decision` + the tick body wired via `run_periodic_tick` + the comment reword), **Step 4: GREEN** — `cargo test -p rupu-config`, `cargo test -p rupu-orchestrator`, `cargo build -p rupu-cli` (the sweep compiles + wires; the IO tick body is exercised manually in Task 4).
-- [ ] **Step 5: Commit** — `feat(cli): cp-serve gate sweep — timeout routing, web-reject cleanup, orphan reaping`
+- [x] **Step 1: Failing tests** — (a) `CpConfig` parse test: `gate_sweep_enabled` defaults true, `gate_sweep_interval_secs` defaults 60, both override from TOML (mirror the cron_tick test in `crates/rupu-config/tests/parse.rs`). (b) `sweep_decision` truth table: AwaitingApproval+Reject→ExpireThenCleanupReject; +Approve→ExpireApprove; +Fail/None→Skip; Running+dead-local-pid→Reap; Running+dead-pid-but-remote→Skip; Running+alive→Skip; terminal→Skip.
+- [x] **Step 2: RED**, **Step 3: implement** (config flags + `sweep_decision` + the tick body wired via `run_periodic_tick` + the comment reword), **Step 4: GREEN** — `cargo test -p rupu-config`, `cargo test -p rupu-orchestrator`, `cargo build -p rupu-cli` (the sweep compiles + wires; the IO tick body is exercised manually in Task 4).
+- [x] **Step 5: Commit** — `feat(cli): cp-serve gate sweep — timeout routing, web-reject cleanup, orphan reaping`
 
 ---
 
@@ -107,11 +107,11 @@
 - Modify: `.rupu/workflows/gate-demo.yaml` (add an `on_timeout` + a `notify:` hook using a READ tool so dogfooding never writes unexpectedly — e.g. `notify: [{ action: scm.prs.list, with: { owner: Section9Labs, repo: rupu, state: open } }]`; verify keys), `CLAUDE.md` (note notify + gate sweep; the [cp] flags), `docs/.../plan-4` tick "Deferred" done
 - Manual verification script (documented in the report, not committed): drive a real gate with a short `timeout_seconds` + `on_timeout: reject` + an `on_reject` step, start `rupu cp serve`, confirm the sweep expires + runs cleanup + the run ends Rejected with the cleanup step's result AND events.jsonl ends terminal.
 
-- [ ] **Step 1:** Update the sample; `cargo run -p rupu-cli -- workflow show gate-demo --view full` parses clean.
-- [ ] **Step 2: Manual sweep smoke** (document commands + observed outcome in the report): a gate with `timeout_seconds: 5, on_timeout: reject, on_reject: [<agent step>]`; `rupu workflow run` it to the park, then run `rupu cp serve` (or invoke the sweep tick directly if a test hook exists) and confirm after the interval: run.json status Rejected, the on_reject step_result persisted, `events.jsonl` last line is `run_completed`(rejected). Also fabricate an orphan (a Running run.json with a dead runner_pid) and confirm the sweep reaps it to Failed. If running the full daemon is impractical in the harness, invoke `run_gate_sweep`'s tick body once via a small integration test instead and say so.
-- [ ] **Step 3: Full verification** — `cargo test -p rupu-orchestrator -p rupu-config -p rupu-cli` (baseline flakes/redness excepted — compare, don't chase), `cargo build --workspace`, `cargo clippy -p rupu-orchestrator -p rupu-cli 2>&1 | grep -c "^error"` (report count; host/ssh.rs toolchain artifact excepted).
-- [ ] **Step 4: Update memory** — append to the arc memory (`project_gate_action_nodes_arc.md`) + the run-state-closure memory (`project_run_state_closure.md`): the orphan reaper is now BUILT (was the open follow-up), and the web-path timeout-reject cleanup is no longer orphaned.
-- [ ] **Step 5: Commit** — `feat(cli): gate-demo notify + on_timeout sample; sweep docs + memory`
+- [x] **Step 1:** Update the sample; `cargo run -p rupu-cli -- workflow show gate-demo --view full` parses clean.
+- [x] **Step 2: Manual sweep smoke** (document commands + observed outcome in the report): a gate with `timeout_seconds: 5, on_timeout: reject, on_reject: [<agent step>]`; `rupu workflow run` it to the park, then run `rupu cp serve` (or invoke the sweep tick directly if a test hook exists) and confirm after the interval: run.json status Rejected, the on_reject step_result persisted, `events.jsonl` last line is `run_completed`(rejected). Also fabricate an orphan (a Running run.json with a dead runner_pid) and confirm the sweep reaps it to Failed. If running the full daemon is impractical in the harness, invoke `run_gate_sweep`'s tick body once via a small integration test instead and say so.
+- [x] **Step 3: Full verification** — `cargo test -p rupu-orchestrator -p rupu-config -p rupu-cli` (baseline flakes/redness excepted — compare, don't chase), `cargo build --workspace`, `cargo clippy -p rupu-orchestrator -p rupu-cli 2>&1 | grep -c "^error"` (report count; host/ssh.rs toolchain artifact excepted).
+- [x] **Step 4: Update memory** — append to the arc memory (`project_gate_action_nodes_arc.md`) + the run-state-closure memory (`project_run_state_closure.md`): the orphan reaper is now BUILT (was the open follow-up), and the web-path timeout-reject cleanup is no longer orphaned.
+- [x] **Step 5: Commit** — `feat(cli): gate-demo notify + on_timeout sample; sweep docs + memory`
 
 ---
 

@@ -11,6 +11,9 @@ steps:
       auto_approve: "{{ steps.assess.output == 'clean' }}"
       timeout_seconds: 86400
       on_timeout: reject
+      notify:
+        - action: scm.prs.list
+          with: { owner: Section9Labs, repo: rupu, state: open }
       on_reject:
         - id: note_rejection
           agent: code-reviewer
