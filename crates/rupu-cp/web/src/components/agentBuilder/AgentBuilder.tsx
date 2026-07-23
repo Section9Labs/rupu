@@ -129,10 +129,6 @@ function unionWantedCards(prev: string[], draft: AgentDraft): string[] {
 
 const GROUPS: CardMeta['group'][] = ['Core', 'Runtime', 'Advanced'];
 
-function cardIcon(id: string): string {
-  return id.slice(0, 2).toUpperCase();
-}
-
 function renderCardBody(
   id: string,
   draft: AgentDraft,
@@ -472,7 +468,9 @@ export default function AgentBuilder({
                         }}
                         aria-label={`add ${c.label} card`}
                       >
-                        <span className="ab-ic">{cardIcon(c.id)}</span>
+                        <span className="ab-ic">
+                          <c.icon className="ab-cicon" aria-hidden="true" />
+                        </span>
                         <div>
                           <div className="ab-pl">{c.label}</div>
                           <div className="ab-pd mono">{c.yamlKeys}</div>
@@ -561,7 +559,9 @@ export default function AgentBuilder({
                         <span className="ab-grip" aria-hidden="true">
                           ⠿
                         </span>
-                        <span className="ab-ic">{cardIcon(id)}</span>
+                        <span className="ab-ic">
+                          <meta.icon className="ab-cicon" aria-hidden="true" />
+                        </span>
                         <span className="ab-ct">{meta.label}</span>
                         <span className="ab-cyaml mono">{meta.yamlKeys}</span>
                         {!meta.required && (
