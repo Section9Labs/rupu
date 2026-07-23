@@ -60,6 +60,7 @@ pub async fn handle(action: Action) -> ExitCode {
             // claims/approves/resumes runs the web UI marked for resume.
             let store = Arc::new(RunStore::new(global_dir.join("runs")));
             let worker_id = format!("cp-serve-{}", std::process::id());
+            let gate_sweep_worker_id = format!("{worker_id}-gate-sweep");
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             tracing::info!(
                 worker_id = %worker_id,
@@ -155,8 +156,9 @@ pub async fn handle(action: Action) -> ExitCode {
                     let store = Arc::clone(&gate_sweep_store);
                     let hosts = rupu_workspace::HostStore { root: gate_sweep_hosts.root.clone() };
                     let exe = gate_sweep_exe.clone();
+                    let worker_id = gate_sweep_worker_id.clone();
                     async move {
-                        run_gate_sweep(store, hosts, exe).await;
+                        run_gate_sweep(store, hosts, exe, worker_id).await;
                     }
                 },
             ));
@@ -621,9 +623,13 @@ async fn run_resume_worker(
 ///
 /// * `AwaitingApproval` (non-remote): resolve the gate's `on_timeout`, call
 ///   `expire_if_overdue` (finalizes the `Fail`/default timeout, or no-ops
-///   when not overdue), then — per the decision — spawn a detached
-///   `rupu workflow approve <id>` (`on_timeout: approve`) or run the
-///   `on_reject` cleanup chain (`on_timeout: reject`).
+///   when not overdue), then — per the decision — claim the resume lease
+///   and spawn a detached `rupu workflow approve <id>` (`on_timeout:
+///   approve`) or run the `on_reject` cleanup chain (`on_timeout: reject`).
+///   The claim (via [`RunStore::claim_resume`]) guards against the SAME run
+///   also being picked up by the web-approve `run_resume_worker` — both
+///   paths race on the same lease field regardless of which one requested
+///   the resume, so whichever claims first wins and the other backs off.
 /// * `Running`/`Pending` (non-remote) with a dead recorded runner pid:
 ///   `reap_if_orphaned` finalizes it `Failed`.
 ///
@@ -635,6 +641,7 @@ async fn run_gate_sweep(
     store: Arc<RunStore>,
     hosts: rupu_workspace::HostStore,
     exe: std::path::PathBuf,
+    worker_id: String,
 ) {
     let now = chrono::Utc::now();
 
@@ -703,6 +710,26 @@ async fn run_gate_sweep(
                         }
                     }
                     SweepAction::ExpireApprove => {
+                        // Claim the resume lease before spawning: the web
+                        // approve path's `run_resume_worker` also spawns
+                        // `workflow approve` for AwaitingApproval runs it
+                        // finds via `list_pending_resume`, and both paths
+                        // race on the SAME `resume_claimed_at` field
+                        // regardless of which one requested the resume — so
+                        // claiming here stops the sweep from re-spawning a
+                        // second approve for a run the resume worker (or a
+                        // prior sweep tick) already handed off.
+                        let claimed = match store.claim_resume(&run_id, &worker_id, now) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::warn!(run_id = %run_id, error = %e, "gate sweep: claim_resume failed");
+                                continue;
+                            }
+                        };
+                        if !claimed {
+                            tracing::info!(run_id = %run_id, "gate-sweep: approve already claimed for run_id, skipping");
+                            continue;
+                        }
                         // expire left the record AwaitingApproval; hand off to a
                         // detached `rupu workflow approve <id>`, which re-resolves
                         // the on_timeout: approve policy and does the approve +
@@ -720,6 +747,13 @@ async fn run_gate_sweep(
                             Err(e) => {
                                 tracing::error!(run_id = %run_id, error = %e, "gate sweep: failed to spawn workflow approve for on_timeout=approve");
                             }
+                        }
+                        // The spawned child now owns the run (or the spawn
+                        // failed and we don't want to strand the lease
+                        // either way) — clear the marker/claim exactly like
+                        // the resume worker does after its own spawn.
+                        if let Err(ce) = store.clear_resume(&run_id, now) {
+                            tracing::warn!(run_id = %run_id, error = %ce, "gate sweep: clear_resume failed");
                         }
                     }
                     SweepAction::ExpireThenCleanupReject => {

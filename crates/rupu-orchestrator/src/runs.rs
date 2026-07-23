@@ -973,6 +973,15 @@ impl RunStore {
         }
     }
 
+    /// Public entry to [`gate_on_timeout`](Self::gate_on_timeout) for
+    /// out-of-crate callers (the cp-serve gate sweep, Plan 4) that need to
+    /// resolve a paused run's gate `on_timeout` routing before calling
+    /// [`expire_if_overdue`](Self::expire_if_overdue) themselves. Same
+    /// best-effort `None`-on-any-failure contract as the private resolver.
+    pub fn resolve_gate_timeout(&self, record: &RunRecord) -> Option<TimeoutAction> {
+        self.gate_on_timeout(record)
+    }
+
     /// Resolve the `on_timeout` routing configured on the gate NODE
     /// `record` is paused at, by loading the run's persisted workflow
     /// snapshot. `None` — collapsing to
@@ -983,15 +992,6 @@ impl RunStore {
     /// or fails to parse, even though it parsed fine when the run
     /// started) — the latter is logged loudly since it signals
     /// corrupted on-disk state, not an absent policy.
-    /// Public entry to [`gate_on_timeout`](Self::gate_on_timeout) for
-    /// out-of-crate callers (the cp-serve gate sweep, Plan 4) that need to
-    /// resolve a paused run's gate `on_timeout` routing before calling
-    /// [`expire_if_overdue`](Self::expire_if_overdue) themselves. Same
-    /// best-effort `None`-on-any-failure contract as the private resolver.
-    pub fn resolve_gate_timeout(&self, record: &RunRecord) -> Option<TimeoutAction> {
-        self.gate_on_timeout(record)
-    }
-
     fn gate_on_timeout(&self, record: &RunRecord) -> Option<TimeoutAction> {
         let step_id = record.awaiting_step_id.as_deref()?;
         let body = match self.read_workflow_snapshot(&record.id) {
