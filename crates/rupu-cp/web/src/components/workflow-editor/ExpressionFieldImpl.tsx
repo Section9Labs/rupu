@@ -19,7 +19,6 @@ import {
   Decoration,
   ViewPlugin,
   drawSelection,
-  tooltips,
   type DecorationSet,
   type ViewUpdate,
 } from '@codemirror/view';
@@ -36,6 +35,13 @@ import {
 import { completionsFor, type ExprContext, type ExprKind } from '../../lib/workflowExpressions';
 import type { ExpressionFieldProps } from './ExpressionField';
 import type { Mode } from '../theme/ThemeProvider';
+import { buildTooltipExtensions } from '../cmTooltips';
+
+// Re-exported for backward compatibility — `buildTooltipExtensions` now lives
+// in the shared `cmTooltips` module (CodeEditorImpl's markdown mode needs it
+// too), but this module keeps exporting it so existing imports/tests
+// (`ExpressionField.test.tsx`) keep working unchanged.
+export { buildTooltipExtensions } from '../cmTooltips';
 
 // ── mustache scanning (shared by highlighter + completion gate) ───────────────
 
@@ -157,20 +163,6 @@ function makeCompletionSource(getContext: () => ExprContext) {
     if (options.length === 0) return null;
     return { from: word.from, options, filter: false };
   };
-}
-
-/** Body-parented, viewport-fixed tooltip config — the completion popup would
- *  otherwise render inside the editor DOM and get clipped by the inspector
- *  rail's `overflow-y-auto` (matt's screenshot: dropdown cut off after one
- *  row). `position: 'fixed'` makes CM's coordinates viewport-based so
- *  body-parenting still tracks correctly, including on rail scroll. Exported
- *  (not just inlined below) so it's independently testable — jsdom's
- *  CodeMirror rendering is too limited to reliably assert the popup escapes
- *  the DOM by mounting it, so tests assert this builder's output instead.
- *  SSR/jsdom-safe: no-ops when `document` isn't available. */
-export function buildTooltipExtensions(): Extension[] {
-  if (typeof document === 'undefined') return [];
-  return [tooltips({ position: 'fixed', parent: document.body })];
 }
 
 // ── theme ─────────────────────────────────────────────────────────────────────
