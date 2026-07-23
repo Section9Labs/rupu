@@ -97,3 +97,9 @@ Composition (a light `FilterBar.tsx` layout component with slots), fixed order o
 - Tests: kit components (variant/active/nowrap assertions), usePagedList (paging, filter-reset, poll gating — mocked timers), 7a (standalone row gains agent+started_at from a fixture transcript; session_turn joins session.json), 7b (DTO forwards detail + issue_ref fallback; frontend renders expandable error).
 - Per-phase operator gate: matt eyeballs light+dark before each merge (the approved artifact is the visual reference: https://claude.ai/code/artifact/37cea336-89a1-4555-805b-1f142d1fb676).
 - Investigation baselines cite v0.59.2 line numbers; implementers re-verify against HEAD (confirmed identical at v0.63.0).
+
+## Amendments (2026-07-23, operator feedback round 2)
+
+1. **Find on every table (§6 extension):** the FilterBar search slot is standard on list pages, not optional. Behavior: case-insensitive substring across the table's searchable fields (subject, ids, issue refs, host/worker names); filters loaded rows live; footer shows `N matches of M loaded`; Esc clears; composes with pills/scope (narrows within active filters).
+2. **Agent Runs dedupe + source semantics (§7a extension):** session-turn runs exist in BOTH backend sources (standalone meta.json AND session.json runs[]) — 55 duplicates on the operator's data. `list_agent_runs` dedupes by run_id (merging fields; session-derived fields win when richer). The page gains a Source FilterPills group (All / Standalone / Session) defaulting to **Standalone** — agents reads as standalone invocations; session work lives with its session.
+3. **Build nav order:** Agents / Workflows / Autoflows.
