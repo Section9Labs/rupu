@@ -17,6 +17,7 @@
 
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
+import { MessageSquare } from 'lucide-react';
 import { api, type SessionSummary } from '../../lib/api';
 import SortableTable, { type Column } from '../lists/SortableTable';
 import UsageBarChart from '../charts/UsageBarChart';
@@ -249,6 +250,7 @@ export default function ProjectSessionsTab({ wsId }: { wsId: string }) {
         </div>
       ) : filtered.length === 0 ? (
         <EmptyState
+          icon={<MessageSquare size={20} />}
           title={rows.length === 0 ? 'No sessions for this project yet' : 'No sessions match this filter'}
         />
       ) : visible.length === 0 ? (

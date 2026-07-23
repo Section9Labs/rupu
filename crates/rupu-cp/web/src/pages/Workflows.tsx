@@ -3,7 +3,7 @@
 
 import { useEffect, useId, useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Plus, Sparkles } from 'lucide-react';
+import { Plus, Sparkles, Workflow as WorkflowIcon } from 'lucide-react';
 import { api, type ProviderModels, type WorkflowSummary } from '../lib/api';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
@@ -90,8 +90,14 @@ export default function Workflows() {
         </div>
       ) : sorted.length === 0 ? (
         <EmptyState
+          icon={<WorkflowIcon size={20} />}
           title="No workflows found"
-          hint="Add workflow YAML under .rupu/workflows/ to populate this library."
+          hint={
+            <>
+              Add workflow YAML under <span className="font-mono">.rupu/workflows/</span> to populate
+              this library.
+            </>
+          }
         />
       ) : (
         <section>

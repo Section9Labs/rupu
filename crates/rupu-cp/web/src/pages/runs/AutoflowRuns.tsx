@@ -33,6 +33,7 @@ import UsageChip from '../../components/UsageChip';
 import { Button } from '../../components/ui/Button';
 import { FilterBar } from '../../components/ui/FilterBar';
 import { Segmented, type SegmentedOption } from '../../components/ui/Segmented';
+import { Badge } from '../../components/ui/Badge';
 import { SearchInput } from '../../components/ui/SearchInput';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { ErrorBanner } from '../../components/ui/ErrorBanner';
@@ -103,14 +104,6 @@ function CycleFailedPill() {
     >
       <Icon size={10} />
       CYCLE FAILED
-    </span>
-  );
-}
-
-function IssueChip({ displayRef }: { displayRef: string }) {
-  return (
-    <span className="inline-flex items-center rounded bg-surface text-ink ring-1 ring-border text-meta font-medium px-1.5 py-0.5">
-      {displayRef}
     </span>
   );
 }
@@ -224,7 +217,9 @@ const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
     sortValue: (e) => e.issue_display_ref ?? null,
     render: (e) =>
       e.issue_display_ref ? (
-        <IssueChip displayRef={e.issue_display_ref} />
+        <Badge tone="neutral" ring>
+          {e.issue_display_ref}
+        </Badge>
       ) : (
         <span className="text-ink-mute">—</span>
       ),
@@ -588,7 +583,11 @@ export default function AutoflowRuns() {
       fit: true,
       sortable: true,
       sortValue: (c) => c.workflow,
-      render: (c) => <IssueChip displayRef={c.workflow} />,
+      render: (c) => (
+        <Badge tone="neutral" ring>
+          {c.workflow}
+        </Badge>
+      ),
     },
     {
       key: 'repo',

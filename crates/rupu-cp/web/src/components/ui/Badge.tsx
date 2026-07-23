@@ -37,11 +37,16 @@ const SIZE_CLS: Record<BadgeSize, string> = {
 export interface BadgeProps extends HTMLAttributes<HTMLSpanElement> {
   tone?: BadgeTone;
   size?: BadgeSize;
+  /** Adds the `ring-1 ring-border` bordered look (the "quiet metadata, but
+   *  outlined" treatment several hand-rolled local badge components used
+   *  before being flattened onto this primitive). Off by default — flat. */
+  ring?: boolean;
 }
 
 export function Badge({
   tone = 'neutral',
   size = 'sm',
+  ring = false,
   className,
   ...rest
 }: BadgeProps) {
@@ -51,6 +56,7 @@ export function Badge({
         'inline-flex items-center rounded font-medium whitespace-nowrap',
         TONE_CLS[tone],
         SIZE_CLS[size],
+        ring && 'ring-1 ring-border',
         className,
       )}
       {...rest}

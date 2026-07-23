@@ -82,8 +82,14 @@ export default function Agents() {
         </div>
       ) : sorted.length === 0 ? (
         <EmptyState
+          icon={<Sparkles size={20} />}
           title="No agents found"
-          hint="Add agent files under .rupu/agents/ to populate this library."
+          hint={
+            <>
+              Add agent files under <span className="font-mono">.rupu/agents/</span> to populate this
+              library.
+            </>
+          }
         />
       ) : (
         <section>
