@@ -76,7 +76,7 @@ describe('AgentRuns — FilterBar', () => {
     renderPage();
 
     const pills = await screen.findByRole('button', { name: 'Running' });
-    const hostSelect = screen.getByLabelText('Host');
+    const hostSelect = screen.getByLabelText('Host filter');
     // The pills group precedes the host select in document order.
     expect(pills.compareDocumentPosition(hostSelect) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
@@ -163,9 +163,9 @@ describe('AgentRuns host filter — server-driven', () => {
     const runsSpy = vi.spyOn(api, 'getAgentRuns').mockResolvedValue([]);
 
     renderPage();
-    await waitFor(() => expect(screen.getByLabelText('Host')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText('Host filter')).toBeInTheDocument());
 
-    fireEvent.change(screen.getByLabelText('Host'), { target: { value: '__all__' } });
+    fireEvent.change(screen.getByLabelText('Host filter'), { target: { value: '__all__' } });
 
     await waitFor(() => {
       const calls = runsSpy.mock.calls;
@@ -183,7 +183,7 @@ describe('AgentRuns host filter — server-driven', () => {
       expect(screen.getByRole('option', { name: 'prod' })).toBeInTheDocument(),
     );
 
-    fireEvent.change(screen.getByLabelText('Host'), { target: { value: 'host_prod' } });
+    fireEvent.change(screen.getByLabelText('Host filter'), { target: { value: 'host_prod' } });
 
     await waitFor(() =>
       expect(runsSpy).toHaveBeenCalledWith(expect.objectContaining({ host: 'host_prod' })),
@@ -264,6 +264,38 @@ describe('AgentRuns — status column', () => {
     renderPage();
 
     await waitFor(() => expect(screen.getAllByText('—').length).toBeGreaterThan(0));
+  });
+
+  it('normalizes a session-branch "ok" wire status to the green Completed pill (no AlertCircle fallback)', async () => {
+    stubDeps();
+    const okRow: AgentRunRow = { ...SESSION_ROW, status: 'ok' };
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([okRow]);
+
+    renderPage();
+
+    // "Completed" also names the (unrelated) lifecycle filter pill button, so
+    // disambiguate by tag: the status pill is a <span>, the filter is a
+    // <button>.
+    await waitFor(() => expect(screen.getAllByText('Completed').length).toBeGreaterThan(0));
+    const status = screen.getAllByText('Completed').find((el) => el.tagName === 'SPAN');
+    expect(status).toBeDefined();
+    expect(status).toHaveClass('bg-status-done/10');
+    // CheckCircle2 (the completed icon), never AlertCircle (the
+    // unknown-status fallback) — proves the wire "ok" hit the real
+    // descriptor, not StatusPill's fallback branch.
+    expect(status?.querySelector('svg')).toHaveClass('lucide-circle-check');
+  });
+
+  it('normalizes a session-branch "error" wire status to the Failed pill', async () => {
+    stubDeps();
+    const errorRow: AgentRunRow = { ...SESSION_ROW, status: 'error' };
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([errorRow]);
+
+    renderPage();
+
+    const status = await screen.findByText('Failed');
+    expect(status.closest('span')).toHaveClass('bg-status-failed/10');
+    expect(status.closest('span')?.querySelector('svg')).toHaveClass('lucide-circle-x');
   });
 });
 

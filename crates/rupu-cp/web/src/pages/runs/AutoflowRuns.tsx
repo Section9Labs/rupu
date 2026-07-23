@@ -20,6 +20,7 @@ import {
   type AutoflowClaim,
   type AutoflowCycleRow,
   type AutoflowEventRow,
+  type RunStatusStr,
 } from '../../lib/api';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import UsageChip from '../../components/UsageChip';
@@ -30,7 +31,7 @@ import { EmptyState } from '../../components/ui/EmptyState';
 import { ErrorBanner } from '../../components/ui/ErrorBanner';
 import { Spinner } from '../../components/ui/Spinner';
 import HostSelect, { ALL_HOSTS } from '../../components/HostSelect';
-import { RUN_STATUS_STYLES } from '../../components/StatusPill';
+import { RUN_STATUS_STYLES, StatusPill } from '../../components/StatusPill';
 import { usePagedList } from '../../lib/usePagedList';
 import { cn } from '../../lib/cn';
 import { durationBetween, relativeTime } from '../../lib/time';
@@ -248,8 +249,10 @@ const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
     sortValue: (e) => e.status ?? null,
     render: (e) => {
       if (!isRunEvent(e)) return null;
+      // `e.status` is a serialized `RunStatus` (see rupu-cp's
+      // api/run_resolve.rs) — the same lexicon `StatusPill` speaks.
       return e.status ? (
-        <span className="text-ink-dim">{e.status}</span>
+        <StatusPill status={e.status as RunStatusStr} />
       ) : (
         <span className="text-ink-mute">—</span>
       );

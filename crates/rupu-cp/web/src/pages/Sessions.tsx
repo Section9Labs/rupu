@@ -153,9 +153,9 @@ export default function Sessions() {
             rows={rows}
             rowKey={(s) => s.session_id}
           />
-          {(hasMore || ended) && (
+          {(loading || hasMore || ended) && (
             <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
-              {hasMore ? 'scroll for more' : `— end of ${rows.length} —`}
+              {loading ? 'loading more…' : hasMore ? 'scroll for more' : `— end of ${rows.length} —`}
             </div>
           )}
         </div>

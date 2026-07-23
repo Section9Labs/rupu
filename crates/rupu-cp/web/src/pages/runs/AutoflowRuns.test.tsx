@@ -475,13 +475,13 @@ describe('AutoflowRuns — Event column (cycle_failed detail + issue ref fallbac
 
     renderPage();
 
-    expect(await screen.findByText('running')).toBeInTheDocument();
+    expect(await screen.findByText('Running')).toBeInTheDocument();
     expect(screen.getByText('120')).toBeInTheDocument();
 
     // No `detail` on this event → the row is NOT expandable (no chevron);
     // it falls through to rowHref's per-row link-wrapping instead.
     expect(screen.queryByLabelText('Expand row')).not.toBeInTheDocument();
-    const link = await screen.findByRole('link', { name: 'running' });
+    const link = await screen.findByRole('link', { name: 'Running' });
     expect(link).toHaveAttribute('href', '/runs/run-77');
   });
 

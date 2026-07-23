@@ -77,14 +77,16 @@ export default function AgentRuns() {
         filters={
           <FilterPills options={LIFECYCLE_OPTIONS} value={tab} onChange={(v) => setTab(v as Tab)} />
         }
-        scope={<HostSelect allowAll value={hostFilter} onChange={setHostFilter} />}
+        scope={<HostSelect allowAll ariaLabel="Host filter" value={hostFilter} onChange={setHostFilter} />}
       />
 
       <div className="mt-5">
         {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
         {loading && rows.length === 0 ? (
-          <Spinner size="md" label="Loading agent runs…" />
+          <div className="py-16 flex items-center justify-center">
+            <Spinner label="Loading agent runs…" />
+          </div>
         ) : sorted.length === 0 ? (
           <EmptyState
             title="No agent runs yet"
@@ -127,6 +129,27 @@ export default function AgentRuns() {
 /** Returns true when the status string indicates the run is still in progress. */
 function isRunning(status: string | null | undefined): boolean {
   return status === 'running' || status === 'awaiting_approval';
+}
+
+// Session-branch agent-run rows carry the CLI's own wire vocabulary
+// (`"ok" | "error" | "aborted"` — see rupu-cp's api/run_streams.rs /
+// api/sessions.rs), NOT the run-status lexicon `StatusPill` speaks
+// (`RunStatusStr`). Standalone rows already use the run lexicon directly.
+// Map the CLI vocabulary onto it before rendering so a session row's "ok"
+// doesn't hit StatusPill's unknown-status fallback (neutral tone, AlertCircle
+// icon) instead of the green Completed pill it actually means. Statuses
+// already in the run lexicon pass through unchanged.
+function normalizeAgentRunStatus(s: string): RunStatusStr {
+  switch (s) {
+    case 'ok':
+      return 'completed';
+    case 'error':
+      return 'failed';
+    case 'aborted':
+      return 'cancelled';
+    default:
+      return s as RunStatusStr;
+  }
 }
 
 const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
@@ -219,7 +242,7 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
     sortValue: (r) => r.status ?? null,
     render: (r) =>
       r.status ? (
-        <StatusPill status={r.status as RunStatusStr} />
+        <StatusPill status={normalizeAgentRunStatus(r.status)} />
       ) : (
         <span className="text-ink-mute">—</span>
       ),

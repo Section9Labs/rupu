@@ -272,9 +272,9 @@ export default function WorkflowRuns() {
             rowHref={runHref}
             initialSort={{ key: 'started', dir: 'desc' }}
           />
-          {!archived && (hasMore || ended) && (
+          {!archived && (loading || hasMore || ended) && (
             <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
-              {hasMore ? 'scroll for more' : `— end of ${rows.length} —`}
+              {loading ? 'loading more…' : hasMore ? 'scroll for more' : `— end of ${filtered.length} —`}
             </div>
           )}
         </div>
