@@ -136,15 +136,33 @@ describe('WorkflowEditor live reconcile', () => {
     expect(screen.getByRole('heading', { name: 'Inputs' })).toBeInTheDocument();
   });
 
-  it('classic: no rail palette slot, and WorkflowEditorGraph gets no paletteContainer', () => {
+  it('classic: no rail palette slot, no Blocks tab, and WorkflowEditorGraph gets no paletteContainer', () => {
     const { container } = render(
       <WorkflowEditor draftYaml={VALID} onYamlChange={() => {}} agents={[]} validity={null} />,
     );
     expect(container.querySelector('.wfx-rail-palette-slot')).not.toBeInTheDocument();
+    expect(screen.queryByRole('tab', { name: 'Blocks' })).not.toBeInTheDocument();
     expect(screen.getByTestId('graph')).toHaveAttribute('data-palette-container', 'none');
+    // classic default tab is still Settings.
+    expect(screen.getByRole('tab', { name: 'Settings' })).toHaveAttribute('aria-selected', 'true');
   });
 
-  it('next: a rail palette slot renders inside the aside above the tabs, and WorkflowEditorGraph receives it', () => {
+  it('next: renders 4 tabs (Blocks · Step · Settings · Reference) in that order, defaulting to Blocks', () => {
+    render(
+      <WorkflowEditor
+        draftYaml={VALID}
+        onYamlChange={() => {}}
+        agents={[]}
+        validity={null}
+        workflowEditorUi="next"
+      />,
+    );
+    const tabs = screen.getAllByRole('tab');
+    expect(tabs.map((t) => t.textContent)).toEqual(['Blocks', 'Step', 'Settings', 'Reference']);
+    expect(screen.getByRole('tab', { name: 'Blocks' })).toHaveAttribute('aria-selected', 'true');
+  });
+
+  it('next: the Blocks tab is the default and its tabpanel hosts the rail palette slot; WorkflowEditorGraph receives it', () => {
     const { container } = render(
       <WorkflowEditor
         draftYaml={VALID}
@@ -154,13 +172,42 @@ describe('WorkflowEditor live reconcile', () => {
         workflowEditorUi="next"
       />,
     );
-    const aside = container.querySelector('aside');
-    expect(aside).toBeInTheDocument();
-    const slot = aside!.querySelector('.wfx-rail-palette-slot');
+    const panel = screen.getByRole('tabpanel');
+    expect(panel).toHaveAttribute('id', 'inspector-blocks');
+    const slot = container.querySelector('.wfx-rail-palette-slot');
     expect(slot).toBeInTheDocument();
-    // above the tabs row: it's the aside's first element child.
-    expect(aside!.firstElementChild).toBe(slot);
+    expect(panel.contains(slot)).toBe(true);
     expect(screen.getByTestId('graph')).toHaveAttribute('data-palette-container', 'set');
+  });
+
+  it('next: switching off the Blocks tab unmounts the palette slot (only mounted while Blocks is active)', () => {
+    render(
+      <WorkflowEditor
+        draftYaml={VALID}
+        onYamlChange={() => {}}
+        agents={[]}
+        validity={null}
+        workflowEditorUi="next"
+      />,
+    );
+    fireEvent.click(screen.getByRole('tab', { name: 'Step' }));
+    expect(screen.queryByRole('tabpanel', { name: 'Blocks' })).not.toBeInTheDocument();
+    expect(screen.getByTestId('graph')).toHaveAttribute('data-palette-container', 'none');
+  });
+
+  it('next: selecting a canvas node still auto-switches to the Step tab', () => {
+    render(
+      <WorkflowEditor
+        draftYaml={VALID}
+        onYamlChange={() => {}}
+        agents={[]}
+        validity={null}
+        workflowEditorUi="next"
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'select-a' }));
+    expect(screen.getByRole('tab', { name: 'Step' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByTestId('stepform')).toHaveAttribute('data-node-id', 'a');
   });
 
   it('un-pauses once YAML parses again', () => {

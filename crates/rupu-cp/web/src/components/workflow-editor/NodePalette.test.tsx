@@ -170,11 +170,59 @@ describe('NodePalette', () => {
       expect(container.querySelectorAll('.wfx-picon').length).toBe(4);
     });
 
-    it('clicking a rail card still fires onAdd with that kind', () => {
+    it('clicking a rail card SELECTS it (shows a detail card) rather than instantly adding', () => {
       const onAdd = vi.fn();
       render(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} variant="rail" />);
       fireEvent.click(screen.getByRole('button', { name: 'Add parallel node' }));
+      expect(onAdd).not.toHaveBeenCalled();
+      expect(screen.getByRole('region', { name: 'parallel details' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Add to canvas' })).toBeInTheDocument();
+    });
+
+    it('the detail card shows the block blurb, `*`-marked required fields, and a YAML example', () => {
+      render(<NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" />);
+      fireEvent.click(screen.getByRole('button', { name: 'Add step node' }));
+      const detail = screen.getByRole('region', { name: 'step details' });
+      expect(detail).toHaveTextContent(/runs one agent/i);
+      expect(detail.querySelector('code')).toHaveTextContent('agent');
+      expect(detail.querySelectorAll('.wfx-detail-req-star').length).toBeGreaterThan(0);
+      expect(detail.querySelector('pre')).toHaveTextContent('agent: code-reviewer');
+    });
+
+    it('the gate block has NO required fields (approval: is entirely optional per workflow.rs) — no `*` list renders', () => {
+      render(
+        <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" workflowEditorUi="next" />,
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'Add gate node' }));
+      const detail = screen.getByRole('region', { name: 'gate details' });
+      expect(detail.querySelector('.wfx-detail-reqs')).not.toBeInTheDocument();
+      expect(detail.querySelectorAll('.wfx-detail-req-star').length).toBe(0);
+      expect(detail).toHaveTextContent(/optional/i);
+    });
+
+    it('the Add-to-canvas button respects `disabled` (paused editor) instead of silently no-op-ing', () => {
+      const onAdd = vi.fn();
+      // Select a card while enabled, then flip the whole rail `disabled`
+      // (mirrors the editor pausing on unparseable YAML while a card is
+      // already selected) — the CTA must disable along with everything else.
+      const { rerender } = render(
+        <NodePalette onAdd={onAdd} onDragStartKind={() => {}} variant="rail" />,
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'Add parallel node' }));
+      rerender(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} variant="rail" disabled />);
+      const cta = screen.getByRole('button', { name: 'Add to canvas' });
+      expect(cta).toBeDisabled();
+      fireEvent.click(cta);
+      expect(onAdd).not.toHaveBeenCalled();
+    });
+
+    it('"Add to canvas" calls onAdd with the selected block kind and clears the selection', () => {
+      const onAdd = vi.fn();
+      render(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} variant="rail" />);
+      fireEvent.click(screen.getByRole('button', { name: 'Add parallel node' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Add to canvas' }));
       expect(onAdd).toHaveBeenCalledWith('parallel');
+      expect(screen.queryByRole('region', { name: 'parallel details' })).not.toBeInTheDocument();
     });
 
     it('rail cards stay draggable and disabled-aware', () => {
@@ -189,7 +237,20 @@ describe('NodePalette', () => {
       expect(card).toHaveAttribute('draggable', 'false');
     });
 
-    it("with workflowEditorUi='next' the rail variant also offers the branch card", () => {
+    it('dragging a rail card still sets the node-kind DnD mime (drag-to-place is unchanged)', () => {
+      const onDragStartKind = vi.fn();
+      render(<NodePalette onAdd={() => {}} onDragStartKind={onDragStartKind} variant="rail" />);
+      const card = screen.getByRole('button', { name: 'Add step node' });
+      const dataTransfer = {
+        setData: vi.fn(),
+        effectAllowed: '',
+      };
+      fireEvent.dragStart(card, { dataTransfer });
+      expect(dataTransfer.setData).toHaveBeenCalledWith('application/rupu-node-kind', 'step');
+      expect(onDragStartKind).toHaveBeenCalledWith('step');
+    });
+
+    it("with workflowEditorUi='next' the rail variant also offers the branch card, select-then-add", () => {
       const onAdd = vi.fn();
       render(
         <NodePalette onAdd={onAdd} onDragStartKind={() => {}} variant="rail" workflowEditorUi="next" />,
@@ -197,7 +258,81 @@ describe('NodePalette', () => {
       const card = screen.getByRole('button', { name: 'Add branch node' });
       expect(card).toBeInTheDocument();
       fireEvent.click(card);
+      expect(onAdd).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole('button', { name: 'Add to canvas' }));
       expect(onAdd).toHaveBeenCalledWith('branch');
+    });
+
+    it('a filter input narrows the visible block chips by label (case-insensitive)', () => {
+      render(
+        <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" workflowEditorUi="next" />,
+      );
+      const filter = screen.getByRole('searchbox', { name: 'Filter blocks and actions' });
+      fireEvent.change(filter, { target: { value: 'BRANCH' } });
+      expect(screen.getByRole('button', { name: 'Add branch node' })).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Add step node' })).not.toBeInTheDocument();
+    });
+
+    describe('connector detail card (parsed from ToolSpec.input_schema)', () => {
+      const TOOL_WITH_SCHEMA = {
+        name: 'scm.prs.create',
+        description: 'Open a pull request.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            title: { type: 'string', description: 'PR title' },
+            base: { type: 'string', description: 'Base branch' },
+          },
+          required: ['title', 'base'],
+        },
+        kind: 'write' as const,
+      };
+      const TOOL_WITHOUT_SCHEMA = {
+        name: 'issues.comment',
+        description: 'Comment on an issue.',
+        input_schema: {},
+        kind: 'write' as const,
+      };
+
+      it('clicking a connector chip SELECTS it and renders required params parsed from input_schema', () => {
+        const onAdd = vi.fn();
+        render(
+          <NodePalette
+            onAdd={onAdd}
+            onDragStartKind={() => {}}
+            variant="rail"
+            workflowEditorUi="next"
+            tools={[TOOL_WITH_SCHEMA]}
+          />,
+        );
+        fireEvent.click(screen.getByRole('button', { name: 'Add scm.prs.create action' }));
+        expect(onAdd).not.toHaveBeenCalled();
+        const detail = screen.getByRole('region', { name: 'scm.prs.create details' });
+        expect(detail).toHaveTextContent('Open a pull request.');
+        expect(detail).toHaveTextContent('title');
+        expect(detail).toHaveTextContent('base');
+        expect(detail).toHaveTextContent('PR title');
+
+        fireEvent.click(screen.getByRole('button', { name: 'Add to canvas' }));
+        expect(onAdd).toHaveBeenCalledWith('action', { action: 'scm.prs.create' });
+      });
+
+      it('a connector with no required[] in its schema shows the description + a fallback note instead of a required-fields list', () => {
+        render(
+          <NodePalette
+            onAdd={() => {}}
+            onDragStartKind={() => {}}
+            variant="rail"
+            workflowEditorUi="next"
+            tools={[TOOL_WITHOUT_SCHEMA]}
+          />,
+        );
+        fireEvent.click(screen.getByRole('button', { name: 'Add issues.comment action' }));
+        const detail = screen.getByRole('region', { name: 'issues.comment details' });
+        expect(detail).toHaveTextContent('Comment on an issue.');
+        expect(detail.querySelector('.wfx-detail-reqs')).not.toBeInTheDocument();
+        expect(detail).toHaveTextContent(/parameters come from the tool schema/i);
+      });
     });
 
     it('default (float) variant is unaffected by the rail addition', () => {
@@ -206,6 +341,13 @@ describe('NodePalette', () => {
       );
       expect(container.querySelector('.wfx-palette')).toBeInTheDocument();
       expect(container.querySelector('.wfx-palette-rail')).not.toBeInTheDocument();
+    });
+
+    it('the float ("next" instrument) variant is unchanged: click still instantly adds', () => {
+      const onAdd = vi.fn();
+      render(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} workflowEditorUi="next" />);
+      fireEvent.click(screen.getByRole('button', { name: 'Add parallel node' }));
+      expect(onAdd).toHaveBeenCalledWith('parallel');
     });
   });
 });
