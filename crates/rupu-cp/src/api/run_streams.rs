@@ -494,6 +494,12 @@ fn merge_agent_run_rows(a: AgentRunRow, b: AgentRunRow) -> AgentRunRow {
         // Standalone meta.json never sets `status` — session's real
         // end-state wins whenever present.
         status: session.status.or(standalone.status),
+        // When both exist these are two genuinely different (sub-second-apart)
+        // instants for the same run — session records enqueue time, standalone
+        // reads the transcript's actual `run_start`. Preferring session here
+        // means the enqueue timestamp wins; the drift never changes sort order,
+        // and both sides already emit `Z`-suffixed UTC so the merge is safe
+        // against the `+00:00`-vs-`Z` lexicographic-sort hazard.
         started_at: session.started_at.or(standalone.started_at),
         transcript_path: session.transcript_path.or(standalone.transcript_path),
         // Usage/turns/duration are filled in AFTER this merge (by
