@@ -104,6 +104,13 @@ export default function WorkflowEditor({
   // (canonical rewrite) and drops comments. Shown at most once per browser.
   const [reformatNotice, setReformatNotice] = useState(false);
 
+  // Inspector-rail palette slot (Task 1, `next` only): captured via a ref
+  // callback (not useRef) so its FIRST paint is a state update — the graph
+  // needs the actual mounted element to portal the palette into, and a plain
+  // ref wouldn't trigger the re-render that hands it down.
+  const [paletteSlot, setPaletteSlot] = useState<HTMLElement | null>(null);
+  const paletteSlotRef = useCallback((el: HTMLElement | null) => setPaletteSlot(el), []);
+
   // Keep the latest selectedId + graph readable inside the debounce timeout
   // WITHOUT adding them to the effect deps (which would re-arm the timer on every
   // select / graph edit). Reading via refs lets every state write below stay a
@@ -306,6 +313,7 @@ export default function WorkflowEditor({
                 onInvalidConnection={setConnError}
                 paused={paused}
                 workflowEditorUi={workflowEditorUi}
+                paletteContainer={workflowEditorUi === 'next' ? paletteSlot : undefined}
               />
             </div>
           }
@@ -332,6 +340,9 @@ export default function WorkflowEditor({
 
       {/* ── RIGHT: inspector rail ─────────────────────────────────────────── */}
       <aside className="flex w-full shrink-0 flex-col border-t border-border bg-panel lg:w-80 lg:border-l lg:border-t-0">
+        {workflowEditorUi === 'next' && (
+          <div ref={paletteSlotRef} className="wfx-rail-palette-slot border-b border-border" />
+        )}
         <div className="border-b border-border p-3">
           <div role="tablist" aria-label="Inspector" className="inline-flex rounded-lg border border-border bg-panel p-0.5">
             <PanelTabButton

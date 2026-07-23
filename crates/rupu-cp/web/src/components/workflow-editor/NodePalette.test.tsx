@@ -99,4 +99,66 @@ describe('NodePalette', () => {
       expect(container.querySelectorAll('.wfx-pcard').length).toBe(5);
     });
   });
+
+  describe('variant="rail" (Task 1: inspector-rail dock)', () => {
+    it('renders a non-absolute .wfx-palette-rail block with all kind cards', () => {
+      const { container } = render(
+        <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" />,
+      );
+      const rail = container.querySelector('.wfx-palette-rail');
+      expect(rail).toBeInTheDocument();
+      expect(rail).not.toHaveClass('absolute');
+      for (const label of ['step', 'for_each', 'parallel', 'panel']) {
+        expect(screen.getByRole('button', { name: `Add ${label} node` })).toBeInTheDocument();
+      }
+      // the rail variant never also renders the floating dock.
+      expect(container.querySelector('.wfx-palette')).not.toBeInTheDocument();
+    });
+
+    it('rail cards are .wfx-pcard with a .wfx-pdot accent, same as the float next look', () => {
+      const { container } = render(
+        <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" />,
+      );
+      expect(container.querySelectorAll('.wfx-pcard').length).toBe(4);
+      expect(container.querySelectorAll('.wfx-pdot').length).toBe(4);
+    });
+
+    it('clicking a rail card still fires onAdd with that kind', () => {
+      const onAdd = vi.fn();
+      render(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} variant="rail" />);
+      fireEvent.click(screen.getByRole('button', { name: 'Add parallel node' }));
+      expect(onAdd).toHaveBeenCalledWith('parallel');
+    });
+
+    it('rail cards stay draggable and disabled-aware', () => {
+      const { rerender } = render(
+        <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" />,
+      );
+      expect(screen.getByRole('button', { name: 'Add step node' })).toHaveAttribute('draggable', 'true');
+
+      rerender(<NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" disabled />);
+      const card = screen.getByRole('button', { name: 'Add step node' });
+      expect(card).toBeDisabled();
+      expect(card).toHaveAttribute('draggable', 'false');
+    });
+
+    it("with workflowEditorUi='next' the rail variant also offers the branch card", () => {
+      const onAdd = vi.fn();
+      render(
+        <NodePalette onAdd={onAdd} onDragStartKind={() => {}} variant="rail" workflowEditorUi="next" />,
+      );
+      const card = screen.getByRole('button', { name: 'Add branch node' });
+      expect(card).toBeInTheDocument();
+      fireEvent.click(card);
+      expect(onAdd).toHaveBeenCalledWith('branch');
+    });
+
+    it('default (float) variant is unaffected by the rail addition', () => {
+      const { container } = render(
+        <NodePalette onAdd={() => {}} onDragStartKind={() => {}} workflowEditorUi="next" />,
+      );
+      expect(container.querySelector('.wfx-palette')).toBeInTheDocument();
+      expect(container.querySelector('.wfx-palette-rail')).not.toBeInTheDocument();
+    });
+  });
 });

@@ -12,11 +12,20 @@ import { render, screen, cleanup, act, fireEvent } from '@testing-library/react'
 import type { WorkflowGraph } from '../../lib/workflowGraph';
 
 vi.mock('./WorkflowEditorGraph', () => ({
-  default: ({ graph, paused }: { graph: WorkflowGraph; paused?: boolean }) => (
+  default: ({
+    graph,
+    paused,
+    paletteContainer,
+  }: {
+    graph: WorkflowGraph;
+    paused?: boolean;
+    paletteContainer?: HTMLElement | null;
+  }) => (
     <div
       data-testid="graph"
       data-paused={paused ? 'true' : 'false'}
       data-ids={graph.nodes.map((n) => n.id).join(',')}
+      data-palette-container={paletteContainer ? 'set' : 'none'}
     />
   ),
 }));
@@ -90,6 +99,33 @@ describe('WorkflowEditor live reconcile', () => {
     expect(panel).toHaveAttribute('aria-labelledby', 'inspector-tab-reference');
     expect(screen.getByRole('searchbox', { name: 'Search expressions' })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Inputs' })).toBeInTheDocument();
+  });
+
+  it('classic: no rail palette slot, and WorkflowEditorGraph gets no paletteContainer', () => {
+    const { container } = render(
+      <WorkflowEditor draftYaml={VALID} onYamlChange={() => {}} agents={[]} validity={null} />,
+    );
+    expect(container.querySelector('.wfx-rail-palette-slot')).not.toBeInTheDocument();
+    expect(screen.getByTestId('graph')).toHaveAttribute('data-palette-container', 'none');
+  });
+
+  it('next: a rail palette slot renders inside the aside above the tabs, and WorkflowEditorGraph receives it', () => {
+    const { container } = render(
+      <WorkflowEditor
+        draftYaml={VALID}
+        onYamlChange={() => {}}
+        agents={[]}
+        validity={null}
+        workflowEditorUi="next"
+      />,
+    );
+    const aside = container.querySelector('aside');
+    expect(aside).toBeInTheDocument();
+    const slot = aside!.querySelector('.wfx-rail-palette-slot');
+    expect(slot).toBeInTheDocument();
+    // above the tabs row: it's the aside's first element child.
+    expect(aside!.firstElementChild).toBe(slot);
+    expect(screen.getByTestId('graph')).toHaveAttribute('data-palette-container', 'set');
   });
 
   it('un-pauses once YAML parses again', () => {

@@ -11,6 +11,7 @@
 // applyDelete / applyAddNode) so it is unit-testable without mounting the canvas.
 
 import { useCallback, useMemo, useState, type DragEvent, type KeyboardEvent } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Background,
   BackgroundVariant,
@@ -200,6 +201,13 @@ interface Props {
    *  ('next' only). Rendering an EXISTING branch node is always on regardless
    *  of this flag; only the ability to ADD a new one from the palette is gated. */
   workflowEditorUi?: WorkflowEditorUi;
+  /** Inspector-rail slot to portal the palette into (Task 1), owned by
+   *  WorkflowEditor. Only consulted when `workflowEditorUi === 'next'`:
+   *  - set → the palette portals in as `variant="rail"`, no floating dock.
+   *  - null/undefined (rail slot not mounted yet) → palette renders nothing
+   *    for that frame, rather than flashing the floating dock.
+   *  Classic ALWAYS renders today's floating dock and ignores this prop. */
+  paletteContainer?: HTMLElement | null;
 }
 
 export default function WorkflowEditorGraph(props: Props) {
@@ -219,6 +227,7 @@ function WorkflowEditorGraphInner({
   onInvalidConnection,
   paused = false,
   workflowEditorUi = 'classic',
+  paletteContainer,
 }: Props) {
   const colors = useThemeColors();
   const nodes = useMemo<Node<NodeData>[]>(
@@ -462,12 +471,26 @@ function WorkflowEditorGraphInner({
         </div>
       </div>
 
-      <NodePalette
-        onAdd={addNode}
-        onDragStartKind={() => {}}
-        disabled={paused}
-        workflowEditorUi={workflowEditorUi}
-      />
+      {workflowEditorUi === 'next'
+        ? paletteContainer &&
+          createPortal(
+            <NodePalette
+              onAdd={addNode}
+              onDragStartKind={() => {}}
+              disabled={paused}
+              workflowEditorUi={workflowEditorUi}
+              variant="rail"
+            />,
+            paletteContainer,
+          )
+        : (
+          <NodePalette
+            onAdd={addNode}
+            onDragStartKind={() => {}}
+            disabled={paused}
+            workflowEditorUi={workflowEditorUi}
+          />
+        )}
 
       <div
         className={paused ? 'h-full w-full opacity-60 pointer-events-none' : 'h-full w-full'}

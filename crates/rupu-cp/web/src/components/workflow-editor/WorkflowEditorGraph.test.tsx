@@ -274,6 +274,67 @@ describe('canvas backdrop (Task 3)', () => {
   });
 });
 
+describe('palette container / portal (Task 1: inspector-rail dock)', () => {
+  it('classic ignores paletteContainer — floating dock renders inline, container stays empty', () => {
+    const portalHost = document.createElement('div');
+    document.body.appendChild(portalHost);
+    const { container } = render(
+      <WorkflowEditorGraph
+        graph={makeGraph()}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi="classic"
+        paletteContainer={portalHost}
+      />,
+    );
+    expect(screen.getByRole('button', { name: 'Add step node' })).toBeInTheDocument();
+    expect(container.querySelector('.wfx-palette-rail')).not.toBeInTheDocument();
+    expect(portalHost.children.length).toBe(0);
+    document.body.removeChild(portalHost);
+  });
+
+  it('next + paletteContainer set: the palette portals into the container as variant="rail", not the canvas', () => {
+    const portalHost = document.createElement('div');
+    document.body.appendChild(portalHost);
+    const { container } = render(
+      <WorkflowEditorGraph
+        graph={makeGraph()}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi="next"
+        paletteContainer={portalHost}
+      />,
+    );
+    expect(portalHost.querySelector('.wfx-palette-rail')).toBeInTheDocument();
+    expect(container.querySelector('.wfx-palette-rail')).not.toBeInTheDocument();
+    expect(container.querySelector('.wfx-palette')).not.toBeInTheDocument();
+    document.body.removeChild(portalHost);
+  });
+
+  it('next + no paletteContainer: renders nothing for the palette that frame (no flash of the floating dock)', () => {
+    const { container } = render(
+      <WorkflowEditorGraph
+        graph={makeGraph()}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi="next"
+      />,
+    );
+    expect(container.querySelector('.wfx-palette')).not.toBeInTheDocument();
+    expect(container.querySelector('.wfx-palette-rail')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Add step node' })).not.toBeInTheDocument();
+  });
+});
+
 describe('applyConnect', () => {
   it('valid connection emits onChange with the new edge, not onInvalid', () => {
     const onChange = vi.fn();

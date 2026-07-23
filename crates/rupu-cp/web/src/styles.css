@@ -560,6 +560,29 @@
   .wfx-node, .wfx-pcard { transition: none !important; }
 }
 
+/* ── inspector-rail palette dock (Task 1) ── */
+/* The `next`-only rail placement: same `.wfx-pcard`/`.wfx-pdot` skin as the
+ * float dock above, laid out as a compact non-absolute 2-col grid sized for
+ * the ~320px inspector aside. Sits inside a slot div (WorkflowEditor.tsx)
+ * above the Settings/Step/Reference tabs. */
+.wfx-palette-rail {
+  padding: 10px 12px 12px;
+}
+.wfx-palette-rail-label {
+  padding: 0 2px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: rgb(var(--c-ink-mute));
+}
+.wfx-palette-rail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+.wfx-palette-rail-grid .wfx-pcard { width: 100%; }
+
 /* ── Settings inspector authoring cards (Task 5): Trigger / Inputs ── */
 /* Ported from the mockup's `.card-sec`/`.sh`/`.sb` (card shell) and
  * `.seg`/`.chip` (segmented control / removable chip). Behind

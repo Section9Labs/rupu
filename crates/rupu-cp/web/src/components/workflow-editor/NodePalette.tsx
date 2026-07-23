@@ -71,6 +71,10 @@ interface Props {
   /** Workflow-editor-UI flag — the branch card renders only when 'next'.
    *  Defaults to 'classic' (no branch card) for callers that don't thread it. */
   workflowEditorUi?: WorkflowEditorUi;
+  /** 'float' (default): the classic/next floating dock, unchanged. 'rail': a
+   *  compact, non-absolute block for the inspector rail (Task 1) — same cards,
+   *  themed accent, no drag-hint copy, sub-text moved to a `title` tooltip. */
+  variant?: 'float' | 'rail';
 }
 
 export default function NodePalette({
@@ -78,6 +82,7 @@ export default function NodePalette({
   onDragStartKind,
   disabled = false,
   workflowEditorUi = 'classic',
+  variant = 'float',
 }: Props) {
   const items = workflowEditorUi === 'next' ? [...ITEMS, BRANCH_ITEM] : ITEMS;
   const colors = useThemeColors();
@@ -90,6 +95,43 @@ export default function NodePalette({
     e.dataTransfer.effectAllowed = 'move';
     onDragStartKind(kind);
   };
+
+  // Inspector-rail dock (Task 1) — compact, non-absolute block meant to sit
+  // inside the ~320px aside above the tabs. Reuses the themed `.wfx-pcard`/
+  // `.wfx-pdot` skin (same accent-dot-per-kind look as the `next` float dock)
+  // in a 2-col grid; the one-line "what this is" tagline drops to a `title`
+  // tooltip instead of a second text row to stay compact. Same onAdd/
+  // onDragStart wiring as every other variant.
+  if (variant === 'rail') {
+    return (
+      <div data-ui="next" className="wfx-palette-rail">
+        <div className="wfx-palette-rail-label">Blocks</div>
+        <div className="wfx-palette-rail-grid">
+          {items.map((item) => {
+            const color = colors.get(KIND_ACCENT[item.kind]);
+            return (
+              <button
+                key={item.kind}
+                type="button"
+                draggable={!disabled}
+                disabled={disabled}
+                onClick={() => onAdd(item.kind)}
+                onDragStart={handleDragStart(item.kind)}
+                aria-label={`Add ${item.label} node`}
+                title={item.sub}
+                className="wfx-pcard"
+              >
+                <span className="wfx-pdot" style={{ background: color }} />
+                <div className="wfx-pcard-text">
+                  <div className="wfx-pl">{item.label}</div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
 
   // "next" (instrument) look — a wholly separate render path so the classic
   // markup below stays byte-identical. Ported from the mockup's `.palette`/
