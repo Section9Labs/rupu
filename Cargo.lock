@@ -6337,11 +6337,7 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
 name = "rupu-agent"
-<<<<<<< HEAD
 version = "0.65.0"
-=======
-version = "0.64.0"
->>>>>>> origin/main
 dependencies = [
  "assert_fs",
  "async-trait",
@@ -6369,11 +6365,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-app"
-<<<<<<< HEAD
 version = "0.65.0"
-=======
-version = "0.64.0"
->>>>>>> origin/main
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6409,11 +6401,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-app-canvas"
-<<<<<<< HEAD
 version = "0.65.0"
-=======
-version = "0.64.0"
->>>>>>> origin/main
 dependencies = [
  "insta",
  "rupu-orchestrator",
@@ -6422,11 +6410,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-ast"
-<<<<<<< HEAD
 version = "0.65.0"
-=======
-version = "0.64.0"
->>>>>>> origin/main
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -6441,11 +6425,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-auth"
-<<<<<<< HEAD
 version = "0.65.0"
-=======
-version = "0.64.0"
->>>>>>> origin/main
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -6474,11 +6454,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-cli"
-<<<<<<< HEAD
 version = "0.65.0"
-=======
-version = "0.64.0"
->>>>>>> origin/main
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -6538,11 +6514,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-config"
-<<<<<<< HEAD
 version = "0.65.0"
-=======
-version = "0.64.0"
->>>>>>> origin/main
 dependencies = [
  "serde",
  "tempfile",
@@ -6552,11 +6524,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-coverage"
-<<<<<<< HEAD
 version = "0.65.0"
-=======
-version = "0.64.0"
->>>>>>> origin/main
 dependencies = [
  "chrono",
  "glob",
@@ -6575,11 +6543,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-cp"
-<<<<<<< HEAD
 version = "0.65.0"
-=======
-version = "0.64.0"
->>>>>>> origin/main
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6626,11 +6590,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-keychain-acl"
-<<<<<<< HEAD
 version = "0.65.0"
-=======
-version = "0.64.0"
->>>>>>> origin/main
 dependencies = [
  "core-foundation 0.10.0",
  "core-foundation-sys",
@@ -6641,11 +6601,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-mcp"
-<<<<<<< HEAD
 version = "0.65.0"
-=======
-version = "0.64.0"
->>>>>>> origin/main
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6665,11 +6621,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-orchestrator"
-<<<<<<< HEAD
 version = "0.65.0"
-=======
-version = "0.64.0"
->>>>>>> origin/main
 dependencies = [
  "assert_fs",
  "async-trait",
@@ -6700,11 +6652,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-providers"
-<<<<<<< HEAD
 version = "0.65.0"
-=======
-version = "0.64.0"
->>>>>>> origin/main
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6727,11 +6675,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-runtime"
-<<<<<<< HEAD
 version = "0.65.0"
-=======
-version = "0.64.0"
->>>>>>> origin/main
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6753,11 +6697,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-scm"
-<<<<<<< HEAD
 version = "0.65.0"
-=======
-version = "0.64.0"
->>>>>>> origin/main
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6785,11 +6725,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-tools"
-<<<<<<< HEAD
 version = "0.65.0"
-=======
-version = "0.64.0"
->>>>>>> origin/main
 dependencies = [
  "assert_fs",
  "async-trait",
@@ -6808,11 +6744,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-transcript"
-<<<<<<< HEAD
 version = "0.65.0"
-=======
-version = "0.64.0"
->>>>>>> origin/main
 dependencies = [
  "chrono",
  "serde",
@@ -6825,11 +6757,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-update"
-<<<<<<< HEAD
 version = "0.65.0"
-=======
-version = "0.64.0"
->>>>>>> origin/main
 dependencies = [
  "async-trait",
  "reqwest 0.12.28",
@@ -6845,11 +6773,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-webhook"
-<<<<<<< HEAD
 version = "0.65.0"
-=======
-version = "0.64.0"
->>>>>>> origin/main
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6872,11 +6796,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-workspace"
-<<<<<<< HEAD
 version = "0.65.0"
-=======
-version = "0.64.0"
->>>>>>> origin/main
 dependencies = [
  "assert_fs",
  "chrono",
