@@ -11,20 +11,19 @@
 // everything in one shot); the fetcher returns `[]` for any offset > 0 so
 // the hook settles as `ended` after that single page.
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
-import { api, type HostView, type RunListRow } from '../../lib/api';
+import { api, type RunListRow } from '../../lib/api';
 import { StatusPill } from '../../components/StatusPill';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import UsageBarChart from '../../components/charts/UsageBarChart';
 import { Button } from '../../components/ui/Button';
 import { FilterBar } from '../../components/ui/FilterBar';
 import { FilterPills, type FilterPillOption } from '../../components/ui/FilterPills';
-import { Select } from '../../components/ui/Select';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { ErrorBanner } from '../../components/ui/ErrorBanner';
 import { Spinner } from '../../components/ui/Spinner';
-import { ALL_HOSTS } from '../../components/HostSelect';
+import HostSelect, { ALL_HOSTS } from '../../components/HostSelect';
 import { usePagedList } from '../../lib/usePagedList';
 import { cn } from '../../lib/cn';
 import { durationBetween, relativeTime } from '../../lib/time';
@@ -90,16 +89,9 @@ export default function WorkflowRuns() {
   const [filter, setFilter] = useState<TriggerFilter>('all');
   // Default to 'local' → fast server-side path; ALL_HOSTS → fan-out.
   const [hostFilter, setHostFilter] = useState<string>('local');
-  const [hosts, setHosts] = useState<HostView[] | null>(null);
   // Row-action (archive/restore/delete) failures — kept separate from the
   // list-fetch error the hook owns, but shown in the same banner.
   const [actionError, setActionError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    api.getHosts().then((hs) => { if (!cancelled) setHosts(hs); }).catch(() => { if (!cancelled) setHosts([]); });
-    return () => { cancelled = true; };
-  }, []);
 
   const fetchRows = useCallback(
     ({ offset, limit }: { offset: number; limit: number }): Promise<RunListRow[]> => {
@@ -238,19 +230,12 @@ export default function WorkflowRuns() {
           }
           scope={
             !archived && (
-              <Select
+              <HostSelect
+                allowAll
+                ariaLabel="Host filter"
                 value={hostFilter}
-                onChange={(e) => setHostFilter(e.target.value)}
-                aria-label="Host filter"
-              >
-                <option value="local">This host</option>
-                <option value={ALL_HOSTS}>All hosts</option>
-                {(hosts ?? [])
-                  .filter((h) => h.transport_kind !== 'local')
-                  .map((h) => (
-                    <option key={h.id} value={h.id}>{h.name}</option>
-                  ))}
-              </Select>
+                onChange={setHostFilter}
+              />
             )
           }
         />

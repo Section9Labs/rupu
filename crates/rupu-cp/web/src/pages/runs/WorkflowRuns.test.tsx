@@ -99,6 +99,17 @@ describe('WorkflowRuns host filter — server-driven', () => {
     );
   });
 
+  it('renders This host, registered (non-local) hosts, and All hosts — via the shared HostSelect', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByRole('option', { name: 'prod' })).toBeInTheDocument());
+
+    const options = screen.getAllByRole('option') as HTMLOptionElement[];
+    expect(options.map((o) => o.textContent)).toEqual(['This host', 'All hosts', 'prod']);
+  });
+
   it('"All hosts" option fetches without a host param (fan-out branch)', async () => {
     stubDeps();
     const runsSpy = vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([]);

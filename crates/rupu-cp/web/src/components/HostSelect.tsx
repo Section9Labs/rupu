@@ -4,6 +4,13 @@
 //
 // Restyled internally onto `ui/Select`'s shared chrome (visual parity — same
 // classes, now sourced from one place) per the One Control Language kit.
+//
+// `allowAll` switches on the fan-out variant the run-list pages need: "This
+// host" (local) + registered non-local hosts + a trailing "All hosts"
+// (value = ALL_HOSTS) option, absorbing what used to be page-local
+// host-listing logic duplicated across WorkflowRuns/AgentRuns. Default false
+// keeps the launcher-sheet consumers (LauncherSheet, AgentLauncherSheet)
+// unchanged.
 
 import { useEffect, useState } from 'react';
 import { api, type HostView } from '../lib/api';
@@ -19,9 +26,22 @@ interface Props {
   onChange: (hostId: string) => void;
   disabled?: boolean;
   className?: string;
+  /** Render the "This host" / registered hosts / "All hosts" fan-out list
+   *  instead of the plain registered-hosts list. Default false. */
+  allowAll?: boolean;
+  /** Override the default `aria-label` ("Host"). WorkflowRuns passes
+   *  "Host filter" to keep its pre-migration label unchanged. */
+  ariaLabel?: string;
 }
 
-export default function HostSelect({ value, onChange, disabled, className }: Props) {
+export default function HostSelect({
+  value,
+  onChange,
+  disabled,
+  className,
+  allowAll = false,
+  ariaLabel = 'Host',
+}: Props) {
   const [hosts, setHosts] = useState<HostView[] | null>(null);
 
   useEffect(() => {
@@ -39,12 +59,34 @@ export default function HostSelect({ value, onChange, disabled, className }: Pro
     };
   }, []);
 
+  if (allowAll) {
+    return (
+      <Select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        disabled={disabled}
+        aria-label={ariaLabel}
+        className={className}
+      >
+        <option value="local">This host</option>
+        <option value={ALL_HOSTS}>All hosts</option>
+        {(hosts ?? [])
+          .filter((h) => h.transport_kind !== 'local')
+          .map((h) => (
+            <option key={h.id} value={h.id}>
+              {h.name}
+            </option>
+          ))}
+      </Select>
+    );
+  }
+
   return (
     <Select
       value={value}
       onChange={(e) => onChange(e.target.value)}
       disabled={disabled}
-      aria-label="Host"
+      aria-label={ariaLabel}
       className={className}
     >
       {/* While loading or empty, keep a stable local option so the select is always usable. */}

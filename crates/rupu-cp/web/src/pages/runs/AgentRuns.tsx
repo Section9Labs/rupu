@@ -77,7 +77,7 @@ export default function AgentRuns() {
         filters={
           <FilterPills options={LIFECYCLE_OPTIONS} value={tab} onChange={(v) => setTab(v as Tab)} />
         }
-        scope={<HostSelect value={hostFilter} onChange={setHostFilter} />}
+        scope={<HostSelect allowAll value={hostFilter} onChange={setHostFilter} />}
       />
 
       <div className="mt-5">
