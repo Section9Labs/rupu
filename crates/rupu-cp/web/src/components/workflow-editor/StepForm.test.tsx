@@ -355,6 +355,103 @@ describe('StepForm — Approval prompt expression completions (Task 3, next only
   });
 });
 
+describe('StepForm — approval gate body (Task 5)', () => {
+  it('a gate node shows the gate fields (prompt / auto approve / on timeout) and NOT the agent fields', () => {
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'approval_gate', approvalRequired: true })}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+        workflowEditorUi="next"
+      />,
+    );
+    expect(screen.getByLabelText('Approval prompt')).toBeInTheDocument();
+    expect(screen.getByLabelText('Auto approve')).toBeInTheDocument();
+    expect(screen.getByLabelText('On timeout')).toBeInTheDocument();
+    // A gate is not an agent step — no Agent/Prompt fields, and the shared
+    // inline "Require approval" checkbox is hidden (the gate owns approval).
+    expect(screen.queryByLabelText('Agent')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Require approval')).not.toBeInTheDocument();
+  });
+
+  it('editing the auto-approve + on-timeout fields flows to node data', () => {
+    const spy = vi.fn();
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'approval_gate', approvalRequired: true })}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={spy}
+        workflowEditorUi="next"
+      />,
+    );
+    fireEvent.change(screen.getByLabelText('Auto approve'), { target: { value: '{{ inputs.ok }}' } });
+    expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({ approvalAutoApprove: '{{ inputs.ok }}' }));
+    fireEvent.change(screen.getByLabelText('On timeout'), { target: { value: 'reject' } });
+    expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({ approvalOnTimeout: 'reject' }));
+  });
+
+  it('Add cleanup step appends an on-reject entry', () => {
+    const spy = vi.fn();
+    render(<Harness initial={nodeWith({ kind: 'approval_gate', approvalRequired: true, approvalOnReject: [] })} spy={spy} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Add cleanup step' }));
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.approvalOnReject).toHaveLength(1);
+  });
+});
+
+describe('StepForm — action body (Task 5)', () => {
+  const TOOLS = [
+    {
+      name: 'scm.prs.create',
+      description: 'Open a PR',
+      input_schema: { properties: { title: {}, base: {} } },
+      kind: 'write' as const,
+    },
+    { name: 'issues.comment', description: 'Comment', input_schema: { properties: { body: {} } }, kind: 'write' as const },
+  ];
+
+  function ActionHarness({ spy }: { spy: (d: StepNodeData) => void }) {
+    const [node, setNode] = useState<GraphNode>(nodeWith({ kind: 'action', action: '', with: {} }));
+    return (
+      <StepForm
+        node={node}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        tools={TOOLS}
+        onChange={(d) => {
+          spy(d);
+          setNode((n) => ({ ...n, id: d.id, data: d }));
+        }}
+      />
+    );
+  }
+
+  it('shows a tool <select> populated from the catalog', () => {
+    render(<ActionHarness spy={vi.fn()} />);
+    const select = screen.getByLabelText('Action tool');
+    expect(select).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'scm.prs.create' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'issues.comment' })).toBeInTheDocument();
+  });
+
+  it('selecting a tool renders a with-field per input_schema property', () => {
+    const spy = vi.fn();
+    render(<ActionHarness spy={spy} />);
+    fireEvent.change(screen.getByLabelText('Action tool'), { target: { value: 'scm.prs.create' } });
+    expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({ action: 'scm.prs.create' }));
+    expect(screen.getByLabelText('With title')).toBeInTheDocument();
+    expect(screen.getByLabelText('With base')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('With title'), { target: { value: 'Fix bug' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.with).toEqual({ title: 'Fix bug' });
+  });
+});
+
 describe('WorkflowSettingsForm', () => {
   it('editing the name emits a meta with rest preserved', () => {
     const spy = vi.fn();

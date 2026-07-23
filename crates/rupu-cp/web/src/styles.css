@@ -589,6 +589,35 @@
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
+/* ── connector ACTION cards (Task 5, `next` only) ── */
+/* Rendered after the kind cards in both the float dock and the inspector rail.
+ * One labeled group per tool-name prefix (scm / issues / github / gitlab); each
+ * card is the same `.wfx-pcard` skin dropping an `action` node seeded with the
+ * tool name. Themed via the shared `--c-*` tokens (no new tokens). */
+.wfx-palette-connectors {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgb(var(--c-border));
+  max-width: 22rem;
+}
+.wfx-palette-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.wfx-palette-group-label {
+  flex-basis: 100%;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: rgb(var(--c-ink-mute));
+}
+.wfx-palette-rail .wfx-palette-connectors { max-width: none; }
+
 @media (prefers-reduced-motion: reduce) {
   .wfx-node, .wfx-pcard { transition: none !important; }
 }

@@ -151,6 +151,39 @@ function BranchBody({ d, colors }: { d: StepNodeData; colors: ThemeColors }) {
   );
 }
 
+/** connector tool name chip — classic look for an action step. */
+function ActionBody({ d, colors }: { d: StepNodeData; colors: ThemeColors }) {
+  return (
+    <>
+      <div className="mt-1.5 flex items-center gap-1.5">
+        <span className="rounded px-1.5 py-px text-meta font-medium" style={kindChipStyle(colors, 'action')}>
+          action
+        </span>
+        <span className="truncate rounded bg-surface px-1.5 py-px text-meta text-ink-dim font-mono">
+          {d.action || '(no tool)'}
+        </span>
+      </div>
+    </>
+  );
+}
+
+/** approval-gate roll-up — prompt snippet + auto tag; classic look. */
+function GateBody({ d, colors }: { d: StepNodeData; colors: ThemeColors }) {
+  return (
+    <>
+      <div className="mt-1.5 flex items-center gap-1.5">
+        <span className="rounded px-1.5 py-px text-meta font-medium" style={kindChipStyle(colors, 'approval_gate')}>
+          gate
+        </span>
+        {d.approvalAutoApprove ? (
+          <span className="text-meta text-ink-mute tabular-nums">· auto</span>
+        ) : null}
+      </div>
+      <div className="mt-1 truncate text-meta text-ink-mute">{d.approvalPrompt || 'awaiting approval'}</div>
+    </>
+  );
+}
+
 // ── "next" (instrument) look — mockup-ported bodies ────────────────────────
 // Ported from flow-designer.html's `.node`/`.kindpill`/`.nid`/`.expr`/`.port`.
 // Namespaced `.wfx-*` (Task 2 — CSS block in styles.css). Same underlying
@@ -230,6 +263,21 @@ function BranchBodyNext({ d }: { d: StepNodeData }) {
   );
 }
 
+/** connector tool name chip — next look for an action step. */
+function ActionBodyNext({ d }: { d: StepNodeData }) {
+  return <div className="wfx-agent">⚡ {d.action || '(no tool)'}</div>;
+}
+
+/** approval-gate prompt snippet + optional auto chip — next look. */
+function GateBodyNext({ d }: { d: StepNodeData }) {
+  return (
+    <>
+      <div className="wfx-expr">{d.approvalPrompt || 'awaiting approval'}</div>
+      {d.approvalAutoApprove ? <div className="wfx-meta">auto-approve</div> : null}
+    </>
+  );
+}
+
 function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
   const { node, problems } = data;
   const ui = data.workflowEditorUi ?? 'classic';
@@ -289,6 +337,10 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
               <PanelBodyNext d={d} />
             ) : d.kind === 'branch' ? (
               <BranchBodyNext d={d} />
+            ) : d.kind === 'action' ? (
+              <ActionBodyNext d={d} />
+            ) : d.kind === 'approval_gate' ? (
+              <GateBodyNext d={d} />
             ) : (
               <StepBodyNext d={d} />
             )}
@@ -353,6 +405,10 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
         <PanelBody d={d} colors={colors} />
       ) : d.kind === 'branch' ? (
         <BranchBody d={d} colors={colors} />
+      ) : d.kind === 'action' ? (
+        <ActionBody d={d} colors={colors} />
+      ) : d.kind === 'approval_gate' ? (
+        <GateBody d={d} colors={colors} />
       ) : (
         <StepBody d={d} colors={colors} />
       )}

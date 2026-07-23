@@ -542,6 +542,62 @@ describe('graphToWorkflowObject', () => {
     expect(g.nodes[0].data.approvalTimeoutSeconds).toBe(3600);
     expectRoundTrip(input);
   });
+
+  it('classifies a standalone approval GATE node and round-trips the full approval block', () => {
+    const input = {
+      name: 'wf',
+      steps: [
+        { id: 'work', agent: 'coder', prompt: 'do work' },
+        {
+          id: 'ship-gate',
+          approval: {
+            required: true,
+            prompt: 'Ship {{ inputs.tag }}?',
+            timeout_seconds: 3600,
+            auto_approve: '{{ inputs.trusted }}',
+            on_timeout: 'reject',
+            notify: [{ action: 'scm.prs.comment', with: { body: 'awaiting approval' } }],
+            on_reject: [{ id: 'cleanup', agent: 'coder', prompt: 'revert' }],
+          },
+        },
+      ],
+    };
+    const g = yamlToGraph(input);
+    const gate = g.nodes.find((n) => n.id === 'ship-gate');
+    expect(gate?.data.kind).toBe('approval_gate');
+    expect(gate?.data.agent).toBeUndefined();
+    expect(gate?.data.approvalAutoApprove).toBe('{{ inputs.trusted }}');
+    expect(gate?.data.approvalOnTimeout).toBe('reject');
+    expect(gate?.data.approvalNotify).toHaveLength(1);
+    expect(gate?.data.approvalOnReject).toHaveLength(1);
+    expectRoundTrip(input);
+  });
+
+  it('keeps a legacy inline approval (agent + prompt + approval) as a plain step, not a gate', () => {
+    const input = {
+      name: 'wf',
+      steps: [{ id: 'a', agent: 'x', prompt: 'p', approval: { required: true } }],
+    };
+    const g = yamlToGraph(input);
+    expect(g.nodes[0].data.kind).toBe('step');
+    expectRoundTrip(input);
+  });
+
+  it('classifies a connector ACTION step and round-trips action + with', () => {
+    const input = {
+      name: 'wf',
+      steps: [
+        { id: 'open-pr', action: 'scm.prs.create', with: { title: 'Fix {{ inputs.bug }}', base: 'main' } },
+      ],
+    };
+    const g = yamlToGraph(input);
+    const node = g.nodes.find((n) => n.id === 'open-pr');
+    expect(node?.data.kind).toBe('action');
+    expect(node?.data.action).toBe('scm.prs.create');
+    expect(node?.data.with).toEqual({ title: 'Fix {{ inputs.bug }}', base: 'main' });
+    expect(node?.data.agent).toBeUndefined();
+    expectRoundTrip(input);
+  });
 });
 
 // ── canConnect ──────────────────────────────────────────────────────────────

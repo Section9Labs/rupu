@@ -41,9 +41,10 @@ import {
 import { autoLayout, NODE_W } from '../../lib/workflowLayout';
 import { useThemeColors, type ThemeColors } from '../../lib/useThemeColors';
 import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
+import type { ToolSpec } from '../../lib/api';
 import EditableStepNode, { type NodeData } from './nodes/EditableStepNode';
 import { KIND_ACCENT } from './kindVisuals';
-import NodePalette, { NODE_KIND_MIME } from './NodePalette';
+import NodePalette, { NODE_KIND_MIME, NODE_SEED_MIME } from './NodePalette';
 
 import '@xyflow/react/dist/style.css';
 
@@ -168,6 +169,14 @@ function newNodeData(id: string, kind: StepKind): StepNodeData {
     data.thenTargets = [];
     data.elseTargets = [];
   }
+  if (kind === 'approval_gate') {
+    data.approvalRequired = true;
+    data.approvalOnReject = [];
+  }
+  if (kind === 'action') {
+    data.action = '';
+    data.with = {};
+  }
   return data;
 }
 
@@ -178,18 +187,26 @@ export function applyAddNodeAt(
   graph: WorkflowGraph,
   kind: StepKind,
   position: { x: number; y: number },
+  seed?: Partial<StepNodeData>,
 ): { graph: WorkflowGraph; id: string } {
   const id = nextNodeId(graph.nodes);
-  const node: GraphNode = { id, data: newNodeData(id, kind), position: { x: position.x, y: position.y } };
+  // `seed` pre-fills kind-specific fields (e.g. a connector palette card seeds
+  // `action` with a tool name); id/kind always win over any seeded value.
+  const data: StepNodeData = { ...newNodeData(id, kind), ...seed, id, kind };
+  const node: GraphNode = { id, data, position: { x: position.x, y: position.y } };
   return { graph: { ...graph, nodes: [...graph.nodes, node] }, id };
 }
 
 /** Append a new node of the given kind near canvas center; returns the updated
  *  graph and the new id (so the caller can select it to open the form). The
- *  click-to-add (no-drag) path. */
-export function applyAddNode(graph: WorkflowGraph, kind: StepKind): { graph: WorkflowGraph; id: string } {
+ *  click-to-add (no-drag) path. `seed` pre-fills kind-specific fields. */
+export function applyAddNode(
+  graph: WorkflowGraph,
+  kind: StepKind,
+  seed?: Partial<StepNodeData>,
+): { graph: WorkflowGraph; id: string } {
   const count = graph.nodes.length;
-  return applyAddNodeAt(graph, kind, { x: 60, y: 60 + 100 * count });
+  return applyAddNodeAt(graph, kind, { x: 60, y: 60 + 100 * count }, seed);
 }
 
 /** Add a new node (default kind `step`) AND an edge `sourceId -> newId`,
@@ -240,7 +257,15 @@ export function applyInsertOnEdge(
 
 /** Narrow an arbitrary dataTransfer string to a StepKind. Exported for tests. */
 export function asStepKind(v: string): StepKind | null {
-  return v === 'step' || v === 'for_each' || v === 'parallel' || v === 'panel' || v === 'branch' ? v : null;
+  return v === 'step' ||
+    v === 'for_each' ||
+    v === 'parallel' ||
+    v === 'panel' ||
+    v === 'branch' ||
+    v === 'approval_gate' ||
+    v === 'action'
+    ? v
+    : null;
 }
 
 /** Edge accent color for a branch arm — green for the "then" (true) arm, red
@@ -275,6 +300,10 @@ interface Props {
    *    for that frame, rather than flashing the floating dock.
    *  Classic ALWAYS renders today's floating dock and ignores this prop. */
   paletteContainer?: HTMLElement | null;
+  /** MCP tool catalog (from `api.getTools()`), owned by WorkflowEditor and
+   *  threaded to NodePalette so the `next` look can offer connector ACTION
+   *  cards grouped by prefix. Empty/omitted → no connector cards. */
+  tools?: ToolSpec[];
 }
 
 export default function WorkflowEditorGraph(props: Props) {
@@ -295,6 +324,7 @@ function WorkflowEditorGraphInner({
   paused = false,
   workflowEditorUi = 'classic',
   paletteContainer,
+  tools,
 }: Props) {
   const colors = useThemeColors();
 
@@ -518,11 +548,12 @@ function WorkflowEditorGraphInner({
 
   const rf = useReactFlow();
 
-  // Click-to-add (palette card click / keyboard): drop near center.
+  // Click-to-add (palette card click / keyboard): drop near center. `seed`
+  // carries a connector card's pre-filled tool name (kind 'action').
   const addNode = useCallback(
-    (kind: StepKind) => {
+    (kind: StepKind, seed?: Partial<StepNodeData>) => {
       if (paused) return;
-      const { graph: g, id } = applyAddNode(graph, kind);
+      const { graph: g, id } = applyAddNode(graph, kind, seed);
       onChange(g);
       onSelect(id);
     },
@@ -554,8 +585,19 @@ function WorkflowEditorGraphInner({
       e.preventDefault();
       const kind = asStepKind(e.dataTransfer.getData(NODE_KIND_MIME));
       if (!kind) return;
+      // A connector card also stashes a JSON seed (e.g. `{ action: '<tool>' }`).
+      let seed: Partial<StepNodeData> | undefined;
+      const seedRaw = e.dataTransfer.getData(NODE_SEED_MIME);
+      if (seedRaw) {
+        try {
+          const parsed = JSON.parse(seedRaw);
+          if (parsed && typeof parsed === 'object') seed = parsed as Partial<StepNodeData>;
+        } catch {
+          /* malformed seed — fall back to a bare node of `kind` */
+        }
+      }
       const position = rf.screenToFlowPosition({ x: e.clientX, y: e.clientY });
-      const { graph: g, id } = applyAddNodeAt(graph, kind, position);
+      const { graph: g, id } = applyAddNodeAt(graph, kind, position, seed);
       onChange(g);
       onSelect(id);
     },
@@ -671,6 +713,7 @@ function WorkflowEditorGraphInner({
               disabled={paused}
               workflowEditorUi={workflowEditorUi}
               variant="rail"
+              tools={tools}
             />,
             paletteContainer,
           )
@@ -680,6 +723,7 @@ function WorkflowEditorGraphInner({
             onDragStartKind={() => {}}
             disabled={paused}
             workflowEditorUi={workflowEditorUi}
+            tools={tools}
           />
         )}
 
