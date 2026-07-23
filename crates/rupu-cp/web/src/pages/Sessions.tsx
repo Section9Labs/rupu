@@ -16,7 +16,7 @@
 
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { RefreshCw } from 'lucide-react';
+import { MessageSquare, RefreshCw } from 'lucide-react';
 import { api, type SessionSummary } from '../lib/api';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import UsageBarChart from '../components/charts/UsageBarChart';
@@ -151,6 +151,7 @@ export default function Sessions() {
         </div>
       ) : rows.length === 0 ? (
         <EmptyState
+          icon={<MessageSquare size={20} />}
           title={tab === 'active' ? 'No active sessions' : 'No archived sessions'}
           hint={
             tab === 'active'

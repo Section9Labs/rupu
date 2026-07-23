@@ -138,32 +138,32 @@ export default function UsageTimeline({
   const isUpdating = !isInitialLoad && (isFetching || !!pending);
 
   return (
-    <section className="rounded-lg border border-[rgb(var(--c-border))] bg-[rgb(var(--c-panel))] p-3">
+    <section className="rounded-lg border border-border bg-panel p-3">
       <div className="mb-2 flex flex-wrap items-start justify-between gap-2">
         <div>
-          <h2 className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-[rgb(var(--c-ink-dim))]">
+          <h2 className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-ink-dim">
             Spend over time
             {/* Subtle "this is refreshing" cue — a ~0.3s window/filter
                 refetch should read as intentional, not a stall. Only shown
                 once the graph has already painted once (see `isUpdating`). */}
             {isUpdating && <Spinner size="sm" label="updating" />}
           </h2>
-          <p className="mt-0.5 text-2xl font-semibold tabular-nums text-[rgb(var(--c-ink))]">
+          <p className="mt-0.5 text-2xl font-semibold tabular-nums text-ink">
             {headline.costLabel}
           </p>
-          <p className="text-xs text-[rgb(var(--c-ink-mute))]">{headline.subLabel}</p>
+          <p className="text-xs text-ink-mute">{headline.subLabel}</p>
         </div>
         <div className="flex items-center gap-2">
           {excludedCount > 0 && (
             <button
               type="button"
               onClick={onReset}
-              className="rounded-full border border-[rgb(var(--c-border))] px-2 py-0.5 text-[10px] text-[rgb(var(--c-ink-mute))] hover:bg-[rgb(var(--c-surface))]"
+              className="rounded-full border border-border px-2 py-0.5 text-[10px] text-ink-mute hover:bg-surface"
             >
               Excluded ({excludedCount}) · reset
             </button>
           )}
-          <div className="flex rounded-md border border-[rgb(var(--c-border))]">
+          <div className="flex rounded-md border border-border">
             {METRICS.map((m) => (
               <button
                 key={m}
@@ -171,8 +171,8 @@ export default function UsageTimeline({
                 onClick={() => onMetricChange(m)}
                 className={`px-2 py-1 text-xs capitalize ${
                   metric === m
-                    ? 'bg-[rgb(var(--c-surface))] text-[rgb(var(--c-ink))]'
-                    : 'text-[rgb(var(--c-ink-mute))]'
+                    ? 'bg-surface text-ink'
+                    : 'text-ink-mute'
                 }`}
               >
                 {m}
@@ -183,7 +183,7 @@ export default function UsageTimeline({
       </div>
       {/* This graph is fed by `/api/usage/runs`, which has no host fan-out —
           say so, or a multi-host operator reads it as fleet-wide too. */}
-      <p className="mb-2 text-[10px] uppercase tracking-wide text-[rgb(var(--c-ink-mute))]">
+      <p className="mb-2 text-[10px] uppercase tracking-wide text-ink-mute">
         local host only
       </p>
       {/* `opacity-70` only kicks in once the graph has real data on screen

@@ -8,11 +8,12 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Loader2, AlertTriangle } from 'lucide-react';
+import { AlertTriangle } from 'lucide-react';
 import { api } from '../lib/api';
 import type { TranscriptEvent } from '../lib/transcript';
 import { cn } from '../lib/cn';
 import { formatDuration } from '../lib/duration';
+import { Spinner } from './ui/Spinner';
 import { buildTranscriptView } from './transcript/transcriptView';
 import Turn from './transcript/Turn';
 
@@ -133,9 +134,8 @@ export default function TranscriptPanel({
 
   if (state === 'loading') {
     return (
-      <div className="flex items-center justify-center gap-2 p-8 text-sm text-ink-dim">
-        <Loader2 size={14} className="animate-spin" />
-        Loading transcript…
+      <div className="flex items-center justify-center gap-2 p-8">
+        <Spinner label="Loading transcript…" />
       </div>
     );
   }

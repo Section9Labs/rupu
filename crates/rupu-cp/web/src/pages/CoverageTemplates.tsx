@@ -6,6 +6,8 @@ import { ArrowLeft } from 'lucide-react';
 import { api, type TemplateSummary, type TemplateDetail } from '../lib/api';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
+import { ErrorBanner } from '../components/ui/ErrorBanner';
+import { Spinner } from '../components/ui/Spinner';
 import { SEVERITY_STYLE, type Severity } from '../lib/severity';
 
 // Severity columns, most → least severe.
@@ -46,9 +48,11 @@ export default function CoverageTemplates() {
         </p>
       </header>
 
-      {error && <p className="mt-4 text-sm text-err">{error}</p>}
+      {error && <ErrorBanner className="mt-4">{error}</ErrorBanner>}
       {templates === null ? (
-        <p className="mt-4 text-sm text-ink-dim">Loading…</p>
+        <div className="mt-4 py-16 flex items-center justify-center">
+          <Spinner label="Loading templates…" />
+        </div>
       ) : (
         <section className="mt-6">
           <SectionHeader tone="muted" label="Templates" count={templates.length} />
@@ -70,7 +74,7 @@ function TemplatesTable({ templates }: { templates: TemplateSummary[] }) {
     key: sev,
     header: SEVERITY_STYLE[sev].label,
     align: 'right',
-    width: 'w-16',
+    fit: true,
     render: (t) => {
       const n = t.severity_breakdown[sev] ?? 0;
       return n > 0 ? <span className={SEVERITY_STYLE[sev].text}>{n}</span> : <span className="text-ink-mute">—</span>;
@@ -81,8 +85,10 @@ function TemplatesTable({ templates }: { templates: TemplateSummary[] }) {
     {
       key: 'name',
       header: 'Template',
+      subject: true,
       sortable: true,
       sortValue: (t) => t.name,
+      titleValue: (t) => t.name,
       render: (t) => (
         <div className="min-w-0">
           <span className="text-sm font-medium text-ink">{t.name}</span>
@@ -95,7 +101,7 @@ function TemplatesTable({ templates }: { templates: TemplateSummary[] }) {
     {
       key: 'version',
       header: 'Version',
-      width: 'w-20',
+      fit: true,
       sortable: true,
       sortValue: (t) => t.version,
       render: (t) => <span className="text-meta text-ink-mute">v{t.version}</span>,
@@ -104,7 +110,7 @@ function TemplatesTable({ templates }: { templates: TemplateSummary[] }) {
       key: 'concerns',
       header: 'Concerns',
       align: 'right',
-      width: 'w-24',
+      fit: true,
       sortable: true,
       sortValue: (t) => t.concern_count,
       render: (t) => t.concern_count,
@@ -143,8 +149,8 @@ function TemplateConcerns({ name }: { name: string }) {
     };
   }, [name]);
 
-  if (failed) return <p className="text-note text-ink-mute">Failed to load concerns.</p>;
-  if (!detail) return <p className="text-note text-ink-mute">Loading concerns…</p>;
+  if (failed) return <ErrorBanner className="text-note">Failed to load concerns.</ErrorBanner>;
+  if (!detail) return <Spinner size="sm" label="Loading concerns…" />;
 
   return (
     <ul className="space-y-1 border-l-2 border-border pl-3">

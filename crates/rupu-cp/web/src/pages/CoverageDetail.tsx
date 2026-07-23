@@ -11,6 +11,7 @@ import CoverageCatalogTab from '../components/coverage/CoverageCatalogTab';
 import CoverageAuditTab from '../components/coverage/CoverageAuditTab';
 import CoverageGapTab from '../components/coverage/CoverageGapTab';
 import CoverageDiffTab from '../components/coverage/CoverageDiffTab';
+import { Spinner } from '../components/ui/Spinner';
 import {
   api,
   normAssertionStatus,
@@ -80,7 +81,7 @@ export default function CoverageDetail({ tab = 'overview' }: { tab?: CoverageTab
     return (
       <div className="p-8">
         <BackLink />
-        <div className="mt-4 text-sm text-ink-dim">Loading…</div>
+        <div className="mt-4"><Spinner label="Loading…" /></div>
       </div>
     );
   }

@@ -4,11 +4,13 @@
 // Target columns show each finding's owning project · target.
 
 import { useEffect, useMemo, useState } from 'react';
-import { Inbox } from 'lucide-react';
 import { api, normFindingSeverity, type FindingOut, type FindingsSummary } from '../lib/api';
 import { type Severity } from '../lib/severity';
 import { FindingMetrics } from '../components/findings/FindingMetrics';
 import { FindingsTable } from '../components/findings/FindingsTable';
+import { EmptyState } from '../components/ui/EmptyState';
+import { ErrorBanner } from '../components/ui/ErrorBanner';
+import { Spinner } from '../components/ui/Spinner';
 
 const EMPTY_SUMMARY: FindingsSummary = { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 };
 
@@ -55,43 +57,28 @@ export default function Findings() {
         </p>
       </header>
 
-      {error && (
-        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {error}
-        </div>
-      )}
+      {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
       {findings === null ? (
-        <div className="text-sm text-ink-dim">Loading findings…</div>
+        <div className="py-16 flex items-center justify-center">
+          <Spinner label="Loading findings…" />
+        </div>
       ) : all.length === 0 ? (
-        <EmptyState />
+        <EmptyState
+          title="No findings"
+          hint="Run an assessment workflow to start recording findings across your projects."
+        />
       ) : (
         <div className="space-y-6">
           <FindingMetrics summary={summary} active={activeSev} onSelect={setActiveSev} />
 
           {rows.length === 0 ? (
-            <div className="rounded-xl border border-dashed border-border bg-panel/50 py-10 text-center text-sm text-ink-dim">
-              No {activeSev} findings.
-            </div>
+            <EmptyState title="No matches" hint={`No ${activeSev} findings.`} />
           ) : (
             <FindingsTable findings={rows} showProvenance />
           )}
         </div>
       )}
-    </div>
-  );
-}
-
-function EmptyState() {
-  return (
-    <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
-        <Inbox size={20} className="text-ink-mute" />
-      </div>
-      <h2 className="text-sm font-medium text-ink">No findings</h2>
-      <p className="mt-1 text-xs text-ink-dim max-w-xs">
-        Run an assessment workflow to start recording findings across your projects.
-      </p>
     </div>
   );
 }

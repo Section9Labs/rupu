@@ -17,6 +17,7 @@ import { sessionStatusDot, sessionStatusLabel, sessionStatusTone } from '../lib/
 import { isSessionActive, pollIntervalFor } from '../lib/sessionPoll';
 import UsageChip from '../components/UsageChip';
 import { Button } from '../components/ui/Button';
+import { Spinner } from '../components/ui/Spinner';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
 import SessionConversation from '../components/session/SessionConversation';
 
@@ -201,7 +202,7 @@ export default function SessionDetailPage() {
     return (
       <div className="p-8">
         <BackLink />
-        <div className="mt-4 text-sm text-ink-dim">Loading…</div>
+        <div className="mt-4"><Spinner label="Loading…" /></div>
       </div>
     );
   }

@@ -36,4 +36,33 @@ describe('EmptyState', () => {
     expect(box.className).toMatch(/rounded-lg/);
     expect(box.className).toMatch(/text-center/);
   });
+
+  it('omits the icon slot when not given', () => {
+    const { container } = render(<EmptyState title="No runs yet" />);
+    expect(container.querySelector('svg')).toBeNull();
+  });
+
+  it('renders an optional icon, dim and centered, above the title', () => {
+    render(<EmptyState title="No runs yet" icon={<svg data-testid="empty-icon" />} />);
+    const icon = screen.getByTestId('empty-icon');
+    const wrapper = icon.parentElement as HTMLElement;
+    expect(wrapper.className).toMatch(/text-ink-mute/);
+    expect(wrapper.className).toMatch(/justify-center/);
+  });
+
+  it('accepts a ReactNode hint (e.g. with a mono-styled path segment)', () => {
+    render(
+      <EmptyState
+        title="No workflows found"
+        hint={
+          <>
+            Add workflow YAML under <span className="font-mono">.rupu/workflows/</span> to populate
+            this library.
+          </>
+        }
+      />,
+    );
+    const mono = screen.getByText('.rupu/workflows/');
+    expect(mono.className).toMatch(/font-mono/);
+  });
 });

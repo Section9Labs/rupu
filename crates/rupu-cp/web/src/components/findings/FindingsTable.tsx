@@ -49,7 +49,7 @@ export function FindingsTable({
     {
       key: 'severity',
       header: 'Severity',
-      width: 'w-24',
+      fit: true,
       sortable: true,
       // sevRank: critical=0 … info=4, so ascending (first click) sorts
       // most-severe first — matching the backend default order + intuition.
@@ -59,13 +59,16 @@ export function FindingsTable({
     {
       key: 'summary',
       header: 'Summary',
+      subject: true,
       sortable: true,
       sortValue: (f) => f.summary,
+      titleValue: (f) => f.summary,
       render: (f) => <span className="text-ink leading-snug">{f.summary}</span>,
     },
     {
       key: 'location',
       header: 'File:Line',
+      fit: true,
       sortable: true,
       sortValue: (f) => f.file_path ?? null,
       render: (f) => {
@@ -93,7 +96,7 @@ export function FindingsTable({
     {
       key: 'cwe',
       header: 'CWE',
-      width: 'w-24',
+      fit: true,
       render: (f) => {
         const cwe = cweFromFinding(f);
         return cwe ? (
@@ -113,6 +116,7 @@ export function FindingsTable({
     {
       key: 'concern',
       header: 'Concern',
+      fit: true,
       sortable: true,
       sortValue: (f) => f.concern_id ?? null,
       render: (f) =>
@@ -129,11 +133,13 @@ export function FindingsTable({
       {
         key: 'project',
         header: 'Project',
+        fit: true,
         render: (f) => <span className="text-ink-dim">{(f as FindingOut).project || '—'}</span>,
       },
       {
         key: 'target',
         header: 'Target',
+        fit: true,
         render: (f) => (
           <span className="font-mono text-note text-ink-mute break-all">
             {(f as FindingOut).target_id || '—'}

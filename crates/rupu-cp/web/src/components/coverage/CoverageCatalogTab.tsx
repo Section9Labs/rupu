@@ -4,6 +4,7 @@ import { api, type FlatCatalog } from '../../lib/api';
 import { filterConcerns } from '../../lib/coverageFilter';
 import { SectionHeader } from '../lists/SectionHeader';
 import { ListCard } from '../lists/ListCard';
+import { Spinner } from '../ui/Spinner';
 import CollapsibleRow from './CollapsibleRow';
 import SeverityChip from './SeverityChip';
 import ConcernControls from './ConcernControls';
@@ -43,7 +44,7 @@ export default function CoverageCatalogTab({ target, wsId }: { target: string; w
   }
 
   if (error) return <p className="mt-4 text-sm text-err">{error}</p>;
-  if (!cat) return <p className="mt-4 text-sm text-ink-dim">Loading…</p>;
+  if (!cat) return <div className="mt-4"><Spinner label="Loading…" /></div>;
   if (cat.concerns.length === 0)
     return <p className="mt-4 text-sm text-ink-dim">No catalog snapshot for this target.</p>;
 

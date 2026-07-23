@@ -10,6 +10,9 @@ import SortableTable, { type Column } from '../components/lists/SortableTable';
 import LauncherSheet from '../components/LauncherSheet';
 import CodeEditor from '../components/CodeEditor';
 import { Button } from '../components/ui/Button';
+import { EmptyState } from '../components/ui/EmptyState';
+import { ErrorBanner } from '../components/ui/ErrorBanner';
+import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
 import UsageBarChart from '../components/charts/UsageBarChart';
 import { formatTokens, formatCost } from '../lib/usage';
@@ -79,16 +82,23 @@ export default function Workflows() {
         </Button>
       </header>
 
-      {error && (
-        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {error}
-        </div>
-      )}
+      {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
       {workflows === null ? (
-        <div className="text-sm text-ink-dim">Loading workflows…</div>
+        <div className="py-16 flex items-center justify-center">
+          <Spinner label="Loading workflows…" />
+        </div>
       ) : sorted.length === 0 ? (
-        <EmptyState />
+        <EmptyState
+          icon={<WorkflowIcon size={20} />}
+          title="No workflows found"
+          hint={
+            <>
+              Add workflow YAML under <span className="font-mono">.rupu/workflows/</span> to populate
+              this library.
+            </>
+          }
+        />
       ) : (
         <section>
           <div className="mb-4 rounded-xl border border-border bg-panel/50 p-4">
@@ -316,12 +326,14 @@ function workflowColumns(onRun: (name: string) => void): Column<WorkflowSummary>
     {
       key: 'name',
       header: 'Name',
+      subject: true,
       sortable: true,
       sortValue: (w) => w.name,
+      titleValue: (w) => w.name,
       render: (w) => (
         <Link
           to={`/workflows/${encodeURIComponent(w.name)}`}
-          className="text-sm font-medium text-ink truncate hover:underline"
+          className="text-sm font-medium text-ink hover:underline"
         >
           {w.name}
         </Link>
@@ -330,7 +342,7 @@ function workflowColumns(onRun: (name: string) => void): Column<WorkflowSummary>
     {
       key: 'scope',
       header: 'Scope',
-      width: 'w-24',
+      fit: true,
       sortable: true,
       sortValue: (w) => w.scope,
       render: (w) => <ScopeChip scope={w.scope} />,
@@ -339,7 +351,7 @@ function workflowColumns(onRun: (name: string) => void): Column<WorkflowSummary>
       key: 'runs',
       header: 'Runs',
       align: 'right',
-      width: 'w-20',
+      fit: true,
       sortable: true,
       sortValue: (w) => w.run_count,
       render: (w) => (
@@ -350,7 +362,7 @@ function workflowColumns(onRun: (name: string) => void): Column<WorkflowSummary>
       key: 'tokens',
       header: 'Tokens',
       align: 'right',
-      width: 'w-24',
+      fit: true,
       sortable: true,
       sortValue: (w) => w.usage?.total_tokens ?? null,
       render: (w) => (
@@ -361,7 +373,7 @@ function workflowColumns(onRun: (name: string) => void): Column<WorkflowSummary>
       key: 'cost',
       header: 'Cost',
       align: 'right',
-      width: 'w-24',
+      fit: true,
       sortable: true,
       sortValue: (w) => w.usage?.cost_usd ?? null,
       render: (w) => (
@@ -372,7 +384,7 @@ function workflowColumns(onRun: (name: string) => void): Column<WorkflowSummary>
       key: 'last_run',
       header: 'Last run',
       align: 'right',
-      width: 'w-28',
+      fit: true,
       sortable: true,
       sortValue: (w) => (w.last_run ? Date.parse(w.last_run) : null),
       render: (w) => (
@@ -383,7 +395,7 @@ function workflowColumns(onRun: (name: string) => void): Column<WorkflowSummary>
       key: 'action',
       header: '',
       align: 'right',
-      width: 'w-20',
+      fit: true,
       render: (w) => (
         <button
           type="button"
@@ -396,19 +408,4 @@ function workflowColumns(onRun: (name: string) => void): Column<WorkflowSummary>
       ),
     },
   ];
-}
-
-function EmptyState() {
-  return (
-    <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
-        <WorkflowIcon size={20} className="text-ink-mute" />
-      </div>
-      <h2 className="text-sm font-medium text-ink">No workflows found</h2>
-      <p className="mt-1 text-xs text-ink-dim max-w-xs">
-        Add workflow YAML under <span className="font-mono">.rupu/workflows/</span> to populate this
-        library.
-      </p>
-    </div>
-  );
 }

@@ -23,7 +23,7 @@ type Tab = 'agents' | 'workflows' | 'autoflows';
 
 const SCOPE_CLS: Record<string, string> = {
   project: 'bg-ok-bg text-ok ring-ok/30',
-  global: 'bg-indigo-50 text-indigo-700 ring-indigo-200',
+  global: 'bg-info-bg text-info ring-info/30',
 };
 
 function ScopeChip({ scope }: { scope?: string }) {

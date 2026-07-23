@@ -6,6 +6,7 @@ import { gapRows } from '../../lib/coverageGap';
 import { filterGapRows } from '../../lib/coverageFilter';
 import { SectionHeader } from '../lists/SectionHeader';
 import { ListCard } from '../lists/ListCard';
+import { Spinner } from '../ui/Spinner';
 import CollapsibleRow from './CollapsibleRow';
 import SeverityChip from './SeverityChip';
 import CappedList from './CappedList';
@@ -50,7 +51,7 @@ export default function CoverageGapTab({ target, wsId }: { target: string; wsId?
   }
 
   if (error) return <p className="mt-4 text-sm text-err">{error}</p>;
-  if (!report) return <p className="mt-4 text-sm text-ink-dim">Loading…</p>;
+  if (!report) return <div className="mt-4"><Spinner label="Loading…" /></div>;
   if (gapRows(report).length === 0)
     return <p className="mt-4 text-sm text-ink-dim">No gaps — every in-scope file assessed.</p>;
 

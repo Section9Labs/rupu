@@ -58,7 +58,7 @@ export default function Dashboard() {
     <div className="space-y-4 p-4">
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-lg font-semibold text-[rgb(var(--c-ink))]">Dashboard</h1>
+          <h1 className="text-lg font-semibold text-ink">Dashboard</h1>
           <div className="mt-1">
             <HostFreshnessStrip hosts={freshnessHosts} />
           </div>
@@ -67,19 +67,19 @@ export default function Dashboard() {
           {/* Stale data is kept on a transient error rather than flashing an
               error state; surface it quietly instead. */}
           {error && data && (
-            <span className="text-xs text-[rgb(var(--c-status-failed))]" title={error.message}>
+            <span className="text-xs text-status-failed" title={error.message}>
               refresh failed — showing last good data
             </span>
           )}
-          <div className="flex rounded-md border border-[rgb(var(--c-border))]">
+          <div className="flex rounded-md border border-border">
             {RANGES.map((r) => (
               <button
                 key={r}
                 onClick={() => setRange(r)}
                 className={`px-2 py-1 text-xs ${
                   range === r
-                    ? 'bg-[rgb(var(--c-surface))] text-[rgb(var(--c-ink))]'
-                    : 'text-[rgb(var(--c-ink-mute))]'
+                    ? 'bg-surface text-ink'
+                    : 'text-ink-mute'
                 }`}
               >
                 {r}
@@ -91,7 +91,7 @@ export default function Dashboard() {
               left open until the page it points to was real. */}
           <Link
             to="/usage"
-            className="rounded-md border border-[rgb(var(--c-border))] px-3 py-1 text-xs text-[rgb(var(--c-ink-dim))] hover:text-[rgb(var(--c-ink))]"
+            className="rounded-md border border-border px-3 py-1 text-xs text-ink-dim hover:text-ink"
           >
             Spend →
           </Link>
@@ -109,14 +109,14 @@ export default function Dashboard() {
           />
 
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-            <section className="rounded-lg border border-[rgb(var(--c-border))] bg-[rgb(var(--c-panel))] p-3">
-              <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-[rgb(var(--c-ink-dim))]">
+            <section className="rounded-lg border border-border bg-panel p-3">
+              <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-ink-dim">
                 Outcomes over time
               </h2>
               <TerminalTrend buckets={data.terminal_buckets} />
             </section>
-            <section className="rounded-lg border border-[rgb(var(--c-border))] bg-[rgb(var(--c-panel))] p-3">
-              <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-[rgb(var(--c-ink-dim))]">
+            <section className="rounded-lg border border-border bg-panel p-3">
+              <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-ink-dim">
                 Throughput by trigger
               </h2>
               <ThroughputChart buckets={data.throughput_buckets} />
@@ -126,7 +126,7 @@ export default function Dashboard() {
           <CycleSummaryLine cycles={data.cycles} cyclesPartial={data.cycles_partial} />
         </>
       ) : error ? (
-        <div className="p-6 text-sm text-[rgb(var(--c-status-failed))]">
+        <div className="p-6 text-sm text-status-failed">
           Could not load dashboard: {error.message}
         </div>
       ) : (

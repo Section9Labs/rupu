@@ -22,7 +22,7 @@ export function ThroughputChart({ buckets }: { buckets: ThroughputBucket[] }) {
 
   if (buckets.length === 0) {
     return (
-      <div className="flex h-48 items-center justify-center text-sm text-[rgb(var(--c-ink-mute))]">
+      <div className="flex h-48 items-center justify-center text-sm text-ink-mute">
         No runs in this range
       </div>
     );
