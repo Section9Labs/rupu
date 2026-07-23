@@ -222,6 +222,7 @@ async fn distributed_fanout_round_robin_results_and_host_persisted() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: Some(dispatcher.clone()),
+        action_dispatcher: None,
         pause: None,
     };
 
@@ -313,6 +314,7 @@ async fn local_fanout_control_produces_results_with_no_host_attribution() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
+        action_dispatcher: None,
         pause: None,
     };
 

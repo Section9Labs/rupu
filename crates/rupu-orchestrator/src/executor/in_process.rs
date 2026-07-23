@@ -172,6 +172,7 @@ impl WorkflowExecutor for InProcessExecutor {
             strict_templates: false,
             event_sink: Some(fan_out as Arc<dyn EventSink>),
             unit_dispatcher: None,
+            action_dispatcher: None,
             pause: Some(pause.clone()),
         };
 

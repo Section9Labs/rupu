@@ -1,0 +1,14 @@
+name: action-demo
+description: "Demo: a read-only action step (scm.prs.list) feeding an agent step."
+steps:
+  - id: list_prs
+    action: scm.prs.list
+    with:
+      platform: github
+      owner: "Section9Labs"
+      repo: "rupu"
+      state: "open"
+
+  - id: summarize
+    agent: code-reviewer
+    prompt: "Open PRs on Section9Labs/rupu: {{ steps.list_prs.output }} — summarize in one line."

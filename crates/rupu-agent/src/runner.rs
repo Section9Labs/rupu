@@ -1370,7 +1370,13 @@ fn parse_mode_for_event(s: &str) -> RunMode {
     }
 }
 
-fn parse_mode_for_runtime(s: &str) -> PermissionMode {
+/// Map a CLI/config mode string (`"ask"` / `"bypass"` / `"readonly"`,
+/// defaulting to `Ask` for anything else) to a [`PermissionMode`]. `pub`
+/// so callers building an in-process MCP `ToolDispatcher` outside this
+/// crate (rupu-cli's action-dispatcher wiring) can reuse the exact same
+/// mapping `run_agent` uses for its own tool registry, rather than
+/// duplicating the match arms.
+pub fn parse_mode_for_runtime(s: &str) -> PermissionMode {
     match s {
         "bypass" => PermissionMode::Bypass,
         "readonly" => PermissionMode::Readonly,

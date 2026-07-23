@@ -166,6 +166,14 @@ pub enum WorkflowParseError {
     ActionMutuallyExclusive { step: String },
     #[error("step `{step}`: `action:` must name a tool (e.g. scm.prs.create)")]
     ActionEmptyName { step: String },
+    #[error("step `{step}`: action `{tool}` is not a known MCP tool")]
+    ActionUnknownTool { step: String, tool: String },
+    #[error("step `{step}`: action `{tool}` params invalid: {detail}")]
+    ActionInvalidParams {
+        step: String,
+        tool: String,
+        detail: String,
+    },
 }
 
 /// How a workflow gets kicked off. Manual is the existing behavior
@@ -1115,6 +1123,62 @@ fn validate_cron_expression(expr: &str) -> Result<(), WorkflowParseError> {
     Ok(())
 }
 
+/// Parse-time validation of an action invocation against the static MCP
+/// catalog (spec §4.2): the tool must exist, `with:` keys must be schema
+/// properties, and required keys must be present. VALUES are not checked —
+/// they may be minijinja templates rendered at runtime (the dispatcher's
+/// typed serde parse re-validates then).
+fn validate_action_step(
+    step_id: &str,
+    tool: &str,
+    with: Option<&serde_json::Value>,
+) -> Result<(), WorkflowParseError> {
+    let catalog = rupu_mcp::tools::tool_catalog();
+    let Some(spec) = catalog.iter().find(|s| s.name == tool) else {
+        return Err(WorkflowParseError::ActionUnknownTool {
+            step: step_id.to_string(),
+            tool: tool.to_string(),
+        });
+    };
+    let schema = &spec.input_schema;
+    let props = schema.get("properties").and_then(|p| p.as_object());
+    let empty = serde_json::Map::new();
+    let with_map = match with {
+        None => &empty,
+        Some(serde_json::Value::Object(m)) => m,
+        Some(_) => {
+            return Err(WorkflowParseError::ActionInvalidParams {
+                step: step_id.to_string(),
+                tool: tool.to_string(),
+                detail: "`with:` must be a mapping".into(),
+            })
+        }
+    };
+    if let Some(props) = props {
+        for key in with_map.keys() {
+            if !props.contains_key(key) {
+                return Err(WorkflowParseError::ActionInvalidParams {
+                    step: step_id.to_string(),
+                    tool: tool.to_string(),
+                    detail: format!("unknown parameter `{key}`"),
+                });
+            }
+        }
+    }
+    if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
+        for req in required.iter().filter_map(|v| v.as_str()) {
+            if !with_map.contains_key(req) {
+                return Err(WorkflowParseError::ActionInvalidParams {
+                    step: step_id.to_string(),
+                    tool: tool.to_string(),
+                    detail: format!("missing required parameter `{req}`"),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a step's effective workspace mode: the step's own `workspace`,
 /// else the workflow `defaults.workspace`, else `WorkspaceMode::None`.
 pub fn effective_workspace_mode(step: &Step, defaults: &WorkflowDefaults) -> WorkspaceMode {
@@ -1230,6 +1294,14 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
                 step: step.id.clone(),
             });
         }
+        for na in &ap.notify {
+            let with = if na.with.is_null() {
+                None
+            } else {
+                Some(&na.with)
+            };
+            validate_action_step(&format!("{}.notify", step.id), &na.action, with)?;
+        }
         for sub in &ap.on_reject {
             if sub.approval.is_some()
                 || sub.for_each.is_some()
@@ -1278,6 +1350,7 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
                 step: step.id.clone(),
             });
         }
+        validate_action_step(&step.id, action, step.with.as_ref())?;
     } else {
         // Linear / for_each step — agent + prompt are required.
         if step.agent.is_none() {

@@ -114,6 +114,7 @@ async fn second_step_sees_first_step_output_via_template() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -163,6 +164,7 @@ async fn event_payload_is_visible_in_step_prompts() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -221,6 +223,7 @@ async fn issue_payload_is_visible_in_step_prompts_and_when_filters() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -285,6 +288,7 @@ async fn for_each_dispatches_one_item_per_line_and_binds_loop_metadata() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -349,6 +353,7 @@ async fn for_each_accepts_a_json_array_of_objects() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -396,6 +401,7 @@ steps:
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -443,6 +449,7 @@ async fn for_each_pulls_items_from_workflow_inputs_with_max_parallel_cap() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -563,6 +570,7 @@ async fn for_each_continue_on_error_records_failures_and_keeps_going() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -610,6 +618,7 @@ async fn for_each_without_continue_on_error_aborts_workflow_on_first_failure() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let err = run_workflow(opts).await.expect_err("should abort");
@@ -670,6 +679,7 @@ async fn parallel_dispatches_each_sub_step_with_its_own_agent_and_prompt() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -736,6 +746,7 @@ async fn parallel_continue_on_error_records_per_sub_step_failures() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -783,6 +794,7 @@ async fn parallel_without_continue_on_error_aborts_with_sub_step_id_in_message()
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let err = run_workflow(opts).await.expect_err("should abort");
@@ -831,6 +843,7 @@ async fn run_store_records_run_metadata_and_per_step_rows() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -900,6 +913,7 @@ async fn run_store_marks_run_failed_with_error_message() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let _ = run_workflow(opts).await.expect_err("workflow should fail");
@@ -948,6 +962,7 @@ async fn no_run_store_skips_persistence_and_emits_empty_run_id() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -1005,6 +1020,7 @@ async fn approval_gate_pauses_run_and_persists_awaiting_state() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -1068,6 +1084,7 @@ async fn resume_from_approval_picks_up_at_awaited_step() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -1110,6 +1127,7 @@ async fn resume_from_approval_picks_up_at_awaited_step() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -1184,6 +1202,7 @@ steps:
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -1318,6 +1337,7 @@ async fn panel_step_runs_panelists_in_parallel_and_aggregates_findings() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -1388,6 +1408,7 @@ steps:
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -1438,6 +1459,7 @@ steps:
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -1590,6 +1612,7 @@ async fn panel_gate_loops_with_fixer_until_severity_clears() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -1645,6 +1668,7 @@ async fn panel_gate_marks_unresolved_when_max_iterations_exhausted() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -1705,6 +1729,7 @@ steps:
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -1771,6 +1796,7 @@ async fn approval_with_timeout_seconds_persists_awaiting_since_and_expires_at() 
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -1831,6 +1857,7 @@ steps:
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -1882,6 +1909,7 @@ async fn unit_checkpoints_persist_each_fanout_item() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let res = run_workflow(opts).await.unwrap();
@@ -2024,6 +2052,7 @@ async fn resume_reruns_only_failed_fanout_units() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
+                action_dispatcher: None,
                 pause: None,
             };
     let err = run_workflow(opts)
@@ -2117,6 +2146,7 @@ async fn resume_reruns_only_failed_fanout_units() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
+        action_dispatcher: None,
         pause: None,
     };
     let res = run_workflow(opts).await.unwrap();
