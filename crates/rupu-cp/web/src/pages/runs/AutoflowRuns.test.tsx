@@ -162,6 +162,18 @@ describe('AutoflowRuns host filter — server-driven (runs + cycles tabs)', () =
     expect(runsSpy).toHaveBeenCalledWith(expect.objectContaining({ host: 'local' }));
   });
 
+  it('renders This host, registered (non-local) hosts, and All hosts — via the shared HostSelect', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([]);
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByRole('option', { name: 'prod' })).toBeInTheDocument());
+
+    const options = screen.getAllByRole('option') as HTMLOptionElement[];
+    expect(options.map((o) => o.textContent)).toEqual(['This host', 'All hosts', 'prod']);
+  });
+
   it('"All hosts" option fetches without a host param', async () => {
     vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
     const eventsSpy = vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([]);
@@ -287,6 +299,120 @@ describe('AutoflowRuns host filter — server-driven (runs + cycles tabs)', () =
 
     await waitFor(() => expect(screen.getByText('No active claims')).toBeInTheDocument());
     expect(screen.queryByLabelText('Host filter')).not.toBeInTheDocument();
+  });
+});
+
+describe('AutoflowRuns — Segmented view control (One Control Language kit)', () => {
+  it('renders as a single Segmented group with Runs/Cycles/Claims options, Runs active by default', async () => {
+    stubPage();
+    renderPage();
+    await waitFor(() => expect(screen.getByText('No autoflow activity yet')).toBeInTheDocument());
+
+    const group = screen.getByRole('group', { name: 'View' });
+    const options = within(group).getAllByRole('button');
+    expect(options.map((o) => o.textContent)).toEqual(['Runs', 'Cycles', 'Claims']);
+    expect(within(group).getByRole('button', { name: 'Runs' })).toHaveAttribute('aria-pressed', 'true');
+    expect(within(group).getByRole('button', { name: 'Cycles' })).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('clicking a Segmented option switches the active tab (aria-pressed flips)', async () => {
+    stubPage();
+    vi.spyOn(api, 'getAutoflowClaims').mockResolvedValue([]);
+    renderPage();
+    await waitFor(() => expect(screen.getByText('No autoflow activity yet')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Claims' }));
+
+    await waitFor(() => expect(screen.getByText('No active claims')).toBeInTheDocument());
+    const group = screen.getByRole('group', { name: 'View' });
+    expect(within(group).getByRole('button', { name: 'Claims' })).toHaveAttribute('aria-pressed', 'true');
+    expect(within(group).getByRole('button', { name: 'Runs' })).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('FilterBar slot order: Segmented view control first, then the host scope select', async () => {
+    stubPage();
+    const { container } = renderPage();
+    await waitFor(() => expect(screen.getByLabelText('Host filter')).toBeInTheDocument());
+
+    const controls = Array.from(container.querySelectorAll('button, select')).filter(
+      (el) => el.tagName === 'SELECT' || ['Runs', 'Cycles', 'Claims'].includes(el.textContent ?? ''),
+    );
+    const order = controls.map((el) => (el.tagName === 'SELECT' ? 'HOST_SELECT' : el.textContent));
+    expect(order).toEqual(['Runs', 'Cycles', 'Claims', 'HOST_SELECT']);
+  });
+});
+
+describe('AutoflowRuns — kit loading state', () => {
+  it('shows the kit Spinner while the Runs tab first page is in flight', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    let resolveFn: (v: AutoflowEventRow[]) => void = () => {};
+    vi.spyOn(api, 'getAutoflowEvents').mockReturnValue(
+      new Promise((r) => {
+        resolveFn = r;
+      }),
+    );
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+
+    renderPage();
+
+    expect(screen.getByRole('status')).toBeInTheDocument();
+    expect(screen.getByText('Loading autoflow activity…')).toBeInTheDocument();
+
+    resolveFn([]);
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument());
+  });
+});
+
+describe('AutoflowRuns — table rules (fit/subject columns)', () => {
+  it('the Workflow column is the one flexible/truncating subject column on the Runs tab', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([REMOTE_EVENT]);
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+    renderPage();
+    await waitFor(() => expect(screen.getByText('fix-issue')).toBeInTheDocument());
+
+    const subjectCell = screen.getByText('fix-issue').closest('td');
+    expect(subjectCell?.className).toMatch(/max-w-0/);
+    expect(subjectCell?.querySelector('[title="fix-issue"]')).toBeInTheDocument();
+  });
+
+  it('Run/Event/Host/Status columns are fit (nowrap) on the Runs tab', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([REMOTE_EVENT]);
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+    const { container } = renderPage();
+    await waitFor(() => expect(screen.getByText('fix-issue')).toBeInTheDocument());
+
+    for (const label of ['Run', 'Event', 'Host']) {
+      const th = Array.from(container.querySelectorAll('thead th')).find((el) =>
+        el.textContent?.includes(label),
+      );
+      expect(th?.className).toMatch(/whitespace-nowrap/);
+    }
+  });
+
+  it('Cycle detail table columns are all fit (no dominant subject column)', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([]);
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([CYCLE]);
+    renderPage();
+    fireEvent.click(screen.getByRole('button', { name: 'Cycles' }));
+    await waitFor(() => expect(screen.getByText('worker-1')).toBeInTheDocument());
+
+    const cell = screen.getByText('worker-1').closest('td');
+    expect(cell?.className).toMatch(/whitespace-nowrap/);
+    expect(cell?.className).not.toMatch(/max-w-0/);
+  });
+
+  it('the Claims Issue Ref column is the subject column (max-w-0 + title tooltip)', async () => {
+    stubPage();
+    vi.spyOn(api, 'getAutoflowClaims').mockResolvedValue([CLAIM]);
+    renderPage();
+    fireEvent.click(screen.getByText('Claims'));
+    await waitFor(() => expect(screen.getByText('acme/widgets#42')).toBeInTheDocument());
+
+    const subjectCell = screen.getByText('acme/widgets#42').closest('td');
+    expect(subjectCell?.className).toMatch(/max-w-0/);
   });
 });
 
