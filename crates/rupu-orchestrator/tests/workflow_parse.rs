@@ -1,4 +1,4 @@
-use rupu_orchestrator::Workflow;
+use rupu_orchestrator::{is_approval_gate, TimeoutAction, Workflow};
 
 const SIMPLE: &str = r#"
 name: investigate-then-fix
@@ -1138,4 +1138,105 @@ steps:
         err.contains("steps.b") && err.contains("forward reference"),
         "expected branch.condition forward-ref lint to fire, got: {err}"
     );
+}
+
+const GATE_WORKFLOW: &str = r#"
+name: gate-demo
+steps:
+  - id: review
+    agent: reviewer
+    prompt: "review it"
+  - id: merge_gate
+    approval:
+      prompt: "Approve to open the PR."
+      auto_approve: "{{ steps.review.output == 'clean' }}"
+      timeout_seconds: 86400
+      on_timeout: reject
+      on_reject:
+        - id: note_rejection
+          agent: issue-commenter
+          prompt: "note the rejection"
+"#;
+
+#[test]
+fn approval_gate_node_parses() {
+    let wf = Workflow::parse(GATE_WORKFLOW).unwrap();
+    let gate = &wf.steps[1];
+    assert!(is_approval_gate(gate));
+    let ap = gate.approval.as_ref().unwrap();
+    assert_eq!(ap.auto_approve.as_deref(), Some("{{ steps.review.output == 'clean' }}"));
+    assert_eq!(ap.on_timeout, Some(TimeoutAction::Reject));
+    assert_eq!(ap.on_reject.len(), 1);
+    assert_eq!(ap.on_reject[0].id, "note_rejection");
+}
+
+#[test]
+fn inline_approval_option_is_not_a_gate_node() {
+    // Legacy shape: approval alongside agent+prompt keeps its old meaning.
+    let yaml = r#"
+name: legacy
+steps:
+  - id: deploy
+    agent: deployer
+    prompt: "deploy"
+    approval:
+      required: true
+"#;
+    let wf = Workflow::parse(yaml).unwrap();
+    assert!(!is_approval_gate(&wf.steps[0]));
+}
+
+#[test]
+fn gate_node_rejects_agent_mixing() {
+    let yaml = r#"
+name: bad
+steps:
+  - id: g
+    agent: someone
+    approval:
+      on_reject: []
+"#;
+    // agent + approval WITHOUT prompt: linear validation already fails on
+    // missing prompt; the point is a gate-ish step with agent must error.
+    assert!(Workflow::parse(yaml).is_err());
+}
+
+#[test]
+fn gate_on_timeout_requires_timeout_seconds() {
+    let yaml = r#"
+name: bad
+steps:
+  - id: g
+    approval:
+      on_timeout: approve
+"#;
+    let err = Workflow::parse(yaml).unwrap_err();
+    assert!(err.to_string().contains("on_timeout"), "got: {err}");
+}
+
+#[test]
+fn gate_on_reject_forbids_nested_gates_and_fanout() {
+    let yaml = r#"
+name: bad
+steps:
+  - id: g
+    approval:
+      on_reject:
+        - id: nested
+          approval:
+            prompt: "no"
+"#;
+    assert!(Workflow::parse(yaml).is_err());
+    let yaml2 = r#"
+name: bad2
+steps:
+  - id: g
+    approval:
+      on_reject:
+        - id: fan
+          agent: a
+          for_each: "{{ steps.x.output }}"
+          prompt: "p"
+"#;
+    assert!(Workflow::parse(yaml2).is_err());
 }

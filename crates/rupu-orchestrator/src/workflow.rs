@@ -150,6 +150,10 @@ pub enum WorkflowParseError {
         "step `{step}`: `when:` is not allowed on a branch step; use the branch condition to gate routing"
     )]
     BranchWithWhen { step: String },
+    #[error("step `{step}`: approval.on_timeout requires timeout_seconds")]
+    GateOnTimeoutWithoutTimeout { step: String },
+    #[error("step `{step}`: on_reject step `{sub}` must be a plain agent or action step (no nested gates, fan-out, panel, or branch)")]
+    GateOnRejectInvalidStep { step: String, sub: String },
 }
 
 /// How a workflow gets kicked off. Manual is the existing behavior
@@ -625,7 +629,7 @@ pub struct PanelGate {
 ///   ever evaluating — neither arm gets added to the run's skip-set,
 ///   so both arms run. Use the branch condition to gate routing
 ///   instead.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Branch {
     /// minijinja template rendered to decide which branch to take.
@@ -650,7 +654,7 @@ pub struct Branch {
 /// because of `when:` doesn't ask for approval. Approval pauses
 /// regardless of fan-out shape (linear / `for_each:` / `parallel:`)
 /// since pausing happens before any dispatch.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Approval {
     /// When `true`, the runner pauses before dispatching this step.
@@ -674,6 +678,58 @@ pub struct Approval {
     /// interaction; a future ticker daemon could enforce it eagerly.
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
+    /// Minijinja expression evaluated when the gate is reached (same
+    /// context as `prompt:`). Truthy ⇒ the gate resolves as approved
+    /// (`via: auto`) without pausing. Only meaningful on a gate NODE
+    /// (standalone `approval:` step); ignored on the legacy inline option.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approve: Option<String>,
+    /// What a timed-out gate resolves to. Requires `timeout_seconds`.
+    /// Absent ⇒ `fail` (today's behavior: run marked Failed on expiry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_timeout: Option<TimeoutAction>,
+    /// Connector actions fired best-effort on entering AwaitingApproval
+    /// (spec §3.1). Parsed in Plan 1; executed in Plan 4.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notify: Vec<NotifyAction>,
+    /// Inline cleanup steps run after a reject decision, before the run
+    /// ends Rejected. Linear agent steps and (from Plan 2) action steps
+    /// only — no nested gates, no fan-out/panel/branch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_reject: Vec<Step>,
+}
+
+/// Outcome routing for a timed-out gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TimeoutAction {
+    Approve,
+    Reject,
+    Fail,
+}
+
+/// One notify hook on a gate: an SCM/issue/CI tool invocation, same
+/// shape as an `action:` step's (`action`, `with`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotifyAction {
+    pub action: String,
+    #[serde(default)]
+    pub with: serde_json::Value,
+}
+
+/// A step is an approval GATE NODE when it has an `approval:` block and
+/// no other shape (no agent/prompt/for_each/parallel/panel/branch/action).
+/// `approval:` alongside `agent`+`prompt` is the legacy inline option.
+pub fn is_approval_gate(step: &Step) -> bool {
+    step.approval.is_some()
+        && step.agent.is_none()
+        && step.prompt.is_none()
+        && step.for_each.is_none()
+        && step.parallel.is_none()
+        && step.panel.is_none()
+        && step.branch.is_none()
+        && step.action.is_none()
 }
 
 /// Workflow-level defaults inherited by every step. A step's own
@@ -714,7 +770,7 @@ pub struct Distribute {
     pub hosts: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Step {
     pub id: String,
@@ -815,12 +871,18 @@ pub struct Step {
     /// on a remote step (`host:` or `distribute:`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceMode>,
+    /// Connector action step (spec §3.2). Parse-level in Plan 1; execution in Plan 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Parameters for `action:`; values are minijinja-rendered at execution time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub with: Option<serde_json::Value>,
 }
 
 /// One sub-step inside a `parallel:` block. Same surface as a linear
 /// step except `actions:` and `continue_on_error:` are not allowed —
 /// the parent step controls those for the whole block.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SubStep {
     pub id: String,
@@ -891,6 +953,13 @@ impl Workflow {
         for step in &wf.steps {
             if !seen.insert(step.id.clone()) {
                 return Err(WorkflowParseError::DuplicateStep(step.id.clone()));
+            }
+            if let Some(ap) = &step.approval {
+                for sub in &ap.on_reject {
+                    if !seen.insert(sub.id.clone()) {
+                        return Err(WorkflowParseError::DuplicateStep(sub.id.clone()));
+                    }
+                }
             }
             if let Some(mp) = step.max_parallel {
                 if mp < 1 {
@@ -1120,6 +1189,27 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
                     sub: sub.id.clone(),
                 });
             }
+        }
+    } else if is_approval_gate(step) {
+        let ap = step.approval.as_ref().expect("gate has approval");
+        if ap.on_timeout.is_some() && ap.timeout_seconds.is_none() {
+            return Err(WorkflowParseError::GateOnTimeoutWithoutTimeout {
+                step: step.id.clone(),
+            });
+        }
+        for sub in &ap.on_reject {
+            if sub.approval.is_some()
+                || sub.for_each.is_some()
+                || sub.parallel.is_some()
+                || sub.panel.is_some()
+                || sub.branch.is_some()
+            {
+                return Err(WorkflowParseError::GateOnRejectInvalidStep {
+                    step: step.id.clone(),
+                    sub: sub.id.clone(),
+                });
+            }
+            validate_step_shape(sub)?; // linear (or Plan-2 action) rules apply
         }
     } else {
         // Linear / for_each step — agent + prompt are required.
