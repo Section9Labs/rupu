@@ -682,6 +682,7 @@ async fn reject_runs_on_reject_cleanup_chain() {
         serde_json::from_str(&gate_record.output).expect("gate output is JSON");
     assert_eq!(gate_output["decision"], "rejected");
     assert_eq!(gate_output["via"], "human");
+    assert_eq!(gate_output["reason"], "not today");
 
     let cleanup_record = records
         .iter()

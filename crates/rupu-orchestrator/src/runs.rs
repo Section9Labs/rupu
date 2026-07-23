@@ -1268,7 +1268,7 @@ impl RunStore {
     /// transition and show the run as running forever. Mirrors
     /// `JsonlSink`'s contract: failures are logged, never propagated
     /// (the persisted `run.json` flip above is the source of truth).
-    fn append_terminal_event(&self, run_id: &str, ev: &crate::executor::Event) {
+    pub(crate) fn append_terminal_event(&self, run_id: &str, ev: &crate::executor::Event) {
         use crate::executor::{EventSink, JsonlSink};
         let path = self.run_dir(run_id).join("events.jsonl");
         match JsonlSink::create(&path) {
