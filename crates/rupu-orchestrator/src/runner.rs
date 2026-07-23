@@ -1160,6 +1160,14 @@ async fn run_steps_inner(
                 }
             }
             info!(step = %step.id, "gate: pausing for approval");
+            fire_notify_hooks(
+                opts,
+                &step.id,
+                &ap.notify,
+                &ctx,
+                render_mode(opts.strict_templates),
+            )
+            .await;
             if let Some(sink) = opts.event_sink.as_ref() {
                 sink.emit(
                     run_id,
@@ -1733,6 +1741,57 @@ async fn execute_action_step(
                     source,
                 })
             }
+        }
+    }
+}
+
+/// Fire a gate's `notify:` hooks best-effort, right as the gate is about to
+/// actually park (never on auto-approve, never on a resume-suppressed
+/// gate — callers only reach here on the real pause path). Each hook is a
+/// throwaway `action:`-shaped step run through the same
+/// [`execute_action_step`] the main loop uses; every failure (missing
+/// dispatcher, render error, dispatch error) is logged and swallowed —
+/// notify never changes the park outcome, never blocks it, and never
+/// surfaces as a run error.
+async fn fire_notify_hooks(
+    opts: &OrchestratorRunOpts,
+    step_id: &str,
+    notify: &[crate::workflow::NotifyAction],
+    ctx: &StepContext,
+    mode: RenderMode,
+) {
+    if notify.is_empty() {
+        return;
+    }
+    let Some(dispatcher) = opts.action_dispatcher.as_ref() else {
+        warn!(step = %step_id, "notify skipped: no action dispatcher");
+        return;
+    };
+    for n in notify {
+        let synth = Step {
+            id: format!("{step_id}.notify"),
+            agent: None,
+            actions: Vec::new(),
+            when: None,
+            continue_on_error: None,
+            for_each: None,
+            parallel: None,
+            max_parallel: None,
+            prompt: None,
+            approval: None,
+            panel: None,
+            branch: None,
+            contract: None,
+            distribute: None,
+            host: None,
+            workspace: None,
+            action: Some(n.action.clone()),
+            with: Some(n.with.clone()),
+        };
+        if let Err(e) =
+            execute_action_step(dispatcher, &synth, ctx, mode, true, &opts.transcript_dir).await
+        {
+            warn!(step = %step_id, action = %n.action, error = %e, "gate notify hook failed; continuing");
         }
     }
 }
