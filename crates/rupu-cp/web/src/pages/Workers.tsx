@@ -9,10 +9,12 @@
 
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Server } from 'lucide-react';
 import { api, type WorkerView } from '../lib/api';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { SectionHeader } from '../components/lists/SectionHeader';
+import { EmptyState } from '../components/ui/EmptyState';
+import { ErrorBanner } from '../components/ui/ErrorBanner';
+import { Spinner } from '../components/ui/Spinner';
 import { cn } from '../lib/cn';
 import { relativeTime } from '../lib/time';
 
@@ -62,16 +64,17 @@ export default function Workers() {
 
       <Explainer />
 
-      {error && (
-        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {error}
-        </div>
-      )}
+      {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
       {workers === null ? (
-        <div className="text-sm text-ink-dim">Loading workers…</div>
+        <div className="py-16 flex items-center justify-center">
+          <Spinner label="Loading workers…" />
+        </div>
       ) : workers.length === 0 ? (
-        <EmptyState />
+        <EmptyState
+          title="No workers registered"
+          hint="Workers appear here once you run a workflow or send a session turn on a machine connected to this control plane."
+        />
       ) : (
         <section>
           <SectionHeader tone="muted" label="Workers" count={workers.length} />
@@ -91,8 +94,10 @@ const COLUMNS: Column<WorkerView>[] = [
   {
     key: 'name',
     header: 'Name',
+    subject: true,
     sortable: true,
     sortValue: (w) => w.name,
+    titleValue: (w) => w.name,
     render: (w) => (
       <div className="min-w-0">
         <div className="text-sm font-medium text-ink truncate">{w.name}</div>
@@ -103,6 +108,7 @@ const COLUMNS: Column<WorkerView>[] = [
   {
     key: 'kind',
     header: 'Kind',
+    fit: true,
     sortable: true,
     sortValue: (w) => w.kind,
     render: (w) => (
@@ -112,13 +118,14 @@ const COLUMNS: Column<WorkerView>[] = [
   {
     key: 'host',
     header: 'Host',
+    fit: true,
     render: (w) => <span className="text-note text-ink-mute font-mono">{w.host}</span>,
   },
   {
     key: 'active',
     header: 'Active runs',
     align: 'right',
-    width: 'w-24',
+    fit: true,
     sortable: true,
     sortValue: (w) => w.active_run_count,
     render: (w) =>
@@ -137,7 +144,7 @@ const COLUMNS: Column<WorkerView>[] = [
     key: 'total',
     header: 'Total runs',
     align: 'right',
-    width: 'w-24',
+    fit: true,
     sortable: true,
     sortValue: (w) => w.total_run_count,
     render: (w) => <span className="text-ink-dim tabular-nums">{w.total_run_count}</span>,
@@ -145,6 +152,8 @@ const COLUMNS: Column<WorkerView>[] = [
   {
     key: 'last_run',
     header: 'Last run',
+    align: 'right',
+    fit: true,
     sortable: true,
     sortValue: (w) => {
       if (!w.last_run_at) return null;
@@ -161,6 +170,8 @@ const COLUMNS: Column<WorkerView>[] = [
   {
     key: 'last_seen',
     header: 'Last seen',
+    align: 'right',
+    fit: true,
     sortable: true,
     sortValue: (w) => {
       const t = Date.parse(w.last_seen_at);
@@ -169,7 +180,7 @@ const COLUMNS: Column<WorkerView>[] = [
     render: (w) => {
       const stale = isStale(w.last_seen_at);
       return (
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 justify-end">
           <span className={cn('text-ui', stale ? 'text-warn' : 'text-ink-dim')}>
             {relativeTime(w.last_seen_at)}
           </span>
@@ -181,13 +192,14 @@ const COLUMNS: Column<WorkerView>[] = [
   {
     key: 'capabilities',
     header: 'Capabilities',
+    fit: true,
     render: (w) => <Capabilities worker={w} />,
   },
   {
     key: 'version',
     header: 'Version',
     align: 'right',
-    width: 'w-16',
+    fit: true,
     render: (w) => <span className="text-note text-ink-mute tabular-nums">v{w.version}</span>,
   },
 ];
@@ -257,21 +269,6 @@ function Explainer() {
           not seen in over 5 minutes.
         </li>
       </ul>
-    </div>
-  );
-}
-
-function EmptyState() {
-  return (
-    <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
-        <Server size={20} className="text-ink-mute" />
-      </div>
-      <h2 className="text-sm font-medium text-ink">No workers registered</h2>
-      <p className="mt-1 text-xs text-ink-dim max-w-xs">
-        Workers appear here once you run a workflow or send a session turn on a machine connected to
-        this control plane.
-      </p>
     </div>
   );
 }
