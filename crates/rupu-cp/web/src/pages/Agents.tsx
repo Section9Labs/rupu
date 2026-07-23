@@ -10,6 +10,9 @@ import SortableTable, { type Column } from '../components/lists/SortableTable';
 import UsageBarChart from '../components/charts/UsageBarChart';
 import CodeEditor from '../components/CodeEditor';
 import { Button } from '../components/ui/Button';
+import { EmptyState } from '../components/ui/EmptyState';
+import { ErrorBanner } from '../components/ui/ErrorBanner';
+import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
 import { formatTokens, formatCost } from '../lib/usage';
 import { cn } from '../lib/cn';
@@ -71,16 +74,17 @@ export default function Agents() {
         </Button>
       </header>
 
-      {error && (
-        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {error}
-        </div>
-      )}
+      {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
       {agents === null ? (
-        <div className="text-sm text-ink-dim">Loading agents…</div>
+        <div className="py-16 flex items-center justify-center">
+          <Spinner label="Loading agents…" />
+        </div>
       ) : sorted.length === 0 ? (
-        <EmptyState />
+        <EmptyState
+          title="No agents found"
+          hint="Add agent files under .rupu/agents/ to populate this library."
+        />
       ) : (
         <section>
           <div className="mb-4 rounded-xl border border-border bg-panel/50 p-4">
@@ -300,11 +304,13 @@ const AGENT_COLUMNS: Column<AgentSummary>[] = [
   {
     key: 'name',
     header: 'Name',
+    subject: true,
     sortable: true,
     sortValue: (a) => a.name,
+    titleValue: (a) => a.name,
     render: (a) => (
       <div className="flex flex-wrap items-center gap-2">
-        <span className="text-sm font-medium text-ink truncate">{a.name}</span>
+        <span className="text-sm font-medium text-ink">{a.name}</span>
         {a.provider && <MetaChip>{a.provider}</MetaChip>}
         {a.model && <MetaChip>{a.model}</MetaChip>}
         {a.effort && <MetaChip>effort: {a.effort}</MetaChip>}
@@ -314,7 +320,7 @@ const AGENT_COLUMNS: Column<AgentSummary>[] = [
   {
     key: 'scope',
     header: 'Scope',
-    width: 'w-24',
+    fit: true,
     sortable: true,
     sortValue: (a) => a.scope,
     render: (a) => <ScopeChip scope={a.scope} />,
@@ -322,6 +328,7 @@ const AGENT_COLUMNS: Column<AgentSummary>[] = [
   {
     key: 'description',
     header: 'Description',
+    fit: true,
     render: (a) =>
       a.description ? (
         <span className="text-ui text-ink-dim leading-snug truncate block max-w-md">
@@ -335,7 +342,7 @@ const AGENT_COLUMNS: Column<AgentSummary>[] = [
     key: 'runs',
     header: 'Runs',
     align: 'right',
-    width: 'w-20',
+    fit: true,
     sortable: true,
     sortValue: (a) => a.run_count,
     render: (a) => <span className="text-ink">{a.run_count ? String(a.run_count) : '—'}</span>,
@@ -344,7 +351,7 @@ const AGENT_COLUMNS: Column<AgentSummary>[] = [
     key: 'tokens',
     header: 'Tokens',
     align: 'right',
-    width: 'w-24',
+    fit: true,
     sortable: true,
     sortValue: (a) => a.usage?.total_tokens ?? null,
     render: (a) => (
@@ -355,7 +362,7 @@ const AGENT_COLUMNS: Column<AgentSummary>[] = [
     key: 'cost',
     header: 'Cost',
     align: 'right',
-    width: 'w-24',
+    fit: true,
     sortable: true,
     sortValue: (a) => a.usage?.cost_usd ?? null,
     render: (a) => (
@@ -374,20 +381,5 @@ function MetaChip({ children, className }: { children: React.ReactNode; classNam
     >
       {children}
     </span>
-  );
-}
-
-function EmptyState() {
-  return (
-    <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
-        <Sparkles size={20} className="text-ink-mute" />
-      </div>
-      <h2 className="text-sm font-medium text-ink">No agents found</h2>
-      <p className="mt-1 text-xs text-ink-dim max-w-xs">
-        Add agent files under <span className="font-mono">.rupu/agents/</span> to populate this
-        library.
-      </p>
-    </div>
   );
 }
