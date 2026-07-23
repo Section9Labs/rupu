@@ -1,0 +1,21 @@
+name: gate-demo
+description: "Demo: approval gate node with auto-approve and reject cleanup."
+steps:
+  - id: assess
+    agent: code-reviewer
+    prompt: "Assess the working tree; reply exactly 'clean' if nothing is risky."
+
+  - id: ship_gate
+    approval:
+      prompt: "Assessment: {{ steps.assess.output }} — approve to continue."
+      auto_approve: "{{ steps.assess.output == 'clean' }}"
+      timeout_seconds: 86400
+      on_timeout: reject
+      on_reject:
+        - id: note_rejection
+          agent: code-reviewer
+          prompt: "Summarize why run {{ steps.assess.output }} was rejected, one line."
+
+  - id: proceed
+    agent: code-reviewer
+    prompt: "Gate decision was {{ steps.ship_gate.decision }}. Say 'shipped'."
