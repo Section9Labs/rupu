@@ -53,6 +53,12 @@ export interface GraphNode {
   /** For panel/gate steps — current iteration / max. Task 9 populates `current`. */
   round?: { current: number; max: number };
   gate?: StepNodeDto['gate'];
+  /** Connector action tool name — populated only for `kind === 'action'`. */
+  action?: StepNodeDto['action'];
+  /** Standalone approval-gate configuration — populated only for
+   *  `kind === 'gate'`. Distinct from `gate` above, which is the panel step's
+   *  iteration-loop gate. */
+  approval_gate?: StepNodeDto['approval_gate'];
 }
 
 export interface GraphEdge {
@@ -113,6 +119,8 @@ export function buildRunGraphModel(
 
     if (dto.agent != null) node.agent = dto.agent;
     if (dto.gate != null) node.gate = dto.gate;
+    if (dto.action != null) node.action = dto.action;
+    if (dto.approval_gate != null) node.approval_gate = dto.approval_gate;
 
     // Parallel sub-steps: initialise each to pending.
     if (dto.kind === 'parallel' && dto.parallel != null) {

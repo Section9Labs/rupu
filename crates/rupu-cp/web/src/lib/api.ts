@@ -341,7 +341,7 @@ export interface RunListRow {
 /** Step-DAG node from /api/runs/:id/graph .workflow.steps */
 export interface StepNodeDto {
   id: string;
-  kind: 'step' | 'for_each' | 'parallel' | 'panel';
+  kind: 'step' | 'for_each' | 'parallel' | 'panel' | 'action' | 'gate';
   agent?: string | null;
   for_each?: string | null;
   parallel?: { id: string; agent: string }[] | null;
@@ -350,6 +350,16 @@ export interface StepNodeDto {
     max_iterations: number;
     until_severity: 'low' | 'medium' | 'high' | 'critical';
     fix_with: string;
+  } | null;
+  /** Connector action tool name, populated only for `kind === 'action'`. */
+  action?: string | null;
+  /** Approval-gate configuration, populated only for `kind === 'gate'` — a
+   *  standalone `approval:` gate NODE. Distinct from `gate` above, which is
+   *  the panel step's iteration-loop gate. */
+  approval_gate?: {
+    auto_approve: boolean;
+    has_on_reject: boolean;
+    timeout_seconds: number | null;
   } | null;
 }
 
@@ -791,6 +801,17 @@ export interface AgentDetail extends AgentSummary {
   system_prompt: string;
   /** Full raw agent definition file (`.md` frontmatter + body). */
   raw: string;
+}
+
+// ---------------------------------------------------------------------------
+// MCP tool catalog (workflow-step editor connector cards)
+// ---------------------------------------------------------------------------
+
+export interface ToolSpec {
+  name: string;
+  description: string;
+  input_schema: unknown;
+  kind: 'read' | 'write';
 }
 
 // ---------------------------------------------------------------------------
@@ -1692,6 +1713,12 @@ export const api = {
   },
   getAutoflowDefs(): Promise<AutoflowDefRow[]> {
     return request<AutoflowDefRow[]>('/api/autoflows');
+  },
+
+  // --- Tools (MCP catalog) ---
+  async getTools(): Promise<ToolSpec[]> {
+    const res = await request<{ tools: ToolSpec[] }>('/api/tools');
+    return res.tools;
   },
   /**
    * Enable or disable an autoflow — writes `autoflow.enabled` to the on-disk

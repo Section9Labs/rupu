@@ -13,7 +13,7 @@
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
-export type StepKind = 'step' | 'for_each' | 'parallel' | 'panel' | 'branch';
+export type StepKind = 'step' | 'for_each' | 'parallel' | 'panel' | 'branch' | 'approval_gate' | 'action';
 
 export interface SubStep {
   id: string;
@@ -62,6 +62,19 @@ export interface StepNodeData {
   // boolean because it drives the form checkbox.
   approvalPrompt?: string;
   approvalTimeoutSeconds?: number;
+  // Standalone approval-GATE fields (workflow.rs Approval, only meaningful on a
+  // gate NODE — a step with `approval:` and no agent/prompt/for_each/parallel/
+  // panel/branch/action). `notify` / `on_reject` are preserved verbatim as raw
+  // step objects so their full shape (action steps, extra keys) round-trips even
+  // though the form edits only a subset.
+  approvalAutoApprove?: string;
+  approvalOnTimeout?: 'approve' | 'reject' | 'fail';
+  approvalNotify?: Record<string, unknown>[];
+  approvalOnReject?: Record<string, unknown>[];
+  // Connector ACTION-step fields (workflow.rs Step.action / Step.with). An action
+  // node carries no agent/prompt — it invokes an SCM/issue/CI tool with params.
+  action?: string;
+  with?: Record<string, unknown>;
   // Any step-level keys we don't model (e.g. `contract:`) are captured verbatim
   // here on load and spread back on emit, so unmodeled config is never dropped.
   raw_passthrough?: Record<string, unknown>;
@@ -162,25 +175,36 @@ function parseStepData(raw: unknown, i: number): StepNodeData {
   const o = asRecord(raw) ?? {};
   const id = asString(o.id) ?? `step-${i}`;
 
-  // Kind precedence: panel > parallel > branch > for_each > step. A step
-  // matching none cleanly still becomes a plain `step` node carrying whatever
-  // it has. A branch step has no agent/prompt of its own.
+  // Kind precedence (most-specific first): panel > parallel > branch > action >
+  // for_each > approval_gate > step. A step matching none cleanly still becomes
+  // a plain `step` node carrying whatever it has. A branch/gate/action step has
+  // no agent/prompt of its own. The gate arm mirrors workflow.rs `is_approval_gate`:
+  // an `approval:` block AND no agent/prompt/for_each/parallel/panel/branch/action
+  // (the earlier arms already peeled those shapes off, so here we only re-check
+  // agent/prompt).
   const panelRaw = asRecord(o.panel);
   const parallelRaw = asArray(o.parallel);
   const branchRaw = asRecord(o.branch);
+  const actionName = asString(o.action);
   const forEach = asString(o.for_each);
+  const approvalRaw = asRecord(o.approval);
+  const agentName = asString(o.agent);
+  const promptText = asString(o.prompt);
   let kind: StepKind = 'step';
   if (panelRaw) kind = 'panel';
   else if (parallelRaw) kind = 'parallel';
   else if (branchRaw) kind = 'branch';
+  else if (actionName !== undefined) kind = 'action';
   else if (forEach !== undefined) kind = 'for_each';
+  else if (approvalRaw && agentName === undefined && promptText === undefined) kind = 'approval_gate';
 
   const data: StepNodeData = { id, kind };
 
-  const agent = asString(o.agent);
-  if (agent !== undefined) data.agent = agent;
-  const prompt = asString(o.prompt);
-  if (prompt !== undefined) data.prompt = prompt;
+  if (agentName !== undefined) data.agent = agentName;
+  if (promptText !== undefined) data.prompt = promptText;
+  if (actionName !== undefined) data.action = actionName;
+  const withRaw = asRecord(o.with);
+  if (withRaw !== undefined) data.with = withRaw;
   const when = asString(o.when);
   if (when !== undefined) data.when = when;
   const coe = asBool(o.continue_on_error);
@@ -201,13 +225,21 @@ function parseStepData(raw: unknown, i: number): StepNodeData {
     if (elseTargets && elseTargets.length > 0) data.elseTargets = elseTargets;
   }
 
-  const approval = asRecord(o.approval);
+  const approval = approvalRaw;
   if (approval) {
     if (approval.required === true) data.approvalRequired = true;
     const ap = asString(approval.prompt);
     if (ap !== undefined) data.approvalPrompt = ap;
     const ats = asNumber(approval.timeout_seconds);
     if (ats !== undefined) data.approvalTimeoutSeconds = ats;
+    const aa = asString(approval.auto_approve);
+    if (aa !== undefined) data.approvalAutoApprove = aa;
+    const ot = asString(approval.on_timeout);
+    if (ot === 'approve' || ot === 'reject' || ot === 'fail') data.approvalOnTimeout = ot;
+    const notify = asArray(approval.notify);
+    if (notify) data.approvalNotify = notify.map((n) => asRecord(n) ?? {});
+    const onReject = asArray(approval.on_reject);
+    if (onReject) data.approvalOnReject = onReject.map((s) => asRecord(s) ?? {});
   }
 
   // Capture any step-level keys we don't model so they survive round-trips.
@@ -235,6 +267,8 @@ const MODELLED_STEP_KEYS = new Set<string>([
   'panel',
   'branch',
   'approval',
+  'action',
+  'with',
 ]);
 
 // ── extractStepRefs ───────────────────────────────────────────────────────────
@@ -408,6 +442,21 @@ function nodeToStepObject(d: StepNodeData): Record<string, unknown> {
     if (d.thenTargets && d.thenTargets.length > 0) bo.then = d.thenTargets;
     if (d.elseTargets && d.elseTargets.length > 0) bo.else = d.elseTargets;
     o.branch = bo;
+  } else if (d.kind === 'action') {
+    // action step — `action:` (tool name) + optional `with:` params, plus the
+    // shared when/continue_on_error a linear step also carries.
+    if (d.action) o.action = d.action;
+    if (d.with !== undefined) o.with = d.with;
+    if (d.when) o.when = d.when;
+    if (d.continue_on_error === true) o.continue_on_error = true;
+    if (d.actions && d.actions.length > 0) o.actions = d.actions;
+  } else if (d.kind === 'approval_gate') {
+    // standalone gate NODE — its whole identity is the `approval:` block emitted
+    // below; it carries no agent/prompt. `when` is still valid on a gate, so
+    // preserve it (it lives in MODELLED_STEP_KEYS, i.e. never in raw_passthrough).
+    if (d.when) o.when = d.when;
+    if (d.continue_on_error === true) o.continue_on_error = true;
+    if (d.actions && d.actions.length > 0) o.actions = d.actions;
   } else {
     // step / for_each
     if (d.agent) o.agent = d.agent;
@@ -417,15 +466,40 @@ function nodeToStepObject(d: StepNodeData): Record<string, unknown> {
     if (d.actions && d.actions.length > 0) o.actions = d.actions;
     if (d.for_each) o.for_each = d.for_each;
     if (d.max_parallel !== undefined) o.max_parallel = d.max_parallel;
+    // `with` is normally only meaningful alongside `action:` (see the action
+    // arm above), but it's in MODELLED_STEP_KEYS (so never falls into
+    // raw_passthrough either) — emit it here too so a step/for_each node that
+    // somehow carries one (e.g. hand-authored YAML with a stray `with:`)
+    // still round-trips instead of silently vanishing. Schema-invalid on save
+    // either way (workflow.rs rejects `with:` without `action:`), but dropping
+    // data silently is worse than a validation error the user can act on.
+    if (d.with !== undefined) o.with = d.with;
   }
 
-  // Approval applies to any step kind. Emit only when there's something to say,
-  // preserving the optional prompt/timeout alongside `required`.
-  if (d.approvalRequired || d.approvalPrompt !== undefined || d.approvalTimeoutSeconds !== undefined) {
+  // Approval applies to any step kind. A gate NODE ALWAYS emits an `approval:`
+  // block (it is the node's identity); other kinds emit only when there's an
+  // inline approval to say. The gate-only fields (auto_approve / on_timeout /
+  // notify / on_reject) round-trip verbatim.
+  const hasGateExtras =
+    d.approvalAutoApprove !== undefined ||
+    d.approvalOnTimeout !== undefined ||
+    (d.approvalNotify !== undefined && d.approvalNotify.length > 0) ||
+    (d.approvalOnReject !== undefined && d.approvalOnReject.length > 0);
+  if (
+    d.kind === 'approval_gate' ||
+    d.approvalRequired ||
+    d.approvalPrompt !== undefined ||
+    d.approvalTimeoutSeconds !== undefined ||
+    hasGateExtras
+  ) {
     const ap: Record<string, unknown> = {};
     if (d.approvalRequired) ap.required = true;
     if (d.approvalPrompt !== undefined) ap.prompt = d.approvalPrompt;
     if (d.approvalTimeoutSeconds !== undefined) ap.timeout_seconds = d.approvalTimeoutSeconds;
+    if (d.approvalAutoApprove !== undefined) ap.auto_approve = d.approvalAutoApprove;
+    if (d.approvalOnTimeout !== undefined) ap.on_timeout = d.approvalOnTimeout;
+    if (d.approvalNotify !== undefined && d.approvalNotify.length > 0) ap.notify = d.approvalNotify;
+    if (d.approvalOnReject !== undefined && d.approvalOnReject.length > 0) ap.on_reject = d.approvalOnReject;
     o.approval = ap;
   }
 
@@ -565,4 +639,102 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
   }
 
   return out;
+}
+
+// ── convertInlineApprovalToGate ──────────────────────────────────────────────
+
+/** True for a "legacy inline approval": an agent-bearing step/for_each node
+ *  whose `approval.required` is set directly on it (workflow.rs `Approval` on
+ *  `Step`), rather than expressed as a standalone `approval_gate` node. This is
+ *  the shape the dashed-gate badge and the "Convert to gate node" affordance
+ *  both target. */
+export function hasInlineApproval(d: StepNodeData): boolean {
+  return (d.kind === 'step' || d.kind === 'for_each') && d.approvalRequired === true;
+}
+
+/** Node-box width + gap used to offset the new gate node so it doesn't render
+ *  on top of the agent step before the next auto-layout/relayout. Mirrors
+ *  `NODE_W` (210) + the `applyAddConnectedNext` gap (64) in workflowLayout /
+ *  WorkflowEditorGraph — duplicated as a literal rather than imported so this
+ *  module stays framework/layout-free (see the file-header comment). */
+const CONVERT_GATE_X_OFFSET = 274;
+
+/** Rewrite `stepId`'s inline `approval:` into a NEW standalone `approval_gate`
+ *  node inserted immediately before it: every edge that targeted `stepId` is
+ *  re-targeted at the new gate, and a gate→`stepId` edge is added, so the gate
+ *  always runs first regardless of node array order or layout position. The
+ *  agent step's `approval*` fields are cleared (moved onto the gate) — every
+ *  other field (agent/prompt/when/raw_passthrough/etc.) is untouched.
+ *
+ *  A no-op (returns `g` unchanged) when `stepId` doesn't name a node, or names
+ *  a node without an inline approval (see `hasInlineApproval`) — callers don't
+ *  need to guard before invoking this.
+ *
+ *  Pure graph transform, like `canConnect`/`applyConnect` — callers re-serialize
+ *  the result via `graphToWorkflowObject` + `yaml.dump` same as any other graph
+ *  edit. Powers the StepForm "Convert to gate node" button (Slice D Plan 3
+ *  Task 6); full auto-synthesis of a gate on EVERY legacy inline approval is
+ *  deferred (this is opt-in, one node at a time, from the editor). */
+export function convertInlineApprovalToGate(g: WorkflowGraph, stepId: string): WorkflowGraph {
+  const idx = g.nodes.findIndex((n) => n.id === stepId);
+  if (idx === -1) return g;
+  const node = g.nodes[idx];
+  if (!hasInlineApproval(node.data)) return g;
+
+  // Smallest-available `<stepId>-gate[-N]` id, so converting the same step
+  // twice (or a workflow that already has `<id>-gate`) never collides.
+  const existingIds = new Set(g.nodes.map((n) => n.id));
+  let gateId = `${stepId}-gate`;
+  for (let n = 1; existingIds.has(gateId); n++) gateId = `${stepId}-gate-${n}`;
+
+  const gateData: StepNodeData = { id: gateId, kind: 'approval_gate', approvalRequired: true };
+  if (node.data.approvalPrompt !== undefined) gateData.approvalPrompt = node.data.approvalPrompt;
+  if (node.data.approvalTimeoutSeconds !== undefined) {
+    gateData.approvalTimeoutSeconds = node.data.approvalTimeoutSeconds;
+  }
+  if (node.data.approvalAutoApprove !== undefined) {
+    gateData.approvalAutoApprove = node.data.approvalAutoApprove;
+  }
+  if (node.data.approvalOnTimeout !== undefined) {
+    gateData.approvalOnTimeout = node.data.approvalOnTimeout;
+  }
+  if (node.data.approvalNotify !== undefined) {
+    gateData.approvalNotify = node.data.approvalNotify;
+  }
+  if (node.data.approvalOnReject !== undefined) {
+    gateData.approvalOnReject = node.data.approvalOnReject;
+  }
+
+  const strippedData: StepNodeData = { ...node.data };
+  delete strippedData.approvalRequired;
+  delete strippedData.approvalPrompt;
+  delete strippedData.approvalTimeoutSeconds;
+  delete strippedData.approvalAutoApprove;
+  delete strippedData.approvalOnTimeout;
+  delete strippedData.approvalNotify;
+  delete strippedData.approvalOnReject;
+
+  const gateNode: GraphNode = {
+    id: gateId,
+    data: gateData,
+    position: { x: node.position.x, y: node.position.y },
+  };
+  const strippedNode: GraphNode = {
+    ...node,
+    data: strippedData,
+    position: { x: node.position.x + CONVERT_GATE_X_OFFSET, y: node.position.y },
+  };
+
+  const nodes = [...g.nodes];
+  nodes[idx] = strippedNode;
+  nodes.splice(idx, 0, gateNode);
+
+  const edges: GraphEdge[] = g.edges.map((e) => {
+    if (e.target !== stepId) return e;
+    const id = e.branch ? `${e.source}->${gateId}:${e.branch}` : `${e.source}->${gateId}`;
+    return { ...e, id, target: gateId };
+  });
+  edges.push({ id: `${gateId}->${stepId}`, source: gateId, target: stepId });
+
+  return { ...g, nodes, edges };
 }

@@ -5,8 +5,16 @@
 // always carried through untouched. Validation `problems` for this node render
 // in an inline alert block at the top.
 
-import type { AgentSummary } from '../../lib/api';
-import type { GraphNode, PanelCfg, PanelGate, StepKind, StepNodeData, SubStep } from '../../lib/workflowGraph';
+import type { AgentSummary, ToolSpec } from '../../lib/api';
+import {
+  hasInlineApproval,
+  type GraphNode,
+  type PanelCfg,
+  type PanelGate,
+  type StepKind,
+  type StepNodeData,
+  type SubStep,
+} from '../../lib/workflowGraph';
 import type { ExprContext } from '../../lib/workflowExpressions';
 import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 import ExpressionField from './ExpressionField';
@@ -31,6 +39,17 @@ interface StepFormProps {
    *  already a branch (an existing branch node must always be editable
    *  regardless of the flag). Defaults to 'classic'. */
   workflowEditorUi?: WorkflowEditorUi;
+  /** MCP tool catalog — populates the action body's tool <select> and drives its
+   *  `with:` key/value editor (the selected tool's `input_schema.properties`).
+   *  Defaults to empty for callers that don't thread it. */
+  tools?: ToolSpec[];
+  /** Rewrite the SELECTED node's legacy inline approval (`hasInlineApproval`)
+   *  into a new standalone gate step inserted before it — the editor's wiring
+   *  of `convertInlineApprovalToGate` (a whole-graph transform, so StepForm
+   *  can't do it via the per-node `onChange` alone). Only invoked from the
+   *  "Convert to gate node" button, which itself only renders when
+   *  `hasInlineApproval(d)`. Omitted (or absent) → the button doesn't render. */
+  onConvertToGate?: () => void;
 }
 
 /** Build a full ExprContext for a single field from the shared step context. */
@@ -70,7 +89,14 @@ const KIND_LABELS: Record<StepKind, string> = {
   parallel: 'Parallel',
   panel: 'Panel',
   branch: 'Branch (if)',
+  approval_gate: 'Approval gate',
+  action: 'Action',
 };
+
+// Kinds offered in the Kind <select> only when the `next` flag is on — UNLESS
+// the node being edited is already that kind, in which case it must always be
+// selectable (an existing node stays fully editable regardless of the flag).
+const NEXT_ONLY_KINDS = new Set<StepKind>(['branch', 'approval_gate', 'action']);
 
 export default function StepForm({
   node,
@@ -80,14 +106,13 @@ export default function StepForm({
   exprContext,
   allNodeIds = [],
   workflowEditorUi = 'classic',
+  tools = [],
+  onConvertToGate,
 }: StepFormProps) {
   const d = node.data;
 
-  // The "branch" kind option is behind the flag — UNLESS the node being
-  // edited is already a branch, in which case it must always be selectable
-  // (an existing branch node is always fully editable regardless of the flag).
   const kindOptions = (Object.keys(KIND_LABELS) as StepKind[]).filter(
-    (k) => k !== 'branch' || workflowEditorUi === 'next' || d.kind === 'branch',
+    (k) => !NEXT_ONLY_KINDS.has(k) || workflowEditorUi === 'next' || d.kind === k,
   );
 
   // Generic field patch — spread the old data so raw_passthrough and every
@@ -183,12 +208,18 @@ export default function StepForm({
       {d.kind === 'branch' && (
         <BranchFields d={d} allNodeIds={allNodeIds} patch={patch} exprContext={exprContext} />
       )}
+      {d.kind === 'approval_gate' && (
+        <GateFields d={d} agents={agents} patch={patch} exprContext={exprContext} workflowEditorUi={workflowEditorUi} />
+      )}
+      {d.kind === 'action' && <ActionFields d={d} tools={tools} patch={patch} />}
 
       {/* ── common: when / continue_on_error / approval ─────────────── */}
-      {/* branch — like panel — hides this block: nodeToStepObject never reads
-         when/continue_on_error for branch (mirrors panel's exclusion), and
-         approval is mirrored off here the same way panel already excludes it. */}
-      {d.kind !== 'panel' && d.kind !== 'branch' && (
+      {/* branch/panel/approval_gate hide this block: nodeToStepObject never reads
+         when/continue_on_error for branch/panel, and a gate owns its whole
+         approval block via GateFields (so the shared inline-approval checkbox
+         would double up). Action keeps the block (when/continue_on_error are
+         valid on an action step). */}
+      {d.kind !== 'panel' && d.kind !== 'branch' && d.kind !== 'approval_gate' && (
         <>
           <label className="block">
             <span className={labelCls}>When (optional)</span>
@@ -210,7 +241,13 @@ export default function StepForm({
             Continue on error
           </label>
 
-          <ApprovalFields d={d} patch={patch} exprContext={exprContext} workflowEditorUi={workflowEditorUi} />
+          <ApprovalFields
+            d={d}
+            patch={patch}
+            exprContext={exprContext}
+            workflowEditorUi={workflowEditorUi}
+            onConvertToGate={onConvertToGate}
+          />
         </>
       )}
     </div>
@@ -635,6 +672,248 @@ function BranchFields({
   );
 }
 
+// ── approval gate (standalone gate NODE) ─────────────────────────────────────
+
+/** Read a string field off a raw on_reject step record (preserved verbatim in
+ *  `approvalOnReject`), tolerating a missing/non-string value. */
+function recStr(rec: Record<string, unknown>, key: string): string {
+  const v = rec[key];
+  return typeof v === 'string' ? v : '';
+}
+
+function GateFields({
+  d,
+  agents,
+  patch,
+  exprContext,
+  workflowEditorUi,
+}: {
+  d: StepNodeData;
+  agents: AgentSummary[];
+  patch: (p: Partial<StepNodeData>) => void;
+  exprContext: StepExprContext;
+  workflowEditorUi: WorkflowEditorUi;
+}) {
+  const onReject = d.approvalOnReject ?? [];
+
+  function setOnReject(next: Record<string, unknown>[]): void {
+    patch({ approvalOnReject: next });
+  }
+  function updateReject(i: number, p: Record<string, unknown>): void {
+    setOnReject(onReject.map((s, j) => (j === i ? { ...s, ...p } : s)));
+  }
+  function addReject(): void {
+    setOnReject([...onReject, { id: `cleanup-${onReject.length + 1}`, agent: '', prompt: '' }]);
+  }
+  function removeReject(i: number): void {
+    setOnReject(onReject.filter((_, j) => j !== i));
+  }
+
+  return (
+    <div className="space-y-3">
+      <label className="block">
+        <span className={labelCls}>Approval prompt</span>
+        {workflowEditorUi === 'next' ? (
+          <ExpressionField
+            value={d.approvalPrompt ?? ''}
+            onChange={(v) => patch({ approvalPrompt: v === '' ? undefined : v })}
+            context={fieldCtx(exprContext, {})}
+            multiline
+            ariaLabel="Approval prompt"
+          />
+        ) : (
+          <input
+            type="text"
+            value={d.approvalPrompt ?? ''}
+            onChange={(e) => patch({ approvalPrompt: e.target.value === '' ? undefined : e.target.value })}
+            aria-label="Approval prompt"
+            className={fieldCls}
+          />
+        )}
+      </label>
+
+      <label className="block">
+        <span className={labelCls}>Auto approve (expression)</span>
+        <input
+          type="text"
+          value={d.approvalAutoApprove ?? ''}
+          onChange={(e) => patch({ approvalAutoApprove: e.target.value === '' ? undefined : e.target.value })}
+          aria-label="Auto approve"
+          placeholder="{{ inputs.trusted }}"
+          className={`${fieldCls} font-mono`}
+        />
+      </label>
+
+      <label className="block">
+        <span className={labelCls}>Timeout (seconds)</span>
+        <input
+          type="number"
+          value={d.approvalTimeoutSeconds ?? ''}
+          onChange={(e) => patch({ approvalTimeoutSeconds: parseNum(e.target.value) })}
+          aria-label="Approval timeout seconds"
+          className={fieldCls}
+        />
+      </label>
+
+      <label className="block">
+        <span className={labelCls}>On timeout</span>
+        <select
+          value={d.approvalOnTimeout ?? ''}
+          onChange={(e) =>
+            patch({
+              approvalOnTimeout:
+                e.target.value === '' ? undefined : (e.target.value as 'approve' | 'reject' | 'fail'),
+            })
+          }
+          aria-label="On timeout"
+          className={fieldCls}
+        >
+          <option value="">— default (fail) —</option>
+          <option value="approve">approve</option>
+          <option value="reject">reject</option>
+          <option value="fail">fail</option>
+        </select>
+      </label>
+
+      <div>
+        <span className={labelCls}>On reject (cleanup steps)</span>
+        <div className="space-y-3">
+          {onReject.map((s, i) => (
+            <div key={i} className="space-y-2 rounded-md border border-border bg-surface p-2.5">
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={recStr(s, 'id')}
+                  onChange={(e) => updateReject(i, { id: e.target.value })}
+                  aria-label={`On-reject step ${i + 1} id`}
+                  placeholder="id"
+                  className={`${fieldCls} font-mono`}
+                />
+                <Button
+                  variant="danger-outline"
+                  onClick={() => removeReject(i)}
+                  aria-label={`Remove on-reject step ${i + 1}`}
+                  className="shrink-0 px-2.5"
+                >
+                  Remove
+                </Button>
+              </div>
+              <AgentSelect
+                value={recStr(s, 'agent') || undefined}
+                agents={agents}
+                ariaLabel={`On-reject step ${i + 1} agent`}
+                onChange={(v) => updateReject(i, { agent: v ?? '' })}
+              />
+              <ExpressionField
+                value={recStr(s, 'prompt')}
+                onChange={(v) => updateReject(i, { prompt: v })}
+                context={fieldCtx(exprContext, {})}
+                multiline
+                ariaLabel={`On-reject step ${i + 1} prompt`}
+                placeholder="prompt"
+                size={workflowEditorUi === 'next' ? 'large' : undefined}
+              />
+            </div>
+          ))}
+        </div>
+        <button
+          type="button"
+          onClick={addReject}
+          className="mt-2 text-ui font-medium text-brand-600 hover:text-brand-700"
+        >
+          Add cleanup step
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── action (connector step) ──────────────────────────────────────────────────
+
+/** Extract the parameter keys the selected tool declares
+ *  (`input_schema.properties`), tolerating an absent/malformed schema. */
+function toolParamKeys(tool: ToolSpec | undefined): string[] {
+  if (!tool) return [];
+  const schema = tool.input_schema;
+  if (typeof schema !== 'object' || schema === null) return [];
+  const props = (schema as Record<string, unknown>).properties;
+  if (typeof props !== 'object' || props === null || Array.isArray(props)) return [];
+  return Object.keys(props as Record<string, unknown>);
+}
+
+function ActionFields({
+  d,
+  tools,
+  patch,
+}: {
+  d: StepNodeData;
+  tools: ToolSpec[];
+  patch: (p: Partial<StepNodeData>) => void;
+}) {
+  const withObj = d.with ?? {};
+  const selected = tools.find((t) => t.name === d.action);
+  // Tool option names: every catalog tool plus the current value if it's not in
+  // the list (so a step referencing an unknown/renamed tool still round-trips).
+  const names = tools.map((t) => t.name);
+  const options = d.action && !names.includes(d.action) ? [d.action, ...names] : names;
+  const paramKeys = toolParamKeys(selected);
+  // Show any params the schema declares, PLUS any keys already set on `with:`
+  // (so hand-authored / unknown-tool params stay editable and never dropped).
+  const keys = [...new Set([...paramKeys, ...Object.keys(withObj)])];
+
+  function patchWith(key: string, value: string): void {
+    const next = { ...withObj };
+    if (value === '') delete next[key];
+    else next[key] = value;
+    patch({ with: next });
+  }
+
+  return (
+    <div className="space-y-3">
+      <label className="block">
+        <span className={labelCls}>Tool</span>
+        <select
+          value={d.action ?? ''}
+          onChange={(e) => patch({ action: e.target.value })}
+          aria-label="Action tool"
+          className={fieldCls}
+        >
+          <option value="">— select tool —</option>
+          {options.map((name) => (
+            <option key={name} value={name}>
+              {name}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      <div>
+        <span className={labelCls}>With (parameters)</span>
+        <div className="space-y-2 rounded-md border border-border bg-surface p-2.5">
+          {keys.length === 0 ? (
+            <p className="text-ui text-ink-mute">
+              {d.action ? 'This tool takes no parameters.' : 'Select a tool to configure its parameters.'}
+            </p>
+          ) : (
+            keys.map((key) => (
+              <label key={key} className="block">
+                <span className="mb-1 block text-note font-mono text-ink-dim">{key}</span>
+                <input
+                  type="text"
+                  value={typeof withObj[key] === 'string' ? (withObj[key] as string) : ''}
+                  onChange={(e) => patchWith(key, e.target.value)}
+                  aria-label={`With ${key}`}
+                  className={`${fieldCls} font-mono`}
+                />
+              </label>
+            ))
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── approval (step / for_each) ───────────────────────────────────────────────
 
 function ApprovalFields({
@@ -642,6 +921,7 @@ function ApprovalFields({
   patch,
   exprContext,
   workflowEditorUi,
+  onConvertToGate,
 }: {
   d: StepNodeData;
   patch: (p: Partial<StepNodeData>) => void;
@@ -652,6 +932,11 @@ function ApprovalFields({
    *  orchestrator's `Approval.prompt` doc comment), so it's genuinely
    *  expression-capable; classic keeps today's plain input byte-identical. */
   workflowEditorUi: WorkflowEditorUi;
+  /** Threaded from StepForm — rewrites this legacy inline approval into a
+   *  standalone gate step. Renders the "Convert to gate node" button only when
+   *  provided AND `hasInlineApproval(d)` (i.e. `d.approvalRequired` is set —
+   *  this component only mounts for step/for_each, so that's the only gate). */
+  onConvertToGate?: () => void;
 }) {
   return (
     <div className="space-y-3">
@@ -702,6 +987,16 @@ function ApprovalFields({
               className={fieldCls}
             />
           </label>
+          {onConvertToGate && hasInlineApproval(d) && (
+            <div className="border-t border-border pt-3">
+              <Button variant="secondary" onClick={onConvertToGate} className="w-full">
+                Convert to gate node
+              </Button>
+              <p className="mt-1.5 text-note text-ink-mute">
+                Moves this approval onto a new standalone gate step inserted just before this one.
+              </p>
+            </div>
+          )}
         </div>
       )}
     </div>

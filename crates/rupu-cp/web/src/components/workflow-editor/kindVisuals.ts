@@ -9,7 +9,7 @@
 // violet (brand), parallel/purple (sev-critical), panel/amber (awaiting),
 // branch/green (done — a routing decision, distinct from every other kind).
 
-import { Bot, Columns3, GitBranch, Repeat, ShieldCheck, type LucideIcon } from 'lucide-react';
+import { Bot, Columns3, GitBranch, Repeat, ShieldCheck, UserCheck, Zap, type LucideIcon } from 'lucide-react';
 import type { StepKind } from '../../lib/workflowGraph';
 import type { ColorKey } from '../../lib/useThemeColors';
 
@@ -19,6 +19,9 @@ export const KIND_ACCENT: Record<StepKind, ColorKey> = {
   parallel: 'sev.critical',
   panel: 'status.awaiting',
   branch: 'status.done',
+  // approval_gate/paused (a human hold) + action/sev.info (a connector call).
+  approval_gate: 'status.paused',
+  action: 'sev.info',
 };
 
 export const KIND_ICON: Record<StepKind, LucideIcon> = {
@@ -27,4 +30,6 @@ export const KIND_ICON: Record<StepKind, LucideIcon> = {
   parallel: Columns3,
   panel: ShieldCheck,
   branch: GitBranch,
+  approval_gate: UserCheck,
+  action: Zap,
 };

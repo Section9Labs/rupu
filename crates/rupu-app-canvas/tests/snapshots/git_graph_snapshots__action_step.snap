@@ -1,0 +1,25 @@
+---
+source: crates/rupu-app-canvas/tests/git_graph_snapshots.rs
+expression: rows
+---
+- cells:
+    - Bullet: waiting
+    - Space: 2
+    - Label: classify
+    - Space: 2
+    - Meta: classifier
+  anchor:
+    - classify
+    - waiting
+- cells:
+    - Pipe: waiting
+  anchor: ~
+- cells:
+    - Bullet: waiting
+    - Space: 2
+    - Label: open_pr
+    - Space: 2
+    - Meta: action · scm.prs.create
+  anchor:
+    - open_pr
+    - waiting

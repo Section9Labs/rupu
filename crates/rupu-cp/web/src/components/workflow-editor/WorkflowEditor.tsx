@@ -18,8 +18,9 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import yaml from 'js-yaml';
-import type { AgentSummary } from '../../lib/api';
+import { api, type AgentSummary, type ToolSpec } from '../../lib/api';
 import {
+  convertInlineApprovalToGate,
   graphToWorkflowObject,
   topoSort,
   validateGraph,
@@ -146,6 +147,10 @@ export default function WorkflowEditor({
   workflowEditorUi = 'classic',
 }: WorkflowEditorProps) {
   const [graph, setGraph] = useState<WorkflowGraph>(() => seedGraph(draftYaml));
+  // MCP tool catalog for the connector ACTION cards + the action-body tool
+  // <select> (Task 5). Best-effort: a fetch failure just leaves no connector
+  // cards (the palette degrades to kind cards only).
+  const [tools, setTools] = useState<ToolSpec[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [panelTab, setPanelTab] = useState<PanelTab>('settings');
   const [connError, setConnError] = useState<string | null>(null);
@@ -279,6 +284,22 @@ export default function WorkflowEditor({
     return () => clearTimeout(handle);
   }, [draftYaml]);
 
+  // Fetch the MCP tool catalog once on mount (connector cards + action body).
+  useEffect(() => {
+    let alive = true;
+    api
+      .getTools()
+      .then((t) => {
+        if (alive) setTools(t);
+      })
+      .catch(() => {
+        /* no catalog → palette degrades to kind cards only */
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   // Auto-dismiss the transient notice.
   useEffect(() => {
     if (notice === null) return;
@@ -343,6 +364,16 @@ export default function WorkflowEditor({
     },
     [commit, graph],
   );
+
+  // "Convert to gate node" (StepForm) — a whole-graph transform (inserts a new
+  // node), so it can't go through onStepChange's single-node patch. Keeps the
+  // selected id pointed at the (now approval-free) agent step; the new gate
+  // just isn't selected.
+  const onConvertToGate = useCallback((): void => {
+    if (selectedId === null) return;
+    const next = convertInlineApprovalToGate(graph, selectedId);
+    if (next !== graph) commit(next);
+  }, [commit, graph, selectedId]);
 
   const selectedNode = selectedId ? graph.nodes.find((n) => n.id === selectedId) ?? null : null;
 
@@ -438,6 +469,7 @@ export default function WorkflowEditor({
                 paused={paused}
                 workflowEditorUi={workflowEditorUi}
                 paletteContainer={paletteSlot}
+                tools={tools}
               />
             </div>
             <div className="flex items-center gap-2 border-t border-border bg-panel px-3 py-1.5">
@@ -470,6 +502,7 @@ export default function WorkflowEditor({
                   paused={paused}
                   workflowEditorUi={workflowEditorUi}
                   paletteContainer={workflowEditorUi === 'next' ? paletteSlot : undefined}
+                  tools={tools}
                 />
               </div>
             }
@@ -577,6 +610,8 @@ export default function WorkflowEditor({
                   exprContext={exprContext}
                   allNodeIds={graph.nodes.map((n) => n.id)}
                   workflowEditorUi={workflowEditorUi}
+                  tools={tools}
+                  onConvertToGate={onConvertToGate}
                 />
               ) : (
                 <p className="text-lead text-ink-dim">Select a node to edit its step.</p>

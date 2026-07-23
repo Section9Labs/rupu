@@ -6563,6 +6563,7 @@ dependencies = [
  "rupu-ast",
  "rupu-config",
  "rupu-coverage",
+ "rupu-mcp",
  "rupu-orchestrator",
  "rupu-runtime",
  "rupu-scm",
