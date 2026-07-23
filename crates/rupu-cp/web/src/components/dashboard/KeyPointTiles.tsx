@@ -41,7 +41,7 @@ function TileShell({
       className={`rounded-lg border p-3 ${
         weighted
           ? `border-[rgb(var(${weightVar}))] bg-[rgb(var(--c-surface))]`
-          : 'border-[rgb(var(--c-border))] bg-[rgb(var(--c-panel))]'
+          : 'border-border bg-panel'
       } ${className ?? ''}`}
     >
       {children}
@@ -50,7 +50,7 @@ function TileShell({
 }
 
 function TileLabel({ children }: { children: React.ReactNode }) {
-  return <div className="text-xs text-[rgb(var(--c-ink-dim))]">{children}</div>;
+  return <div className="text-xs text-ink-dim">{children}</div>;
 }
 
 export function KeyPointTiles({
@@ -89,7 +89,7 @@ export function KeyPointTiles({
       <TileShell testId="tile-awaiting" weighted={active.awaiting_approval > 0} weightVar="--c-status-awaiting">
         <TileLabel>Awaiting you</TileLabel>
         <div
-          className={`mt-1 tabular-nums text-[rgb(var(--c-ink))] ${
+          className={`mt-1 tabular-nums text-ink ${
             active.awaiting_approval > 0 ? 'text-3xl font-semibold' : 'text-2xl'
           }`}
         >
@@ -100,7 +100,7 @@ export function KeyPointTiles({
       <TileShell testId="tile-paused" weighted={active.paused > 0} weightVar="--c-status-paused">
         <TileLabel>Paused</TileLabel>
         <div
-          className={`mt-1 tabular-nums text-[rgb(var(--c-ink))] ${
+          className={`mt-1 tabular-nums text-ink ${
             active.paused > 0 ? 'text-3xl font-semibold' : 'text-2xl'
           }`}
         >
@@ -110,7 +110,7 @@ export function KeyPointTiles({
 
       <TileShell testId="tile-failed" weighted={failedTotal > 0} weightVar="--c-status-failed">
         <TileLabel>Failed</TileLabel>
-        <div className="mt-1 text-2xl tabular-nums text-[rgb(var(--c-ink))]">{failedTotal}</div>
+        <div className="mt-1 text-2xl tabular-nums text-ink">{failedTotal}</div>
         {failedSeries.length > 0 && (
           <div className="mt-1 h-8 w-full">
             <ResponsiveContainer width="100%" height="100%">
@@ -134,7 +134,7 @@ export function KeyPointTiles({
 
       <TileShell testId="tile-success-rate" weighted={false} weightVar="--c-border">
         <TileLabel>Success rate</TileLabel>
-        <div className="mt-1 text-2xl tabular-nums text-[rgb(var(--c-ink))]">
+        <div className="mt-1 text-2xl tabular-nums text-ink">
           {successRate === null ? '—' : `${successRate}%`}
         </div>
       </TileShell>
@@ -142,13 +142,13 @@ export function KeyPointTiles({
       <Link
         to="/runs"
         data-testid="tile-active-now"
-        className="rounded-lg border border-[rgb(var(--c-border))] bg-[rgb(var(--c-panel))] p-3 hover:bg-[rgb(var(--c-surface-hover))]"
+        className="rounded-lg border border-border bg-panel p-3 hover:bg-surface-hover"
       >
         <TileLabel>Active now</TileLabel>
-        <div className="mt-1 tabular-nums text-[rgb(var(--c-ink))]">
+        <div className="mt-1 tabular-nums text-ink">
           <span className="text-2xl">{active.running}</span>
           {activeLongest && (
-            <span className="ml-1 text-sm font-normal text-[rgb(var(--c-ink-dim))]">
+            <span className="ml-1 text-sm font-normal text-ink-dim">
               · longest {formatDuration(activeLongest.age_ms)} — {activeLongest.workflow_name}
             </span>
           )}
@@ -158,7 +158,7 @@ export function KeyPointTiles({
       <Link
         to="/findings"
         data-testid="tile-findings"
-        className="rounded-lg border border-[rgb(var(--c-border))] bg-[rgb(var(--c-panel))] p-3 hover:bg-[rgb(var(--c-surface-hover))]"
+        className="rounded-lg border border-border bg-panel p-3 hover:bg-surface-hover"
       >
         <TileLabel>
           Open findings
@@ -169,7 +169,7 @@ export function KeyPointTiles({
             </span>
           )}
         </TileLabel>
-        <div className="mt-1 text-2xl tabular-nums text-[rgb(var(--c-ink))]">
+        <div className="mt-1 text-2xl tabular-nums text-ink">
           {/* `null` means nobody reported. "—" not "0": unknown is not none. */}
           {findingsOpen === null ? '—' : `${findingsOpen}${findingsPartial ? '+' : ''}`}
         </div>

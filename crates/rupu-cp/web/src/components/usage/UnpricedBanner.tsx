@@ -11,11 +11,11 @@ export type { UnpricedGap };
 export function UnpricedBanner({ unpriced }: { unpriced: UnpricedGap }) {
   if (unpriced.models.length === 0) return null;
   return (
-    <div className="rounded-lg border border-[rgb(var(--c-status-awaiting))] bg-[rgb(var(--c-surface))] px-4 py-2 text-sm">
-      <span className="font-medium text-[rgb(var(--c-ink))]">
+    <div className="rounded-lg border border-status-awaiting bg-surface px-4 py-2 text-sm">
+      <span className="font-medium text-ink">
         {unpriced.models.length} model{unpriced.models.length === 1 ? '' : 's'} unpriced
       </span>
-      <span className="text-[rgb(var(--c-ink-dim))]">
+      <span className="text-ink-dim">
         {' '}
         — spend below excludes {unpriced.rows} token row
         {unpriced.rows === 1 ? '' : 's'} from {unpriced.models.join(', ')}

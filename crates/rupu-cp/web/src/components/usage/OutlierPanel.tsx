@@ -30,13 +30,13 @@ export function OutlierPanel({
 }) {
   if (outliers.length === 0) {
     return (
-      <div className="p-4 text-sm text-[rgb(var(--c-ink-mute))]">
+      <div className="p-4 text-sm text-ink-mute">
         No cost outliers in this window
       </div>
     );
   }
   return (
-    <ul className="divide-y divide-[rgb(var(--c-border))]">
+    <ul className="divide-y divide-border">
       {outliers.map((o) => {
         const excluded = !!excludedRunIds?.has(o.run_id);
         return (
@@ -51,18 +51,18 @@ export function OutlierPanel({
             )}
             <Link
               to={`/runs/${o.run_id}`}
-              className={`font-medium text-[rgb(var(--c-ink))] ${excluded ? 'line-through opacity-50' : ''}`}
+              className={`font-medium text-ink ${excluded ? 'line-through opacity-50' : ''}`}
             >
               {o.workflow_name}
             </Link>
-            <span className={`text-xs text-[rgb(var(--c-ink-mute))] ${excluded ? 'opacity-50' : ''}`}>
+            <span className={`text-xs text-ink-mute ${excluded ? 'opacity-50' : ''}`}>
               {o.run_id}
             </span>
-            <span className={`ml-auto tabular-nums text-[rgb(var(--c-ink))] ${excluded ? 'opacity-50' : ''}`}>
+            <span className={`ml-auto tabular-nums text-ink ${excluded ? 'opacity-50' : ''}`}>
               ${o.cost_usd.toFixed(2)}
             </span>
             <span
-              className={`tabular-nums text-[rgb(var(--c-status-failed))] ${excluded ? 'opacity-50' : ''}`}
+              className={`tabular-nums text-status-failed ${excluded ? 'opacity-50' : ''}`}
             >
               {o.ratio.toFixed(1)}× baseline (${o.baseline_usd.toFixed(2)})
             </span>

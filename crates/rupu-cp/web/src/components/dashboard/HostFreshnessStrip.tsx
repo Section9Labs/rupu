@@ -58,21 +58,21 @@ export function HostFreshnessStrip({ hosts }: { hosts: HostFreshnessEntry[] }) {
             ? // Pulsing dot: this host has never actually reported, so it must
               // not read as the same "known-stale" gray a resolved-but-not-live
               // host gets below.
-              'bg-[rgb(var(--c-status-pending))] animate-pulse'
+              'bg-status-pending animate-pulse'
             : h.state === 'ok'
               ? isLive
-                ? 'bg-[rgb(var(--c-status-running))]'
-                : 'bg-[rgb(var(--c-status-pending))]'
-              : 'bg-[rgb(var(--c-status-failed))]';
+                ? 'bg-status-running'
+                : 'bg-status-pending'
+              : 'bg-status-failed';
         return (
           <span
             key={h.host_id}
-            className="inline-flex items-center gap-1.5 text-[rgb(var(--c-ink-dim))]"
+            className="inline-flex items-center gap-1.5 text-ink-dim"
             title={h.reason ?? `${h.transport_kind} host`}
           >
             <span className={`h-1.5 w-1.5 rounded-full ${tone}`} aria-hidden />
-            <span className="font-medium text-[rgb(var(--c-ink))]">{h.name}</span>
-            <span className="text-[rgb(var(--c-ink-mute))]">·</span>
+            <span className="font-medium text-ink">{h.name}</span>
+            <span className="text-ink-mute">·</span>
             <span>{label}</span>
           </span>
         );

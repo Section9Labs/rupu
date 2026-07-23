@@ -220,7 +220,7 @@ export default function Usage() {
     <div className="space-y-4 p-4">
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-lg font-semibold text-[rgb(var(--c-ink))]">Usage</h1>
+          <h1 className="text-lg font-semibold text-ink">Usage</h1>
           {data && (
             <div className="mt-1">
               <HostFreshnessStrip hosts={data.hosts} />
@@ -229,7 +229,7 @@ export default function Usage() {
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {error && data && (
-            <span className="text-xs text-[rgb(var(--c-status-failed))]" title={error.message}>
+            <span className="text-xs text-status-failed" title={error.message}>
               refresh failed — showing last good data
             </span>
           )}
@@ -238,13 +238,13 @@ export default function Usage() {
             <button
               type="button"
               onClick={clearCustomWindow}
-              className="rounded-full border border-[rgb(var(--c-border))] px-2 py-0.5 text-[10px] text-[rgb(var(--c-ink-mute))] hover:bg-[rgb(var(--c-surface))]"
+              className="rounded-full border border-border px-2 py-0.5 text-[10px] text-ink-mute hover:bg-surface"
               title="Clear the drag-selected window and return to the active preset"
             >
               custom · ×
             </button>
           )}
-          <div className="flex rounded-md border border-[rgb(var(--c-border))]">
+          <div className="flex rounded-md border border-border">
             {RANGES.map((r) => (
               <button
                 key={r}
@@ -252,8 +252,8 @@ export default function Usage() {
                 onClick={() => handleRangeChange(r)}
                 className={`px-2 py-1 text-xs ${
                   !isCustomWindow && range === r
-                    ? 'bg-[rgb(var(--c-surface))] text-[rgb(var(--c-ink))]'
-                    : 'text-[rgb(var(--c-ink-mute))]'
+                    ? 'bg-surface text-ink'
+                    : 'text-ink-mute'
                 }`}
               >
                 {r}
@@ -292,8 +292,8 @@ export default function Usage() {
             }}
           />
 
-          <section className="rounded-lg border border-[rgb(var(--c-border))] bg-[rgb(var(--c-panel))] p-3">
-            <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-[rgb(var(--c-ink-dim))]">
+          <section className="rounded-lg border border-border bg-panel p-3">
+            <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-ink-dim">
               Breakdown by {PIVOT_LABEL[pivot]}
             </h2>
             <ModelBreakdownTable
@@ -306,10 +306,10 @@ export default function Usage() {
             />
           </section>
 
-          <section className="rounded-lg border border-[rgb(var(--c-border))] bg-[rgb(var(--c-panel))] p-3">
-            <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-[rgb(var(--c-ink-dim))]">
+          <section className="rounded-lg border border-border bg-panel p-3">
+            <h2 className="mb-2 text-xs font-medium uppercase tracking-wide text-ink-dim">
               Cost outliers{' '}
-              <span className="font-normal normal-case text-[rgb(var(--c-ink-mute))]">
+              <span className="font-normal normal-case text-ink-mute">
                 (this host only)
               </span>
             </h2>
@@ -317,7 +317,7 @@ export default function Usage() {
           </section>
         </>
       ) : error ? (
-        <div className="p-6 text-sm text-[rgb(var(--c-status-failed))]">
+        <div className="p-6 text-sm text-status-failed">
           Could not load usage: {error.message}
         </div>
       ) : (

@@ -9,7 +9,7 @@ import { cn } from '../../lib/cn';
 import type { RosterProject, SevCounts } from '../../lib/situationRoom/roster';
 
 function Pips({ f }: { f: SevCounts }) {
-  if (f.total === 0) return <span style={{ color: 'rgb(var(--c-ink-mute))' }}>no findings</span>;
+  if (f.total === 0) return <span className="text-ink-mute">no findings</span>;
   return (
     <>
       {f.critical > 0 && <span className="sr-sev-critical">{f.critical}</span>}
