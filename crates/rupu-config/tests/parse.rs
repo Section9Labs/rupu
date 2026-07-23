@@ -115,3 +115,18 @@ fn cp_config_accepts_next_workflow_editor_ui() {
         toml::from_str("workflow_editor_ui = \"next\"").unwrap();
     assert_eq!(cfg.workflow_editor_ui, "next");
 }
+
+#[test]
+fn cp_config_defaults_gate_sweep_enabled_true_and_interval_60() {
+    let cfg: rupu_config::policy_config::CpConfig = toml::from_str("").expect("empty [cp] parses");
+    assert!(cfg.gate_sweep_enabled);
+    assert_eq!(cfg.gate_sweep_interval_secs, 60);
+}
+
+#[test]
+fn cp_config_overrides_gate_sweep_flags_from_toml() {
+    let cfg: rupu_config::policy_config::CpConfig =
+        toml::from_str("gate_sweep_enabled = false\ngate_sweep_interval_secs = 15").unwrap();
+    assert!(!cfg.gate_sweep_enabled);
+    assert_eq!(cfg.gate_sweep_interval_secs, 15);
+}

@@ -983,6 +983,15 @@ impl RunStore {
     /// or fails to parse, even though it parsed fine when the run
     /// started) — the latter is logged loudly since it signals
     /// corrupted on-disk state, not an absent policy.
+    /// Public entry to [`gate_on_timeout`](Self::gate_on_timeout) for
+    /// out-of-crate callers (the cp-serve gate sweep, Plan 4) that need to
+    /// resolve a paused run's gate `on_timeout` routing before calling
+    /// [`expire_if_overdue`](Self::expire_if_overdue) themselves. Same
+    /// best-effort `None`-on-any-failure contract as the private resolver.
+    pub fn resolve_gate_timeout(&self, record: &RunRecord) -> Option<TimeoutAction> {
+        self.gate_on_timeout(record)
+    }
+
     fn gate_on_timeout(&self, record: &RunRecord) -> Option<TimeoutAction> {
         let step_id = record.awaiting_step_id.as_deref()?;
         let body = match self.read_workflow_snapshot(&record.id) {
@@ -1283,22 +1292,18 @@ impl RunStore {
                 // does NOT run the gate's `on_reject` cleanup chain —
                 // that needs the full `OrchestratorRunOpts` wiring only a
                 // CLI command builds (see `run_reject_cleanup` in
-                // `runner.rs`). That cleanup is currently orphaned for
-                // web-initiated decisions: once this call returns, the
-                // run is terminal, so `expire_if_overdue` no-ops for
-                // every future observer and `approve`/`reject` both
-                // return `NotAwaiting` — nothing will ever pick this
-                // chain up on its own. Per the "Deferred to later plans"
-                // section of
-                // docs/superpowers/plans/2026-07-23-rupu-gate-nodes-plan-1-schema-and-runner.md,
-                // Plan 4's cp-serve gate sweep (which consumes this same
-                // `expire_if_overdue` contract) is what will actually
-                // execute it for the web path.
+                // `runner.rs`). For web-initiated decisions that cleanup is
+                // executed out-of-band by the cp-serve gate sweep (Plan 4):
+                // the sweep re-reads this same `expire_if_overdue` contract,
+                // and on `Some(Reject)` runs `build_reject_cleanup_opts` +
+                // `run_reject_cleanup` for the timed-out gate. This call
+                // still just finalizes the status and returns
+                // `ExpiredRejected` so the CLI's own approve path can print
+                // + run the chain synchronously.
                 tracing::warn!(
                     run_id,
-                    "on_reject cleanup is not executed on the web path yet (Plan 4): \
-                     run auto-rejected but its on_reject chain is orphaned until the \
-                     cp-serve gate sweep lands"
+                    "gate auto-rejected on timeout; its on_reject cleanup chain is \
+                     executed by the cp-serve gate sweep (Plan 4) for the web path"
                 );
                 return Err(ApprovalError::ExpiredRejected {
                     step_id: step_id_before_expiry.unwrap_or_default(),

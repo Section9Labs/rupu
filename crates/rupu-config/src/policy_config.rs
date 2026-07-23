@@ -39,6 +39,17 @@ pub struct CpConfig {
     /// Defaults to 60.
     #[serde(default = "CpConfig::default_background_interval_secs")]
     pub cron_tick_interval_secs: u64,
+    /// Whether `rupu cp serve` runs the gate sweep loop (Plan 4) in-process
+    /// on a timer. The sweep enforces gate `on_timeout` routing, runs the
+    /// `on_reject` cleanup chain for web-initiated timeout-rejects, and reaps
+    /// orphaned local runs whose runner process died. Defaults to `true` so
+    /// timed-out gates and dead-runner runs never wedge Live Events.
+    #[serde(default = "CpConfig::default_true")]
+    pub gate_sweep_enabled: bool,
+    /// Seconds between gate sweep passes when the loop above is enabled.
+    /// Defaults to 60.
+    #[serde(default = "CpConfig::default_background_interval_secs")]
+    pub gate_sweep_interval_secs: u64,
     /// Which agent-authoring UI the CP web app renders: "classic" (raw editor)
     /// or "next" (the card-based Agent Builder). Defaults to classic so the new
     /// UI is opt-in behind this flag.
@@ -77,6 +88,8 @@ impl Default for CpConfig {
             autoflow_reconcile_interval_secs: Self::default_background_interval_secs(),
             cron_tick_enabled: Self::default_true(),
             cron_tick_interval_secs: Self::default_background_interval_secs(),
+            gate_sweep_enabled: Self::default_true(),
+            gate_sweep_interval_secs: Self::default_background_interval_secs(),
             agent_authoring_ui: Self::default_agent_authoring_ui(),
             workflow_editor_ui: Self::default_workflow_editor_ui(),
         }
