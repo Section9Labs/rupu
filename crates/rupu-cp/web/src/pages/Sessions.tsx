@@ -1,131 +1,94 @@
-// Sessions list — agent sessions tracked by the control plane. Two tabs
-// (Active / Archived) with independent fetches keyed on scope. Active polls
-// every 5 s (unpaginated); Archived paginates (no poll) — keeping paginated
-// history off the poll loop avoids the scroll-reset flicker. Each row links to
-// /sessions/:id. Status is `unknown` on the wire, coerced via lib/sessionStatus.
+// Sessions list — agent sessions tracked by the control plane. Active /
+// Archived FilterPills group (Active is the default) + a host scope select;
+// fetch/paginate/poll is owned by the shared `usePagedList` hook — Active
+// polls every 5 s (page 0 only, spliced back over the head of the list, same
+// as WorkflowRuns/AgentRuns' "Running" tab — see `usePagedList`'s doc comment
+// for why that doesn't reset a scrolled view). Each row links to
+// /sessions/:id. Status is `unknown` on the wire, coerced via
+// lib/sessionStatus — a distinct vocabulary from the run-status enum
+// `StatusPill` renders, so this page keeps its own dot+label rendering
+// rather than routing through StatusPill.
 
-import { useCallback, useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { MessageSquare, RefreshCw } from 'lucide-react';
-import { api, type SessionSummary, type HostView } from '../lib/api';
+import { RefreshCw } from 'lucide-react';
+import { api, type SessionSummary } from '../lib/api';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import UsageBarChart from '../components/charts/UsageBarChart';
 import { Button } from '../components/ui/Button';
+import { FilterBar } from '../components/ui/FilterBar';
+import { FilterPills, type FilterPillOption } from '../components/ui/FilterPills';
+import { EmptyState } from '../components/ui/EmptyState';
+import { ErrorBanner } from '../components/ui/ErrorBanner';
+import { Spinner } from '../components/ui/Spinner';
+import HostSelect, { ALL_HOSTS } from '../components/HostSelect';
+import { usePagedList } from '../lib/usePagedList';
 import { cn } from '../lib/cn';
 import { durationBetween } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
 import { sessionStatusDot, sessionStatusLabel } from '../lib/sessionStatus';
-import { useInfiniteScroll } from '../lib/useInfiniteScroll';
-
-const PAGE = 20;
-/** Sentinel select value meaning "fetch all hosts" (fan-out / no ?host= param). */
-const ALL_HOSTS = '__all__';
+import { shortId } from '../lib/shortId';
 
 type Tab = 'active' | 'archived';
 
-const TABS: { id: Tab; label: string }[] = [
-  { id: 'active', label: 'Active' },
-  { id: 'archived', label: 'Archived' },
+const TAB_OPTIONS: FilterPillOption[] = [
+  { value: 'active', label: 'Active' },
+  { value: 'archived', label: 'Archived' },
 ];
-
-function shortId(id: string): string {
-  return id.length > 12 ? `${id.slice(0, 10)}…` : id;
-}
 
 export default function Sessions() {
   const [tab, setTab] = useState<Tab>('active');
-  const [sessions, setSessions] = useState<SessionSummary[] | null>(null);
-  const [hasMore, setHasMore] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [refreshing, setRefreshing] = useState(false);
   // Default to 'local' → fast server-side path; ALL_HOSTS → fan-out.
   const [hostFilter, setHostFilter] = useState<string>('local');
-  const [hosts, setHosts] = useState<HostView[] | null>(null);
-  const [rowError, setRowError] = useState<string | null>(null);
+  // Row-action (archive/restore/delete) failures — kept separate from the
+  // list-fetch error the hook owns, but shown in the same banner.
+  const [actionError, setActionError] = useState<string | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    api.getHosts().then((hs) => { if (!cancelled) setHosts(hs); }).catch(() => { if (!cancelled) setHosts([]); });
-    return () => { cancelled = true; };
-  }, []);
-
-  // Page-0 fetch (and the 5 s poll on the active tab). Reset on tab/host change.
-  // Active: fetch ALL in one call (unpaginated) → poll never resets a scrolled
-  // list. Archived: page-0 only; loadMore appends.
-  const refresh = useCallback(async () => {
-    setRefreshing(true);
-    try {
-      const limit = tab === 'active' ? 200 : PAGE;
+  const { rows, loading, error, hasMore, sentinelRef, refresh, ended } = usePagedList<SessionSummary>({
+    fetch: ({ offset, limit }) => {
       const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
-      const data = await api.getSessions({ scope: tab, limit, host });
-      setSessions(data);
-      setHasMore(tab !== 'active' && data.length >= PAGE);
-      setError(null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load sessions');
-    } finally {
-      setRefreshing(false);
-    }
-  }, [tab, hostFilter]);
-
-  useEffect(() => {
-    setSessions(null); // show loading on tab/host switch
-    void refresh();
-    if (tab === 'active') {
-      const t = window.setInterval(() => void refresh(), 5000);
-      return () => window.clearInterval(t);
-    }
-    return () => {};
-  }, [tab, hostFilter, refresh]);
-
-  const loadMore = async () => {
-    if (tab === 'active') return; // active is unpaginated
-    const current = sessions ?? [];
-    const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
-    const next = await api.getSessions({ scope: tab, offset: current.length, limit: PAGE, host });
-    if (next.length === 0) { setHasMore(false); return; }
-    setSessions([...current, ...next]);
-    if (next.length < PAGE) setHasMore(false);
-  };
-
-  const { sentinelRef, loading } = useInfiniteScroll({ hasMore, loadMore });
+      return api.getSessions({ scope: tab, offset, limit, host });
+    },
+    deps: [tab, hostFilter],
+    poll: tab === 'active',
+  });
 
   // Row-level archive / restore / delete — each refetches after success.
   async function handleRowArchive(id: string) {
-    setRowError(null);
     try {
       await api.archiveSession(id);
-      void refresh();
+      setActionError(null);
+      refresh();
     } catch (e) {
-      setRowError(e instanceof Error ? e.message : 'Archive failed');
+      setActionError(e instanceof Error ? e.message : 'Archive failed');
     }
   }
 
   async function handleRowRestore(id: string) {
-    setRowError(null);
     try {
       await api.restoreSession(id);
-      void refresh();
+      setActionError(null);
+      refresh();
     } catch (e) {
-      setRowError(e instanceof Error ? e.message : 'Restore failed');
+      setActionError(e instanceof Error ? e.message : 'Restore failed');
     }
   }
 
   async function handleRowDelete(id: string) {
     if (!window.confirm('Permanently delete this session and its transcripts? This cannot be undone.')) return;
-    setRowError(null);
     try {
       await api.deleteSession(id);
-      void refresh();
+      setActionError(null);
+      refresh();
     } catch (e) {
-      setRowError(e instanceof Error ? e.message : 'Delete failed');
+      setActionError(e instanceof Error ? e.message : 'Delete failed');
     }
   }
 
-  // Action column — changes shape based on current tab (active vs archived).
+  // Action column — changes shape based on the current tab (active vs archived).
   const actionColumn = buildActionColumn(tab, handleRowArchive, handleRowRestore, handleRowDelete);
-
-  const rows = sessions ?? [];
+  const columns: Column<SessionSummary>[] = [...SESSION_BASE_COLUMNS, actionColumn];
+  const bannerError = error ?? actionError;
 
   return (
     <div className="p-8">
@@ -137,58 +100,34 @@ export default function Sessions() {
             history.
           </p>
         </div>
-        <Button variant="secondary" onClick={() => void refresh()} className="gap-1.5">
-          <RefreshCw size={12} className={cn(refreshing && 'animate-spin')} />
+        <Button variant="secondary" onClick={() => refresh()} className="gap-1.5">
+          <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
           Refresh
         </Button>
       </header>
 
-      {/* Scope tabs */}
-      <div className="flex items-center gap-2 mb-4">
-        {TABS.map((t) => (
-          <button
-            key={t.id}
-            onClick={() => setTab(t.id)}
-            className={cn(
-              'text-xs font-medium px-3 py-1.5 rounded-md border transition-colors',
-              tab === t.id
-                ? 'bg-brand-600 text-white border-brand-600'
-                : 'bg-panel text-ink-dim border-border hover:bg-surface-hover',
-            )}
-          >
-            {t.label}
-          </button>
-        ))}
+      <div className="mb-5">
+        <FilterBar
+          filters={<FilterPills options={TAB_OPTIONS} value={tab} onChange={(v) => setTab(v as Tab)} />}
+          scope={<HostSelect allowAll ariaLabel="Host filter" value={hostFilter} onChange={setHostFilter} />}
+        />
       </div>
 
-      {/* Host filter — drives server-side fetch scope. */}
-      <div className="flex items-center gap-2 mb-5">
-        <select
-          value={hostFilter}
-          onChange={(e) => setHostFilter(e.target.value)}
-          aria-label="Host filter"
-          className="text-xs font-medium px-2 py-1 rounded-md border border-border bg-panel text-ink-dim focus:outline-none focus:border-brand-500"
-        >
-          <option value="local">This host</option>
-          <option value={ALL_HOSTS}>All hosts</option>
-          {(hosts ?? [])
-            .filter((h) => h.transport_kind !== 'local')
-            .map((h) => (
-              <option key={h.id} value={h.id}>{h.name}</option>
-            ))}
-        </select>
-      </div>
+      {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
-      {(error || rowError) && (
-        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {error ?? rowError}
+      {loading && rows.length === 0 ? (
+        <div className="py-16 flex items-center justify-center">
+          <Spinner label="Loading sessions…" />
         </div>
-      )}
-
-      {sessions === null ? (
-        <div className="text-sm text-ink-dim">Loading sessions…</div>
       ) : rows.length === 0 ? (
-        <EmptyState tab={tab} />
+        <EmptyState
+          title={tab === 'active' ? 'No active sessions' : 'No archived sessions'}
+          hint={
+            tab === 'active'
+              ? 'Active sessions appear here once an agent conversation is started against this control plane.'
+              : 'Archived sessions appear here once an active conversation is closed.'
+          }
+        />
       ) : (
         <div className="space-y-6">
           {rows.some((s) => s.usage) && (
@@ -210,13 +149,13 @@ export default function Sessions() {
               first, so source order already satisfies the default. Clicking any
               header re-sorts client-side. */}
           <SortableTable<SessionSummary>
-            columns={[...SESSION_BASE_COLUMNS, actionColumn]}
+            columns={columns}
             rows={rows}
             rowKey={(s) => s.session_id}
           />
-          {tab !== 'active' && hasMore && (
+          {(hasMore || ended) && (
             <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
-              {loading ? 'loading more…' : 'scroll for more'}
+              {hasMore ? 'scroll for more' : `— end of ${rows.length} —`}
             </div>
           )}
         </div>
@@ -237,6 +176,7 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
   {
     key: 'status',
     header: 'Status',
+    fit: true,
     sortable: true,
     sortValue: (s) => sessionStatusLabel(s.status),
     render: (s) => (
@@ -249,13 +189,16 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
   {
     key: 'agent',
     header: 'Agent',
+    subject: true,
     sortable: true,
     sortValue: (s) => s.agent_name,
-    render: (s) => <span className="text-sm font-medium text-ink truncate">{s.agent_name}</span>,
+    titleValue: (s) => s.agent_name,
+    render: (s) => <span className="text-sm font-medium text-ink">{s.agent_name}</span>,
   },
   {
     key: 'session',
     header: 'Session',
+    fit: true,
     render: (s) => {
       const hostSuffix = s.host_id && s.host_id !== 'local'
         ? `?host=${encodeURIComponent(s.host_id)}`
@@ -273,6 +216,7 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
   {
     key: 'host',
     header: 'Host',
+    fit: true,
     sortable: true,
     sortValue: (s) => s.host_id ?? 'local',
     render: (s) => (
@@ -282,6 +226,7 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
   {
     key: 'model',
     header: 'Model',
+    fit: true,
     sortable: true,
     sortValue: (s) => s.model,
     render: (s) => <span className="text-note text-ink-mute font-mono">{s.model}</span>,
@@ -290,7 +235,7 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
     key: 'in',
     header: 'In',
     align: 'right',
-    width: 'w-20',
+    fit: true,
     sortable: true,
     sortValue: (s) => s.usage?.input_tokens ?? null,
     render: (s) => (
@@ -301,7 +246,7 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
     key: 'out',
     header: 'Out',
     align: 'right',
-    width: 'w-20',
+    fit: true,
     sortable: true,
     sortValue: (s) => s.usage?.output_tokens ?? null,
     render: (s) => (
@@ -312,7 +257,7 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
     key: 'cached',
     header: 'Cached',
     align: 'right',
-    width: 'w-20',
+    fit: true,
     sortable: true,
     sortValue: (s) => s.usage?.cached_tokens ?? null,
     render: (s) =>
@@ -326,7 +271,7 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
     key: 'cost',
     header: 'Cost',
     align: 'right',
-    width: 'w-24',
+    fit: true,
     sortable: true,
     sortValue: (s) => s.usage?.cost_usd ?? null,
     render: (s) => (
@@ -337,7 +282,7 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
     key: 'turns',
     header: 'Turns',
     align: 'right',
-    width: 'w-16',
+    fit: true,
     sortable: true,
     sortValue: (s) => s.total_turns,
     render: (s) => <span className="text-ink">{s.total_turns ? String(s.total_turns) : '—'}</span>,
@@ -346,7 +291,7 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
     key: 'duration',
     header: 'Duration',
     align: 'right',
-    width: 'w-24',
+    fit: true,
     sortable: true,
     sortValue: (s) => sessionDurationMs(s),
     render: (s) => (
@@ -365,8 +310,8 @@ function buildActionColumn(
   return {
     key: 'action',
     header: '',
+    fit: true,
     align: 'right',
-    width: 'w-48',
     render: (s) => (
       <div
         className="flex items-center justify-end gap-1"
@@ -382,51 +327,30 @@ function buildActionColumn(
           </Link>
         )}
         {tab === 'active' ? (
-          <button
-            type="button"
+          <Button
+            variant="ring"
             onClick={() => onArchive(s.session_id)}
-            className="rounded px-2 py-0.5 text-note font-medium ring-1 bg-panel text-ink-dim ring-border hover:bg-surface-hover"
             aria-label={`Archive session ${s.session_id}`}
           >
             Archive
-          </button>
+          </Button>
         ) : (
-          <button
-            type="button"
+          <Button
+            variant="ring"
             onClick={() => onRestore(s.session_id)}
-            className="rounded px-2 py-0.5 text-note font-medium ring-1 bg-panel text-ink-dim ring-border hover:bg-surface-hover"
             aria-label={`Restore session ${s.session_id}`}
           >
             Restore
-          </button>
+          </Button>
         )}
-        <button
-          type="button"
+        <Button
+          variant="ring-danger"
           onClick={() => onDelete(s.session_id)}
-          className="rounded px-2 py-0.5 text-note font-medium ring-1 bg-err-bg text-err ring-err/30 hover:bg-err-bg"
           aria-label={`Delete session ${s.session_id}`}
         >
           Delete
-        </button>
+        </Button>
       </div>
     ),
   };
-}
-
-function EmptyState({ tab }: { tab: Tab }) {
-  return (
-    <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
-        <MessageSquare size={20} className="text-ink-mute" />
-      </div>
-      <h2 className="text-sm font-medium text-ink">
-        {tab === 'active' ? 'No active sessions' : 'No archived sessions'}
-      </h2>
-      <p className="mt-1 text-xs text-ink-dim max-w-xs">
-        {tab === 'active'
-          ? 'Active sessions appear here once an agent conversation is started against this control plane.'
-          : 'Archived sessions appear here once an active conversation is closed.'}
-      </p>
-    </div>
-  );
 }
