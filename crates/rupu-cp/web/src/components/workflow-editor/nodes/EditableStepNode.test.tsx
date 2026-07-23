@@ -227,5 +227,74 @@ describe('EditableStepNode', () => {
         expect(icon?.tagName.toLowerCase()).toBe('svg');
       },
     );
+
+    describe('card chrome (Task 2 round 2: clipped bar + coherent selection)', () => {
+      it('wraps .wfx-bar, .wfx-head, and .wfx-body inside a .wfx-clip so the accent bar is clipped to the card radius', () => {
+        const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], false, 'next');
+        const clip = container.querySelector('.wfx-clip');
+        expect(clip).toBeInTheDocument();
+
+        const bar = clip?.querySelector('.wfx-bar');
+        const head = clip?.querySelector('.wfx-head');
+        const body = clip?.querySelector('.wfx-body');
+        expect(bar).toBeInTheDocument();
+        expect(head).toBeInTheDocument();
+        expect(body).toBeInTheDocument();
+
+        // structurally exactly bar/head/body live inside the clip — nothing else.
+        expect(clip?.children).toHaveLength(3);
+        expect(clip?.children[0]).toBe(bar);
+        expect(clip?.children[1]).toBe(head);
+        expect(clip?.children[2]).toBe(body);
+      });
+
+      it('keeps the Handles outside .wfx-clip, as direct children of .wfx-node', () => {
+        // Handle is mocked to `() => null`, so it renders no DOM node — assert
+        // structurally instead: .wfx-node's only element children are the
+        // clip wrapper (nothing handle-shaped leaks in, and nothing from the
+        // clip's bar/head/body leaks onto .wfx-node directly).
+        const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], false, 'next');
+        const node = container.querySelector('.wfx-node');
+        expect(node).toBeInTheDocument();
+        expect(node?.querySelector(':scope > .wfx-clip')).toBeInTheDocument();
+        // .wfx-bar/.wfx-head/.wfx-body must NOT be direct children of .wfx-node
+        // (they belong inside .wfx-clip only).
+        expect(node?.querySelector(':scope > .wfx-bar')).not.toBeInTheDocument();
+        expect(node?.querySelector(':scope > .wfx-head')).not.toBeInTheDocument();
+        expect(node?.querySelector(':scope > .wfx-body')).not.toBeInTheDocument();
+      });
+
+      it('a branch node still renders two labeled ports outside the clip (unaffected by clipping)', () => {
+        const { container } = renderNode(
+          { id: 'route', kind: 'branch', condition: 'x == 1', thenTargets: ['a'], elseTargets: ['b'] },
+          [],
+          false,
+          'next',
+        );
+        // Handle is mocked away, but the surrounding structure (clip present,
+        // node still renders) must be unaffected by the branch's extra handle.
+        expect(container.querySelector('.wfx-clip')).toBeInTheDocument();
+        expect(container.querySelector('.wfx-port-true')).toBeInTheDocument();
+        expect(container.querySelector('.wfx-port-false')).toBeInTheDocument();
+      });
+
+      it('an unselected next card has no inline boxShadow and no .wfx-sel class', () => {
+        const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], false, 'next');
+        const node = container.querySelector('.wfx-node') as HTMLElement;
+        expect(node.classList.contains('wfx-sel')).toBe(false);
+        expect(node.style.boxShadow).toBe('');
+      });
+
+      it('a selected next card carries an inline accent boxShadow ring, no .wfx-sel purple class', () => {
+        const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], true, 'next');
+        const node = container.querySelector('.wfx-node') as HTMLElement;
+        // the coherent-signal fix drops the brand-purple `.wfx-sel` class ring
+        // in favor of a single inline accent boxShadow.
+        expect(node.classList.contains('wfx-sel')).toBe(false);
+        expect(node.style.boxShadow).not.toBe('');
+        // still carries the accent border too (unchanged from before).
+        expect(node.style.borderColor).not.toBe('');
+      });
+    });
   });
 });
