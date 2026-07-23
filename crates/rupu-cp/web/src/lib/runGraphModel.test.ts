@@ -634,6 +634,35 @@ describe('gate and action kinds', () => {
     const model = buildRunGraphModel(g, []);
     expect(model.nodeById('create_pr')!.kind).toBe('action');
   });
+
+  it('threads dto.action onto the GraphNode', () => {
+    const ACTION_STEP: StepNodeDto = { id: 'create_pr', kind: 'action', action: 'scm.prs.create' };
+    const g = makeGraph({ steps: [ACTION_STEP] });
+    const model = buildRunGraphModel(g, []);
+    expect(model.nodeById('create_pr')!.action).toBe('scm.prs.create');
+  });
+
+  it('threads dto.approval_gate onto the GraphNode', () => {
+    const GATE_STEP: StepNodeDto = {
+      id: 'approve',
+      kind: 'gate',
+      approval_gate: { auto_approve: true, has_on_reject: true, timeout_seconds: 3600 },
+    };
+    const g = makeGraph({ steps: [GATE_STEP] });
+    const model = buildRunGraphModel(g, []);
+    expect(model.nodeById('approve')!.approval_gate).toEqual({
+      auto_approve: true,
+      has_on_reject: true,
+      timeout_seconds: 3600,
+    });
+  });
+
+  it('leaves action/approval_gate undefined when the DTO has none', () => {
+    const g = makeGraph({ steps: [STEP_A] });
+    const model = buildRunGraphModel(g, []);
+    expect(model.nodeById('a')!.action).toBeUndefined();
+    expect(model.nodeById('a')!.approval_gate).toBeUndefined();
+  });
 });
 
 describe('pause / resume events', () => {
