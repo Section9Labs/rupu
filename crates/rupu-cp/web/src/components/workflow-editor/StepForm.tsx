@@ -210,7 +210,7 @@ export default function StepForm({
             Continue on error
           </label>
 
-          <ApprovalFields d={d} patch={patch} />
+          <ApprovalFields d={d} patch={patch} exprContext={exprContext} workflowEditorUi={workflowEditorUi} />
         </>
       )}
     </div>
@@ -640,9 +640,18 @@ function BranchFields({
 function ApprovalFields({
   d,
   patch,
+  exprContext,
+  workflowEditorUi,
 }: {
   d: StepNodeData;
   patch: (p: Partial<StepNodeData>) => void;
+  /** Vocabulary context for the Approval-prompt field (next-gated ExpressionField). */
+  exprContext: StepExprContext;
+  /** Approval prompt renders as an ExpressionField only when 'next' — it is a
+   *  minijinja-rendered template (same engine/context as `prompt:`, per the
+   *  orchestrator's `Approval.prompt` doc comment), so it's genuinely
+   *  expression-capable; classic keeps today's plain input byte-identical. */
+  workflowEditorUi: WorkflowEditorUi;
 }) {
   return (
     <div className="space-y-3">
@@ -666,13 +675,22 @@ function ApprovalFields({
         <div className="space-y-3 rounded-md border border-border bg-surface p-2.5">
           <label className="block">
             <span className={labelCls}>Approval prompt</span>
-            <input
-              type="text"
-              value={d.approvalPrompt ?? ''}
-              onChange={(e) => patch({ approvalPrompt: e.target.value === '' ? undefined : e.target.value })}
-              aria-label="Approval prompt"
-              className={fieldCls}
-            />
+            {workflowEditorUi === 'next' ? (
+              <ExpressionField
+                value={d.approvalPrompt ?? ''}
+                onChange={(v) => patch({ approvalPrompt: v === '' ? undefined : v })}
+                context={fieldCtx(exprContext, {})}
+                ariaLabel="Approval prompt"
+              />
+            ) : (
+              <input
+                type="text"
+                value={d.approvalPrompt ?? ''}
+                onChange={(e) => patch({ approvalPrompt: e.target.value === '' ? undefined : e.target.value })}
+                aria-label="Approval prompt"
+                className={fieldCls}
+              />
+            )}
           </label>
           <label className="block">
             <span className={labelCls}>Approval timeout (seconds)</span>

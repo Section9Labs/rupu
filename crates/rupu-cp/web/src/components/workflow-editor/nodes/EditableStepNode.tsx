@@ -245,38 +245,54 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
   // markup below stays byte-identical. Same data (`d`/`colors`/`box`/handles),
   // new `.wfx-*` classes only.
   if (ui === 'next') {
+    // Selection ring/glow computed from the SAME kind accent as the border —
+    // one coherent color signal instead of accent-border + brand-purple ring.
+    const selBoxShadow = selected
+      ? `0 0 0 2px ${colors.alpha(KIND_ACCENT[d.kind], 0.3)}, 0 6px 20px ${colors.alpha(KIND_ACCENT[d.kind], 0.14)}`
+      : undefined;
     return (
       <div
         data-ui={ui}
-        className={['wfx-node', selected ? 'wfx-sel' : ''].join(' ').trim()}
-        style={{ borderColor: selected ? color : undefined, width: box.width, minHeight: box.height }}
+        className="wfx-node"
+        style={{
+          borderColor: selected ? color : undefined,
+          boxShadow: selBoxShadow,
+          width: box.width,
+          minHeight: box.height,
+        }}
       >
         <Handle type="target" position={Position.Left} style={handleStyle} />
 
-        {/* colored top-bar — by KIND (no run-state) */}
-        <div className="wfx-bar" style={{ background: color }} />
+        {/* .wfx-clip clips the bar/head/body to the card's radius — a 3px-tall
+            absolutely-positioned bar can't hold its own 12px corner radius, so
+            it must be clipped by an ancestor instead of rounding itself.
+            Handles stay OUTSIDE the clip (siblings, on the card border). */}
+        <div className="wfx-clip">
+          {/* colored top-bar — by KIND (no run-state) */}
+          <div className="wfx-bar" style={{ background: color }} />
 
-        <div className="wfx-head">
-          <span className="wfx-kindpill" style={kindChipStyle(colors, d.kind)}>
-            <KindIcon className="wfx-kindicon" size={12} strokeWidth={2} aria-hidden />
-            {d.kind}
-          </span>
-          <span className="wfx-nid">{d.id}</span>
-          {hasProblems && (
-            <span className="wfx-problem" title={problems.join('\n')} aria-label="has problems" />
-          )}
-        </div>
+          <div className="wfx-head">
+            <span className="wfx-kindpill" style={kindChipStyle(colors, d.kind)}>
+              <KindIcon className="wfx-kindicon" size={12} strokeWidth={2} aria-hidden />
+              {d.kind}
+            </span>
+            <span className="wfx-nid">{d.id}</span>
+            {hasProblems && (
+              <span className="wfx-problem" title={problems.join('\n')} aria-label="has problems" />
+            )}
+          </div>
 
-        <div className="wfx-body">
-          {d.kind === 'parallel' ? (
-            <ParallelBodyNext d={d} />
-          ) : d.kind === 'panel' ? (
-            <PanelBodyNext d={d} />
-          ) : d.kind === 'branch' ? (
-            <BranchBodyNext d={d} />
-          ) : (
-            <StepBodyNext d={d} />
-          )}
+          <div className="wfx-body">
+            {d.kind === 'parallel' ? (
+              <ParallelBodyNext d={d} />
+            ) : d.kind === 'panel' ? (
+              <PanelBodyNext d={d} />
+            ) : d.kind === 'branch' ? (
+              <BranchBodyNext d={d} />
+            ) : (
+              <StepBodyNext d={d} />
+            )}
+          </div>
         </div>
 
         {/* branch nodes get TWO labeled source handles (one per arm) instead of

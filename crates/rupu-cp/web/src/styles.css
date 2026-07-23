@@ -416,14 +416,32 @@
   cursor: grab;
   transition: border-color .15s ease, box-shadow .15s ease;
 }
-.wfx-node.wfx-sel {
-  box-shadow: 0 0 0 2px rgb(var(--c-brand-500) / .3), 0 6px 20px rgb(var(--c-brand-500) / .14);
+/* Selected state's ring/glow is computed inline (JS, from the same kind
+ * accent as the border — see EditableStepNode's `selBoxShadow`) so border
+ * and ring are always ONE color signal, never a fixed brand-purple ring
+ * clashing with a kind-colored border. */
+
+/* ── bar/head/body clip — keeps the 3px accent bar inside the card's radius.
+ * A 3px-tall absolutely-positioned strip can't hold its own 12px corner
+ * radius (the browser collapses it), so it must be clipped by an ancestor
+ * instead. `border-radius: inherit` tracks `.wfx-node`'s radius; `.wfx-node`
+ * itself stays unclipped so the Handles (siblings, positioned on the card's
+ * border) are never cut off. `.wfx-node` has no explicit `height` (only an
+ * inline `minHeight`), so this stays `display: flex; flex-direction: column`
+ * — content-sized, same as the un-wrapped head/body were before — rather
+ * than `height: 100%`, which would resolve to `auto` here anyway per the
+ * CSS percentage-height-on-auto-height-container rule and only add noise. */
+.wfx-clip {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border-radius: inherit;
+  overflow: hidden;
 }
 
 /* ── colored top-bar, by KIND (no run-state in the editor) ── */
 .wfx-bar {
   position: absolute; left: 0; right: 0; top: 0; height: 3px;
-  border-radius: 12px 12px 0 0;
 }
 
 /* ── header: kindpill + mono id + problem dot ── */
@@ -505,6 +523,19 @@
  * `--c-brand-500` value in light + dark, so one alpha works for both. */
 .wfx-canvas {
   background: radial-gradient(120% 60% at 50% -10%, rgb(var(--c-brand-500) / .05), transparent 60%);
+}
+
+/* ── edge animation (Task 1 round 2: kind-colored + animated edges) ── */
+/* Every `next` edge sets `animated: true` (WorkflowEditorGraph.tsx), which
+ * opts it into xyflow's built-in `.react-flow__edge.animated path` dash-flow
+ * (5px dash / 0.5s linear cycle, `@xyflow/react/dist/style.css`) — that
+ * default reads fine over the `.wfx-canvas` grid, so nothing to override
+ * there. This guard is the one thing that DOES need overriding: a global,
+ * live `prefers-reduced-motion` rule for the edge path itself, since xyflow
+ * ships no such guard out of the box. Global selector is safe here — it only
+ * ever turns an animation OFF, never on. */
+@media (prefers-reduced-motion: reduce) {
+  .react-flow__edge-path { animation: none !important; stroke-dasharray: none !important; }
 }
 
 /* ── palette dock (Task 3) ── */
@@ -1022,3 +1053,13 @@ pre.ab-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-
 @media (prefers-reduced-motion: reduce) {
   .ab-card.ab-enter { animation: none !important; }
 }
+
+/* CodeMirror completion tooltip theming moved to `EditorView.theme()` in
+   `src/components/cmTooltips.ts` (final-review round 2): the popup is
+   body-parented outside any app container it could inherit tokens from, AND
+   CodeMirror's own base theme (`&light`/`&dark .cm-tooltip`, etc.) compiles
+   to higher-or-tied CSS specificity than a plain global rule here could ever
+   win against — this file's version was silently losing to stock CM colors.
+   `EditorView.theme()` rides the same `themeClasses` CM stamps onto the
+   tooltip container, so it can actually tie/beat the base theme; see
+   cmTooltips.ts's header comment for the full specificity accounting. */

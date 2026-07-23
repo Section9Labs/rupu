@@ -47,6 +47,7 @@ import {
 import { markdown } from '@codemirror/lang-markdown';
 import { yaml } from '@codemirror/lang-yaml';
 import { highlightStyleFor } from './codeHighlightTheme';
+import { buildTooltipExtensions } from './cmTooltips';
 import type { CodeEditorProps } from './CodeEditor';
 import type { Mode } from './theme/ThemeProvider';
 
@@ -114,6 +115,12 @@ function baseExtensions(mode: Mode): Extension[] {
     bracketMatching(),
     closeBrackets(),
     autocompletion(),
+    // Markdown mode's `@codemirror/lang-markdown` registers a real HTML-tag
+    // completion source, so this editor hits the same popup-clipping bug the
+    // expression editor had (agent `.md` editors sit in `overflow` containers
+    // too) — same fix, shared builder. Harmless for yaml/toml, where no
+    // completion source ever fires.
+    ...buildTooltipExtensions(),
     rectangularSelection(),
     crosshairCursor(),
     highlightActiveLine(),

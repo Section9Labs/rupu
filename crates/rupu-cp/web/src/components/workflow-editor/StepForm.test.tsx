@@ -308,6 +308,53 @@ describe('StepForm — roomier long-text fields (Task 5, next only)', () => {
   });
 });
 
+describe('StepForm — Approval prompt expression completions (Task 3, next only)', () => {
+  function nodeWithApproval(): GraphNode {
+    return nodeWith({ kind: 'step', agent: 'planner', approvalRequired: true, approvalPrompt: 'ok {{ inputs.x }}?' });
+  }
+
+  it('classic: Approval prompt stays a plain input (byte-identical)', () => {
+    render(
+      <StepForm node={nodeWithApproval()} agents={AGENTS} problems={[]} exprContext={EXPR} onChange={() => {}} />,
+    );
+    const field = screen.getByLabelText('Approval prompt');
+    expect(field.tagName).toBe('INPUT');
+    expect(field).toHaveValue('ok {{ inputs.x }}?');
+  });
+
+  it('next: Approval prompt renders the ExpressionField shell (mocked as a textarea)', () => {
+    render(
+      <StepForm
+        node={nodeWithApproval()}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+        workflowEditorUi="next"
+      />,
+    );
+    const field = screen.getByLabelText('Approval prompt');
+    expect(field.tagName).toBe('TEXTAREA');
+    expect(field).toHaveValue('ok {{ inputs.x }}?');
+  });
+
+  it('next: editing the Approval prompt via ExpressionField emits the new value', () => {
+    const spy = vi.fn();
+    render(
+      <StepForm
+        node={nodeWithApproval()}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={spy}
+        workflowEditorUi="next"
+      />,
+    );
+    fireEvent.change(screen.getByLabelText('Approval prompt'), { target: { value: 'confirm {{ inputs.y }}' } });
+    expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({ approvalPrompt: 'confirm {{ inputs.y }}' }));
+  });
+});
+
 describe('WorkflowSettingsForm', () => {
   it('editing the name emits a meta with rest preserved', () => {
     const spy = vi.fn();

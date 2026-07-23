@@ -35,6 +35,13 @@ import {
 import { completionsFor, type ExprContext, type ExprKind } from '../../lib/workflowExpressions';
 import type { ExpressionFieldProps } from './ExpressionField';
 import type { Mode } from '../theme/ThemeProvider';
+import { buildTooltipExtensions } from '../cmTooltips';
+
+// Re-exported for backward compatibility — `buildTooltipExtensions` now lives
+// in the shared `cmTooltips` module (CodeEditorImpl's markdown mode needs it
+// too), but this module keeps exporting it so existing imports/tests
+// (`ExpressionField.test.tsx`) keep working unchanged.
+export { buildTooltipExtensions } from '../cmTooltips';
 
 // ── mustache scanning (shared by highlighter + completion gate) ───────────────
 
@@ -245,6 +252,7 @@ export default function ExpressionFieldImpl({
       closeBrackets(),
       mustacheHighlighter,
       autocompletion({ override: [makeCompletionSource(() => contextRef.current)] }),
+      ...buildTooltipExtensions(),
       keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap, ...completionKeymap]),
       makeExprTheme(mode === 'dark'),
       updateListener,
