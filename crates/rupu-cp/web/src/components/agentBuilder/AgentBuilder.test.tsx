@@ -30,6 +30,7 @@ vi.mock('../CodeEditor', () => ({
 }));
 
 import AgentBuilder from './AgentBuilder';
+import { CARD_REGISTRY } from '../../lib/agentBuilder/fields';
 
 const SAMPLE_RAW = `---
 name: security-reviewer
@@ -534,5 +535,36 @@ describe('AgentBuilder', () => {
     expect(after).toEqual(['Reasoning', 'Identity', 'Permission', 'Prompt']);
     expect(after.indexOf('Reasoning')).toBeLessThan(after.indexOf('Identity'));
     expect(after).not.toEqual(before);
+  });
+
+  it('renders a lucide icon on every palette card', () => {
+    render(
+      <AgentBuilder
+        initialRaw={SAMPLE_RAW}
+        submitLabel="Create agent"
+        submitting={false}
+        error={null}
+        onSubmit={vi.fn()}
+      />,
+    );
+    const icons = document.querySelectorAll('.ab-pcard svg.ab-cicon');
+    expect(icons.length).toBeGreaterThanOrEqual(CARD_REGISTRY.length);
+  });
+
+  it('renders a lucide icon in the canvas card head when a card is added', () => {
+    render(
+      <AgentBuilder
+        initialRaw={SAMPLE_RAW}
+        submitLabel="Create agent"
+        submitting={false}
+        error={null}
+        onSubmit={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText('add Reasoning card'));
+    const reasoningHead = screen
+      .getByText('Reasoning', { selector: '.ab-ct' })
+      .closest('.ab-card-head') as HTMLElement;
+    expect(reasoningHead.querySelector('svg.ab-cicon')).toBeInTheDocument();
   });
 });

@@ -274,6 +274,67 @@ describe('canvas backdrop (Task 3)', () => {
   });
 });
 
+describe('palette container / portal (Task 1: inspector-rail dock)', () => {
+  it('classic ignores paletteContainer — floating dock renders inline, container stays empty', () => {
+    const portalHost = document.createElement('div');
+    document.body.appendChild(portalHost);
+    const { container } = render(
+      <WorkflowEditorGraph
+        graph={makeGraph()}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi="classic"
+        paletteContainer={portalHost}
+      />,
+    );
+    expect(screen.getByRole('button', { name: 'Add step node' })).toBeInTheDocument();
+    expect(container.querySelector('.wfx-palette-rail')).not.toBeInTheDocument();
+    expect(portalHost.children.length).toBe(0);
+    document.body.removeChild(portalHost);
+  });
+
+  it('next + paletteContainer set: the palette portals into the container as variant="rail", not the canvas', () => {
+    const portalHost = document.createElement('div');
+    document.body.appendChild(portalHost);
+    const { container } = render(
+      <WorkflowEditorGraph
+        graph={makeGraph()}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi="next"
+        paletteContainer={portalHost}
+      />,
+    );
+    expect(portalHost.querySelector('.wfx-palette-rail')).toBeInTheDocument();
+    expect(container.querySelector('.wfx-palette-rail')).not.toBeInTheDocument();
+    expect(container.querySelector('.wfx-palette')).not.toBeInTheDocument();
+    document.body.removeChild(portalHost);
+  });
+
+  it('next + no paletteContainer: renders nothing for the palette that frame (no flash of the floating dock)', () => {
+    const { container } = render(
+      <WorkflowEditorGraph
+        graph={makeGraph()}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi="next"
+      />,
+    );
+    expect(container.querySelector('.wfx-palette')).not.toBeInTheDocument();
+    expect(container.querySelector('.wfx-palette-rail')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Add step node' })).not.toBeInTheDocument();
+  });
+});
+
 describe('applyConnect', () => {
   it('valid connection emits onChange with the new edge, not onInvalid', () => {
     const onChange = vi.fn();
@@ -439,6 +500,139 @@ describe('branch edge rendering', () => {
     const plain = edges.find((e) => e.id === 'a->b');
     expect(plain?.style?.stroke).toBeTruthy();
     expect(plain?.style?.strokeWidth).toBeTruthy();
+  });
+
+  it('next mode swaps branch-arm labels for ✓ then / ✕ else chips with a filled bg (Task 3)', () => {
+    const g = makeGraph();
+    g.nodes.push({
+      id: 'br',
+      data: { id: 'br', kind: 'branch', condition: 'inputs.ok', thenTargets: ['a'], elseTargets: ['b'] },
+      position: { x: 0, y: 0 },
+    });
+    g.edges.push(
+      { id: 'br->a:then', source: 'br', target: 'a', label: 'true', branch: 'then' },
+      { id: 'br->b:else', source: 'br', target: 'b', label: 'false', branch: 'else' },
+    );
+    render(
+      <WorkflowEditorGraph
+        graph={g}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi="next"
+      />,
+    );
+    const raw = screen.getByTestId('rf').getAttribute('data-edges');
+    const edges = JSON.parse(raw!) as Array<{
+      id: string;
+      label?: string;
+      labelBgStyle?: { fill?: string; fillOpacity?: number };
+      labelBgPadding?: number[];
+      labelBgBorderRadius?: number;
+    }>;
+    const thenEdge = edges.find((e) => e.id === 'br->a:then');
+    const elseEdge = edges.find((e) => e.id === 'br->b:else');
+    expect(thenEdge?.label).toBe('✓ then');
+    expect(elseEdge?.label).toBe('✕ else');
+    expect(thenEdge?.labelBgStyle?.fill).toBeTruthy();
+    expect(elseEdge?.labelBgStyle?.fill).toBeTruthy();
+    expect(thenEdge?.labelBgPadding).toEqual([6, 3]);
+    expect(thenEdge?.labelBgBorderRadius).toBe(6);
+  });
+
+  it('classic mode keeps the raw true/false label and a transparent labelBgStyle (unchanged)', () => {
+    const g = makeGraph();
+    g.nodes.push({
+      id: 'br',
+      data: { id: 'br', kind: 'branch', condition: 'inputs.ok', thenTargets: ['a'], elseTargets: ['b'] },
+      position: { x: 0, y: 0 },
+    });
+    g.edges.push({ id: 'br->a:then', source: 'br', target: 'a', label: 'true', branch: 'then' });
+    render(
+      <WorkflowEditorGraph
+        graph={g}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi="classic"
+      />,
+    );
+    const raw = screen.getByTestId('rf').getAttribute('data-edges');
+    const edges = JSON.parse(raw!) as Array<{
+      id: string;
+      label?: string;
+      labelBgStyle?: { fill?: string; fillOpacity?: number };
+    }>;
+    const thenEdge = edges.find((e) => e.id === 'br->a:then');
+    expect(thenEdge?.label).toBe('true');
+    expect(thenEdge?.labelBgStyle).toEqual({ fillOpacity: 0 });
+  });
+
+  it('next mode tints the plain edge arrow marker (classic leaves it undefined)', () => {
+    const classicRender = () => {
+      const { unmount } = render(
+        <WorkflowEditorGraph
+          graph={makeGraph()}
+          onChange={() => {}}
+          selectedId={null}
+          onSelect={() => {}}
+          problemsById={{}}
+          onInvalidConnection={() => {}}
+          workflowEditorUi="classic"
+        />,
+      );
+      const raw = screen.getByTestId('rf').getAttribute('data-edges');
+      unmount();
+      return JSON.parse(raw!) as Array<{ id: string; markerEnd?: { color?: string } }>;
+    };
+    const classicEdges = classicRender();
+    const classicPlain = classicEdges.find((e) => e.id === 'a->b');
+    expect(classicPlain?.markerEnd?.color).toBeUndefined();
+
+    render(
+      <WorkflowEditorGraph
+        graph={makeGraph()}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi="next"
+      />,
+    );
+    const raw = screen.getByTestId('rf').getAttribute('data-edges');
+    const nextEdges = JSON.parse(raw!) as Array<{ id: string; markerEnd?: { color?: string } }>;
+    const nextPlain = nextEdges.find((e) => e.id === 'a->b');
+    expect(nextPlain?.markerEnd?.color).toBeTruthy();
+  });
+
+  it('next mode gives a non-branch labeled edge a neutral brand-tinted chip', () => {
+    const g = makeGraph();
+    g.edges.push({ id: 'a->b:extra', source: 'a', target: 'b', label: 'data-ref' });
+    render(
+      <WorkflowEditorGraph
+        graph={g}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+        workflowEditorUi="next"
+      />,
+    );
+    const raw = screen.getByTestId('rf').getAttribute('data-edges');
+    const edges = JSON.parse(raw!) as Array<{
+      id: string;
+      label?: string;
+      labelBgStyle?: { fill?: string };
+    }>;
+    const labeled = edges.find((e) => e.id === 'a->b:extra');
+    expect(labeled?.label).toBe('data-ref');
+    expect(labeled?.labelBgStyle?.fill).toBeTruthy();
   });
 });
 

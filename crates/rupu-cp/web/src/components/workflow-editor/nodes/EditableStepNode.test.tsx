@@ -109,6 +109,12 @@ describe('EditableStepNode', () => {
       expect(container.querySelector('.wfx-kindpill')).not.toBeInTheDocument();
       expect(container.querySelector('.wfx-nid')).not.toBeInTheDocument();
     });
+
+    it('renders no kind icon (Task 3: icons are next-only)', () => {
+      const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' });
+      expect(container.querySelector('.wfx-kindicon')).not.toBeInTheDocument();
+      expect(container.querySelector('svg')).not.toBeInTheDocument();
+    });
   });
 
   describe('next (instrument) look', () => {
@@ -202,5 +208,24 @@ describe('EditableStepNode', () => {
       expect(container.querySelector('.wfx-problem')).toBeInTheDocument();
       expect(screen.getByLabelText('has problems')).toBeInTheDocument();
     });
+
+    it.each(['step', 'for_each', 'parallel', 'panel', 'branch'] as const)(
+      'renders a .wfx-kindicon svg inside the .wfx-kindpill for kind=%s (Task 3)',
+      (kind) => {
+        const data =
+          kind === 'parallel'
+            ? { id: 'x', kind, parallel: [] }
+            : kind === 'panel'
+              ? { id: 'x', kind, panel: { panelists: [], subject: '' } }
+              : kind === 'branch'
+                ? { id: 'x', kind, condition: '', thenTargets: [], elseTargets: [] }
+                : { id: 'x', kind, agent: 'a' };
+        const { container } = renderNode(data as StepNodeData, [], false, 'next');
+        const pill = container.querySelector('.wfx-kindpill');
+        const icon = pill?.querySelector('.wfx-kindicon');
+        expect(icon).toBeInTheDocument();
+        expect(icon?.tagName.toLowerCase()).toBe('svg');
+      },
+    );
   });
 });

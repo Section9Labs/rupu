@@ -11,6 +11,7 @@
 // applyDelete / applyAddNode) so it is unit-testable without mounting the canvas.
 
 import { useCallback, useMemo, useState, type DragEvent, type KeyboardEvent } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Background,
   BackgroundVariant,
@@ -200,6 +201,13 @@ interface Props {
    *  ('next' only). Rendering an EXISTING branch node is always on regardless
    *  of this flag; only the ability to ADD a new one from the palette is gated. */
   workflowEditorUi?: WorkflowEditorUi;
+  /** Inspector-rail slot to portal the palette into (Task 1), owned by
+   *  WorkflowEditor. Only consulted when `workflowEditorUi === 'next'`:
+   *  - set → the palette portals in as `variant="rail"`, no floating dock.
+   *  - null/undefined (rail slot not mounted yet) → palette renders nothing
+   *    for that frame, rather than flashing the floating dock.
+   *  Classic ALWAYS renders today's floating dock and ignores this prop. */
+  paletteContainer?: HTMLElement | null;
 }
 
 export default function WorkflowEditorGraph(props: Props) {
@@ -219,6 +227,7 @@ function WorkflowEditorGraphInner({
   onInvalidConnection,
   paused = false,
   workflowEditorUi = 'classic',
+  paletteContainer,
 }: Props) {
   const colors = useThemeColors();
   const nodes = useMemo<Node<NodeData>[]>(
@@ -236,26 +245,50 @@ function WorkflowEditorGraphInner({
   const edges = useMemo<Edge[]>(
     () =>
       graph.edges.map((e) => {
-        const color = branchEdgeColor(e.branch, colors);
+        const branchColor = branchEdgeColor(e.branch, colors);
         const next = workflowEditorUi === 'next';
+        // Plain (non-branch) edges get a muted tinted arrowhead in `next`
+        // (classic leaves the marker color undefined → xyflow's default).
+        const markerColor = branchColor ?? (next ? colors.alpha('inkMute', 0.5) : undefined);
         const edge: Edge = {
           id: e.id,
           source: e.source,
           target: e.target,
           type: 'smoothstep',
-          markerEnd: { type: MarkerType.ArrowClosed, color },
+          markerEnd: { type: MarkerType.ArrowClosed, color: markerColor },
         };
         if (e.label !== undefined) edge.label = e.label;
-        if (color !== undefined) {
+        if (branchColor !== undefined) {
           // Branch (true/false) arm — colored stroke, a touch bolder for `next`
           // (mirrors the mockup's `.edge.t-true`/`.edge.t-false`).
-          edge.style = next ? { stroke: color, strokeWidth: 2.5 } : { stroke: color };
-          edge.labelStyle = { fill: color, fontWeight: 600 };
-          edge.labelBgStyle = { fillOpacity: 0 };
+          edge.style = next ? { stroke: branchColor, strokeWidth: 2.5 } : { stroke: branchColor };
+          edge.labelStyle = { fill: branchColor, fontWeight: 600 };
+          if (next) {
+            // Semantic label chip: ✓ then / ✕ else, filled with a soft tint of
+            // the arm's own accent (status.done / status.failed).
+            const isThen = e.branch === 'then';
+            edge.label = isThen ? '✓ then' : '✕ else';
+            edge.labelBgStyle = {
+              fill: colors.alpha(isThen ? 'status.done' : 'status.failed', 0.12),
+            };
+            edge.labelBgPadding = [6, 3];
+            edge.labelBgBorderRadius = 6;
+          } else {
+            edge.labelBgStyle = { fillOpacity: 0 };
+          }
         } else if (next) {
           // Plain chain/data-ref edge — themed muted stroke for `next` (mockup's
           // `.edge`); classic leaves this edge with xyflow's default styling.
           edge.style = { stroke: colors.alpha('inkMute', 0.5), strokeWidth: 1.6 };
+          if (e.label !== undefined) {
+            // Non-branch edges that carry a label (none produced by
+            // yamlToGraph today, but the renderer stays generic) get a
+            // neutral brand-tinted chip instead of the branch-arm colors.
+            edge.labelStyle = { fill: colors.inkDim, fontWeight: 600 };
+            edge.labelBgStyle = { fill: colors.alpha('brand.500', 0.12) };
+            edge.labelBgPadding = [6, 3];
+            edge.labelBgBorderRadius = 6;
+          }
         }
         return edge;
       }),
@@ -462,12 +495,26 @@ function WorkflowEditorGraphInner({
         </div>
       </div>
 
-      <NodePalette
-        onAdd={addNode}
-        onDragStartKind={() => {}}
-        disabled={paused}
-        workflowEditorUi={workflowEditorUi}
-      />
+      {workflowEditorUi === 'next'
+        ? paletteContainer &&
+          createPortal(
+            <NodePalette
+              onAdd={addNode}
+              onDragStartKind={() => {}}
+              disabled={paused}
+              workflowEditorUi={workflowEditorUi}
+              variant="rail"
+            />,
+            paletteContainer,
+          )
+        : (
+          <NodePalette
+            onAdd={addNode}
+            onDragStartKind={() => {}}
+            disabled={paused}
+            workflowEditorUi={workflowEditorUi}
+          />
+        )}
 
       <div
         className={paused ? 'h-full w-full opacity-60 pointer-events-none' : 'h-full w-full'}

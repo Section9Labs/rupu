@@ -15,8 +15,9 @@ import { memo } from 'react';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { GraphNode, StepKind, StepNodeData } from '../../../lib/workflowGraph';
 import { editorNodeSize } from '../../../lib/workflowLayout';
-import { useThemeColors, type ColorKey, type ThemeColors } from '../../../lib/useThemeColors';
+import { useThemeColors, type ThemeColors } from '../../../lib/useThemeColors';
 import type { WorkflowEditorUi } from '../../../hooks/useWorkflowEditorUi';
+import { KIND_ACCENT, KIND_ICON } from '../kindVisuals';
 
 // Node data carried on the xyflow node. Exported so WorkflowEditorGraph projects
 // the exact same shape when it derives the flow `nodes`.
@@ -31,23 +32,12 @@ export interface NodeData extends Record<string, unknown> {
 
 type EditableFlowNode = Node<NodeData, 'editable'>;
 
-// Per-kind accent → a THEMED palette token: step/blue (running), for_each/violet
-// (brand), parallel/purple (sev-critical), panel/amber (awaiting), branch/green
-// (done — a routing decision, distinct from every other kind). Resolved from
-// the hook at render so the kind coloring matches the rest of the UI and stays
-// legible on dark — the kind chips paint with an inline alpha tint of the accent
-// (no fixed `bg-*-50` classes that wash out on near-black).
-const KIND_KEY: Record<StepKind, ColorKey> = {
-  step: 'status.running',
-  for_each: 'brand.500',
-  parallel: 'sev.critical',
-  panel: 'status.awaiting',
-  branch: 'status.done',
-};
-
-/** Inline style for a kind chip — soft accent tint bg + accent text. */
+/** Inline style for a kind chip — soft accent tint bg + accent text. Accent
+ *  resolved from the shared `kindVisuals.KIND_ACCENT` (also used by
+ *  NodePalette) so the kind chips paint with an inline alpha tint of the
+ *  accent (no fixed `bg-*-50` classes that wash out on near-black). */
 function kindChipStyle(colors: ThemeColors, kind: StepKind): React.CSSProperties {
-  return { background: colors.alpha(KIND_KEY[kind], 0.14), color: colors.get(KIND_KEY[kind]) };
+  return { background: colors.alpha(KIND_ACCENT[kind], 0.14), color: colors.get(KIND_ACCENT[kind]) };
 }
 
 /** kind chip + agent chip — shared by step / for_each. */
@@ -246,7 +236,8 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
   const d = node.data;
   const colors = useThemeColors();
   const handleStyle = { background: colors.border, width: 7, height: 7, border: 'none' } as const;
-  const color = colors.get(KIND_KEY[d.kind]);
+  const color = colors.get(KIND_ACCENT[d.kind]);
+  const KindIcon = KIND_ICON[d.kind];
   const box = editorNodeSize(d);
   const hasProblems = problems.length > 0;
 
@@ -267,6 +258,7 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
 
         <div className="wfx-head">
           <span className="wfx-kindpill" style={kindChipStyle(colors, d.kind)}>
+            <KindIcon className="wfx-kindicon" size={12} strokeWidth={2} aria-hidden />
             {d.kind}
           </span>
           <span className="wfx-nid">{d.id}</span>

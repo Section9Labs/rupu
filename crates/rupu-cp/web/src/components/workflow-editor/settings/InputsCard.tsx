@@ -198,12 +198,12 @@ export default function InputsCard({ rest, onRest }: InputsCardProps) {
 
             <label className="block">
               <span className={labelCls}>Description</span>
-              <input
-                type="text"
+              <textarea
                 value={row.description ?? ''}
                 onChange={(e) => updateRow(i, { description: e.target.value === '' ? undefined : e.target.value })}
                 aria-label={`Input ${i + 1} description`}
-                className={fieldCls}
+                rows={4}
+                className={`${fieldCls} resize-y`}
               />
             </label>
 

@@ -74,6 +74,59 @@ type PanelTab = 'step' | 'settings' | 'reference';
 /** localStorage flag: the canonical-rewrite notice has been shown once. */
 const REFORMAT_NOTICE_KEY = 'rupu.editor.reformatNoticeSeen';
 
+/** localStorage flag: whether the YAML source pane is open (`next` UI only).
+ *  Missing / garbage / '1' → open; only an explicit '0' collapses it. */
+const SOURCE_OPEN_KEY = 'rupu.editor.sourceOpen';
+
+function readSourceOpen(): boolean {
+  try {
+    if (typeof localStorage === 'undefined') return true;
+    return localStorage.getItem(SOURCE_OPEN_KEY) !== '0';
+  } catch {
+    return true;
+  }
+}
+
+/** id shared between the source-toggle button's `aria-controls` and the YAML
+ *  editor's wrapping container, so assistive tech can locate the pane it
+ *  expands/collapses. Only mounted while the pane is open. */
+const SOURCE_PANE_ID = 'wf-source-editor';
+
+// ── inspector rail width (Task 5, `next` UI only, lg+ screens) ──────────────
+
+/** localStorage key for the persisted inspector-rail width (px, int). */
+const RAIL_WIDTH_KEY = 'rupu.editor.railWidth';
+const RAIL_WIDTH_DEFAULT = 320;
+const RAIL_WIDTH_MIN = 280;
+const RAIL_WIDTH_MAX = 640;
+
+function clampRailWidth(n: number): number {
+  return Math.min(RAIL_WIDTH_MAX, Math.max(RAIL_WIDTH_MIN, n));
+}
+
+/** Read the persisted rail width. Missing / garbage / out-of-range → the
+ *  default (280–640 clamp handles out-of-range; a non-finite parse falls back
+ *  to the default outright). */
+function readRailWidth(): number {
+  try {
+    if (typeof localStorage === 'undefined') return RAIL_WIDTH_DEFAULT;
+    const raw = localStorage.getItem(RAIL_WIDTH_KEY);
+    if (raw === null) return RAIL_WIDTH_DEFAULT;
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) ? clampRailWidth(n) : RAIL_WIDTH_DEFAULT;
+  } catch {
+    return RAIL_WIDTH_DEFAULT;
+  }
+}
+
+function persistRailWidth(n: number): void {
+  try {
+    localStorage.setItem(RAIL_WIDTH_KEY, String(Math.round(n)));
+  } catch {
+    /* localStorage unavailable (private mode / SSR) — skip persistence */
+  }
+}
+
 /** True if `text` contains a YAML comment — a line whose first non-space char is
  *  `#`, or an inline ` #`. A heuristic (may flag `#` inside a quoted scalar);
  *  used only to gate a one-time, dismissible notice, so over-warning is benign. */
@@ -103,6 +156,84 @@ export default function WorkflowEditor({
   // One-time banner: a graph edit on a commented document reformats the YAML
   // (canonical rewrite) and drops comments. Shown at most once per browser.
   const [reformatNotice, setReformatNotice] = useState(false);
+
+  // Inspector-rail palette slot (Task 1, `next` only): captured via a ref
+  // callback (not useRef) so its FIRST paint is a state update — the graph
+  // needs the actual mounted element to portal the palette into, and a plain
+  // ref wouldn't trigger the re-render that hands it down.
+  const [paletteSlot, setPaletteSlot] = useState<HTMLElement | null>(null);
+  const paletteSlotRef = useCallback((el: HTMLElement | null) => setPaletteSlot(el), []);
+
+  // YAML source pane visibility (`next` UI only, Task 2). Classic always shows
+  // the SplitPane and never reads/writes this state.
+  const [sourceOpen, setSourceOpen] = useState<boolean>(() => readSourceOpen());
+  const toggleSourceOpen = useCallback(() => {
+    setSourceOpen((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem(SOURCE_OPEN_KEY, next ? '1' : '0');
+      } catch {
+        /* localStorage unavailable (private mode / SSR) — skip persistence */
+      }
+      return next;
+    });
+  }, []);
+
+  // Inspector-rail width (`next` UI only, lg+ screens, Task 5). Classic keeps
+  // the literal `lg:w-80` markup and never reads this state. A ref mirrors the
+  // latest width so the pointer-drag "up" handler (registered once per drag,
+  // outside React state) can persist the FINAL value without re-subscribing
+  // on every pointermove.
+  const [railWidth, setRailWidth] = useState<number>(() => readRailWidth());
+  const railWidthRef = useRef(railWidth);
+  railWidthRef.current = railWidth;
+  const asideRef = useRef<HTMLElement>(null);
+
+  const setRailWidthFromClientX = useCallback((clientX: number) => {
+    const el = asideRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    // The aside's right edge is fixed while dragging (only its left edge —
+    // i.e. its width — moves), so `rect.right - clientX` is the live width;
+    // dragging left (smaller clientX) widens the rail.
+    setRailWidth(clampRailWidth(rect.right - clientX));
+  }, []);
+
+  const onRailPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      const handle = e.currentTarget;
+      handle.setPointerCapture(e.pointerId);
+      const onMove = (ev: PointerEvent) => setRailWidthFromClientX(ev.clientX);
+      const onUp = (ev: PointerEvent) => {
+        handle.releasePointerCapture(ev.pointerId);
+        handle.removeEventListener('pointermove', onMove);
+        handle.removeEventListener('pointerup', onUp);
+        persistRailWidth(railWidthRef.current); // persist once, at drag end.
+      };
+      handle.addEventListener('pointermove', onMove);
+      handle.addEventListener('pointerup', onUp);
+    },
+    [setRailWidthFromClientX],
+  );
+
+  const onRailKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      setRailWidth((w) => {
+        const next = clampRailWidth(w + 16); // left widens, mirrors the drag direction.
+        persistRailWidth(next);
+        return next;
+      });
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      setRailWidth((w) => {
+        const next = clampRailWidth(w - 16);
+        persistRailWidth(next);
+        return next;
+      });
+    }
+  }, []);
 
   // Keep the latest selectedId + graph readable inside the debounce timeout
   // WITHOUT adding them to the effect deps (which would re-arm the timer on every
@@ -294,9 +425,9 @@ export default function WorkflowEditor({
 
       {/* ── LEFT / MAIN: graph over YAML, resizable ───────────────────────── */}
       <div className="min-h-0 min-w-0 flex-1">
-        <SplitPane
-          top={
-            <div className="h-full overflow-hidden p-3">
+        {workflowEditorUi === 'next' && !sourceOpen ? (
+          <div className="flex h-full min-h-0 flex-col">
+            <div className="min-h-0 flex-1 overflow-hidden p-3">
               <WorkflowEditorGraph
                 graph={graph}
                 onChange={commit}
@@ -306,32 +437,105 @@ export default function WorkflowEditor({
                 onInvalidConnection={setConnError}
                 paused={paused}
                 workflowEditorUi={workflowEditorUi}
+                paletteContainer={paletteSlot}
               />
             </div>
-          }
-          bottom={
-            <div className="flex h-full min-h-0 flex-col">
-              <div className="min-h-0 flex-1 overflow-auto p-3">
-                <CodeEditor
-                  value={draftYaml}
-                  onChange={onYamlChange}
-                  language="yaml"
-                  ariaLabel="Workflow YAML editor"
+            <div className="flex items-center gap-2 border-t border-border bg-panel px-3 py-1.5">
+              <span className="text-note text-ink-mute">⟳ synced from graph</span>
+              <button
+                type="button"
+                onClick={toggleSourceOpen}
+                aria-expanded={false}
+                aria-controls={SOURCE_PANE_ID}
+                className="rounded px-1.5 py-0.5 text-note font-medium text-ink-dim hover:bg-surface-hover hover:text-ink"
+              >
+                Show source
+              </button>
+              <span className="ml-auto">
+                <ValidityBadge validity={validity} />
+              </span>
+            </div>
+          </div>
+        ) : (
+          <SplitPane
+            top={
+              <div className="h-full overflow-hidden p-3">
+                <WorkflowEditorGraph
+                  graph={graph}
+                  onChange={commit}
+                  selectedId={selectedId}
+                  onSelect={handleSelect}
+                  problemsById={problemsById}
+                  onInvalidConnection={setConnError}
+                  paused={paused}
+                  workflowEditorUi={workflowEditorUi}
+                  paletteContainer={workflowEditorUi === 'next' ? paletteSlot : undefined}
                 />
               </div>
-              <div className="flex items-center gap-2 border-t border-border bg-panel px-3 py-1.5">
-                <span className="text-note text-ink-mute">⟳ synced from graph</span>
-                <span className="ml-auto">
-                  <ValidityBadge validity={validity} />
-                </span>
+            }
+            bottom={
+              <div className="flex h-full min-h-0 flex-col">
+                <div
+                  className="min-h-0 flex-1 overflow-auto p-3"
+                  {...(workflowEditorUi === 'next' ? { id: SOURCE_PANE_ID } : {})}
+                >
+                  <CodeEditor
+                    value={draftYaml}
+                    onChange={onYamlChange}
+                    language="yaml"
+                    ariaLabel="Workflow YAML editor"
+                  />
+                </div>
+                <div className="flex items-center gap-2 border-t border-border bg-panel px-3 py-1.5">
+                  <span className="text-note text-ink-mute">⟳ synced from graph</span>
+                  {workflowEditorUi === 'next' && (
+                    <button
+                      type="button"
+                      onClick={toggleSourceOpen}
+                      aria-expanded={true}
+                      aria-controls={SOURCE_PANE_ID}
+                      className="rounded px-1.5 py-0.5 text-note font-medium text-ink-dim hover:bg-surface-hover hover:text-ink"
+                    >
+                      Hide source
+                    </button>
+                  )}
+                  <span className="ml-auto">
+                    <ValidityBadge validity={validity} />
+                  </span>
+                </div>
               </div>
-            </div>
-          }
-        />
+            }
+          />
+        )}
       </div>
 
       {/* ── RIGHT: inspector rail ─────────────────────────────────────────── */}
-      <aside className="flex w-full shrink-0 flex-col border-t border-border bg-panel lg:w-80 lg:border-l lg:border-t-0">
+      <aside
+        ref={workflowEditorUi === 'next' ? asideRef : undefined}
+        className={
+          workflowEditorUi === 'next'
+            ? 'relative flex w-full shrink-0 flex-col border-t border-border bg-panel wfx-rail-sized lg:border-l lg:border-t-0'
+            : 'flex w-full shrink-0 flex-col border-t border-border bg-panel lg:w-80 lg:border-l lg:border-t-0'
+        }
+        style={workflowEditorUi === 'next' ? ({ '--wfx-rail-w': `${railWidth}px` } as React.CSSProperties) : undefined}
+      >
+        {workflowEditorUi === 'next' && (
+          <div ref={paletteSlotRef} className="wfx-rail-palette-slot border-b border-border" />
+        )}
+        {workflowEditorUi === 'next' && (
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize inspector"
+            aria-valuenow={railWidth}
+            aria-valuemin={RAIL_WIDTH_MIN}
+            aria-valuemax={RAIL_WIDTH_MAX}
+            tabIndex={0}
+            onPointerDown={onRailPointerDown}
+            onKeyDown={onRailKeyDown}
+            className="wfx-rail-handle hidden lg:block"
+          />
+        )}
         <div className="border-b border-border p-3">
           <div role="tablist" aria-label="Inspector" className="inline-flex rounded-lg border border-border bg-panel p-0.5">
             <PanelTabButton
