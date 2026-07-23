@@ -2109,6 +2109,7 @@ async fn resume_reruns_only_failed_fanout_units() {
             completed_units,
             reason: rupu_orchestrator::PauseReason::Approval,
             paused_step: None,
+            rejected_reason: None,
         }),
         issue: None,
         issue_ref: None,

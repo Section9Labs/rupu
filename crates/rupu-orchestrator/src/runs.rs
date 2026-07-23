@@ -25,6 +25,7 @@
 //! per-item rows for fan-out are nested inside the line's JSON.
 
 use crate::runner::{ItemResult, StepResult};
+use crate::workflow::TimeoutAction;
 use chrono::{DateTime, Utc};
 use rupu_providers::types::Message;
 use rupu_runtime::{ArtifactManifest, RunEnvelope};
@@ -274,6 +275,8 @@ pub enum StepKind {
     Parallel,
     Panel,
     Branch,
+    Action,
+    ApprovalGate,
 }
 
 /// One entry in `step_results.jsonl`. Mirrors [`StepResult`] but with
@@ -876,51 +879,137 @@ impl RunStore {
     }
 
     /// If `record` is in `AwaitingApproval` and its `expires_at`
-    /// (when set) is in the past relative to `now`, transition the
-    /// record to `Failed` with an "expired" error message and
-    /// persist. Returns `Ok(true)` when a transition happened,
-    /// `Ok(false)` otherwise. Used by the CLI's `approve` /
-    /// `reject` / `runs` paths to enforce the timeout lazily — no
-    /// daemon needed.
+    /// (when set) is in the past relative to `now`, resolve the
+    /// timed-out gate's `on_timeout` routing (`None` ⇒ `Fail`, today's
+    /// unconditional behavior):
+    ///
+    /// - `Fail` — transition the record to `Failed` with an "expired"
+    ///   error message, persist, append a `RunFailed` terminal event.
+    ///   Fully handled here, as today.
+    /// - `Reject` — transition the record to `Rejected` (mirroring
+    ///   [`reject`](Self::reject)'s field mutations), persist, append a
+    ///   `RunCompleted { status: Rejected }` terminal event. The
+    ///   CALLER is responsible for then running the gate's
+    ///   `on_reject` cleanup chain (same path `reject` uses) — this
+    ///   method only finalizes the run's terminal state.
+    /// - `Approve` — mutate NOTHING; the record stays `AwaitingApproval`
+    ///   exactly as it was. The CALLER resumes it exactly like an
+    ///   operator approve.
+    ///
+    /// Returns `Ok(Some(action))` when expiry fired (telling the
+    /// caller which action was taken/is needed), `Ok(None)` when the
+    /// record wasn't overdue. Used by the CLI's `approve` / `reject` /
+    /// `runs` paths (and Plan 4's cp-serve sweep) to enforce the
+    /// timeout lazily — no daemon needed.
     pub fn expire_if_overdue(
         &self,
         record: &mut RunRecord,
         now: DateTime<Utc>,
-    ) -> Result<bool, RunStoreError> {
+        on_timeout: Option<TimeoutAction>,
+    ) -> Result<Option<TimeoutAction>, RunStoreError> {
         if record.status != RunStatus::AwaitingApproval {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(expires_at) = record.expires_at else {
-            return Ok(false);
+            return Ok(None);
         };
         if now <= expires_at {
-            return Ok(false);
+            return Ok(None);
+        }
+        let action = on_timeout.unwrap_or(TimeoutAction::Fail);
+        if action == TimeoutAction::Approve {
+            // Gate policy resolves the timed-out wait to an
+            // auto-approve: leave the record untouched (still
+            // `AwaitingApproval`) and tell the caller to proceed
+            // exactly as if an operator had approved it.
+            return Ok(Some(TimeoutAction::Approve));
         }
         let waited = expires_at - record.awaiting_since.unwrap_or(record.started_at);
-        record.status = RunStatus::Failed;
         record.finished_at = Some(now);
         record.error_message = Some(format!(
             "approval expired: paused at step `{}` waited longer than {}s without approval",
             record.awaiting_step_id.as_deref().unwrap_or("?"),
             waited.num_seconds()
         ));
-        // Keep awaiting_step_id / approval_prompt around so
-        // post-mortem inspection can see what was missed; clear
-        // expires_at so subsequent reads don't re-expire.
-        record.expires_at = None;
-        self.update(record)?;
-        self.append_terminal_event(
-            &record.id,
-            &crate::executor::Event::RunFailed {
-                run_id: record.id.clone(),
-                error: record
-                    .error_message
-                    .clone()
-                    .unwrap_or_else(|| "approval expired".into()),
-                finished_at: now,
-            },
-        );
-        Ok(true)
+        match action {
+            TimeoutAction::Fail => {
+                record.status = RunStatus::Failed;
+                // Keep awaiting_step_id / approval_prompt around so
+                // post-mortem inspection can see what was missed; clear
+                // expires_at so subsequent reads don't re-expire.
+                record.expires_at = None;
+                self.update(record)?;
+                self.append_terminal_event(
+                    &record.id,
+                    &crate::executor::Event::RunFailed {
+                        run_id: record.id.clone(),
+                        error: record
+                            .error_message
+                            .clone()
+                            .unwrap_or_else(|| "approval expired".into()),
+                        finished_at: now,
+                    },
+                );
+                Ok(Some(TimeoutAction::Fail))
+            }
+            TimeoutAction::Reject => {
+                record.status = RunStatus::Rejected;
+                record.awaiting_step_id = None;
+                record.approval_prompt = None;
+                record.awaiting_since = None;
+                record.expires_at = None;
+                self.update(record)?;
+                self.append_terminal_event(
+                    &record.id,
+                    &crate::executor::Event::RunCompleted {
+                        run_id: record.id.clone(),
+                        status: RunStatus::Rejected,
+                        finished_at: now,
+                    },
+                );
+                Ok(Some(TimeoutAction::Reject))
+            }
+            TimeoutAction::Approve => unreachable!("handled above"),
+        }
+    }
+
+    /// Resolve the `on_timeout` routing configured on the gate NODE
+    /// `record` is paused at, by loading the run's persisted workflow
+    /// snapshot. `None` — collapsing to
+    /// [`expire_if_overdue`](Self::expire_if_overdue)'s default `Fail`
+    /// — covers two shapes: the legitimate case (no awaiting step, or
+    /// the step isn't a gate NODE / has no `on_timeout` set) and the
+    /// should-never-happen case (the persisted snapshot is unreadable
+    /// or fails to parse, even though it parsed fine when the run
+    /// started) — the latter is logged loudly since it signals
+    /// corrupted on-disk state, not an absent policy.
+    fn gate_on_timeout(&self, record: &RunRecord) -> Option<TimeoutAction> {
+        let step_id = record.awaiting_step_id.as_deref()?;
+        let body = match self.read_workflow_snapshot(&record.id) {
+            Ok(body) => body,
+            Err(e) => {
+                tracing::warn!(
+                    run_id = %record.id,
+                    error = %e,
+                    "could not read workflow snapshot to resolve gate on_timeout; \
+                     defaulting to `fail`"
+                );
+                return None;
+            }
+        };
+        let workflow = match crate::workflow::Workflow::parse(&body) {
+            Ok(wf) => wf,
+            Err(e) => {
+                tracing::warn!(
+                    run_id = %record.id,
+                    error = %e,
+                    "could not parse persisted workflow snapshot to resolve gate on_timeout; \
+                     defaulting to `fail`"
+                );
+                return None;
+            }
+        };
+        crate::workflow::gate_timeout_action(&workflow, step_id)
     }
 }
 
@@ -952,6 +1041,15 @@ pub enum ApprovalError {
     NotAwaiting(String),
     #[error("approval expired: {0}")]
     Expired(String),
+    /// The gate's `on_timeout: reject` policy fired: the run has
+    /// already been transitioned to `Rejected` (mirroring an operator
+    /// reject) by the time this error is returned. Distinct from
+    /// [`Expired`](Self::Expired) so the CLI caller can invoke the
+    /// same `on_reject` cleanup chain a normal reject runs — the
+    /// `step_id` is threaded through because the run record's
+    /// `awaiting_step_id` is already cleared by the time this fires.
+    #[error("approval expired at step `{step_id}` and gate auto-rejected: {reason}")]
+    ExpiredRejected { step_id: String, reason: String },
     #[error("missing awaiting_step_id in record")]
     NoAwaitingStep,
     #[error("store: {0}")]
@@ -996,13 +1094,33 @@ impl RunStore {
             RunStoreError::NotFound(s) => ApprovalError::NotFound(s),
             other => ApprovalError::Store(other),
         })?;
-        if self.expire_if_overdue(&mut record, now)? {
-            return Err(ApprovalError::Expired(
-                record
-                    .error_message
-                    .clone()
-                    .unwrap_or_else(|| "paused run timed out".into()),
-            ));
+        // Captured before `expire_if_overdue` can clear it (the
+        // `Reject` arm mirrors `reject`'s field mutations, which
+        // includes clearing `awaiting_step_id`).
+        let step_id_before_expiry = record.awaiting_step_id.clone();
+        let on_timeout = self.gate_on_timeout(&record);
+        match self.expire_if_overdue(&mut record, now, on_timeout)? {
+            Some(TimeoutAction::Fail) => {
+                return Err(ApprovalError::Expired(
+                    record
+                        .error_message
+                        .clone()
+                        .unwrap_or_else(|| "paused run timed out".into()),
+                ));
+            }
+            Some(TimeoutAction::Reject) => {
+                return Err(ApprovalError::ExpiredRejected {
+                    step_id: step_id_before_expiry.unwrap_or_default(),
+                    reason: record
+                        .error_message
+                        .clone()
+                        .unwrap_or_else(|| "approval expired".into()),
+                });
+            }
+            // `Approve` leaves the record untouched — fall through
+            // and proceed exactly like an operator approve. `None`
+            // means it wasn't overdue at all.
+            Some(TimeoutAction::Approve) | None => {}
         }
         if record.status != RunStatus::AwaitingApproval {
             return Err(ApprovalError::NotAwaiting(
@@ -1038,13 +1156,38 @@ impl RunStore {
             RunStoreError::NotFound(s) => ApprovalError::NotFound(s),
             other => ApprovalError::Store(other),
         })?;
-        if self.expire_if_overdue(&mut record, now)? {
-            return Err(ApprovalError::Expired(
-                record
-                    .error_message
-                    .clone()
-                    .unwrap_or_else(|| "paused run timed out".into()),
-            ));
+        // Captured before `expire_if_overdue` can clear it.
+        let step_id_before_expiry = record.awaiting_step_id.clone();
+        let on_timeout = self.gate_on_timeout(&record);
+        match self.expire_if_overdue(&mut record, now, on_timeout)? {
+            Some(TimeoutAction::Fail) => {
+                return Err(ApprovalError::Expired(
+                    record
+                        .error_message
+                        .clone()
+                        .unwrap_or_else(|| "paused run timed out".into()),
+                ));
+            }
+            Some(TimeoutAction::Reject) => {
+                // The gate's own `on_timeout: reject` policy already
+                // finalized this exactly as an operator reject would
+                // have — report it as the same success the operator
+                // asked for so the caller runs the identical
+                // `on_reject` cleanup chain.
+                return Ok(ApprovalDecision::Rejected {
+                    run_id: run_id.to_string(),
+                    step_id: step_id_before_expiry.unwrap_or_default(),
+                    reason: record
+                        .error_message
+                        .clone()
+                        .unwrap_or_else(|| "approval expired".into()),
+                });
+            }
+            // `Approve` leaves the record untouched — the operator's
+            // explicit reject below still wins over the gate's
+            // auto-approve-on-timeout policy. `None` means it wasn't
+            // overdue at all.
+            Some(TimeoutAction::Approve) | None => {}
         }
         if record.status != RunStatus::AwaitingApproval {
             return Err(ApprovalError::NotAwaiting(
@@ -1123,13 +1266,49 @@ impl RunStore {
             RunStoreError::NotFound(s) => ApprovalError::NotFound(s),
             other => ApprovalError::Store(other),
         })?;
-        if self.expire_if_overdue(&mut record, now)? {
-            return Err(ApprovalError::Expired(
-                record
-                    .error_message
-                    .clone()
-                    .unwrap_or_else(|| "paused run timed out".into()),
-            ));
+        // Captured before `expire_if_overdue` can clear it.
+        let step_id_before_expiry = record.awaiting_step_id.clone();
+        let on_timeout = self.gate_on_timeout(&record);
+        match self.expire_if_overdue(&mut record, now, on_timeout)? {
+            Some(TimeoutAction::Fail) => {
+                return Err(ApprovalError::Expired(
+                    record
+                        .error_message
+                        .clone()
+                        .unwrap_or_else(|| "paused run timed out".into()),
+                ));
+            }
+            Some(TimeoutAction::Reject) => {
+                // This marker-only path finalizes the run `Rejected` but
+                // does NOT run the gate's `on_reject` cleanup chain —
+                // that needs the full `OrchestratorRunOpts` wiring only a
+                // CLI command builds (see `run_reject_cleanup` in
+                // `runner.rs`). That cleanup is currently orphaned for
+                // web-initiated decisions: once this call returns, the
+                // run is terminal, so `expire_if_overdue` no-ops for
+                // every future observer and `approve`/`reject` both
+                // return `NotAwaiting` — nothing will ever pick this
+                // chain up on its own. Per the "Deferred to later plans"
+                // section of
+                // docs/superpowers/plans/2026-07-23-rupu-gate-nodes-plan-1-schema-and-runner.md,
+                // Plan 4's cp-serve gate sweep (which consumes this same
+                // `expire_if_overdue` contract) is what will actually
+                // execute it for the web path.
+                tracing::warn!(
+                    run_id,
+                    "on_reject cleanup is not executed on the web path yet (Plan 4): \
+                     run auto-rejected but its on_reject chain is orphaned until the \
+                     cp-serve gate sweep lands"
+                );
+                return Err(ApprovalError::ExpiredRejected {
+                    step_id: step_id_before_expiry.unwrap_or_default(),
+                    reason: record
+                        .error_message
+                        .clone()
+                        .unwrap_or_else(|| "approval expired".into()),
+                });
+            }
+            Some(TimeoutAction::Approve) | None => {}
         }
         if !matches!(
             record.status,
@@ -1266,7 +1445,7 @@ impl RunStore {
     /// transition and show the run as running forever. Mirrors
     /// `JsonlSink`'s contract: failures are logged, never propagated
     /// (the persisted `run.json` flip above is the source of truth).
-    fn append_terminal_event(&self, run_id: &str, ev: &crate::executor::Event) {
+    pub(crate) fn append_terminal_event(&self, run_id: &str, ev: &crate::executor::Event) {
         use crate::executor::{EventSink, JsonlSink};
         let path = self.run_dir(run_id).join("events.jsonl");
         match JsonlSink::create(&path) {
@@ -1903,8 +2082,10 @@ mod tests {
         rec.status = RunStatus::Running;
         store.create(rec.clone(), "x").unwrap();
         let mut loaded = rec;
-        let flipped = store.expire_if_overdue(&mut loaded, Utc::now()).unwrap();
-        assert!(!flipped);
+        let flipped = store
+            .expire_if_overdue(&mut loaded, Utc::now(), None)
+            .unwrap();
+        assert!(flipped.is_none());
         assert_eq!(loaded.status, RunStatus::Running);
     }
 
@@ -1919,8 +2100,10 @@ mod tests {
         // expires_at intentionally None: timeout not configured.
         store.create(rec.clone(), "x").unwrap();
         let mut loaded = rec;
-        let flipped = store.expire_if_overdue(&mut loaded, Utc::now()).unwrap();
-        assert!(!flipped, "no timeout configured → never expires");
+        let flipped = store
+            .expire_if_overdue(&mut loaded, Utc::now(), None)
+            .unwrap();
+        assert!(flipped.is_none(), "no timeout configured → never expires");
         assert_eq!(loaded.status, RunStatus::AwaitingApproval);
     }
 
@@ -1936,8 +2119,8 @@ mod tests {
         rec.expires_at = Some(now + chrono::Duration::seconds(60));
         store.create(rec.clone(), "x").unwrap();
         let mut loaded = rec;
-        let flipped = store.expire_if_overdue(&mut loaded, now).unwrap();
-        assert!(!flipped);
+        let flipped = store.expire_if_overdue(&mut loaded, now, None).unwrap();
+        assert!(flipped.is_none());
         assert_eq!(loaded.status, RunStatus::AwaitingApproval);
     }
 
@@ -1954,8 +2137,8 @@ mod tests {
         store.create(rec.clone(), "x").unwrap();
 
         let mut loaded = rec;
-        let flipped = store.expire_if_overdue(&mut loaded, now).unwrap();
-        assert!(flipped);
+        let flipped = store.expire_if_overdue(&mut loaded, now, None).unwrap();
+        assert_eq!(flipped, Some(TimeoutAction::Fail));
         assert_eq!(loaded.status, RunStatus::Failed);
         assert!(loaded.finished_at.is_some());
         let msg = loaded.error_message.as_deref().unwrap();
@@ -1965,6 +2148,97 @@ mod tests {
         // Persisted to disk too.
         let reloaded = store.load("run_a").unwrap();
         assert_eq!(reloaded.status, RunStatus::Failed);
+    }
+
+    #[test]
+    fn expire_if_overdue_on_timeout_fail_is_same_as_default() {
+        // on_timeout: fail is spelled out explicitly here (vs the
+        // `None` default exercised above) — same body, same outcome.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_fail_explicit");
+        rec.status = RunStatus::AwaitingApproval;
+        rec.awaiting_step_id = Some("deploy".into());
+        rec.awaiting_since = Some(now - chrono::Duration::seconds(120));
+        rec.expires_at = Some(now - chrono::Duration::seconds(30));
+        store.create(rec.clone(), "x").unwrap();
+
+        let mut loaded = rec;
+        let flipped = store
+            .expire_if_overdue(&mut loaded, now, Some(TimeoutAction::Fail))
+            .unwrap();
+        assert_eq!(flipped, Some(TimeoutAction::Fail));
+        assert_eq!(loaded.status, RunStatus::Failed);
+    }
+
+    #[test]
+    fn expire_if_overdue_on_timeout_approve_leaves_record_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_timeout_approve");
+        rec.status = RunStatus::AwaitingApproval;
+        rec.awaiting_step_id = Some("deploy".into());
+        rec.approval_prompt = Some("ok?".into());
+        rec.awaiting_since = Some(now - chrono::Duration::seconds(120));
+        rec.expires_at = Some(now - chrono::Duration::seconds(30));
+        store.create(rec.clone(), "x").unwrap();
+
+        let mut loaded = rec.clone();
+        let outcome = store
+            .expire_if_overdue(&mut loaded, now, Some(TimeoutAction::Approve))
+            .unwrap();
+        assert_eq!(outcome, Some(TimeoutAction::Approve));
+        // Nothing mutated: still AwaitingApproval, no error_message,
+        // pause fields intact — the caller resumes exactly like an
+        // operator approve.
+        assert_eq!(loaded.status, RunStatus::AwaitingApproval);
+        assert!(loaded.error_message.is_none());
+        assert!(loaded.finished_at.is_none());
+        assert_eq!(loaded.awaiting_step_id, rec.awaiting_step_id);
+        assert_eq!(loaded.approval_prompt, rec.approval_prompt);
+        assert_eq!(loaded.expires_at, rec.expires_at);
+        // Not persisted either — no update() call happened.
+        let reloaded = store.load("run_timeout_approve").unwrap();
+        assert_eq!(reloaded.status, RunStatus::AwaitingApproval);
+    }
+
+    #[test]
+    fn expire_if_overdue_on_timeout_reject_flips_rejected_with_terminal_event() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_timeout_reject");
+        rec.status = RunStatus::AwaitingApproval;
+        rec.awaiting_step_id = Some("deploy".into());
+        rec.awaiting_since = Some(now - chrono::Duration::seconds(120));
+        rec.expires_at = Some(now - chrono::Duration::seconds(30));
+        store.create(rec.clone(), "x").unwrap();
+
+        let mut loaded = rec;
+        let outcome = store
+            .expire_if_overdue(&mut loaded, now, Some(TimeoutAction::Reject))
+            .unwrap();
+        assert_eq!(outcome, Some(TimeoutAction::Reject));
+        assert_eq!(loaded.status, RunStatus::Rejected);
+        assert!(loaded.finished_at.is_some());
+        let msg = loaded.error_message.as_deref().unwrap();
+        assert!(msg.contains("approval expired"), "msg: {msg}");
+        assert!(loaded.expires_at.is_none());
+        // Persisted to disk too.
+        let reloaded = store.load("run_timeout_reject").unwrap();
+        assert_eq!(reloaded.status, RunStatus::Rejected);
+
+        match last_event(&store, "run_timeout_reject") {
+            crate::executor::Event::RunCompleted {
+                run_id, status, ..
+            } => {
+                assert_eq!(run_id, "run_timeout_reject");
+                assert_eq!(status, RunStatus::Rejected);
+            }
+            other => panic!("expected RunCompleted(rejected), got {other:?}"),
+        }
     }
 
     #[test]
@@ -1979,10 +2253,16 @@ mod tests {
         store.create(rec.clone(), "x").unwrap();
 
         let mut loaded = rec;
-        assert!(store.expire_if_overdue(&mut loaded, now).unwrap());
+        assert!(store
+            .expire_if_overdue(&mut loaded, now, None)
+            .unwrap()
+            .is_some());
         // Second call should be a no-op since status is no longer
         // AwaitingApproval.
-        assert!(!store.expire_if_overdue(&mut loaded, now).unwrap());
+        assert!(store
+            .expire_if_overdue(&mut loaded, now, None)
+            .unwrap()
+            .is_none());
     }
 
     const SAMPLE_YAML: &str =
@@ -2007,6 +2287,108 @@ mod tests {
         assert!(reloaded.approval_prompt.is_none());
     }
 
+    const GATE_YAML_ON_TIMEOUT_APPROVE: &str = "name: g\nsteps:\n  - id: deploy\n    approval:\n      timeout_seconds: 60\n      on_timeout: approve\n";
+    const GATE_YAML_ON_TIMEOUT_REJECT: &str = "name: g\nsteps:\n  - id: deploy\n    approval:\n      timeout_seconds: 60\n      on_timeout: reject\n";
+
+    #[test]
+    fn approve_on_overdue_gate_with_on_timeout_approve_resumes_normally() {
+        // The gate's own `on_timeout: approve` policy already resolved
+        // the overdue wait — `store.approve()` must proceed exactly
+        // like a normal operator approve rather than erroring.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_appr_timeout_approve");
+        rec.status = RunStatus::AwaitingApproval;
+        rec.awaiting_step_id = Some("deploy".into());
+        rec.awaiting_since = Some(now - chrono::Duration::seconds(120));
+        rec.expires_at = Some(now - chrono::Duration::seconds(30));
+        store.create(rec.clone(), GATE_YAML_ON_TIMEOUT_APPROVE).unwrap();
+
+        let decision = store.approve(&rec.id, "matt", now).unwrap();
+        assert!(matches!(
+            decision,
+            ApprovalDecision::Approved { ref step_id, .. } if step_id == "deploy"
+        ));
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Running);
+    }
+
+    #[test]
+    fn approve_on_overdue_gate_with_on_timeout_reject_errors_expired_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_appr_timeout_reject");
+        rec.status = RunStatus::AwaitingApproval;
+        rec.awaiting_step_id = Some("deploy".into());
+        rec.awaiting_since = Some(now - chrono::Duration::seconds(120));
+        rec.expires_at = Some(now - chrono::Duration::seconds(30));
+        store.create(rec.clone(), GATE_YAML_ON_TIMEOUT_REJECT).unwrap();
+
+        let err = store.approve(&rec.id, "matt", now).unwrap_err();
+        match err {
+            ApprovalError::ExpiredRejected { step_id, reason } => {
+                assert_eq!(step_id, "deploy");
+                assert!(reason.contains("approval expired"), "reason: {reason}");
+            }
+            other => panic!("expected ExpiredRejected, got {other:?}"),
+        }
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Rejected);
+    }
+
+    #[test]
+    fn reject_on_overdue_gate_with_on_timeout_reject_returns_rejected_decision() {
+        // The gate's own `on_timeout: reject` policy fired first —
+        // `store.reject()` must report the identical `Rejected`
+        // success shape it always does so the CLI's existing cleanup
+        // wiring runs unconditionally.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_rej_timeout_reject");
+        rec.status = RunStatus::AwaitingApproval;
+        rec.awaiting_step_id = Some("deploy".into());
+        rec.awaiting_since = Some(now - chrono::Duration::seconds(120));
+        rec.expires_at = Some(now - chrono::Duration::seconds(30));
+        store.create(rec.clone(), GATE_YAML_ON_TIMEOUT_REJECT).unwrap();
+
+        let decision = store.reject(&rec.id, "matt", "operator reason", now).unwrap();
+        match decision {
+            ApprovalDecision::Rejected { step_id, reason, .. } => {
+                assert_eq!(step_id, "deploy");
+                // The auto-reject reason wins — the run was already
+                // terminal by the time this explicit reject landed.
+                assert!(reason.contains("approval expired"), "reason: {reason}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Rejected);
+    }
+
+    #[test]
+    fn approve_on_overdue_gate_with_no_matching_step_defaults_to_fail() {
+        // awaiting_step_id doesn't match any step in the snapshot (or
+        // the snapshot isn't a gate at all) → `gate_on_timeout`
+        // collapses to `None` → today's unconditional Fail behavior.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_appr_no_gate_match");
+        rec.status = RunStatus::AwaitingApproval;
+        rec.awaiting_step_id = Some("deploy".into());
+        rec.awaiting_since = Some(now - chrono::Duration::seconds(120));
+        rec.expires_at = Some(now - chrono::Duration::seconds(30));
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let err = store.approve(&rec.id, "matt", now).unwrap_err();
+        assert!(matches!(err, ApprovalError::Expired(_)));
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Failed);
+    }
+
     #[test]
     fn step_kind_round_trips_through_jsonl() {
         // Each variant must round-trip cleanly through serde so the
@@ -2017,6 +2399,8 @@ mod tests {
             StepKind::Parallel,
             StepKind::Panel,
             StepKind::Branch,
+            StepKind::Action,
+            StepKind::ApprovalGate,
         ] {
             let mut rec = sample_step_result("k");
             rec.kind = kind;
@@ -2606,7 +2990,10 @@ mod tests {
         store.create(rec.clone(), SAMPLE_YAML).unwrap();
 
         let mut loaded = store.load(&rec.id).unwrap();
-        assert!(store.expire_if_overdue(&mut loaded, Utc::now()).unwrap());
+        assert!(store
+            .expire_if_overdue(&mut loaded, Utc::now(), None)
+            .unwrap()
+            .is_some());
 
         match last_event(&store, &rec.id) {
             crate::executor::Event::RunFailed { run_id, error, .. } => {

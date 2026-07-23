@@ -54,6 +54,73 @@ pub async fn resume_run(
     awaited_step_id: &str,
     mode: Option<&str>,
 ) -> anyhow::Result<ResumeOutcome> {
+    let awaited_step_id = awaited_step_id.to_string();
+    let (mut opts, prior_step_results) = rebuild_opts_from_disk(store, run_id, mode).await?;
+    opts.resume_from = Some(rupu_orchestrator::ResumeState::from_approval(
+        run_id.to_string(),
+        prior_step_results,
+        awaited_step_id.clone(),
+    ));
+
+    let result = run_workflow(opts).await?;
+    Ok(ResumeOutcome {
+        awaited_step_id,
+        result,
+    })
+}
+
+/// Rebuild `OrchestratorRunOpts` for a run's `on_reject` cleanup chain
+/// (`rupu workflow reject`, and Plan 4's cp-serve reject worker), called
+/// AFTER `RunStore::reject` has already finalized the run as `Rejected`.
+///
+/// Shares [`rebuild_opts_from_disk`] with [`resume_run`] — same disk state,
+/// same wiring — but sets `resume_from` to
+/// [`rupu_orchestrator::ResumeState::from_rejection`] instead of
+/// `from_approval`, and never re-enters `run_workflow`: the caller passes
+/// the returned opts straight to
+/// [`rupu_orchestrator::runner::run_reject_cleanup`].
+///
+/// Returns the opts alongside the rejected gate's `on_reject` chain length
+/// (0 for a legacy inline-approval step, an unknown step id, or an empty
+/// chain) so the caller can print `cleanup: <n> step(s) executed` without
+/// re-deriving it after `opts.workflow` has moved into the cleanup call.
+pub async fn build_reject_cleanup_opts(
+    store: &RunStore,
+    run_id: &str,
+    rejected_step_id: &str,
+    reason: &str,
+    mode: Option<&str>,
+) -> anyhow::Result<(OrchestratorRunOpts, usize)> {
+    let (mut opts, prior_step_results) = rebuild_opts_from_disk(store, run_id, mode).await?;
+    let chain_len = opts
+        .workflow
+        .steps
+        .iter()
+        .find(|s| s.id == rejected_step_id)
+        .and_then(|s| s.approval.as_ref())
+        .map(|a| a.on_reject.len())
+        .unwrap_or(0);
+    opts.resume_from = Some(rupu_orchestrator::ResumeState::from_rejection(
+        run_id.to_string(),
+        prior_step_results,
+        rejected_step_id.to_string(),
+        reason.to_string(),
+    ));
+    Ok((opts, chain_len))
+}
+
+/// Shared disk-rebuild step for [`resume_run`] (approve-resume) and
+/// [`build_reject_cleanup_opts`] (reject-cleanup): reload the persisted
+/// workflow snapshot + prior step results and reconstruct the full
+/// `OrchestratorRunOpts` wiring (resolver, layered config, SCM registry,
+/// dispatcher, `DefaultStepFactory`, event sink) exactly as the original
+/// run used. Returns the opts with `resume_from: None` — callers set it
+/// afterward to the resume shape they need.
+async fn rebuild_opts_from_disk(
+    store: &RunStore,
+    run_id: &str,
+    mode: Option<&str>,
+) -> anyhow::Result<(OrchestratorRunOpts, Vec<rupu_orchestrator::StepResult>)> {
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
     let runs_dir = global.join("runs");
@@ -61,12 +128,11 @@ pub async fn resume_run(
 
     // Reload the record from disk to get inputs, event, workspace path
     // for the run_workflow re-entry. The library call already persisted
-    // the status flip to Running, so the record is coherent.
+    // the status flip (Running for approve, Rejected for reject), so the
+    // record is coherent.
     let record = store
         .load(run_id)
         .map_err(|e| anyhow::anyhow!("reload run record: {e}"))?;
-
-    let awaited_step_id = awaited_step_id.to_string();
 
     // Rebuild context from disk: workflow YAML snapshot + prior
     // step results.
@@ -150,12 +216,6 @@ pub async fn resume_run(
         default_model: cfg.default_model.clone(),
     });
 
-    let resume = rupu_orchestrator::ResumeState::from_approval(
-        run_id.to_string(),
-        prior_step_results,
-        awaited_step_id.clone(),
-    );
-
     let opts = OrchestratorRunOpts {
         workflow,
         inputs: inputs_map,
@@ -168,7 +228,7 @@ pub async fn resume_run(
         issue_ref: issue_ref_text,
         run_store: Some(store_arc),
         workflow_yaml: Some(body),
-        resume_from: Some(resume),
+        resume_from: None,
         run_id_override: None,
         strict_templates: false,
         event_sink: event_sink_for_resume,
@@ -176,9 +236,5 @@ pub async fn resume_run(
         pause: None,
     };
 
-    let result = run_workflow(opts).await?;
-    Ok(ResumeOutcome {
-        awaited_step_id,
-        result,
-    })
+    Ok((opts, prior_step_results))
 }
