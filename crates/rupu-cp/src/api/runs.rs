@@ -47,6 +47,7 @@ fn map_approval_err(id: &str, e: ApprovalError) -> ApiError {
         ApprovalError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
         ApprovalError::NotAwaiting(_)
         | ApprovalError::Expired(_)
+        | ApprovalError::ExpiredRejected { .. }
         | ApprovalError::NoAwaitingStep => ApiError::conflict(e.to_string()),
         ApprovalError::Store(other) => ApiError::internal(other.to_string()),
     }

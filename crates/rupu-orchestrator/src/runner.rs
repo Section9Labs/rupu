@@ -163,6 +163,8 @@ pub enum RunWorkflowError {
         "pausing a workflow with a `workspace: sync` step is not supported (v1): let it run to completion instead"
     )]
     PauseWithWorkspaceSync,
+    #[error("step `{step}`: `action:` steps are not supported by this rupu version yet (Plan 2)")]
+    ActionStepsNotYetSupported { step: String },
 }
 
 /// Trait the orchestrator uses to construct per-unit [`AgentRunOpts`].
@@ -450,6 +452,13 @@ pub struct ResumeState {
     /// persisted transcript (role-alternation-safe). `None` for approval and
     /// step-boundary pauses.
     pub paused_step: Option<PausedStep>,
+    /// The operator's rejection reason, when this `ResumeState` was built by
+    /// [`ResumeState::from_rejection`]. `None` for every other constructor.
+    /// Not consulted by [`run_reject_cleanup`] itself (its caller already
+    /// has the reason as a plain `&str` argument) — carried here so a
+    /// caller that only holds the `ResumeState` (e.g. a future cp-serve
+    /// reject worker) doesn't need to thread the reason through separately.
+    pub rejected_reason: Option<String>,
 }
 
 /// A linear step that paused mid-run, carried on [`ResumeState`] so the
@@ -479,6 +488,31 @@ impl ResumeState {
             completed_units: std::collections::BTreeMap::new(),
             reason: PauseReason::Approval,
             paused_step: None,
+            rejected_reason: None,
+        }
+    }
+
+    /// Resume context carrying the run id + prior step results for
+    /// [`run_reject_cleanup`] to persist against — the same disk state
+    /// `from_approval` carries for approve-resume, plus the operator's
+    /// rejection reason. Not a "pause" in the [`PauseReason`] sense (a
+    /// rejected gate is terminal, never re-entering [`run_workflow`]'s
+    /// main loop), so `reason` stays `PauseReason::Approval` — no new
+    /// pause-reason variant is introduced for rejection.
+    pub fn from_rejection(
+        run_id: String,
+        prior_step_results: Vec<StepResult>,
+        rejected_step_id: String,
+        reason: String,
+    ) -> Self {
+        Self {
+            run_id,
+            prior_step_results,
+            approved_step_id: rejected_step_id,
+            completed_units: std::collections::BTreeMap::new(),
+            reason: PauseReason::Approval,
+            paused_step: None,
+            rejected_reason: Some(reason),
         }
     }
 }
@@ -1067,6 +1101,68 @@ async fn run_steps_inner(
             }
         }
 
+        // ── Approval GATE NODE (spec §4.1) ─────────────────────────────
+        // A standalone `approval:` step (no agent/prompt/for_each/parallel/
+        // panel/branch/action — see `is_approval_gate`). Distinct from the
+        // legacy inline `approval:` option handled just below, which stays
+        // on an agent-bearing step. Runs BEFORE that legacy check so a gate
+        // step never falls through to it (a gate step's `step.approval` is
+        // always `Some`, so it would otherwise also match the legacy block
+        // and pause twice).
+        if crate::workflow::is_approval_gate(step) {
+            let ap = step.approval.as_ref().expect("gate has approval");
+            let gate_suppressed = approved_step_id == Some(step.id.as_str());
+            let prompt = match &ap.prompt {
+                Some(t) => render_step_prompt(t, &ctx, render_mode(opts.strict_templates))
+                    .map_err(|e| RunWorkflowError::Render {
+                        step: step.id.clone(),
+                        source: e,
+                    })?,
+                None => format!(
+                    "Approve gate `{}` of workflow `{}`?",
+                    step.id, opts.workflow.name
+                ),
+            };
+
+            if gate_suppressed {
+                info!(step = %step.id, "gate: resuming with human approval");
+                emit_gate_result(opts, run_id, step, "approved", "human", None, step_results);
+                continue;
+            }
+            if let Some(expr) = &ap.auto_approve {
+                let truthy =
+                    render_when_expression(expr, &ctx, render_mode(opts.strict_templates))
+                        .map_err(|e| RunWorkflowError::Render {
+                            step: step.id.clone(),
+                            source: e,
+                        })?;
+                if truthy {
+                    info!(step = %step.id, "gate auto-approved");
+                    emit_gate_result(opts, run_id, step, "approved", "auto", None, step_results);
+                    continue;
+                }
+            }
+            info!(step = %step.id, "gate: pausing for approval");
+            if let Some(sink) = opts.event_sink.as_ref() {
+                sink.emit(
+                    run_id,
+                    &crate::executor::Event::StepAwaitingApproval {
+                        run_id: run_id.to_string(),
+                        step_id: step.id.clone(),
+                        reason: prompt.clone(),
+                    },
+                );
+            }
+            return Ok(InnerOutcome::Paused {
+                step_id: step.id.clone(),
+                prompt,
+                timeout_seconds: ap.timeout_seconds,
+                reason: PauseReason::Approval,
+                seed: Vec::new(),
+                fanout_completed_units: std::collections::BTreeMap::new(),
+            });
+        }
+
         // Approval gate: pause BEFORE dispatching the step. The
         // outer `run_workflow` flips the persisted RunRecord to
         // AwaitingApproval and exits cleanly. On resume the step's
@@ -1176,6 +1272,15 @@ async fn run_steps_inner(
             persist_step_result(opts, run_id, &result);
             step_results.push(result);
             continue;
+        }
+
+        // Action steps parse (Plan 1) but execute in Plan 2. Fail loudly
+        // rather than silently no-op — a workflow that names one needs
+        // the newer binary.
+        if step.action.is_some() {
+            return Err(RunWorkflowError::ActionStepsNotYetSupported {
+                step: step.id.clone(),
+            });
         }
 
         let effective_continue_on_error =
@@ -1403,14 +1508,33 @@ fn base_context_for_step(
                     .unwrap_or_default(),
                 iterations: sr.iterations,
                 resolved: sr.resolved,
+                decision: gate_decision(sr),
             },
         );
     }
     ctx
 }
 
+/// Extract the `decision` field out of an approval-gate step's `output`
+/// JSON (spec §3.1: `{"decision": "approved"|"rejected", ...}`) so
+/// downstream templates can write `{{ steps.<id>.decision }}` instead of
+/// hand-parsing the JSON string. Empty for non-gate steps, or if a gate's
+/// `output` somehow fails to parse (defensive — the value is always
+/// produced by `emit_gate_resolved`, never author-supplied).
+fn gate_decision(sr: &StepResult) -> String {
+    if sr.kind != crate::runs::StepKind::ApprovalGate {
+        return String::new();
+    }
+    serde_json::from_str::<serde_json::Value>(&sr.output)
+        .ok()
+        .and_then(|v| v.get("decision").and_then(|d| d.as_str()).map(String::from))
+        .unwrap_or_default()
+}
+
 fn step_kind_for_run_record(step: &Step) -> crate::runs::StepKind {
-    if step.branch.is_some() {
+    if crate::workflow::is_approval_gate(step) {
+        crate::runs::StepKind::ApprovalGate
+    } else if step.branch.is_some() {
         crate::runs::StepKind::Branch
     } else if step.panel.is_some() {
         crate::runs::StepKind::Panel
@@ -1418,9 +1542,333 @@ fn step_kind_for_run_record(step: &Step) -> crate::runs::StepKind {
         crate::runs::StepKind::Parallel
     } else if step.for_each.is_some() {
         crate::runs::StepKind::ForEach
+    } else if step.action.is_some() {
+        crate::runs::StepKind::Action
     } else {
         crate::runs::StepKind::Linear
     }
+}
+
+/// Record a resolved gate node's result: `StepStarted` + `StepCompleted`
+/// events, a `StepResult` whose `output` is the decision JSON (spec §3.1),
+/// persisted like any other step. `decision` is `"approved"` or
+/// `"rejected"`; `via` is `"human"` (approve-resume / operator reject) or
+/// `"auto"` (auto_approve truthy — always paired with `decision:
+/// "approved"`); `reason` is the operator's rejection reason (`Some` only
+/// for a rejected decision, `None` otherwise, matching spec §3.1's
+/// `"reason": null` for approvals).
+fn emit_gate_result(
+    opts: &OrchestratorRunOpts,
+    run_id: &str,
+    step: &Step,
+    decision: &str,
+    via: &str,
+    reason: Option<&str>,
+    step_results: &mut Vec<StepResult>,
+) {
+    if let Some(sink) = opts.event_sink.as_ref() {
+        sink.emit(
+            run_id,
+            &crate::executor::Event::StepStarted {
+                run_id: run_id.to_string(),
+                step_id: step.id.clone(),
+                kind: crate::runs::StepKind::ApprovalGate,
+                agent: None,
+                host: None,
+            },
+        );
+    }
+    let output = serde_json::json!({
+        "decision": decision,
+        "via": via,
+        "reason": reason,
+        "decided_at": chrono::Utc::now().to_rfc3339(),
+    })
+    .to_string();
+    let result = StepResult {
+        step_id: step.id.clone(),
+        output,
+        success: true,
+        skipped: false,
+        kind: crate::runs::StepKind::ApprovalGate,
+        ..Default::default()
+    };
+    if let Some(sink) = opts.event_sink.as_ref() {
+        sink.emit(
+            run_id,
+            &crate::executor::Event::StepCompleted {
+                run_id: run_id.to_string(),
+                step_id: step.id.clone(),
+                success: true,
+                duration_ms: 0,
+                host: None,
+            },
+        );
+    }
+    persist_step_result(opts, run_id, &result);
+    step_results.push(result);
+}
+
+/// Execute a rejected gate's `on_reject` chain (spec §4.1). Called by
+/// the rejecting process AFTER `RunStore::reject` finalized the run.
+/// Failures inside the chain are logged per-step (`continue`), never
+/// returned — the run is already terminal.
+///
+/// `opts.resume_from` carries the run id + prior step results this
+/// cleanup persists against — built via [`ResumeState::from_rejection`]
+/// the same way approve-resume's `opts.resume_from` carries
+/// [`ResumeState::from_approval`]'s. When `resume_from` is `None` (a
+/// caller that didn't wire it), persistence + event emission silently
+/// no-op (same as `run_workflow`'s in-memory mode) since there is no
+/// run id to key off of.
+///
+/// `via` is the gate output's decision provenance (spec §3.1): `"human"`
+/// for an operator-issued reject (`rupu workflow reject`), `"timeout"`
+/// for a gate's own `on_timeout: reject` policy firing (whether observed
+/// via `rupu workflow runs`'s lazy-expiry sweep or via an `approve` call
+/// that lands on an already-overdue `on_timeout: reject` gate). Callers
+/// must pass the value that matches how this rejection actually came
+/// about — it is persisted verbatim into the gate's `StepResult` output.
+pub async fn run_reject_cleanup(
+    opts: OrchestratorRunOpts,
+    rejected_step_id: &str,
+    reason: &str,
+    via: &str,
+) -> Result<(), RunWorkflowError> {
+    let Some(gate) = opts.workflow.steps.iter().find(|s| s.id == rejected_step_id) else {
+        return Ok(()); // legacy inline approval or unknown id — nothing to run
+    };
+    if !crate::workflow::is_approval_gate(gate) {
+        return Ok(());
+    }
+    let chain = gate
+        .approval
+        .as_ref()
+        .map(|a| a.on_reject.clone())
+        .unwrap_or_default();
+
+    // 1. Prior results + run id come from `opts.resume_from` (the CLI
+    //    reject path builds it with `ResumeState::from_rejection` after
+    //    reading `step_results.jsonl` back — the same loader
+    //    approve-resume uses; see `crates/rupu-cli/src/resume.rs`). This
+    //    mirrors how `run_workflow` itself pulls `run_id` +
+    //    `prior_step_results` off `opts.resume_from` at its own top
+    //    (~line 519).
+    let run_id = opts
+        .resume_from
+        .as_ref()
+        .map(|r| r.run_id.clone())
+        .unwrap_or_default();
+    let mut step_results: Vec<StepResult> = opts
+        .resume_from
+        .as_ref()
+        .map(|r| r.prior_step_results.clone())
+        .unwrap_or_default();
+
+    // 2. The gate's own rejected result, recorded BEFORE the chain runs
+    //    (a `via`/`decision` variant of Task 3's now-generalized
+    //    `emit_gate_result`).
+    emit_gate_result(
+        &opts,
+        &run_id,
+        gate,
+        "rejected",
+        via,
+        Some(reason),
+        &mut step_results,
+    );
+
+    // 3. Dispatch each on_reject step through the same per-step
+    //    machinery `run_workflow`'s linear arm uses (StepStarted event →
+    //    factory build_opts_for_step → agent run → StepCompleted /
+    //    StepFailed event → persist_step_result → push). Mirrored inline
+    //    rather than extracted into a shared helper: `run_linear_step`
+    //    (~1726, now further down this file) also carries host-redirect,
+    //    cooperative-pause, and resume-seed logic that a terminal cleanup
+    //    chain never needs (cleanup steps always run local, uninterrupted,
+    //    fresh — no host:, no opts.pause, no mid-step resume-seed), so
+    //    extracting a shared helper would either drag that machinery along
+    //    unused or require new plumbing on `run_linear_step` itself. The
+    //    subset actually needed here is small enough to mirror directly.
+    let resolved_inputs = resolve_inputs(&opts.workflow, &opts.inputs)?;
+    for step in &chain {
+        if step.action.is_some() {
+            // Action steps parse but don't execute yet (Plan 2), same
+            // limitation `run_workflow`'s main loop enforces — but a
+            // cleanup chain never aborts the (already-terminal) run for
+            // it; record the step as a logged failure and continue.
+            warn!(
+                step = %step.id,
+                "on_reject: action steps are not runtime-supported yet (Plan 2); skipping"
+            );
+            let result = StepResult {
+                step_id: step.id.clone(),
+                success: false,
+                skipped: false,
+                kind: crate::runs::StepKind::Action,
+                ..Default::default()
+            };
+            persist_step_result(&opts, &run_id, &result);
+            step_results.push(result);
+            continue;
+        }
+
+        let ctx = base_context_for_step(
+            &resolved_inputs,
+            opts.event.as_ref(),
+            opts.issue.as_ref(),
+            &step_results,
+        );
+        let agent_name = step.agent.as_deref().unwrap_or_default();
+        let prompt = step.prompt.as_deref().unwrap_or_default();
+        let step_run_id = format!("run_{}", Ulid::new());
+        let transcript_path = opts.transcript_dir.join(format!("{step_run_id}.jsonl"));
+
+        if let Some(sink) = opts.event_sink.as_ref() {
+            sink.emit(
+                &run_id,
+                &crate::executor::Event::StepStarted {
+                    run_id: run_id.clone(),
+                    step_id: step.id.clone(),
+                    kind: crate::runs::StepKind::Linear,
+                    agent: step.agent.clone(),
+                    host: step.host.clone(),
+                },
+            );
+        }
+
+        let rendered = match render_step_prompt(prompt, &ctx, render_mode(opts.strict_templates))
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    step = %step.id,
+                    error = %e,
+                    "on_reject cleanup step: prompt render failed; continuing chain"
+                );
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        &run_id,
+                        &crate::executor::Event::StepFailed {
+                            run_id: run_id.clone(),
+                            step_id: step.id.clone(),
+                            error: e.to_string(),
+                        },
+                    );
+                }
+                let result = StepResult {
+                    step_id: step.id.clone(),
+                    success: false,
+                    skipped: false,
+                    kind: crate::runs::StepKind::Linear,
+                    ..Default::default()
+                };
+                persist_step_result(&opts, &run_id, &result);
+                step_results.push(result);
+                continue;
+            }
+        };
+
+        let step_timer = std::time::Instant::now();
+        let outcome = dispatch_one(
+            &opts.factory,
+            &step.id,
+            agent_name,
+            rendered.clone(),
+            step_run_id.clone(),
+            opts.workspace_id.clone(),
+            opts.workspace_path.clone(),
+            transcript_path.clone(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        let duration_ms = step_timer.elapsed().as_millis() as u64;
+
+        let (success, error_text) = match outcome {
+            Ok(_) => (true, String::new()),
+            Err(e) => {
+                warn!(
+                    step = %step.id,
+                    error = %e,
+                    "on_reject cleanup step failed; continuing chain"
+                );
+                (false, e.to_string())
+            }
+        };
+        if let Some(sink) = opts.event_sink.as_ref() {
+            if success {
+                sink.emit(
+                    &run_id,
+                    &crate::executor::Event::StepCompleted {
+                        run_id: run_id.clone(),
+                        step_id: step.id.clone(),
+                        success: true,
+                        duration_ms,
+                        host: None,
+                    },
+                );
+            } else {
+                sink.emit(
+                    &run_id,
+                    &crate::executor::Event::StepFailed {
+                        run_id: run_id.clone(),
+                        step_id: step.id.clone(),
+                        error: error_text,
+                    },
+                );
+            }
+        }
+        let output = read_final_assistant_text(&transcript_path, success, &step_run_id, &step.id);
+        let result = StepResult {
+            step_id: step.id.clone(),
+            rendered_prompt: rendered,
+            run_id: step_run_id,
+            transcript_path,
+            output,
+            success,
+            skipped: false,
+            kind: crate::runs::StepKind::Linear,
+            ..Default::default()
+        };
+        persist_step_result(&opts, &run_id, &result);
+        step_results.push(result);
+    }
+
+    // 4. Cleanup never changes the terminal status — `RunStore::reject`
+    //    already finalized it before this function was called.
+
+    // 5. `RunStore::reject` already appended a terminal `RunCompleted`
+    //    event before this function ran (step 1 doc comment above), but
+    //    `emit_gate_result` (step 2 above) unconditionally emits the
+    //    gate's own `StepStarted`/`StepCompleted` events after that, and
+    //    every cleanup step dispatched in the loop above appends its own
+    //    `StepStarted`/`StepCompleted`/`StepFailed` events on top of
+    //    those — so `events.jsonl` ends with step events, not a terminal
+    //    one, even when the chain is empty. Newest-event-fold consumers
+    //    (Situation Room's live event stream) fold the log by treating
+    //    its last event as the run's current state; with a step event
+    //    trailing, a rejected run would briefly render as "active" until
+    //    a fresh terminal event lands. Re-append the same
+    //    `RunCompleted(Rejected)` event here — after the chain — so the
+    //    log ends closed. This is a deliberate duplicate: it is NOT
+    //    deduped downstream, it is simply an accepted trailing marker
+    //    that keeps the log's last line authoritative. Skipped silently
+    //    only when `opts.run_store` is `None` (in-memory runs have no
+    //    `events.jsonl` to close).
+    if let Some(store) = &opts.run_store {
+        store.append_terminal_event(
+            &run_id,
+            &crate::executor::Event::RunCompleted {
+                run_id: run_id.clone(),
+                status: crate::runs::RunStatus::Rejected,
+                finished_at: chrono::Utc::now(),
+            },
+        );
+    }
+
+    Ok(())
 }
 
 fn persist_active_step(
@@ -4065,6 +4513,7 @@ steps:
             completed_units: std::collections::BTreeMap::new(),
             reason: PauseReason::Approval,
             paused_step: None,
+            rejected_reason: None,
         });
         let err = run_workflow(opts)
             .await
@@ -4340,6 +4789,7 @@ steps:
                 step_id: "solo".into(),
                 seed_messages: awaiting.resume_seed,
             }),
+            rejected_reason: None,
         });
 
         let res2 = run_workflow(opts2).await.expect("resume completes");
@@ -4432,6 +4882,7 @@ steps:
             completed_units: std::collections::BTreeMap::new(),
             reason: PauseReason::Manual,
             paused_step: None,
+            rejected_reason: None,
         });
 
         let res2 = run_workflow(opts2).await.expect("resume completes");
@@ -4559,6 +5010,7 @@ steps:
                 step_id: "solo".into(),
                 seed_messages: seed.clone(),
             }),
+            rejected_reason: None,
         });
 
         run_workflow(opts).await.expect("resume completes");
@@ -4631,6 +5083,7 @@ steps:
                 step_id: "solo".into(),
                 seed_messages: seed.clone(),
             }),
+            rejected_reason: None,
         });
 
         run_workflow(opts).await.expect("resume completes");
@@ -4844,6 +5297,7 @@ steps:
                 completed_units,
                 reason: PauseReason::Manual,
                 paused_step: None,
+                rejected_reason: None,
             }),
             run_id_override: None,
             strict_templates: false,
@@ -5008,6 +5462,7 @@ steps:
             completed_units,
             reason: PauseReason::Manual,
             paused_step: None,
+            rejected_reason: None,
         });
 
         let res2 = run_workflow(opts2).await.expect("resume completes");

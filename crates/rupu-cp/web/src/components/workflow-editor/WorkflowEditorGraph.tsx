@@ -10,7 +10,7 @@
 // The mutation logic lives in small exported pure helpers (applyConnect /
 // applyDelete / applyAddNode) so it is unit-testable without mounting the canvas.
 
-import { useCallback, useMemo, useState, type DragEvent, type KeyboardEvent } from 'react';
+import { useCallback, useEffect, useMemo, useState, type DragEvent, type KeyboardEvent } from 'react';
 import { createPortal } from 'react-dom';
 import {
   Background,
@@ -55,20 +55,60 @@ const NODE_TYPES: NodeTypes = { editable: EditableStepNode };
 
 /** Validate + apply a drawn connection. Valid → onChange with the new edge
  *  appended; invalid → onInvalid(reason) and NO onChange. Missing endpoints are
- *  ignored. */
+ *  ignored.
+ *
+ *  Branch arms: `EditableStepNode` gives every `branch`-kind node TWO source
+ *  handles, `id="then"` / `id="else"` (both the `next` and classic render
+ *  paths). When the drawn connection originates from one of those handles AND
+ *  the source node really is a `branch`, the new edge is tagged
+ *  `branch: <arm>` + the matching `label` (mirrors `yamlToGraph`'s own
+ *  `{label:'true'|'false', branch:'then'|'else'}` emission exactly, so the id
+ *  scheme (`source->target:arm`) and dedupe key line up) AND `target` is
+ *  appended to the source node's `thenTargets`/`elseTargets` — the exact
+ *  mirror of `applyRemoveEdges`' strip. Those arrays, not the edges array,
+ *  are what `graphToWorkflowObject` reads to emit `branch.then`/`branch.else`,
+ *  so without the append a hand-drawn branch-arm edge would vanish on the
+ *  next YAML round-trip. Any other `sourceHandle` (including `null`, the
+ *  every-other-kind default single source handle) falls back to today's
+ *  plain-edge behavior. */
 export function applyConnect(
   graph: WorkflowGraph,
-  conn: { source: string | null; target: string | null },
+  conn: { source: string | null; target: string | null; sourceHandle?: string | null },
   onChange: (g: WorkflowGraph) => void,
   onInvalid: (reason: string) => void,
 ): void {
-  const { source, target } = conn;
+  const { source, target, sourceHandle } = conn;
   if (!source || !target) return;
   const res = canConnect(source, target, { edges: graph.edges });
   if (!res.ok) {
     onInvalid(res.reason);
     return;
   }
+
+  const sourceNode = graph.nodes.find((n) => n.id === source);
+  const isArmHandle = sourceHandle === 'then' || sourceHandle === 'else';
+  const arm: 'then' | 'else' | undefined =
+    sourceNode?.data.kind === 'branch' && isArmHandle ? sourceHandle : undefined;
+
+  if (arm) {
+    const id = `${source}->${target}:${arm}`;
+    const label = arm === 'then' ? 'true' : 'false';
+    const edges = [...graph.edges, { id, source, target, branch: arm, label }];
+    const nodes = graph.nodes.map((n) => {
+      if (n.id !== source) return n;
+      if (arm === 'then') {
+        const list = n.data.thenTargets ?? [];
+        if (list.includes(target)) return n;
+        return { ...n, data: { ...n.data, thenTargets: [...list, target] } };
+      }
+      const list = n.data.elseTargets ?? [];
+      if (list.includes(target)) return n;
+      return { ...n, data: { ...n.data, elseTargets: [...list, target] } };
+    });
+    onChange({ ...graph, nodes, edges });
+    return;
+  }
+
   const id = `${source}->${target}`;
   onChange({ ...graph, edges: [...graph.edges, { id, source, target }] });
 }
@@ -80,6 +120,32 @@ export function applyDelete(graph: WorkflowGraph, id: string): WorkflowGraph {
     nodes: graph.nodes.filter((n) => n.id !== id),
     edges: graph.edges.filter((e) => e.source !== id && e.target !== id),
   };
+}
+
+/** Remove edges by id. Plain chain/data-ref edges are simply filtered out. A
+ *  removed branch-arm edge (`branch: 'then' | 'else'`) ALSO drops `edge.target`
+ *  from the source branch node's corresponding arm list (`thenTargets` /
+ *  `elseTargets`) — those arrays, not the edges array, are what
+ *  `graphToWorkflowObject` reads to emit `branch.then`/`branch.else`, so
+ *  without this the arm re-derives the deleted edge on the next YAML
+ *  reconcile. */
+export function applyRemoveEdges(graph: WorkflowGraph, ids: ReadonlySet<string>): WorkflowGraph {
+  const removed = graph.edges.filter((e) => ids.has(e.id));
+  const edges = graph.edges.filter((e) => !ids.has(e.id));
+  if (removed.length === 0) return { ...graph, edges };
+  const nodes = graph.nodes.map((n) => {
+    let data = n.data;
+    for (const e of removed) {
+      if (e.source !== n.id || !e.branch) continue;
+      if (e.branch === 'then' && data.thenTargets?.includes(e.target)) {
+        data = { ...data, thenTargets: data.thenTargets.filter((t) => t !== e.target) };
+      } else if (e.branch === 'else' && data.elseTargets?.includes(e.target)) {
+        data = { ...data, elseTargets: data.elseTargets.filter((t) => t !== e.target) };
+      }
+    }
+    return data === n.data ? n : { ...n, data };
+  });
+  return { ...graph, nodes, edges };
 }
 
 /** Smallest free `step-N` id (N ≥ 1) not already used by a node. */
@@ -231,6 +297,30 @@ function WorkflowEditorGraphInner({
   paletteContainer,
 }: Props) {
   const colors = useThemeColors();
+
+  // Edge selection lives here (not on GraphEdge) — it's transient UI state,
+  // not something that round-trips to YAML. ReactFlow is fully controlled, so
+  // without this an edge click's `EdgeChange {type:'select'}` has nowhere to
+  // land: the edge never renders `selected`, and Backspace (which deletes
+  // SELECTED elements) never sees a selected edge to remove.
+  const [selectedEdgeIds, setSelectedEdgeIds] = useState<ReadonlySet<string>>(new Set());
+
+  // Prune ids that no longer name an edge (e.g. a YAML reconcile dropped one
+  // out from under the selection) so stale ids don't linger in state forever.
+  useEffect(() => {
+    setSelectedEdgeIds((prev) => {
+      if (prev.size === 0) return prev;
+      const live = new Set(graph.edges.map((e) => e.id));
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (live.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [graph.edges]);
+
   const nodes = useMemo<Node<NodeData>[]>(
     () =>
       graph.nodes.map((node) => ({
@@ -262,6 +352,7 @@ function WorkflowEditorGraphInner({
     return graph.edges.map((e) => {
       const branchColor = branchEdgeColor(e.branch, colors);
       const next = workflowEditorUi === 'next';
+      const isSelected = selectedEdgeIds.has(e.id);
       const sourceKind = kindById.get(e.source);
       const accentKey = sourceKind ? KIND_ACCENT[sourceKind] : undefined;
       // Plain (non-branch) edges get a kind-tinted arrowhead in `next`,
@@ -275,6 +366,20 @@ function WorkflowEditorGraphInner({
         type: 'smoothstep',
         markerEnd: { type: MarkerType.ArrowClosed, color: markerColor },
       };
+      // Anchor the edge at the branch node's matching arm handle.
+      // `EditableStepNode` gives every `branch`-kind node TWO source handles,
+      // `id="then"` (green, top) / `id="else"` (red, below) — both the `next`
+      // and classic render paths use those exact ids. Without this, xyflow
+      // falls back to the FIRST source handle it finds for every edge from
+      // that node (always "then"/green), so a correctly-derived else-arm
+      // edge still visually draws from the green dot. `branch` and the
+      // handle id are the same two literal strings by construction, so this
+      // is a pure derivation, not a new field to keep in sync.
+      if (e.branch) edge.sourceHandle = e.branch;
+      // Only set `selected` when true, so an unselected edge's emitted shape
+      // stays byte-identical to before edge selection existed (classic tests
+      // assert exact edge shapes).
+      if (isSelected) edge.selected = true;
       // xyflow's built-in dashed flow animation — every `next` edge gets it
       // (branch arm or plain); classic never sets the key at all, so its
       // emission stays byte-identical to before this change.
@@ -282,9 +387,13 @@ function WorkflowEditorGraphInner({
       if (e.label !== undefined) edge.label = e.label;
       if (branchColor !== undefined) {
         // Branch (true/false) arm — colored stroke, a touch bolder for `next`
-        // (mirrors the mockup's `.edge.t-true`/`.edge.t-false`). Unchanged by
-        // this pass except for `animated` above.
-        edge.style = next ? { stroke: branchColor, strokeWidth: 2.5 } : { stroke: branchColor };
+        // (mirrors the mockup's `.edge.t-true`/`.edge.t-false`), bolder still
+        // when selected. An inline `style.stroke` always wins over xyflow's
+        // default `.selected` CSS treatment, so `next` earns its selected
+        // emphasis here rather than through the stylesheet; classic (no
+        // inline strokeWidth here) still falls back to xyflow's default
+        // selected-edge CSS.
+        edge.style = next ? { stroke: branchColor, strokeWidth: isSelected ? 3.5 : 2.5 } : { stroke: branchColor };
         edge.labelStyle = { fill: branchColor, fontWeight: 600 };
         if (next) {
           // Semantic label chip: ✓ then / ✕ else, filled with a soft tint of
@@ -302,9 +411,13 @@ function WorkflowEditorGraphInner({
       } else if (next) {
         // Plain chain/data-ref edge — themed off the SOURCE node's kind
         // accent (mockup's `.edge`, upgraded from a flat muted stroke so
-        // every edge — not just branch arms — reads as meaningful); classic
-        // leaves this edge with xyflow's default styling.
-        edge.style = { stroke: colors.alpha(accentKey ?? 'inkMute', 0.55), strokeWidth: 2 };
+        // every edge — not just branch arms — reads as meaningful); bolder,
+        // full-strength when selected. Classic leaves this edge with
+        // xyflow's default styling (including its default selected look).
+        edge.style = {
+          stroke: colors.alpha(accentKey ?? 'inkMute', isSelected ? 0.9 : 0.55),
+          strokeWidth: isSelected ? 3 : 2,
+        };
         if (e.label !== undefined) {
           // Non-branch edges that carry a label (none produced by
           // yamlToGraph today, but the renderer stays generic) get a
@@ -317,7 +430,7 @@ function WorkflowEditorGraphInner({
       }
       return edge;
     });
-  }, [graph.edges, kindById, colors, workflowEditorUi]);
+  }, [graph.edges, kindById, colors, workflowEditorUi, selectedEdgeIds]);
 
   // Move (drag) + delete (Backspace/Delete) both arrive as node changes.
   const onNodesChange = useCallback(
@@ -345,11 +458,41 @@ function WorkflowEditorGraphInner({
     [graph, nodes, onChange, selectedId, onSelect],
   );
 
+  // Select (click) + remove (Backspace/Delete on a selected edge) both arrive
+  // as edge changes. In controlled mode xyflow only APPLIES a change once we
+  // mirror it back into the edges we hand it next render — select changes go
+  // into `selectedEdgeIds` (which the edges memo reads back as `selected`),
+  // remove changes go through `applyRemoveEdges` (which also detaches a
+  // deleted branch-arm target from the source branch node's arm list).
   const onEdgesChange = useCallback(
     (changes: EdgeChange<Edge>[]) => {
+      const selects = changes.filter(
+        (c): c is Extract<EdgeChange<Edge>, { type: 'select' }> => c.type === 'select',
+      );
+      if (selects.length > 0) {
+        setSelectedEdgeIds((prev) => {
+          let next: Set<string> | undefined;
+          for (const c of selects) {
+            const has = prev.has(c.id) || (next?.has(c.id) ?? false);
+            if (c.selected === has) continue;
+            if (!next) next = new Set(prev);
+            if (c.selected) next.add(c.id);
+            else next.delete(c.id);
+          }
+          return next ?? prev;
+        });
+      }
+
       const removed = new Set(changes.flatMap((c) => (c.type === 'remove' ? [c.id] : [])));
-      if (removed.size === 0) return;
-      onChange({ ...graph, edges: graph.edges.filter((e) => !removed.has(e.id)) });
+      if (removed.size > 0) {
+        onChange(applyRemoveEdges(graph, removed));
+        setSelectedEdgeIds((prev) => {
+          if (![...removed].some((id) => prev.has(id))) return prev;
+          const next = new Set(prev);
+          for (const id of removed) next.delete(id);
+          return next;
+        });
+      }
     },
     [graph, onChange],
   );
