@@ -1,0 +1,25 @@
+---
+source: crates/rupu-app-canvas/tests/git_graph_snapshots.rs
+expression: rows
+---
+- cells:
+    - Bullet: waiting
+    - Space: 2
+    - Label: classify
+    - Space: 2
+    - Meta: classifier
+  anchor:
+    - classify
+    - waiting
+- cells:
+    - Pipe: waiting
+  anchor: ~
+- cells:
+    - Bullet: waiting
+    - Space: 2
+    - Label: ship_gate
+    - Space: 2
+    - Meta: gate · auto
+  anchor:
+    - ship_gate
+    - waiting

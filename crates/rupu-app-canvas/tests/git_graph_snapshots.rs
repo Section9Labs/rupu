@@ -81,6 +81,79 @@ steps:
 }
 
 #[test]
+fn snapshot_standalone_approval_gate() {
+    let wf = fixture(
+        r#"
+name: gate-flow
+steps:
+  - id: classify
+    agent: classifier
+    actions: []
+    prompt: hi
+  - id: ship_gate
+    approval:
+      required: true
+      prompt: "Ship this to prod?"
+    actions: []
+  - id: publish
+    agent: publisher
+    actions: []
+    prompt: hi
+"#,
+    );
+    let rows = render_rows(&wf, |_| rupu_app_canvas::NodeStatus::Waiting);
+    insta::assert_yaml_snapshot!("standalone_approval_gate", rows);
+}
+
+#[test]
+fn snapshot_standalone_approval_gate_with_auto_approve() {
+    let wf = fixture(
+        r#"
+name: auto-gate-flow
+steps:
+  - id: classify
+    agent: classifier
+    actions: []
+    prompt: hi
+  - id: ship_gate
+    approval:
+      required: true
+      prompt: "Ship this to prod?"
+      auto_approve: "{{ inputs.trusted }}"
+    actions: []
+"#,
+    );
+    let rows = render_rows(&wf, |_| rupu_app_canvas::NodeStatus::Waiting);
+    insta::assert_yaml_snapshot!("standalone_approval_gate_with_auto_approve", rows);
+}
+
+#[test]
+fn snapshot_action_step() {
+    let wf = fixture(
+        r#"
+name: action-flow
+steps:
+  - id: classify
+    agent: classifier
+    actions: []
+    prompt: hi
+  - id: open_pr
+    action: scm.prs.create
+    with:
+      owner: acme
+      repo: widgets
+      title: "Automated PR"
+      body: "Opened by workflow"
+      head: feature-branch
+      base: main
+    actions: []
+"#,
+    );
+    let rows = render_rows(&wf, |_| rupu_app_canvas::NodeStatus::Waiting);
+    insta::assert_yaml_snapshot!("action_step", rows);
+}
+
+#[test]
 fn snapshot_panel_with_one_active_step() {
     let yaml = r#"
 name: live-snapshot
