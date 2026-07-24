@@ -130,7 +130,7 @@ export function ProviderIcon({ remote }: { remote?: string | null }) {
       role="img"
       aria-label={label}
     >
-      <Icon size={15} />
+      <Icon size={30} />
     </span>
   );
 }
