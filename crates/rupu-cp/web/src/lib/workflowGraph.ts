@@ -576,10 +576,10 @@ export function canConnect(
   target: string,
   g: { edges: GraphEdge[] },
   arm?: 'then' | 'else',
-): { ok: true } | { ok: false; reason: string } {
-  if (source === target) return { ok: false, reason: "A step can't depend on itself." };
+): { ok: true } | { ok: false; reason: string; kind: 'self' | 'duplicate' | 'cycle' } {
+  if (source === target) return { ok: false, reason: "A step can't depend on itself.", kind: 'self' };
   if (g.edges.some((e) => e.source === source && e.target === target && (e.branch ?? undefined) === arm)) {
-    return { ok: false, reason: 'These steps are already connected.' };
+    return { ok: false, reason: 'These steps are already connected.', kind: 'duplicate' };
   }
 
   const adj = new Map<string, string[]>();
@@ -594,7 +594,7 @@ export function canConnect(
   while (stack.length > 0) {
     const cur = stack.pop() as string;
     if (cur === source) {
-      return { ok: false, reason: 'This would create a cycle — steps must form a DAG.' };
+      return { ok: false, reason: 'This would create a cycle — steps must form a DAG.', kind: 'cycle' };
     }
     if (seen.has(cur)) continue;
     seen.add(cur);

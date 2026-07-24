@@ -622,7 +622,7 @@ function BranchFields({
     if (id === d.id) return false;
     if (thenTargets.includes(id) || elseTargets.includes(id)) return true;
     const res = canConnect(d.id, id, { edges });
-    return res.ok || !res.reason.includes('cycle');
+    return !(!res.ok && res.kind === 'cycle');
   });
 
   function toggleThen(id: string, on: boolean): void {

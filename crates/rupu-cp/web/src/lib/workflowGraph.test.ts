@@ -612,18 +612,21 @@ describe('graphToWorkflowObject', () => {
 describe('canConnect', () => {
   it('rejects a self-loop', () => {
     const res = canConnect('a', 'a', { edges: [] });
-    expect(res).toEqual({ ok: false, reason: "A step can't depend on itself." });
+    expect(res).toEqual({ ok: false, reason: "A step can't depend on itself.", kind: 'self' });
   });
 
   it('rejects a duplicate edge', () => {
     const res = canConnect('a', 'b', { edges: [edge('a', 'b')] });
-    expect(res).toEqual({ ok: false, reason: 'These steps are already connected.' });
+    expect(res).toEqual({ ok: false, reason: 'These steps are already connected.', kind: 'duplicate' });
   });
 
   it('rejects a back-edge that closes a cycle', () => {
     const res = canConnect('b', 'a', { edges: [edge('a', 'b')] });
     expect(res.ok).toBe(false);
-    if (!res.ok) expect(res.reason).toContain('cycle');
+    if (!res.ok) {
+      expect(res.reason).toContain('cycle');
+      expect(res.kind).toBe('cycle');
+    }
   });
 
   it('rejects a transitive cycle', () => {

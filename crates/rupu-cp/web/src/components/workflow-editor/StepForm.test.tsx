@@ -36,7 +36,7 @@ vi.mock('./ExpressionField', () => ({
 
 import StepForm from './StepForm';
 import WorkflowSettingsForm from './WorkflowSettingsForm';
-import { deriveEdges, type GraphNode, type StepNodeData, type WorkflowMeta } from '../../lib/workflowGraph';
+import { deriveEdges, yamlToGraph, type GraphNode, type StepNodeData, type WorkflowMeta } from '../../lib/workflowGraph';
 import type { ExprContext } from '../../lib/workflowExpressions';
 import type { AgentSummary } from '../../lib/api';
 
@@ -278,6 +278,41 @@ describe('StepForm — branch (flag-gated)', () => {
     const checkbox = screen.getByLabelText('Then target a');
     expect(checkbox).toBeInTheDocument();
     expect(checkbox).toBeChecked();
+  });
+
+  it('the branch Then/Else picker offers an array-adjacent successor connected only by the auto-derived chain edge (P0.1 regression)', () => {
+    // Graph: b (branch, empty then/else) immediately followed by c (agent step).
+    // deriveEdges yields ONLY the plain chain edge b->c (branch: undefined) —
+    // no branch arm exists yet. `c` is exactly the everyday case the branch
+    // picker must offer: the branch's array-adjacent successor. A naive
+    // `canConnect(...).ok` filter would hide it, because the chain edge trips
+    // canConnect's "already connected" (duplicate) check for a plain (arm:
+    // undefined) connect — that's a drag-connect concern, not a cycle, so it
+    // must NOT exclude `c` from the then/else candidate list.
+    const g = yamlToGraph({
+      name: 'wf',
+      steps: [
+        { id: 'b', branch: { condition: 'true' } },
+        { id: 'c', agent: 'planner', prompt: 'hi' },
+      ],
+    });
+    const bNode = g.nodes.find((n) => n.id === 'b') as GraphNode;
+    expect(g.edges).toEqual([{ id: 'b->c', source: 'b', target: 'c' }]);
+
+    render(
+      <StepForm
+        node={bNode}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+        allNodeIds={g.nodes.map((n) => n.id)}
+        edges={g.edges}
+      />,
+    );
+
+    expect(screen.getByLabelText('Then target c')).toBeInTheDocument();
+    expect(screen.getByLabelText('Else target c')).toBeInTheDocument();
   });
 
   it('branch hides the when/continue_on_error/approval block', () => {
