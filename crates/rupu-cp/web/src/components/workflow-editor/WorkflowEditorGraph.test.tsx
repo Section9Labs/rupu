@@ -132,7 +132,7 @@ import WorkflowEditorGraph, {
   applyInsertOnEdge,
   asStepKind,
 } from './WorkflowEditorGraph';
-import { deriveEdges, yamlToGraph } from '../../lib/workflowGraph';
+import { deriveEdges, hasExplicitEdges, yamlToGraph } from '../../lib/workflowGraph';
 import type { WorkflowGraph } from '../../lib/workflowGraph';
 import { KIND_ACCENT } from './kindVisuals';
 
@@ -388,12 +388,23 @@ describe('applyConnect', () => {
     expect(onInvalid).toHaveBeenCalledWith(expect.stringContaining('cycle'));
   });
 
-  it('duplicate edge is rejected with a reason, no onChange', () => {
+  // Was "duplicate edge is rejected with a reason, no onChange" under the old
+  // reorder model, where redrawing an already-adjacent pair was a pointless
+  // no-op worth flagging. Task 5: a plain connect that only fails as a
+  // "duplicate" is let through (`plainConnectAllowed`) — under the
+  // derived-edges model an already-adjacent pair already carries an
+  // unlabeled chain edge, indistinguishable from an explicit `next` at the
+  // `edges`-array level, so redrawing it is exactly how you turn an implicit
+  // chain edge into an explicit one. `setNext` is idempotent for the same
+  // target either way.
+  it('redrawing an already-connected pair sets an explicit `next` instead of being rejected as a duplicate', () => {
     const onChange = vi.fn();
     const onInvalid = vi.fn();
     applyConnect(makeGraph(), { source: 'a', target: 'b' }, onChange, onInvalid);
-    expect(onChange).not.toHaveBeenCalled();
-    expect(onInvalid).toHaveBeenCalledWith(expect.stringContaining('already connected'));
+    expect(onInvalid).not.toHaveBeenCalled();
+    expect(onChange).toHaveBeenCalledTimes(1);
+    const next = onChange.mock.calls[0][0] as WorkflowGraph;
+    expect(next.nodes.find((n) => n.id === 'a')!.data.next).toEqual(['b']);
   });
 
   it('missing endpoint is a no-op', () => {
@@ -477,11 +488,14 @@ describe('applyConnect', () => {
 
       applyConnect(g, { source: 'a', target: 'b', sourceHandle: 'then' }, onChange, onInvalid);
 
-      // 'a'->'b' already exists in makeGraph(), so this would normally be
-      // rejected as a duplicate — proving the arm branch was NOT taken (it
-      // would have produced a DIFFERENT id `a->b:then` and succeeded).
-      expect(onChange).not.toHaveBeenCalled();
-      expect(onInvalid).toHaveBeenCalledWith(expect.stringContaining('already connected'));
+      // Proof the arm branch was NOT taken: the result sets 'a'.data.next
+      // (the plain-connect path), NOT a `br->b:then`-shaped edge/thenTargets
+      // entry (which the arm path would have produced instead).
+      expect(onInvalid).not.toHaveBeenCalled();
+      expect(onChange).toHaveBeenCalledTimes(1);
+      const next = onChange.mock.calls[0][0] as WorkflowGraph;
+      expect(next.nodes.find((n) => n.id === 'a')!.data.next).toEqual(['b']);
+      expect(next.edges).toContainEqual({ id: 'a->b', source: 'a', target: 'b' });
     });
 
     it('a branch source with no sourceHandle (or null) falls back to a plain edge, unchanged behavior', () => {
@@ -595,6 +609,176 @@ describe('applyRemoveEdges', () => {
   });
 });
 
+// Critical fix: drawing ONE edge (or branch arm) on a legacy multi-step
+// workflow used to flip `hasExplicitEdges` for the WHOLE graph, so every
+// OTHER node — still with no explicit `next` of its own — lost the implicit
+// chain edge it used to derive from list order. `applyConnect` now runs the
+// nodes through `materializeLegacyChain` before applying the new edge, so the
+// pre-existing chain survives as explicit `next` entries.
+describe('legacy->graph migration (materialize before the first explicit edge)', () => {
+  it('the exact repro: legacy chain a->b->c->d, drawing b->d preserves a->b and c->d instead of collapsing to [b->d]', () => {
+    let g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+        { id: 'c', agent: 'x', prompt: 'p' },
+        { id: 'd', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(hasExplicitEdges(g.nodes)).toBe(false); // confirms this starts legacy
+
+    applyConnect(g, { source: 'b', target: 'd', sourceHandle: null }, (ng) => (g = ng), () => {});
+
+    // Nothing orphaned: a and c both still reach a successor, and the new
+    // edge is there too — exactly {a->b, c->d, b->d}, in any order.
+    const bySourceTarget = (e: { source: string; target: string }) => `${e.source}->${e.target}`;
+    expect(new Set(g.edges.map(bySourceTarget))).toEqual(new Set(['a->b', 'c->d', 'b->d']));
+    expect(g.edges).toHaveLength(3);
+  });
+
+  it('applying the SAME drawn edge to the raw (unmaterialized) nodes reproduces the bug — the collapse this test guards against', () => {
+    // Same starting graph as above, but skipping materialization (the bug's
+    // exact mechanism): only `b` gets an explicit `next`, everyone else's
+    // implicit chain edge is gone once graph mode kicks in.
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+        { id: 'c', agent: 'x', prompt: 'p' },
+        { id: 'd', agent: 'x', prompt: 'p' },
+      ],
+    });
+    const buggyNodes = g.nodes.map((n) => (n.id === 'b' ? { ...n, data: { ...n.data, next: ['d'] } } : n));
+    const edges = deriveEdges(buggyNodes);
+    expect(edges).toHaveLength(1);
+    expect(edges[0]).toMatchObject({ source: 'b', target: 'd' });
+  });
+
+  it('a first branch-arm draw on a legacy chain preserves the other chain edges', () => {
+    // `br` leads the array, then a->b->c is the legacy chain; drawing br's
+    // "then" arm forward to `c` (not backward, which would close a cycle
+    // through the existing implicit chain) is the first explicit connection.
+    let g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'br', branch: { condition: 'x' } },
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+        { id: 'c', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(hasExplicitEdges(g.nodes)).toBe(false);
+
+    applyConnect(g, { source: 'br', target: 'c', sourceHandle: 'then' }, (ng) => (g = ng), () => {});
+
+    expect(g.edges).toContainEqual({ id: 'a->b', source: 'a', target: 'b' });
+    expect(g.edges).toContainEqual({ id: 'b->c', source: 'b', target: 'c' });
+    expect(g.edges).toContainEqual({
+      id: 'br->c:then',
+      source: 'br',
+      target: 'c',
+      branch: 'then',
+      label: 'true',
+    });
+  });
+});
+
+// Task 5: drawing a line sets an explicit `next` edge (replacing the old one
+// on a regular node, accumulating on a `split`); dropping a node leaves it
+// unconnected; deleting a line clears the edge it came from. Supersedes the
+// earlier "plain connect = reorder" model (see the `applyConnect`/
+// `applyAddConnectedNext` rewrites below).
+describe('explicit connect/drop', () => {
+  it('drawing a plain edge sets next; a second draw from a regular node REPLACES it', () => {
+    let g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p', next: [] },
+        { id: 'b', agent: 'x', prompt: 'p' },
+        { id: 'c', agent: 'x', prompt: 'p' },
+      ],
+    });
+    applyConnect(g, { source: 'a', target: 'b', sourceHandle: null }, (ng) => (g = ng), () => {});
+    expect(g.nodes.find((n) => n.id === 'a')!.data.next).toEqual(['b']);
+    applyConnect(g, { source: 'a', target: 'c', sourceHandle: null }, (ng) => (g = ng), () => {});
+    expect(g.nodes.find((n) => n.id === 'a')!.data.next).toEqual(['c']); // replaced, not [b, c]
+  });
+
+  it('a split node accumulates edges instead of replacing', () => {
+    let g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 's', split: [] }, { id: 'a', agent: 'x', prompt: 'p' }, { id: 'b', agent: 'x', prompt: 'p' }],
+    });
+    applyConnect(g, { source: 's', target: 'a', sourceHandle: null }, (ng) => (g = ng), () => {});
+    applyConnect(g, { source: 's', target: 'b', sourceHandle: null }, (ng) => (g = ng), () => {});
+    expect(g.nodes.find((n) => n.id === 's')!.data.split).toEqual(['a', 'b']);
+  });
+
+  it('a freshly added node is disconnected (no next)', () => {
+    const r = applyAddNode(yamlToGraph({ name: 'w', steps: [{ id: 'a', agent: 'x', prompt: 'p', next: [] }] }), 'step');
+    expect(r.graph.nodes.find((n) => n.id === r.id)!.data.next ?? []).toEqual([]);
+  });
+
+  it('applyDelete scrubs the deleted id from a surviving node\'s `next`', () => {
+    let g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p', next: ['b'] },
+        { id: 'b', agent: 'x', prompt: 'p' },
+      ],
+    });
+    g = applyDelete(g, 'b');
+    expect(g.nodes.find((n) => n.id === 'a')!.data.next ?? []).toEqual([]);
+    expect(invariantHolds(g)).toBe(true);
+  });
+
+  it('applyDelete scrubs the deleted id from a surviving `split` node\'s fan-out list', () => {
+    let g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 's', split: ['a', 'b'] }, { id: 'a', agent: 'x', prompt: 'p' }, { id: 'b', agent: 'x', prompt: 'p' }],
+    });
+    g = applyDelete(g, 'a');
+    expect(g.nodes.find((n) => n.id === 's')!.data.split).toEqual(['b']);
+    expect(invariantHolds(g)).toBe(true);
+  });
+
+  it('applyRemoveEdges clears the `next` entry a drawn edge set (not a reorder)', () => {
+    // A third `split` node (kind alone keeps the workflow in graph mode
+    // regardless of its own empty fan-out) isolates "clear the entry" from
+    // the separate legacy/graph-mode-boundary behavior a 2-node all-next
+    // workflow would hit: clearing the ONLY non-empty `next` in a graph with
+    // no split/join anywhere reverts `hasExplicitEdges` to false, and a
+    // legacy chain edge would derive right back between the two remaining
+    // array-adjacent nodes — see `hasExplicitEdges`'s doc comment. That's a
+    // real, accepted boundary of the derived-edges model (Task 4), not
+    // something this op should paper over.
+    let g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p', next: ['b'] },
+        { id: 'b', agent: 'x', prompt: 'p' },
+        { id: 'z', split: [] },
+      ],
+    });
+    g = applyRemoveEdges(g, new Set(['a->b']));
+    expect(g.nodes.find((n) => n.id === 'a')!.data.next).toEqual([]);
+    expect(g.edges).toEqual([]);
+    expect(invariantHolds(g)).toBe(true);
+  });
+
+  it('applyRemoveEdges clears the target from a `split` node\'s fan-out list', () => {
+    let g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 's', split: ['a', 'b'] }, { id: 'a', agent: 'x', prompt: 'p' }, { id: 'b', agent: 'x', prompt: 'p' }],
+    });
+    g = applyRemoveEdges(g, new Set(['s->a']));
+    expect(g.nodes.find((n) => n.id === 's')!.data.split).toEqual(['b']);
+    expect(invariantHolds(g)).toBe(true);
+  });
+});
+
 describe('applyAddNode', () => {
   it('parallel default carries an empty parallel array', () => {
     const { graph, id } = applyAddNode(makeGraph(), 'parallel');
@@ -632,6 +816,14 @@ describe('asStepKind', () => {
     expect(asStepKind('branch')).toBe('branch');
     expect(asStepKind('step')).toBe('step');
     expect(asStepKind('nonsense')).toBeNull();
+  });
+
+  it('accepts split and join so a palette drag creates the node (I1)', () => {
+    // The palette makes split/join cards draggable via NODE_KIND_MIME =
+    // 'split'/'join', but asStepKind previously omitted them, so a drop
+    // silently no-oped (`if (!kind) return;`) while click-to-add worked.
+    expect(asStepKind('split')).toBe('split');
+    expect(asStepKind('join')).toBe('join');
   });
 });
 
@@ -1186,6 +1378,28 @@ describe('applyAddConnectedNext', () => {
     expect(graph.nodes).toHaveLength(3);
     expect(graph.nodes[graph.nodes.length - 1]?.id).toBe(id);
     expect(graph.edges).toContainEqual({ id: `b->${id}`, source: 'b', target: id });
+  });
+
+  it('"+ next" from the middle of a legacy 3-chain a->b->c preserves a->b and reroutes b->c through the new node instead of orphaning c (Critical-bug fix)', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+        { id: 'c', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(hasExplicitEdges(g.nodes)).toBe(false);
+
+    const { graph, id } = applyAddConnectedNext(g, 'b');
+
+    // a->b: untouched, still there. b->new: the "+ next" edge this op draws.
+    // new->c: the old (implicit) b->c successor, rerouted through the
+    // inserted node rather than dropped — c is never left unreachable.
+    expect(graph.edges).toContainEqual({ id: 'a->b', source: 'a', target: 'b' });
+    expect(graph.edges).toContainEqual({ id: `b->${id}`, source: 'b', target: id });
+    expect(graph.edges).toContainEqual({ id: `${id}->c`, source: id, target: 'c' });
+    expect(graph.edges).toHaveLength(3);
   });
 });
 

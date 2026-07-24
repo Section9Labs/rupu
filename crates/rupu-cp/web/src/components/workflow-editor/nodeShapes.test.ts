@@ -88,6 +88,8 @@ const ALL: ShapeName[] = [
   'hexagon',
   'subroutine',
   'stacked',
+  'fanout',
+  'fanin',
 ];
 
 describe('shapeFor', () => {
@@ -256,6 +258,35 @@ describe('shapeFor', () => {
     const s = shapeFor(name as ShapeName, 34, 20);
     const flatWidth = Math.abs(s.points[bIdx][0] - s.points[aIdx][0]);
     expect(flatWidth, `${name} flat top edge is only ${flatWidth}px wide at 34x20`).toBeGreaterThanOrEqual(34 / 3);
+  });
+
+  // ── split/join placeholder silhouettes (Task 6) ───────────────────────────
+  // `fanout` (split — "one in, many out") is a right-fanning pentagon: a flat
+  // vertical left edge (the single inbound side) and a single point on the
+  // right. `fanin` (join — "many in, one out") is its mirror: a single point
+  // on the left, a flat vertical right edge. Both are deliberate placeholders
+  // (Task 6 brief) — recognizable and geometrically correct, not final art.
+  it('a fanout has 5 vertices: a flat left edge and a single point on the right', () => {
+    const s = shapeFor('fanout', 220, 130);
+    expect(s.points).toHaveLength(5);
+    // Flat left edge: two vertices share the same (leftmost) x.
+    const leftXs = s.points.map(([x]) => x).sort((a, b) => a - b);
+    expect(leftXs[0]).toBe(leftXs[1]); // two points at the same minimal x
+    // The single rightmost point is a unique vertex, strictly right of every
+    // other vertex's x (the "point" tip).
+    const rightmost = Math.max(...s.points.map(([x]) => x));
+    const atRightmost = s.points.filter(([x]) => x === rightmost);
+    expect(atRightmost).toHaveLength(1);
+  });
+
+  it('a fanin has 5 vertices: a single point on the left and a flat right edge', () => {
+    const s = shapeFor('fanin', 220, 130);
+    expect(s.points).toHaveLength(5);
+    const rightXs = s.points.map(([x]) => x).sort((a, b) => b - a);
+    expect(rightXs[0]).toBe(rightXs[1]); // two points at the same maximal x (flat right edge)
+    const leftmost = Math.min(...s.points.map(([x]) => x));
+    const atLeftmost = s.points.filter(([x]) => x === leftmost);
+    expect(atLeftmost).toHaveLength(1);
   });
 
   // ── F3: handle anchors must resolve ON the silhouette's outline ──────────
