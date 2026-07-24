@@ -291,26 +291,14 @@ export function extractStepRefs(data: StepNodeData): string[] {
   return [...ids];
 }
 
-// ── yamlToGraph ───────────────────────────────────────────────────────────────
+// ── deriveEdges ───────────────────────────────────────────────────────────────
 
-/** Convert a parsed workflow object into the graph model. */
-export function yamlToGraph(obj: Record<string, unknown>): WorkflowGraph {
-  // meta: name + description are surfaced; everything else top-level survives in
-  // `rest` so a round-trip leaves trigger/inputs/defaults/autoflow/etc untouched.
-  const rest: Record<string, unknown> = { ...obj };
-  delete rest.name;
-  delete rest.description;
-  delete rest.steps;
-  const meta: WorkflowMeta = { name: asString(obj.name) ?? '', rest };
-  const desc = asString(obj.description);
-  if (desc !== undefined) meta.description = desc;
-
-  const stepsRaw = asArray(obj.steps) ?? [];
-  const nodes: GraphNode[] = stepsRaw.map((s, i) => {
-    const data = parseStepData(s, i);
-    return { id: data.id, data, position: { x: 0, y: 0 } };
-  });
-
+/** The ONE producer of canvas edges. Pure function of the ordered node list:
+ *  (a) a chain edge between each consecutive pair (declared order),
+ *  (b) a data-ref edge X->Y whenever Y references steps.X,
+ *  (c) a branch-arm edge per then/else target (labeled true/false).
+ *  graph.edges is ALWAYS this — never stored independently. */
+export function deriveEdges(nodes: GraphNode[]): GraphEdge[] {
   const ids = new Set(nodes.map((n) => n.id));
   const edges: GraphEdge[] = [];
   const seen = new Set<string>();
@@ -350,7 +338,36 @@ export function yamlToGraph(obj: Record<string, unknown>): WorkflowGraph {
     }
   }
 
-  return { nodes, edges, meta };
+  return edges;
+}
+
+/** Build a WorkflowGraph whose edges are derived from its nodes — the only
+ *  correct way to construct/return a graph. */
+export function withDerivedEdges(meta: WorkflowMeta, nodes: GraphNode[]): WorkflowGraph {
+  return { meta, nodes, edges: deriveEdges(nodes) };
+}
+
+// ── yamlToGraph ───────────────────────────────────────────────────────────────
+
+/** Convert a parsed workflow object into the graph model. */
+export function yamlToGraph(obj: Record<string, unknown>): WorkflowGraph {
+  // meta: name + description are surfaced; everything else top-level survives in
+  // `rest` so a round-trip leaves trigger/inputs/defaults/autoflow/etc untouched.
+  const rest: Record<string, unknown> = { ...obj };
+  delete rest.name;
+  delete rest.description;
+  delete rest.steps;
+  const meta: WorkflowMeta = { name: asString(obj.name) ?? '', rest };
+  const desc = asString(obj.description);
+  if (desc !== undefined) meta.description = desc;
+
+  const stepsRaw = asArray(obj.steps) ?? [];
+  const nodes: GraphNode[] = stepsRaw.map((s, i) => {
+    const data = parseStepData(s, i);
+    return { id: data.id, data, position: { x: 0, y: 0 } };
+  });
+
+  return { nodes, edges: deriveEdges(nodes), meta };
 }
 
 // ── topoSort ──────────────────────────────────────────────────────────────────

@@ -970,3 +970,40 @@ describe('convertInlineApprovalToGate', () => {
     expect(after - before).toBe(278);
   });
 });
+
+import { deriveEdges, withDerivedEdges } from './workflowGraph';
+import fs from 'node:fs';
+import path from 'node:path';
+import yaml from 'js-yaml';
+
+const WF_DIR = path.resolve(__dirname, '../../../../../.rupu/workflows');
+
+describe('deriveEdges', () => {
+  it('reproduces yamlToGraph edges exactly for every real workflow', () => {
+    for (const f of fs.readdirSync(WF_DIR).filter((n) => n.endsWith('.yaml'))) {
+      const g = yamlToGraph(yaml.load(fs.readFileSync(path.join(WF_DIR, f), 'utf8')) as Record<string, unknown>);
+      // deriveEdges(nodes) must equal what yamlToGraph itself produced.
+      expect(deriveEdges(g.nodes), f).toEqual(g.edges);
+    }
+  });
+
+  it('derives a branch arm edge from thenTargets/elseTargets', () => {
+    const nodes = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'b', branch: { condition: 'x', then: ['t'], else: ['e'] } },
+        { id: 't', agent: 'a', prompt: 'p' },
+        { id: 'e', agent: 'a', prompt: 'p' },
+      ],
+    }).nodes;
+    const edges = deriveEdges(nodes);
+    expect(edges).toContainEqual(expect.objectContaining({ source: 'b', target: 't', branch: 'then', label: 'true' }));
+    expect(edges).toContainEqual(expect.objectContaining({ source: 'b', target: 'e', branch: 'else', label: 'false' }));
+  });
+
+  it('withDerivedEdges always satisfies edges === deriveEdges(nodes)', () => {
+    const nodes = yamlToGraph({ name: 'w', steps: [{ id: 'a', agent: 'x', prompt: 'p' }] }).nodes;
+    const g = withDerivedEdges({ name: 'w', rest: {} }, nodes);
+    expect(g.edges).toEqual(deriveEdges(g.nodes));
+  });
+});
