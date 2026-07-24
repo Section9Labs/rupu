@@ -174,6 +174,18 @@ pub enum WorkflowParseError {
         tool: String,
         detail: String,
     },
+    #[error("step `{step}`: edge target `{target}` is not a known step")]
+    EdgeTargetUnknown { step: String, target: String },
+    #[error("step `{step}`: an edge cannot target its own step")]
+    EdgeSelfLoop { step: String },
+    #[error("workflow has a cycle through: {path}")]
+    WorkflowCycle { path: String },
+    #[error(
+        "step `{step}`: a `{kind}` orchestration node cannot also carry agent/action/for_each/parallel/panel/branch/approval"
+    )]
+    OrchestrationNodeHasWork { step: String, kind: String },
+    #[error("step `{step}`: `join.wait.count` must be at least 1")]
+    JoinCountInvalid { step: String },
 }
 
 /// How a workflow gets kicked off. Manual is the existing behavior
@@ -1061,6 +1073,9 @@ impl Workflow {
         validate_autoflow(&wf)?;
         validate_template_refs(&wf)?;
         validate_branch_targets(&wf)?;
+        if workflow_has_explicit_edges(&wf) {
+            validate_graph(&wf)?;
+        }
         Ok(wf)
     }
 
@@ -1782,6 +1797,144 @@ fn scan_step_refs(template: &str) -> Vec<(String, Option<String>)> {
     refs
 }
 
+/// All dependency edges (source_id -> target_id): explicit control edges
+/// (`next`, `split`, branch then/else) UNION inferred data edges (a step that
+/// references `steps.X.*` depends on X). Deduped. `pub` because the CP
+/// `next` workflow editor mirrors this logic client-side and Phase-2
+/// execution (`is_nonlinear`) consumes it too.
+pub fn workflow_edges(wf: &Workflow) -> Vec<(String, String)> {
+    let ids: BTreeSet<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
+    let mut edges: BTreeSet<(String, String)> = BTreeSet::new();
+    for step in &wf.steps {
+        for t in &step.next {
+            edges.insert((step.id.clone(), t.clone()));
+        }
+        if let Some(sp) = &step.split {
+            for t in sp {
+                edges.insert((step.id.clone(), t.clone()));
+            }
+        }
+        if let Some(br) = &step.branch {
+            for t in br.then.iter().chain(br.r#else.iter()) {
+                edges.insert((step.id.clone(), t.clone()));
+            }
+        }
+        // Inferred data edges: X -> step for every steps.X reference in this step.
+        for (_, tmpl) in collect_templates_for_step(step) {
+            for (referenced, _field) in scan_step_refs(&tmpl) {
+                if ids.contains(referenced.as_str()) && referenced != step.id {
+                    edges.insert((referenced, step.id.clone()));
+                }
+            }
+        }
+    }
+    edges.into_iter().collect()
+}
+
+/// A workflow "has explicit edges" (is a graph workflow rather than a
+/// legacy linear one) when any step declares `next:`, `split:`, or
+/// `join:`. Legacy edge-free workflows keep running only the pre-existing
+/// forward-only `validate_branch_targets` / `validate_template_refs`
+/// checks — `validate_graph` never runs for them.
+fn workflow_has_explicit_edges(wf: &Workflow) -> bool {
+    wf.steps
+        .iter()
+        .any(|s| !s.next.is_empty() || s.split.is_some() || s.join.is_some())
+}
+
+/// Validate the dependency graph of a workflow that has explicit edges:
+/// - `split`/`join` orchestration nodes carry no agent/action/for_each/
+///   parallel/panel/branch/approval work of their own.
+/// - `join.wait.count` (when the count form is used) is at least 1.
+/// - every `next:`/`split:` edge target names a known step and isn't a
+///   self-loop.
+/// - the full dependency graph (control edges union inferred data edges)
+///   is acyclic, via Kahn's algorithm.
+fn validate_graph(wf: &Workflow) -> Result<(), WorkflowParseError> {
+    let ids: BTreeSet<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
+    for step in &wf.steps {
+        let is_orch = step.split.is_some() || step.join.is_some();
+        let has_work = step.agent.is_some()
+            || step.action.is_some()
+            || step.for_each.is_some()
+            || step.parallel.is_some()
+            || step.panel.is_some()
+            || step.branch.is_some()
+            || step.approval.is_some();
+        if is_orch && has_work {
+            return Err(WorkflowParseError::OrchestrationNodeHasWork {
+                step: step.id.clone(),
+                kind: if step.split.is_some() {
+                    "split".into()
+                } else {
+                    "join".into()
+                },
+            });
+        }
+        if let Some(Join {
+            wait: JoinWait::Count { count },
+        }) = &step.join
+        {
+            if *count < 1 {
+                return Err(WorkflowParseError::JoinCountInvalid {
+                    step: step.id.clone(),
+                });
+            }
+        }
+        for t in step.next.iter().chain(step.split.iter().flatten()) {
+            if t == &step.id {
+                return Err(WorkflowParseError::EdgeSelfLoop {
+                    step: step.id.clone(),
+                });
+            }
+            if !ids.contains(t.as_str()) {
+                return Err(WorkflowParseError::EdgeTargetUnknown {
+                    step: step.id.clone(),
+                    target: t.clone(),
+                });
+            }
+        }
+    }
+
+    // Cycle detection over the full dependency graph (Kahn's algorithm).
+    let edges = workflow_edges(wf);
+    let mut indeg: BTreeMap<&str, usize> = wf.steps.iter().map(|s| (s.id.as_str(), 0)).collect();
+    let mut adj: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (a, b) in &edges {
+        *indeg.entry(b.as_str()).or_insert(0) += 1;
+        adj.entry(a.as_str()).or_default().push(b.as_str());
+    }
+    let mut ready: Vec<&str> = indeg
+        .iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(&k, _)| k)
+        .collect();
+    let mut seen = 0usize;
+    while let Some(n) = ready.pop() {
+        seen += 1;
+        for &m in adj.get(n).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let e = indeg
+                .get_mut(m)
+                .expect("adj target always present in indeg");
+            *e -= 1;
+            if *e == 0 {
+                ready.push(m);
+            }
+        }
+    }
+    if seen != wf.steps.len() {
+        let stuck: Vec<&str> = indeg
+            .iter()
+            .filter(|(_, &d)| d > 0)
+            .map(|(&k, _)| k)
+            .collect();
+        return Err(WorkflowParseError::WorkflowCycle {
+            path: stuck.join(" -> "),
+        });
+    }
+    Ok(())
+}
+
 fn validate_autoflow(wf: &Workflow) -> Result<(), WorkflowParseError> {
     let Some(autoflow) = &wf.autoflow else {
         return Ok(());
@@ -2428,5 +2581,83 @@ steps:
         assert!(!out.contains("next"), "legacy step must not emit next:");
         assert!(!out.contains("split"));
         assert!(!out.contains("join"));
+    }
+
+    #[test]
+    fn rejects_a_cycle() {
+        // a -> b -> a via explicit next
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [b]\n  - id: b\n    agent: x\n    prompt: p\n    next: [a]\n";
+        let err = Workflow::parse(raw).unwrap_err();
+        assert!(
+            matches!(err, WorkflowParseError::WorkflowCycle { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_a_diamond_reconverge() {
+        // a -> b, a -> c, b -> d, c -> d: not a cycle, must be accepted.
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [b, c]\n  - id: b\n    agent: x\n    prompt: p\n    next: [d]\n  - id: c\n    agent: x\n    prompt: p\n    next: [d]\n  - id: d\n    agent: x\n    prompt: p\n";
+        Workflow::parse(raw).expect("diamond reconverge is not a cycle");
+    }
+
+    #[test]
+    fn rejects_unknown_edge_target() {
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [nope]\n";
+        assert!(matches!(
+            Workflow::parse(raw).unwrap_err(),
+            WorkflowParseError::EdgeTargetUnknown { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_self_loop_edge() {
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [a]\n";
+        assert!(matches!(
+            Workflow::parse(raw).unwrap_err(),
+            WorkflowParseError::EdgeSelfLoop { .. }
+        ));
+    }
+
+    #[test]
+    fn split_node_may_not_carry_an_agent() {
+        let raw = "name: w\nsteps:\n  - id: s\n    agent: x\n    prompt: p\n    split: [a]\n  - id: a\n    agent: x\n    prompt: p\n";
+        assert!(matches!(
+            Workflow::parse(raw).unwrap_err(),
+            WorkflowParseError::OrchestrationNodeHasWork { .. }
+        ));
+    }
+
+    #[test]
+    fn join_count_zero_is_invalid() {
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [j]\n  - id: j\n    join: { wait: { count: 0 } }\n";
+        assert!(matches!(
+            Workflow::parse(raw).unwrap_err(),
+            WorkflowParseError::JoinCountInvalid { .. }
+        ));
+    }
+
+    #[test]
+    fn data_reference_creates_an_inferred_edge_but_forward_ok() {
+        // a is referenced by b's prompt; b declares no next; still valid (inferred a->b)
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: \"use {{ steps.a.output }}\"\n";
+        let wf = Workflow::parse(raw).unwrap();
+        let edges = workflow_edges(&wf);
+        assert!(edges.contains(&("a".to_string(), "b".to_string())));
+    }
+
+    #[test]
+    fn legacy_edge_free_workflow_skips_graph_validation() {
+        // No next/split/join anywhere -> validate_graph must not run, so the
+        // pre-existing forward-only template-ref checks are what govern this.
+        // A workflow with a step referencing a *later* step's output (which
+        // validate_graph's inferred edges would tolerate, since it doesn't
+        // care about declaration order) must still be rejected as a forward
+        // reference by the legacy path.
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: \"use {{ steps.b.output }}\"\n  - id: b\n    agent: x\n    prompt: p\n";
+        assert!(matches!(
+            Workflow::parse(raw).unwrap_err(),
+            WorkflowParseError::TemplateForwardStepRef { .. }
+        ));
     }
 }
