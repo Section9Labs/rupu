@@ -343,6 +343,132 @@ describe('StepForm — branch (flag-gated)', () => {
   });
 });
 
+describe('StepForm — split/join orchestration nodes (Task 6)', () => {
+  it('a split node renders its target id list, excluding its own id, and toggling emits the split array', () => {
+    const spy = vi.fn();
+    render(
+      <StepForm
+        node={nodeWith({ id: 's1', kind: 'split', split: [] })}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={spy}
+        allNodeIds={['s1', 'a', 'b']}
+      />,
+    );
+
+    expect(screen.getByLabelText('Split target a')).toBeInTheDocument();
+    expect(screen.getByLabelText('Split target b')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Split target s1')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText('Split target a'));
+    expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({ split: ['a'] }));
+  });
+
+  it('a split target that would form a cycle is excluded, but an already-selected cycle-forming target still renders checked', () => {
+    const aNode: GraphNode = { id: 'a', data: { id: 'a', kind: 'step', agent: 'planner', prompt: 'hi' }, position: { x: 0, y: 0 } };
+    const bNode: GraphNode = { id: 'b', data: { id: 'b', kind: 'split', split: ['a'] }, position: { x: 0, y: 100 } };
+    const edges = deriveEdges([aNode, bNode]); // chain edge a -> b
+
+    render(
+      <StepForm
+        node={bNode}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+        allNodeIds={['a', 'b']}
+        edges={edges}
+      />,
+    );
+
+    const checkbox = screen.getByLabelText('Split target a');
+    expect(checkbox).toBeInTheDocument();
+    expect(checkbox).toBeChecked();
+  });
+
+  it('split hides the when/continue_on_error/approval block', () => {
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'split', split: [] })}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.queryByLabelText('When condition')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Continue on error')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Require approval')).not.toBeInTheDocument();
+  });
+
+  it('a join node with no joinWait set shows "all" selected in the wait-policy select', () => {
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'join' })}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.getByLabelText('Join wait policy')).toHaveValue('all');
+    expect(screen.queryByLabelText('Join wait count')).not.toBeInTheDocument();
+  });
+
+  it('a join node selecting "any" emits joinWait: "any"', () => {
+    const spy = vi.fn();
+    render(
+      <StepForm node={nodeWith({ kind: 'join' })} agents={AGENTS} problems={[]} exprContext={EXPR} onChange={spy} />,
+    );
+    fireEvent.change(screen.getByLabelText('Join wait policy'), { target: { value: 'any' } });
+    expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({ joinWait: 'any' }));
+  });
+
+  it('a join node selecting "count" reveals a count input and emits joinWait: { count }', () => {
+    const spy = vi.fn();
+    render(
+      <Harness initial={nodeWith({ kind: 'join' })} spy={spy} />,
+    );
+    fireEvent.change(screen.getByLabelText('Join wait policy'), { target: { value: 'count' } });
+    expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({ joinWait: { count: 1 } }));
+
+    const countInput = screen.getByLabelText('Join wait count');
+    expect(countInput).toBeInTheDocument();
+    fireEvent.change(countInput, { target: { value: '3' } });
+    expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({ joinWait: { count: 3 } }));
+  });
+
+  it('an existing joinWait: { count: 2 } round-trips into the select + count input', () => {
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'join', joinWait: { count: 2 } })}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.getByLabelText('Join wait policy')).toHaveValue('count');
+    expect(screen.getByLabelText('Join wait count')).toHaveValue(2);
+  });
+
+  it('join hides the when/continue_on_error/approval block', () => {
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'join' })}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.queryByLabelText('When condition')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Continue on error')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Require approval')).not.toBeInTheDocument();
+  });
+});
+
 describe('StepForm — roomier long-text fields (Task 5, next only)', () => {
   it('classic: the Prompt field stays default-sized (no size prop threaded)', () => {
     render(

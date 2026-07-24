@@ -70,12 +70,12 @@ describe('NodePalette', () => {
     it('renders the .wfx-palette dock with a .wfx-pcard per item and a .wfx-picon accent icon', () => {
       const { container } = render(<NodePalette onAdd={() => {}} onDragStartKind={() => {}} workflowEditorUi="next" />);
       expect(container.querySelector('.wfx-palette')).toBeInTheDocument();
-      // next offers the branch + gate cards too
-      // (step/for_each/parallel/panel/branch/gate = 6).
+      // next offers the branch + gate + split + join cards too
+      // (step/for_each/parallel/panel/branch/gate/split/join = 8).
       const cards = container.querySelectorAll('.wfx-pcard');
-      expect(cards.length).toBe(6);
+      expect(cards.length).toBe(8);
       const icons = container.querySelectorAll('.wfx-picon');
-      expect(icons.length).toBe(6);
+      expect(icons.length).toBe(8);
       for (const icon of icons) expect(icon.tagName.toLowerCase()).toBe('svg');
       // no classic markers leak into the next look.
       expect(container.querySelector('.rounded-lg.border.border-border.bg-panel\\/95')).not.toBeInTheDocument();
@@ -99,7 +99,30 @@ describe('NodePalette', () => {
       const { container } = render(<NodePalette onAdd={() => {}} onDragStartKind={() => {}} workflowEditorUi="next" />);
       const branchCard = screen.getByRole('button', { name: 'Add branch node' });
       expect(branchCard).toHaveClass('wfx-pcard');
-      expect(container.querySelectorAll('.wfx-pcard').length).toBe(6);
+      expect(container.querySelectorAll('.wfx-pcard').length).toBe(8);
+    });
+  });
+
+  describe('split/join orchestration cards (Task 6, next only)', () => {
+    it('classic hides the split and join cards', () => {
+      render(<NodePalette onAdd={() => {}} onDragStartKind={() => {}} />);
+      expect(screen.queryByRole('button', { name: 'Add split node' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Add join node' })).not.toBeInTheDocument();
+    });
+
+    it("with workflowEditorUi='next' the split and join cards render and add their nodes", () => {
+      const onAdd = vi.fn();
+      render(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} workflowEditorUi="next" />);
+
+      const splitCard = screen.getByRole('button', { name: 'Add split node' });
+      expect(splitCard).toBeInTheDocument();
+      fireEvent.click(splitCard);
+      expect(onAdd).toHaveBeenCalledWith('split');
+
+      const joinCard = screen.getByRole('button', { name: 'Add join node' });
+      expect(joinCard).toBeInTheDocument();
+      fireEvent.click(joinCard);
+      expect(onAdd).toHaveBeenCalledWith('join');
     });
   });
 
@@ -394,6 +417,51 @@ describe('NodePalette', () => {
         .querySelector('[aria-label="Add step node"] .wfx-pshape path')
         ?.getAttribute('d');
       expect(stepD).toContain('Q');
+    });
+
+    describe('Work / Orchestration grouping (Task 6, KIND_FAMILY)', () => {
+      it('classic (work-only) rail shows a single Work group and no Orchestration heading', () => {
+        const { container } = render(
+          <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" />,
+        );
+        const labels = [...container.querySelectorAll('.wfx-palette-family-label')].map((n) => n.textContent);
+        expect(labels).toEqual(['Work']);
+        expect(container.querySelector('[data-family="work"]')).toBeInTheDocument();
+        expect(container.querySelector('[data-family="orchestration"]')).not.toBeInTheDocument();
+      });
+
+      it("next rail groups chips under 'Work' and 'Orchestration' subheadings, in that order", () => {
+        const { container } = render(
+          <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" workflowEditorUi="next" />,
+        );
+        const labels = [...container.querySelectorAll('.wfx-palette-family-label')].map((n) => n.textContent);
+        expect(labels).toEqual(['Work', 'Orchestration']);
+
+        const workGroup = container.querySelector('[data-family="work"]');
+        const orchGroup = container.querySelector('[data-family="orchestration"]');
+        expect(workGroup).toBeInTheDocument();
+        expect(orchGroup).toBeInTheDocument();
+
+        for (const label of ['step', 'for_each', 'parallel', 'panel']) {
+          expect(workGroup?.querySelector(`[aria-label="Add ${label} node"]`)).toBeInTheDocument();
+          expect(orchGroup?.querySelector(`[aria-label="Add ${label} node"]`)).not.toBeInTheDocument();
+        }
+        for (const label of ['branch', 'gate', 'split', 'join']) {
+          expect(orchGroup?.querySelector(`[aria-label="Add ${label} node"]`)).toBeInTheDocument();
+          expect(workGroup?.querySelector(`[aria-label="Add ${label} node"]`)).not.toBeInTheDocument();
+        }
+      });
+
+      it('a filter that narrows to only orchestration chips drops the empty Work heading', () => {
+        const { container } = render(
+          <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" workflowEditorUi="next" />,
+        );
+        fireEvent.change(screen.getByRole('searchbox', { name: 'Filter blocks and actions' }), {
+          target: { value: 'split' },
+        });
+        const labels = [...container.querySelectorAll('.wfx-palette-family-label')].map((n) => n.textContent);
+        expect(labels).toEqual(['Orchestration']);
+      });
     });
   });
 });

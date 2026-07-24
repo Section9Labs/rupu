@@ -15,7 +15,7 @@ import type { StepKind, StepNodeData } from '../../lib/workflowGraph';
 import type { ToolSpec } from '../../lib/api';
 import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 import { useThemeColors } from '../../lib/useThemeColors';
-import { KIND_ACCENT, KIND_ICON, KIND_SHAPE } from './kindVisuals';
+import { KIND_ACCENT, KIND_FAMILY, KIND_ICON, KIND_SHAPE } from './kindVisuals';
 import { shapeFor } from './nodeShapes';
 
 /** dataTransfer key the canvas reads on drop. Exported so the canvas drop
@@ -40,9 +40,9 @@ const KIND_COLOR: Record<StepKind, string> = {
   // satisfy the exhaustive Record; the classic dock never renders them.
   approval_gate: '#a855f7',
   action: '#0ea5e9',
-  // split/join (Phase 1 non-linear orchestration) are not offered as palette
-  // cards yet (Task 5-7's call) — these hexes exist only to satisfy the
-  // exhaustive Record, same as gate/action above.
+  // split/join (Phase 1 non-linear orchestration) are `next`-only cards, like
+  // gate/action above — these hexes exist only to satisfy the exhaustive
+  // Record; the classic dock never renders them.
   split: '#6366f1',
   join: '#4338ca',
 };
@@ -66,6 +66,15 @@ const ITEMS: readonly PaletteItem[] = [
 // palette when `workflowEditorUi === 'next'` (see Props.workflowEditorUi below).
 const BRANCH_ITEM: PaletteItem = { kind: 'branch', label: 'branch', sub: 'if / then / else' };
 const GATE_ITEM: PaletteItem = { kind: 'approval_gate', label: 'gate', sub: 'human approval' };
+// split/join (Task 6) — Phase 1 non-linear orchestration nodes, `next`-only
+// like branch/gate above.
+const SPLIT_ITEM: PaletteItem = { kind: 'split', label: 'split', sub: 'fan out' };
+const JOIN_ITEM: PaletteItem = { kind: 'join', label: 'join', sub: 'barrier' };
+
+// Rail block-grid grouping (Task 6): which KIND_FAMILY section renders first,
+// and its subheading text.
+const FAMILY_ORDER: Array<'work' | 'orchestration'> = ['work', 'orchestration'];
+const FAMILY_LABEL: Record<'work' | 'orchestration', string> = { work: 'Work', orchestration: 'Orchestration' };
 
 // ── Block catalog (rail "Blocks" tab detail card) ───────────────────────────
 // One entry per StepKind the palette offers. Field names in `example` mirror
@@ -87,7 +96,7 @@ interface BlockCatalogEntry {
 }
 
 const BLOCK_CATALOG: Record<
-  'step' | 'for_each' | 'parallel' | 'panel' | 'branch' | 'approval_gate',
+  'step' | 'for_each' | 'parallel' | 'panel' | 'branch' | 'approval_gate' | 'split' | 'join',
   BlockCatalogEntry
 > = {
   step: {
@@ -136,6 +145,20 @@ const BLOCK_CATALOG: Record<
       'Every field on `approval:` is optional (including prompt: — the approval message shown to approvers) — only the block\'s presence is required.',
     requiredFields: [],
     example: '- id: ship_gate\n  approval:\n    prompt: "Approve to continue?"\n    timeout_seconds: 86400\n    on_timeout: reject',
+  },
+  split: {
+    kind: 'split',
+    label: 'split',
+    what: 'Fans the run out along explicit target step ids — every listed target runs; the split step itself carries no agent/action of its own.',
+    requiredFields: [],
+    example: '- id: fanout\n  split: [review_a, review_b]',
+  },
+  join: {
+    kind: 'join',
+    label: 'join',
+    what: 'A barrier: waits for its inbound edges per a wait policy (all / any / a count) before the run continues past it.',
+    requiredFields: [],
+    example: '- id: barrier\n  join:\n    wait: all',
   },
 };
 
@@ -326,7 +349,7 @@ export default function NodePalette({
   variant = 'float',
   tools,
 }: Props) {
-  const items = workflowEditorUi === 'next' ? [...ITEMS, BRANCH_ITEM, GATE_ITEM] : ITEMS;
+  const items = workflowEditorUi === 'next' ? [...ITEMS, BRANCH_ITEM, GATE_ITEM, SPLIT_ITEM, JOIN_ITEM] : ITEMS;
   // Connector cards are `next`-only (classic dock stays byte-stable).
   const connectorGroups = workflowEditorUi === 'next' && tools ? groupConnectors(tools) : [];
   const colors = useThemeColors();
@@ -420,37 +443,48 @@ export default function NodePalette({
           aria-label="Filter blocks and actions"
           className="wfx-palette-filter"
         />
-        <div className="wfx-palette-rail-grid">
-          {filteredItems.map((item) => {
-            const color = colors.get(KIND_ACCENT[item.kind]);
-            const isSelected = selected?.type === 'block' && selected.kind === item.kind;
-            return (
-              <button
-                key={item.kind}
-                type="button"
-                draggable={!disabled}
-                disabled={disabled}
-                onClick={() => setSelected({ type: 'block', kind: item.kind })}
-                onDragStart={handleDragStart(item.kind)}
-                aria-label={`Add ${item.label} node`}
-                aria-pressed={isSelected}
-                title={item.sub}
-                className={isSelected ? 'wfx-pcard wfx-pcard-selected' : 'wfx-pcard'}
-              >
-                {/* F1: the silhouette IS the kind icon here — no lucide glyph
-                    alongside it. At the rail's 3-col grid the two together
-                    left too little room for the label (e.g. `parallel` and
-                    `panel` both truncated to "pa…"); the shape is a strictly
-                    better kind signal than a 14px icon, so it stands alone.
-                    Connector-tool chips below have no shape and keep theirs. */}
-                <ShapePreview kind={item.kind} color={color} />
-                <div className="wfx-pcard-text">
-                  <div className="wfx-pl">{item.label}</div>
-                </div>
-              </button>
-            );
-          })}
-        </div>
+        {/* F1 (unchanged): the silhouette IS the kind icon here — no lucide
+            glyph alongside it (see the per-chip comment inside renderChip).
+            Task 6: chips are grouped by KIND_FAMILY into "Work" (a kind that
+            carries its own agent/action work) and "Orchestration" (a kind
+            that routes/gates/fans the run without doing any of its own) —
+            a light section, not a restructure: same chips, same grid, same
+            filter, just under a small heading per non-empty group. A group
+            with zero chips after filtering renders no heading at all. */}
+        {FAMILY_ORDER.map((family) => {
+          const famItems = filteredItems.filter((item) => KIND_FAMILY[item.kind] === family);
+          if (famItems.length === 0) return null;
+          return (
+            <div key={family} data-family={family} className="wfx-palette-family">
+              <div className="wfx-palette-family-label">{FAMILY_LABEL[family]}</div>
+              <div className="wfx-palette-rail-grid">
+                {famItems.map((item) => {
+                  const color = colors.get(KIND_ACCENT[item.kind]);
+                  const isSelected = selected?.type === 'block' && selected.kind === item.kind;
+                  return (
+                    <button
+                      key={item.kind}
+                      type="button"
+                      draggable={!disabled}
+                      disabled={disabled}
+                      onClick={() => setSelected({ type: 'block', kind: item.kind })}
+                      onDragStart={handleDragStart(item.kind)}
+                      aria-label={`Add ${item.label} node`}
+                      aria-pressed={isSelected}
+                      title={item.sub}
+                      className={isSelected ? 'wfx-pcard wfx-pcard-selected' : 'wfx-pcard'}
+                    >
+                      <ShapePreview kind={item.kind} color={color} />
+                      <div className="wfx-pcard-text">
+                        <div className="wfx-pl">{item.label}</div>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
         {filteredGroups.length > 0 && (
           <div className="wfx-palette-connectors">
             {filteredGroups.map((group) => {

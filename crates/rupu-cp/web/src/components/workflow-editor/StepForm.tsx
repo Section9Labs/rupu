@@ -99,10 +99,7 @@ const KIND_LABELS: Record<StepKind, string> = {
   branch: 'Branch (if)',
   approval_gate: 'Approval gate',
   action: 'Action',
-  // split/join (Phase 1 non-linear orchestration nodes). No dedicated form
-  // body exists yet for either (Task 5-7's call) — the label exists only to
-  // satisfy the exhaustive Record and keep the Kind <select> non-broken for
-  // a node that already has one of these kinds.
+  // split/join (Phase 1 non-linear orchestration nodes, Task 6).
   split: 'Split (fan-out)',
   join: 'Join (barrier)',
 };
@@ -169,6 +166,7 @@ export default function StepForm({
       base.approvalRequired = true;
       base.approvalOnReject = [];
     }
+    if (kind === 'split') base.split = [];
     onChange(base);
   }
 
@@ -249,14 +247,23 @@ export default function StepForm({
         <GateFields d={d} agents={agents} patch={patch} exprContext={exprContext} workflowEditorUi={workflowEditorUi} />
       )}
       {d.kind === 'action' && <ActionFields d={d} tools={tools} patch={patch} />}
+      {d.kind === 'split' && <SplitFields d={d} allNodeIds={allNodeIds} edges={edges} patch={patch} />}
+      {d.kind === 'join' && <JoinFields d={d} patch={patch} />}
 
       {/* ── common: when / continue_on_error / approval ─────────────── */}
-      {/* branch/panel/approval_gate hide this block: nodeToStepObject never reads
-         when/continue_on_error for branch/panel, and a gate owns its whole
-         approval block via GateFields (so the shared inline-approval checkbox
-         would double up). Action keeps the block (when/continue_on_error are
-         valid on an action step). */}
-      {d.kind !== 'panel' && d.kind !== 'branch' && d.kind !== 'approval_gate' && (
+      {/* branch/panel/approval_gate/split/join hide this block: nodeToStepObject
+         never reads when/continue_on_error for branch/panel/split/join, a gate
+         owns its whole approval block via GateFields (so the shared inline-
+         approval checkbox would double up), and an orchestration node (split/
+         join) carrying an inline `approval:` is rejected by the backend as
+         `OrchestrationNodeHasWork` (workflow.rs's `is_orch` check) — so the
+         "Require approval" control must never render for one. Action keeps
+         the block (when/continue_on_error are valid on an action step). */}
+      {d.kind !== 'panel' &&
+        d.kind !== 'branch' &&
+        d.kind !== 'approval_gate' &&
+        d.kind !== 'split' &&
+        d.kind !== 'join' && (
         <>
           <label className="block">
             <span className={labelCls}>When (optional)</span>
@@ -736,6 +743,131 @@ function BranchFields({
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+// ── split (fan-out orchestration node, Task 6) ───────────────────────────────
+
+function SplitFields({
+  d,
+  allNodeIds,
+  edges,
+  patch,
+}: {
+  d: StepNodeData;
+  allNodeIds: string[];
+  edges: GraphEdge[];
+  patch: (p: Partial<StepNodeData>) => void;
+}) {
+  const targets = d.split ?? [];
+  // Same candidate rule as BranchFields' then/else pickers: every other node
+  // is offered EXCEPT the split's own id and a target that would close a
+  // cycle back onto an upstream node — unless it's already selected, so an
+  // existing (possibly hand-authored, currently cyclic) selection stays
+  // uncheckable rather than disappearing from the list.
+  const candidates = allNodeIds.filter((id) => {
+    if (id === d.id) return false;
+    if (targets.includes(id)) return true;
+    const res = canConnect(d.id, id, { edges });
+    return !(!res.ok && res.kind === 'cycle');
+  });
+
+  function toggleTarget(id: string, on: boolean): void {
+    const set = new Set(targets);
+    if (on) set.add(id);
+    else set.delete(id);
+    patch({ split: [...set] });
+  }
+
+  return (
+    <div className="space-y-3">
+      <div>
+        <span className={labelCls}>Targets</span>
+        <p className="mb-1.5 text-note text-ink-mute">
+          Every checked step runs — a split carries no agent/action of its own.
+        </p>
+        <div className="space-y-1.5 rounded-md border border-border bg-surface p-2.5">
+          {candidates.length === 0 ? (
+            <p className="text-ui text-ink-mute">No other steps available.</p>
+          ) : (
+            candidates.map((id) => (
+              <label key={id} className={checkLabelCls}>
+                <input
+                  type="checkbox"
+                  checked={targets.includes(id)}
+                  onChange={(e) => toggleTarget(id, e.target.checked)}
+                  aria-label={`Split target ${id}`}
+                />
+                <span className="font-mono">{id}</span>
+              </label>
+            ))
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── join (barrier orchestration node, Task 6) ────────────────────────────────
+
+type JoinWaitMode = 'all' | 'any' | 'count';
+
+/** Which <select> option a `StepNodeData.joinWait` value corresponds to.
+ *  Unset (undefined) reads as 'all' — the backend's own `JoinWait` default
+ *  (see `Join`'s `#[serde(default)]` in workflow.rs), so the control shows
+ *  the policy that will actually apply rather than a blank/unset state. */
+function joinWaitMode(wait: StepNodeData['joinWait']): JoinWaitMode {
+  if (wait === 'any') return 'any';
+  if (typeof wait === 'object' && wait !== null) return 'count';
+  return 'all';
+}
+
+function JoinFields({ d, patch }: { d: StepNodeData; patch: (p: Partial<StepNodeData>) => void }) {
+  const mode = joinWaitMode(d.joinWait);
+  const count = typeof d.joinWait === 'object' && d.joinWait !== null ? d.joinWait.count : 1;
+
+  function setMode(next: JoinWaitMode): void {
+    if (next === 'all') patch({ joinWait: 'all' });
+    else if (next === 'any') patch({ joinWait: 'any' });
+    else patch({ joinWait: { count: count > 0 ? count : 1 } });
+  }
+
+  return (
+    <div className="space-y-3">
+      <p className="text-note text-ink-mute">
+        A join is a barrier: its inbound edges are derived from the graph, not authored here.
+      </p>
+      <label className="block">
+        <span className={labelCls}>Wait policy</span>
+        <select
+          value={mode}
+          onChange={(e) => setMode(e.target.value as JoinWaitMode)}
+          aria-label="Join wait policy"
+          className={fieldCls}
+        >
+          <option value="all">all — every inbound edge must complete</option>
+          <option value="any">any — the first inbound edge to complete continues the run</option>
+          <option value="count">count — a specific number of inbound edges must complete</option>
+        </select>
+      </label>
+
+      {mode === 'count' && (
+        <label className="block">
+          <span className={labelCls}>Count</span>
+          <input
+            type="number"
+            min={1}
+            value={count}
+            onChange={(e) => {
+              const n = parseNum(e.target.value);
+              patch({ joinWait: { count: n && n > 0 ? n : 1 } });
+            }}
+            aria-label="Join wait count"
+            className={fieldCls}
+          />
+        </label>
+      )}
     </div>
   );
 }
