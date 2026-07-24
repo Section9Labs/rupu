@@ -1785,6 +1785,9 @@ async fn fire_notify_hooks(
             distribute: None,
             host: None,
             workspace: None,
+            next: Vec::new(),
+            split: None,
+            join: None,
             action: Some(n.action.clone()),
             with: Some(n.with.clone()),
         };

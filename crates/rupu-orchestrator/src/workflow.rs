@@ -805,6 +805,41 @@ pub struct Distribute {
     pub hosts: Vec<String>,
 }
 
+/// Bare-keyword form of a join's wait policy (`wait: all` / `wait: any`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum JoinWaitKeyword {
+    All,
+    Any,
+}
+
+/// Join barrier policy (Phase 1 language; executed in Phase 2).
+///
+/// Parses all three authoring forms: `wait: all`, `wait: any`, and
+/// `wait: { count: <n> }`. `#[serde(untagged)]` tries `Keyword` (a bare
+/// string) before `Count` (a map with a `count:` key), so the two are
+/// unambiguous regardless of order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum JoinWait {
+    Keyword(JoinWaitKeyword),
+    Count { count: u32 },
+}
+impl Default for JoinWait {
+    fn default() -> Self {
+        JoinWait::Keyword(JoinWaitKeyword::All)
+    }
+}
+
+/// A join (barrier) orchestration node. Its inbound set is derived from the
+/// edges that point at it; it declares only the wait policy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Join {
+    #[serde(default)]
+    pub wait: JoinWait,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Step {
@@ -906,6 +941,18 @@ pub struct Step {
     /// on a remote step (`host:` or `distribute:`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceMode>,
+    /// Explicit successor edge(s). Empty in a legacy (edge-free) workflow,
+    /// where flow follows list order. Non-empty makes this an explicit graph.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub next: Vec<String>,
+    /// `split` orchestration node — fans the flow into N independent concurrent
+    /// tracks. Carries no agent/action/etc. (validated). Executed in Phase 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split: Option<Vec<String>>,
+    /// `join` (barrier) orchestration node — waits for its inbound paths per
+    /// `wait`. Carries no agent/etc. Executed in Phase 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<Join>,
     /// Connector action step (spec §3.2). Parse-level in Plan 1; execution in Plan 2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
@@ -1351,6 +1398,13 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
             });
         }
         validate_action_step(&step.id, action, step.with.as_ref())?;
+    } else if step.split.is_some() || step.join.is_some() {
+        // `split`/`join` orchestration nodes (Phase 1 language). No shape
+        // constraints enforced yet — they carry no agent/prompt of their
+        // own, but that (and everything else: arity, mutual exclusivity
+        // with other blocks, dangling `next:` targets) is Task 2's job.
+        // This arm exists solely so the catch-all "linear step" branch
+        // below doesn't reject them for missing `agent`/`prompt`.
     } else {
         // Linear / for_each step — agent + prompt are required.
         if step.agent.is_none() {
@@ -2280,5 +2334,99 @@ mod author_allowlist_tests {
         let wf = Workflow::parse(y).unwrap();
         let af = wf.autoflow.unwrap();
         assert_eq!(af.selector.on_skip, Some(SkipAction::LabelNeedsHuman));
+    }
+}
+
+#[cfg(test)]
+mod nonlinear_schema_tests {
+    use super::*;
+
+    #[test]
+    fn parses_next_split_join() {
+        let raw = r#"
+name: w
+steps:
+  - id: a
+    agent: x
+    prompt: p
+    next: [fan]
+  - id: fan
+    split: [b, c]
+  - id: b
+    agent: x
+    prompt: p
+    next: [gather]
+  - id: c
+    agent: x
+    prompt: p
+    next: [gather]
+  - id: gather
+    join: { wait: all }
+"#;
+        let wf = Workflow::parse(raw).expect("should parse");
+        let a = wf.steps.iter().find(|s| s.id == "a").unwrap();
+        assert_eq!(a.next, vec!["fan".to_string()]);
+        let fan = wf.steps.iter().find(|s| s.id == "fan").unwrap();
+        assert_eq!(
+            fan.split.as_deref(),
+            Some(&["b".to_string(), "c".to_string()][..])
+        );
+        let gather = wf.steps.iter().find(|s| s.id == "gather").unwrap();
+        assert!(matches!(
+            gather.join.as_ref().unwrap().wait,
+            JoinWait::Keyword(JoinWaitKeyword::All)
+        ));
+    }
+
+    #[test]
+    fn join_wait_count_and_any_parse() {
+        let any = Workflow::parse("name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: j\n    join: { wait: any }\n").unwrap();
+        assert!(matches!(
+            any.steps[1].join.as_ref().unwrap().wait,
+            JoinWait::Keyword(JoinWaitKeyword::Any)
+        ));
+        let cnt = Workflow::parse("name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: j\n    join: { wait: { count: 2 } }\n").unwrap();
+        assert!(matches!(
+            cnt.steps[1].join.as_ref().unwrap().wait,
+            JoinWait::Count { count: 2 }
+        ));
+    }
+
+    #[test]
+    fn join_wait_round_trips_all_three_forms() {
+        for (yaml_wait, expected) in [
+            ("all", JoinWait::Keyword(JoinWaitKeyword::All)),
+            ("any", JoinWait::Keyword(JoinWaitKeyword::Any)),
+        ] {
+            let raw = format!("name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: j\n    join: {{ wait: {yaml_wait} }}\n");
+            let wf = Workflow::parse(&raw).unwrap();
+            assert_eq!(wf.steps[1].join.as_ref().unwrap().wait, expected);
+            let out = serde_yaml::to_string(&wf).unwrap();
+            let wf2 = Workflow::parse(&out).unwrap();
+            assert_eq!(wf2.steps[1].join.as_ref().unwrap().wait, expected);
+        }
+
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: j\n    join: { wait: { count: 2 } }\n";
+        let wf = Workflow::parse(raw).unwrap();
+        assert_eq!(
+            wf.steps[1].join.as_ref().unwrap().wait,
+            JoinWait::Count { count: 2 }
+        );
+        let out = serde_yaml::to_string(&wf).unwrap();
+        let wf2 = Workflow::parse(&out).unwrap();
+        assert_eq!(
+            wf2.steps[1].join.as_ref().unwrap().wait,
+            JoinWait::Count { count: 2 }
+        );
+    }
+
+    #[test]
+    fn legacy_workflow_serializes_without_new_fields() {
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n";
+        let wf = Workflow::parse(raw).unwrap();
+        let out = serde_yaml::to_string(&wf).unwrap();
+        assert!(!out.contains("next"), "legacy step must not emit next:");
+        assert!(!out.contains("split"));
+        assert!(!out.contains("join"));
     }
 }
