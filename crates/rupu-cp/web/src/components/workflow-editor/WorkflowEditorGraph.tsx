@@ -38,7 +38,7 @@ import {
   type StepNodeData,
   type WorkflowGraph,
 } from '../../lib/workflowGraph';
-import { autoLayout, NODE_W } from '../../lib/workflowLayout';
+import { autoLayout, editorNodeSize, NODE_W } from '../../lib/workflowLayout';
 import { useThemeColors, type ThemeColors } from '../../lib/useThemeColors';
 import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 import type { ToolSpec } from '../../lib/api';
@@ -226,7 +226,7 @@ export function applyAddConnectedNext(
   const node: GraphNode = {
     id,
     data: newNodeData(id, kind),
-    position: { x: base.x + NODE_W + gap, y: base.y },
+    position: { x: base.x + (source ? editorNodeSize(source.data).width : NODE_W) + gap, y: base.y },
   };
   const nodes = [...graph.nodes, node];
   const edges = source

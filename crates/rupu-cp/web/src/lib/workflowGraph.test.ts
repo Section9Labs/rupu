@@ -948,4 +948,25 @@ describe('convertInlineApprovalToGate', () => {
     const gate = next.nodes.find((n) => n.data.kind === 'approval_gate');
     expect(gate?.id).toBe('ship-gate-1');
   });
+
+  it('shifts the agent step clear of the inserted gate, which is wider than a step', () => {
+    const g = yamlToGraph({
+      name: 'wf',
+      steps: [
+        {
+          id: 'ship',
+          agent: 'deployer',
+          prompt: 'deploy it',
+          approval: { required: true, prompt: 'ok to ship?' },
+        },
+      ],
+    });
+    const before = g.nodes.find((n) => n.id === 'ship')!.position.x;
+    const next = convertInlineApprovalToGate(g, 'ship');
+    const after = next.nodes.find((n) => n.id === 'ship')!.position.x;
+
+    // a gate is GATE_W (214) wide, not NODE_W (210) — at the old 274 the step
+    // landed 4px inside the gate it was making room for.
+    expect(after - before).toBe(278);
+  });
 });

@@ -1180,6 +1180,44 @@ describe('applyAddConnectedNext', () => {
   });
 });
 
+describe('applyAddConnectedNext placement', () => {
+  it('offsets by the SOURCE node width, so a wide container never overlaps its next node', () => {
+    const graph = {
+      nodes: [
+        {
+          id: 'fan',
+          data: {
+            id: 'fan',
+            kind: 'parallel' as const,
+            parallel: [{ id: 'a', agent: 'x', prompt: 'p' }],
+          },
+          position: { x: 100, y: 40 },
+        },
+      ],
+      edges: [],
+      settings: {},
+    } as unknown as Parameters<typeof applyAddConnectedNext>[0];
+
+    const { graph: next, id } = applyAddConnectedNext(graph, 'fan');
+    const added = next.nodes.find((n) => n.id === id)!;
+    // parallel is PARALLEL_W (220) wide, + the 64px gap — NOT NODE_W (210).
+    expect(added.position).toEqual({ x: 100 + 220 + 64, y: 40 });
+  });
+
+  it('still offsets a plain step by the step width', () => {
+    const graph = {
+      nodes: [
+        { id: 's', data: { id: 's', kind: 'step' as const, agent: 'a' }, position: { x: 0, y: 0 } },
+      ],
+      edges: [],
+      settings: {},
+    } as unknown as Parameters<typeof applyAddConnectedNext>[0];
+
+    const { graph: next, id } = applyAddConnectedNext(graph, 's');
+    expect(next.nodes.find((n) => n.id === id)!.position).toEqual({ x: 210 + 64, y: 0 });
+  });
+});
+
 describe('applyInsertOnEdge', () => {
   it('splits A->B into A->new and new->B', () => {
     const { graph, id } = applyInsertOnEdge(makeGraph(), 'a->b', 'step', { x: 5, y: 5 });

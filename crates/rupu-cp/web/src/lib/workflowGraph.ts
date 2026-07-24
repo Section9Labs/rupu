@@ -652,12 +652,14 @@ export function hasInlineApproval(d: StepNodeData): boolean {
   return (d.kind === 'step' || d.kind === 'for_each') && d.approvalRequired === true;
 }
 
-/** Node-box width + gap used to offset the new gate node so it doesn't render
- *  on top of the agent step before the next auto-layout/relayout. Mirrors
- *  `NODE_W` (210) + the `applyAddConnectedNext` gap (64) in workflowLayout /
+/** Horizontal shift applied to the agent step when a gate node is inserted
+ *  before it, so the two never overlap: the gate's own box width (`GATE_W`,
+ *  214) + the `applyAddConnectedNext` gap (64) in workflowLayout /
  *  WorkflowEditorGraph — duplicated as a literal rather than imported so this
- *  module stays framework/layout-free (see the file-header comment). */
-const CONVERT_GATE_X_OFFSET = 274;
+ *  module stays framework/layout-free (see the file-header comment). The gate
+ *  is a trapezoid and is WIDER than a plain step (210), which is why this is
+ *  not `NODE_W + gap`. */
+const CONVERT_GATE_X_OFFSET = 278;
 
 /** Rewrite `stepId`'s inline `approval:` into a NEW standalone `approval_gate`
  *  node inserted immediately before it: every edge that targeted `stepId` is
