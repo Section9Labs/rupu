@@ -40,6 +40,11 @@ const KIND_COLOR: Record<StepKind, string> = {
   // satisfy the exhaustive Record; the classic dock never renders them.
   approval_gate: '#a855f7',
   action: '#0ea5e9',
+  // split/join (Phase 1 non-linear orchestration) are not offered as palette
+  // cards yet (Task 5-7's call) — these hexes exist only to satisfy the
+  // exhaustive Record, same as gate/action above.
+  split: '#6366f1',
+  join: '#4338ca',
 };
 
 interface PaletteItem {

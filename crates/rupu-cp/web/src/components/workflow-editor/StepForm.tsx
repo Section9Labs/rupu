@@ -99,12 +99,18 @@ const KIND_LABELS: Record<StepKind, string> = {
   branch: 'Branch (if)',
   approval_gate: 'Approval gate',
   action: 'Action',
+  // split/join (Phase 1 non-linear orchestration nodes). No dedicated form
+  // body exists yet for either (Task 5-7's call) — the label exists only to
+  // satisfy the exhaustive Record and keep the Kind <select> non-broken for
+  // a node that already has one of these kinds.
+  split: 'Split (fan-out)',
+  join: 'Join (barrier)',
 };
 
 // Kinds offered in the Kind <select> only when the `next` flag is on — UNLESS
 // the node being edited is already that kind, in which case it must always be
 // selectable (an existing node stays fully editable regardless of the flag).
-const NEXT_ONLY_KINDS = new Set<StepKind>(['branch', 'approval_gate', 'action']);
+const NEXT_ONLY_KINDS = new Set<StepKind>(['branch', 'approval_gate', 'action', 'split', 'join']);
 
 export default function StepForm({
   node,
