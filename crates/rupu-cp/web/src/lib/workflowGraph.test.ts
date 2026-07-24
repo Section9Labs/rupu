@@ -607,6 +607,18 @@ describe('graphToWorkflowObject', () => {
   });
 });
 
+describe('nested passthrough', () => {
+  it.each([
+    ['panel', { name: 'w', steps: [{ id: 'p', panel: { panelists: ['r'], subject: 's', future_key: 42 } }] }, (s: any) => s.panel.future_key],
+    ['branch', { name: 'w', steps: [{ id: 'b', branch: { condition: 'x', future_key: 42 } }] }, (s: any) => s.branch.future_key],
+    ['approval', { name: 'w', steps: [{ id: 'g', approval: { required: true, future_key: 42 } }] }, (s: any) => s.approval.future_key],
+  ])('an unmodeled key under %s survives a round-trip', (_name, input, get) => {
+    const g = yamlToGraph(input as Record<string, unknown>);
+    const out = graphToWorkflowObject(g) as { obj: Record<string, unknown> };
+    expect(get((out.obj.steps as Record<string, unknown>[])[0])).toBe(42);
+  });
+});
+
 // ── canConnect ──────────────────────────────────────────────────────────────
 
 describe('canConnect', () => {
