@@ -29,6 +29,20 @@ export const NODE_H = 80;
 /** for_each carries an extra `for_each: <expr>` line. */
 export const FOR_EACH_H = 100;
 
+/** branch paints a diamond — taller, and narrower than a step because a
+ *  diamond's usable width collapses toward its tips (it shows only its
+ *  condition, which is all a branch has). */
+export const BRANCH_W = 200;
+export const BRANCH_H = 124;
+
+/** action (parallelogram) and approval_gate (trapezoid) both lose horizontal
+ *  room to slanted sides; the box grows so the text band stays step-sized. */
+export const ACTION_W = 214;
+export const GATE_W = 214;
+
+/** for_each (hexagon) loses room to its left/right points. Height unchanged. */
+export const FOR_EACH_W = 214;
+
 /** parallel container: header + N stacked sub-step rows. */
 export const PARALLEL_W = 220;
 export const PARALLEL_HEADER_H = 54;
@@ -56,8 +70,14 @@ export function editorNodeSize(d: StepNodeData): NodeBox {
     }
     case 'panel':
       return { width: PANEL_W, height: PANEL_BASE_H + (d.panel?.gate ? PANEL_GATE_H : 0) };
+    case 'branch':
+      return { width: BRANCH_W, height: BRANCH_H };
+    case 'action':
+      return { width: ACTION_W, height: NODE_H };
+    case 'approval_gate':
+      return { width: GATE_W, height: NODE_H };
     case 'for_each':
-      return { width: NODE_W, height: FOR_EACH_H };
+      return { width: FOR_EACH_W, height: FOR_EACH_H };
     default:
       return { width: NODE_W, height: NODE_H };
   }
