@@ -622,6 +622,28 @@ describe('StepForm — action body (Task 5)', () => {
     const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
     expect(last.with).toEqual({ title: 'Fix bug' });
   });
+
+  it('renders a typed (non-string) with: value in its field instead of blank (Task 2)', () => {
+    const spy = vi.fn();
+    const node = nodeWith({ kind: 'action', action: 'scm.prs.create', with: { count: 3 } });
+    render(
+      <StepForm node={node} agents={AGENTS} problems={[]} exprContext={EXPR} tools={TOOLS} onChange={spy} />,
+    );
+    // `count` isn't in the tool's schema but is preserved from `with:`, so its
+    // field still renders (fold-in behavior already covered elsewhere) showing
+    // the typed value's JSON text rather than blank.
+    expect(screen.getByLabelText('With count')).toHaveValue('3');
+  });
+
+  it('typing a JSON literal into a with: field stores it typed, not as a string (Task 2)', () => {
+    const spy = vi.fn();
+    render(<ActionHarness spy={spy} />);
+    fireEvent.change(screen.getByLabelText('Action tool'), { target: { value: 'scm.prs.create' } });
+    fireEvent.change(screen.getByLabelText('With title'), { target: { value: '3' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.with).toEqual({ title: 3 });
+    expect(typeof (last.with as Record<string, unknown>).title).toBe('number');
+  });
 });
 
 describe('StepForm — switchKind', () => {

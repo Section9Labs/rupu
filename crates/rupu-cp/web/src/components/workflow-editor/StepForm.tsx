@@ -21,6 +21,7 @@ import type { ExprContext } from '../../lib/workflowExpressions';
 import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 import ExpressionField from './ExpressionField';
 import { Button } from '../ui/Button';
+import { parseWithValue, formatWithValue } from '../../lib/withValue';
 
 /** Context for expression fields, minus the per-field gates StepForm derives. */
 type StepExprContext = Omit<ExprContext, 'isForEachPrompt' | 'isPanelField'>;
@@ -921,10 +922,11 @@ function ActionFields({
   // (so hand-authored / unknown-tool params stay editable and never dropped).
   const keys = [...new Set([...paramKeys, ...Object.keys(withObj)])];
 
-  function patchWith(key: string, value: string): void {
+  function patchWith(key: string, text: string): void {
     const next = { ...withObj };
-    if (value === '') delete next[key];
-    else next[key] = value;
+    const v = parseWithValue(text);
+    if (v === undefined) delete next[key];
+    else next[key] = v;
     patch({ with: next });
   }
 
@@ -960,7 +962,7 @@ function ActionFields({
                 <span className="mb-1 block text-note font-mono text-ink-dim">{key}</span>
                 <input
                   type="text"
-                  value={typeof withObj[key] === 'string' ? (withObj[key] as string) : ''}
+                  value={formatWithValue(withObj[key])}
                   onChange={(e) => patchWith(key, e.target.value)}
                   aria-label={`With ${key}`}
                   className={`${fieldCls} font-mono`}
