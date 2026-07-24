@@ -2,8 +2,9 @@
 // Each row is a project card that links to /projects/:wsId for the overview.
 
 import { useEffect, useState } from 'react';
-import { GitBranch, GitFork } from 'lucide-react';
+import { GitBranch, GitFork, Github, Gitlab, HardDrive, Server } from 'lucide-react';
 import { api, type ProjectRow } from '../lib/api';
+import { projectProvider, providerLabel, type ProjectProvider } from '../lib/projectProvider';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import UsageBarChart from '../components/charts/UsageBarChart';
 import { EmptyState } from '../components/ui/EmptyState';
@@ -108,7 +109,49 @@ function projectLastActive(p: ProjectRow): string | null | undefined {
   return p.last_active ?? p.last_run_at;
 }
 
+/** Leading-icon component for a project's SCM provider. Muted to fit the
+ *  instrument look; carries a `title`/`aria-label` so the row is identifiable
+ *  without relying on the glyph alone. */
+export function ProviderIcon({ remote }: { remote?: string | null }) {
+  const provider: ProjectProvider = projectProvider(remote);
+  const label = providerLabel(remote);
+  const Icon =
+    provider === 'github'
+      ? Github
+      : provider === 'gitlab'
+        ? Gitlab
+        : provider === 'local'
+          ? HardDrive
+          : Server;
+  return (
+    <span
+      className="inline-flex text-ink-dim"
+      title={label}
+      role="img"
+      aria-label={label}
+    >
+      <Icon size={30} />
+    </span>
+  );
+}
+
+// Sort ordering for the provider column (groups same-host projects together).
+const PROVIDER_ORDER: Record<ProjectProvider, number> = {
+  github: 0,
+  gitlab: 1,
+  remote: 2,
+  local: 3,
+};
+
 const PROJECT_COLUMNS: Column<ProjectRow>[] = [
+  {
+    key: 'provider',
+    header: 'Source',
+    fit: true,
+    sortable: true,
+    sortValue: (p) => PROVIDER_ORDER[projectProvider(p.repo_remote)],
+    render: (p) => <ProviderIcon remote={p.repo_remote} />,
+  },
   {
     key: 'name',
     header: 'Name',
