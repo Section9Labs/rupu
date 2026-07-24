@@ -560,6 +560,63 @@ describe('StepForm — approval gate body (Task 5)', () => {
     // remaining entry's own add-param field must be empty.
     expect(screen.getByLabelText('Notification 1 new param name')).toHaveValue('');
   });
+
+  it('an action-shaped on_reject row renders action fields and editing its id never injects agent/prompt (F.4)', () => {
+    const spy = vi.fn();
+    render(
+      <Harness
+        initial={nodeWith({
+          kind: 'approval_gate',
+          approvalRequired: true,
+          approvalOnReject: [{ id: 'cleanup', action: 'scm.prs.comment', with: { body: 'x' } }],
+        })}
+        spy={spy}
+      />,
+    );
+
+    // Renders action fields, NOT agent/prompt.
+    expect(screen.queryByLabelText('On-reject step 1 agent')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('On-reject step 1 prompt')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('On-reject step 1 action')).toHaveValue('scm.prs.comment');
+
+    fireEvent.change(screen.getByLabelText('On-reject step 1 id'), { target: { value: 'cleanup-renamed' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    const row = (last.approvalOnReject as Record<string, unknown>[])[0];
+    expect(row).toEqual({ id: 'cleanup-renamed', action: 'scm.prs.comment', with: { body: 'x' } });
+    expect(row).not.toHaveProperty('agent');
+    expect(row).not.toHaveProperty('prompt');
+  });
+
+  it('the on_reject kind toggle switches an agent row to action (dropping agent/prompt) and back (dropping action/with)', () => {
+    const spy = vi.fn();
+    render(
+      <Harness
+        initial={nodeWith({
+          kind: 'approval_gate',
+          approvalRequired: true,
+          approvalOnReject: [{ id: 'cleanup', agent: 'planner', prompt: 'clean up' }],
+        })}
+        spy={spy}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText('On-reject step 1 kind'), { target: { value: 'action' } });
+    let last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    let row = (last.approvalOnReject as Record<string, unknown>[])[0];
+    expect(row.id).toBe('cleanup');
+    expect(row).toHaveProperty('action');
+    expect(row).not.toHaveProperty('agent');
+    expect(row).not.toHaveProperty('prompt');
+
+    fireEvent.change(screen.getByLabelText('On-reject step 1 kind'), { target: { value: 'agent' } });
+    last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    row = (last.approvalOnReject as Record<string, unknown>[])[0];
+    expect(row.id).toBe('cleanup');
+    expect(row).toHaveProperty('agent');
+    expect(row).toHaveProperty('prompt');
+    expect(row).not.toHaveProperty('action');
+    expect(row).not.toHaveProperty('with');
+  });
 });
 
 describe('StepForm — Convert to gate node button (Task 6)', () => {

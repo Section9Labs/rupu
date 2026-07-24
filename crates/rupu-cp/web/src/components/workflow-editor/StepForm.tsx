@@ -819,8 +819,45 @@ function GateFields({
   function setOnReject(next: Record<string, unknown>[]): void {
     patch({ approvalOnReject: next });
   }
+  // An on_reject entry is a raw step record that's either agent-shaped
+  // (`{id, agent, prompt}`) or action-shaped (`{id, action, with}`) — the
+  // backend rejects an entry carrying both (`ActionMutuallyExclusive`, P0.5 /
+  // rejection-risk F.4). Detect shape off the `action` key so every row edit
+  // (including a bare id edit) stays scoped to its own shape's fields.
+  function isActionShapedReject(rec: Record<string, unknown>): boolean {
+    return 'action' in rec;
+  }
+  // Belt-and-suspenders on top of kind-aware rendering below (which only ever
+  // calls this with same-shape fields): strip whichever shape's fields DON'T
+  // belong to this row before merging, so an update can never inject the
+  // other shape's keys onto a row.
   function updateReject(i: number, p: Record<string, unknown>): void {
-    setOnReject(onReject.map((s, j) => (j === i ? { ...s, ...p } : s)));
+    setOnReject(
+      onReject.map((s, j) => {
+        if (j !== i) return s;
+        const safe = { ...p };
+        if (isActionShapedReject(s)) {
+          delete safe.agent;
+          delete safe.prompt;
+        } else {
+          delete safe.action;
+          delete safe.with;
+        }
+        return { ...s, ...safe };
+      }),
+    );
+  }
+  /** Switch a row's shape wholesale — keeps `id`, drops the other shape's
+   *  fields entirely (never merges across shapes) and seeds the target
+   *  shape's required fields so it renders/round-trips cleanly. */
+  function switchRejectKind(i: number, kind: 'agent' | 'action'): void {
+    setOnReject(
+      onReject.map((s, j) => {
+        if (j !== i) return s;
+        const id = recStr(s, 'id');
+        return kind === 'action' ? { id, action: '', with: {} } : { id, agent: '', prompt: '' };
+      }),
+    );
   }
   function addReject(): void {
     idState.current.reject = [...idState.current.reject, nextRowId()];
@@ -915,43 +952,80 @@ function GateFields({
       <div>
         <span className={labelCls}>On reject (cleanup steps)</span>
         <div className="space-y-3">
-          {onReject.map((s, i) => (
-            <div key={idState.current.reject[i]} className="space-y-2 rounded-md border border-border bg-surface p-2.5">
-              <div className="flex items-center gap-2">
-                <input
-                  type="text"
-                  value={recStr(s, 'id')}
-                  onChange={(e) => updateReject(i, { id: e.target.value })}
-                  aria-label={`On-reject step ${i + 1} id`}
-                  placeholder="id"
-                  className={`${fieldCls} font-mono`}
-                />
-                <Button
-                  variant="danger-outline"
-                  onClick={() => removeReject(i)}
-                  aria-label={`Remove on-reject step ${i + 1}`}
-                  className="shrink-0 px-2.5"
-                >
-                  Remove
-                </Button>
+          {onReject.map((s, i) => {
+            const isAction = isActionShapedReject(s);
+            const withObj = isAction ? ((s.with as Record<string, unknown> | undefined) ?? {}) : {};
+            return (
+              <div key={idState.current.reject[i]} className="space-y-2 rounded-md border border-border bg-surface p-2.5">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={recStr(s, 'id')}
+                    onChange={(e) => updateReject(i, { id: e.target.value })}
+                    aria-label={`On-reject step ${i + 1} id`}
+                    placeholder="id"
+                    className={`${fieldCls} font-mono`}
+                  />
+                  <select
+                    value={isAction ? 'action' : 'agent'}
+                    onChange={(e) => switchRejectKind(i, e.target.value as 'agent' | 'action')}
+                    aria-label={`On-reject step ${i + 1} kind`}
+                    className={`${fieldCls} shrink-0 w-auto`}
+                  >
+                    <option value="agent">agent</option>
+                    <option value="action">action</option>
+                  </select>
+                  <Button
+                    variant="danger-outline"
+                    onClick={() => removeReject(i)}
+                    aria-label={`Remove on-reject step ${i + 1}`}
+                    className="shrink-0 px-2.5"
+                  >
+                    Remove
+                  </Button>
+                </div>
+                {isAction ? (
+                  <>
+                    <input
+                      type="text"
+                      value={recStr(s, 'action')}
+                      onChange={(e) => updateReject(i, { action: e.target.value })}
+                      aria-label={`On-reject step ${i + 1} action`}
+                      placeholder="action"
+                      className={`${fieldCls} font-mono`}
+                    />
+                    <WithParamsEditor
+                      value={withObj}
+                      onChange={(next) => updateReject(i, { with: next })}
+                      keys={Object.keys(withObj)}
+                      ariaLabel={(key) => `On-reject step ${i + 1} with ${key}`}
+                      emptyMessage="No parameters."
+                      allowAddKey
+                      addKeyAriaLabel={`On-reject step ${i + 1} new param name`}
+                    />
+                  </>
+                ) : (
+                  <>
+                    <AgentSelect
+                      value={recStr(s, 'agent') || undefined}
+                      agents={agents}
+                      ariaLabel={`On-reject step ${i + 1} agent`}
+                      onChange={(v) => updateReject(i, { agent: v ?? '' })}
+                    />
+                    <ExpressionField
+                      value={recStr(s, 'prompt')}
+                      onChange={(v) => updateReject(i, { prompt: v })}
+                      context={fieldCtx(exprContext, {})}
+                      multiline
+                      ariaLabel={`On-reject step ${i + 1} prompt`}
+                      placeholder="prompt"
+                      size={workflowEditorUi === 'next' ? 'large' : undefined}
+                    />
+                  </>
+                )}
               </div>
-              <AgentSelect
-                value={recStr(s, 'agent') || undefined}
-                agents={agents}
-                ariaLabel={`On-reject step ${i + 1} agent`}
-                onChange={(v) => updateReject(i, { agent: v ?? '' })}
-              />
-              <ExpressionField
-                value={recStr(s, 'prompt')}
-                onChange={(v) => updateReject(i, { prompt: v })}
-                context={fieldCtx(exprContext, {})}
-                multiline
-                ariaLabel={`On-reject step ${i + 1} prompt`}
-                placeholder="prompt"
-                size={workflowEditorUi === 'next' ? 'large' : undefined}
-              />
-            </div>
-          ))}
+            );
+          })}
         </div>
         <button
           type="button"
