@@ -1,7 +1,7 @@
 // nodeShapes — pure silhouette geometry for the Flow Designer's `next` nodes.
 //
 // Each node KIND paints a flowchart symbol (see kindVisuals.KIND_SHAPE):
-// step→rect, branch→diamond, action→parallelogram, approval_gate→trapezoid,
+// step→rect, branch→vhex, action→parallelogram, approval_gate→trapezoid,
 // for_each→hexagon, parallel→subroutine, panel→stacked. This module owns the
 // geometry only — no React, no DOM, no colour. The component paints `path`
 // (plus `extra`) into an SVG layer and positions its content inside `safe`.
@@ -11,7 +11,7 @@
 //     overrun the outline (truncation is bounded by the safe rect, not the
 //     bounding box).
 //  2. `align` is part of the shape. A silhouette whose width varies across the
-//     text band (the diamond) CENTRES its content — left-aligned text there
+//     text band (the vhex) CENTRES its content — left-aligned text there
 //     starts on the slope and reads as spilling outside the outline.
 
 /** Stroke inset, in px — keeps the 1.5px silhouette stroke off the box edge so
@@ -25,6 +25,13 @@ const SHEAR = 20;
 const TAPER = 26;
 /** How far a hexagon's left/right points reach in from the box edge. */
 const POINT = 22;
+/** How far a vhex's top/bottom points reach in from the box edge — the same
+ *  role as `POINT`, rotated 90°: `POINT` insets the hexagon's flat top/bottom
+ *  edge from the LEFT/RIGHT box edges; `Q` insets the vhex's flat left/right
+ *  edge from the TOP/BOTTOM box edges. Same self-intersection risk, so it
+ *  goes through the same `clampInset`/`EDGE_CLAMP_FRACTION` treatment, just
+ *  against `h` instead of `w`. */
+const Q = 22;
 /** Inset of a subroutine's two vertical rails from the box edge. */
 const RAIL = 11;
 /** Offset of a stacked shape's layers behind its body. */
@@ -32,7 +39,7 @@ const LAYER = 9;
 
 export type ShapeName =
   | 'rect'
-  | 'diamond'
+  | 'vhex'
   | 'parallelogram'
   | 'trapezoid'
   | 'hexagon'
@@ -175,33 +182,36 @@ export function shapeFor(shape: ShapeName, w: number, h: number): NodeShape {
   const base = { align: 'start', target: LEFT_TARGET, sources: RIGHT_SOURCE } as const;
 
   switch (shape) {
-    case 'diamond': {
+    case 'vhex': {
+      // A vertical hexagon: points on the TOP/BOTTOM (a "decision" shape),
+      // distinct from `hexagon`'s points on the LEFT/RIGHT (`for_each`). It
+      // is `hexagon`'s geometry rotated 90°: `Q` (vertical) plays the role
+      // `POINT` (horizontal) plays there, so it gets the same clamp against
+      // the axis it cuts into from both ends — here `h`, not `w`.
+      const q = clampInset(Q, h, EDGE_CLAMP_FRACTION);
       const points: [number, number][] = [
+        [I, q],
         [w / 2, I],
-        [w - I, h / 2],
+        [w - I, q],
+        [w - I, h - q],
         [w / 2, h - I],
-        [I, h / 2],
+        [I, h - q],
       ];
       return {
         points,
         path: toPath(points),
         extra: [],
-        // inscribed at the band's narrowest rows (y = .28h and .72h). At
-        // vertical offset f*h from the top/bottom tip, a diamond's half-width
-        // is exactly f*w (the boundary edge is a straight line from the tip),
-        // so the safe rect's half-width (0.25w here) must stay under f*w
-        // (0.28w) — an 0.03w margin, ~8px at BRANCH_W/BRANCH_H (see
-        // workflowLayout.ts). Measured against BranchBodyNext's real rendered
-        // content in headless Chrome: header (kindpill + id) + condition line
-        // + two then/else port pills (which wrap to two rows for any
-        // realistic target name) stack to ~75px tall and, once `.wfx-head`/
-        // `.wfx-body` are given `align-self: stretch` under `.wfx-safe-mid`
-        // (styles.css) so their own ellipsis engages, a realistic body's
-        // widest row (a port pill, ~95-100px) fits with comfortable slack in
-        // this 140px-wide band — the condition line still ellipsizes for long
-        // conditions, by design (nodeShapes.test.ts's point-in-polygon test
-        // pins these fractions independent of BRANCH_W/BRANCH_H).
-        safe: { x: w * 0.25, y: h * 0.28, w: w * 0.5, h: h * 0.44 },
+        // The flat band ([q, h-q]) is exactly where the shape reaches full
+        // width — the top/bottom tip triangles converge to the box's full
+        // width AT y=q/y=h-q, not past it, so the safe rect's y/h can use
+        // that band directly with no extra vertical margin needed (unlike a
+        // diamond, whose width shrinks continuously toward its tips). Only
+        // the horizontal pad is tunable: ~11px in from each flat side, giving
+        // an 11px clearance to the outline — comfortable slack for a
+        // realistic branch body (kindpill+id header, `if <condition>` line,
+        // true/false port pills) at BRANCH_W/BRANCH_H (see workflowLayout.ts),
+        // measured in headless Chrome.
+        safe: { x: I + 11, y: q, w: w - 2 * I - 22, h: h - 2 * q },
         align: 'center',
         target: LEFT_TARGET,
         sources: [

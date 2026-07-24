@@ -338,8 +338,8 @@ describe('EditableStepNode', () => {
         );
         const brSafe = br.querySelector('.wfx-safe') as HTMLElement;
         expect(brSafe.className).toContain('wfx-safe-mid');
-        // 280 * 0.25 = 70
-        expect(brSafe.style.left).toBe('70px');
+        // I (2) + 11 = 13 — see the `vhex` case in nodeShapes.ts.
+        expect(brSafe.style.left).toBe('13px');
       });
 
       it('strokes the silhouette with the kind accent when selected', () => {
@@ -386,7 +386,7 @@ describe('EditableStepNode', () => {
         expect(node.style.borderColor).toBe('');
       });
 
-      it('anchors a branch on its diamond vertices — then right, else bottom', () => {
+      it('anchors a branch on its vhex outline — then right, else bottom', () => {
         const { container } = renderNode(
           { id: 'route', kind: 'branch', condition: 'x == 1' },
           [],
@@ -401,8 +401,9 @@ describe('EditableStepNode', () => {
         expect(handles).toEqual([
           { type: 'target', position: 'left', id: '' },
           { type: 'source', position: 'right', id: 'then' },
-          // else drops to the BOTTOM vertex — at the old top:68% it floated
-          // mid-slope, visibly detached from the diamond's outline.
+          // else drops to the BOTTOM point vertex — at the old top:68% it
+          // floated mid-slope, visibly detached from the diamond this shape
+          // replaced.
           { type: 'source', position: 'bottom', id: 'else' },
         ]);
       });

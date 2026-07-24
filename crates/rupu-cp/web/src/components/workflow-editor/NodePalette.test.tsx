@@ -383,11 +383,11 @@ describe('NodePalette', () => {
       const shape = branchChip?.querySelector('.wfx-pshape');
       expect(shape).toBeInTheDocument();
       expect(shape?.tagName.toLowerCase()).toBe('svg');
-      // a diamond: four vertices, no curves
+      // a vhex: six vertices, no curves
       const d = shape?.querySelector('path')?.getAttribute('d') ?? '';
       expect(d).toMatch(/^M /);
       expect(d).not.toContain('Q');
-      expect(d.match(/L/g) ?? []).toHaveLength(3);
+      expect(d.match(/L/g) ?? []).toHaveLength(5);
 
       // a step chip previews the rounded rect instead
       const stepD = container

@@ -82,7 +82,7 @@ function isSimplePolygon(points: [number, number][]): boolean {
 
 const ALL: ShapeName[] = [
   'rect',
-  'diamond',
+  'vhex',
   'parallelogram',
   'trapezoid',
   'hexagon',
@@ -111,41 +111,46 @@ describe('shapeFor', () => {
     expect(s.path.trimEnd().endsWith('Z')).toBe(true);
   });
 
-  it('a diamond has its four vertices at the box mid-points', () => {
-    const s = shapeFor('diamond', 200, 124);
+  it('a vhex has its six vertices at the top/bottom points and the flat left/right sides', () => {
+    const s = shapeFor('vhex', 200, 124);
     expect(s.points).toEqual([
+      [2, 22],
       [100, 2],
-      [198, 62],
+      [198, 22],
+      [198, 102],
       [100, 122],
-      [2, 62],
+      [2, 102],
     ]);
   });
 
-  it('a diamond centres its text — every other shape aligns to the start', () => {
-    expect(shapeFor('diamond', 200, 124).align).toBe('center');
-    for (const name of ALL.filter((n) => n !== 'diamond')) {
+  it('a vhex centres its text — every other shape aligns to the start', () => {
+    expect(shapeFor('vhex', 200, 124).align).toBe('center');
+    for (const name of ALL.filter((n) => n !== 'vhex')) {
       expect(shapeFor(name, 220, 130).align, name).toBe('start');
     }
   });
 
-  it('a diamond anchors then on the right vertex and else on the bottom vertex', () => {
-    const s = shapeFor('diamond', 200, 124);
+  it('a vhex anchors then on the right flat edge and else on the bottom point', () => {
+    const s = shapeFor('vhex', 200, 124);
     expect(s.target).toEqual({ side: 'left', offset: '50%' });
     expect(s.sources).toEqual([
       { id: 'then', anchor: { side: 'right', offset: '50%' } },
       { id: 'else', anchor: { side: 'bottom', offset: '50%' } },
     ]);
-    // both anchor points are real vertices of the polygon, not mid-slope
-    expect(s.points).toContainEqual([198, 62]); // right vertex  == then
-    expect(s.points).toContainEqual([100, 122]); // bottom vertex == else
+    // else lands on the bottom tip — a real vertex of the polygon.
+    expect(s.points).toContainEqual([100, 122]); // bottom point == else
+    // then lands mid-way down the right flat edge (a vertical run between
+    // the shape's two right vertices), which the flat edge covers entirely.
+    expect(s.points).toContainEqual([198, 22]);
+    expect(s.points).toContainEqual([198, 102]);
   });
 
-  it('every non-diamond shape has one unlabelled source on the right edge', () => {
+  it('every non-vhex shape has one unlabelled source on the right edge', () => {
     // `inset` (F3) varies per shape — parallelogram/trapezoid/stacked pull
     // their anchors in from the box edge to stay on their slanted/narrowed
     // boundary (see the dedicated outline test below); side/offset stay
     // uniform across every shape regardless.
-    for (const name of ALL.filter((n) => n !== 'diamond')) {
+    for (const name of ALL.filter((n) => n !== 'vhex')) {
       const s = shapeFor(name, 220, 130);
       expect(s.target, name).toMatchObject({ side: 'left', offset: '50%' });
       expect(s.sources, name).toHaveLength(1);
@@ -154,7 +159,7 @@ describe('shapeFor', () => {
   });
 
   it('parallelogram/trapezoid/stacked pull their anchors in from the box edge; the rest stay flush', () => {
-    const flush = ALL.filter((n) => !['diamond', 'parallelogram', 'trapezoid', 'stacked'].includes(n));
+    const flush = ALL.filter((n) => !['vhex', 'parallelogram', 'trapezoid', 'stacked'].includes(n));
     for (const name of flush) {
       const s = shapeFor(name, 220, 130);
       expect(s.target.inset ?? 0, name).toBe(0);
@@ -237,8 +242,8 @@ describe('shapeFor', () => {
   // inset from each side (`POINT`/`TAPER`); at the palette's 34x20 box, a
   // 15px inset (the mathematically tightest simplicity bound, k=0.5) leaves
   // only a 4px flat edge, which AA blur erases at the true 24x14 CSS chip
-  // size — the hexagon then reads as a plain diamond (branch) and the
-  // trapezoid as a plain triangle, silently colliding two kinds' symbols.
+  // size — the hexagon then reads as a plain diamond and the trapezoid as a
+  // plain triangle, degenerate shapes that no longer read as their symbol.
   // Assert the flat top edge is at least a third of the box width, derived
   // straight from `points` (not a hardcoded pixel count), so this stays
   // correct if the preview box size ever changes. This must fail at k=0.5
@@ -305,7 +310,10 @@ describe('shapeFor', () => {
   // ~11px, trapezoid ~14px, stacked's right edge ~11px at real node sizes).
   const EPSILON = 3;
 
-  it.each(ALL.filter((n) => n !== 'diamond'))(
+  // vhex's then/else placement (right flat edge / bottom point) is approved
+  // design and, unlike the diamond it replaces, resolves onto the outline the
+  // same way every other shape's anchors do — no exclusion needed here.
+  it.each(ALL)(
     '%s: target + source anchors resolve onto the silhouette outline',
     (name) => {
       const s = shapeFor(name, 220, 130);
@@ -313,24 +321,11 @@ describe('shapeFor', () => {
       for (const a of anchors) {
         const pt = resolveAnchor(a, 220, 130);
         const dist = distToPolygon(pt, s.points);
-        expect(dist, `${name} anchor ${JSON.stringify(a)} is ${dist.toFixed(1)}px off the outline`).toBeLessThanOrEqual(
-          EPSILON,
-        );
+        expect(
+          dist,
+          `${name} anchor ${JSON.stringify(a)} is ${dist.toFixed(1)}px off the outline`,
+        ).toBeLessThanOrEqual(EPSILON);
       }
     },
   );
-
-  // diamond's then/else placement (right vertex / bottom vertex) is approved
-  // design, not a geometry bug — checked separately, never touched by F3.
-  it('diamond: then/else anchors resolve onto the silhouette outline (unchanged)', () => {
-    const s = shapeFor('diamond', 220, 130);
-    const anchors = [s.target, ...s.sources.map((src) => src.anchor)];
-    for (const a of anchors) {
-      const pt = resolveAnchor(a, 220, 130);
-      const dist = distToPolygon(pt, s.points);
-      expect(dist, `diamond anchor ${JSON.stringify(a)} is ${dist.toFixed(1)}px off the outline`).toBeLessThanOrEqual(
-        EPSILON,
-      );
-    }
-  });
 });

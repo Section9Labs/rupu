@@ -405,7 +405,7 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
 
         {/* Content lives in the shape's safe rect, inscribed at the silhouette's
             narrowest row — truncation is bounded by THIS box, not the bounding
-            box. `align` is part of the shape: a diamond centres, because
+            box. `align` is part of the shape: a vhex (branch) centres, because
             left-aligned text there starts on the slope and reads as spilling
             outside the outline. */}
         <div
