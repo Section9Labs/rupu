@@ -7,12 +7,14 @@
 import { lazy, Suspense, useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, Trash2 } from 'lucide-react';
+import yaml from 'js-yaml';
 import { api, ApiError, type AgentSummary, type WorkflowDetail } from '../lib/api';
 import { ScopeChip } from '../components/ScopeChip';
 import LauncherSheet from '../components/LauncherSheet';
 import { Button } from '../components/ui/Button';
 import { Spinner } from '../components/ui/Spinner';
 import { useWorkflowEditorUi } from '../hooks/useWorkflowEditorUi';
+import { yamlToGraph, validateGraph } from '../lib/workflowGraph';
 
 // Lazy so the @xyflow/react canvas + CodeMirror (and the rest of the visual
 // editor) stay out of the main bundle — only fetched once the page mounts.
@@ -156,6 +158,27 @@ export default function WorkflowDetailPage() {
     }
     let cancelled = false;
     const t = setTimeout(() => {
+      // Client-side structural gate first: while the graph is mid-edit (a
+      // fresh branch with no condition, a panel with no panelists, a sub-step
+      // with no agent, …) the backend parser would reject the draft with a
+      // 400 on every debounce tick. Show the incompleteness inline instead of
+      // flooding the server; only POST once the graph is structurally clean
+      // (the server still catches things only it can — action catalog,
+      // cross-refs — once we get there).
+      let loaded: unknown;
+      try {
+        loaded = yaml.load(draftYaml);
+      } catch {
+        setValidity({ ok: false, error: 'YAML does not parse yet.' });
+        return;
+      }
+      if (typeof loaded !== 'object' || loaded === null) return;
+      const problems = validateGraph(yamlToGraph(loaded as Record<string, unknown>));
+      const count = Object.values(problems).reduce((a, l) => a + l.length, 0);
+      if (count > 0) {
+        setValidity({ ok: false, error: `${count} unfinished ${count === 1 ? 'field' : 'fields'}` });
+        return;
+      }
       api
         .validateWorkflow(draftYaml)
         .then((r) => {

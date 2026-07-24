@@ -242,4 +242,43 @@ describe('WorkflowDetail', () => {
     expect(screen.queryByRole('button', { name: 'Disable nightly' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Resume nightly' })).not.toBeInTheDocument();
   });
+
+  // ── Client-side gate on the server /validate POST ────────────────────────
+  // A structurally incomplete draft (branch with no condition, step with no
+  // agent/prompt, etc.) must never reach the server — the backend parser 400s
+  // on it, and re-triggering that on every keystroke floods the console. The
+  // client runs `validateGraph(yamlToGraph(...))` first and only POSTs once
+  // the graph is structurally clean.
+
+  const INCOMPLETE_BRANCH_YAML = 'name: w\nsteps:\n  - id: b\n    branch: {}\n';
+  const COMPLETE_STEP_YAML = 'name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n';
+
+  it('does not POST to /validate while a node is structurally incomplete', async () => {
+    vi.spyOn(api, 'getWorkflow').mockResolvedValue({
+      workflow: { name: 'w', steps: [] },
+      yaml: INCOMPLETE_BRANCH_YAML,
+    });
+    const spy = vi.spyOn(api, 'validateWorkflow');
+    renderPage();
+
+    await screen.findByTestId('stub-editor');
+    // Give the 400ms debounce time to fire, then assert it never called out.
+    await new Promise((r) => setTimeout(r, 600));
+    expect(spy).not.toHaveBeenCalled();
+    // The inline client-side reason renders instead of a server error.
+    expect(await screen.findByText(/unfinished/i)).toBeInTheDocument();
+  });
+
+  it('DOES POST once the graph is structurally complete', async () => {
+    vi.spyOn(api, 'getWorkflow').mockResolvedValue({
+      workflow: { name: 'w', steps: [{ id: 'a', agent: 'x', prompt: 'p' }] },
+      yaml: COMPLETE_STEP_YAML,
+    });
+    const spy = vi.spyOn(api, 'validateWorkflow').mockResolvedValue({ ok: true });
+    renderPage();
+
+    await screen.findByTestId('stub-editor');
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+    expect(spy).toHaveBeenCalledWith(COMPLETE_STEP_YAML);
+  });
 });
