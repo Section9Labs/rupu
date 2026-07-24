@@ -17,7 +17,8 @@ import { hasInlineApproval, type GraphNode, type StepKind, type StepNodeData } f
 import { editorNodeSize } from '../../../lib/workflowLayout';
 import { useThemeColors, type ThemeColors } from '../../../lib/useThemeColors';
 import type { WorkflowEditorUi } from '../../../hooks/useWorkflowEditorUi';
-import { KIND_ACCENT, KIND_ICON } from '../kindVisuals';
+import { KIND_ACCENT, KIND_ICON, KIND_SHAPE } from '../kindVisuals';
+import { shapeFor } from '../nodeShapes';
 
 // Node data carried on the xyflow node. Exported so WorkflowEditorGraph projects
 // the exact same shape when it derives the flow `nodes`.
@@ -323,32 +324,59 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
   // markup below stays byte-identical. Same data (`d`/`colors`/`box`/handles),
   // new `.wfx-*` classes only.
   if (ui === 'next') {
-    // Selection ring/glow computed from the SAME kind accent as the border —
-    // one coherent color signal instead of accent-border + brand-purple ring.
-    const selBoxShadow = selected
-      ? `0 0 0 2px ${colors.alpha(KIND_ACCENT[d.kind], 0.3)}, 0 6px 20px ${colors.alpha(KIND_ACCENT[d.kind], 0.14)}`
-      : undefined;
+    const shape = shapeFor(KIND_SHAPE[d.kind], box.width, box.height);
+    const stroke = selected ? color : 'rgb(var(--c-border))';
     return (
       <div
         data-ui={ui}
         className="wfx-node"
-        style={{
-          borderColor: selected ? color : undefined,
-          boxShadow: selBoxShadow,
-          width: box.width,
-          minHeight: box.height,
-        }}
+        style={{ width: box.width, minHeight: box.height }}
       >
         <Handle type="target" position={Position.Left} style={handleStyle} />
 
-        {/* .wfx-clip clips the bar/head/body to the card's radius — a 3px-tall
-            absolutely-positioned bar can't hold its own 12px corner radius, so
-            it must be clipped by an ancestor instead of rounding itself.
-            Handles stay OUTSIDE the clip (siblings, on the card border). */}
-        <div className="wfx-clip">
-          {/* colored top-bar — by KIND (no run-state) */}
-          <div className="wfx-bar" style={{ background: color }} />
+        {/* The silhouette is painted in SVG rather than clipped with
+            `clip-path`: a clip slices the 1px border at the clip boundary and
+            cannot clip an outward selection glow, and it would leave the empty
+            corners outside the shape still catching drags. The path is also
+            the pointer target (see .wfx-sil in styles.css), so a diamond stops
+            being grabbable in its corners. */}
+        <svg className="wfx-sil" viewBox={`0 0 ${box.width} ${box.height}`} aria-hidden>
+          {selected && (
+            <path
+              d={shape.path}
+              fill="none"
+              stroke={color}
+              strokeWidth={5}
+              strokeLinejoin="round"
+              opacity={0.25}
+            />
+          )}
+          {shape.extra.map((d2, i) => (
+            <path key={i} d={d2} fill="none" stroke="rgb(var(--c-border))" strokeWidth={1.5} />
+          ))}
+          <path
+            d={shape.path}
+            fill="rgb(var(--c-panel))"
+            stroke={stroke}
+            strokeWidth={1.5}
+            strokeLinejoin="round"
+          />
+        </svg>
 
+        {/* Content lives in the shape's safe rect, inscribed at the silhouette's
+            narrowest row — truncation is bounded by THIS box, not the bounding
+            box. `align` is part of the shape: a diamond centres, because
+            left-aligned text there starts on the slope and reads as spilling
+            outside the outline. */}
+        <div
+          className={shape.align === 'center' ? 'wfx-safe wfx-safe-mid' : 'wfx-safe'}
+          style={{
+            left: shape.safe.x,
+            top: shape.safe.y,
+            width: shape.safe.w,
+            minHeight: shape.safe.h,
+          }}
+        >
           <div className="wfx-head">
             <span className="wfx-kindpill" style={kindChipStyle(colors, d.kind)}>
               <KindIcon className="wfx-kindicon" size={12} strokeWidth={2} aria-hidden />
@@ -377,8 +405,6 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
           </div>
         </div>
 
-        {/* branch nodes get TWO labeled source handles (one per arm) instead of
-            the single default source handle every other kind uses. */}
         {d.kind === 'branch' ? (
           <>
             <Handle
