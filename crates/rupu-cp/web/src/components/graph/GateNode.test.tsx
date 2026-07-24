@@ -21,8 +21,8 @@ function renderGate(props: NodeProps<GateFlowNode>) {
   );
 }
 
-function makeProps(node: GraphNode): NodeProps<GateFlowNode> {
-  const data: GateNodeData = { node };
+function makeProps(node: GraphNode, ui?: 'classic' | 'next'): NodeProps<GateFlowNode> {
+  const data: GateNodeData = { node, ui };
   return {
     id: node.id,
     data,
@@ -89,5 +89,12 @@ describe('GateNode', () => {
     const failed: GraphNode = { id: 'approve', kind: 'gate', state: 'failed' };
     renderGate(makeProps(failed));
     expect(screen.getByText('failed')).toBeInTheDocument();
+  });
+
+  it('next: renders a kind pill alongside the existing status treatment', () => {
+    const node: GraphNode = { id: 'approve', kind: 'gate', state: 'awaiting_approval' };
+    renderGate(makeProps(node, 'next'));
+    expect(screen.getByTestId('rg-kindpill')).toBeInTheDocument();
+    expect(screen.getByText('awaiting')).toBeInTheDocument();
   });
 });

@@ -21,8 +21,8 @@ function renderAction(props: NodeProps<ActionFlowNode>) {
   );
 }
 
-function makeProps(node: GraphNode): NodeProps<ActionFlowNode> {
-  const data: ActionNodeData = { node };
+function makeProps(node: GraphNode, ui?: 'classic' | 'next'): NodeProps<ActionFlowNode> {
+  const data: ActionNodeData = { node, ui };
   return {
     id: node.id,
     data,
@@ -71,5 +71,17 @@ describe('ActionNode', () => {
     };
     renderAction(makeProps(node));
     expect(screen.getByText('done')).toBeInTheDocument();
+  });
+
+  it('next: renders a kind pill alongside the existing status treatment', () => {
+    const node: GraphNode = {
+      id: 'create_pr',
+      kind: 'action',
+      state: 'running',
+      action: 'scm.prs.create',
+    };
+    renderAction(makeProps(node, 'next'));
+    expect(screen.getByTestId('rg-kindpill')).toBeInTheDocument();
+    expect(screen.getByText('scm.prs.create')).toBeInTheDocument();
   });
 });
