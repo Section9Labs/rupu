@@ -18,7 +18,7 @@ import { editorNodeSize } from '../../../lib/workflowLayout';
 import { useThemeColors, type ThemeColors } from '../../../lib/useThemeColors';
 import type { WorkflowEditorUi } from '../../../hooks/useWorkflowEditorUi';
 import { KIND_ACCENT, KIND_ICON, KIND_SHAPE } from '../kindVisuals';
-import { shapeFor } from '../nodeShapes';
+import { shapeFor, type HandleAnchor } from '../nodeShapes';
 
 // Node data carried on the xyflow node. Exported so WorkflowEditorGraph projects
 // the exact same shape when it derives the flow `nodes`.
@@ -319,6 +319,21 @@ function GateBodyNext({ d }: { d: StepNodeData }) {
   );
 }
 
+const HANDLE_SIDE = { left: Position.Left, right: Position.Right, bottom: Position.Bottom } as const;
+
+/** Turn a shape's HandleAnchor into xyflow's (position, style) pair. `offset`
+ *  runs along the anchored side: `top` for a left/right edge, `left` for the
+ *  bottom edge. */
+function anchorProps(
+  anchor: HandleAnchor,
+  base: React.CSSProperties,
+): { position: Position; style: React.CSSProperties } {
+  return {
+    position: HANDLE_SIDE[anchor.side],
+    style: anchor.side === 'bottom' ? { ...base, left: anchor.offset } : { ...base, top: anchor.offset },
+  };
+}
+
 function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
   const { node, problems } = data;
   const ui = data.workflowEditorUi ?? 'classic';
@@ -342,7 +357,7 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
         className="wfx-node"
         style={{ width: box.width, minHeight: box.height }}
       >
-        <Handle type="target" position={Position.Left} style={handleStyle} />
+        <Handle type="target" {...anchorProps(shape.target, handleStyle)} />
 
         {/* The silhouette is painted in SVG rather than clipped with
             `clip-path`: a clip slices the 1px border at the clip boundary and
@@ -422,24 +437,22 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
             write thenTargets/elseTargets — not just a UI convenience, even
             though their on-canvas positions are shape-derived (see
             nodeShapes.ts's SourceAnchor). */}
-        {d.kind === 'branch' ? (
-          <>
+        {shape.sources.map((s) => {
+          // arm colour is a UI cue; the handle ID is a MODEL CONTRACT
+          // (applyConnect reads 'then'/'else' to write thenTargets/elseTargets).
+          const tint =
+            s.id === 'then' ? colors.status.done : s.id === 'else' ? colors.status.failed : undefined;
+          const { position, style } = anchorProps(s.anchor, handleStyle);
+          return (
             <Handle
+              key={s.id ?? 'source'}
               type="source"
-              position={Position.Right}
-              id="then"
-              style={{ ...handleStyle, top: '38%', background: colors.status.done }}
+              id={s.id}
+              position={position}
+              style={tint ? { ...style, background: tint } : style}
             />
-            <Handle
-              type="source"
-              position={Position.Right}
-              id="else"
-              style={{ ...handleStyle, top: '68%', background: colors.status.failed }}
-            />
-          </>
-        ) : (
-          <Handle type="source" position={Position.Right} style={handleStyle} />
-        )}
+          );
+        })}
       </div>
     );
   }

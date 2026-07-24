@@ -10,7 +10,14 @@ import { render, screen, cleanup } from '@testing-library/react';
 import type { Node, NodeProps } from '@xyflow/react';
 
 vi.mock('@xyflow/react', () => ({
-  Handle: () => null,
+  Handle: (props: Record<string, unknown>) => (
+    <i
+      data-testid="handle"
+      data-type={String(props.type)}
+      data-position={String(props.position)}
+      data-handleid={props.id === undefined ? '' : String(props.id)}
+    />
+  ),
   Position: { Top: 'top', Bottom: 'bottom', Left: 'left', Right: 'right' },
 }));
 
@@ -377,6 +384,40 @@ describe('EditableStepNode', () => {
         expect(node.classList.contains('wfx-sel')).toBe(false);
         expect(node.style.boxShadow).toBe('');
         expect(node.style.borderColor).toBe('');
+      });
+
+      it('anchors a branch on its diamond vertices — then right, else bottom', () => {
+        const { container } = renderNode(
+          { id: 'route', kind: 'branch', condition: 'x == 1' },
+          [],
+          false,
+          'next',
+        );
+        const handles = [...container.querySelectorAll('[data-testid="handle"]')].map((h) => ({
+          type: h.getAttribute('data-type'),
+          position: h.getAttribute('data-position'),
+          id: h.getAttribute('data-handleid'),
+        }));
+        expect(handles).toEqual([
+          { type: 'target', position: 'left', id: '' },
+          { type: 'source', position: 'right', id: 'then' },
+          // else drops to the BOTTOM vertex — at the old top:68% it floated
+          // mid-slope, visibly detached from the diamond's outline.
+          { type: 'source', position: 'bottom', id: 'else' },
+        ]);
+      });
+
+      it('every other kind keeps a single right-edge source', () => {
+        const { container } = renderNode({ id: 's', kind: 'step', agent: 'a' }, [], false, 'next');
+        const handles = [...container.querySelectorAll('[data-testid="handle"]')].map((h) => ({
+          type: h.getAttribute('data-type'),
+          position: h.getAttribute('data-position'),
+          id: h.getAttribute('data-handleid'),
+        }));
+        expect(handles).toEqual([
+          { type: 'target', position: 'left', id: '' },
+          { type: 'source', position: 'right', id: '' },
+        ]);
       });
     });
   });
