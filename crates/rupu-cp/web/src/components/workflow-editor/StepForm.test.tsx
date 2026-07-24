@@ -534,6 +534,32 @@ describe('StepForm — approval gate body (Task 5)', () => {
     const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
     expect(last.approvalNotify).toEqual([]);
   });
+
+  it('removing an earlier notify entry does not leak its pending add-param draft onto the shifted-in entry (Task 4 regression)', () => {
+    const spy = vi.fn();
+    render(
+      <Harness
+        initial={nodeWith({
+          kind: 'approval_gate',
+          approvalRequired: true,
+          approvalNotify: [{ action: 'issues.comment' }, { action: 'slack.post' }],
+        })}
+        spy={spy}
+      />,
+    );
+    // Type an uncommitted "add param" draft into the FIRST entry only — never
+    // clicking "Add param", so it never reaches approvalNotify data.
+    fireEvent.change(screen.getByLabelText('Notification 1 new param name'), {
+      target: { value: 'draft-leak' },
+    });
+    // Remove the first entry — the second entry (never touched) shifts down
+    // into what was index 0.
+    fireEvent.click(screen.getByRole('button', { name: 'Remove notification 1' }));
+    // With an array-index key, React would reuse the removed row's component
+    // instance (and its local draft state) for the shifted-in entry. The
+    // remaining entry's own add-param field must be empty.
+    expect(screen.getByLabelText('Notification 1 new param name')).toHaveValue('');
+  });
 });
 
 describe('StepForm — Convert to gate node button (Task 6)', () => {

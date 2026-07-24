@@ -5,7 +5,7 @@
 // always carried through untouched. Validation `problems` for this node render
 // in an inline alert block at the top.
 
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import type { AgentSummary, ToolSpec } from '../../lib/api';
 import {
   canConnect,
@@ -743,6 +743,17 @@ function recStr(rec: Record<string, unknown>, key: string): string {
   return typeof v === 'string' ? v : '';
 }
 
+// Monotonic counter backing `nextRowId` — module-level so ids stay unique
+// across every GateFields instance/remount, not just within one.
+let rowIdSeq = 0;
+
+/** Mint a fresh UI-only row id. Never persisted onto step data (see the
+ *  `idState` doc comment in GateFields below for why). */
+function nextRowId(): string {
+  rowIdSeq += 1;
+  return `row-${rowIdSeq}`;
+}
+
 function GateFields({
   d,
   agents,
@@ -759,6 +770,52 @@ function GateFields({
   const onReject = d.approvalOnReject ?? [];
   const notify = d.approvalNotify ?? [];
 
+  // Stable UI-only row keys for the on-reject / notify lists. Both entry
+  // types are plain `Record<string, unknown>` step data — deliberately NOT
+  // stamped with an id field (that would leak into the serialized YAML) — so
+  // list rows can't key off entry identity via the data itself, and index
+  // keys are unsafe: `updateReject`/`updateNotify` replace the edited entry
+  // with a NEW object (`{ ...s, ...p }`) every keystroke, so a plain
+  // per-object WeakMap would also mint a new key on every edit (forcing that
+  // row's own child components — e.g. WithParamsEditor — to remount and lose
+  // their own in-progress draft while the user is mid-edit). Instead this
+  // keeps a parallel array of ids per list, mutated in lockstep with this
+  // component's own push (add) / splice (remove) calls, so a row's key
+  // follows its logical position across add/remove but never changes just
+  // because a sibling field on that row was edited. Rows only ever move by
+  // position when an earlier row is removed — without this, React reuses the
+  // shifted-in row's DOM/component instance (and its local state) for what is
+  // now a different entry (the notify-list bug this fixes: a pending "add
+  // param name" draft leaking onto the entry that shifted into a removed
+  // row's slot). Reset wholesale whenever the node being edited changes
+  // (`d.id`) — a different step's lists start fresh regardless of any
+  // position-for-position length coincidence with the previous node.
+  const idState = useRef({
+    nodeId: d.id,
+    reject: onReject.map(() => nextRowId()),
+    notify: notify.map(() => nextRowId()),
+  });
+  if (idState.current.nodeId !== d.id) {
+    idState.current = {
+      nodeId: d.id,
+      reject: onReject.map(() => nextRowId()),
+      notify: notify.map(() => nextRowId()),
+    };
+  } else {
+    // Defensive resync if a list's length ever changes by some path other
+    // than this component's own add/remove (e.g. an external round-trip) —
+    // preserves existing per-position ids and only mints new ones for the
+    // delta. Not exercised by add/remove themselves, since those already
+    // keep `idState` exactly in sync (see addReject/removeReject/addNotify/
+    // removeNotify below).
+    if (idState.current.reject.length !== onReject.length) {
+      idState.current.reject = onReject.map((_, i) => idState.current.reject[i] ?? nextRowId());
+    }
+    if (idState.current.notify.length !== notify.length) {
+      idState.current.notify = notify.map((_, i) => idState.current.notify[i] ?? nextRowId());
+    }
+  }
+
   function setOnReject(next: Record<string, unknown>[]): void {
     patch({ approvalOnReject: next });
   }
@@ -766,9 +823,11 @@ function GateFields({
     setOnReject(onReject.map((s, j) => (j === i ? { ...s, ...p } : s)));
   }
   function addReject(): void {
+    idState.current.reject = [...idState.current.reject, nextRowId()];
     setOnReject([...onReject, { id: `cleanup-${onReject.length + 1}`, agent: '', prompt: '' }]);
   }
   function removeReject(i: number): void {
+    idState.current.reject = idState.current.reject.filter((_, j) => j !== i);
     setOnReject(onReject.filter((_, j) => j !== i));
   }
 
@@ -779,9 +838,11 @@ function GateFields({
     setNotify(notify.map((n, j) => (j === i ? { ...n, ...p } : n)));
   }
   function addNotify(): void {
+    idState.current.notify = [...idState.current.notify, nextRowId()];
     setNotify([...notify, {}]);
   }
   function removeNotify(i: number): void {
+    idState.current.notify = idState.current.notify.filter((_, j) => j !== i);
     setNotify(notify.filter((_, j) => j !== i));
   }
 
@@ -855,7 +916,7 @@ function GateFields({
         <span className={labelCls}>On reject (cleanup steps)</span>
         <div className="space-y-3">
           {onReject.map((s, i) => (
-            <div key={i} className="space-y-2 rounded-md border border-border bg-surface p-2.5">
+            <div key={idState.current.reject[i]} className="space-y-2 rounded-md border border-border bg-surface p-2.5">
               <div className="flex items-center gap-2">
                 <input
                   type="text"
@@ -907,7 +968,7 @@ function GateFields({
           {notify.map((n, i) => {
             const withObj = (n.with as Record<string, unknown> | undefined) ?? {};
             return (
-              <div key={i} className="space-y-2 rounded-md border border-border bg-surface p-2.5">
+              <div key={idState.current.notify[i]} className="space-y-2 rounded-md border border-border bg-surface p-2.5">
                 <div className="flex items-center gap-2">
                   <input
                     type="text"
