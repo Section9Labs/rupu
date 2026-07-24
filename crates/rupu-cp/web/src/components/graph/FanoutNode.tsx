@@ -168,7 +168,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
 
       <div
         className="text-meta font-bold uppercase tracking-wide"
-        style={{ color: colors.status.running }}
+        style={{ color: colors.get(accentKey) }}
       >
         for_each · {node.id}
       </div>
@@ -178,7 +178,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
         <span className="text-note text-ink-mute">/ {total} units</span>
         <span
           className="ml-auto text-lead font-bold tabular-nums"
-          style={{ color: colors.status.running }}
+          style={{ color: colors.get(accentKey) }}
         >
           {pct}%
         </span>
@@ -226,7 +226,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
         type="button"
         onClick={() => onExpandFanout?.(node.id)}
         className="mt-2 text-note font-medium hover:underline"
-        style={{ color: colors.status.running }}
+        style={{ color: colors.get(accentKey) }}
       >
         ▸ expand all {total}
         {failed > 0 && ` · failed (${failed})`}

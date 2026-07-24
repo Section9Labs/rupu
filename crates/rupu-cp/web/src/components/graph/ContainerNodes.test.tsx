@@ -173,3 +173,48 @@ describe('FanoutNode', () => {
     expect(nextTint).not.toBe(classicTint);
   });
 });
+
+// total > FANOUT_INLINE_THRESHOLD (12) takes the LARGE collapsed-card branch
+// instead of the inline unit grid.
+const FANOUT_LARGE: GraphNode = {
+  id: 'bigshard',
+  kind: 'for_each',
+  state: 'running',
+  fanout: {
+    total: 15,
+    byState: { pending: 2, running: 3, awaiting_approval: 0, paused: 0, done: 10, failed: 0, skipped: 0 },
+    units: Array.from({ length: 15 }, (_, i) => ({
+      index: i,
+      key: `u${i}`,
+      state: i < 10 ? 'done' : i < 13 ? 'running' : 'pending',
+    })),
+  },
+} as unknown as GraphNode;
+
+describe('FanoutNode (large card, total > 12)', () => {
+  it('next: the header label, the %, and the expand-all button take the for_each kind accent, not the legacy running-blue', () => {
+    const classic = renderFanout(FANOUT_LARGE, 'classic');
+    const classicHeader = screen.getByText(/for_each · bigshard/);
+    const classicHeaderColor = getComputedStyle(classicHeader).color;
+    const classicPct = screen.getByText('67%');
+    const classicPctColor = getComputedStyle(classicPct).color;
+    const classicButton = screen.getByRole('button', { name: /expand all/ });
+    const classicButtonColor = getComputedStyle(classicButton).color;
+    cleanup();
+
+    const next = renderFanout(FANOUT_LARGE, 'next');
+    const nextHeader = screen.getByText(/for_each · bigshard/);
+    const nextHeaderColor = getComputedStyle(nextHeader).color;
+    const nextPct = screen.getByText('67%');
+    const nextPctColor = getComputedStyle(nextPct).color;
+    const nextButton = screen.getByRole('button', { name: /expand all/ });
+    const nextButtonColor = getComputedStyle(nextButton).color;
+
+    expect(nextHeaderColor).not.toBe(classicHeaderColor);
+    expect(nextPctColor).not.toBe(classicPctColor);
+    expect(nextButtonColor).not.toBe(classicButtonColor);
+
+    void classic;
+    void next;
+  });
+});
