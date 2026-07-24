@@ -146,7 +146,7 @@ const PROVIDER_ORDER: Record<ProjectProvider, number> = {
 const PROJECT_COLUMNS: Column<ProjectRow>[] = [
   {
     key: 'provider',
-    header: '',
+    header: 'Source',
     fit: true,
     sortable: true,
     sortValue: (p) => PROVIDER_ORDER[projectProvider(p.repo_remote)],
