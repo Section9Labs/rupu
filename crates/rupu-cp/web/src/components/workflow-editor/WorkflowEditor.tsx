@@ -167,6 +167,11 @@ export default function WorkflowEditor({
   // One-time banner: a graph edit on a commented document reformats the YAML
   // (canonical rewrite) and drops comments. Shown at most once per browser.
   const [reformatNotice, setReformatNotice] = useState(false);
+  // Set when `commit` rejects an edit (graphToWorkflowObject → {error}, i.e. a
+  // cycle) — cleared on the next successful commit. Surfaced as an inline
+  // banner; the rejected graph is never applied, so this is the only trace of
+  // the attempted edit.
+  const [commitError, setCommitError] = useState<string | null>(null);
 
   // Inspector-rail palette slot (Task 1, `next` only): captured via a ref
   // callback (not useRef) so its FIRST paint is a state update — the graph
@@ -315,32 +320,36 @@ export default function WorkflowEditor({
 
   const problemsById = useMemo(() => validateGraph(graph), [graph]);
 
-  // Commit a new graph: store it, then serialize back to YAML and emit. A cycle
-  // (graphToWorkflowObject → {error}) keeps the graph state but skips the emit —
-  // the canvas already prevents cycles, so this is only a safety net.
+  // Commit a new graph: all-or-nothing. Serialize FIRST — a cycle
+  // (graphToWorkflowObject → {error}) rejects the edit outright (surfaced via
+  // `commitError`) without ever calling setGraph or emitting YAML, so the
+  // canvas and the YAML never diverge. Only a serializable graph gets applied.
   const commit = useCallback(
     (next: WorkflowGraph): void => {
-      setGraph(next);
       const res = graphToWorkflowObject(next);
-      if ('obj' in res) {
-        // First graph edit on a commented document: warn (once per browser) that
-        // editing the graph reformats the YAML canonically and removes comments.
-        try {
-          if (
-            typeof localStorage !== 'undefined' &&
-            !localStorage.getItem(REFORMAT_NOTICE_KEY) &&
-            hasYamlComments(draftYamlRef.current)
-          ) {
-            localStorage.setItem(REFORMAT_NOTICE_KEY, '1');
-            setReformatNotice(true);
-          }
-        } catch {
-          /* localStorage unavailable (private mode / SSR) — skip the notice */
-        }
-        const dumped = yaml.dump(res.obj);
-        lastSeenYaml.current = dumped;
-        onYamlChange(dumped);
+      if (!('obj' in res)) {
+        setCommitError(res.error);
+        return; // reject — do NOT mutate the graph or emit YAML.
       }
+      setCommitError(null);
+      setGraph(next);
+      // First graph edit on a commented document: warn (once per browser) that
+      // editing the graph reformats the YAML canonically and removes comments.
+      try {
+        if (
+          typeof localStorage !== 'undefined' &&
+          !localStorage.getItem(REFORMAT_NOTICE_KEY) &&
+          hasYamlComments(draftYamlRef.current)
+        ) {
+          localStorage.setItem(REFORMAT_NOTICE_KEY, '1');
+          setReformatNotice(true);
+        }
+      } catch {
+        /* localStorage unavailable (private mode / SSR) — skip the notice */
+      }
+      const dumped = yaml.dump(res.obj);
+      lastSeenYaml.current = dumped;
+      onYamlChange(dumped);
     },
     [onYamlChange],
   );
@@ -438,6 +447,23 @@ export default function WorkflowEditor({
           className="absolute left-1/2 top-3 z-30 -translate-x-1/2 rounded-md border border-slate-300 bg-slate-800 px-3 py-1.5 text-ui font-medium text-white shadow-card"
         >
           {notice}
+        </div>
+      )}
+
+      {commitError && (
+        <div
+          role="alert"
+          className="absolute left-3 right-3 top-3 z-20 flex items-start gap-2 rounded-md border border-err/30 bg-err-bg px-3 py-2 text-ui text-err shadow-card lg:right-[21rem]"
+        >
+          <span className="flex-1">{commitError}</span>
+          <button
+            type="button"
+            onClick={() => setCommitError(null)}
+            aria-label="Dismiss"
+            className="shrink-0 font-semibold text-err hover:text-err"
+          >
+            ✕
+          </button>
         </div>
       )}
 
@@ -657,6 +683,7 @@ export default function WorkflowEditor({
                   problems={problemsById[selectedNode.id] ?? []}
                   exprContext={exprContext}
                   allNodeIds={graph.nodes.map((n) => n.id)}
+                  edges={graph.edges}
                   workflowEditorUi={workflowEditorUi}
                   tools={tools}
                   onConvertToGate={onConvertToGate}

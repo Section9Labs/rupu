@@ -36,7 +36,7 @@ vi.mock('./ExpressionField', () => ({
 
 import StepForm from './StepForm';
 import WorkflowSettingsForm from './WorkflowSettingsForm';
-import type { GraphNode, StepNodeData, WorkflowMeta } from '../../lib/workflowGraph';
+import { deriveEdges, type GraphNode, type StepNodeData, type WorkflowMeta } from '../../lib/workflowGraph';
 import type { ExprContext } from '../../lib/workflowExpressions';
 import type { AgentSummary } from '../../lib/api';
 
@@ -226,6 +226,58 @@ describe('StepForm — branch (flag-gated)', () => {
 
     fireEvent.click(screen.getByLabelText('Else target fail-path'));
     expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({ elseTargets: ['fail-path'] }));
+  });
+
+  it('the branch Then/Else picker excludes a target that would form a cycle (P0.1)', () => {
+    // Graph: a -> b(branch). `a` is upstream of `b` — offering it as a then/else
+    // target would let the user close a cycle back onto `a`.
+    const aNode: GraphNode = { id: 'a', data: { id: 'a', kind: 'step', agent: 'planner', prompt: 'hi' }, position: { x: 0, y: 0 } };
+    const bNode: GraphNode = { id: 'b', data: { id: 'b', kind: 'branch', condition: 'true' }, position: { x: 0, y: 100 } };
+    const edges = deriveEdges([aNode, bNode]); // chain edge a -> b
+
+    render(
+      <StepForm
+        node={bNode}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+        allNodeIds={['a', 'b']}
+        edges={edges}
+      />,
+    );
+
+    expect(screen.queryByLabelText('Then target a')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Else target a')).not.toBeInTheDocument();
+  });
+
+  it('the branch Then/Else picker still offers an already-selected target even though it is currently cycle-forming', () => {
+    // `b` already routes to `a` via thenTargets — combined with the chain edge
+    // a -> b, the graph already contains a cycle (a->b->a). The checkbox for
+    // `a` must still render (checked) so the user can uncheck it.
+    const aNode: GraphNode = { id: 'a', data: { id: 'a', kind: 'step', agent: 'planner', prompt: 'hi' }, position: { x: 0, y: 0 } };
+    const bNode: GraphNode = {
+      id: 'b',
+      data: { id: 'b', kind: 'branch', condition: 'true', thenTargets: ['a'] },
+      position: { x: 0, y: 100 },
+    };
+    const edges = deriveEdges([aNode, bNode]);
+
+    render(
+      <StepForm
+        node={bNode}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+        allNodeIds={['a', 'b']}
+        edges={edges}
+      />,
+    );
+
+    const checkbox = screen.getByLabelText('Then target a');
+    expect(checkbox).toBeInTheDocument();
+    expect(checkbox).toBeChecked();
   });
 
   it('branch hides the when/continue_on_error/approval block', () => {

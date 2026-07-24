@@ -7,7 +7,9 @@
 
 import type { AgentSummary, ToolSpec } from '../../lib/api';
 import {
+  canConnect,
   hasInlineApproval,
+  type GraphEdge,
   type GraphNode,
   type PanelCfg,
   type PanelGate,
@@ -34,6 +36,10 @@ interface StepFormProps {
    *  target pickers. Defaults to empty (no candidates) for callers that don't
    *  thread it. */
   allNodeIds?: string[];
+  /** The graph's derived edges — powers BranchFields' cycle guard (a then/else
+   *  target that would close a cycle back onto an upstream node is excluded).
+   *  Defaults to empty (no cycle guard) for callers that don't thread it. */
+  edges?: GraphEdge[];
   /** Workflow-editor-UI flag — the "Branch (if)" kind option is only offered
    *  in the Kind <select> when 'next', UNLESS the node being edited is
    *  already a branch (an existing branch node must always be editable
@@ -105,6 +111,7 @@ export default function StepForm({
   problems,
   exprContext,
   allNodeIds = [],
+  edges = [],
   workflowEditorUi = 'classic',
   tools = [],
   onConvertToGate,
@@ -206,7 +213,7 @@ export default function StepForm({
         />
       )}
       {d.kind === 'branch' && (
-        <BranchFields d={d} allNodeIds={allNodeIds} patch={patch} exprContext={exprContext} />
+        <BranchFields d={d} allNodeIds={allNodeIds} edges={edges} patch={patch} exprContext={exprContext} />
       )}
       {d.kind === 'approval_gate' && (
         <GateFields d={d} agents={agents} patch={patch} exprContext={exprContext} workflowEditorUi={workflowEditorUi} />
@@ -588,19 +595,35 @@ function PanelFields({
 function BranchFields({
   d,
   allNodeIds,
+  edges,
   patch,
   exprContext,
 }: {
   d: StepNodeData;
   allNodeIds: string[];
+  edges: GraphEdge[];
   patch: (p: Partial<StepNodeData>) => void;
   exprContext: StepExprContext;
 }) {
   const thenTargets = d.thenTargets ?? [];
   const elseTargets = d.elseTargets ?? [];
-  // Every other node in the graph is a valid then/else target; excludes the
-  // branch's own id (a self-target would be a self-loop).
-  const candidates = allNodeIds.filter((id) => id !== d.id);
+  // Every other node in the graph is a candidate then/else target, EXCEPT:
+  //  - the branch's own id (a self-target would be a self-loop), and
+  //  - a target that would close a cycle back onto an upstream node — UNLESS
+  //    it's already selected, in which case it must still render (checked) so
+  //    the user can uncheck it, even if the graph is currently in a cyclic
+  //    state (e.g. hand-edited YAML).
+  //
+  // `canConnect` also flags "already connected" (a plain chain/data-ref edge
+  // already runs branch -> candidate, which is the everyday case for the
+  // branch's array-adjacent successor) — that's a drag-connect duplicate
+  // concern, not a cycle, so it's deliberately NOT treated as exclusion here.
+  const candidates = allNodeIds.filter((id) => {
+    if (id === d.id) return false;
+    if (thenTargets.includes(id) || elseTargets.includes(id)) return true;
+    const res = canConnect(d.id, id, { edges });
+    return res.ok || !res.reason.includes('cycle');
+  });
 
   function toggleThen(id: string, on: boolean): void {
     const set = new Set(thenTargets);
