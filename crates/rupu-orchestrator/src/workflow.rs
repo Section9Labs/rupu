@@ -1071,9 +1071,17 @@ impl Workflow {
         validate_trigger(&wf.trigger)?;
         validate_contracts(&wf)?;
         validate_autoflow(&wf)?;
-        validate_template_refs(&wf)?;
+        let has_explicit_edges = workflow_has_explicit_edges(&wf);
+        // Legacy (edge-free) workflows execute in declaration order, so a
+        // `steps.X` reference to a later-declared step is genuinely unbound
+        // at render time — enforce forward-only. Graph workflows execute in
+        // edge order, not list order, so a later-declared-but-connected-
+        // earlier step is legitimate; `validate_graph` below already
+        // enforces acyclicity over the real dependency graph, making a
+        // declaration-order lint both wrong and redundant there.
+        validate_template_refs(&wf, !has_explicit_edges)?;
         validate_branch_targets(&wf)?;
-        if workflow_has_explicit_edges(&wf) {
+        if has_explicit_edges {
             validate_graph(&wf)?;
         }
         Ok(wf)
@@ -1650,10 +1658,21 @@ const STEP_OUTPUT_FIELDS: &[&str] = &[
 /// Walk every templated string in the workflow and validate
 /// `steps.<id>.<field>` references against the actual step graph.
 /// Catches:
-///   - References to step ids that don't exist anywhere in the workflow.
-///   - References to step ids that come *later* in the linear order
-///     (forward reference — the value isn't bound yet at render time).
-///   - References to fields that aren't on `StepOutput`.
+///   - References to step ids that don't exist anywhere in the workflow
+///     (always — `TemplateUnknownStepRef`).
+///   - References to fields that aren't on `StepOutput` (always —
+///     `TemplateUnknownStepField`).
+///   - References to step ids that come *later* in the linear
+///     declaration order (forward reference — `TemplateForwardStepRef`),
+///     but only when `require_forward` is set. Legacy (edge-free)
+///     workflows execute in declaration order, so a forward reference is
+///     genuinely unbound at render time and must be rejected. Graph
+///     workflows (`next`/`split`/`join`) execute in edge order, not list
+///     order — a step may legitimately reference another step declared
+///     later in the YAML but connected earlier via edges. Callers pass
+///     `require_forward: false` for those; `validate_graph` already
+///     enforces acyclicity over the real dependency graph, so the
+///     declaration-order lint would be both wrong and redundant there.
 ///
 /// Limitations of the MVP scanner:
 ///   - Doesn't validate deeper paths like `steps.x.sub_results.<sub_id>`
@@ -1662,32 +1681,31 @@ const STEP_OUTPUT_FIELDS: &[&str] = &[
 ///   - Doesn't see references that are computed at runtime
 ///     (`{{ steps[var] }}`). We accept the false negative — those
 ///     are rare in workflow YAML and would still fail loudly at render.
-fn validate_template_refs(wf: &Workflow) -> Result<(), WorkflowParseError> {
-    // Linear order of step ids — every reference must point at a
-    // step earlier in this list.
+fn validate_template_refs(wf: &Workflow, require_forward: bool) -> Result<(), WorkflowParseError> {
+    // Linear order of step ids — used only for the forward-reference
+    // lint, which is itself only active when `require_forward` is set.
     let step_order: Vec<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
     for (idx, step) in wf.steps.iter().enumerate() {
         let prior: BTreeSet<&str> = step_order[..idx].iter().copied().collect();
         // Top-level prompt / when / for_each / panel.subject.
         for (kind, src) in collect_templates_for_step(step) {
             for (referenced, field) in scan_step_refs(&src) {
-                if !prior.contains(referenced.as_str()) {
-                    // Distinguish "doesn't exist anywhere" from "forward
-                    // reference" so the error message is actionable.
-                    let exists_later = wf.steps.iter().any(|s| s.id == referenced);
-                    if exists_later {
-                        return Err(WorkflowParseError::TemplateForwardStepRef {
-                            step: step.id.clone(),
-                            template_kind: kind,
-                            referenced,
-                        });
-                    } else {
-                        return Err(WorkflowParseError::TemplateUnknownStepRef {
-                            step: step.id.clone(),
-                            template_kind: kind,
-                            referenced,
-                        });
-                    }
+                // Existence check always applies, regardless of order.
+                let exists = wf.steps.iter().any(|s| s.id == referenced);
+                if !exists {
+                    return Err(WorkflowParseError::TemplateUnknownStepRef {
+                        step: step.id.clone(),
+                        template_kind: kind,
+                        referenced,
+                    });
+                }
+                // Declaration-order lint: legacy workflows only.
+                if require_forward && !prior.contains(referenced.as_str()) {
+                    return Err(WorkflowParseError::TemplateForwardStepRef {
+                        step: step.id.clone(),
+                        template_kind: kind,
+                        referenced,
+                    });
                 }
                 if let Some(f) = field {
                     if !STEP_OUTPUT_FIELDS.contains(&f.as_str()) {
@@ -2658,6 +2676,58 @@ steps:
         assert!(matches!(
             Workflow::parse(raw).unwrap_err(),
             WorkflowParseError::TemplateForwardStepRef { .. }
+        ));
+    }
+
+    #[test]
+    fn graph_workflow_allows_reference_to_later_declared_but_earlier_connected_step() {
+        // Declaration order: a, later. But `later` runs before `a` via an
+        // explicit edge (later.next = [a]), forming a valid acyclic DAG:
+        // later -> a. `a` referencing `{{ steps.later.output }}` is a
+        // legitimate backward-in-execution-order (forward-in-declaration-
+        // order) reference and must NOT be rejected now that the workflow
+        // has explicit edges — validate_graph governs ordering instead.
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: \"use {{ steps.later.output }}\"\n  - id: later\n    agent: x\n    prompt: p\n    next: [a]\n";
+        Workflow::parse(raw)
+            .expect("graph workflow with a valid edge-ordered forward-declared reference should parse");
+    }
+
+    #[test]
+    fn graph_workflow_data_cycle_is_still_rejected_by_validate_graph() {
+        // A references steps.b, B references steps.a: a genuine cycle in
+        // the inferred data-edge graph. No declaration-order forward-ref
+        // check applies (this is a graph workflow — it has an edge), but
+        // validate_graph's cycle detection must still catch it, now
+        // reported as WorkflowCycle rather than TemplateForwardStepRef.
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: \"use {{ steps.b.output }}\"\n    next: [gate]\n  - id: b\n    agent: x\n    prompt: \"use {{ steps.a.output }}\"\n  - id: gate\n    agent: x\n    prompt: p\n";
+        let err = Workflow::parse(raw).unwrap_err();
+        assert!(
+            matches!(err, WorkflowParseError::WorkflowCycle { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn graph_workflow_rejects_reference_to_nonexistent_step() {
+        // Existence checking must remain unconditional even for graph
+        // workflows: a `steps.X` reference to an id that appears nowhere
+        // in the workflow is always an error, not just for legacy ones.
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: \"use {{ steps.ghost.output }}\"\n    next: [b]\n  - id: b\n    agent: x\n    prompt: p\n";
+        assert!(matches!(
+            Workflow::parse(raw).unwrap_err(),
+            WorkflowParseError::TemplateUnknownStepRef { .. }
+        ));
+    }
+
+    #[test]
+    fn join_node_may_not_carry_an_agent() {
+        // Same code path as `split_node_may_not_carry_an_agent`, but for
+        // `join` — the `kind` string in OrchestrationNodeHasWork differs
+        // ("join" vs "split") and was previously untested.
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [j]\n  - id: j\n    agent: x\n    prompt: p\n    join: { wait: { count: 1 } }\n";
+        assert!(matches!(
+            Workflow::parse(raw).unwrap_err(),
+            WorkflowParseError::OrchestrationNodeHasWork { .. }
         ));
     }
 }
