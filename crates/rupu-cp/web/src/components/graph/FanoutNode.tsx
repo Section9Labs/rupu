@@ -17,11 +17,15 @@ import type { GraphNode } from '../../lib/runGraphModel';
 import { stateStyle, glyphBg } from './stepStyle';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { nodeSize, FANOUT_INLINE_THRESHOLD, FANOUT_INLINE_COLS } from '../../lib/nodeSize';
+import { runKindAccent } from './kindBridge';
+import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 
 export interface FanoutNodeData extends Record<string, unknown> {
   node: GraphNode;
   onOpenUnit?: (stepId: string, index: number) => void;
   onExpandFanout?: (stepId: string) => void;
+  /** 'next' turns on the kind-colored container tint; absent/'classic' keeps today's. */
+  ui?: WorkflowEditorUi;
 }
 
 type FanoutFlowNode = Node<FanoutNodeData, 'fanout'>;
@@ -32,8 +36,16 @@ const PREVIEW_CELLS = 60;
 function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
   const { node, onOpenUnit, onExpandFanout } = data;
   const colors = useThemeColors();
+  const next = data.ui === 'next';
+  // Container identity: in next this is the SAME accent the editor paints
+  // 'for_each' with (brand.500 — violet); classic keeps the legacy
+  // running-blue tint. The empty-units placeholder card below stays
+  // state-driven (it has no fanout yet, so there is nothing to fan out with
+  // a kind identity) and the per-unit squares/progress gradient stay
+  // state-colored — only the container tint switches on kind.
+  const accentKey = next ? runKindAccent(node.kind) : 'status.running';
   const handleStyle = {
-    background: colors.alpha('status.running', 0.4),
+    background: colors.alpha(accentKey, 0.4),
     width: 6,
     height: 6,
     border: 'none',
@@ -102,10 +114,11 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
     const cols = Math.min(total, FANOUT_INLINE_COLS);
     return (
       <div
+        data-testid="rg-container"
         className={['relative rounded-[12px] border px-2 py-1.5', running ? 'rg-pulse-run' : ''].join(' ')}
         style={{
-          borderColor: colors.alpha('status.running', 0.4),
-          background: colors.alpha('status.running', 0.12),
+          borderColor: colors.alpha(accentKey, 0.4),
+          background: colors.alpha(accentKey, 0.12),
           width: box.width,
           minHeight: box.height,
         }}
@@ -113,7 +126,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
         <Handle type="target" position={Position.Left} style={handleStyle} />
         <div
           className="mb-1 flex items-center justify-between gap-3 text-meta font-bold uppercase tracking-wide"
-          style={{ color: colors.status.running }}
+          style={{ color: colors.get(accentKey) }}
         >
           <span className="truncate">for_each · {node.id} · {total}</span>
           <span className="tabular-nums">
@@ -147,14 +160,15 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
   const preview = fo.units.slice(0, PREVIEW_CELLS);
   return (
     <div
+      data-testid="rg-container"
       className={['relative rounded-[12px] border bg-panel px-3 py-2.5 shadow-card', running ? 'rg-pulse-run' : ''].join(' ')}
-      style={{ borderColor: colors.alpha('status.running', 0.4), width: box.width, minHeight: box.height }}
+      style={{ borderColor: colors.alpha(accentKey, 0.4), width: box.width, minHeight: box.height }}
     >
       <Handle type="target" position={Position.Left} style={handleStyle} />
 
       <div
         className="text-meta font-bold uppercase tracking-wide"
-        style={{ color: colors.status.running }}
+        style={{ color: colors.get(accentKey) }}
       >
         for_each · {node.id}
       </div>
@@ -164,7 +178,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
         <span className="text-note text-ink-mute">/ {total} units</span>
         <span
           className="ml-auto text-lead font-bold tabular-nums"
-          style={{ color: colors.status.running }}
+          style={{ color: colors.get(accentKey) }}
         >
           {pct}%
         </span>
@@ -212,7 +226,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
         type="button"
         onClick={() => onExpandFanout?.(node.id)}
         className="mt-2 text-note font-medium hover:underline"
-        style={{ color: colors.status.running }}
+        style={{ color: colors.get(accentKey) }}
       >
         ▸ expand all {total}
         {failed > 0 && ` · failed (${failed})`}

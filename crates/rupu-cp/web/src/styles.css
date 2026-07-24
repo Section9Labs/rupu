@@ -229,6 +229,16 @@
   animation: rg-march 0.9s linear infinite;
 }
 
+/* `next` run-graph flow: animation only, no color. The stroke is supplied by
+ * the edge's inline style (RunGraph's edge memo) so the marching-ants can
+ * render in ANY per-kind accent. Classic keeps .rg-edge-active/.rg-edge-await
+ * above, which bake their own blue/amber stroke. */
+.react-flow__edge.rg-edge-flow .react-flow__edge-path {
+  stroke-width: 2;
+  stroke-dasharray: 7 7;
+  animation: rg-march 0.7s linear infinite;
+}
+
 /* Animated panel-loop back-edge marker (round-counter loop cue). */
 @keyframes rg-loop-spin {
   to { transform: rotate(360deg); }
