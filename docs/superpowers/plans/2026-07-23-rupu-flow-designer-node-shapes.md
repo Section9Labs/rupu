@@ -431,6 +431,15 @@ git commit -m "feat(cp): pure silhouette geometry for Flow Designer nodes"
 - Consumes: `ShapeName` from `./nodeShapes` (Task 1).
 - Produces: `KIND_SHAPE: Record<StepKind, ShapeName>` from `kindVisuals.ts`; new size exports `BRANCH_W`, `BRANCH_H`, `ACTION_W`, `GATE_W`, `FOR_EACH_W` from `lib/workflowLayout.ts`. Task 3 uses both.
 
+> **Amended post-ship (F5, final review):** `BRANCH_W`/`BRANCH_H` shipped as
+> **280 × 200**, not the 200×124 this Task originally specified — the
+> narrower/shorter starting guess didn't leave enough safe-rect headroom for
+> `BranchBodyNext`'s realistic content (header + condition + two then/else
+> port pills). The test/code blocks below are left as originally written for
+> plan-history fidelity; substitute 280/200 wherever 200/124 appears when
+> actually running them. See `workflowLayout.ts:32-44`'s doc comment for the
+> real derivation, and the design spec's §4c "shipped values" table.
+
 - [ ] **Step 1: Write the failing tests**
 
 Append to `src/lib/workflowLayout.test.ts` (inside the existing top-level `describe`, or as a new `describe` at the end of the file):
@@ -498,8 +507,8 @@ In `src/lib/workflowLayout.ts`, after the `FOR_EACH_H` declaration (line 30), ad
 /** branch paints a diamond — taller, and narrower than a step because a
  *  diamond's usable width collapses toward its tips (it shows only its
  *  condition, which is all a branch has). */
-export const BRANCH_W = 200;
-export const BRANCH_H = 124;
+export const BRANCH_W = 200;   // shipped as 280 — see the amendment note above Step 1
+export const BRANCH_H = 124;   // shipped as 200 — see the amendment note above Step 1
 
 /** action (parallelogram) and approval_gate (trapezoid) both lose horizontal
  *  room to slanted sides; the box grows so the text band stays step-sized. */
@@ -520,6 +529,12 @@ export function editorNodeSize(d: StepNodeData): NodeBox {
       return { width: PARALLEL_W, height: PARALLEL_HEADER_H + rows * PARALLEL_SUBROW_H + PARALLEL_PAD_V };
     }
     case 'panel':
+      // Superseded post-ship (F5, final review): a fixed PANEL_BASE_H
+      // reserved the same height regardless of panelist count, clipping a
+      // 3-panelist node's 3rd panelist. Shipped panel case scales with
+      // panelist count, mirroring the `parallel` case just above — see the
+      // design spec's §4c "shipped values" table and workflowLayout.ts's
+      // doc comment for the measured constants.
       return { width: PANEL_W, height: PANEL_BASE_H + (d.panel?.gate ? PANEL_GATE_H : 0) };
     case 'branch':
       return { width: BRANCH_W, height: BRANCH_H };

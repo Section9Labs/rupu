@@ -418,7 +418,6 @@ export default function NodePalette({
         <div className="wfx-palette-rail-grid">
           {filteredItems.map((item) => {
             const color = colors.get(KIND_ACCENT[item.kind]);
-            const Icon = KIND_ICON[item.kind];
             const isSelected = selected?.type === 'block' && selected.kind === item.kind;
             return (
               <button
@@ -433,8 +432,13 @@ export default function NodePalette({
                 title={item.sub}
                 className={isSelected ? 'wfx-pcard wfx-pcard-selected' : 'wfx-pcard'}
               >
+                {/* F1: the silhouette IS the kind icon here — no lucide glyph
+                    alongside it. At the rail's 3-col grid the two together
+                    left too little room for the label (e.g. `parallel` and
+                    `panel` both truncated to "pa…"); the shape is a strictly
+                    better kind signal than a 14px icon, so it stands alone.
+                    Connector-tool chips below have no shape and keep theirs. */}
                 <ShapePreview kind={item.kind} color={color} />
-                <Icon className="wfx-picon" size={14} strokeWidth={2} style={{ color }} aria-hidden />
                 <div className="wfx-pcard-text">
                   <div className="wfx-pl">{item.label}</div>
                 </div>

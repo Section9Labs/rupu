@@ -433,9 +433,15 @@
   flex-direction: column;
   min-width: 0;
   /* hard-bounds content to the shape's inscribed rect — the same job
-   * `.wfx-clip`'s `overflow: hidden` did for the old rectangular card. A
-   * silhouette has no CSS clip of its own, so without this a body taller
-   * than `safe.h` paints over the outline instead of being contained. */
+   * `.wfx-clip`'s `overflow: hidden` did for the old rectangular card. The
+   * box height is a fixed `height` (not `min-height`): a silhouette has no
+   * CSS clip of its own, and `min-height` would let this box grow past
+   * `safe.h` whenever content is taller, which makes `overflow: hidden`
+   * clip only horizontally. `height` keeps the box pinned at `safe.h` so
+   * `overflow: hidden` genuinely bounds content on BOTH axes — a body
+   * taller than `safe.h` is clipped instead of painting over the outline.
+   * (`editorNodeSize()` reserves enough height that real content fits
+   * without needing this clip to engage — see workflowLayout.ts.) */
   overflow: hidden;
 }
 /* shapes whose width varies across the text band centre their content.
@@ -641,7 +647,7 @@
 .wfx-palette-rail .wfx-palette-connectors { max-width: none; }
 
 @media (prefers-reduced-motion: reduce) {
-  .wfx-node, .wfx-pcard { transition: none !important; }
+  .wfx-pcard { transition: none !important; }
 }
 
 /* ── inspector-rail palette dock (Blocks tab) ── */

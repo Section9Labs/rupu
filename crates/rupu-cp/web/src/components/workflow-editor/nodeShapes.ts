@@ -53,6 +53,12 @@ export interface SafeRect {
 export interface HandleAnchor {
   side: 'left' | 'right' | 'bottom';
   offset: string;
+  /** Perpendicular inset, in px, in from the box edge along `side` — e.g. for
+   *  `side: 'right'` this becomes a `right: <inset>px` offset instead of the
+   *  default `right: 0`. Needed by any shape whose boundary at the anchored
+   *  offset is not flush with the box edge (a slanted or narrowed side).
+   *  Default 0 (flush with the box edge) when omitted. */
+  inset?: number;
 }
 
 /** A source handle. `id` is omitted for the single default source; `branch`
@@ -213,12 +219,21 @@ export function shapeFor(shape: ShapeName, w: number, h: number): NodeShape {
         [w - shear, h - I],
         [I, h - I],
       ];
+      // Both slanted sides (p1->p2 on the right, p3->p0 on the left) cross
+      // y=h/2 at their parameter midpoint (t=0.5, since y runs linearly from
+      // I to h-I and h/2 is that range's own midpoint) — giving boundary x =
+      // w - (shear+I)/2 on the right, (shear+I)/2 on the left. Both handles
+      // sit at the box edge (x=0 or x=w) by default, so the inset needed to
+      // land back on the boundary is the same (shear+I)/2 on both sides.
+      const inset = (shear + I) / 2;
       return {
         ...base,
         points,
         path: toPath(points),
         extra: [],
         safe: { x: shear + 8, y: 11, w: w - 2 * shear - 16, h: h - 22 },
+        target: { side: 'left', offset: '50%', inset },
+        sources: [{ anchor: { side: 'right', offset: '50%', inset } }],
       };
     }
 
@@ -230,12 +245,18 @@ export function shapeFor(shape: ShapeName, w: number, h: number): NodeShape {
         [w - I, h - I],
         [I, h - I],
       ];
+      // Same midpoint argument as parallelogram above, applied to the
+      // trapezoid's own slanted sides: boundary x at y=h/2 is
+      // w - (taper+I)/2 on the right, (taper+I)/2 on the left.
+      const inset = (taper + I) / 2;
       return {
         ...base,
         points,
         path: toPath(points),
         extra: [],
         safe: { x: taper + 7, y: 13, w: w - 2 * taper - 14, h: h - 26 },
+        target: { side: 'left', offset: '50%', inset },
+        sources: [{ anchor: { side: 'right', offset: '50%', inset } }],
       };
     }
 
@@ -300,6 +321,13 @@ export function shapeFor(shape: ShapeName, w: number, h: number): NodeShape {
           `M ${layer - 3} ${I + 6} L ${w - I - 6} ${I + 6} L ${w - I - 6} ${h - layer - 3}`,
         ],
         safe: { x: 13, y: layer + 10, w: w - layer - 24, h: h - layer - 21 },
+        // The body rect's LEFT edge is at x=I, same as every other shape's
+        // un-inset side (rect/hexagon/diamond/subroutine all sit I off their
+        // box edge too) — no inset needed there. Its RIGHT edge, though, is
+        // pulled in by `layer` on top of the usual `I` (to leave room for the
+        // stack layers peeking out), so the default right:0 handle lands on
+        // the decorative layer stroke, not the body — inset by `layer + I`.
+        sources: [{ anchor: { side: 'right', offset: '50%', inset: layer + I } }],
       };
     }
 

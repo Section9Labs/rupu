@@ -78,6 +78,16 @@ Starting values (from the approved artifact; final values tuned at the operator 
 | `parallel` | existing formula | header + rows × 26 + pad, unchanged |
 | `panel` | existing formula | base + gate, unchanged |
 
+**Shipped values differ from the starting table above** (tuned during implementation, plus a
+final-review fix):
+
+| kind | box | note |
+|---|---|---|
+| `branch` | **280 × 200** | widened/heightened from 200×124 — the diamond's safe rect is inscribed at its narrowest band (28%–72% of height), so headroom for `BranchBodyNext`'s realistic header+condition+two port-pill content needed more than the starting guess. |
+| `panel` | **`PANEL_HEADER_H`(31) + rows × `PANEL_PORT_ROW_H`(17) + `PANEL_PAD_V`(30) + gate** | NOT "unchanged" as this table originally said. A final-review pass (F2) found the old fixed `PANEL_BASE_H`(84) reserved the same height regardless of panelist count, so a 3-panelist node (each panelist wraps to its own port-pill row in the fixed-width safe rect) clipped its 3rd panelist. `rows = Math.max(panelists.length, 1)`, mirroring `parallel`'s own per-row scaling; constants measured in headless Chrome against `PanelBodyNext`'s real CSS — see `workflowLayout.ts`'s doc comment for the full derivation. |
+
+`step` / `action` / `approval_gate` / `for_each` / `parallel` shipped exactly as the starting table specified.
+
 ### 4d. Handle anchors become shape-aware
 
 Anchors move from hardcoded percentages to the shape's own geometry:

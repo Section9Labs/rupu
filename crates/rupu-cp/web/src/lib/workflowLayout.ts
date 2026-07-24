@@ -58,9 +58,31 @@ export const PARALLEL_HEADER_H = 54;
 export const PARALLEL_SUBROW_H = 26;
 export const PARALLEL_PAD_V = 18;
 
-/** panel container: header + panelists row + optional gate block. */
+/** panel container: header (kindpill+id row + "N panelists" meta line) + one
+ *  port-pill row per panelist + optional gate block. Mirrors PARALLEL's
+ *  header/per-row/pad split above.
+ *
+ *  `PanelBodyNext` wraps each panelist name into its OWN `.wfx-port` pill in
+ *  a flex-wrap row (`.wfx-ports` in styles.css) — for any realistic panelist
+ *  name at the panel's fixed 187px-wide safe rect (PANEL_W=220 fed through
+ *  the `stacked` shape in nodeShapes.ts), that wrap puts exactly one pill per
+ *  row, so reserving one row's height per panelist is not a worst-case
+ *  guess, it is what actually renders.
+ *
+ *  Measured in headless Chrome against the real `.wfx-*` CSS with the three
+ *  panelist names from `.rupu/workflows/code-review-panel.yaml`
+ *  (security-reviewer / performance-reviewer / maintainability-reviewer):
+ *  content height (head + meta line + N port rows) is `31 + 17*N` px, and the
+ *  `stacked` shape's box-to-safe-height overhead (`layer(9) + 21` from
+ *  nodeShapes.ts) is a further 30px — giving `61 + 17*N` total. Split the
+ *  same way PARALLEL_HEADER_H/PARALLEL_SUBROW_H/PARALLEL_PAD_V are split:
+ *  PANEL_HEADER_H is the fixed head+meta content, PANEL_PORT_ROW_H is the
+ *  per-panelist row (14px pill + 3px row gap), PANEL_PAD_V folds in the
+ *  `stacked` shape's fixed box overhead. */
 export const PANEL_W = 220;
-export const PANEL_BASE_H = 84;
+export const PANEL_HEADER_H = 31;
+export const PANEL_PORT_ROW_H = 17;
+export const PANEL_PAD_V = 30;
 export const PANEL_GATE_H = 34;
 
 export interface NodeBox {
@@ -77,8 +99,13 @@ export function editorNodeSize(d: StepNodeData): NodeBox {
       const rows = Math.max(d.parallel?.length ?? 0, 1);
       return { width: PARALLEL_W, height: PARALLEL_HEADER_H + rows * PARALLEL_SUBROW_H + PARALLEL_PAD_V };
     }
-    case 'panel':
-      return { width: PANEL_W, height: PANEL_BASE_H + (d.panel?.gate ? PANEL_GATE_H : 0) };
+    case 'panel': {
+      const rows = Math.max(d.panel?.panelists?.length ?? 0, 1);
+      return {
+        width: PANEL_W,
+        height: PANEL_HEADER_H + rows * PANEL_PORT_ROW_H + PANEL_PAD_V + (d.panel?.gate ? PANEL_GATE_H : 0),
+      };
+    }
     case 'branch':
       return { width: BRANCH_W, height: BRANCH_H };
     case 'action':

@@ -323,14 +323,28 @@ const HANDLE_SIDE = { left: Position.Left, right: Position.Right, bottom: Positi
 
 /** Turn a shape's HandleAnchor into xyflow's (position, style) pair. `offset`
  *  runs along the anchored side: `top` for a left/right edge, `left` for the
- *  bottom edge. */
+ *  bottom edge. `inset` (default 0) runs PERPENDICULAR to `side` — xyflow's
+ *  default handle CSS pins the handle flush with the box edge via a `0`
+ *  offset (`left: 0` / `right: 0` / `bottom: 0`) plus a `translate(±50%, …)`
+ *  that centers the handle ON that edge; substituting `inset` px for that
+ *  `0` shifts the same centered point in from the edge by `inset`, landing
+ *  it back on the shape's true boundary for shapes whose side isn't flush
+ *  with the box (see nodeShapes.ts's parallelogram/trapezoid/stacked). */
 function anchorProps(
   anchor: HandleAnchor,
   base: React.CSSProperties,
 ): { position: Position; style: React.CSSProperties } {
+  const inset = anchor.inset ?? 0;
+  if (anchor.side === 'bottom') {
+    return {
+      position: HANDLE_SIDE.bottom,
+      style: inset ? { ...base, left: anchor.offset, bottom: inset } : { ...base, left: anchor.offset },
+    };
+  }
+  const perpendicular = inset ? { [anchor.side]: inset } : {};
   return {
     position: HANDLE_SIDE[anchor.side],
-    style: anchor.side === 'bottom' ? { ...base, left: anchor.offset } : { ...base, top: anchor.offset },
+    style: { ...base, top: anchor.offset, ...perpendicular },
   };
 }
 
@@ -400,7 +414,7 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
             left: shape.safe.x,
             top: shape.safe.y,
             width: shape.safe.w,
-            minHeight: shape.safe.h,
+            height: shape.safe.h,
           }}
         >
           <div className="wfx-head">

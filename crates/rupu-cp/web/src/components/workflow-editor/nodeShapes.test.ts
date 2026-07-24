@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { shapeFor, type ShapeName } from './nodeShapes';
+import { shapeFor, type HandleAnchor, type ShapeName } from './nodeShapes';
 
 /** Ray-casting point-in-polygon. Points exactly ON an edge may report either
  *  way, so callers test corners that should be strictly inside. */
@@ -141,11 +141,36 @@ describe('shapeFor', () => {
   });
 
   it('every non-diamond shape has one unlabelled source on the right edge', () => {
+    // `inset` (F3) varies per shape — parallelogram/trapezoid/stacked pull
+    // their anchors in from the box edge to stay on their slanted/narrowed
+    // boundary (see the dedicated outline test below); side/offset stay
+    // uniform across every shape regardless.
     for (const name of ALL.filter((n) => n !== 'diamond')) {
       const s = shapeFor(name, 220, 130);
-      expect(s.target, name).toEqual({ side: 'left', offset: '50%' });
-      expect(s.sources, name).toEqual([{ anchor: { side: 'right', offset: '50%' } }]);
+      expect(s.target, name).toMatchObject({ side: 'left', offset: '50%' });
+      expect(s.sources, name).toHaveLength(1);
+      expect(s.sources[0].anchor, name).toMatchObject({ side: 'right', offset: '50%' });
     }
+  });
+
+  it('parallelogram/trapezoid/stacked pull their anchors in from the box edge; the rest stay flush', () => {
+    const flush = ALL.filter((n) => !['diamond', 'parallelogram', 'trapezoid', 'stacked'].includes(n));
+    for (const name of flush) {
+      const s = shapeFor(name, 220, 130);
+      expect(s.target.inset ?? 0, name).toBe(0);
+      expect(s.sources[0].anchor.inset ?? 0, name).toBe(0);
+    }
+    // parallelogram/trapezoid inset both target AND source, symmetrically.
+    for (const name of ['parallelogram', 'trapezoid'] as const) {
+      const s = shapeFor(name, 220, 130);
+      expect(s.target.inset, name).toBeGreaterThan(0);
+      expect(s.sources[0].anchor.inset, name).toBe(s.target.inset);
+    }
+    // stacked only insets its source (right side lands on the stack layer
+    // otherwise); its target (left) is flush like every other shape.
+    const stacked = shapeFor('stacked', 220, 130);
+    expect(stacked.target.inset ?? 0).toBe(0);
+    expect(stacked.sources[0].anchor.inset).toBeGreaterThan(0);
   });
 
   it('a subroutine adds its two vertical bars as extra strokes', () => {
@@ -226,5 +251,86 @@ describe('shapeFor', () => {
     const s = shapeFor(name as ShapeName, 34, 20);
     const flatWidth = Math.abs(s.points[bIdx][0] - s.points[aIdx][0]);
     expect(flatWidth, `${name} flat top edge is only ${flatWidth}px wide at 34x20`).toBeGreaterThanOrEqual(34 / 3);
+  });
+
+  // ── F3: handle anchors must resolve ON the silhouette's outline ──────────
+  // Reproduces exactly what EditableStepNode.tsx's `anchorProps` does to turn
+  // a HandleAnchor into a point: `side` picks the fixed coordinate (0/w for
+  // left/right, h for bottom) *minus* `inset` (default 0) back toward the
+  // box interior, and `offset` (always a `%` string here) picks the position
+  // along the perpendicular axis.
+  function resolveAnchor(anchor: HandleAnchor, w: number, h: number): [number, number] {
+    const pct = parseFloat(anchor.offset) / 100;
+    const inset = anchor.inset ?? 0;
+    switch (anchor.side) {
+      case 'left':
+        return [inset, h * pct];
+      case 'right':
+        return [w - inset, h * pct];
+      case 'bottom':
+        return [w * pct, h - inset];
+    }
+  }
+
+  /** Shortest distance from point `p` to the segment `a`-`b`. */
+  function distToSegment(p: [number, number], a: [number, number], b: [number, number]): number {
+    const [px, py] = p;
+    const [ax, ay] = a;
+    const [bx, by] = b;
+    const dx = bx - ax;
+    const dy = by - ay;
+    const lenSq = dx * dx + dy * dy;
+    const t = lenSq === 0 ? 0 : Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lenSq));
+    const cx = ax + t * dx;
+    const cy = ay + t * dy;
+    return Math.hypot(px - cx, py - cy);
+  }
+
+  /** Shortest distance from `p` to ANY edge of the (closed) polygon `poly`. */
+  function distToPolygon(p: [number, number], poly: [number, number][]): number {
+    let min = Infinity;
+    for (let i = 0; i < poly.length; i++) {
+      const a = poly[i];
+      const b = poly[(i + 1) % poly.length];
+      min = Math.min(min, distToSegment(p, a, b));
+    }
+    return min;
+  }
+
+  // Every "currently correct" shape's anchor sits exactly `I` (the module's
+  // 2px stroke inset) off the box edge, because its boundary at the anchored
+  // offset IS the box edge minus that stroke inset (see e.g. rect's/hexagon's
+  // points). `EPSILON` tolerates that fixed, by-design 2px gap while staying
+  // far below the 11-14px gaps this test exists to catch (parallelogram
+  // ~11px, trapezoid ~14px, stacked's right edge ~11px at real node sizes).
+  const EPSILON = 3;
+
+  it.each(ALL.filter((n) => n !== 'diamond'))(
+    '%s: target + source anchors resolve onto the silhouette outline',
+    (name) => {
+      const s = shapeFor(name, 220, 130);
+      const anchors = [s.target, ...s.sources.map((src) => src.anchor)];
+      for (const a of anchors) {
+        const pt = resolveAnchor(a, 220, 130);
+        const dist = distToPolygon(pt, s.points);
+        expect(dist, `${name} anchor ${JSON.stringify(a)} is ${dist.toFixed(1)}px off the outline`).toBeLessThanOrEqual(
+          EPSILON,
+        );
+      }
+    },
+  );
+
+  // diamond's then/else placement (right vertex / bottom vertex) is approved
+  // design, not a geometry bug — checked separately, never touched by F3.
+  it('diamond: then/else anchors resolve onto the silhouette outline (unchanged)', () => {
+    const s = shapeFor('diamond', 220, 130);
+    const anchors = [s.target, ...s.sources.map((src) => src.anchor)];
+    for (const a of anchors) {
+      const pt = resolveAnchor(a, 220, 130);
+      const dist = distToPolygon(pt, s.points);
+      expect(dist, `diamond anchor ${JSON.stringify(a)} is ${dist.toFixed(1)}px off the outline`).toBeLessThanOrEqual(
+        EPSILON,
+      );
+    }
   });
 });
