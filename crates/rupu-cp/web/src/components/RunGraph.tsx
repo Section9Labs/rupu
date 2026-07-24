@@ -166,7 +166,9 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
 
       if (ui !== 'next') {
         // Classic — unchanged: flat inkMute, with the blue/amber marching-ants
-        // classes owning both color and animation for the live frontier.
+        // classes (rg-edge-active / rg-edge-await) owning both color and
+        // animation for the live frontier. `animated` stays off — it would
+        // double up on top of the CSS dash animation.
         const stroke = active
           ? colors.status.running
           : awaiting
