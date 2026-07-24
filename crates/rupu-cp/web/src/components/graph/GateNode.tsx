@@ -19,9 +19,13 @@ import type { GraphNode } from '../../lib/runGraphModel';
 import { stateStyle } from './stepStyle';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { STEP_W, STEP_H } from '../../lib/nodeSize';
+import { runKindAccent, runKindIcon, runKindLabel } from './kindBridge';
+import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 
 export interface GateNodeData extends Record<string, unknown> {
   node: GraphNode;
+  /** 'next' turns on the kind-colored paint; absent/'classic' keeps today's. */
+  ui?: WorkflowEditorUi;
 }
 
 export type GateFlowNode = Node<GateNodeData, 'gate'>;
@@ -34,6 +38,13 @@ function GateNodeView({ data }: NodeProps<GateFlowNode>) {
   const running = node.state === 'running';
   const awaiting = node.state === 'awaiting_approval';
   const gate = node.approval_gate;
+  const next = data.ui === 'next';
+  // Kind channel (identity) vs status channel (overlay): in next the top-bar
+  // and pill carry the gate's KIND color while the glyph badge + label keep
+  // the STATE color, so a failed gate still reads as failed.
+  const accent = runKindAccent(node.kind);
+  const barColor = next ? colors.get(accent) : s.color;
+  const KindIcon = runKindIcon(node.kind);
 
   return (
     <div
@@ -50,7 +61,7 @@ function GateNodeView({ data }: NodeProps<GateFlowNode>) {
       {/* colored top-bar */}
       <div
         className="absolute left-0 right-0 top-0 h-[3px] rounded-t-[10px]"
-        style={{ background: s.color }}
+        style={{ background: barColor }}
       />
 
       <div className="flex items-center gap-2 pt-0.5">
@@ -68,9 +79,20 @@ function GateNodeView({ data }: NodeProps<GateFlowNode>) {
       </div>
 
       <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-        <span className="rounded-full border border-border px-1.5 py-px text-meta text-ink-dim">
-          ◇ gate
-        </span>
+        {next ? (
+          <span
+            data-testid="rg-kindpill"
+            className="inline-flex items-center gap-1 rounded px-1.5 py-px text-meta font-medium"
+            style={{ background: colors.alpha(accent, 0.14), color: colors.get(accent) }}
+          >
+            <KindIcon size={10} aria-hidden />
+            {runKindLabel(node.kind)}
+          </span>
+        ) : (
+          <span className="rounded-full border border-border px-1.5 py-px text-meta text-ink-dim">
+            ◇ gate
+          </span>
+        )}
         {gate?.auto_approve && (
           <span className="rounded bg-surface px-1.5 py-px text-meta text-ink-dim">auto</span>
         )}
