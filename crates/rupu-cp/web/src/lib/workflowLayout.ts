@@ -78,11 +78,14 @@ export const PARALLEL_PAD_V = 18;
  *  same way PARALLEL_HEADER_H/PARALLEL_SUBROW_H/PARALLEL_PAD_V are split:
  *  PANEL_HEADER_H is the fixed head+meta content, PANEL_PORT_ROW_H is the
  *  per-panelist row (14px pill + 3px row gap), PANEL_PAD_V folds in the
- *  `stacked` shape's fixed box overhead. */
+ *  `stacked` shape's fixed box overhead (30px) PLUS a 4px cushion — the
+ *  measured fit was exact (natural content == safe.h), and since `.wfx-safe`
+ *  now hard-clips with `overflow:hidden`, a sub-pixel font-metric difference
+ *  in production could otherwise shave the last panelist pill. */
 export const PANEL_W = 220;
 export const PANEL_HEADER_H = 31;
 export const PANEL_PORT_ROW_H = 17;
-export const PANEL_PAD_V = 30;
+export const PANEL_PAD_V = 34;
 export const PANEL_GATE_H = 34;
 
 export interface NodeBox {
