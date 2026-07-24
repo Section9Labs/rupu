@@ -29,20 +29,28 @@ export const NODE_H = 80;
 /** for_each carries an extra `for_each: <expr>` line. */
 export const FOR_EACH_H = 100;
 
-/** branch paints a diamond — a diamond's usable width collapses toward its
- *  tips, so its safe rect can only ever use a fraction of the box (here,
- *  half the width, a band centred at 28%-72% of the height — see the diamond
- *  case in nodeShapes.ts). Widening is cheaper than heightening for a
- *  diamond's safe area (the safe rect's usable half-width grows linearly with
- *  BOTH the box width and the y-fraction, but a taller box also pushes ranks
- *  apart more under dagre's `rankdir: 'LR'`, where node HEIGHT is the
- *  cross-axis extent) — so BRANCH_W is wider than a step's 210 (despite a
- *  branch carrying more content: header + condition + two then/else port
- *  pills), while BRANCH_H stays modest. At 280x200 the safe rect is a
- *  140x88 band — comfortable room for a realistic branch body (measured in
- *  headless Chrome; see the diamond case in nodeShapes.ts). */
-export const BRANCH_W = 280;
-export const BRANCH_H = 200;
+/** branch paints a vhex (a vertical hexagon — points on the top/bottom,
+ *  flat left/right sides): a compact "decision" shape, distinct from
+ *  `for_each`'s hexagon whose points sit on the left/right (see the `vhex`
+ *  case in nodeShapes.ts). Unlike a diamond, a vhex's safe band is full-width
+ *  for the whole middle of the box (only the top/bottom tip triangles lose
+ *  width), so a modest box comfortably fits a realistic branch body (header
+ *  + `if <condition>` line + two then/else port pills) without the diamond's
+ *  need to over-widen.
+ *
+ *  BRANCH_H=128 rather than a rounder 112: measured in headless Chrome
+ *  against BranchBodyNext's real rendered content (kindpill+id header, an
+ *  `if sev == high` condition line, and true/false port pills that — for any
+ *  realistic target id — wrap to two rows in the 174px-wide safe band, same
+ *  as the diamond this shape replaced), the header+condition+two-port-rows
+ *  stack needs ~73px. At 112 the safe rect is only 68px tall (a 5px clip,
+ *  caught by rendering, not by the unit tests, which is exactly why this
+ *  module's render-verify step exists). 128 gives an 84px-tall safe rect —
+ *  73px of real content plus ~11px slack, proportionally close to the
+ *  diamond's old ~13px-over-75px margin at 280x200. Still far more compact
+ *  than the diamond's 280x200 it replaces. */
+export const BRANCH_W = 200;
+export const BRANCH_H = 128;
 
 /** action (parallelogram) and approval_gate (trapezoid) both lose horizontal
  *  room to slanted sides; the box grows so the text band stays step-sized. */

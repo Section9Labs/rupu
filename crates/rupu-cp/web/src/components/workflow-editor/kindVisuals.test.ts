@@ -42,7 +42,7 @@ describe('kindVisuals', () => {
       for_each: 'hexagon',
       parallel: 'subroutine',
       panel: 'stacked',
-      branch: 'diamond',
+      branch: 'vhex',
       approval_gate: 'trapezoid',
       action: 'parallelogram',
     });
