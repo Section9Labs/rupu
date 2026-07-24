@@ -70,6 +70,41 @@ function armForConnection(
   return sourceNode?.data.kind === 'branch' ? sourceHandle : undefined;
 }
 
+/** Whether a `canConnect` result should actually block the draw. A plain
+ *  (non-arm) connect that fails ONLY because `canConnect` sees a "duplicate"
+ *  is let through: under the derived-edges model every array-adjacent node
+ *  pair already carries an (unlabeled) chain edge (or the pair may already
+ *  carry an explicit `next`), so `canConnect` can't tell "redraw an edge that
+ *  already exists" apart from "reject an accidental double-click" — and for a
+ *  plain connect the former is exactly what authoring a `next`/`split` edge
+ *  over an already-adjacent pair looks like (`setNext`/`addSplitTarget` are
+ *  both idempotent when the target is unchanged, so letting it through is
+ *  harmless). Self-loop and cycle rejections still block a plain connect;
+ *  branch arms keep the strict duplicate check (unchanged — `arm` is only
+ *  passed for a real arm draw, so this bypass never applies to one). */
+function plainConnectAllowed(
+  res: ReturnType<typeof canConnect>,
+  arm: 'then' | 'else' | undefined,
+): boolean {
+  return res.ok || (arm === undefined && res.kind === 'duplicate');
+}
+
+/** Set a regular (non-branch, non-split) source node's SOLE successor to
+ *  `target` — a fresh draw REPLACES whatever `next` previously held, since a
+ *  regular node has exactly one explicit successor. Shared by `applyConnect`
+ *  and `applyAddConnectedNext` so both draw the same edge the same way. */
+function setNext(data: StepNodeData, target: string): StepNodeData {
+  return { ...data, next: [target] };
+}
+
+/** Append `target` to a `split` node's fan-out list (accumulate, deduped) —
+ *  a split fans out to every target drawn to it, unlike a regular node's
+ *  single `next`. Shared by `applyConnect` and `applyAddConnectedNext`. */
+function addSplitTarget(data: StepNodeData, target: string): StepNodeData {
+  const list = data.split ?? [];
+  return list.includes(target) ? data : { ...data, split: [...list, target] };
+}
+
 /** Validate + apply a drawn connection. Valid → onChange with the new edge
  *  appended; invalid → onInvalid(reason) and NO onChange. Missing endpoints are
  *  ignored.
@@ -84,7 +119,15 @@ function armForConnection(
  *  branch-arm edge on the very next render, so the append alone is enough for
  *  the connection to round-trip and to draw. Any other `sourceHandle`
  *  (including `null`, the every-other-kind default single source handle)
- *  falls back to today's plain-edge behavior.
+ *  falls back to the plain-edge behavior below.
+ *
+ *  Plain (non-arm) connect — the Task 5 model: dropping a node leaves it
+ *  unconnected; DRAWING is what authors an edge. A `split` source ACCUMULATES
+ *  (`addSplitTarget` — a split fans out to every target drawn to it); any
+ *  other source REPLACES its `next` (`setNext` — one explicit successor, so a
+ *  second draw supersedes the first rather than appending). This replaces the
+ *  earlier "plain connect = reorder the node array" behavior, which doesn't
+ *  hold once edges are explicit rather than array-position-derived.
  *
  *  `canConnect` is called with the resolved `arm` (not `undefined`) so its
  *  duplicate check compares like with like: under the derived-edges model
@@ -101,7 +144,7 @@ export function applyConnect(
   if (!source || !target) return;
   const arm = armForConnection(graph.nodes, source, sourceHandle);
   const res = canConnect(source, target, { edges: graph.edges }, arm);
-  if (!res.ok) {
+  if (!res.ok && !(arm === undefined && res.kind === 'duplicate')) {
     onInvalid(res.reason);
     return;
   }
@@ -117,30 +160,45 @@ export function applyConnect(
     onChange(withDerivedEdges(graph.meta, nodes));
     return;
   }
-  // plain connect = reorder: move target to immediately after source (linear
-  // flow is node-array order; a free-floating stored edge doesn't round-trip).
-  const src = graph.nodes.findIndex((n) => n.id === source);
-  const tgt = graph.nodes.findIndex((n) => n.id === target);
-  if (src < 0 || tgt < 0) return;
-  const nodes = [...graph.nodes];
-  const [moved] = nodes.splice(tgt, 1);
-  nodes.splice(nodes.findIndex((n) => n.id === source) + 1, 0, moved);
+
+  const nodes = graph.nodes.map((n) => {
+    if (n.id !== source) return n;
+    return { ...n, data: n.data.kind === 'split' ? addSplitTarget(n.data, target) : setNext(n.data, target) };
+  });
   onChange(withDerivedEdges(graph.meta, nodes));
 }
 
-/** Remove a node, scrubbing it from any surviving branch node's then/else
- *  target list (branch routing is single-source — the arrays, not a stored
- *  edges array, are what the deleted node's incoming/outgoing edges derive
- *  from). Chain/data-ref edges touching the deleted id simply stop existing
- *  once the id is gone from the node array — nothing else to clean up there. */
+/** Remove a node, scrubbing it from any surviving node's `next`/`split`
+ *  successor list and any surviving branch node's then/else target list —
+ *  those arrays, not a stored edges array, are what the deleted node's
+ *  outgoing edges derive from, so without this an edge to a now-gone node
+ *  would keep trying to derive. Chain/data-ref edges touching the deleted id
+ *  simply stop existing once the id is gone from the node array — nothing
+ *  else to clean up there. */
 export function applyDelete(graph: WorkflowGraph, id: string): WorkflowGraph {
   const nodes = graph.nodes
     .filter((n) => n.id !== id)
     .map((n) => {
       const then = n.data.thenTargets?.filter((t) => t !== id);
       const els = n.data.elseTargets?.filter((t) => t !== id);
-      if ((then?.length ?? 0) === (n.data.thenTargets?.length ?? 0) && (els?.length ?? 0) === (n.data.elseTargets?.length ?? 0)) return n;
-      return { ...n, data: { ...n.data, ...(then ? { thenTargets: then } : {}), ...(els ? { elseTargets: els } : {}) } };
+      const nxt = n.data.next?.filter((t) => t !== id);
+      const spl = n.data.split?.filter((t) => t !== id);
+      const changed =
+        (then?.length ?? 0) !== (n.data.thenTargets?.length ?? 0) ||
+        (els?.length ?? 0) !== (n.data.elseTargets?.length ?? 0) ||
+        (nxt?.length ?? 0) !== (n.data.next?.length ?? 0) ||
+        (spl?.length ?? 0) !== (n.data.split?.length ?? 0);
+      if (!changed) return n;
+      return {
+        ...n,
+        data: {
+          ...n.data,
+          ...(then ? { thenTargets: then } : {}),
+          ...(els ? { elseTargets: els } : {}),
+          ...(nxt ? { next: nxt } : {}),
+          ...(spl ? { split: spl } : {}),
+        },
+      };
     });
   return withDerivedEdges(graph.meta, nodes);
 }
@@ -149,20 +207,32 @@ export function applyDelete(graph: WorkflowGraph, id: string): WorkflowGraph {
  *  drops `edge.target` from the source branch node's corresponding arm list
  *  (`thenTargets` / `elseTargets`) — those arrays are the single source of
  *  truth the edge derives from, so without this the arm would re-derive the
- *  "deleted" edge on the very next render. A removed PLAIN chain/data-ref edge
- *  is a no-op: linear order is expressed by node-array position (or a
- *  `steps.X` template reference), neither of which "delete an edge" can
- *  target individually under the derived-edges model — see the file-header
- *  comment. */
+ *  "deleted" edge on the very next render. A removed PLAIN edge that derives
+ *  from an explicit `next`/`split` entry clears that entry the same way (the
+ *  Task 5 model — deleting a drawn line clears the edge it came from, not a
+ *  reorder). A removed edge that derives from node-array position (legacy
+ *  chain) or a `steps.X` template reference is a no-op: neither is something
+ *  "delete an edge" can target individually — see the file-header comment. */
 export function applyRemoveEdges(graph: WorkflowGraph, ids: ReadonlySet<string>): WorkflowGraph {
-  const removed = deriveEdges(graph.nodes).filter((e) => ids.has(e.id) && e.branch);
+  const removed = deriveEdges(graph.nodes).filter((e) => ids.has(e.id));
   if (removed.length === 0) return graph;
   const nodes = graph.nodes.map((n) => {
     let data = n.data;
     for (const e of removed) {
       if (e.source !== n.id) continue;
-      if (e.branch === 'then') data = { ...data, thenTargets: (data.thenTargets ?? []).filter((t) => t !== e.target) };
-      else if (e.branch === 'else') data = { ...data, elseTargets: (data.elseTargets ?? []).filter((t) => t !== e.target) };
+      if (e.branch === 'then') {
+        if (!(data.thenTargets ?? []).includes(e.target)) continue;
+        data = { ...data, thenTargets: (data.thenTargets ?? []).filter((t) => t !== e.target) };
+      } else if (e.branch === 'else') {
+        if (!(data.elseTargets ?? []).includes(e.target)) continue;
+        data = { ...data, elseTargets: (data.elseTargets ?? []).filter((t) => t !== e.target) };
+      } else if (data.kind === 'split' && (data.split ?? []).includes(e.target)) {
+        data = { ...data, split: (data.split ?? []).filter((t) => t !== e.target) };
+      } else if ((data.next ?? []).includes(e.target)) {
+        data = { ...data, next: (data.next ?? []).filter((t) => t !== e.target) };
+      }
+      // else: this edge derives from node-array position (legacy chain) or a
+      // data-ref — nothing explicit to clear, no-op for this node.
     }
     return data === n.data ? n : { ...n, data };
   });
@@ -179,7 +249,10 @@ export function nextNodeId(nodes: GraphNode[]): string {
 
 /** Build the StepNodeData for a fresh node of `kind`, seeding the container
  *  shapes (parallel array, panel config) so the node is immediately valid to
- *  render and round-trip. */
+ *  render and round-trip. Deliberately never sets `next`/`split` — a dropped
+ *  node is disconnected (Task 5 model) until a line is drawn FROM it or TO
+ *  it; leaving the field undefined is `deriveEdges`'s definition of "no
+ *  outgoing edge", so no explicit `next: []` is needed here either. */
 function newNodeData(id: string, kind: StepKind): StepNodeData {
   const data: StepNodeData = { id, kind };
   if (kind === 'parallel') data.parallel = [];
@@ -231,13 +304,15 @@ export function applyAddNode(
 }
 
 /** Add a new node (default kind `step`), SPLICED into the node array
- *  immediately after `sourceId` so the chain edge `sourceId -> newId` derives
- *  from consecutive order, positioned to the right of the source so the
- *  linear chain reads L→R. Powers the inline "⊕ next" fast path. Returns the
- *  updated graph and the new id. If `sourceId` is unknown the node is still
- *  appended at the end (placed at a sane default position) — under the
- *  derived-edges model that still chains it from whatever was previously
- *  last in the array, since EVERY consecutive array pair is a chain edge. */
+ *  immediately after `sourceId` (a cosmetic placement so the YAML `steps:`
+ *  list reads L→R near its source) AND wired as `sourceId`'s explicit
+ *  successor — a `split` source ACCUMULATES (fans out), any other source
+ *  REPLACES its existing `next`, the same draw semantics `applyConnect` uses
+ *  (Task 5: edges are authored, never implied by array order). Powers the
+ *  inline "⊕ next" fast path. Returns the updated graph and the new id. If
+ *  `sourceId` is unknown the node is still appended at the end and wired from
+ *  whatever was previously LAST in the array, so it still lands connected to
+ *  something rather than floating free. */
 export function applyAddConnectedNext(
   graph: WorkflowGraph,
   sourceId: string,
@@ -255,7 +330,18 @@ export function applyAddConnectedNext(
   };
   const nodes = [...graph.nodes];
   nodes.splice(sourceIdx >= 0 ? sourceIdx + 1 : nodes.length, 0, node);
-  return { graph: withDerivedEdges(graph.meta, nodes), id };
+
+  // Wire the new node as an explicit successor of `source` — or, when
+  // `sourceId` is unknown, of whatever was previously last in `graph.nodes`
+  // (captured before the splice above).
+  const anchorId = source ? source.id : graph.nodes[graph.nodes.length - 1]?.id;
+  const wired = anchorId
+    ? nodes.map((n) => {
+        if (n.id !== anchorId) return n;
+        return { ...n, data: n.data.kind === 'split' ? addSplitTarget(n.data, id) : setNext(n.data, id) };
+      })
+    : nodes;
+  return { graph: withDerivedEdges(graph.meta, wired), id };
 }
 
 /** Insert a new node onto an existing edge A→B, keeping the derived edges
@@ -587,7 +673,8 @@ function WorkflowEditorGraphInner({
     (c: Edge | Connection) => {
       if (!c.source || !c.target) return false;
       const arm = armForConnection(graph.nodes, c.source, c.sourceHandle);
-      return canConnect(c.source, c.target, { edges: graph.edges }, arm).ok;
+      const res = canConnect(c.source, c.target, { edges: graph.edges }, arm);
+      return plainConnectAllowed(res, arm);
     },
     [graph.edges, graph.nodes],
   );
