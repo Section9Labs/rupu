@@ -909,6 +909,48 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
     }
   }
 
+  // Graph-mode checks (Phase 1 non-linear orchestration): only meaningful once
+  // a workflow has explicit edges at all — a legacy edge-free workflow can't
+  // author a cycle/dangling-target/degenerate-split-join through this
+  // vocabulary, so these mirror the backend's `validate_graph` gate exactly
+  // and never fire on a legacy workflow (spec §2/§4 compat).
+  if (hasExplicitEdges(g.nodes)) {
+    // Cycle: mirrors the backend's `WorkflowCycle` check. `sorted` (above)
+    // already ran Kahn's algorithm over `g.edges` (== `deriveEdges(g.nodes)`
+    // by the graph's own invariant); any node topoSort couldn't place still
+    // has unresolved in-degree, i.e. is part of a cycle. A reconverging
+    // diamond (a→b, a→c, b→d, c→d) is NOT a cycle — Kahn's tracks per-node
+    // in-degree, not pairwise adjacency, so it drains cleanly.
+    if ('cycle' in sorted) {
+      for (const id of sorted.cycle) add(id, 'part of a cycle — steps must form a DAG');
+    }
+
+    // Unknown edge target: a `next`/`split` id that isn't a known node.
+    for (const n of g.nodes) {
+      for (const t of n.data.next ?? []) {
+        if (!nodeIds.has(t)) add(n.id, `edge target \`${t}\` is not a known step`);
+      }
+      if (n.data.kind === 'split') {
+        for (const t of n.data.split ?? []) {
+          if (!nodeIds.has(t)) add(n.id, `edge target \`${t}\` is not a known step`);
+        }
+      }
+    }
+
+    // Degenerate split/join: fanning out to (or in from) fewer than 2 steps
+    // isn't doing real orchestration work — a plain `next` chain would do the
+    // same job with less ceremony. Low-severity (not a save-blocking error
+    // like the checks above), so distinct wording.
+    for (const n of g.nodes) {
+      if (n.data.kind === 'split') {
+        if ((n.data.split ?? []).length < 2) add(n.id, 'a split should fan out to 2+ steps');
+      } else if (n.data.kind === 'join') {
+        const inbound = g.edges.filter((e) => e.target === n.id).length;
+        if (inbound < 2) add(n.id, 'a join should have 2+ inbound paths');
+      }
+    }
+  }
+
   return out;
 }
 

@@ -860,6 +860,104 @@ describe('validateGraph', () => {
     const problems = validateGraph(g);
     expect((problems.gate ?? []).some((m) => /on_reject/.test(m))).toBe(false);
   });
+
+  // ── graph-mode checks (Task 7): cycle / unknown edge target / split-join degree ──
+
+  it('flags a cycle', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p', next: ['b'] },
+        { id: 'b', agent: 'x', prompt: 'p', next: ['a'] },
+      ],
+    });
+    expect(Object.values(validateGraph(g)).flat().some((m) => /cycle/i.test(m))).toBe(true);
+  });
+
+  it('flags an unknown `next` edge target', () => {
+    const g = yamlToGraph({ name: 'w', steps: [{ id: 'a', agent: 'x', prompt: 'p', next: ['ghost'] }] });
+    expect(Object.values(validateGraph(g)).flat().some((m) => /ghost|unknown|not a known/i.test(m))).toBe(true);
+  });
+
+  it('flags an unknown `split` edge target', () => {
+    const g = yamlToGraph({ name: 'w', steps: [{ id: 's', split: ['ghost'] }] });
+    const problems = validateGraph(g);
+    expect(problems.s.some((m) => /ghost/.test(m) && /not a known step/.test(m))).toBe(true);
+  });
+
+  it('does NOT flag a reconverging diamond (a→b, a→c, b→d, c→d) as a cycle', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p', next: ['b', 'c'] },
+        { id: 'b', agent: 'x', prompt: 'p', next: ['d'] },
+        { id: 'c', agent: 'x', prompt: 'p', next: ['d'] },
+        { id: 'd', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(Object.values(validateGraph(g)).flat().some((m) => /cycle/i.test(m))).toBe(false);
+  });
+
+  it('does not run cycle detection on a legacy workflow (no explicit edges)', () => {
+    // Chain a->b (legacy consecutive-pair edge) + data-ref edge b->a (a's
+    // prompt references steps.b) is a genuine cycle in `deriveEdges`, but
+    // this workflow has no `next`/`split`/`join` anywhere, so `hasExplicitEdges`
+    // is false and the new graph-mode checks must not fire.
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'uses steps.b' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(Object.values(validateGraph(g)).flat().some((m) => /part of a cycle/i.test(m))).toBe(false);
+  });
+
+  it('flags a split with fewer than 2 targets', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 's', split: ['a'] },
+        { id: 'a', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(validateGraph(g).s).toEqual(expect.arrayContaining(['a split should fan out to 2+ steps']));
+  });
+
+  it('does not flag a split with 2+ targets', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 's', split: ['a', 'b'] },
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect((validateGraph(g).s ?? []).some((m) => /fan out/.test(m))).toBe(false);
+  });
+
+  it('flags a join with fewer than 2 inbound edges', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p', next: ['j'] },
+        { id: 'j', join: {} },
+      ],
+    });
+    expect(validateGraph(g).j).toEqual(expect.arrayContaining(['a join should have 2+ inbound paths']));
+  });
+
+  it('does not flag a join with 2+ inbound edges', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p', next: ['j'] },
+        { id: 'b', agent: 'x', prompt: 'p', next: ['j'] },
+        { id: 'j', join: {} },
+      ],
+    });
+    expect((validateGraph(g).j ?? []).some((m) => /inbound/.test(m))).toBe(false);
+  });
 });
 
 // ── fold-in (review Minor): `with:` on a non-action step/for_each node ──────
