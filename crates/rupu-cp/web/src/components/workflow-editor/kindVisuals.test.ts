@@ -3,7 +3,7 @@
 // EXACT accents both call sites used inline before this module existed.
 
 import { describe, it, expect } from 'vitest';
-import { KIND_ACCENT, KIND_ICON } from './kindVisuals';
+import { KIND_ACCENT, KIND_ICON, KIND_SHAPE } from './kindVisuals';
 import type { StepKind } from '../../lib/workflowGraph';
 import type { ColorKey } from '../../lib/useThemeColors';
 
@@ -34,5 +34,17 @@ describe('kindVisuals', () => {
     expect(Object.keys(KIND_ICON).sort()).toEqual([...KINDS].sort());
     // Every kind gets a visually distinct icon (no accidental aliasing).
     expect(new Set(Object.values(KIND_ICON)).size).toBe(KINDS.length);
+  });
+
+  it('KIND_SHAPE maps every kind to its flowchart symbol', () => {
+    expect(KIND_SHAPE).toEqual({
+      step: 'rect',
+      for_each: 'hexagon',
+      parallel: 'subroutine',
+      panel: 'stacked',
+      branch: 'diamond',
+      approval_gate: 'trapezoid',
+      action: 'parallelogram',
+    });
   });
 });

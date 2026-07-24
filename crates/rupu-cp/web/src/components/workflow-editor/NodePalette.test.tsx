@@ -162,12 +162,35 @@ describe('NodePalette', () => {
       expect(container.querySelector('.wfx-palette')).not.toBeInTheDocument();
     });
 
-    it('rail cards are .wfx-pcard with a .wfx-picon accent icon, same as the float next look', () => {
+    it('rail BLOCK cards are .wfx-pcard with a .wfx-pshape silhouette and NO lucide icon (F1)', () => {
+      // The rail's 3-col grid gives each chip too little width for both a
+      // silhouette AND a 14px lucide glyph AND a readable label — dropping
+      // the glyph on block chips (the shape already IS the kind signal) is
+      // what keeps `parallel`/`panel` from both truncating to the same
+      // "pa…" at the rail's default width. Connector-tool chips have no
+      // shape and keep their icon — see the next test.
       const { container } = render(
         <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" />,
       );
       expect(container.querySelectorAll('.wfx-pcard').length).toBe(4);
-      expect(container.querySelectorAll('.wfx-picon').length).toBe(4);
+      expect(container.querySelectorAll('.wfx-pshape').length).toBe(4);
+      expect(container.querySelectorAll('.wfx-picon').length).toBe(0);
+    });
+
+    it('rail CONNECTOR-TOOL cards keep their .wfx-picon (no shape to preview) (F1)', () => {
+      const { container } = render(
+        <NodePalette
+          onAdd={() => {}}
+          onDragStartKind={() => {}}
+          variant="rail"
+          workflowEditorUi="next"
+          tools={[{ name: 'scm.prs.create', description: 'Open a PR', input_schema: {}, kind: 'write' }]}
+        />,
+      );
+      const connectorCard = container.querySelector('[aria-label="Add scm.prs.create action"]');
+      expect(connectorCard).toBeInTheDocument();
+      expect(connectorCard?.querySelector('.wfx-picon')).toBeInTheDocument();
+      expect(connectorCard?.querySelector('.wfx-pshape')).not.toBeInTheDocument();
     });
 
     it('clicking a rail card SELECTS it (shows a detail card) rather than instantly adding', () => {
@@ -348,6 +371,29 @@ describe('NodePalette', () => {
       render(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} workflowEditorUi="next" />);
       fireEvent.click(screen.getByRole('button', { name: 'Add parallel node' }));
       expect(onAdd).toHaveBeenCalledWith('parallel');
+    });
+
+    it('each block chip previews its kind silhouette, so the shape is learned at pick time', () => {
+      const { container } = render(
+        <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" workflowEditorUi="next" />,
+      );
+      const branchChip = container.querySelector('[aria-label="Add branch node"]');
+      expect(branchChip).toBeInTheDocument();
+
+      const shape = branchChip?.querySelector('.wfx-pshape');
+      expect(shape).toBeInTheDocument();
+      expect(shape?.tagName.toLowerCase()).toBe('svg');
+      // a diamond: four vertices, no curves
+      const d = shape?.querySelector('path')?.getAttribute('d') ?? '';
+      expect(d).toMatch(/^M /);
+      expect(d).not.toContain('Q');
+      expect(d.match(/L/g) ?? []).toHaveLength(3);
+
+      // a step chip previews the rounded rect instead
+      const stepD = container
+        .querySelector('[aria-label="Add step node"] .wfx-pshape path')
+        ?.getAttribute('d');
+      expect(stepD).toContain('Q');
     });
   });
 });

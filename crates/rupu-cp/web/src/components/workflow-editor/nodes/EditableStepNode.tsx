@@ -17,7 +17,8 @@ import { hasInlineApproval, type GraphNode, type StepKind, type StepNodeData } f
 import { editorNodeSize } from '../../../lib/workflowLayout';
 import { useThemeColors, type ThemeColors } from '../../../lib/useThemeColors';
 import type { WorkflowEditorUi } from '../../../hooks/useWorkflowEditorUi';
-import { KIND_ACCENT, KIND_ICON } from '../kindVisuals';
+import { KIND_ACCENT, KIND_ICON, KIND_SHAPE } from '../kindVisuals';
+import { shapeFor, type HandleAnchor } from '../nodeShapes';
 
 // Node data carried on the xyflow node. Exported so WorkflowEditorGraph projects
 // the exact same shape when it derives the flow `nodes`.
@@ -38,6 +39,16 @@ type EditableFlowNode = Node<NodeData, 'editable'>;
  *  accent (no fixed `bg-*-50` classes that wash out on near-black). */
 function kindChipStyle(colors: ThemeColors, kind: StepKind): React.CSSProperties {
   return { background: colors.alpha(KIND_ACCENT[kind], 0.14), color: colors.get(KIND_ACCENT[kind]) };
+}
+
+/** `next`-path kind pill label — matches the approved design artifact, which
+ *  drops the `approval_` prefix (a standalone gate node already reads as a
+ *  gate via its trapezoid silhouette; the full `approval_gate` string eats
+ *  ~115px of a 148px-wide safe rect, truncating the node id instead). Every
+ *  other kind's label is `d.kind` verbatim, unchanged. Classic path (below)
+ *  keeps its own separate, hardcoded "gate" text — not driven by this. */
+function pillLabel(kind: StepKind): string {
+  return kind === 'approval_gate' ? 'gate' : kind;
 }
 
 /** dashed ring badge marking a legacy inline approval (agent step carrying
@@ -308,6 +319,35 @@ function GateBodyNext({ d }: { d: StepNodeData }) {
   );
 }
 
+const HANDLE_SIDE = { left: Position.Left, right: Position.Right, bottom: Position.Bottom } as const;
+
+/** Turn a shape's HandleAnchor into xyflow's (position, style) pair. `offset`
+ *  runs along the anchored side: `top` for a left/right edge, `left` for the
+ *  bottom edge. `inset` (default 0) runs PERPENDICULAR to `side` — xyflow's
+ *  default handle CSS pins the handle flush with the box edge via a `0`
+ *  offset (`left: 0` / `right: 0` / `bottom: 0`) plus a `translate(±50%, …)`
+ *  that centers the handle ON that edge; substituting `inset` px for that
+ *  `0` shifts the same centered point in from the edge by `inset`, landing
+ *  it back on the shape's true boundary for shapes whose side isn't flush
+ *  with the box (see nodeShapes.ts's parallelogram/trapezoid/stacked). */
+function anchorProps(
+  anchor: HandleAnchor,
+  base: React.CSSProperties,
+): { position: Position; style: React.CSSProperties } {
+  const inset = anchor.inset ?? 0;
+  if (anchor.side === 'bottom') {
+    return {
+      position: HANDLE_SIDE.bottom,
+      style: inset ? { ...base, left: anchor.offset, bottom: inset } : { ...base, left: anchor.offset },
+    };
+  }
+  const perpendicular = inset ? { [anchor.side]: inset } : {};
+  return {
+    position: HANDLE_SIDE[anchor.side],
+    style: { ...base, top: anchor.offset, ...perpendicular },
+  };
+}
+
 function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
   const { node, problems } = data;
   const ui = data.workflowEditorUi ?? 'classic';
@@ -323,36 +363,64 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
   // markup below stays byte-identical. Same data (`d`/`colors`/`box`/handles),
   // new `.wfx-*` classes only.
   if (ui === 'next') {
-    // Selection ring/glow computed from the SAME kind accent as the border —
-    // one coherent color signal instead of accent-border + brand-purple ring.
-    const selBoxShadow = selected
-      ? `0 0 0 2px ${colors.alpha(KIND_ACCENT[d.kind], 0.3)}, 0 6px 20px ${colors.alpha(KIND_ACCENT[d.kind], 0.14)}`
-      : undefined;
+    const shape = shapeFor(KIND_SHAPE[d.kind], box.width, box.height);
+    const stroke = selected ? color : 'rgb(var(--c-border))';
     return (
       <div
         data-ui={ui}
         className="wfx-node"
-        style={{
-          borderColor: selected ? color : undefined,
-          boxShadow: selBoxShadow,
-          width: box.width,
-          minHeight: box.height,
-        }}
+        style={{ width: box.width, minHeight: box.height }}
       >
-        <Handle type="target" position={Position.Left} style={handleStyle} />
+        <Handle type="target" {...anchorProps(shape.target, handleStyle)} />
 
-        {/* .wfx-clip clips the bar/head/body to the card's radius — a 3px-tall
-            absolutely-positioned bar can't hold its own 12px corner radius, so
-            it must be clipped by an ancestor instead of rounding itself.
-            Handles stay OUTSIDE the clip (siblings, on the card border). */}
-        <div className="wfx-clip">
-          {/* colored top-bar — by KIND (no run-state) */}
-          <div className="wfx-bar" style={{ background: color }} />
+        {/* The silhouette is painted in SVG rather than clipped with
+            `clip-path`: a clip slices the 1px border at the clip boundary and
+            cannot clip an outward selection glow. Paint order matters: the
+            filled body must land BEFORE `extra` (rails / stack layers) or an
+            opaque fill paints straight over them — `extra` is stroked-only
+            and always on top, per nodeShapes.ts's NodeShape contract. */}
+        <svg className="wfx-sil" viewBox={`0 0 ${box.width} ${box.height}`} aria-hidden>
+          {selected && (
+            <path
+              d={shape.path}
+              fill="none"
+              stroke={color}
+              strokeWidth={5}
+              strokeLinejoin="round"
+              opacity={0.25}
+            />
+          )}
+          <path
+            className="wfx-sil-shape"
+            d={shape.path}
+            fill="rgb(var(--c-panel))"
+            stroke={stroke}
+            strokeWidth={1.5}
+            strokeLinejoin="round"
+          />
+          {shape.extra.map((d2, i) => (
+            <path key={i} d={d2} fill="none" stroke="rgb(var(--c-border))" strokeWidth={1.5} />
+          ))}
+        </svg>
 
+        {/* Content lives in the shape's safe rect, inscribed at the silhouette's
+            narrowest row — truncation is bounded by THIS box, not the bounding
+            box. `align` is part of the shape: a diamond centres, because
+            left-aligned text there starts on the slope and reads as spilling
+            outside the outline. */}
+        <div
+          className={shape.align === 'center' ? 'wfx-safe wfx-safe-mid' : 'wfx-safe'}
+          style={{
+            left: shape.safe.x,
+            top: shape.safe.y,
+            width: shape.safe.w,
+            height: shape.safe.h,
+          }}
+        >
           <div className="wfx-head">
             <span className="wfx-kindpill" style={kindChipStyle(colors, d.kind)}>
               <KindIcon className="wfx-kindicon" size={12} strokeWidth={2} aria-hidden />
-              {d.kind}
+              {pillLabel(d.kind)}
             </span>
             <span className="wfx-nid">{d.id}</span>
             {hasProblems && (
@@ -378,25 +446,27 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
         </div>
 
         {/* branch nodes get TWO labeled source handles (one per arm) instead of
-            the single default source handle every other kind uses. */}
-        {d.kind === 'branch' ? (
-          <>
+            the single default source handle every other kind uses. 'then'/
+            'else' are a MODEL CONTRACT — applyConnect reads these exact ids to
+            write thenTargets/elseTargets — not just a UI convenience, even
+            though their on-canvas positions are shape-derived (see
+            nodeShapes.ts's SourceAnchor). */}
+        {shape.sources.map((s) => {
+          // arm colour is a UI cue; the handle ID is a MODEL CONTRACT
+          // (applyConnect reads 'then'/'else' to write thenTargets/elseTargets).
+          const tint =
+            s.id === 'then' ? colors.status.done : s.id === 'else' ? colors.status.failed : undefined;
+          const { position, style } = anchorProps(s.anchor, handleStyle);
+          return (
             <Handle
+              key={s.id ?? 'source'}
               type="source"
-              position={Position.Right}
-              id="then"
-              style={{ ...handleStyle, top: '38%', background: colors.status.done }}
+              id={s.id}
+              position={position}
+              style={tint ? { ...style, background: tint } : style}
             />
-            <Handle
-              type="source"
-              position={Position.Right}
-              id="else"
-              style={{ ...handleStyle, top: '68%', background: colors.status.failed }}
-            />
-          </>
-        ) : (
-          <Handle type="source" position={Position.Right} style={handleStyle} />
-        )}
+          );
+        })}
       </div>
     );
   }

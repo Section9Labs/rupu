@@ -12,6 +12,7 @@
 import { Bot, Columns3, GitBranch, Repeat, ShieldCheck, UserCheck, Zap, type LucideIcon } from 'lucide-react';
 import type { StepKind } from '../../lib/workflowGraph';
 import type { ColorKey } from '../../lib/useThemeColors';
+import type { ShapeName } from './nodeShapes';
 
 export const KIND_ACCENT: Record<StepKind, ColorKey> = {
   step: 'status.running',
@@ -32,4 +33,18 @@ export const KIND_ICON: Record<StepKind, LucideIcon> = {
   branch: GitBranch,
   approval_gate: UserCheck,
   action: Zap,
+};
+
+/** Which flowchart symbol each kind paints (see nodeShapes.ts). `parallel` and
+ *  `panel` keep a rectangular body deliberately — they are the only kinds whose
+ *  height grows with content, so the subroutine/stacked idioms (which grow)
+ *  are the right flowchart forms rather than a fixed silhouette. */
+export const KIND_SHAPE: Record<StepKind, ShapeName> = {
+  step: 'rect',
+  for_each: 'hexagon',
+  parallel: 'subroutine',
+  panel: 'stacked',
+  branch: 'diamond',
+  approval_gate: 'trapezoid',
+  action: 'parallelogram',
 };

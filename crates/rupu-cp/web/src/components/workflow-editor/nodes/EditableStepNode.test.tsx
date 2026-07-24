@@ -10,7 +10,14 @@ import { render, screen, cleanup } from '@testing-library/react';
 import type { Node, NodeProps } from '@xyflow/react';
 
 vi.mock('@xyflow/react', () => ({
-  Handle: () => null,
+  Handle: (props: Record<string, unknown>) => (
+    <i
+      data-testid="handle"
+      data-type={String(props.type)}
+      data-position={String(props.position)}
+      data-handleid={props.id === undefined ? '' : String(props.id)}
+    />
+  ),
   Position: { Top: 'top', Bottom: 'bottom', Left: 'left', Right: 'right' },
 }));
 
@@ -166,6 +173,31 @@ describe('EditableStepNode', () => {
       expect(container.querySelector('.text-ui.font-semibold')).not.toBeInTheDocument();
     });
 
+    it('an approval_gate node\'s kind pill reads "gate", not "approval_gate" — the full string would eat most of the trapezoid\'s safe width', () => {
+      const { container } = renderNode({ id: 'approve-deploy', kind: 'approval_gate' }, [], false, 'next');
+      const pill = container.querySelector('.wfx-kindpill');
+      expect(pill).toHaveTextContent('gate');
+      expect(pill?.textContent).not.toContain('approval_gate');
+      // the node id itself is untouched by the label change.
+      expect(container.querySelector('.wfx-nid')).toHaveTextContent('approve-deploy');
+    });
+
+    it('every other kind keeps its label verbatim in the kind pill', () => {
+      const kinds: Array<[StepNodeData, string]> = [
+        [{ id: 'x', kind: 'step', agent: 'a' }, 'step'],
+        [{ id: 'x', kind: 'for_each', agent: 'a', for_each: 'items' }, 'for_each'],
+        [{ id: 'x', kind: 'parallel', parallel: [] }, 'parallel'],
+        [{ id: 'x', kind: 'panel', panel: { panelists: [], subject: '' } }, 'panel'],
+        [{ id: 'x', kind: 'branch', condition: 'c' }, 'branch'],
+        [{ id: 'x', kind: 'action', action: 'scm.prs.create' }, 'action'],
+      ];
+      for (const [data, label] of kinds) {
+        const { container } = renderNode(data, [], false, 'next');
+        expect(container.querySelector('.wfx-kindpill')).toHaveTextContent(label);
+        cleanup();
+      }
+    });
+
     it('a step shows the agent as a mono expr line', () => {
       renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], false, 'next');
       expect(screen.getByText(/coder/)).toBeInTheDocument();
@@ -256,72 +288,136 @@ describe('EditableStepNode', () => {
       },
     );
 
-    describe('card chrome (Task 2 round 2: clipped bar + coherent selection)', () => {
-      it('wraps .wfx-bar, .wfx-head, and .wfx-body inside a .wfx-clip so the accent bar is clipped to the card radius', () => {
+    describe('card chrome (Task 3: SVG silhouette shell, no CSS-drawn card)', () => {
+      it('wraps .wfx-head and .wfx-body inside .wfx-safe — the shape-derived content box', () => {
         const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], false, 'next');
-        const clip = container.querySelector('.wfx-clip');
-        expect(clip).toBeInTheDocument();
+        const safe = container.querySelector('.wfx-safe');
+        expect(safe).toBeInTheDocument();
 
-        const bar = clip?.querySelector('.wfx-bar');
-        const head = clip?.querySelector('.wfx-head');
-        const body = clip?.querySelector('.wfx-body');
-        expect(bar).toBeInTheDocument();
+        const head = safe?.querySelector('.wfx-head');
+        const body = safe?.querySelector('.wfx-body');
         expect(head).toBeInTheDocument();
         expect(body).toBeInTheDocument();
 
-        // structurally exactly bar/head/body live inside the clip — nothing else.
-        expect(clip?.children).toHaveLength(3);
-        expect(clip?.children[0]).toBe(bar);
-        expect(clip?.children[1]).toBe(head);
-        expect(clip?.children[2]).toBe(body);
+        // exactly head/body live in the safe box — the accent bar is gone (the
+        // silhouette is the kind signal now).
+        expect(safe?.children).toHaveLength(2);
+        expect(safe?.children[0]).toBe(head);
+        expect(safe?.children[1]).toBe(body);
+        expect(container.querySelector('.wfx-bar')).not.toBeInTheDocument();
       });
 
-      it('keeps the Handles outside .wfx-clip, as direct children of .wfx-node', () => {
-        // Handle is mocked to `() => null`, so it renders no DOM node — assert
-        // structurally instead: .wfx-node's only element children are the
-        // clip wrapper (nothing handle-shaped leaks in, and nothing from the
-        // clip's bar/head/body leaks onto .wfx-node directly).
+      it('paints the silhouette as an SVG layer, a direct child of .wfx-node', () => {
         const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], false, 'next');
         const node = container.querySelector('.wfx-node');
         expect(node).toBeInTheDocument();
-        expect(node?.querySelector(':scope > .wfx-clip')).toBeInTheDocument();
-        // .wfx-bar/.wfx-head/.wfx-body must NOT be direct children of .wfx-node
-        // (they belong inside .wfx-clip only).
-        expect(node?.querySelector(':scope > .wfx-bar')).not.toBeInTheDocument();
+
+        const sil = node?.querySelector(':scope > .wfx-sil');
+        expect(sil).toBeInTheDocument();
+        expect(sil?.tagName.toLowerCase()).toBe('svg');
+        expect(sil?.querySelector('path')?.getAttribute('d')).toMatch(/^M /);
+
+        // Handle is mocked to `() => null`, so assert structurally: .wfx-node's
+        // element children are the silhouette + the safe box, nothing else.
+        expect(node?.querySelector(':scope > .wfx-safe')).toBeInTheDocument();
         expect(node?.querySelector(':scope > .wfx-head')).not.toBeInTheDocument();
         expect(node?.querySelector(':scope > .wfx-body')).not.toBeInTheDocument();
       });
 
-      it('a branch node still renders two labeled ports outside the clip (unaffected by clipping)', () => {
+      it('positions the safe box at the shape safe rect, centring a branch only', () => {
+        const { container: step } = renderNode({ id: 's', kind: 'step', agent: 'a' }, [], false, 'next');
+        const stepSafe = step.querySelector('.wfx-safe') as HTMLElement;
+        expect(stepSafe.className).not.toContain('wfx-safe-mid');
+        expect(stepSafe.style.left).toBe('15px');
+
+        const { container: br } = renderNode(
+          { id: 'route', kind: 'branch', condition: 'x == 1' },
+          [],
+          false,
+          'next',
+        );
+        const brSafe = br.querySelector('.wfx-safe') as HTMLElement;
+        expect(brSafe.className).toContain('wfx-safe-mid');
+        // 280 * 0.25 = 70
+        expect(brSafe.style.left).toBe('70px');
+      });
+
+      it('strokes the silhouette with the kind accent when selected', () => {
+        const { container: idle } = renderNode({ id: 's', kind: 'step', agent: 'a' }, [], false, 'next');
+        const { container: sel } = renderNode({ id: 's', kind: 'step', agent: 'a' }, [], true, 'next');
+        // `.wfx-sil-shape` is the silhouette's own filled+stroked path — stable
+        // regardless of paint order or how many `extra` rails/layers a kind
+        // paints on top of it (unlike `path:last-of-type`, which resolves to
+        // an `extra` rail for parallel/panel since fix round 1 moved `extra`
+        // to paint last).
+        const strokeOf = (c: HTMLElement) => c.querySelector('.wfx-sil-shape')?.getAttribute('stroke');
+        expect(strokeOf(idle as HTMLElement)).not.toBe(strokeOf(sel as HTMLElement));
+      });
+
+      it('a branch node still renders two labeled ports outside the safe box (unaffected by the silhouette)', () => {
         const { container } = renderNode(
           { id: 'route', kind: 'branch', condition: 'x == 1', thenTargets: ['a'], elseTargets: ['b'] },
           [],
           false,
           'next',
         );
-        // Handle is mocked away, but the surrounding structure (clip present,
+        // Handle is mocked away, but the surrounding structure (safe box present,
         // node still renders) must be unaffected by the branch's extra handle.
-        expect(container.querySelector('.wfx-clip')).toBeInTheDocument();
+        expect(container.querySelector('.wfx-safe')).toBeInTheDocument();
         expect(container.querySelector('.wfx-port-true')).toBeInTheDocument();
         expect(container.querySelector('.wfx-port-false')).toBeInTheDocument();
       });
 
-      it('an unselected next card has no inline boxShadow and no .wfx-sel class', () => {
+      it('an unselected next card has no inline boxShadow, borderColor, or .wfx-sel class — the shell paints nothing', () => {
         const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], false, 'next');
         const node = container.querySelector('.wfx-node') as HTMLElement;
         expect(node.classList.contains('wfx-sel')).toBe(false);
         expect(node.style.boxShadow).toBe('');
+        expect(node.style.borderColor).toBe('');
       });
 
-      it('a selected next card carries an inline accent boxShadow ring, no .wfx-sel purple class', () => {
+      it('a selected next card still has no inline boxShadow/borderColor on .wfx-node — the glow lives on the SVG silhouette', () => {
         const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], true, 'next');
         const node = container.querySelector('.wfx-node') as HTMLElement;
-        // the coherent-signal fix drops the brand-purple `.wfx-sel` class ring
-        // in favor of a single inline accent boxShadow.
+        // the accent border/glow moved into the SVG silhouette (see "strokes
+        // the silhouette..." above) — the shell div itself paints nothing.
         expect(node.classList.contains('wfx-sel')).toBe(false);
-        expect(node.style.boxShadow).not.toBe('');
-        // still carries the accent border too (unchanged from before).
-        expect(node.style.borderColor).not.toBe('');
+        expect(node.style.boxShadow).toBe('');
+        expect(node.style.borderColor).toBe('');
+      });
+
+      it('anchors a branch on its diamond vertices — then right, else bottom', () => {
+        const { container } = renderNode(
+          { id: 'route', kind: 'branch', condition: 'x == 1' },
+          [],
+          false,
+          'next',
+        );
+        const handles = [...container.querySelectorAll('[data-testid="handle"]')].map((h) => ({
+          type: h.getAttribute('data-type'),
+          position: h.getAttribute('data-position'),
+          id: h.getAttribute('data-handleid'),
+        }));
+        expect(handles).toEqual([
+          { type: 'target', position: 'left', id: '' },
+          { type: 'source', position: 'right', id: 'then' },
+          // else drops to the BOTTOM vertex — at the old top:68% it floated
+          // mid-slope, visibly detached from the diamond's outline.
+          { type: 'source', position: 'bottom', id: 'else' },
+        ]);
+      });
+
+      it('every other kind keeps a single right-edge source', () => {
+        const { container } = renderNode({ id: 's', kind: 'step', agent: 'a' }, [], false, 'next');
+        const handles = [...container.querySelectorAll('[data-testid="handle"]')].map((h) => ({
+          type: h.getAttribute('data-type'),
+          position: h.getAttribute('data-position'),
+          id: h.getAttribute('data-handleid'),
+        }));
+        expect(handles).toEqual([
+          { type: 'target', position: 'left', id: '' },
+          { type: 'source', position: 'right', id: '' },
+        ]);
       });
     });
   });

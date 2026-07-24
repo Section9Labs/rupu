@@ -1,4 +1,4 @@
-import { it, expect } from 'vitest';
+import { it, expect, describe } from 'vitest';
 import {
   autoLayout,
   reconcileGraph,
@@ -80,6 +80,27 @@ it('editorNodeSize reserves a taller box for a parallel node per sub-step', () =
     panel: { panelists: [], subject: '', gate: { until_no_findings_at_severity_or_above: 'high' } },
   };
   expect(editorNodeSize(panelGate).height).toBeGreaterThan(editorNodeSize(panelNoGate).height);
+  // panel scales with panelist count (F2): each panelist wraps to its own
+  // port-pill row in the fixed-width safe rect, so a 3-panelist node must
+  // reserve more height than a 1-panelist node, or the extra panelists get
+  // silently clipped by `.wfx-safe`'s `overflow: hidden`.
+  const panelOne: StepNodeData = {
+    id: 'g',
+    kind: 'panel',
+    panel: { panelists: ['security-reviewer'], subject: '' },
+  };
+  const panelThree: StepNodeData = {
+    id: 'g',
+    kind: 'panel',
+    panel: {
+      panelists: ['security-reviewer', 'performance-reviewer', 'maintainability-reviewer'],
+      subject: '',
+    },
+  };
+  expect(editorNodeSize(panelThree).height).toBeGreaterThan(editorNodeSize(panelOne).height);
+  // no panelists reserves the same as one (a `Math.max(rows, 1)` floor, same
+  // discipline as the `parallel` case above).
+  expect(editorNodeSize(panelNoGate).height).toBe(editorNodeSize(panelOne).height);
 });
 
 it('returns [] for an empty node list without throwing', () => {
@@ -183,4 +204,32 @@ it('reconcileFromYaml pauses on a non-object document (scalar / list)', () => {
   expect(reconcileFromYaml(prev, '42').paused).toBe(true);
   expect(reconcileFromYaml(prev, '- a\n- b').paused).toBe(true);
   expect(reconcileFromYaml(prev, '').paused).toBe(true); // empty → null
+});
+
+describe('editorNodeSize — per-kind shape boxes', () => {
+  it('a branch reserves a wider box for its diamond (width over height — a diamond only uses a fraction of its box)', () => {
+    expect(editorNodeSize({ id: 'b', kind: 'branch', condition: 'x' })).toEqual({
+      width: 280,
+      height: 200,
+    });
+  });
+
+  it('action and approval_gate reserve extra width for their slanted sides', () => {
+    expect(editorNodeSize({ id: 'a', kind: 'action', action: 'scm.prs.create' })).toEqual({
+      width: 214,
+      height: 80,
+    });
+    expect(editorNodeSize({ id: 'g', kind: 'approval_gate' })).toEqual({ width: 214, height: 80 });
+  });
+
+  it('for_each reserves extra width for its hexagon points, keeping its height', () => {
+    expect(editorNodeSize({ id: 'f', kind: 'for_each', for_each: 'items' })).toEqual({
+      width: 214,
+      height: 100,
+    });
+  });
+
+  it('a plain step is unchanged', () => {
+    expect(editorNodeSize({ id: 's', kind: 'step', agent: 'a' })).toEqual({ width: 210, height: 80 });
+  });
 });

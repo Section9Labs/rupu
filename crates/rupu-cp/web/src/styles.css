@@ -413,49 +413,65 @@
 /* ================================================================== */
 
 /* ── node card shell ── */
-/* Width/min-height come from `editorNodeSize()` inline (shared with the
- * dagre layout reservation — see workflowLayout.ts) so this card never
- * grows past what the canvas reserved for it; nothing below sets `width`. */
+/* Width/min-height come from `editorNodeSize()` inline (shared with the dagre
+ * layout reservation — see workflowLayout.ts) so this card never grows past
+ * what the canvas reserved for it; nothing below sets `width`.
+ * The shell paints NOTHING: border, fill and selection glow all live on the
+ * SVG silhouette (.wfx-sil) so non-rectangular kinds don't show a stray
+ * rectangle behind their shape. */
 .wfx-node {
   position: relative;
   text-align: left;
-  border: 1px solid rgb(var(--c-border));
-  border-radius: 12px;
-  background: rgb(var(--c-panel));
-  box-shadow: 0 2px 8px rgb(0 0 0 / .06);
   cursor: grab;
-  transition: border-color .15s ease, box-shadow .15s ease;
 }
-/* Selected state's ring/glow is computed inline (JS, from the same kind
- * accent as the border — see EditableStepNode's `selBoxShadow`) so border
- * and ring are always ONE color signal, never a fixed brand-purple ring
- * clashing with a kind-colored border. */
 
-/* ── bar/head/body clip — keeps the 3px accent bar inside the card's radius.
- * A 3px-tall absolutely-positioned strip can't hold its own 12px corner
- * radius (the browser collapses it), so it must be clipped by an ancestor
- * instead. `border-radius: inherit` tracks `.wfx-node`'s radius; `.wfx-node`
- * itself stays unclipped so the Handles (siblings, positioned on the card's
- * border) are never cut off. `.wfx-node` has no explicit `height` (only an
- * inline `minHeight`), so this stays `display: flex; flex-direction: column`
- * — content-sized, same as the un-wrapped head/body were before — rather
- * than `height: 100%`, which would resolve to `auto` here anyway per the
- * CSS percentage-height-on-auto-height-container rule and only add noise. */
-.wfx-clip {
-  position: relative;
+/* ── silhouette: the per-kind flowchart symbol (see nodeShapes.ts) ── */
+.wfx-sil {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  /* the selection glow strokes outside the box */
+  overflow: visible;
+  transition: none;
+}
+
+/* ── safe box: where content may live, inscribed in the silhouette ── */
+.wfx-safe {
+  position: absolute;
   display: flex;
   flex-direction: column;
-  border-radius: inherit;
+  min-width: 0;
+  /* hard-bounds content to the shape's inscribed rect — the same job
+   * `.wfx-clip`'s `overflow: hidden` did for the old rectangular card. The
+   * box height is a fixed `height` (not `min-height`): a silhouette has no
+   * CSS clip of its own, and `min-height` would let this box grow past
+   * `safe.h` whenever content is taller, which makes `overflow: hidden`
+   * clip only horizontally. `height` keeps the box pinned at `safe.h` so
+   * `overflow: hidden` genuinely bounds content on BOTH axes — a body
+   * taller than `safe.h` is clipped instead of painting over the outline.
+   * (`editorNodeSize()` reserves enough height that real content fits
+   * without needing this clip to engage — see workflowLayout.ts.) */
   overflow: hidden;
 }
-
-/* ── colored top-bar, by KIND (no run-state in the editor) ── */
-.wfx-bar {
-  position: absolute; left: 0; right: 0; top: 0; height: 3px;
-}
+/* shapes whose width varies across the text band centre their content.
+ * `align-items: center` on `.wfx-safe` makes its two flex children
+ * (`.wfx-head`/`.wfx-body`) shrink-to-fit their own content instead of
+ * stretching to the safe rect's width — which then means THEIR children's
+ * `overflow: hidden; text-overflow: ellipsis` never engages (a shrunk box is
+ * already exactly as wide as its content, so it never actually overflows;
+ * `.wfx-safe`'s own `overflow: hidden` clips instead, mid-glyph, with no
+ * ellipsis). Re-stretching `.wfx-head`/`.wfx-body` restores their real width
+ * so their own ellipsis rules work; `justify-content: center` keeps them
+ * LOOKING centred without shrinking them. */
+.wfx-safe-mid { align-items: center; text-align: center; }
+.wfx-safe-mid .wfx-head { justify-content: center; align-self: stretch; }
+.wfx-safe-mid .wfx-body { align-self: stretch; }
+.wfx-safe-mid .wfx-nid { flex: 0 1 auto; }
+.wfx-safe-mid .wfx-ports { justify-content: center; }
 
 /* ── header: kindpill + mono id + problem dot ── */
-.wfx-head { display: flex; align-items: center; gap: 7px; padding: 9px 10px 6px; }
+.wfx-head { display: flex; align-items: center; gap: 7px; padding: 0 0 4px; }
 .wfx-kindpill {
   display: flex; align-items: center; gap: 3px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -475,8 +491,9 @@
 
 /* ── body: agent line / expr chips / port pills / gate chip ── */
 .wfx-body {
-  padding: 0 10px 9px; font-size: 10.5px; color: rgb(var(--c-ink-dim));
+  padding: 0; font-size: 10.5px; color: rgb(var(--c-ink-dim));
   display: flex; flex-direction: column; gap: 5px;
+  min-width: 0;
 }
 .wfx-agent {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -598,6 +615,7 @@
 .wfx-pcard:active { cursor: grabbing; }
 .wfx-pcard:disabled { cursor: not-allowed; opacity: .5; }
 .wfx-picon { flex: none; }
+.wfx-pshape { flex: none; width: 24px; height: 14px; }
 .wfx-pcard-text { min-width: 0; }
 .wfx-pl {
   font-size: 11.5px; font-weight: 600; color: rgb(var(--c-ink));
@@ -639,7 +657,7 @@
 .wfx-palette-rail .wfx-palette-connectors { max-width: none; }
 
 @media (prefers-reduced-motion: reduce) {
-  .wfx-node, .wfx-pcard { transition: none !important; }
+  .wfx-pcard { transition: none !important; }
 }
 
 /* ── inspector-rail palette dock (Blocks tab) ── */
