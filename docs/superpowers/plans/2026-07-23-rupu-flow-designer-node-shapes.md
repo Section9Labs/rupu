@@ -46,7 +46,7 @@
 - Test: `crates/rupu-cp/web/src/components/workflow-editor/nodeShapes.test.ts`
 
 **Interfaces:**
-- Consumes: `StepKind` from `../../lib/workflowGraph` (type only).
+- Consumes: nothing. This module is standalone — it knows shapes, not kinds. (The kind→shape mapping lands in `kindVisuals.KIND_SHAPE` in Task 2.)
 - Produces: `type ShapeName`, `interface SafeRect`, `interface HandleAnchor`, `interface SourceAnchor`, `interface NodeShape`, and `shapeFor(shape: ShapeName, w: number, h: number): NodeShape`. Tasks 2, 3, 4 and 5 all depend on these exact names.
 
 - [ ] **Step 1: Write the failing test**
