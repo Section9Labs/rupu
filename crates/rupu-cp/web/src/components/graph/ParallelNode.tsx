@@ -9,9 +9,13 @@ import type { GraphNode } from '../../lib/runGraphModel';
 import { stateStyle } from './stepStyle';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { nodeSize } from '../../lib/nodeSize';
+import { runKindAccent } from './kindBridge';
+import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 
 export interface ParallelNodeData extends Record<string, unknown> {
   node: GraphNode;
+  /** 'next' turns on the kind-colored container tint; absent/'classic' keeps today's. */
+  ui?: WorkflowEditorUi;
 }
 
 type ParallelFlowNode = Node<ParallelNodeData, 'parallel'>;
@@ -19,8 +23,12 @@ type ParallelFlowNode = Node<ParallelNodeData, 'parallel'>;
 function ParallelNodeView({ data }: NodeProps<ParallelFlowNode>) {
   const { node } = data;
   const colors = useThemeColors();
+  const next = data.ui === 'next';
+  // Container identity: in next this is the SAME accent the editor paints
+  // 'parallel' with (sev.critical); classic keeps the legacy brand tint.
+  const accentKey = next ? runKindAccent(node.kind) : 'brand.500';
   const handleStyle = {
-    background: colors.alpha('brand.500', 0.5),
+    background: colors.alpha(accentKey, 0.5),
     width: 6,
     height: 6,
     border: 'none',
@@ -33,17 +41,24 @@ function ParallelNodeView({ data }: NodeProps<ParallelFlowNode>) {
 
   return (
     <div
+      data-testid="rg-container"
       className={['relative rounded-[12px] border px-2 py-1.5', running ? 'rg-pulse-run' : ''].join(' ')}
       style={{
-        borderColor: colors.alpha('brand.500', 0.4),
-        background: colors.alpha('brand.500', 0.08),
+        borderColor: colors.alpha(accentKey, 0.4),
+        background: colors.alpha(accentKey, 0.08),
         width: box.width,
         minHeight: box.height,
       }}
     >
       <Handle type="target" position={Position.Left} style={handleStyle} />
 
-      <div className="mb-1.5 flex items-center justify-between gap-3 text-meta font-bold uppercase tracking-wide text-brand-500">
+      <div
+        className={[
+          'mb-1.5 flex items-center justify-between gap-3 text-meta font-bold uppercase tracking-wide',
+          next ? '' : 'text-brand-500',
+        ].join(' ')}
+        style={next ? { color: colors.get(accentKey) } : undefined}
+      >
         <span className="truncate">parallel · {node.id}</span>
         <span className="tabular-nums">
           {done}/{total} ✓

@@ -12,11 +12,15 @@ import type { GraphNode } from '../../lib/runGraphModel';
 import { stateStyle, glyphBg } from './stepStyle';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { PANEL_W, PANEL_H } from '../../lib/nodeSize';
+import { runKindAccent } from './kindBridge';
+import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 
 export interface PanelLoopNodeData extends Record<string, unknown> {
   node: GraphNode;
   /** Select a panelist/fixer unit's transcript — same callback FanoutNode uses. */
   onOpenUnit?: (stepId: string, index: number) => void;
+  /** 'next' turns on the kind-colored container tint; absent/'classic' keeps today's. */
+  ui?: WorkflowEditorUi;
 }
 
 type PanelFlowNode = Node<PanelLoopNodeData, 'panel'>;
@@ -24,8 +28,12 @@ type PanelFlowNode = Node<PanelLoopNodeData, 'panel'>;
 function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
   const { node, onOpenUnit } = data;
   const colors = useThemeColors();
+  const next = data.ui === 'next';
+  // Container identity: in next this is the SAME accent the editor paints
+  // 'panel' with (status.awaiting); classic keeps the legacy brand tint.
+  const accentKey = next ? runKindAccent(node.kind) : 'brand.500';
   const handleStyle = {
-    background: colors.alpha('brand.500', 0.5),
+    background: colors.alpha(accentKey, 0.5),
     width: 6,
     height: 6,
     border: 'none',
@@ -40,17 +48,24 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
 
   return (
     <div
+      data-testid="rg-container"
       className={['relative rounded-[12px] border px-2.5 py-2', running ? 'rg-pulse-await' : ''].join(' ')}
       style={{
-        borderColor: colors.alpha('brand.500', 0.4),
-        background: colors.alpha('brand.500', 0.08),
+        borderColor: colors.alpha(accentKey, 0.4),
+        background: colors.alpha(accentKey, 0.08),
         width: PANEL_W,
         minHeight: PANEL_H,
       }}
     >
       <Handle type="target" position={Position.Left} style={handleStyle} />
 
-      <div className="flex items-center justify-between gap-2 text-meta font-bold uppercase tracking-wide text-brand-500">
+      <div
+        className={[
+          'flex items-center justify-between gap-2 text-meta font-bold uppercase tracking-wide',
+          next ? '' : 'text-brand-500',
+        ].join(' ')}
+        style={next ? { color: colors.get(accentKey) } : undefined}
+      >
         <span className="truncate">
           panel · {node.id}
           {round && <span className="ml-1 tabular-nums">· round {round.current}/{round.max}</span>}
