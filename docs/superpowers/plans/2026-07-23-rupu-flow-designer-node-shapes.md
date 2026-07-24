@@ -453,7 +453,7 @@ describe('editorNodeSize — per-kind shape boxes', () => {
   });
 
   it('for_each reserves extra width for its hexagon points, keeping its height', () => {
-    expect(editorNodeSize({ id: 'f', kind: 'for_each', forEach: 'items' })).toEqual({
+    expect(editorNodeSize({ id: 'f', kind: 'for_each', for_each: 'items' })).toEqual({
       width: 214,
       height: 100,
     });
