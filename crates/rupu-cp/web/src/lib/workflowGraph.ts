@@ -403,6 +403,36 @@ export function hasExplicitEdges(nodes: GraphNode[]): boolean {
   return nodes.some((n) => (n.data.next && n.data.next.length > 0) || n.data.kind === 'split' || n.data.kind === 'join');
 }
 
+/** The legacy->graph migration primitive (spec 3d): a no-op when `nodes`
+ *  already has explicit edges (`hasExplicitEdges`); otherwise returns a copy
+ *  where every node's `next` is set to exactly what `deriveEdges`'s legacy
+ *  chain loop would already have drawn for it — `[the next node in list
+ *  order]`, and `[]` for the last node — so the derived edge SET is identical
+ *  before and after, just now explicit instead of implicit.
+ *
+ *  A `branch` node is left untouched (no `next` written, even `[]`): its
+ *  routing is its `then`/`else` targets, and `next` is not part of that
+ *  node's identity the way it is for every other kind.
+ *
+ *  Exists to fix the Critical bug where authoring the FIRST explicit edge on
+ *  a legacy multi-step workflow (a single `applyConnect`/
+ *  `applyAddConnectedNext` draw) flips `hasExplicitEdges` for the WHOLE
+ *  graph, and every OTHER node — which still has no explicit `next` of its
+ *  own — silently loses the implicit chain edge it used to derive from list
+ *  order. Callers run the current nodes through this BEFORE mutating the
+ *  node that's about to gain the new edge, so the pre-existing connections
+ *  survive as explicit `next` entries and the new edge applies on top of
+ *  that materialized base rather than a graph that just lost the rest of its
+ *  chain. */
+export function materializeLegacyChain(nodes: GraphNode[]): GraphNode[] {
+  if (hasExplicitEdges(nodes)) return nodes;
+  return nodes.map((n, i) => {
+    if (n.data.kind === 'branch') return n;
+    const next = i < nodes.length - 1 ? [nodes[i + 1].id] : [];
+    return { ...n, data: { ...n.data, next } };
+  });
+}
+
 /** The ONE producer of canvas edges. Pure function of the ordered node list,
  *  branching on `hasExplicitEdges`:
  *

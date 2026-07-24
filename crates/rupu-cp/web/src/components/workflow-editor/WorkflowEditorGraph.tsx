@@ -33,6 +33,7 @@ import {
 import {
   canConnect,
   deriveEdges,
+  materializeLegacyChain,
   withDerivedEdges,
   type GraphEdge,
   type GraphNode,
@@ -149,8 +150,21 @@ export function applyConnect(
     return;
   }
 
+  // This connect is about to author the graph's first explicit edge (or the
+  // graph already has one, in which case this is a no-op): materialize the
+  // implicit legacy chain into explicit `next` BEFORE the new edge is
+  // applied, so every OTHER node keeps the successor it already had instead
+  // of losing it when `hasExplicitEdges` flips the whole graph into graph
+  // mode (see `materializeLegacyChain`'s docstring — this is the fix for the
+  // Critical "one drawn edge orphans the rest of the legacy chain" bug). A
+  // branch-arm connect is an explicit connection too, so it materializes the
+  // same way, even though `hasExplicitEdges` itself doesn't count then/else
+  // targets (Task 4's accepted boundary) — this keeps a first arm draw from
+  // depending on that distinction.
+  const baseNodes = materializeLegacyChain(graph.nodes);
+
   if (arm) {
-    const nodes = graph.nodes.map((n) => {
+    const nodes = baseNodes.map((n) => {
       if (n.id !== source) return n;
       const key = arm === 'then' ? 'thenTargets' : 'elseTargets';
       const list = (n.data[key] as string[] | undefined) ?? [];
@@ -161,7 +175,7 @@ export function applyConnect(
     return;
   }
 
-  const nodes = graph.nodes.map((n) => {
+  const nodes = baseNodes.map((n) => {
     if (n.id !== source) return n;
     return { ...n, data: n.data.kind === 'split' ? addSplitTarget(n.data, target) : setNext(n.data, target) };
   });
@@ -328,12 +342,25 @@ export function applyAddConnectedNext(
     data: newNodeData(id, kind),
     position: { x: base.x + (source ? editorNodeSize(source.data).width : NODE_W) + gap, y: base.y },
   };
-  const nodes = [...graph.nodes];
-  nodes.splice(sourceIdx >= 0 ? sourceIdx + 1 : nodes.length, 0, node);
+  const spliced = [...graph.nodes];
+  spliced.splice(sourceIdx >= 0 ? sourceIdx + 1 : spliced.length, 0, node);
+
+  // Splicing the new node in (right after its source) is about to author the
+  // graph's first explicit edge if it was still legacy: materialize the
+  // implicit chain BEFORE wiring, over the POST-splice order, so the new
+  // node's own materialized successor is whatever the source's old
+  // (implicit) successor already was — nothing downstream of the insertion
+  // point loses its edge (the same Critical-bug fix as `applyConnect`; see
+  // `materializeLegacyChain`'s docstring). A no-op when the graph already
+  // has explicit edges.
+  const nodes = materializeLegacyChain(spliced);
 
   // Wire the new node as an explicit successor of `source` — or, when
   // `sourceId` is unknown, of whatever was previously last in `graph.nodes`
-  // (captured before the splice above).
+  // (captured before the splice above). On a legacy graph this replays the
+  // exact value materialization already set (source and the new node are
+  // array-adjacent by construction), so it's a no-op there; on an
+  // already-graph-mode graph it's the whole effect.
   const anchorId = source ? source.id : graph.nodes[graph.nodes.length - 1]?.id;
   const wired = anchorId
     ? nodes.map((n) => {

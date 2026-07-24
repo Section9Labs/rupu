@@ -1095,7 +1095,7 @@ describe('convertInlineApprovalToGate', () => {
   });
 });
 
-import { deriveEdges, withDerivedEdges, hasExplicitEdges } from './workflowGraph';
+import { deriveEdges, withDerivedEdges, hasExplicitEdges, materializeLegacyChain } from './workflowGraph';
 
 describe('deriveEdges', () => {
   // NOTE: as of this writing, no *.yaml under .rupu/workflows/ actually
@@ -1249,6 +1249,70 @@ describe('explicit-edge model', () => {
 
     const withJoin = yamlToGraph({ name: 'w', steps: [{ id: 'j', join: { wait: 'any' } }] });
     expect(hasExplicitEdges(withJoin.nodes)).toBe(true);
+  });
+
+  it('materializeLegacyChain writes each node\'s array-order successor into an explicit `next`, leaving derived edges identical', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+        { id: 'c', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(hasExplicitEdges(g.nodes)).toBe(false);
+    const before = deriveEdges(g.nodes);
+
+    const materialized = materializeLegacyChain(g.nodes);
+
+    expect(hasExplicitEdges(materialized)).toBe(true);
+    expect(materialized.find((n) => n.id === 'a')!.data.next).toEqual(['b']);
+    expect(materialized.find((n) => n.id === 'b')!.data.next).toEqual(['c']);
+    expect(materialized.find((n) => n.id === 'c')!.data.next).toEqual([]);
+    // Same edge SET before/after — materialization only makes the existing
+    // chain explicit, it never changes what deriveEdges produces.
+    expect(deriveEdges(materialized)).toEqual(before);
+  });
+
+  it('materializeLegacyChain leaves a branch node without a `next` (its identity is then/else, not next)', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'br', branch: { condition: 'x' } },
+        { id: 't', agent: 'a', prompt: 'p' },
+      ],
+    });
+    const materialized = materializeLegacyChain(g.nodes);
+    expect(materialized.find((n) => n.id === 'br')!.data.next).toBeUndefined();
+    expect(materialized.find((n) => n.id === 't')!.data.next).toEqual([]);
+  });
+
+  it('materializeLegacyChain is a no-op on an already-graph-mode graph (returns equivalent nodes)', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p', next: ['b'] },
+        { id: 'b', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(hasExplicitEdges(g.nodes)).toBe(true);
+    const materialized = materializeLegacyChain(g.nodes);
+    expect(materialized).toBe(g.nodes); // same reference — an explicit early return, not a defensive copy
+    expect(materialized).toEqual(g.nodes);
+  });
+
+  it('a legacy workflow LOADED and serialized without any edit still emits no `next` — materialization only happens on an edit, never on load (round-trip guard for the legacy->graph migration fix)', () => {
+    const input = {
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+        { id: 'c', agent: 'x', prompt: 'p' },
+      ],
+    };
+    expectRoundTrip(input);
+    const out = graphToWorkflowObject(yamlToGraph(input)) as { obj: any };
+    for (const s of out.obj.steps) expect('next' in s).toBe(false);
   });
 
   it('a split node fans out to its split targets as edges', () => {

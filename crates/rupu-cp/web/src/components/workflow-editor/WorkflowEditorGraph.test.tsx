@@ -132,7 +132,7 @@ import WorkflowEditorGraph, {
   applyInsertOnEdge,
   asStepKind,
 } from './WorkflowEditorGraph';
-import { deriveEdges, yamlToGraph } from '../../lib/workflowGraph';
+import { deriveEdges, hasExplicitEdges, yamlToGraph } from '../../lib/workflowGraph';
 import type { WorkflowGraph } from '../../lib/workflowGraph';
 import { KIND_ACCENT } from './kindVisuals';
 
@@ -606,6 +606,82 @@ describe('applyRemoveEdges', () => {
     const br = next.nodes.find((n) => n.id === 'br');
     expect(br?.data.thenTargets).toEqual([]);
     expect(br?.data.elseTargets).toEqual([]);
+  });
+});
+
+// Critical fix: drawing ONE edge (or branch arm) on a legacy multi-step
+// workflow used to flip `hasExplicitEdges` for the WHOLE graph, so every
+// OTHER node — still with no explicit `next` of its own — lost the implicit
+// chain edge it used to derive from list order. `applyConnect` now runs the
+// nodes through `materializeLegacyChain` before applying the new edge, so the
+// pre-existing chain survives as explicit `next` entries.
+describe('legacy->graph migration (materialize before the first explicit edge)', () => {
+  it('the exact repro: legacy chain a->b->c->d, drawing b->d preserves a->b and c->d instead of collapsing to [b->d]', () => {
+    let g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+        { id: 'c', agent: 'x', prompt: 'p' },
+        { id: 'd', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(hasExplicitEdges(g.nodes)).toBe(false); // confirms this starts legacy
+
+    applyConnect(g, { source: 'b', target: 'd', sourceHandle: null }, (ng) => (g = ng), () => {});
+
+    // Nothing orphaned: a and c both still reach a successor, and the new
+    // edge is there too — exactly {a->b, c->d, b->d}, in any order.
+    const bySourceTarget = (e: { source: string; target: string }) => `${e.source}->${e.target}`;
+    expect(new Set(g.edges.map(bySourceTarget))).toEqual(new Set(['a->b', 'c->d', 'b->d']));
+    expect(g.edges).toHaveLength(3);
+  });
+
+  it('applying the SAME drawn edge to the raw (unmaterialized) nodes reproduces the bug — the collapse this test guards against', () => {
+    // Same starting graph as above, but skipping materialization (the bug's
+    // exact mechanism): only `b` gets an explicit `next`, everyone else's
+    // implicit chain edge is gone once graph mode kicks in.
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+        { id: 'c', agent: 'x', prompt: 'p' },
+        { id: 'd', agent: 'x', prompt: 'p' },
+      ],
+    });
+    const buggyNodes = g.nodes.map((n) => (n.id === 'b' ? { ...n, data: { ...n.data, next: ['d'] } } : n));
+    const edges = deriveEdges(buggyNodes);
+    expect(edges).toHaveLength(1);
+    expect(edges[0]).toMatchObject({ source: 'b', target: 'd' });
+  });
+
+  it('a first branch-arm draw on a legacy chain preserves the other chain edges', () => {
+    // `br` leads the array, then a->b->c is the legacy chain; drawing br's
+    // "then" arm forward to `c` (not backward, which would close a cycle
+    // through the existing implicit chain) is the first explicit connection.
+    let g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'br', branch: { condition: 'x' } },
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+        { id: 'c', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(hasExplicitEdges(g.nodes)).toBe(false);
+
+    applyConnect(g, { source: 'br', target: 'c', sourceHandle: 'then' }, (ng) => (g = ng), () => {});
+
+    expect(g.edges).toContainEqual({ id: 'a->b', source: 'a', target: 'b' });
+    expect(g.edges).toContainEqual({ id: 'b->c', source: 'b', target: 'c' });
+    expect(g.edges).toContainEqual({
+      id: 'br->c:then',
+      source: 'br',
+      target: 'c',
+      branch: 'then',
+      label: 'true',
+    });
   });
 });
 
@@ -1294,6 +1370,28 @@ describe('applyAddConnectedNext', () => {
     expect(graph.nodes).toHaveLength(3);
     expect(graph.nodes[graph.nodes.length - 1]?.id).toBe(id);
     expect(graph.edges).toContainEqual({ id: `b->${id}`, source: 'b', target: id });
+  });
+
+  it('"+ next" from the middle of a legacy 3-chain a->b->c preserves a->b and reroutes b->c through the new node instead of orphaning c (Critical-bug fix)', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+        { id: 'c', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(hasExplicitEdges(g.nodes)).toBe(false);
+
+    const { graph, id } = applyAddConnectedNext(g, 'b');
+
+    // a->b: untouched, still there. b->new: the "+ next" edge this op draws.
+    // new->c: the old (implicit) b->c successor, rerouted through the
+    // inserted node rather than dropped — c is never left unreachable.
+    expect(graph.edges).toContainEqual({ id: 'a->b', source: 'a', target: 'b' });
+    expect(graph.edges).toContainEqual({ id: `b->${id}`, source: 'b', target: id });
+    expect(graph.edges).toContainEqual({ id: `${id}->c`, source: id, target: 'c' });
+    expect(graph.edges).toHaveLength(3);
   });
 });
 
