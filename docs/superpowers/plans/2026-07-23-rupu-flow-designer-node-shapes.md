@@ -621,7 +621,7 @@ In `src/components/workflow-editor/nodes/EditableStepNode.test.tsx`, replace the
         expect(node?.querySelector(':scope > .wfx-body')).not.toBeInTheDocument();
       });
 
-      it('positions the safe box at the shaperect and centres a branch only', () => {
+      it('positions the safe box at the shape safe rect, centring a branch only', () => {
         const { container: step } = renderNode({ id: 's', kind: 'step', agent: 'a' }, [], false, 'next');
         const stepSafe = step.querySelector('.wfx-safe') as HTMLElement;
         expect(stepSafe.className).not.toContain('wfx-safe-mid');
