@@ -105,6 +105,32 @@ function roundedRectPath(w: number, h: number): string {
   );
 }
 
+/** Clamp a horizontal inset constant (`SHEAR`/`TAPER`/`POINT`/`RAIL`) to what
+ *  a small box can actually hold, the same way `roundedRectPath`'s `rad` is
+ *  clamped above. Each of those constants cuts in from a box edge on BOTH
+ *  sides (e.g. a hexagon's top edge runs from `x=POINT` to `x=w-POINT`); once
+ *  the box is narrower than roughly `2*CONST + 2*I`, the two insets overlap
+ *  and the vertex order the shape depends on reverses — a hexagon/trapezoid's
+ *  top edge runs backwards, producing the self-intersecting bowtie this
+ *  clamp exists to prevent. Capping at HALF the inner span
+ *  (`(dim - 2*I) * 0.5`) is the largest value under which both insets can
+ *  coexist without crossing (it is exactly the fraction `rad` claims of each
+ *  axis above), and it leaves a guaranteed non-zero `2*I` (4px) span at the
+ *  moment of clamping — `SHEAR`/`RAIL` only eat ONE side per axis, so their
+ *  true bound is looser than this, but the same factor is used for every
+ *  horizontal inset here for one auditable rule rather than four bespoke
+ *  ones, and it is still comfortably safe for both.
+ *
+ *  No-op at every real node box: the largest raw constant clamped here is
+ *  `TAPER` (26), and the narrowest real box (`NODE_W`/`ACTION_W`/`GATE_W` =
+ *  210-214, `workflowLayout.ts`) puts `(dim - 2*I) * 0.5` at ~103-105 — far
+ *  above any raw constant, so `Math.min` always keeps the unclamped value. It
+ *  only engages at the 34x20 palette-preview box, where `(34 - 4) * 0.5 = 15`
+ *  is below `POINT` (22) and `TAPER` (26). */
+function clampInset(value: number, dim: number): number {
+  return Math.min(value, (dim - 2 * I) * 0.5);
+}
+
 const LEFT_TARGET: HandleAnchor = { side: 'left', offset: '50%' };
 const RIGHT_SOURCE: SourceAnchor[] = [{ anchor: { side: 'right', offset: '50%' } }];
 
@@ -152,10 +178,11 @@ export function shapeFor(shape: ShapeName, w: number, h: number): NodeShape {
     }
 
     case 'parallelogram': {
+      const shear = clampInset(SHEAR, w);
       const points: [number, number][] = [
-        [SHEAR, I],
+        [shear, I],
         [w - I, I],
-        [w - SHEAR, h - I],
+        [w - shear, h - I],
         [I, h - I],
       ];
       return {
@@ -163,14 +190,15 @@ export function shapeFor(shape: ShapeName, w: number, h: number): NodeShape {
         points,
         path: toPath(points),
         extra: [],
-        safe: { x: SHEAR + 8, y: 11, w: w - 2 * SHEAR - 16, h: h - 22 },
+        safe: { x: shear + 8, y: 11, w: w - 2 * shear - 16, h: h - 22 },
       };
     }
 
     case 'trapezoid': {
+      const taper = clampInset(TAPER, w);
       const points: [number, number][] = [
-        [TAPER, I],
-        [w - TAPER, I],
+        [taper, I],
+        [w - taper, I],
         [w - I, h - I],
         [I, h - I],
       ];
@@ -179,17 +207,18 @@ export function shapeFor(shape: ShapeName, w: number, h: number): NodeShape {
         points,
         path: toPath(points),
         extra: [],
-        safe: { x: TAPER + 7, y: 13, w: w - 2 * TAPER - 14, h: h - 26 },
+        safe: { x: taper + 7, y: 13, w: w - 2 * taper - 14, h: h - 26 },
       };
     }
 
     case 'hexagon': {
+      const point = clampInset(POINT, w);
       const points: [number, number][] = [
-        [POINT, I],
-        [w - POINT, I],
+        [point, I],
+        [w - point, I],
         [w - I, h / 2],
-        [w - POINT, h - I],
-        [POINT, h - I],
+        [w - point, h - I],
+        [point, h - I],
         [I, h / 2],
       ];
       return {
@@ -197,11 +226,12 @@ export function shapeFor(shape: ShapeName, w: number, h: number): NodeShape {
         points,
         path: toPath(points),
         extra: [],
-        safe: { x: POINT + 7, y: 11, w: w - 2 * POINT - 14, h: h - 22 },
+        safe: { x: point + 7, y: 11, w: w - 2 * point - 14, h: h - 22 },
       };
     }
 
     case 'subroutine': {
+      const rail = clampInset(RAIL, w);
       const points: [number, number][] = [
         [I, I],
         [w - I, I],
@@ -212,17 +242,22 @@ export function shapeFor(shape: ShapeName, w: number, h: number): NodeShape {
         ...base,
         points,
         path: toPath(points),
-        extra: [`M ${RAIL} ${I} L ${RAIL} ${h - I}`, `M ${w - RAIL} ${I} L ${w - RAIL} ${h - I}`],
-        safe: { x: RAIL + 8, y: 11, w: w - 2 * RAIL - 16, h: h - 22 },
+        extra: [`M ${rail} ${I} L ${rail} ${h - I}`, `M ${w - rail} ${I} L ${w - rail} ${h - I}`],
+        safe: { x: rail + 8, y: 11, w: w - 2 * rail - 16, h: h - 22 },
       };
     }
 
     case 'stacked': {
-      // body sits down-left; the layers peek out up-right.
+      // body sits down-left; the layers peek out up-right. LAYER offsets one
+      // side of BOTH axes (not two, unlike SHEAR/TAPER/POINT/RAIL above), so
+      // it is clamped against each axis independently and the tighter of the
+      // two wins — at the 34x20 palette box, height (20) is the binding
+      // constraint, not width (34).
+      const layer = Math.min(clampInset(LAYER, w), clampInset(LAYER, h));
       const points: [number, number][] = [
-        [I, LAYER + I],
-        [w - LAYER - I, LAYER + I],
-        [w - LAYER - I, h - I],
+        [I, layer + I],
+        [w - layer - I, layer + I],
+        [w - layer - I, h - I],
         [I, h - I],
       ];
       return {
@@ -230,10 +265,10 @@ export function shapeFor(shape: ShapeName, w: number, h: number): NodeShape {
         points,
         path: toPath(points),
         extra: [
-          `M ${LAYER} ${I + 3} L ${w - I - 3} ${I + 3} L ${w - I - 3} ${h - LAYER}`,
-          `M ${LAYER - 3} ${I + 6} L ${w - I - 6} ${I + 6} L ${w - I - 6} ${h - LAYER - 3}`,
+          `M ${layer} ${I + 3} L ${w - I - 3} ${I + 3} L ${w - I - 3} ${h - layer}`,
+          `M ${layer - 3} ${I + 6} L ${w - I - 6} ${I + 6} L ${w - I - 6} ${h - layer - 3}`,
         ],
-        safe: { x: 13, y: LAYER + 10, w: w - LAYER - 24, h: h - LAYER - 21 },
+        safe: { x: 13, y: layer + 10, w: w - layer - 24, h: h - layer - 21 },
       };
     }
 

@@ -14,6 +14,72 @@ function inside(pt: [number, number], poly: [number, number][]): boolean {
   return hit;
 }
 
+/** True if point `q` lies on segment `p`-`r`, GIVEN `p`, `q`, `r` are already
+ *  known collinear (only called from `segmentsIntersect`'s collinear
+ *  branches). Used for the on-edge / touching-endpoint cases the cross-product
+ *  test alone can't classify. */
+function onSegment(p: [number, number], q: [number, number], r: [number, number]): boolean {
+  return (
+    Math.min(p[0], r[0]) - 1e-9 <= q[0] &&
+    q[0] <= Math.max(p[0], r[0]) + 1e-9 &&
+    Math.min(p[1], r[1]) - 1e-9 <= q[1] &&
+    q[1] <= Math.max(p[1], r[1]) + 1e-9
+  );
+}
+
+/** Orientation of the turn `p`->`q`->`r`: 0 collinear, 1 clockwise, 2
+ *  counter-clockwise (screen coords, y-down — the sign convention doesn't
+ *  matter, only that it's consistent). */
+function orient(p: [number, number], q: [number, number], r: [number, number]): number {
+  const v = (q[1] - p[1]) * (r[0] - q[0]) - (q[0] - p[0]) * (r[1] - q[1]);
+  if (Math.abs(v) < 1e-9) return 0;
+  return v > 0 ? 1 : 2;
+}
+
+/** Standard O(1) segment-intersection test (orientation + collinear-overlap
+ *  fallback), used below to certify a silhouette's `points` polygon is
+ *  SIMPLE — the general shape of check the palette-preview bowtie defect
+ *  needed and spot-checks don't generalise to. */
+function segmentsIntersect(
+  p1: [number, number],
+  q1: [number, number],
+  p2: [number, number],
+  q2: [number, number],
+): boolean {
+  const o1 = orient(p1, q1, p2);
+  const o2 = orient(p1, q1, q2);
+  const o3 = orient(p2, q2, p1);
+  const o4 = orient(p2, q2, q1);
+  if (o1 !== o2 && o3 !== o4) return true;
+  if (o1 === 0 && onSegment(p1, p2, q1)) return true;
+  if (o2 === 0 && onSegment(p1, q2, q1)) return true;
+  if (o3 === 0 && onSegment(p2, p1, q2)) return true;
+  if (o4 === 0 && onSegment(p2, q1, q2)) return true;
+  return false;
+}
+
+/** A polygon is simple iff no two of its NON-ADJACENT edges intersect.
+ *  Adjacent edges (consecutive, sharing a vertex) are always excluded — that
+ *  shared vertex is an intended touch, not a self-intersection. This is
+ *  exactly the check that catches a `POINT`/`TAPER`-style inversion: an
+ *  inverted hexagon/trapezoid's top edge crosses the edges leading into it
+ *  from the sides, which are non-adjacent to it. */
+function isSimplePolygon(points: [number, number][]): boolean {
+  const n = points.length;
+  for (let i = 0; i < n; i++) {
+    const a1 = points[i];
+    const a2 = points[(i + 1) % n];
+    for (let j = i + 1; j < n; j++) {
+      const isAdjacent = j === (i + 1) % n || (j + 1) % n === i;
+      if (isAdjacent) continue;
+      const b1 = points[j];
+      const b2 = points[(j + 1) % n];
+      if (segmentsIntersect(a1, a2, b1, b2)) return false;
+    }
+  }
+  return true;
+}
+
 const ALL: ShapeName[] = [
   'rect',
   'diamond',
@@ -118,5 +184,25 @@ describe('shapeFor', () => {
     expect(small).toContain('Q 32 2 32 10');
     expect(small).toContain('L 32 10');
     expect(small).not.toMatch(/L 32 6\b/);
+  });
+
+  // General invariant, not more spot-checks: EVERY shape's `points` polygon
+  // must be simple (no two non-adjacent edges cross) at both a real node size
+  // and the palette's tiny 34x20 preview box. This is the check that would
+  // have caught the hexagon/trapezoid bowtie defect (POINT/TAPER inverting
+  // the top-edge vertex order below half the box width) — and, being general,
+  // it catches the whole class rather than only those two known instances.
+  // Deliberately checks ONLY `points`/the rendered polygon, never `safe`: at
+  // 34x20 several shapes' safe rects go zero/negative-sized (e.g. rect's
+  // h = 20 - 22 = -2), which is harmless because ShapePreview (NodePalette)
+  // never reads `safe` — only `path`/`extra`. That is not this test's concern.
+  it.each(ALL)('%s: the silhouette polygon is simple at a real node size (220x130)', (name) => {
+    const s = shapeFor(name, 220, 130);
+    expect(isSimplePolygon(s.points), `${name} self-intersects at 220x130`).toBe(true);
+  });
+
+  it.each(ALL)('%s: the silhouette polygon is simple at the palette preview size (34x20)', (name) => {
+    const s = shapeFor(name, 34, 20);
+    expect(isSimplePolygon(s.points), `${name} self-intersects at 34x20`).toBe(true);
   });
 });
