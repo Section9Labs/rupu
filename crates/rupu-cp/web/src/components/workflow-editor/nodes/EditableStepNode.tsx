@@ -41,6 +41,16 @@ function kindChipStyle(colors: ThemeColors, kind: StepKind): React.CSSProperties
   return { background: colors.alpha(KIND_ACCENT[kind], 0.14), color: colors.get(KIND_ACCENT[kind]) };
 }
 
+/** `next`-path kind pill label — matches the approved design artifact, which
+ *  drops the `approval_` prefix (a standalone gate node already reads as a
+ *  gate via its trapezoid silhouette; the full `approval_gate` string eats
+ *  ~115px of a 148px-wide safe rect, truncating the node id instead). Every
+ *  other kind's label is `d.kind` verbatim, unchanged. Classic path (below)
+ *  keeps its own separate, hardcoded "gate" text — not driven by this. */
+function pillLabel(kind: StepKind): string {
+  return kind === 'approval_gate' ? 'gate' : kind;
+}
+
 /** dashed ring badge marking a legacy inline approval (agent step carrying
  *  `approval.required` directly, rather than a standalone gate node) — a
  *  render-only marker, no serialize-side effect (see `hasInlineApproval`). */
@@ -352,6 +362,7 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
             />
           )}
           <path
+            className="wfx-sil-shape"
             d={shape.path}
             fill="rgb(var(--c-panel))"
             stroke={stroke}
@@ -380,7 +391,7 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
           <div className="wfx-head">
             <span className="wfx-kindpill" style={kindChipStyle(colors, d.kind)}>
               <KindIcon className="wfx-kindicon" size={12} strokeWidth={2} aria-hidden />
-              {d.kind}
+              {pillLabel(d.kind)}
             </span>
             <span className="wfx-nid">{d.id}</span>
             {hasProblems && (

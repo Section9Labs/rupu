@@ -116,12 +116,22 @@ export function shapeFor(shape: ShapeName, w: number, h: number): NodeShape {
         points,
         path: toPath(points),
         extra: [],
-        // inscribed at the band's narrowest rows (y = .28h and .72h). Sized
-        // against BranchBodyNext's real rendered content at BRANCH_W/BRANCH_H
-        // (see workflowLayout.ts) — header (kindpill + id) + condition line +
-        // two then/else port pills (which usually wrap to two rows) measure
-        // to roughly 75-80px; this band gives ~92px, a little slack.
-        safe: { x: w * 0.27, y: h * 0.28, w: w * 0.46, h: h * 0.44 },
+        // inscribed at the band's narrowest rows (y = .28h and .72h). At
+        // vertical offset f*h from the top/bottom tip, a diamond's half-width
+        // is exactly f*w (the boundary edge is a straight line from the tip),
+        // so the safe rect's half-width (0.25w here) must stay under f*w
+        // (0.28w) — an 0.03w margin, ~8px at BRANCH_W/BRANCH_H (see
+        // workflowLayout.ts). Measured against BranchBodyNext's real rendered
+        // content in headless Chrome: header (kindpill + id) + condition line
+        // + two then/else port pills (which wrap to two rows for any
+        // realistic target name) stack to ~75px tall and, once `.wfx-head`/
+        // `.wfx-body` are given `align-self: stretch` under `.wfx-safe-mid`
+        // (styles.css) so their own ellipsis engages, a realistic body's
+        // widest row (a port pill, ~95-100px) fits with comfortable slack in
+        // this 140px-wide band — the condition line still ellipsizes for long
+        // conditions, by design (nodeShapes.test.ts's point-in-polygon test
+        // pins these fractions independent of BRANCH_W/BRANCH_H).
+        safe: { x: w * 0.25, y: h * 0.28, w: w * 0.5, h: h * 0.44 },
         align: 'center',
         target: LEFT_TARGET,
         sources: [

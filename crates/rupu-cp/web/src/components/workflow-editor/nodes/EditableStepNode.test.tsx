@@ -166,6 +166,31 @@ describe('EditableStepNode', () => {
       expect(container.querySelector('.text-ui.font-semibold')).not.toBeInTheDocument();
     });
 
+    it('an approval_gate node\'s kind pill reads "gate", not "approval_gate" — the full string would eat most of the trapezoid\'s safe width', () => {
+      const { container } = renderNode({ id: 'approve-deploy', kind: 'approval_gate' }, [], false, 'next');
+      const pill = container.querySelector('.wfx-kindpill');
+      expect(pill).toHaveTextContent('gate');
+      expect(pill?.textContent).not.toContain('approval_gate');
+      // the node id itself is untouched by the label change.
+      expect(container.querySelector('.wfx-nid')).toHaveTextContent('approve-deploy');
+    });
+
+    it('every other kind keeps its label verbatim in the kind pill', () => {
+      const kinds: Array<[StepNodeData, string]> = [
+        [{ id: 'x', kind: 'step', agent: 'a' }, 'step'],
+        [{ id: 'x', kind: 'for_each', agent: 'a', for_each: 'items' }, 'for_each'],
+        [{ id: 'x', kind: 'parallel', parallel: [] }, 'parallel'],
+        [{ id: 'x', kind: 'panel', panel: { panelists: [], subject: '' } }, 'panel'],
+        [{ id: 'x', kind: 'branch', condition: 'c' }, 'branch'],
+        [{ id: 'x', kind: 'action', action: 'scm.prs.create' }, 'action'],
+      ];
+      for (const [data, label] of kinds) {
+        const { container } = renderNode(data, [], false, 'next');
+        expect(container.querySelector('.wfx-kindpill')).toHaveTextContent(label);
+        cleanup();
+      }
+    });
+
     it('a step shows the agent as a mono expr line', () => {
       renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], false, 'next');
       expect(screen.getByText(/coder/)).toBeInTheDocument();
@@ -306,15 +331,19 @@ describe('EditableStepNode', () => {
         );
         const brSafe = br.querySelector('.wfx-safe') as HTMLElement;
         expect(brSafe.className).toContain('wfx-safe-mid');
-        // 200 * 0.27 = 54
-        expect(brSafe.style.left).toBe('54px');
+        // 280 * 0.25 = 70
+        expect(brSafe.style.left).toBe('70px');
       });
 
       it('strokes the silhouette with the kind accent when selected', () => {
         const { container: idle } = renderNode({ id: 's', kind: 'step', agent: 'a' }, [], false, 'next');
         const { container: sel } = renderNode({ id: 's', kind: 'step', agent: 'a' }, [], true, 'next');
-        const strokeOf = (c: HTMLElement) =>
-          c.querySelector('.wfx-sil path:last-of-type')?.getAttribute('stroke');
+        // `.wfx-sil-shape` is the silhouette's own filled+stroked path — stable
+        // regardless of paint order or how many `extra` rails/layers a kind
+        // paints on top of it (unlike `path:last-of-type`, which resolves to
+        // an `extra` rail for parallel/panel since fix round 1 moved `extra`
+        // to paint last).
+        const strokeOf = (c: HTMLElement) => c.querySelector('.wfx-sil-shape')?.getAttribute('stroke');
         expect(strokeOf(idle as HTMLElement)).not.toBe(strokeOf(sel as HTMLElement));
       });
 

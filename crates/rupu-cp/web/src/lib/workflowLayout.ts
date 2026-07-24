@@ -29,14 +29,20 @@ export const NODE_H = 80;
 /** for_each carries an extra `for_each: <expr>` line. */
 export const FOR_EACH_H = 100;
 
-/** branch paints a diamond — taller, and narrower than a step because a
- *  diamond's usable width collapses toward its tips (it shows only its
- *  condition, which is all a branch has). BRANCH_H is generous: the safe rect
- *  also has to fit the header + condition line + two then/else port pills
- *  (BranchBodyNext), which wrap to two rows more often than not — see the
- *  sizing note on the diamond case in nodeShapes.ts. */
-export const BRANCH_W = 200;
-export const BRANCH_H = 210;
+/** branch paints a diamond — a diamond's usable width collapses toward its
+ *  tips, so its safe rect can only ever use a fraction of the box (here,
+ *  half the width, a band centred at 28%-72% of the height — see the diamond
+ *  case in nodeShapes.ts). Widening is cheaper than heightening for a
+ *  diamond's safe area (the safe rect's usable half-width grows linearly with
+ *  BOTH the box width and the y-fraction, but a taller box also pushes ranks
+ *  apart more under dagre's `rankdir: 'LR'`, where node HEIGHT is the
+ *  cross-axis extent) — so BRANCH_W is wider than a step's 210 (despite a
+ *  branch carrying more content: header + condition + two then/else port
+ *  pills), while BRANCH_H stays modest. At 280x200 the safe rect is a
+ *  140x88 band — comfortable room for a realistic branch body (measured in
+ *  headless Chrome; see the diamond case in nodeShapes.ts). */
+export const BRANCH_W = 280;
+export const BRANCH_H = 200;
 
 /** action (parallelogram) and approval_gate (trapezoid) both lose horizontal
  *  room to slanted sides; the box grows so the text band stays step-sized. */

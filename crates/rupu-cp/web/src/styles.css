@@ -438,10 +438,21 @@
    * than `safe.h` paints over the outline instead of being contained. */
   overflow: hidden;
 }
-/* shapes whose width varies across the text band centre their content */
+/* shapes whose width varies across the text band centre their content.
+ * `align-items: center` on `.wfx-safe` makes its two flex children
+ * (`.wfx-head`/`.wfx-body`) shrink-to-fit their own content instead of
+ * stretching to the safe rect's width — which then means THEIR children's
+ * `overflow: hidden; text-overflow: ellipsis` never engages (a shrunk box is
+ * already exactly as wide as its content, so it never actually overflows;
+ * `.wfx-safe`'s own `overflow: hidden` clips instead, mid-glyph, with no
+ * ellipsis). Re-stretching `.wfx-head`/`.wfx-body` restores their real width
+ * so their own ellipsis rules work; `justify-content: center` keeps them
+ * LOOKING centred without shrinking them. */
 .wfx-safe-mid { align-items: center; text-align: center; }
-.wfx-safe-mid .wfx-head { justify-content: center; }
+.wfx-safe-mid .wfx-head { justify-content: center; align-self: stretch; }
+.wfx-safe-mid .wfx-body { align-self: stretch; }
 .wfx-safe-mid .wfx-nid { flex: 0 1 auto; }
+.wfx-safe-mid .wfx-ports { justify-content: center; }
 
 /* ── header: kindpill + mono id + problem dot ── */
 .wfx-head { display: flex; align-items: center; gap: 7px; padding: 0 0 4px; }

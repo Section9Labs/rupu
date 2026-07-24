@@ -186,10 +186,10 @@ it('reconcileFromYaml pauses on a non-object document (scalar / list)', () => {
 });
 
 describe('editorNodeSize — per-kind shape boxes', () => {
-  it('a branch reserves a taller, narrower box for its diamond', () => {
+  it('a branch reserves a wider box for its diamond (width over height — a diamond only uses a fraction of its box)', () => {
     expect(editorNodeSize({ id: 'b', kind: 'branch', condition: 'x' })).toEqual({
-      width: 200,
-      height: 210,
+      width: 280,
+      height: 200,
     });
   });
 
