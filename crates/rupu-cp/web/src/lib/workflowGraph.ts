@@ -453,6 +453,9 @@ function nodeToStepObject(d: StepNodeData): Record<string, unknown> {
       po.gate = go;
     }
     o.panel = po;
+    if (d.when) o.when = d.when;
+    if (d.continue_on_error === true) o.continue_on_error = true;
+    if (d.actions && d.actions.length > 0) o.actions = d.actions;
   } else if (d.kind === 'branch') {
     const bo: Record<string, unknown> = {};
     if (d.condition !== undefined) bo.condition = d.condition;
@@ -537,7 +540,7 @@ function nodeToStepObject(d: StepNodeData): Record<string, unknown> {
 export function graphToWorkflowObject(
   g: WorkflowGraph,
 ): { obj: Record<string, unknown> } | { error: string } {
-  const sorted = topoSort(g.nodes, g.edges);
+  const sorted = topoSort(g.nodes, deriveEdges(g.nodes));
   if ('cycle' in sorted) {
     return { error: 'Cannot serialize: cycle through ' + sorted.cycle.join(', ') };
   }

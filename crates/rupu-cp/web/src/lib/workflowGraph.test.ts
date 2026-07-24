@@ -306,9 +306,14 @@ describe('topoSort', () => {
 
 describe('graphToWorkflowObject', () => {
   it('errors on a cycle', () => {
+    // graphToWorkflowObject now derives edges from nodes (deriveEdges), so a
+    // cycle must be genuinely derivable: 'x' declared before 'y' gives a chain
+    // edge x->y, and 'x' forward-referencing steps.y gives a data-ref edge
+    // y->x — together a real cycle. Hand-supplied raw g.edges (as this test
+    // used to do) are no longer consulted at all.
     const g = {
-      nodes: [node('x', {}), node('y', {})],
-      edges: [edge('x', 'y'), edge('y', 'x')],
+      nodes: [node('x', { prompt: 'steps.y.output' }, { x: 0, y: 0 }), node('y', {}, { x: 0, y: 1 })],
+      edges: [],
       meta: { name: 'wf', rest: {} },
     };
     const res = graphToWorkflowObject(g);
@@ -1039,5 +1044,33 @@ describe('deriveEdges', () => {
     const nodes = yamlToGraph({ name: 'w', steps: [{ id: 'a', agent: 'x', prompt: 'p' }] }).nodes;
     const g = withDerivedEdges({ name: 'w', rest: {} }, nodes);
     expect(g.edges).toEqual(deriveEdges(g.nodes));
+  });
+});
+
+describe('serialization totality', () => {
+  it('a panel step keeps its when/continue_on_error on round-trip (P0.4)', () => {
+    const input = {
+      name: 'w',
+      steps: [{ id: 'p', when: 'inputs.go', continue_on_error: true, panel: { panelists: ['r'], subject: 's' } }],
+    };
+    const g = yamlToGraph(input);
+    const out = graphToWorkflowObject(g) as { obj: Record<string, unknown> };
+    const step = (out.obj.steps as Record<string, unknown>[])[0];
+    expect(step.when).toBe('inputs.go');
+    expect(step.continue_on_error).toBe(true);
+  });
+
+  it('graphToWorkflowObject orders by derived edges, not stored edges', () => {
+    // Declaration order is 'b' then 'a' — lexicographically the reverse of id
+    // order, and every node gets position {x:0,y:0} from yamlToGraph, so the
+    // topoSort tiebreak (position, then id) can't accidentally reproduce the
+    // correct order on its own. Only the derived chain edge b->a forces 'b'
+    // first; trusting an emptied g.edges would fall back to the id tiebreak
+    // and wrongly emit ['a', 'b'].
+    const g = yamlToGraph({ name: 'w', steps: [{ id: 'b', agent: 'x', prompt: 'p' }, { id: 'a', agent: 'x', prompt: 'p' }] });
+    // corrupt the stored edges; serialization must ignore them and use deriveEdges(nodes)
+    const corrupted = { ...g, edges: [] };
+    const out = graphToWorkflowObject(corrupted) as { obj: Record<string, unknown> };
+    expect((out.obj.steps as Record<string, unknown>[]).map((s) => s.id)).toEqual(['b', 'a']);
   });
 });
