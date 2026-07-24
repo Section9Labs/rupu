@@ -128,17 +128,39 @@ export default function StepForm({
     onChange({ ...d, ...p });
   }
 
-  // Kind switch — keep id + common fields (when / continue_on_error / approval /
-  // actions / raw_passthrough); drop the previous kind's specific fields.
+  // Kind switch — keep id; carry shared fields only where the DESTINATION kind
+  // can hold them; seed the destination's required defaults so it round-trips
+  // and validates with a friendly error rather than a raw parser one.
   function switchKind(kind: StepKind): void {
     const base: StepNodeData = { id: d.id, kind };
     if (d.when !== undefined) base.when = d.when;
     if (d.continue_on_error !== undefined) base.continue_on_error = d.continue_on_error;
-    if (d.approvalRequired !== undefined) base.approvalRequired = d.approvalRequired;
-    if (d.approvalPrompt !== undefined) base.approvalPrompt = d.approvalPrompt;
-    if (d.approvalTimeoutSeconds !== undefined) base.approvalTimeoutSeconds = d.approvalTimeoutSeconds;
     if (d.actions !== undefined) base.actions = d.actions;
     if (d.raw_passthrough !== undefined) base.raw_passthrough = d.raw_passthrough;
+    // agent/prompt are shared by the step + for_each forms — preserve across those.
+    if (kind === 'step' || kind === 'for_each') {
+      if (d.agent !== undefined) base.agent = d.agent;
+      if (d.prompt !== undefined) base.prompt = d.prompt;
+    }
+    // approval is only editable on step/for_each/approval_gate — carry it there, drop it elsewhere.
+    if (kind === 'step' || kind === 'for_each' || kind === 'approval_gate') {
+      if (d.approvalRequired !== undefined) base.approvalRequired = d.approvalRequired;
+      if (d.approvalPrompt !== undefined) base.approvalPrompt = d.approvalPrompt;
+      if (d.approvalTimeoutSeconds !== undefined) base.approvalTimeoutSeconds = d.approvalTimeoutSeconds;
+    }
+    // seed destination defaults (mirrors newNodeData)
+    if (kind === 'parallel') base.parallel = [];
+    if (kind === 'panel') base.panel = { panelists: [], subject: '' };
+    if (kind === 'branch') {
+      base.condition = '';
+      base.thenTargets = [];
+      base.elseTargets = [];
+    }
+    if (kind === 'action') base.action = '';
+    if (kind === 'approval_gate') {
+      base.approvalRequired = true;
+      base.approvalOnReject = [];
+    }
     onChange(base);
   }
 

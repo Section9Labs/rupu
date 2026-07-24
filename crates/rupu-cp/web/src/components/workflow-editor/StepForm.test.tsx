@@ -56,8 +56,19 @@ function nodeWith(data: Partial<StepNodeData>): GraphNode {
   return { id: data.id ?? 's1', data: { id: 's1', kind: 'step', ...data }, position: { x: 0, y: 0 } };
 }
 
-/** Controlled wrapper — re-renders StepForm with the latest emitted data. */
-function Harness({ initial, spy }: { initial: GraphNode; spy: (d: StepNodeData) => void }) {
+/** Controlled wrapper — re-renders StepForm with the latest emitted data.
+ *  `workflowEditorUi` defaults through to StepForm's own default ('classic');
+ *  pass 'next' when a test needs the Kind <select> to offer branch/action/
+ *  approval_gate as switch targets. */
+function Harness({
+  initial,
+  spy,
+  workflowEditorUi,
+}: {
+  initial: GraphNode;
+  spy: (d: StepNodeData) => void;
+  workflowEditorUi?: 'classic' | 'next';
+}) {
   const [node, setNode] = useState(initial);
   return (
     <StepForm
@@ -65,6 +76,7 @@ function Harness({ initial, spy }: { initial: GraphNode; spy: (d: StepNodeData) 
       agents={AGENTS}
       problems={[]}
       exprContext={EXPR}
+      workflowEditorUi={workflowEditorUi}
       onChange={(d) => {
         spy(d);
         setNode((n) => ({ ...n, id: d.id, data: d }));
@@ -609,6 +621,82 @@ describe('StepForm — action body (Task 5)', () => {
     fireEvent.change(screen.getByLabelText('With title'), { target: { value: 'Fix bug' } });
     const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
     expect(last.with).toEqual({ title: 'Fix bug' });
+  });
+});
+
+describe('StepForm — switchKind', () => {
+  it('switching to branch seeds an empty condition + empty then/else (F.1)', () => {
+    const spy = vi.fn();
+    render(
+      <Harness initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go' })} spy={spy} workflowEditorUi="next" />,
+    );
+    fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'branch' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.kind).toBe('branch');
+    expect(last.condition).toBe('');
+    expect(last.thenTargets).toEqual([]);
+    expect(last.elseTargets).toEqual([]);
+  });
+
+  it('switching to action seeds an empty action (P0.3)', () => {
+    const spy = vi.fn();
+    render(
+      <Harness initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go' })} spy={spy} workflowEditorUi="next" />,
+    );
+    fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'action' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.kind).toBe('action');
+    expect(last.action).toBe('');
+  });
+
+  it('switching step -> for_each preserves agent and prompt (§8.3)', () => {
+    const spy = vi.fn();
+    render(<Harness initial={nodeWith({ kind: 'step', agent: 'coder', prompt: 'do it' })} spy={spy} />);
+    fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'for_each' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.kind).toBe('for_each');
+    expect(last.agent).toBe('coder');
+    expect(last.prompt).toBe('do it');
+  });
+
+  it('switching a step that had approval into a branch clears the approval block (§8.4)', () => {
+    const spy = vi.fn();
+    render(
+      <Harness
+        initial={nodeWith({ kind: 'step', agent: 'planner', approvalRequired: true })}
+        spy={spy}
+        workflowEditorUi="next"
+      />,
+    );
+    fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'branch' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.kind).toBe('branch');
+    expect(last.approvalRequired).toBeUndefined();
+  });
+
+  it('switching to approval_gate seeds approvalRequired true regardless of source', () => {
+    const spy = vi.fn();
+    render(<Harness initial={nodeWith({ kind: 'step', agent: 'planner' })} spy={spy} workflowEditorUi="next" />);
+    fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'approval_gate' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.kind).toBe('approval_gate');
+    expect(last.approvalRequired).toBe(true);
+    expect(last.approvalOnReject).toEqual([]);
+  });
+
+  it('switching step -> parallel/panel seeds their required defaults', () => {
+    const spy = vi.fn();
+    const { unmount } = render(<Harness initial={nodeWith({ kind: 'step', agent: 'planner' })} spy={spy} />);
+    fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'parallel' } });
+    let last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.parallel).toEqual([]);
+    unmount();
+
+    const spy2 = vi.fn();
+    render(<Harness initial={nodeWith({ kind: 'step', agent: 'planner' })} spy={spy2} />);
+    fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'panel' } });
+    last = spy2.mock.calls[spy2.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.panel).toEqual({ panelists: [], subject: '' });
   });
 });
 
