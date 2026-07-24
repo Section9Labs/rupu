@@ -362,6 +362,7 @@ function LinearFields({
             <span className={labelCls}>Max parallel</span>
             <input
               type="number"
+              min={1}
               value={d.max_parallel ?? ''}
               onChange={(e) => patch({ max_parallel: parseNum(e.target.value) })}
               aria-label="Max parallel"
@@ -410,6 +411,7 @@ function ParallelFields({
         <span className={labelCls}>Max parallel</span>
         <input
           type="number"
+          min={1}
           value={d.max_parallel ?? ''}
           onChange={(e) => patch({ max_parallel: parseNum(e.target.value) })}
           aria-label="Max parallel"
@@ -552,6 +554,7 @@ function PanelFields({
         <span className={labelCls}>Max parallel (optional)</span>
         <input
           type="number"
+          min={1}
           value={panel.max_parallel ?? ''}
           onChange={(e) => patchPanel({ max_parallel: parseNum(e.target.value) })}
           aria-label="Panel max parallel"
@@ -574,8 +577,7 @@ function PanelFields({
         <div className="space-y-3 rounded-md border border-border bg-surface p-2.5">
           <label className="block">
             <span className={labelCls}>Until no findings at severity or above</span>
-            <input
-              type="text"
+            <select
               value={panel.gate.until_no_findings_at_severity_or_above ?? ''}
               onChange={(e) =>
                 patchGate({
@@ -583,9 +585,22 @@ function PanelFields({
                 })
               }
               aria-label="Until no findings at severity or above"
-              placeholder="medium"
               className={fieldCls}
-            />
+            >
+              <option value="">(choose severity)</option>
+              {['low', 'medium', 'high', 'critical'].map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+              {/* keep an off-list value authored by hand so it still round-trips */}
+              {panel.gate.until_no_findings_at_severity_or_above &&
+                !['low', 'medium', 'high', 'critical'].includes(panel.gate.until_no_findings_at_severity_or_above) && (
+                  <option value={panel.gate.until_no_findings_at_severity_or_above}>
+                    {panel.gate.until_no_findings_at_severity_or_above}
+                  </option>
+                )}
+            </select>
           </label>
           <label className="block">
             <span className={labelCls}>Fix with</span>

@@ -751,6 +751,49 @@ describe('validateGraph', () => {
     const v = validateGraph(g);
     expect(v.a.some((m) => m.includes('unknown step ghost'))).toBe(true);
   });
+
+  it('flags max_parallel below 1', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'p', parallel: [{ id: 's', agent: 'a', prompt: 'x' }], max_parallel: 0 }],
+    });
+    const problems = validateGraph(g);
+    expect(Object.values(problems).flat().some((m) => /max.?parallel/i.test(m) && /1/.test(m))).toBe(true);
+  });
+
+  it('does not flag a valid positive max_parallel', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'p', parallel: [{ id: 's', agent: 'a', prompt: 'x' }], max_parallel: 2 }],
+    });
+    const problems = validateGraph(g);
+    expect(Object.values(problems).flat().some((m) => /max.?parallel/i.test(m))).toBe(false);
+  });
+
+  it('flags an enabled gate with no severity/fix_with/max_iterations', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'p', panel: { panelists: ['r'], subject: 's', gate: {} } }],
+    });
+    expect(Object.values(validateGraph(g)).flat().some((m) => /gate/i.test(m))).toBe(true);
+  });
+
+  it('does not flag a fully-specified gate', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        {
+          id: 'p',
+          panel: {
+            panelists: ['r'],
+            subject: 's',
+            gate: { until_no_findings_at_severity_or_above: 'medium', fix_with: 'r', max_iterations: 3 },
+          },
+        },
+      ],
+    });
+    expect(Object.values(validateGraph(g)).flat().some((m) => /gate/i.test(m))).toBe(false);
+  });
 });
 
 // ── fold-in (review Minor): `with:` on a non-action step/for_each node ──────

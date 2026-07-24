@@ -639,12 +639,19 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
       const p = d.panel;
       if (!p || p.panelists.length === 0) add(n.id, 'panel needs at least one panelist');
       if (!p || !p.subject) add(n.id, 'panel needs a subject');
+      if (p?.gate) {
+        const gate = p.gate;
+        if (!gate.until_no_findings_at_severity_or_above || !gate.fix_with || gate.max_iterations === undefined) {
+          add(n.id, 'gate needs a severity, a fix agent, and max iterations');
+        }
+      }
     } else if (d.kind === 'branch') {
       if (!d.condition) add(n.id, 'branch needs a condition');
       for (const t of [...(d.thenTargets ?? []), ...(d.elseTargets ?? [])]) {
         if (!nodeIds.has(t)) add(n.id, `branch target ${t} is not a known step`);
       }
     }
+    if (d.max_parallel !== undefined && d.max_parallel < 1) add(n.id, '`max_parallel` must be at least 1');
     if ((counts.get(n.id) ?? 0) > 1) add(n.id, 'duplicate step id');
   }
 

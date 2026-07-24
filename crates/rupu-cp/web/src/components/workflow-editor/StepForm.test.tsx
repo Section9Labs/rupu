@@ -700,6 +700,52 @@ describe('StepForm — switchKind', () => {
   });
 });
 
+describe('StepForm — panel gate severity select + max_parallel guard (Task 1)', () => {
+  it('gate severity is a select of the four severities and keeps an off-list value', () => {
+    const spy = vi.fn();
+    render(
+      <Harness
+        initial={nodeWith({
+          kind: 'panel',
+          panel: { panelists: [], subject: 'review', gate: { until_no_findings_at_severity_or_above: 'legacy-custom' } },
+        })}
+        spy={spy}
+      />,
+    );
+
+    const select = screen.getByLabelText('Until no findings at severity or above');
+    expect(select.tagName).toBe('SELECT');
+    expect(screen.getByRole('option', { name: 'low' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'medium' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'high' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'critical' })).toBeInTheDocument();
+    // Off-list hand-authored value still renders as a selectable option so it round-trips.
+    expect(screen.getByRole('option', { name: 'legacy-custom' })).toBeInTheDocument();
+    expect(select).toHaveValue('legacy-custom');
+
+    fireEvent.change(select, { target: { value: 'high' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.panel?.gate?.until_no_findings_at_severity_or_above).toBe('high');
+  });
+
+  it('a fresh gate with no severity shows the empty "(choose severity)" option and no off-list option', () => {
+    render(<Harness initial={nodeWith({ kind: 'panel', panel: { panelists: [], subject: 'review', gate: {} } })} spy={vi.fn()} />);
+    const select = screen.getByLabelText('Until no findings at severity or above');
+    expect(screen.getByRole('option', { name: '(choose severity)' })).toBeInTheDocument();
+    expect(select).toHaveValue('');
+  });
+
+  it('panel max_parallel input has a min of 1', () => {
+    render(<Harness initial={nodeWith({ kind: 'panel', panel: { panelists: [], subject: 'review' } })} spy={vi.fn()} />);
+    expect(screen.getByLabelText('Panel max parallel')).toHaveAttribute('min', '1');
+  });
+
+  it('parallel arm max_parallel input has a min of 1', () => {
+    render(<Harness initial={nodeWith({ kind: 'parallel', parallel: [] })} spy={vi.fn()} />);
+    expect(screen.getByLabelText('Max parallel')).toHaveAttribute('min', '1');
+  });
+});
+
 describe('WorkflowSettingsForm', () => {
   it('editing the name emits a meta with rest preserved', () => {
     const spy = vi.fn();

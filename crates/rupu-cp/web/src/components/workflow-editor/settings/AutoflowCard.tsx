@@ -251,6 +251,29 @@ export default function AutoflowCard({ rest, onRest }: AutoflowCardProps) {
             </div>
           </div>
 
+          <div className="wfx-row-two">
+            <label className="block">
+              <span className={labelCls}>Source (optional)</span>
+              <input
+                type="text"
+                value={model.source ?? ''}
+                onChange={(e) => commit({ ...model, source: e.target.value === '' ? undefined : e.target.value })}
+                aria-label="Autoflow source"
+                className={fieldCls}
+              />
+            </label>
+            <label className="block">
+              <span className={labelCls}>Priority</span>
+              <input
+                type="number"
+                value={model.priority ?? ''}
+                onChange={(e) => commit({ ...model, priority: e.target.value === '' ? 0 : Number(e.target.value) })}
+                aria-label="Autoflow priority"
+                className={fieldCls}
+              />
+            </label>
+          </div>
+
           <div className="wfx-subcard">
             <div className="wfx-subcard-h">Selector</div>
 
