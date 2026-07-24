@@ -1100,13 +1100,20 @@ git commit -m "feat(cp): preview each block's silhouette in the palette"
 
 **Files:**
 - Modify: `crates/rupu-cp/web/src/components/workflow-editor/WorkflowEditorGraph.tsx:41,229`
+- Modify: `crates/rupu-cp/web/src/lib/workflowGraph.ts:655-660`
 - Test: `crates/rupu-cp/web/src/components/workflow-editor/WorkflowEditorGraph.test.tsx`
+- Test: `crates/rupu-cp/web/src/lib/workflowGraph.test.ts`
 
 **Interfaces:**
 - Consumes: `editorNodeSize` from `../../lib/workflowLayout` (Task 2).
 - Produces: no new exports. `applyAddConnectedNext`'s placement is now source-width-aware.
 
-`applyAddConnectedNext` hardcodes `NODE_W` (210) for the horizontal gap. That was already wrong for `parallel`/`panel` (220 wide) and is now wrong for four more kinds. In scope because per-shape widths make the overlap materially more visible.
+There are **two** placement sites that hardcode the old 210-wide step box, and per-kind widths break both:
+
+1. `applyAddConnectedNext` (`WorkflowEditorGraph.tsx:229`) hardcodes `NODE_W` (210) for the horizontal gap. Already wrong for `parallel`/`panel` (220 wide); now wrong for four more kinds, worst for `branch` at 280 — selecting a branch and clicking "⊕ next" places the new node overlapping its source by 6px until a manual Re-layout.
+2. `CONVERT_GATE_X_OFFSET` (`workflowGraph.ts:660`) is the literal `274` — `NODE_W` + the 64px gap — used to shift an agent step right to make room for a gate node inserted before it. A gate is now `GATE_W` (214) + 64 = **278**, so the step lands 4px into the gate.
+
+Site 2 stays a **literal**, not an import: `workflowGraph.ts` is deliberately framework- and layout-free (see its file-header comment and the comment at `:655-659`). Update the number and its comment; do not import `editorNodeSize` there.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1152,6 +1159,31 @@ describe('applyAddConnectedNext placement', () => {
 });
 ```
 
+And append to `src/lib/workflowGraph.test.ts`, inside the existing `describe('convertInlineApprovalToGate', …)` block (it already imports `yamlToGraph` and `convertInlineApprovalToGate`):
+
+```ts
+  it('shifts the agent step clear of the inserted gate, which is wider than a step', () => {
+    const g = yamlToGraph({
+      name: 'wf',
+      steps: [
+        {
+          id: 'ship',
+          agent: 'deployer',
+          prompt: 'deploy it',
+          approval: { required: true, prompt: 'ok to ship?' },
+        },
+      ],
+    });
+    const before = g.nodes.find((n) => n.id === 'ship')!.position.x;
+    const next = convertInlineApprovalToGate(g, 'ship');
+    const after = next.nodes.find((n) => n.id === 'ship')!.position.x;
+
+    // a gate is GATE_W (214) wide, not NODE_W (210) — at the old 274 the step
+    // landed 4px inside the gate it was making room for.
+    expect(after - before).toBe(278);
+  });
+```
+
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `cd crates/rupu-cp/web && npx vitest run src/components/workflow-editor/WorkflowEditorGraph.test.tsx`
@@ -1169,6 +1201,19 @@ and replace the `position` line at 229:
 
 ```ts
     position: { x: base.x + (source ? editorNodeSize(source.data).width : NODE_W) + gap, y: base.y },
+```
+
+In `workflowGraph.ts`, update the offset constant and its comment at lines 655-660. It must stay a literal — this module is deliberately framework- and layout-free, so it may not import `editorNodeSize`:
+
+```ts
+/** Horizontal shift applied to the agent step when a gate node is inserted
+ *  before it, so the two never overlap: the gate's own box width (`GATE_W`,
+ *  214) + the `applyAddConnectedNext` gap (64) in workflowLayout /
+ *  WorkflowEditorGraph — duplicated as a literal rather than imported so this
+ *  module stays framework/layout-free (see the file-header comment). The gate
+ *  is a trapezoid and is WIDER than a plain step (210), which is why this is
+ *  not `NODE_W + gap`. */
+const CONVERT_GATE_X_OFFSET = 278;
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
