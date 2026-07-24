@@ -599,6 +599,7 @@
 .wfx-pcard:active { cursor: grabbing; }
 .wfx-pcard:disabled { cursor: not-allowed; opacity: .5; }
 .wfx-picon { flex: none; }
+.wfx-pshape { flex: none; width: 24px; height: 14px; }
 .wfx-pcard-text { min-width: 0; }
 .wfx-pl {
   font-size: 11.5px; font-weight: 600; color: rgb(var(--c-ink));

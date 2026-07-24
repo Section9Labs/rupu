@@ -81,17 +81,27 @@ function toPath(points: [number, number][]): string {
 }
 
 /** Rounded rectangle — the only silhouette whose painted path differs from its
- *  polygon (the polygon is the un-rounded box, used for geometry tests). */
+ *  polygon (the polygon is the un-rounded box, used for geometry tests).
+ *
+ *  The corner radius `R` is fixed at 12px, sized for real node boxes
+ *  (~210x80+). Painted naively at a small box — e.g. the 34x20 palette-chip
+ *  preview — `R` no longer fits: the straight run between two corner curves
+ *  (from `t+R` to `b-R` on the vertical edges, `l+R` to `r-R` on the
+ *  horizontal ones) would need to run backwards once the box is shorter than
+ *  `2*R + 2*I`. Clamping to what the box can actually hold keeps the curve
+ *  monotonic at any size and is a no-op at real node sizes (210x80 clamps to
+ *  12, unchanged). */
 function roundedRectPath(w: number, h: number): string {
   const l = I;
   const t = I;
   const r = w - I;
   const b = h - I;
+  const rad = Math.min(R, (w - 2 * I) / 2, (h - 2 * I) / 2);
   return (
-    `M ${l + R} ${t} L ${r - R} ${t} Q ${r} ${t} ${r} ${t + R} ` +
-    `L ${r} ${b - R} Q ${r} ${b} ${r - R} ${b} ` +
-    `L ${l + R} ${b} Q ${l} ${b} ${l} ${b - R} ` +
-    `L ${l} ${t + R} Q ${l} ${t} ${l + R} ${t} Z`
+    `M ${l + rad} ${t} L ${r - rad} ${t} Q ${r} ${t} ${r} ${t + rad} ` +
+    `L ${r} ${b - rad} Q ${r} ${b} ${r - rad} ${b} ` +
+    `L ${l + rad} ${b} Q ${l} ${b} ${l} ${b - rad} ` +
+    `L ${l} ${t + rad} Q ${l} ${t} ${l + rad} ${t} Z`
   );
 }
 

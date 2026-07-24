@@ -349,5 +349,28 @@ describe('NodePalette', () => {
       fireEvent.click(screen.getByRole('button', { name: 'Add parallel node' }));
       expect(onAdd).toHaveBeenCalledWith('parallel');
     });
+
+    it('each block chip previews its kind silhouette, so the shape is learned at pick time', () => {
+      const { container } = render(
+        <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" workflowEditorUi="next" />,
+      );
+      const branchChip = container.querySelector('[aria-label="Add branch node"]');
+      expect(branchChip).toBeInTheDocument();
+
+      const shape = branchChip?.querySelector('.wfx-pshape');
+      expect(shape).toBeInTheDocument();
+      expect(shape?.tagName.toLowerCase()).toBe('svg');
+      // a diamond: four vertices, no curves
+      const d = shape?.querySelector('path')?.getAttribute('d') ?? '';
+      expect(d).toMatch(/^M /);
+      expect(d).not.toContain('Q');
+      expect(d.match(/L/g) ?? []).toHaveLength(3);
+
+      // a step chip previews the rounded rect instead
+      const stepD = container
+        .querySelector('[aria-label="Add step node"] .wfx-pshape path')
+        ?.getAttribute('d');
+      expect(stepD).toContain('Q');
+    });
   });
 });

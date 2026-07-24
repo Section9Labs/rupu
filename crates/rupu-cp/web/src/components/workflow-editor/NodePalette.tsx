@@ -15,7 +15,8 @@ import type { StepKind, StepNodeData } from '../../lib/workflowGraph';
 import type { ToolSpec } from '../../lib/api';
 import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 import { useThemeColors } from '../../lib/useThemeColors';
-import { KIND_ACCENT, KIND_ICON } from './kindVisuals';
+import { KIND_ACCENT, KIND_ICON, KIND_SHAPE } from './kindVisuals';
+import { shapeFor } from './nodeShapes';
 
 /** dataTransfer key the canvas reads on drop. Exported so the canvas drop
  *  handler and the palette agree on one string. */
@@ -201,6 +202,21 @@ function groupConnectors(tools: ToolSpec[]): ConnectorGroup[] {
     g.tools.push(t);
   }
   return groups;
+}
+
+/** Miniature silhouette for a palette chip — the same geometry the canvas
+ *  paints, so a shape is learned where you PICK the block rather than first
+ *  met where it lands. Drawn at a fixed 34x20 viewBox and scaled by CSS. */
+function ShapePreview({ kind, color }: { kind: StepKind; color: string }) {
+  const shape = shapeFor(KIND_SHAPE[kind], 34, 20);
+  return (
+    <svg className="wfx-pshape" viewBox="0 0 34 20" aria-hidden>
+      {shape.extra.map((d, i) => (
+        <path key={i} d={d} fill="none" stroke={color} strokeWidth={1} opacity={0.5} />
+      ))}
+      <path d={shape.path} fill="none" stroke={color} strokeWidth={1.25} strokeLinejoin="round" />
+    </svg>
+  );
 }
 
 interface NodeDetailProps {
@@ -417,6 +433,7 @@ export default function NodePalette({
                 title={item.sub}
                 className={isSelected ? 'wfx-pcard wfx-pcard-selected' : 'wfx-pcard'}
               >
+                <ShapePreview kind={item.kind} color={color} />
                 <Icon className="wfx-picon" size={14} strokeWidth={2} style={{ color }} aria-hidden />
                 <div className="wfx-pcard-text">
                   <div className="wfx-pl">{item.label}</div>

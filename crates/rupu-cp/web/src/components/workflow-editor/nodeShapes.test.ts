@@ -99,4 +99,24 @@ describe('shapeFor', () => {
     expect(p.safe.x).toBeGreaterThanOrEqual(20);
     expect(p.safe.x + p.safe.w).toBeLessThanOrEqual(214 - 20);
   });
+
+  it('a rect clamps its corner radius to the box at a small palette-preview size, so the straight edges do not double back', () => {
+    // At a real node size (210x80) the box comfortably holds the fixed
+    // R=12 radius: the Q control points still run monotonically. At a small
+    // preview box (34x20, the palette chip's viewBox) an unclamped R=12
+    // would make the top/bottom straight run (from t+R to b-R) reverse
+    // direction, since b-R < t+R once h < 2R + 2*inset. Assert both.
+    const real = shapeFor('rect', 210, 80).path;
+    // I=2 (stroke inset), so t+R=14 and b-R=68 at h=80 — monotonic descent.
+    expect(real).toContain('Q 208 2 208 14');
+    expect(real).toContain('L 208 66');
+
+    const small = shapeFor('rect', 34, 20).path;
+    // Clamped radius at 34x20 (I=2): min(12, (34-4)/2, (20-4)/2) = 8.
+    // t+R=10, b-R=10 — the straight run degenerates to zero length rather
+    // than reversing (10 -> 10, never 14 -> 6).
+    expect(small).toContain('Q 32 2 32 10');
+    expect(small).toContain('L 32 10');
+    expect(small).not.toMatch(/L 32 6\b/);
+  });
 });
