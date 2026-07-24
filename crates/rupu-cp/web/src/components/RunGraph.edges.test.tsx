@@ -94,10 +94,12 @@ describe('RunGraph edges', () => {
     const edge = captured[0];
     // live frontier animates via the color-agnostic class...
     expect(edge.className).toBe('rg-edge-flow');
-    // ...and its stroke comes from JS (the SOURCE step is an action step, so
-    // the stroke must NOT be the running-blue the classic path would use).
-    expect(edge.style?.stroke).toBeTruthy();
-    expect(edge.style?.stroke).not.toBe('');
+    // ...and its stroke comes from JS: the SOURCE step is an `action` step,
+    // whose kind accent is `sev.info` (see kindVisuals.KIND_ACCENT), so the
+    // stroke must be the seeded --c-sev-info value, and NOT the running-blue
+    // the classic path would use.
+    expect(edge.style?.stroke).toBe('rgb(100 116 139)');
+    expect(edge.style?.stroke).not.toBe('rgb(59 130 246)');
   });
 
   it('next: an edge into an awaiting gate flows in amber, not the source kind color', () => {

@@ -13,9 +13,22 @@ import type { StepNodeDto } from '../../lib/api';
 
 export type RunKind = StepNodeDto['kind'];
 
+// Total map, not a cast: if `RunKind` ever gains a member, this object
+// literal fails to satisfy `Record<RunKind, StepKind>` and the build breaks
+// at compile time instead of quietly handing `KIND_ACCENT` an `undefined`
+// key (which paints `rgb(undefined)`).
+const STEP_KIND: Record<RunKind, StepKind> = {
+  step: 'step',
+  for_each: 'for_each',
+  parallel: 'parallel',
+  panel: 'panel',
+  gate: 'approval_gate',
+  action: 'action',
+};
+
 /** Map a run-model step kind onto the editor's `StepKind` vocabulary. */
 export function runKindToStepKind(kind: RunKind): StepKind {
-  return kind === 'gate' ? 'approval_gate' : (kind as StepKind);
+  return STEP_KIND[kind];
 }
 
 /** The themed accent token for a run step's kind (same palette as the editor). */

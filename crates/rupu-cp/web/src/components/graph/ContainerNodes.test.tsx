@@ -31,7 +31,7 @@ const CSS_VARS: Record<string, string> = {
   '--c-status-failed': '239 68 68',
   '--c-status-pending': '148 163 184',
   '--c-status-paused': '6 182 212',
-  '--c-status-skipped': '148 163 184',
+  '--c-status-skipped': '203 213 225',
 };
 
 for (const [k, v] of Object.entries(CSS_VARS)) {
@@ -136,10 +136,14 @@ describe('PanelLoopNode', () => {
     expect(screen.getByLabelText('looping')).toBeInTheDocument();
   });
 
-  // No tint-distinctness assertion here: panel's kind accent (`status.awaiting`)
-  // and its legacy brand tint may resolve to different tokens but the SAME
-  // computed string under jsdom's seeded fixture — asserting `not.toBe` would
-  // be a coin flip on the seed values, not a real signal.
+  it('next: the container tint switches from the legacy brand violet to the panel kind accent', () => {
+    const classic = renderPanel(PANEL, 'classic');
+    const classicTint = containerBorderColor(classic.container);
+    cleanup();
+    const next = renderPanel(PANEL, 'next');
+    const nextTint = containerBorderColor(next.container);
+    expect(nextTint).not.toBe(classicTint);
+  });
 });
 
 const FANOUT: GraphNode = {
@@ -193,7 +197,7 @@ const FANOUT_LARGE: GraphNode = {
 
 describe('FanoutNode (large card, total > 12)', () => {
   it('next: the header label, the %, and the expand-all button take the for_each kind accent, not the legacy running-blue', () => {
-    const classic = renderFanout(FANOUT_LARGE, 'classic');
+    renderFanout(FANOUT_LARGE, 'classic');
     const classicHeader = screen.getByText(/for_each · bigshard/);
     const classicHeaderColor = getComputedStyle(classicHeader).color;
     const classicPct = screen.getByText('67%');
@@ -202,7 +206,7 @@ describe('FanoutNode (large card, total > 12)', () => {
     const classicButtonColor = getComputedStyle(classicButton).color;
     cleanup();
 
-    const next = renderFanout(FANOUT_LARGE, 'next');
+    renderFanout(FANOUT_LARGE, 'next');
     const nextHeader = screen.getByText(/for_each · bigshard/);
     const nextHeaderColor = getComputedStyle(nextHeader).color;
     const nextPct = screen.getByText('67%');
@@ -213,8 +217,5 @@ describe('FanoutNode (large card, total > 12)', () => {
     expect(nextHeaderColor).not.toBe(classicHeaderColor);
     expect(nextPctColor).not.toBe(classicPctColor);
     expect(nextButtonColor).not.toBe(classicButtonColor);
-
-    void classic;
-    void next;
   });
 });
