@@ -817,6 +817,14 @@ describe('asStepKind', () => {
     expect(asStepKind('step')).toBe('step');
     expect(asStepKind('nonsense')).toBeNull();
   });
+
+  it('accepts split and join so a palette drag creates the node (I1)', () => {
+    // The palette makes split/join cards draggable via NODE_KIND_MIME =
+    // 'split'/'join', but asStepKind previously omitted them, so a drop
+    // silently no-oped (`if (!kind) return;`) while click-to-add worked.
+    expect(asStepKind('split')).toBe('split');
+    expect(asStepKind('join')).toBe('join');
+  });
 });
 
 describe('branch edge rendering', () => {

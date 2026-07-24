@@ -963,6 +963,39 @@ describe('StepForm — switchKind', () => {
     last = spy2.mock.calls[spy2.mock.calls.length - 1][0] as StepNodeData;
     expect(last.panel).toEqual({ panelists: [], subject: '' });
   });
+
+  it('switching step -> action preserves the outgoing `next` edge (M5)', () => {
+    // `next` is a GENERAL field (a node's outgoing successor edge), not
+    // kind-specific — switching a node's kind shouldn't silently disconnect
+    // it from its downstream successor.
+    const spy = vi.fn();
+    render(
+      <Harness
+        initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go', next: ['b'] })}
+        spy={spy}
+        workflowEditorUi="next"
+      />,
+    );
+    fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'action' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.kind).toBe('action');
+    expect(last.next).toEqual(['b']);
+  });
+
+  it('switching step -> branch drops `next` (branch routes via then/else arms, not next) (M5)', () => {
+    const spy = vi.fn();
+    render(
+      <Harness
+        initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go', next: ['b'] })}
+        spy={spy}
+        workflowEditorUi="next"
+      />,
+    );
+    fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'branch' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.kind).toBe('branch');
+    expect(last.next).toBeUndefined();
+  });
 });
 
 describe('StepForm — panel gate severity select + max_parallel guard (Task 1)', () => {

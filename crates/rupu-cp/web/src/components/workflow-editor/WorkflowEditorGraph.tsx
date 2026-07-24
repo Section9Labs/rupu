@@ -423,7 +423,9 @@ export function asStepKind(v: string): StepKind | null {
     v === 'panel' ||
     v === 'branch' ||
     v === 'approval_gate' ||
-    v === 'action'
+    v === 'action' ||
+    v === 'split' ||
+    v === 'join'
     ? v
     : null;
 }

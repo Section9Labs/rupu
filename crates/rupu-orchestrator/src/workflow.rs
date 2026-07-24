@@ -1849,17 +1849,29 @@ pub fn workflow_edges(wf: &Workflow) -> Vec<(String, String)> {
     edges.into_iter().collect()
 }
 
-/// True iff this workflow needs the Phase 2 DAG scheduler: it uses
-/// split/join, OR its control-edge graph has a fork (a non-branch step
-/// with `next.len() > 1`) or a reconverge (any node with >1 inbound
-/// control edge, counted over `next`/`split`/branch then-or-else arms).
+/// True iff this workflow needs the Phase 2 DAG scheduler, i.e. the
+/// existing linear runner (which walks `wf.steps` in LIST order and
+/// ignores `next` for dispatch) cannot faithfully execute it. That's the
+/// case when the workflow:
+/// - uses split/join, or
+/// - has a fork (a non-branch step with `next.len() > 1`) or a
+///   reconverge (any node with >1 inbound control edge, counted over
+///   `next`/`split`/branch then-or-else arms), or
+/// - has explicit edges (`next`/`split`/`join`) AND its declaration
+///   order isn't a valid topological order of the full dependency graph
+///   (control edges union inferred `steps.X.*` data edges — see
+///   `declaration_order_is_topological`).
 ///
-/// Deliberately does NOT fold in `workflow_edges`'s inferred *data* edges
-/// (`steps.X.*` template references): a step referencing two different
-/// prior steps' outputs would otherwise falsely read as a reconverge. A
-/// plain linear chain — even with explicit `next:` that just restates
-/// list order — and today's branches are `false`: the existing linear
-/// runner executes both faithfully.
+/// The fork/reconverge checks above deliberately do NOT fold in
+/// `workflow_edges`'s inferred *data* edges: a step referencing two
+/// different prior steps' outputs would otherwise falsely read as a
+/// reconverge. The topological-order check below is different — it's the
+/// one place data edges matter, because a graph workflow that references
+/// `steps.X` before `X` is declared/connected would render against
+/// state that doesn't exist yet under the linear runner's list-order
+/// walk. A plain linear chain — even with explicit `next:` that just
+/// restates list order — and today's branches are `false`: the existing
+/// linear runner executes both faithfully.
 pub fn is_nonlinear(wf: &Workflow) -> bool {
     if wf.steps.iter().any(|s| s.split.is_some() || s.join.is_some()) {
         return true;
@@ -1883,7 +1895,80 @@ pub fn is_nonlinear(wf: &Workflow) -> bool {
             *indeg.entry(t.as_str()).or_insert(0) += 1;
         }
     }
-    indeg.values().any(|&d| d > 1)
+    if indeg.values().any(|&d| d > 1) {
+        return true;
+    }
+    // Honesty check: the linear runner walks `wf.steps` in LIST order and
+    // ignores `next` for dispatch — it only consults the dependency graph
+    // here, to gate. A graph-mode workflow (one with explicit `next`/
+    // `split`/`join`) is only faithfully runnable by that linear walk if
+    // its list order already IS a valid topological order of the full
+    // dependency graph (control edges union inferred `steps.X.*` data
+    // edges — see `workflow_edges`). If some edge `a -> b` (a must run
+    // before b) has `b` declared at or before `a`, the linear runner will
+    // reach `b` before `a` ran and render/execute it against stale or
+    // empty state. This is exactly the class of silent mis-run this gate
+    // exists to prevent, so a violation here routes to the same
+    // `NonlinearNotYetSupported` error as a fork/reconverge/split/join.
+    if workflow_has_explicit_edges(wf) && !declaration_order_is_topological(wf) {
+        return true;
+    }
+    false
+}
+
+/// True iff the workflow's declaration order (`wf.steps` order) is a valid
+/// topological order of its dependency graph: for every edge `a -> b` in
+/// [`workflow_edges`] (control edges union inferred data edges), `a` must
+/// be declared strictly before `b`.
+///
+/// Branch-arm edges (`branch.then`/`branch.else`) are deliberately
+/// excluded from this check. Unlike `next`/`split` and data edges, the
+/// linear runner doesn't dispatch a branch arm by jumping to its edge
+/// target — it walks `wf.steps` in list order and marks every step on the
+/// NOT-taken arm `branch_skipped`, skipping them in place when it reaches
+/// them (see `run_workflow`). List order is therefore already safe for
+/// branch arms regardless of their edge direction; the only ordering
+/// constraint that construct actually needs — each arm target declared
+/// strictly after the branch step — is enforced unconditionally by
+/// `validate_branch_targets` at parse time. Folding branch edges into
+/// this check would risk over-gating a workflow the runner already
+/// executes faithfully, for no faithfulness benefit.
+fn declaration_order_is_topological(wf: &Workflow) -> bool {
+    let index_of: BTreeMap<&str, usize> = wf
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.id.as_str(), i))
+        .collect();
+    let branch_arms: BTreeSet<(String, String)> = wf
+        .steps
+        .iter()
+        .flat_map(|s| {
+            let sid = s.id.clone();
+            s.branch.iter().flat_map(move |b| {
+                let sid = sid.clone();
+                b.then
+                    .iter()
+                    .chain(b.r#else.iter())
+                    .map(move |t| (sid.clone(), t.clone()))
+            })
+        })
+        .collect();
+    for (a, b) in workflow_edges(wf) {
+        if branch_arms.contains(&(a.clone(), b.clone())) {
+            continue;
+        }
+        let (Some(&ia), Some(&ib)) = (index_of.get(a.as_str()), index_of.get(b.as_str())) else {
+            // Unknown id — existence is enforced elsewhere (validate_graph
+            // for control edges; workflow_edges only emits data edges for
+            // ids that exist). Not this check's job.
+            continue;
+        };
+        if ia >= ib {
+            return false;
+        }
+    }
+    true
 }
 
 /// A workflow "has explicit edges" (is a graph workflow rather than a
@@ -2842,6 +2927,32 @@ mod is_nonlinear_tests {
         // Two inferred *data* edges converge on `c` (a->c, b->c), but there
         // is no explicit control edge at all here — must stay linear.
         let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: p\n  - id: c\n    agent: x\n    prompt: \"use {{ steps.a.output }} and {{ steps.b.output }}\"\n";
+        let wf = Workflow::parse(raw).unwrap();
+        assert!(!is_nonlinear(&wf));
+    }
+
+    #[test]
+    fn is_nonlinear_true_for_a_forward_data_ref_out_of_declaration_order() {
+        // Graph-mode workflow (a.next=[b]) whose list order is NOT a
+        // topological order of the full dependency graph: b's prompt reads
+        // `steps.c.output`, but `c` is declared AFTER `b`. There's no
+        // control-edge fork/reconverge, so the pre-existing checks miss
+        // this — the linear runner walks a, b, c in that order and would
+        // render b's prompt before c ever ran (silent empty substitution).
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [b]\n  - id: b\n    agent: x\n    prompt: \"{{ steps.c.output }}\"\n  - id: c\n    agent: x\n    prompt: p\n";
+        let wf = Workflow::parse(raw).unwrap();
+        assert!(is_nonlinear(&wf));
+    }
+
+    #[test]
+    fn is_nonlinear_false_for_a_graph_mode_branch_in_forward_order() {
+        // A branch mixed into an otherwise-graph workflow (has explicit
+        // `next`), with both arms declared strictly after the branch step
+        // and no reconvergence. Branch-arm edges are excluded from the new
+        // declaration-order check (the linear runner's `branch_skipped`
+        // mechanism makes list order safe for them regardless of edge
+        // direction), so this must stay linear-runnable.
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [g]\n  - id: g\n    branch:\n      condition: \"{{ steps.a.output }}\"\n      then: [x]\n      else: [y]\n  - id: x\n    agent: a\n    prompt: p\n  - id: y\n    agent: a\n    prompt: p\n";
         let wf = Workflow::parse(raw).unwrap();
         assert!(!is_nonlinear(&wf));
     }

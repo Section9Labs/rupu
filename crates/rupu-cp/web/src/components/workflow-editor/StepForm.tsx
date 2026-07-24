@@ -142,6 +142,12 @@ export default function StepForm({
     if (d.continue_on_error !== undefined) base.continue_on_error = d.continue_on_error;
     if (d.actions !== undefined) base.actions = d.actions;
     if (d.raw_passthrough !== undefined) base.raw_passthrough = d.raw_passthrough;
+    // `next` is a GENERAL field (a node's outgoing successor edge), not
+    // kind-specific — carry it across the switch EXCEPT to `branch` (its
+    // successors are the then/else arms, not `next`) or `split` (its
+    // successors are the `split` array). step/for_each/action/parallel/
+    // panel/join/approval_gate all route via `next`, so preserve it there.
+    if (d.next !== undefined && kind !== 'branch' && kind !== 'split') base.next = d.next;
     // agent/prompt are shared by the step + for_each forms — preserve across those.
     if (kind === 'step' || kind === 'for_each') {
       if (d.agent !== undefined) base.agent = d.agent;
