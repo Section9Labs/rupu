@@ -885,6 +885,45 @@ describe('validateGraph', () => {
     expect(problems.s.some((m) => /ghost/.test(m) && /not a known step/.test(m))).toBe(true);
   });
 
+  it('flags a `next` edge that targets its own step (self-loop)', () => {
+    const g = yamlToGraph({ name: 'w', steps: [{ id: 'a', agent: 'x', prompt: 'p', next: ['a'] }] });
+    expect(validateGraph(g).a).toEqual(expect.arrayContaining(['an edge cannot target its own step']));
+  });
+
+  it('flags a `split` edge that targets its own step (self-loop)', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 's', split: ['s', 'b'] },
+        { id: 'b', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(validateGraph(g).s).toEqual(expect.arrayContaining(['an edge cannot target its own step']));
+  });
+
+  it('does not flag a normal graph (no self-target) with the self-loop message', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p', next: ['b'] },
+        { id: 'b', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(Object.values(validateGraph(g)).flat().some((m) => /cannot target its own step/.test(m))).toBe(false);
+  });
+
+  it('does not run the self-loop check on a legacy workflow (no explicit edges)', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(hasExplicitEdges(g.nodes)).toBe(false);
+    expect(Object.values(validateGraph(g)).flat().some((m) => /cannot target its own step/.test(m))).toBe(false);
+  });
+
   it('does NOT flag a reconverging diamond (a→b, a→c, b→d, c→d) as a cycle', () => {
     const g = yamlToGraph({
       name: 'w',

@@ -937,6 +937,23 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
       }
     }
 
+    // Self-loop: a `next`/`split` entry that targets the node's own id.
+    // Mirrors the backend's `EdgeSelfLoop` check exactly (workflow.rs). Reads
+    // the raw node fields directly rather than `g.edges` — `deriveEdges`'s
+    // `addEdge` silently drops `source === target` edges (correct for
+    // rendering, since there's nothing to draw), so a self-loop never reaches
+    // `g.edges` and the cycle/unknown-target checks above never see it.
+    for (const n of g.nodes) {
+      for (const t of n.data.next ?? []) {
+        if (t === n.id) add(n.id, 'an edge cannot target its own step');
+      }
+      if (n.data.kind === 'split') {
+        for (const t of n.data.split ?? []) {
+          if (t === n.id) add(n.id, 'an edge cannot target its own step');
+        }
+      }
+    }
+
     // Degenerate split/join: fanning out to (or in from) fewer than 2 steps
     // isn't doing real orchestration work — a plain `next` chain would do the
     // same job with less ceremony. Low-severity (not a save-blocking error
