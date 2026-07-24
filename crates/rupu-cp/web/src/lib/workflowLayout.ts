@@ -14,7 +14,7 @@ import { Graph } from '@dagrejs/graphlib';
 import { layout } from '@dagrejs/dagre';
 import type { GraphLabel, NodeLabel } from '@dagrejs/dagre';
 import yaml from 'js-yaml';
-import { yamlToGraph } from './workflowGraph';
+import { withDerivedEdges, yamlToGraph } from './workflowGraph';
 import type { GraphNode, GraphEdge, StepNodeData, WorkflowGraph } from './workflowGraph';
 
 // ── Per-kind size constants (shared with EditableStepNode) ───────────────────
@@ -169,7 +169,7 @@ export function reconcileGraph(prev: WorkflowGraph, next: WorkflowGraph): Workfl
     ...n,
     position: prevPosById.get(n.id) ?? laidPosById.get(n.id) ?? { x: 0, y: 0 },
   }));
-  return { meta: next.meta, edges: next.edges, nodes };
+  return withDerivedEdges(next.meta, nodes);
 }
 
 // ── reconcileFromYaml ─────────────────────────────────────────────────────────

@@ -132,6 +132,7 @@ import WorkflowEditorGraph, {
   applyInsertOnEdge,
   asStepKind,
 } from './WorkflowEditorGraph';
+import { deriveEdges, yamlToGraph } from '../../lib/workflowGraph';
 import type { WorkflowGraph } from '../../lib/workflowGraph';
 import { KIND_ACCENT } from './kindVisuals';
 
@@ -533,10 +534,10 @@ describe('applyDelete', () => {
 });
 
 describe('applyRemoveEdges', () => {
-  it('removes a plain chain edge; node data is untouched', () => {
+  it('removing a plain chain edge is a no-op — chain order derives from node-array position, which an edge-id delete cannot target (Task 3: single-source)', () => {
     const g = makeGraph();
     const next = applyRemoveEdges(g, new Set(['a->b']));
-    expect(next.edges).toHaveLength(0);
+    expect(next.edges).toEqual(g.edges);
     expect(next.nodes).toEqual(g.nodes);
   });
 
@@ -581,7 +582,13 @@ describe('applyRemoveEdges', () => {
 
     const next = applyRemoveEdges(g, new Set(['br->a:then', 'br->b:else']));
 
-    expect(next.edges).toHaveLength(1); // only the plain a->b chain edge remains
+    // Under the derived-edges model EVERY consecutive node-array pair carries
+    // a chain edge — nodes are [a, b, br], so both a->b and b->br remain;
+    // only the two branch-arm edges (which derived from the now-empty
+    // then/else lists) are gone.
+    expect(next.edges).toHaveLength(2);
+    expect(next.edges).toContainEqual({ id: 'a->b', source: 'a', target: 'b' });
+    expect(next.edges).toContainEqual({ id: 'b->br', source: 'b', target: 'br' });
     const br = next.nodes.find((n) => n.id === 'br');
     expect(br?.data.thenTargets).toEqual([]);
     expect(br?.data.elseTargets).toEqual([]);
@@ -1067,14 +1074,15 @@ describe('edge selection + deletion (onEdgesChange)', () => {
     for (const e of currentEdges()) expect(e.selected).toBeUndefined();
   });
 
-  it('a remove change for a chain edge filters it out of the graph passed to onChange', () => {
-    const { onChange } = renderGraph();
+  it('a remove change for a chain edge is a no-op (chain order derives from node-array position, not a stored edge) — onChange still fires with the edge intact (Task 3: single-source)', () => {
+    const { onChange, graph } = renderGraph();
     act(() => {
       rfCapture.onEdgesChange?.([{ type: 'remove', id: 'a->b' }]);
     });
     expect(onChange).toHaveBeenCalledTimes(1);
     const next = onChange.mock.calls[0][0] as WorkflowGraph;
-    expect(next.edges.find((e) => e.id === 'a->b')).toBeUndefined();
+    expect(next.edges.find((e) => e.id === 'a->b')).toBeDefined();
+    expect(next).toEqual(graph);
   });
 
   it('removing a selected edge prunes it from the selection set', () => {
@@ -1172,11 +1180,12 @@ describe('applyAddConnectedNext', () => {
     expect(graph.nodes.find((n) => n.id === id)?.data.kind).toBe('panel');
   });
 
-  it('adds the node but no edge when the source is unknown', () => {
-    const g = makeGraph();
-    const { graph } = applyAddConnectedNext(g, 'does-not-exist');
+  it('appends the node at the end of the array when the source is unknown — under the derived-edges model that still chains it from whatever was previously last (no more "disconnected append")', () => {
+    const g = makeGraph(); // a, b (b is last)
+    const { graph, id } = applyAddConnectedNext(g, 'does-not-exist');
     expect(graph.nodes).toHaveLength(3);
-    expect(graph.edges).toHaveLength(g.edges.length);
+    expect(graph.nodes[graph.nodes.length - 1]?.id).toBe(id);
+    expect(graph.edges).toContainEqual({ id: `b->${id}`, source: 'b', target: id });
   });
 });
 
@@ -1227,10 +1236,49 @@ describe('applyInsertOnEdge', () => {
     expect(graph.nodes.find((n) => n.id === id)?.position).toEqual({ x: 5, y: 5 });
   });
 
-  it('falls back to a plain add when the edge is unknown', () => {
-    const g = makeGraph();
+  it('falls back to a plain add (appended to the end) when the edge is unknown — the derived-edges model chains it from whatever was previously last', () => {
+    const g = makeGraph(); // a, b (b is last)
     const { graph, id } = applyInsertOnEdge(g, 'no->such', 'step', { x: 1, y: 2 });
-    expect(graph.edges).toHaveLength(g.edges.length);
+    expect(graph.nodes).toHaveLength(g.nodes.length + 1);
+    expect(graph.edges).toContainEqual({ id: `b->${id}`, source: 'b', target: id });
     expect(graph.nodes.find((n) => n.id === id)?.position).toEqual({ x: 1, y: 2 });
+  });
+});
+
+function invariantHolds(g: { nodes: any[]; edges: any[] }): boolean {
+  return JSON.stringify(g.edges) === JSON.stringify(deriveEdges(g.nodes));
+}
+
+describe('single-source graph ops', () => {
+  const base = () =>
+    yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'b', branch: { condition: 'x', then: [], else: [] } },
+        { id: 't', agent: 'a', prompt: 'p' },
+      ],
+    });
+
+  it('a branch then-target set via applyConnect appears as a derived edge (P0.2)', () => {
+    let g = base();
+    applyConnect(g, { source: 'b', target: 't', sourceHandle: 'then' }, (ng) => (g = ng), () => {});
+    expect(g.nodes.find((n) => n.id === 'b')!.data.thenTargets).toContain('t');
+    expect(invariantHolds(g)).toBe(true);
+    expect(deriveEdges(g.nodes)).toContainEqual(expect.objectContaining({ source: 'b', target: 't', branch: 'then' }));
+  });
+
+  it('applyDelete scrubs the deleted id from surviving branch targets (P1)', () => {
+    let g = base();
+    applyConnect(g, { source: 'b', target: 't', sourceHandle: 'then' }, (ng) => (g = ng), () => {});
+    g = applyDelete(g, 't');
+    expect(g.nodes.find((n) => n.id === 'b')!.data.thenTargets ?? []).not.toContain('t');
+    expect(invariantHolds(g)).toBe(true);
+  });
+
+  it('every op leaves edges === deriveEdges(nodes)', () => {
+    let g = base();
+    expect(invariantHolds(g)).toBe(true);
+    const r = applyAddNode(g, 'step');
+    expect(invariantHolds(r.graph)).toBe(true);
   });
 });

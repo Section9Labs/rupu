@@ -24,6 +24,7 @@ import {
   graphToWorkflowObject,
   topoSort,
   validateGraph,
+  withDerivedEdges,
   yamlToGraph,
   type StepKind,
   type StepNodeData,
@@ -352,11 +353,12 @@ export default function WorkflowEditor({
   const onStepChange = useCallback(
     (data: StepNodeData): void => {
       if (selectedId === null) return;
-      const next: WorkflowGraph = {
-        ...graph,
-        nodes: graph.nodes.map((n) => (n.id === selectedId ? { ...n, id: data.id, data } : n)),
-      };
-      commit(next);
+      const nodes = graph.nodes.map((n) => (n.id === selectedId ? { ...n, id: data.id, data } : n));
+      // StepForm can patch `thenTargets`/`elseTargets` (the branch inspector's
+      // then/else checkboxes) or `condition` directly on node data — branch
+      // routing is single-source, so re-deriving here is what makes a form
+      // edit draw/round-trip, exactly like a canvas-drawn arm connection.
+      commit(withDerivedEdges(graph.meta, nodes));
       // The step id may have been renamed — keep the selection pointing at it.
       setSelectedId(data.id);
     },

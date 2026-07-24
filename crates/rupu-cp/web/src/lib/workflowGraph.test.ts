@@ -866,10 +866,17 @@ describe('convertInlineApprovalToGate', () => {
     const next = convertInlineApprovalToGate(g, 'ship');
     const gateId = next.nodes.find((n) => n.data.kind === 'approval_gate')!.id;
 
-    // build -> gate -> ship (build no longer points straight at ship).
+    // Linear execution order is build -> gate -> ship (the chain edges derive
+    // from the new node-array order: gate is spliced immediately before ship).
     expect(next.edges.some((e) => e.source === 'build' && e.target === gateId)).toBe(true);
-    expect(next.edges.some((e) => e.source === 'build' && e.target === 'ship')).toBe(false);
     expect(next.edges.some((e) => e.source === gateId && e.target === 'ship')).toBe(true);
+    // A build->ship DATA-REF edge also derives (honestly) because `ship`'s
+    // prompt still reads `steps.build.output` — under the single-source
+    // model edges are a pure derivation of node data/order, so this is now
+    // expected: it represents ship's real data dependency on build's output,
+    // independent of the gate the operator inserted into the linear chain
+    // above (the chain edges alone already enforce gate-runs-between-them).
+    expect(next.edges.some((e) => e.source === 'build' && e.target === 'ship')).toBe(true);
   });
 
   it('is a no-op for an unknown step id', () => {
