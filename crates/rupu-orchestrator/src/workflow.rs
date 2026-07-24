@@ -1849,6 +1849,43 @@ pub fn workflow_edges(wf: &Workflow) -> Vec<(String, String)> {
     edges.into_iter().collect()
 }
 
+/// True iff this workflow needs the Phase 2 DAG scheduler: it uses
+/// split/join, OR its control-edge graph has a fork (a non-branch step
+/// with `next.len() > 1`) or a reconverge (any node with >1 inbound
+/// control edge, counted over `next`/`split`/branch then-or-else arms).
+///
+/// Deliberately does NOT fold in `workflow_edges`'s inferred *data* edges
+/// (`steps.X.*` template references): a step referencing two different
+/// prior steps' outputs would otherwise falsely read as a reconverge. A
+/// plain linear chain — even with explicit `next:` that just restates
+/// list order — and today's branches are `false`: the existing linear
+/// runner executes both faithfully.
+pub fn is_nonlinear(wf: &Workflow) -> bool {
+    if wf.steps.iter().any(|s| s.split.is_some() || s.join.is_some()) {
+        return true;
+    }
+    // Fork: a non-branch step whose `next` has more than one target.
+    if wf
+        .steps
+        .iter()
+        .any(|s| s.branch.is_none() && s.next.len() > 1)
+    {
+        return true;
+    }
+    // Reconverge: any node with >1 inbound control edge.
+    let mut indeg: BTreeMap<&str, usize> = BTreeMap::new();
+    for s in &wf.steps {
+        for t in s.next.iter().chain(s.split.iter().flatten()).chain(
+            s.branch
+                .iter()
+                .flat_map(|b| b.then.iter().chain(b.r#else.iter())),
+        ) {
+            *indeg.entry(t.as_str()).or_insert(0) += 1;
+        }
+    }
+    indeg.values().any(|&d| d > 1)
+}
+
 /// A workflow "has explicit edges" (is a graph workflow rather than a
 /// legacy linear one) when any step declares `next:`, `split:`, or
 /// `join:`. Legacy edge-free workflows keep running only the pre-existing
@@ -2729,5 +2766,83 @@ steps:
             Workflow::parse(raw).unwrap_err(),
             WorkflowParseError::OrchestrationNodeHasWork { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod is_nonlinear_tests {
+    use super::*;
+
+    #[test]
+    fn is_nonlinear_is_false_for_every_sample_workflow() {
+        for entry in std::fs::read_dir(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../.rupu/workflows"
+        ))
+        .unwrap()
+        {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let wf = Workflow::parse(&std::fs::read_to_string(&p).unwrap()).unwrap();
+            assert!(
+                !is_nonlinear(&wf),
+                "{:?} should be linear-runnable",
+                p.file_name().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn is_nonlinear_true_for_split_and_for_a_fork() {
+        let sp = Workflow::parse("name: w\nsteps:\n  - id: s\n    split: [a, b]\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: p\n").unwrap();
+        assert!(is_nonlinear(&sp));
+        let fork = Workflow::parse("name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [b, c]\n  - id: b\n    agent: x\n    prompt: p\n  - id: c\n    agent: x\n    prompt: p\n").unwrap();
+        assert!(is_nonlinear(&fork));
+    }
+
+    #[test]
+    fn is_nonlinear_true_for_a_join_node() {
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [j]\n  - id: j\n    join: { wait: { count: 1 } }\n";
+        let wf = Workflow::parse(raw).unwrap();
+        assert!(is_nonlinear(&wf));
+    }
+
+    #[test]
+    fn is_nonlinear_true_for_a_diamond_reconverge() {
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [b, c]\n  - id: b\n    agent: x\n    prompt: p\n    next: [d]\n  - id: c\n    agent: x\n    prompt: p\n    next: [d]\n  - id: d\n    agent: x\n    prompt: p\n";
+        let wf = Workflow::parse(raw).unwrap();
+        assert!(is_nonlinear(&wf));
+    }
+
+    #[test]
+    fn is_nonlinear_false_for_a_plain_linear_chain() {
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: p\n  - id: c\n    agent: x\n    prompt: p\n";
+        let wf = Workflow::parse(raw).unwrap();
+        assert!(!is_nonlinear(&wf));
+    }
+
+    #[test]
+    fn is_nonlinear_false_for_a_linear_chain_with_explicit_next() {
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [b]\n  - id: b\n    agent: x\n    prompt: p\n    next: [c]\n  - id: c\n    agent: x\n    prompt: p\n";
+        let wf = Workflow::parse(raw).unwrap();
+        assert!(!is_nonlinear(&wf));
+    }
+
+    #[test]
+    fn is_nonlinear_false_for_a_branch() {
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: g\n    branch:\n      condition: \"{{ steps.a.output }}\"\n      then: [x]\n      else: [y]\n  - id: x\n    agent: a\n    prompt: p\n  - id: y\n    agent: a\n    prompt: p\n";
+        let wf = Workflow::parse(raw).unwrap();
+        assert!(!is_nonlinear(&wf));
+    }
+
+    #[test]
+    fn is_nonlinear_false_for_a_step_referencing_two_prior_steps() {
+        // Two inferred *data* edges converge on `c` (a->c, b->c), but there
+        // is no explicit control edge at all here — must stay linear.
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: p\n  - id: c\n    agent: x\n    prompt: \"use {{ steps.a.output }} and {{ steps.b.output }}\"\n";
+        let wf = Workflow::parse(raw).unwrap();
+        assert!(!is_nonlinear(&wf));
     }
 }
