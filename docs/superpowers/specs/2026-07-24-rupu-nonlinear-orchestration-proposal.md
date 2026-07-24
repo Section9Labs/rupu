@@ -129,10 +129,15 @@ Replace the `for step in steps` loop in `run_steps_inner` with a **ready-set sch
 3. **Scheduler.** Replace the linear loop with the ready-set scheduler; workflow-scope concurrency; branch pruning; **per-node resume/pause/cancel** (the hard part).
 4. **The extras** (error edges, guarded edges, concurrency budget), then the deferred set (loops, sub-workflows, subgraph-map).
 
-## 9. Open decisions I want your call on
+## 9. Decisions (operator, 2026-07-24)
 
-- **D1 — Edge direction.** `next:` (successor, matches how you draw and how `branch` already works) vs `depends_on:` (predecessor, makes joins self-describing). I lean **`next:`** for authoring consistency, with joins reading their inbound set from the graph. *(This proposal is written in `next:`.)*
-- **D2 — Implicit join.** A regular node with several inbound edges: **implicitly wait for all** (my lean — least surprising, terse) vs **require an explicit `join`** for every reconverge (more ceremony, more visible). Explicit `join` still exists either way for `any`/`count`.
-- **D3 — Data-edge inference.** Auto-order from `steps.X` references (my lean — terse, powerful) vs edges must be 100% explicit (more verbose, zero magic). Inference can always be *overridden* by an explicit edge.
-- **D4 — Loops.** Deferred bounded `loop` construct (my lean) vs allow raw back-edges now (riskier).
-- **D5 — Scope now.** Do we do the full arc, or land Phase 1+2 (language + editor, so you can *author* non-linear flows) before committing to the Phase 3 scheduler rewrite?
+- **D1 — Edge direction.** ✅ **Both, but `next:` first.** `depends_on:` (predecessor edges) lands in **Phase 3**.
+- **D2 — Implicit join.** ✅ **Implicit wait-for-all** on a multi-inbound node; explicit `join` node for `any` / `count`.
+- **D3 — Data-edge inference.** ✅ **Infer** dependency edges from `steps.X` references; an explicit edge overrides.
+- **D4 — Loops.** ✅ Bounded `loop` construct as a **Phase 3** fast-follow (core graph stays acyclic).
+- **D5 — Scope.** ✅ **Phase 1 = language + editor first**, then **Phase 2 = scheduler + per-node-resume rewrite**.
+
+### Resulting phasing
+- **Phase 1 — language + editor.** `next:` edges, `split`/`join` nodes, DAG/cycle validation, data-edge inference, legacy-linear compat; the editor authors explicit edges (draw/clear/replace), split/join nodes, drop-is-disconnected. **The runner rejects a non-linear workflow at run time with a clear "requires the DAG scheduler (Phase 2)" error** — no silent linear mis-run. You can design + validate non-linear flows; execution waits for Phase 2. *(Spec: `2026-07-24-rupu-nonlinear-phase1-design.md`.)*
+- **Phase 2 — the scheduler.** Replace the linear loop with the ready-set scheduler; workflow-scope concurrency; branch pruning; per-node resume/pause/cancel. Non-linear workflows execute.
+- **Phase 3 — fast-follows.** `depends_on:` predecessor edges; bounded `loop`. Then the deferred set (error edges, guarded edges, sub-workflows, subgraph-map).
