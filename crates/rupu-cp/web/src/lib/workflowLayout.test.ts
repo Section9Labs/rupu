@@ -189,7 +189,7 @@ describe('editorNodeSize — per-kind shape boxes', () => {
   it('a branch reserves a taller, narrower box for its diamond', () => {
     expect(editorNodeSize({ id: 'b', kind: 'branch', condition: 'x' })).toEqual({
       width: 200,
-      height: 124,
+      height: 210,
     });
   });
 

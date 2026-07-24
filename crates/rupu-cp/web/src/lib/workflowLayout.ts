@@ -31,9 +31,12 @@ export const FOR_EACH_H = 100;
 
 /** branch paints a diamond — taller, and narrower than a step because a
  *  diamond's usable width collapses toward its tips (it shows only its
- *  condition, which is all a branch has). */
+ *  condition, which is all a branch has). BRANCH_H is generous: the safe rect
+ *  also has to fit the header + condition line + two then/else port pills
+ *  (BranchBodyNext), which wrap to two rows more often than not — see the
+ *  sizing note on the diamond case in nodeShapes.ts. */
 export const BRANCH_W = 200;
-export const BRANCH_H = 124;
+export const BRANCH_H = 210;
 
 /** action (parallelogram) and approval_gate (trapezoid) both lose horizontal
  *  room to slanted sides; the box grows so the text band stays step-sized. */

@@ -116,8 +116,12 @@ export function shapeFor(shape: ShapeName, w: number, h: number): NodeShape {
         points,
         path: toPath(points),
         extra: [],
-        // inscribed at the band's narrowest rows (y = .32h and .68h)
-        safe: { x: w * 0.23, y: h * 0.32, w: w * 0.54, h: h * 0.36 },
+        // inscribed at the band's narrowest rows (y = .28h and .72h). Sized
+        // against BranchBodyNext's real rendered content at BRANCH_W/BRANCH_H
+        // (see workflowLayout.ts) — header (kindpill + id) + condition line +
+        // two then/else port pills (which usually wrap to two rows) measure
+        // to roughly 75-80px; this band gives ~92px, a little slack.
+        safe: { x: w * 0.27, y: h * 0.28, w: w * 0.46, h: h * 0.44 },
         align: 'center',
         target: LEFT_TARGET,
         sources: [

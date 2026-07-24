@@ -306,8 +306,8 @@ describe('EditableStepNode', () => {
         );
         const brSafe = br.querySelector('.wfx-safe') as HTMLElement;
         expect(brSafe.className).toContain('wfx-safe-mid');
-        // 200 * 0.23 = 46
-        expect(brSafe.style.left).toBe('46px');
+        // 200 * 0.27 = 54
+        expect(brSafe.style.left).toBe('54px');
       });
 
       it('strokes the silhouette with the kind accent when selected', () => {

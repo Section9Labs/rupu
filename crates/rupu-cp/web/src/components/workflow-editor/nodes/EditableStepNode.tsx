@@ -336,10 +336,10 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
 
         {/* The silhouette is painted in SVG rather than clipped with
             `clip-path`: a clip slices the 1px border at the clip boundary and
-            cannot clip an outward selection glow, and it would leave the empty
-            corners outside the shape still catching drags. The path is also
-            the pointer target (see .wfx-sil in styles.css), so a diamond stops
-            being grabbable in its corners. */}
+            cannot clip an outward selection glow. Paint order matters: the
+            filled body must land BEFORE `extra` (rails / stack layers) or an
+            opaque fill paints straight over them — `extra` is stroked-only
+            and always on top, per nodeShapes.ts's NodeShape contract. */}
         <svg className="wfx-sil" viewBox={`0 0 ${box.width} ${box.height}`} aria-hidden>
           {selected && (
             <path
@@ -351,9 +351,6 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
               opacity={0.25}
             />
           )}
-          {shape.extra.map((d2, i) => (
-            <path key={i} d={d2} fill="none" stroke="rgb(var(--c-border))" strokeWidth={1.5} />
-          ))}
           <path
             d={shape.path}
             fill="rgb(var(--c-panel))"
@@ -361,6 +358,9 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
             strokeWidth={1.5}
             strokeLinejoin="round"
           />
+          {shape.extra.map((d2, i) => (
+            <path key={i} d={d2} fill="none" stroke="rgb(var(--c-border))" strokeWidth={1.5} />
+          ))}
         </svg>
 
         {/* Content lives in the shape's safe rect, inscribed at the silhouette's
@@ -405,6 +405,12 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
           </div>
         </div>
 
+        {/* branch nodes get TWO labeled source handles (one per arm) instead of
+            the single default source handle every other kind uses. 'then'/
+            'else' are a MODEL CONTRACT — applyConnect reads these exact ids to
+            write thenTargets/elseTargets — not just a UI convenience, even
+            though their on-canvas positions are shape-derived (see
+            nodeShapes.ts's SourceAnchor). */}
         {d.kind === 'branch' ? (
           <>
             <Handle

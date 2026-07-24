@@ -413,9 +413,6 @@
   position: relative;
   text-align: left;
   cursor: grab;
-  /* the silhouette path is the hit area, not the bounding box — a diamond must
-   * not be grabbable in its empty corners. Children opt back in below. */
-  pointer-events: none;
 }
 
 /* ── silhouette: the per-kind flowchart symbol (see nodeShapes.ts) ── */
@@ -428,7 +425,6 @@
   overflow: visible;
   transition: none;
 }
-.wfx-sil path { pointer-events: auto; }
 
 /* ── safe box: where content may live, inscribed in the silhouette ── */
 .wfx-safe {
@@ -436,8 +432,11 @@
   display: flex;
   flex-direction: column;
   min-width: 0;
-  /* text is never interactive; clicks belong to the silhouette beneath */
-  pointer-events: none;
+  /* hard-bounds content to the shape's inscribed rect — the same job
+   * `.wfx-clip`'s `overflow: hidden` did for the old rectangular card. A
+   * silhouette has no CSS clip of its own, so without this a body taller
+   * than `safe.h` paints over the outline instead of being contained. */
+  overflow: hidden;
 }
 /* shapes whose width varies across the text band centre their content */
 .wfx-safe-mid { align-items: center; text-align: center; }
