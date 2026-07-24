@@ -972,19 +972,48 @@ describe('convertInlineApprovalToGate', () => {
 });
 
 import { deriveEdges, withDerivedEdges } from './workflowGraph';
-import fs from 'node:fs';
-import path from 'node:path';
-import yaml from 'js-yaml';
-
-const WF_DIR = path.resolve(__dirname, '../../../../../.rupu/workflows');
 
 describe('deriveEdges', () => {
-  it('reproduces yamlToGraph edges exactly for every real workflow', () => {
-    for (const f of fs.readdirSync(WF_DIR).filter((n) => n.endsWith('.yaml'))) {
-      const g = yamlToGraph(yaml.load(fs.readFileSync(path.join(WF_DIR, f), 'utf8')) as Record<string, unknown>);
-      // deriveEdges(nodes) must equal what yamlToGraph itself produced.
-      expect(deriveEdges(g.nodes), f).toEqual(g.edges);
-    }
+  // NOTE: as of this writing, no *.yaml under .rupu/workflows/ actually
+  // contains a step-level `branch:` block (issue-supervisor-dispatch.yaml and
+  // phase-delivery-cycle.yaml only have an unrelated `workspace.branch`
+  // string field — verified by grep, not a branch *step*). So this test
+  // hand-authors a small, realistic workflow object instead of loading one
+  // from disk, in the same style as every other yamlToGraph({...}) call in
+  // this file.
+  //
+  // Critically, the expectation below is a HARDCODED edge list computed by
+  // hand from the steps — never `g.edges` or another `deriveEdges(...)` call
+  // — so it actually discriminates: it fails if the chain loop or the
+  // branch-arm loop in `deriveEdges` is broken or removed. (Verified by
+  // temporarily deleting the branch-arm loop — see task-1-report.md.)
+  it('derives the exact edge set for a workflow with a chain, a data-ref, and a branch', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'triage', agent: 'a', prompt: 'look at the issue' },
+        { id: 'route', branch: { condition: '{{ steps.triage.output }}', then: ['fix'], else: ['escalate'] } },
+        { id: 'fix', agent: 'a', prompt: 'fix it based on {{ steps.triage.output }}' },
+        { id: 'escalate', agent: 'a', prompt: 'escalate to a human' },
+      ],
+    });
+
+    // Hand-derived from the steps above:
+    //  (a) chain:     triage->route, route->fix, fix->escalate
+    //  (b) data-ref:  `fix`'s prompt references steps.triage -> triage->fix
+    //                 (route's condition also references steps.triage, but
+    //                 that collapses onto the triage->route chain edge, so
+    //                 it does NOT appear again here)
+    //  (c) branch arm: route's then->fix and else->escalate
+    const expected = [
+      { id: 'triage->route', source: 'triage', target: 'route' },
+      { id: 'route->fix', source: 'route', target: 'fix' },
+      { id: 'fix->escalate', source: 'fix', target: 'escalate' },
+      { id: 'triage->fix', source: 'triage', target: 'fix' },
+      { id: 'route->fix:then', source: 'route', target: 'fix', label: 'true', branch: 'then' },
+      { id: 'route->escalate:else', source: 'route', target: 'escalate', label: 'false', branch: 'else' },
+    ];
+    expect(deriveEdges(g.nodes)).toEqual(expected);
   });
 
   it('derives a branch arm edge from thenTargets/elseTargets', () => {
@@ -1001,7 +1030,12 @@ describe('deriveEdges', () => {
     expect(edges).toContainEqual(expect.objectContaining({ source: 'b', target: 'e', branch: 'else', label: 'false' }));
   });
 
-  it('withDerivedEdges always satisfies edges === deriveEdges(nodes)', () => {
+  // This is NOT a deriveEdges correctness guard (that's the hardcoded test
+  // above) — it documents a separate, real contract: `withDerivedEdges`
+  // must always wire `edges` through `deriveEdges(nodes)` rather than letting
+  // a caller pass/store edges independently. Later tasks (T2-T4) depend on
+  // that wiring, not on deriveEdges's internal correctness.
+  it('withDerivedEdges always wires edges through deriveEdges(nodes)', () => {
     const nodes = yamlToGraph({ name: 'w', steps: [{ id: 'a', agent: 'x', prompt: 'p' }] }).nodes;
     const g = withDerivedEdges({ name: 'w', rest: {} }, nodes);
     expect(g.edges).toEqual(deriveEdges(g.nodes));
