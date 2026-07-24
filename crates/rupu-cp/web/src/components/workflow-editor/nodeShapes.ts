@@ -112,24 +112,52 @@ function roundedRectPath(w: number, h: number): string {
  *  the box is narrower than roughly `2*CONST + 2*I`, the two insets overlap
  *  and the vertex order the shape depends on reverses — a hexagon/trapezoid's
  *  top edge runs backwards, producing the self-intersecting bowtie this
- *  clamp exists to prevent. Capping at HALF the inner span
- *  (`(dim - 2*I) * 0.5`) is the largest value under which both insets can
- *  coexist without crossing (it is exactly the fraction `rad` claims of each
- *  axis above), and it leaves a guaranteed non-zero `2*I` (4px) span at the
- *  moment of clamping — `SHEAR`/`RAIL` only eat ONE side per axis, so their
- *  true bound is looser than this, but the same factor is used for every
- *  horizontal inset here for one auditable rule rather than four bespoke
- *  ones, and it is still comfortably safe for both.
+ *  clamp exists to prevent.
  *
- *  No-op at every real node box: the largest raw constant clamped here is
- *  `TAPER` (26), and the narrowest real box (`NODE_W`/`ACTION_W`/`GATE_W` =
- *  210-214, `workflowLayout.ts`) puts `(dim - 2*I) * 0.5` at ~103-105 — far
- *  above any raw constant, so `Math.min` always keeps the unclamped value. It
- *  only engages at the 34x20 palette-preview box, where `(34 - 4) * 0.5 = 15`
- *  is below `POINT` (22) and `TAPER` (26). */
-function clampInset(value: number, dim: number): number {
-  return Math.min(value, (dim - 2 * I) * 0.5);
+ *  `fraction` of the inner span (`(dim - 2*I) * fraction`) is the cap.
+ *  `0.5` (HALF the inner span) is the largest value under which both insets
+ *  can coexist without crossing at all — the mathematically tightest
+ *  simple-polygon bound — but simplicity alone is not the acceptance bar for
+ *  every caller: at the 34x20 palette-preview box, `0.5` leaves only a 4px
+ *  flat edge, which anti-aliases away at the true 24x14 CSS display size and
+ *  makes a hexagon read as a diamond and a trapezoid read as a triangle
+ *  (see `EDGE_CLAMP_FRACTION`). Callers pass a fraction chosen for their own
+ *  recognisability requirement, not just non-self-intersection; `0.5` remains
+ *  available as the loosest safe value (used by `LAYER_CLAMP_FRACTION`,
+ *  which has no inversion risk at all — see its call site). */
+function clampInset(value: number, dim: number, fraction: number): number {
+  return Math.min(value, (dim - 2 * I) * fraction);
 }
+
+/** Fraction used for the four insets that cut in from BOTH sides of an edge
+ *  (`SHEAR`/`TAPER`/`POINT`/`RAIL`) — the ones that self-intersect into a
+ *  bowtie if pushed past `0.5`. `0.3` was measured empirically (see
+ *  `nodeShapes.test.ts`'s recognisability test and Task 5's fix-round-2
+ *  report) as the point where the palette's 34x20 preview keeps a flat edge
+ *  wide enough to read as a hexagon/trapezoid rather than degenerating to a
+ *  diamond/triangle at the true 24x14 CSS display size, while staying well
+ *  clear of the `0.5` self-intersection boundary (9px of margin at 34x20:
+ *  the `0.3` cap is 9, the `0.5` cap is 15). No-op at every real node box —
+ *  see the no-op note below. */
+const EDGE_CLAMP_FRACTION = 0.3;
+
+/** Fraction used for `LAYER` (the `stacked` shape's layer offset). `LAYER`
+ *  is not an edge inset — it does not cut in from both sides of the same
+ *  edge, so it cannot invert the polygon's vertex order the way
+ *  `EDGE_CLAMP_FRACTION`'s four constants can. Its only correctness
+ *  requirement is that the offset stays smaller than the box itself
+ *  (`layer < min(w, h) - 2*I`, so the inner body rect stays non-degenerate);
+ *  `0.5` of the inner span satisfies that with wide margin (a value up to
+ *  just under `1.0` would still be geometrically safe) and was already
+ *  validated as visually correct in fix round 1 (layers clearly visible at
+ *  34x20). Lowering it to `0.3` in lockstep with the edge insets — as a
+ *  blind "apply the same number everywhere" move — would instead REGRESS
+ *  `stacked`: at 34x20 the binding axis is height (20), where `0.3` computes
+ *  to `(20-4)*0.3 = 4.8` versus `0.5`'s `8`, shrinking the layer offset by
+ *  nearly half and making the stacked layers harder to see for no
+ *  recognisability benefit (nothing about `stacked` was reported broken).
+ *  Kept at `0.5`, unchanged from fix round 1. */
+const LAYER_CLAMP_FRACTION = 0.5;
 
 const LEFT_TARGET: HandleAnchor = { side: 'left', offset: '50%' };
 const RIGHT_SOURCE: SourceAnchor[] = [{ anchor: { side: 'right', offset: '50%' } }];
@@ -178,7 +206,7 @@ export function shapeFor(shape: ShapeName, w: number, h: number): NodeShape {
     }
 
     case 'parallelogram': {
-      const shear = clampInset(SHEAR, w);
+      const shear = clampInset(SHEAR, w, EDGE_CLAMP_FRACTION);
       const points: [number, number][] = [
         [shear, I],
         [w - I, I],
@@ -195,7 +223,7 @@ export function shapeFor(shape: ShapeName, w: number, h: number): NodeShape {
     }
 
     case 'trapezoid': {
-      const taper = clampInset(TAPER, w);
+      const taper = clampInset(TAPER, w, EDGE_CLAMP_FRACTION);
       const points: [number, number][] = [
         [taper, I],
         [w - taper, I],
@@ -212,7 +240,7 @@ export function shapeFor(shape: ShapeName, w: number, h: number): NodeShape {
     }
 
     case 'hexagon': {
-      const point = clampInset(POINT, w);
+      const point = clampInset(POINT, w, EDGE_CLAMP_FRACTION);
       const points: [number, number][] = [
         [point, I],
         [w - point, I],
@@ -231,7 +259,7 @@ export function shapeFor(shape: ShapeName, w: number, h: number): NodeShape {
     }
 
     case 'subroutine': {
-      const rail = clampInset(RAIL, w);
+      const rail = clampInset(RAIL, w, EDGE_CLAMP_FRACTION);
       const points: [number, number][] = [
         [I, I],
         [w - I, I],
@@ -253,7 +281,10 @@ export function shapeFor(shape: ShapeName, w: number, h: number): NodeShape {
       // it is clamped against each axis independently and the tighter of the
       // two wins — at the 34x20 palette box, height (20) is the binding
       // constraint, not width (34).
-      const layer = Math.min(clampInset(LAYER, w), clampInset(LAYER, h));
+      const layer = Math.min(
+        clampInset(LAYER, w, LAYER_CLAMP_FRACTION),
+        clampInset(LAYER, h, LAYER_CLAMP_FRACTION),
+      );
       const points: [number, number][] = [
         [I, layer + I],
         [w - layer - I, layer + I],

@@ -205,4 +205,26 @@ describe('shapeFor', () => {
     const s = shapeFor(name, 34, 20);
     expect(isSimplePolygon(s.points), `${name} self-intersects at 34x20`).toBe(true);
   });
+
+  // Simplicity (above) is necessary but not sufficient: a polygon can be
+  // simple and STILL be unrecognisable if the clamp that keeps it simple is
+  // too tight. `hexagon` and `trapezoid` are both built from a flat top edge
+  // inset from each side (`POINT`/`TAPER`); at the palette's 34x20 box, a
+  // 15px inset (the mathematically tightest simplicity bound, k=0.5) leaves
+  // only a 4px flat edge, which AA blur erases at the true 24x14 CSS chip
+  // size — the hexagon then reads as a plain diamond (branch) and the
+  // trapezoid as a plain triangle, silently colliding two kinds' symbols.
+  // Assert the flat top edge is at least a third of the box width, derived
+  // straight from `points` (not a hardcoded pixel count), so this stays
+  // correct if the preview box size ever changes. This must fail at k=0.5
+  // (4px < 34/3 ≈ 11.3px) and pass once the clamp is loosened — see Task 5
+  // fix-round-2 report for the before/after evidence.
+  it.each([
+    ['hexagon', 0, 1] as const,
+    ['trapezoid', 0, 1] as const,
+  ])('%s: the flat top edge stays at least a third of the box width at 34x20, so it stays recognisable', (name, aIdx, bIdx) => {
+    const s = shapeFor(name as ShapeName, 34, 20);
+    const flatWidth = Math.abs(s.points[bIdx][0] - s.points[aIdx][0]);
+    expect(flatWidth, `${name} flat top edge is only ${flatWidth}px wide at 34x20`).toBeGreaterThanOrEqual(34 / 3);
+  });
 });
