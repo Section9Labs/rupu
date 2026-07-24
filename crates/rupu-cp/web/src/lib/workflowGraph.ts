@@ -37,6 +37,10 @@ export interface PanelCfg {
   prompt?: string;
   max_parallel?: number;
   gate?: PanelGate;
+  // Any panel-level keys we don't model, captured verbatim on load and spread
+  // back on emit — mirrors the step-level `raw_passthrough` pattern one level
+  // deeper so an unmodeled key nested directly under `panel:` isn't dropped.
+  _rest?: Record<string, unknown>;
 }
 
 export interface StepNodeData {
@@ -71,6 +75,11 @@ export interface StepNodeData {
   approvalOnTimeout?: 'approve' | 'reject' | 'fail';
   approvalNotify?: Record<string, unknown>[];
   approvalOnReject?: Record<string, unknown>[];
+  // Any keys nested directly under `branch:` / `approval:` we don't model,
+  // captured verbatim on load and spread back on emit — mirrors the
+  // step-level `raw_passthrough` pattern one level deeper.
+  branchRest?: Record<string, unknown>;
+  approvalRest?: Record<string, unknown>;
   // Connector ACTION-step fields (workflow.rs Step.action / Step.with). An action
   // node carries no agent/prompt — it invokes an SCM/issue/CI tool with params.
   action?: string;
@@ -168,8 +177,17 @@ function parsePanel(o: Record<string, unknown>): PanelCfg {
     if (mi !== undefined) gate.max_iterations = mi;
     cfg.gate = gate;
   }
+  const rest: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(o)) {
+    if (!PANEL_KEYS.has(k)) rest[k] = v;
+  }
+  if (Object.keys(rest).length > 0) cfg._rest = rest;
   return cfg;
 }
+
+// Keys this module models on a `panel:` block. Everything else is captured
+// into `PanelCfg._rest` on load and re-emitted on save.
+const PANEL_KEYS = new Set<string>(['panelists', 'subject', 'prompt', 'max_parallel', 'gate']);
 
 function parseStepData(raw: unknown, i: number): StepNodeData {
   const o = asRecord(raw) ?? {};
@@ -223,6 +241,11 @@ function parseStepData(raw: unknown, i: number): StepNodeData {
     if (thenTargets && thenTargets.length > 0) data.thenTargets = thenTargets;
     const elseTargets = asStringArray(branchRaw.else);
     if (elseTargets && elseTargets.length > 0) data.elseTargets = elseTargets;
+    const branchRest: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(branchRaw)) {
+      if (!BRANCH_KEYS.has(k)) branchRest[k] = v;
+    }
+    if (Object.keys(branchRest).length > 0) data.branchRest = branchRest;
   }
 
   const approval = approvalRaw;
@@ -240,6 +263,11 @@ function parseStepData(raw: unknown, i: number): StepNodeData {
     if (notify) data.approvalNotify = notify.map((n) => asRecord(n) ?? {});
     const onReject = asArray(approval.on_reject);
     if (onReject) data.approvalOnReject = onReject.map((s) => asRecord(s) ?? {});
+    const approvalRest: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(approval)) {
+      if (!APPROVAL_KEYS.has(k)) approvalRest[k] = v;
+    }
+    if (Object.keys(approvalRest).length > 0) data.approvalRest = approvalRest;
   }
 
   // Capture any step-level keys we don't model so they survive round-trips.
@@ -269,6 +297,22 @@ const MODELLED_STEP_KEYS = new Set<string>([
   'approval',
   'action',
   'with',
+]);
+
+// Keys this module models on a `branch:` block. Everything else is captured
+// into `StepNodeData.branchRest` on load and re-emitted on save.
+const BRANCH_KEYS = new Set<string>(['condition', 'then', 'else']);
+
+// Keys this module models on an `approval:` block. Everything else is
+// captured into `StepNodeData.approvalRest` on load and re-emitted on save.
+const APPROVAL_KEYS = new Set<string>([
+  'required',
+  'prompt',
+  'timeout_seconds',
+  'auto_approve',
+  'on_timeout',
+  'notify',
+  'on_reject',
 ]);
 
 // ── extractStepRefs ───────────────────────────────────────────────────────────
@@ -452,6 +496,11 @@ function nodeToStepObject(d: StepNodeData): Record<string, unknown> {
       if (p.gate.max_iterations !== undefined) go.max_iterations = p.gate.max_iterations;
       po.gate = go;
     }
+    if (p._rest) {
+      for (const [k, v] of Object.entries(p._rest)) {
+        if (!(k in po)) po[k] = v;
+      }
+    }
     o.panel = po;
     if (d.when) o.when = d.when;
     if (d.continue_on_error === true) o.continue_on_error = true;
@@ -461,6 +510,11 @@ function nodeToStepObject(d: StepNodeData): Record<string, unknown> {
     if (d.condition !== undefined) bo.condition = d.condition;
     if (d.thenTargets && d.thenTargets.length > 0) bo.then = d.thenTargets;
     if (d.elseTargets && d.elseTargets.length > 0) bo.else = d.elseTargets;
+    if (d.branchRest) {
+      for (const [k, v] of Object.entries(d.branchRest)) {
+        if (!(k in bo)) bo[k] = v;
+      }
+    }
     o.branch = bo;
   } else if (d.kind === 'action') {
     // action step — `action:` (tool name) + optional `with:` params, plus the
@@ -505,12 +559,14 @@ function nodeToStepObject(d: StepNodeData): Record<string, unknown> {
     d.approvalOnTimeout !== undefined ||
     (d.approvalNotify !== undefined && d.approvalNotify.length > 0) ||
     (d.approvalOnReject !== undefined && d.approvalOnReject.length > 0);
+  const hasApprovalRest = d.approvalRest !== undefined && Object.keys(d.approvalRest).length > 0;
   if (
     d.kind === 'approval_gate' ||
     d.approvalRequired ||
     d.approvalPrompt !== undefined ||
     d.approvalTimeoutSeconds !== undefined ||
-    hasGateExtras
+    hasGateExtras ||
+    hasApprovalRest
   ) {
     const ap: Record<string, unknown> = {};
     if (d.approvalRequired) ap.required = true;
@@ -520,6 +576,11 @@ function nodeToStepObject(d: StepNodeData): Record<string, unknown> {
     if (d.approvalOnTimeout !== undefined) ap.on_timeout = d.approvalOnTimeout;
     if (d.approvalNotify !== undefined && d.approvalNotify.length > 0) ap.notify = d.approvalNotify;
     if (d.approvalOnReject !== undefined && d.approvalOnReject.length > 0) ap.on_reject = d.approvalOnReject;
+    if (d.approvalRest) {
+      for (const [k, v] of Object.entries(d.approvalRest)) {
+        if (!(k in ap)) ap[k] = v;
+      }
+    }
     o.approval = ap;
   }
 
@@ -639,13 +700,42 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
       const p = d.panel;
       if (!p || p.panelists.length === 0) add(n.id, 'panel needs at least one panelist');
       if (!p || !p.subject) add(n.id, 'panel needs a subject');
+      if (p?.gate) {
+        const gate = p.gate;
+        if (!gate.until_no_findings_at_severity_or_above || !gate.fix_with || gate.max_iterations === undefined) {
+          add(n.id, 'gate needs a severity, a fix agent, and max iterations');
+        }
+      }
+      if (p?.max_parallel !== undefined && p.max_parallel < 1) {
+        add(n.id, 'panel `max_parallel` must be at least 1');
+      }
     } else if (d.kind === 'branch') {
       if (!d.condition) add(n.id, 'branch needs a condition');
       for (const t of [...(d.thenTargets ?? []), ...(d.elseTargets ?? [])]) {
         if (!nodeIds.has(t)) add(n.id, `branch target ${t} is not a known step`);
       }
     }
+    if (d.max_parallel !== undefined && d.max_parallel < 1) add(n.id, '`max_parallel` must be at least 1');
     if ((counts.get(n.id) ?? 0) > 1) add(n.id, 'duplicate step id');
+
+    // A `notify` row with no `action` (backend `NotifyAction.action` is
+    // required) 400s on save rather than failing validation up-front.
+    if (d.approvalNotify) {
+      d.approvalNotify.forEach((entry, i) => {
+        if (!entry.action || entry.action === '') add(n.id, `notification ${i + 1} needs an action`);
+      });
+    }
+    // An action-shaped `on_reject` row (identified by having an `action` key
+    // at all, vs. an agent-shaped row) with an empty `action` is the same
+    // required-field gap as above. An agent-shaped row (agent/prompt) is
+    // validated elsewhere / pre-existing and is left alone here.
+    if (d.approvalOnReject) {
+      d.approvalOnReject.forEach((entry, i) => {
+        if ('action' in entry && (!entry.action || entry.action === '')) {
+          add(n.id, `on_reject entry ${i + 1} needs an action`);
+        }
+      });
+    }
   }
 
   // Reference checks: dangling refs (steps.X where X is not a node) and forward
@@ -737,6 +827,9 @@ export function convertInlineApprovalToGate(g: WorkflowGraph, stepId: string): W
   if (node.data.approvalOnReject !== undefined) {
     gateData.approvalOnReject = node.data.approvalOnReject;
   }
+  if (node.data.approvalRest !== undefined) {
+    gateData.approvalRest = node.data.approvalRest;
+  }
 
   const strippedData: StepNodeData = { ...node.data };
   delete strippedData.approvalRequired;
@@ -746,6 +839,7 @@ export function convertInlineApprovalToGate(g: WorkflowGraph, stepId: string): W
   delete strippedData.approvalOnTimeout;
   delete strippedData.approvalNotify;
   delete strippedData.approvalOnReject;
+  delete strippedData.approvalRest;
 
   const gateNode: GraphNode = {
     id: gateId,

@@ -607,6 +607,18 @@ describe('graphToWorkflowObject', () => {
   });
 });
 
+describe('nested passthrough', () => {
+  it.each([
+    ['panel', { name: 'w', steps: [{ id: 'p', panel: { panelists: ['r'], subject: 's', future_key: 42 } }] }, (s: any) => s.panel.future_key],
+    ['branch', { name: 'w', steps: [{ id: 'b', branch: { condition: 'x', future_key: 42 } }] }, (s: any) => s.branch.future_key],
+    ['approval', { name: 'w', steps: [{ id: 'g', approval: { required: true, future_key: 42 } }] }, (s: any) => s.approval.future_key],
+  ])('an unmodeled key under %s survives a round-trip', (_name, input, get) => {
+    const g = yamlToGraph(input as Record<string, unknown>);
+    const out = graphToWorkflowObject(g) as { obj: Record<string, unknown> };
+    expect(get((out.obj.steps as Record<string, unknown>[])[0])).toBe(42);
+  });
+});
+
 // ── canConnect ──────────────────────────────────────────────────────────────
 
 describe('canConnect', () => {
@@ -750,6 +762,103 @@ describe('validateGraph', () => {
     };
     const v = validateGraph(g);
     expect(v.a.some((m) => m.includes('unknown step ghost'))).toBe(true);
+  });
+
+  it('flags max_parallel below 1', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'p', parallel: [{ id: 's', agent: 'a', prompt: 'x' }], max_parallel: 0 }],
+    });
+    const problems = validateGraph(g);
+    expect(Object.values(problems).flat().some((m) => /max.?parallel/i.test(m) && /1/.test(m))).toBe(true);
+  });
+
+  it('does not flag a valid positive max_parallel', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'p', parallel: [{ id: 's', agent: 'a', prompt: 'x' }], max_parallel: 2 }],
+    });
+    const problems = validateGraph(g);
+    expect(Object.values(problems).flat().some((m) => /max.?parallel/i.test(m))).toBe(false);
+  });
+
+  it('flags an enabled gate with no severity/fix_with/max_iterations', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'p', panel: { panelists: ['r'], subject: 's', gate: {} } }],
+    });
+    expect(Object.values(validateGraph(g)).flat().some((m) => /gate/i.test(m))).toBe(true);
+  });
+
+  it('does not flag a fully-specified gate', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        {
+          id: 'p',
+          panel: {
+            panelists: ['r'],
+            subject: 's',
+            gate: { until_no_findings_at_severity_or_above: 'medium', fix_with: 'r', max_iterations: 3 },
+          },
+        },
+      ],
+    });
+    expect(Object.values(validateGraph(g)).flat().some((m) => /gate/i.test(m))).toBe(false);
+  });
+
+  it('flags a panel with max_parallel below 1', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'pan', panel: { panelists: ['r'], subject: 's', max_parallel: 0 } }],
+    });
+    const problems = validateGraph(g);
+    expect(Object.values(problems).flat().some((m) => /max.*parallel.*1/.test(m))).toBe(true);
+  });
+
+  it('does not flag a panel with a valid positive max_parallel', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'pan', panel: { panelists: ['r'], subject: 's', max_parallel: 2 } }],
+    });
+    const problems = validateGraph(g);
+    expect(Object.values(problems).flat().some((m) => /max.*parallel/i.test(m))).toBe(false);
+  });
+
+  it('flags a notify entry with no action', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'gate', approval: { required: true, notify: [{}] } }],
+    });
+    const problems = validateGraph(g);
+    expect(problems.gate.some((m) => /notification/.test(m) && /action/.test(m))).toBe(true);
+  });
+
+  it('does not flag a complete notify entry', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'gate', approval: { required: true, notify: [{ action: 'x' }] } }],
+    });
+    const problems = validateGraph(g);
+    expect((problems.gate ?? []).some((m) => /notification/.test(m))).toBe(false);
+  });
+
+  it('flags an action-shaped on_reject entry with an empty action', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'gate', approval: { required: true, on_reject: [{ action: '' }] } }],
+    });
+    const problems = validateGraph(g);
+    expect(problems.gate.some((m) => /on_reject/.test(m) && /action/.test(m))).toBe(true);
+  });
+
+  it('does not flag an agent-shaped on_reject entry (pre-existing behavior)', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'gate', approval: { required: true, on_reject: [{ agent: '', prompt: '' }] } }],
+    });
+    const problems = validateGraph(g);
+    expect((problems.gate ?? []).some((m) => /on_reject/.test(m))).toBe(false);
   });
 });
 

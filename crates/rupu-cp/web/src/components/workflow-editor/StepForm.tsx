@@ -5,6 +5,7 @@
 // always carried through untouched. Validation `problems` for this node render
 // in an inline alert block at the top.
 
+import { useRef, useState } from 'react';
 import type { AgentSummary, ToolSpec } from '../../lib/api';
 import {
   canConnect,
@@ -21,6 +22,7 @@ import type { ExprContext } from '../../lib/workflowExpressions';
 import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 import ExpressionField from './ExpressionField';
 import { Button } from '../ui/Button';
+import { parseWithValue, formatWithValue } from '../../lib/withValue';
 
 /** Context for expression fields, minus the per-field gates StepForm derives. */
 type StepExprContext = Omit<ExprContext, 'isForEachPrompt' | 'isPanelField'>;
@@ -362,6 +364,7 @@ function LinearFields({
             <span className={labelCls}>Max parallel</span>
             <input
               type="number"
+              min={1}
               value={d.max_parallel ?? ''}
               onChange={(e) => patch({ max_parallel: parseNum(e.target.value) })}
               aria-label="Max parallel"
@@ -410,6 +413,7 @@ function ParallelFields({
         <span className={labelCls}>Max parallel</span>
         <input
           type="number"
+          min={1}
           value={d.max_parallel ?? ''}
           onChange={(e) => patch({ max_parallel: parseNum(e.target.value) })}
           aria-label="Max parallel"
@@ -552,6 +556,7 @@ function PanelFields({
         <span className={labelCls}>Max parallel (optional)</span>
         <input
           type="number"
+          min={1}
           value={panel.max_parallel ?? ''}
           onChange={(e) => patchPanel({ max_parallel: parseNum(e.target.value) })}
           aria-label="Panel max parallel"
@@ -574,8 +579,7 @@ function PanelFields({
         <div className="space-y-3 rounded-md border border-border bg-surface p-2.5">
           <label className="block">
             <span className={labelCls}>Until no findings at severity or above</span>
-            <input
-              type="text"
+            <select
               value={panel.gate.until_no_findings_at_severity_or_above ?? ''}
               onChange={(e) =>
                 patchGate({
@@ -583,9 +587,22 @@ function PanelFields({
                 })
               }
               aria-label="Until no findings at severity or above"
-              placeholder="medium"
               className={fieldCls}
-            />
+            >
+              <option value="">(choose severity)</option>
+              {['low', 'medium', 'high', 'critical'].map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+              {/* keep an off-list value authored by hand so it still round-trips */}
+              {panel.gate.until_no_findings_at_severity_or_above &&
+                !['low', 'medium', 'high', 'critical'].includes(panel.gate.until_no_findings_at_severity_or_above) && (
+                  <option value={panel.gate.until_no_findings_at_severity_or_above}>
+                    {panel.gate.until_no_findings_at_severity_or_above}
+                  </option>
+                )}
+            </select>
           </label>
           <label className="block">
             <span className={labelCls}>Fix with</span>
@@ -726,6 +743,17 @@ function recStr(rec: Record<string, unknown>, key: string): string {
   return typeof v === 'string' ? v : '';
 }
 
+// Monotonic counter backing `nextRowId` — module-level so ids stay unique
+// across every GateFields instance/remount, not just within one.
+let rowIdSeq = 0;
+
+/** Mint a fresh UI-only row id. Never persisted onto step data (see the
+ *  `idState` doc comment in GateFields below for why). */
+function nextRowId(): string {
+  rowIdSeq += 1;
+  return `row-${rowIdSeq}`;
+}
+
 function GateFields({
   d,
   agents,
@@ -740,18 +768,119 @@ function GateFields({
   workflowEditorUi: WorkflowEditorUi;
 }) {
   const onReject = d.approvalOnReject ?? [];
+  const notify = d.approvalNotify ?? [];
+
+  // Stable UI-only row keys for the on-reject / notify lists. Both entry
+  // types are plain `Record<string, unknown>` step data — deliberately NOT
+  // stamped with an id field (that would leak into the serialized YAML) — so
+  // list rows can't key off entry identity via the data itself, and index
+  // keys are unsafe: `updateReject`/`updateNotify` replace the edited entry
+  // with a NEW object (`{ ...s, ...p }`) every keystroke, so a plain
+  // per-object WeakMap would also mint a new key on every edit (forcing that
+  // row's own child components — e.g. WithParamsEditor — to remount and lose
+  // their own in-progress draft while the user is mid-edit). Instead this
+  // keeps a parallel array of ids per list, mutated in lockstep with this
+  // component's own push (add) / splice (remove) calls, so a row's key
+  // follows its logical position across add/remove but never changes just
+  // because a sibling field on that row was edited. Rows only ever move by
+  // position when an earlier row is removed — without this, React reuses the
+  // shifted-in row's DOM/component instance (and its local state) for what is
+  // now a different entry (the notify-list bug this fixes: a pending "add
+  // param name" draft leaking onto the entry that shifted into a removed
+  // row's slot). Reset wholesale whenever the node being edited changes
+  // (`d.id`) — a different step's lists start fresh regardless of any
+  // position-for-position length coincidence with the previous node.
+  const idState = useRef({
+    nodeId: d.id,
+    reject: onReject.map(() => nextRowId()),
+    notify: notify.map(() => nextRowId()),
+  });
+  if (idState.current.nodeId !== d.id) {
+    idState.current = {
+      nodeId: d.id,
+      reject: onReject.map(() => nextRowId()),
+      notify: notify.map(() => nextRowId()),
+    };
+  } else {
+    // Defensive resync if a list's length ever changes by some path other
+    // than this component's own add/remove (e.g. an external round-trip) —
+    // preserves existing per-position ids and only mints new ones for the
+    // delta. Not exercised by add/remove themselves, since those already
+    // keep `idState` exactly in sync (see addReject/removeReject/addNotify/
+    // removeNotify below).
+    if (idState.current.reject.length !== onReject.length) {
+      idState.current.reject = onReject.map((_, i) => idState.current.reject[i] ?? nextRowId());
+    }
+    if (idState.current.notify.length !== notify.length) {
+      idState.current.notify = notify.map((_, i) => idState.current.notify[i] ?? nextRowId());
+    }
+  }
 
   function setOnReject(next: Record<string, unknown>[]): void {
     patch({ approvalOnReject: next });
   }
+  // An on_reject entry is a raw step record that's either agent-shaped
+  // (`{id, agent, prompt}`) or action-shaped (`{id, action, with}`) — the
+  // backend rejects an entry carrying both (`ActionMutuallyExclusive`, P0.5 /
+  // rejection-risk F.4). Detect shape off the `action` key so every row edit
+  // (including a bare id edit) stays scoped to its own shape's fields.
+  function isActionShapedReject(rec: Record<string, unknown>): boolean {
+    return 'action' in rec;
+  }
+  // Belt-and-suspenders on top of kind-aware rendering below (which only ever
+  // calls this with same-shape fields): strip whichever shape's fields DON'T
+  // belong to this row before merging, so an update can never inject the
+  // other shape's keys onto a row.
   function updateReject(i: number, p: Record<string, unknown>): void {
-    setOnReject(onReject.map((s, j) => (j === i ? { ...s, ...p } : s)));
+    setOnReject(
+      onReject.map((s, j) => {
+        if (j !== i) return s;
+        const safe = { ...p };
+        if (isActionShapedReject(s)) {
+          delete safe.agent;
+          delete safe.prompt;
+        } else {
+          delete safe.action;
+          delete safe.with;
+        }
+        return { ...s, ...safe };
+      }),
+    );
+  }
+  /** Switch a row's shape wholesale — keeps `id`, drops the other shape's
+   *  fields entirely (never merges across shapes) and seeds the target
+   *  shape's required fields so it renders/round-trips cleanly. */
+  function switchRejectKind(i: number, kind: 'agent' | 'action'): void {
+    setOnReject(
+      onReject.map((s, j) => {
+        if (j !== i) return s;
+        const id = recStr(s, 'id');
+        return kind === 'action' ? { id, action: '', with: {} } : { id, agent: '', prompt: '' };
+      }),
+    );
   }
   function addReject(): void {
+    idState.current.reject = [...idState.current.reject, nextRowId()];
     setOnReject([...onReject, { id: `cleanup-${onReject.length + 1}`, agent: '', prompt: '' }]);
   }
   function removeReject(i: number): void {
+    idState.current.reject = idState.current.reject.filter((_, j) => j !== i);
     setOnReject(onReject.filter((_, j) => j !== i));
+  }
+
+  function setNotify(next: Record<string, unknown>[]): void {
+    patch({ approvalNotify: next });
+  }
+  function updateNotify(i: number, p: Record<string, unknown>): void {
+    setNotify(notify.map((n, j) => (j === i ? { ...n, ...p } : n)));
+  }
+  function addNotify(): void {
+    idState.current.notify = [...idState.current.notify, nextRowId()];
+    setNotify([...notify, {}]);
+  }
+  function removeNotify(i: number): void {
+    idState.current.notify = idState.current.notify.filter((_, j) => j !== i);
+    setNotify(notify.filter((_, j) => j !== i));
   }
 
   return (
@@ -823,43 +952,80 @@ function GateFields({
       <div>
         <span className={labelCls}>On reject (cleanup steps)</span>
         <div className="space-y-3">
-          {onReject.map((s, i) => (
-            <div key={i} className="space-y-2 rounded-md border border-border bg-surface p-2.5">
-              <div className="flex items-center gap-2">
-                <input
-                  type="text"
-                  value={recStr(s, 'id')}
-                  onChange={(e) => updateReject(i, { id: e.target.value })}
-                  aria-label={`On-reject step ${i + 1} id`}
-                  placeholder="id"
-                  className={`${fieldCls} font-mono`}
-                />
-                <Button
-                  variant="danger-outline"
-                  onClick={() => removeReject(i)}
-                  aria-label={`Remove on-reject step ${i + 1}`}
-                  className="shrink-0 px-2.5"
-                >
-                  Remove
-                </Button>
+          {onReject.map((s, i) => {
+            const isAction = isActionShapedReject(s);
+            const withObj = isAction ? ((s.with as Record<string, unknown> | undefined) ?? {}) : {};
+            return (
+              <div key={idState.current.reject[i]} className="space-y-2 rounded-md border border-border bg-surface p-2.5">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={recStr(s, 'id')}
+                    onChange={(e) => updateReject(i, { id: e.target.value })}
+                    aria-label={`On-reject step ${i + 1} id`}
+                    placeholder="id"
+                    className={`${fieldCls} font-mono`}
+                  />
+                  <select
+                    value={isAction ? 'action' : 'agent'}
+                    onChange={(e) => switchRejectKind(i, e.target.value as 'agent' | 'action')}
+                    aria-label={`On-reject step ${i + 1} kind`}
+                    className={`${fieldCls} shrink-0 w-auto`}
+                  >
+                    <option value="agent">agent</option>
+                    <option value="action">action</option>
+                  </select>
+                  <Button
+                    variant="danger-outline"
+                    onClick={() => removeReject(i)}
+                    aria-label={`Remove on-reject step ${i + 1}`}
+                    className="shrink-0 px-2.5"
+                  >
+                    Remove
+                  </Button>
+                </div>
+                {isAction ? (
+                  <>
+                    <input
+                      type="text"
+                      value={recStr(s, 'action')}
+                      onChange={(e) => updateReject(i, { action: e.target.value })}
+                      aria-label={`On-reject step ${i + 1} action`}
+                      placeholder="action"
+                      className={`${fieldCls} font-mono`}
+                    />
+                    <WithParamsEditor
+                      value={withObj}
+                      onChange={(next) => updateReject(i, { with: next })}
+                      keys={Object.keys(withObj)}
+                      ariaLabel={(key) => `On-reject step ${i + 1} with ${key}`}
+                      emptyMessage="No parameters."
+                      allowAddKey
+                      addKeyAriaLabel={`On-reject step ${i + 1} new param name`}
+                    />
+                  </>
+                ) : (
+                  <>
+                    <AgentSelect
+                      value={recStr(s, 'agent') || undefined}
+                      agents={agents}
+                      ariaLabel={`On-reject step ${i + 1} agent`}
+                      onChange={(v) => updateReject(i, { agent: v ?? '' })}
+                    />
+                    <ExpressionField
+                      value={recStr(s, 'prompt')}
+                      onChange={(v) => updateReject(i, { prompt: v })}
+                      context={fieldCtx(exprContext, {})}
+                      multiline
+                      ariaLabel={`On-reject step ${i + 1} prompt`}
+                      placeholder="prompt"
+                      size={workflowEditorUi === 'next' ? 'large' : undefined}
+                    />
+                  </>
+                )}
               </div>
-              <AgentSelect
-                value={recStr(s, 'agent') || undefined}
-                agents={agents}
-                ariaLabel={`On-reject step ${i + 1} agent`}
-                onChange={(v) => updateReject(i, { agent: v ?? '' })}
-              />
-              <ExpressionField
-                value={recStr(s, 'prompt')}
-                onChange={(v) => updateReject(i, { prompt: v })}
-                context={fieldCtx(exprContext, {})}
-                multiline
-                ariaLabel={`On-reject step ${i + 1} prompt`}
-                placeholder="prompt"
-                size={workflowEditorUi === 'next' ? 'large' : undefined}
-              />
-            </div>
-          ))}
+            );
+          })}
         </div>
         <button
           type="button"
@@ -869,6 +1035,143 @@ function GateFields({
           Add cleanup step
         </button>
       </div>
+
+      <div>
+        <span className={labelCls}>Notify (on park)</span>
+        <div className="space-y-3">
+          {notify.map((n, i) => {
+            const withObj = (n.with as Record<string, unknown> | undefined) ?? {};
+            return (
+              <div key={idState.current.notify[i]} className="space-y-2 rounded-md border border-border bg-surface p-2.5">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={recStr(n, 'action')}
+                    onChange={(e) => updateNotify(i, { action: e.target.value })}
+                    aria-label={`Notification ${i + 1} action`}
+                    placeholder="action"
+                    className={`${fieldCls} font-mono`}
+                  />
+                  <Button
+                    variant="danger-outline"
+                    onClick={() => removeNotify(i)}
+                    aria-label={`Remove notification ${i + 1}`}
+                    className="shrink-0 px-2.5"
+                  >
+                    Remove
+                  </Button>
+                </div>
+                <WithParamsEditor
+                  value={withObj}
+                  onChange={(next) => updateNotify(i, { with: next })}
+                  keys={Object.keys(withObj)}
+                  ariaLabel={(key) => `Notification ${i + 1} with ${key}`}
+                  emptyMessage="No parameters."
+                  allowAddKey
+                  addKeyAriaLabel={`Notification ${i + 1} new param name`}
+                />
+              </div>
+            );
+          })}
+        </div>
+        <button
+          type="button"
+          onClick={addNotify}
+          className="mt-2 text-ui font-medium text-brand-600 hover:text-brand-700"
+        >
+          Add notification
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── shared: connector `with:` param editor ───────────────────────────────────
+
+/** Editor for a connector's `with:` param bag — shared by `ActionFields` (an
+ *  action step's own `with:`, keyed off the selected tool's schema) and
+ *  `GateFields`' Notify list (each notify entry's own `with:`, which has no
+ *  schema to derive keys from, so it also offers an "add param" control via
+ *  `allowAddKey`). `keys` is caller-supplied (schema-derived for actions,
+ *  `Object.keys(value)` for notify entries) so both call sites keep their own
+ *  key-sourcing logic; this component only renders the per-key text field +
+ *  (optionally) the add-key control. `ariaLabel` lets each call site keep its
+ *  own accessible-name convention (`With ${key}` for actions; a
+ *  per-notify-index-scoped label for notify entries, since a gate can have
+ *  multiple notify entries whose param keys would otherwise collide). */
+function WithParamsEditor({
+  value,
+  onChange,
+  keys,
+  ariaLabel,
+  emptyMessage,
+  allowAddKey = false,
+  addKeyAriaLabel,
+}: {
+  value: Record<string, unknown>;
+  onChange: (next: Record<string, unknown>) => void;
+  keys: string[];
+  ariaLabel: (key: string) => string;
+  emptyMessage?: string;
+  allowAddKey?: boolean;
+  addKeyAriaLabel?: string;
+}) {
+  const [newKey, setNewKey] = useState('');
+
+  function patchKey(key: string, text: string): void {
+    const next = { ...value };
+    const v = parseWithValue(text);
+    if (v === undefined) delete next[key];
+    else next[key] = v;
+    onChange(next);
+  }
+
+  function addKey(): void {
+    const key = newKey.trim();
+    if (key === '' || key in value) return;
+    onChange({ ...value, [key]: '' });
+    setNewKey('');
+  }
+
+  return (
+    <div className="space-y-2 rounded-md border border-border bg-surface p-2.5">
+      {keys.length === 0 ? (
+        emptyMessage && <p className="text-ui text-ink-mute">{emptyMessage}</p>
+      ) : (
+        keys.map((key) => (
+          <label key={key} className="block">
+            <span className="mb-1 block text-note font-mono text-ink-dim">{key}</span>
+            <input
+              type="text"
+              value={formatWithValue(value[key])}
+              onChange={(e) => patchKey(key, e.target.value)}
+              aria-label={ariaLabel(key)}
+              className={`${fieldCls} font-mono`}
+            />
+          </label>
+        ))
+      )}
+      {allowAddKey && (
+        <div className="flex items-center gap-2">
+          <input
+            type="text"
+            value={newKey}
+            onChange={(e) => setNewKey(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                addKey();
+              }
+            }}
+            aria-label={addKeyAriaLabel}
+            placeholder="param name"
+            className={`${fieldCls} font-mono`}
+          />
+          <Button variant="secondary" onClick={addKey} className="shrink-0 px-2.5">
+            Add param
+          </Button>
+        </div>
+      )}
     </div>
   );
 }
@@ -906,13 +1209,6 @@ function ActionFields({
   // (so hand-authored / unknown-tool params stay editable and never dropped).
   const keys = [...new Set([...paramKeys, ...Object.keys(withObj)])];
 
-  function patchWith(key: string, value: string): void {
-    const next = { ...withObj };
-    if (value === '') delete next[key];
-    else next[key] = value;
-    patch({ with: next });
-  }
-
   return (
     <div className="space-y-3">
       <label className="block">
@@ -934,26 +1230,13 @@ function ActionFields({
 
       <div>
         <span className={labelCls}>With (parameters)</span>
-        <div className="space-y-2 rounded-md border border-border bg-surface p-2.5">
-          {keys.length === 0 ? (
-            <p className="text-ui text-ink-mute">
-              {d.action ? 'This tool takes no parameters.' : 'Select a tool to configure its parameters.'}
-            </p>
-          ) : (
-            keys.map((key) => (
-              <label key={key} className="block">
-                <span className="mb-1 block text-note font-mono text-ink-dim">{key}</span>
-                <input
-                  type="text"
-                  value={typeof withObj[key] === 'string' ? (withObj[key] as string) : ''}
-                  onChange={(e) => patchWith(key, e.target.value)}
-                  aria-label={`With ${key}`}
-                  className={`${fieldCls} font-mono`}
-                />
-              </label>
-            ))
-          )}
-        </div>
+        <WithParamsEditor
+          value={withObj}
+          onChange={(next) => patch({ with: next })}
+          keys={keys}
+          ariaLabel={(key) => `With ${key}`}
+          emptyMessage={d.action ? 'This tool takes no parameters.' : 'Select a tool to configure its parameters.'}
+        />
       </div>
     </div>
   );

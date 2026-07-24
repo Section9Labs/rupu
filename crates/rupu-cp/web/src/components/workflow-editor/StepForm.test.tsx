@@ -500,6 +500,123 @@ describe('StepForm — approval gate body (Task 5)', () => {
     const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
     expect(last.approvalOnReject).toHaveLength(1);
   });
+
+  it('a gate notify entry (action + with) can be added and round-trips (Task 4)', () => {
+    const spy = vi.fn();
+    render(
+      <Harness
+        initial={nodeWith({ kind: 'approval_gate', approvalRequired: true, approvalNotify: [] })}
+        spy={spy}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Add notification' }));
+    fireEvent.change(screen.getByLabelText('Notification 1 action'), { target: { value: 'issues.comment' } });
+    fireEvent.change(screen.getByLabelText('Notification 1 new param name'), { target: { value: 'retries' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add param' }));
+    fireEvent.change(screen.getByLabelText('Notification 1 with retries'), { target: { value: '3' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.approvalNotify).toEqual([{ action: 'issues.comment', with: { retries: 3 } }]);
+  });
+
+  it('Remove notification removes a notify entry', () => {
+    const spy = vi.fn();
+    render(
+      <Harness
+        initial={nodeWith({
+          kind: 'approval_gate',
+          approvalRequired: true,
+          approvalNotify: [{ action: 'issues.comment', with: { body: 'hi' } }],
+        })}
+        spy={spy}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Remove notification 1' }));
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.approvalNotify).toEqual([]);
+  });
+
+  it('removing an earlier notify entry does not leak its pending add-param draft onto the shifted-in entry (Task 4 regression)', () => {
+    const spy = vi.fn();
+    render(
+      <Harness
+        initial={nodeWith({
+          kind: 'approval_gate',
+          approvalRequired: true,
+          approvalNotify: [{ action: 'issues.comment' }, { action: 'slack.post' }],
+        })}
+        spy={spy}
+      />,
+    );
+    // Type an uncommitted "add param" draft into the FIRST entry only — never
+    // clicking "Add param", so it never reaches approvalNotify data.
+    fireEvent.change(screen.getByLabelText('Notification 1 new param name'), {
+      target: { value: 'draft-leak' },
+    });
+    // Remove the first entry — the second entry (never touched) shifts down
+    // into what was index 0.
+    fireEvent.click(screen.getByRole('button', { name: 'Remove notification 1' }));
+    // With an array-index key, React would reuse the removed row's component
+    // instance (and its local draft state) for the shifted-in entry. The
+    // remaining entry's own add-param field must be empty.
+    expect(screen.getByLabelText('Notification 1 new param name')).toHaveValue('');
+  });
+
+  it('an action-shaped on_reject row renders action fields and editing its id never injects agent/prompt (F.4)', () => {
+    const spy = vi.fn();
+    render(
+      <Harness
+        initial={nodeWith({
+          kind: 'approval_gate',
+          approvalRequired: true,
+          approvalOnReject: [{ id: 'cleanup', action: 'scm.prs.comment', with: { body: 'x' } }],
+        })}
+        spy={spy}
+      />,
+    );
+
+    // Renders action fields, NOT agent/prompt.
+    expect(screen.queryByLabelText('On-reject step 1 agent')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('On-reject step 1 prompt')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('On-reject step 1 action')).toHaveValue('scm.prs.comment');
+
+    fireEvent.change(screen.getByLabelText('On-reject step 1 id'), { target: { value: 'cleanup-renamed' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    const row = (last.approvalOnReject as Record<string, unknown>[])[0];
+    expect(row).toEqual({ id: 'cleanup-renamed', action: 'scm.prs.comment', with: { body: 'x' } });
+    expect(row).not.toHaveProperty('agent');
+    expect(row).not.toHaveProperty('prompt');
+  });
+
+  it('the on_reject kind toggle switches an agent row to action (dropping agent/prompt) and back (dropping action/with)', () => {
+    const spy = vi.fn();
+    render(
+      <Harness
+        initial={nodeWith({
+          kind: 'approval_gate',
+          approvalRequired: true,
+          approvalOnReject: [{ id: 'cleanup', agent: 'planner', prompt: 'clean up' }],
+        })}
+        spy={spy}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText('On-reject step 1 kind'), { target: { value: 'action' } });
+    let last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    let row = (last.approvalOnReject as Record<string, unknown>[])[0];
+    expect(row.id).toBe('cleanup');
+    expect(row).toHaveProperty('action');
+    expect(row).not.toHaveProperty('agent');
+    expect(row).not.toHaveProperty('prompt');
+
+    fireEvent.change(screen.getByLabelText('On-reject step 1 kind'), { target: { value: 'agent' } });
+    last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    row = (last.approvalOnReject as Record<string, unknown>[])[0];
+    expect(row.id).toBe('cleanup');
+    expect(row).toHaveProperty('agent');
+    expect(row).toHaveProperty('prompt');
+    expect(row).not.toHaveProperty('action');
+    expect(row).not.toHaveProperty('with');
+  });
 });
 
 describe('StepForm — Convert to gate node button (Task 6)', () => {
@@ -622,6 +739,28 @@ describe('StepForm — action body (Task 5)', () => {
     const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
     expect(last.with).toEqual({ title: 'Fix bug' });
   });
+
+  it('renders a typed (non-string) with: value in its field instead of blank (Task 2)', () => {
+    const spy = vi.fn();
+    const node = nodeWith({ kind: 'action', action: 'scm.prs.create', with: { count: 3 } });
+    render(
+      <StepForm node={node} agents={AGENTS} problems={[]} exprContext={EXPR} tools={TOOLS} onChange={spy} />,
+    );
+    // `count` isn't in the tool's schema but is preserved from `with:`, so its
+    // field still renders (fold-in behavior already covered elsewhere) showing
+    // the typed value's JSON text rather than blank.
+    expect(screen.getByLabelText('With count')).toHaveValue('3');
+  });
+
+  it('typing a JSON literal into a with: field stores it typed, not as a string (Task 2)', () => {
+    const spy = vi.fn();
+    render(<ActionHarness spy={spy} />);
+    fireEvent.change(screen.getByLabelText('Action tool'), { target: { value: 'scm.prs.create' } });
+    fireEvent.change(screen.getByLabelText('With title'), { target: { value: '3' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.with).toEqual({ title: 3 });
+    expect(typeof (last.with as Record<string, unknown>).title).toBe('number');
+  });
 });
 
 describe('StepForm — switchKind', () => {
@@ -697,6 +836,52 @@ describe('StepForm — switchKind', () => {
     fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'panel' } });
     last = spy2.mock.calls[spy2.mock.calls.length - 1][0] as StepNodeData;
     expect(last.panel).toEqual({ panelists: [], subject: '' });
+  });
+});
+
+describe('StepForm — panel gate severity select + max_parallel guard (Task 1)', () => {
+  it('gate severity is a select of the four severities and keeps an off-list value', () => {
+    const spy = vi.fn();
+    render(
+      <Harness
+        initial={nodeWith({
+          kind: 'panel',
+          panel: { panelists: [], subject: 'review', gate: { until_no_findings_at_severity_or_above: 'legacy-custom' } },
+        })}
+        spy={spy}
+      />,
+    );
+
+    const select = screen.getByLabelText('Until no findings at severity or above');
+    expect(select.tagName).toBe('SELECT');
+    expect(screen.getByRole('option', { name: 'low' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'medium' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'high' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'critical' })).toBeInTheDocument();
+    // Off-list hand-authored value still renders as a selectable option so it round-trips.
+    expect(screen.getByRole('option', { name: 'legacy-custom' })).toBeInTheDocument();
+    expect(select).toHaveValue('legacy-custom');
+
+    fireEvent.change(select, { target: { value: 'high' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.panel?.gate?.until_no_findings_at_severity_or_above).toBe('high');
+  });
+
+  it('a fresh gate with no severity shows the empty "(choose severity)" option and no off-list option', () => {
+    render(<Harness initial={nodeWith({ kind: 'panel', panel: { panelists: [], subject: 'review', gate: {} } })} spy={vi.fn()} />);
+    const select = screen.getByLabelText('Until no findings at severity or above');
+    expect(screen.getByRole('option', { name: '(choose severity)' })).toBeInTheDocument();
+    expect(select).toHaveValue('');
+  });
+
+  it('panel max_parallel input has a min of 1', () => {
+    render(<Harness initial={nodeWith({ kind: 'panel', panel: { panelists: [], subject: 'review' } })} spy={vi.fn()} />);
+    expect(screen.getByLabelText('Panel max parallel')).toHaveAttribute('min', '1');
+  });
+
+  it('parallel arm max_parallel input has a min of 1', () => {
+    render(<Harness initial={nodeWith({ kind: 'parallel', parallel: [] })} spy={vi.fn()} />);
+    expect(screen.getByLabelText('Max parallel')).toHaveAttribute('min', '1');
   });
 });
 
