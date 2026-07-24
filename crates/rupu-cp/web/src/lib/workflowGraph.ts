@@ -706,6 +706,9 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
           add(n.id, 'gate needs a severity, a fix agent, and max iterations');
         }
       }
+      if (p?.max_parallel !== undefined && p.max_parallel < 1) {
+        add(n.id, 'panel `max_parallel` must be at least 1');
+      }
     } else if (d.kind === 'branch') {
       if (!d.condition) add(n.id, 'branch needs a condition');
       for (const t of [...(d.thenTargets ?? []), ...(d.elseTargets ?? [])]) {
@@ -714,6 +717,25 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
     }
     if (d.max_parallel !== undefined && d.max_parallel < 1) add(n.id, '`max_parallel` must be at least 1');
     if ((counts.get(n.id) ?? 0) > 1) add(n.id, 'duplicate step id');
+
+    // A `notify` row with no `action` (backend `NotifyAction.action` is
+    // required) 400s on save rather than failing validation up-front.
+    if (d.approvalNotify) {
+      d.approvalNotify.forEach((entry, i) => {
+        if (!entry.action || entry.action === '') add(n.id, `notification ${i + 1} needs an action`);
+      });
+    }
+    // An action-shaped `on_reject` row (identified by having an `action` key
+    // at all, vs. an agent-shaped row) with an empty `action` is the same
+    // required-field gap as above. An agent-shaped row (agent/prompt) is
+    // validated elsewhere / pre-existing and is left alone here.
+    if (d.approvalOnReject) {
+      d.approvalOnReject.forEach((entry, i) => {
+        if ('action' in entry && (!entry.action || entry.action === '')) {
+          add(n.id, `on_reject entry ${i + 1} needs an action`);
+        }
+      });
+    }
   }
 
   // Reference checks: dangling refs (steps.X where X is not a node) and forward

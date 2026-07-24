@@ -806,6 +806,60 @@ describe('validateGraph', () => {
     });
     expect(Object.values(validateGraph(g)).flat().some((m) => /gate/i.test(m))).toBe(false);
   });
+
+  it('flags a panel with max_parallel below 1', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'pan', panel: { panelists: ['r'], subject: 's', max_parallel: 0 } }],
+    });
+    const problems = validateGraph(g);
+    expect(Object.values(problems).flat().some((m) => /max.*parallel.*1/.test(m))).toBe(true);
+  });
+
+  it('does not flag a panel with a valid positive max_parallel', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'pan', panel: { panelists: ['r'], subject: 's', max_parallel: 2 } }],
+    });
+    const problems = validateGraph(g);
+    expect(Object.values(problems).flat().some((m) => /max.*parallel/i.test(m))).toBe(false);
+  });
+
+  it('flags a notify entry with no action', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'gate', approval: { required: true, notify: [{}] } }],
+    });
+    const problems = validateGraph(g);
+    expect(problems.gate.some((m) => /notification/.test(m) && /action/.test(m))).toBe(true);
+  });
+
+  it('does not flag a complete notify entry', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'gate', approval: { required: true, notify: [{ action: 'x' }] } }],
+    });
+    const problems = validateGraph(g);
+    expect((problems.gate ?? []).some((m) => /notification/.test(m))).toBe(false);
+  });
+
+  it('flags an action-shaped on_reject entry with an empty action', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'gate', approval: { required: true, on_reject: [{ action: '' }] } }],
+    });
+    const problems = validateGraph(g);
+    expect(problems.gate.some((m) => /on_reject/.test(m) && /action/.test(m))).toBe(true);
+  });
+
+  it('does not flag an agent-shaped on_reject entry (pre-existing behavior)', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'gate', approval: { required: true, on_reject: [{ agent: '', prompt: '' }] } }],
+    });
+    const problems = validateGraph(g);
+    expect((problems.gate ?? []).some((m) => /on_reject/.test(m))).toBe(false);
+  });
 });
 
 // ── fold-in (review Minor): `with:` on a non-action step/for_each node ──────

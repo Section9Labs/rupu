@@ -21,6 +21,12 @@ describe('parseWithValue', () => {
   });
 });
 
+describe('formatWithValue', () => {
+  it('renders undefined as an empty string, not the literal undefined', () => {
+    expect(formatWithValue(undefined)).toBe('');
+  });
+});
+
 describe('formatWithValue round-trips parseWithValue', () => {
   it.each(['3', 'true', '["a","b"]', '{"k":1}', '{{ inputs.x }}', 'hello world'])('%s', (text) => {
     const v = parseWithValue(text);

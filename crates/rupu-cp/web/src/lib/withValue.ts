@@ -22,5 +22,6 @@ export function parseWithValue(text: string): unknown {
  *  verbatim; everything else shows its JSON text (so `3`/`true`/`["a"]`
  *  round-trip through `parseWithValue`). */
 export function formatWithValue(v: unknown): string {
+  if (v === undefined) return '';
   return typeof v === 'string' ? v : JSON.stringify(v);
 }
