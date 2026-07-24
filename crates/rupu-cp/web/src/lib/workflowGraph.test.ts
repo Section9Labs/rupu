@@ -306,9 +306,14 @@ describe('topoSort', () => {
 
 describe('graphToWorkflowObject', () => {
   it('errors on a cycle', () => {
+    // graphToWorkflowObject now derives edges from nodes (deriveEdges), so a
+    // cycle must be genuinely derivable: 'x' declared before 'y' gives a chain
+    // edge x->y, and 'x' forward-referencing steps.y gives a data-ref edge
+    // y->x — together a real cycle. Hand-supplied raw g.edges (as this test
+    // used to do) are no longer consulted at all.
     const g = {
-      nodes: [node('x', {}), node('y', {})],
-      edges: [edge('x', 'y'), edge('y', 'x')],
+      nodes: [node('x', { prompt: 'steps.y.output' }, { x: 0, y: 0 }), node('y', {}, { x: 0, y: 1 })],
+      edges: [],
       meta: { name: 'wf', rest: {} },
     };
     const res = graphToWorkflowObject(g);
@@ -607,18 +612,21 @@ describe('graphToWorkflowObject', () => {
 describe('canConnect', () => {
   it('rejects a self-loop', () => {
     const res = canConnect('a', 'a', { edges: [] });
-    expect(res).toEqual({ ok: false, reason: "A step can't depend on itself." });
+    expect(res).toEqual({ ok: false, reason: "A step can't depend on itself.", kind: 'self' });
   });
 
   it('rejects a duplicate edge', () => {
     const res = canConnect('a', 'b', { edges: [edge('a', 'b')] });
-    expect(res).toEqual({ ok: false, reason: 'These steps are already connected.' });
+    expect(res).toEqual({ ok: false, reason: 'These steps are already connected.', kind: 'duplicate' });
   });
 
   it('rejects a back-edge that closes a cycle', () => {
     const res = canConnect('b', 'a', { edges: [edge('a', 'b')] });
     expect(res.ok).toBe(false);
-    if (!res.ok) expect(res.reason).toContain('cycle');
+    if (!res.ok) {
+      expect(res.reason).toContain('cycle');
+      expect(res.kind).toBe('cycle');
+    }
   });
 
   it('rejects a transitive cycle', () => {
@@ -861,10 +869,17 @@ describe('convertInlineApprovalToGate', () => {
     const next = convertInlineApprovalToGate(g, 'ship');
     const gateId = next.nodes.find((n) => n.data.kind === 'approval_gate')!.id;
 
-    // build -> gate -> ship (build no longer points straight at ship).
+    // Linear execution order is build -> gate -> ship (the chain edges derive
+    // from the new node-array order: gate is spliced immediately before ship).
     expect(next.edges.some((e) => e.source === 'build' && e.target === gateId)).toBe(true);
-    expect(next.edges.some((e) => e.source === 'build' && e.target === 'ship')).toBe(false);
     expect(next.edges.some((e) => e.source === gateId && e.target === 'ship')).toBe(true);
+    // A build->ship DATA-REF edge also derives (honestly) because `ship`'s
+    // prompt still reads `steps.build.output` — under the single-source
+    // model edges are a pure derivation of node data/order, so this is now
+    // expected: it represents ship's real data dependency on build's output,
+    // independent of the gate the operator inserted into the linear chain
+    // above (the chain edges alone already enforce gate-runs-between-them).
+    expect(next.edges.some((e) => e.source === 'build' && e.target === 'ship')).toBe(true);
   });
 
   it('is a no-op for an unknown step id', () => {
@@ -968,5 +983,104 @@ describe('convertInlineApprovalToGate', () => {
     // a gate is GATE_W (214) wide, not NODE_W (210) — at the old 274 the step
     // landed 4px inside the gate it was making room for.
     expect(after - before).toBe(278);
+  });
+});
+
+import { deriveEdges, withDerivedEdges } from './workflowGraph';
+
+describe('deriveEdges', () => {
+  // NOTE: as of this writing, no *.yaml under .rupu/workflows/ actually
+  // contains a step-level `branch:` block (issue-supervisor-dispatch.yaml and
+  // phase-delivery-cycle.yaml only have an unrelated `workspace.branch`
+  // string field — verified by grep, not a branch *step*). So this test
+  // hand-authors a small, realistic workflow object instead of loading one
+  // from disk, in the same style as every other yamlToGraph({...}) call in
+  // this file.
+  //
+  // Critically, the expectation below is a HARDCODED edge list computed by
+  // hand from the steps — never `g.edges` or another `deriveEdges(...)` call
+  // — so it actually discriminates: it fails if the chain loop or the
+  // branch-arm loop in `deriveEdges` is broken or removed. (Verified by
+  // temporarily deleting the branch-arm loop — see task-1-report.md.)
+  it('derives the exact edge set for a workflow with a chain, a data-ref, and a branch', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'triage', agent: 'a', prompt: 'look at the issue' },
+        { id: 'route', branch: { condition: '{{ steps.triage.output }}', then: ['fix'], else: ['escalate'] } },
+        { id: 'fix', agent: 'a', prompt: 'fix it based on {{ steps.triage.output }}' },
+        { id: 'escalate', agent: 'a', prompt: 'escalate to a human' },
+      ],
+    });
+
+    // Hand-derived from the steps above:
+    //  (a) chain:     triage->route, route->fix, fix->escalate
+    //  (b) data-ref:  `fix`'s prompt references steps.triage -> triage->fix
+    //                 (route's condition also references steps.triage, but
+    //                 that collapses onto the triage->route chain edge, so
+    //                 it does NOT appear again here)
+    //  (c) branch arm: route's then->fix and else->escalate
+    const expected = [
+      { id: 'triage->route', source: 'triage', target: 'route' },
+      { id: 'route->fix', source: 'route', target: 'fix' },
+      { id: 'fix->escalate', source: 'fix', target: 'escalate' },
+      { id: 'triage->fix', source: 'triage', target: 'fix' },
+      { id: 'route->fix:then', source: 'route', target: 'fix', label: 'true', branch: 'then' },
+      { id: 'route->escalate:else', source: 'route', target: 'escalate', label: 'false', branch: 'else' },
+    ];
+    expect(deriveEdges(g.nodes)).toEqual(expected);
+  });
+
+  it('derives a branch arm edge from thenTargets/elseTargets', () => {
+    const nodes = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'b', branch: { condition: 'x', then: ['t'], else: ['e'] } },
+        { id: 't', agent: 'a', prompt: 'p' },
+        { id: 'e', agent: 'a', prompt: 'p' },
+      ],
+    }).nodes;
+    const edges = deriveEdges(nodes);
+    expect(edges).toContainEqual(expect.objectContaining({ source: 'b', target: 't', branch: 'then', label: 'true' }));
+    expect(edges).toContainEqual(expect.objectContaining({ source: 'b', target: 'e', branch: 'else', label: 'false' }));
+  });
+
+  // This is NOT a deriveEdges correctness guard (that's the hardcoded test
+  // above) — it documents a separate, real contract: `withDerivedEdges`
+  // must always wire `edges` through `deriveEdges(nodes)` rather than letting
+  // a caller pass/store edges independently. Later tasks (T2-T4) depend on
+  // that wiring, not on deriveEdges's internal correctness.
+  it('withDerivedEdges always wires edges through deriveEdges(nodes)', () => {
+    const nodes = yamlToGraph({ name: 'w', steps: [{ id: 'a', agent: 'x', prompt: 'p' }] }).nodes;
+    const g = withDerivedEdges({ name: 'w', rest: {} }, nodes);
+    expect(g.edges).toEqual(deriveEdges(g.nodes));
+  });
+});
+
+describe('serialization totality', () => {
+  it('a panel step keeps its when/continue_on_error on round-trip (P0.4)', () => {
+    const input = {
+      name: 'w',
+      steps: [{ id: 'p', when: 'inputs.go', continue_on_error: true, panel: { panelists: ['r'], subject: 's' } }],
+    };
+    const g = yamlToGraph(input);
+    const out = graphToWorkflowObject(g) as { obj: Record<string, unknown> };
+    const step = (out.obj.steps as Record<string, unknown>[])[0];
+    expect(step.when).toBe('inputs.go');
+    expect(step.continue_on_error).toBe(true);
+  });
+
+  it('graphToWorkflowObject orders by derived edges, not stored edges', () => {
+    // Declaration order is 'b' then 'a' — lexicographically the reverse of id
+    // order, and every node gets position {x:0,y:0} from yamlToGraph, so the
+    // topoSort tiebreak (position, then id) can't accidentally reproduce the
+    // correct order on its own. Only the derived chain edge b->a forces 'b'
+    // first; trusting an emptied g.edges would fall back to the id tiebreak
+    // and wrongly emit ['a', 'b'].
+    const g = yamlToGraph({ name: 'w', steps: [{ id: 'b', agent: 'x', prompt: 'p' }, { id: 'a', agent: 'x', prompt: 'p' }] });
+    // corrupt the stored edges; serialization must ignore them and use deriveEdges(nodes)
+    const corrupted = { ...g, edges: [] };
+    const out = graphToWorkflowObject(corrupted) as { obj: Record<string, unknown> };
+    expect((out.obj.steps as Record<string, unknown>[]).map((s) => s.id)).toEqual(['b', 'a']);
   });
 });

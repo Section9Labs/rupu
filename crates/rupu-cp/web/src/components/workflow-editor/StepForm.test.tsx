@@ -36,7 +36,7 @@ vi.mock('./ExpressionField', () => ({
 
 import StepForm from './StepForm';
 import WorkflowSettingsForm from './WorkflowSettingsForm';
-import type { GraphNode, StepNodeData, WorkflowMeta } from '../../lib/workflowGraph';
+import { deriveEdges, yamlToGraph, type GraphNode, type StepNodeData, type WorkflowMeta } from '../../lib/workflowGraph';
 import type { ExprContext } from '../../lib/workflowExpressions';
 import type { AgentSummary } from '../../lib/api';
 
@@ -56,8 +56,19 @@ function nodeWith(data: Partial<StepNodeData>): GraphNode {
   return { id: data.id ?? 's1', data: { id: 's1', kind: 'step', ...data }, position: { x: 0, y: 0 } };
 }
 
-/** Controlled wrapper — re-renders StepForm with the latest emitted data. */
-function Harness({ initial, spy }: { initial: GraphNode; spy: (d: StepNodeData) => void }) {
+/** Controlled wrapper — re-renders StepForm with the latest emitted data.
+ *  `workflowEditorUi` defaults through to StepForm's own default ('classic');
+ *  pass 'next' when a test needs the Kind <select> to offer branch/action/
+ *  approval_gate as switch targets. */
+function Harness({
+  initial,
+  spy,
+  workflowEditorUi,
+}: {
+  initial: GraphNode;
+  spy: (d: StepNodeData) => void;
+  workflowEditorUi?: 'classic' | 'next';
+}) {
   const [node, setNode] = useState(initial);
   return (
     <StepForm
@@ -65,6 +76,7 @@ function Harness({ initial, spy }: { initial: GraphNode; spy: (d: StepNodeData) 
       agents={AGENTS}
       problems={[]}
       exprContext={EXPR}
+      workflowEditorUi={workflowEditorUi}
       onChange={(d) => {
         spy(d);
         setNode((n) => ({ ...n, id: d.id, data: d }));
@@ -226,6 +238,93 @@ describe('StepForm — branch (flag-gated)', () => {
 
     fireEvent.click(screen.getByLabelText('Else target fail-path'));
     expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({ elseTargets: ['fail-path'] }));
+  });
+
+  it('the branch Then/Else picker excludes a target that would form a cycle (P0.1)', () => {
+    // Graph: a -> b(branch). `a` is upstream of `b` — offering it as a then/else
+    // target would let the user close a cycle back onto `a`.
+    const aNode: GraphNode = { id: 'a', data: { id: 'a', kind: 'step', agent: 'planner', prompt: 'hi' }, position: { x: 0, y: 0 } };
+    const bNode: GraphNode = { id: 'b', data: { id: 'b', kind: 'branch', condition: 'true' }, position: { x: 0, y: 100 } };
+    const edges = deriveEdges([aNode, bNode]); // chain edge a -> b
+
+    render(
+      <StepForm
+        node={bNode}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+        allNodeIds={['a', 'b']}
+        edges={edges}
+      />,
+    );
+
+    expect(screen.queryByLabelText('Then target a')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Else target a')).not.toBeInTheDocument();
+  });
+
+  it('the branch Then/Else picker still offers an already-selected target even though it is currently cycle-forming', () => {
+    // `b` already routes to `a` via thenTargets — combined with the chain edge
+    // a -> b, the graph already contains a cycle (a->b->a). The checkbox for
+    // `a` must still render (checked) so the user can uncheck it.
+    const aNode: GraphNode = { id: 'a', data: { id: 'a', kind: 'step', agent: 'planner', prompt: 'hi' }, position: { x: 0, y: 0 } };
+    const bNode: GraphNode = {
+      id: 'b',
+      data: { id: 'b', kind: 'branch', condition: 'true', thenTargets: ['a'] },
+      position: { x: 0, y: 100 },
+    };
+    const edges = deriveEdges([aNode, bNode]);
+
+    render(
+      <StepForm
+        node={bNode}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+        allNodeIds={['a', 'b']}
+        edges={edges}
+      />,
+    );
+
+    const checkbox = screen.getByLabelText('Then target a');
+    expect(checkbox).toBeInTheDocument();
+    expect(checkbox).toBeChecked();
+  });
+
+  it('the branch Then/Else picker offers an array-adjacent successor connected only by the auto-derived chain edge (P0.1 regression)', () => {
+    // Graph: b (branch, empty then/else) immediately followed by c (agent step).
+    // deriveEdges yields ONLY the plain chain edge b->c (branch: undefined) —
+    // no branch arm exists yet. `c` is exactly the everyday case the branch
+    // picker must offer: the branch's array-adjacent successor. A naive
+    // `canConnect(...).ok` filter would hide it, because the chain edge trips
+    // canConnect's "already connected" (duplicate) check for a plain (arm:
+    // undefined) connect — that's a drag-connect concern, not a cycle, so it
+    // must NOT exclude `c` from the then/else candidate list.
+    const g = yamlToGraph({
+      name: 'wf',
+      steps: [
+        { id: 'b', branch: { condition: 'true' } },
+        { id: 'c', agent: 'planner', prompt: 'hi' },
+      ],
+    });
+    const bNode = g.nodes.find((n) => n.id === 'b') as GraphNode;
+    expect(g.edges).toEqual([{ id: 'b->c', source: 'b', target: 'c' }]);
+
+    render(
+      <StepForm
+        node={bNode}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        onChange={() => {}}
+        allNodeIds={g.nodes.map((n) => n.id)}
+        edges={g.edges}
+      />,
+    );
+
+    expect(screen.getByLabelText('Then target c')).toBeInTheDocument();
+    expect(screen.getByLabelText('Else target c')).toBeInTheDocument();
   });
 
   it('branch hides the when/continue_on_error/approval block', () => {
@@ -522,6 +621,82 @@ describe('StepForm — action body (Task 5)', () => {
     fireEvent.change(screen.getByLabelText('With title'), { target: { value: 'Fix bug' } });
     const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
     expect(last.with).toEqual({ title: 'Fix bug' });
+  });
+});
+
+describe('StepForm — switchKind', () => {
+  it('switching to branch seeds an empty condition + empty then/else (F.1)', () => {
+    const spy = vi.fn();
+    render(
+      <Harness initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go' })} spy={spy} workflowEditorUi="next" />,
+    );
+    fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'branch' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.kind).toBe('branch');
+    expect(last.condition).toBe('');
+    expect(last.thenTargets).toEqual([]);
+    expect(last.elseTargets).toEqual([]);
+  });
+
+  it('switching to action seeds an empty action (P0.3)', () => {
+    const spy = vi.fn();
+    render(
+      <Harness initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go' })} spy={spy} workflowEditorUi="next" />,
+    );
+    fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'action' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.kind).toBe('action');
+    expect(last.action).toBe('');
+  });
+
+  it('switching step -> for_each preserves agent and prompt (§8.3)', () => {
+    const spy = vi.fn();
+    render(<Harness initial={nodeWith({ kind: 'step', agent: 'coder', prompt: 'do it' })} spy={spy} />);
+    fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'for_each' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.kind).toBe('for_each');
+    expect(last.agent).toBe('coder');
+    expect(last.prompt).toBe('do it');
+  });
+
+  it('switching a step that had approval into a branch clears the approval block (§8.4)', () => {
+    const spy = vi.fn();
+    render(
+      <Harness
+        initial={nodeWith({ kind: 'step', agent: 'planner', approvalRequired: true })}
+        spy={spy}
+        workflowEditorUi="next"
+      />,
+    );
+    fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'branch' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.kind).toBe('branch');
+    expect(last.approvalRequired).toBeUndefined();
+  });
+
+  it('switching to approval_gate seeds approvalRequired true regardless of source', () => {
+    const spy = vi.fn();
+    render(<Harness initial={nodeWith({ kind: 'step', agent: 'planner' })} spy={spy} workflowEditorUi="next" />);
+    fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'approval_gate' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.kind).toBe('approval_gate');
+    expect(last.approvalRequired).toBe(true);
+    expect(last.approvalOnReject).toEqual([]);
+  });
+
+  it('switching step -> parallel/panel seeds their required defaults', () => {
+    const spy = vi.fn();
+    const { unmount } = render(<Harness initial={nodeWith({ kind: 'step', agent: 'planner' })} spy={spy} />);
+    fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'parallel' } });
+    let last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.parallel).toEqual([]);
+    unmount();
+
+    const spy2 = vi.fn();
+    render(<Harness initial={nodeWith({ kind: 'step', agent: 'planner' })} spy={spy2} />);
+    fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'panel' } });
+    last = spy2.mock.calls[spy2.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.panel).toEqual({ panelists: [], subject: '' });
   });
 });
 

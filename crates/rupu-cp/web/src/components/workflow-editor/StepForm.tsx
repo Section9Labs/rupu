@@ -7,7 +7,9 @@
 
 import type { AgentSummary, ToolSpec } from '../../lib/api';
 import {
+  canConnect,
   hasInlineApproval,
+  type GraphEdge,
   type GraphNode,
   type PanelCfg,
   type PanelGate,
@@ -34,6 +36,10 @@ interface StepFormProps {
    *  target pickers. Defaults to empty (no candidates) for callers that don't
    *  thread it. */
   allNodeIds?: string[];
+  /** The graph's derived edges — powers BranchFields' cycle guard (a then/else
+   *  target that would close a cycle back onto an upstream node is excluded).
+   *  Defaults to empty (no cycle guard) for callers that don't thread it. */
+  edges?: GraphEdge[];
   /** Workflow-editor-UI flag — the "Branch (if)" kind option is only offered
    *  in the Kind <select> when 'next', UNLESS the node being edited is
    *  already a branch (an existing branch node must always be editable
@@ -105,6 +111,7 @@ export default function StepForm({
   problems,
   exprContext,
   allNodeIds = [],
+  edges = [],
   workflowEditorUi = 'classic',
   tools = [],
   onConvertToGate,
@@ -121,17 +128,39 @@ export default function StepForm({
     onChange({ ...d, ...p });
   }
 
-  // Kind switch — keep id + common fields (when / continue_on_error / approval /
-  // actions / raw_passthrough); drop the previous kind's specific fields.
+  // Kind switch — keep id; carry shared fields only where the DESTINATION kind
+  // can hold them; seed the destination's required defaults so it round-trips
+  // and validates with a friendly error rather than a raw parser one.
   function switchKind(kind: StepKind): void {
     const base: StepNodeData = { id: d.id, kind };
     if (d.when !== undefined) base.when = d.when;
     if (d.continue_on_error !== undefined) base.continue_on_error = d.continue_on_error;
-    if (d.approvalRequired !== undefined) base.approvalRequired = d.approvalRequired;
-    if (d.approvalPrompt !== undefined) base.approvalPrompt = d.approvalPrompt;
-    if (d.approvalTimeoutSeconds !== undefined) base.approvalTimeoutSeconds = d.approvalTimeoutSeconds;
     if (d.actions !== undefined) base.actions = d.actions;
     if (d.raw_passthrough !== undefined) base.raw_passthrough = d.raw_passthrough;
+    // agent/prompt are shared by the step + for_each forms — preserve across those.
+    if (kind === 'step' || kind === 'for_each') {
+      if (d.agent !== undefined) base.agent = d.agent;
+      if (d.prompt !== undefined) base.prompt = d.prompt;
+    }
+    // approval is only editable on step/for_each/approval_gate — carry it there, drop it elsewhere.
+    if (kind === 'step' || kind === 'for_each' || kind === 'approval_gate') {
+      if (d.approvalRequired !== undefined) base.approvalRequired = d.approvalRequired;
+      if (d.approvalPrompt !== undefined) base.approvalPrompt = d.approvalPrompt;
+      if (d.approvalTimeoutSeconds !== undefined) base.approvalTimeoutSeconds = d.approvalTimeoutSeconds;
+    }
+    // seed destination defaults (mirrors newNodeData)
+    if (kind === 'parallel') base.parallel = [];
+    if (kind === 'panel') base.panel = { panelists: [], subject: '' };
+    if (kind === 'branch') {
+      base.condition = '';
+      base.thenTargets = [];
+      base.elseTargets = [];
+    }
+    if (kind === 'action') base.action = '';
+    if (kind === 'approval_gate') {
+      base.approvalRequired = true;
+      base.approvalOnReject = [];
+    }
     onChange(base);
   }
 
@@ -206,7 +235,7 @@ export default function StepForm({
         />
       )}
       {d.kind === 'branch' && (
-        <BranchFields d={d} allNodeIds={allNodeIds} patch={patch} exprContext={exprContext} />
+        <BranchFields d={d} allNodeIds={allNodeIds} edges={edges} patch={patch} exprContext={exprContext} />
       )}
       {d.kind === 'approval_gate' && (
         <GateFields d={d} agents={agents} patch={patch} exprContext={exprContext} workflowEditorUi={workflowEditorUi} />
@@ -588,19 +617,35 @@ function PanelFields({
 function BranchFields({
   d,
   allNodeIds,
+  edges,
   patch,
   exprContext,
 }: {
   d: StepNodeData;
   allNodeIds: string[];
+  edges: GraphEdge[];
   patch: (p: Partial<StepNodeData>) => void;
   exprContext: StepExprContext;
 }) {
   const thenTargets = d.thenTargets ?? [];
   const elseTargets = d.elseTargets ?? [];
-  // Every other node in the graph is a valid then/else target; excludes the
-  // branch's own id (a self-target would be a self-loop).
-  const candidates = allNodeIds.filter((id) => id !== d.id);
+  // Every other node in the graph is a candidate then/else target, EXCEPT:
+  //  - the branch's own id (a self-target would be a self-loop), and
+  //  - a target that would close a cycle back onto an upstream node — UNLESS
+  //    it's already selected, in which case it must still render (checked) so
+  //    the user can uncheck it, even if the graph is currently in a cyclic
+  //    state (e.g. hand-edited YAML).
+  //
+  // `canConnect` also flags "already connected" (a plain chain/data-ref edge
+  // already runs branch -> candidate, which is the everyday case for the
+  // branch's array-adjacent successor) — that's a drag-connect duplicate
+  // concern, not a cycle, so it's deliberately NOT treated as exclusion here.
+  const candidates = allNodeIds.filter((id) => {
+    if (id === d.id) return false;
+    if (thenTargets.includes(id) || elseTargets.includes(id)) return true;
+    const res = canConnect(d.id, id, { edges });
+    return !(!res.ok && res.kind === 'cycle');
+  });
 
   function toggleThen(id: string, on: boolean): void {
     const set = new Set(thenTargets);

@@ -291,26 +291,14 @@ export function extractStepRefs(data: StepNodeData): string[] {
   return [...ids];
 }
 
-// ── yamlToGraph ───────────────────────────────────────────────────────────────
+// ── deriveEdges ───────────────────────────────────────────────────────────────
 
-/** Convert a parsed workflow object into the graph model. */
-export function yamlToGraph(obj: Record<string, unknown>): WorkflowGraph {
-  // meta: name + description are surfaced; everything else top-level survives in
-  // `rest` so a round-trip leaves trigger/inputs/defaults/autoflow/etc untouched.
-  const rest: Record<string, unknown> = { ...obj };
-  delete rest.name;
-  delete rest.description;
-  delete rest.steps;
-  const meta: WorkflowMeta = { name: asString(obj.name) ?? '', rest };
-  const desc = asString(obj.description);
-  if (desc !== undefined) meta.description = desc;
-
-  const stepsRaw = asArray(obj.steps) ?? [];
-  const nodes: GraphNode[] = stepsRaw.map((s, i) => {
-    const data = parseStepData(s, i);
-    return { id: data.id, data, position: { x: 0, y: 0 } };
-  });
-
+/** The ONE producer of canvas edges. Pure function of the ordered node list:
+ *  (a) a chain edge between each consecutive pair (declared order),
+ *  (b) a data-ref edge X->Y whenever Y references steps.X,
+ *  (c) a branch-arm edge per then/else target (labeled true/false).
+ *  graph.edges is ALWAYS this — never stored independently. */
+export function deriveEdges(nodes: GraphNode[]): GraphEdge[] {
   const ids = new Set(nodes.map((n) => n.id));
   const edges: GraphEdge[] = [];
   const seen = new Set<string>();
@@ -350,7 +338,36 @@ export function yamlToGraph(obj: Record<string, unknown>): WorkflowGraph {
     }
   }
 
-  return { nodes, edges, meta };
+  return edges;
+}
+
+/** Build a WorkflowGraph whose edges are derived from its nodes — the only
+ *  correct way to construct/return a graph. */
+export function withDerivedEdges(meta: WorkflowMeta, nodes: GraphNode[]): WorkflowGraph {
+  return { meta, nodes, edges: deriveEdges(nodes) };
+}
+
+// ── yamlToGraph ───────────────────────────────────────────────────────────────
+
+/** Convert a parsed workflow object into the graph model. */
+export function yamlToGraph(obj: Record<string, unknown>): WorkflowGraph {
+  // meta: name + description are surfaced; everything else top-level survives in
+  // `rest` so a round-trip leaves trigger/inputs/defaults/autoflow/etc untouched.
+  const rest: Record<string, unknown> = { ...obj };
+  delete rest.name;
+  delete rest.description;
+  delete rest.steps;
+  const meta: WorkflowMeta = { name: asString(obj.name) ?? '', rest };
+  const desc = asString(obj.description);
+  if (desc !== undefined) meta.description = desc;
+
+  const stepsRaw = asArray(obj.steps) ?? [];
+  const nodes: GraphNode[] = stepsRaw.map((s, i) => {
+    const data = parseStepData(s, i);
+    return { id: data.id, data, position: { x: 0, y: 0 } };
+  });
+
+  return { nodes, edges: deriveEdges(nodes), meta };
 }
 
 // ── topoSort ──────────────────────────────────────────────────────────────────
@@ -436,6 +453,9 @@ function nodeToStepObject(d: StepNodeData): Record<string, unknown> {
       po.gate = go;
     }
     o.panel = po;
+    if (d.when) o.when = d.when;
+    if (d.continue_on_error === true) o.continue_on_error = true;
+    if (d.actions && d.actions.length > 0) o.actions = d.actions;
   } else if (d.kind === 'branch') {
     const bo: Record<string, unknown> = {};
     if (d.condition !== undefined) bo.condition = d.condition;
@@ -520,7 +540,7 @@ function nodeToStepObject(d: StepNodeData): Record<string, unknown> {
 export function graphToWorkflowObject(
   g: WorkflowGraph,
 ): { obj: Record<string, unknown> } | { error: string } {
-  const sorted = topoSort(g.nodes, g.edges);
+  const sorted = topoSort(g.nodes, deriveEdges(g.nodes));
   if ('cycle' in sorted) {
     return { error: 'Cannot serialize: cycle through ' + sorted.cycle.join(', ') };
   }
@@ -540,15 +560,26 @@ export function graphToWorkflowObject(
 /** Whether dragging a new edge source→target is allowed: no self-loops, no
  *  duplicates, and the result must stay a DAG. We reject if `target` can already
  *  reach `source` (a DFS over existing edges) — adding source→target would then
- *  close a cycle. */
+ *  close a cycle.
+ *
+ *  `arm` distinguishes WHICH logical edge is being drawn: a plain connect
+ *  (`arm` undefined) duplicate-checks only against other plain edges; a
+ *  branch-arm connect (`arm: 'then' | 'else'`) duplicate-checks only against
+ *  an existing edge tagged with that SAME arm. Without this, a branch node
+ *  that sits array-adjacent to its intended then/else target would always
+ *  find the auto-derived chain edge between them and reject the arm connect
+ *  as "already connected" — under the derived-edges model every consecutive
+ *  node pair carries a chain edge, so a branch arm and a chain edge to the
+ *  same target are two DISTINCT logical edges, not a duplicate. */
 export function canConnect(
   source: string,
   target: string,
   g: { edges: GraphEdge[] },
-): { ok: true } | { ok: false; reason: string } {
-  if (source === target) return { ok: false, reason: "A step can't depend on itself." };
-  if (g.edges.some((e) => e.source === source && e.target === target)) {
-    return { ok: false, reason: 'These steps are already connected.' };
+  arm?: 'then' | 'else',
+): { ok: true } | { ok: false; reason: string; kind: 'self' | 'duplicate' | 'cycle' } {
+  if (source === target) return { ok: false, reason: "A step can't depend on itself.", kind: 'self' };
+  if (g.edges.some((e) => e.source === source && e.target === target && (e.branch ?? undefined) === arm)) {
+    return { ok: false, reason: 'These steps are already connected.', kind: 'duplicate' };
   }
 
   const adj = new Map<string, string[]>();
@@ -563,7 +594,7 @@ export function canConnect(
   while (stack.length > 0) {
     const cur = stack.pop() as string;
     if (cur === source) {
-      return { ok: false, reason: 'This would create a cycle — steps must form a DAG.' };
+      return { ok: false, reason: 'This would create a cycle — steps must form a DAG.', kind: 'cycle' };
     }
     if (seen.has(cur)) continue;
     seen.add(cur);
@@ -731,12 +762,14 @@ export function convertInlineApprovalToGate(g: WorkflowGraph, stepId: string): W
   nodes[idx] = strippedNode;
   nodes.splice(idx, 0, gateNode);
 
-  const edges: GraphEdge[] = g.edges.map((e) => {
-    if (e.target !== stepId) return e;
-    const id = e.branch ? `${e.source}->${gateId}:${e.branch}` : `${e.source}->${gateId}`;
-    return { ...e, id, target: gateId };
-  });
-  edges.push({ id: `${gateId}->${stepId}`, source: gateId, target: stepId });
-
-  return { ...g, nodes, edges };
+  // gate -> stepId re-derives as a plain chain edge because gateNode is
+  // spliced immediately before strippedNode; any node that previously chained
+  // straight into stepId now chains into gateNode first for the same reason
+  // (consecutive array order shifted, nothing else to rewire). Branch-arm
+  // then/else targets naming stepId are NOT retargeted here — they live on
+  // the source branch node's own data, untouched by this transform, so a
+  // branch that routed to stepId still routes there (running after the new
+  // gate in the chain, same as before the branch existed) rather than
+  // silently retargeting someone else's routing decision.
+  return withDerivedEdges(g.meta, nodes);
 }

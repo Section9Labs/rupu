@@ -20,21 +20,52 @@ vi.mock('./WorkflowEditorGraph', () => ({
     paused,
     paletteContainer,
     onSelect,
+    onChange,
   }: {
     graph: WorkflowGraph;
     paused?: boolean;
     paletteContainer?: HTMLElement | null;
     onSelect?: (id: string | null) => void;
+    onChange?: (g: WorkflowGraph) => void;
   }) => (
     <div
       data-testid="graph"
       data-paused={paused ? 'true' : 'false'}
       data-ids={graph.nodes.map((n) => n.id).join(',')}
       data-palette-container={paletteContainer ? 'set' : 'none'}
+      data-branch-then={
+        graph.nodes.find((n) => n.data.kind === 'branch')?.data.thenTargets?.join(',') ?? ''
+      }
     >
       {graph.nodes.map((n) => (
         <button key={n.id} onClick={() => onSelect?.(n.id)}>{`select-${n.id}`}</button>
       ))}
+      {/* Task 4 test hook: fire a graph edit that points the (sole) branch
+          node's then-target back at the FIRST node in the array — since a
+          chain edge already runs first-node -> ... -> branch, this closes a
+          cycle. Exercises `commit`'s all-or-nothing path exactly like a real
+          canvas edit would, without needing to drive @xyflow/react. */}
+      {onChange && graph.nodes.some((n) => n.data.kind === 'branch') && (
+        <button
+          onClick={() =>
+            onChange({
+              meta: graph.meta,
+              nodes: graph.nodes.map((n) =>
+                n.data.kind === 'branch'
+                  ? { ...n, data: { ...n.data, thenTargets: [graph.nodes[0].id] } }
+                  : n,
+              ),
+              edges: graph.edges,
+            })
+          }
+        >
+          commit-cycle
+        </button>
+      )}
+      {/* Task 4 test hook: re-commit the CURRENT (acyclic) graph verbatim — a
+          valid edit, used to assert a later successful commit clears the
+          commit-error banner set by a prior rejected one. */}
+      {onChange && <button onClick={() => onChange(graph)}>commit-noop</button>}
     </div>
   ),
 }));
@@ -494,5 +525,44 @@ describe('WorkflowEditor — Convert to gate node wiring (Task 6)', () => {
     expect(gateIdx).toBeLessThan(shipIdx);
     expect(emitted).toContain('ok to ship?');
     expect(emitted.slice(shipIdx)).not.toContain('approval');
+  });
+});
+
+describe('WorkflowEditor commit is all-or-nothing (Task 4)', () => {
+  afterEach(cleanup);
+
+  const branchYaml =
+    'name: wf\nsteps:\n' +
+    '  - id: a\n    agent: x\n    prompt: hi\n' +
+    '  - id: b\n    branch:\n      condition: "true"\n';
+
+  it('commit rejects a cycle-forming edit: no onYamlChange call, on-screen graph unchanged, banner shown (P0.1)', () => {
+    const onYamlChange = vi.fn();
+    render(<WorkflowEditor draftYaml={branchYaml} onYamlChange={onYamlChange} agents={[]} validity={null} />);
+
+    const g = screen.getByTestId('graph');
+    expect(g).toHaveAttribute('data-ids', 'a,b');
+    expect(g).toHaveAttribute('data-branch-then', '');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'commit-cycle' }));
+
+    // Rejected before mutating anything: no YAML emitted, canvas unchanged.
+    expect(onYamlChange).not.toHaveBeenCalled();
+    expect(g).toHaveAttribute('data-ids', 'a,b');
+    expect(g).toHaveAttribute('data-branch-then', '');
+    expect(screen.getByRole('alert')).toHaveTextContent(/cannot serialize/i);
+  });
+
+  it('a subsequent valid edit succeeds and clears the commit-error banner', () => {
+    const onYamlChange = vi.fn();
+    render(<WorkflowEditor draftYaml={branchYaml} onYamlChange={onYamlChange} agents={[]} validity={null} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'commit-cycle' }));
+    expect(screen.getByRole('alert')).toHaveTextContent(/cannot serialize/i);
+
+    fireEvent.click(screen.getByRole('button', { name: 'commit-noop' }));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(onYamlChange).toHaveBeenCalledTimes(1);
   });
 });
