@@ -500,6 +500,40 @@ describe('StepForm — approval gate body (Task 5)', () => {
     const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
     expect(last.approvalOnReject).toHaveLength(1);
   });
+
+  it('a gate notify entry (action + with) can be added and round-trips (Task 4)', () => {
+    const spy = vi.fn();
+    render(
+      <Harness
+        initial={nodeWith({ kind: 'approval_gate', approvalRequired: true, approvalNotify: [] })}
+        spy={spy}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Add notification' }));
+    fireEvent.change(screen.getByLabelText('Notification 1 action'), { target: { value: 'issues.comment' } });
+    fireEvent.change(screen.getByLabelText('Notification 1 new param name'), { target: { value: 'retries' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add param' }));
+    fireEvent.change(screen.getByLabelText('Notification 1 with retries'), { target: { value: '3' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.approvalNotify).toEqual([{ action: 'issues.comment', with: { retries: 3 } }]);
+  });
+
+  it('Remove notification removes a notify entry', () => {
+    const spy = vi.fn();
+    render(
+      <Harness
+        initial={nodeWith({
+          kind: 'approval_gate',
+          approvalRequired: true,
+          approvalNotify: [{ action: 'issues.comment', with: { body: 'hi' } }],
+        })}
+        spy={spy}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Remove notification 1' }));
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.approvalNotify).toEqual([]);
+  });
 });
 
 describe('StepForm — Convert to gate node button (Task 6)', () => {

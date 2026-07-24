@@ -5,6 +5,7 @@
 // always carried through untouched. Validation `problems` for this node render
 // in an inline alert block at the top.
 
+import { useState } from 'react';
 import type { AgentSummary, ToolSpec } from '../../lib/api';
 import {
   canConnect,
@@ -756,6 +757,7 @@ function GateFields({
   workflowEditorUi: WorkflowEditorUi;
 }) {
   const onReject = d.approvalOnReject ?? [];
+  const notify = d.approvalNotify ?? [];
 
   function setOnReject(next: Record<string, unknown>[]): void {
     patch({ approvalOnReject: next });
@@ -768,6 +770,19 @@ function GateFields({
   }
   function removeReject(i: number): void {
     setOnReject(onReject.filter((_, j) => j !== i));
+  }
+
+  function setNotify(next: Record<string, unknown>[]): void {
+    patch({ approvalNotify: next });
+  }
+  function updateNotify(i: number, p: Record<string, unknown>): void {
+    setNotify(notify.map((n, j) => (j === i ? { ...n, ...p } : n)));
+  }
+  function addNotify(): void {
+    setNotify([...notify, {}]);
+  }
+  function removeNotify(i: number): void {
+    setNotify(notify.filter((_, j) => j !== i));
   }
 
   return (
@@ -885,6 +900,143 @@ function GateFields({
           Add cleanup step
         </button>
       </div>
+
+      <div>
+        <span className={labelCls}>Notify (on park)</span>
+        <div className="space-y-3">
+          {notify.map((n, i) => {
+            const withObj = (n.with as Record<string, unknown> | undefined) ?? {};
+            return (
+              <div key={i} className="space-y-2 rounded-md border border-border bg-surface p-2.5">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={recStr(n, 'action')}
+                    onChange={(e) => updateNotify(i, { action: e.target.value })}
+                    aria-label={`Notification ${i + 1} action`}
+                    placeholder="action"
+                    className={`${fieldCls} font-mono`}
+                  />
+                  <Button
+                    variant="danger-outline"
+                    onClick={() => removeNotify(i)}
+                    aria-label={`Remove notification ${i + 1}`}
+                    className="shrink-0 px-2.5"
+                  >
+                    Remove
+                  </Button>
+                </div>
+                <WithParamsEditor
+                  value={withObj}
+                  onChange={(next) => updateNotify(i, { with: next })}
+                  keys={Object.keys(withObj)}
+                  ariaLabel={(key) => `Notification ${i + 1} with ${key}`}
+                  emptyMessage="No parameters."
+                  allowAddKey
+                  addKeyAriaLabel={`Notification ${i + 1} new param name`}
+                />
+              </div>
+            );
+          })}
+        </div>
+        <button
+          type="button"
+          onClick={addNotify}
+          className="mt-2 text-ui font-medium text-brand-600 hover:text-brand-700"
+        >
+          Add notification
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── shared: connector `with:` param editor ───────────────────────────────────
+
+/** Editor for a connector's `with:` param bag — shared by `ActionFields` (an
+ *  action step's own `with:`, keyed off the selected tool's schema) and
+ *  `GateFields`' Notify list (each notify entry's own `with:`, which has no
+ *  schema to derive keys from, so it also offers an "add param" control via
+ *  `allowAddKey`). `keys` is caller-supplied (schema-derived for actions,
+ *  `Object.keys(value)` for notify entries) so both call sites keep their own
+ *  key-sourcing logic; this component only renders the per-key text field +
+ *  (optionally) the add-key control. `ariaLabel` lets each call site keep its
+ *  own accessible-name convention (`With ${key}` for actions; a
+ *  per-notify-index-scoped label for notify entries, since a gate can have
+ *  multiple notify entries whose param keys would otherwise collide). */
+function WithParamsEditor({
+  value,
+  onChange,
+  keys,
+  ariaLabel,
+  emptyMessage,
+  allowAddKey = false,
+  addKeyAriaLabel,
+}: {
+  value: Record<string, unknown>;
+  onChange: (next: Record<string, unknown>) => void;
+  keys: string[];
+  ariaLabel: (key: string) => string;
+  emptyMessage?: string;
+  allowAddKey?: boolean;
+  addKeyAriaLabel?: string;
+}) {
+  const [newKey, setNewKey] = useState('');
+
+  function patchKey(key: string, text: string): void {
+    const next = { ...value };
+    const v = parseWithValue(text);
+    if (v === undefined) delete next[key];
+    else next[key] = v;
+    onChange(next);
+  }
+
+  function addKey(): void {
+    const key = newKey.trim();
+    if (key === '' || key in value) return;
+    onChange({ ...value, [key]: '' });
+    setNewKey('');
+  }
+
+  return (
+    <div className="space-y-2 rounded-md border border-border bg-surface p-2.5">
+      {keys.length === 0 ? (
+        emptyMessage && <p className="text-ui text-ink-mute">{emptyMessage}</p>
+      ) : (
+        keys.map((key) => (
+          <label key={key} className="block">
+            <span className="mb-1 block text-note font-mono text-ink-dim">{key}</span>
+            <input
+              type="text"
+              value={formatWithValue(value[key])}
+              onChange={(e) => patchKey(key, e.target.value)}
+              aria-label={ariaLabel(key)}
+              className={`${fieldCls} font-mono`}
+            />
+          </label>
+        ))
+      )}
+      {allowAddKey && (
+        <div className="flex items-center gap-2">
+          <input
+            type="text"
+            value={newKey}
+            onChange={(e) => setNewKey(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                addKey();
+              }
+            }}
+            aria-label={addKeyAriaLabel}
+            placeholder="param name"
+            className={`${fieldCls} font-mono`}
+          />
+          <Button variant="secondary" onClick={addKey} className="shrink-0 px-2.5">
+            Add param
+          </Button>
+        </div>
+      )}
     </div>
   );
 }
@@ -922,14 +1074,6 @@ function ActionFields({
   // (so hand-authored / unknown-tool params stay editable and never dropped).
   const keys = [...new Set([...paramKeys, ...Object.keys(withObj)])];
 
-  function patchWith(key: string, text: string): void {
-    const next = { ...withObj };
-    const v = parseWithValue(text);
-    if (v === undefined) delete next[key];
-    else next[key] = v;
-    patch({ with: next });
-  }
-
   return (
     <div className="space-y-3">
       <label className="block">
@@ -951,26 +1095,13 @@ function ActionFields({
 
       <div>
         <span className={labelCls}>With (parameters)</span>
-        <div className="space-y-2 rounded-md border border-border bg-surface p-2.5">
-          {keys.length === 0 ? (
-            <p className="text-ui text-ink-mute">
-              {d.action ? 'This tool takes no parameters.' : 'Select a tool to configure its parameters.'}
-            </p>
-          ) : (
-            keys.map((key) => (
-              <label key={key} className="block">
-                <span className="mb-1 block text-note font-mono text-ink-dim">{key}</span>
-                <input
-                  type="text"
-                  value={formatWithValue(withObj[key])}
-                  onChange={(e) => patchWith(key, e.target.value)}
-                  aria-label={`With ${key}`}
-                  className={`${fieldCls} font-mono`}
-                />
-              </label>
-            ))
-          )}
-        </div>
+        <WithParamsEditor
+          value={withObj}
+          onChange={(next) => patch({ with: next })}
+          keys={keys}
+          ariaLabel={(key) => `With ${key}`}
+          emptyMessage={d.action ? 'This tool takes no parameters.' : 'Select a tool to configure its parameters.'}
+        />
       </div>
     </div>
   );
