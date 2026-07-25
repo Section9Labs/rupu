@@ -1237,6 +1237,12 @@ const UNBOUNDED_MAX_CONCURRENCY: usize = 1 << 20;
 /// dedicated variant is no longer deferred). Marking the split `done` unlocks every one of its
 /// targets in the SAME indegree decrement pass, so they all go ready
 /// together and get dispatched concurrently on the very next drain below.
+/// (The bounded-loop super-node below — see the `if let Some(loop_suffix)
+/// = step.id.strip_prefix("loop:")` branch — historically piggybacked on
+/// this exact `StepKind::Split` value too, once loop execution landed on
+/// top of this already-live code path; Phase 3 gave it its own
+/// [`crate::runs::StepKind::Loop`] instead, so this variant is once again
+/// exclusively split's.)
 ///
 /// **Concurrency (§4).** Real dispatch (linear / panel / parallel /
 /// for_each / action, via [`run_node`]) is the only work that
@@ -2281,6 +2287,13 @@ async fn run_scheduler_scoped(
             // widening `NodeOutcome`'s pause/abort-handle plumbing to a
             // second dispatch shape for no required gain — see this
             // task's report for the tradeoff (Task 4 may revisit).
+            //
+            // Phase 3 fix: this `StepStarted` (and the `StepResult`
+            // `run_loop_node` returns below) now carries
+            // [`crate::runs::StepKind::Loop`], not the reused
+            // [`crate::runs::StepKind::Split`] loop execution originally
+            // shipped with — see [`crate::runs::StepKind::Loop`]'s doc for
+            // why it was `Split` in the first place.
             if let Some(loop_suffix) = step.id.strip_prefix("loop:") {
                 if let Some(loop_def) = opts.workflow.loops.get(loop_suffix) {
                     if let Some(sink) = opts.event_sink.as_ref() {
@@ -2289,7 +2302,7 @@ async fn run_scheduler_scoped(
                             &crate::executor::Event::StepStarted {
                                 run_id: run_id.to_string(),
                                 step_id: step.id.clone(),
-                                kind: crate::runs::StepKind::Split,
+                                kind: crate::runs::StepKind::Loop,
                                 agent: None,
                                 host: None,
                             },
@@ -3079,7 +3092,10 @@ async fn run_loop_node(
             output,
             success: converged || matches!(loop_def.on_max, crate::workflow::OnMax::Proceed),
             skipped: false,
-            kind: crate::runs::StepKind::Split,
+            // Phase 3 fix: [`crate::runs::StepKind::Loop`], not the
+            // reused [`crate::runs::StepKind::Split`] — see that
+            // variant's doc.
+            kind: crate::runs::StepKind::Loop,
             // Deliberately `None`, not `current_loop_iteration`-style —
             // this is the loop's OWN super-node record, not a member's.
             // See `StepResult::loop_iteration`'s doc.
@@ -8995,6 +9011,23 @@ loops:
         assert!(gen.success && !gen.skipped);
         assert!(test.success && !test.skipped);
         assert_eq!(test.output, "done:p");
+
+        // Phase 3: the loop super-node's own persisted `StepResult` must
+        // carry `StepKind::Loop`, not the reused `StepKind::Split` — this
+        // is the exact render-correctness defect this task fixes (mirrors
+        // the split/join assertions in
+        // `run_workflow_runs_a_split_join_workflow_live_through_the_scheduler`
+        // / the join-gathering equivalent).
+        let loop_node = result
+            .step_results
+            .iter()
+            .find(|sr| sr.step_id == "loop:refine")
+            .expect("the loop super-node itself has a persisted StepResult");
+        assert_eq!(
+            loop_node.kind,
+            crate::runs::StepKind::Loop,
+            "a live loop super-node must persist kind: Loop, not the reused Split"
+        );
     }
 
     /// Loop execution persists real run-state exactly like any other

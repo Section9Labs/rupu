@@ -782,6 +782,7 @@ fn overall_progress_fraction(state: &LiveRunState) -> f64 {
             StepKind::Branch => 0.0,
             StepKind::Split => 0.0,
             StepKind::Join => 0.0,
+            StepKind::Loop => 0.0,
             StepKind::Action => 0.0,
             StepKind::ApprovalGate => 0.0,
         })
@@ -1075,6 +1076,7 @@ pub fn render_graph(state: &LiveRunState, _workflow: &Workflow, width: usize) ->
             | StepKind::Branch
             | StepKind::Split
             | StepKind::Join
+            | StepKind::Loop
             | StepKind::Action
             | StepKind::ApprovalGate => {
                 let right = if matches!(step.status, NodeStatus::Complete) {

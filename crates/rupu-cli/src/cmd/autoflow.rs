@@ -4002,6 +4002,7 @@ fn step_kind_label(kind: StepKind) -> &'static str {
         StepKind::Branch => "branch",
         StepKind::Split => "split",
         StepKind::Join => "join",
+        StepKind::Loop => "loop",
         StepKind::Action => "action",
         StepKind::ApprovalGate => "gate",
     }

@@ -429,6 +429,24 @@ pub enum StepKind {
     /// what was actually a join node still deserializes fine — it just
     /// renders with the branch glyph, exactly as it always has.
     Join,
+    /// Bounded-loop super-node (`"loop:<name>"`, spec §2b-§2e) — the
+    /// synthetic node the scheduler dispatches to `run_loop_node`'s
+    /// bounded iteration driver instead of `run_node`. Phase 3: before
+    /// this variant existed, the loop super-node's own persisted
+    /// `StepResult` (and its `StepStarted` event) carried `kind: Split` —
+    /// a leftover from when loop execution was built directly on top of
+    /// the split machinery's already-live inline-resolution code path,
+    /// not a deliberate reuse the way `Split`/`Join` briefly reused
+    /// `Branch`. That mislabeled a loop as a `split` in the CLI
+    /// transcript/live-view and any other `StepKind` consumer. A REAL
+    /// `split:` node is unaffected — it still persists [`Self::Split`],
+    /// unchanged. A legacy on-disk `StepResult` with `kind: "split"` for
+    /// what was actually a loop super-node still deserializes fine as
+    /// [`Self::Split`] — it just renders with the split glyph, exactly as
+    /// it always has. Completes the orchestration-node-render consistency
+    /// arc started by `Split`/`Join`: split, join, and loop now all
+    /// render as themselves.
+    Loop,
     Action,
     ApprovalGate,
 }
@@ -3546,6 +3564,7 @@ mod tests {
             StepKind::Branch,
             StepKind::Split,
             StepKind::Join,
+            StepKind::Loop,
             StepKind::Action,
             StepKind::ApprovalGate,
         ] {
@@ -3580,6 +3599,39 @@ mod tests {
         assert_eq!(serde_json::to_string(&StepKind::Join).unwrap(), "\"join\"");
         let parsed: StepKind = serde_json::from_str("\"join\"").unwrap();
         assert_eq!(parsed, StepKind::Join);
+    }
+
+    /// Phase 3: `Loop`'s wire repr is exactly `"loop"` (the same
+    /// `snake_case` convention every other variant uses), and it round-trips
+    /// through the same JSONL shape a live loop-super-node `StepResult` is
+    /// persisted as. Mirrors [`step_kind_split_serializes_to_snake_case_split`].
+    #[test]
+    fn step_kind_loop_serializes_to_snake_case_loop() {
+        assert_eq!(serde_json::to_string(&StepKind::Loop).unwrap(), "\"loop\"");
+        let parsed: StepKind = serde_json::from_str("\"loop\"").unwrap();
+        assert_eq!(parsed, StepKind::Loop);
+    }
+
+    /// Phase 3, PRIMARY SAFETY INVARIANT: a legacy on-disk record with
+    /// `kind: "split"` — either a real split node, or (pre-this-task) a
+    /// loop super-node that was persisted under the reused `Split` variant
+    /// — still deserializes cleanly as `StepKind::Split`. Adding `Loop` is
+    /// additive; it must never break reading an old record.
+    #[test]
+    fn legacy_split_kind_record_still_deserializes_as_split() {
+        let json = serde_json::json!({
+            "step_id": "old_loop_or_split",
+            "run_id": "run_old",
+            "transcript_path": "",
+            "output": "",
+            "success": true,
+            "skipped": false,
+            "rendered_prompt": "",
+            "kind": "split",
+            "finished_at": Utc::now().to_rfc3339(),
+        });
+        let parsed: StepResultRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.kind, StepKind::Split);
     }
 
     #[test]
