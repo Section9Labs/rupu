@@ -2743,6 +2743,7 @@ mod tests {
             resume_claimed_at: None,
             resume_claimed_by: None,
             resume_mode: None,
+            resume_gate_id: None,
             issue_ref: None,
             issue: None,
             parent_run_id: None,

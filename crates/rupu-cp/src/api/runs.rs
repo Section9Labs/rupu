@@ -839,6 +839,7 @@ pub(crate) fn synthesize_unpersisted_run(
         resume_claimed_at: None,
         resume_claimed_by: None,
         resume_mode: None,
+        resume_gate_id: None,
         final_output: None,
     };
     let mut v = serde_json::to_value(&record).unwrap_or_else(|_| serde_json::json!({ "id": id }));
@@ -1273,6 +1274,7 @@ mod tests {
             resume_claimed_at: None,
             resume_claimed_by: None,
             resume_mode: None,
+            resume_gate_id: None,
             final_output: None,
         }
     }
@@ -1482,9 +1484,15 @@ mod tests {
         assert_eq!(loaded.awaiting.len(), 2);
         assert!(loaded.awaiting.iter().any(|g| g.step_id == "gate_a"));
         assert!(loaded.awaiting.iter().any(|g| g.step_id == "gate_b"));
-        // The derived-compat field the background worker reads to build its
-        // `--gate` argv now names the targeted gate.
+        // The derived-compat field now names the targeted gate too.
         assert_eq!(loaded.awaiting_step_id.as_deref(), Some("gate_b"));
+        // T5b-2b-i correctness fix: the MARKER itself carries the target
+        // gate — this is what the `cp serve` resume worker actually reads
+        // (via `resume_gate_id`, not the mutable `awaiting_step_id`) to
+        // build its `--gate` argv. Without this, the worker's spawned
+        // `workflow approve` hits `AmbiguousGate` on a still-2-gate run and
+        // the run is permanently stranded `AwaitingApproval`.
+        assert_eq!(loaded.resume_gate_id.as_deref(), Some("gate_b"));
     }
 
     #[tokio::test]

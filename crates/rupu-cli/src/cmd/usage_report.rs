@@ -729,6 +729,7 @@ mod tests {
             resume_claimed_at: None,
             resume_claimed_by: None,
             resume_mode: None,
+            resume_gate_id: None,
             issue_ref: Some("github:Section9Labs/rupu/issues/42".into()),
             issue: None,
             parent_run_id: None,

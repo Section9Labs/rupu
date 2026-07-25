@@ -278,6 +278,7 @@ impl WorkflowExecutor for InProcessExecutor {
                             resume_claimed_at: None,
                             resume_claimed_by: None,
                             resume_mode: None,
+                            resume_gate_id: None,
                             final_output: None,
                         },
                     );

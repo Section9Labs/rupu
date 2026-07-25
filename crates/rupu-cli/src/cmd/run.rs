@@ -949,6 +949,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             resume_claimed_at: None,
             resume_claimed_by: None,
             resume_mode: None,
+            resume_gate_id: None,
         };
         match store.create(rec, "") {
             Ok(_) => {}
@@ -1276,6 +1277,7 @@ mod tests {
             resume_claimed_at: None,
             resume_claimed_by: None,
             resume_mode: None,
+            resume_gate_id: None,
         };
         rupu_cp::api::runs::RunListRow::from(&rec)
     }

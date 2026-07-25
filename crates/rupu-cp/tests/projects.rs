@@ -60,6 +60,7 @@ fn seed_scoped_run(id: &str, ws_id: &str, proj_path: &Path, status: RunStatus) -
         resume_claimed_at: None,
         resume_claimed_by: None,
         resume_mode: None,
+        resume_gate_id: None,
         issue_ref: None,
         issue: None,
         parent_run_id: None,

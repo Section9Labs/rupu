@@ -255,6 +255,23 @@ pub struct RunRecord {
     /// [`RunStore::clear_resume`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_mode: Option<String>,
+    /// The SPECIFIC gate this marker targets, on a multi-gate
+    /// `AwaitingApproval` run (Task 5b-2b-i correctness fix, spec §7). Set
+    /// alongside `resume_requested_at`/`resume_mode` by
+    /// [`RunStore::request_resume_approval`] whenever the caller named a
+    /// gate explicitly (`gate_id: Some(_)`); `None` for a legacy/sole-gate
+    /// marker. This is the ONLY channel the marker itself carries the
+    /// target gate through to the background resume worker — reordering
+    /// `awaiting` so `awaiting_step_id` names the target (which
+    /// `request_resume_approval` also does) is NOT sufficient on its own:
+    /// `awaiting_step_id` is mutable state that a second concurrent
+    /// approve request can reorder again before this marker is consumed,
+    /// so the worker must read the target gate off the MARKER, not off
+    /// live record state. The worker passes `--gate <id>` to `workflow
+    /// approve` when this is `Some`, and omits it (sole-gate back-compat)
+    /// when `None`. Cleared by [`RunStore::clear_resume`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_gate_id: Option<String>,
     /// Final assistant text for an agent run (set by `rupu run`); `None` for
     /// workflow runs and older records. Carried by the mirror so a remotely
     /// dispatched unit's output is retrievable centrally.
@@ -1749,6 +1766,17 @@ impl RunStore {
         // the untouched byte-for-byte-identical path (whether `gate_id` is
         // `None`, or `Some` naming that sole gate); only a record with >1
         // parked gates needs the reorder-and-resync below.
+        //
+        // `resolved_gate_id` is separate from the `awaiting`
+        // reorder/`sync_awaiting_compat()` below: it's what actually gets
+        // persisted onto the MARKER itself (`record.resume_gate_id`,
+        // written further down). The reorder alone is not sufficient to
+        // get the target gate to the background resume worker — a second
+        // concurrent approve request could reorder `awaiting_step_id`
+        // again before this marker is consumed (T5b-2b-i correctness fix:
+        // the marker must carry its own immutable target, not rely on
+        // mutable live record state at resume time).
+        let mut resolved_gate_id: Option<String> = None;
         if record.status == RunStatus::AwaitingApproval {
             let gates = record.awaiting_gates();
             if gates.len() > 1 {
@@ -1772,19 +1800,24 @@ impl RunStore {
                         reordered.insert(0, target);
                         record.awaiting = reordered;
                         record.sync_awaiting_compat();
+                        resolved_gate_id = Some(id.to_string());
                     }
                 }
             } else if let Some(id) = gate_id {
                 // Sole-gate (or legacy compat-only) record: an explicit
                 // gate id must still name the one gate that's actually
                 // parked, but no reorder/resync is needed — the compat
-                // fields already mirror it.
+                // fields already mirror it. Still recorded on the marker
+                // (harmless — `approve_gate(Some(sole)) ==
+                // approve_gate(None)` — but robust against the same
+                // race the multi-gate branch above guards against).
                 if !gates.iter().any(|g| g.step_id == id) {
                     return Err(ApprovalError::GateNotFound {
                         run_id: run_id.to_string(),
                         step_id: id.to_string(),
                     });
                 }
+                resolved_gate_id = Some(id.to_string());
             }
         }
         // The approval-gate case always has `awaiting_step_id` set (the
@@ -1809,6 +1842,7 @@ impl RunStore {
         record.resume_mode = mode
             .filter(|m| matches!(*m, "ask" | "bypass" | "readonly"))
             .map(str::to_string);
+        record.resume_gate_id = resolved_gate_id;
         self.update(&record)?;
         Ok(ApprovalDecision::Approved {
             run_id: run_id.to_string(),
@@ -1881,6 +1915,7 @@ impl RunStore {
         record.resume_claimed_at = None;
         record.resume_claimed_by = None;
         record.resume_mode = None;
+        record.resume_gate_id = None;
         self.update(&record)?;
         Ok(())
     }
@@ -2303,6 +2338,7 @@ mod tests {
             resume_claimed_at: None,
             resume_claimed_by: None,
             resume_mode: None,
+            resume_gate_id: None,
             final_output: None,
         }
     }
@@ -3544,6 +3580,10 @@ mod tests {
         assert!(reloaded.approval_prompt.is_some());
         assert!(reloaded.awaiting_since.is_some());
         assert_eq!(reloaded.resume_requested_at, Some(now));
+        // `gate_id: None` and only one gate parked — the marker carries no
+        // gate id at all (the resume worker omits `--gate`, byte-for-byte
+        // the pre-T5b-2b-i behavior).
+        assert_eq!(reloaded.resume_gate_id, None);
     }
 
     /// A 2-gate `AwaitingApproval` record — both `gate_a` and `gate_b`
@@ -3573,10 +3613,16 @@ mod tests {
     #[test]
     fn request_resume_approval_with_gate_targets_that_gate_on_a_multi_gate_run() {
         // Task 5b-2b (spec §7): the web marker path has no way to hand the
-        // target gate id directly to the resume worker, so it reorders
-        // `awaiting` so the targeted gate is first and re-syncs the
-        // derived-compat `awaiting_step_id` — the field the worker already
-        // reads to build its `--gate` argv.
+        // target gate id directly to the resume worker, so it BOTH reorders
+        // `awaiting` (so the targeted gate is first and the derived-compat
+        // `awaiting_step_id` names it — useful for display / a first
+        // approximation) AND persists it on `resume_gate_id`, the field the
+        // marker itself carries the target through on (T5b-2b-i
+        // correctness fix: `awaiting_step_id` is live, mutable record
+        // state a second concurrent approve request could reorder again
+        // before the async resume worker gets to it — the worker reads
+        // `resume_gate_id`, not `awaiting_step_id`, for exactly that
+        // reason; see that field's doc).
         let tmp = TempDir::new().unwrap();
         let store = RunStore::new(tmp.path().to_path_buf());
         let rec = multi_gate_awaiting_record("run_resume_multi_b");
@@ -3601,10 +3647,12 @@ mod tests {
         assert_eq!(reloaded.awaiting.len(), 2);
         assert!(reloaded.awaiting.iter().any(|g| g.step_id == "gate_a"));
         assert!(reloaded.awaiting.iter().any(|g| g.step_id == "gate_b"));
-        // gate_b is now first, so the derived-compat field the worker reads
-        // names it.
+        // gate_b is now first, so the derived-compat field names it too.
         assert_eq!(reloaded.awaiting_step_id.as_deref(), Some("gate_b"));
         assert_eq!(reloaded.resume_requested_at, Some(now));
+        // The marker itself carries the target gate — this is what the
+        // resume worker actually reads to build its `--gate` argv.
+        assert_eq!(reloaded.resume_gate_id.as_deref(), Some("gate_b"));
     }
 
     #[test]
@@ -3648,8 +3696,15 @@ mod tests {
     #[test]
     fn request_resume_approval_with_gate_id_matching_sole_gate_is_unchanged() {
         // Sole-gate parity: an explicit `gate_id` that happens to name the
-        // one parked gate on a 1-gate run behaves exactly like `None` —
-        // primary safety invariant.
+        // one parked gate on a 1-gate run resolves/resumes identically to
+        // `None` — primary safety invariant (`approve_gate(Some(sole)) ==
+        // approve_gate(None)`). The marker DOES still record
+        // `resume_gate_id: Some("deploy")` here (harmless — the worker's
+        // `--gate deploy` on a sole gate is a no-op-equivalent to omitting
+        // it), which is a deliberate robustness choice, not a behavior
+        // change: contrast with `request_resume_approval_is_marker_only_and_stays_awaiting`
+        // below, which omits `gate_id` entirely and asserts
+        // `resume_gate_id` stays `None`.
         let tmp = TempDir::new().unwrap();
         let store = RunStore::new(tmp.path().to_path_buf());
         let rec = awaiting_record("run_resume_sole_gate_named");
@@ -3670,6 +3725,7 @@ mod tests {
         assert_eq!(reloaded.status, RunStatus::AwaitingApproval);
         assert_eq!(reloaded.awaiting_step_id.as_deref(), Some("deploy"));
         assert_eq!(reloaded.resume_requested_at, Some(now));
+        assert_eq!(reloaded.resume_gate_id.as_deref(), Some("deploy"));
     }
 
     #[test]

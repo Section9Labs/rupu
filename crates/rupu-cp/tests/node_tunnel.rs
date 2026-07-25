@@ -1312,6 +1312,7 @@ fn mirrored_awaiting_run_is_not_pending_resume() {
         resume_claimed_at: None,
         resume_claimed_by: None,
         resume_mode: None,
+        resume_gate_id: None,
         final_output: None,
     };
     store.create(rec, "").unwrap();
@@ -1372,6 +1373,7 @@ fn mirrored_awaiting_run_is_not_pending_resume_ssh_host() {
         resume_claimed_at: None,
         resume_claimed_by: None,
         resume_mode: None,
+        resume_gate_id: None,
         final_output: None,
     };
     store.create(rec, "").unwrap();
@@ -1427,6 +1429,7 @@ fn mirrored_awaiting_run_is_not_pending_resume_bucket_host() {
         resume_claimed_at: None,
         resume_claimed_by: None,
         resume_mode: None,
+        resume_gate_id: None,
         final_output: None,
     };
     store.create(rec, "").unwrap();

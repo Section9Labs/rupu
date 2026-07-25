@@ -13338,6 +13338,7 @@ steps:
             resume_claimed_at: None,
             resume_claimed_by: None,
             resume_mode: None,
+            resume_gate_id: None,
             active_step_transcript_path: None,
             final_output: None,
         };
@@ -13485,6 +13486,7 @@ steps:
             resume_claimed_at: None,
             resume_claimed_by: None,
             resume_mode: None,
+            resume_gate_id: None,
             active_step_transcript_path: None,
             final_output: None,
         };
@@ -13617,6 +13619,7 @@ steps:
             resume_claimed_at: None,
             resume_claimed_by: None,
             resume_mode: None,
+            resume_gate_id: None,
             active_step_transcript_path: None,
             final_output: None,
         };
@@ -13764,6 +13767,7 @@ steps:
             resume_claimed_at: None,
             resume_claimed_by: None,
             resume_mode: None,
+            resume_gate_id: None,
             active_step_transcript_path: None,
             final_output: None,
         };
@@ -13901,6 +13905,7 @@ steps:
             resume_claimed_at: None,
             resume_claimed_by: None,
             resume_mode: None,
+            resume_gate_id: None,
             active_step_transcript_path: None,
             final_output: None,
         };
@@ -14030,6 +14035,7 @@ steps:
                     resume_claimed_at: None,
                     resume_claimed_by: None,
                     resume_mode: None,
+                    resume_gate_id: None,
                     active_step_transcript_path: None,
                     final_output: None,
                 },
@@ -14175,6 +14181,7 @@ steps:
                     resume_claimed_at: None,
                     resume_claimed_by: None,
                     resume_mode: None,
+                    resume_gate_id: None,
                     active_step_transcript_path: None,
                     final_output: None,
                 },
@@ -14345,6 +14352,7 @@ steps:
                     resume_claimed_at: None,
                     resume_claimed_by: None,
                     resume_mode: None,
+                    resume_gate_id: None,
                     active_step_transcript_path: None,
                     final_output: None,
                 },

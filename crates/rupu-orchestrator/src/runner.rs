@@ -660,6 +660,7 @@ pub async fn run_workflow(
                 resume_claimed_at: None,
                 resume_claimed_by: None,
                 resume_mode: None,
+                resume_gate_id: None,
                 final_output: None,
             };
             Some(store.create(record, yaml).map_err(map_run_store_err)?)

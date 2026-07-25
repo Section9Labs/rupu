@@ -564,55 +564,108 @@ async fn run_resume_worker(
             };
             let store = Arc::clone(&store);
             let run_id = run.id.clone();
-            tokio::spawn(async move {
-                let now2 = chrono::Utc::now();
-                // Capture the requested resume mode while the marker is still
-                // present, then hand the run off to a detached
-                // `rupu workflow <subcommand> <run_id> [--mode <m>]` child.
-                // The child does `store.approve`/the checkpoint-resume flip +
-                // the in-process resume in ITS OWN process, so the resumed
-                // run is independently killable (Cancel) and a resume crash
-                // can't take down `cp serve`. The web marker leaves the run
-                // AwaitingApproval/Paused, so the child's precondition holds.
-                let mode = store.load(&run_id).ok().and_then(|r| r.resume_mode.clone());
+            tokio::spawn(resume_one_run(store, run_id, subcommand, None));
+        }
+    }
+}
 
-                let exe = match std::env::current_exe() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!(run_id = %run_id, error = %e, "resume worker: cannot resolve current exe; clearing marker");
-                        if let Err(ce) = store.clear_resume(&run_id, now2) {
-                            tracing::warn!(run_id = %run_id, error = %ce, "resume worker: clear_resume failed");
-                        }
-                        return;
-                    }
-                };
+/// Build the `rupu workflow <subcommand> <run_id> [--gate <g>] [--mode <m>]`
+/// argv the resume worker spawns for a claimed run. Pure + independently
+/// testable (T5b-2b-i correctness fix, spec §7): `gate` MUST come from the
+/// run's `resume_gate_id` MARKER field, not live `awaiting_step_id` — a
+/// second concurrent approve request can reorder the latter before this
+/// runs, but the marker is immutable once written (see `resume_gate_id`'s
+/// doc on `RunRecord`) — and is only ever appended for the `approve`
+/// subcommand: a `Paused` resume (`workflow resume`) has no gate concept.
+///
+/// Without `--gate` on a genuinely >1-gate run, `workflow approve` hits
+/// `AmbiguousGate` and the detached child exits non-zero — but the caller
+/// already cleared the marker on a successful SPAWN (not on the child's
+/// eventual exit status, which it can't observe — the child is detached),
+/// so a missing `--gate` here permanently strands the run
+/// `AwaitingApproval` with every gate still parked. This was a real,
+/// shipped bug (fixed as part of T5b-2b-i) — see
+/// `resume_one_run_passes_the_markers_gate_id_to_the_spawned_approve_child`
+/// for the regression test.
+fn build_resume_argv<'a>(
+    subcommand: &'a str,
+    run_id: &'a str,
+    gate: Option<&'a str>,
+    mode: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut argv: Vec<&str> = vec!["workflow", subcommand, run_id];
+    if subcommand == "approve" {
+        if let Some(g) = gate {
+            argv.push("--gate");
+            argv.push(g);
+        }
+    }
+    if let Some(m) = mode {
+        argv.push("--mode");
+        argv.push(m);
+    }
+    argv
+}
 
-                let mut argv: Vec<&str> = vec!["workflow", subcommand, &run_id];
-                if let Some(m) = mode.as_deref() {
-                    argv.push("--mode");
-                    argv.push(m);
+/// Resolve + spawn the detached `rupu workflow <subcommand> <run_id> [...]`
+/// child for ONE already-claimed run (the resume worker's per-run body,
+/// extracted so tests can drive it directly instead of waiting out the
+/// worker's 4s poll interval), then clear its resume marker on either a
+/// successful spawn (the child now owns the run) or a failed one (so a
+/// poisoned run isn't retried forever).
+///
+/// Captures the requested resume mode AND the targeted gate (T5b-2b-i) from
+/// the run's marker fields (`resume_mode`/`resume_gate_id`) while the
+/// marker is still present, then hands off to
+/// [`build_resume_argv`]. `exe_override` lets tests point at a fake
+/// executable instead of `std::env::current_exe()` (the production
+/// default, used when `None`) — e.g. a capture script that records its
+/// argv, so a test can assert on the EXACT argv the real `rupu` binary
+/// would have received, rather than just on marker-field plumbing.
+async fn resume_one_run(
+    store: Arc<RunStore>,
+    run_id: String,
+    subcommand: &'static str,
+    exe_override: Option<std::path::PathBuf>,
+) {
+    let now2 = chrono::Utc::now();
+    let loaded = store.load(&run_id).ok();
+    let mode = loaded.as_ref().and_then(|r| r.resume_mode.clone());
+    let gate = loaded.as_ref().and_then(|r| r.resume_gate_id.clone());
+
+    let exe = match exe_override {
+        Some(p) => p,
+        None => match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(run_id = %run_id, error = %e, "resume worker: cannot resolve current exe; clearing marker");
+                if let Err(ce) = store.clear_resume(&run_id, now2) {
+                    tracing::warn!(run_id = %run_id, error = %ce, "resume worker: clear_resume failed");
                 }
+                return;
+            }
+        },
+    };
 
-                match std::process::Command::new(&exe).args(&argv).spawn() {
-                    Ok(_child) => {
-                        // Detached: do NOT wait. The child now owns the run;
-                        // clear the marker so we don't re-claim it.
-                        tracing::info!(run_id = %run_id, subcommand, "spawned workflow subprocess to resume");
-                        if let Err(ce) = store.clear_resume(&run_id, now2) {
-                            tracing::warn!(run_id = %run_id, error = %ce, "resume worker: clear_resume failed");
-                        } else {
-                            tracing::info!(run_id = %run_id, "resume worker: cleared resume marker");
-                        }
-                    }
-                    Err(e) => {
-                        // Don't retry a poisoned spawn forever; clear marker.
-                        tracing::error!(run_id = %run_id, subcommand, error = %e, "resume worker: spawn workflow subprocess failed; clearing marker");
-                        if let Err(ce) = store.clear_resume(&run_id, now2) {
-                            tracing::warn!(run_id = %run_id, error = %ce, "resume worker: clear_resume failed");
-                        }
-                    }
-                }
-            });
+    let argv = build_resume_argv(subcommand, &run_id, gate.as_deref(), mode.as_deref());
+
+    match std::process::Command::new(&exe).args(&argv).spawn() {
+        Ok(_child) => {
+            // Detached: do NOT wait. The child now owns the run;
+            // clear the marker so we don't re-claim it.
+            tracing::info!(run_id = %run_id, subcommand, "spawned workflow subprocess to resume");
+            if let Err(ce) = store.clear_resume(&run_id, now2) {
+                tracing::warn!(run_id = %run_id, error = %ce, "resume worker: clear_resume failed");
+            } else {
+                tracing::info!(run_id = %run_id, "resume worker: cleared resume marker");
+            }
+        }
+        Err(e) => {
+            // Don't retry a poisoned spawn forever; clear marker.
+            tracing::error!(run_id = %run_id, subcommand, error = %e, "resume worker: spawn workflow subprocess failed; clearing marker");
+            if let Err(ce) = store.clear_resume(&run_id, now2) {
+                tracing::warn!(run_id = %run_id, error = %ce, "resume worker: clear_resume failed");
+            }
         }
     }
 }
@@ -890,11 +943,247 @@ async fn run_gate_sweep(
 
 #[cfg(test)]
 mod tests {
-    use super::{run_gate_sweep, run_periodic_tick, sweep_decision, SweepAction};
+    use super::{
+        build_resume_argv, resume_one_run, run_gate_sweep, run_periodic_tick, sweep_decision,
+        SweepAction,
+    };
     use rupu_orchestrator::{RunStatus, TimeoutAction};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    // ── T5b-2b-i correctness fix: the resume worker's gate-id round-trip ──
+
+    #[test]
+    fn build_resume_argv_includes_gate_only_for_approve_when_present() {
+        // The bug: on a >1-gate run, the worker used to omit `--gate`
+        // entirely, so the spawned `workflow approve` hit `AmbiguousGate`
+        // and exited non-zero while the marker had already been cleared —
+        // permanently stranding the run `AwaitingApproval` with every gate
+        // still parked. `--gate` must be present whenever a gate id was
+        // resolved AND the subcommand is `approve`.
+        assert_eq!(
+            build_resume_argv("approve", "run_x", Some("gate_b"), None),
+            vec!["workflow", "approve", "run_x", "--gate", "gate_b"],
+        );
+        // Legacy/sole-gate marker (no gate id resolved) — back-compat,
+        // `--gate` omitted exactly like before this field existed.
+        assert_eq!(
+            build_resume_argv("approve", "run_x", None, None),
+            vec!["workflow", "approve", "run_x"],
+        );
+        // `--mode` composes with `--gate`.
+        assert_eq!(
+            build_resume_argv("approve", "run_x", Some("gate_b"), Some("bypass")),
+            vec!["workflow", "approve", "run_x", "--gate", "gate_b", "--mode", "bypass"],
+        );
+        // `workflow resume` (a cooperative-pause resume) has no gate
+        // concept — `--gate` must never appear even if `gate` is `Some`
+        // (e.g. a stale marker field left over from a different flow).
+        assert_eq!(
+            build_resume_argv("resume", "run_x", Some("gate_b"), None),
+            vec!["workflow", "resume", "run_x"],
+        );
+    }
+
+    /// A 2-gate `AwaitingApproval` run for the resume-worker round-trip
+    /// tests — both `gate_a` and `gate_b` genuinely parked.
+    fn multi_gate_resume_record(id: &str) -> rupu_orchestrator::RunRecord {
+        use rupu_orchestrator::runs::AwaitingGate;
+        let now = chrono::Utc::now();
+        let mut rec = rupu_orchestrator::RunRecord {
+            id: id.into(),
+            workflow_name: "g".into(),
+            status: RunStatus::AwaitingApproval,
+            inputs: std::collections::BTreeMap::new(),
+            event: None,
+            workspace_id: "ws_1".into(),
+            workspace_path: std::path::PathBuf::from("/tmp/proj"),
+            transcript_dir: std::path::PathBuf::from("/tmp/proj/.rupu/transcripts"),
+            started_at: now,
+            finished_at: None,
+            final_output: None,
+            error_message: None,
+            awaiting: vec![
+                AwaitingGate {
+                    step_id: "gate_a".into(),
+                    prompt: Some("approve a?".into()),
+                    since: now,
+                    expires_at: None,
+                },
+                AwaitingGate {
+                    step_id: "gate_b".into(),
+                    prompt: Some("approve b?".into()),
+                    since: now,
+                    expires_at: None,
+                },
+            ],
+            awaiting_step_id: None,
+            approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            resume_gate_id: None,
+        };
+        rec.sync_awaiting_compat();
+        rec
+    }
+
+    /// The full round-trip this bug slipped through on: a web operator
+    /// approves gate_b of a 2-gate run (`request_resume_approval` — the
+    /// EXACT call `api/runs.rs`'s `approve_run` makes), which sets the
+    /// `resume_gate_id` marker; `resume_one_run` (the resume worker's
+    /// per-run body) then reads that marker and spawns the child with
+    /// `--gate gate_b` in its REAL argv — verified by pointing the spawn at
+    /// a capture script instead of a real `rupu` binary, so this asserts on
+    /// the literal argv a production spawn would receive, not just on
+    /// marker-field plumbing. Must FAIL on the pre-fix code (which had no
+    /// `resume_gate_id` field/argv wiring at all — verified via a temporary
+    /// revert, see the T5b-2b-i report) and PASS with the fix.
+    #[tokio::test]
+    async fn resume_one_run_passes_the_markers_gate_id_to_the_spawned_approve_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
+        let rec = multi_gate_resume_record("run_resume_worker_gate_b");
+        store
+            .create(
+                rec.clone(),
+                "name: g\nsteps:\n  - id: gate_a\n    approval: {}\n  - id: gate_b\n    approval: {}\n",
+            )
+            .unwrap();
+
+        // Simulate the web operator approving gate_b specifically — the
+        // exact `RunStore` call `POST /api/runs/:id/approve?gate=gate_b`
+        // makes (api/runs.rs's `approve_run`).
+        let now = chrono::Utc::now();
+        store
+            .request_resume_approval(&rec.id, "web", None, now, Some("gate_b"))
+            .expect("approving gate_b of a 2-gate run should succeed");
+        // Sanity: the marker really does carry the target gate.
+        assert_eq!(
+            store.load(&rec.id).unwrap().resume_gate_id.as_deref(),
+            Some("gate_b")
+        );
+
+        // A capture script standing in for the real `rupu` binary: appends
+        // its argv to a file instead of actually running anything.
+        let capture_path = tmp.path().join("captured_argv.txt");
+        let script_path = tmp.path().join("capture.sh");
+        std::fs::write(
+            &script_path,
+            format!("#!/bin/sh\necho \"$@\" >> {}\n", capture_path.display()),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        resume_one_run(
+            Arc::clone(&store),
+            rec.id.clone(),
+            "approve",
+            Some(script_path),
+        )
+        .await;
+
+        // The script runs asynchronously (detached, not awaited by
+        // `resume_one_run` itself) — poll briefly for its output.
+        let mut captured = None;
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&capture_path) {
+                captured = Some(s);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let captured = captured.expect("capture script should have run and recorded its argv");
+        assert!(
+            captured.contains("--gate gate_b"),
+            "spawned child's argv was: {captured:?} — missing --gate gate_b"
+        );
+        // gate_a must not appear as the target.
+        assert!(!captured.contains("--gate gate_a"));
+
+        // The marker was cleared (spawn succeeded) — the child now owns
+        // resolving gate_b for real.
+        let reloaded = store.load(&rec.id).unwrap();
+        assert!(reloaded.resume_requested_at.is_none());
+        assert!(reloaded.resume_gate_id.is_none());
+    }
+
+    /// Single-gate parity: a legacy/sole-gate marker (`resume_gate_id:
+    /// None`) must still spawn a working `workflow approve` — `--gate`
+    /// omitted, exactly like before this field existed.
+    #[tokio::test]
+    async fn resume_one_run_omits_gate_for_a_sole_gate_marker() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
+        let mut rec = multi_gate_resume_record("run_resume_worker_sole");
+        // Collapse to a single parked gate.
+        rec.awaiting.truncate(1);
+        rec.sync_awaiting_compat();
+        store
+            .create(rec.clone(), "name: g\nsteps:\n  - id: gate_a\n    approval: {}\n")
+            .unwrap();
+
+        let now = chrono::Utc::now();
+        store
+            .request_resume_approval(&rec.id, "web", None, now, None)
+            .expect("approving the sole gate with no explicit id should work as today");
+        assert_eq!(store.load(&rec.id).unwrap().resume_gate_id, None);
+
+        let capture_path = tmp.path().join("captured_argv.txt");
+        let script_path = tmp.path().join("capture.sh");
+        std::fs::write(
+            &script_path,
+            format!("#!/bin/sh\necho \"$@\" >> {}\n", capture_path.display()),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        resume_one_run(
+            Arc::clone(&store),
+            rec.id.clone(),
+            "approve",
+            Some(script_path),
+        )
+        .await;
+
+        let mut captured = None;
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&capture_path) {
+                captured = Some(s);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let captured = captured.expect("capture script should have run and recorded its argv");
+        assert!(
+            !captured.contains("--gate"),
+            "sole-gate resume must not pass --gate: {captured:?}"
+        );
+    }
 
     /// gate_a: `timeout_seconds: 10`, `on_timeout: reject`, no `on_reject:`
     /// (an empty chain — `cheap_on_reject_chain_len` short-circuits before
@@ -969,6 +1258,7 @@ mod tests {
             resume_claimed_at: None,
             resume_claimed_by: None,
             resume_mode: None,
+            resume_gate_id: None,
         };
         rec.sync_awaiting_compat();
         store.create(rec.clone(), GATE_A_REJECT_GATE_B_NONE_YAML).unwrap();
@@ -1073,6 +1363,7 @@ mod tests {
             resume_claimed_at: None,
             resume_claimed_by: None,
             resume_mode: None,
+            resume_gate_id: None,
         };
         rec.sync_awaiting_compat();
         store
@@ -1144,6 +1435,7 @@ mod tests {
             resume_claimed_at: None,
             resume_claimed_by: None,
             resume_mode: None,
+            resume_gate_id: None,
         };
         store.create(rec.clone(), GATE_A_REJECT_GATE_B_NONE_YAML).unwrap();
 

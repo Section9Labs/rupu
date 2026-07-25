@@ -1130,6 +1130,7 @@ mod tests {
             resume_claimed_at: None,
             resume_claimed_by: None,
             resume_mode: None,
+            resume_gate_id: None,
             final_output: None,
         };
         s.run_store.create(record, "name: wf\n").unwrap();
