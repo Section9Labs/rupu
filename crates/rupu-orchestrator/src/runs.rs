@@ -150,7 +150,7 @@ pub struct RunRecord {
     /// [`RunRecord::awaiting_gates`] rather than by a load-time rewrite,
     /// so an old `run.json` a caller merely READS (never mutates) round-
     /// trips byte-for-byte with its legacy shape intact.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub awaiting: Vec<AwaitingGate>,
     /// id of the step the run is paused at, if any. DERIVED COMPAT — see
     /// `awaiting` above; authoritative only for a legacy record where
@@ -1049,10 +1049,21 @@ impl RunStore {
         match action {
             TimeoutAction::Fail => {
                 record.status = RunStatus::Failed;
-                // Keep awaiting_step_id / approval_prompt around so
-                // post-mortem inspection can see what was missed; clear
-                // expires_at so subsequent reads don't re-expire.
-                record.expires_at = None;
+                // Task 5b-1 follow-up: clear the timed-out gate from
+                // `awaiting` and re-sync the compat fields so a terminal
+                // (Failed) record has NO parked gate in EITHER
+                // representation. Leaving `awaiting` populated here while
+                // clearing only `expires_at` (this arm's pre-5b-1 shape)
+                // left `awaiting=[gate]` disagreeing with
+                // `awaiting_step_id: None` on a Failed run — invisible
+                // while every reader still used the compat fields, but a
+                // phantom parked gate the moment a reader (Task 5b-2)
+                // switches to `awaiting`. The step id this arm used to
+                // keep the compat fields around for (post-mortem
+                // inspection) is preserved anyway: `error_message`,
+                // built above, embeds it.
+                record.awaiting.clear();
+                record.sync_awaiting_compat();
                 self.update(record)?;
                 self.append_terminal_event(
                     &record.id,
@@ -1069,10 +1080,13 @@ impl RunStore {
             }
             TimeoutAction::Reject => {
                 record.status = RunStatus::Rejected;
-                record.awaiting_step_id = None;
-                record.approval_prompt = None;
-                record.awaiting_since = None;
-                record.expires_at = None;
+                // Task 5b-1 follow-up: clear via the set + sync (not the
+                // four manual field-assignments this arm used before) so
+                // `awaiting` and the compat fields agree on this
+                // terminal record — see the Fail arm's comment above for
+                // the full rationale (same fix, same reasoning).
+                record.awaiting.clear();
+                record.sync_awaiting_compat();
                 self.update(record)?;
                 self.append_terminal_event(
                     &record.id,
@@ -2541,6 +2555,91 @@ mod tests {
         }
     }
 
+    /// Confirmed-latent bug from 5b-1 review: on the timeout Fail/Reject
+    /// terminal paths, `record.awaiting` must end up empty IN SYNC with
+    /// the compat fields — before this fix, those two arms cleared only
+    /// the compat fields, leaving a populated `awaiting` set (the real
+    /// shape `run_workflow`'s Approval-pause handling persists post-5b-1)
+    /// disagreeing with `awaiting_step_id: None` on a terminal record: a
+    /// phantom parked gate, invisible only because every reader still
+    /// used the compat fields. The pre-existing timeout tests never
+    /// caught this because they build a legacy record (`awaiting: []`,
+    /// only the compat fields set) directly rather than the populated-set
+    /// shape a real batch-park produces — this helper simulates THAT
+    /// shape.
+    fn awaiting_set_record_for_timeout(id: &str, now: DateTime<Utc>) -> RunRecord {
+        let mut rec = sample_record(id);
+        rec.status = RunStatus::AwaitingApproval;
+        rec.awaiting = vec![AwaitingGate {
+            step_id: "deploy".into(),
+            prompt: Some("ok?".into()),
+            since: now - chrono::Duration::seconds(120),
+            expires_at: Some(now - chrono::Duration::seconds(30)),
+        }];
+        rec.sync_awaiting_compat();
+        rec
+    }
+
+    #[test]
+    fn expire_if_overdue_on_timeout_fail_clears_awaiting_set_in_sync_with_compat_fields() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let rec = awaiting_set_record_for_timeout("run_timeout_fail_sync", now);
+        let run_id = rec.id.clone();
+        store.create(rec.clone(), "x").unwrap();
+
+        let mut loaded = rec;
+        let outcome = store
+            .expire_if_overdue(&mut loaded, now, Some(TimeoutAction::Fail))
+            .unwrap();
+        assert_eq!(outcome, Some(TimeoutAction::Fail));
+        assert_eq!(loaded.status, RunStatus::Failed);
+        // `awaiting` and the compat fields must AGREE — both empty.
+        assert!(
+            loaded.awaiting.is_empty(),
+            "phantom parked gate on a Failed record: {:?}",
+            loaded.awaiting
+        );
+        assert!(loaded.awaiting_step_id.is_none());
+        assert!(loaded.approval_prompt.is_none());
+        assert!(loaded.awaiting_since.is_none());
+        assert!(loaded.expires_at.is_none());
+        // Persisted to disk too — not just the in-memory `loaded`.
+        let reloaded = store.load(&run_id).unwrap();
+        assert!(reloaded.awaiting.is_empty());
+        assert!(reloaded.awaiting_step_id.is_none());
+    }
+
+    #[test]
+    fn expire_if_overdue_on_timeout_reject_clears_awaiting_set_in_sync_with_compat_fields() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let rec = awaiting_set_record_for_timeout("run_timeout_reject_sync", now);
+        let run_id = rec.id.clone();
+        store.create(rec.clone(), "x").unwrap();
+
+        let mut loaded = rec;
+        let outcome = store
+            .expire_if_overdue(&mut loaded, now, Some(TimeoutAction::Reject))
+            .unwrap();
+        assert_eq!(outcome, Some(TimeoutAction::Reject));
+        assert_eq!(loaded.status, RunStatus::Rejected);
+        assert!(
+            loaded.awaiting.is_empty(),
+            "phantom parked gate on a Rejected record: {:?}",
+            loaded.awaiting
+        );
+        assert!(loaded.awaiting_step_id.is_none());
+        assert!(loaded.approval_prompt.is_none());
+        assert!(loaded.awaiting_since.is_none());
+        assert!(loaded.expires_at.is_none());
+        let reloaded = store.load(&run_id).unwrap();
+        assert!(reloaded.awaiting.is_empty());
+        assert!(reloaded.awaiting_step_id.is_none());
+    }
+
     #[test]
     fn expire_if_overdue_is_idempotent() {
         let tmp = TempDir::new().unwrap();
@@ -2769,6 +2868,60 @@ mod tests {
         let reloaded = store.load(&rec.id).unwrap();
         assert!(reloaded.awaiting.is_empty());
         assert_eq!(reloaded.awaiting_step_id.as_deref(), Some("deploy"));
+    }
+
+    #[test]
+    fn record_json_with_no_awaiting_key_at_all_deserializes_and_normalizes() {
+        // The REAL migration case: a `run.json` written before `awaiting`
+        // existed has no such key in the file at all — not even `[]`.
+        // `#[serde(default)]` must produce an empty `Vec` from a wholly
+        // ABSENT key (the earlier round-trip tests only ever exercise a
+        // record built from the `RunRecord` struct itself, which always
+        // serializes SOME value for every field pre-5b-1-serde-attribute
+        // or none at all now that `skip_serializing_if` is set — neither
+        // proves the absent-key case a genuinely pre-existing on-disk
+        // file has). Hand-written JSON, not constructed via the struct.
+        let json = r#"{
+            "id": "run_hand_written_legacy",
+            "workflow_name": "investigate-then-fix",
+            "status": "awaiting_approval",
+            "inputs": {},
+            "workspace_id": "ws_1",
+            "workspace_path": "/tmp/proj",
+            "transcript_dir": "/tmp/proj/.rupu/transcripts",
+            "started_at": "2026-01-01T00:00:00Z",
+            "awaiting_step_id": "deploy",
+            "approval_prompt": "ok?",
+            "awaiting_since": "2026-01-01T00:05:00Z"
+        }"#;
+        let rec: RunRecord = serde_json::from_str(json).expect("no `awaiting` key must still parse");
+        assert!(
+            rec.awaiting.is_empty(),
+            "absent key must default to empty, not error or synthesize eagerly"
+        );
+        assert_eq!(rec.awaiting_step_id.as_deref(), Some("deploy"));
+
+        let gates = rec.awaiting_gates();
+        assert_eq!(gates.len(), 1, "normalizes to a one-element set on demand");
+        assert_eq!(gates[0].step_id, "deploy");
+        assert_eq!(gates[0].prompt.as_deref(), Some("ok?"));
+    }
+
+    #[test]
+    fn empty_awaiting_set_does_not_grow_an_awaiting_key_on_serialize() {
+        // Mirrors how `next` is skipped on `Step` when empty — an empty
+        // `awaiting` must not add a `"awaiting": []` key when a legacy or
+        // terminal record re-persists, so a pre-5b-1 `run.json` (or a
+        // just-expired/approved/rejected one, post the sync fix above)
+        // stays byte-identical on rewrite instead of silently growing a
+        // new key every future task would then have to tolerate too.
+        let rec = sample_record("run_no_awaiting_key_on_write");
+        assert!(rec.awaiting.is_empty());
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(
+            !json.contains("\"awaiting\""),
+            "empty `awaiting` must be omitted from the serialized record, got: {json}"
+        );
     }
 
     #[test]
