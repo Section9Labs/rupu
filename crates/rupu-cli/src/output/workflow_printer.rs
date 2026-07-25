@@ -830,6 +830,7 @@ fn replay_step_result_history(
         StepKind::Linear
         | StepKind::Branch
         | StepKind::Split
+        | StepKind::Join
         | StepKind::Action
         | StepKind::ApprovalGate => replay_linear_step_history(state, rec, view_mode, prefs),
         StepKind::ForEach | StepKind::Parallel | StepKind::Panel => {
@@ -1022,6 +1023,7 @@ fn append_step_result_lines(
         StepKind::Linear
         | StepKind::Branch
         | StepKind::Split
+        | StepKind::Join
         | StepKind::Action
         | StepKind::ApprovalGate => {
             let status = if rec.success {
@@ -1094,6 +1096,7 @@ fn append_step_result_lines(
                 StepKind::Linear => unreachable!(),
                 StepKind::Branch => unreachable!(),
                 StepKind::Split => unreachable!(),
+                StepKind::Join => unreachable!(),
                 StepKind::Action => unreachable!(),
                 StepKind::ApprovalGate => unreachable!(),
             };
@@ -1148,6 +1151,7 @@ fn append_fanout_item_lines(
             StepKind::Linear => unreachable!(),
             StepKind::Branch => unreachable!(),
             StepKind::Split => unreachable!(),
+            StepKind::Join => unreachable!(),
             StepKind::Action => unreachable!(),
             StepKind::ApprovalGate => unreachable!(),
         };
@@ -2698,6 +2702,7 @@ fn drain_step_results(
             StepKind::Linear
             | StepKind::Branch
             | StepKind::Split
+            | StepKind::Join
             | StepKind::Action
             | StepKind::ApprovalGate => {
                 // Linear step — open a tailer if we have a transcript.
@@ -2756,6 +2761,7 @@ fn render_fanout_step(
         StepKind::Linear => unreachable!("render_fanout_step called for linear step"),
         StepKind::Branch => unreachable!("render_fanout_step called for branch step"),
         StepKind::Split => unreachable!("render_fanout_step called for split step"),
+        StepKind::Join => unreachable!("render_fanout_step called for join step"),
         StepKind::Action => unreachable!("render_fanout_step called for action step"),
         StepKind::ApprovalGate => unreachable!("render_fanout_step called for gate step"),
     };
@@ -2792,6 +2798,7 @@ fn render_fanout_step(
         StepKind::Linear => unreachable!(),
         StepKind::Branch => unreachable!(),
         StepKind::Split => unreachable!(),
+        StepKind::Join => unreachable!(),
         StepKind::Action => unreachable!(),
         StepKind::ApprovalGate => unreachable!(),
     }
@@ -2851,6 +2858,7 @@ fn render_child_item(
         StepKind::Linear => unreachable!(),
         StepKind::Branch => unreachable!(),
         StepKind::Split => unreachable!(),
+        StepKind::Join => unreachable!(),
         StepKind::Action => unreachable!(),
         StepKind::ApprovalGate => unreachable!(),
     };

@@ -2782,7 +2782,7 @@ fn drain_joins(
                 &crate::executor::Event::StepStarted {
                     run_id: run_id.to_string(),
                     step_id: join_step.id.clone(),
-                    kind: crate::runs::StepKind::Branch,
+                    kind: crate::runs::StepKind::Join,
                     agent: None,
                     host: None,
                 },
@@ -2794,7 +2794,7 @@ fn drain_joins(
             output,
             success: all_success,
             skipped: false,
-            kind: crate::runs::StepKind::Branch,
+            kind: crate::runs::StepKind::Join,
             items,
             ..Default::default()
         };
@@ -3547,6 +3547,8 @@ fn step_kind_for_run_record(step: &Step) -> crate::runs::StepKind {
         crate::runs::StepKind::Branch
     } else if step.split.is_some() {
         crate::runs::StepKind::Split
+    } else if step.join.is_some() {
+        crate::runs::StepKind::Join
     } else if step.panel.is_some() {
         crate::runs::StepKind::Panel
     } else if step.parallel.is_some() {
@@ -9790,6 +9792,16 @@ steps:
         let sub_ids: std::collections::BTreeSet<&str> =
             gathered.items.iter().map(|it| it.sub_id.as_str()).collect();
         assert_eq!(sub_ids, std::collections::BTreeSet::from(["a", "b"]));
+
+        // The join node's own persisted `StepResult` must carry
+        // `StepKind::Join`, not the reused `StepKind::Branch` — the exact
+        // render-correctness defect this task fixes (mirrors the split
+        // assertion in `run_workflow_runs_a_split_join_workflow_live_through_the_scheduler`).
+        assert_eq!(
+            gathered.kind,
+            crate::runs::StepKind::Join,
+            "a live join node must persist kind: Join, not the reused Branch"
+        );
 
         let after = result_for(&res.step_results, "after");
         assert!(

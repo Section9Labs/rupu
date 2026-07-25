@@ -402,6 +402,17 @@ pub enum StepKind {
     /// what was actually a split node still deserializes fine — it just
     /// renders with the branch glyph, exactly as it always has.
     Split,
+    /// `join:` orchestration node (a barrier/merge reconverge). Persists
+    /// the join's own `StepResult` (winners' outputs gathered into
+    /// `items`/`output`) under its own kind rather than reusing
+    /// [`Self::Branch`]. Mirrors [`Self::Split`]'s history exactly: before
+    /// this variant existed, a live join node persisted `kind: Branch`
+    /// (see `runner.rs`'s join-resolution sites in `drain_joins`) to avoid
+    /// rippling this enum's exhaustive matches while join was still
+    /// test-only. A legacy on-disk `StepResult` with `kind: "branch"` for
+    /// what was actually a join node still deserializes fine — it just
+    /// renders with the branch glyph, exactly as it always has.
+    Join,
     Action,
     ApprovalGate,
 }
@@ -3507,6 +3518,7 @@ mod tests {
             StepKind::Panel,
             StepKind::Branch,
             StepKind::Split,
+            StepKind::Join,
             StepKind::Action,
             StepKind::ApprovalGate,
         ] {
@@ -3530,6 +3542,17 @@ mod tests {
         );
         let parsed: StepKind = serde_json::from_str("\"split\"").unwrap();
         assert_eq!(parsed, StepKind::Split);
+    }
+
+    /// Join's wire repr is exactly `"join"` (the same `snake_case`
+    /// convention every other variant uses), and it round-trips through
+    /// the same JSONL shape a live join-node `StepResult` is persisted as.
+    /// Mirrors [`step_kind_split_serializes_to_snake_case_split`].
+    #[test]
+    fn step_kind_join_serializes_to_snake_case_join() {
+        assert_eq!(serde_json::to_string(&StepKind::Join).unwrap(), "\"join\"");
+        let parsed: StepKind = serde_json::from_str("\"join\"").unwrap();
+        assert_eq!(parsed, StepKind::Join);
     }
 
     #[test]
