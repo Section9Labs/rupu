@@ -68,6 +68,18 @@ export type RunStatusStr =
   | 'rejected'
   | 'cancelled';
 
+/**
+ * One parked approval gate (Task 5b-2b, spec §7). An element of
+ * `RunRecord.awaiting` — a DAG run can batch-park more than one of these at
+ * once (two concurrent paths each hitting a gate).
+ */
+export interface AwaitingGate {
+  step_id: string;
+  prompt?: string | null;
+  since: string;
+  expires_at?: string | null;
+}
+
 /** Mirrors rupu-orchestrator's persisted `run.json` record. */
 export interface RunRecord {
   id: string;
@@ -80,6 +92,16 @@ export interface RunRecord {
   workspace_path?: string;
   transcript_dir?: string;
   error_message?: string | null;
+  /**
+   * The FULL set of currently-parked gates (Task 5b-2b, spec §7). Absent or
+   * empty on a legacy/single-gate record — `awaiting_step_id` /
+   * `approval_prompt` below still mirror its first (only) element for
+   * back-compat. A genuine multi-gate DAG run populates this with >1
+   * element; `awaiting_step_id` then names only the FIRST of them, so a
+   * caller that needs to address a specific gate (approve/reject) must read
+   * this array, not just the singular compat fields.
+   */
+  awaiting?: AwaitingGate[];
   awaiting_step_id?: string | null;
   approval_prompt?: string | null;
   awaiting_since?: string | null;
@@ -1575,20 +1597,42 @@ export const api = {
   },
   /** Record approval for an awaiting run. The run stays `awaiting_approval`
    *  but gains `resume_requested_at` (+ `resume_mode`); a worker then resumes
-   *  it in the chosen permission mode (defaults to `ask`). */
-  async approveRun(id: string, mode?: 'ask' | 'bypass' | 'readonly', host?: string): Promise<void> {
+   *  it in the chosen permission mode (defaults to `ask`).
+   *
+   *  `gate` (Task 5b-2b, spec §7) targets a specific parked gate on a run
+   *  that has batch-parked more than one (two concurrent DAG paths each
+   *  hitting a gate). Omit it for a run with at most one parked gate — the
+   *  server-side back-compat contract is identical to before this param
+   *  existed. Passing it when there's genuinely only one gate is also safe
+   *  (validated against the sole gate, same outcome). */
+  async approveRun(
+    id: string,
+    mode?: 'ask' | 'bypass' | 'readonly',
+    host?: string,
+    gate?: string,
+  ): Promise<void> {
     const body: Record<string, unknown> = {};
     if (mode) body.mode = mode;
-    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
+    const qsParams: string[] = [];
+    if (host) qsParams.push(`host=${encodeURIComponent(host)}`);
+    if (gate) qsParams.push(`gate=${encodeURIComponent(gate)}`);
+    const qs = qsParams.length ? `?${qsParams.join('&')}` : '';
     await request<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }>(
       `/api/runs/${encodeURIComponent(id)}/approve${qs}`,
       { method: 'POST', body: Object.keys(body).length ? JSON.stringify(body) : undefined },
     );
   },
-  /** Reject an awaiting run (terminal → `rejected`). */
-  async rejectRun(id: string, reason: string, host?: string): Promise<void> {
+  /** Reject an awaiting run (terminal → `rejected`, unless a sibling gate is
+   *  still parked — see `gate` below).
+   *
+   *  `gate` (Task 5b-2b, spec §7) targets a specific parked gate, mirroring
+   *  `approveRun`'s `gate` param. */
+  async rejectRun(id: string, reason: string, host?: string, gate?: string): Promise<void> {
     const body: Record<string, unknown> = { reason };
-    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
+    const qsParams: string[] = [];
+    if (host) qsParams.push(`host=${encodeURIComponent(host)}`);
+    if (gate) qsParams.push(`gate=${encodeURIComponent(gate)}`);
+    const qs = qsParams.length ? `?${qsParams.join('&')}` : '';
     await request<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }>(
       `/api/runs/${encodeURIComponent(id)}/reject${qs}`,
       { method: 'POST', body: JSON.stringify(body) },

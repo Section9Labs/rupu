@@ -1668,12 +1668,29 @@ impl RunStore {
     /// run (`ask` / `bypass` / `readonly`). It is validated and stored on
     /// `resume_mode`; anything outside the three known modes (or `None`)
     /// stores `None`, leaving the worker to fall back to its default.
+    ///
+    /// `gate_id` (Task 5b-2b, spec §7) targets a specific parked gate on a
+    /// genuinely multi-gate `AwaitingApproval` run — this marker-only path
+    /// has no way to hand the target gate id directly to the background
+    /// worker that eventually spawns `rupu workflow approve`, so instead it
+    /// REORDERS `record.awaiting` so the targeted gate becomes the first
+    /// element, then re-derives the compat fields
+    /// ([`RunRecord::sync_awaiting_compat`]) — `awaiting_step_id` (which the
+    /// worker already reads to build its `--gate` argv) now names exactly
+    /// this gate. `None` behaves exactly like before this task for a record
+    /// with at most one parked gate (the sole-gate back-compat contract);
+    /// for a genuine multi-gate record it returns
+    /// [`ApprovalError::AmbiguousGate`] rather than silently marking the
+    /// first gate. `Some(id)` that doesn't name a currently-parked gate
+    /// returns [`ApprovalError::GateNotFound`]. Only applies to the
+    /// `AwaitingApproval` case — a `Paused` run has no gate to target.
     pub fn request_resume_approval(
         &self,
         run_id: &str,
         approver: &str,
         mode: Option<&str>,
         now: chrono::DateTime<chrono::Utc>,
+        gate_id: Option<&str>,
     ) -> Result<ApprovalDecision, ApprovalError> {
         let mut record = self.load(run_id).map_err(|e| match e {
             RunStoreError::NotFound(s) => ApprovalError::NotFound(s),
@@ -1726,6 +1743,49 @@ impl RunStore {
             return Err(ApprovalError::NotAwaiting(
                 record.status.as_str().to_string(),
             ));
+        }
+        // Gate targeting (spec §7) — only meaningful while genuinely
+        // `AwaitingApproval`. A record with at most one parked gate takes
+        // the untouched byte-for-byte-identical path (whether `gate_id` is
+        // `None`, or `Some` naming that sole gate); only a record with >1
+        // parked gates needs the reorder-and-resync below.
+        if record.status == RunStatus::AwaitingApproval {
+            let gates = record.awaiting_gates();
+            if gates.len() > 1 {
+                match gate_id {
+                    None => {
+                        return Err(ApprovalError::AmbiguousGate {
+                            run_id: run_id.to_string(),
+                            candidates: gates.iter().map(|g| g.step_id.clone()).collect(),
+                        });
+                    }
+                    Some(id) => {
+                        let mut reordered = gates;
+                        let pos = reordered
+                            .iter()
+                            .position(|g| g.step_id == id)
+                            .ok_or_else(|| ApprovalError::GateNotFound {
+                                run_id: run_id.to_string(),
+                                step_id: id.to_string(),
+                            })?;
+                        let target = reordered.remove(pos);
+                        reordered.insert(0, target);
+                        record.awaiting = reordered;
+                        record.sync_awaiting_compat();
+                    }
+                }
+            } else if let Some(id) = gate_id {
+                // Sole-gate (or legacy compat-only) record: an explicit
+                // gate id must still name the one gate that's actually
+                // parked, but no reorder/resync is needed — the compat
+                // fields already mirror it.
+                if !gates.iter().any(|g| g.step_id == id) {
+                    return Err(ApprovalError::GateNotFound {
+                        run_id: run_id.to_string(),
+                        step_id: id.to_string(),
+                    });
+                }
+            }
         }
         // The approval-gate case always has `awaiting_step_id` set (the
         // runner persists it alongside the gate); keep that a hard error so
@@ -3465,7 +3525,7 @@ mod tests {
 
         let now = Utc::now();
         let decision = store
-            .request_resume_approval(&rec.id, "matt", None, now)
+            .request_resume_approval(&rec.id, "matt", None, now, None)
             .unwrap();
         // The decision reports the still-present awaited step id.
         assert_eq!(
@@ -3486,6 +3546,147 @@ mod tests {
         assert_eq!(reloaded.resume_requested_at, Some(now));
     }
 
+    /// A 2-gate `AwaitingApproval` record — both `gate_a` and `gate_b`
+    /// genuinely parked (not the legacy compat-only shape).
+    fn multi_gate_awaiting_record(id: &str) -> RunRecord {
+        let mut rec = sample_record(id);
+        rec.status = RunStatus::AwaitingApproval;
+        let since = Utc::now();
+        rec.awaiting = vec![
+            AwaitingGate {
+                step_id: "gate_a".into(),
+                prompt: Some("approve a?".into()),
+                since,
+                expires_at: None,
+            },
+            AwaitingGate {
+                step_id: "gate_b".into(),
+                prompt: Some("approve b?".into()),
+                since,
+                expires_at: None,
+            },
+        ];
+        rec.sync_awaiting_compat();
+        rec
+    }
+
+    #[test]
+    fn request_resume_approval_with_gate_targets_that_gate_on_a_multi_gate_run() {
+        // Task 5b-2b (spec §7): the web marker path has no way to hand the
+        // target gate id directly to the resume worker, so it reorders
+        // `awaiting` so the targeted gate is first and re-syncs the
+        // derived-compat `awaiting_step_id` — the field the worker already
+        // reads to build its `--gate` argv.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = multi_gate_awaiting_record("run_resume_multi_b");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let now = Utc::now();
+        let decision = store
+            .request_resume_approval(&rec.id, "web", None, now, Some("gate_b"))
+            .unwrap();
+        assert_eq!(
+            decision,
+            ApprovalDecision::Approved {
+                run_id: rec.id.clone(),
+                step_id: "gate_b".into(),
+            }
+        );
+
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::AwaitingApproval);
+        // Both gates remain parked — targeting one for resume does not drop
+        // its sibling.
+        assert_eq!(reloaded.awaiting.len(), 2);
+        assert!(reloaded.awaiting.iter().any(|g| g.step_id == "gate_a"));
+        assert!(reloaded.awaiting.iter().any(|g| g.step_id == "gate_b"));
+        // gate_b is now first, so the derived-compat field the worker reads
+        // names it.
+        assert_eq!(reloaded.awaiting_step_id.as_deref(), Some("gate_b"));
+        assert_eq!(reloaded.resume_requested_at, Some(now));
+    }
+
+    #[test]
+    fn request_resume_approval_with_no_gate_on_a_multi_gate_run_is_ambiguous() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = multi_gate_awaiting_record("run_resume_multi_ambig");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let err = store
+            .request_resume_approval(&rec.id, "web", None, Utc::now(), None)
+            .unwrap_err();
+        match err {
+            ApprovalError::AmbiguousGate { run_id, candidates } => {
+                assert_eq!(run_id, rec.id);
+                assert_eq!(candidates, vec!["gate_a".to_string(), "gate_b".to_string()]);
+            }
+            other => panic!("expected AmbiguousGate, got {other:?}"),
+        }
+        // No marker was set — the run is untouched by the failed attempt.
+        let reloaded = store.load(&rec.id).unwrap();
+        assert!(reloaded.resume_requested_at.is_none());
+        assert_eq!(reloaded.awaiting.len(), 2);
+    }
+
+    #[test]
+    fn request_resume_approval_with_unknown_gate_id_on_multi_gate_run_errors() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = multi_gate_awaiting_record("run_resume_multi_unknown");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let err = store
+            .request_resume_approval(&rec.id, "web", None, Utc::now(), Some("nope"))
+            .unwrap_err();
+        assert!(matches!(err, ApprovalError::GateNotFound { .. }));
+        let reloaded = store.load(&rec.id).unwrap();
+        assert!(reloaded.resume_requested_at.is_none());
+    }
+
+    #[test]
+    fn request_resume_approval_with_gate_id_matching_sole_gate_is_unchanged() {
+        // Sole-gate parity: an explicit `gate_id` that happens to name the
+        // one parked gate on a 1-gate run behaves exactly like `None` —
+        // primary safety invariant.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = awaiting_record("run_resume_sole_gate_named");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let now = Utc::now();
+        let decision = store
+            .request_resume_approval(&rec.id, "web", None, now, Some("deploy"))
+            .unwrap();
+        assert_eq!(
+            decision,
+            ApprovalDecision::Approved {
+                run_id: rec.id.clone(),
+                step_id: "deploy".into(),
+            }
+        );
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::AwaitingApproval);
+        assert_eq!(reloaded.awaiting_step_id.as_deref(), Some("deploy"));
+        assert_eq!(reloaded.resume_requested_at, Some(now));
+    }
+
+    #[test]
+    fn request_resume_approval_with_wrong_gate_id_on_sole_gate_run_errors() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = awaiting_record("run_resume_sole_gate_wrong");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let err = store
+            .request_resume_approval(&rec.id, "web", None, Utc::now(), Some("not-deploy"))
+            .unwrap_err();
+        assert!(matches!(err, ApprovalError::GateNotFound { .. }));
+        let reloaded = store.load(&rec.id).unwrap();
+        assert!(reloaded.resume_requested_at.is_none());
+    }
+
     #[test]
     fn request_resume_approval_on_non_awaiting_run_errors() {
         let tmp = TempDir::new().unwrap();
@@ -3495,7 +3696,7 @@ mod tests {
         store.create(rec.clone(), SAMPLE_YAML).unwrap();
 
         let err = store
-            .request_resume_approval(&rec.id, "matt", None, Utc::now())
+            .request_resume_approval(&rec.id, "matt", None, Utc::now(), None)
             .unwrap_err();
         assert!(matches!(err, ApprovalError::NotAwaiting(_)));
     }
@@ -3514,7 +3715,7 @@ mod tests {
 
         let now = Utc::now();
         let decision = store
-            .request_resume_approval(&rec.id, "web", None, now)
+            .request_resume_approval(&rec.id, "web", None, now, None)
             .unwrap();
         assert_eq!(
             decision,
@@ -3544,7 +3745,7 @@ mod tests {
         store.create(rec.clone(), SAMPLE_YAML).unwrap();
 
         let decision = store
-            .request_resume_approval(&rec.id, "web", None, Utc::now())
+            .request_resume_approval(&rec.id, "web", None, Utc::now(), None)
             .unwrap();
         assert_eq!(
             decision,
@@ -3812,7 +4013,7 @@ mod tests {
         store.create(rec.clone(), SAMPLE_YAML).unwrap();
 
         store
-            .request_resume_approval(&rec.id, "matt", Some("bypass"), Utc::now())
+            .request_resume_approval(&rec.id, "matt", Some("bypass"), Utc::now(), None)
             .unwrap();
 
         let reloaded = store.load(&rec.id).unwrap();
@@ -3830,7 +4031,7 @@ mod tests {
         store.create(rec.clone(), SAMPLE_YAML).unwrap();
 
         store
-            .request_resume_approval(&rec.id, "matt", Some("turbo"), Utc::now())
+            .request_resume_approval(&rec.id, "matt", Some("turbo"), Utc::now(), None)
             .unwrap();
 
         let reloaded = store.load(&rec.id).unwrap();

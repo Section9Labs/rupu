@@ -41,11 +41,12 @@ pub fn routes() -> Router<AppState> {
 /// - `NotFound` → 404
 /// - `NotAwaiting` / `Expired` / `NoAwaitingStep` / `AmbiguousGate` /
 ///   `GateNotFound` → 409 (the run isn't in a state where the decision can
-///   be recorded as-is — `AmbiguousGate`/`GateNotFound` are rupu-orchestrator
-///   Task 5b-1's multi-gate awaiting-set additions (spec §7): this endpoint
-///   still calls the gate-id-less `approve`/`reject`, so it only ever sees
-///   these on a DAG run whose scheduler batch-parked >1 gate — a per-gate
-///   web approve/reject control is Task 5b-2's job, not wired up here yet)
+///   be recorded as-is — `AmbiguousGate` fires when `?gate=` is omitted on a
+///   run with >1 parked gate, its `candidates` list embedded in the message
+///   body so the UI can prompt; `GateNotFound` fires when `?gate=<id>` names
+///   a step that isn't currently parked. Both are rupu-orchestrator Task
+///   5b-1's multi-gate awaiting-set additions (spec §7), wired up to the
+///   `?gate=` query param by Task 5b-2b.)
 /// - everything else → 500
 fn map_approval_err(id: &str, e: ApprovalError) -> ApiError {
     match e {
@@ -74,13 +75,25 @@ fn run_response(s: &AppState, id: &str) -> ApiResult<Json<serde_json::Value>> {
     ))
 }
 
-/// Optional `?host=<id>` query param for control endpoints
-/// (`approve` / `reject` / `cancel`).
-/// Absent or `"local"` → today's local logic. Remote id → proxy via connector.
+/// Optional `?host=<id>` / `?gate=<step_id>` query params for control
+/// endpoints (`approve` / `reject` / `cancel` / `pause`).
+/// Absent `host` (or `"local"`) → today's local logic. Remote id → proxy
+/// via connector.
+///
+/// `gate` (Task 5b-2b, spec §7) targets a specific parked gate on
+/// `approve`/`reject` for a genuinely multi-gate `AwaitingApproval` run
+/// (two concurrent paths each hitting a gate). Absent → the sole-gate
+/// back-compat behavior [`RunStore::approve_gate`]/[`RunStore::reject_gate`]/
+/// [`RunStore::request_resume_approval`] already guarantee: identical to
+/// today for a record with at most one parked gate, `ApprovalError::
+/// AmbiguousGate` for a genuine multi-gate record. Ignored by `cancel`/
+/// `pause` (neither operates on a specific gate).
 #[derive(serde::Deserialize, Default)]
 struct RunControlQuery {
     #[serde(default)]
     host: Option<String>,
+    #[serde(default)]
+    gate: Option<String>,
 }
 
 /// Optional body for `POST /api/runs/:id/approve`. `mode` selects the
@@ -92,15 +105,29 @@ struct ApproveBody {
     mode: Option<String>,
 }
 
-/// `POST /api/runs/:id/approve[?host=<id>]` — record a web approval decision for
-/// a paused (awaiting-approval) run.
+/// `POST /api/runs/:id/approve[?host=<id>][&gate=<step_id>]` — record a web
+/// approval decision for a paused (awaiting-approval) run.
 ///
 /// Without `?host=` (or `?host=local`): sets the `resume_requested_at` marker
 /// (and the optional `resume_mode`) that a background worker picks up. The run
 /// stays `AwaitingApproval` until the worker resumes it.
 ///
+/// `?gate=<step_id>` (Task 5b-2b, spec §7) targets a specific parked gate on
+/// a run that has batch-parked more than one (two concurrent DAG paths each
+/// hitting a gate). Omitted → the sole-gate back-compat behavior
+/// [`RunStore::request_resume_approval`] already guarantees: identical to
+/// today for a run with at most one parked gate; a 409 listing every parked
+/// gate id (`ApprovalError::AmbiguousGate`, see [`map_approval_err`]) for a
+/// genuine multi-gate run. A `gate` naming a step that isn't currently
+/// parked also 409s (`ApprovalError::GateNotFound`) rather than a silent
+/// no-op or a 500.
+///
 /// With `?host=<remote-id>`: proxies via [`HostConnector::approve_run`] and
-/// returns `{ "ok": true, "host_id": "<id>" }`.
+/// returns `{ "ok": true, "host_id": "<id>" }`. `gate` is NOT threaded
+/// through the remote-host path — no cross-host per-gate approval protocol
+/// exists yet (every `HostConnector` impl's `approve_run` signature is
+/// still gate-id-less); out of scope for this task (see `host/local.rs`'s
+/// doc on its own `approve_run`/`reject_run`).
 ///
 /// The JSON body is optional — a bodyless POST is accepted and treated as
 /// `mode = None`.
@@ -121,11 +148,11 @@ async fn approve_run(
         })?;
         return Ok(Json(serde_json::json!({ "ok": true, "host_id": host })));
     }
-    // Local path: unchanged.
+    // Local path: unchanged for `gate: None` on a <=1-gate run (see doc).
     let now = chrono::Utc::now();
     let mode = body.and_then(|b| b.0.mode);
     s.run_store
-        .request_resume_approval(&id, "web", mode.as_deref(), now)
+        .request_resume_approval(&id, "web", mode.as_deref(), now, q.gate.as_deref())
         .map_err(|e| map_approval_err(&id, e))?;
     let mut resp = run_response(&s, &id)?;
     resp.0["host_id"] = serde_json::json!("local");
@@ -138,11 +165,24 @@ struct RejectBody {
     reason: Option<String>,
 }
 
-/// `POST /api/runs/:id/reject[?host=<id>]` — record a web rejection decision.
+/// `POST /api/runs/:id/reject[?host=<id>][&gate=<step_id>]` — record a web
+/// rejection decision.
 ///
-/// Without `?host=` (or `?host=local`): transitions the run to `Rejected`.
+/// Without `?host=` (or `?host=local`): rejects the named gate immediately
+/// (no marker/worker round-trip — unlike approve, a reject needs no
+/// execution runtime to finalize). `?gate=<step_id>` (Task 5b-2b, spec §7)
+/// targets a specific parked gate on a multi-gate run: that gate is removed
+/// from the awaiting set and the run stays `AwaitingApproval` while
+/// siblings remain parked, flipping to `Rejected` only once the set empties
+/// ([`RunStore::reject_gate`]). Omitted → the sole-gate back-compat
+/// behavior: identical to today for a run with at most one parked gate; a
+/// 409 listing every parked gate id for a genuine multi-gate run. A `gate`
+/// naming a step that isn't currently parked also 409s rather than a
+/// silent no-op or a 500 (see [`map_approval_err`]).
+///
 /// With `?host=<remote-id>`: proxies via [`HostConnector::reject_run`] and
-/// returns `{ "ok": true, "host_id": "<id>" }`.
+/// returns `{ "ok": true, "host_id": "<id>" }`. `gate` is NOT threaded
+/// through the remote-host path (see `approve_run`'s doc on the same gap).
 async fn reject_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -161,11 +201,11 @@ async fn reject_run(
             })?;
         return Ok(Json(serde_json::json!({ "ok": true, "host_id": host })));
     }
-    // Local path: unchanged.
+    // Local path: unchanged for `gate: None` on a <=1-gate run (see doc).
     let now = chrono::Utc::now();
     let reason = body.reason.unwrap_or_default();
     s.run_store
-        .reject(&id, "web", &reason, now)
+        .reject_gate(&id, "web", &reason, now, q.gate.as_deref())
         .map_err(|e| map_approval_err(&id, e))?;
     let mut resp = run_response(&s, &id)?;
     resp.0["host_id"] = serde_json::json!("local");
@@ -338,7 +378,7 @@ async fn resume_run(
     }
     let now = chrono::Utc::now();
     s.run_store
-        .request_resume_approval(&id, "web", None, now)
+        .request_resume_approval(&id, "web", None, now, None)
         .map_err(|e| map_approval_err(&id, e))?;
     let mut resp = run_response(&s, &id)?;
     resp.0["host_id"] = serde_json::json!("local");
@@ -1248,7 +1288,7 @@ mod tests {
         let resp = approve_run(
             State(s.clone()),
             Path("run_app".into()),
-            Query(RunControlQuery { host: None }),
+            Query(RunControlQuery { host: None, gate: None }),
             None,
         )
         .await
@@ -1284,7 +1324,7 @@ mod tests {
         let resp = reject_run(
             State(s.clone()),
             Path("run_rej".into()),
-            Query(RunControlQuery { host: None }),
+            Query(RunControlQuery { host: None, gate: None }),
             Json(body),
         )
         .await
@@ -1310,7 +1350,7 @@ mod tests {
         let err = approve_run(
             State(s),
             Path("run_done".into()),
-            Query(RunControlQuery { host: None }),
+            Query(RunControlQuery { host: None, gate: None }),
             None,
         )
         .await
@@ -1325,7 +1365,7 @@ mod tests {
         let err = reject_run(
             State(s),
             Path("nope".into()),
-            Query(RunControlQuery { host: None }),
+            Query(RunControlQuery { host: None, gate: None }),
             Json(RejectBody { reason: None }),
         )
         .await
@@ -1347,7 +1387,7 @@ mod tests {
         let _ = approve_run(
             State(s.clone()),
             Path("run_mode".into()),
-            Query(RunControlQuery { host: None }),
+            Query(RunControlQuery { host: None, gate: None }),
             Some(Json(body)),
         )
         .await
@@ -1370,7 +1410,7 @@ mod tests {
         let _ = approve_run(
             State(s.clone()),
             Path("run_nobody".into()),
-            Query(RunControlQuery { host: None }),
+            Query(RunControlQuery { host: None, gate: None }),
             None,
         )
         .await
@@ -1379,6 +1419,232 @@ mod tests {
         let loaded = s.run_store.load("run_nobody").unwrap();
         assert_eq!(loaded.status, RunStatus::AwaitingApproval);
         assert_eq!(loaded.resume_mode, None);
+        assert!(loaded.resume_requested_at.is_some());
+    }
+
+    // ── Task 5b-2b: per-gate approve/reject (spec §7) ──────────────────────
+
+    /// A 2-gate `AwaitingApproval` run — both `gate_a` and `gate_b`
+    /// genuinely parked (not the legacy compat-only shape a 1-gate run
+    /// serializes to).
+    fn multi_gate_awaiting_record(id: &str) -> RunRecord {
+        let mut rec = awaiting_record(id, "gate_a");
+        let since = chrono::Utc::now();
+        rec.awaiting = vec![
+            rupu_orchestrator::runs::AwaitingGate {
+                step_id: "gate_a".into(),
+                prompt: Some("approve a?".into()),
+                since,
+                expires_at: None,
+            },
+            rupu_orchestrator::runs::AwaitingGate {
+                step_id: "gate_b".into(),
+                prompt: Some("approve b?".into()),
+                since,
+                expires_at: None,
+            },
+        ];
+        rec.sync_awaiting_compat();
+        rec
+    }
+
+    #[tokio::test]
+    async fn approve_targets_a_specific_gate_on_a_multi_gate_run_leaves_sibling_parked() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .create(multi_gate_awaiting_record("run_multi_approve_b"), "name: x\n")
+            .unwrap();
+
+        let resp = approve_run(
+            State(s.clone()),
+            Path("run_multi_approve_b".into()),
+            Query(RunControlQuery {
+                host: None,
+                gate: Some("gate_b".into()),
+            }),
+            None,
+        )
+        .await
+        .expect("approving a named gate on a multi-gate run should succeed");
+        // Marker-only, same as the sole-gate case: the run stays
+        // AwaitingApproval for the background worker to actually resume.
+        assert_eq!(
+            resp.0["run"]["status"],
+            serde_json::json!("awaiting_approval")
+        );
+
+        let loaded = s.run_store.load("run_multi_approve_b").unwrap();
+        assert_eq!(loaded.status, RunStatus::AwaitingApproval);
+        assert!(loaded.resume_requested_at.is_some());
+        // Both gates remain parked — targeting one for resume does not drop
+        // its sibling; gate_a is unaffected.
+        assert_eq!(loaded.awaiting.len(), 2);
+        assert!(loaded.awaiting.iter().any(|g| g.step_id == "gate_a"));
+        assert!(loaded.awaiting.iter().any(|g| g.step_id == "gate_b"));
+        // The derived-compat field the background worker reads to build its
+        // `--gate` argv now names the targeted gate.
+        assert_eq!(loaded.awaiting_step_id.as_deref(), Some("gate_b"));
+    }
+
+    #[tokio::test]
+    async fn approve_with_no_gate_on_a_multi_gate_run_is_conflict_listing_candidates() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .create(multi_gate_awaiting_record("run_multi_ambig"), "name: x\n")
+            .unwrap();
+
+        let err = approve_run(
+            State(s.clone()),
+            Path("run_multi_ambig".into()),
+            Query(RunControlQuery { host: None, gate: None }),
+            None,
+        )
+        .await
+        .expect_err("omitting ?gate= on a multi-gate run should be a conflict, not a guess");
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+        // The candidate gate ids are listed in the error body so the UI can
+        // prompt with them.
+        assert!(err.1.contains("gate_a"));
+        assert!(err.1.contains("gate_b"));
+
+        // No marker was set — the failed attempt didn't mutate the run.
+        let loaded = s.run_store.load("run_multi_ambig").unwrap();
+        assert!(loaded.resume_requested_at.is_none());
+        assert_eq!(loaded.awaiting.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn approve_with_unknown_gate_on_multi_gate_run_is_conflict_not_500() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .create(multi_gate_awaiting_record("run_multi_unknown_gate"), "name: x\n")
+            .unwrap();
+
+        let err = approve_run(
+            State(s.clone()),
+            Path("run_multi_unknown_gate".into()),
+            Query(RunControlQuery {
+                host: None,
+                gate: Some("does_not_exist".into()),
+            }),
+            None,
+        )
+        .await
+        .expect_err("naming a gate that isn't parked should be a clean error, not a 500");
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+
+        let loaded = s.run_store.load("run_multi_unknown_gate").unwrap();
+        assert!(loaded.resume_requested_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn reject_targets_a_specific_gate_on_a_multi_gate_run_leaves_sibling_parked() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .create(multi_gate_awaiting_record("run_multi_reject_a"), "name: x\n")
+            .unwrap();
+
+        let resp = reject_run(
+            State(s.clone()),
+            Path("run_multi_reject_a".into()),
+            Query(RunControlQuery {
+                host: None,
+                gate: Some("gate_a".into()),
+            }),
+            Json(RejectBody {
+                reason: Some("gate_a looks bad".into()),
+            }),
+        )
+        .await
+        .expect("rejecting a named gate on a multi-gate run should succeed");
+        // gate_b is still parked, so the run itself is NOT terminal yet.
+        assert_eq!(
+            resp.0["run"]["status"],
+            serde_json::json!("awaiting_approval")
+        );
+
+        let loaded = s.run_store.load("run_multi_reject_a").unwrap();
+        assert_eq!(loaded.status, RunStatus::AwaitingApproval);
+        assert_eq!(loaded.awaiting.len(), 1);
+        assert_eq!(loaded.awaiting[0].step_id, "gate_b");
+    }
+
+    #[tokio::test]
+    async fn reject_last_gate_of_a_multi_gate_run_flips_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .create(multi_gate_awaiting_record("run_multi_reject_both"), "name: x\n")
+            .unwrap();
+
+        let _ = reject_run(
+            State(s.clone()),
+            Path("run_multi_reject_both".into()),
+            Query(RunControlQuery {
+                host: None,
+                gate: Some("gate_a".into()),
+            }),
+            Json(RejectBody { reason: None }),
+        )
+        .await
+        .expect("rejecting gate_a should succeed");
+        // Still awaiting: gate_b remains parked.
+        assert_eq!(
+            s.run_store.load("run_multi_reject_both").unwrap().status,
+            RunStatus::AwaitingApproval
+        );
+
+        let resp = reject_run(
+            State(s.clone()),
+            Path("run_multi_reject_both".into()),
+            Query(RunControlQuery {
+                host: None,
+                gate: Some("gate_b".into()),
+            }),
+            Json(RejectBody {
+                reason: Some("gate_b too".into()),
+            }),
+        )
+        .await
+        .expect("rejecting the last remaining gate should succeed");
+        assert_eq!(resp.0["run"]["status"], serde_json::json!("rejected"));
+
+        let loaded = s.run_store.load("run_multi_reject_both").unwrap();
+        assert_eq!(loaded.status, RunStatus::Rejected);
+        assert!(loaded.awaiting.is_empty());
+    }
+
+    /// Single-gate parity: an explicit `?gate=` naming the sole parked gate
+    /// on a 1-gate run behaves exactly like omitting it.
+    #[tokio::test]
+    async fn approve_with_gate_matching_the_sole_gate_is_unchanged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .create(awaiting_record("run_sole_named", "gate"), "name: x\n")
+            .unwrap();
+
+        let resp = approve_run(
+            State(s.clone()),
+            Path("run_sole_named".into()),
+            Query(RunControlQuery {
+                host: None,
+                gate: Some("gate".into()),
+            }),
+            None,
+        )
+        .await
+        .expect("naming the sole parked gate should behave like omitting it");
+        assert_eq!(
+            resp.0["run"]["status"],
+            serde_json::json!("awaiting_approval")
+        );
+        let loaded = s.run_store.load("run_sole_named").unwrap();
+        assert_eq!(loaded.awaiting_step_id.as_deref(), Some("gate"));
         assert!(loaded.resume_requested_at.is_some());
     }
 
@@ -1397,7 +1663,7 @@ mod tests {
         let resp = cancel_run(
             State(s.clone()),
             Path("run_cancel".into()),
-            Query(RunControlQuery { host: None }),
+            Query(RunControlQuery { host: None, gate: None }),
             None,
         )
         .await
@@ -1429,7 +1695,7 @@ mod tests {
         let err = cancel_run(
             State(s),
             Path("run_term".into()),
-            Query(RunControlQuery { host: None }),
+            Query(RunControlQuery { host: None, gate: None }),
             Some(Json(body)),
         )
         .await
@@ -1444,7 +1710,7 @@ mod tests {
         let err = cancel_run(
             State(s),
             Path("ghost".into()),
-            Query(RunControlQuery { host: None }),
+            Query(RunControlQuery { host: None, gate: None }),
             None,
         )
         .await
@@ -1503,7 +1769,7 @@ mod tests {
         let resp = pause_run(
             State(s.clone()),
             Path("run_pause".into()),
-            Query(RunControlQuery { host: None }),
+            Query(RunControlQuery { host: None, gate: None }),
         )
         .await
         .expect("pause should succeed");
@@ -1529,7 +1795,7 @@ mod tests {
         let err = pause_run(
             State(s),
             Path("run_pause_done".into()),
-            Query(RunControlQuery { host: None }),
+            Query(RunControlQuery { host: None, gate: None }),
         )
         .await
         .expect_err("pausing a completed run should fail");
@@ -1548,7 +1814,7 @@ mod tests {
         let err = resume_run(
             State(s),
             Path("run_resume_nolauncher".into()),
-            Query(RunControlQuery { host: None }),
+            Query(RunControlQuery { host: None, gate: None }),
         )
         .await
         .expect_err("resume without a launcher should be unavailable");
@@ -1566,7 +1832,7 @@ mod tests {
         let err = resume_run(
             State(s),
             Path("run_resume_running".into()),
-            Query(RunControlQuery { host: None }),
+            Query(RunControlQuery { host: None, gate: None }),
         )
         .await
         .expect_err("resuming a running (non-paused) run should conflict");
@@ -1590,7 +1856,7 @@ mod tests {
         let resp = resume_run(
             State(s.clone()),
             Path("run_resume_ok".into()),
-            Query(RunControlQuery { host: None }),
+            Query(RunControlQuery { host: None, gate: None }),
         )
         .await
         .expect("resume should succeed");
@@ -1616,7 +1882,7 @@ mod tests {
         let err = resume_run(
             State(s),
             Path("ghost".into()),
-            Query(RunControlQuery { host: None }),
+            Query(RunControlQuery { host: None, gate: None }),
         )
         .await
         .expect_err("resume on missing run should 404");

@@ -148,6 +148,33 @@ const AWAITING_GRAPH: RunGraphResponse = {
   units: [],
 };
 
+// A multi-gate awaiting-approval run (Task 5b-2b, spec §7): two concurrent
+// DAG paths each parked their own gate in the same batch-park wave.
+const MULTI_GATE_GRAPH: RunGraphResponse = {
+  run: {
+    id: 'run-1',
+    workflow_name: 'nightly-scan',
+    status: 'awaiting_approval',
+    started_at: '2026-06-01T00:00:00Z',
+    // Derived-compat fields mirror the FIRST gate only — the multi-gate UI
+    // must read `awaiting` (the full set), not these.
+    awaiting_step_id: 'gate_a',
+    approval_prompt: 'Approve path A?',
+    awaiting: [
+      { step_id: 'gate_a', prompt: 'Approve path A?', since: '2026-06-01T00:00:00Z' },
+      { step_id: 'gate_b', prompt: 'Approve path B?', since: '2026-06-01T00:00:00Z' },
+    ],
+  } as RunGraphResponse['run'],
+  workflow: {
+    steps: [
+      { id: 'gate_a', kind: 'gate' },
+      { id: 'gate_b', kind: 'gate' },
+    ],
+  },
+  step_results: [],
+  units: [],
+};
+
 // A non-terminal (running) run — eligible for cancel from the header.
 const RUNNING_GRAPH: RunGraphResponse = {
   run: {
@@ -337,6 +364,67 @@ describe('RunDetail shell', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Confirm rejection' }));
 
     await waitFor(() => expect(rejectSpy).toHaveBeenCalledWith('run-1', 'not safe'));
+  });
+
+  it('renders one approve/reject control PER gate on a multi-gate run, each targeting its own gate id', async () => {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(MULTI_GATE_GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    const approveSpy = vi.spyOn(api, 'approveRun').mockResolvedValue(undefined);
+    const rejectSpy = vi.spyOn(api, 'rejectRun').mockResolvedValue(undefined);
+
+    renderPage();
+
+    // Two distinct Approve controls, one per gate — NOT the single-gate
+    // "Approve run" control.
+    await screen.findByRole('button', { name: 'Approve gate_a' });
+    screen.getByRole('button', { name: 'Approve gate_b' });
+    expect(screen.queryByRole('button', { name: 'Approve run' })).not.toBeInTheDocument();
+
+    // Both prompts render.
+    expect(screen.getByText('Approve path A?')).toBeInTheDocument();
+    expect(screen.getByText('Approve path B?')).toBeInTheDocument();
+
+    // Approving gate_b calls the API with gate_b's id — gate_a is untouched.
+    fireEvent.click(screen.getByRole('button', { name: 'Approve gate_b' }));
+    await waitFor(() =>
+      expect(approveSpy).toHaveBeenCalledWith('run-1', 'ask', undefined, 'gate_b'),
+    );
+    expect(approveSpy).not.toHaveBeenCalledWith('run-1', 'ask', undefined, 'gate_a');
+    // gate_b's own row now shows the resuming state; gate_a's is untouched.
+    await screen.findByText(/Approved — resuming/);
+    screen.getByRole('button', { name: 'Approve gate_a' });
+
+    // Rejecting gate_a calls the API with gate_a's id.
+    fireEvent.click(screen.getByRole('button', { name: 'Reject gate_a' }));
+    const reasonInput = await screen.findByLabelText('Rejection reason for gate_a');
+    fireEvent.change(reasonInput, { target: { value: 'gate_a looks bad' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm rejection for gate_a' }));
+
+    await waitFor(() =>
+      expect(rejectSpy).toHaveBeenCalledWith('run-1', 'gate_a looks bad', undefined, 'gate_a'),
+    );
+  });
+
+  it('keeps the single-gate control unchanged when a run has exactly one parked gate', async () => {
+    // Primary safety invariant: a 1-gate run must render the SAME single
+    // "Approve run"/"Reject run" control this task started with, not a
+    // 1-row rendering of the multi-gate list.
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(AWAITING_GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    const approveSpy = vi.spyOn(api, 'approveRun').mockResolvedValue(undefined);
+
+    renderPage();
+
+    await screen.findByRole('button', { name: 'Approve run' });
+    expect(screen.queryByRole('button', { name: /^Approve gate_/ })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve run' }));
+    // Byte-for-byte the pre-existing call shape: no trailing host/gate args.
+    await waitFor(() => expect(approveSpy).toHaveBeenCalledWith('run-1', 'ask'));
   });
 
   it('cancels a running run via the header Cancel button (after confirm)', async () => {

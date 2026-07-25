@@ -765,6 +765,35 @@ async fn run_gate_sweep(
                             match std::process::Command::new(&exe).args(&argv).spawn() {
                                 Ok(_child) => {
                                     tracing::info!(run_id = %run_id, gate = %gate_step_id, "gate sweep: on_timeout=approve → spawned detached workflow approve");
+                                    // Minor (5b-2a handoff): the detached child
+                                    // now independently owns approving THIS
+                                    // gate — it will call `store.approve_gate`
+                                    // itself, which persists removing
+                                    // `gate_step_id` from `awaiting`. Mirror
+                                    // that removal in THIS in-memory `rec` too
+                                    // so a sibling gate processed later in the
+                                    // SAME sweep pass (e.g. an
+                                    // `ExpireThenCleanupReject` arm below, via
+                                    // `expire_gate_if_overdue`'s
+                                    // `self.update(record)`) doesn't clobber
+                                    // the child's concurrent write by
+                                    // re-persisting a full record that still
+                                    // shows this gate parked — a race that
+                                    // otherwise transiently flips the run back
+                                    // to `AwaitingApproval[gate_step_id]`
+                                    // (self-heals once the child's own write
+                                    // lands, but must not be reintroduced by a
+                                    // sibling's write in this same pass). Only
+                                    // done on a successful spawn: on a failed
+                                    // spawn no child exists to race against,
+                                    // and the gate is still genuinely parked
+                                    // on disk for the next sweep tick to retry.
+                                    rec.awaiting = rec
+                                        .awaiting_gates()
+                                        .into_iter()
+                                        .filter(|g| g.step_id != gate_step_id)
+                                        .collect();
+                                    rec.sync_awaiting_compat();
                                 }
                                 Err(e) => {
                                     tracing::error!(run_id = %run_id, gate = %gate_step_id, error = %e, "gate sweep: failed to spawn workflow approve for on_timeout=approve");
@@ -961,6 +990,110 @@ mod tests {
         assert_eq!(reloaded.awaiting.len(), 1);
         assert_eq!(reloaded.awaiting[0].step_id, "gate_b");
         assert_eq!(reloaded.awaiting_step_id.as_deref(), Some("gate_b"));
+    }
+
+    /// gate_a: `on_timeout: approve`. gate_b: `on_timeout: reject` with no
+    /// `on_reject:` (empty chain, same short-circuit as
+    /// `GATE_A_REJECT_GATE_B_NONE_YAML`).
+    const GATE_A_APPROVE_GATE_B_REJECT_YAML: &str = "name: g\nsteps:\n  - id: gate_a\n    approval:\n      timeout_seconds: 10\n      on_timeout: approve\n  - id: gate_b\n    approval:\n      timeout_seconds: 10\n      on_timeout: reject\n";
+
+    /// Task 5b-2b-i sweep-race fix: when a SINGLE sweep pass processes two
+    /// concurrently-overdue gates with mixed `on_timeout` policies — gate_a:
+    /// `approve` (processed first, per `awaiting`'s order), gate_b: `reject`
+    /// (processed second) — the approve branch's detached spawn hands gate_a
+    /// off to a child process that will independently call
+    /// `store.approve_gate`. Before this fix, the in-memory `rec` was never
+    /// updated to reflect that hand-off, so gate_b's own
+    /// `expire_gate_if_overdue` → `self.update(record)` a moment later
+    /// persisted a STALE 2-gate copy (minus only gate_b) — resurrecting
+    /// gate_a in `run.json` even though a detached process now owns
+    /// resolving it, and leaving the run `AwaitingApproval` instead of
+    /// reaching the `Rejected` state gate_b's own timeout earned on its own
+    /// path.
+    #[tokio::test]
+    async fn run_gate_sweep_two_overdue_mixed_policy_gates_does_not_resurrect_the_approved_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
+        let hosts = rupu_workspace::HostStore {
+            root: tmp.path().join("hosts"),
+        };
+        // A trivial, instantly-exiting binary — the sweep's `ExpireApprove`
+        // branch really does spawn it (so the fix's "on a *successful*
+        // spawn" in-memory removal actually exercises), but it ignores
+        // every arg and never touches `run.json`, so it can't itself
+        // resolve the race this test is isolating.
+        let exe = std::path::PathBuf::from("true");
+
+        let now = chrono::Utc::now();
+        let since = now - chrono::Duration::seconds(120);
+        let mut rec = rupu_orchestrator::RunRecord {
+            id: "run_sweep_mixed_policy".into(),
+            workflow_name: "g".into(),
+            status: RunStatus::AwaitingApproval,
+            inputs: std::collections::BTreeMap::new(),
+            event: None,
+            workspace_id: "ws_1".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            started_at: since,
+            finished_at: None,
+            final_output: None,
+            error_message: None,
+            awaiting: vec![
+                rupu_orchestrator::runs::AwaitingGate {
+                    step_id: "gate_a".into(),
+                    prompt: Some("approve a?".into()),
+                    since,
+                    expires_at: Some(now - chrono::Duration::seconds(30)), // overdue
+                },
+                rupu_orchestrator::runs::AwaitingGate {
+                    step_id: "gate_b".into(),
+                    prompt: Some("approve b?".into()),
+                    since,
+                    expires_at: Some(now - chrono::Duration::seconds(30)), // overdue
+                },
+            ],
+            awaiting_step_id: None,
+            approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+        };
+        rec.sync_awaiting_compat();
+        store
+            .create(rec.clone(), GATE_A_APPROVE_GATE_B_REJECT_YAML)
+            .unwrap();
+
+        run_gate_sweep(Arc::clone(&store), hosts, exe, "sweep-test".to_string()).await;
+
+        let reloaded = store.load(&rec.id).unwrap();
+        assert!(
+            !reloaded.awaiting.iter().any(|g| g.step_id == "gate_a"),
+            "gate_a was handed off to a detached approve — it must not be \
+             resurrected by gate_b's own reject persisting a stale \
+             in-memory copy of the awaiting set: {:?}",
+            reloaded.awaiting
+        );
+        // gate_b's own reject empties what's left of the (correctly fixed)
+        // in-memory set, so the run reaches the same terminal `Rejected`
+        // state its own timeout earned.
+        assert_eq!(reloaded.status, RunStatus::Rejected);
+        assert!(reloaded.awaiting.is_empty());
     }
 
     /// Single-gate parity: a legacy-shaped record (empty `awaiting`, only

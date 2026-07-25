@@ -188,12 +188,24 @@ impl HostConnector for LocalHostConnector {
             .map_err(|e| map_store_err(run_id, e))
     }
 
+    // Task 5b-2b (spec §7): unlike the CP HTTP handlers (`api/runs.rs`),
+    // this trait's `approve_run`/`reject_run` signature carries no gate id
+    // — every `HostConnector` (SSH/HTTP/Tunnel too, not just this local
+    // one) would need a matching wire-protocol change to thread one
+    // through, and no remote per-gate approval protocol exists yet. This
+    // connector's own body has never had independent gate-targeting logic
+    // (it just forwards to the sole-gate `RunStore` calls), so it isn't
+    // "independently" rejecting/approving a gate — it inherits the exact
+    // same `gate_id: None` back-compat behavior
+    // `RunStore::request_resume_approval`/`reject_gate` already guarantee.
+    // Deliberately out of scope here; a cross-host per-gate protocol is a
+    // separate, larger design (T5b-2b handoff).
     async fn approve_run(&self, run_id: &str, mode: &str) -> Result<(), HostConnectorError> {
         let mode_opt = if mode.is_empty() { None } else { Some(mode) };
         let now = chrono::Utc::now();
         // TODO(task-5): replace hardcoded "connector" actor with identity from AppState
         self.run_store
-            .request_resume_approval(run_id, "connector", mode_opt, now)
+            .request_resume_approval(run_id, "connector", mode_opt, now, None)
             .map(|_| ())
             .map_err(|e| map_approval_err(run_id, e))
     }
@@ -254,7 +266,7 @@ impl HostConnector for LocalHostConnector {
         // has exited (`runner_pid` no longer live), so clearing the marker
         // can't un-pause an original that hasn't yet honored the pause.
         self.run_store
-            .request_resume_approval(run_id, "connector", None, now)
+            .request_resume_approval(run_id, "connector", None, now, None)
             .map(|_| ())
             .map_err(|e| map_approval_err(run_id, e))
     }
