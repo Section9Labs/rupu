@@ -185,15 +185,6 @@ pub enum RunWorkflowError {
     /// unconverged output is "the" answer.
     #[error("loop '{name}' exhausted {max_iterations} iterations, until never held")]
     LoopExhausted { name: String, max_iterations: u32 },
-    /// A cooperative pause or approval gate landed on a member INSIDE a
-    /// loop iteration. Task 3 wires real loop execution but not pause/
-    /// resume mid-loop (Task 4's job — see that task's plan) — surfacing
-    /// this loudly is strictly better than silently losing the pause or
-    /// mis-resuming at the wrong iteration.
-    #[error(
-        "loop `{name}`: a pause/approval gate on a member mid-iteration is not supported yet (lands in the loop-resume follow-up task) — this run cannot continue"
-    )]
-    LoopIterationPaused { name: String },
 }
 
 /// Trait the orchestrator uses to construct per-unit [`AgentRunOpts`].
@@ -367,6 +358,18 @@ pub struct StepResult {
     /// above the severity threshold. Always `true` for non-panel
     /// steps.
     pub resolved: bool,
+    /// Task 4 (spec §3): which bounded-loop iteration produced this
+    /// result, when this `StepResult` belongs to a loop member
+    /// (`run_loop_node`'s recursive per-iteration call stamps it from
+    /// `SchedulerScope::loop_progress`). `None` for every non-loop step
+    /// and for the loop's own synthetic `"loop:<name>"` completion
+    /// record — only an actual MEMBER's result carries this. Persisted
+    /// into [`crate::runs::StepResultRecord::loop_iteration`]
+    /// (`#[serde(default, skip_serializing_if = "Option::is_none")]` —
+    /// absent, not `null`, for every legacy/non-loop record, so
+    /// `step_results.jsonl` for a loop-free workflow is byte-identical
+    /// to before this field existed).
+    pub loop_iteration: Option<u32>,
 }
 
 /// Runtime form of one finding emitted by a panelist. Aggregated
@@ -399,6 +402,7 @@ impl Default for StepResult {
             // panel-step constructors overwrite this when they
             // decide.
             resolved: true,
+            loop_iteration: None,
         }
     }
 }
@@ -677,6 +681,7 @@ pub async fn run_workflow(
                 resume_mode: None,
                 resume_gate_id: None,
                 final_output: None,
+                loop_progress: std::collections::BTreeMap::new(),
             };
             Some(store.create(record, yaml).map_err(map_run_store_err)?)
         } else {
@@ -784,6 +789,19 @@ pub async fn run_workflow(
     // Error = `Failed`.
     let mut awaiting: Option<AwaitingInfo> = None;
     if let (Some(store), Some(record)) = (opts.run_store.as_ref(), run_record_opt.as_mut()) {
+        // Task 4, spec §3: `run_loop_node`'s own checkpoint writes
+        // (`persist_loop_progress`) go straight to disk via their own
+        // load/mutate/update cycle WHILE the scheduler above was
+        // running — `record` here is a snapshot taken/created BEFORE
+        // that (at `run_workflow`'s own start), so it's stale on this
+        // one field. Refresh it from disk before this terminal-state
+        // update below writes `record` back out, or it would clobber
+        // every mid-run loop checkpoint back to empty (this run's own
+        // `RunRecord`, so no cross-run race — nothing else touches
+        // `loop_progress` between the scheduler returning and here).
+        if let Ok(fresh) = store.load(&record.id) {
+            record.loop_progress = fresh.loop_progress;
+        }
         match &outcome {
             Ok(InnerOutcome::Done) => {
                 record.status = crate::runs::RunStatus::Completed;
@@ -1713,6 +1731,23 @@ async fn run_scheduler_scoped(
     // EVERY gate reached in the wave in the set, not only the first.
     let mut parked: Vec<GateParked> = Vec::new();
 
+    // Task 4 (spec §3): which bounded-loop iteration THIS call's own
+    // dispatches belong to, if any. Non-empty (exactly one entry) only
+    // for `run_loop_node`'s per-iteration recursive call — the outer
+    // call (and every pre-Task-4 call) always has `scope.loop_progress`
+    // empty, so this is `None` there, and every `StepResult` this call
+    // persists keeps `loop_iteration: None` (its `Default`) — the
+    // legacy/byte-equality guarantee. Stamped onto a member's result at
+    // every completion site below (skip / branch / split / real
+    // dispatch) right before it's persisted, so `step_results.jsonl`
+    // can tell which iteration produced it (Task 4's resume re-entry
+    // reads this back via `StepResult::loop_iteration`).
+    let current_loop_iteration: Option<u32> = if scope.loop_progress.len() == 1 {
+        scope.loop_progress.values().next().map(|p| p.iteration)
+    } else {
+        None
+    };
+
     loop {
         // Drain every currently-ready, not-yet-dispatched node. Resolving
         // one synchronously (skip / branch / split / gate-approved) can
@@ -1774,6 +1809,7 @@ async fn run_scheduler_scoped(
                     skipped: true,
                     kind: step_kind_for_run_record(step),
                     items: Vec::new(),
+                    loop_iteration: current_loop_iteration,
                     ..Default::default()
                 };
                 complete_and_drain_joins(
@@ -1892,6 +1928,7 @@ async fn run_scheduler_scoped(
                         success: false,
                         skipped: true,
                         items: Vec::new(),
+                        loop_iteration: current_loop_iteration,
                         ..Default::default()
                     };
                     complete_and_drain_joins(
@@ -1931,7 +1968,16 @@ async fn run_scheduler_scoped(
 
                 if gate_suppressed {
                     info!(step = %step.id, "gate: resuming with human approval");
-                    emit_gate_result(opts, run_id, step, "approved", "human", None, step_results);
+                    emit_gate_result(
+                        opts,
+                        run_id,
+                        step,
+                        "approved",
+                        "human",
+                        None,
+                        step_results,
+                        current_loop_iteration,
+                    );
                     let worklist = mark_done_and_track_joins(
                         i,
                         true, // gate resolved with a real decision — a live arrival
@@ -1974,6 +2020,7 @@ async fn run_scheduler_scoped(
                             "auto",
                             None,
                             step_results,
+                            current_loop_iteration,
                         );
                         let worklist = mark_done_and_track_joins(
                             i,
@@ -2128,6 +2175,7 @@ async fn run_scheduler_scoped(
                     success: true,
                     skipped: false,
                     kind: crate::runs::StepKind::Branch,
+                    loop_iteration: current_loop_iteration,
                     ..Default::default()
                 };
                 let duration_ms = branch_timer.elapsed().as_millis() as u64;
@@ -2183,6 +2231,7 @@ async fn run_scheduler_scoped(
                     success: true,
                     skipped: false,
                     kind: crate::runs::StepKind::Split,
+                    loop_iteration: current_loop_iteration,
                     ..Default::default()
                 };
                 let duration_ms = split_timer.elapsed().as_millis() as u64;
@@ -2256,10 +2305,11 @@ async fn run_scheduler_scoped(
                         workflow_default_continue,
                         step_results,
                         cancel,
+                        approved_step_id,
                     ))
                     .await;
                     match loop_result {
-                        Ok((result, progress)) => {
+                        Ok(LoopNodeOutcome::Completed(result, progress)) => {
                             let duration_ms = loop_timer.elapsed().as_millis() as u64;
                             if let Some(sink) = opts.event_sink.as_ref() {
                                 sink.emit(
@@ -2294,6 +2344,36 @@ async fn run_scheduler_scoped(
                                 &mut join_state,
                                 &mut cancel_state,
                             );
+                        }
+                        // Task 4 (spec §3/§5): a member (or a gate on
+                        // one) paused mid-iteration. NOT a failure —
+                        // forward it as the exact same hard-return every
+                        // other pause site in this function uses (no
+                        // `StepFailed`/`StepCompleted` event for the
+                        // loop itself; the paused member's own event was
+                        // already emitted deep inside the recursive
+                        // call). A later resume re-enters this loop at
+                        // its checkpointed iteration (`run_loop_node`'s
+                        // `load_loop_start_iteration`) and re-runs only
+                        // that iteration's not-done members.
+                        Ok(LoopNodeOutcome::Paused {
+                            step_id,
+                            prompt,
+                            timeout_seconds,
+                            reason,
+                            seed,
+                            fanout_completed_units,
+                            gates,
+                        }) => {
+                            return Ok(InnerOutcome::Paused {
+                                step_id,
+                                prompt,
+                                timeout_seconds,
+                                reason,
+                                seed,
+                                fanout_completed_units,
+                                gates,
+                            });
                         }
                         Err(e) => {
                             if let Some(sink) = opts.event_sink.as_ref() {
@@ -2384,8 +2464,15 @@ async fn run_scheduler_scoped(
         // drained still gets caught before we settle in to await the next
         // completion.
         if cancel_requested(cancel) {
-            return cancel_finalize(opts, run_id, step_results, &mut in_flight, &mut cancel_state)
-                .await;
+            return cancel_finalize(
+                opts,
+                run_id,
+                step_results,
+                &mut in_flight,
+                &mut cancel_state,
+                current_loop_iteration,
+            )
+            .await;
         }
 
         if in_flight.is_empty() {
@@ -2402,6 +2489,7 @@ async fn run_scheduler_scoped(
                 () = token.cancelled() => {
                     return cancel_finalize(
                         opts, run_id, step_results, &mut in_flight, &mut cancel_state,
+                        current_loop_iteration,
                     )
                     .await;
                 }
@@ -2508,7 +2596,7 @@ async fn run_scheduler_scoped(
                     gates: Vec::new(),
                 });
             }
-            NodeOutcome::Completed(result) => {
+            NodeOutcome::Completed(mut result) => {
                 let done_step_id = wf.steps[i].id.clone();
                 clear_active_step(opts, run_id, &done_step_id);
                 if cancel_state.cancelled_by_us.remove(&i) {
@@ -2521,6 +2609,11 @@ async fn run_scheduler_scoped(
                     // that already fired.
                     continue;
                 }
+                // Task 4 (spec §3): stamp which iteration this real
+                // dispatch belongs to (`None` outside a loop's own
+                // per-iteration recursive call — see
+                // `current_loop_iteration`'s doc).
+                result.loop_iteration = current_loop_iteration;
                 complete_and_drain_joins(
                     i,
                     true, // real dispatch completed — a live arrival
@@ -2718,6 +2811,65 @@ fn loop_forward_edges(wf: &Workflow, loop_name: &str) -> Vec<(String, String)> {
 /// true` for every id present in the `step_results` it's given — if a
 /// member's PRIOR-iteration result lived in that same vector, it would
 /// never be scheduled again this iteration.
+///
+/// **Resume / checkpoint (Task 4, spec §3).** Not fresh-empty ANYMORE,
+/// actually — see below: the recursive call's seed `step_results` is
+/// empty only in the common (non-resumed) case; on resume it's exactly
+/// this iteration's already-done members, reconstructed from
+/// `outer_step_results`.
+///
+/// The re-entry point is `start_iteration`
+/// ([`load_loop_start_iteration`], reading `RunRecord.loop_progress`):
+/// `0` for a fresh run (no entry yet) or the LAST iteration a prior
+/// process of this same run persisted as in-flight
+/// ([`persist_loop_progress`], called at the top of the loop below,
+/// BEFORE that iteration's recursive call — so even a pause that landed
+/// before any member of it ran still checkpoints correctly at that
+/// iteration, not the previous one). A loop whose OWN `"loop:<name>"`
+/// synthetic result is already in `outer_step_results` (i.e. it already
+/// converged, or exhausted with `on_max: proceed`) is never re-entered
+/// at all — `run_scheduler_scoped`'s existing resume-seeding
+/// (`done[loop_idx] = true`) keeps the outer ready-drain loop from ever
+/// reaching this function for it, with zero code here needed to special-
+/// case that (requirement #4 falls out of the pre-existing Phase-2
+/// mechanism for free).
+///
+/// For iteration `start_iteration` specifically, `iteration_results` is
+/// seeded from `outer_step_results` with every record matching (a) this
+/// loop's members and (b) `loop_iteration == Some(start_iteration)` —
+/// i.e. exactly the members THIS iteration already finished before the
+/// prior process stopped. Handed to the recursive `run_scheduler_scoped`
+/// call as its OWN `step_results`, this makes its resume-seeding mark
+/// those members `done` (so they are NOT re-dispatched) while anything
+/// else in the iteration still runs. For every iteration AFTER
+/// `start_iteration` the same filter naturally returns empty (no
+/// records exist yet for an iteration that hasn't started), so this is
+/// one code path for both the fresh and resumed cases — not a special
+/// resume branch.
+///
+/// `feedback_history` starts as `outer_step_results.clone()` exactly as
+/// before, which already carries every earlier iteration's (and this
+/// iteration's own already-done) member results straight from disk on
+/// resume — so a member's prior-iteration feedback read reconstructs
+/// correctly with no extra bookkeeping.
+///
+/// A pause/approval gate landing on a member mid-iteration
+/// (`InnerOutcome::Paused` from the recursive call) is forwarded
+/// verbatim as [`LoopNodeOutcome::Paused`] instead of the fail-loud
+/// `LoopIterationPaused` Task 3 shipped — see that variant's doc and
+/// this function's caller for how it becomes a normal, resumable
+/// `InnerOutcome::Paused` at the outer scheduler level. **Pause
+/// granularity decision (spec §3, requirement #5): mid-iteration, not
+/// just between-iterations.** This works out to the finer granularity
+/// for free (not the simpler between-iterations-only alternative)
+/// because the checkpoint primitives above — `loop_iteration`-tagged
+/// per-member persistence (already true since every member dispatch
+/// funnels through the SAME `persist_step_result` path as any other
+/// step) plus the `RunRecord.loop_progress` counter recorded before the
+/// iteration starts — are together already sufficient to reconstruct
+/// "which members of the in-flight iteration are done" on resume; there
+/// is no extra state a between-iterations-only design would avoid
+/// needing.
 #[allow(clippy::too_many_arguments)]
 async fn run_loop_node(
     loop_name: &str,
@@ -2728,17 +2880,33 @@ async fn run_loop_node(
     workflow_default_continue: bool,
     outer_step_results: &mut Vec<StepResult>,
     cancel: Option<&CancellationToken>,
-) -> Result<(StepResult, crate::templates::LoopProgress), RunWorkflowError> {
+    // Task 4, spec §3/§5 fix: the id of a gate an approve-resume just
+    // suppressed, forwarded from `run_workflow`/`run_scheduler_scoped`'s
+    // own parameter of the same name. Task 3 hardcoded `None` on the
+    // recursive call below — harmless for that task (no test exercised
+    // an approval gate INSIDE a loop) but silently broken for one: a
+    // loop member gate could never be suppressed on resume, so
+    // approving it would just re-park it forever. Threaded through
+    // unchanged; `run_scheduler_scoped`'s own gate-suppression check
+    // (`approved_step_id == Some(step.id.as_str())`) does the rest.
+    approved_step_id: Option<&str>,
+) -> Result<LoopNodeOutcome, RunWorkflowError> {
     let wf = &opts.workflow;
     let member_ids: std::collections::BTreeSet<String> = loop_def.nodes.iter().cloned().collect();
     let forward_edges = loop_forward_edges(wf, loop_name);
 
     let mut feedback_history: Vec<StepResult> = outer_step_results.clone();
     let mut converged = false;
-    let mut last_iteration = 0u32;
+    let start_iteration = load_loop_start_iteration(opts, run_id, loop_name);
+    let mut last_iteration = start_iteration;
 
-    for iteration in 0..loop_def.max_iterations {
+    for iteration in start_iteration..loop_def.max_iterations {
         last_iteration = iteration;
+        // Task 4, spec §3: checkpoint BEFORE this iteration's recursive
+        // call — a pause/cancel landing anywhere inside it (even before
+        // any member has run) resumes at THIS iteration, never the
+        // previous one.
+        persist_loop_progress(opts, run_id, loop_name, iteration);
 
         let mut loop_progress = std::collections::BTreeMap::new();
         loop_progress.insert(
@@ -2755,36 +2923,97 @@ async fn run_loop_node(
             loop_progress,
         };
 
-        let mut iteration_results: Vec<StepResult> = Vec::new();
+        // Task 4, spec §3: seeded with this iteration's already-done
+        // members on resume (empty otherwise — see this function's
+        // doc); the recursive call's own resume-seeding treats these
+        // exactly like Phase 2 treats any other pre-seeded
+        // `step_results`, so they are NOT re-dispatched.
+        let mut iteration_results: Vec<StepResult> = outer_step_results
+            .iter()
+            .filter(|sr| sr.loop_iteration == Some(iteration) && member_ids.contains(&sr.step_id))
+            .cloned()
+            .collect();
+        // Everything in `iteration_results` at this point is a SEED —
+        // already present in `outer_step_results`/`feedback_history`
+        // (that's where it was cloned from). Only the entries the
+        // recursive call itself APPENDS past this point are genuinely
+        // NEW this iteration; merging the seed back in too would
+        // duplicate it (Task 4 resume bug: a resumed, already-done
+        // member counted twice in `step_results`, once from the
+        // original persist and once from THIS re-merge).
+        let seeded_count = iteration_results.len();
         let outcome = Box::pin(run_scheduler_scoped(
             opts,
             run_id,
             resolved_inputs,
             workflow_default_continue,
-            None,
+            approved_step_id,
             &mut iteration_results,
             cancel,
             scope,
         ))
-        .await?;
+        .await;
+
+        // Fold whatever THIS iteration NEWLY produced — whether it ran
+        // to completion, paused partway through, or the recursive call
+        // itself returned an `Err` (e.g. `RunCancelled` — Task 4, spec
+        // §8/§3: a whole-run cancel aborts an in-flight member, but
+        // `iteration_results` already has whatever completed
+        // SYNCHRONOUSLY before the abort landed, mutated through the
+        // `&mut` regardless of the call's own return value) — into the
+        // cross-iteration history (latest-wins via append — never
+        // cleared; see this function's doc) AND into the OUTER run's
+        // `step_results`, BEFORE inspecting `outcome` or propagating an
+        // error. Task 4, spec §3: unconditionally, for every iteration
+        // outcome (NOT only a converged/`Done` one) — a member that
+        // finished right before a mid-iteration pause/cancel is real,
+        // persisted history and must be visible the same way a
+        // converged iteration's members are, exactly ONCE (hence
+        // `[seeded_count..]`, not the whole vector — see above).
+        outer_step_results.extend(iteration_results[seeded_count..].iter().cloned());
+        feedback_history.extend(iteration_results[seeded_count..].iter().cloned());
+        let outcome = outcome?;
+
         match outcome {
             InnerOutcome::Done => {}
-            InnerOutcome::Paused { .. } => {
-                // A pause/approval gate landed on a member mid-iteration —
-                // not supported this task (Task 4's job, spec §3's loop
-                // resume). Fail loudly rather than silently drop it or
-                // mis-resume at the wrong iteration.
-                return Err(RunWorkflowError::LoopIterationPaused {
-                    name: loop_name.to_string(),
+            InnerOutcome::Paused {
+                step_id,
+                prompt,
+                timeout_seconds,
+                reason,
+                seed,
+                fanout_completed_units,
+                gates,
+            } => {
+                // Task 4, spec §3/§5: a member (or a gate on one) paused
+                // mid-iteration. Every member that finished before this
+                // point in THIS iteration is already persisted (the
+                // recursive call's own dispatch path) and tagged with
+                // `loop_iteration`, and just got merged into
+                // `outer_step_results`/`feedback_history` above —
+                // nothing extra to checkpoint here beyond the
+                // `persist_loop_progress` call already made above.
+                // Forward the pause verbatim rather than failing the
+                // run: the caller turns this into a normal
+                // `InnerOutcome::Paused`, and a later resume re-enters
+                // this exact iteration via `start_iteration` above,
+                // re-running only what didn't finish.
+                return Ok(LoopNodeOutcome::Paused {
+                    step_id,
+                    prompt,
+                    timeout_seconds,
+                    reason,
+                    seed,
+                    fanout_completed_units,
+                    gates,
                 });
             }
         }
 
-        // Fold this iteration's results into the cross-iteration history
-        // (latest-wins via append — never cleared; see this function's
-        // doc).
-        feedback_history.extend(iteration_results.iter().cloned());
-
+        // Everything below only runs on `InnerOutcome::Done` — the
+        // `Paused` arm above already returned. `iteration_results` was
+        // already merged into `outer_step_results`/`feedback_history`
+        // above, before the match.
         let mut until_progress = std::collections::BTreeMap::new();
         until_progress.insert(
             loop_name.to_string(),
@@ -2811,13 +3040,13 @@ async fn run_loop_node(
         })?;
 
         if holds {
+            // This (converged) iteration's member results are already in
+            // `outer_step_results` (merged unconditionally above) — its
+            // successors (e.g. `ship`) see them via the normal
+            // `base_context_for_step` path. Never re-persisted here —
+            // each member was already persisted once by its own dispatch
+            // inside the recursive call above.
             converged = true;
-            // Merge THIS (converged) iteration's member results into the
-            // outer run's `step_results` so successors (e.g. `ship`) see
-            // them via the normal `base_context_for_step` path. Never
-            // re-persisted here — each member was already persisted once
-            // by its own dispatch inside the recursive call above.
-            outer_step_results.extend(iteration_results);
             break;
         }
         if iteration + 1 >= loop_def.max_iterations {
@@ -2830,7 +3059,6 @@ async fn run_loop_node(
                 }
                 crate::workflow::OnMax::Proceed => {
                     converged = false;
-                    outer_step_results.extend(iteration_results);
                     break;
                 }
             }
@@ -2845,17 +3073,94 @@ async fn run_loop_node(
         iteration: last_iteration,
         converged,
     };
-    Ok((
+    Ok(LoopNodeOutcome::Completed(
         StepResult {
             step_id: format!("loop:{loop_name}"),
             output,
             success: converged || matches!(loop_def.on_max, crate::workflow::OnMax::Proceed),
             skipped: false,
             kind: crate::runs::StepKind::Split,
+            // Deliberately `None`, not `current_loop_iteration`-style —
+            // this is the loop's OWN super-node record, not a member's.
+            // See `StepResult::loop_iteration`'s doc.
             ..Default::default()
         },
         progress,
     ))
+}
+
+/// [`run_loop_node`]'s result (Task 4, spec §3/§5): either it resolved
+/// (converged, or exhausted with `on_max: proceed`) with its synthetic
+/// `"loop:<name>"` [`StepResult`] + final [`crate::templates::
+/// LoopProgress`], or a member (or a gate on one) hit a real pause
+/// boundary mid-iteration — forwarded verbatim from the recursive
+/// `run_scheduler_scoped` call's own `InnerOutcome::Paused` (same field
+/// set, deliberately not reusing `InnerOutcome` itself so this type
+/// can't also carry `InnerOutcome::Done`, which `run_loop_node` never
+/// produces this way — it uses `Completed` instead). The caller
+/// (`run_scheduler_scoped`'s loop-supernode dispatch interception)
+/// turns `Paused` into a normal `InnerOutcome::Paused` hard-return —
+/// this is what makes a mid-loop pause resumable instead of the
+/// fail-loud `LoopIterationPaused` Task 3 shipped (now removed).
+enum LoopNodeOutcome {
+    Completed(StepResult, crate::templates::LoopProgress),
+    Paused {
+        step_id: String,
+        prompt: String,
+        timeout_seconds: Option<u64>,
+        reason: PauseReason,
+        seed: Vec<Message>,
+        fanout_completed_units: std::collections::BTreeMap<usize, ItemResult>,
+        gates: Vec<GateParked>,
+    },
+}
+
+/// Task 4 (spec §3): the loop-resume checkpoint counter, mirroring
+/// [`persist_active_step`]'s load/mutate/store shape. Writes
+/// `RunRecord.loop_progress[loop_name] = iteration`, overwriting any
+/// prior value for this loop (the running process is always the
+/// authority on "what iteration is in flight now"). A no-op when
+/// there's no run store or run id (in-memory harness / unit tests
+/// without persistence) — the loop still runs correctly in a single
+/// process, it just has nothing to resume FROM if the process exits.
+fn persist_loop_progress(opts: &OrchestratorRunOpts, run_id: &str, loop_name: &str, iteration: u32) {
+    let Some(store) = &opts.run_store else { return };
+    if run_id.is_empty() {
+        return;
+    }
+    let Ok(mut record) = store.load(run_id) else {
+        return;
+    };
+    record.loop_progress.insert(loop_name.to_string(), iteration);
+    if let Err(e) = store.update(&record) {
+        warn!(loop_name, iteration, error = %e, "failed to persist loop progress checkpoint");
+    }
+}
+
+/// Task 4 (spec §3): the resume-re-entry counterpart to
+/// [`persist_loop_progress`] — `0` when there's no run store / run id
+/// (fresh in-memory run) or no recorded entry for this loop yet (a
+/// truly fresh run, including a fresh run that HAS a run store but
+/// hasn't reached this loop before). Otherwise the iteration a prior
+/// process of THIS SAME run id last checkpointed as in-flight.
+///
+/// Deliberately unconditional — this function does not (and cannot,
+/// from a plain counter alone) distinguish "fresh run" from "resumed
+/// run": both cases return `0` for a loop this run id has never
+/// checkpointed, which is exactly correct for a fresh run and would
+/// also be correct for a resumed run whose pause landed before this
+/// loop's very first iteration was checkpointed (nothing to skip
+/// either way).
+fn load_loop_start_iteration(opts: &OrchestratorRunOpts, run_id: &str, loop_name: &str) -> u32 {
+    let Some(store) = &opts.run_store else { return 0 };
+    if run_id.is_empty() {
+        return 0;
+    }
+    store
+        .load(run_id)
+        .ok()
+        .and_then(|r| r.loop_progress.get(loop_name).copied())
+        .unwrap_or(0)
 }
 
 /// Task 4, spec §8: a whole-run cancel signal fired mid-schedule. Aborts
@@ -2903,6 +3208,11 @@ async fn cancel_finalize(
     step_results: &mut Vec<StepResult>,
     in_flight: &mut tokio::task::JoinSet<(usize, Result<NodeOutcome, RunWorkflowError>)>,
     cancel_state: &mut Cancellation,
+    // Task 4 (spec §3): same stamp `complete_and_drain_joins`'s call
+    // sites apply — a node that raced to completion just as a
+    // whole-run cancel landed still belongs to the iteration this call
+    // is scoped to (or `None` outside a loop).
+    loop_iteration: Option<u32>,
 ) -> Result<InnerOutcome, RunWorkflowError> {
     let to_abort: Vec<usize> = cancel_state.in_flight_abort.keys().copied().collect();
     for i in &to_abort {
@@ -2914,7 +3224,8 @@ async fn cancel_finalize(
     let aborted = to_abort.len();
     while let Some(joined) = in_flight.join_next().await {
         match joined {
-            Ok((_, Ok(NodeOutcome::Completed(result)))) => {
+            Ok((_, Ok(NodeOutcome::Completed(mut result)))) => {
+                result.loop_iteration = loop_iteration;
                 persist_step_result(opts, run_id, &result);
                 step_results.push(result);
             }
@@ -3653,7 +3964,9 @@ async fn run_steps_over(
 
             if gate_suppressed {
                 info!(step = %step.id, "gate: resuming with human approval");
-                emit_gate_result(opts, run_id, step, "approved", "human", None, step_results);
+                emit_gate_result(
+                    opts, run_id, step, "approved", "human", None, step_results, None,
+                );
                 continue;
             }
             if let Some(expr) = &ap.auto_approve {
@@ -3665,7 +3978,9 @@ async fn run_steps_over(
                         })?;
                 if truthy {
                     info!(step = %step.id, "gate auto-approved");
-                    emit_gate_result(opts, run_id, step, "approved", "auto", None, step_results);
+                    emit_gate_result(
+                        opts, run_id, step, "approved", "auto", None, step_results, None,
+                    );
                     continue;
                 }
             }
@@ -4391,6 +4706,7 @@ async fn fire_notify_hooks(
 /// "approved"`); `reason` is the operator's rejection reason (`Some` only
 /// for a rejected decision, `None` otherwise, matching spec §3.1's
 /// `"reason": null` for approvals).
+#[allow(clippy::too_many_arguments)]
 fn emit_gate_result(
     opts: &OrchestratorRunOpts,
     run_id: &str,
@@ -4399,6 +4715,13 @@ fn emit_gate_result(
     via: &str,
     reason: Option<&str>,
     step_results: &mut Vec<StepResult>,
+    // Task 4 (spec §3): stamped onto this gate's persisted `StepResult`
+    // when it resolved as a member INSIDE a loop iteration (`Some` only
+    // from `run_scheduler_scoped`'s two in-loop call sites, via its own
+    // `current_loop_iteration`). `None` for every other caller (the
+    // legacy single-cursor loop, and `run_reject_cleanup`'s rejected-
+    // gate record) — preserves the legacy absent-field shape exactly.
+    loop_iteration: Option<u32>,
 ) {
     if let Some(sink) = opts.event_sink.as_ref() {
         sink.emit(
@@ -4425,6 +4748,7 @@ fn emit_gate_result(
         success: true,
         skipped: false,
         kind: crate::runs::StepKind::ApprovalGate,
+        loop_iteration,
         ..Default::default()
     };
     if let Some(sink) = opts.event_sink.as_ref() {
@@ -4510,6 +4834,7 @@ pub async fn run_reject_cleanup(
         via,
         Some(reason),
         &mut step_results,
+        None,
     );
 
     // 3. Dispatch each on_reject step through the same per-step
@@ -6335,6 +6660,7 @@ impl PanelPass {
             findings: self.findings,
             iterations,
             resolved,
+            loop_iteration: None,
         }
     }
 }
@@ -10530,6 +10856,887 @@ loops:
             2,
             "a and b must have overlapped in flight within the same iteration"
         );
+    }
+}
+
+/// Task 4 (spec §3): loop resume / checkpoint. Builds on `bounded_loops`'
+/// `REFINE_WF` fixture but drives real on-disk `RunRecord`/
+/// `step_results.jsonl` persistence (`run_store: Some(..)`) since
+/// `run_loop_node`'s re-entry point (`RunRecord.loop_progress`) is,
+/// deliberately, only reconstructible from disk — see
+/// `load_loop_start_iteration`'s doc.
+#[cfg(test)]
+mod loop_resume {
+    use super::*;
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_providers::types::StopReason;
+    use rupu_tools::ToolContext;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    const REFINE_WF: &str = r#"
+name: refine
+steps:
+  - id: seed
+    agent: seeder
+    prompt: "seed"
+  - id: gen
+    agent: generator
+    prompt: "attempt={{ loops.refine.iteration }} seed={{ steps.seed.output }} critique={{ steps.critique.output }}"
+    depends_on: [seed]
+  - id: test
+    agent: tester
+    prompt: "test {{ steps.gen.output }}"
+    depends_on: [gen]
+  - id: critique
+    agent: critic
+    prompt: "critique {{ steps.test.output }}"
+    depends_on: [test]
+  - id: ship
+    agent: shipper
+    prompt: "ship critique={{ steps.critique.output }} converged={{ loops.refine.converged }}"
+loops:
+  refine:
+    nodes: [gen, test, critique]
+    until: "{{ steps.critique.output }}"
+    max_iterations: 5
+"#;
+
+    /// Flexible refine-loop mock factory covering every test in this
+    /// module: `critique` answers `"false"` for its first `false_calls`
+    /// dispatches (counted from `critique_call_offset`, so a restart's
+    /// factory can continue the SAME global call sequence a prior
+    /// phase started), then `"true"`. Optionally sleeps before
+    /// returning for `critique` (`critique_delay_ms`) so a hard
+    /// whole-run cancel has a real in-flight task to abort.
+    struct ResumableRefineFactory {
+        false_calls: usize,
+        critique_call_offset: usize,
+        critique_delay_ms: Option<u64>,
+        critique_calls: Arc<AtomicUsize>,
+        test_calls: Arc<AtomicUsize>,
+        calls: Arc<Mutex<Vec<String>>>,
+        gen_prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ResumableRefineFactory {
+        fn new(false_calls: usize) -> Self {
+            Self {
+                false_calls,
+                critique_call_offset: 0,
+                critique_delay_ms: None,
+                critique_calls: Arc::new(AtomicUsize::new(0)),
+                test_calls: Arc::new(AtomicUsize::new(0)),
+                calls: Arc::new(Mutex::new(Vec::new())),
+                gen_prompts: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn critique_call_offset(mut self, n: usize) -> Self {
+            self.critique_call_offset = n;
+            self
+        }
+
+        fn critique_delay_ms(mut self, ms: u64) -> Self {
+            self.critique_delay_ms = Some(ms);
+            self
+        }
+    }
+
+    #[async_trait]
+    impl StepFactory for ResumableRefineFactory {
+        async fn build_opts_for_step(
+            &self,
+            step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: PathBuf,
+            transcript_path: PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> AgentRunOpts {
+            self.calls.lock().unwrap().push(step_id.to_string());
+            if step_id == "gen" {
+                self.gen_prompts
+                    .lock()
+                    .unwrap()
+                    .push(rendered_prompt.clone());
+            }
+            if step_id == "test" {
+                let _ = self.test_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            let text = if step_id == "critique" {
+                if let Some(ms) = self.critique_delay_ms {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
+                let n = self.critique_call_offset
+                    + self.critique_calls.fetch_add(1, Ordering::SeqCst);
+                if n < self.false_calls {
+                    "false".to_string()
+                } else {
+                    "true".to_string()
+                }
+            } else {
+                format!("out-{step_id}")
+            };
+            let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+                text,
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            }]);
+            AgentRunOpts {
+                agent_name: format!("ag-{agent_name}"),
+                agent_system_prompt: "echo".into(),
+                agent_tools: None,
+                provider: Box::new(provider),
+                provider_name: "mock".into(),
+                model: "mock-1".into(),
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                max_turns: 5,
+                decider: Arc::new(BypassDecider),
+                tool_context: ToolContext::default(),
+                user_message: rendered_prompt,
+                initial_messages: Vec::new(),
+                turn_index_offset: 0,
+                mode_str: "bypass".into(),
+                no_stream: true,
+                suppress_stream_stdout: true,
+                mcp_registry: None,
+                effort: None,
+                context_window: None,
+                output_format: None,
+                output_schema: None,
+                anthropic_task_budget: None,
+                anthropic_context_management: None,
+                anthropic_speed: None,
+                parent_run_id: None,
+                depth: 0,
+                dispatchable_agents: None,
+                step_id: step_id.to_string(),
+                on_tool_call,
+                on_stream_event: None,
+                concerns: None,
+                max_tokens: DEFAULT_MAX_TOKENS,
+                scope_name: None,
+                surface_tag: None,
+                context_window_tokens: None,
+                compact_at_percent: None,
+                pause: None,
+            }
+        }
+    }
+
+    fn store_opts(
+        wf: Workflow,
+        factory: ResumableRefineFactory,
+        tmp: &tempfile::TempDir,
+        store: Arc<crate::runs::RunStore>,
+        pause: Option<CancellationToken>,
+        resume_from: Option<ResumeState>,
+    ) -> OrchestratorRunOpts {
+        OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_loop_resume".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(store),
+            workflow_yaml: Some(REFINE_WF.to_string()),
+            resume_from,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause,
+        }
+    }
+
+    fn count(calls: &[String], id: &str) -> usize {
+        calls.iter().filter(|s| s.as_str() == id).count()
+    }
+
+    /// Runs `REFINE_WF` to full natural convergence (no pause) and
+    /// returns `(run_id, full step_results)`. Used as the deterministic
+    /// starting point for both resume tests below: rather than racing a
+    /// live cooperative pause against a fully-synchronous `MockProvider`
+    /// (no real dispatch latency exists to land a pause boundary
+    /// exactly between two specific member dispatches), each test
+    /// TRUNCATES this known-good, fully-tagged history back to "as if
+    /// paused at iteration N" and manually sets the `RunRecord.
+    /// loop_progress` checkpoint a real pause would have left — exactly
+    /// the plan's own Step 1 wording ("simulate a pause... persist
+    /// those + set `loop_progress`"). This is Phase 2's own resume-test
+    /// convention too (`resume_and_cancel`'s tests hand-seed
+    /// `step_results` rather than drive a live pause for the same
+    /// reason).
+    async fn run_refine_to_convergence(
+        wf: &Workflow,
+        tmp: &tempfile::TempDir,
+        store: &Arc<crate::runs::RunStore>,
+        false_calls: usize,
+    ) -> (String, Vec<StepResult>) {
+        let factory = ResumableRefineFactory::new(false_calls);
+        let opts = store_opts(wf.clone(), factory, tmp, Arc::clone(store), None, None);
+        let res = tokio::time::timeout(Duration::from_secs(5), run_workflow(opts))
+            .await
+            .expect("full run must not hang")
+            .expect("full run must converge and complete");
+        assert!(res.awaiting.is_none());
+        (res.run_id, res.step_results)
+    }
+
+    /// Plan Task 4 Step 1 / spec §3: pause mid-loop (iteration 2, `gen`
+    /// + `test` done, `critique` not), resume with a fresh scheduler
+    /// over the same run dir. Must re-enter iteration 2, re-dispatch
+    /// ONLY `critique`, then — since the global critique sequence isn't
+    /// exhausted yet — continue into iteration 3, whose `gen` must see
+    /// iteration 2's critique via the feedback mechanic (not empty, not
+    /// its own not-yet-run value), converge, and run `ship` exactly
+    /// once.
+    #[tokio::test]
+    async fn resume_mid_loop_reenters_and_reruns_only_not_done_members() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::runs::RunStore::new(tmp.path().join("runs")));
+        let wf = Workflow::parse(REFINE_WF).unwrap();
+
+        // Converges at global critique call #3 (0-indexed) — false at
+        // calls 0,1,2 (iterations 0,1,2), true at call 3 (iteration 3).
+        let (run_id, full_results) = run_refine_to_convergence(&wf, &tmp, &store, 3).await;
+
+        let gen_at_2 = full_results
+            .iter()
+            .find(|sr| sr.step_id == "gen" && sr.loop_iteration == Some(2))
+            .cloned()
+            .expect("gen@iteration2 must be persisted with its iteration tag");
+        assert!(gen_at_2.rendered_prompt.contains("attempt=2") && gen_at_2.rendered_prompt.contains("critique=false"));
+        // Every non-loop step (seed) keeps `loop_iteration` absent.
+        let seed = full_results.iter().find(|sr| sr.step_id == "seed").unwrap();
+        assert_eq!(seed.loop_iteration, None);
+
+        // --- Simulate "paused mid-iteration-2, critique not yet run":
+        // truncate to seed + iterations 0,1 (full) + iteration 2's
+        // `gen`/`test` only (drop iteration 2's `critique` onward, the
+        // loop's own synthetic result, and `ship`); checkpoint iteration
+        // 2 as in-flight — exactly what `run_loop_node` would have
+        // persisted the instant it started iteration 2, before
+        // dispatching any of its members.
+        let truncated: Vec<StepResult> = full_results
+            .iter()
+            .filter(|sr| match sr.loop_iteration {
+                Some(it) => it < 2 || (it == 2 && (sr.step_id == "gen" || sr.step_id == "test")),
+                None => sr.step_id != "loop:refine" && sr.step_id != "ship",
+            })
+            .cloned()
+            .collect();
+        assert_eq!(count_ids(&truncated, "gen"), 3, "seed's siblings gen@0,1,2");
+        assert_eq!(count_ids(&truncated, "test"), 3);
+        assert_eq!(count_ids(&truncated, "critique"), 2, "only iterations 0,1");
+        let mut rec = store.load(&run_id).unwrap();
+        rec.loop_progress.insert("refine".to_string(), 2);
+        store.update(&rec).unwrap();
+
+        // --- Resume. Only `critique` of iteration 2 must be
+        // re-dispatched (not gen/test again); the global critique
+        // sequence continues from call #2 (0-indexed) — still false —
+        // so the loop proceeds into iteration 3, whose `gen` must see
+        // iteration 2's critique ("false") via the feedback mechanic,
+        // then converges (call #3 = true) and ships once.
+        let factory2 = ResumableRefineFactory::new(3).critique_call_offset(2);
+        let calls2 = Arc::clone(&factory2.calls);
+        let gen_prompts2 = Arc::clone(&factory2.gen_prompts);
+        let opts2 = store_opts(
+            wf,
+            factory2,
+            &tmp,
+            Arc::clone(&store),
+            None,
+            Some(ResumeState {
+                run_id: run_id.clone(),
+                prior_step_results: truncated,
+                approved_step_id: String::new(),
+                completed_units: std::collections::BTreeMap::new(),
+                reason: PauseReason::Manual,
+                paused_step: None,
+                rejected_reason: None,
+            }),
+        );
+
+        let res2 = tokio::time::timeout(Duration::from_secs(5), run_workflow(opts2))
+            .await
+            .expect("resume must not hang")
+            .expect("resume must converge and complete — Ok, never LoopIterationPaused/any error");
+        assert!(res2.awaiting.is_none(), "run must complete after resume");
+
+        let calls2 = calls2.lock().unwrap().clone();
+        assert_eq!(
+            count(&calls2, "gen"),
+            1,
+            "only iteration 3's gen must run on resume (iteration 2's gen is done): {calls2:?}"
+        );
+        assert_eq!(
+            count(&calls2, "test"),
+            1,
+            "only iteration 3's test must run on resume: {calls2:?}"
+        );
+        assert_eq!(
+            count(&calls2, "critique"),
+            2,
+            "iteration 2's critique (re-dispatched) + iteration 3's critique: {calls2:?}"
+        );
+        assert_eq!(count(&calls2, "ship"), 1, "ship exactly once: {calls2:?}");
+
+        // Feedback reconstruction across the resumed iteration boundary:
+        // iteration 3's gen prompt must show iteration 2's real critique
+        // value ("false"), not empty and not a live/cyclic read.
+        let gen_prompts2 = gen_prompts2.lock().unwrap().clone();
+        assert_eq!(gen_prompts2.len(), 1);
+        assert!(
+            gen_prompts2[0].contains("attempt=3") && gen_prompts2[0].contains("critique=false"),
+            "iteration 3's gen must see iteration 2's critique output: {gen_prompts2:?}"
+        );
+
+        let ship_result = res2
+            .step_results
+            .iter()
+            .find(|sr| sr.step_id == "ship")
+            .expect("ship ran");
+        assert!(ship_result.rendered_prompt.contains("critique=true"));
+        assert!(ship_result.rendered_prompt.contains("converged=true"));
+    }
+
+    fn count_ids(results: &[StepResult], id: &str) -> usize {
+        results.iter().filter(|sr| sr.step_id == id).count()
+    }
+
+    /// Plan Task 4 Step 3 / spec §3 requirement #4: a loop that already
+    /// converged (its members + the loop's own synthetic result
+    /// recorded, but its successor `ship` not yet run) must NOT be
+    /// re-entered on resume — `ship` runs exactly once, and no loop
+    /// member is dispatched again — REGARDLESS of what `loop_progress`
+    /// still says (deliberately left pointing at iteration 0 here, to
+    /// prove the converged super-node result is what actually gates
+    /// re-entry, not the counter alone).
+    #[tokio::test]
+    async fn converged_loop_not_rerun_on_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::runs::RunStore::new(tmp.path().join("runs")));
+        let wf = Workflow::parse(REFINE_WF).unwrap();
+
+        // Converges at iteration 1 (false at call 0, true at call 1).
+        let (run_id, full_results) = run_refine_to_convergence(&wf, &tmp, &store, 1).await;
+        assert!(
+            full_results.iter().any(|sr| sr.step_id == "loop:refine"),
+            "the loop's own super-node result must be persisted once it converges"
+        );
+        assert_eq!(count_ids(&full_results, "ship"), 1);
+
+        // --- Simulate "paused right before ship": truncate to
+        // everything except `ship` (the loop's own converged result
+        // stays).
+        let truncated: Vec<StepResult> = full_results
+            .iter()
+            .filter(|sr| sr.step_id != "ship")
+            .cloned()
+            .collect();
+
+        // --- Resume. A factory that panics if ANY loop member is
+        // dispatched again — only `ship` may run.
+        struct PanicIfLoopMemberDispatched;
+        #[async_trait]
+        impl StepFactory for PanicIfLoopMemberDispatched {
+            async fn build_opts_for_step(
+                &self,
+                step_id: &str,
+                agent_name: &str,
+                rendered_prompt: String,
+                run_id: String,
+                workspace_id: String,
+                workspace_path: PathBuf,
+                transcript_path: PathBuf,
+                on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+            ) -> AgentRunOpts {
+                assert_ne!(step_id, "gen", "a converged loop must not re-dispatch gen");
+                assert_ne!(step_id, "test", "a converged loop must not re-dispatch test");
+                assert_ne!(
+                    step_id, "critique",
+                    "a converged loop must not re-dispatch critique"
+                );
+                let text = format!("out-{step_id}");
+                let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+                    text,
+                    stop: StopReason::EndTurn,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                }]);
+                AgentRunOpts {
+                    agent_name: format!("ag-{agent_name}"),
+                    agent_system_prompt: "echo".into(),
+                    agent_tools: None,
+                    provider: Box::new(provider),
+                    provider_name: "mock".into(),
+                    model: "mock-1".into(),
+                    run_id,
+                    workspace_id,
+                    workspace_path,
+                    transcript_path,
+                    max_turns: 5,
+                    decider: Arc::new(BypassDecider),
+                    tool_context: ToolContext::default(),
+                    user_message: rendered_prompt,
+                    initial_messages: Vec::new(),
+                    turn_index_offset: 0,
+                    mode_str: "bypass".into(),
+                    no_stream: true,
+                    suppress_stream_stdout: true,
+                    mcp_registry: None,
+                    effort: None,
+                    context_window: None,
+                    output_format: None,
+                    output_schema: None,
+                    anthropic_task_budget: None,
+                    anthropic_context_management: None,
+                    anthropic_speed: None,
+                    parent_run_id: None,
+                    depth: 0,
+                    dispatchable_agents: None,
+                    step_id: step_id.to_string(),
+                    on_tool_call,
+                    on_stream_event: None,
+                    concerns: None,
+                    max_tokens: DEFAULT_MAX_TOKENS,
+                    scope_name: None,
+                    surface_tag: None,
+                    context_window_tokens: None,
+                    compact_at_percent: None,
+                    pause: None,
+                }
+            }
+        }
+        let opts2 = OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_loop_resume".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(PanicIfLoopMemberDispatched),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(REFINE_WF.to_string()),
+            resume_from: Some(ResumeState {
+                run_id: run_id.clone(),
+                prior_step_results: truncated,
+                approved_step_id: String::new(),
+                completed_units: std::collections::BTreeMap::new(),
+                reason: PauseReason::Manual,
+                paused_step: None,
+                rejected_reason: None,
+            }),
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+
+        let res2 = tokio::time::timeout(Duration::from_secs(5), run_workflow(opts2))
+            .await
+            .expect("resume must not hang")
+            .expect("resume must complete — the loop is converged, not re-entered");
+        assert!(res2.awaiting.is_none());
+        let ship_count = res2
+            .step_results
+            .iter()
+            .filter(|sr| sr.step_id == "ship")
+            .count();
+        assert_eq!(ship_count, 1, "ship must run exactly once");
+    }
+
+    const GATED_LOOP_WF: &str = r#"
+name: gated-loop
+steps:
+  - id: seed
+    agent: seeder
+    prompt: "seed"
+  - id: work
+    agent: worker
+    prompt: "work {{ loops.refine.iteration }}"
+    depends_on: [seed]
+  - id: review
+    approval:
+      prompt: "approve iteration {{ loops.refine.iteration }}?"
+    depends_on: [work]
+  - id: ship
+    agent: shipper
+    prompt: "ship"
+loops:
+  refine:
+    nodes: [work, review]
+    until: "{{ steps.review.output }}"
+    max_iterations: 3
+"#;
+
+    /// Plan Task 4 Step 5 / spec §3 requirement #5: a REAL, live pause
+    /// landing mid-iteration — here, a standalone `approval:` gate that
+    /// is itself a loop member — must surface as a normal, resumable
+    /// `InnerOutcome::Paused` (reason `Approval`, `gates` populated),
+    /// NEVER as an error (the fail-loud `LoopIterationPaused`
+    /// placeholder Task 3 shipped, now removed). Deterministic (no
+    /// timing race): an approval gate always parks on its first reach.
+    /// Approving + resuming must converge the loop (an approval gate's
+    /// own output is a non-empty decision JSON, so `until` holds right
+    /// after) and run `ship` exactly once.
+    #[tokio::test]
+    async fn live_approval_gate_pause_inside_loop_is_resumable_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::runs::RunStore::new(tmp.path().join("runs")));
+        let wf = Workflow::parse(GATED_LOOP_WF).unwrap();
+
+        struct SimpleFactory;
+        #[async_trait]
+        impl StepFactory for SimpleFactory {
+            async fn build_opts_for_step(
+                &self,
+                step_id: &str,
+                agent_name: &str,
+                rendered_prompt: String,
+                run_id: String,
+                workspace_id: String,
+                workspace_path: PathBuf,
+                transcript_path: PathBuf,
+                on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+            ) -> AgentRunOpts {
+                let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+                    text: format!("out-{step_id}"),
+                    stop: StopReason::EndTurn,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                }]);
+                AgentRunOpts {
+                    agent_name: format!("ag-{agent_name}"),
+                    agent_system_prompt: "echo".into(),
+                    agent_tools: None,
+                    provider: Box::new(provider),
+                    provider_name: "mock".into(),
+                    model: "mock-1".into(),
+                    run_id,
+                    workspace_id,
+                    workspace_path,
+                    transcript_path,
+                    max_turns: 5,
+                    decider: Arc::new(BypassDecider),
+                    tool_context: ToolContext::default(),
+                    user_message: rendered_prompt,
+                    initial_messages: Vec::new(),
+                    turn_index_offset: 0,
+                    mode_str: "bypass".into(),
+                    no_stream: true,
+                    suppress_stream_stdout: true,
+                    mcp_registry: None,
+                    effort: None,
+                    context_window: None,
+                    output_format: None,
+                    output_schema: None,
+                    anthropic_task_budget: None,
+                    anthropic_context_management: None,
+                    anthropic_speed: None,
+                    parent_run_id: None,
+                    depth: 0,
+                    dispatchable_agents: None,
+                    step_id: step_id.to_string(),
+                    on_tool_call,
+                    on_stream_event: None,
+                    concerns: None,
+                    max_tokens: DEFAULT_MAX_TOKENS,
+                    scope_name: None,
+                    surface_tag: None,
+                    context_window_tokens: None,
+                    compact_at_percent: None,
+                    pause: None,
+                }
+            }
+        }
+
+        let opts1 = OrchestratorRunOpts {
+            workflow: wf.clone(),
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_loop_resume".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(SimpleFactory),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(GATED_LOOP_WF.to_string()),
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+        let res1 = tokio::time::timeout(Duration::from_secs(5), run_workflow(opts1))
+            .await
+            .expect("phase 1 must not hang")
+            .expect("a gate pausing mid-loop must be Ok(..), never Err(LoopIterationPaused)");
+        let run_id = res1.run_id.clone();
+        let awaiting1 = res1.awaiting.clone().expect("the gate must park the run");
+        assert_eq!(awaiting1.reason, PauseReason::Approval);
+        assert_eq!(awaiting1.step_id, "review");
+        assert_eq!(awaiting1.gates.len(), 1);
+        assert_eq!(awaiting1.gates[0].step_id, "review");
+        assert_eq!(count_ids(&res1.step_results, "work"), 1);
+        assert_eq!(count_ids(&res1.step_results, "ship"), 0);
+
+        let rec1 = store.load(&run_id).unwrap();
+        assert_eq!(rec1.loop_progress.get("refine"), Some(&0));
+
+        // --- Approve + resume: the gate resolves, `until` holds
+        // (non-empty decision JSON), the loop converges at iteration 0,
+        // `ship` runs exactly once.
+        store.approve_gate(&run_id, "matt", chrono::Utc::now(), None).unwrap();
+        let opts2 = OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_loop_resume".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(SimpleFactory),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(GATED_LOOP_WF.to_string()),
+            resume_from: Some(ResumeState::from_approval(
+                run_id.clone(),
+                res1.step_results.clone(),
+                "review".to_string(),
+            )),
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+        let res2 = tokio::time::timeout(Duration::from_secs(5), run_workflow(opts2))
+            .await
+            .expect("resume must not hang")
+            .expect("resume must converge and complete");
+        assert!(res2.awaiting.is_none());
+        assert_eq!(count_ids(&res2.step_results, "work"), 1, "work must not be re-dispatched");
+        assert_eq!(count_ids(&res2.step_results, "ship"), 1, "ship exactly once");
+    }
+
+    /// Plan Task 4 Step 5 / spec §3: cancel mid-loop (Phase-2 hard
+    /// cancel, distinct from the cooperative pause above) aborts the
+    /// in-flight iteration's member; restart re-enters at the recorded
+    /// iteration. Asserts no member of a not-yet-started iteration
+    /// (iteration 1) ran before the cancel.
+    #[tokio::test]
+    async fn cancel_mid_loop_then_restart_reenters_at_recorded_iteration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::runs::RunStore::new(tmp.path().join("runs")));
+        let wf = Workflow::parse(REFINE_WF).unwrap();
+        let run_id = "run_loop_cancel_test".to_string();
+        store
+            .create(
+                crate::runs::RunRecord {
+                    id: run_id.clone(),
+                    workflow_name: wf.name.clone(),
+                    status: crate::runs::RunStatus::Running,
+                    inputs: BTreeMap::new(),
+                    event: None,
+                    workspace_id: "ws_loop_resume".into(),
+                    workspace_path: tmp.path().to_path_buf(),
+                    transcript_dir: tmp.path().to_path_buf(),
+                    started_at: chrono::Utc::now(),
+                    finished_at: None,
+                    error_message: None,
+                    awaiting: Vec::new(),
+                    awaiting_step_id: None,
+                    approval_prompt: None,
+                    awaiting_since: None,
+                    expires_at: None,
+                    issue_ref: None,
+                    issue: None,
+                    parent_run_id: None,
+                    backend_id: None,
+                    worker_id: None,
+                    artifact_manifest_path: None,
+                    runner_pid: None,
+                    source_wake_id: None,
+                    active_step_id: None,
+                    active_step_kind: None,
+                    active_step_agent: None,
+                    active_step_transcript_path: None,
+                    resume_requested_at: None,
+                    resume_claimed_at: None,
+                    resume_claimed_by: None,
+                    resume_mode: None,
+                    resume_gate_id: None,
+                    final_output: None,
+                    loop_progress: BTreeMap::new(),
+                },
+                REFINE_WF,
+            )
+            .unwrap();
+
+        // --- Phase 1: `critique` is slow (150ms); cancel the whole run
+        // 50ms in — iteration 0's `gen`/`test` finish near-instantly,
+        // then `critique` starts and is aborted mid-flight.
+        let factory1 = ResumableRefineFactory::new(2).critique_delay_ms(150);
+        let calls1 = Arc::clone(&factory1.calls);
+        let opts1 = OrchestratorRunOpts {
+            workflow: wf.clone(),
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_loop_resume".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory1),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: None,
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let cancel_token = CancellationToken::new();
+        let trigger = cancel_token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(
+                &opts1,
+                &run_id,
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                Some(&cancel_token),
+            ),
+        )
+        .await
+        .expect("cancel must not hang");
+        match outcome {
+            Err(RunWorkflowError::RunCancelled { aborted }) => {
+                assert_eq!(aborted, 1, "critique must have been in-flight and aborted");
+            }
+            other => panic!("expected Err(RunCancelled), got {other:?}"),
+        }
+
+        let calls1 = calls1.lock().unwrap().clone();
+        assert_eq!(count(&calls1, "gen"), 1, "only iteration 0's gen: {calls1:?}");
+        assert_eq!(count(&calls1, "test"), 1, "only iteration 0's test: {calls1:?}");
+        assert_eq!(
+            count(&calls1, "critique"),
+            1,
+            "iteration 0's critique attempted (aborted): {calls1:?}"
+        );
+        assert!(
+            !step_results.iter().any(|sr| sr.step_id == "critique"),
+            "the aborted critique must not be recorded: {step_results:?}"
+        );
+        assert!(step_results.iter().any(|sr| sr.step_id == "gen"));
+        assert!(step_results.iter().any(|sr| sr.step_id == "test"));
+
+        let rec1 = store.load(&run_id).unwrap();
+        assert_eq!(
+            rec1.loop_progress.get("refine"),
+            Some(&0),
+            "checkpoint must record iteration 0 as in-flight, not advanced"
+        );
+
+        // --- Phase 2: restart — same run id/store, the SAME
+        // `step_results` vector (already reflects "gen/test@0 done,
+        // critique@0 not done" exactly like a real on-disk resume
+        // would). A fresh factory continues the global critique
+        // sequence from call #0 (iteration 0's critique wasn't
+        // recorded as having answered anything yet).
+        let factory2 = ResumableRefineFactory::new(2);
+        let calls2 = Arc::clone(&factory2.calls);
+        let opts2 = OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_loop_resume".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory2),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: None,
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+        let outcome2 = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(
+                &opts2,
+                &run_id,
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                None,
+            ),
+        )
+        .await
+        .expect("restart must not hang")
+        .expect("restart must converge and complete");
+        assert!(matches!(outcome2, InnerOutcome::Done));
+
+        let calls2 = calls2.lock().unwrap().clone();
+        assert_eq!(
+            count(&calls2, "gen"),
+            2,
+            "iteration 0's gen must NOT be re-dispatched — only iterations 1,2: {calls2:?}"
+        );
+        assert_eq!(
+            count(&calls2, "test"),
+            2,
+            "iteration 0's test must NOT be re-dispatched — only iterations 1,2: {calls2:?}"
+        );
+        assert_eq!(
+            count(&calls2, "critique"),
+            3,
+            "iteration 0's critique (re-dispatched) + iterations 1,2: {calls2:?}"
+        );
+        assert_eq!(count(&calls2, "ship"), 1, "ship exactly once: {calls2:?}");
     }
 }
 

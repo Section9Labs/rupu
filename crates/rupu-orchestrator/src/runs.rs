@@ -277,6 +277,22 @@ pub struct RunRecord {
     /// dispatched unit's output is retrievable centrally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_output: Option<String>,
+    /// Task 4 (spec §3): bounded-loop checkpoint — loop name → the
+    /// current/last iteration index `run_loop_node` reached. Written at
+    /// each iteration boundary (before the recursive per-iteration call,
+    /// so a resume sees the iteration that was IN FLIGHT, not the last
+    /// one that fully finished) and on convergence/exhaustion (the FINAL
+    /// iteration). On resume: a loop name present here whose super-node
+    /// result (`"loop:<name>"`) is NOT yet in `step_results.jsonl` was
+    /// in-flight — re-enter at this recorded iteration rather than at
+    /// `0`. A loop whose super-node result IS already persisted has
+    /// converged (or exhausted-with-`on_max: proceed`) and is never
+    /// re-entered, regardless of what's recorded here. Empty for every
+    /// run with no `loops:` block and for every `run.json` written
+    /// before this field existed (`#[serde(default)]` restores `{}` on
+    /// load) — a loop-free run's `run.json` is byte-identical.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub loop_progress: std::collections::BTreeMap<String, u32>,
 }
 
 /// One parked approval gate (Phase 2, spec §7). An element of
@@ -452,6 +468,13 @@ pub struct StepResultRecord {
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub resolved: bool,
     pub finished_at: DateTime<Utc>,
+    /// Task 4 (spec §3): which bounded-loop iteration produced this
+    /// record — mirrors [`crate::runner::StepResult::loop_iteration`].
+    /// Absent (not `null`) for every non-loop step and for every record
+    /// written before this field existed, so a legacy/loop-free
+    /// `step_results.jsonl` round-trips byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_iteration: Option<u32>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -543,6 +566,7 @@ impl From<&StepResult> for StepResultRecord {
             iterations: sr.iterations,
             resolved: sr.resolved,
             finished_at: Utc::now(),
+            loop_iteration: sr.loop_iteration,
         }
     }
 }
@@ -586,6 +610,7 @@ impl From<&StepResultRecord> for StepResult {
                 .collect(),
             iterations: rec.iterations,
             resolved: rec.resolved,
+            loop_iteration: rec.loop_iteration,
         }
     }
 }
@@ -2362,6 +2387,7 @@ mod tests {
             resume_mode: None,
             resume_gate_id: None,
             final_output: None,
+            loop_progress: BTreeMap::new(),
         }
     }
 
@@ -2380,6 +2406,7 @@ mod tests {
             iterations: 0,
             resolved: true,
             finished_at: Utc::now(),
+            loop_iteration: None,
         }
     }
 

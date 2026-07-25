@@ -1314,6 +1314,7 @@ fn mirrored_awaiting_run_is_not_pending_resume() {
         resume_mode: None,
         resume_gate_id: None,
         final_output: None,
+        loop_progress: Default::default(),
     };
     store.create(rec, "").unwrap();
 
@@ -1375,6 +1376,7 @@ fn mirrored_awaiting_run_is_not_pending_resume_ssh_host() {
         resume_mode: None,
         resume_gate_id: None,
         final_output: None,
+        loop_progress: Default::default(),
     };
     store.create(rec, "").unwrap();
 
@@ -1431,6 +1433,7 @@ fn mirrored_awaiting_run_is_not_pending_resume_bucket_host() {
         resume_mode: None,
         resume_gate_id: None,
         final_output: None,
+        loop_progress: Default::default(),
     };
     store.create(rec, "").unwrap();
 

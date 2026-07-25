@@ -13343,6 +13343,7 @@ steps:
             resume_gate_id: None,
             active_step_transcript_path: None,
             final_output: None,
+            loop_progress: Default::default(),
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -13362,6 +13363,7 @@ steps:
                     iterations: 0,
                     resolved: true,
                     finished_at: chrono::Utc::now(),
+                    loop_iteration: None,
                 },
             )
             .unwrap();
@@ -13491,6 +13493,7 @@ steps:
             resume_gate_id: None,
             active_step_transcript_path: None,
             final_output: None,
+            loop_progress: Default::default(),
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -13510,6 +13513,7 @@ steps:
                     iterations: 0,
                     resolved: true,
                     finished_at: chrono::Utc::now(),
+                    loop_iteration: None,
                 },
             )
             .unwrap();
@@ -13624,6 +13628,7 @@ steps:
             resume_gate_id: None,
             active_step_transcript_path: None,
             final_output: None,
+            loop_progress: Default::default(),
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -13658,6 +13663,7 @@ steps:
                     iterations: 0,
                     resolved: true,
                     finished_at: chrono::Utc::now(),
+                    loop_iteration: None,
                 },
             )
             .unwrap();
@@ -13772,6 +13778,7 @@ steps:
             resume_gate_id: None,
             active_step_transcript_path: None,
             final_output: None,
+            loop_progress: Default::default(),
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -13791,6 +13798,7 @@ steps:
                     iterations: 0,
                     resolved: true,
                     finished_at: chrono::Utc::now(),
+                    loop_iteration: None,
                 },
             )
             .unwrap();
@@ -13910,6 +13918,7 @@ steps:
             resume_gate_id: None,
             active_step_transcript_path: None,
             final_output: None,
+            loop_progress: Default::default(),
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -13929,6 +13938,7 @@ steps:
                     iterations: 0,
                     resolved: true,
                     finished_at: chrono::Utc::now(),
+                    loop_iteration: None,
                 },
             )
             .unwrap();
@@ -14040,6 +14050,7 @@ steps:
                     resume_gate_id: None,
                     active_step_transcript_path: None,
                     final_output: None,
+                    loop_progress: Default::default(),
                 },
                 "name: controller\nsteps: []\n",
             )
@@ -14186,6 +14197,7 @@ steps:
                     resume_gate_id: None,
                     active_step_transcript_path: None,
                     final_output: None,
+                    loop_progress: Default::default(),
                 },
                 "name: issue-supervisor-dispatch\nsteps: []\n",
             )
@@ -14357,6 +14369,7 @@ steps:
                     resume_gate_id: None,
                     active_step_transcript_path: None,
                     final_output: None,
+                    loop_progress: Default::default(),
                 },
                 "name: issue-supervisor-dispatch\nsteps: []\n",
             )
@@ -14378,6 +14391,7 @@ steps:
                     iterations: 0,
                     resolved: true,
                     finished_at: chrono::Utc::now(),
+                    loop_iteration: None,
                 },
             )
             .unwrap();

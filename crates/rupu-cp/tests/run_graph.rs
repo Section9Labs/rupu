@@ -76,6 +76,7 @@ fn seed_run(id: &str) -> RunRecord {
         active_step_agent: None,
         active_step_transcript_path: None,
         final_output: None,
+        loop_progress: Default::default(),
     }
 }
 
@@ -94,6 +95,7 @@ fn seed_step(run_id: &str, step_id: &str) -> StepResultRecord {
         iterations: 0,
         resolved: true,
         finished_at: Utc::now(),
+        loop_iteration: None,
     }
 }
 

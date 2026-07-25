@@ -54,6 +54,7 @@ fn make_run(id: &str) -> RunRecord {
         active_step_agent: None,
         active_step_transcript_path: None,
         final_output: None,
+        loop_progress: Default::default(),
     }
 }
 

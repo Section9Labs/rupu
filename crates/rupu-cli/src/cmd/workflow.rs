@@ -4488,6 +4488,7 @@ mod tests {
             active_step_agent: Some("writer".into()),
             active_step_transcript_path: Some(PathBuf::from("/tmp/transcripts/step.jsonl")),
             final_output: None,
+            loop_progress: Default::default(),
         }
     }
 

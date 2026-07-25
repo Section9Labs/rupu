@@ -3730,6 +3730,7 @@ mod tests {
             active_step_agent: None,
             active_step_transcript_path: None,
             final_output: None,
+            loop_progress: Default::default(),
         }
     }
 
@@ -4084,6 +4085,7 @@ mod tests {
             iterations: 0,
             resolved: true,
             finished_at: Utc::now(),
+            loop_iteration: None,
         };
         std::fs::write(
             &step_results,
@@ -4364,6 +4366,7 @@ mod tests {
             iterations: 0,
             resolved: true,
             finished_at: Utc::now(),
+            loop_iteration: None,
         };
         let prefs = UiPrefs::resolve(
             &rupu_config::UiConfig::default(),

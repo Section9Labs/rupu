@@ -280,6 +280,7 @@ impl WorkflowExecutor for InProcessExecutor {
                             resume_mode: None,
                             resume_gate_id: None,
                             final_output: None,
+                            loop_progress: BTreeMap::new(),
                         },
                     );
                 }

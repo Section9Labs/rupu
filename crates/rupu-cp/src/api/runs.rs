@@ -841,6 +841,7 @@ pub(crate) fn synthesize_unpersisted_run(
         resume_mode: None,
         resume_gate_id: None,
         final_output: None,
+        loop_progress: Default::default(),
     };
     let mut v = serde_json::to_value(&record).unwrap_or_else(|_| serde_json::json!({ "id": id }));
     v["cycle_id"] = serde_json::json!(cycle_id);
@@ -1276,6 +1277,7 @@ mod tests {
             resume_mode: None,
             resume_gate_id: None,
             final_output: None,
+            loop_progress: Default::default(),
         }
     }
 

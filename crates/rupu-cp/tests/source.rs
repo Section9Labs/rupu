@@ -42,6 +42,7 @@ fn seed_run(id: &str, workspace: &std::path::Path) -> RunRecord {
         active_step_agent: None,
         active_step_transcript_path: None,
         final_output: None,
+        loop_progress: Default::default(),
     }
 }
 
