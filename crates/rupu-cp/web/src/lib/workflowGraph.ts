@@ -408,12 +408,26 @@ const APPROVAL_KEYS = new Set<string>([
 
 /** Parse the top-level `loops:` map (`obj.loops`) into a name-sorted
  *  `WorkflowLoop[]` (mirrors the Rust side's `BTreeMap<String, LoopDef>`
- *  iteration order). A malformed entry (not a map, or missing `nodes`) is
- *  skipped rather than dropping the whole workflow — same defensive posture
- *  as every other `as*` helper in this module. `max_iterations` defaults to
- *  1 when absent/non-numeric and `on_max` to `'fail'` — the same defaults
- *  `LoopDef`/`OnMax` use on the Rust side — so a hand-authored loop missing
- *  those keys still renders something sane rather than `NaN`/`undefined`. */
+ *  iteration order). A malformed entry (not a map at all) is skipped rather
+ *  than dropping the whole workflow — same defensive posture as every other
+ *  `as*` helper in this module.
+ *
+ *  Only `on_max` has a REAL default on the Rust side (`LoopDef`'s
+ *  `#[serde(default)]` is on `on_max` alone — `nodes`/`until`/
+ *  `max_iterations` are required, and the struct is `deny_unknown_fields`),
+ *  so `onMax` defaults to `'fail'` here to match. `nodes`/`until` absent
+ *  parse to `[]`/`''`, which already fall straight into the EXISTING inline
+ *  checks (`needs at least 2 member steps`, `` `until` must be a non-empty
+ *  condition ``) — no special handling needed. `max_iterations` is the one
+ *  field that needed care: substituting a plausible-looking valid default
+ *  (e.g. `1`) for an ABSENT required field would silently mask that the
+ *  loop is missing something the backend requires (parses fine in the
+ *  editor, 400s on save) — the exact kind of silent-mask this codebase
+ *  avoids elsewhere. So an absent/non-numeric `max_iterations` parses to
+ *  `NaN`, which the EXISTING `!Number.isFinite(...)` inline check already
+ *  flags (`` `max_iterations` must be at least 1 ``) — the user sees it
+ *  needs setting, rather than a value that looks valid but isn't really
+ *  there. */
 function parseLoops(raw: unknown): WorkflowLoop[] {
   const rec = asRecord(raw);
   if (!rec) return [];
@@ -423,7 +437,7 @@ function parseLoops(raw: unknown): WorkflowLoop[] {
     if (!def) continue;
     const nodes = asStringArray(def.nodes) ?? [];
     const until = asString(def.until) ?? '';
-    const maxIterations = asNumber(def.max_iterations) ?? 1;
+    const maxIterations = asNumber(def.max_iterations) ?? NaN;
     const onMaxRaw = asString(def.on_max);
     const onMax: 'fail' | 'proceed' = onMaxRaw === 'proceed' ? 'proceed' : 'fail';
     out.push({ name, nodes, until, maxIterations, onMax });
@@ -706,19 +720,18 @@ function validateLoops(g: WorkflowGraph, nodeIds: Set<string>, add: (id: string,
       }
     }
 
-    // Member-escape: a member's OWN outgoing control edge targeting a
-    // non-member. An external INBOUND edge (entry) or an outside node's own
-    // `depends_on`/`next` into the loop is fine — only the member's own
-    // outgoing next/split/branch-arm leaving the loop is rejected.
+    // Member-escape: a member's OWN `split:` fan-out targeting a
+    // non-member — mirrors the backend's `validate_loop_member_escapes`
+    // EXACTLY: `split` is the ONLY escape check. A plain `next:` or a
+    // branch-arm (`thenTargets`/`elseTargets`) from a member to a
+    // non-member is the loop's VALID EXIT edge (spec §2b/§2f — a member's
+    // external OUTBOUND `next`/branch-arm is how the loop's successors
+    // become ready once it converges); flagging it as an escape rejects
+    // the loop's own canonical exit flow (`join` has no outgoing target
+    // field either, so there's nothing else to check here).
     for (const n of g.nodes) {
-      if (!memberSet.has(n.id)) continue;
-      const outs: string[] = [
-        ...(n.data.next ?? []),
-        ...(n.data.kind === 'split' ? n.data.split ?? [] : []),
-        ...(n.data.thenTargets ?? []),
-        ...(n.data.elseTargets ?? []),
-      ];
-      for (const t of outs) {
+      if (!memberSet.has(n.id) || n.data.kind !== 'split') continue;
+      for (const t of n.data.split ?? []) {
         if (nodeIds.has(t) && !memberSet.has(t)) {
           add(n.id, `edge to \`${t}\` escapes loop \`${l.name}\``);
           add(key, `step \`${n.id}\`'s edge to \`${t}\` escapes the loop`);

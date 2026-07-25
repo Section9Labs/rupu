@@ -1628,6 +1628,16 @@ describe('loops: parse + round-trip', () => {
     const g = yamlToGraph(input);
     expect(g.loops?.[0]?.onMax).toBe('proceed');
   });
+
+  it('a missing `max_iterations` (a backend-REQUIRED field, unlike `on_max`) is NOT silently defaulted to a valid-looking 1 — it surfaces inline instead', () => {
+    const input = refineWorkflowObj();
+    delete (input.loops as Record<string, Record<string, unknown>>).refine.max_iterations;
+    const g = yamlToGraph(input);
+    // Parses to a non-finite marker, not the plausible-but-wrong `1`.
+    expect(Number.isFinite(g.loops?.[0]?.maxIterations)).toBe(false);
+    // ...and the EXISTING inline check catches it, same as an explicit `0`.
+    expect(validateGraph(g)[loopProblemKey('refine')].join(' ')).toContain('max_iterations` must be at least 1');
+  });
 });
 
 describe('loops: membership + grouping helpers', () => {
@@ -1741,11 +1751,43 @@ describe('loops: inline validation', () => {
     expect(validateGraph(g)[loopProblemKey('cyc')].join(' ')).toContain('cycle');
   });
 
-  it('flags a member escaping the loop via its own next', () => {
+  it('a member\'s plain `next` to a non-member is the loop\'s VALID EXIT — not an escape (mirrors backend validate_loop_member_escapes, which checks `split` only)', () => {
     const g = yamlToGraph({
       name: 'w',
       steps: [
         { id: 'a', agent: 'x', prompt: 'p', next: ['outside'] },
+        { id: 'b', agent: 'x', prompt: 'p' },
+        { id: 'outside', agent: 'x', prompt: 'p' },
+      ],
+      loops: { esc: { nodes: ['a', 'b'], until: 'u', max_iterations: 3 } },
+    });
+    const problems = validateGraph(g);
+    expect((problems.a ?? []).join(' ')).not.toContain('escapes');
+    expect(problems[loopProblemKey('esc')]).toBeUndefined();
+    // The exit edge still collapses into a real loop -> outside edge.
+    expect(deriveEdges(g.nodes)).toContainEqual({ id: 'a->outside', source: 'a', target: 'outside' });
+  });
+
+  it('a member\'s branch-arm (then/else) to a non-member is also a valid exit — not an escape', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', branch: { condition: 'x', then: ['outside'], else: ['a'] } },
+        { id: 'outside', agent: 'x', prompt: 'p' },
+      ],
+      loops: { esc: { nodes: ['a', 'b'], until: 'u', max_iterations: 3 } },
+    });
+    const problems = validateGraph(g);
+    expect((problems.b ?? []).join(' ')).not.toContain('escapes');
+    expect(problems[loopProblemKey('esc')]).toBeUndefined();
+  });
+
+  it('flags a member\'s `split:` fan-out to a non-member as an escape (the ONLY escape check, mirroring the backend)', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', split: ['b', 'outside'] },
         { id: 'b', agent: 'x', prompt: 'p' },
         { id: 'outside', agent: 'x', prompt: 'p' },
       ],
