@@ -1194,6 +1194,12 @@ async fn run_scheduler(
     // without a single line of it needing to special-case "am I in chain
     // mode".
     let mut join_threshold: BTreeMap<usize, usize> = BTreeMap::new();
+    // Total inbound-edge count per join, independent of `threshold` —
+    // needed so a join can still fire once every inbound path is
+    // ACCOUNTED FOR (live or pruned/skipped/cancelled), even when too many
+    // of them turned out non-live to ever reach `threshold` via live
+    // arrivals alone (post-review fix: see `JoinScheduling`'s doc).
+    let mut join_inbound_total: BTreeMap<usize, usize> = BTreeMap::new();
     for (i, step) in wf.steps.iter().enumerate() {
         let Some(j) = &step.join else { continue };
         let inbound = predecessors[i].len();
@@ -1205,6 +1211,7 @@ async fn run_scheduler(
             crate::workflow::JoinWait::Count { count } => *count as usize,
         };
         join_threshold.insert(i, threshold);
+        join_inbound_total.insert(i, inbound);
     }
 
     // Resume seeding: steps already in a caller-pre-seeded `step_results`
@@ -1264,7 +1271,9 @@ async fn run_scheduler(
     // interruption.
     let mut join_state = JoinScheduling {
         threshold: join_threshold,
+        inbound_total: join_inbound_total,
         arrived: BTreeMap::new(),
+        resolved_count: BTreeMap::new(),
         resolved: std::collections::BTreeSet::new(),
     };
     let mut cancel_state = Cancellation {
@@ -1348,6 +1357,7 @@ async fn run_scheduler(
                 };
                 complete_and_drain_joins(
                     i,
+                    false, // skip / prune / cancel no-op — never a live join arrival
                     result,
                     wf,
                     opts,
@@ -1418,6 +1428,7 @@ async fn run_scheduler(
                     };
                     complete_and_drain_joins(
                         i,
+                        false, // skip / prune / cancel no-op — never a live join arrival
                         result,
                         wf,
                         opts,
@@ -1455,6 +1466,7 @@ async fn run_scheduler(
                     emit_gate_result(opts, run_id, step, "approved", "human", None, step_results);
                     let worklist = mark_done_and_track_joins(
                         i,
+                        true, // gate resolved with a real decision — a live arrival
                         &successors,
                         &mut indegree,
                         &mut ready,
@@ -1497,6 +1509,7 @@ async fn run_scheduler(
                         );
                         let worklist = mark_done_and_track_joins(
                             i,
+                            true, // gate resolved with a real decision — a live arrival
                             &successors,
                             &mut indegree,
                             &mut ready,
@@ -1615,30 +1628,21 @@ async fn run_scheduler(
                 })?;
                 let taken = if take { "then" } else { "else" };
                 if graph_mode {
-                    // Task 3, spec §6: real reachability over the graph
-                    // (`successors`, control edges union inferred data
-                    // edges — the same graph the rest of graph-mode
-                    // scheduling uses), NOT the author-declared
+                    // Task 3, spec §6 (post-review fix): real reachability
+                    // over the graph (`successors`, control edges union
+                    // inferred data edges), NOT the author-declared
                     // `branch_skipped` set the chain-mode `else` arm below
-                    // still relies on. A node reachable through BOTH the
-                    // taken and the untaken arm (a reconverge) is
-                    // deliberately excluded — `branch_prune_set` computes
-                    // the difference, not a naive union of the untaken
-                    // arm's declared ids.
-                    let (taken_ids, untaken_ids): (&[String], &[String]) = if take {
-                        (&branch.then, &branch.r#else)
-                    } else {
-                        (&branch.r#else, &branch.then)
-                    };
-                    let taken_idxs: Vec<usize> = taken_ids
-                        .iter()
-                        .filter_map(|id| index_of.get(id.as_str()).copied())
-                        .collect();
+                    // still relies on, and NOT a naive "reachable from the
+                    // untaken arm minus reachable from the taken arm" diff
+                    // either — see `branch_prune_set`'s doc for why that
+                    // naive version silently over-prunes a node fed by an
+                    // UNRELATED live predecessor (not either branch arm).
+                    let untaken_ids: &[String] = if take { &branch.r#else } else { &branch.then };
                     let untaken_idxs: Vec<usize> = untaken_ids
                         .iter()
                         .filter_map(|id| index_of.get(id.as_str()).copied())
                         .collect();
-                    for idx in branch_prune_set(&taken_idxs, &untaken_idxs, &successors) {
+                    for idx in branch_prune_set(i, &untaken_idxs, &successors, &predecessors) {
                         pruned.insert(wf.steps[idx].id.clone());
                     }
                 } else if take {
@@ -1670,6 +1674,7 @@ async fn run_scheduler(
                 }
                 complete_and_drain_joins(
                     i,
+                    true, // branch resolution is a real completion — a live arrival
                     result,
                     wf,
                     opts,
@@ -1724,6 +1729,7 @@ async fn run_scheduler(
                 }
                 complete_and_drain_joins(
                     i,
+                    true, // split resolution is a real completion — a live arrival
                     result,
                     wf,
                     opts,
@@ -1863,6 +1869,7 @@ async fn run_scheduler(
                 }
                 complete_and_drain_joins(
                     i,
+                    true, // real dispatch completed — a live arrival
                     result,
                     wf,
                     opts,
@@ -1915,19 +1922,39 @@ fn unlock_successors(
 }
 
 /// Per-run join-scheduling state (Task 3, spec §5): `threshold[j]` is how
-/// many inbound paths must land before join `j` fires (`predecessors.len()`
-/// for `all`, `1` for `any`/`first`, `count` for the count form — see
-/// [`run_scheduler`]'s setup). `arrived[j]` is the list of predecessor node
-/// indices that have completed so far, in COMPLETION order (meaningful for
-/// `first`: it's the single fastest path; harmless for `all`/`count`, which
-/// don't care about order). `resolved` guards against processing the same
-/// join twice — necessary because `count == predecessors.len()` makes the
-/// early-arrival path and a (hypothetical) indegree-driven path coincide,
-/// and because [`drain_joins`] can cascade (a join feeding another join).
+/// many LIVE inbound paths must land before join `j` fires
+/// (`predecessors.len()` for `all`, `1` for `any`/`first`, `count` for the
+/// count form — see [`run_scheduler`]'s setup). `arrived[j]` is the list of
+/// predecessor node indices that completed LIVE (actually ran — NOT
+/// pruned/`when:`-skipped/cancelled) so far, in COMPLETION order
+/// (meaningful for `first`: it's the single fastest LIVE path; harmless for
+/// `all`/`count`, which don't care about order).
+///
+/// **Post-review fix:** a pruned/skipped/cancelled predecessor must still
+/// resolve the join's indegree (so the join can fire on its live arms —
+/// [`unlock_successors`] is unconditional) but must NEVER be counted in
+/// `arrived` or merged into the join's `results`/`sub_results` — see
+/// [`mark_done_and_track_joins`]'s `live` parameter. Because a pruned
+/// predecessor is invisible to `arrived`, `threshold` alone can no longer
+/// be the only fire condition for `all` (or for `count`/`any` when enough
+/// of a join's inbound get pruned that live arrivals can never reach
+/// `threshold`): `resolved_count[j]` tracks EVERY inbound resolution
+/// (live or not) against `inbound_total[j]` (`predecessors[j].len()`,
+/// fixed at setup), and a join fires when EITHER `arrived.len() >=
+/// threshold` (the live-count reaches policy) OR `resolved_count[j] >=
+/// inbound_total[j]` (everything inbound is accounted for, whether or not
+/// enough was live) — the second clause is what prevents a join from
+/// hanging forever when too many of its paths get pruned to ever satisfy
+/// the first. `resolved` guards against processing the same join twice —
+/// necessary because both fire conditions can become true on the same
+/// call, and because [`drain_joins`] can cascade (a join feeding another
+/// join).
 #[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
 struct JoinScheduling {
     threshold: BTreeMap<usize, usize>,
+    inbound_total: BTreeMap<usize, usize>,
     arrived: BTreeMap<usize, Vec<usize>>,
+    resolved_count: BTreeMap<usize, usize>,
     resolved: std::collections::BTreeSet<usize>,
 }
 
@@ -1989,21 +2016,78 @@ fn reachable_via(
     seen
 }
 
-/// Task 3, spec §6: the subgraph reachable ONLY through `untaken_targets`
-/// — i.e. reachable from the untaken arm and NOT also reachable from the
-/// taken arm. A node reachable via both (a reconverge) is excluded, per
-/// the spec's own critical rule. Only meaningful in graph mode (`successors`
-/// built from [`workflow_edges`], which includes branch-arm edges); chain
-/// mode never calls this — see [`run_scheduler`]'s branch-handling arm.
+/// Like [`reachable_via`], but any edge FROM `cut_from` INTO a node in
+/// `cut_to` is skipped during traversal — the one specific edge (or set of
+/// edges) this computation is entitled to treat as severed. Lets
+/// [`branch_prune_set`] ask "if the branch's untaken-arm edge(s) didn't
+/// exist, would this node still be reachable from somewhere?" without
+/// actually mutating the graph.
+#[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
+fn reachable_via_excluding(
+    starts: &[usize],
+    adj: &[Vec<usize>],
+    cut_from: usize,
+    cut_to: &std::collections::BTreeSet<usize>,
+) -> std::collections::BTreeSet<usize> {
+    let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut stack: Vec<usize> = starts.to_vec();
+    while let Some(n) = stack.pop() {
+        if seen.insert(n) {
+            for &m in &adj[n] {
+                if n == cut_from && cut_to.contains(&m) {
+                    continue;
+                }
+                stack.push(m);
+            }
+        }
+    }
+    seen
+}
+
+/// Task 3, spec §6. **Post-review fix — replaces the original naive
+/// "reachable from untaken minus reachable from taken" diff, which had a
+/// real silent-drop bug:** that version correctly excluded a reconverge
+/// (reachable via BOTH arms) but WRONGLY pruned a node that's reachable
+/// via the untaken arm AND via some entirely UNRELATED live predecessor
+/// that has nothing to do with either branch arm (e.g. an independent
+/// entry step feeding the same downstream node) — that node has a
+/// perfectly good way to become ready regardless of this branch's
+/// decision, so pruning it silently starved whatever's downstream of it.
+///
+/// **The fix:** instead of comparing against "reachable from the taken
+/// arm specifically", compare `reach_untaken` against "reachable from ANY
+/// graph entry point (a node with no inbound edges at all) once ONLY
+/// `branch_idx`'s edge(s) to `untaken_targets` are cut" — via
+/// [`reachable_via_excluding`]. This is a strict superset of the old
+/// taken-arm-only reachability (an entry point can always still reach the
+/// taken arm, since that edge is untouched) that ALSO covers any
+/// unrelated live path into the same node. A node is pruned only if
+/// EVERY structural path into it required the specific edge being cut —
+/// which both correctly excludes a reconverge (still reachable via the
+/// taken arm) AND correctly excludes a node fed by an unrelated live
+/// predecessor (still reachable via that predecessor).
+///
+/// Only meaningful in graph mode (`successors`/`predecessors` built from
+/// [`workflow_edges`], which includes branch-arm edges); chain mode never
+/// calls this — see [`run_scheduler`]'s branch-handling arm.
 #[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
 fn branch_prune_set(
-    taken_targets: &[usize],
+    branch_idx: usize,
     untaken_targets: &[usize],
     successors: &[Vec<usize>],
+    predecessors: &[Vec<usize>],
 ) -> std::collections::BTreeSet<usize> {
-    let reach_taken = reachable_via(taken_targets, successors);
     let reach_untaken = reachable_via(untaken_targets, successors);
-    reach_untaken.difference(&reach_taken).copied().collect()
+    let untaken_set: std::collections::BTreeSet<usize> = untaken_targets.iter().copied().collect();
+    let entries: Vec<usize> = (0..predecessors.len())
+        .filter(|&i| predecessors[i].is_empty())
+        .collect();
+    let reach_from_entries_reduced =
+        reachable_via_excluding(&entries, successors, branch_idx, &untaken_set);
+    reach_untaken
+        .difference(&reach_from_entries_reduced)
+        .copied()
+        .collect()
 }
 
 /// The non-persisting half of "a node just resolved": mark it `done`,
@@ -2011,14 +2095,29 @@ fn branch_prune_set(
 /// resolution counts exactly like a real completion for this purpose —
 /// Task 3, spec §6's requirement that a pruned predecessor not block a
 /// downstream reconverge), and record this node's arrival against every
-/// join it directly feeds (Task 3, spec §5). Returns the indices of
-/// joins whose threshold is newly satisfied — the caller
-/// ([`drain_joins`]) resolves those. Split out from [`finish_node`] so
-/// the two call sites that persist via [`emit_gate_result`] (which
-/// already pushes a `StepResult` itself) don't push a second one.
+/// join it directly feeds (Task 3, spec §5) — but ONLY as a live arrival
+/// when `live` is `true`. Returns the indices of joins newly satisfied —
+/// the caller ([`drain_joins`]) resolves those. Split out from
+/// [`finish_node`] so the two call sites that persist via
+/// [`emit_gate_result`] (which already pushes a `StepResult` itself)
+/// don't push a second one.
+///
+/// **`live` — post-review fix, CRITICAL.** `live` must be `false` for a
+/// node resolved via the skip/prune/cancel no-op path (branch pruning,
+/// `when:`-skip, join loser-cancellation) and `true` for everything that
+/// actually ran (real dispatch, `branch`/`split`'s own synchronous
+/// resolution, an approval gate's decision, a join's own merge). A
+/// NON-live resolution still counts toward `resolved_count` (so a join
+/// waiting on it doesn't hang) but is NEVER pushed into `arrived` — i.e.
+/// never merged into a join's `results`/`sub_results`, and never poisons
+/// its `success`. Before this fix, every completing node — pruned or not
+/// — was recorded as a join arrival unconditionally, so a `wait: all`
+/// join downstream of a branch merged the DEAD arm's `"pruned"` output
+/// and forced `success = false` even though the live arm succeeded.
 #[allow(dead_code, clippy::too_many_arguments)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
 fn mark_done_and_track_joins(
     i: usize,
+    live: bool,
     successors: &[Vec<usize>],
     indegree: &mut [usize],
     ready: &mut std::collections::BTreeSet<usize>,
@@ -2035,11 +2134,22 @@ fn mark_done_and_track_joins(
         let Some(&threshold) = joins.threshold.get(&s) else {
             continue;
         };
-        let arrived = joins.arrived.entry(s).or_default();
-        if !arrived.contains(&i) {
-            arrived.push(i);
+        let resolved_count = joins.resolved_count.entry(s).or_insert(0);
+        *resolved_count += 1;
+        if live {
+            let arrived = joins.arrived.entry(s).or_default();
+            if !arrived.contains(&i) {
+                arrived.push(i);
+            }
         }
-        if arrived.len() >= threshold {
+        let arrived_len = joins.arrived.get(&s).map(Vec::len).unwrap_or(0);
+        let inbound_total = joins.inbound_total.get(&s).copied().unwrap_or(0);
+        // Fire on whichever condition comes first: enough LIVE arrivals to
+        // satisfy the wait policy, OR every inbound path accounted for
+        // (live or not) — the second clause is what stops a join from
+        // hanging forever when too many of its paths were pruned/skipped
+        // to ever reach `threshold` via live arrivals alone.
+        if arrived_len >= threshold || *resolved_count >= inbound_total {
             newly_satisfied.push(s);
         }
     }
@@ -2050,10 +2160,12 @@ fn mark_done_and_track_joins(
 /// `StepResult`, then run [`mark_done_and_track_joins`]. The shared tail
 /// every completion path in [`run_scheduler`] calls (mirroring what the
 /// pre-Task-3 code did inline at each site — skip / when-skip / branch /
-/// split / the async `Completed` arm — now also join-aware).
+/// split / the async `Completed` arm — now also join-aware). See
+/// [`mark_done_and_track_joins`] for what `live` must be at each call site.
 #[allow(dead_code, clippy::too_many_arguments)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
 fn finish_node(
     i: usize,
+    live: bool,
     result: StepResult,
     opts: &OrchestratorRunOpts,
     run_id: &str,
@@ -2066,7 +2178,7 @@ fn finish_node(
 ) -> Vec<usize> {
     persist_step_result(opts, run_id, &result);
     step_results.push(result);
-    mark_done_and_track_joins(i, successors, indegree, ready, done, joins)
+    mark_done_and_track_joins(i, live, successors, indegree, ready, done, joins)
 }
 
 /// Resolve every join in `worklist` (Task 3, spec §5), cascading if
@@ -2077,20 +2189,22 @@ fn finish_node(
 ///    completion at a time, so there's no race within this single-
 ///    threaded bookkeeping). **Losers** are `j`'s other direct
 ///    predecessors.
-/// 2. **Cancellation** (spec §8): compute the ancestor-exclusive closure
-///    of the losers (reachable backward from `losers`, minus reachable
-///    backward from `winners` — the same `reachable_via`
-///    set-difference [`branch_prune_set`] uses forward). Every node in
-///    that closure that isn't already `done` is either aborted (if
-///    currently in-flight — `cancel.in_flight_abort`) or marked
-///    `cancelled` (if not yet dispatched) so the ready-drain loop's skip
-///    check resolves it as a no-op instead of ever running it. **Known
-///    limitation** (mirrors branch pruning's own): a node that feeds
-///    BOTH a losing path and some entirely unrelated part of the graph
-///    would be cancelled here too — the closure only knows about this
-///    join's winners/losers, not the whole graph's other consumers. Not
-///    exercised by any workflow shape this task's tests or the golden
-///    set cover; flagged for Task 4/5.
+/// 2. **Cancellation** (spec §8): start from the ancestor-exclusive
+///    closure of the losers (reachable backward from `losers`, minus
+///    reachable backward from `winners` — the same `reachable_via`
+///    set-difference [`branch_prune_set`] uses forward). **Post-review
+///    fix:** a candidate is then PROTECTED (removed from the closure,
+///    left to run normally) if cancelling it would silently strand a
+///    live consumer outside this join's losing path — i.e. it has a
+///    successor that's neither another still-cancellable candidate nor
+///    the join `j` itself (the one edge this resolution is entitled to
+///    cut). Protecting a candidate also protects its own candidate
+///    ancestors transitively (they must still run to feed it), so this
+///    runs to a fixed point. Only what survives that fixed point is
+///    actually cancelled: aborted if currently in-flight
+///    (`cancel.in_flight_abort`), or marked `cancelled` (if not yet
+///    dispatched) so the ready-drain loop's skip check resolves it as a
+///    no-op instead of ever running it.
 /// 3. **Merge** (spec §5's ONE rule): the join's own `StepResult.items`
 ///    is one [`ItemResult`] per winner, `sub_id` = that winner's step id
 ///    (source-keyed) — `base_context_for_step` turns this into BOTH
@@ -2127,7 +2241,33 @@ fn drain_joins(
         if !losers.is_empty() {
             let reach_losers = reachable_via(&losers, predecessors);
             let reach_winners = reachable_via(&winners, predecessors);
-            for idx in reach_losers.difference(&reach_winners).copied() {
+            let mut cancel_candidates: std::collections::BTreeSet<usize> =
+                reach_losers.difference(&reach_winners).copied().collect();
+            // Post-review fix: protect (un-cancel) any candidate that
+            // feeds a live consumer outside this closure — a successor
+            // that's neither another candidate nor the join `j` itself
+            // (the one edge we're entitled to cut). Protecting a node
+            // also protects its own candidate ancestors transitively
+            // (they must still run to feed it), so iterate to a fixed
+            // point rather than a single pass.
+            loop {
+                let protect: Vec<usize> = cancel_candidates
+                    .iter()
+                    .copied()
+                    .filter(|&x| {
+                        successors[x]
+                            .iter()
+                            .any(|&s| s != j && !cancel_candidates.contains(&s))
+                    })
+                    .collect();
+                if protect.is_empty() {
+                    break;
+                }
+                for x in protect {
+                    cancel_candidates.remove(&x);
+                }
+            }
+            for idx in cancel_candidates {
                 if done[idx] {
                     continue;
                 }
@@ -2202,7 +2342,8 @@ fn drain_joins(
             );
         }
         let more = finish_node(
-            j, join_result, opts, run_id, step_results, done, successors, indegree, ready, joins,
+            j, true, join_result, opts, run_id, step_results, done, successors, indegree, ready,
+            joins,
         );
         worklist.extend(more);
     }
@@ -2215,6 +2356,7 @@ fn drain_joins(
 #[allow(dead_code, clippy::too_many_arguments)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
 fn complete_and_drain_joins(
     i: usize,
+    live: bool,
     result: StepResult,
     wf: &Workflow,
     opts: &OrchestratorRunOpts,
@@ -2229,7 +2371,7 @@ fn complete_and_drain_joins(
     cancel: &mut Cancellation,
 ) {
     let worklist = finish_node(
-        i, result, opts, run_id, step_results, done, successors, indegree, ready, joins,
+        i, live, result, opts, run_id, step_results, done, successors, indegree, ready, joins,
     );
     drain_joins(
         worklist,
@@ -8600,6 +8742,334 @@ steps:
             "pruned nodes must never reach the StepFactory: {calls:?}"
         );
         assert!(calls.contains(&"x".to_string()) && calls.contains(&"reconverge".to_string()));
+    }
+
+    const BRANCH_TO_JOIN_WF: &str = r#"
+name: branch-to-join
+steps:
+  - id: br
+    branch:
+      condition: "true"
+      then: [a]
+      else: [b]
+  - id: a
+    agent: worker
+    prompt: "do a"
+    next: [gathered]
+  - id: b
+    agent: worker
+    prompt: "do b"
+    next: [gathered]
+  - id: gathered
+    join: { wait: all }
+  - id: after
+    agent: worker
+    prompt: "n={{ steps.gathered.results | length }}"
+"#;
+
+    /// **Post-review CRITICAL-fix regression.** A branch's PRUNED arm must
+    /// never be merged into a downstream `join`'s results, nor poison its
+    /// `success`. Before the fix, `mark_done_and_track_joins` counted
+    /// EVERY completing node — pruned or not — as a join arrival, so
+    /// `gathered` fired with BOTH `a` (live, taken) and `b` (pruned,
+    /// `output: "pruned"`, `success: false`) merged in:
+    /// `results.len() == 2` and `gathered.success == false` even though
+    /// the live arm succeeded cleanly. Confirmed to FAIL against the
+    /// pre-fix code (`items.len() == 2`, `sub_results.b.output ==
+    /// "pruned"`, `gathered.success == false`) and PASS after the `live`
+    /// parameter was threaded through — see this task's report.
+    #[tokio::test]
+    async fn branch_pruned_arm_is_never_merged_into_a_downstream_join() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(BRANCH_TO_JOIN_WF).unwrap();
+        let factory = JoinTestFactory::new(&[]);
+        let calls = Arc::clone(&factory.calls);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        let b = result_for(&step_results, "b");
+        assert!(
+            b.skipped && b.output == "pruned",
+            "b (untaken arm) must be pruned: {b:?}"
+        );
+
+        let gathered = result_for(&step_results, "gathered");
+        assert!(
+            gathered.success,
+            "join must not be poisoned by the pruned arm: {gathered:?}"
+        );
+        assert_eq!(
+            gathered.items.len(),
+            1,
+            "join must merge ONLY the taken arm, not the pruned one: {:?}",
+            gathered.items
+        );
+        assert_eq!(gathered.items[0].sub_id, "a");
+        assert!(
+            !gathered.items.iter().any(|it| it.output == "pruned"),
+            "the pruned arm's marker output must never appear in the merge: {:?}",
+            gathered.items
+        );
+
+        let after = result_for(&step_results, "after");
+        assert!(
+            after.output.contains("n=1"),
+            "downstream should see exactly 1 merged result: {}",
+            after.output
+        );
+
+        assert!(
+            !calls.lock().unwrap().contains(&"b".to_string()),
+            "pruned arm must never reach the StepFactory"
+        );
+    }
+
+    const WHEN_SKIP_TO_JOIN_WF: &str = r#"
+name: when-skip-to-join
+steps:
+  - id: a
+    agent: worker
+    prompt: "do a"
+    when: "false"
+    next: [gathered]
+  - id: b
+    agent: worker
+    prompt: "do b"
+    next: [gathered]
+  - id: gathered
+    join: { wait: all }
+  - id: after
+    agent: worker
+    prompt: "n={{ steps.gathered.results | length }}"
+"#;
+
+    /// **Post-review CRITICAL-fix regression, the `when:`-skip flavor.** A
+    /// `when: false` predecessor must never be merged into a downstream
+    /// `join`'s results either — same bug class as the branch case above,
+    /// same fix (the `live` flag on `mark_done_and_track_joins`).
+    /// Confirmed to FAIL against the pre-fix code and PASS after.
+    #[tokio::test]
+    async fn when_skipped_predecessor_is_never_merged_into_a_downstream_join() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(WHEN_SKIP_TO_JOIN_WF).unwrap();
+        let factory = JoinTestFactory::new(&[]);
+        let calls = Arc::clone(&factory.calls);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        let a = result_for(&step_results, "a");
+        assert!(a.skipped, "a (when: false) must be skipped: {a:?}");
+
+        let gathered = result_for(&step_results, "gathered");
+        assert!(
+            gathered.success,
+            "join must not be poisoned by the skipped predecessor: {gathered:?}"
+        );
+        assert_eq!(
+            gathered.items.len(),
+            1,
+            "join must merge ONLY the live predecessor: {:?}",
+            gathered.items
+        );
+        assert_eq!(gathered.items[0].sub_id, "b");
+
+        let after = result_for(&step_results, "after");
+        assert!(
+            after.output.contains("n=1"),
+            "downstream should see exactly 1 merged result: {}",
+            after.output
+        );
+
+        assert!(
+            !calls.lock().unwrap().contains(&"a".to_string()),
+            "when-skipped predecessor must never reach the StepFactory"
+        );
+    }
+
+    const BRANCH_PRUNE_UNRELATED_LIVE_PREDECESSOR_WF: &str = r#"
+name: branch-prune-unrelated-live-predecessor
+steps:
+  - id: br
+    branch:
+      condition: "true"
+      then: [a]
+      else: [b]
+  - id: a
+    agent: worker
+    prompt: "a"
+  - id: b
+    agent: worker
+    prompt: "b"
+    next: [shared]
+  - id: z
+    agent: worker
+    prompt: "z"
+    next: [shared]
+  - id: shared
+    agent: worker
+    prompt: "shared sees z={{ steps.z.output }}"
+"#;
+
+    /// **Post-review IMPORTANT-fix regression.** `shared` is reachable
+    /// from the untaken arm (`b`) AND from `z` — an entirely independent,
+    /// always-live entry step that has nothing to do with either branch
+    /// arm. The naive "reachable-from-untaken minus reachable-from-taken"
+    /// diff would prune `shared` anyway (it's not reachable via the TAKEN
+    /// arm `a`), silently stranding `z`'s real output. The fix compares
+    /// against reachability from every graph entry point with only the
+    /// untaken edge cut, which correctly finds `shared` still reachable
+    /// via `z` and leaves it un-pruned. `b` itself (which has NO
+    /// alternate live path) must still be pruned. Confirmed to FAIL
+    /// against the pre-fix `branch_prune_set` (see this task's report)
+    /// and PASS after.
+    #[tokio::test]
+    async fn branch_prune_does_not_strand_a_node_fed_by_an_unrelated_live_predecessor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(BRANCH_PRUNE_UNRELATED_LIVE_PREDECESSOR_WF).unwrap();
+        assert!(crate::workflow::is_nonlinear(&wf), "fixture must be graph mode");
+        let factory = JoinTestFactory::new(&[]);
+        let calls = Arc::clone(&factory.calls);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        let b = result_for(&step_results, "b");
+        assert!(b.skipped && b.output == "pruned", "b must still be pruned: {b:?}");
+
+        let shared = result_for(&step_results, "shared");
+        assert!(
+            !shared.skipped && shared.success,
+            "shared must NOT be pruned — z gives it a live path: {shared:?}"
+        );
+        assert!(
+            shared.output.contains("step z agent worker echo: z"),
+            "shared must have actually run and seen z's real output: {}",
+            shared.output
+        );
+
+        assert!(calls.lock().unwrap().contains(&"shared".to_string()));
+        assert!(!calls.lock().unwrap().contains(&"b".to_string()));
+    }
+
+    const JOIN_CANCEL_UNRELATED_CONSUMER_WF: &str = r#"
+name: join-cancel-unrelated-consumer
+steps:
+  - id: fanout
+    split: [w, fast]
+  - id: w
+    agent: worker
+    prompt: "w"
+    next: [loser, y]
+  - id: loser
+    agent: worker
+    prompt: "loser"
+    next: [gathered]
+  - id: fast
+    agent: worker
+    prompt: "fast"
+    next: [gathered]
+  - id: gathered
+    join: { wait: any }
+  - id: y
+    agent: worker
+    prompt: "y sees w={{ steps.w.output }}"
+"#;
+
+    /// **Post-review IMPORTANT-fix regression, the symmetric loser-
+    /// cancellation case.** `w` feeds BOTH `loser` (the join's losing
+    /// inbound path) AND `y` — a live consumer that has nothing to do
+    /// with the join at all. The naive ancestor-exclusive closure
+    /// (ancestors of `loser` minus ancestors of `fast`) would include `w`
+    /// and cancel/abort it, silently stranding `y`. The fix protects `w`
+    /// (it has a successor — `y` — outside the cancellation closure and
+    /// isn't the join itself), so `w` runs to completion normally; only
+    /// `loser` itself (whose ONLY successor is the join) is actually
+    /// cancelled. Confirmed to FAIL against the pre-fix cancellation
+    /// closure (see this task's report) and PASS after.
+    #[tokio::test]
+    async fn join_loser_cancellation_does_not_strand_an_ancestors_unrelated_consumer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(JOIN_CANCEL_UNRELATED_CONSUMER_WF).unwrap();
+        let factory = JoinTestFactory::new(&[("w", 80)]);
+        let calls = Arc::clone(&factory.calls);
+        let finished = Arc::clone(&factory.finished);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        let gathered = result_for(&step_results, "gathered");
+        assert_eq!(gathered.items.len(), 1);
+        assert_eq!(gathered.items[0].sub_id, "fast", "fast must win the race");
+
+        // `w` must survive (not aborted) — it's needed by `y`.
+        assert!(
+            finished.lock().unwrap().contains(&"w".to_string()),
+            "w must have been allowed to run to completion, not cancelled"
+        );
+        let w = result_for(&step_results, "w");
+        assert!(w.success, "w must have a real StepResult: {w:?}");
+
+        // `y` must actually run and see `w`'s real output.
+        let y = result_for(&step_results, "y");
+        assert!(
+            y.output.contains("step w agent worker echo: w"),
+            "y must have run with w's real output: {}",
+            y.output
+        );
+
+        // `loser` itself (no consumer besides the join) must still be
+        // cancelled — it gets a `StepResult` (the same "resolved as a
+        // no-op" marker a pruned/skipped node gets, per the ready-drain
+        // loop's unified skip check), but it must be `skipped` with the
+        // `"cancelled"` marker, and must NEVER actually reach the
+        // `StepFactory`.
+        let loser = result_for(&step_results, "loser");
+        assert!(
+            loser.skipped && loser.output == "cancelled",
+            "loser must be resolved as cancelled, not dispatched: {loser:?}"
+        );
+        assert!(
+            !calls.lock().unwrap().contains(&"loser".to_string()),
+            "loser must never reach the StepFactory"
+        );
     }
 }
 

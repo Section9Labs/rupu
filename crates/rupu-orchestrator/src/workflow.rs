@@ -196,6 +196,10 @@ pub enum WorkflowParseError {
         count: u32,
         inbound: usize,
     },
+    #[error(
+        "step `{step}`: `join` has no inbound edges — it would never fire, silently stranding it and everything downstream of it"
+    )]
+    JoinNoInboundEdges { step: String },
 }
 
 /// How a workflow gets kicked off. Manual is the existing behavior
@@ -2048,26 +2052,36 @@ fn validate_graph(wf: &Workflow) -> Result<(), WorkflowParseError> {
                 },
             });
         }
-        if let Some(Join {
-            wait: JoinWait::Count { count },
-        }) = &step.join
-        {
-            if *count < 1 {
-                return Err(WorkflowParseError::JoinCountInvalid {
+        if let Some(join) = &step.join {
+            // A join with zero inbound edges can never fire under ANY wait
+            // policy (`all`/`any`/`count`) — its arrival tracking never
+            // gets a single completion to react to, so it (and everything
+            // downstream of it) would silently never run while the rest of
+            // the workflow reports `Done`. Reject unconditionally, not just
+            // for the `count` form.
+            let inbound = inbound_degree.get(step.id.as_str()).copied().unwrap_or(0);
+            if inbound == 0 {
+                return Err(WorkflowParseError::JoinNoInboundEdges {
                     step: step.id.clone(),
                 });
             }
-            // A join can never actually reach a count higher than the
-            // number of paths that feed it — reject at parse time rather
-            // than let the scheduler wait forever on inbound paths that
-            // don't exist (spec §5).
-            let inbound = inbound_degree.get(step.id.as_str()).copied().unwrap_or(0);
-            if (*count as usize) > inbound {
-                return Err(WorkflowParseError::JoinCountExceedsInbound {
-                    step: step.id.clone(),
-                    count: *count,
-                    inbound,
-                });
+            if let JoinWait::Count { count } = &join.wait {
+                if *count < 1 {
+                    return Err(WorkflowParseError::JoinCountInvalid {
+                        step: step.id.clone(),
+                    });
+                }
+                // A join can never actually reach a count higher than the
+                // number of paths that feed it — reject at parse time
+                // rather than let the scheduler wait forever on inbound
+                // paths that don't exist (spec §5).
+                if (*count as usize) > inbound {
+                    return Err(WorkflowParseError::JoinCountExceedsInbound {
+                        step: step.id.clone(),
+                        count: *count,
+                        inbound,
+                    });
+                }
             }
         }
         for t in step.next.iter().chain(step.split.iter().flatten()) {
@@ -2721,7 +2735,7 @@ steps:
 
     #[test]
     fn join_wait_count_and_any_parse() {
-        let any = Workflow::parse("name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: j\n    join: { wait: any }\n").unwrap();
+        let any = Workflow::parse("name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [j]\n  - id: j\n    join: { wait: any }\n").unwrap();
         assert!(matches!(
             any.steps[1].join.as_ref().unwrap().wait,
             JoinWait::Keyword(JoinWaitKeyword::Any)
@@ -2739,7 +2753,7 @@ steps:
             ("all", JoinWait::Keyword(JoinWaitKeyword::All)),
             ("any", JoinWait::Keyword(JoinWaitKeyword::Any)),
         ] {
-            let raw = format!("name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: j\n    join: {{ wait: {yaml_wait} }}\n");
+            let raw = format!("name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [j]\n  - id: j\n    join: {{ wait: {yaml_wait} }}\n");
             let wf = Workflow::parse(&raw).unwrap();
             assert_eq!(wf.steps[1].join.as_ref().unwrap().wait, expected);
             let out = serde_yaml::to_string(&wf).unwrap();
@@ -2843,6 +2857,23 @@ steps:
             ),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn join_with_zero_inbound_edges_is_rejected_regardless_of_wait_policy() {
+        // A join nobody feeds would never fire under ANY policy (`all`,
+        // `any`, or `count`), silently stranding it and everything
+        // downstream while the run reports `Done` — reject at parse time.
+        for wait in ["all", "any", "{ count: 1 }"] {
+            let raw = format!(
+                "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: j\n    join: {{ wait: {wait} }}\n"
+            );
+            let err = Workflow::parse(&raw).unwrap_err();
+            assert!(
+                matches!(err, WorkflowParseError::JoinNoInboundEdges { .. }),
+                "wait: {wait}: got {err:?}"
+            );
+        }
     }
 
     #[test]
