@@ -164,6 +164,7 @@ mod tests {
             steps: vec![],
             concerns: None,
             max_concurrency: None,
+            loops: BTreeMap::new(),
         }
     }
 

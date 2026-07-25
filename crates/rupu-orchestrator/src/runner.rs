@@ -179,6 +179,10 @@ pub enum RunWorkflowError {
         "run cancelled: {aborted} in-flight node(s) aborted; restart to resume from checkpoint"
     )]
     RunCancelled { aborted: usize },
+    #[error(
+        "loop `{name}` execution requires the loop driver (lands in a follow-up task) — this workflow's `loops:` block cannot run yet"
+    )]
+    LoopRuntimeNotYetWired { name: String },
 }
 
 /// Trait the orchestrator uses to construct per-unit [`AgentRunOpts`].
@@ -574,6 +578,20 @@ pub async fn run_workflow(
     // the same `InnerOutcome`, so every consumer below that point (events,
     // awaiting-parking, persistence) is unchanged and shared between the
     // two paths.
+
+    // Task 2 honesty gate (temporary): `loops:` language + validation land
+    // in this task; loop EXECUTION (the super-node + recursive iteration
+    // driver) is a follow-up task's job. `run_scheduler` doesn't know
+    // about loop super-nodes yet, so a workflow declaring `loops:` must
+    // not be allowed to silently mis-run through it — reject loudly,
+    // before ANY run.json side effect (directory creation, `RunStore::
+    // create`, event emission), so nothing partially runs and no orphaned
+    // run record is left behind. The follow-up task removes this gate
+    // when it wires real execution (see `LoopDef`/`loop_of_step`/
+    // `loop_internal_edges`/`collapsed_graph_edges` in `workflow.rs`).
+    if let Some(name) = opts.workflow.loops.keys().next() {
+        return Err(RunWorkflowError::LoopRuntimeNotYetWired { name: name.clone() });
+    }
 
     std::fs::create_dir_all(&opts.transcript_dir)?;
     let resolved_inputs = resolve_inputs(&opts.workflow, &opts.inputs)?;
@@ -8011,6 +8029,90 @@ steps:
         assert_eq!(
             result.step_results[1].output, "done:then done:p",
             "step b ran with step a's real output, proving genuine sequential execution"
+        );
+    }
+
+    /// Task 2 honesty gate: `loops:` language + validation land in this
+    /// task; loop EXECUTION is a follow-up task's job. `run_scheduler`
+    /// doesn't know about the loop super-node yet, so a workflow
+    /// declaring `loops:` must be rejected loudly rather than silently
+    /// mis-run. `PanicFactory` (via `make_opts`) additionally proves no
+    /// step dispatch happens at all — the gate fires before any work.
+    #[tokio::test]
+    async fn run_workflow_rejects_a_loop_workflow_with_the_honesty_gate() {
+        let yaml = r#"
+name: has-loop
+steps:
+  - id: gen
+    agent: x
+    prompt: p
+  - id: test
+    agent: x
+    prompt: p
+    depends_on: [gen]
+loops:
+  refine:
+    nodes: [gen, test]
+    until: "{{ steps.test.output }}"
+    max_iterations: 3
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = Arc::new(FakeUnitDispatcher::new());
+        let wf = Workflow::parse(yaml).unwrap();
+        let opts = make_opts(wf, dir.path().to_path_buf(), dispatcher);
+
+        let err = run_workflow(opts)
+            .await
+            .expect_err("a loop workflow must not silently run through the scheduler");
+        match err {
+            RunWorkflowError::LoopRuntimeNotYetWired { name } => {
+                assert_eq!(name, "refine");
+            }
+            other => panic!("expected LoopRuntimeNotYetWired, got {other:?}"),
+        }
+    }
+
+    /// The gate must fire BEFORE any run.json side effect: no `RunRecord`
+    /// created, and (since `RunStore::create` is what makes the directory)
+    /// the runs directory never even comes into existence.
+    #[tokio::test]
+    async fn run_workflow_loop_gate_fires_before_any_run_json_side_effect() {
+        let yaml = r#"
+name: has-loop
+steps:
+  - id: gen
+    agent: x
+    prompt: p
+  - id: test
+    agent: x
+    prompt: p
+    depends_on: [gen]
+loops:
+  refine:
+    nodes: [gen, test]
+    until: "{{ steps.test.output }}"
+    max_iterations: 3
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = Arc::new(FakeUnitDispatcher::new());
+        let wf = Workflow::parse(yaml).unwrap();
+        let mut opts = make_opts(wf, dir.path().to_path_buf(), dispatcher);
+        let runs_dir = dir.path().join("runs");
+        let store = Arc::new(crate::runs::RunStore::new(runs_dir.clone()));
+        opts.run_store = Some(store.clone());
+        opts.workflow_yaml = Some(yaml.to_string());
+
+        let err = run_workflow(opts)
+            .await
+            .expect_err("gate must fire before any RunRecord is created");
+        assert!(matches!(err, RunWorkflowError::LoopRuntimeNotYetWired { .. }));
+        assert!(
+            store.list().unwrap().is_empty(),
+            "no RunRecord must have been created"
+        );
+        assert!(
+            !runs_dir.exists(),
+            "the gate must fire before the runs directory is even created"
         );
     }
 }
