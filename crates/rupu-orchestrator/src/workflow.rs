@@ -50,6 +50,8 @@ pub enum WorkflowParseError {
     },
     #[error("step `{step}`: `max_parallel` must be at least 1, got {value}")]
     InvalidMaxParallel { step: String, value: i64 },
+    #[error("workflow: `max_concurrency` must be at least 1, got {value}")]
+    InvalidMaxConcurrency { value: i64 },
     #[error(
         "step `{step}`: `parallel:` is mutually exclusive with `for_each:` and with the top-level `agent`/`prompt`"
     )]
@@ -1027,6 +1029,17 @@ pub struct Workflow {
     /// from the workflow name) so their ledger entries accumulate together.
     #[serde(default)]
     pub concerns: Option<ConcernsBlock>,
+    /// Phase-2 DAG scheduler: caps the total number of nodes the scheduler
+    /// runs concurrently across the WHOLE graph (workflow scope — distinct
+    /// from a `parallel:`/`for_each:` step's own `max_parallel:`, which
+    /// caps only that one step's internal fan-out). `None` (the default)
+    /// is unbounded: the scheduler runs every node the graph's dependency
+    /// structure makes ready, including a `split:`'s full fan-out, with no
+    /// artificial cap. Must be at least 1 when set — see
+    /// `WorkflowParseError::InvalidMaxConcurrency`. Not consulted by the
+    /// legacy linear runner (`run_steps_inner`), only by `run_scheduler`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
     pub steps: Vec<Step>,
 }
 
@@ -1042,6 +1055,11 @@ impl Workflow {
         let wf: Workflow = serde_yaml::from_str(s)?;
         if wf.steps.is_empty() {
             return Err(WorkflowParseError::Empty);
+        }
+        if let Some(mc) = wf.max_concurrency {
+            if mc < 1 {
+                return Err(WorkflowParseError::InvalidMaxConcurrency { value: mc as i64 });
+            }
         }
         let mut seen = BTreeSet::new();
         for step in &wf.steps {
@@ -1976,7 +1994,7 @@ fn declaration_order_is_topological(wf: &Workflow) -> bool {
 /// `join:`. Legacy edge-free workflows keep running only the pre-existing
 /// forward-only `validate_branch_targets` / `validate_template_refs`
 /// checks — `validate_graph` never runs for them.
-fn workflow_has_explicit_edges(wf: &Workflow) -> bool {
+pub(crate) fn workflow_has_explicit_edges(wf: &Workflow) -> bool {
     wf.steps
         .iter()
         .any(|s| !s.next.is_empty() || s.split.is_some() || s.join.is_some())

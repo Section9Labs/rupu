@@ -177,6 +177,8 @@ pub enum RunWorkflowError {
         "workflow `{name}` uses non-linear orchestration (split/join/fork), which requires the DAG scheduler — not yet available (Phase 2)"
     )]
     NonlinearNotYetSupported { name: String },
+    #[error("scheduler: a dispatched node task panicked or was cancelled: {0}")]
+    SchedulerTaskJoin(#[from] tokio::task::JoinError),
 }
 
 /// Trait the orchestrator uses to construct per-unit [`AgentRunOpts`].
@@ -207,6 +209,15 @@ pub trait StepFactory: Send + Sync {
     ) -> AgentRunOpts;
 }
 
+/// `Clone` exists solely so [`run_scheduler`] can wrap one `Arc`-shared copy
+/// (`Arc::new(opts.clone())`, cloned once per run) and hand a cheap
+/// `Arc::clone` of it into every `tokio::spawn`ed node dispatch — the same
+/// reason `run_parallel_step` clones individual `Arc` fields today, just
+/// promoted to the whole struct now that dispatch happens at workflow scope,
+/// not only inside one fan-out step. Every field is itself `Clone` (plain
+/// data or an `Arc<dyn Trait + Send + Sync>`), so this is a cheap,
+/// non-semantic addition — no behavior depends on it outside the scheduler.
+#[derive(Clone)]
 pub struct OrchestratorRunOpts {
     pub workflow: Workflow,
     pub inputs: BTreeMap<String, String>,
@@ -946,6 +957,7 @@ fn split_seed_for_resume(seed: Vec<Message>) -> (Vec<Message>, String) {
 /// Inner loop's terminal state. Distinguishes "ran to completion"
 /// from "paused at an approval gate" without forcing the caller to
 /// inspect persisted state.
+#[derive(Debug)]
 enum InnerOutcome {
     Done,
     Paused {
@@ -1002,26 +1014,94 @@ async fn run_steps_inner(
     .await
 }
 
-/// Ready-set scheduler driver (Phase-2 DAG scheduler foundation): dispatches
-/// the workflow's steps in [`ready_set_order`]'s dependency-graph order
-/// (built from [`workflow_edges`]) instead of `opts.workflow.steps`' plain
-/// declaration order, but is otherwise IDENTICAL to [`run_steps_inner`] —
-/// same resume-skip / branch-skip / step-boundary-pause / `when:`-skip /
-/// approval-gate / branch-arm-selection / [`run_node`] dispatch, via the
-/// same shared [`run_steps_over`] body. For every workflow this crate can
-/// run today (`is_nonlinear(&opts.workflow) == false` — see that
-/// function's doc, which already covers every `.rupu/workflows/*.yaml`
-/// sample), [`ready_set_order`] provably returns EXACTLY
-/// `opts.workflow.steps`' own order (see this module's
-/// `dag_scheduler_golden` tests), so this driver is a byte-for-byte-proven
-/// stand-in for [`run_steps_inner`] — NOT yet wired as `run_workflow`'s
-/// live path. A later task in this arc switches the default driver once
-/// concurrency is layered on top of the ready set; until then this exists
-/// so `dag_scheduler_golden` (a `#[cfg(test)]` module in this file, not
-/// `tests/`, specifically so it can reach this and `run_steps_inner`
-/// directly without widening the crate's public API before the scheduler
-/// actually replaces anything) can prove the ready-set walk reproduces the
-/// loop exactly, before later tasks build concurrency on top of it.
+/// Effectively-unbounded concurrency cap used when a workflow declares no
+/// `max_concurrency:` (§4/§11 of the Phase-2 scheduler design doc: default
+/// is unbounded — every ready node runs, including a `split:`'s full
+/// fan-out, never artificially serialized). Comfortably under
+/// `tokio::sync::Semaphore`'s internal permit ceiling; no real workflow's
+/// graph width will ever approach it.
+#[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
+const UNBOUNDED_MAX_CONCURRENCY: usize = 1 << 20;
+
+/// Concurrent ready-set scheduler (Phase-2 design doc §2 "the scheduler",
+/// §4 "concurrency"). Unlike [`run_steps_inner`]/[`run_steps_over`] (which
+/// dispatch `opts.workflow.steps` one at a time in declaration order), this
+/// dispatches EVERY currently-ready node at once and launches each
+/// newly-ready node the instant its dependencies clear — not a
+/// per-declaration-order walk and not a rigid wave barrier.
+///
+/// **Readiness / implicit all-join (§2, D2).** A node is ready when every
+/// inbound edge from [`workflow_edges`] (control edges — `next`/`split`/
+/// branch arms — UNION inferred `steps.X.*` data edges, the same graph
+/// [`is_nonlinear`]'s topological check and Task 1's `ready_set_order` used)
+/// is `done`. Tracked as a plain Kahn's-algorithm indegree array: a node
+/// with N inbound edges simply needs N decrements before it's ready. This
+/// covers Task 2's "implicit all-join" requirement with NO separate join
+/// code path — a regular node with two predecessors just has indegree 2.
+///
+/// **`split` (§2, §4).** A `split:` node fans into N targets. It carries no
+/// agent (enforced at parse time by `validate_graph`'s
+/// `OrchestrationNodeHasWork` check), so it resolves synchronously as an
+/// orchestration no-op — an instant `StepResult`, no `tokio::spawn` — the
+/// same way `branch` already resolves inline below. Its kind is
+/// [`crate::runs::StepKind::Branch`] (reused rather than adding a new
+/// `StepKind` variant: every other `StepKind` consumer lives in
+/// `rupu-cli`/`rupu-cp`, outside this crate's Task-2 scope, and several
+/// match it exhaustively with no wildcard arm; adding a variant today would
+/// require patching those crates for a node the live `run_workflow` path
+/// can't reach yet anyway, since [`is_nonlinear`] still gates it out — see
+/// this task's report). Marking the split `done` unlocks every one of its
+/// targets in the SAME indegree decrement pass, so they all go ready
+/// together and get dispatched concurrently on the very next drain below.
+///
+/// **Concurrency (§4).** Real dispatch (linear / panel / parallel /
+/// for_each / action, via [`run_node`]) is the only work that
+/// `tokio::spawn`s, bounded by a workflow-scope [`Semaphore`] sized from
+/// `opts.workflow.max_concurrency` (default [`UNBOUNDED_MAX_CONCURRENCY`])
+/// — exactly the `Semaphore` + `tokio::spawn` + join pattern
+/// [`run_parallel_step`] already uses for one step's internal fan-out,
+/// promoted here to the whole graph. A `tokio::task::JoinSet` (keyed by
+/// declaration index) holds every in-flight dispatch; the main loop
+/// alternates between draining every ready-but-undispatched node
+/// (resolving control-flow synchronously, spawning real work) and awaiting
+/// exactly the next task to finish (`JoinSet::join_next`, not a
+/// wait-for-everyone barrier) — so a node with one predecessor still
+/// running launches the moment THAT ONE predecessor completes, without
+/// waiting on unrelated siblings. `opts` is cloned once into an `Arc`
+/// (`OrchestratorRunOpts` derives `Clone` for exactly this) so every
+/// spawned task gets a cheap `Arc::clone` instead of needing `opts` to
+/// outlive the function as a bare reference.
+///
+/// For a legacy linear chain (graph width 1, every sample under
+/// `.rupu/workflows/*.yaml`) exactly one node is ever ready at a time, so
+/// this degenerates to the original one-at-a-time dispatch — proven
+/// byte-for-byte against [`run_steps_inner`] by `dag_scheduler_golden`
+/// below, now exercising the concurrent implementation directly (there is
+/// no separate sequential-only code path anymore).
+///
+/// **Persist order.** `step_results` is appended to in the order each
+/// node's outcome is drained from the `JoinSet` (completion order) — same
+/// as `run_parallel_step`'s own join loop. For a linear chain, completion
+/// order IS dispatch order IS declaration order (only one node in flight
+/// ever), so this is byte-for-byte unaffected. For a genuine fork,
+/// completion order between unrelated siblings is a real race; this is a
+/// deliberate choice, not forced into a declaration-order re-sort, because
+/// nothing in this crate treats `step_results`' order as positionally
+/// meaningful — downstream templates key `steps.<id>` by NAME
+/// (`base_context_for_step` builds a `BTreeMap`), so no template-visible
+/// behavior depends on inter-sibling order.
+///
+/// **Error / pause unwinding.** A hard failure (`run_node` returning `Err`
+/// — i.e. NOT `continue_on_error`) or any pause (approval-gate parking, the
+/// legacy inline gate, the step-boundary check, or a mid-dispatch pause
+/// bubbling out as `NodeOutcome::Paused`) stops launching new nodes and
+/// returns immediately — "like the loop does" per this task's brief. Any
+/// sibling tasks still in the `JoinSet` are ABORTED when it drops (tokio's
+/// documented `JoinSet` drop behavior), not gracefully drained to a safe
+/// boundary; full in-flight cancellation (a token threaded through
+/// `dispatch_one`, §8 of the design doc) is later in this arc. Every
+/// sample this task's golden test covers has graph width 1, so there is
+/// never another task in flight when this fires — unobservable there.
 #[allow(dead_code)] // driven only by tests until a later task wires it in as the live path
 async fn run_scheduler(
     opts: &OrchestratorRunOpts,
@@ -1031,74 +1111,533 @@ async fn run_scheduler(
     approved_step_id: Option<&str>,
     step_results: &mut Vec<StepResult>,
 ) -> Result<InnerOutcome, RunWorkflowError> {
-    let order = ready_set_order(&opts.workflow);
-    run_steps_over(
-        &order,
-        opts,
-        run_id,
-        resolved_inputs,
-        workflow_default_continue,
-        approved_step_id,
-        step_results,
-    )
-    .await
-}
-
-/// Topologically order a workflow's steps via [`workflow_edges`]' DAG using
-/// a ready-set walk (Kahn's algorithm keyed by a `BTreeSet<usize>` of
-/// ready declaration-indices, so the GLOBALLY smallest-index ready node is
-/// always dispatched next — a per-batch sort isn't enough, since a later
-/// batch of newly-readied nodes can still contain a smaller index than one
-/// already queued from an earlier batch). Whenever declaration order is
-/// itself a valid topological order of the full edge set (control edges
-/// union inferred data edges — exactly the invariant `is_nonlinear`
-/// enforces for a workflow with explicit `next`/`split`/`join`, and the
-/// invariant every `.rupu/workflows/*.yaml` sample happens to satisfy even
-/// without explicit edges — see `dag_scheduler_golden`), this walk
-/// reproduces `wf.steps`' own order exactly: by induction, once steps
-/// `0..k` have been dispatched, step `k`'s predecessors (all indices `<
-/// k`) are already dispatched, so `k` is ready and is the smallest ready
-/// index, and is picked next.
-fn ready_set_order(wf: &Workflow) -> Vec<&Step> {
-    let edges = workflow_edges(wf);
+    let wf = &opts.workflow;
+    let n = wf.steps.len();
     let index_of: BTreeMap<&str, usize> = wf
         .steps
         .iter()
         .enumerate()
         .map(|(i, s)| (s.id.as_str(), i))
         .collect();
-    let n = wf.steps.len();
+
     let mut indegree: Vec<usize> = vec![0; n];
     let mut successors: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (a, b) in &edges {
-        if let (Some(&ai), Some(&bi)) = (index_of.get(a.as_str()), index_of.get(b.as_str())) {
-            successors[ai].push(bi);
-            indegree[bi] += 1;
+    if crate::workflow::workflow_has_explicit_edges(wf) {
+        // Graph-mode workflow (`next:`/`split:`/`join:` present somewhere):
+        // use the real dependency graph — control edges union inferred data
+        // edges — exactly as authored. Independent nodes are MEANT to run
+        // concurrently here; that's the whole point of Phase 2.
+        for (a, b) in &workflow_edges(wf) {
+            if let (Some(&ai), Some(&bi)) = (index_of.get(a.as_str()), index_of.get(b.as_str())) {
+                successors[ai].push(bi);
+                indegree[bi] += 1;
+            }
+        }
+    } else {
+        // Legacy (edge-free) workflow: declaration order alone IS the
+        // control flow (same invariant `validate_template_refs`/
+        // `is_nonlinear` already rely on) — `workflow_edges`' inferred data
+        // edges are NOT a complete substitute for it. Two declaration-
+        // adjacent steps that don't reference each other's `steps.*`
+        // output and aren't joined by any `next:` have NO edge between
+        // them in that graph, yet the legacy contract still requires the
+        // earlier one to fully finish before the later one starts (e.g.
+        // `gate-demo.yaml`'s `assess` step and its unrelated `ship_gate`
+        // approval gate — this exact gap broke the golden test before this
+        // fix, since both would otherwise read as simultaneously "ready").
+        // Synthesizing the full chain `steps[i] -> steps[i+1]` is strictly
+        // sufficient (a superset of any real data edge: by the time node
+        // `i+1` is ready every one of `0..=i` is already done) and keeps
+        // graph width at 1 throughout, so `run_scheduler` degenerates to
+        // the exact one-at-a-time order `run_steps_inner` walks.
+        for i in 0..n.saturating_sub(1) {
+            successors[i].push(i + 1);
+            indegree[i + 1] += 1;
         }
     }
-    let mut ready: std::collections::BTreeSet<usize> =
-        (0..n).filter(|&i| indegree[i] == 0).collect();
-    let mut order: Vec<&Step> = Vec::with_capacity(n);
-    while let Some(&i) = ready.iter().next() {
-        ready.remove(&i);
-        order.push(&wf.steps[i]);
-        for &s in &successors[i] {
-            indegree[s] -= 1;
-            if indegree[s] == 0 {
-                ready.insert(s);
+
+    // Resume seeding: steps already in a caller-pre-seeded `step_results`
+    // are `done` up front (mirrors `run_steps_over`'s `already_done`), and
+    // an already-done `branch:` step's persisted taken-arm output
+    // reconstructs `branch_skipped` the same way `run_steps_over` does —
+    // see that function's comment for why (an untaken arm not yet reached
+    // at the original pause is neither `done` nor `branch_skipped`
+    // otherwise, and would wrongly go ready on resume).
+    let mut done: Vec<bool> = vec![false; n];
+    let mut branch_skipped: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for sr in step_results.iter() {
+        if let Some(&i) = index_of.get(sr.step_id.as_str()) {
+            done[i] = true;
+            if let Some(branch) = &wf.steps[i].branch {
+                match sr.output.as_str() {
+                    "then" => branch_skipped.extend(branch.r#else.iter().cloned()),
+                    "else" => branch_skipped.extend(branch.then.iter().cloned()),
+                    _ => {}
+                }
             }
         }
     }
-    order
+    for (i, &is_done) in done.iter().enumerate() {
+        if is_done {
+            for &s in &successors[i] {
+                indegree[s] = indegree[s].saturating_sub(1);
+            }
+        }
+    }
+
+    let mut ready: std::collections::BTreeSet<usize> = (0..n)
+        .filter(|&i| !done[i] && indegree[i] == 0)
+        .collect();
+
+    let resume_paused_step_id: Option<&str> = opts
+        .resume_from
+        .as_ref()
+        .and_then(|r| r.paused_step.as_ref())
+        .map(|ps| ps.step_id.as_str());
+
+    let max_concurrency = wf
+        .max_concurrency
+        .map(|m| m as usize)
+        .unwrap_or(UNBOUNDED_MAX_CONCURRENCY)
+        .max(1);
+    let semaphore = Arc::new(Semaphore::new(max_concurrency));
+    let opts_arc = Arc::new(opts.clone());
+
+    let mut in_flight: tokio::task::JoinSet<(usize, Result<NodeOutcome, RunWorkflowError>)> =
+        tokio::task::JoinSet::new();
+
+    loop {
+        // Drain every currently-ready, not-yet-dispatched node. Resolving
+        // one synchronously (skip / branch / split / gate-approved) can
+        // unlock a LATER-indexed node in the same `ready` set — the
+        // `while let` keeps draining until nothing more is ready, so a
+        // chain of instant no-ops (e.g. several `when:`-skips in a row)
+        // still resolves in one pass, exactly like the sequential loop.
+        while let Some(&i) = ready.iter().next() {
+            ready.remove(&i);
+            let step = &wf.steps[i];
+
+            if branch_skipped.contains(&step.id) {
+                info!(step = %step.id, "skipping (not taken by branch)");
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepSkipped {
+                            run_id: run_id.to_string(),
+                            step_id: step.id.clone(),
+                            reason: "not taken by branch".to_string(),
+                        },
+                    );
+                }
+                let result = StepResult {
+                    step_id: step.id.clone(),
+                    rendered_prompt: String::new(),
+                    run_id: String::new(),
+                    transcript_path: PathBuf::new(),
+                    output: String::new(),
+                    success: false,
+                    skipped: true,
+                    kind: step_kind_for_run_record(step),
+                    items: Vec::new(),
+                    ..Default::default()
+                };
+                persist_step_result(opts, run_id, &result);
+                step_results.push(result);
+                done[i] = true;
+                unlock_successors(i, &successors, &mut indegree, &mut ready);
+                continue;
+            }
+
+            if pause_triggered(&opts.pause) {
+                if workflow_has_sync_step(opts) {
+                    return Err(RunWorkflowError::PauseWithWorkspaceSync);
+                }
+                info!(step = %step.id, "cooperative pause at step boundary");
+                return Ok(InnerOutcome::Paused {
+                    step_id: step.id.clone(),
+                    prompt: String::new(),
+                    timeout_seconds: None,
+                    reason: PauseReason::Manual,
+                    seed: Vec::new(),
+                    fanout_completed_units: std::collections::BTreeMap::new(),
+                });
+            }
+
+            let ctx = base_context_for_step(
+                resolved_inputs,
+                opts.event.as_ref(),
+                opts.issue.as_ref(),
+                step_results,
+            );
+
+            if let Some(when_expr) = &step.when {
+                let take =
+                    render_when_expression(when_expr, &ctx, render_mode(opts.strict_templates))
+                        .map_err(|e| RunWorkflowError::Render {
+                            step: step.id.clone(),
+                            source: e,
+                        })?;
+                if !take {
+                    info!(step = %step.id, "skipping (when: expression is falsy)");
+                    if let Some(sink) = opts.event_sink.as_ref() {
+                        sink.emit(
+                            run_id,
+                            &crate::executor::Event::StepSkipped {
+                                run_id: run_id.to_string(),
+                                step_id: step.id.clone(),
+                                reason: "when: expression evaluated to false".into(),
+                            },
+                        );
+                    }
+                    let result = StepResult {
+                        step_id: step.id.clone(),
+                        rendered_prompt: String::new(),
+                        run_id: String::new(),
+                        transcript_path: PathBuf::new(),
+                        output: String::new(),
+                        success: false,
+                        skipped: true,
+                        items: Vec::new(),
+                        ..Default::default()
+                    };
+                    persist_step_result(opts, run_id, &result);
+                    step_results.push(result);
+                    done[i] = true;
+                    unlock_successors(i, &successors, &mut indegree, &mut ready);
+                    continue;
+                }
+            }
+
+            if crate::workflow::is_approval_gate(step) {
+                let ap = step.approval.as_ref().expect("gate has approval");
+                let gate_suppressed = approved_step_id == Some(step.id.as_str());
+                let prompt = match &ap.prompt {
+                    Some(t) => render_step_prompt(t, &ctx, render_mode(opts.strict_templates))
+                        .map_err(|e| RunWorkflowError::Render {
+                            step: step.id.clone(),
+                            source: e,
+                        })?,
+                    None => format!(
+                        "Approve gate `{}` of workflow `{}`?",
+                        step.id, opts.workflow.name
+                    ),
+                };
+
+                if gate_suppressed {
+                    info!(step = %step.id, "gate: resuming with human approval");
+                    emit_gate_result(opts, run_id, step, "approved", "human", None, step_results);
+                    done[i] = true;
+                    unlock_successors(i, &successors, &mut indegree, &mut ready);
+                    continue;
+                }
+                if let Some(expr) = &ap.auto_approve {
+                    let truthy =
+                        render_when_expression(expr, &ctx, render_mode(opts.strict_templates))
+                            .map_err(|e| RunWorkflowError::Render {
+                                step: step.id.clone(),
+                                source: e,
+                            })?;
+                    if truthy {
+                        info!(step = %step.id, "gate auto-approved");
+                        emit_gate_result(
+                            opts,
+                            run_id,
+                            step,
+                            "approved",
+                            "auto",
+                            None,
+                            step_results,
+                        );
+                        done[i] = true;
+                        unlock_successors(i, &successors, &mut indegree, &mut ready);
+                        continue;
+                    }
+                }
+                info!(step = %step.id, "gate: pausing for approval");
+                fire_notify_hooks(
+                    opts,
+                    &step.id,
+                    &ap.notify,
+                    &ctx,
+                    render_mode(opts.strict_templates),
+                )
+                .await;
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepAwaitingApproval {
+                            run_id: run_id.to_string(),
+                            step_id: step.id.clone(),
+                            reason: prompt.clone(),
+                        },
+                    );
+                }
+                return Ok(InnerOutcome::Paused {
+                    step_id: step.id.clone(),
+                    prompt,
+                    timeout_seconds: ap.timeout_seconds,
+                    reason: PauseReason::Approval,
+                    seed: Vec::new(),
+                    fanout_completed_units: std::collections::BTreeMap::new(),
+                });
+            }
+
+            if let Some(approval) = &step.approval {
+                let gate_suppressed = approved_step_id == Some(step.id.as_str())
+                    || resume_paused_step_id == Some(step.id.as_str());
+                if approval.required && !gate_suppressed {
+                    let prompt = match &approval.prompt {
+                        Some(template) => render_step_prompt(
+                            template,
+                            &ctx,
+                            render_mode(opts.strict_templates),
+                        )
+                        .map_err(|e| RunWorkflowError::Render {
+                            step: step.id.clone(),
+                            source: e,
+                        })?,
+                        None => format!(
+                            "Approve step `{}` of workflow `{}`?",
+                            step.id, opts.workflow.name
+                        ),
+                    };
+                    info!(step = %step.id, "pausing for approval");
+                    if let Some(sink) = opts.event_sink.as_ref() {
+                        sink.emit(
+                            run_id,
+                            &crate::executor::Event::StepAwaitingApproval {
+                                run_id: run_id.to_string(),
+                                step_id: step.id.clone(),
+                                reason: prompt.clone(),
+                            },
+                        );
+                    }
+                    return Ok(InnerOutcome::Paused {
+                        step_id: step.id.clone(),
+                        prompt,
+                        timeout_seconds: approval.timeout_seconds,
+                        reason: PauseReason::Approval,
+                        seed: Vec::new(),
+                        fanout_completed_units: std::collections::BTreeMap::new(),
+                    });
+                }
+            }
+
+            if let Some(branch) = &step.branch {
+                let branch_timer = std::time::Instant::now();
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepStarted {
+                            run_id: run_id.to_string(),
+                            step_id: step.id.clone(),
+                            kind: crate::runs::StepKind::Branch,
+                            agent: None,
+                            host: None,
+                        },
+                    );
+                }
+                let take = render_when_expression(
+                    &branch.condition,
+                    &ctx,
+                    render_mode(opts.strict_templates),
+                )
+                .map_err(|e| RunWorkflowError::Render {
+                    step: step.id.clone(),
+                    source: e,
+                })?;
+                let taken = if take { "then" } else { "else" };
+                if take {
+                    branch_skipped.extend(branch.r#else.iter().cloned());
+                } else {
+                    branch_skipped.extend(branch.then.iter().cloned());
+                }
+                info!(step = %step.id, arm = taken, "branch: took arm");
+                let result = StepResult {
+                    step_id: step.id.clone(),
+                    output: taken.to_string(),
+                    success: true,
+                    skipped: false,
+                    kind: crate::runs::StepKind::Branch,
+                    ..Default::default()
+                };
+                let duration_ms = branch_timer.elapsed().as_millis() as u64;
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepCompleted {
+                            run_id: run_id.to_string(),
+                            step_id: step.id.clone(),
+                            success: true,
+                            duration_ms,
+                            host: None,
+                        },
+                    );
+                }
+                persist_step_result(opts, run_id, &result);
+                step_results.push(result);
+                done[i] = true;
+                unlock_successors(i, &successors, &mut indegree, &mut ready);
+                continue;
+            }
+
+            // `split:` orchestration no-op — see this function's doc.
+            if step.split.is_some() {
+                let split_timer = std::time::Instant::now();
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepStarted {
+                            run_id: run_id.to_string(),
+                            step_id: step.id.clone(),
+                            kind: crate::runs::StepKind::Branch,
+                            agent: None,
+                            host: None,
+                        },
+                    );
+                }
+                let result = StepResult {
+                    step_id: step.id.clone(),
+                    output: String::new(),
+                    success: true,
+                    skipped: false,
+                    kind: crate::runs::StepKind::Branch,
+                    ..Default::default()
+                };
+                let duration_ms = split_timer.elapsed().as_millis() as u64;
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepCompleted {
+                            run_id: run_id.to_string(),
+                            step_id: step.id.clone(),
+                            success: true,
+                            duration_ms,
+                            host: None,
+                        },
+                    );
+                }
+                persist_step_result(opts, run_id, &result);
+                step_results.push(result);
+                done[i] = true;
+                unlock_successors(i, &successors, &mut indegree, &mut ready);
+                continue;
+            }
+
+            // Real dispatch: linear / panel / parallel / for_each / action —
+            // spawned concurrently, bounded by `semaphore`. Everything up to
+            // and including the `StepStarted` emit mirrors `run_steps_over`
+            // exactly; only WHERE the dispatch itself runs changed.
+            let effective_continue_on_error =
+                step.continue_on_error.unwrap_or(workflow_default_continue);
+            persist_active_step(opts, run_id, step, None);
+            let step_kind = step_kind_for_run_record(step);
+            if let Some(sink) = opts.event_sink.as_ref() {
+                sink.emit(
+                    run_id,
+                    &crate::executor::Event::StepStarted {
+                        run_id: run_id.to_string(),
+                        step_id: step.id.clone(),
+                        kind: step_kind,
+                        agent: step.agent.clone(),
+                        host: step.host.clone(),
+                    },
+                );
+            }
+            if resume_paused_step_id == Some(step.id.as_str()) {
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepResumed {
+                            run_id: run_id.to_string(),
+                            step_id: step.id.clone(),
+                        },
+                    );
+                }
+            }
+
+            let permit_sem = Arc::clone(&semaphore);
+            let opts_task = Arc::clone(&opts_arc);
+            let run_id_owned = run_id.to_string();
+            let step_owned = step.clone();
+            let ctx_owned = ctx;
+            in_flight.spawn(async move {
+                let _permit = permit_sem
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore not closed");
+                let outcome = run_node(
+                    &run_id_owned,
+                    &step_owned,
+                    &ctx_owned,
+                    &opts_task,
+                    effective_continue_on_error,
+                )
+                .await;
+                (i, outcome)
+            });
+        }
+
+        if in_flight.is_empty() {
+            break;
+        }
+
+        let (i, node_result) = in_flight
+            .join_next()
+            .await
+            .expect("in_flight is non-empty")?;
+        match node_result? {
+            NodeOutcome::Paused {
+                step_id,
+                seed,
+                fanout_completed_units,
+            } => {
+                return Ok(InnerOutcome::Paused {
+                    step_id,
+                    prompt: String::new(),
+                    timeout_seconds: None,
+                    reason: PauseReason::Manual,
+                    seed,
+                    fanout_completed_units,
+                });
+            }
+            NodeOutcome::Completed(result) => {
+                let done_step_id = wf.steps[i].id.clone();
+                persist_step_result(opts, run_id, &result);
+                clear_active_step(opts, run_id, &done_step_id);
+                step_results.push(result);
+                done[i] = true;
+                unlock_successors(i, &successors, &mut indegree, &mut ready);
+            }
+        }
+    }
+
+    Ok(InnerOutcome::Done)
 }
 
-/// The actual per-step loop body, shared by [`run_steps_inner`] (order =
-/// plain declaration order) and [`run_scheduler`] (order =
-/// [`ready_set_order`]'s dependency-graph walk) — see those functions'
-/// docs. Behavior is otherwise IDENTICAL to what was, before this
-/// extraction, `run_steps_inner`'s own body iterating
-/// `&opts.workflow.steps` directly; only the source of the iteration
-/// order changed.
+/// Decrement node `i`'s successors' indegree (it just completed — sync
+/// resolution or an awaited async dispatch) and insert any that reach 0
+/// into `ready`. Shared by every completion path in [`run_scheduler`].
+#[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
+fn unlock_successors(
+    i: usize,
+    successors: &[Vec<usize>],
+    indegree: &mut [usize],
+    ready: &mut std::collections::BTreeSet<usize>,
+) {
+    for &s in &successors[i] {
+        indegree[s] = indegree[s].saturating_sub(1);
+        if indegree[s] == 0 {
+            ready.insert(s);
+        }
+    }
+}
+
+/// The actual per-step loop body — [`run_steps_inner`]'s (and only
+/// [`run_steps_inner`]'s, since Task 2) shared implementation, iterating
+/// `order` (declaration order) directly. Behavior is IDENTICAL to what was,
+/// before the Task-1 extraction, `run_steps_inner`'s own body iterating
+/// `&opts.workflow.steps` directly.
 async fn run_steps_over(
     order: &[&Step],
     opts: &OrchestratorRunOpts,
@@ -6563,6 +7102,409 @@ mod dag_scheduler_golden {
                 "{name}: run_scheduler must reproduce run_steps_inner exactly"
             );
         }
+    }
+}
+
+/// Task 2: concurrent dispatch + `split` fan-out + implicit all-join +
+/// `max_concurrency`. These exercise [`run_scheduler`] directly (same
+/// reason `dag_scheduler_golden` does — it isn't `pub`, and isn't reachable
+/// through [`run_workflow`], which still gates non-linear workflows via
+/// [`is_nonlinear`] until a later task in this arc lifts it).
+#[cfg(test)]
+mod scheduler_concurrency {
+    use super::*;
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_providers::types::StopReason;
+    use rupu_tools::ToolContext;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    const SPLIT_FANOUT_WF: &str = r#"
+name: split-fanout
+steps:
+  - id: fanout
+    split: [a, b]
+  - id: a
+    agent: worker
+    prompt: "do a"
+  - id: b
+    agent: worker
+    prompt: "do b"
+  - id: d
+    agent: worker
+    prompt: "reconverge a={{ steps.a.output }} b={{ steps.b.output }}"
+"#;
+
+    /// One `StepFactory` covering every Task-2 test below:
+    /// - `concurrency_tracked` steps increment/decrement `current` around an
+    ///   `sleep_ms`-long `tokio::time::sleep`, with `max_seen` recording the
+    ///   high-water mark — the concurrency-overlap proof (§ this task's
+    ///   brief: "assert overlap ... via ... a shared timestamp"). A step
+    ///   NOT in this list dispatches instantly.
+    /// - `slow_step` independently makes ONE named step artificially slow
+    ///   (used to keep a sibling reliably still in-flight while another
+    ///   step fails, for the mid-graph-failure test).
+    /// - `calls` records every step id actually dispatched through this
+    ///   factory, in call order — proves a `split:` node (never dispatched
+    ///   here) is a true orchestration no-op, and gives a coarse ordering
+    ///   check (a reconverge step is always the LAST id appended).
+    ///
+    /// Deliberately has NO "make the agent turn itself fail" knob: `rupu-
+    /// agent`'s `run_agent` retries a `ScriptedTurn::ProviderError` up to
+    /// `MAX_HTTP_RETRIES` times with capped exponential backoff (it maps to
+    /// `ProviderError::Http`, which `is_retryable_provider_error` always
+    /// retries) — a real ~48s wall-clock cascade before giving up, the same
+    /// cost `tests/linear_runner.rs`'s `FailingFactory`-based tests already
+    /// pay. The mid-graph-failure test below instead fails via a template
+    /// render error (`RunWorkflowError::Render`), which propagates
+    /// immediately with no retry — same "hard failure, no
+    /// `continue_on_error`" contract, without the unrelated retry-timing
+    /// cost.
+    struct SchedulerTestFactory {
+        concurrency_tracked: &'static [&'static str],
+        sleep_ms: u64,
+        slow_step: Option<(&'static str, u64)>,
+        current: Arc<AtomicUsize>,
+        max_seen: Arc<AtomicUsize>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SchedulerTestFactory {
+        fn new() -> Self {
+            Self {
+                concurrency_tracked: &[],
+                sleep_ms: 0,
+                slow_step: None,
+                current: Arc::new(AtomicUsize::new(0)),
+                max_seen: Arc::new(AtomicUsize::new(0)),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn tracking(mut self, steps: &'static [&'static str], sleep_ms: u64) -> Self {
+            self.concurrency_tracked = steps;
+            self.sleep_ms = sleep_ms;
+            self
+        }
+
+        fn slow(mut self, step: &'static str, ms: u64) -> Self {
+            self.slow_step = Some((step, ms));
+            self
+        }
+    }
+
+    #[async_trait]
+    impl StepFactory for SchedulerTestFactory {
+        async fn build_opts_for_step(
+            &self,
+            step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: PathBuf,
+            transcript_path: PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> AgentRunOpts {
+            self.calls.lock().unwrap().push(step_id.to_string());
+
+            if self.concurrency_tracked.contains(&step_id) {
+                let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_seen.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(self.sleep_ms)).await;
+                self.current.fetch_sub(1, Ordering::SeqCst);
+            } else if let Some((slow_id, ms)) = self.slow_step {
+                if slow_id == step_id {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
+            }
+
+            let turn = ScriptedTurn::AssistantText {
+                text: format!("step {step_id} agent {agent_name} echo: {rendered_prompt}"),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            };
+            let provider = MockProvider::new(vec![turn]);
+            AgentRunOpts {
+                agent_name: format!("ag-{agent_name}"),
+                agent_system_prompt: "echo".into(),
+                agent_tools: None,
+                provider: Box::new(provider),
+                provider_name: "mock".into(),
+                model: "mock-1".into(),
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                max_turns: 5,
+                decider: Arc::new(BypassDecider),
+                tool_context: ToolContext::default(),
+                user_message: rendered_prompt,
+                initial_messages: Vec::new(),
+                turn_index_offset: 0,
+                mode_str: "bypass".into(),
+                no_stream: true,
+                suppress_stream_stdout: true,
+                mcp_registry: None,
+                effort: None,
+                context_window: None,
+                output_format: None,
+                output_schema: None,
+                anthropic_task_budget: None,
+                anthropic_context_management: None,
+                anthropic_speed: None,
+                parent_run_id: None,
+                depth: 0,
+                dispatchable_agents: None,
+                step_id: step_id.to_string(),
+                on_tool_call,
+                on_stream_event: None,
+                concerns: None,
+                max_tokens: DEFAULT_MAX_TOKENS,
+                scope_name: None,
+                surface_tag: None,
+                context_window_tokens: None,
+                compact_at_percent: None,
+                pause: None,
+            }
+        }
+    }
+
+    fn opts_for(wf: Workflow, factory: SchedulerTestFactory, tmp: &tempfile::TempDir) -> OrchestratorRunOpts {
+        OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_sched".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: None,
+            workflow_yaml: None,
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        }
+    }
+
+    /// (1) A `split:` node fans into two targets that dispatch and run
+    /// CONCURRENTLY (both in flight at once — `max_seen` hits 2, which is
+    /// only possible if `a`'s and `b`'s `sleep(50ms)` windows overlapped in
+    /// real time), and the reconverge step (`d`, which reads BOTH
+    /// `steps.a.output` and `steps.b.output`) runs exactly once, strictly
+    /// after both are done — the implicit all-join. Wrapped in a
+    /// `tokio::time::timeout` as a belt-and-suspenders: if the scheduler
+    /// somehow serialized `a`/`b` there'd be no deadlock risk here (unlike
+    /// a barrier-based proof), but a regression that stalls the scheduler
+    /// entirely still fails loudly instead of hanging the test suite.
+    #[tokio::test]
+    async fn split_fans_into_concurrent_jobs_and_reconverge_runs_once_after_both() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(SPLIT_FANOUT_WF).unwrap();
+        let factory = SchedulerTestFactory::new().tracking(&["a", "b"], 50);
+        let max_seen = Arc::clone(&factory.max_seen);
+        let calls = Arc::clone(&factory.calls);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+
+        assert!(matches!(outcome, InnerOutcome::Done));
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            2,
+            "a and b must have been in flight at the same time at least once"
+        );
+
+        let ids: std::collections::BTreeSet<&str> =
+            step_results.iter().map(|sr| sr.step_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            std::collections::BTreeSet::from(["fanout", "a", "b", "d"]),
+            "every node should have a StepResult"
+        );
+        for sr in &step_results {
+            assert!(sr.success, "{}: expected success, got {sr:?}", sr.step_id);
+        }
+
+        // `d` (the reconverge) is dispatched strictly after both `a` and
+        // `b` have fully completed — never merely after their `sleep`
+        // resolves, but after `run_node` returns and the scheduler marks
+        // them `done`.
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            3,
+            "fanout must never be dispatched (orchestration no-op): {calls:?}"
+        );
+        assert_eq!(calls[2], "d", "reconverge must be the last dispatch: {calls:?}");
+        let first_two: std::collections::BTreeSet<&str> =
+            [calls[0].as_str(), calls[1].as_str()].into_iter().collect();
+        assert_eq!(first_two, std::collections::BTreeSet::from(["a", "b"]));
+    }
+
+    /// (2) Split's `StepResult` itself: no agent dispatched, instant
+    /// success, empty output — the orchestration-no-op contract.
+    #[tokio::test]
+    async fn split_node_is_orchestration_only_no_agent_dispatched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(SPLIT_FANOUT_WF).unwrap();
+        let factory = SchedulerTestFactory::new();
+        let calls = Arc::clone(&factory.calls);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results)
+            .await
+            .expect("scheduler must not error");
+
+        let fanout = step_results
+            .iter()
+            .find(|sr| sr.step_id == "fanout")
+            .expect("split node should still have a StepResult");
+        assert!(fanout.success);
+        assert!(fanout.output.is_empty());
+        assert!(
+            !calls.lock().unwrap().contains(&"fanout".to_string()),
+            "split must never reach the StepFactory (no agent to dispatch)"
+        );
+    }
+
+    /// (3) `max_concurrency: 1` bounds the semaphore to one permit: `a` and
+    /// `b` still both run (the run still completes, correctly), but never
+    /// concurrently — `max_seen` never exceeds 1, even though both are
+    /// simultaneously READY the instant the split completes.
+    #[tokio::test]
+    async fn max_concurrency_one_serializes_the_split_fanout_but_still_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut wf = Workflow::parse(SPLIT_FANOUT_WF).unwrap();
+        wf.max_concurrency = Some(1);
+        let factory = SchedulerTestFactory::new().tracking(&["a", "b"], 30);
+        let max_seen = Arc::clone(&factory.max_seen);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+
+        assert!(matches!(outcome, InnerOutcome::Done));
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "max_concurrency: 1 must never let two nodes run at once"
+        );
+        let ids: std::collections::BTreeSet<&str> =
+            step_results.iter().map(|sr| sr.step_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            std::collections::BTreeSet::from(["fanout", "a", "b", "d"]),
+            "the run must still complete every node despite the cap"
+        );
+        for sr in &step_results {
+            assert!(sr.success, "{}: expected success, got {sr:?}", sr.step_id);
+        }
+    }
+
+    /// (4) `max_concurrency: 0` is rejected at parse time (mirrors
+    /// `max_parallel`'s own >=1 validation) rather than silently meaning
+    /// "unbounded" or "never run anything".
+    #[test]
+    fn max_concurrency_zero_is_rejected_at_parse_time() {
+        let raw = SPLIT_FANOUT_WF.replacen(
+            "name: split-fanout\n",
+            "name: split-fanout\nmax_concurrency: 0\n",
+            1,
+        );
+        let err = Workflow::parse(&raw).expect_err("max_concurrency: 0 must fail to parse");
+        assert!(
+            matches!(
+                err,
+                WorkflowParseError::InvalidMaxConcurrency { value: 0 }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Same shape as [`SPLIT_FANOUT_WF`], except `a`'s prompt references an
+    /// input nobody ever provides (`inputs.missing`). Under
+    /// `strict_templates: true` this is a `RunWorkflowError::Render` —
+    /// synchronous, inside `run_node`, with no retry — the cleanest way to
+    /// fail a node instantly without touching `rupu-agent`'s provider-
+    /// error retry cascade (see [`SchedulerTestFactory`]'s doc comment).
+    const SPLIT_FANOUT_WF_BAD_TEMPLATE: &str = r#"
+name: split-fanout-bad-template
+steps:
+  - id: fanout
+    split: [a, b]
+  - id: a
+    agent: worker
+    prompt: "{{ inputs.missing }}"
+  - id: b
+    agent: worker
+    prompt: "do b"
+  - id: d
+    agent: worker
+    prompt: "reconverge a={{ steps.a.output }} b={{ steps.b.output }}"
+"#;
+
+    /// (5) A mid-graph failure (no `continue_on_error`) stops the run: the
+    /// failing node's sibling (`b`, deliberately kept in flight via
+    /// `slow(...)` well past `a`'s near-instant render failure) never
+    /// reaches `step_results`, and the reconverge (`d`, which needs BOTH
+    /// `a` and `b` done) never launches at all. Matches `run_steps_over`'s
+    /// own contract: a hard failure propagates as `Err` before its own
+    /// `StepResult` is ever pushed, so only the already-synchronously-
+    /// resolved `split` node's result survives.
+    #[tokio::test]
+    async fn mid_graph_failure_without_continue_on_error_stops_the_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(SPLIT_FANOUT_WF_BAD_TEMPLATE).unwrap();
+        let factory = SchedulerTestFactory::new().slow("b", 300);
+        let mut opts = opts_for(wf, factory, &tmp);
+        opts.strict_templates = true;
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect_err("a's render failure must abort the run");
+
+        assert!(
+            matches!(err, RunWorkflowError::Render { ref step, .. } if step == "a"),
+            "unexpected error: {err}"
+        );
+        let ids: Vec<&str> = step_results.iter().map(|sr| sr.step_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["fanout"],
+            "only the already-resolved split node should be persisted; got {ids:?}"
+        );
     }
 }
 
