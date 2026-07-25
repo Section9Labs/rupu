@@ -1952,9 +1952,62 @@ async fn run_scheduler(
                             // Expected: this is a join loser we
                             // deliberately aborted (spec §5/§8) —
                             // `in_flight_abort` was already removed at
-                            // the moment we called `.abort()`. Swallow
-                            // and keep scheduling; this is NOT a run
-                            // failure.
+                            // the moment we called `.abort()`. This node
+                            // itself deliberately gets NO `StepResult` of
+                            // its own (unchanged from Task 3 — it never
+                            // ran, so there's nothing to record, and
+                            // `join_and_prune`'s tests assert exactly
+                            // this for a single-hop loser).
+                            //
+                            // **Post-review fix (Task 4 follow-up):** but
+                            // its own bookkeeping MUST still run —
+                            // `unlock_successors` (decrement its
+                            // successors' indegree) and
+                            // `track_join_arrivals` (non-live: resolve
+                            // any join it directly feeds without counting
+                            // as an arrival). Without this, a MULTI-HOP
+                            // losing closure (e.g. a losing arm
+                            // `A -> B -> C` behind a `wait: any` join,
+                            // where `A` is the one actually in-flight and
+                            // aborted here) silently strands `B`/`C`:
+                            // `drain_joins` already marked them
+                            // `cancel_state.cancelled`, but with `A` never
+                            // decrementing `B`'s indegree, `B` never
+                            // reaches `ready` at all — it never hits the
+                            // skip-persist check, never gets a terminal
+                            // `StepResult`, and the run still reports
+                            // `Ok(Done)` having silently dropped a
+                            // reachable node. Running this now lets `B`
+                            // (and, cascading, `C`) flow into `ready` and
+                            // resolve through the EXISTING
+                            // `cancel_state.cancelled` skip-persist path
+                            // exactly like a loser that was never
+                            // dispatched at all.
+                            let worklist = mark_done_and_track_joins(
+                                ix,
+                                false, // aborted, not a live arrival
+                                &successors,
+                                &mut indegree,
+                                &mut ready,
+                                &mut done,
+                                &mut join_state,
+                            );
+                            if !worklist.is_empty() {
+                                drain_joins(
+                                    worklist,
+                                    wf,
+                                    opts,
+                                    run_id,
+                                    step_results,
+                                    &mut done,
+                                    &successors,
+                                    &predecessors,
+                                    &mut indegree,
+                                    &mut ready,
+                                    &mut join_state,
+                                    &mut cancel_state,
+                                );
+                            }
                             continue;
                         }
                     }
@@ -9312,6 +9365,123 @@ steps:
         assert!(
             !calls.lock().unwrap().contains(&"loser".to_string()),
             "loser must never reach the StepFactory"
+        );
+    }
+
+    const MULTI_HOP_LOSER_CHAIN_WF: &str = r#"
+name: multi-hop-loser-chain
+steps:
+  - id: fanout
+    split: [fast, a]
+  - id: fast
+    agent: worker
+    prompt: "fast"
+    next: [gathered]
+  - id: a
+    agent: worker
+    prompt: "a"
+    next: [b]
+  - id: b
+    agent: worker
+    prompt: "b"
+    next: [c]
+  - id: c
+    agent: worker
+    prompt: "c"
+    next: [gathered]
+  - id: gathered
+    join: { wait: any }
+"#;
+
+    /// **Post-review regression: the multi-hop losing-closure silent-vanish
+    /// bug.** `fast` wins `gathered`'s `wait: any` immediately; the losing
+    /// closure is `{a, b, c}` (none protected — none has a consumer outside
+    /// the closure or the join itself). `a` is the ONLY one actually
+    /// in-flight at that moment (`b`/`c` are still blocked behind it,
+    /// indegree > 0) — it gets hard-aborted via `cancel.in_flight_abort`.
+    ///
+    /// Before the fix: the abort-swallow path (`Err(join_err)` +
+    /// `cancelled_by_us.remove` in the main loop) only `continue`d — it
+    /// never ran `unlock_successors`/`track_join_arrivals` for `a`, so
+    /// `b`'s indegree never reached 0. `b`/`c` were marked
+    /// `cancel_state.cancelled` (by `drain_joins`, when the closure was
+    /// computed) but NEVER entered `ready`, so they never reached the
+    /// skip-persist check — no `StepResult`, ever. The run still returned
+    /// `Ok(InnerOutcome::Done)`, silently dropping two reachable nodes with
+    /// zero terminal record. Confirmed to FAIL against the pre-fix code
+    /// (this exact assertion block) and PASS after: `a`'s abort now runs
+    /// that bookkeeping non-live, which unblocks `b` into `ready`, which
+    /// resolves through the EXISTING skip-persist path and unblocks `c`
+    /// the same way — the SAME terminal `"cancelled"` marker a
+    /// never-dispatched loser already gets.
+    #[tokio::test]
+    async fn multi_hop_losing_closure_does_not_silently_drop_descendants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(MULTI_HOP_LOSER_CHAIN_WF).unwrap();
+        let factory = JoinTestFactory::new(&[("a", 300)]);
+        let calls = Arc::clone(&factory.calls);
+        let finished = Arc::clone(&factory.finished);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        let gathered = result_for(&step_results, "gathered");
+        assert!(gathered.success);
+        assert_eq!(gathered.items.len(), 1, "any: exactly one winner");
+        assert_eq!(gathered.items[0].sub_id, "fast");
+
+        // `a` — the one genuinely in-flight, hard-aborted node — gets NO
+        // `StepResult` of its own, unchanged from the single-hop contract
+        // above: it never ran, so there's nothing of ITS OWN to record.
+        assert!(
+            !step_results.iter().any(|sr| sr.step_id == "a"),
+            "the directly-aborted node itself still gets no StepResult"
+        );
+        assert!(calls.lock().unwrap().contains(&"a".to_string()));
+        assert!(
+            !finished.lock().unwrap().contains(&"a".to_string()),
+            "a must have been genuinely aborted mid-flight, not run to completion"
+        );
+
+        // `b` and `c` — blocked behind `a`, never dispatched — MUST each
+        // still resolve to a terminal `"cancelled"` marker. This is the
+        // core regression assertion: before the fix, both of these
+        // `result_for` calls panic (no StepResult exists for either).
+        let b = result_for(&step_results, "b");
+        assert!(
+            b.skipped && b.output == "cancelled",
+            "b must resolve as cancelled, not silently vanish: {b:?}"
+        );
+        let c = result_for(&step_results, "c");
+        assert!(
+            c.skipped && c.output == "cancelled",
+            "c must resolve as cancelled, not silently vanish: {c:?}"
+        );
+        assert!(
+            !calls.lock().unwrap().contains(&"b".to_string())
+                && !calls.lock().unwrap().contains(&"c".to_string()),
+            "b and c must never reach the StepFactory"
+        );
+
+        // Every node in the workflow must be accounted for: either it has
+        // a StepResult, or (only `a`, the one genuinely in-flight
+        // ancestor) it drove its successors' bookkeeping without one of
+        // its own. No step silently disappears from both.
+        let recorded: std::collections::BTreeSet<&str> =
+            step_results.iter().map(|sr| sr.step_id.as_str()).collect();
+        assert_eq!(
+            recorded,
+            std::collections::BTreeSet::from(["fanout", "fast", "gathered", "b", "c"]),
+            "exactly every reachable node except the one genuinely in-flight ancestor must have a terminal StepResult"
         );
     }
 }
