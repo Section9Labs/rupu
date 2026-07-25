@@ -173,10 +173,6 @@ pub enum RunWorkflowError {
         "action step `{step}` requires runtime wiring — this entry point does not provide an SCM dispatcher"
     )]
     ActionDispatcherMissing { step: String },
-    #[error(
-        "workflow `{name}` uses non-linear orchestration (split/join/fork), which requires the DAG scheduler — not yet available (Phase 2)"
-    )]
-    NonlinearNotYetSupported { name: String },
     #[error("scheduler: a dispatched node task panicked or was cancelled: {0}")]
     SchedulerTaskJoin(#[from] tokio::task::JoinError),
     #[error(
@@ -556,20 +552,18 @@ impl ResumeState {
 pub async fn run_workflow(
     opts: OrchestratorRunOpts,
 ) -> Result<OrchestratorRunResult, RunWorkflowError> {
-    // Phase 2 gate: the linear runner below can only execute a workflow
-    // whose control flow is a single line (with today's skip-set branches).
-    // A workflow using split/join, a fork, or a reconverge needs the DAG
-    // scheduler, which doesn't exist yet. Reject it here — before the
-    // transcript dir is created, before inputs are resolved, and before any
-    // run-record is persisted — so no partial state or on-disk bookkeeping
-    // is left behind for a run that never truly started. Legacy/linear
-    // workflows (including branches and an explicit-but-linear `next`
-    // chain) are unaffected and fall through to run exactly as before.
-    if is_nonlinear(&opts.workflow) {
-        return Err(RunWorkflowError::NonlinearNotYetSupported {
-            name: opts.workflow.name.clone(),
-        });
-    }
+    // Phase 2 (Task 5): `is_nonlinear` used to be an honesty GATE here —
+    // reject before any work started. It is now a ROUTER instead (spec §9):
+    // a workflow whose control flow is more than a single line (split/join,
+    // a fork, or a reconverge) executes through the concurrent ready-set
+    // scheduler (`run_scheduler`); a legacy/linear workflow (including
+    // today's branches and an explicit-but-linear `next` chain) continues
+    // through the untouched declaration-order loop (`run_steps_inner`).
+    // The actual routing decision is made once, at the `run_steps_inner`/
+    // `run_scheduler` call site below — see the comment there. Both return
+    // the same `InnerOutcome`, so every consumer below that point (events,
+    // awaiting-parking, persistence) is unchanged and shared between the
+    // two paths.
 
     std::fs::create_dir_all(&opts.transcript_dir)?;
     let resolved_inputs = resolve_inputs(&opts.workflow, &opts.inputs)?;
@@ -709,15 +703,53 @@ pub async fn run_workflow(
         }
     }
 
-    let outcome = run_steps_inner(
-        &opts,
-        &run_id,
-        &resolved_inputs,
-        workflow_default_continue,
-        approved_step_id.as_deref(),
-        &mut step_results,
-    )
-    .await;
+    // The router (spec §2, §9): a non-linear workflow (split/join/fork/
+    // reconverge — `is_nonlinear`) runs through the concurrent ready-set
+    // scheduler; every other (legacy/linear) workflow continues through
+    // the untouched declaration-order loop — byte-identical by
+    // construction, since it's the exact same function call this crate
+    // has always made here. This `if`/`else` is the ONLY place the two
+    // paths diverge; everything below (event emission, awaiting-parking,
+    // run-record persistence) consumes the shared `InnerOutcome` and does
+    // not know or care which path produced it.
+    //
+    // `cancel: None` — a whole-run cancel signal (spec §8) is not yet
+    // threaded through `run_workflow`'s public surface; that wiring, and
+    // the CP/CLI-facing plumbing to trigger it, is out of this task's
+    // scope.
+    //
+    // Concurrent-gate boundary (T5b): a non-linear workflow whose
+    // concurrent paths each reach an approval gate does NOT park all of
+    // them independently yet — `run_scheduler`'s ready-drain loop returns
+    // `InnerOutcome::Paused` on the FIRST gate it reaches (same as today),
+    // so multiple gates are handled sequentially across resumes rather
+    // than concurrently. This is correct (every gate is eventually
+    // handled, nothing silently skipped) but not the full "awaiting set"
+    // model spec §7 describes — that migration (`RunRecord.awaiting_
+    // step_id` -> `awaiting: Vec<AwaitingGate>`, approve/reject-by-gate-id,
+    // the CP UI, and the gate sweep) is Task 5b's job, not this one's.
+    let outcome = if is_nonlinear(&opts.workflow) {
+        run_scheduler(
+            &opts,
+            &run_id,
+            &resolved_inputs,
+            workflow_default_continue,
+            approved_step_id.as_deref(),
+            &mut step_results,
+            None,
+        )
+        .await
+    } else {
+        run_steps_inner(
+            &opts,
+            &run_id,
+            &resolved_inputs,
+            workflow_default_continue,
+            approved_step_id.as_deref(),
+            &mut step_results,
+        )
+        .await
+    };
 
     // Map the inner outcome onto the persisted terminal status.
     // Paused = `AwaitingApproval` and the record carries the
@@ -899,7 +931,6 @@ fn pause_triggered(pause: &Option<CancellationToken>) -> bool {
 /// [`cancel_finalize`]). `false` for the no-cancel path (`None`), so this
 /// is a cheap no-op for every call site until [`run_scheduler`] is handed
 /// a real token.
-#[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
 fn cancel_requested(cancel: Option<&CancellationToken>) -> bool {
     cancel.is_some_and(|t| t.is_cancelled())
 }
@@ -1036,7 +1067,6 @@ async fn run_steps_inner(
 /// fan-out, never artificially serialized). Comfortably under
 /// `tokio::sync::Semaphore`'s internal permit ceiling; no real workflow's
 /// graph width will ever approach it.
-#[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
 const UNBOUNDED_MAX_CONCURRENCY: usize = 1 << 20;
 
 /// Concurrent ready-set scheduler (Phase-2 design doc §2 "the scheduler",
@@ -1064,9 +1094,11 @@ const UNBOUNDED_MAX_CONCURRENCY: usize = 1 << 20;
 /// `StepKind` variant: every other `StepKind` consumer lives in
 /// `rupu-cli`/`rupu-cp`, outside this crate's Task-2 scope, and several
 /// match it exhaustively with no wildcard arm; adding a variant today would
-/// require patching those crates for a node the live `run_workflow` path
-/// can't reach yet anyway, since [`is_nonlinear`] still gates it out — see
-/// this task's report). Marking the split `done` unlocks every one of its
+/// require patching those crates. As of Task 5, [`is_nonlinear`] workflows
+/// DO reach this via the live `run_workflow` router — a dedicated
+/// `StepKind` for `split` is still deferred, tracked as a follow-up for
+/// whoever next touches `rupu-cli`/`rupu-cp`'s `StepKind` matches, not a
+/// correctness gap here). Marking the split `done` unlocks every one of its
 /// targets in the SAME indegree decrement pass, so they all go ready
 /// together and get dispatched concurrently on the very next drain below.
 ///
@@ -1118,7 +1150,6 @@ const UNBOUNDED_MAX_CONCURRENCY: usize = 1 << 20;
 /// `dispatch_one`, §8 of the design doc) is later in this arc. Every
 /// sample this task's golden test covers has graph width 1, so there is
 /// never another task in flight when this fires — unobservable there.
-#[allow(dead_code)] // driven only by tests until a later task wires it in as the live path
 async fn run_scheduler(
     opts: &OrchestratorRunOpts,
     run_id: &str,
@@ -2108,7 +2139,6 @@ async fn run_scheduler(
 /// independent of the scheduler-level hard-cancel signal here) and is
 /// exercised unchanged — see this task's report for how a fan-out node
 /// restarts from checkpoint under the scheduler.
-#[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
 async fn cancel_finalize(
     opts: &OrchestratorRunOpts,
     run_id: &str,
@@ -2179,7 +2209,6 @@ async fn cancel_finalize(
 /// only `first`/`count` that need to fire EARLIER, before indegree
 /// reaches 0, which is why joins are excluded from `ready` uniformly
 /// rather than only for those two policies.
-#[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
 fn unlock_successors(
     i: usize,
     successors: &[Vec<usize>],
@@ -2223,7 +2252,6 @@ fn unlock_successors(
 /// necessary because both fire conditions can become true on the same
 /// call, and because [`drain_joins`] can cascade (a join feeding another
 /// join).
-#[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
 struct JoinScheduling {
     threshold: BTreeMap<usize, usize>,
     inbound_total: BTreeMap<usize, usize>,
@@ -2254,7 +2282,6 @@ struct JoinScheduling {
 /// progress so a restart resumes rather than reruns from scratch — is
 /// NOT implemented here; a cancelled node simply never gets a
 /// `StepResult` and is never retried within the same run.
-#[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
 struct Cancellation {
     cancelled: std::collections::BTreeSet<String>,
     in_flight_abort: BTreeMap<usize, tokio::task::AbortHandle>,
@@ -2275,7 +2302,6 @@ struct Cancellation {
 ///   it's reachable from that side and NOT reachable from the other — see
 ///   [`branch_prune_set`] and [`drain_joins`], which both compute a set
 ///   difference of two `reachable_via` calls.
-#[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
 fn reachable_via(
     starts: &[usize],
     adj: &[Vec<usize>],
@@ -2296,7 +2322,6 @@ fn reachable_via(
 /// [`branch_prune_set`] ask "if the branch's untaken-arm edge(s) didn't
 /// exist, would this node still be reachable from somewhere?" without
 /// actually mutating the graph.
-#[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
 fn reachable_via_excluding(
     starts: &[usize],
     adj: &[Vec<usize>],
@@ -2344,7 +2369,6 @@ fn reachable_via_excluding(
 /// Only meaningful in graph mode (`successors`/`predecessors` built from
 /// [`workflow_edges`], which includes branch-arm edges); chain mode never
 /// calls this — see [`run_scheduler`]'s branch-handling arm.
-#[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
 fn branch_prune_set(
     branch_idx: usize,
     untaken_targets: &[usize],
@@ -2388,7 +2412,7 @@ fn branch_prune_set(
 /// — was recorded as a join arrival unconditionally, so a `wait: all`
 /// join downstream of a branch merged the DEAD arm's `"pruned"` output
 /// and forced `success = false` even though the live arm succeeded.
-#[allow(dead_code, clippy::too_many_arguments)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
+#[allow(clippy::too_many_arguments)]
 fn mark_done_and_track_joins(
     i: usize,
     live: bool,
@@ -2414,7 +2438,6 @@ fn mark_done_and_track_joins(
 /// `!step_result.skipped` (every skip/prune/cancel marker sets `skipped:
 /// true`, matching exactly the `live: false` those call sites already
 /// pass).
-#[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
 fn track_join_arrivals(
     i: usize,
     live: bool,
@@ -2457,7 +2480,7 @@ fn track_join_arrivals(
 /// pre-Task-3 code did inline at each site — skip / when-skip / branch /
 /// split / the async `Completed` arm — now also join-aware). See
 /// [`mark_done_and_track_joins`] for what `live` must be at each call site.
-#[allow(dead_code, clippy::too_many_arguments)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
+#[allow(clippy::too_many_arguments)]
 fn finish_node(
     i: usize,
     live: bool,
@@ -2507,7 +2530,7 @@ fn finish_node(
 ///    arrival order) and `steps.<join>.sub_results.<source_id>.output`
 ///    (keyed lookup) for free, with no new `StepOutput` field. See this
 ///    task's report for the exact shape + a template example.
-#[allow(dead_code, clippy::too_many_arguments)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
+#[allow(clippy::too_many_arguments)]
 fn drain_joins(
     mut worklist: Vec<usize>,
     wf: &Workflow,
@@ -2648,7 +2671,7 @@ fn drain_joins(
 /// completion path except the two `emit_gate_result`-backed gate-approval
 /// sites, which push their own `StepResult` and call
 /// [`mark_done_and_track_joins`] + [`drain_joins`] directly).
-#[allow(dead_code, clippy::too_many_arguments)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
+#[allow(clippy::too_many_arguments)]
 fn complete_and_drain_joins(
     i: usize,
     live: bool,
@@ -7639,7 +7662,12 @@ steps:
     }
 
     // -----------------------------------------------------------------------
-    // Phase 2 gate — non-linear workflows are rejected before any execution
+    // Phase 2 router (Task 5) — non-linear workflows now run for real
+    // through the live scheduler instead of being rejected. This fixture
+    // and test used to prove the honesty gate fired
+    // (`run_workflow_rejects_a_split_workflow_before_any_execution`,
+    // asserting `RunWorkflowError::NonlinearNotYetSupported`); flipped
+    // here to prove the opposite — a real end-to-end execution.
     // -----------------------------------------------------------------------
 
     const WF_SPLIT: &str = r#"
@@ -7650,33 +7678,64 @@ steps:
   - id: a
     agent: x
     prompt: p
+    next: [d]
   - id: b
     agent: x
     prompt: p
+    next: [d]
+  - id: d
+    agent: x
+    prompt: "merged a={{ steps.a.output }} b={{ steps.b.output }}"
 "#;
 
     #[tokio::test]
-    async fn run_workflow_rejects_a_split_workflow_before_any_execution() {
+    async fn run_workflow_runs_a_split_join_workflow_live_through_the_scheduler() {
         let dir = tempfile::tempdir().unwrap();
         let dispatcher = Arc::new(FakeUnitDispatcher::new());
         let wf = Workflow::parse(WF_SPLIT).unwrap();
-        let opts = make_opts(wf, dir.path().to_path_buf(), dispatcher.clone());
-
-        let err = run_workflow(opts)
-            .await
-            .expect_err("split workflow must be rejected, not mis-run as a line");
         assert!(
-            matches!(err, RunWorkflowError::NonlinearNotYetSupported { ref name } if name == "nonlinear-split"),
-            "expected NonlinearNotYetSupported, got: {err:?}"
+            is_nonlinear(&wf),
+            "fixture must be non-linear to exercise the live scheduler router"
+        );
+        let mut opts = make_opts(wf, dir.path().to_path_buf(), dispatcher);
+        opts.factory = Arc::new(PerCallMockFactory);
+
+        let res = run_workflow(opts).await.expect(
+            "a split/join workflow must now run to completion through run_workflow, not be rejected",
+        );
+        assert!(
+            res.awaiting.is_none(),
+            "no gate in this workflow — must reach Completed, not park"
         );
 
-        // PanicFactory (wired into `make_opts`) never fires and the fake
-        // dispatcher was never called — proof the gate fired before the
-        // linear loop dispatched anything.
-        assert!(dispatcher.calls.lock().unwrap().is_empty());
-        // No transcript dir side effect either — the gate is the very
-        // first statement in `run_workflow`, ahead of `create_dir_all`.
-        assert!(!dir.path().join("run.json").exists());
+        // The split node itself never dispatches (an orchestration
+        // no-op); `a` and `b` both ran (concurrently — dispatch order
+        // between them isn't asserted, only that both completed), and
+        // `d` (the implicit all-join reconverge) sees BOTH of their real
+        // outputs.
+        let a = res
+            .step_results
+            .iter()
+            .find(|sr| sr.step_id == "a")
+            .expect("a ran");
+        let b = res
+            .step_results
+            .iter()
+            .find(|sr| sr.step_id == "b")
+            .expect("b ran");
+        let d = res
+            .step_results
+            .iter()
+            .find(|sr| sr.step_id == "d")
+            .expect("d ran");
+        assert!(!a.skipped && a.success);
+        assert!(!b.skipped && b.success);
+        assert!(!d.skipped && d.success);
+        assert!(
+            d.output.contains("a=done:p") && d.output.contains("b=done:p"),
+            "d must see both a's and b's real output: {}",
+            d.output
+        );
     }
 
     /// Hands out a fresh `MockProvider` per call (unlike `OneShotFactory`,
@@ -7758,8 +7817,10 @@ steps:
 /// sample before anything downstream (concurrency, later tasks) builds on
 /// it. A `#[cfg(test)]` module in THIS file, not `tests/`, specifically so
 /// it can call `run_steps_inner` / `run_scheduler` / `InnerOutcome`
-/// directly without making any of them part of the crate's public API
-/// before the scheduler actually replaces the loop as the live path.
+/// directly without making any of them part of the crate's public API —
+/// both are private helpers `run_workflow`'s router (`is_nonlinear`)
+/// chooses between (Task 5); this module keeps proving their equality at
+/// that white-box level rather than only through `run_workflow`.
 #[cfg(test)]
 mod dag_scheduler_golden {
     use super::*;
@@ -8213,9 +8274,11 @@ steps:
 
 /// Task 2: concurrent dispatch + `split` fan-out + implicit all-join +
 /// `max_concurrency`. These exercise [`run_scheduler`] directly (same
-/// reason `dag_scheduler_golden` does — it isn't `pub`, and isn't reachable
-/// through [`run_workflow`], which still gates non-linear workflows via
-/// [`is_nonlinear`] until a later task in this arc lifts it).
+/// reason `dag_scheduler_golden` does — it isn't `pub`). As of Task 5,
+/// [`run_workflow`] also reaches it for any [`is_nonlinear`] workflow (see
+/// `join_and_prune`'s trailing `..._live_through_run_workflow` tests for
+/// coverage through that full public surface); these tests target the
+/// scheduler's internals directly instead.
 #[cfg(test)]
 mod scheduler_concurrency {
     use super::*;
@@ -8617,8 +8680,10 @@ steps:
 /// Task 3: branch pruning (spec §6) + explicit `join` (spec §5,
 /// `all`/`first`/`count`) + loser-cancellation (spec §8, first use).
 /// Exercises [`run_scheduler`] directly — same reason `scheduler_concurrency`
-/// does (not `pub`, not reachable via [`run_workflow`] until Task 5 lifts
-/// the [`is_nonlinear`] gate).
+/// does (not `pub`). This module's trailing `..._live_through_run_workflow`
+/// tests (added by Task 5) re-run a couple of these same fixtures through
+/// the live [`run_workflow`] entry point instead, now that its
+/// [`is_nonlinear`] router reaches the scheduler for real.
 #[cfg(test)]
 mod join_and_prune {
     use super::*;
@@ -9482,6 +9547,180 @@ steps:
             recorded,
             std::collections::BTreeSet::from(["fanout", "fast", "gathered", "b", "c"]),
             "exactly every reachable node except the one genuinely in-flight ancestor must have a terminal StepResult"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 5: the SAME fixtures above, now driven through the LIVE
+    // `run_workflow` entry point rather than calling `run_scheduler`
+    // directly. Every test above this point proves the scheduler's
+    // internals; these prove `run_workflow`'s router actually reaches it
+    // for a non-linear workflow (spec §9) instead of rejecting it.
+    // -----------------------------------------------------------------------
+
+    /// `split → [a, b] → join(wait: all) gathered → after`, run through
+    /// `run_workflow` (not `run_scheduler`). Before this task this fixture
+    /// was rejected outright with `NonlinearNotYetSupported`; now it must
+    /// run to a real `Done` terminal, with `a`/`b` both dispatched and
+    /// `gathered` merging both of their results — the flipped shape of the
+    /// old honesty-gate regression test.
+    #[tokio::test]
+    async fn join_wait_all_completes_live_through_run_workflow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(JOIN_ALL_WF).unwrap();
+        assert!(
+            is_nonlinear(&wf),
+            "fixture must be non-linear to exercise the live scheduler router"
+        );
+        let factory = JoinTestFactory::new(&[]);
+        let opts = opts_for(wf, factory, &tmp);
+
+        let res = run_workflow(opts)
+            .await
+            .expect("a split/join workflow must now run to completion through run_workflow");
+        assert!(
+            res.awaiting.is_none(),
+            "no gate in this workflow — must reach Done, not park"
+        );
+
+        let gathered = result_for(&res.step_results, "gathered");
+        assert!(gathered.success);
+        assert_eq!(gathered.items.len(), 2, "both inbound paths waited for");
+        let sub_ids: std::collections::BTreeSet<&str> =
+            gathered.items.iter().map(|it| it.sub_id.as_str()).collect();
+        assert_eq!(sub_ids, std::collections::BTreeSet::from(["a", "b"]));
+
+        let after = result_for(&res.step_results, "after");
+        assert!(
+            after.output.contains("n=2"),
+            "downstream step must see steps.gathered.results | length == 2: {}",
+            after.output
+        );
+    }
+
+    /// The branch-pruning fixture, run through `run_workflow`: the taken
+    /// arm (`x`) and the shared reconverge run; the untaken arm (`y`) and
+    /// the node reachable only through it (`only_via_y`) are pruned and
+    /// never dispatched — same assertions as
+    /// `branch_prunes_the_untaken_arm_but_not_a_shared_reconverge` above,
+    /// now proving the LIVE router reaches the same real-reachability
+    /// pruning logic, not just `run_scheduler` called directly.
+    #[tokio::test]
+    async fn branch_pruning_completes_live_through_run_workflow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(BRANCH_PRUNE_WF).unwrap();
+        assert!(is_nonlinear(&wf), "fixture must be graph mode");
+        let factory = JoinTestFactory::new(&[]);
+        let calls = Arc::clone(&factory.calls);
+        let opts = opts_for(wf, factory, &tmp);
+
+        let res = run_workflow(opts)
+            .await
+            .expect("branch pruning must run to completion through run_workflow");
+        assert!(res.awaiting.is_none());
+
+        let x = result_for(&res.step_results, "x");
+        assert!(!x.skipped && x.success, "taken arm must run: {x:?}");
+        let reconverge = result_for(&res.step_results, "reconverge");
+        assert!(
+            !reconverge.skipped && reconverge.success,
+            "shared reconverge must still run: {reconverge:?}"
+        );
+        let y = result_for(&res.step_results, "y");
+        assert!(y.skipped, "untaken arm must be pruned: {y:?}");
+        let only_via_y = result_for(&res.step_results, "only_via_y");
+        assert!(
+            only_via_y.skipped,
+            "node reachable only through the untaken arm must be pruned: {only_via_y:?}"
+        );
+        let calls = calls.lock().unwrap();
+        assert!(
+            !calls.contains(&"y".to_string()) && !calls.contains(&"only_via_y".to_string()),
+            "pruned nodes must never reach the StepFactory: {calls:?}"
+        );
+    }
+
+    /// A non-linear workflow (a fork out of the gate step itself — a
+    /// non-branch step with 2 `next:` targets, `is_nonlinear`'s fork rule)
+    /// whose SOLE approval gate is also its entry node: the gate is the
+    /// only ready node at the start, so it parks before anything else is
+    /// ever dispatched — a clean, deterministic instance of "ONE approval
+    /// gate parks" (spec §7's simplest case; T5b's full concurrent
+    /// awaiting-set is NOT exercised here — see this task's report for the
+    /// boundary). Approve-resume (mirroring `tests/gate_node.rs`'s
+    /// pattern) then completes the run, dispatching both fork targets.
+    const NONLINEAR_GATE_WF: &str = r#"
+name: nonlinear-gate
+steps:
+  - id: gate
+    approval:
+      prompt: "Approve the fan-out?"
+    next: [a, b]
+  - id: a
+    agent: worker
+    prompt: "do a"
+  - id: b
+    agent: worker
+    prompt: "do b"
+"#;
+
+    #[tokio::test]
+    async fn single_gate_in_nonlinear_workflow_parks_then_resume_completes_live_through_run_workflow(
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(NONLINEAR_GATE_WF).unwrap();
+        assert!(
+            is_nonlinear(&wf),
+            "fixture must be non-linear (fork out of the gate) to exercise the live router"
+        );
+
+        // --- Phase 1: the gate is the only ready node — it must park
+        // before `a`/`b` are ever reachable. ---
+        let factory1 = JoinTestFactory::new(&[]);
+        let calls1 = Arc::clone(&factory1.calls);
+        let opts1 = opts_for(wf.clone(), factory1, &tmp);
+        let res1 = run_workflow(opts1)
+            .await
+            .expect("a pause is Ok, not Err");
+        let awaiting = res1.awaiting.clone().expect("the gate must pause the run");
+        assert_eq!(awaiting.step_id, "gate");
+        assert!(
+            res1.step_results.is_empty(),
+            "a paused gate has no completed result yet"
+        );
+        assert!(
+            calls1.lock().unwrap().is_empty(),
+            "a/b must never reach the StepFactory before the gate is approved: {:?}",
+            calls1.lock().unwrap()
+        );
+
+        // --- Phase 2: approve + resume — mirrors `tests/gate_node.rs`'s
+        // approve-resume pattern, adapted for the in-memory (no run_store)
+        // shape this module's `opts_for` uses. ---
+        let factory2 = JoinTestFactory::new(&[]);
+        let calls2 = Arc::clone(&factory2.calls);
+        let mut opts2 = opts_for(wf, factory2, &tmp);
+        opts2.resume_from = Some(ResumeState::from_approval(
+            res1.run_id.clone(),
+            res1.step_results.clone(),
+            "gate".to_string(),
+        ));
+
+        let res2 = run_workflow(opts2)
+            .await
+            .expect("resume after approval must complete the run");
+        assert!(res2.awaiting.is_none(), "resumed run must reach Done");
+
+        let gate = result_for(&res2.step_results, "gate");
+        assert!(gate.success);
+        let a = result_for(&res2.step_results, "a");
+        let b = result_for(&res2.step_results, "b");
+        assert!(!a.skipped && a.success, "a must run after the gate resolves: {a:?}");
+        assert!(!b.skipped && b.success, "b must run after the gate resolves: {b:?}");
+        let dispatched = calls2.lock().unwrap();
+        assert!(
+            dispatched.contains(&"a".to_string()) && dispatched.contains(&"b".to_string()),
+            "both fork targets must have been dispatched post-approval: {dispatched:?}"
         );
     }
 }

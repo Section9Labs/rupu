@@ -1928,18 +1928,21 @@ pub fn is_nonlinear(wf: &Workflow) -> bool {
     if indeg.values().any(|&d| d > 1) {
         return true;
     }
-    // Honesty check: the linear runner walks `wf.steps` in LIST order and
-    // ignores `next` for dispatch — it only consults the dependency graph
-    // here, to gate. A graph-mode workflow (one with explicit `next`/
-    // `split`/`join`) is only faithfully runnable by that linear walk if
-    // its list order already IS a valid topological order of the full
-    // dependency graph (control edges union inferred `steps.X.*` data
-    // edges — see `workflow_edges`). If some edge `a -> b` (a must run
-    // before b) has `b` declared at or before `a`, the linear runner will
-    // reach `b` before `a` ran and render/execute it against stale or
-    // empty state. This is exactly the class of silent mis-run this gate
-    // exists to prevent, so a violation here routes to the same
-    // `NonlinearNotYetSupported` error as a fork/reconverge/split/join.
+    // Honesty check: the linear runner (`run_steps_inner`) walks
+    // `wf.steps` in LIST order and ignores `next` for dispatch — it only
+    // consults the dependency graph here, to route. A graph-mode workflow
+    // (one with explicit `next`/`split`/`join`) is only faithfully
+    // runnable by that linear walk if its list order already IS a valid
+    // topological order of the full dependency graph (control edges union
+    // inferred `steps.X.*` data edges — see `workflow_edges`). If some
+    // edge `a -> b` (a must run before b) has `b` declared at or before
+    // `a`, the linear runner would reach `b` before `a` ran and
+    // render/execute it against stale or empty state. This is exactly the
+    // class of silent mis-run `is_nonlinear` exists to catch, so a
+    // violation here is treated the same as a fork/reconverge/split/join:
+    // `run_workflow`'s router (`crates/rupu-orchestrator/src/runner.rs`)
+    // sends it to the real dependency-graph scheduler (`run_scheduler`)
+    // instead of the declaration-order loop.
     if workflow_has_explicit_edges(wf) && !declaration_order_is_topological(wf) {
         return true;
     }
