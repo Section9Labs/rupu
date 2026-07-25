@@ -316,6 +316,15 @@ pub enum Action {
         /// (`ask` | `bypass` | `readonly`).
         #[arg(long)]
         mode: Option<String>,
+        /// Target a specific parked approval gate by step id (Task 5b-2a,
+        /// spec §7) — required once a run has more than one gate parked
+        /// at once (a concurrent DAG run with several gates in the same
+        /// batch-park wave). Omit for the legacy/single-gate case: the
+        /// sole parked gate is approved exactly as before. Approving one
+        /// gate of several leaves the others parked; the run stays
+        /// `awaiting_approval` until every gate is resolved.
+        #[arg(long)]
+        gate: Option<String>,
     },
     /// Reject a paused run. Marks it `rejected`; no further steps
     /// dispatch.
@@ -325,6 +334,13 @@ pub enum Action {
         /// `error_message`.
         #[arg(long)]
         reason: Option<String>,
+        /// Target a specific parked approval gate by step id (Task 5b-2a,
+        /// spec §7) — same targeting rule as `approve --gate`. Rejecting
+        /// one gate of several runs THAT gate's `on_reject` cleanup chain
+        /// and leaves the others parked; the run flips to `rejected` only
+        /// once every gate is resolved.
+        #[arg(long)]
+        gate: Option<String>,
     },
     /// Cancel a running workflow run.
     Cancel {
@@ -486,8 +502,14 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
             };
             show_run(&run_id, view, no_color, pager_flag, global_format).await
         }
-        Action::Approve { run_id, mode } => approve(&run_id, mode.as_deref()).await,
-        Action::Reject { run_id, reason } => reject(&run_id, reason.as_deref()).await,
+        Action::Approve { run_id, mode, gate } => {
+            approve(&run_id, mode.as_deref(), gate.as_deref()).await
+        }
+        Action::Reject {
+            run_id,
+            reason,
+            gate,
+        } => reject(&run_id, reason.as_deref(), gate.as_deref()).await,
         Action::Cancel { run_id } => cancel(&run_id).await,
         Action::Pause { run_id } => pause(&run_id).await,
         Action::Resume {
@@ -1804,11 +1826,28 @@ fn read_and_parse_workflow_snapshot(
 /// awaiting step, step isn't a gate NODE, no `on_timeout` set)
 /// collapses to `None`, which `expire_if_overdue` treats as the
 /// default `Fail`.
+///
+/// **Sole-gate-shaped** — resolves the policy for `record.awaiting_step_id`
+/// (the compat mirror of the FIRST parked gate). Task 5b-2a's per-gate
+/// callers (an explicit `--gate <id>`) want
+/// [`gate_on_timeout_for_step`] instead.
 fn gate_on_timeout_for(
     store: &rupu_orchestrator::RunStore,
     record: &rupu_orchestrator::RunRecord,
 ) -> Option<rupu_orchestrator::TimeoutAction> {
     let step_id = record.awaiting_step_id.as_deref()?;
+    gate_on_timeout_for_step(store, record, step_id)
+}
+
+/// Per-gate counterpart to [`gate_on_timeout_for`] (Task 5b-2a): resolve
+/// the `on_timeout` routing for the gate NODE named `step_id`, independent
+/// of which gate the compat fields happen to mirror. Used by `approve`/
+/// `reject`'s `--gate`-targeted overdue pre-check.
+fn gate_on_timeout_for_step(
+    store: &rupu_orchestrator::RunStore,
+    record: &rupu_orchestrator::RunRecord,
+    step_id: &str,
+) -> Option<rupu_orchestrator::TimeoutAction> {
     let workflow = match read_and_parse_workflow_snapshot(store, &record.id) {
         Ok(wf) => wf,
         Err(e) => {
@@ -2187,47 +2226,139 @@ async fn show_run(
     report::emit_event(global_format, &output)
 }
 
-async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
-    let global = paths::global_dir()?;
-    paths::ensure_dir(&global)?;
-    let runs_dir = global.join("runs");
-    let store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir));
+/// User-facing message for `ApprovalError::AmbiguousGate` (Task 5b-2a) —
+/// pulled out of [`resolve_approve_gate`]/[`resolve_reject_gate`] so it's
+/// unit-testable without the full CLI wiring those async fns need
+/// (config/resolver/MCP registry). Lists every candidate gate id and
+/// tells the operator which flag resolves it.
+fn ambiguous_gate_message(action: &str, run_id: &str, candidates: &[String]) -> String {
+    format!(
+        "run `{run_id}` has {} pending gates ({}) — pass --gate <STEP_ID> to {action} one, \
+         e.g. `rupu workflow {action} {run_id} --gate {}`",
+        candidates.len(),
+        candidates.join(", "),
+        candidates.first().map(String::as_str).unwrap_or("<STEP_ID>"),
+    )
+}
+
+/// Outcome of [`resolve_approve_gate`] — phase 1 of `approve` (Task
+/// 5b-2a).
+#[derive(Debug)]
+enum ApproveGateOutcome {
+    /// The targeted gate was approved; resume from this step id.
+    Approved(String),
+    /// The gate had already auto-rejected on `on_timeout: reject` before
+    /// this operator approve landed — the store already finalized the run
+    /// `Rejected`. The caller (phase 2, async) still needs to run the
+    /// on_reject cleanup chain for `step_id`.
+    ExpiredRejected { step_id: String, reason: String },
+}
+
+/// Phase 1 of `approve` (Task 5b-2a): the overdue pre-check message +
+/// `store.approve_gate` call + friendly error mapping, split out of
+/// `approve` itself so this gate-targeting logic is unit-testable without
+/// the full resume wiring (config/resolver/MCP registry/dispatcher) phase
+/// 2 needs. `gate: None` is the legacy sole-gate case — identical
+/// behavior to before this task; `gate: Some(id)` targets that gate,
+/// leaving any other parked gate untouched.
+fn resolve_approve_gate(
+    store: &rupu_orchestrator::RunStore,
+    run_id: &str,
+    gate: Option<&str>,
+) -> anyhow::Result<ApproveGateOutcome> {
     let approver = whoami::username();
 
-    // `store.approve()` treats a timed-out `on_timeout: approve` gate
-    // identically to an operator approve (it falls through and
-    // resumes normally) — it has no way to tell the caller that's
-    // what happened, so detect it here first purely to print a
-    // distinct message before making the same library call.
+    // `store.approve_gate()` treats a timed-out `on_timeout: approve`
+    // gate identically to an operator approve (it falls through and
+    // resumes normally) — it has no way to tell the caller that's what
+    // happened, so detect it here first purely to print a distinct
+    // message before making the same library call. Task 5b-2a: check the
+    // TARGETED gate's own overdue-ness/policy (falling back to the
+    // compat-mirrored first gate when `--gate` is omitted) rather than
+    // always the first gate in the set — a multi-gate run's other gates
+    // may have different policies entirely.
     if let Ok(record) = store.load(run_id) {
-        let overdue = record.status == rupu_orchestrator::RunStatus::AwaitingApproval
-            && record.expires_at.is_some_and(|exp| chrono::Utc::now() > exp);
-        if overdue
-            && gate_on_timeout_for(&store, &record)
-                == Some(rupu_orchestrator::TimeoutAction::Approve)
-        {
-            println!(
-                "rupu: gate timed out with on_timeout: approve — auto-approving and resuming"
-            );
+        let target_step_id = gate
+            .map(str::to_string)
+            .or_else(|| record.awaiting_step_id.clone());
+        if let Some(step_id) = target_step_id {
+            let gate_expires_at = record
+                .awaiting_gates()
+                .into_iter()
+                .find(|g| g.step_id == step_id)
+                .and_then(|g| g.expires_at);
+            let overdue = record.status == rupu_orchestrator::RunStatus::AwaitingApproval
+                && gate_expires_at.is_some_and(|exp| chrono::Utc::now() > exp);
+            if overdue
+                && gate_on_timeout_for_step(store, &record, &step_id)
+                    == Some(rupu_orchestrator::TimeoutAction::Approve)
+            {
+                println!(
+                    "rupu: gate `{step_id}` timed out with on_timeout: approve — \
+                     auto-approving and resuming"
+                );
+            }
         }
     }
 
-    // Library call replaces inline load + expire-check + status check
-    // + mutate + update. Re-entering run_workflow stays in the CLI
-    // because the TUI uses a different resume model.
-    let awaited_step_id = match store.approve(run_id, &approver, chrono::Utc::now()) {
-        Ok(rupu_orchestrator::ApprovalDecision::Approved { step_id, .. }) => step_id,
+    // Library call replaces inline load + expire-check + status check +
+    // mutate + update. Re-entering run_workflow stays in the CLI because
+    // the TUI uses a different resume model.
+    match store.approve_gate(run_id, &approver, chrono::Utc::now(), gate) {
+        Ok(rupu_orchestrator::ApprovalDecision::Approved { step_id, .. }) => {
+            Ok(ApproveGateOutcome::Approved(step_id))
+        }
         Err(rupu_orchestrator::ApprovalError::Expired(msg)) => {
             anyhow::bail!("approval expired before it was acted on — {msg}");
         }
         Err(rupu_orchestrator::ApprovalError::ExpiredRejected { step_id, reason }) => {
             // The gate's own `on_timeout: reject` policy fired before
             // this operator approve landed — the store already
-            // finalized the run as `Rejected`. Report it and run the
-            // same `on_reject` cleanup chain a normal reject does.
+            // finalized the run as `Rejected`. Report it; the caller
+            // runs the same `on_reject` cleanup chain a normal reject
+            // does.
             println!(
                 "rupu: gate timed out (on_timeout: reject) — run {run_id} auto-rejected at step `{step_id}`"
             );
+            Ok(ApproveGateOutcome::ExpiredRejected { step_id, reason })
+        }
+        Err(rupu_orchestrator::ApprovalError::NotAwaiting(s)) => {
+            anyhow::bail!(
+                "run is `{s}`, not `awaiting_approval` — only paused runs can be approved",
+            );
+        }
+        Err(rupu_orchestrator::ApprovalError::NoAwaitingStep) => {
+            anyhow::bail!("run has no awaiting_step_id; record may be corrupt");
+        }
+        Err(rupu_orchestrator::ApprovalError::NotFound(id)) => {
+            anyhow::bail!(
+                "run not found: {id}\n  hint: \
+                 list paused runs with `rupu workflow runs --status awaiting_approval`"
+            );
+        }
+        Err(rupu_orchestrator::ApprovalError::AmbiguousGate { run_id, candidates }) => {
+            anyhow::bail!(ambiguous_gate_message("approve", &run_id, &candidates));
+        }
+        Err(rupu_orchestrator::ApprovalError::GateNotFound { run_id, step_id }) => {
+            anyhow::bail!(
+                "gate `{step_id}` is not awaiting approval on run `{run_id}` — check \
+                 `rupu workflow show-run {run_id}` for the currently parked gate ids"
+            );
+        }
+        Err(e) => Err(anyhow::anyhow!("approve: {e}")),
+        Ok(other) => anyhow::bail!("unexpected decision: {other:?}"),
+    }
+}
+
+async fn approve(run_id: &str, mode: Option<&str>, gate: Option<&str>) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    paths::ensure_dir(&global)?;
+    let runs_dir = global.join("runs");
+    let store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir));
+
+    let awaited_step_id = match resolve_approve_gate(&store, run_id, gate)? {
+        ApproveGateOutcome::Approved(step_id) => step_id,
+        ApproveGateOutcome::ExpiredRejected { step_id, reason } => {
             if cheap_on_reject_chain_len(&store, run_id, &step_id) != Some(0) {
                 match crate::resume::build_reject_cleanup_opts(
                     &store, run_id, &step_id, &reason, mode,
@@ -2258,22 +2389,6 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        Err(rupu_orchestrator::ApprovalError::NotAwaiting(s)) => {
-            anyhow::bail!(
-                "run is `{s}`, not `awaiting_approval` — only paused runs can be approved",
-            );
-        }
-        Err(rupu_orchestrator::ApprovalError::NoAwaitingStep) => {
-            anyhow::bail!("run has no awaiting_step_id; record may be corrupt");
-        }
-        Err(rupu_orchestrator::ApprovalError::NotFound(id)) => {
-            anyhow::bail!(
-                "run not found: {id}\n  hint: \
-                 list paused runs with `rupu workflow runs --status awaiting_approval`"
-            );
-        }
-        Err(e) => return Err(anyhow::anyhow!("approve: {e}")),
-        Ok(other) => anyhow::bail!("unexpected decision: {other:?}"),
     };
     // Phase 2 — the resume — lives in `crate::resume::resume_run` so the
     // background session worker can resume an approved gate identically.
@@ -2704,62 +2819,133 @@ pub(crate) async fn resume_run(
     Ok(())
 }
 
-async fn reject(run_id: &str, reason: Option<&str>) -> anyhow::Result<()> {
-    let global = paths::global_dir()?;
-    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+/// Outcome of [`resolve_reject_gate`] — phase 1 of `reject` (Task 5b-2a).
+#[derive(Debug)]
+struct RejectGateOutcome {
+    step_id: String,
+    reason: String,
+    /// spec §3.1's `via` attribution: `"timeout"` when the gate's own
+    /// `on_timeout: reject` policy had already fired before this operator
+    /// reject landed, `"human"` for a genuine operator decision.
+    via: &'static str,
+}
+
+/// Phase 1 of `reject` (Task 5b-2a): the `via`-attribution pre-check +
+/// `store.reject_gate` call + friendly error mapping, split out of
+/// `reject` itself so it's unit-testable without the async on_reject
+/// cleanup wiring. `gate: None` is the legacy sole-gate case; `gate:
+/// Some(id)` targets that gate, leaving any other parked gate untouched.
+fn resolve_reject_gate(
+    store: &rupu_orchestrator::RunStore,
+    run_id: &str,
+    reason: Option<&str>,
+    gate: Option<&str>,
+) -> anyhow::Result<RejectGateOutcome> {
     let approver = whoami::username();
     let reason_str = reason.unwrap_or("rejected by operator");
 
-    // `store.reject()` treats a gate that already timed out with
+    // `store.reject_gate()` treats a gate that already timed out with
     // `on_timeout: reject` identically to an explicit operator reject
     // (both return `Ok(ApprovalDecision::Rejected { .. })`) — it has no
     // way to tell this caller which one actually happened. Detect it
     // here, before the library call, purely to attribute the gate
     // output's `via` correctly (spec §3.1): "timeout" when the policy
-    // already fired, "human" for a genuine operator decision.
+    // already fired, "human" for a genuine operator decision. Task
+    // 5b-2a: check the TARGETED gate's own overdue-ness/policy (falling
+    // back to the compat-mirrored first gate when `--gate` is omitted).
     let via = if let Ok(record) = store.load(run_id) {
-        let overdue = record.status == rupu_orchestrator::RunStatus::AwaitingApproval
-            && record.expires_at.is_some_and(|exp| chrono::Utc::now() > exp);
-        if overdue
-            && gate_on_timeout_for(&store, &record)
-                == Some(rupu_orchestrator::TimeoutAction::Reject)
-        {
-            println!(
-                "rupu: gate timed out with on_timeout: reject — already auto-rejected"
-            );
-            "timeout"
-        } else {
-            "human"
+        let target_step_id = gate
+            .map(str::to_string)
+            .or_else(|| record.awaiting_step_id.clone());
+        match target_step_id {
+            Some(step_id) => {
+                let gate_expires_at = record
+                    .awaiting_gates()
+                    .into_iter()
+                    .find(|g| g.step_id == step_id)
+                    .and_then(|g| g.expires_at);
+                let overdue = record.status == rupu_orchestrator::RunStatus::AwaitingApproval
+                    && gate_expires_at.is_some_and(|exp| chrono::Utc::now() > exp);
+                if overdue
+                    && gate_on_timeout_for_step(store, &record, &step_id)
+                        == Some(rupu_orchestrator::TimeoutAction::Reject)
+                {
+                    println!(
+                        "rupu: gate `{step_id}` timed out with on_timeout: reject — \
+                         already auto-rejected"
+                    );
+                    "timeout"
+                } else {
+                    "human"
+                }
+            }
+            None => "human",
         }
     } else {
         "human"
     };
 
-    // Library call replaces inline load + expire-check + status check
-    // + mutate + update.
-    let (rejected_step_id, rejected_reason) =
-        match store.reject(run_id, &approver, reason_str, chrono::Utc::now()) {
-            Ok(rupu_orchestrator::ApprovalDecision::Rejected { step_id, reason, .. }) => {
-                (step_id, reason)
-            }
-            Err(rupu_orchestrator::ApprovalError::Expired(msg)) => {
-                anyhow::bail!("approval expired before it was acted on — {msg}");
-            }
-            Err(rupu_orchestrator::ApprovalError::NotAwaiting(s)) => {
-                anyhow::bail!(
-                    "run is `{s}`, not `awaiting_approval` — only paused runs can be rejected",
-                );
-            }
-            Err(rupu_orchestrator::ApprovalError::NotFound(id)) => {
-                anyhow::bail!(
-                    "run not found: {id}\n  hint: \
-                     list paused runs with `rupu workflow runs --status awaiting_approval`"
-                );
-            }
-            Err(e) => return Err(anyhow::anyhow!("reject: {e}")),
-            Ok(other) => anyhow::bail!("unexpected decision: {other:?}"),
-        };
-    println!("rupu: run {run_id} marked rejected");
+    // Library call replaces inline load + expire-check + status check +
+    // mutate + update.
+    match store.reject_gate(run_id, &approver, reason_str, chrono::Utc::now(), gate) {
+        Ok(rupu_orchestrator::ApprovalDecision::Rejected {
+            step_id, reason, ..
+        }) => Ok(RejectGateOutcome {
+            step_id,
+            reason,
+            via,
+        }),
+        Err(rupu_orchestrator::ApprovalError::Expired(msg)) => {
+            anyhow::bail!("approval expired before it was acted on — {msg}");
+        }
+        Err(rupu_orchestrator::ApprovalError::NotAwaiting(s)) => {
+            anyhow::bail!(
+                "run is `{s}`, not `awaiting_approval` — only paused runs can be rejected",
+            );
+        }
+        Err(rupu_orchestrator::ApprovalError::NotFound(id)) => {
+            anyhow::bail!(
+                "run not found: {id}\n  hint: \
+                 list paused runs with `rupu workflow runs --status awaiting_approval`"
+            );
+        }
+        Err(rupu_orchestrator::ApprovalError::AmbiguousGate { run_id, candidates }) => {
+            anyhow::bail!(ambiguous_gate_message("reject", &run_id, &candidates));
+        }
+        Err(rupu_orchestrator::ApprovalError::GateNotFound { run_id, step_id }) => {
+            anyhow::bail!(
+                "gate `{step_id}` is not awaiting approval on run `{run_id}` — check \
+                 `rupu workflow show-run {run_id}` for the currently parked gate ids"
+            );
+        }
+        Err(e) => Err(anyhow::anyhow!("reject: {e}")),
+        Ok(other) => anyhow::bail!("unexpected decision: {other:?}"),
+    }
+}
+
+async fn reject(run_id: &str, reason: Option<&str>, gate: Option<&str>) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+
+    let RejectGateOutcome {
+        step_id: rejected_step_id,
+        reason: rejected_reason,
+        via,
+    } = resolve_reject_gate(&store, run_id, reason, gate)?;
+    // Task 5b-2a: rejecting one gate of a still-parked multi-gate set
+    // leaves the run `AwaitingApproval` (the other gates stay parked) —
+    // "marked rejected" only holds once the set is empty and the run
+    // itself flipped terminal.
+    match store.load(run_id) {
+        Ok(rec) if rec.status == rupu_orchestrator::RunStatus::AwaitingApproval => {
+            println!(
+                "rupu: gate `{rejected_step_id}` rejected on run {run_id}; {} other gate(s) \
+                 still awaiting approval",
+                rec.awaiting.len()
+            );
+        }
+        _ => println!("rupu: run {run_id} marked rejected"),
+    }
 
     // The run is already correctly `Rejected` at this point (the library
     // call above is what finalized it) — a cleanup-load failure is warned,
@@ -4460,5 +4646,164 @@ mod tests {
 
         let err = pause_with_store(&store, "run_test_cancel").unwrap_err();
         assert!(err.to_string().contains("only a running run can be paused"));
+    }
+
+    // ── Task 5b-2a: CLI `--gate` wiring (approve/reject phase 1) ────────
+
+    /// Record with TWO parked gates (`gate_a`, `gate_b`), neither overdue —
+    /// the CLI-level counterpart to `runs.rs`'s `two_gate_record`, built
+    /// straight off `sample_run_record` so it carries the same
+    /// otherwise-valid `RunRecord` shape these CLI tests need.
+    fn two_gate_awaiting_record(id: &str) -> RunRecord {
+        let mut rec = sample_run_record(RunStatus::AwaitingApproval, None);
+        rec.id = id.to_string();
+        let since = Utc::now();
+        rec.awaiting = vec![
+            rupu_orchestrator::runs::AwaitingGate {
+                step_id: "gate_a".into(),
+                prompt: Some("approve a?".into()),
+                since,
+                expires_at: None,
+            },
+            rupu_orchestrator::runs::AwaitingGate {
+                step_id: "gate_b".into(),
+                prompt: Some("approve b?".into()),
+                since,
+                expires_at: None,
+            },
+        ];
+        rec.sync_awaiting_compat();
+        rec
+    }
+
+    const TWO_GATE_YAML: &str = "name: g\nsteps:\n  - id: gate_a\n    approval: {}\n  - id: gate_b\n    approval: {}\n";
+
+    #[test]
+    fn ambiguous_gate_message_lists_every_candidate_and_the_gate_flag() {
+        let msg = ambiguous_gate_message(
+            "approve",
+            "run_x",
+            &["gate_a".to_string(), "gate_b".to_string()],
+        );
+        assert!(msg.contains("gate_a"), "message: {msg}");
+        assert!(msg.contains("gate_b"), "message: {msg}");
+        assert!(msg.contains("--gate"), "message: {msg}");
+        assert!(msg.contains("run_x"), "message: {msg}");
+    }
+
+    #[test]
+    fn resolve_approve_gate_with_explicit_gate_targets_only_that_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let rec = two_gate_awaiting_record("run_cli_approve_b");
+        store.create(rec.clone(), TWO_GATE_YAML).unwrap();
+
+        let outcome = resolve_approve_gate(&store, &rec.id, Some("gate_b")).unwrap();
+        match outcome {
+            ApproveGateOutcome::Approved(step_id) => assert_eq!(step_id, "gate_b"),
+            ApproveGateOutcome::ExpiredRejected { .. } => panic!("must not have expired"),
+        }
+
+        // gate_a is untouched and still parked; the run stays
+        // AwaitingApproval (NOT Running — the set is non-empty).
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::AwaitingApproval);
+        assert_eq!(reloaded.awaiting.len(), 1);
+        assert_eq!(reloaded.awaiting[0].step_id, "gate_a");
+    }
+
+    #[test]
+    fn resolve_approve_gate_with_no_gate_on_a_multi_gate_run_errors_listing_candidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let rec = two_gate_awaiting_record("run_cli_approve_ambiguous");
+        store.create(rec.clone(), TWO_GATE_YAML).unwrap();
+
+        let err = resolve_approve_gate(&store, &rec.id, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("gate_a"), "message: {msg}");
+        assert!(msg.contains("gate_b"), "message: {msg}");
+        assert!(msg.contains("--gate"), "message: {msg}");
+
+        // Nothing mutated by the failed attempt.
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::AwaitingApproval);
+        assert_eq!(reloaded.awaiting.len(), 2);
+    }
+
+    #[test]
+    fn resolve_approve_gate_with_no_gate_on_a_single_gate_run_works_as_today() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let rec = sample_run_record(RunStatus::AwaitingApproval, None);
+        store.create(rec.clone(), "name: sample\nsteps: []\n").unwrap();
+
+        let outcome = resolve_approve_gate(&store, &rec.id, None).unwrap();
+        match outcome {
+            ApproveGateOutcome::Approved(step_id) => assert_eq!(step_id, "step_approve"),
+            ApproveGateOutcome::ExpiredRejected { .. } => panic!("must not have expired"),
+        }
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Running);
+        assert!(reloaded.awaiting_step_id.is_none());
+    }
+
+    #[test]
+    fn resolve_approve_gate_with_unknown_gate_id_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let rec = two_gate_awaiting_record("run_cli_approve_unknown");
+        store.create(rec.clone(), TWO_GATE_YAML).unwrap();
+
+        let err = resolve_approve_gate(&store, &rec.id, Some("no_such_gate")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no_such_gate"), "message: {msg}");
+        assert!(msg.contains("not awaiting approval"), "message: {msg}");
+    }
+
+    #[test]
+    fn resolve_reject_gate_with_explicit_gate_targets_only_that_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let rec = two_gate_awaiting_record("run_cli_reject_a");
+        store.create(rec.clone(), TWO_GATE_YAML).unwrap();
+
+        let outcome = resolve_reject_gate(&store, &rec.id, Some("no thanks"), Some("gate_a")).unwrap();
+        assert_eq!(outcome.step_id, "gate_a");
+        assert_eq!(outcome.via, "human");
+
+        // gate_b is untouched and still parked; the run stays
+        // AwaitingApproval (NOT Rejected — the set is non-empty).
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::AwaitingApproval);
+        assert_eq!(reloaded.awaiting.len(), 1);
+        assert_eq!(reloaded.awaiting[0].step_id, "gate_b");
+    }
+
+    #[test]
+    fn resolve_reject_gate_with_no_gate_on_a_multi_gate_run_errors_listing_candidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let rec = two_gate_awaiting_record("run_cli_reject_ambiguous");
+        store.create(rec.clone(), TWO_GATE_YAML).unwrap();
+
+        let err = resolve_reject_gate(&store, &rec.id, None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("gate_a"), "message: {msg}");
+        assert!(msg.contains("gate_b"), "message: {msg}");
+        assert!(msg.contains("--gate"), "message: {msg}");
+    }
+
+    #[test]
+    fn resolve_reject_gate_with_no_gate_on_a_single_gate_run_works_as_today() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let rec = sample_run_record(RunStatus::AwaitingApproval, None);
+        store.create(rec.clone(), "name: sample\nsteps: []\n").unwrap();
+
+        let outcome = resolve_reject_gate(&store, &rec.id, Some("no"), None).unwrap();
+        assert_eq!(outcome.step_id, "step_approve");
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Rejected);
     }
 }

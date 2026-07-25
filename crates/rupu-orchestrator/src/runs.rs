@@ -1107,8 +1107,31 @@ impl RunStore {
     /// resolve a paused run's gate `on_timeout` routing before calling
     /// [`expire_if_overdue`](Self::expire_if_overdue) themselves. Same
     /// best-effort `None`-on-any-failure contract as the private resolver.
+    ///
+    /// **Sole-gate-shaped** — resolves the policy for `record.awaiting_step_id`
+    /// (the compat mirror of the awaiting-set's FIRST gate). Task 5b-2a's
+    /// per-gate callers (the gate sweep, once a run genuinely batch-parks
+    /// more than one gate) want
+    /// [`resolve_gate_timeout_for`](Self::resolve_gate_timeout_for) instead,
+    /// which takes the target gate's own step id explicitly.
     pub fn resolve_gate_timeout(&self, record: &RunRecord) -> Option<TimeoutAction> {
         self.gate_on_timeout(record)
+    }
+
+    /// Per-gate counterpart to [`resolve_gate_timeout`](Self::resolve_gate_timeout)
+    /// (Task 5b-2a, spec §7/§8): resolve the `on_timeout` routing configured
+    /// on the gate NODE named `step_id`, independent of which gate (if any)
+    /// the compat fields mirror. Every concurrently-parked gate can carry a
+    /// different `on_timeout` policy, so the gate sweep must resolve each
+    /// one by its own id rather than assuming "the sole/first gate" like
+    /// [`resolve_gate_timeout`](Self::resolve_gate_timeout) does. Same
+    /// best-effort `None`-on-any-failure contract.
+    pub fn resolve_gate_timeout_for(
+        &self,
+        record: &RunRecord,
+        step_id: &str,
+    ) -> Option<TimeoutAction> {
+        self.gate_on_timeout_for_step(record, step_id)
     }
 
     /// Resolve the `on_timeout` routing configured on the gate NODE
@@ -1123,6 +1146,14 @@ impl RunStore {
     /// corrupted on-disk state, not an absent policy.
     fn gate_on_timeout(&self, record: &RunRecord) -> Option<TimeoutAction> {
         let step_id = record.awaiting_step_id.as_deref()?;
+        self.gate_on_timeout_for_step(record, step_id)
+    }
+
+    /// Shared body of [`gate_on_timeout`](Self::gate_on_timeout) and
+    /// [`resolve_gate_timeout_for`](Self::resolve_gate_timeout_for) — same
+    /// snapshot-load-and-resolve logic, parametrized by an explicit
+    /// `step_id` instead of always reading it off `record.awaiting_step_id`.
+    fn gate_on_timeout_for_step(&self, record: &RunRecord, step_id: &str) -> Option<TimeoutAction> {
         let body = match self.read_workflow_snapshot(&record.id) {
             Ok(body) => body,
             Err(e) => {
@@ -1148,6 +1179,127 @@ impl RunStore {
             }
         };
         crate::workflow::gate_timeout_action(&workflow, step_id)
+    }
+
+    /// Per-gate counterpart to [`expire_if_overdue`](Self::expire_if_overdue)
+    /// (Task 5b-2a, spec §7/§8's sweep half). `expire_if_overdue` stays
+    /// sole-gate-only and byte-for-byte unchanged (the primary safety
+    /// invariant); this method is what a caller that has already resolved
+    /// a run's FULL awaiting set (`awaiting_gates()`) uses to time out ONE
+    /// named gate while every OTHER parked gate on `record.awaiting` is
+    /// left untouched.
+    ///
+    /// Action semantics, deliberately chosen so the sole-gate case is
+    /// byte-identical to `expire_if_overdue`'s (this is what makes single-
+    /// gate parity hold: with exactly one gate parked, calling this method
+    /// with that gate's id reaches the SAME terminal state
+    /// `expire_if_overdue` would):
+    /// - `Fail` (default) — an abort-the-run policy: timing out THIS gate
+    ///   fails the WHOLE run immediately, regardless of any sibling gates
+    ///   still parked (a gate authored `on_timeout: fail` is an operator
+    ///   directive that this gate's timeout is fatal to the run, not just
+    ///   to its own path — unlike `reject`, which is inherently path-scoped).
+    ///   `record.awaiting` is cleared in FULL (mirroring
+    ///   `expire_if_overdue`'s Fail arm), not just the timed-out gate's
+    ///   entry — a terminal `Failed` record carries no parked gate in
+    ///   either representation.
+    /// - `Reject` — a path-scoped decision: only THIS gate is removed from
+    ///   the set. The run transitions to `Rejected` only once removing it
+    ///   EMPTIES the set (mirroring [`reject_gate`](Self::reject_gate)'s
+    ///   empties-the-set-transitions-out rule); otherwise the record stays
+    ///   `AwaitingApproval` with the remaining gates untouched. The CALLER
+    ///   is responsible for then running this gate's own `on_reject`
+    ///   cleanup chain — same contract as `expire_if_overdue`'s Reject arm.
+    /// - `Approve` — mutate NOTHING; the record stays `AwaitingApproval`
+    ///   exactly as it was. The CALLER resumes THIS gate exactly like an
+    ///   operator approve (`approve_gate(.., Some(step_id))`).
+    ///
+    /// Returns `Ok(Some(action))` when this gate's expiry fired (telling
+    /// the caller which action was taken/is needed), `Ok(None)` when it
+    /// wasn't overdue — covering: the run isn't `AwaitingApproval`,
+    /// `step_id` isn't currently one of the parked gates, or that gate has
+    /// no `timeout_seconds` set.
+    pub fn expire_gate_if_overdue(
+        &self,
+        record: &mut RunRecord,
+        step_id: &str,
+        now: DateTime<Utc>,
+        on_timeout: Option<TimeoutAction>,
+    ) -> Result<Option<TimeoutAction>, RunStoreError> {
+        if record.status != RunStatus::AwaitingApproval {
+            return Ok(None);
+        }
+        let gates = record.awaiting_gates();
+        let Some(gate) = gates.iter().find(|g| g.step_id == step_id).cloned() else {
+            return Ok(None);
+        };
+        let Some(expires_at) = gate.expires_at else {
+            return Ok(None);
+        };
+        if now <= expires_at {
+            return Ok(None);
+        }
+        let action = on_timeout.unwrap_or(TimeoutAction::Fail);
+        if action == TimeoutAction::Approve {
+            // Gate policy resolves the timed-out wait to an auto-approve:
+            // leave the record untouched (still `AwaitingApproval`) and
+            // tell the caller to proceed exactly as if an operator had
+            // approved THIS gate.
+            return Ok(Some(TimeoutAction::Approve));
+        }
+        let waited = expires_at - gate.since;
+        let message = format!(
+            "approval expired: paused at step `{step_id}` waited longer than {}s without approval",
+            waited.num_seconds()
+        );
+        match action {
+            TimeoutAction::Fail => {
+                record.finished_at = Some(now);
+                record.error_message = Some(message);
+                record.status = RunStatus::Failed;
+                // Fail is an abort-the-run policy — clear the WHOLE set,
+                // not just the timed-out gate (see this method's doc).
+                record.awaiting.clear();
+                record.sync_awaiting_compat();
+                self.update(record)?;
+                self.append_terminal_event(
+                    &record.id,
+                    &crate::executor::Event::RunFailed {
+                        run_id: record.id.clone(),
+                        error: record
+                            .error_message
+                            .clone()
+                            .unwrap_or_else(|| "approval expired".into()),
+                        finished_at: now,
+                    },
+                );
+                Ok(Some(TimeoutAction::Fail))
+            }
+            TimeoutAction::Reject => {
+                let mut remaining = gates;
+                remaining.retain(|g| g.step_id != step_id);
+                record.awaiting = remaining;
+                if record.awaiting.is_empty() {
+                    record.status = RunStatus::Rejected;
+                    record.error_message = Some(message);
+                    record.finished_at = Some(now);
+                }
+                record.sync_awaiting_compat();
+                self.update(record)?;
+                if record.status == RunStatus::Rejected {
+                    self.append_terminal_event(
+                        &record.id,
+                        &crate::executor::Event::RunCompleted {
+                            run_id: record.id.clone(),
+                            status: RunStatus::Rejected,
+                            finished_at: now,
+                        },
+                    );
+                }
+                Ok(Some(TimeoutAction::Reject))
+            }
+            TimeoutAction::Approve => unreachable!("handled above"),
+        }
     }
 }
 
@@ -3020,6 +3172,195 @@ mod tests {
         let done = store.load(&rec.id).unwrap();
         assert_eq!(done.status, RunStatus::Rejected);
         assert!(done.awaiting.is_empty());
+    }
+
+    // ── Task 5b-2a: per-gate expiry (`expire_gate_if_overdue`) ──────────
+
+    fn two_gate_record_with_expiry(
+        id: &str,
+        gate_a_expires_at: Option<DateTime<Utc>>,
+        gate_b_expires_at: Option<DateTime<Utc>>,
+    ) -> RunRecord {
+        let mut rec = sample_record(id);
+        rec.status = RunStatus::AwaitingApproval;
+        let since = Utc::now() - chrono::Duration::seconds(120);
+        rec.awaiting = vec![
+            AwaitingGate {
+                step_id: "gate_a".into(),
+                prompt: Some("approve a?".into()),
+                since,
+                expires_at: gate_a_expires_at,
+            },
+            AwaitingGate {
+                step_id: "gate_b".into(),
+                prompt: Some("approve b?".into()),
+                since,
+                expires_at: gate_b_expires_at,
+            },
+        ];
+        rec.sync_awaiting_compat();
+        rec
+    }
+
+    #[test]
+    fn expire_gate_if_overdue_reject_removes_only_the_overdue_gate_leaves_sibling_parked() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        // gate_a is overdue (timeout: reject); gate_b has NO timeout set —
+        // it must never be touched by timing out gate_a.
+        let rec = two_gate_record_with_expiry(
+            "run_gate_a_overdue_reject",
+            Some(now - chrono::Duration::seconds(30)),
+            None,
+        );
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let mut loaded = rec;
+        let outcome = store
+            .expire_gate_if_overdue(&mut loaded, "gate_a", now, Some(TimeoutAction::Reject))
+            .unwrap();
+        assert_eq!(outcome, Some(TimeoutAction::Reject));
+        // Only gate_a is gone; the run stays AwaitingApproval because
+        // gate_b is still parked (Reject terminates only if it EMPTIES
+        // the set).
+        assert_eq!(loaded.status, RunStatus::AwaitingApproval);
+        assert_eq!(loaded.awaiting.len(), 1);
+        assert_eq!(loaded.awaiting[0].step_id, "gate_b");
+        assert_eq!(loaded.awaiting_step_id.as_deref(), Some("gate_b"));
+
+        let reloaded = store.load(&loaded.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::AwaitingApproval);
+        assert_eq!(reloaded.awaiting.len(), 1);
+        assert_eq!(reloaded.awaiting[0].step_id, "gate_b");
+    }
+
+    #[test]
+    fn expire_gate_if_overdue_reject_flips_rejected_once_the_sole_gate_empties_the_set() {
+        // Single-gate parity: a run with exactly ONE overdue gate must
+        // reach the SAME terminal state `expire_if_overdue` reaches.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_sole_gate_overdue_reject");
+        rec.status = RunStatus::AwaitingApproval;
+        rec.awaiting = vec![AwaitingGate {
+            step_id: "deploy".into(),
+            prompt: Some("ok?".into()),
+            since: now - chrono::Duration::seconds(120),
+            expires_at: Some(now - chrono::Duration::seconds(30)),
+        }];
+        rec.sync_awaiting_compat();
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let mut loaded = rec;
+        let outcome = store
+            .expire_gate_if_overdue(&mut loaded, "deploy", now, Some(TimeoutAction::Reject))
+            .unwrap();
+        assert_eq!(outcome, Some(TimeoutAction::Reject));
+        assert_eq!(loaded.status, RunStatus::Rejected);
+        assert!(loaded.awaiting.is_empty());
+        assert!(loaded.awaiting_step_id.is_none());
+        assert!(loaded.finished_at.is_some());
+
+        match last_event(&store, "run_sole_gate_overdue_reject") {
+            crate::executor::Event::RunCompleted { status, .. } => {
+                assert_eq!(status, RunStatus::Rejected);
+            }
+            other => panic!("expected RunCompleted(rejected), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expire_gate_if_overdue_fail_forces_whole_run_failed_even_with_sibling_parked() {
+        // `on_timeout: fail` is an abort-the-run policy: timing out gate_a
+        // fails the WHOLE run immediately, clearing gate_b too — unlike
+        // Reject, Fail does not wait for the set to empty on its own.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let rec = two_gate_record_with_expiry(
+            "run_gate_a_overdue_fail",
+            Some(now - chrono::Duration::seconds(30)),
+            None,
+        );
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let mut loaded = rec;
+        let outcome = store
+            .expire_gate_if_overdue(&mut loaded, "gate_a", now, Some(TimeoutAction::Fail))
+            .unwrap();
+        assert_eq!(outcome, Some(TimeoutAction::Fail));
+        assert_eq!(loaded.status, RunStatus::Failed);
+        assert!(
+            loaded.awaiting.is_empty(),
+            "Fail clears the WHOLE set, including sibling gate_b"
+        );
+        assert!(loaded.awaiting_step_id.is_none());
+
+        let reloaded = store.load(&loaded.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Failed);
+        assert!(reloaded.awaiting.is_empty());
+    }
+
+    #[test]
+    fn expire_gate_if_overdue_approve_leaves_record_untouched_for_that_gate() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let rec = two_gate_record_with_expiry(
+            "run_gate_a_overdue_approve",
+            Some(now - chrono::Duration::seconds(30)),
+            None,
+        );
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let mut loaded = rec.clone();
+        let outcome = store
+            .expire_gate_if_overdue(&mut loaded, "gate_a", now, Some(TimeoutAction::Approve))
+            .unwrap();
+        assert_eq!(outcome, Some(TimeoutAction::Approve));
+        // Nothing mutated — both gates untouched, not persisted.
+        assert_eq!(loaded.awaiting, rec.awaiting);
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.awaiting.len(), 2);
+    }
+
+    #[test]
+    fn expire_gate_if_overdue_is_noop_for_a_gate_not_currently_parked() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let rec = two_gate_record_with_expiry(
+            "run_gate_unknown_id",
+            Some(now - chrono::Duration::seconds(30)),
+            None,
+        );
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let mut loaded = rec;
+        let outcome = store
+            .expire_gate_if_overdue(&mut loaded, "no_such_gate", now, Some(TimeoutAction::Reject))
+            .unwrap();
+        assert!(outcome.is_none());
+        assert_eq!(loaded.awaiting.len(), 2, "unrelated gate id must not touch the set");
+    }
+
+    #[test]
+    fn expire_gate_if_overdue_is_noop_when_gate_has_no_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        // gate_b has no timeout_seconds — never expires no matter `now`.
+        let rec = two_gate_record_with_expiry("run_gate_b_no_timeout", None, None);
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let mut loaded = rec;
+        let outcome = store
+            .expire_gate_if_overdue(&mut loaded, "gate_b", now, Some(TimeoutAction::Reject))
+            .unwrap();
+        assert!(outcome.is_none());
+        assert_eq!(loaded.awaiting.len(), 2);
     }
 
     #[test]

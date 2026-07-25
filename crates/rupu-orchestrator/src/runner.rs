@@ -819,16 +819,39 @@ pub async fn run_workflow(
                 // see `GateParked`'s doc) — `record.awaiting` stays EMPTY
                 // and only the legacy compat fields carry the paused-mid-
                 // step id, exactly as before this task.
+                // Task 5b-2a (5b-1 Minor #3): a gate that was ALREADY parked
+                // before this resume cycle must keep its ORIGINAL `since`/
+                // `expires_at` rather than restarting its timeout clock. On
+                // resume, `record` (loaded from disk above, before the
+                // scheduler ran) still carries the PRE-resume awaiting set —
+                // e.g. after approving gate A, `record.awaiting` here is
+                // exactly `[gate B]` with gate B's original park instant.
+                // The scheduler recomputes the ready-set from scratch and
+                // re-reports every still-parked gate (including B) in
+                // `gates` for THIS pass, so without this lookup B would get
+                // a fresh `since: now` / `expires_at: now + timeout` every
+                // single resume — silently extending its deadline forever.
+                // Only a genuinely NEW gate (not in `prior_gates`) gets a
+                // fresh clock.
+                let prior_gates = record.awaiting.clone();
                 let gate_set: Vec<crate::runs::AwaitingGate> = match reason {
                     PauseReason::Approval => gates
                         .iter()
-                        .map(|g| crate::runs::AwaitingGate {
-                            step_id: g.step_id.clone(),
-                            prompt: Some(g.prompt.clone()),
-                            since: now,
-                            expires_at: g
-                                .timeout_seconds
-                                .map(|secs| now + chrono::Duration::seconds(secs as i64)),
+                        .map(|g| match prior_gates.iter().find(|p| p.step_id == g.step_id) {
+                            Some(prior) => crate::runs::AwaitingGate {
+                                step_id: g.step_id.clone(),
+                                prompt: Some(g.prompt.clone()),
+                                since: prior.since,
+                                expires_at: prior.expires_at,
+                            },
+                            None => crate::runs::AwaitingGate {
+                                step_id: g.step_id.clone(),
+                                prompt: Some(g.prompt.clone()),
+                                since: now,
+                                expires_at: g
+                                    .timeout_seconds
+                                    .map(|secs| now + chrono::Duration::seconds(secs as i64)),
+                            },
                         })
                         .collect(),
                     PauseReason::Manual => Vec::new(),
@@ -4113,11 +4136,19 @@ pub async fn run_reject_cleanup(
         step_results.push(result);
     }
 
-    // 4. Cleanup never changes the terminal status — `RunStore::reject`
-    //    already finalized it before this function was called.
+    // 4. Cleanup never changes the terminal status itself — that was
+    //    already decided by whichever `reject_gate`/`expire_gate_if_overdue`
+    //    call preceded this cleanup. Pre-5b-2a that was ALWAYS `Rejected`
+    //    (the sole gate, emptying the set). Task 5b-2a (spec §7): several
+    //    concurrent gates can each carry their own `on_reject` chain —
+    //    rejecting one gate of a still-parked set only removes it, and
+    //    the run stays `AwaitingApproval` until every gate resolves. This
+    //    cleanup call is scoped to ONE gate's chain regardless of which
+    //    case applies; step 5 below is what has to tell the difference.
 
-    // 5. `RunStore::reject` already appended a terminal `RunCompleted`
-    //    event before this function ran (step 1 doc comment above), but
+    // 5. `RunStore::reject_gate`/`expire_gate_if_overdue` already appended
+    //    a terminal `RunCompleted` event IF rejecting this gate emptied
+    //    the awaiting set (step 1 doc comment above), but
     //    `emit_gate_result` (step 2 above) unconditionally emits the
     //    gate's own `StepStarted`/`StepCompleted` events after that, and
     //    every cleanup step dispatched in the loop above appends its own
@@ -4131,18 +4162,31 @@ pub async fn run_reject_cleanup(
     //    `RunCompleted(Rejected)` event here — after the chain — so the
     //    log ends closed. This is a deliberate duplicate: it is NOT
     //    deduped downstream, it is simply an accepted trailing marker
-    //    that keeps the log's last line authoritative. Skipped silently
-    //    only when `opts.run_store` is `None` (in-memory runs have no
-    //    `events.jsonl` to close).
+    //    that keeps the log's last line authoritative.
+    //
+    //    Task 5b-2a: this must NOT fire while the run is still
+    //    `AwaitingApproval` — a sibling gate rejected earlier in the same
+    //    set must not falsely close the event log for a run that's still
+    //    genuinely active on another path. Reload the persisted record
+    //    and gate the re-append on it actually being terminal. Skipped
+    //    entirely when `opts.run_store` is `None` (in-memory runs have no
+    //    `events.jsonl` to close) or the record can't be reloaded (same
+    //    best-effort contract `append_terminal_event` itself already has).
     if let Some(store) = &opts.run_store {
-        store.append_terminal_event(
-            &run_id,
-            &crate::executor::Event::RunCompleted {
-                run_id: run_id.clone(),
-                status: crate::runs::RunStatus::Rejected,
-                finished_at: chrono::Utc::now(),
-            },
-        );
+        let still_awaiting = store
+            .load(&run_id)
+            .map(|r| r.status == crate::runs::RunStatus::AwaitingApproval)
+            .unwrap_or(false);
+        if !still_awaiting {
+            store.append_terminal_event(
+                &run_id,
+                &crate::executor::Event::RunCompleted {
+                    run_id: run_id.clone(),
+                    status: crate::runs::RunStatus::Rejected,
+                    finished_at: chrono::Utc::now(),
+                },
+            );
+        }
     }
 
     Ok(())
@@ -10074,6 +10118,244 @@ steps:
         assert_eq!(rec5.status, crate::runs::RunStatus::Completed);
         assert!(rec5.awaiting.is_empty());
         assert!(rec5.awaiting_step_id.is_none());
+    }
+
+    const NONLINEAR_TWO_GATE_TIMEOUT_WF: &str = r#"
+name: nonlinear-two-gate-timeout
+steps:
+  - id: fanout
+    split: [gate_a, gate_b]
+  - id: gate_a
+    approval:
+      prompt: "Approve A?"
+    next: [a]
+  - id: gate_b
+    approval:
+      prompt: "Approve B?"
+      timeout_seconds: 3600
+    next: [b]
+  - id: a
+    agent: worker
+    prompt: "do a"
+  - id: b
+    agent: worker
+    prompt: "do b"
+"#;
+
+    /// Task 5b-2a (5b-1 Minor #3, deferred): a still-parked gate must keep
+    /// its ORIGINAL `since`/`expires_at` across a resume cycle, not get a
+    /// fresh clock every time `run_workflow` re-enters. Before the fix,
+    /// `run_workflow`'s Approval-pause handling unconditionally recomputed
+    /// `since: now()` / `expires_at: now() + timeout` for EVERY gate the
+    /// scheduler re-parks on a resume pass — including a gate that was
+    /// already parked before this resume and never touched by the
+    /// operator. Approving gate_a resumes gate_a's path while gate_b (with
+    /// a real `timeout_seconds`) is re-evaluated fresh by the scheduler and
+    /// re-parks in THIS resume's `Paused` outcome; its clock must be
+    /// carried forward from the FIRST pause, not restarted.
+    #[tokio::test]
+    async fn resume_preserves_still_parked_gates_original_clock_not_a_fresh_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::runs::RunStore::new(tmp.path().join("runs")));
+        let wf = Workflow::parse(NONLINEAR_TWO_GATE_TIMEOUT_WF).unwrap();
+        assert!(is_nonlinear(&wf), "fixture must fork to exercise the DAG scheduler");
+
+        // --- Phase 1: fanout parks both gates in one batch. ---
+        let factory1 = JoinTestFactory::new(&[]);
+        let opts1 = OrchestratorRunOpts {
+            workflow: wf.clone(),
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_gate_clock".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory1),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(NONLINEAR_TWO_GATE_TIMEOUT_WF.to_string()),
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+        let res1 = run_workflow(opts1).await.expect("both gates batch-park");
+        let run_id = res1.run_id.clone();
+
+        let rec1 = store.load(&run_id).unwrap();
+        assert_eq!(rec1.awaiting.len(), 2);
+        let gate_b_before = rec1
+            .awaiting
+            .iter()
+            .find(|g| g.step_id == "gate_b")
+            .cloned()
+            .expect("gate_b must be parked after phase 1");
+        assert!(
+            gate_b_before.expires_at.is_some(),
+            "gate_b carries a real timeout_seconds — its clock must be checkable"
+        );
+
+        // A newly-parked gate always gets `since` from THIS pause instant —
+        // sanity check the fixture actually exercises a non-trivial clock
+        // before asserting it survives a resume unchanged.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // --- Phase 2: approve gate_a only; resume. gate_b re-parks in the
+        // SAME resume call — its since/expires_at must be UNCHANGED from
+        // phase 1, not recomputed against phase 2's `now()`. ---
+        store
+            .approve_gate(&run_id, "matt", chrono::Utc::now(), Some("gate_a"))
+            .expect("approve gate_a");
+
+        let factory2 = JoinTestFactory::new(&[]);
+        let opts2 = OrchestratorRunOpts {
+            workflow: wf.clone(),
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_gate_clock".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory2),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(NONLINEAR_TWO_GATE_TIMEOUT_WF.to_string()),
+            resume_from: Some(ResumeState::from_approval(
+                run_id.clone(),
+                res1.step_results.clone(),
+                "gate_a".to_string(),
+            )),
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+        let res2 = run_workflow(opts2).await.expect("resume of gate_a's path re-parks on gate_b");
+        let awaiting2 = res2.awaiting.clone().expect("gate_b must still be parked");
+        assert_eq!(awaiting2.gates.len(), 1);
+        assert_eq!(awaiting2.gates[0].step_id, "gate_b");
+
+        let rec2 = store.load(&run_id).unwrap();
+        assert_eq!(rec2.status, crate::runs::RunStatus::AwaitingApproval);
+        assert_eq!(rec2.awaiting.len(), 1);
+        let gate_b_after = &rec2.awaiting[0];
+        assert_eq!(gate_b_after.step_id, "gate_b");
+
+        // The bug: `since`/`expires_at` reset to a fresh `now()` on every
+        // resume. The fix: both are carried forward byte-for-byte from
+        // phase 1's pause instant.
+        assert_eq!(
+            gate_b_after.since, gate_b_before.since,
+            "gate_b's park instant must survive the resume unchanged"
+        );
+        assert_eq!(
+            gate_b_after.expires_at, gate_b_before.expires_at,
+            "gate_b's timeout deadline must survive the resume unchanged"
+        );
+    }
+
+    /// Counterpart to the clock-preservation test above: a gate that is
+    /// NEWLY parked in this resume pass (not present in the prior
+    /// `awaiting` set at all) must still get a FRESH `since`/`expires_at`
+    /// computed at ITS OWN pause instant — the preservation logic must not
+    /// leak into gates that have no prior record to preserve.
+    #[tokio::test]
+    async fn resume_gives_a_genuinely_new_gate_a_fresh_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::runs::RunStore::new(tmp.path().join("runs")));
+        // Linear-with-two-sequential-gates: gate_a first, gate_b only
+        // becomes reachable once gate_a is approved — so gate_b is a
+        // GENUINELY new gate on the resume that approves gate_a, not one
+        // that was already parked before it.
+        const WF: &str = r#"
+name: sequential-two-gate
+steps:
+  - id: gate_a
+    approval:
+      prompt: "Approve A?"
+  - id: gate_b
+    approval:
+      prompt: "Approve B?"
+      timeout_seconds: 3600
+"#;
+        let wf = Workflow::parse(WF).unwrap();
+
+        let opts1 = OrchestratorRunOpts {
+            workflow: wf.clone(),
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_new_gate_clock".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(JoinTestFactory::new(&[])),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(WF.to_string()),
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+        let res1 = run_workflow(opts1).await.expect("pauses at gate_a");
+        let run_id = res1.run_id.clone();
+        let rec1 = store.load(&run_id).unwrap();
+        assert_eq!(rec1.awaiting.len(), 1);
+        assert_eq!(rec1.awaiting[0].step_id, "gate_a");
+
+        let before_resume = chrono::Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        store
+            .approve_gate(&run_id, "matt", chrono::Utc::now(), Some("gate_a"))
+            .expect("approve gate_a");
+
+        let opts2 = OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_new_gate_clock".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(JoinTestFactory::new(&[])),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(WF.to_string()),
+            resume_from: Some(ResumeState::from_approval(
+                run_id.clone(),
+                res1.step_results.clone(),
+                "gate_a".to_string(),
+            )),
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+        let res2 = run_workflow(opts2).await.expect("resume reaches the newly-unlocked gate_b");
+        let awaiting2 = res2.awaiting.expect("gate_b must park");
+        assert_eq!(awaiting2.gates.len(), 1);
+        assert_eq!(awaiting2.gates[0].step_id, "gate_b");
+
+        let rec2 = store.load(&run_id).unwrap();
+        let gate_b = &rec2.awaiting[0];
+        assert_eq!(gate_b.step_id, "gate_b");
+        assert!(
+            gate_b.since > before_resume,
+            "a genuinely new gate must get a FRESH since from THIS pause instant, not \
+             something predating the resume that unlocked it"
+        );
+        assert!(gate_b.expires_at.is_some_and(|exp| exp > gate_b.since));
     }
 }
 
