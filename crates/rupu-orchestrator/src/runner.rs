@@ -1122,10 +1122,11 @@ async fn run_scheduler(
 
     let mut indegree: Vec<usize> = vec![0; n];
     let mut successors: Vec<Vec<usize>> = vec![Vec::new(); n];
-    if crate::workflow::workflow_has_explicit_edges(wf) {
-        // Graph-mode workflow (`next:`/`split:`/`join:` present somewhere):
-        // use the real dependency graph — control edges union inferred data
-        // edges — exactly as authored. Independent nodes are MEANT to run
+    if is_nonlinear(wf) {
+        // Genuinely non-linear (split/join/fork, or explicit edges whose
+        // declaration order isn't already topological): use the real
+        // dependency graph — control edges union inferred data edges —
+        // exactly as authored. Independent nodes are MEANT to run
         // concurrently here; that's the whole point of Phase 2.
         for (a, b) in &workflow_edges(wf) {
             if let (Some(&ai), Some(&bi)) = (index_of.get(a.as_str()), index_of.get(b.as_str())) {
@@ -1134,22 +1135,34 @@ async fn run_scheduler(
             }
         }
     } else {
-        // Legacy (edge-free) workflow: declaration order alone IS the
-        // control flow (same invariant `validate_template_refs`/
-        // `is_nonlinear` already rely on) — `workflow_edges`' inferred data
-        // edges are NOT a complete substitute for it. Two declaration-
-        // adjacent steps that don't reference each other's `steps.*`
-        // output and aren't joined by any `next:` have NO edge between
-        // them in that graph, yet the legacy contract still requires the
-        // earlier one to fully finish before the later one starts (e.g.
-        // `gate-demo.yaml`'s `assess` step and its unrelated `ship_gate`
-        // approval gate — this exact gap broke the golden test before this
-        // fix, since both would otherwise read as simultaneously "ready").
-        // Synthesizing the full chain `steps[i] -> steps[i+1]` is strictly
-        // sufficient (a superset of any real data edge: by the time node
-        // `i+1` is ready every one of `0..=i` is already done) and keeps
-        // graph width at 1 throughout, so `run_scheduler` degenerates to
-        // the exact one-at-a-time order `run_steps_inner` walks.
+        // Every workflow the LIVE boundary (`run_workflow`'s `is_nonlinear`
+        // honesty gate, ~line 564) treats as linear — edge-free, OR
+        // carrying explicit edges that still happen to be declaration-
+        // order-topological (e.g. `a (next:[b]); b; c`, an independent
+        // trailing step alongside a partial explicit chain) — MUST get the
+        // exact declaration-order chain here, not `workflow_edges`' graph.
+        // Gating on `workflow_has_explicit_edges` instead of `is_nonlinear`
+        // is wrong: it would route that `a;b;c` example into the
+        // explicit-edges branch below, where Kahn's algorithm sees `a` and
+        // `c` as simultaneously ready (no edge relates them) and dispatches
+        // them concurrently — reordering `step_results` vs
+        // `run_steps_inner`'s deterministic `a, b, c` the moment a later
+        // task lifts the `is_nonlinear` gate and this becomes the live
+        // path. `workflow_edges`' inferred data edges are ALSO not a
+        // complete substitute for declaration order even in the plain
+        // edge-free case: two declaration-adjacent steps that don't
+        // reference each other's `steps.*` output and aren't joined by any
+        // `next:` have NO edge between them in that graph, yet the legacy
+        // contract still requires the earlier one to fully finish before
+        // the later one starts (e.g. `gate-demo.yaml`'s `assess` step and
+        // its unrelated `ship_gate` approval gate — this exact gap broke
+        // the golden test before this fix, since both would otherwise read
+        // as simultaneously "ready"). Synthesizing the full chain
+        // `steps[i] -> steps[i+1]` is strictly sufficient (a superset of
+        // any real data or partial-explicit edge: by the time node `i+1`
+        // is ready every one of `0..=i` is already done) and keeps graph
+        // width at 1 throughout, so `run_scheduler` degenerates to the
+        // exact one-at-a-time order `run_steps_inner` walks.
         for i in 0..n.saturating_sub(1) {
             successors[i].push(i + 1);
             indegree[i + 1] += 1;
@@ -7102,6 +7115,60 @@ mod dag_scheduler_golden {
                 "{name}: run_scheduler must reproduce run_steps_inner exactly"
             );
         }
+    }
+
+    /// Regression test (found in review): the synthesized declaration-order
+    /// chain in `run_scheduler` must be gated on `is_nonlinear`, NOT
+    /// `workflow_has_explicit_edges`. Every sample above is edge-free, so
+    /// none of them exercise the explicit-edges branch at all — this
+    /// fixture is `is_nonlinear == false` (the exact boundary
+    /// `run_workflow`'s honesty gate uses) yet DOES carry a partial
+    /// explicit edge (`a: next: [b]`) alongside an independent trailing
+    /// step `c` with no edge to/from `a`/`b` whatsoever. Gating on
+    /// `workflow_has_explicit_edges` (true here) would route this into the
+    /// real-dependency-graph branch, where Kahn's algorithm sees `a` and
+    /// `c` as simultaneously ready (`workflow_edges` only contains `a ->
+    /// b`) and dispatches them concurrently — silently reordering
+    /// `step_results` vs `run_steps_inner`'s deterministic `a, b, c` the
+    /// moment a later task lifts the `is_nonlinear` gate and this becomes
+    /// the live path. Confirmed to FAIL against the pre-fix
+    /// `workflow_has_explicit_edges` gate (see this task's report) and
+    /// PASS against the `is_nonlinear` gate below.
+    #[tokio::test]
+    async fn scheduler_matches_loop_for_partial_explicit_edges_with_independent_step() {
+        const RAW: &str = r#"
+name: partial-edges-plus-independent-step
+steps:
+  - id: a
+    agent: ag
+    prompt: "do a"
+    next: [b]
+  - id: b
+    agent: ag
+    prompt: "do b"
+  - id: c
+    agent: ag
+    prompt: "do c"
+"#;
+        let wf = Workflow::parse(RAW).unwrap();
+        assert!(
+            !crate::workflow::is_nonlinear(&wf),
+            "fixture must be is_nonlinear == false to exercise the gap this test guards"
+        );
+        assert!(
+            crate::workflow::workflow_has_explicit_edges(&wf),
+            "fixture must carry an explicit edge — the whole point is is_nonlinear and \
+             workflow_has_explicit_edges disagree here"
+        );
+
+        let name = "partial-edges-plus-independent-step";
+        let golden = run_one(Driver::Loop, name, RAW).await;
+        let scheduled = run_one(Driver::Scheduler, name, RAW).await;
+        assert_eq!(
+            golden, scheduled,
+            "run_scheduler must reproduce run_steps_inner exactly for a partial-explicit-edges \
+             workflow that is_nonlinear still treats as linear"
+        );
     }
 }
 
