@@ -188,6 +188,14 @@ pub enum WorkflowParseError {
     OrchestrationNodeHasWork { step: String, kind: String },
     #[error("step `{step}`: `join.wait.count` must be at least 1")]
     JoinCountInvalid { step: String },
+    #[error(
+        "step `{step}`: `join.wait.count` ({count}) exceeds the number of inbound paths that can feed it ({inbound})"
+    )]
+    JoinCountExceedsInbound {
+        step: String,
+        count: u32,
+        inbound: usize,
+    },
 }
 
 /// How a workflow gets kicked off. Manual is the existing behavior
@@ -2010,6 +2018,17 @@ pub(crate) fn workflow_has_explicit_edges(wf: &Workflow) -> bool {
 ///   is acyclic, via Kahn's algorithm.
 fn validate_graph(wf: &Workflow) -> Result<(), WorkflowParseError> {
     let ids: BTreeSet<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
+
+    // Computed once up front (control edges union inferred data edges) so
+    // both the `join.wait.count` inbound-degree check below and cycle
+    // detection at the bottom of this function reuse the same edge set
+    // instead of recomputing it.
+    let edges = workflow_edges(wf);
+    let mut inbound_degree: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, b) in &edges {
+        *inbound_degree.entry(b.as_str()).or_insert(0) += 1;
+    }
+
     for step in &wf.steps {
         let is_orch = step.split.is_some() || step.join.is_some();
         let has_work = step.agent.is_some()
@@ -2038,6 +2057,18 @@ fn validate_graph(wf: &Workflow) -> Result<(), WorkflowParseError> {
                     step: step.id.clone(),
                 });
             }
+            // A join can never actually reach a count higher than the
+            // number of paths that feed it — reject at parse time rather
+            // than let the scheduler wait forever on inbound paths that
+            // don't exist (spec §5).
+            let inbound = inbound_degree.get(step.id.as_str()).copied().unwrap_or(0);
+            if (*count as usize) > inbound {
+                return Err(WorkflowParseError::JoinCountExceedsInbound {
+                    step: step.id.clone(),
+                    count: *count,
+                    inbound,
+                });
+            }
         }
         for t in step.next.iter().chain(step.split.iter().flatten()) {
             if t == &step.id {
@@ -2055,7 +2086,6 @@ fn validate_graph(wf: &Workflow) -> Result<(), WorkflowParseError> {
     }
 
     // Cycle detection over the full dependency graph (Kahn's algorithm).
-    let edges = workflow_edges(wf);
     let mut indeg: BTreeMap<&str, usize> = wf.steps.iter().map(|s| (s.id.as_str(), 0)).collect();
     let mut adj: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (a, b) in &edges {
@@ -2696,9 +2726,9 @@ steps:
             any.steps[1].join.as_ref().unwrap().wait,
             JoinWait::Keyword(JoinWaitKeyword::Any)
         ));
-        let cnt = Workflow::parse("name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: j\n    join: { wait: { count: 2 } }\n").unwrap();
+        let cnt = Workflow::parse("name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [j]\n  - id: b\n    agent: x\n    prompt: p\n    next: [j]\n  - id: j\n    join: { wait: { count: 2 } }\n").unwrap();
         assert!(matches!(
-            cnt.steps[1].join.as_ref().unwrap().wait,
+            cnt.steps[2].join.as_ref().unwrap().wait,
             JoinWait::Count { count: 2 }
         ));
     }
@@ -2717,16 +2747,16 @@ steps:
             assert_eq!(wf2.steps[1].join.as_ref().unwrap().wait, expected);
         }
 
-        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: j\n    join: { wait: { count: 2 } }\n";
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [j]\n  - id: b\n    agent: x\n    prompt: p\n    next: [j]\n  - id: j\n    join: { wait: { count: 2 } }\n";
         let wf = Workflow::parse(raw).unwrap();
         assert_eq!(
-            wf.steps[1].join.as_ref().unwrap().wait,
+            wf.steps[2].join.as_ref().unwrap().wait,
             JoinWait::Count { count: 2 }
         );
         let out = serde_yaml::to_string(&wf).unwrap();
         let wf2 = Workflow::parse(&out).unwrap();
         assert_eq!(
-            wf2.steps[1].join.as_ref().unwrap().wait,
+            wf2.steps[2].join.as_ref().unwrap().wait,
             JoinWait::Count { count: 2 }
         );
     }
@@ -2793,6 +2823,32 @@ steps:
             Workflow::parse(raw).unwrap_err(),
             WorkflowParseError::JoinCountInvalid { .. }
         ));
+    }
+
+    #[test]
+    fn join_count_exceeding_inbound_degree_is_invalid() {
+        // Only 2 inbound edges (a, b) feed `j`, but `count: 3` demands more
+        // paths than can ever arrive — must be rejected at parse time
+        // rather than let the scheduler wait forever.
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [j]\n  - id: b\n    agent: x\n    prompt: p\n    next: [j]\n  - id: j\n    join: { wait: { count: 3 } }\n";
+        let err = Workflow::parse(raw).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WorkflowParseError::JoinCountExceedsInbound {
+                    count: 3,
+                    inbound: 2,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn join_count_equal_to_inbound_degree_is_valid() {
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [j]\n  - id: b\n    agent: x\n    prompt: p\n    next: [j]\n  - id: j\n    join: { wait: { count: 2 } }\n";
+        Workflow::parse(raw).expect("count equal to inbound degree must be accepted");
     }
 
     #[test]

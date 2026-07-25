@@ -1120,9 +1120,21 @@ async fn run_scheduler(
         .map(|(i, s)| (s.id.as_str(), i))
         .collect();
 
+    // Captured once — both the graph-construction choice just below and
+    // the branch-pruning arm further down (which needs REAL reachability
+    // over the graph, not the author-declared `branch_skipped` set — Task
+    // 3, spec §6) must agree on which mode this run is in.
+    let graph_mode = is_nonlinear(wf);
     let mut indegree: Vec<usize> = vec![0; n];
     let mut successors: Vec<Vec<usize>> = vec![Vec::new(); n];
-    if is_nonlinear(wf) {
+    // Reverse of `successors` — every node's direct predecessors. Used by
+    // an explicit `join`'s inbound-set (Task 3, spec §5) and by
+    // loser-cancellation's ancestor-exclusivity check (Task 3, spec §8).
+    // Only meaningful in graph mode (chain mode's `successors` is a
+    // synthesized linear chain that doesn't encode a join's real inbound
+    // edges at all — see the `else` arm below).
+    let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); n];
+    if graph_mode {
         // Genuinely non-linear (split/join/fork, or explicit edges whose
         // declaration order isn't already topological): use the real
         // dependency graph — control edges union inferred data edges —
@@ -1131,6 +1143,7 @@ async fn run_scheduler(
         for (a, b) in &workflow_edges(wf) {
             if let (Some(&ai), Some(&bi)) = (index_of.get(a.as_str()), index_of.get(b.as_str())) {
                 successors[ai].push(bi);
+                predecessors[bi].push(ai);
                 indegree[bi] += 1;
             }
         }
@@ -1165,8 +1178,33 @@ async fn run_scheduler(
         // exact one-at-a-time order `run_steps_inner` walks.
         for i in 0..n.saturating_sub(1) {
             successors[i].push(i + 1);
+            predecessors[i + 1].push(i);
             indegree[i + 1] += 1;
         }
+    }
+
+    // Explicit `join` nodes (Task 3, spec §5) — the ONE rule: a join's
+    // inbound set is exactly its `predecessors` row (edges that point at
+    // it), and its wait POLICY determines the threshold of inbound paths
+    // that must land before it fires. A `join:` anywhere makes
+    // `is_nonlinear` true (see that function), so `join_threshold` is
+    // always empty when `!graph_mode` — chain-mode workflows never
+    // exercise any of this task's join/prune/cancel machinery, which is
+    // exactly how the golden test's byte-for-byte equality stays intact
+    // without a single line of it needing to special-case "am I in chain
+    // mode".
+    let mut join_threshold: BTreeMap<usize, usize> = BTreeMap::new();
+    for (i, step) in wf.steps.iter().enumerate() {
+        let Some(j) = &step.join else { continue };
+        let inbound = predecessors[i].len();
+        let threshold = match &j.wait {
+            crate::workflow::JoinWait::Keyword(crate::workflow::JoinWaitKeyword::All) => inbound,
+            crate::workflow::JoinWait::Keyword(crate::workflow::JoinWaitKeyword::Any) => 1,
+            // `validate_graph`'s `JoinCountExceedsInbound` check already
+            // rejects `count > inbound` at parse time; nothing to clamp.
+            crate::workflow::JoinWait::Count { count } => *count as usize,
+        };
+        join_threshold.insert(i, threshold);
     }
 
     // Resume seeding: steps already in a caller-pre-seeded `step_results`
@@ -1178,6 +1216,15 @@ async fn run_scheduler(
     // otherwise, and would wrongly go ready on resume).
     let mut done: Vec<bool> = vec![false; n];
     let mut branch_skipped: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Real-reachability branch pruning (Task 3, spec §6, graph mode
+    // only — see the branch-handling arm below) and join
+    // loser-cancellation markers for a node that hasn't been dispatched
+    // yet (Task 3, spec §5/§8). Both start empty on every run, including
+    // a resumed one: rebuilding them from the persisted markers (see
+    // `drain_joins`/the skip arms below, which persist a distinguishing
+    // `output` value for exactly this purpose) is Task 4's job — this
+    // task only guarantees the decision is ON DISK.
+    let mut pruned: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for sr in step_results.iter() {
         if let Some(&i) = index_of.get(sr.step_id.as_str()) {
             done[i] = true;
@@ -1199,8 +1246,33 @@ async fn run_scheduler(
     }
 
     let mut ready: std::collections::BTreeSet<usize> = (0..n)
-        .filter(|&i| !done[i] && indegree[i] == 0)
+        .filter(|&i| !done[i] && indegree[i] == 0 && !join_threshold.contains_key(&i))
         .collect();
+
+    // Join arrival tracking (Task 3, spec §5) + loser-cancellation
+    // bookkeeping (Task 3, spec §8, first use in this arc):
+    // `in_flight_abort` lets a join resolution reach into an in-flight
+    // sibling's `JoinSet` slot and abort it directly; `task_id_to_index`
+    // recovers which of OUR node indices a `JoinError` belongs to (the
+    // error itself only carries tokio's own `task::Id`); `cancelled_by_us`
+    // distinguishes an EXPECTED abort (swallow it, keep scheduling) from a
+    // genuine panic/cancellation (propagate as `SchedulerTaskJoin`, same
+    // as before this task). See this task's report for exactly what
+    // "cancel" reaches today (the scheduler/`JoinSet` boundary — the
+    // dispatched task is aborted, so a MockProvider-backed test agent
+    // stops at its next await point) vs. Task 4's deeper agent-run
+    // interruption.
+    let mut join_state = JoinScheduling {
+        threshold: join_threshold,
+        arrived: BTreeMap::new(),
+        resolved: std::collections::BTreeSet::new(),
+    };
+    let mut cancel_state = Cancellation {
+        cancelled: std::collections::BTreeSet::new(),
+        in_flight_abort: BTreeMap::new(),
+        task_id_to_index: BTreeMap::new(),
+        cancelled_by_us: std::collections::BTreeSet::new(),
+    };
 
     let resume_paused_step_id: Option<&str> = opts
         .resume_from
@@ -1230,15 +1302,35 @@ async fn run_scheduler(
             ready.remove(&i);
             let step = &wf.steps[i];
 
-            if branch_skipped.contains(&step.id) {
-                info!(step = %step.id, "skipping (not taken by branch)");
+            let is_pruned = pruned.contains(&step.id);
+            let is_cancelled = !is_pruned && cancel_state.cancelled.contains(&step.id);
+            if branch_skipped.contains(&step.id) || is_pruned || is_cancelled {
+                // Task 3: a node can now be skipped for three distinct
+                // reasons — the pre-existing author-declared branch-arm
+                // skip-set (chain mode only), real-reachability branch
+                // pruning (spec §6, graph mode — see the branch-handling
+                // arm below), or join loser-cancellation (spec §5/§8 —
+                // see `drain_joins`). Each persists a distinguishing
+                // `output` marker so a later resume (Task 4) can tell
+                // them apart on disk.
+                let (marker, reason): (&str, &str) = if is_pruned {
+                    ("pruned", "pruned (unreachable via the taken branch arm)")
+                } else if is_cancelled {
+                    (
+                        "cancelled",
+                        "cancelled (a join resolved without waiting for this path)",
+                    )
+                } else {
+                    ("", "not taken by branch")
+                };
+                info!(step = %step.id, reason, "skipping");
                 if let Some(sink) = opts.event_sink.as_ref() {
                     sink.emit(
                         run_id,
                         &crate::executor::Event::StepSkipped {
                             run_id: run_id.to_string(),
                             step_id: step.id.clone(),
-                            reason: "not taken by branch".to_string(),
+                            reason: reason.to_string(),
                         },
                     );
                 }
@@ -1247,17 +1339,28 @@ async fn run_scheduler(
                     rendered_prompt: String::new(),
                     run_id: String::new(),
                     transcript_path: PathBuf::new(),
-                    output: String::new(),
+                    output: marker.to_string(),
                     success: false,
                     skipped: true,
                     kind: step_kind_for_run_record(step),
                     items: Vec::new(),
                     ..Default::default()
                 };
-                persist_step_result(opts, run_id, &result);
-                step_results.push(result);
-                done[i] = true;
-                unlock_successors(i, &successors, &mut indegree, &mut ready);
+                complete_and_drain_joins(
+                    i,
+                    result,
+                    wf,
+                    opts,
+                    run_id,
+                    step_results,
+                    &mut done,
+                    &successors,
+                    &predecessors,
+                    &mut indegree,
+                    &mut ready,
+                    &mut join_state,
+                    &mut cancel_state,
+                );
                 continue;
             }
 
@@ -1313,10 +1416,21 @@ async fn run_scheduler(
                         items: Vec::new(),
                         ..Default::default()
                     };
-                    persist_step_result(opts, run_id, &result);
-                    step_results.push(result);
-                    done[i] = true;
-                    unlock_successors(i, &successors, &mut indegree, &mut ready);
+                    complete_and_drain_joins(
+                        i,
+                        result,
+                        wf,
+                        opts,
+                        run_id,
+                        step_results,
+                        &mut done,
+                        &successors,
+                        &predecessors,
+                        &mut indegree,
+                        &mut ready,
+                        &mut join_state,
+                        &mut cancel_state,
+                    );
                     continue;
                 }
             }
@@ -1339,8 +1453,28 @@ async fn run_scheduler(
                 if gate_suppressed {
                     info!(step = %step.id, "gate: resuming with human approval");
                     emit_gate_result(opts, run_id, step, "approved", "human", None, step_results);
-                    done[i] = true;
-                    unlock_successors(i, &successors, &mut indegree, &mut ready);
+                    let worklist = mark_done_and_track_joins(
+                        i,
+                        &successors,
+                        &mut indegree,
+                        &mut ready,
+                        &mut done,
+                        &mut join_state,
+                    );
+                    drain_joins(
+                        worklist,
+                        wf,
+                        opts,
+                        run_id,
+                        step_results,
+                        &mut done,
+                        &successors,
+                        &predecessors,
+                        &mut indegree,
+                        &mut ready,
+                        &mut join_state,
+                        &mut cancel_state,
+                    );
                     continue;
                 }
                 if let Some(expr) = &ap.auto_approve {
@@ -1361,8 +1495,28 @@ async fn run_scheduler(
                             None,
                             step_results,
                         );
-                        done[i] = true;
-                        unlock_successors(i, &successors, &mut indegree, &mut ready);
+                        let worklist = mark_done_and_track_joins(
+                            i,
+                            &successors,
+                            &mut indegree,
+                            &mut ready,
+                            &mut done,
+                            &mut join_state,
+                        );
+                        drain_joins(
+                            worklist,
+                            wf,
+                            opts,
+                            run_id,
+                            step_results,
+                            &mut done,
+                            &successors,
+                            &predecessors,
+                            &mut indegree,
+                            &mut ready,
+                            &mut join_state,
+                            &mut cancel_state,
+                        );
                         continue;
                     }
                 }
@@ -1460,7 +1614,34 @@ async fn run_scheduler(
                     source: e,
                 })?;
                 let taken = if take { "then" } else { "else" };
-                if take {
+                if graph_mode {
+                    // Task 3, spec §6: real reachability over the graph
+                    // (`successors`, control edges union inferred data
+                    // edges — the same graph the rest of graph-mode
+                    // scheduling uses), NOT the author-declared
+                    // `branch_skipped` set the chain-mode `else` arm below
+                    // still relies on. A node reachable through BOTH the
+                    // taken and the untaken arm (a reconverge) is
+                    // deliberately excluded — `branch_prune_set` computes
+                    // the difference, not a naive union of the untaken
+                    // arm's declared ids.
+                    let (taken_ids, untaken_ids): (&[String], &[String]) = if take {
+                        (&branch.then, &branch.r#else)
+                    } else {
+                        (&branch.r#else, &branch.then)
+                    };
+                    let taken_idxs: Vec<usize> = taken_ids
+                        .iter()
+                        .filter_map(|id| index_of.get(id.as_str()).copied())
+                        .collect();
+                    let untaken_idxs: Vec<usize> = untaken_ids
+                        .iter()
+                        .filter_map(|id| index_of.get(id.as_str()).copied())
+                        .collect();
+                    for idx in branch_prune_set(&taken_idxs, &untaken_idxs, &successors) {
+                        pruned.insert(wf.steps[idx].id.clone());
+                    }
+                } else if take {
                     branch_skipped.extend(branch.r#else.iter().cloned());
                 } else {
                     branch_skipped.extend(branch.then.iter().cloned());
@@ -1487,10 +1668,21 @@ async fn run_scheduler(
                         },
                     );
                 }
-                persist_step_result(opts, run_id, &result);
-                step_results.push(result);
-                done[i] = true;
-                unlock_successors(i, &successors, &mut indegree, &mut ready);
+                complete_and_drain_joins(
+                    i,
+                    result,
+                    wf,
+                    opts,
+                    run_id,
+                    step_results,
+                    &mut done,
+                    &successors,
+                    &predecessors,
+                    &mut indegree,
+                    &mut ready,
+                    &mut join_state,
+                    &mut cancel_state,
+                );
                 continue;
             }
 
@@ -1530,10 +1722,21 @@ async fn run_scheduler(
                         },
                     );
                 }
-                persist_step_result(opts, run_id, &result);
-                step_results.push(result);
-                done[i] = true;
-                unlock_successors(i, &successors, &mut indegree, &mut ready);
+                complete_and_drain_joins(
+                    i,
+                    result,
+                    wf,
+                    opts,
+                    run_id,
+                    step_results,
+                    &mut done,
+                    &successors,
+                    &predecessors,
+                    &mut indegree,
+                    &mut ready,
+                    &mut join_state,
+                    &mut cancel_state,
+                );
                 continue;
             }
 
@@ -1574,7 +1777,7 @@ async fn run_scheduler(
             let run_id_owned = run_id.to_string();
             let step_owned = step.clone();
             let ctx_owned = ctx;
-            in_flight.spawn(async move {
+            let abort_handle = in_flight.spawn(async move {
                 let _permit = permit_sem
                     .acquire_owned()
                     .await
@@ -1589,16 +1792,47 @@ async fn run_scheduler(
                 .await;
                 (i, outcome)
             });
+            // Task 3, spec §8: recorded so a join resolving via `first`/
+            // `count` can reach into this exact in-flight slot and abort
+            // it (`cancel_state.in_flight_abort`), and so the `JoinError`
+            // that abort produces can be traced back to node `i` when it
+            // surfaces below (`cancel_state.task_id_to_index` — the
+            // `JoinError` itself only carries tokio's own `task::Id`).
+            cancel_state.task_id_to_index.insert(abort_handle.id(), i);
+            cancel_state.in_flight_abort.insert(i, abort_handle);
         }
 
         if in_flight.is_empty() {
             break;
         }
 
-        let (i, node_result) = in_flight
-            .join_next()
-            .await
-            .expect("in_flight is non-empty")?;
+        let (i, node_result) = match in_flight.join_next().await.expect("in_flight is non-empty")
+        {
+            Ok(pair) => {
+                cancel_state.in_flight_abort.remove(&pair.0);
+                pair
+            }
+            Err(join_err) => {
+                let idx = cancel_state.task_id_to_index.remove(&join_err.id());
+                if join_err.is_cancelled() {
+                    if let Some(ix) = idx {
+                        if cancel_state.cancelled_by_us.remove(&ix) {
+                            // Expected: this is a join loser we
+                            // deliberately aborted (spec §5/§8) —
+                            // `in_flight_abort` was already removed at
+                            // the moment we called `.abort()`. Swallow
+                            // and keep scheduling; this is NOT a run
+                            // failure.
+                            continue;
+                        }
+                    }
+                }
+                // A genuine panic, or a cancellation we did NOT
+                // initiate (e.g. the whole `JoinSet` being dropped) —
+                // propagate exactly as before this task.
+                return Err(RunWorkflowError::SchedulerTaskJoin(join_err));
+            }
+        };
         match node_result? {
             NodeOutcome::Paused {
                 step_id,
@@ -1616,11 +1850,32 @@ async fn run_scheduler(
             }
             NodeOutcome::Completed(result) => {
                 let done_step_id = wf.steps[i].id.clone();
-                persist_step_result(opts, run_id, &result);
                 clear_active_step(opts, run_id, &done_step_id);
-                step_results.push(result);
-                done[i] = true;
-                unlock_successors(i, &successors, &mut indegree, &mut ready);
+                if cancel_state.cancelled_by_us.remove(&i) {
+                    // Lost the abort race — tokio's own docs note a task
+                    // that had already finished when `.abort()` was
+                    // called still yields `Ok`. This node was already
+                    // written off as a join loser (the join resolved
+                    // without it); discard the straggler result rather
+                    // than double-counting it or re-triggering a join
+                    // that already fired.
+                    continue;
+                }
+                complete_and_drain_joins(
+                    i,
+                    result,
+                    wf,
+                    opts,
+                    run_id,
+                    step_results,
+                    &mut done,
+                    &successors,
+                    &predecessors,
+                    &mut indegree,
+                    &mut ready,
+                    &mut join_state,
+                    &mut cancel_state,
+                );
             }
         }
     }
@@ -1631,19 +1886,365 @@ async fn run_scheduler(
 /// Decrement node `i`'s successors' indegree (it just completed — sync
 /// resolution or an awaited async dispatch) and insert any that reach 0
 /// into `ready`. Shared by every completion path in [`run_scheduler`].
+///
+/// A successor that's an explicit `join` node (present as a key in
+/// `join_threshold`) is deliberately never inserted into `ready` here,
+/// even at indegree 0 — Task 3, spec §5: a join's readiness is governed
+/// by its wait POLICY (tracked separately in [`JoinScheduling`] and
+/// resolved by [`drain_joins`]), not by "every inbound edge resolved".
+/// For the default `wait: all` policy the two conditions coincide
+/// (`threshold == predecessors.len()`), so a join still fires at exactly
+/// the same moment it would have under plain indegree tracking — it's
+/// only `first`/`count` that need to fire EARLIER, before indegree
+/// reaches 0, which is why joins are excluded from `ready` uniformly
+/// rather than only for those two policies.
 #[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
 fn unlock_successors(
     i: usize,
     successors: &[Vec<usize>],
     indegree: &mut [usize],
     ready: &mut std::collections::BTreeSet<usize>,
+    join_threshold: &BTreeMap<usize, usize>,
 ) {
     for &s in &successors[i] {
         indegree[s] = indegree[s].saturating_sub(1);
-        if indegree[s] == 0 {
+        if indegree[s] == 0 && !join_threshold.contains_key(&s) {
             ready.insert(s);
         }
     }
+}
+
+/// Per-run join-scheduling state (Task 3, spec §5): `threshold[j]` is how
+/// many inbound paths must land before join `j` fires (`predecessors.len()`
+/// for `all`, `1` for `any`/`first`, `count` for the count form — see
+/// [`run_scheduler`]'s setup). `arrived[j]` is the list of predecessor node
+/// indices that have completed so far, in COMPLETION order (meaningful for
+/// `first`: it's the single fastest path; harmless for `all`/`count`, which
+/// don't care about order). `resolved` guards against processing the same
+/// join twice — necessary because `count == predecessors.len()` makes the
+/// early-arrival path and a (hypothetical) indegree-driven path coincide,
+/// and because [`drain_joins`] can cascade (a join feeding another join).
+#[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
+struct JoinScheduling {
+    threshold: BTreeMap<usize, usize>,
+    arrived: BTreeMap<usize, Vec<usize>>,
+    resolved: std::collections::BTreeSet<usize>,
+}
+
+/// Loser-cancellation bookkeeping (Task 3, spec §8, first use in this arc).
+/// `cancelled` is the string (step-id) set the ready-drain loop's skip
+/// check consults for a node that was never dispatched at all — the same
+/// shape as `branch_skipped`/`pruned`. `in_flight_abort` holds every
+/// currently-spawned node's `AbortHandle`, keyed by OUR node index, so a
+/// join resolution can reach in and cancel one directly.
+/// `task_id_to_index` is the reverse lookup a `JoinError` needs (it only
+/// carries tokio's own `task::Id`, not our index). `cancelled_by_us`
+/// distinguishes an abort WE initiated (swallow the resulting `JoinError`,
+/// or discard a straggler `Ok` that won the race against the abort) from
+/// a genuine panic or an externally-initiated cancellation (still a hard
+/// error, exactly as before this task).
+///
+/// **What "cancel" reaches today, vs. Task 4:** aborting the
+/// `tokio::spawn`ed task stops the dispatch at its next `.await` point —
+/// for a real agent run that's wherever `rupu_agent::run_agent`'s own
+/// internal awaits are (a provider call, a tool run), so the in-flight
+/// HTTP/tool work is dropped, not gracefully interrupted mid-turn. Task
+/// 4's "cancel is restart-aware" (spec §8) — checkpointing partial
+/// progress so a restart resumes rather than reruns from scratch — is
+/// NOT implemented here; a cancelled node simply never gets a
+/// `StepResult` and is never retried within the same run.
+#[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
+struct Cancellation {
+    cancelled: std::collections::BTreeSet<String>,
+    in_flight_abort: BTreeMap<usize, tokio::task::AbortHandle>,
+    task_id_to_index: BTreeMap<tokio::task::Id, usize>,
+    cancelled_by_us: std::collections::BTreeSet<usize>,
+}
+
+/// Transitive closure (including every start node) reachable by following
+/// `adj` from every node in `starts`. Shared by two Task-3 reachability
+/// questions that are mirror images of each other:
+/// - Branch pruning (spec §6): forward, over `successors` — "everything
+///   downstream of the untaken arm".
+/// - Join loser-cancellation's ancestor-exclusivity check (spec §5/§8):
+///   backward, over `predecessors` — "everything upstream of a losing
+///   inbound path".
+///
+/// In both cases, a node belongs EXCLUSIVELY to one side of a fork iff
+///   it's reachable from that side and NOT reachable from the other — see
+///   [`branch_prune_set`] and [`drain_joins`], which both compute a set
+///   difference of two `reachable_via` calls.
+#[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
+fn reachable_via(
+    starts: &[usize],
+    adj: &[Vec<usize>],
+) -> std::collections::BTreeSet<usize> {
+    let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut stack: Vec<usize> = starts.to_vec();
+    while let Some(n) = stack.pop() {
+        if seen.insert(n) {
+            stack.extend(adj[n].iter().copied());
+        }
+    }
+    seen
+}
+
+/// Task 3, spec §6: the subgraph reachable ONLY through `untaken_targets`
+/// — i.e. reachable from the untaken arm and NOT also reachable from the
+/// taken arm. A node reachable via both (a reconverge) is excluded, per
+/// the spec's own critical rule. Only meaningful in graph mode (`successors`
+/// built from [`workflow_edges`], which includes branch-arm edges); chain
+/// mode never calls this — see [`run_scheduler`]'s branch-handling arm.
+#[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
+fn branch_prune_set(
+    taken_targets: &[usize],
+    untaken_targets: &[usize],
+    successors: &[Vec<usize>],
+) -> std::collections::BTreeSet<usize> {
+    let reach_taken = reachable_via(taken_targets, successors);
+    let reach_untaken = reachable_via(untaken_targets, successors);
+    reach_untaken.difference(&reach_taken).copied().collect()
+}
+
+/// The non-persisting half of "a node just resolved": mark it `done`,
+/// unlock its successors' indegree (a pruned/skipped/cancelled node's
+/// resolution counts exactly like a real completion for this purpose —
+/// Task 3, spec §6's requirement that a pruned predecessor not block a
+/// downstream reconverge), and record this node's arrival against every
+/// join it directly feeds (Task 3, spec §5). Returns the indices of
+/// joins whose threshold is newly satisfied — the caller
+/// ([`drain_joins`]) resolves those. Split out from [`finish_node`] so
+/// the two call sites that persist via [`emit_gate_result`] (which
+/// already pushes a `StepResult` itself) don't push a second one.
+#[allow(dead_code, clippy::too_many_arguments)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
+fn mark_done_and_track_joins(
+    i: usize,
+    successors: &[Vec<usize>],
+    indegree: &mut [usize],
+    ready: &mut std::collections::BTreeSet<usize>,
+    done: &mut [bool],
+    joins: &mut JoinScheduling,
+) -> Vec<usize> {
+    done[i] = true;
+    unlock_successors(i, successors, indegree, ready, &joins.threshold);
+    let mut newly_satisfied = Vec::new();
+    for &s in &successors[i] {
+        if joins.resolved.contains(&s) {
+            continue;
+        }
+        let Some(&threshold) = joins.threshold.get(&s) else {
+            continue;
+        };
+        let arrived = joins.arrived.entry(s).or_default();
+        if !arrived.contains(&i) {
+            arrived.push(i);
+        }
+        if arrived.len() >= threshold {
+            newly_satisfied.push(s);
+        }
+    }
+    newly_satisfied
+}
+
+/// Persist + push a completed/skipped/pruned/cancelled node's
+/// `StepResult`, then run [`mark_done_and_track_joins`]. The shared tail
+/// every completion path in [`run_scheduler`] calls (mirroring what the
+/// pre-Task-3 code did inline at each site — skip / when-skip / branch /
+/// split / the async `Completed` arm — now also join-aware).
+#[allow(dead_code, clippy::too_many_arguments)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
+fn finish_node(
+    i: usize,
+    result: StepResult,
+    opts: &OrchestratorRunOpts,
+    run_id: &str,
+    step_results: &mut Vec<StepResult>,
+    done: &mut [bool],
+    successors: &[Vec<usize>],
+    indegree: &mut [usize],
+    ready: &mut std::collections::BTreeSet<usize>,
+    joins: &mut JoinScheduling,
+) -> Vec<usize> {
+    persist_step_result(opts, run_id, &result);
+    step_results.push(result);
+    mark_done_and_track_joins(i, successors, indegree, ready, done, joins)
+}
+
+/// Resolve every join in `worklist` (Task 3, spec §5), cascading if
+/// resolving one join newly satisfies another (a join feeding a join).
+/// For each join `j`:
+/// 1. **Winners** are `joins.arrived[j]` (already exactly `threshold`
+///    entries, in arrival order — the scheduler processes one node
+///    completion at a time, so there's no race within this single-
+///    threaded bookkeeping). **Losers** are `j`'s other direct
+///    predecessors.
+/// 2. **Cancellation** (spec §8): compute the ancestor-exclusive closure
+///    of the losers (reachable backward from `losers`, minus reachable
+///    backward from `winners` — the same `reachable_via`
+///    set-difference [`branch_prune_set`] uses forward). Every node in
+///    that closure that isn't already `done` is either aborted (if
+///    currently in-flight — `cancel.in_flight_abort`) or marked
+///    `cancelled` (if not yet dispatched) so the ready-drain loop's skip
+///    check resolves it as a no-op instead of ever running it. **Known
+///    limitation** (mirrors branch pruning's own): a node that feeds
+///    BOTH a losing path and some entirely unrelated part of the graph
+///    would be cancelled here too — the closure only knows about this
+///    join's winners/losers, not the whole graph's other consumers. Not
+///    exercised by any workflow shape this task's tests or the golden
+///    set cover; flagged for Task 4/5.
+/// 3. **Merge** (spec §5's ONE rule): the join's own `StepResult.items`
+///    is one [`ItemResult`] per winner, `sub_id` = that winner's step id
+///    (source-keyed) — `base_context_for_step` turns this into BOTH
+///    `steps.<join>.results` (ordered list of output strings, winner
+///    arrival order) and `steps.<join>.sub_results.<source_id>.output`
+///    (keyed lookup) for free, with no new `StepOutput` field. See this
+///    task's report for the exact shape + a template example.
+#[allow(dead_code, clippy::too_many_arguments)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
+fn drain_joins(
+    mut worklist: Vec<usize>,
+    wf: &Workflow,
+    opts: &OrchestratorRunOpts,
+    run_id: &str,
+    step_results: &mut Vec<StepResult>,
+    done: &mut [bool],
+    successors: &[Vec<usize>],
+    predecessors: &[Vec<usize>],
+    indegree: &mut [usize],
+    ready: &mut std::collections::BTreeSet<usize>,
+    joins: &mut JoinScheduling,
+    cancel: &mut Cancellation,
+) {
+    while let Some(j) = worklist.pop() {
+        if !joins.resolved.insert(j) {
+            continue;
+        }
+        let winners = joins.arrived.get(&j).cloned().unwrap_or_default();
+        let losers: Vec<usize> = predecessors[j]
+            .iter()
+            .copied()
+            .filter(|p| !winners.contains(p))
+            .collect();
+
+        if !losers.is_empty() {
+            let reach_losers = reachable_via(&losers, predecessors);
+            let reach_winners = reachable_via(&winners, predecessors);
+            for idx in reach_losers.difference(&reach_winners).copied() {
+                if done[idx] {
+                    continue;
+                }
+                if let Some(handle) = cancel.in_flight_abort.remove(&idx) {
+                    handle.abort();
+                    cancel.cancelled_by_us.insert(idx);
+                } else {
+                    cancel.cancelled.insert(wf.steps[idx].id.clone());
+                    ready.remove(&idx);
+                }
+            }
+        }
+
+        let join_timer = std::time::Instant::now();
+        let mut items = Vec::with_capacity(winners.len());
+        let mut outputs = Vec::with_capacity(winners.len());
+        let mut all_success = true;
+        for (idx0, &w) in winners.iter().enumerate() {
+            let source_id = wf.steps[w].id.clone();
+            let src = step_results
+                .iter()
+                .rev()
+                .find(|sr| sr.step_id == source_id)
+                .expect("a join's winner must already have a StepResult");
+            all_success = all_success && src.success;
+            outputs.push(src.output.clone());
+            items.push(ItemResult {
+                index: idx0,
+                item: serde_json::Value::Null,
+                sub_id: source_id,
+                rendered_prompt: String::new(),
+                run_id: src.run_id.clone(),
+                transcript_path: src.transcript_path.clone(),
+                output: src.output.clone(),
+                success: src.success,
+            });
+        }
+        let join_step = &wf.steps[j];
+        if let Some(sink) = opts.event_sink.as_ref() {
+            sink.emit(
+                run_id,
+                &crate::executor::Event::StepStarted {
+                    run_id: run_id.to_string(),
+                    step_id: join_step.id.clone(),
+                    kind: crate::runs::StepKind::Branch,
+                    agent: None,
+                    host: None,
+                },
+            );
+        }
+        let output = serde_json::to_string(&outputs).unwrap_or_else(|_| "[]".into());
+        let join_result = StepResult {
+            step_id: join_step.id.clone(),
+            output,
+            success: all_success,
+            skipped: false,
+            kind: crate::runs::StepKind::Branch,
+            items,
+            ..Default::default()
+        };
+        let duration_ms = join_timer.elapsed().as_millis() as u64;
+        if let Some(sink) = opts.event_sink.as_ref() {
+            sink.emit(
+                run_id,
+                &crate::executor::Event::StepCompleted {
+                    run_id: run_id.to_string(),
+                    step_id: join_step.id.clone(),
+                    success: all_success,
+                    duration_ms,
+                    host: None,
+                },
+            );
+        }
+        let more = finish_node(
+            j, join_result, opts, run_id, step_results, done, successors, indegree, ready, joins,
+        );
+        worklist.extend(more);
+    }
+}
+
+/// [`finish_node`] followed by [`drain_joins`] — the common case (every
+/// completion path except the two `emit_gate_result`-backed gate-approval
+/// sites, which push their own `StepResult` and call
+/// [`mark_done_and_track_joins`] + [`drain_joins`] directly).
+#[allow(dead_code, clippy::too_many_arguments)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
+fn complete_and_drain_joins(
+    i: usize,
+    result: StepResult,
+    wf: &Workflow,
+    opts: &OrchestratorRunOpts,
+    run_id: &str,
+    step_results: &mut Vec<StepResult>,
+    done: &mut [bool],
+    successors: &[Vec<usize>],
+    predecessors: &[Vec<usize>],
+    indegree: &mut [usize],
+    ready: &mut std::collections::BTreeSet<usize>,
+    joins: &mut JoinScheduling,
+    cancel: &mut Cancellation,
+) {
+    let worklist = finish_node(
+        i, result, opts, run_id, step_results, done, successors, indegree, ready, joins,
+    );
+    drain_joins(
+        worklist,
+        wf,
+        opts,
+        run_id,
+        step_results,
+        done,
+        successors,
+        predecessors,
+        indegree,
+        ready,
+        joins,
+        cancel,
+    );
 }
 
 /// The actual per-step loop body — [`run_steps_inner`]'s (and only
@@ -7572,6 +8173,433 @@ steps:
             vec!["fanout"],
             "only the already-resolved split node should be persisted; got {ids:?}"
         );
+    }
+}
+
+/// Task 3: branch pruning (spec §6) + explicit `join` (spec §5,
+/// `all`/`first`/`count`) + loser-cancellation (spec §8, first use).
+/// Exercises [`run_scheduler`] directly — same reason `scheduler_concurrency`
+/// does (not `pub`, not reachable via [`run_workflow`] until Task 5 lifts
+/// the [`is_nonlinear`] gate).
+#[cfg(test)]
+mod join_and_prune {
+    use super::*;
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_providers::types::StopReason;
+    use rupu_tools::ToolContext;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Dispatches every step to an echoing `MockProvider` turn. Any step
+    /// named in `slow` sleeps that many ms BEFORE the (near-instant)
+    /// scripted turn — the delay stands in for "this path is still doing
+    /// real work" so a `first`/`count` join's threshold is reliably met by
+    /// the OTHER (fast) inbound path first, giving deterministic winners.
+    ///
+    /// `finished` is the key proof for cancellation: it's appended to only
+    /// AFTER the sleep completes, right before the scripted turn would run.
+    /// A step that appears in `calls` (dispatch started) but NOT in
+    /// `finished` (never got past its sleep) was genuinely cancelled by an
+    /// abort — not merely "the join proceeded without waiting for it" —
+    /// since aborting a `tokio::spawn`ed task drops it at its very next
+    /// `.await` point (here, the `tokio::time::sleep`).
+    struct JoinTestFactory {
+        slow: &'static [(&'static str, u64)],
+        calls: Arc<Mutex<Vec<String>>>,
+        finished: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl JoinTestFactory {
+        fn new(slow: &'static [(&'static str, u64)]) -> Self {
+            Self {
+                slow,
+                calls: Arc::new(Mutex::new(Vec::new())),
+                finished: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StepFactory for JoinTestFactory {
+        async fn build_opts_for_step(
+            &self,
+            step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: PathBuf,
+            transcript_path: PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> AgentRunOpts {
+            self.calls.lock().unwrap().push(step_id.to_string());
+            if let Some(&(_, ms)) = self.slow.iter().find(|&&(id, _)| id == step_id) {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
+            self.finished.lock().unwrap().push(step_id.to_string());
+
+            let turn = ScriptedTurn::AssistantText {
+                text: format!("step {step_id} agent {agent_name} echo: {rendered_prompt}"),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            };
+            let provider = MockProvider::new(vec![turn]);
+            AgentRunOpts {
+                agent_name: format!("ag-{agent_name}"),
+                agent_system_prompt: "echo".into(),
+                agent_tools: None,
+                provider: Box::new(provider),
+                provider_name: "mock".into(),
+                model: "mock-1".into(),
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                max_turns: 5,
+                decider: Arc::new(BypassDecider),
+                tool_context: ToolContext::default(),
+                user_message: rendered_prompt,
+                initial_messages: Vec::new(),
+                turn_index_offset: 0,
+                mode_str: "bypass".into(),
+                no_stream: true,
+                suppress_stream_stdout: true,
+                mcp_registry: None,
+                effort: None,
+                context_window: None,
+                output_format: None,
+                output_schema: None,
+                anthropic_task_budget: None,
+                anthropic_context_management: None,
+                anthropic_speed: None,
+                parent_run_id: None,
+                depth: 0,
+                dispatchable_agents: None,
+                step_id: step_id.to_string(),
+                on_tool_call,
+                on_stream_event: None,
+                concerns: None,
+                max_tokens: DEFAULT_MAX_TOKENS,
+                scope_name: None,
+                surface_tag: None,
+                context_window_tokens: None,
+                compact_at_percent: None,
+                pause: None,
+            }
+        }
+    }
+
+    fn opts_for(
+        wf: Workflow,
+        factory: JoinTestFactory,
+        tmp: &tempfile::TempDir,
+    ) -> OrchestratorRunOpts {
+        OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_join".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: None,
+            workflow_yaml: None,
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        }
+    }
+
+    fn result_for<'a>(step_results: &'a [StepResult], id: &str) -> &'a StepResult {
+        step_results
+            .iter()
+            .find(|sr| sr.step_id == id)
+            .unwrap_or_else(|| panic!("missing StepResult for `{id}`; got {step_results:?}"))
+    }
+
+    const JOIN_ALL_WF: &str = r#"
+name: join-all
+steps:
+  - id: fanout
+    split: [a, b]
+  - id: a
+    agent: worker
+    prompt: "do a"
+    next: [gathered]
+  - id: b
+    agent: worker
+    prompt: "do b"
+    next: [gathered]
+  - id: gathered
+    join: { wait: all }
+  - id: after
+    agent: worker
+    prompt: "n={{ steps.gathered.results | length }} a={{ steps.gathered.sub_results.a.output }} b={{ steps.gathered.sub_results.b.output }}"
+"#;
+
+    /// `join: { wait: all }` over 2 inbound paths merges BOTH outputs into
+    /// `steps.<join>.results` (an ordered list) AND
+    /// `steps.<join>.sub_results.<source_id>` (keyed by source step id) —
+    /// the exact shape documented in this task's report. A downstream step
+    /// reads both forms.
+    #[tokio::test]
+    async fn join_wait_all_merges_both_inbound_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(JOIN_ALL_WF).unwrap();
+        let factory = JoinTestFactory::new(&[]);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        let gathered = result_for(&step_results, "gathered");
+        assert!(gathered.success);
+        assert_eq!(gathered.items.len(), 2, "both inbound paths waited for");
+        let sub_ids: std::collections::BTreeSet<&str> =
+            gathered.items.iter().map(|it| it.sub_id.as_str()).collect();
+        assert_eq!(sub_ids, std::collections::BTreeSet::from(["a", "b"]));
+
+        let after = result_for(&step_results, "after");
+        assert!(
+            after.output.contains("n=2"),
+            "downstream step should see steps.gathered.results | length == 2: {}",
+            after.output
+        );
+        assert!(
+            after.output.contains("a=step a agent worker echo: do a")
+                && after.output.contains("b=step b agent worker echo: do b"),
+            "downstream step should see both sub_results outputs: {}",
+            after.output
+        );
+    }
+
+    const JOIN_ANY_WF: &str = r#"
+name: join-any
+steps:
+  - id: fanout
+    split: [a, b]
+  - id: a
+    agent: worker
+    prompt: "do a"
+    next: [gathered]
+  - id: b
+    agent: worker
+    prompt: "do b"
+    next: [gathered]
+  - id: gathered
+    join: { wait: any }
+  - id: after
+    agent: worker
+    prompt: "n={{ steps.gathered.results | length }}"
+"#;
+
+    /// `wait: any` (`first`): the join proceeds on the FIRST inbound path
+    /// (`a`, dispatched with no delay) and CANCELS the other (`b`, made
+    /// artificially slow so it's still in-flight when `a` wins). The
+    /// assertion is that `b` was genuinely cancelled — dispatched (in
+    /// `calls`) but never reached past its sleep (`finished` lacks it),
+    /// and never got a `StepResult` — not merely that the join proceeded
+    /// without it.
+    #[tokio::test]
+    async fn join_wait_any_proceeds_on_first_and_cancels_the_loser() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(JOIN_ANY_WF).unwrap();
+        let factory = JoinTestFactory::new(&[("b", 300)]);
+        let calls = Arc::clone(&factory.calls);
+        let finished = Arc::clone(&factory.finished);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        let gathered = result_for(&step_results, "gathered");
+        assert!(gathered.success);
+        assert_eq!(gathered.items.len(), 1, "any: exactly one winner");
+        assert_eq!(gathered.items[0].sub_id, "a");
+
+        let after = result_for(&step_results, "after");
+        assert!(after.output.contains("n=1"));
+
+        assert!(
+            !step_results.iter().any(|sr| sr.step_id == "b"),
+            "the cancelled loser must never get a StepResult"
+        );
+        assert!(
+            calls.lock().unwrap().contains(&"b".to_string()),
+            "b must have actually been dispatched (started) before losing"
+        );
+        assert!(
+            !finished.lock().unwrap().contains(&"b".to_string()),
+            "b must have been cancelled mid-flight, not run to completion"
+        );
+    }
+
+    const JOIN_COUNT_WF: &str = r#"
+name: join-count
+steps:
+  - id: fanout
+    split: [a, b, c]
+  - id: a
+    agent: worker
+    prompt: "do a"
+    next: [gathered]
+  - id: b
+    agent: worker
+    prompt: "do b"
+    next: [gathered]
+  - id: c
+    agent: worker
+    prompt: "do c"
+    next: [gathered]
+  - id: gathered
+    join: { wait: { count: 2 } }
+  - id: after
+    agent: worker
+    prompt: "n={{ steps.gathered.results | length }}"
+"#;
+
+    /// `wait: { count: 2 }` over 3 inbound paths: proceeds once 2 land
+    /// (`a`, `b` — both dispatched with no delay), merges those 2, and
+    /// cancels the 3rd (`c`, made artificially slow).
+    #[tokio::test]
+    async fn join_wait_count_proceeds_on_two_of_three_and_cancels_the_third() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(JOIN_COUNT_WF).unwrap();
+        let factory = JoinTestFactory::new(&[("c", 300)]);
+        let calls = Arc::clone(&factory.calls);
+        let finished = Arc::clone(&factory.finished);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        let gathered = result_for(&step_results, "gathered");
+        assert!(gathered.success);
+        assert_eq!(gathered.items.len(), 2, "count:2 waits for exactly 2");
+        let sub_ids: std::collections::BTreeSet<&str> =
+            gathered.items.iter().map(|it| it.sub_id.as_str()).collect();
+        assert_eq!(sub_ids, std::collections::BTreeSet::from(["a", "b"]));
+
+        assert!(
+            !step_results.iter().any(|sr| sr.step_id == "c"),
+            "the cancelled 3rd path must never get a StepResult"
+        );
+        assert!(calls.lock().unwrap().contains(&"c".to_string()));
+        assert!(
+            !finished.lock().unwrap().contains(&"c".to_string()),
+            "c must have been cancelled mid-flight, not run to completion"
+        );
+    }
+
+    const BRANCH_PRUNE_WF: &str = r#"
+name: branch-prune
+steps:
+  - id: br
+    branch:
+      condition: "true"
+      then: [x]
+      else: [y]
+  - id: x
+    agent: worker
+    prompt: "x"
+    next: [reconverge]
+  - id: y
+    agent: worker
+    prompt: "y"
+    next: [reconverge, only_via_y]
+  - id: only_via_y
+    agent: worker
+    prompt: "only reachable via y"
+  - id: reconverge
+    agent: worker
+    prompt: "reconverge"
+"#;
+
+    /// Branch pruning (spec §6): the branch takes `then` (`x`). Real
+    /// reachability over the graph must prune `y` (the untaken arm) AND
+    /// `only_via_y` (reachable ONLY through `y`) — neither is ever
+    /// dispatched — while `reconverge` (reachable through BOTH `x` and
+    /// `y`) still runs exactly once, on the live `x` arm, once `y`'s
+    /// pruned-resolution has unblocked its half of `reconverge`'s
+    /// indegree.
+    #[tokio::test]
+    async fn branch_prunes_the_untaken_arm_but_not_a_shared_reconverge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(BRANCH_PRUNE_WF).unwrap();
+        assert!(
+            crate::workflow::is_nonlinear(&wf),
+            "fixture must be graph mode to exercise real-reachability pruning"
+        );
+        let factory = JoinTestFactory::new(&[]);
+        let calls = Arc::clone(&factory.calls);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        let x = result_for(&step_results, "x");
+        assert!(!x.skipped && x.success, "taken arm must run: {x:?}");
+        let reconverge = result_for(&step_results, "reconverge");
+        assert!(
+            !reconverge.skipped && reconverge.success,
+            "shared reconverge must still run: {reconverge:?}"
+        );
+
+        let y = result_for(&step_results, "y");
+        assert!(y.skipped, "untaken arm must be pruned: {y:?}");
+        assert_eq!(y.output, "pruned");
+        let only_via_y = result_for(&step_results, "only_via_y");
+        assert!(
+            only_via_y.skipped,
+            "node reachable only through the untaken arm must be pruned: {only_via_y:?}"
+        );
+        assert_eq!(only_via_y.output, "pruned");
+
+        let calls = calls.lock().unwrap();
+        assert!(
+            !calls.contains(&"y".to_string()) && !calls.contains(&"only_via_y".to_string()),
+            "pruned nodes must never reach the StepFactory: {calls:?}"
+        );
+        assert!(calls.contains(&"x".to_string()) && calls.contains(&"reconverge".to_string()));
     }
 }
 
