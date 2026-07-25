@@ -1196,15 +1196,12 @@ const UNBOUNDED_MAX_CONCURRENCY: usize = 1 << 20;
 /// `OrchestrationNodeHasWork` check), so it resolves synchronously as an
 /// orchestration no-op — an instant `StepResult`, no `tokio::spawn` — the
 /// same way `branch` already resolves inline below. Its kind is
-/// [`crate::runs::StepKind::Branch`] (reused rather than adding a new
-/// `StepKind` variant: every other `StepKind` consumer lives in
-/// `rupu-cli`/`rupu-cp`, outside this crate's Task-2 scope, and several
-/// match it exhaustively with no wildcard arm; adding a variant today would
-/// require patching those crates. As of Task 5, [`is_nonlinear`] workflows
-/// DO reach this via the live `run_workflow` router — a dedicated
-/// `StepKind` for `split` is still deferred, tracked as a follow-up for
-/// whoever next touches `rupu-cli`/`rupu-cp`'s `StepKind` matches, not a
-/// correctness gap here). Marking the split `done` unlocks every one of its
+/// [`crate::runs::StepKind::Split`] (Task 5b-2b-ii: previously reused
+/// [`crate::runs::StepKind::Branch`] to avoid rippling `rupu-cli`/`rupu-cp`'s
+/// exhaustive `StepKind` matches while split was still test-only; now that
+/// split is live via [`is_nonlinear`] workflows through this same
+/// `run_workflow` router, every consumer has its own `Split` arm and the
+/// dedicated variant is no longer deferred). Marking the split `done` unlocks every one of its
 /// targets in the SAME indegree decrement pass, so they all go ready
 /// together and get dispatched concurrently on the very next drain below.
 ///
@@ -1958,7 +1955,7 @@ async fn run_scheduler(
                         &crate::executor::Event::StepStarted {
                             run_id: run_id.to_string(),
                             step_id: step.id.clone(),
-                            kind: crate::runs::StepKind::Branch,
+                            kind: crate::runs::StepKind::Split,
                             agent: None,
                             host: None,
                         },
@@ -1969,7 +1966,7 @@ async fn run_scheduler(
                     output: String::new(),
                     success: true,
                     skipped: false,
-                    kind: crate::runs::StepKind::Branch,
+                    kind: crate::runs::StepKind::Split,
                     ..Default::default()
                 };
                 let duration_ms = split_timer.elapsed().as_millis() as u64;
@@ -3548,6 +3545,8 @@ fn step_kind_for_run_record(step: &Step) -> crate::runs::StepKind {
         crate::runs::StepKind::ApprovalGate
     } else if step.branch.is_some() {
         crate::runs::StepKind::Branch
+    } else if step.split.is_some() {
+        crate::runs::StepKind::Split
     } else if step.panel.is_some() {
         crate::runs::StepKind::Panel
     } else if step.parallel.is_some() {
@@ -7901,6 +7900,20 @@ steps:
         // between them isn't asserted, only that both completed), and
         // `d` (the implicit all-join reconverge) sees BOTH of their real
         // outputs.
+        //
+        // Task 5b-2b-ii: the split node's own persisted `StepResult` must
+        // carry `StepKind::Split`, not the reused `StepKind::Branch` — this
+        // is the exact render-correctness defect this task fixes.
+        let s = res
+            .step_results
+            .iter()
+            .find(|sr| sr.step_id == "s")
+            .expect("the split node itself has a persisted StepResult");
+        assert_eq!(
+            s.kind,
+            crate::runs::StepKind::Split,
+            "a live split node must persist kind: Split, not the reused Branch"
+        );
         let a = res
             .step_results
             .iter()
@@ -10544,7 +10557,7 @@ steps:
             StepResult {
                 step_id: "fanout".into(),
                 success: true,
-                kind: crate::runs::StepKind::Branch,
+                kind: crate::runs::StepKind::Split,
                 ..Default::default()
             },
             StepResult {

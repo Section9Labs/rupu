@@ -391,6 +391,17 @@ pub enum StepKind {
     Parallel,
     Panel,
     Branch,
+    /// `split:` orchestration node — fans control flow into N named
+    /// targets (no `wait:`/merge semantics of its own; each target is a
+    /// normal node with its own inbound edge). Distinct from [`Self::Branch`]
+    /// (a conditional then/else fork): a split always takes every arm.
+    /// Added in Task 5b-2b-ii; before this, a live split node persisted
+    /// `kind: Branch` (see `runner.rs`'s split-resolution sites) purely to
+    /// avoid rippling this enum's exhaustive matches while split was
+    /// test-only. A legacy on-disk `StepResult` with `kind: "branch"` for
+    /// what was actually a split node still deserializes fine — it just
+    /// renders with the branch glyph, exactly as it always has.
+    Split,
     Action,
     ApprovalGate,
 }
@@ -3495,6 +3506,7 @@ mod tests {
             StepKind::Parallel,
             StepKind::Panel,
             StepKind::Branch,
+            StepKind::Split,
             StepKind::Action,
             StepKind::ApprovalGate,
         ] {
@@ -3504,6 +3516,20 @@ mod tests {
             let parsed: StepResultRecord = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed.kind, kind);
         }
+    }
+
+    /// Task 5b-2b-ii: `Split`'s wire repr is exactly `"split"` (the same
+    /// `snake_case` convention every other variant uses), and it round-trips
+    /// through the same JSONL shape a live split-node `StepResult` is
+    /// persisted as.
+    #[test]
+    fn step_kind_split_serializes_to_snake_case_split() {
+        assert_eq!(
+            serde_json::to_string(&StepKind::Split).unwrap(),
+            "\"split\""
+        );
+        let parsed: StepKind = serde_json::from_str("\"split\"").unwrap();
+        assert_eq!(parsed, StepKind::Split);
     }
 
     #[test]
@@ -3523,6 +3549,28 @@ mod tests {
         });
         let parsed: StepResultRecord = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.kind, StepKind::Linear);
+    }
+
+    /// Task 5b-2b-ii, PRIMARY SAFETY INVARIANT: a legacy on-disk record with
+    /// `kind: "branch"` — either a real branch, or (pre-this-task) a split
+    /// node that was persisted under the reused `Branch` variant — still
+    /// deserializes cleanly as `StepKind::Branch`. Adding `Split` is
+    /// additive; it must never break reading an old record.
+    #[test]
+    fn legacy_branch_kind_record_still_deserializes_as_branch() {
+        let json = serde_json::json!({
+            "step_id": "old_split_or_branch",
+            "run_id": "run_old",
+            "transcript_path": "",
+            "output": "",
+            "success": true,
+            "skipped": false,
+            "rendered_prompt": "",
+            "kind": "branch",
+            "finished_at": Utc::now().to_rfc3339(),
+        });
+        let parsed: StepResultRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.kind, StepKind::Branch);
     }
 
     #[test]
