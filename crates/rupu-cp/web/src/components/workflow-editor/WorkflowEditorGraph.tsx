@@ -183,12 +183,13 @@ export function applyConnect(
 }
 
 /** Remove a node, scrubbing it from any surviving node's `next`/`split`
- *  successor list and any surviving branch node's then/else target list —
- *  those arrays, not a stored edges array, are what the deleted node's
- *  outgoing edges derive from, so without this an edge to a now-gone node
- *  would keep trying to derive. Chain/data-ref edges touching the deleted id
- *  simply stop existing once the id is gone from the node array — nothing
- *  else to clean up there. */
+ *  successor list, any surviving branch node's then/else target list, and
+ *  any surviving node's `depends_on` predecessor list — those arrays, not a
+ *  stored edges array, are what the deleted node's outgoing (or, for
+ *  `depends_on`, incoming) edges derive from, so without this an edge to or
+ *  from a now-gone node would keep trying to derive. Chain/data-ref edges
+ *  touching the deleted id simply stop existing once the id is gone from the
+ *  node array — nothing else to clean up there. */
 export function applyDelete(graph: WorkflowGraph, id: string): WorkflowGraph {
   const nodes = graph.nodes
     .filter((n) => n.id !== id)
@@ -197,11 +198,13 @@ export function applyDelete(graph: WorkflowGraph, id: string): WorkflowGraph {
       const els = n.data.elseTargets?.filter((t) => t !== id);
       const nxt = n.data.next?.filter((t) => t !== id);
       const spl = n.data.split?.filter((t) => t !== id);
+      const dep = n.data.depends_on?.filter((p) => p !== id);
       const changed =
         (then?.length ?? 0) !== (n.data.thenTargets?.length ?? 0) ||
         (els?.length ?? 0) !== (n.data.elseTargets?.length ?? 0) ||
         (nxt?.length ?? 0) !== (n.data.next?.length ?? 0) ||
-        (spl?.length ?? 0) !== (n.data.split?.length ?? 0);
+        (spl?.length ?? 0) !== (n.data.split?.length ?? 0) ||
+        (dep?.length ?? 0) !== (n.data.depends_on?.length ?? 0);
       if (!changed) return n;
       return {
         ...n,
@@ -211,6 +214,7 @@ export function applyDelete(graph: WorkflowGraph, id: string): WorkflowGraph {
           ...(els ? { elseTargets: els } : {}),
           ...(nxt ? { next: nxt } : {}),
           ...(spl ? { split: spl } : {}),
+          ...(dep ? { depends_on: dep } : {}),
         },
       };
     });
@@ -226,27 +230,42 @@ export function applyDelete(graph: WorkflowGraph, id: string): WorkflowGraph {
  *  Task 5 model — deleting a drawn line clears the edge it came from, not a
  *  reorder). A removed edge that derives from node-array position (legacy
  *  chain) or a `steps.X` template reference is a no-op: neither is something
- *  "delete an edge" can target individually — see the file-header comment. */
+ *  "delete an edge" can target individually — see the file-header comment.
+ *
+ *  `depends_on` is the one edge source that lives on the TARGET node instead
+ *  of the source (it's authored as "I depend on `p`", not "I lead to `t`") —
+ *  so clearing it is a second, independent pass keyed off `e.target` rather
+ *  than `e.source`. A single rendered edge can be described by BOTH an
+ *  authored `next` on the source AND an authored `depends_on` on the target
+ *  (they dedup to one edge in `deriveEdges`); deleting it clears whichever
+ *  of those fields the touched node actually carries, so the edge can't
+ *  silently reappear from the other side. */
 export function applyRemoveEdges(graph: WorkflowGraph, ids: ReadonlySet<string>): WorkflowGraph {
   const removed = deriveEdges(graph.nodes).filter((e) => ids.has(e.id));
   if (removed.length === 0) return graph;
   const nodes = graph.nodes.map((n) => {
     let data = n.data;
     for (const e of removed) {
-      if (e.source !== n.id) continue;
-      if (e.branch === 'then') {
-        if (!(data.thenTargets ?? []).includes(e.target)) continue;
-        data = { ...data, thenTargets: (data.thenTargets ?? []).filter((t) => t !== e.target) };
-      } else if (e.branch === 'else') {
-        if (!(data.elseTargets ?? []).includes(e.target)) continue;
-        data = { ...data, elseTargets: (data.elseTargets ?? []).filter((t) => t !== e.target) };
-      } else if (data.kind === 'split' && (data.split ?? []).includes(e.target)) {
-        data = { ...data, split: (data.split ?? []).filter((t) => t !== e.target) };
-      } else if ((data.next ?? []).includes(e.target)) {
-        data = { ...data, next: (data.next ?? []).filter((t) => t !== e.target) };
+      if (e.source === n.id) {
+        if (e.branch === 'then') {
+          if ((data.thenTargets ?? []).includes(e.target)) {
+            data = { ...data, thenTargets: (data.thenTargets ?? []).filter((t) => t !== e.target) };
+          }
+        } else if (e.branch === 'else') {
+          if ((data.elseTargets ?? []).includes(e.target)) {
+            data = { ...data, elseTargets: (data.elseTargets ?? []).filter((t) => t !== e.target) };
+          }
+        } else if (data.kind === 'split' && (data.split ?? []).includes(e.target)) {
+          data = { ...data, split: (data.split ?? []).filter((t) => t !== e.target) };
+        } else if ((data.next ?? []).includes(e.target)) {
+          data = { ...data, next: (data.next ?? []).filter((t) => t !== e.target) };
+        }
+        // else: this edge derives from node-array position (legacy chain) or
+        // a data-ref — nothing explicit to clear, no-op for this node.
       }
-      // else: this edge derives from node-array position (legacy chain) or a
-      // data-ref — nothing explicit to clear, no-op for this node.
+      if (e.target === n.id && (data.depends_on ?? []).includes(e.source)) {
+        data = { ...data, depends_on: (data.depends_on ?? []).filter((p) => p !== e.source) };
+      }
     }
     return data === n.data ? n : { ...n, data };
   });

@@ -971,6 +971,14 @@ pub struct Step {
     /// where flow follows list order. Non-empty makes this an explicit graph.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub next: Vec<String>,
+    /// Explicit predecessor edge(s) — the symmetric inverse of `next:`. Each
+    /// id `p` here contributes a control edge `p -> this step` (folded into
+    /// [`workflow_edges`] alongside `next`/`split`/branch edges; deduped with
+    /// an equivalent `next` describing the same edge). Empty in a legacy
+    /// (edge-free) workflow. Non-empty makes this an explicit graph, same as
+    /// a non-empty `next` (see [`workflow_has_explicit_edges`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
     /// `split` orchestration node — fans the flow into N independent concurrent
     /// tracks. Carries no agent/action/etc. (validated). Executed in Phase 2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1867,6 +1875,17 @@ pub fn workflow_edges(wf: &Workflow) -> Vec<(String, String)> {
                 edges.insert((step.id.clone(), t.clone()));
             }
         }
+        // `depends_on` is the symmetric inverse of `next`: each id `p` here
+        // contributes the control edge `p -> step.id`. Self-ref filtered
+        // (an explicit self-dependency is rejected by `validate_graph`'s
+        // EdgeSelfLoop check, not represented here); dedups with an
+        // equivalent `next`/`split`/branch edge describing the same pair
+        // via the shared BTreeSet.
+        for p in &step.depends_on {
+            if p != &step.id {
+                edges.insert((p.clone(), step.id.clone()));
+            }
+        }
         // Inferred data edges: X -> step for every steps.X reference in this step.
         for (_, tmpl) in collect_templates_for_step(step) {
             for (referenced, _field) in scan_step_refs(&tmpl) {
@@ -1914,16 +1933,29 @@ pub fn is_nonlinear(wf: &Workflow) -> bool {
     {
         return true;
     }
-    // Reconverge: any node with >1 inbound control edge.
-    let mut indeg: BTreeMap<&str, usize> = BTreeMap::new();
+    // Reconverge: any node with >1 inbound control edge. Built as a deduped
+    // edge set (next/split/branch-arm/depends_on) rather than a raw count,
+    // so a `next` and a `depends_on` describing the SAME edge (the exact
+    // dedup case `workflow_edges` also handles) don't double-count into a
+    // false-positive reconverge; a genuine `depends_on`-authored reconverge
+    // (e.g. `c depends_on: [a, b]`) is still caught since it's two distinct
+    // edges into `c`.
+    let mut control_edges: BTreeSet<(&str, &str)> = BTreeSet::new();
     for s in &wf.steps {
         for t in s.next.iter().chain(s.split.iter().flatten()).chain(
             s.branch
                 .iter()
                 .flat_map(|b| b.then.iter().chain(b.r#else.iter())),
         ) {
-            *indeg.entry(t.as_str()).or_insert(0) += 1;
+            control_edges.insert((s.id.as_str(), t.as_str()));
         }
+        for p in &s.depends_on {
+            control_edges.insert((p.as_str(), s.id.as_str()));
+        }
+    }
+    let mut indeg: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, b) in &control_edges {
+        *indeg.entry(b).or_insert(0) += 1;
     }
     if indeg.values().any(|&d| d > 1) {
         return true;
@@ -2005,14 +2037,14 @@ fn declaration_order_is_topological(wf: &Workflow) -> bool {
 }
 
 /// A workflow "has explicit edges" (is a graph workflow rather than a
-/// legacy linear one) when any step declares `next:`, `split:`, or
-/// `join:`. Legacy edge-free workflows keep running only the pre-existing
-/// forward-only `validate_branch_targets` / `validate_template_refs`
-/// checks — `validate_graph` never runs for them.
+/// legacy linear one) when any step declares `next:`, `split:`, `join:`, or
+/// `depends_on:`. Legacy edge-free workflows keep running only the
+/// pre-existing forward-only `validate_branch_targets` /
+/// `validate_template_refs` checks — `validate_graph` never runs for them.
 pub(crate) fn workflow_has_explicit_edges(wf: &Workflow) -> bool {
-    wf.steps
-        .iter()
-        .any(|s| !s.next.is_empty() || s.split.is_some() || s.join.is_some())
+    wf.steps.iter().any(|s| {
+        !s.next.is_empty() || s.split.is_some() || s.join.is_some() || !s.depends_on.is_empty()
+    })
 }
 
 /// Validate the dependency graph of a workflow that has explicit edges:
@@ -2087,7 +2119,17 @@ fn validate_graph(wf: &Workflow) -> Result<(), WorkflowParseError> {
                 }
             }
         }
-        for t in step.next.iter().chain(step.split.iter().flatten()) {
+        // `depends_on` entries are checked by the same self-loop /
+        // unknown-id logic as `next`/`split`: the check is symmetric in
+        // edge direction (self-loop is `t == step.id` either way; existence
+        // is `ids.contains(t)` either way), so chaining it in here covers
+        // depends_on with no separate error variants.
+        for t in step
+            .next
+            .iter()
+            .chain(step.split.iter().flatten())
+            .chain(step.depends_on.iter())
+        {
             if t == &step.id {
                 return Err(WorkflowParseError::EdgeSelfLoop {
                     step: step.id.clone(),
@@ -2786,6 +2828,82 @@ steps:
         assert!(!out.contains("next"), "legacy step must not emit next:");
         assert!(!out.contains("split"));
         assert!(!out.contains("join"));
+        assert!(!out.contains("depends_on"));
+    }
+
+    #[test]
+    fn parses_depends_on() {
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: p\n    depends_on: [a]\n";
+        let wf = Workflow::parse(raw).unwrap();
+        assert_eq!(wf.steps[1].depends_on, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn legacy_step_serializes_without_depends_on_key() {
+        // A step with no depends_on must round-trip with NO depends_on key
+        // at all (skip_serializing_if, mirrors `next` exactly).
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n";
+        let wf = Workflow::parse(raw).unwrap();
+        let out = serde_yaml::to_string(&wf).unwrap();
+        assert!(
+            !out.contains("depends_on"),
+            "legacy step must not emit depends_on:, got: {out}"
+        );
+        let wf2 = Workflow::parse(&out).unwrap();
+        assert!(wf2.steps[0].depends_on.is_empty());
+    }
+
+    #[test]
+    fn workflow_edges_includes_depends_on_edge() {
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: p\n    depends_on: [a]\n";
+        let wf = Workflow::parse(raw).unwrap();
+        let edges = workflow_edges(&wf);
+        assert!(edges.contains(&("a".to_string(), "b".to_string())));
+    }
+
+    #[test]
+    fn workflow_edges_dedups_next_and_depends_on_describing_the_same_edge() {
+        // a.next = [b] AND b.depends_on = [a] both describe a -> b: must
+        // collapse to exactly ONE edge in the returned set, not two.
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [b]\n  - id: b\n    agent: x\n    prompt: p\n    depends_on: [a]\n";
+        let wf = Workflow::parse(raw).unwrap();
+        let edges = workflow_edges(&wf);
+        let count = edges
+            .iter()
+            .filter(|e| e == &&("a".to_string(), "b".to_string()))
+            .count();
+        assert_eq!(count, 1, "expected exactly one a->b edge, got {edges:?}");
+    }
+
+    #[test]
+    fn depends_on_naming_unknown_step_is_rejected() {
+        let raw =
+            "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    depends_on: [ghost]\n";
+        assert!(matches!(
+            Workflow::parse(raw).unwrap_err(),
+            WorkflowParseError::EdgeTargetUnknown { .. }
+        ));
+    }
+
+    #[test]
+    fn depends_on_self_reference_is_rejected() {
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    depends_on: [a]\n";
+        assert!(matches!(
+            Workflow::parse(raw).unwrap_err(),
+            WorkflowParseError::EdgeSelfLoop { .. }
+        ));
+    }
+
+    #[test]
+    fn depends_on_cycle_is_rejected_with_path() {
+        // a depends_on [b], b depends_on [a]: a real cycle authored purely
+        // via depends_on (a <- b, b <- a is the same two-node cycle).
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    depends_on: [b]\n  - id: b\n    agent: x\n    prompt: p\n    depends_on: [a]\n";
+        let err = Workflow::parse(raw).unwrap_err();
+        assert!(
+            matches!(err, WorkflowParseError::WorkflowCycle { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -3063,5 +3181,69 @@ mod is_nonlinear_tests {
         let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [g]\n  - id: g\n    branch:\n      condition: \"{{ steps.a.output }}\"\n      then: [x]\n      else: [y]\n  - id: x\n    agent: a\n    prompt: p\n  - id: y\n    agent: a\n    prompt: p\n";
         let wf = Workflow::parse(raw).unwrap();
         assert!(!is_nonlinear(&wf));
+    }
+
+    #[test]
+    fn is_nonlinear_false_for_a_depends_on_only_linear_chain_in_declaration_order() {
+        // a; b depends_on:[a]; c depends_on:[b] — declaration order IS a
+        // valid topological order (a before b before c), no fork/reconverge
+        // — must stay linear-runnable, exactly mirroring
+        // `is_nonlinear_false_for_a_linear_chain_with_explicit_next`.
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: p\n    depends_on: [a]\n  - id: c\n    agent: x\n    prompt: p\n    depends_on: [b]\n";
+        let wf = Workflow::parse(raw).unwrap();
+        assert!(!is_nonlinear(&wf));
+    }
+
+    #[test]
+    fn is_nonlinear_true_for_a_depends_on_reconverge() {
+        // c depends_on: [a, b] — two distinct predecessors converging on c,
+        // the depends_on-authored mirror of `is_nonlinear_true_for_a_diamond_reconverge`.
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: p\n  - id: c\n    agent: x\n    prompt: p\n    depends_on: [a, b]\n";
+        let wf = Workflow::parse(raw).unwrap();
+        assert!(is_nonlinear(&wf));
+    }
+
+    #[test]
+    fn is_nonlinear_true_for_depends_on_out_of_topological_order() {
+        // b declares depends_on:[c] but c is declared AFTER b — the linear
+        // runner would dispatch b before c ever ran. Must route to the
+        // scheduler, the depends_on-authored mirror of
+        // `is_nonlinear_true_for_a_forward_data_ref_out_of_declaration_order`.
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: p\n    depends_on: [c]\n  - id: c\n    agent: x\n    prompt: p\n";
+        let wf = Workflow::parse(raw).unwrap();
+        assert!(is_nonlinear(&wf));
+    }
+
+    #[test]
+    fn is_nonlinear_still_false_for_every_sample_workflow_after_depends_on_support() {
+        // Re-confirms the existing golden-safety property holds with the
+        // depends_on-aware code paths in place: no sample workflow uses
+        // depends_on, so nothing here should change is_nonlinear's verdict.
+        for entry in std::fs::read_dir(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../.rupu/workflows"
+        ))
+        .unwrap()
+        {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&p).unwrap();
+            let wf = Workflow::parse(&raw).unwrap();
+            assert!(
+                !is_nonlinear(&wf),
+                "{:?} should be linear-runnable",
+                p.file_name().unwrap()
+            );
+            // Round-trip: reparse the serialized form and confirm the
+            // output is byte-identical (depends_on never introduced).
+            let out = serde_yaml::to_string(&wf).unwrap();
+            assert!(
+                !out.contains("depends_on"),
+                "{:?} must not gain a depends_on key",
+                p.file_name().unwrap()
+            );
+        }
     }
 }

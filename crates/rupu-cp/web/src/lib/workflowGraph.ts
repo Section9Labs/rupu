@@ -100,6 +100,12 @@ export interface StepNodeData {
   // each imply their own `kind` (see parseStepData). `joinWait` mirrors Rust's
   // `JoinWait`: the bare keyword `'all'`/`'any'`, or the `{ count }` form.
   next?: string[];
+  // `Step.depends_on` (workflow.rs) — the symmetric inverse of `next`: an
+  // explicit predecessor id list authored on the TARGET node. `deriveEdges`
+  // reads it to render an inbound `p -> thisNode` edge for each `p` here;
+  // the draw-action never writes this field (drawing still writes `next`
+  // on the source) — it only round-trips a hand-authored `depends_on:`.
+  depends_on?: string[];
   split?: string[];
   joinWait?: 'all' | 'any' | { count: number };
   // Any step-level keys we don't model (e.g. `contract:`) are captured verbatim
@@ -269,6 +275,8 @@ function parseStepData(raw: unknown, i: number): StepNodeData {
   }
   const nextArr = asStringArray(o.next);
   if (nextArr && nextArr.length > 0) data.next = nextArr;
+  const dependsOnArr = asStringArray(o.depends_on);
+  if (dependsOnArr && dependsOnArr.length > 0) data.depends_on = dependsOnArr;
 
   if (agentName !== undefined) data.agent = agentName;
   if (promptText !== undefined) data.prompt = promptText;
@@ -350,6 +358,7 @@ const MODELLED_STEP_KEYS = new Set<string>([
   'action',
   'with',
   'next',
+  'depends_on',
   'split',
   'join',
 ]);
@@ -393,14 +402,21 @@ export function extractStepRefs(data: StepNodeData): string[] {
 // ── deriveEdges ───────────────────────────────────────────────────────────────
 
 /** A workflow "has explicit edges" (is a graph workflow rather than a legacy
- *  linear one) when any node declares `next:`, `split:`, or `join:` — mirrors
- *  workflow.rs `workflow_has_explicit_edges` exactly (non-empty `next`,
- *  `split` present (any array, even empty), `join` present). Legacy edge-free
- *  workflows keep displaying as the pre-existing linear chain (see
- *  `deriveEdges`). Exported so callers (Tasks 5-7: the editor canvas, node
- *  forms, add/connect affordances) can branch on the same distinction. */
+ *  linear one) when any node declares `next:`, `split:`, `join:`, or
+ *  `depends_on:` — mirrors workflow.rs `workflow_has_explicit_edges` exactly
+ *  (non-empty `next`, `split` present (any array, even empty), `join`
+ *  present, non-empty `depends_on`). Legacy edge-free workflows keep
+ *  displaying as the pre-existing linear chain (see `deriveEdges`). Exported
+ *  so callers (Tasks 5-7: the editor canvas, node forms, add/connect
+ *  affordances) can branch on the same distinction. */
 export function hasExplicitEdges(nodes: GraphNode[]): boolean {
-  return nodes.some((n) => (n.data.next && n.data.next.length > 0) || n.data.kind === 'split' || n.data.kind === 'join');
+  return nodes.some(
+    (n) =>
+      (n.data.next && n.data.next.length > 0) ||
+      n.data.kind === 'split' ||
+      n.data.kind === 'join' ||
+      (n.data.depends_on && n.data.depends_on.length > 0),
+  );
 }
 
 /** The legacy->graph migration primitive (spec 3d): a no-op when `nodes`
@@ -472,7 +488,10 @@ export function deriveEdges(nodes: GraphNode[]): GraphEdge[] {
   const graphMode = hasExplicitEdges(nodes);
 
   if (graphMode) {
-    // (a) explicit `next` edges, (b) `split` fan-out edges.
+    // (a) explicit `next` edges, (b) `split` fan-out edges, (e) `depends_on`
+    // inbound edges — the symmetric inverse of `next`, authored on the
+    // TARGET node: `depends_on: [p]` renders as `p -> thisNode`. Dedupes
+    // against an equivalent `next`/`split` edge via `addEdge`'s `seen` key.
     for (const n of nodes) {
       for (const t of n.data.next ?? []) {
         if (ids.has(t)) addEdge(n.id, t);
@@ -481,6 +500,9 @@ export function deriveEdges(nodes: GraphNode[]): GraphEdge[] {
         for (const t of n.data.split ?? []) {
           if (ids.has(t)) addEdge(n.id, t);
         }
+      }
+      for (const p of n.data.depends_on ?? []) {
+        if (ids.has(p)) addEdge(p, n.id);
       }
     }
   } else {
@@ -699,6 +721,12 @@ function nodeToStepObject(d: StepNodeData): Record<string, unknown> {
   // `next` (explicit successor edges) applies to any step kind — omitted
   // when empty so a legacy node (no `next:` on load) round-trips clean.
   if (d.next && d.next.length > 0) o.next = d.next;
+
+  // `depends_on` (explicit predecessor edges) applies to any step kind too —
+  // omitted when empty so a legacy node (no `depends_on:` on load) round-
+  // trips clean. Never written by the draw-action (see `applyConnect`); only
+  // survives a load->save round-trip for a hand-authored `depends_on:`.
+  if (d.depends_on && d.depends_on.length > 0) o.depends_on = d.depends_on;
 
   // Approval applies to any step kind. A gate NODE ALWAYS emits an `approval:`
   // block (it is the node's identity); other kinds emit only when there's an
@@ -925,7 +953,8 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
       for (const id of sorted.cycle) add(id, 'part of a cycle — steps must form a DAG');
     }
 
-    // Unknown edge target: a `next`/`split` id that isn't a known node.
+    // Unknown edge target: a `next`/`split`/`depends_on` id that isn't a
+    // known node.
     for (const n of g.nodes) {
       for (const t of n.data.next ?? []) {
         if (!nodeIds.has(t)) add(n.id, `edge target \`${t}\` is not a known step`);
@@ -935,14 +964,18 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
           if (!nodeIds.has(t)) add(n.id, `edge target \`${t}\` is not a known step`);
         }
       }
+      for (const p of n.data.depends_on ?? []) {
+        if (!nodeIds.has(p)) add(n.id, `depends_on \`${p}\` is not a known step`);
+      }
     }
 
-    // Self-loop: a `next`/`split` entry that targets the node's own id.
-    // Mirrors the backend's `EdgeSelfLoop` check exactly (workflow.rs). Reads
-    // the raw node fields directly rather than `g.edges` — `deriveEdges`'s
-    // `addEdge` silently drops `source === target` edges (correct for
-    // rendering, since there's nothing to draw), so a self-loop never reaches
-    // `g.edges` and the cycle/unknown-target checks above never see it.
+    // Self-loop: a `next`/`split`/`depends_on` entry that targets the node's
+    // own id. Mirrors the backend's `EdgeSelfLoop` check exactly
+    // (workflow.rs). Reads the raw node fields directly rather than
+    // `g.edges` — `deriveEdges`'s `addEdge` silently drops `source ===
+    // target` edges (correct for rendering, since there's nothing to draw),
+    // so a self-loop never reaches `g.edges` and the cycle/unknown-target
+    // checks above never see it.
     for (const n of g.nodes) {
       for (const t of n.data.next ?? []) {
         if (t === n.id) add(n.id, 'an edge cannot target its own step');
@@ -951,6 +984,9 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
         for (const t of n.data.split ?? []) {
           if (t === n.id) add(n.id, 'an edge cannot target its own step');
         }
+      }
+      for (const p of n.data.depends_on ?? []) {
+        if (p === n.id) add(n.id, 'an edge cannot target its own step');
       }
     }
 

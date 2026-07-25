@@ -1492,4 +1492,76 @@ describe('explicit-edge model', () => {
       expect('join' in s).toBe(false);
     }
   });
+
+  // ── depends_on (Phase 3 Task 1) ─────────────────────────────────────────
+  // Mirrors workflow.rs `Step.depends_on`: the symmetric inverse of `next`,
+  // authored on the TARGET node. `deriveEdges` renders it as an inbound
+  // edge; the draw-action never writes it (see WorkflowEditorGraph
+  // `applyConnect`), but a hand-authored `depends_on:` round-trips.
+
+  it('depends_on renders an inbound edge from the named predecessor', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 's1', agent: 'x', prompt: 'p' },
+        { id: 's2', agent: 'x', prompt: 'p', depends_on: ['s1'] },
+      ],
+    });
+    expect(g.nodes.find((n) => n.id === 's2')!.data.depends_on).toEqual(['s1']);
+    expect(deriveEdges(g.nodes)).toContainEqual(expect.objectContaining({ source: 's1', target: 's2' }));
+  });
+
+  it('depends_on and an equivalent next both describing the same edge collapse to one rendered edge', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 's1', agent: 'x', prompt: 'p', next: ['s2'] },
+        { id: 's2', agent: 'x', prompt: 'p', depends_on: ['s1'] },
+      ],
+    });
+    const edges = deriveEdges(g.nodes).filter((e) => e.source === 's1' && e.target === 's2');
+    expect(edges).toHaveLength(1);
+  });
+
+  it('a node with only depends_on (no next/split/join) makes the graph explicit', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 's1', agent: 'x', prompt: 'p' },
+        { id: 's2', agent: 'x', prompt: 'p', depends_on: ['s1'] },
+      ],
+    });
+    expect(hasExplicitEdges(g.nodes)).toBe(true);
+  });
+
+  it('depends_on round-trips through graphToWorkflowObject and is absent on a legacy step', () => {
+    const input = {
+      name: 'w',
+      steps: [
+        { id: 's1', agent: 'x', prompt: 'p' },
+        { id: 's2', agent: 'x', prompt: 'p', depends_on: ['s1'] },
+      ],
+    };
+    expectRoundTrip(input);
+    const out = graphToWorkflowObject(yamlToGraph(input)) as { obj: any };
+    const s1 = out.obj.steps.find((s: any) => s.id === 's1');
+    const s2 = out.obj.steps.find((s: any) => s.id === 's2');
+    expect('depends_on' in s1).toBe(false);
+    expect(s2.depends_on).toEqual(['s1']);
+  });
+
+  it('validateGraph flags an unknown depends_on target and a depends_on self-loop', () => {
+    const unknown = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'a', agent: 'x', prompt: 'p', depends_on: ['ghost'] }],
+    });
+    expect(validateGraph(unknown)).toHaveProperty('a');
+    expect(validateGraph(unknown).a.join(' ')).toContain('ghost');
+
+    const selfLoop = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'a', agent: 'x', prompt: 'p', depends_on: ['a'] }],
+    });
+    expect(validateGraph(selfLoop).a.join(' ')).toContain('own step');
+  });
 });

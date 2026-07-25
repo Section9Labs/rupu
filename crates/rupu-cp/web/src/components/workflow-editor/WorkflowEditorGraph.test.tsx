@@ -777,6 +777,36 @@ describe('explicit connect/drop', () => {
     expect(g.nodes.find((n) => n.id === 's')!.data.split).toEqual(['b']);
     expect(invariantHolds(g)).toBe(true);
   });
+
+  it('applyDelete scrubs the deleted id from a surviving node\'s `depends_on`', () => {
+    let g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p', depends_on: ['a'] },
+      ],
+    });
+    g = applyDelete(g, 'a');
+    expect(g.nodes.find((n) => n.id === 'b')!.data.depends_on ?? []).toEqual([]);
+    expect(invariantHolds(g)).toBe(true);
+  });
+
+  it('applyRemoveEdges clears the `depends_on` entry on the target node — the inverse of clearing `next` on the source', () => {
+    // A third `split` node isolates "clear the entry" from the legacy/
+    // graph-mode boundary, same trick as the `next`-clearing test above.
+    let g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p', depends_on: ['a'] },
+        { id: 'z', split: [] },
+      ],
+    });
+    g = applyRemoveEdges(g, new Set(['a->b']));
+    expect(g.nodes.find((n) => n.id === 'b')!.data.depends_on ?? []).toEqual([]);
+    expect(g.edges.some((e) => e.source === 'a' && e.target === 'b')).toBe(false);
+    expect(invariantHolds(g)).toBe(true);
+  });
 });
 
 describe('applyAddNode', () => {
