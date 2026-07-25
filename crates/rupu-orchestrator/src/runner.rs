@@ -8879,6 +8879,101 @@ steps:
             "only the already-resolved split node should be persisted; got {ids:?}"
         );
     }
+
+    /// `b depends_on: [a]; c depends_on: [a]` describes the IDENTICAL fork
+    /// as `a next: [b, c]` (spec §1a: `depends_on` is `next`'s symmetric
+    /// inverse) — both fixtures must route through `run_workflow` (the
+    /// live router, not `run_scheduler` called directly — see the
+    /// `..._live_through_run_workflow` tests below `join_and_prune` for the
+    /// established pattern) to the concurrent scheduler and dispatch `b`/
+    /// `c` CONCURRENTLY, exactly like the `next`-authored fork does. Before
+    /// the fix, `is_nonlinear`'s fork check read only `s.next.len()` and
+    /// never saw a fork authored purely via `depends_on`: the
+    /// `depends_on`-fork fixture stayed `is_nonlinear == false` and ran
+    /// through `run_steps_inner`, which dispatches strictly sequentially —
+    /// a silent divergence from the promised symmetry.
+    #[tokio::test]
+    async fn depends_on_authored_fork_dispatches_concurrently_through_run_workflow_matching_next() {
+        const DEPENDS_ON_FORK_WF: &str = r#"
+name: depends-on-fork
+steps:
+  - id: a
+    agent: worker
+    prompt: "do a"
+  - id: b
+    agent: worker
+    prompt: "do b"
+    depends_on: [a]
+  - id: c
+    agent: worker
+    prompt: "do c"
+    depends_on: [a]
+"#;
+        const NEXT_FORK_WF: &str = r#"
+name: next-fork
+steps:
+  - id: a
+    agent: worker
+    prompt: "do a"
+    next: [b, c]
+  - id: b
+    agent: worker
+    prompt: "do b"
+  - id: c
+    agent: worker
+    prompt: "do c"
+"#;
+
+        let dep_wf = Workflow::parse(DEPENDS_ON_FORK_WF).unwrap();
+        let next_wf = Workflow::parse(NEXT_FORK_WF).unwrap();
+        assert!(
+            is_nonlinear(&dep_wf),
+            "depends_on-authored fork must be non-linear"
+        );
+        assert!(
+            is_nonlinear(&next_wf),
+            "next-authored fork must be non-linear"
+        );
+
+        for (label, wf) in [("depends_on", dep_wf), ("next", next_wf)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let factory = SchedulerTestFactory::new().tracking(&["b", "c"], 50);
+            let max_seen = Arc::clone(&factory.max_seen);
+            let opts = opts_for(wf, factory, &tmp);
+
+            let res = tokio::time::timeout(Duration::from_secs(5), run_workflow(opts))
+                .await
+                .unwrap_or_else(|_| panic!("[{label}] run_workflow must not hang"))
+                .unwrap_or_else(|e| panic!("[{label}] run_workflow must not error: {e}"));
+
+            assert!(
+                res.awaiting.is_none(),
+                "[{label}] no gate in this workflow — must reach Done, not park"
+            );
+            assert_eq!(
+                max_seen.load(Ordering::SeqCst),
+                2,
+                "[{label}] b and c must have been in flight at the same time at least once"
+            );
+            let ids: std::collections::BTreeSet<&str> = res
+                .step_results
+                .iter()
+                .map(|sr| sr.step_id.as_str())
+                .collect();
+            assert_eq!(
+                ids,
+                std::collections::BTreeSet::from(["a", "b", "c"]),
+                "[{label}] every node should have run"
+            );
+            for sr in &res.step_results {
+                assert!(
+                    sr.success,
+                    "[{label}] {}: expected success, got {sr:?}",
+                    sr.step_id
+                );
+            }
+        }
+    }
 }
 
 /// Task 3: branch pruning (spec §6) + explicit `join` (spec §5,

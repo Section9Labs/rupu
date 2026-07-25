@@ -1925,21 +1925,22 @@ pub fn is_nonlinear(wf: &Workflow) -> bool {
     if wf.steps.iter().any(|s| s.split.is_some() || s.join.is_some()) {
         return true;
     }
-    // Fork: a non-branch step whose `next` has more than one target.
-    if wf
-        .steps
-        .iter()
-        .any(|s| s.branch.is_none() && s.next.len() > 1)
-    {
-        return true;
-    }
-    // Reconverge: any node with >1 inbound control edge. Built as a deduped
-    // edge set (next/split/branch-arm/depends_on) rather than a raw count,
-    // so a `next` and a `depends_on` describing the SAME edge (the exact
-    // dedup case `workflow_edges` also handles) don't double-count into a
-    // false-positive reconverge; a genuine `depends_on`-authored reconverge
-    // (e.g. `c depends_on: [a, b]`) is still caught since it's two distinct
-    // edges into `c`.
+    // The deduped control-edge set (next/split/branch-arm/depends_on) shared
+    // by BOTH the fork (outdegree) and reconverge (indegree) checks below,
+    // so they agree on what counts as a "successor". `depends_on` is
+    // `next`'s symmetric inverse (spec §1a): `a next: [b, c]` and
+    // `b depends_on: [a]; c depends_on: [a]` describe the IDENTICAL fork and
+    // must produce the same `is_nonlinear` verdict — a fork check that only
+    // read `s.next.len()` would miss the latter authoring entirely. Also
+    // dedups a `next` and a `depends_on` describing the SAME edge (the exact
+    // case `workflow_edges` also handles), so that pair doesn't
+    // double-count into a false-positive fork/reconverge.
+    //
+    // Deliberately excludes inferred `steps.X` data edges (unlike
+    // `workflow_edges`): a linear workflow whose step feeds two LATER steps
+    // purely via `{{ steps.X.output }}` (no `next`/`depends_on` at all) must
+    // stay `is_nonlinear == false` — see
+    // `is_nonlinear_false_for_a_step_referencing_two_prior_steps`.
     let mut control_edges: BTreeSet<(&str, &str)> = BTreeSet::new();
     for s in &wf.steps {
         for t in s.next.iter().chain(s.split.iter().flatten()).chain(
@@ -1953,6 +1954,22 @@ pub fn is_nonlinear(wf: &Workflow) -> bool {
             control_edges.insert((p.as_str(), s.id.as_str()));
         }
     }
+
+    // Fork: a non-branch step whose control successors (via the shared set
+    // above) number more than one.
+    let mut outdeg: BTreeMap<&str, usize> = BTreeMap::new();
+    for (a, _) in &control_edges {
+        *outdeg.entry(a).or_insert(0) += 1;
+    }
+    if wf
+        .steps
+        .iter()
+        .any(|s| s.branch.is_none() && outdeg.get(s.id.as_str()).copied().unwrap_or(0) > 1)
+    {
+        return true;
+    }
+
+    // Reconverge: any node with >1 inbound control edge.
     let mut indeg: BTreeMap<&str, usize> = BTreeMap::new();
     for (_, b) in &control_edges {
         *indeg.entry(b).or_insert(0) += 1;
@@ -3201,6 +3218,48 @@ mod is_nonlinear_tests {
         let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: p\n  - id: c\n    agent: x\n    prompt: p\n    depends_on: [a, b]\n";
         let wf = Workflow::parse(raw).unwrap();
         assert!(is_nonlinear(&wf));
+    }
+
+    #[test]
+    fn is_nonlinear_true_for_a_depends_on_authored_fork_matching_a_next_authored_fork() {
+        // `a next: [b, c]` and `b depends_on: [a]; c depends_on: [a]`
+        // describe the IDENTICAL fork (spec §1a: depends_on is next's
+        // symmetric inverse) — both must be is_nonlinear == true. Before
+        // this fix, the fork check read only `s.next.len()` and missed the
+        // depends_on-authored version entirely (it would stay false and
+        // route to `run_steps_inner`, which runs b/c sequentially instead
+        // of concurrently — a silent divergence from the next-authored
+        // fork's behavior).
+        let next_fork = Workflow::parse(
+            "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [b, c]\n  - id: b\n    agent: x\n    prompt: p\n  - id: c\n    agent: x\n    prompt: p\n",
+        )
+        .unwrap();
+        let depends_on_fork = Workflow::parse(
+            "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: p\n    depends_on: [a]\n  - id: c\n    agent: x\n    prompt: p\n    depends_on: [a]\n",
+        )
+        .unwrap();
+        assert!(
+            is_nonlinear(&next_fork),
+            "next-authored fork must be nonlinear"
+        );
+        assert!(
+            is_nonlinear(&depends_on_fork),
+            "the symmetric-inverse depends_on authoring must produce the same verdict"
+        );
+    }
+
+    #[test]
+    fn is_nonlinear_false_for_a_data_fan_out_with_no_control_edges() {
+        // `a` feeds TWO later steps purely via `{{ steps.a.output }}` — no
+        // `next`/`depends_on` anywhere. Proves the depends_on-aware fork
+        // check (which now folds depends_on-derived successors into a
+        // node's out-degree) still excludes INFERRED DATA edges from that
+        // out-degree count — must stay is_nonlinear == false
+        // (byte-equality: a linear workflow with a data fan-out must keep
+        // running through `run_steps_inner`, unchanged).
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: \"use {{ steps.a.output }}\"\n  - id: c\n    agent: x\n    prompt: \"use {{ steps.a.output }}\"\n";
+        let wf = Workflow::parse(raw).unwrap();
+        assert!(!is_nonlinear(&wf));
     }
 
     #[test]
