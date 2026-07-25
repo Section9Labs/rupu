@@ -135,10 +135,35 @@ export interface WorkflowMeta {
   rest: Record<string, unknown>;
 }
 
+/** A named bounded subgraph loop (workflow.rs `LoopDef`, Phase 3 §2a): a
+ *  sub-DAG of existing step ids that re-run together until `until` holds or
+ *  `maxIterations` is reached. Field names are the camelCase mirror of the
+ *  YAML `loops.<name>` map entry (`nodes` / `until` / `max_iterations` /
+ *  `on_max`) — `name` is the map KEY, carried here as a field so a loop is a
+ *  self-contained value the editor can pass around, group, and diff. */
+export interface WorkflowLoop {
+  name: string;
+  nodes: string[];
+  until: string;
+  maxIterations: number;
+  onMax: 'fail' | 'proceed';
+}
+
 export interface WorkflowGraph {
   nodes: GraphNode[];
   edges: GraphEdge[];
   meta: WorkflowMeta;
+  /** Parsed `loops:` map (workflow.rs `Workflow.loops: BTreeMap<String,
+   *  LoopDef>`), as an array sorted by name (mirrors BTreeMap's iteration
+   *  order). Optional (rather than required-but-empty) so every pre-Phase-3
+   *  `WorkflowGraph` literal in the existing codebase/tests keeps compiling
+   *  unchanged — additive, per the Task 5 contract. Absent/empty for every
+   *  legacy workflow — never populated unless the source YAML has a
+   *  `loops:` block, and never emitted on save unless non-empty (see
+   *  `graphToWorkflowObject`) — the Phase 3 Task 5 byte-equality invariant
+   *  for a workflow with no loops. Readers should treat absent the same as
+   *  `[]` (`g.loops ?? []`), never assume presence. */
+  loops?: WorkflowLoop[];
 }
 
 // ── Narrowing helpers ─────────────────────────────────────────────────────────
@@ -379,6 +404,341 @@ const APPROVAL_KEYS = new Set<string>([
   'on_reject',
 ]);
 
+// ── loops: parse / serialize ──────────────────────────────────────────────────
+
+/** Parse the top-level `loops:` map (`obj.loops`) into a name-sorted
+ *  `WorkflowLoop[]` (mirrors the Rust side's `BTreeMap<String, LoopDef>`
+ *  iteration order). A malformed entry (not a map, or missing `nodes`) is
+ *  skipped rather than dropping the whole workflow — same defensive posture
+ *  as every other `as*` helper in this module. `max_iterations` defaults to
+ *  1 when absent/non-numeric and `on_max` to `'fail'` — the same defaults
+ *  `LoopDef`/`OnMax` use on the Rust side — so a hand-authored loop missing
+ *  those keys still renders something sane rather than `NaN`/`undefined`. */
+function parseLoops(raw: unknown): WorkflowLoop[] {
+  const rec = asRecord(raw);
+  if (!rec) return [];
+  const out: WorkflowLoop[] = [];
+  for (const [name, defRaw] of Object.entries(rec)) {
+    const def = asRecord(defRaw);
+    if (!def) continue;
+    const nodes = asStringArray(def.nodes) ?? [];
+    const until = asString(def.until) ?? '';
+    const maxIterations = asNumber(def.max_iterations) ?? 1;
+    const onMaxRaw = asString(def.on_max);
+    const onMax: 'fail' | 'proceed' = onMaxRaw === 'proceed' ? 'proceed' : 'fail';
+    out.push({ name, nodes, until, maxIterations, onMax });
+  }
+  out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  return out;
+}
+
+/** Serialize `WorkflowLoop[]` back to the `loops:` map shape (name-sorted,
+ *  mirroring `BTreeMap`'s serialized order), field order `nodes` / `until` /
+ *  `max_iterations` / `on_max` matching workflow.rs `LoopDef`'s declaration
+ *  order. `on_max` is ALWAYS emitted (workflow.rs has no
+ *  `skip_serializing_if` on that field — it always serializes, defaulted or
+ *  not), unlike most other optional fields in this module. */
+function loopsToObject(loops: WorkflowLoop[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const l of [...loops].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
+    out[l.name] = {
+      nodes: l.nodes,
+      until: l.until,
+      max_iterations: l.maxIterations,
+      on_max: l.onMax,
+    };
+  }
+  return out;
+}
+
+// ── loops: pure graph helpers (grouping / editing / membership) ─────────────
+
+/** The problems-map key a loop-level (not per-node) validation message is
+ *  filed under — `"loop:<name>"`, deliberately the same super-node id
+ *  convention the backend's `collapsed_graph_edges` uses for a loop
+ *  (`"loop:<name>"`), so a loop's own errors (unknown member, overlap, too
+ *  few members, cyclic sub-DAG, member-escape, collapsed-graph cycle) have
+ *  somewhere to live in `problemsById` without being misattributed to any
+ *  one member node. The group-boundary renderer reads this key to show an
+ *  inline error on the loop's own boundary — the Task 5 "reuse the Phase-1
+ *  inline validation surface" requirement. No real step id can collide with
+ *  this key (`:` isn't valid in a step id in practice, and this exact prefix
+ *  is reserved by the backend's own super-node naming). */
+export function loopProblemKey(name: string): string {
+  return `loop:${name}`;
+}
+
+/** The loop `stepId` belongs to, if any. `undefined` for a step in no loop —
+ *  callers don't need to special-case "not in a loop" beyond a falsy check. */
+export function loopOfStep(loops: WorkflowLoop[], stepId: string): WorkflowLoop | undefined {
+  return loops.find((l) => l.nodes.includes(stepId));
+}
+
+/** Drop `id` from every loop's membership (used when a node is deleted from
+ *  the graph — mirrors `applyDelete`'s scrub of `next`/`split`/`depends_on`/
+ *  branch-arm arrays). A loop left with fewer than 2 members after the drop
+ *  is removed outright (workflow.rs `LoopTooSmall` — a 1-member "loop" is
+ *  never valid, so keeping a doomed entry around would just relocate the
+ *  error rather than fix it; the Task 5 spec's "removing the group deletes
+ *  it" already covers the explicit-removal path, this covers the implicit
+ *  one). */
+export function scrubStepFromLoops(loops: WorkflowLoop[], id: string): WorkflowLoop[] {
+  return loops
+    .map((l) => (l.nodes.includes(id) ? { ...l, nodes: l.nodes.filter((n) => n !== id) } : l))
+    .filter((l) => l.nodes.length >= 2);
+}
+
+/** Whether `nodeIds` (order-insensitive) can be grouped into a (new or
+ *  edited) loop: at least 2 ids, and none of them already belongs to a
+ *  DIFFERENT loop (workflow.rs `LoopNodeOverlap` — loops are disjoint, v1
+ *  doesn't nest). `excludeName` is the loop currently being edited (its own
+ *  existing membership doesn't count as a conflict with itself). Powers the
+ *  "Group into loop" toolbar action's enabled/disabled state. */
+export function canGroupIntoLoop(loops: WorkflowLoop[], nodeIds: string[], excludeName?: string): boolean {
+  if (nodeIds.length < 2) return false;
+  const idSet = new Set(nodeIds);
+  return !loops.some((l) => l.name !== excludeName && l.nodes.some((n) => idSet.has(n)));
+}
+
+/** A loop draft as edited by the "Group into loop" form — the same shape as
+ *  `WorkflowLoop` minus `nodes` (the member list is driven by the current
+ *  selection / the editor's add/remove-member UI, not typed by hand). */
+export interface LoopDraft {
+  name: string;
+  until: string;
+  maxIterations: number;
+  onMax: 'fail' | 'proceed';
+}
+
+/** Create a new loop, or overwrite an existing one (`previousName` names the
+ *  loop being edited — pass the SAME value as `draft.name` for a same-name
+ *  edit, or the old name when the edit also renames the loop; `null` for a
+ *  brand-new loop). `nodeIds` becomes the loop's `nodes`. Pure — the caller
+ *  re-serializes via `graphToWorkflowObject` same as any other graph edit. */
+export function upsertLoop(
+  graph: WorkflowGraph,
+  previousName: string | null,
+  draft: LoopDraft,
+  nodeIds: string[],
+): WorkflowGraph {
+  const loop: WorkflowLoop = {
+    name: draft.name,
+    nodes: [...nodeIds],
+    until: draft.until,
+    maxIterations: draft.maxIterations,
+    onMax: draft.onMax,
+  };
+  const filtered = (graph.loops ?? []).filter((l) => l.name !== previousName && l.name !== draft.name);
+  return { ...graph, loops: [...filtered, loop] };
+}
+
+/** Delete a loop entirely (its member steps are untouched — only the
+ *  grouping goes away). A no-op if `name` doesn't name a loop. */
+export function removeLoop(graph: WorkflowGraph, name: string): WorkflowGraph {
+  const before = graph.loops ?? [];
+  const next = before.filter((l) => l.name !== name);
+  return next.length === before.length ? graph : { ...graph, loops: next };
+}
+
+// ── loops: validation helpers (mirror workflow.rs's matrix, client-side) ────
+
+/** Generic cycle check over a small edge list: returns the set of node ids
+ *  that are part of AT LEAST one cycle (Kahn's algorithm — same technique
+ *  `topoSort` uses). Used for both the loop-internal acyclicity check and
+ *  the collapsed outer-graph check below; kept generic (raw `[a,b][]`
+ *  pairs, not `GraphEdge[]`) so it works over the collapsed super-node ids
+ *  too, which aren't real step ids. */
+function cyclicNodes(nodeIds: Iterable<string>, edges: [string, string][]): Set<string> {
+  const indeg = new Map<string, number>();
+  const adj = new Map<string, string[]>();
+  for (const id of nodeIds) indeg.set(id, 0);
+  for (const [a, b] of edges) {
+    if (!indeg.has(a) || !indeg.has(b)) continue;
+    const list = adj.get(a);
+    if (list) list.push(b);
+    else adj.set(a, [b]);
+    indeg.set(b, (indeg.get(b) ?? 0) + 1);
+  }
+  const queue: string[] = [...indeg.entries()].filter(([, d]) => d === 0).map(([id]) => id);
+  const done = new Set<string>();
+  while (queue.length > 0) {
+    const id = queue.shift() as string;
+    done.add(id);
+    for (const t of adj.get(id) ?? []) {
+      const d = (indeg.get(t) ?? 0) - 1;
+      indeg.set(t, d);
+      if (d === 0) queue.push(t);
+    }
+  }
+  const out = new Set<string>();
+  for (const id of indeg.keys()) if (!done.has(id)) out.add(id);
+  return out;
+}
+
+/** A loop's members' internal CONTROL edges only — `next`/`split`/branch-
+ *  arm/`depends_on`, both endpoints members of `memberIds` — mirroring
+ *  workflow.rs `loop_control_edges` exactly (control edges, NOT the
+ *  inferred data-ref edges `deriveEdges` also produces; the feedback
+ *  back-reference, spec §2d, is a data ref to a non-ancestor and must NOT
+ *  be treated as an internal control edge or every refine-style loop would
+ *  false-positive as cyclic). */
+function loopControlEdges(nodes: GraphNode[], memberIds: Set<string>): [string, string][] {
+  const out: [string, string][] = [];
+  for (const n of nodes) {
+    if (!memberIds.has(n.id)) continue;
+    for (const t of n.data.next ?? []) {
+      if (memberIds.has(t) && t !== n.id) out.push([n.id, t]);
+    }
+    if (n.data.kind === 'split') {
+      for (const t of n.data.split ?? []) {
+        if (memberIds.has(t) && t !== n.id) out.push([n.id, t]);
+      }
+    }
+    for (const t of n.data.thenTargets ?? []) {
+      if (memberIds.has(t) && t !== n.id) out.push([n.id, t]);
+    }
+    for (const t of n.data.elseTargets ?? []) {
+      if (memberIds.has(t) && t !== n.id) out.push([n.id, t]);
+    }
+    for (const p of n.data.depends_on ?? []) {
+      if (memberIds.has(p) && p !== n.id) out.push([p, n.id]);
+    }
+  }
+  return out;
+}
+
+/** [`workflow_edges`]-equivalent (control UNION inferred data-ref) with
+ *  every loop collapsed to its super-node id `"loop:<name>"` — mirrors
+ *  workflow.rs `collapsed_graph_edges` exactly: an edge crossing a loop
+ *  boundary is rewired to/from the super-node; an edge fully inside ONE
+ *  loop (both endpoints members of the SAME loop) is dropped (internal,
+ *  not the outer graph's concern); an edge between two different loops
+ *  connects their two super-nodes. */
+function collapsedGraphEdges(g: Pick<WorkflowGraph, 'nodes' | 'edges' | 'loops'>): [string, string][] {
+  const membership = new Map<string, string>();
+  for (const l of g.loops ?? []) for (const id of l.nodes) membership.set(id, loopProblemKey(l.name));
+  const resolve = (id: string): string => membership.get(id) ?? id;
+  const seen = new Set<string>();
+  const out: [string, string][] = [];
+  for (const e of g.edges) {
+    const ra = resolve(e.source);
+    const rb = resolve(e.target);
+    if (ra === rb) continue;
+    const key = `${ra}->${rb}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push([ra, rb]);
+  }
+  return out;
+}
+
+/** `edges` (typically `deriveEdges(nodes)`) with every EDGE fully inside a
+ *  SINGLE loop dropped UNLESS it's a genuine internal control edge
+ *  (`loopControlEdges` — next/split/branch-arm/depends_on). This is the
+ *  client mirror of the backend's collapsed-graph semantics
+ *  (`collapsedGraphEdges` drops same-super-node edges entirely) applied to
+ *  cycle detection specifically: a loop's legitimate feedback data-ref
+ *  (spec §2d — e.g. `gen`'s prompt reading a prior iteration's
+ *  `steps.critique.output`, a REAL edge in `deriveEdges`) must NOT count
+ *  toward the OUTER graph's acyclicity, or a refine-style loop's own
+ *  intended mechanic would falsely trip the general cycle check and BLOCK
+ *  SAVING (`graphToWorkflowObject`) / falsely flag "part of a cycle"
+ *  (`validateGraph`) — even though the backend runs it correctly. A
+ *  genuine internal cycle (`next: a→b; b→a` both in the same loop) is
+ *  still caught by `validateLoops`'s dedicated internal-acyclicity check,
+ *  which is scoped to control edges only anyway. Edges that cross a loop
+ *  boundary, connect two different loops, or don't touch a loop at all are
+ *  always kept unchanged. */
+function outerCycleEdges(nodes: GraphNode[], edges: GraphEdge[], loops: WorkflowLoop[]): GraphEdge[] {
+  if (loops.length === 0) return edges;
+  const membership = new Map<string, string>();
+  for (const l of loops) for (const id of l.nodes) membership.set(id, l.name);
+  const controlPairs = new Set<string>();
+  for (const l of loops) {
+    const memberSet = new Set(l.nodes);
+    for (const [a, b] of loopControlEdges(nodes, memberSet)) controlPairs.add(`${a}->${b}`);
+  }
+  return edges.filter((e) => {
+    const a = membership.get(e.source);
+    const b = membership.get(e.target);
+    if (a === undefined || a !== b) return true;
+    return controlPairs.has(`${e.source}->${e.target}`);
+  });
+}
+
+/** The full loop validation matrix (workflow.rs §2f, mirrored client-side):
+ *  unknown member id, disjointness (a step in >1 loop), <2 members, an
+ *  internal control-subgraph cycle, a member's own control edge escaping
+ *  the loop, and a cycle in the collapsed outer graph. Every message is
+ *  filed under `loopProblemKey(name)` (never fabricated onto an unrelated
+ *  node) via the SAME `add` callback `validateGraph`'s other checks use —
+ *  the Task 5 "reuse the Phase-1 inline validation surface" requirement. */
+function validateLoops(g: WorkflowGraph, nodeIds: Set<string>, add: (id: string, msg: string) => void): void {
+  const loops = g.loops ?? [];
+  if (loops.length === 0) return;
+
+  const membership = new Map<string, string>(); // step id -> owning loop name
+  for (const l of loops) {
+    const key = loopProblemKey(l.name);
+
+    for (const id of l.nodes) {
+      if (!nodeIds.has(id)) add(key, `references unknown step \`${id}\``);
+    }
+    if (l.nodes.length < 2) add(key, 'needs at least 2 member steps');
+    if (!l.until.trim()) add(key, '`until` must be a non-empty condition');
+    if (!Number.isFinite(l.maxIterations) || l.maxIterations < 1) add(key, '`max_iterations` must be at least 1');
+
+    for (const id of l.nodes) {
+      const owner = membership.get(id);
+      if (owner !== undefined && owner !== l.name) {
+        add(loopProblemKey(owner), `step \`${id}\` also belongs to loop \`${l.name}\``);
+        add(key, `step \`${id}\` also belongs to loop \`${owner}\``);
+      } else {
+        membership.set(id, l.name);
+      }
+    }
+
+    const memberSet = new Set(l.nodes.filter((id) => nodeIds.has(id)));
+    if (memberSet.size >= 2) {
+      const internalCyclic = cyclicNodes(memberSet, loopControlEdges(g.nodes, memberSet));
+      if (internalCyclic.size > 0) {
+        add(key, `internal steps form a cycle: ${[...internalCyclic].join(', ')}`);
+      }
+    }
+
+    // Member-escape: a member's OWN outgoing control edge targeting a
+    // non-member. An external INBOUND edge (entry) or an outside node's own
+    // `depends_on`/`next` into the loop is fine — only the member's own
+    // outgoing next/split/branch-arm leaving the loop is rejected.
+    for (const n of g.nodes) {
+      if (!memberSet.has(n.id)) continue;
+      const outs: string[] = [
+        ...(n.data.next ?? []),
+        ...(n.data.kind === 'split' ? n.data.split ?? [] : []),
+        ...(n.data.thenTargets ?? []),
+        ...(n.data.elseTargets ?? []),
+      ];
+      for (const t of outs) {
+        if (nodeIds.has(t) && !memberSet.has(t)) {
+          add(n.id, `edge to \`${t}\` escapes loop \`${l.name}\``);
+          add(key, `step \`${n.id}\`'s edge to \`${t}\` escapes the loop`);
+        }
+      }
+    }
+  }
+
+  // Collapsed outer graph must stay a DAG — a cycle between loops (or a
+  // loop and an outer node) that only unwinds via the loop's OWN bounded
+  // iteration is not a real cycle at this level; anything else is rejected.
+  const collapsedIds = new Set<string>();
+  for (const n of g.nodes) if (loopOfStep(loops, n.id) === undefined) collapsedIds.add(n.id);
+  for (const l of loops) collapsedIds.add(loopProblemKey(l.name));
+  const collapsedCyclic = cyclicNodes(collapsedIds, collapsedGraphEdges(g));
+  for (const id of collapsedCyclic) {
+    add(id, 'part of a cycle in the collapsed outer graph (across a loop boundary)');
+  }
+}
+
 // ── extractStepRefs ───────────────────────────────────────────────────────────
 
 const STEP_REF = /steps\.([A-Za-z0-9_-]+)/g;
@@ -536,9 +896,21 @@ export function deriveEdges(nodes: GraphNode[]): GraphEdge[] {
 }
 
 /** Build a WorkflowGraph whose edges are derived from its nodes — the only
- *  correct way to construct/return a graph. */
-export function withDerivedEdges(meta: WorkflowMeta, nodes: GraphNode[]): WorkflowGraph {
-  return { meta, nodes, edges: deriveEdges(nodes) };
+ *  correct way to construct/return a graph. `loops` is OMITTED from the
+ *  result entirely when not passed (rather than defaulted to `[]`) — every
+ *  existing call site that doesn't pass one (and every existing test
+ *  literal comparing against a graph with no `loops` key at all) keeps
+ *  behaving exactly as before this field existed, byte-for-byte. A caller
+ *  mutating a graph that MAY have loops must pass `graph.loops` through
+ *  explicitly, or the edit silently drops them. */
+export function withDerivedEdges(
+  meta: WorkflowMeta,
+  nodes: GraphNode[],
+  loops?: WorkflowLoop[],
+): WorkflowGraph {
+  return loops === undefined
+    ? { meta, nodes, edges: deriveEdges(nodes) }
+    : { meta, nodes, edges: deriveEdges(nodes), loops };
 }
 
 // ── yamlToGraph ───────────────────────────────────────────────────────────────
@@ -551,6 +923,7 @@ export function yamlToGraph(obj: Record<string, unknown>): WorkflowGraph {
   delete rest.name;
   delete rest.description;
   delete rest.steps;
+  delete rest.loops;
   const meta: WorkflowMeta = { name: asString(obj.name) ?? '', rest };
   const desc = asString(obj.description);
   if (desc !== undefined) meta.description = desc;
@@ -561,7 +934,9 @@ export function yamlToGraph(obj: Record<string, unknown>): WorkflowGraph {
     return { id: data.id, data, position: { x: 0, y: 0 } };
   });
 
-  return { nodes, edges: deriveEdges(nodes), meta };
+  const loops = parseLoops(obj.loops);
+
+  return { nodes, edges: deriveEdges(nodes), meta, loops };
 }
 
 // ── topoSort ──────────────────────────────────────────────────────────────────
@@ -779,7 +1154,13 @@ function nodeToStepObject(d: StepNodeData): Record<string, unknown> {
 export function graphToWorkflowObject(
   g: WorkflowGraph,
 ): { obj: Record<string, unknown> } | { error: string } {
-  const sorted = topoSort(g.nodes, deriveEdges(g.nodes));
+  // `outerCycleEdges` drops a loop's pure feedback data-ref (spec §2d) from
+  // cycle detection — without it, a legitimate refine-style loop (`gen`
+  // reading a prior iteration's `steps.critique.output`, which
+  // `deriveEdges` sees as a real `critique->gen` edge) would falsely
+  // read as cyclic and BLOCK SAVING. A genuine internal cycle among loop
+  // members is still caught by `validateGraph`'s `validateLoops`.
+  const sorted = topoSort(g.nodes, outerCycleEdges(g.nodes, deriveEdges(g.nodes), g.loops ?? []));
   if ('cycle' in sorted) {
     return { error: 'Cannot serialize: cycle through ' + sorted.cycle.join(', ') };
   }
@@ -790,6 +1171,11 @@ export function graphToWorkflowObject(
   obj.name = g.meta.name;
   if (g.meta.description !== undefined) obj.description = g.meta.description;
   for (const [k, v] of Object.entries(g.meta.rest)) obj[k] = v;
+  // `loops` (Phase 3 §2a) sits between the meta keys and `steps`, mirroring
+  // workflow.rs's `Workflow` field order. Omitted entirely when empty — a
+  // workflow with no loops round-trips with NO `loops:` key, exactly as
+  // before this field existed (the Task 5 byte-equality invariant).
+  if (g.loops && g.loops.length > 0) obj.loops = loopsToObject(g.loops);
   obj.steps = steps;
   return { obj };
 }
@@ -918,16 +1304,27 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
 
   // Reference checks: dangling refs (steps.X where X is not a node) and forward
   // refs (X runs AFTER the referencing node — only checkable when there's no
-  // cycle, since order is otherwise undefined).
-  const sorted = topoSort(g.nodes, g.edges);
+  // cycle, since order is otherwise undefined). `outerCycleEdges` drops a
+  // loop's pure feedback data-ref from cycle/order computation (same
+  // rationale as `graphToWorkflowObject`'s use, see that call site) so a
+  // refine-style loop's own topology doesn't read as globally cyclic.
+  const loopsForCycle = g.loops ?? [];
+  const sorted = topoSort(g.nodes, outerCycleEdges(g.nodes, g.edges, loopsForCycle));
   const pos = 'order' in sorted ? new Map(sorted.order.map((n, i) => [n.id, i])) : undefined;
   for (const n of g.nodes) {
     const here = pos?.get(n.id);
+    const ownLoop = loopOfStep(loopsForCycle, n.id);
     for (const ref of extractStepRefs(n.data)) {
       if (!nodeIds.has(ref)) {
         add(n.id, `references unknown step ${ref}`);
         continue;
       }
+      // A reference to a FELLOW loop member is never a "runs later" bug —
+      // it's either a normal within-iteration read or the loop's own
+      // controlled cross-iteration feedback (spec §2d), both legitimate.
+      // Only a reference to something outside the loop (or when neither
+      // side is in a loop) is checked for order.
+      if (ownLoop !== undefined && ownLoop.nodes.includes(ref)) continue;
       if (pos && here !== undefined) {
         const there = pos.get(ref);
         if (there !== undefined && there > here) {
@@ -1003,6 +1400,12 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
       }
     }
   }
+
+  // Loop validation (Phase 3 §2f) — unconditional, independent of
+  // `hasExplicitEdges`: a loop implies non-linear orchestration on its own
+  // (workflow.rs `is_nonlinear`), so its checks run whether or not the rest
+  // of the graph has any `next`/`split`/`depends_on`.
+  validateLoops(g, nodeIds, add);
 
   return out;
 }
@@ -1110,5 +1513,5 @@ export function convertInlineApprovalToGate(g: WorkflowGraph, stepId: string): W
   // branch that routed to stepId still routes there (running after the new
   // gate in the chain, same as before the branch existed) rather than
   // silently retargeting someone else's routing decision.
-  return withDerivedEdges(g.meta, nodes);
+  return withDerivedEdges(g.meta, nodes, g.loops);
 }

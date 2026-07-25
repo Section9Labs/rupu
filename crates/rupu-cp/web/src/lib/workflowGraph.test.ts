@@ -8,9 +8,16 @@ import {
   validateGraph,
   hasInlineApproval,
   convertInlineApprovalToGate,
+  loopOfStep,
+  scrubStepFromLoops,
+  canGroupIntoLoop,
+  upsertLoop,
+  removeLoop,
+  loopProblemKey,
   type GraphNode,
   type GraphEdge,
   type StepNodeData,
+  type WorkflowLoop,
 } from './workflowGraph';
 
 // ── Test helpers ──────────────────────────────────────────────────────────
@@ -1563,5 +1570,233 @@ describe('explicit-edge model', () => {
       steps: [{ id: 'a', agent: 'x', prompt: 'p', depends_on: ['a'] }],
     });
     expect(validateGraph(selfLoop).a.join(' ')).toContain('own step');
+  });
+});
+
+// ── loops (Phase 3 Task 5) ───────────────────────────────────────────────────
+
+function refineWorkflowObj(): Record<string, unknown> {
+  return {
+    name: 'w',
+    steps: [
+      { id: 'seed', agent: 'seeder', prompt: 'seed' },
+      { id: 'gen', agent: 'generator', prompt: 'gen', depends_on: ['seed'] },
+      { id: 'test', agent: 'tester', prompt: 'test', depends_on: ['gen'] },
+      { id: 'critique', agent: 'critic', prompt: 'critique', depends_on: ['test'] },
+      { id: 'ship', agent: 'shipper', prompt: 'ship', depends_on: ['critique'] },
+    ],
+    loops: {
+      refine: {
+        nodes: ['gen', 'test', 'critique'],
+        until: '{{ steps.critique.approved }}',
+        max_iterations: 5,
+        on_max: 'fail',
+      },
+    },
+  };
+}
+
+describe('loops: parse + round-trip', () => {
+  it('parses loops.refine into WorkflowLoop with the right shape', () => {
+    const g = yamlToGraph(refineWorkflowObj());
+    expect(g.loops).toEqual([
+      { name: 'refine', nodes: ['gen', 'test', 'critique'], until: '{{ steps.critique.approved }}', maxIterations: 5, onMax: 'fail' },
+    ]);
+  });
+
+  it('a workflow with no loops parses to an empty/absent loops list and serializes with no `loops` key', () => {
+    const input = { name: 'w', steps: [{ id: 'a', agent: 'x', prompt: 'p' }] };
+    const g = yamlToGraph(input);
+    expect(g.loops ?? []).toEqual([]);
+    const res = graphToWorkflowObject(g);
+    expect('obj' in res).toBe(true);
+    if ('obj' in res) expect('loops' in res.obj).toBe(false);
+  });
+
+  it('round-trips loops.refine through graphToWorkflowObject byte-for-byte', () => {
+    const input = refineWorkflowObj();
+    const res = graphToWorkflowObject(yamlToGraph(input));
+    expect('obj' in res).toBe(true);
+    if ('obj' in res) {
+      expect(res.obj.loops).toEqual(input.loops);
+    }
+  });
+
+  it('on_max: proceed parses to "proceed"', () => {
+    const input = refineWorkflowObj();
+    (input.loops as Record<string, Record<string, unknown>>).refine.on_max = 'proceed';
+    const g = yamlToGraph(input);
+    expect(g.loops?.[0]?.onMax).toBe('proceed');
+  });
+});
+
+describe('loops: membership + grouping helpers', () => {
+  const loops: WorkflowLoop[] = [
+    { name: 'refine', nodes: ['gen', 'test', 'critique'], until: 'x', maxIterations: 5, onMax: 'fail' },
+  ];
+
+  it('loopOfStep reports membership', () => {
+    expect(loopOfStep(loops, 'gen')?.name).toBe('refine');
+    expect(loopOfStep(loops, 'seed')).toBeUndefined();
+  });
+
+  it('scrubStepFromLoops drops a deleted member; removes the loop once <2 remain', () => {
+    const one = scrubStepFromLoops(loops, 'critique');
+    expect(one).toEqual([{ name: 'refine', nodes: ['gen', 'test'], until: 'x', maxIterations: 5, onMax: 'fail' }]);
+    const two = scrubStepFromLoops(one, 'test');
+    expect(two).toEqual([]); // <2 members left → the loop itself is dropped
+  });
+
+  it('canGroupIntoLoop requires >=2 nodes and rejects overlap with an existing loop', () => {
+    expect(canGroupIntoLoop(loops, ['a'])).toBe(false); // <2
+    expect(canGroupIntoLoop(loops, ['a', 'b'])).toBe(true); // disjoint from `refine`
+    expect(canGroupIntoLoop(loops, ['a', 'gen'])).toBe(false); // overlaps `refine`
+    // editing `refine` itself: its own members don't count as a conflict.
+    expect(canGroupIntoLoop(loops, ['gen', 'test'], 'refine')).toBe(true);
+  });
+
+  it('upsertLoop creates a new loop entry with the selected members', () => {
+    const g = withDerivedEdges({ name: 'w', rest: {} }, [
+      { id: 'a', data: { id: 'a', kind: 'step' }, position: { x: 0, y: 0 } },
+      { id: 'b', data: { id: 'b', kind: 'step' }, position: { x: 0, y: 0 } },
+    ]);
+    const next = upsertLoop(g, null, { name: 'r2', until: 'u', maxIterations: 3, onMax: 'proceed' }, ['a', 'b']);
+    expect(next.loops).toEqual([{ name: 'r2', nodes: ['a', 'b'], until: 'u', maxIterations: 3, onMax: 'proceed' }]);
+  });
+
+  it('upsertLoop edits an existing loop (rename, until/max/on_max, add/remove a member)', () => {
+    const g = withDerivedEdges({ name: 'w', rest: {} }, [], loops);
+    const next = upsertLoop(
+      g,
+      'refine',
+      { name: 'refine', until: 'y', maxIterations: 9, onMax: 'proceed' },
+      ['gen', 'critique'], // dropped `test`
+    );
+    expect(next.loops).toEqual([
+      { name: 'refine', nodes: ['gen', 'critique'], until: 'y', maxIterations: 9, onMax: 'proceed' },
+    ]);
+  });
+
+  it('removeLoop deletes the group entry; member steps are untouched', () => {
+    const g = withDerivedEdges(
+      { name: 'w', rest: {} },
+      [{ id: 'gen', data: { id: 'gen', kind: 'step', agent: 'x', prompt: 'p' }, position: { x: 0, y: 0 } }],
+      loops,
+    );
+    const next = removeLoop(g, 'refine');
+    expect(next.loops).toEqual([]);
+    expect(next.nodes.find((n) => n.id === 'gen')?.data.agent).toBe('x');
+  });
+});
+
+describe('loops: inline validation', () => {
+  it('flags a loop with <2 members and an unknown member id', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [{ id: 'a', agent: 'x', prompt: 'p' }],
+      loops: { solo: { nodes: ['a'], until: 'u', max_iterations: 3 } },
+    });
+    const problems = validateGraph(g);
+    const key = loopProblemKey('solo');
+    expect(problems[key].join(' ')).toContain('at least 2');
+
+    const g2 = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+      ],
+      loops: { solo: { nodes: ['a', 'ghost'], until: 'u', max_iterations: 3 } },
+    });
+    expect(validateGraph(g2)[key].join(' ')).toContain('ghost');
+  });
+
+  it('flags overlapping loop membership', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+        { id: 'c', agent: 'x', prompt: 'p' },
+      ],
+      loops: {
+        one: { nodes: ['a', 'b'], until: 'u', max_iterations: 3 },
+        two: { nodes: ['b', 'c'], until: 'u', max_iterations: 3 },
+      },
+    });
+    const problems = validateGraph(g);
+    expect(problems[loopProblemKey('one')].join(' ')).toContain('also belongs to loop');
+    expect(problems[loopProblemKey('two')].join(' ')).toContain('also belongs to loop');
+  });
+
+  it('flags a cyclic internal sub-DAG', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p', next: ['b'] },
+        { id: 'b', agent: 'x', prompt: 'p', next: ['a'] },
+      ],
+      loops: { cyc: { nodes: ['a', 'b'], until: 'u', max_iterations: 3 } },
+    });
+    expect(validateGraph(g)[loopProblemKey('cyc')].join(' ')).toContain('cycle');
+  });
+
+  it('flags a member escaping the loop via its own next', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p', next: ['outside'] },
+        { id: 'b', agent: 'x', prompt: 'p' },
+        { id: 'outside', agent: 'x', prompt: 'p' },
+      ],
+      loops: { esc: { nodes: ['a', 'b'], until: 'u', max_iterations: 3 } },
+    });
+    const problems = validateGraph(g);
+    expect(problems.a.join(' ')).toContain('escapes loop');
+    expect(problems[loopProblemKey('esc')].join(' ')).toContain('escapes');
+  });
+
+  it('a clean refine loop over a real workflow has no loop problems', () => {
+    const g = yamlToGraph(refineWorkflowObj());
+    const problems = validateGraph(g);
+    expect(problems[loopProblemKey('refine')]).toBeUndefined();
+  });
+
+  it('a loop feedback data-ref (gen reading the prior iteration\'s critique output) does NOT read as a cycle and does NOT block saving', () => {
+    // `gen`'s prompt references `steps.critique.output` — a genuine
+    // `deriveEdges` edge (critique -> gen) that, combined with the forward
+    // chain gen -> test -> critique, would be a real cycle in the raw
+    // graph. This is the loop's intended cross-iteration feedback (spec
+    // §2d), NOT a bug: it must not be flagged as "part of a cycle", must
+    // not be flagged as "references steps.critique which runs later", and
+    // graphToWorkflowObject must still be able to serialize it.
+    const input = refineWorkflowObj();
+    const steps = input.steps as Record<string, unknown>[];
+    const gen = steps.find((s) => s.id === 'gen')!;
+    gen.prompt = 'regenerate, improved by: {{ steps.critique.output }}';
+
+    const g = yamlToGraph(input);
+    const problems = validateGraph(g);
+    expect(problems.gen ?? []).not.toContain(expect.stringContaining('cycle'));
+    expect((problems.gen ?? []).join(' ')).not.toContain('cycle');
+    expect((problems.gen ?? []).join(' ')).not.toContain('runs later');
+    expect(problems[loopProblemKey('refine')]).toBeUndefined();
+
+    const res = graphToWorkflowObject(g);
+    expect('obj' in res).toBe(true);
+  });
+
+  it('a GENUINE cross-loop-member control cycle (next: a->b->a) is still caught', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p', next: ['b'] },
+        { id: 'b', agent: 'x', prompt: 'p', next: ['a'] },
+      ],
+      loops: { cyc: { nodes: ['a', 'b'], until: 'u', max_iterations: 3 } },
+    });
+    expect(validateGraph(g)[loopProblemKey('cyc')].join(' ')).toContain('cycle');
+    const res = graphToWorkflowObject(g);
+    expect('error' in res).toBe(true);
   });
 });

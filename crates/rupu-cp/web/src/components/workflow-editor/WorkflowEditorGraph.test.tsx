@@ -22,6 +22,12 @@ import { render, screen, cleanup, fireEvent, act } from '@testing-library/react'
 // and in the test bodies below.
 const rfCapture = vi.hoisted(() => ({
   onEdgesChange: undefined as ((changes: unknown[]) => void) | undefined,
+  // Captures `onNodeClick`/`onNodesChange` too (Phase 3 Task 5's multi-select
+  // + "Group into loop" tests drive these directly — same rationale as
+  // `onEdgesChange` above: the real canvas can't mount under jsdom, so this
+  // is the only way to exercise a node click/removal without it).
+  onNodeClick: undefined as ((evt: Partial<MouseEvent>, node: { id: string }) => void) | undefined,
+  onNodesChange: undefined as ((changes: unknown[]) => void) | undefined,
 }));
 
 // ReactFlow's mock also serializes the `edges` prop it received into a data
@@ -34,13 +40,19 @@ vi.mock('@xyflow/react', () => ({
     edges,
     nodes,
     onEdgesChange,
+    onNodeClick,
+    onNodesChange,
   }: {
     children?: ReactNode;
     edges?: unknown[];
     nodes?: unknown[];
     onEdgesChange?: (changes: unknown[]) => void;
+    onNodeClick?: (evt: Partial<MouseEvent>, node: { id: string }) => void;
+    onNodesChange?: (changes: unknown[]) => void;
   }) => {
     rfCapture.onEdgesChange = onEdgesChange;
+    rfCapture.onNodeClick = onNodeClick;
+    rfCapture.onNodesChange = onNodesChange;
     return (
       <div data-testid="rf" data-edges={JSON.stringify(edges ?? [])} data-nodes={JSON.stringify(nodes ?? [])}>
         {children}
@@ -1524,5 +1536,266 @@ describe('single-source graph ops', () => {
     expect(invariantHolds(g)).toBe(true);
     const r = applyAddNode(g, 'step');
     expect(invariantHolds(r.graph)).toBe(true);
+  });
+});
+
+// ── loops (Phase 3 Task 5) ───────────────────────────────────────────────────
+
+interface FlowNodeDto {
+  id: string;
+  type?: string;
+  data: { loop?: { name: string }; problems?: string[]; workflowEditorUi?: string };
+}
+
+function readFlowNodes(): FlowNodeDto[] {
+  const raw = screen.getByTestId('rf').getAttribute('data-nodes');
+  expect(raw).toBeTruthy();
+  return JSON.parse(raw!) as FlowNodeDto[];
+}
+
+function makeLoopGraph(): WorkflowGraph {
+  return {
+    nodes: [
+      { id: 'gen', data: { id: 'gen', kind: 'step', agent: 'g', prompt: 'p' }, position: { x: 0, y: 0 } },
+      { id: 'test', data: { id: 'test', kind: 'step', agent: 't', prompt: 'p' }, position: { x: 250, y: 0 } },
+      { id: 'ship', data: { id: 'ship', kind: 'step', agent: 's', prompt: 'p' }, position: { x: 500, y: 0 } },
+    ],
+    edges: [],
+    meta: { name: 'wf', rest: {} },
+    loops: [{ name: 'refine', nodes: ['gen', 'test'], until: 'u', maxIterations: 5, onMax: 'fail' }],
+  };
+}
+
+/** Simulate an xyflow node click via the captured `onNodeClick`, so the
+ *  component's real click-handling logic (single vs. multi-select) runs —
+ *  the mocked `<ReactFlow>` doesn't render clickable node cards itself. */
+function clickNode(id: string, opts: { ctrlKey?: boolean } = {}) {
+  act(() => rfCapture.onNodeClick?.({ ctrlKey: opts.ctrlKey ?? false }, { id }));
+}
+
+describe('loops: rendering', () => {
+  it('renders a loopGroup node for each entry in graph.loops', () => {
+    render(
+      <WorkflowEditorGraph
+        graph={makeLoopGraph()}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+      />,
+    );
+    const groups = readFlowNodes().filter((n) => n.type === 'loopGroup');
+    expect(groups).toHaveLength(1);
+    expect(groups[0].data.loop?.name).toBe('refine');
+  });
+
+  it('a workflow with no loops renders no loopGroup node (classic-unchanged)', () => {
+    render(
+      <WorkflowEditorGraph
+        graph={makeGraph()}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+      />,
+    );
+    const nodes = readFlowNodes();
+    expect(nodes.filter((n) => n.type === 'loopGroup')).toHaveLength(0);
+    expect(nodes).toHaveLength(2); // the 2 real step nodes only — no extra rendering
+  });
+
+  it('surfaces loop-level problems (Phase 1 inline validation reuse) on the loopGroup node', () => {
+    render(
+      <WorkflowEditorGraph
+        graph={makeLoopGraph()}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{ 'loop:refine': ["step 'test' also belongs to loop 'other'"] }}
+        onInvalidConnection={() => {}}
+      />,
+    );
+    const group = readFlowNodes().find((n) => n.type === 'loopGroup');
+    expect(group?.data.problems).toEqual(["step 'test' also belongs to loop 'other'"]);
+  });
+
+  it('a clean loop (no problemsById entry) has an empty problems list', () => {
+    render(
+      <WorkflowEditorGraph
+        graph={makeLoopGraph()}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+      />,
+    );
+    const group = readFlowNodes().find((n) => n.type === 'loopGroup');
+    expect(group?.data.problems).toEqual([]);
+  });
+});
+
+describe('loops: "Group into loop" authoring', () => {
+  function renderGraph(graph: WorkflowGraph, onChange = vi.fn()) {
+    render(
+      <WorkflowEditorGraph
+        graph={graph}
+        onChange={onChange}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+      />,
+    );
+    return onChange;
+  }
+
+  it('is disabled with no selection, and with a single-node selection', () => {
+    renderGraph(makeGraph());
+    expect(screen.getByRole('button', { name: /Group into loop/ })).toBeDisabled();
+    clickNode('a');
+    expect(screen.getByRole('button', { name: /Group into loop/ })).toBeDisabled();
+  });
+
+  it('enables once 2 nodes are ctrl-selected, and creates a `loops.<name>` entry with those nodes', () => {
+    const onChange = vi.fn();
+    renderGraph(makeGraph(), onChange); // nodes: a, b
+    clickNode('a', { ctrlKey: true });
+    clickNode('b', { ctrlKey: true });
+    const groupBtn = screen.getByRole('button', { name: /Group into loop \(2\)/ });
+    expect(groupBtn).toBeEnabled();
+    fireEvent.click(groupBtn);
+
+    fireEvent.change(screen.getByLabelText('Loop name'), { target: { value: 'refine' } });
+    fireEvent.change(screen.getByLabelText('Until condition'), {
+      target: { value: '{{ steps.b.approved }}' },
+    });
+    fireEvent.change(screen.getByLabelText('Max iterations'), { target: { value: '3' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create loop' }));
+
+    expect(onChange).toHaveBeenCalledTimes(1);
+    const next = onChange.mock.calls[0][0] as WorkflowGraph;
+    expect(next.loops).toEqual([
+      { name: 'refine', nodes: ['a', 'b'], until: '{{ steps.b.approved }}', maxIterations: 3, onMax: 'fail' },
+    ]);
+  });
+
+  it('a graph with a loop present still round-trips (loops carried through onChange, byte-equality of node data)', () => {
+    const onChange = vi.fn();
+    renderGraph(makeLoopGraph(), onChange);
+    clickNode('gen', { ctrlKey: true });
+    clickNode('ship', { ctrlKey: true }); // 'ship' is NOT already in a loop, but 'gen' is → overlap
+    expect(screen.getByRole('button', { name: /Group into loop/ })).toBeDisabled();
+  });
+});
+
+describe('loops: editing + removing an existing group', () => {
+  function renderGraph(graph: WorkflowGraph, onChange = vi.fn()) {
+    render(
+      <WorkflowEditorGraph
+        graph={graph}
+        onChange={onChange}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+      />,
+    );
+    return onChange;
+  }
+
+  it('selecting exactly an existing loop\'s members opens its edit form, pre-filled', () => {
+    renderGraph(makeLoopGraph());
+    clickNode('gen', { ctrlKey: true });
+    clickNode('test', { ctrlKey: true });
+    const editBtn = screen.getByRole('button', { name: /Edit loop refine/ });
+    expect(editBtn).toBeEnabled();
+    fireEvent.click(editBtn);
+    expect(screen.getByLabelText('Loop name')).toHaveValue('refine');
+    expect(screen.getByLabelText('Until condition')).toHaveValue('u');
+    expect(screen.getByLabelText('Max iterations')).toHaveValue(5);
+  });
+
+  it('editing updates until/max/on_max and add/remove a member', () => {
+    const onChange = vi.fn();
+    renderGraph(makeLoopGraph(), onChange);
+    clickNode('gen', { ctrlKey: true });
+    clickNode('test', { ctrlKey: true });
+    fireEvent.click(screen.getByRole('button', { name: /Edit loop refine/ }));
+
+    fireEvent.change(screen.getByLabelText('Until condition'), { target: { value: 'new-until' } });
+    fireEvent.change(screen.getByLabelText('Max iterations'), { target: { value: '9' } });
+    fireEvent.change(screen.getByLabelText('On max'), { target: { value: 'proceed' } });
+    // Add 'ship' as a member via the checkbox list.
+    fireEvent.click(screen.getByRole('checkbox', { name: 'ship' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    expect(onChange).toHaveBeenCalledTimes(1);
+    const next = onChange.mock.calls[0][0] as WorkflowGraph;
+    expect(next.loops).toEqual([
+      { name: 'refine', nodes: ['gen', 'test', 'ship'], until: 'new-until', maxIterations: 9, onMax: 'proceed' },
+    ]);
+  });
+
+  it('"Remove loop" deletes the group entry; member steps are untouched', () => {
+    const onChange = vi.fn();
+    renderGraph(makeLoopGraph(), onChange);
+    clickNode('gen', { ctrlKey: true });
+    clickNode('test', { ctrlKey: true });
+    fireEvent.click(screen.getByRole('button', { name: /Edit loop refine/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Remove loop' }));
+
+    expect(onChange).toHaveBeenCalledTimes(1);
+    const next = onChange.mock.calls[0][0] as WorkflowGraph;
+    expect(next.loops).toEqual([]);
+    expect(next.nodes.find((n) => n.id === 'gen')).toBeDefined();
+    expect(next.nodes.find((n) => n.id === 'test')).toBeDefined();
+  });
+});
+
+describe('loops: depends_on parity (Task 1 delete-clears still holds with a loop present)', () => {
+  it('applyDelete scrubs BOTH the depends_on entry and the loop membership for the same deleted id', () => {
+    const g: WorkflowGraph = {
+      nodes: [
+        { id: 'seed', data: { id: 'seed', kind: 'step', agent: 'x', prompt: 'p' }, position: { x: 0, y: 0 } },
+        {
+          id: 'gen',
+          data: { id: 'gen', kind: 'step', agent: 'x', prompt: 'p', depends_on: ['seed'] },
+          position: { x: 0, y: 0 },
+        },
+        { id: 'test', data: { id: 'test', kind: 'step', agent: 'x', prompt: 'p' }, position: { x: 0, y: 0 } },
+      ],
+      edges: [],
+      meta: { name: 'wf', rest: {} },
+      loops: [{ name: 'refine', nodes: ['gen', 'test'], until: 'u', maxIterations: 5, onMax: 'fail' }],
+    };
+    const next = applyDelete(g, 'gen');
+    // depends_on parity: no surviving node still depends on the deleted id.
+    expect(next.nodes.some((n) => n.data.depends_on?.includes('gen'))).toBe(false);
+    // loop parity: the loop drops to 1 member ('test') and is removed outright.
+    expect(next.loops).toEqual([]);
+    expect(next.nodes.find((n) => n.id === 'seed')).toBeDefined();
+  });
+
+  it('applyRemoveEdges clears a depends_on-derived edge into a loop member; the loop itself is untouched', () => {
+    const g: WorkflowGraph = {
+      nodes: [
+        { id: 'seed', data: { id: 'seed', kind: 'step', agent: 'x', prompt: 'p' }, position: { x: 0, y: 0 } },
+        {
+          id: 'gen',
+          data: { id: 'gen', kind: 'step', agent: 'x', prompt: 'p', depends_on: ['seed'] },
+          position: { x: 0, y: 0 },
+        },
+        { id: 'test', data: { id: 'test', kind: 'step', agent: 'x', prompt: 'p' }, position: { x: 0, y: 0 } },
+      ],
+      edges: [],
+      meta: { name: 'wf', rest: {} },
+      loops: [{ name: 'refine', nodes: ['gen', 'test'], until: 'u', maxIterations: 5, onMax: 'fail' }],
+    };
+    const next = applyRemoveEdges(g, new Set(['seed->gen']));
+    expect(next.nodes.find((n) => n.id === 'gen')!.data.depends_on ?? []).not.toContain('seed');
+    expect(next.loops).toEqual(g.loops); // the loop's own membership is unaffected by an edge deletion
   });
 });

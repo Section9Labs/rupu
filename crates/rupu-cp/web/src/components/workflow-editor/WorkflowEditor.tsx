@@ -367,7 +367,7 @@ export default function WorkflowEditor({
       // then/else checkboxes) or `condition` directly on node data — branch
       // routing is single-source, so re-deriving here is what makes a form
       // edit draw/round-trip, exactly like a canvas-drawn arm connection.
-      commit(withDerivedEdges(graph.meta, nodes));
+      commit(withDerivedEdges(graph.meta, nodes, graph.loops));
       // The step id may have been renamed — keep the selection pointing at it.
       setSelectedId(data.id);
     },

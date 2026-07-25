@@ -32,20 +32,29 @@ import {
 } from '@xyflow/react';
 import {
   canConnect,
+  canGroupIntoLoop,
   deriveEdges,
+  loopProblemKey,
   materializeLegacyChain,
+  removeLoop,
+  scrubStepFromLoops,
+  upsertLoop,
   withDerivedEdges,
   type GraphEdge,
   type GraphNode,
+  type LoopDraft,
   type StepKind,
   type StepNodeData,
   type WorkflowGraph,
+  type WorkflowLoop,
 } from '../../lib/workflowGraph';
 import { autoLayout, editorNodeSize, NODE_W } from '../../lib/workflowLayout';
 import { useThemeColors, type ThemeColors } from '../../lib/useThemeColors';
 import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 import type { ToolSpec } from '../../lib/api';
 import EditableStepNode, { type NodeData } from './nodes/EditableStepNode';
+import LoopGroupNode, { type LoopGroupNodeData, loopGroupBox } from './nodes/LoopGroupNode';
+import LoopForm from './LoopForm';
 import { KIND_ACCENT } from './kindVisuals';
 import NodePalette, { NODE_KIND_MIME, NODE_SEED_MIME } from './NodePalette';
 
@@ -53,7 +62,7 @@ import '@xyflow/react/dist/style.css';
 
 // Memoized once at module scope so React Flow doesn't see a fresh object each
 // render (mirrors RunGraph).
-const NODE_TYPES: NodeTypes = { editable: EditableStepNode };
+const NODE_TYPES: NodeTypes = { editable: EditableStepNode, loopGroup: LoopGroupNode };
 
 // ── Pure mutation helpers (exported for tests) ───────────────────────────────
 
@@ -171,7 +180,7 @@ export function applyConnect(
       if (list.includes(target)) return n;
       return { ...n, data: { ...n.data, [key]: [...list, target] } };
     });
-    onChange(withDerivedEdges(graph.meta, nodes));
+    onChange(withDerivedEdges(graph.meta, nodes, graph.loops));
     return;
   }
 
@@ -179,7 +188,7 @@ export function applyConnect(
     if (n.id !== source) return n;
     return { ...n, data: n.data.kind === 'split' ? addSplitTarget(n.data, target) : setNext(n.data, target) };
   });
-  onChange(withDerivedEdges(graph.meta, nodes));
+  onChange(withDerivedEdges(graph.meta, nodes, graph.loops));
 }
 
 /** Remove a node, scrubbing it from any surviving node's `next`/`split`
@@ -189,7 +198,13 @@ export function applyConnect(
  *  `depends_on`, incoming) edges derive from, so without this an edge to or
  *  from a now-gone node would keep trying to derive. Chain/data-ref edges
  *  touching the deleted id simply stop existing once the id is gone from the
- *  node array — nothing else to clean up there. */
+ *  node array — nothing else to clean up there.
+ *
+ *  Also scrubs the deleted id from any loop's `nodes` (`scrubStepFromLoops`)
+ *  — a loop referencing a now-gone member would otherwise dangle (and
+ *  validate as `LoopNodeUnknown`); a loop left with <2 members after the
+ *  drop is removed outright, same as the explicit "remove the group"
+ *  action's effect. */
 export function applyDelete(graph: WorkflowGraph, id: string): WorkflowGraph {
   const nodes = graph.nodes
     .filter((n) => n.id !== id)
@@ -218,7 +233,7 @@ export function applyDelete(graph: WorkflowGraph, id: string): WorkflowGraph {
         },
       };
     });
-  return withDerivedEdges(graph.meta, nodes);
+  return withDerivedEdges(graph.meta, nodes, scrubStepFromLoops(graph.loops ?? [], id));
 }
 
 /** Remove edges by id. A removed BRANCH-arm edge (`branch: 'then' | 'else'`)
@@ -269,7 +284,7 @@ export function applyRemoveEdges(graph: WorkflowGraph, ids: ReadonlySet<string>)
     }
     return data === n.data ? n : { ...n, data };
   });
-  return withDerivedEdges(graph.meta, nodes);
+  return withDerivedEdges(graph.meta, nodes, graph.loops);
 }
 
 /** Smallest free `step-N` id (N ≥ 1) not already used by a node. */
@@ -321,7 +336,7 @@ export function applyAddNodeAt(
   const data: StepNodeData = { ...newNodeData(id, kind), ...seed, id, kind };
   const node: GraphNode = { id, data, position: { x: position.x, y: position.y } };
   const nodes = [...graph.nodes, node];
-  return { graph: withDerivedEdges(graph.meta, nodes), id };
+  return { graph: withDerivedEdges(graph.meta, nodes, graph.loops), id };
 }
 
 /** Append a new node of the given kind near canvas center; returns the updated
@@ -387,7 +402,7 @@ export function applyAddConnectedNext(
         return { ...n, data: n.data.kind === 'split' ? addSplitTarget(n.data, id) : setNext(n.data, id) };
       })
     : nodes;
-  return { graph: withDerivedEdges(graph.meta, wired), id };
+  return { graph: withDerivedEdges(graph.meta, wired, graph.loops), id };
 }
 
 /** Insert a new node onto an existing edge A→B, keeping the derived edges
@@ -425,13 +440,13 @@ export function applyInsertOnEdge(
     });
     const bIdx = nodes.findIndex((n) => n.id === edge.target);
     nodes.splice(bIdx >= 0 ? bIdx : nodes.length, 0, newNode);
-    return { graph: withDerivedEdges(graph.meta, nodes), id };
+    return { graph: withDerivedEdges(graph.meta, nodes, graph.loops), id };
   }
 
   const nodes = [...graph.nodes];
   const bIdx = nodes.findIndex((n) => n.id === edge.target);
   nodes.splice(bIdx >= 0 ? bIdx : nodes.length, 0, newNode);
-  return { graph: withDerivedEdges(graph.meta, nodes), id };
+  return { graph: withDerivedEdges(graph.meta, nodes, graph.loops), id };
 }
 
 /** Narrow an arbitrary dataTransfer string to a StepKind. Exported for tests. */
@@ -508,6 +523,17 @@ function WorkflowEditorGraphInner({
   tools,
 }: Props) {
   const colors = useThemeColors();
+  const loops = graph.loops ?? [];
+
+  // Multi-select for "Group into loop" (Phase 3 Task 5) — separate from
+  // `selectedId` (the single-node inspector selection, unchanged). A plain
+  // click resets this to just the clicked node (mirroring `selectedId`); a
+  // shift/ctrl/meta+click toggles membership, building up a multi-node
+  // selection without disturbing the inspector's own single-selection state.
+  const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(new Set());
+
+  // "Group into loop" / edit-loop form (Phase 3 Task 5). `null` = closed.
+  const [loopForm, setLoopForm] = useState<{ editing: WorkflowLoop | null; memberIds: string[] } | null>(null);
 
   // Edge selection lives here (not on GraphEdge) — it's transient UI state,
   // not something that round-trips to YAML. ReactFlow is fully controlled, so
@@ -515,6 +541,23 @@ function WorkflowEditorGraphInner({
   // land: the edge never renders `selected`, and Backspace (which deletes
   // SELECTED elements) never sees a selected edge to remove.
   const [selectedEdgeIds, setSelectedEdgeIds] = useState<ReadonlySet<string>>(new Set());
+
+  // Prune multi-selected ids that no longer name a node (e.g. a YAML
+  // reconcile / undo dropped one) — same "don't linger forever" hygiene as
+  // `selectedEdgeIds` below.
+  useEffect(() => {
+    setSelectedIds((prev) => {
+      if (prev.size === 0) return prev;
+      const live = new Set(graph.nodes.map((n) => n.id));
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (live.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [graph.nodes]);
 
   // Prune ids that no longer name an edge (e.g. a YAML reconcile dropped one
   // out from under the selection) so stale ids don't linger in state forever.
@@ -539,10 +582,47 @@ function WorkflowEditorGraphInner({
         type: 'editable',
         position: node.position,
         data: { node, problems: problemsById[node.id] ?? [], workflowEditorUi },
-        selected: node.id === selectedId,
+        selected: node.id === selectedId || selectedIds.has(node.id),
       })),
-    [graph.nodes, problemsById, selectedId, workflowEditorUi],
+    [graph.nodes, problemsById, selectedId, selectedIds, workflowEditorUi],
   );
+
+  // Loop group boundary nodes (Phase 3 Task 5) — one synthetic, non-
+  // interactive `loopGroup` node per entry in `graph.loops`, sized to its
+  // members' bounding box. Rendered ahead of `nodes` in the array AND given
+  // a negative `zIndex` (xyflow z-orders by array position by default, but
+  // an explicit zIndex is the belt-and-suspenders guarantee it never paints
+  // over a member card even if array order changes). A loop whose members
+  // were all deleted from the canvas (`loopGroupBox` → null) renders
+  // nothing — `validateGraph`'s `LoopNodeUnknown`-mirroring check already
+  // flags that on the loop's own problems key.
+  const loopGroupNodes = useMemo<Node<LoopGroupNodeData>[]>(() => {
+    const out: Node<LoopGroupNodeData>[] = [];
+    for (const loop of loops) {
+      const box = loopGroupBox(graph.nodes, loop);
+      if (!box) continue;
+      out.push({
+        id: `loop-group:${loop.name}`,
+        type: 'loopGroup',
+        position: { x: box.x, y: box.y },
+        style: { width: box.width, height: box.height },
+        zIndex: -1,
+        draggable: false,
+        selectable: false,
+        connectable: false,
+        data: {
+          loop,
+          width: box.width,
+          height: box.height,
+          problems: problemsById[loopProblemKey(loop.name)] ?? [],
+          onEdit: () => setLoopForm({ editing: loop, memberIds: loop.nodes }),
+        },
+      });
+    }
+    return out;
+  }, [loops, graph.nodes, problemsById]);
+
+  const flowNodes = useMemo<Node[]>(() => [...loopGroupNodes, ...nodes], [loopGroupNodes, nodes]);
 
   // Stable string key over (node id, kind) pairs only — NOT `graph.nodes`
   // itself, whose array identity (and therefore the memo below) changes on
@@ -645,13 +725,20 @@ function WorkflowEditorGraphInner({
 
   // Move (drag) + delete (Backspace/Delete) both arrive as node changes.
   const onNodesChange = useCallback(
-    (changes: NodeChange<Node<NodeData>>[]) => {
+    (changes: NodeChange<Node>[]) => {
       const removed = changes.flatMap((c) => (c.type === 'remove' ? [c.id] : []));
       if (removed.length > 0) {
         let g = graph;
         for (const id of removed) g = applyDelete(g, id);
         onChange(g);
         if (selectedId !== null && removed.includes(selectedId)) onSelect(null);
+        if (removed.some((id) => selectedIds.has(id))) {
+          setSelectedIds((prev) => {
+            const next = new Set(prev);
+            for (const id of removed) next.delete(id);
+            return next;
+          });
+        }
         return;
       }
       const moves = changes.filter((c) => c.type === 'position');
@@ -666,7 +753,7 @@ function WorkflowEditorGraphInner({
         }),
       });
     },
-    [graph, nodes, onChange, selectedId, onSelect],
+    [graph, nodes, onChange, selectedId, onSelect, selectedIds],
   );
 
   // Select (click) + remove (Backspace/Delete on a selected edge) both arrive
@@ -727,12 +814,75 @@ function WorkflowEditorGraphInner({
     [graph.edges, graph.nodes],
   );
 
-  const onNodeClick = useCallback<NodeMouseHandler<Node<NodeData>>>(
-    (_evt, node) => onSelect(node.id),
+  // Plain click: single-select (both `selectedId`, for the inspector, and
+  // `selectedIds`, reset to just this node — mirrors clicking away from a
+  // multi-selection in most canvas UIs). Shift/ctrl/meta+click: toggle this
+  // node's membership in `selectedIds` WITHOUT touching `selectedId` (the
+  // multi-select is purely for "Group into loop"; the inspector keeps
+  // showing whatever it already had). A `loop-group:*` pseudo-node
+  // (`selectable: false`) is excluded from both — its own label button
+  // handles its click via `onEdit`.
+  const onNodeClick = useCallback<NodeMouseHandler<Node>>(
+    (evt, node) => {
+      if (node.id.startsWith('loop-group:')) return;
+      if (evt.shiftKey || evt.metaKey || evt.ctrlKey) {
+        setSelectedIds((prev) => {
+          const next = new Set(prev);
+          if (next.has(node.id)) next.delete(node.id);
+          else next.add(node.id);
+          return next;
+        });
+        return;
+      }
+      setSelectedIds(new Set([node.id]));
+      onSelect(node.id);
+    },
     [onSelect],
   );
 
-  const onPaneClick = useCallback(() => onSelect(null), [onSelect]);
+  const onPaneClick = useCallback(() => {
+    onSelect(null);
+    setSelectedIds(new Set());
+  }, [onSelect]);
+
+  // "Group into loop" — enabled for a >=2-node selection with no overlap
+  // against an existing (OTHER) loop (`canGroupIntoLoop`). When the current
+  // selection is EXACTLY an existing loop's own membership, the same button
+  // opens that loop's EDIT form instead of creating a new one — both a
+  // keyboard/selection-driven alternative to clicking the boundary badge
+  // (`LoopGroupNode`'s `onEdit`) and the affordance these tests drive.
+  const selectedIdsArr = useMemo(() => [...selectedIds], [selectedIds]);
+  const exactLoopMatch = useMemo(
+    () =>
+      loops.find(
+        (l) => l.nodes.length === selectedIdsArr.length && l.nodes.every((id) => selectedIds.has(id)),
+      ),
+    [loops, selectedIdsArr, selectedIds],
+  );
+  const canGroup = exactLoopMatch !== undefined || canGroupIntoLoop(loops, selectedIdsArr);
+  const openGroupForm = useCallback(() => {
+    if (!canGroup) return;
+    if (exactLoopMatch) setLoopForm({ editing: exactLoopMatch, memberIds: exactLoopMatch.nodes });
+    else setLoopForm({ editing: null, memberIds: selectedIdsArr });
+  }, [canGroup, exactLoopMatch, selectedIdsArr]);
+
+  const closeLoopForm = useCallback(() => setLoopForm(null), []);
+
+  const submitLoopForm = useCallback(
+    (draft: LoopDraft, memberIds: string[]) => {
+      const previousName = loopForm?.editing?.name ?? null;
+      onChange(upsertLoop(graph, previousName, draft, memberIds));
+      setLoopForm(null);
+      setSelectedIds(new Set());
+    },
+    [graph, loopForm, onChange],
+  );
+
+  const deleteLoopForm = useCallback(() => {
+    if (!loopForm?.editing) return;
+    onChange(removeLoop(graph, loopForm.editing.name));
+    setLoopForm(null);
+  }, [graph, loopForm, onChange]);
 
   const rf = useReactFlow();
 
@@ -862,6 +1012,23 @@ function WorkflowEditorGraphInner({
         >
           ⊕ next
         </button>
+        <button
+          type="button"
+          disabled={paused || !canGroup}
+          onClick={openGroupForm}
+          title={
+            exactLoopMatch
+              ? `Edit loop ${exactLoopMatch.name}`
+              : canGroup
+                ? `Group ${selectedIdsArr.length} steps into a loop`
+                : 'Select 2+ steps (none already in another loop)'
+          }
+          className="rounded-md border border-border bg-panel px-2 py-1 text-note font-medium text-ink-dim hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {exactLoopMatch
+            ? `⟳ Edit loop ${exactLoopMatch.name}`
+            : `⟳ Group into loop${selectedIdsArr.length >= 2 ? ` (${selectedIdsArr.length})` : ''}`}
+        </button>
         <span className="mx-1 h-4 w-px bg-border" aria-hidden />
         <div className="relative">
           <input
@@ -892,6 +1059,18 @@ function WorkflowEditorGraphInner({
         </div>
       </div>
 
+      {loopForm && (
+        <LoopForm
+          editing={loopForm.editing}
+          candidateIds={graph.nodes.map((n) => n.id)}
+          initialMemberIds={loopForm.memberIds}
+          otherLoopNames={loops.filter((l) => l.name !== loopForm.editing?.name).map((l) => l.name)}
+          onSubmit={submitLoopForm}
+          onDelete={loopForm.editing ? deleteLoopForm : undefined}
+          onCancel={closeLoopForm}
+        />
+      )}
+
       {workflowEditorUi === 'next'
         ? paletteContainer &&
           createPortal(
@@ -921,7 +1100,7 @@ function WorkflowEditorGraphInner({
         onDrop={onDrop}
       >
       <ReactFlow
-        nodes={nodes}
+        nodes={flowNodes}
         edges={edges}
         nodeTypes={NODE_TYPES}
         onNodesChange={onNodesChange}

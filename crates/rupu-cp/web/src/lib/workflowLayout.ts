@@ -177,7 +177,7 @@ export function reconcileGraph(prev: WorkflowGraph, next: WorkflowGraph): Workfl
     ...n,
     position: prevPosById.get(n.id) ?? laidPosById.get(n.id) ?? { x: 0, y: 0 },
   }));
-  return withDerivedEdges(next.meta, nodes);
+  return withDerivedEdges(next.meta, nodes, next.loops);
 }
 
 // ── reconcileFromYaml ─────────────────────────────────────────────────────────
