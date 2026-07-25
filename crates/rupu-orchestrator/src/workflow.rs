@@ -202,6 +202,8 @@ pub enum WorkflowParseError {
     JoinNoInboundEdges { step: String },
     #[error("loop `{loop_name}`: node `{node}` does not match any step id")]
     LoopNodeUnknown { loop_name: String, node: String },
+    #[error("loop `{loop_name}`: node `{node}` is listed twice")]
+    LoopDuplicateNode { loop_name: String, node: String },
     #[error("step `{node}` belongs to two loops: `{}` and `{}`", loops.0, loops.1)]
     LoopNodeOverlap {
         node: String,
@@ -216,7 +218,7 @@ pub enum WorkflowParseError {
     #[error("loop `{loop_name}` has a cycle through its internal control edges: {path}")]
     LoopSubgraphCyclic { loop_name: String, path: String },
     #[error(
-        "loop `{loop_name}`: member `{node}`'s own control edge targets `{target}`, which is outside the loop (a member's outgoing next/split/branch edge must stay inside the loop; entry/exit is via outside nodes' edges)"
+        "loop `{loop_name}`: member `{node}`'s own `split`/`join` targets `{target}`, which is outside the loop (a member's split/join fan-out must stay inside the loop; a plain `next`/branch-arm to an outside node is a valid loop EXIT, per spec §2b/§2f)"
     )]
     LoopMemberEscapes {
         loop_name: String,
@@ -2382,19 +2384,23 @@ fn validate_graph(wf: &Workflow) -> Result<(), WorkflowParseError> {
 /// Checks (each its own error, in this order):
 /// 1. every `loops.<name>.nodes` id names a real step
 ///    ([`WorkflowParseError::LoopNodeUnknown`]);
-/// 2. loops are disjoint — a step belongs to at most one loop
+/// 2. a node is not repeated within the SAME loop's `nodes:` list
+///    ([`WorkflowParseError::LoopDuplicateNode`]);
+/// 3. loops are disjoint — a step belongs to at most one loop
 ///    ([`WorkflowParseError::LoopNodeOverlap`]; v1: loops don't nest);
-/// 3. a loop has at least 2 nodes ([`WorkflowParseError::LoopTooSmall`]);
-/// 4. `max_iterations >= 1` ([`WorkflowParseError::LoopMaxIterationsInvalid`]);
-/// 5. `until` is non-empty ([`WorkflowParseError::LoopUntilEmpty`]);
-/// 6. no loop member's own outgoing control edge escapes the loop
+/// 4. a loop has at least 2 DISTINCT nodes ([`WorkflowParseError::LoopTooSmall`]);
+/// 5. `max_iterations >= 1` ([`WorkflowParseError::LoopMaxIterationsInvalid`]);
+/// 6. `until` is non-empty ([`WorkflowParseError::LoopUntilEmpty`]);
+/// 7. no loop member's own `split` fan-out escapes the loop — a plain
+///    `next`/branch-arm exit is VALID, see
+///    [`validate_loop_member_escapes`]'s doc comment
 ///    ([`WorkflowParseError::LoopMemberEscapes`]);
-/// 7. each loop's internal CONTROL edges (next/split/branch-arm/
+/// 8. each loop's internal CONTROL edges (next/split/branch-arm/
 ///    depends_on between members — NOT inferred data edges; see
 ///    `validate_loop_subgraph_acyclic`'s doc comment for why) are acyclic
 ///    ([`WorkflowParseError::LoopSubgraphCyclic`]).
 ///
-/// The 8th spec §2f check — the collapsed outer graph is acyclic — is
+/// The 9th spec §2f check — the collapsed outer graph is acyclic — is
 /// `validate_collapsed_graph_acyclic`, called separately by
 /// `validate_graph` (not here) since it needs to run in place of, not
 /// alongside, the raw full-graph Kahn check.
@@ -2406,9 +2412,22 @@ fn validate_loops(wf: &Workflow) -> Result<(), WorkflowParseError> {
 
     let mut node_loop: BTreeMap<&str, &str> = BTreeMap::new();
     for (name, def) in &wf.loops {
+        let mut seen_in_loop: BTreeSet<&str> = BTreeSet::new();
         for node in &def.nodes {
             if !ids.contains(node.as_str()) {
                 return Err(WorkflowParseError::LoopNodeUnknown {
+                    loop_name: name.clone(),
+                    node: node.clone(),
+                });
+            }
+            // A node repeated within the SAME loop's `nodes:` list is a
+            // mis-authoring, not a legitimate 1-member loop — reject it
+            // explicitly rather than letting it silently dedup down to
+            // fewer distinct members than `LoopTooSmall`'s raw
+            // `Vec::len()` check saw (`[gen, gen]` has len 2, but only
+            // ONE distinct member).
+            if !seen_in_loop.insert(node.as_str()) {
+                return Err(WorkflowParseError::LoopDuplicateNode {
                     loop_name: name.clone(),
                     node: node.clone(),
                 });
@@ -2449,26 +2468,32 @@ fn validate_loops(wf: &Workflow) -> Result<(), WorkflowParseError> {
     Ok(())
 }
 
-/// A loop member's own outgoing control edge (`next`/`split`/branch-arm)
-/// must stay inside the loop. An external node's `next`/`depends_on`
-/// pointing INTO or OUT OF a member (entry/exit) is unrestricted — this
-/// check only looks at edges a MEMBER itself declares. `depends_on` is
-/// deliberately excluded here: it's a predecessor declaration (an
-/// INCOMING edge onto whoever declares it), so a member's own
-/// `depends_on` can never "escape" the loop outward — see the doc comment
-/// on [`WorkflowParseError::LoopMemberEscapes`].
+/// Only a loop member's own `split` fan-out may not reach outside the loop
+/// (spec §2f: "A loop member may not carry split/join that reaches OUTSIDE
+/// the loop"). A plain `next:`/branch-arm from a member to a non-member is
+/// a VALID loop EXIT (spec §2b defines the loop's successors as exactly
+/// "edges from a loop member to a non-member"), and the Phase-3 editor's
+/// draw-action writes `next` on exit — rejecting it here would reject
+/// workflows the editor itself authors. Task 3's per-iteration inner
+/// scheduler is restricted to [`loop_internal_edges`] (which already
+/// excludes any member->outside edge), so a `next`-authored exit is never
+/// followed mid-iteration; [`collapsed_graph_edges`] rewires it to
+/// `loop:<name> -> <target>` so the OUTER scheduler makes the target ready
+/// only once the loop converges — exactly the entry/exit split described
+/// there. `join` has no outgoing target field of its own (its inbound set
+/// is inferred from edges pointing AT it), so there is nothing for a
+/// member's own `join` to "escape" via — only `split`'s explicit target
+/// list is checked. `depends_on` is excluded for the same reason as
+/// before: it's a predecessor declaration (an INCOMING edge onto whoever
+/// declares it), so a member's own `depends_on` can never "escape" the
+/// loop outward.
 fn validate_loop_member_escapes(
     wf: &Workflow,
     loop_name: &str,
     members: &BTreeSet<&str>,
 ) -> Result<(), WorkflowParseError> {
     for step in wf.steps.iter().filter(|s| members.contains(s.id.as_str())) {
-        let targets = step.next.iter().chain(step.split.iter().flatten()).chain(
-            step.branch
-                .iter()
-                .flat_map(|b| b.then.iter().chain(b.r#else.iter())),
-        );
-        for t in targets {
+        for t in step.split.iter().flatten() {
             if !members.contains(t.as_str()) {
                 return Err(WorkflowParseError::LoopMemberEscapes {
                     loop_name: loop_name.to_string(),
@@ -3972,26 +3997,27 @@ loops:
 
     #[test]
     fn loop_member_escapes_is_rejected() {
-        // `gen` is a loop member whose OWN `next:` targets `outside`, a
-        // non-member — rejected regardless of the fact that `outside`
-        // itself never declares anything about the loop.
+        // `fanout` is a loop member whose OWN `split:` targets `outside`,
+        // a non-member — rejected. (A plain `next`/branch-arm exit is
+        // valid per spec §2b/§2f — see
+        // `loop_member_next_authored_exit_is_valid_and_collapses_correctly`
+        // below; only `split`/`join` fan-out reaching outside is
+        // rejected.)
         let raw = r#"
 name: w
 steps:
-  - id: gen
-    agent: x
-    prompt: p
-    next: [outside]
+  - id: fanout
+    split: [outside, test]
   - id: test
     agent: x
     prompt: p
-    depends_on: [gen]
+    depends_on: [fanout]
   - id: outside
     agent: x
     prompt: p
 loops:
   refine:
-    nodes: [gen, test]
+    nodes: [fanout, test]
     until: "{{ steps.test.output }}"
     max_iterations: 3
 "#;
@@ -4003,10 +4029,87 @@ loops:
                 target,
             } => {
                 assert_eq!(loop_name, "refine");
-                assert_eq!(node, "gen");
+                assert_eq!(node, "fanout");
                 assert_eq!(target, "outside");
             }
             other => panic!("expected LoopMemberEscapes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_member_next_authored_exit_is_valid_and_collapses_correctly() {
+        // `critique` (member) exits the loop via a plain `next: [ship]` —
+        // spec §2b defines the loop's successors as exactly "edges from a
+        // loop member to a non-member," and §2f rejects ONLY split/join
+        // reaching outside, not `next`. This is also how the Phase-3
+        // editor's draw-action authors an exit (it always writes `next`),
+        // so rejecting this shape would reject workflows the editor
+        // itself produces.
+        let raw = r#"
+name: w
+steps:
+  - id: seed
+    agent: seeder
+    prompt: p
+    next: [gen]
+  - id: gen
+    agent: generator
+    prompt: p
+  - id: test
+    agent: tester
+    prompt: p
+    depends_on: [gen]
+  - id: critique
+    agent: critic
+    prompt: p
+    depends_on: [test]
+    next: [ship]
+  - id: ship
+    agent: shipper
+    prompt: p
+loops:
+  refine:
+    nodes: [gen, test, critique]
+    until: "{{ steps.critique.output }}"
+    max_iterations: 5
+"#;
+        let wf = Workflow::parse(raw)
+            .expect("a member's plain `next:` exit must be a valid loop successor edge");
+        let edges = collapsed_graph_edges(&wf);
+        assert!(edges.contains(&("seed".to_string(), "loop:refine".to_string())));
+        assert!(edges.contains(&("loop:refine".to_string(), "ship".to_string())));
+        assert_eq!(
+            edges.len(),
+            2,
+            "internal loop edges must still be dropped: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn loop_duplicate_node_is_rejected() {
+        // `nodes: [gen, gen]` has `Vec::len() == 2` (would pass
+        // `LoopTooSmall`'s raw length check) but only ONE distinct
+        // member — a degenerate single-member loop must not silently
+        // reach Task 3's execution; reject explicitly.
+        let raw = r#"
+name: w
+steps:
+  - id: gen
+    agent: x
+    prompt: p
+loops:
+  refine:
+    nodes: [gen, gen]
+    until: "{{ steps.gen.output }}"
+    max_iterations: 3
+"#;
+        let err = Workflow::parse(raw).unwrap_err();
+        match err {
+            WorkflowParseError::LoopDuplicateNode { loop_name, node } => {
+                assert_eq!(loop_name, "refine");
+                assert_eq!(node, "gen");
+            }
+            other => panic!("expected LoopDuplicateNode, got {other:?}"),
         }
     }
 
