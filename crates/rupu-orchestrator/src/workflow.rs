@@ -1990,6 +1990,41 @@ pub fn loop_of_step<'a>(wf: &'a Workflow, step_id: &str) -> Option<&'a str> {
     })
 }
 
+/// A loop's members' internal CONTROL edges only (next/split/branch-arm/
+/// depends_on, both endpoints members) — exactly the acyclic-by-
+/// construction subgraph [`validate_loop_subgraph_acyclic`] already proves
+/// at parse time (this is the same computation, exposed `pub`). Task 3's
+/// iteration driver uses this to tell a genuine intra-iteration dependency
+/// (a control edge, or a [`loop_internal_edges`] DATA edge that is a
+/// control-DAG descendant of its source) apart from the loop's controlled
+/// feedback back-reference (spec §2d), which is neither. Returns an empty
+/// vec for an unknown loop name.
+pub fn loop_control_edges(wf: &Workflow, loop_name: &str) -> Vec<(String, String)> {
+    let Some(def) = wf.loops.get(loop_name) else {
+        return Vec::new();
+    };
+    let members: BTreeSet<&str> = def.nodes.iter().map(|s| s.as_str()).collect();
+    let mut edges: BTreeSet<(String, String)> = BTreeSet::new();
+    for step in wf.steps.iter().filter(|s| members.contains(s.id.as_str())) {
+        let outs = step.next.iter().chain(step.split.iter().flatten()).chain(
+            step.branch
+                .iter()
+                .flat_map(|b| b.then.iter().chain(b.r#else.iter())),
+        );
+        for t in outs {
+            if members.contains(t.as_str()) {
+                edges.insert((step.id.clone(), t.clone()));
+            }
+        }
+        for p in &step.depends_on {
+            if members.contains(p.as_str()) && p != &step.id {
+                edges.insert((p.clone(), step.id.clone()));
+            }
+        }
+    }
+    edges.into_iter().collect()
+}
+
 /// The subset of [`workflow_edges`] whose BOTH endpoints are members of
 /// `loop_name`. Includes both control edges (next/split/branch-arm/
 /// depends_on between members) and inferred data edges — including the

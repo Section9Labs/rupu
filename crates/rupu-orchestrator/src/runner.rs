@@ -179,10 +179,21 @@ pub enum RunWorkflowError {
         "run cancelled: {aborted} in-flight node(s) aborted; restart to resume from checkpoint"
     )]
     RunCancelled { aborted: usize },
+    /// Task 3, spec §2c/§8g: `until` never held through `max_iterations`
+    /// iterations and the loop's `on_max` is `fail` (the default) —
+    /// fail-loudly rather than let a caller believe the last iteration's
+    /// unconverged output is "the" answer.
+    #[error("loop '{name}' exhausted {max_iterations} iterations, until never held")]
+    LoopExhausted { name: String, max_iterations: u32 },
+    /// A cooperative pause or approval gate landed on a member INSIDE a
+    /// loop iteration. Task 3 wires real loop execution but not pause/
+    /// resume mid-loop (Task 4's job — see that task's plan) — surfacing
+    /// this loudly is strictly better than silently losing the pause or
+    /// mis-resuming at the wrong iteration.
     #[error(
-        "loop `{name}` execution requires the loop driver (lands in a follow-up task) — this workflow's `loops:` block cannot run yet"
+        "loop `{name}`: a pause/approval gate on a member mid-iteration is not supported yet (lands in the loop-resume follow-up task) — this run cannot continue"
     )]
-    LoopRuntimeNotYetWired { name: String },
+    LoopIterationPaused { name: String },
 }
 
 /// Trait the orchestrator uses to construct per-unit [`AgentRunOpts`].
@@ -578,20 +589,6 @@ pub async fn run_workflow(
     // the same `InnerOutcome`, so every consumer below that point (events,
     // awaiting-parking, persistence) is unchanged and shared between the
     // two paths.
-
-    // Task 2 honesty gate (temporary): `loops:` language + validation land
-    // in this task; loop EXECUTION (the super-node + recursive iteration
-    // driver) is a follow-up task's job. `run_scheduler` doesn't know
-    // about loop super-nodes yet, so a workflow declaring `loops:` must
-    // not be allowed to silently mis-run through it — reject loudly,
-    // before ANY run.json side effect (directory creation, `RunStore::
-    // create`, event emission), so nothing partially runs and no orphaned
-    // run record is left behind. The follow-up task removes this gate
-    // when it wires real execution (see `LoopDef`/`loop_of_step`/
-    // `loop_internal_edges`/`collapsed_graph_edges` in `workflow.rs`).
-    if let Some(name) = opts.workflow.loops.keys().next() {
-        return Err(RunWorkflowError::LoopRuntimeNotYetWired { name: name.clone() });
-    }
 
     std::fs::create_dir_all(&opts.transcript_dir)?;
     let resolved_inputs = resolve_inputs(&opts.workflow, &opts.inputs)?;
@@ -1278,6 +1275,81 @@ async fn run_scheduler(
     workflow_default_continue: bool,
     approved_step_id: Option<&str>,
     step_results: &mut Vec<StepResult>,
+    cancel: Option<&CancellationToken>,
+) -> Result<InnerOutcome, RunWorkflowError> {
+    run_scheduler_scoped(
+        opts,
+        run_id,
+        resolved_inputs,
+        workflow_default_continue,
+        approved_step_id,
+        step_results,
+        cancel,
+        SchedulerScope::whole_workflow(),
+    )
+    .await
+}
+
+/// Task 3 (bounded loops, spec §2b-§2e): restricts one [`run_scheduler`]
+/// invocation to less than "every step in `opts.workflow.steps`, over
+/// `workflow_edges`/`collapsed_graph_edges`". [`SchedulerScope::
+/// whole_workflow`] is the zero-cost default every pre-Task-3 call site
+/// uses (via the thin [`run_scheduler`] wrapper above) — `only`/`edges`
+/// both `None` means every branch below that reads `scope.*` takes
+/// exactly the value it always computed, so the legacy/golden path is
+/// untouched code, not a parameterized special case of it.
+///
+/// [`run_loop_node`] is the only OTHER constructor: one loop iteration
+/// scopes `only` to the loop's member ids and `edges` to
+/// [`loop_forward_edges`] (intra-iteration dependencies only — the
+/// feedback back-reference is deliberately excluded, see that function's
+/// doc), and seeds `extra_context`/`loop_progress` for the render-context
+/// surface members and `until` see.
+struct SchedulerScope {
+    /// `None` — every step in `wf.steps` is a scheduling candidate
+    /// (today's behavior). `Some(ids)` — only ids in this set may ever
+    /// enter `ready` / be dispatched for the DURATION of this call; every
+    /// other index simply never gets there (never seeded `done`, since
+    /// nothing here changes `step_results` seeding — it just never enters
+    /// `ready`).
+    only: Option<std::collections::BTreeSet<String>>,
+    /// `None` — build the graph from `workflow_edges`/
+    /// `collapsed_graph_edges` exactly as `graph_mode` already decided.
+    /// `Some(edges)` — use exactly this edge list instead (both current
+    /// callers that pass `Some` also pass a matching `only`).
+    edges: Option<Vec<(String, String)>>,
+    /// Extra `StepResult` history merged into every context build
+    /// ALONGSIDE `step_results` (never INTO it — this never affects
+    /// done/indegree seeding). [`run_loop_node`] uses this to carry the
+    /// outer run's history at the moment the loop became ready plus every
+    /// PRIOR iteration's member outputs (spec §2d's feedback mechanic),
+    /// without those entries causing THIS iteration's members to be
+    /// seeded as already-done.
+    extra_context: Vec<StepResult>,
+    /// The `loops.<name>.{iteration,converged}` render-context surface
+    /// (spec §2e) every context build in this call exposes.
+    loop_progress: std::collections::BTreeMap<String, crate::templates::LoopProgress>,
+}
+
+impl SchedulerScope {
+    fn whole_workflow() -> Self {
+        Self {
+            only: None,
+            edges: None,
+            extra_context: Vec::new(),
+            loop_progress: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_scheduler_scoped(
+    opts: &OrchestratorRunOpts,
+    run_id: &str,
+    resolved_inputs: &BTreeMap<String, String>,
+    workflow_default_continue: bool,
+    approved_step_id: Option<&str>,
+    step_results: &mut Vec<StepResult>,
     // Task 4, spec §8: a whole-run cancel signal, DISTINCT from
     // `opts.pause` (the pre-existing cooperative "stop at the next safe
     // boundary" signal — unchanged, still respected below). When `Some`
@@ -1291,8 +1363,26 @@ async fn run_scheduler(
     // additive. See this task's report for exactly what "cancel" reaches
     // (the `tokio::spawn`ed task boundary) vs. what stays detached.
     cancel: Option<&CancellationToken>,
+    scope: SchedulerScope,
 ) -> Result<InnerOutcome, RunWorkflowError> {
-    let wf = &opts.workflow;
+    // Task 3 (spec §2b): the outer scheduler treats a loop as one
+    // super-node collapsed from its members. `wants_loop_supernodes` is
+    // true ONLY for the top-level call over a workflow that HAS loops
+    // (`scope.edges.is_none()` — a recursive per-iteration call always
+    // passes `Some`, so it never re-triggers this). When true, `wf`
+    // becomes an owned clone of `opts.workflow` with one bare synthetic
+    // `Step` appended per loop (`id: "loop:<name>"`, every other field
+    // empty/None) — see `augment_workflow_with_loop_supernodes`'s doc for
+    // why this, rather than touching every `wf.steps[idx]` site below,
+    // is the surgical way to give a loop super-node a valid index without
+    // forking any of this function's join/branch/cancel bookkeeping.
+    let wants_loop_supernodes = scope.edges.is_none() && !opts.workflow.loops.is_empty();
+    let augmented_wf_owned = if wants_loop_supernodes {
+        Some(augment_workflow_with_loop_supernodes(&opts.workflow))
+    } else {
+        None
+    };
+    let wf: &Workflow = augmented_wf_owned.as_ref().unwrap_or(&opts.workflow);
     let n = wf.steps.len();
     let index_of: BTreeMap<&str, usize> = wf
         .steps
@@ -1301,11 +1391,45 @@ async fn run_scheduler(
         .map(|(i, s)| (s.id.as_str(), i))
         .collect();
 
+    // Task 3, CRITICAL: every loop's own members must NEVER be directly
+    // dispatchable by THIS (outer) call — they run exclusively through
+    // `run_loop_node`'s own recursive call. Without this, a member has
+    // indegree 0 in the collapsed outer graph (which never mentions it —
+    // by construction, `collapsed_graph_edges` rewires every edge
+    // touching it to the loop's super-node) and is NOT `done`, so it
+    // would ALSO be dispatched straight through the outer ready-drain
+    // loop's normal real-dispatch path (via `run_node`, with none of the
+    // loop's context/iteration surface) — a double-dispatch race against
+    // `run_loop_node`'s own scheduling of that exact member. `scope.only`
+    // itself is never set for the outer call (the thin `run_scheduler`
+    // wrapper always passes `None`), so this is computed here rather than
+    // trusted from the caller.
+    let effective_only: Option<std::collections::BTreeSet<String>> = if wants_loop_supernodes {
+        let member_ids: std::collections::BTreeSet<&str> = opts
+            .workflow
+            .loops
+            .values()
+            .flat_map(|d| d.nodes.iter().map(|s| s.as_str()))
+            .collect();
+        Some(
+            wf.steps
+                .iter()
+                .map(|s| s.id.clone())
+                .filter(|id| !member_ids.contains(id.as_str()))
+                .collect(),
+        )
+    } else {
+        scope.only.clone()
+    };
+
     // Captured once — both the graph-construction choice just below and
     // the branch-pruning arm further down (which needs REAL reachability
     // over the graph, not the author-declared `branch_skipped` set — Task
-    // 3, spec §6) must agree on which mode this run is in.
-    let graph_mode = is_nonlinear(wf);
+    // 3, spec §6) must agree on which mode this run is in. A scoped call
+    // (`scope.edges.is_some()`, i.e. `run_loop_node`'s per-iteration
+    // sub-DAG) always uses the explicit-graph machinery below, regardless
+    // of what `is_nonlinear` alone would say about the whole workflow.
+    let graph_mode = scope.edges.is_some() || is_nonlinear(wf);
     let mut indegree: Vec<usize> = vec![0; n];
     let mut successors: Vec<Vec<usize>> = vec![Vec::new(); n];
     // Reverse of `successors` — every node's direct predecessors. Used by
@@ -1321,7 +1445,20 @@ async fn run_scheduler(
         // dependency graph — control edges union inferred data edges —
         // exactly as authored. Independent nodes are MEANT to run
         // concurrently here; that's the whole point of Phase 2.
-        for (a, b) in &workflow_edges(wf) {
+        //
+        // Task 3: `scope.edges` (when present) REPLACES this graph
+        // entirely — `run_loop_node`'s per-iteration forward edges, or
+        // (when absent but the workflow has loops) the collapsed outer
+        // graph over `collapsed_graph_edges` instead of the raw
+        // `workflow_edges`. Neither branch fires for a loop-free
+        // workflow, so `workflow_edges(wf)` below is the exact
+        // pre-Task-3 call, unchanged.
+        let edges: Vec<(String, String)> = match &scope.edges {
+            Some(e) => e.clone(),
+            None if wants_loop_supernodes => crate::workflow::collapsed_graph_edges(&opts.workflow),
+            None => workflow_edges(wf),
+        };
+        for (a, b) in &edges {
             if let (Some(&ai), Some(&bi)) = (index_of.get(a.as_str()), index_of.get(b.as_str())) {
                 successors[ai].push(bi);
                 predecessors[bi].push(ai);
@@ -1456,9 +1593,33 @@ async fn run_scheduler(
         }
     }
 
+    // Task 3: `effective_only` excludes every id NOT in the set from ever
+    // entering `ready` — used by the outer loop-supernode call to keep a
+    // loop's own members from being dispatched directly (they run only
+    // through `run_loop_node`'s recursive call, which itself scopes
+    // `only` to exactly that loop's members via `scope.only`, folded into
+    // `effective_only` above). A `None` (every pre-Task-3 call, and every
+    // loop-free workflow) makes this a no-op filter.
+    let only_ok = |i: usize| -> bool {
+        effective_only
+            .as_ref()
+            .is_none_or(|set| set.contains(wf.steps[i].id.as_str()))
+    };
     let mut ready: std::collections::BTreeSet<usize> = (0..n)
-        .filter(|&i| !done[i] && indegree[i] == 0 && !join_threshold.contains_key(&i))
+        .filter(|&i| !done[i] && indegree[i] == 0 && !join_threshold.contains_key(&i) && only_ok(i))
         .collect();
+
+    // Task 3 (spec §2e): as each loop super-node resolves in the
+    // real-dispatch interception below, its final `loops.<name>.
+    // {iteration,converged}` lands here — visible to every LATER context
+    // build in THIS SAME call (a loop's outer successors, e.g. `ship`).
+    // Stays empty for every pre-Task-3 call and for a scoped per-iteration
+    // call (which never dispatches a loop super-node itself — v1 forbids
+    // nesting).
+    let mut resolved_loop_progress: std::collections::BTreeMap<
+        String,
+        crate::templates::LoopProgress,
+    > = std::collections::BTreeMap::new();
 
     // Join arrival tracking (Task 3, spec §5) + loser-cancellation
     // bookkeeping (Task 3, spec §8, first use in this arc):
@@ -1659,12 +1820,49 @@ async fn run_scheduler(
                 });
             }
 
-            let ctx = base_context_for_step(
-                resolved_inputs,
-                opts.event.as_ref(),
-                opts.issue.as_ref(),
-                step_results,
-            );
+            // Task 3 (spec §2d/§2e): `scope.extra_context` (empty for
+            // every pre-Task-3 call) merges in ALONGSIDE `step_results` —
+            // never INTO it, so it never affects the done/indegree
+            // seeding above. `run_loop_node` uses this to carry the
+            // feedback mechanic: chained BEFORE `step_results` so a fresh
+            // completion THIS call recorded (latest, later in the chain)
+            // overwrites a same-id entry `extra_context` carried in from
+            // an earlier iteration (`base_context_for_step` builds its
+            // map by iterating in order and inserting — last write wins).
+            let mut ctx = if scope.extra_context.is_empty() {
+                base_context_for_step(
+                    resolved_inputs,
+                    opts.event.as_ref(),
+                    opts.issue.as_ref(),
+                    step_results,
+                )
+            } else {
+                let combined: Vec<StepResult> = scope
+                    .extra_context
+                    .iter()
+                    .cloned()
+                    .chain(step_results.iter().cloned())
+                    .collect();
+                base_context_for_step(
+                    resolved_inputs,
+                    opts.event.as_ref(),
+                    opts.issue.as_ref(),
+                    &combined,
+                )
+            };
+            // `scope.loop_progress` (this call's own seed, non-empty only
+            // for a per-iteration scoped call) and `resolved_loop_progress`
+            // (loops THIS call has already resolved, non-empty only for
+            // the outer call) are mutually exclusive in practice — merge
+            // both so either shape works without an extra branch.
+            if !scope.loop_progress.is_empty() || !resolved_loop_progress.is_empty() {
+                ctx.loops = scope
+                    .loop_progress
+                    .iter()
+                    .chain(resolved_loop_progress.iter())
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect();
+            }
 
             if let Some(when_expr) = &step.when {
                 let take =
@@ -2019,6 +2217,102 @@ async fn run_scheduler(
                 continue;
             }
 
+            // Task 3 (spec §2b/§2c): a loop super-node (`step.id ==
+            // "loop:<name>"`, only ever present when `wants_loop_
+            // supernodes` augmented `wf` above — a real step can never
+            // collide here, see `augment_workflow_with_loop_supernodes`'s
+            // doc) is driven by `run_loop_node`'s bounded iteration
+            // driver instead of `run_node`. Awaited INLINE here (not
+            // spawned into `in_flight`) rather than through the
+            // `tokio::spawn`+`JoinSet` real-dispatch path below: no
+            // required behavior needs a loop to run concurrently with an
+            // unrelated OUTER sibling (only *within* one iteration, which
+            // `run_loop_node`'s own recursive `run_scheduler_scoped` call
+            // already gets for free), and reusing this path would mean
+            // widening `NodeOutcome`'s pause/abort-handle plumbing to a
+            // second dispatch shape for no required gain — see this
+            // task's report for the tradeoff (Task 4 may revisit).
+            if let Some(loop_suffix) = step.id.strip_prefix("loop:") {
+                if let Some(loop_def) = opts.workflow.loops.get(loop_suffix) {
+                    if let Some(sink) = opts.event_sink.as_ref() {
+                        sink.emit(
+                            run_id,
+                            &crate::executor::Event::StepStarted {
+                                run_id: run_id.to_string(),
+                                step_id: step.id.clone(),
+                                kind: crate::runs::StepKind::Split,
+                                agent: None,
+                                host: None,
+                            },
+                        );
+                    }
+                    let loop_timer = std::time::Instant::now();
+                    let loop_result = Box::pin(run_loop_node(
+                        loop_suffix,
+                        loop_def,
+                        opts,
+                        run_id,
+                        resolved_inputs,
+                        workflow_default_continue,
+                        step_results,
+                        cancel,
+                    ))
+                    .await;
+                    match loop_result {
+                        Ok((result, progress)) => {
+                            let duration_ms = loop_timer.elapsed().as_millis() as u64;
+                            if let Some(sink) = opts.event_sink.as_ref() {
+                                sink.emit(
+                                    run_id,
+                                    &crate::executor::Event::StepCompleted {
+                                        run_id: run_id.to_string(),
+                                        step_id: step.id.clone(),
+                                        success: result.success,
+                                        duration_ms,
+                                        host: None,
+                                    },
+                                );
+                            }
+                            // Spec §2e: visible to every LATER context
+                            // build in this (outer) call — this loop's
+                            // own successors (e.g. `ship`) and any other
+                            // node's `when:`/prompt.
+                            resolved_loop_progress.insert(loop_suffix.to_string(), progress);
+                            complete_and_drain_joins(
+                                i,
+                                true, // the loop's own resolution is a real completion
+                                result,
+                                wf,
+                                opts,
+                                run_id,
+                                step_results,
+                                &mut done,
+                                &successors,
+                                &predecessors,
+                                &mut indegree,
+                                &mut ready,
+                                &mut join_state,
+                                &mut cancel_state,
+                            );
+                        }
+                        Err(e) => {
+                            if let Some(sink) = opts.event_sink.as_ref() {
+                                sink.emit(
+                                    run_id,
+                                    &crate::executor::Event::StepFailed {
+                                        run_id: run_id.to_string(),
+                                        step_id: step.id.clone(),
+                                        error: e.to_string(),
+                                    },
+                                );
+                            }
+                            return Err(e);
+                        }
+                    }
+                    continue;
+                }
+            }
+
             // Real dispatch: linear / panel / parallel / for_each / action —
             // spawned concurrently, bounded by `semaphore`. Everything up to
             // and including the `StepStarted` emit mirrors `run_steps_over`
@@ -2268,6 +2562,279 @@ async fn run_scheduler(
     }
 
     Ok(InnerOutcome::Done)
+}
+
+/// Task 3 (spec §2b): returns an owned clone of `wf` with one bare
+/// synthetic [`Step`] appended per loop — `id: "loop:<name>"`, every
+/// other field empty/`None`. This is the surgical way to give a loop
+/// super-node a valid index into `wf.steps[idx]` without touching any of
+/// [`run_scheduler_scoped`]'s (or its helpers': `drain_joins`,
+/// `branch_prune_set`, `complete_and_drain_joins`, …) many existing
+/// `wf.steps[idx]` reads — a synthetic step has no `when`/`approval`/
+/// `branch`/`split`/`join`/`agent`/`action`, so it flows harmlessly
+/// through every one of those special-case checks straight to the "real
+/// dispatch" site, which is the ONE place that special-cases it (checking
+/// `step.id.strip_prefix("loop:")` and redirecting to [`run_loop_node`]).
+/// Never called when `wf.loops.is_empty()` (every call site gates on
+/// that), so a loop-free workflow's scheduling is completely unaffected —
+/// this function doesn't even run for it.
+fn augment_workflow_with_loop_supernodes(wf: &Workflow) -> Workflow {
+    let mut augmented = wf.clone();
+    for name in wf.loops.keys() {
+        augmented.steps.push(Step {
+            id: format!("loop:{name}"),
+            agent: None,
+            actions: Vec::new(),
+            when: None,
+            continue_on_error: None,
+            for_each: None,
+            parallel: None,
+            max_parallel: None,
+            prompt: None,
+            approval: None,
+            panel: None,
+            branch: None,
+            contract: None,
+            distribute: None,
+            host: None,
+            workspace: None,
+            next: Vec::new(),
+            depends_on: Vec::new(),
+            split: None,
+            join: None,
+            action: None,
+            with: None,
+        });
+    }
+    augmented
+}
+
+/// Splits a loop's full internal edge set ([`crate::workflow::
+/// loop_internal_edges`] — control UNION data, the feedback data edge
+/// included) into exactly the subset safe to feed [`run_loop_node`]'s
+/// per-iteration recursive [`run_scheduler_scoped`] call as its
+/// intra-iteration dependency graph.
+///
+/// A control edge ([`crate::workflow::loop_control_edges`]) is always
+/// kept — Task 2's `validate_loop_subgraph_acyclic` already proved that
+/// subgraph acyclic at parse time, so there's nothing to decide. A DATA
+/// edge `(a, b)` (`b`'s template references `steps.a`) is kept ONLY when
+/// `a` is a control-DAG ANCESTOR of `b` — a genuine same-iteration
+/// dependency, safe to schedule on (e.g. `test` referencing `steps.gen`
+/// when a `gen -> test` control edge, or a longer control path, already
+/// makes `gen` an ancestor of `test`). Every OTHER data edge — `a` is NOT
+/// a control ancestor of `b`, whether unrelated or (the refine-loop
+/// shape) a downstream node feeding back upstream — is the loop's
+/// controlled FEEDBACK reference (spec §2d): dropped here entirely, so it
+/// never gates `b`'s readiness. `run_loop_node` resolves it from the
+/// PRIOR iteration's `StepResult` via `extra_context` instead.
+fn loop_forward_edges(wf: &Workflow, loop_name: &str) -> Vec<(String, String)> {
+    let control = crate::workflow::loop_control_edges(wf, loop_name);
+    let control_set: std::collections::BTreeSet<(String, String)> =
+        control.iter().cloned().collect();
+
+    let mut adj: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (a, b) in &control {
+        adj.entry(a.as_str()).or_default().push(b.as_str());
+    }
+    let is_control_ancestor = |a: &str, b: &str| -> bool {
+        if a == b {
+            return false;
+        }
+        let mut stack = vec![a];
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        while let Some(n) = stack.pop() {
+            for &next in adj.get(n).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if next == b {
+                    return true;
+                }
+                if seen.insert(next) {
+                    stack.push(next);
+                }
+            }
+        }
+        false
+    };
+
+    crate::workflow::loop_internal_edges(wf, loop_name)
+        .into_iter()
+        .filter(|(a, b)| control_set.contains(&(a.clone(), b.clone())) || is_control_ancestor(a, b))
+        .collect()
+}
+
+/// The bounded iteration driver (spec §2b-§2e). Runs `loop_def`'s member
+/// sub-DAG through [`run_scheduler_scoped`] itself — recursively (boxed:
+/// async recursion needs an explicit heap indirection to break the
+/// otherwise-infinite future-size cycle), restricted to the loop's
+/// members and [`loop_forward_edges`] — once per iteration, evaluates
+/// `until` against the accumulated context after each one, and converges
+/// / re-runs / applies `on_max`. Returns a synthetic [`StepResult`] for
+/// the loop's OWN super-node id (`"loop:<name>"`) so its caller
+/// ([`run_scheduler_scoped`]'s real-dispatch interception) can feed it
+/// through the exact same [`complete_and_drain_joins`] bookkeeping every
+/// other node resolution uses.
+///
+/// **The feedback mechanic (spec §2d), concretely.** `feedback_history`
+/// starts as a snapshot of the OUTER `step_results` at the moment the
+/// loop became ready (so a member's `{{ steps.seed.output }}` sees the
+/// run's real history) and, after each iteration, gains that iteration's
+/// own member `StepResult`s appended — NEVER removed/cleared ("carry
+/// forward, only overwrite" per the plan). Each iteration's recursive
+/// call is handed `feedback_history` as `SchedulerScope::extra_context`,
+/// merged into every context build ALONGSIDE that call's own
+/// (freshly-empty) `step_results`. A member's context therefore sees:
+/// (a) this iteration's already-completed upstream siblings, via that
+/// call's own growing `step_results` (normal `base_context_for_step`
+/// latest-wins, later in the chain than `extra_context`), and (b)
+/// everything else — external history + every PRIOR iteration's member
+/// outputs — via `extra_context`. A non-upstream sibling ref therefore
+/// resolves to the PRIOR iteration's value (empty on iteration 0), never
+/// to a not-yet-run value and never as a live cycle.
+///
+/// Handing the recursive call a FRESH, empty `step_results` (rather than
+/// `feedback_history` itself) is what lets a member re-run every
+/// iteration: `run_scheduler_scoped`'s resume-seeding marks `done[i] =
+/// true` for every id present in the `step_results` it's given — if a
+/// member's PRIOR-iteration result lived in that same vector, it would
+/// never be scheduled again this iteration.
+#[allow(clippy::too_many_arguments)]
+async fn run_loop_node(
+    loop_name: &str,
+    loop_def: &crate::workflow::LoopDef,
+    opts: &OrchestratorRunOpts,
+    run_id: &str,
+    resolved_inputs: &BTreeMap<String, String>,
+    workflow_default_continue: bool,
+    outer_step_results: &mut Vec<StepResult>,
+    cancel: Option<&CancellationToken>,
+) -> Result<(StepResult, crate::templates::LoopProgress), RunWorkflowError> {
+    let wf = &opts.workflow;
+    let member_ids: std::collections::BTreeSet<String> = loop_def.nodes.iter().cloned().collect();
+    let forward_edges = loop_forward_edges(wf, loop_name);
+
+    let mut feedback_history: Vec<StepResult> = outer_step_results.clone();
+    let mut converged = false;
+    let mut last_iteration = 0u32;
+
+    for iteration in 0..loop_def.max_iterations {
+        last_iteration = iteration;
+
+        let mut loop_progress = std::collections::BTreeMap::new();
+        loop_progress.insert(
+            loop_name.to_string(),
+            crate::templates::LoopProgress {
+                iteration,
+                converged: false,
+            },
+        );
+        let scope = SchedulerScope {
+            only: Some(member_ids.clone()),
+            edges: Some(forward_edges.clone()),
+            extra_context: feedback_history.clone(),
+            loop_progress,
+        };
+
+        let mut iteration_results: Vec<StepResult> = Vec::new();
+        let outcome = Box::pin(run_scheduler_scoped(
+            opts,
+            run_id,
+            resolved_inputs,
+            workflow_default_continue,
+            None,
+            &mut iteration_results,
+            cancel,
+            scope,
+        ))
+        .await?;
+        match outcome {
+            InnerOutcome::Done => {}
+            InnerOutcome::Paused { .. } => {
+                // A pause/approval gate landed on a member mid-iteration —
+                // not supported this task (Task 4's job, spec §3's loop
+                // resume). Fail loudly rather than silently drop it or
+                // mis-resume at the wrong iteration.
+                return Err(RunWorkflowError::LoopIterationPaused {
+                    name: loop_name.to_string(),
+                });
+            }
+        }
+
+        // Fold this iteration's results into the cross-iteration history
+        // (latest-wins via append — never cleared; see this function's
+        // doc).
+        feedback_history.extend(iteration_results.iter().cloned());
+
+        let mut until_progress = std::collections::BTreeMap::new();
+        until_progress.insert(
+            loop_name.to_string(),
+            crate::templates::LoopProgress {
+                iteration,
+                converged: false,
+            },
+        );
+        let mut until_ctx = base_context_for_step(
+            resolved_inputs,
+            opts.event.as_ref(),
+            opts.issue.as_ref(),
+            &feedback_history,
+        );
+        until_ctx.loops = until_progress;
+        let holds = render_when_expression(
+            &loop_def.until,
+            &until_ctx,
+            render_mode(opts.strict_templates),
+        )
+        .map_err(|e| RunWorkflowError::Render {
+            step: format!("loop:{loop_name}.until"),
+            source: e,
+        })?;
+
+        if holds {
+            converged = true;
+            // Merge THIS (converged) iteration's member results into the
+            // outer run's `step_results` so successors (e.g. `ship`) see
+            // them via the normal `base_context_for_step` path. Never
+            // re-persisted here — each member was already persisted once
+            // by its own dispatch inside the recursive call above.
+            outer_step_results.extend(iteration_results);
+            break;
+        }
+        if iteration + 1 >= loop_def.max_iterations {
+            match loop_def.on_max {
+                crate::workflow::OnMax::Fail => {
+                    return Err(RunWorkflowError::LoopExhausted {
+                        name: loop_name.to_string(),
+                        max_iterations: loop_def.max_iterations,
+                    });
+                }
+                crate::workflow::OnMax::Proceed => {
+                    converged = false;
+                    outer_step_results.extend(iteration_results);
+                    break;
+                }
+            }
+        }
+        // else: `until` didn't hold and the cap isn't reached yet — run
+        // the next iteration.
+    }
+
+    let output =
+        serde_json::json!({ "iteration": last_iteration, "converged": converged }).to_string();
+    let progress = crate::templates::LoopProgress {
+        iteration: last_iteration,
+        converged,
+    };
+    Ok((
+        StepResult {
+            step_id: format!("loop:{loop_name}"),
+            output,
+            success: converged || matches!(loop_def.on_max, crate::workflow::OnMax::Proceed),
+            skipped: false,
+            kind: crate::runs::StepKind::Split,
+            ..Default::default()
+        },
+        progress,
+    ))
 }
 
 /// Task 4, spec §8: a whole-run cancel signal fired mid-schedule. Aborts
@@ -8032,51 +8599,16 @@ steps:
         );
     }
 
-    /// Task 2 honesty gate: `loops:` language + validation land in this
-    /// task; loop EXECUTION is a follow-up task's job. `run_scheduler`
-    /// doesn't know about the loop super-node yet, so a workflow
-    /// declaring `loops:` must be rejected loudly rather than silently
-    /// mis-run. `PanicFactory` (via `make_opts`) additionally proves no
-    /// step dispatch happens at all — the gate fires before any work.
+    /// Task 3: `loops:` execution is wired — the Task-2 honesty gate
+    /// (`LoopRuntimeNotYetWired`) is gone; a workflow declaring `loops:`
+    /// now runs to completion through the live scheduler exactly like any
+    /// other `is_nonlinear` workflow. `until: "{{ steps.test.output }}"`
+    /// is truthy on `PerCallMockFactory`'s very first (non-empty) output,
+    /// so this exercises exactly one iteration end-to-end — the dedicated
+    /// `bounded_loops` test module below covers multi-iteration
+    /// convergence, feedback, `on_max`, and intra-iteration concurrency.
     #[tokio::test]
-    async fn run_workflow_rejects_a_loop_workflow_with_the_honesty_gate() {
-        let yaml = r#"
-name: has-loop
-steps:
-  - id: gen
-    agent: x
-    prompt: p
-  - id: test
-    agent: x
-    prompt: p
-    depends_on: [gen]
-loops:
-  refine:
-    nodes: [gen, test]
-    until: "{{ steps.test.output }}"
-    max_iterations: 3
-"#;
-        let dir = tempfile::tempdir().unwrap();
-        let dispatcher = Arc::new(FakeUnitDispatcher::new());
-        let wf = Workflow::parse(yaml).unwrap();
-        let opts = make_opts(wf, dir.path().to_path_buf(), dispatcher);
-
-        let err = run_workflow(opts)
-            .await
-            .expect_err("a loop workflow must not silently run through the scheduler");
-        match err {
-            RunWorkflowError::LoopRuntimeNotYetWired { name } => {
-                assert_eq!(name, "refine");
-            }
-            other => panic!("expected LoopRuntimeNotYetWired, got {other:?}"),
-        }
-    }
-
-    /// The gate must fire BEFORE any run.json side effect: no `RunRecord`
-    /// created, and (since `RunStore::create` is what makes the directory)
-    /// the runs directory never even comes into existence.
-    #[tokio::test]
-    async fn run_workflow_loop_gate_fires_before_any_run_json_side_effect() {
+    async fn run_workflow_runs_a_loop_workflow_now_that_the_gate_is_removed() {
         let yaml = r#"
 name: has-loop
 steps:
@@ -8097,23 +8629,65 @@ loops:
         let dispatcher = Arc::new(FakeUnitDispatcher::new());
         let wf = Workflow::parse(yaml).unwrap();
         let mut opts = make_opts(wf, dir.path().to_path_buf(), dispatcher);
+        opts.factory = Arc::new(PerCallMockFactory);
+
+        let result = run_workflow(opts).await.expect(
+            "a loop workflow must now run to completion through run_workflow, not be rejected",
+        );
+        assert!(result.awaiting.is_none());
+        let gen = result
+            .step_results
+            .iter()
+            .find(|sr| sr.step_id == "gen")
+            .expect("gen ran");
+        let test = result
+            .step_results
+            .iter()
+            .find(|sr| sr.step_id == "test")
+            .expect("test ran");
+        assert!(gen.success && !gen.skipped);
+        assert!(test.success && !test.skipped);
+        assert_eq!(test.output, "done:p");
+    }
+
+    /// Loop execution persists real run-state exactly like any other
+    /// workflow now that the gate (which used to fire before any run.json
+    /// side effect) is removed: a fresh `RunRecord` is created and flips
+    /// to `Completed`.
+    #[tokio::test]
+    async fn run_workflow_loop_persists_a_completed_run_record() {
+        let yaml = r#"
+name: has-loop
+steps:
+  - id: gen
+    agent: x
+    prompt: p
+  - id: test
+    agent: x
+    prompt: p
+    depends_on: [gen]
+loops:
+  refine:
+    nodes: [gen, test]
+    until: "{{ steps.test.output }}"
+    max_iterations: 3
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = Arc::new(FakeUnitDispatcher::new());
+        let wf = Workflow::parse(yaml).unwrap();
+        let mut opts = make_opts(wf, dir.path().to_path_buf(), dispatcher);
+        opts.factory = Arc::new(PerCallMockFactory);
         let runs_dir = dir.path().join("runs");
         let store = Arc::new(crate::runs::RunStore::new(runs_dir.clone()));
         opts.run_store = Some(store.clone());
         opts.workflow_yaml = Some(yaml.to_string());
 
-        let err = run_workflow(opts)
+        run_workflow(opts)
             .await
-            .expect_err("gate must fire before any RunRecord is created");
-        assert!(matches!(err, RunWorkflowError::LoopRuntimeNotYetWired { .. }));
-        assert!(
-            store.list().unwrap().is_empty(),
-            "no RunRecord must have been created"
-        );
-        assert!(
-            !runs_dir.exists(),
-            "the gate must fire before the runs directory is even created"
-        );
+            .expect("loop workflow with a run-store must complete");
+        let records = store.list().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, crate::runs::RunStatus::Completed);
     }
 }
 
@@ -9075,6 +9649,630 @@ steps:
                 );
             }
         }
+    }
+}
+
+/// Task 3: bounded subgraph loops (spec §2b-§2e) — the super-node +
+/// recursive iteration driver. Exercises [`run_workflow`] directly (the
+/// honesty gate is gone, so a loop workflow now runs for real through
+/// this exact public surface).
+#[cfg(test)]
+mod bounded_loops {
+    use super::*;
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_providers::types::StopReason;
+    use rupu_tools::ToolContext;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    const REFINE_WF: &str = r#"
+name: refine
+steps:
+  - id: seed
+    agent: seeder
+    prompt: "seed"
+  - id: gen
+    agent: generator
+    prompt: "attempt={{ loops.refine.iteration }} seed={{ steps.seed.output }} critique={{ steps.critique.output }}"
+    depends_on: [seed]
+  - id: test
+    agent: tester
+    prompt: "test {{ steps.gen.output }}"
+    depends_on: [gen]
+  - id: critique
+    agent: critic
+    prompt: "critique {{ steps.test.output }}"
+    depends_on: [test]
+  - id: ship
+    agent: shipper
+    prompt: "ship critique={{ steps.critique.output }} converged={{ loops.refine.converged }}"
+loops:
+  refine:
+    nodes: [gen, test, critique]
+    until: "{{ steps.critique.output }}"
+    max_iterations: 5
+"#;
+
+    /// Drives every `bounded_loops` fixture. `critique` returns `"false"`
+    /// for its first `false_calls` dispatches, then `"true"` on every
+    /// dispatch after — the mock stand-in for "approved=false until
+    /// iteration K, true at K" (spec's `until` is a plain minijinja
+    /// expression over `steps.*`, so a literal `"true"`/`"false"` string
+    /// output is the simplest truthy/falsy fixture). Every other step's
+    /// output is a fixed, step-id-keyed marker so downstream prompts are
+    /// deterministic. `calls` and `gen_prompts` capture full dispatch
+    /// history for the convergence-count and feedback assertions.
+    struct RefineFactory {
+        false_calls: usize,
+        critique_calls: Arc<AtomicUsize>,
+        calls: Arc<Mutex<Vec<String>>>,
+        gen_prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RefineFactory {
+        fn new(false_calls: usize) -> Self {
+            Self {
+                false_calls,
+                critique_calls: Arc::new(AtomicUsize::new(0)),
+                calls: Arc::new(Mutex::new(Vec::new())),
+                gen_prompts: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StepFactory for RefineFactory {
+        async fn build_opts_for_step(
+            &self,
+            step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: PathBuf,
+            transcript_path: PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> AgentRunOpts {
+            self.calls.lock().unwrap().push(step_id.to_string());
+            if step_id == "gen" {
+                self.gen_prompts
+                    .lock()
+                    .unwrap()
+                    .push(rendered_prompt.clone());
+            }
+            let text = if step_id == "critique" {
+                let n = self.critique_calls.fetch_add(1, Ordering::SeqCst);
+                if n < self.false_calls {
+                    "false".to_string()
+                } else {
+                    "true".to_string()
+                }
+            } else {
+                format!("out-{step_id}")
+            };
+            let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+                text,
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            }]);
+            AgentRunOpts {
+                agent_name: format!("ag-{agent_name}"),
+                agent_system_prompt: "echo".into(),
+                agent_tools: None,
+                provider: Box::new(provider),
+                provider_name: "mock".into(),
+                model: "mock-1".into(),
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                max_turns: 5,
+                decider: Arc::new(BypassDecider),
+                tool_context: ToolContext::default(),
+                user_message: rendered_prompt,
+                initial_messages: Vec::new(),
+                turn_index_offset: 0,
+                mode_str: "bypass".into(),
+                no_stream: true,
+                suppress_stream_stdout: true,
+                mcp_registry: None,
+                effort: None,
+                context_window: None,
+                output_format: None,
+                output_schema: None,
+                anthropic_task_budget: None,
+                anthropic_context_management: None,
+                anthropic_speed: None,
+                parent_run_id: None,
+                depth: 0,
+                dispatchable_agents: None,
+                step_id: step_id.to_string(),
+                on_tool_call,
+                on_stream_event: None,
+                concerns: None,
+                max_tokens: DEFAULT_MAX_TOKENS,
+                scope_name: None,
+                surface_tag: None,
+                context_window_tokens: None,
+                compact_at_percent: None,
+                pause: None,
+            }
+        }
+    }
+
+    fn opts_for(
+        wf: Workflow,
+        factory: Arc<RefineFactory>,
+        tmp: &tempfile::TempDir,
+    ) -> OrchestratorRunOpts {
+        OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_loop".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory,
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: None,
+            workflow_yaml: None,
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        }
+    }
+
+    /// `critique` is falsy for iterations 0 and 1, truthy at iteration 2
+    /// (`false_calls: 2`) — exactly K+1 = 3 iterations. `ship` runs
+    /// exactly once, after convergence, reading the converged `critique`
+    /// output and `loops.refine.converged == true`.
+    #[tokio::test]
+    async fn refine_loop_converges_after_k_plus_one_iterations_then_ships_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(REFINE_WF).unwrap();
+        let factory = Arc::new(RefineFactory::new(2));
+        let calls = Arc::clone(&factory.calls);
+        let opts = opts_for(wf, factory, &tmp);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), run_workflow(opts))
+            .await
+            .expect("run must not hang")
+            .expect("refine loop must converge and complete");
+        assert!(result.awaiting.is_none());
+
+        let calls = calls.lock().unwrap().clone();
+        let critique_dispatch_count = calls.iter().filter(|s| s.as_str() == "critique").count();
+        assert_eq!(
+            critique_dispatch_count, 3,
+            "false,false,true = exactly 3 iterations, got {calls:?}"
+        );
+        let ship_count = calls.iter().filter(|s| s.as_str() == "ship").count();
+        assert_eq!(ship_count, 1, "ship must run exactly once, got {calls:?}");
+        // ship must come after every gen/test/critique dispatch (runs only
+        // once the loop has fully converged, not mid-iteration).
+        let ship_pos = calls.iter().position(|s| s == "ship").unwrap();
+        assert_eq!(
+            ship_pos,
+            calls.len() - 1,
+            "ship must be the last node dispatched: {calls:?}"
+        );
+
+        let ship_result = result
+            .step_results
+            .iter()
+            .find(|sr| sr.step_id == "ship")
+            .expect("ship ran");
+        assert!(
+            ship_result.rendered_prompt.contains("critique=true"),
+            "ship must read the converged critique output: {}",
+            ship_result.rendered_prompt
+        );
+        assert!(
+            ship_result.rendered_prompt.contains("converged=true"),
+            "ship must see loops.refine.converged == true: {}",
+            ship_result.rendered_prompt
+        );
+    }
+
+    /// `gen` references `{{ steps.critique.output }}` — NOT an ancestor of
+    /// `gen` within the loop's control DAG (`gen -> test -> critique`), so
+    /// it's the controlled feedback reference (spec §2d): iteration 0
+    /// renders empty (nothing has run yet), and iteration N (N>=1) sees
+    /// iteration (N-1)'s critique value — never a cycle, never the
+    /// not-yet-run current-iteration value.
+    #[tokio::test]
+    async fn refine_loop_feedback_reads_prior_iteration_critique_not_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(REFINE_WF).unwrap();
+        let factory = Arc::new(RefineFactory::new(2));
+        let gen_prompts = Arc::clone(&factory.gen_prompts);
+        let opts = opts_for(wf, factory, &tmp);
+
+        tokio::time::timeout(Duration::from_secs(5), run_workflow(opts))
+            .await
+            .expect("run must not hang")
+            .expect("refine loop must converge and complete");
+
+        let prompts = gen_prompts.lock().unwrap().clone();
+        assert_eq!(
+            prompts.len(),
+            3,
+            "gen dispatched once per iteration: {prompts:?}"
+        );
+        assert!(
+            prompts[0].contains("critique=")
+                && !prompts[0].contains("critique=false")
+                && !prompts[0].contains("critique=true"),
+            "iteration 0's gen must see an EMPTY critique (nothing has run yet): {}",
+            prompts[0]
+        );
+        assert!(
+            prompts[1].contains("critique=false"),
+            "iteration 1's gen must see iteration 0's critique value (false): {}",
+            prompts[1]
+        );
+        assert!(
+            prompts[2].contains("critique=false"),
+            "iteration 2's gen must see iteration 1's critique value (false), not the not-yet-run current value: {}",
+            prompts[2]
+        );
+        // The `loops.refine.iteration` surface (spec §2e), sanity-checked
+        // alongside feedback since it's rendered in the same prompt.
+        assert!(prompts[0].contains("attempt=0"));
+        assert!(prompts[1].contains("attempt=1"));
+        assert!(prompts[2].contains("attempt=2"));
+    }
+
+    const NEVER_CONVERGES_WF: &str = r#"
+name: never-converges
+steps:
+  - id: gen
+    agent: generator
+    prompt: "gen"
+  - id: test
+    agent: tester
+    prompt: "test"
+    depends_on: [gen]
+  - id: ship
+    agent: shipper
+    prompt: "ship converged={{ loops.refine.converged }}"
+    depends_on: [test]
+loops:
+  refine:
+    nodes: [gen, test]
+    until: "{{ steps.test.output }}"
+    max_iterations: 3
+"#;
+
+    const NEVER_CONVERGES_PROCEED_WF: &str = r#"
+name: never-converges-proceed
+steps:
+  - id: gen
+    agent: generator
+    prompt: "gen"
+  - id: test
+    agent: tester
+    prompt: "test"
+    depends_on: [gen]
+  - id: ship
+    agent: shipper
+    prompt: "ship converged={{ loops.refine.converged }}"
+    depends_on: [test]
+loops:
+  refine:
+    nodes: [gen, test]
+    until: "{{ steps.test.output }}"
+    max_iterations: 3
+    on_max: proceed
+"#;
+
+    /// A factory whose `test` step ALWAYS renders falsy ("false") — the
+    /// loop can never converge, so `on_max` (fail vs proceed) is what
+    /// decides the run's fate.
+    struct NeverConvergesFactory;
+
+    #[async_trait]
+    impl StepFactory for NeverConvergesFactory {
+        async fn build_opts_for_step(
+            &self,
+            step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: PathBuf,
+            transcript_path: PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> AgentRunOpts {
+            let text = if step_id == "test" { "false" } else { "out" };
+            let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+                text: text.to_string(),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            }]);
+            AgentRunOpts {
+                agent_name: format!("ag-{agent_name}"),
+                agent_system_prompt: "echo".into(),
+                agent_tools: None,
+                provider: Box::new(provider),
+                provider_name: "mock".into(),
+                model: "mock-1".into(),
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                max_turns: 5,
+                decider: Arc::new(BypassDecider),
+                tool_context: ToolContext::default(),
+                user_message: rendered_prompt,
+                initial_messages: Vec::new(),
+                turn_index_offset: 0,
+                mode_str: "bypass".into(),
+                no_stream: true,
+                suppress_stream_stdout: true,
+                mcp_registry: None,
+                effort: None,
+                context_window: None,
+                output_format: None,
+                output_schema: None,
+                anthropic_task_budget: None,
+                anthropic_context_management: None,
+                anthropic_speed: None,
+                parent_run_id: None,
+                depth: 0,
+                dispatchable_agents: None,
+                step_id: step_id.to_string(),
+                on_tool_call,
+                on_stream_event: None,
+                concerns: None,
+                max_tokens: DEFAULT_MAX_TOKENS,
+                scope_name: None,
+                surface_tag: None,
+                context_window_tokens: None,
+                compact_at_percent: None,
+                pause: None,
+            }
+        }
+    }
+
+    fn opts_for_never_converges(wf: Workflow, tmp: &tempfile::TempDir) -> OrchestratorRunOpts {
+        OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_loop".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(NeverConvergesFactory),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: None,
+            workflow_yaml: None,
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        }
+    }
+
+    /// `until` never holds; `on_max` defaults to `fail` — the run fails
+    /// with `LoopExhausted { name, max_iterations }` and the documented
+    /// message, and `ship` never runs.
+    #[tokio::test]
+    async fn on_max_fail_is_the_default_and_fails_the_run_loudly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(NEVER_CONVERGES_WF).unwrap();
+        let opts = opts_for_never_converges(wf, &tmp);
+
+        let err = tokio::time::timeout(Duration::from_secs(5), run_workflow(opts))
+            .await
+            .expect("run must not hang")
+            .expect_err("an unconverged loop with on_max: fail must fail the run");
+        match &err {
+            RunWorkflowError::LoopExhausted {
+                name,
+                max_iterations,
+            } => {
+                assert_eq!(name, "refine");
+                assert_eq!(*max_iterations, 3);
+            }
+            other => panic!("expected LoopExhausted, got {other:?}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            "loop 'refine' exhausted 3 iterations, until never held"
+        );
+    }
+
+    /// `on_max: proceed` — the run continues to `ship` with the last
+    /// iteration's outputs and `loops.refine.converged == false`.
+    #[tokio::test]
+    async fn on_max_proceed_continues_with_converged_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(NEVER_CONVERGES_PROCEED_WF).unwrap();
+        let opts = opts_for_never_converges(wf, &tmp);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), run_workflow(opts))
+            .await
+            .expect("run must not hang")
+            .expect("on_max: proceed must let the run complete");
+        assert!(result.awaiting.is_none());
+        let ship = result
+            .step_results
+            .iter()
+            .find(|sr| sr.step_id == "ship")
+            .expect("ship ran despite non-convergence");
+        assert!(
+            ship.rendered_prompt.contains("converged=false"),
+            "ship must see loops.refine.converged == false: {}",
+            ship.rendered_prompt
+        );
+    }
+
+    const LOOP_WITH_SPLIT_JOIN_WF: &str = r#"
+name: loop-split-join
+steps:
+  - id: fanout
+    split: [a, b]
+  - id: a
+    agent: worker
+    prompt: "do a"
+    next: [j]
+  - id: b
+    agent: worker
+    prompt: "do b"
+    next: [j]
+  - id: j
+    join: { wait: all }
+  - id: gate
+    agent: gater
+    prompt: "gate a={{ steps.a.output }} b={{ steps.b.output }}"
+    depends_on: [j]
+loops:
+  refine:
+    nodes: [fanout, a, b, j, gate]
+    until: "{{ steps.gate.output }}"
+    max_iterations: 2
+"#;
+
+    /// A loop containing `split -> [a,b] -> join` runs `a`/`b`
+    /// concurrently WITHIN each iteration (the atomic high-water-mark
+    /// proof from Phase-2's `scheduler_concurrency` module) — confirms
+    /// `run_loop_node`'s recursive `run_scheduler_scoped` call keeps
+    /// Phase-2 concurrency rather than degenerating to one-at-a-time.
+    /// `gate` renders truthy on its first dispatch, so this converges
+    /// after exactly one iteration — only intra-iteration concurrency is
+    /// under test here.
+    #[tokio::test]
+    async fn loop_member_split_join_runs_concurrently_within_an_iteration() {
+        struct ConcurrencyFactory {
+            current: Arc<AtomicUsize>,
+            max_seen: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl StepFactory for ConcurrencyFactory {
+            async fn build_opts_for_step(
+                &self,
+                step_id: &str,
+                agent_name: &str,
+                rendered_prompt: String,
+                run_id: String,
+                workspace_id: String,
+                workspace_path: PathBuf,
+                transcript_path: PathBuf,
+                on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+            ) -> AgentRunOpts {
+                if step_id == "a" || step_id == "b" {
+                    let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.max_seen.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    self.current.fetch_sub(1, Ordering::SeqCst);
+                }
+                let text = if step_id == "gate" {
+                    "true".to_string()
+                } else {
+                    format!("out-{step_id}")
+                };
+                let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+                    text,
+                    stop: StopReason::EndTurn,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                }]);
+                AgentRunOpts {
+                    agent_name: format!("ag-{agent_name}"),
+                    agent_system_prompt: "echo".into(),
+                    agent_tools: None,
+                    provider: Box::new(provider),
+                    provider_name: "mock".into(),
+                    model: "mock-1".into(),
+                    run_id,
+                    workspace_id,
+                    workspace_path,
+                    transcript_path,
+                    max_turns: 5,
+                    decider: Arc::new(BypassDecider),
+                    tool_context: ToolContext::default(),
+                    user_message: rendered_prompt,
+                    initial_messages: Vec::new(),
+                    turn_index_offset: 0,
+                    mode_str: "bypass".into(),
+                    no_stream: true,
+                    suppress_stream_stdout: true,
+                    mcp_registry: None,
+                    effort: None,
+                    context_window: None,
+                    output_format: None,
+                    output_schema: None,
+                    anthropic_task_budget: None,
+                    anthropic_context_management: None,
+                    anthropic_speed: None,
+                    parent_run_id: None,
+                    depth: 0,
+                    dispatchable_agents: None,
+                    step_id: step_id.to_string(),
+                    on_tool_call,
+                    on_stream_event: None,
+                    concerns: None,
+                    max_tokens: DEFAULT_MAX_TOKENS,
+                    scope_name: None,
+                    surface_tag: None,
+                    context_window_tokens: None,
+                    compact_at_percent: None,
+                    pause: None,
+                }
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(LOOP_WITH_SPLIT_JOIN_WF).unwrap();
+        let factory = ConcurrencyFactory {
+            current: Arc::new(AtomicUsize::new(0)),
+            max_seen: Arc::new(AtomicUsize::new(0)),
+        };
+        let max_seen = Arc::clone(&factory.max_seen);
+        let opts = OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_loop".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: None,
+            workflow_yaml: None,
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(5), run_workflow(opts))
+            .await
+            .expect("run must not hang")
+            .expect("loop with an internal split/join must complete");
+        assert!(result.awaiting.is_none());
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            2,
+            "a and b must have overlapped in flight within the same iteration"
+        );
     }
 }
 

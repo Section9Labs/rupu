@@ -69,6 +69,20 @@ pub struct StepContext {
     /// field name avoids the keyword.
     #[serde(rename = "loop", skip_serializing_if = "Option::is_none")]
     pub loop_info: Option<LoopInfo>,
+    /// Bounded subgraph-loop metadata (Phase 3, spec §2e): one entry per
+    /// named `loops.<name>` the run has entered, keyed by loop name.
+    /// Deliberately a SEPARATE top-level key from `loop` above — `loop` is
+    /// already a singular, per-fan-out-item object (`loop.index`, etc.);
+    /// reusing that name for a per-loop-name MAP would either collide or
+    /// force an awkward union shape. `{{ loops.refine.iteration }}` /
+    /// `{{ loops.refine.converged }}` is available to a loop's own members
+    /// (mid-iteration), to `until`'s own evaluation, and to every node
+    /// downstream of the loop (the value set when the loop last
+    /// completed/converged/exhausted). Empty — and absent from the
+    /// serialized form — for every workflow with no `loops:` block, so
+    /// this is a strictly additive surface.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub loops: BTreeMap<String, LoopProgress>,
 }
 
 /// Per-iteration metadata exposed to fan-out item prompts.
@@ -84,6 +98,20 @@ pub struct LoopInfo {
     pub first: bool,
     /// True on the last item.
     pub last: bool,
+}
+
+/// A bounded subgraph loop's progress (Phase 3, spec §2e), bound as
+/// `{{ loops.<name>.iteration }}` / `{{ loops.<name>.converged }}`.
+/// `iteration` is 0-based: the current iteration while a member or
+/// `until` is being evaluated, or the LAST iteration once the loop has
+/// resolved. `converged` is `false` for the whole duration of every
+/// iteration (including the one that turns out to converge — it is only
+/// set to `true` once `until` has actually been evaluated truthy) and for
+/// an `on_max: proceed` exhaustion; `true` once `until` holds.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct LoopProgress {
+    pub iteration: u32,
+    pub converged: bool,
 }
 
 /// The output record for a completed step, available as
