@@ -179,6 +179,10 @@ pub enum RunWorkflowError {
     NonlinearNotYetSupported { name: String },
     #[error("scheduler: a dispatched node task panicked or was cancelled: {0}")]
     SchedulerTaskJoin(#[from] tokio::task::JoinError),
+    #[error(
+        "run cancelled: {aborted} in-flight node(s) aborted; restart to resume from checkpoint"
+    )]
+    RunCancelled { aborted: usize },
 }
 
 /// Trait the orchestrator uses to construct per-unit [`AgentRunOpts`].
@@ -888,6 +892,18 @@ fn pause_triggered(pause: &Option<CancellationToken>) -> bool {
     pause.as_ref().is_some_and(|t| t.is_cancelled())
 }
 
+/// True when a whole-run cancel has been requested (Task 4, spec §8) — the
+/// harder sibling of [`pause_triggered`]: pause lets in-flight work reach
+/// its own safe boundary and is left completely unaffected by this
+/// function; cancel aborts in-flight work immediately (see
+/// [`cancel_finalize`]). `false` for the no-cancel path (`None`), so this
+/// is a cheap no-op for every call site until [`run_scheduler`] is handed
+/// a real token.
+#[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
+fn cancel_requested(cancel: Option<&CancellationToken>) -> bool {
+    cancel.is_some_and(|t| t.is_cancelled())
+}
+
 /// True when any step in the workflow resolves to `workspace: sync`. Used to
 /// refuse both checkpoint-resume and pause of sync workflows (their in-flight
 /// deltas can't be checkpointed in v1).
@@ -1110,6 +1126,19 @@ async fn run_scheduler(
     workflow_default_continue: bool,
     approved_step_id: Option<&str>,
     step_results: &mut Vec<StepResult>,
+    // Task 4, spec §8: a whole-run cancel signal, DISTINCT from
+    // `opts.pause` (the pre-existing cooperative "stop at the next safe
+    // boundary" signal — unchanged, still respected below). When `Some`
+    // and cancelled, the scheduler stops launching new ready nodes AND
+    // aborts every currently in-flight dispatched node immediately (via
+    // `cancel_finalize`, reusing Task 3's `AbortHandle` map — no parallel
+    // cancellation mechanism), persisting a `"cancelled"` marker for each
+    // one so a resume replays it as not-live instead of re-dispatching it.
+    // `None` (every call site before this task, and every legacy/golden
+    // test) preserves prior behavior exactly — this parameter is
+    // additive. See this task's report for exactly what "cancel" reaches
+    // (the `tokio::spawn`ed task boundary) vs. what stays detached.
+    cancel: Option<&CancellationToken>,
 ) -> Result<InnerOutcome, RunWorkflowError> {
     let wf = &opts.workflow;
     let n = wf.steps.len();
@@ -1226,12 +1255,19 @@ async fn run_scheduler(
     // Real-reachability branch pruning (Task 3, spec §6, graph mode
     // only — see the branch-handling arm below) and join
     // loser-cancellation markers for a node that hasn't been dispatched
-    // yet (Task 3, spec §5/§8). Both start empty on every run, including
-    // a resumed one: rebuilding them from the persisted markers (see
-    // `drain_joins`/the skip arms below, which persist a distinguishing
-    // `output` value for exactly this purpose) is Task 4's job — this
-    // task only guarantees the decision is ON DISK.
+    // yet (Task 3, spec §5/§8). Task 4, spec §3: rebuilt from the
+    // persisted `"pruned"`/`"cancelled"` `StepResult.output` markers below
+    // — a resumed run must REPLAY these decisions, not just rely on
+    // `done[i]` already being `true` for that one node (which alone
+    // would still stop IT from re-dispatching, but leaves these sets
+    // inconsistent with reality for anything else that inspects them).
     let mut pruned: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut cancel_state = Cancellation {
+        cancelled: std::collections::BTreeSet::new(),
+        in_flight_abort: BTreeMap::new(),
+        task_id_to_index: BTreeMap::new(),
+        cancelled_by_us: std::collections::BTreeSet::new(),
+    };
     for sr in step_results.iter() {
         if let Some(&i) = index_of.get(sr.step_id.as_str()) {
             done[i] = true;
@@ -1239,6 +1275,22 @@ async fn run_scheduler(
                 match sr.output.as_str() {
                     "then" => branch_skipped.extend(branch.r#else.iter().cloned()),
                     "else" => branch_skipped.extend(branch.then.iter().cloned()),
+                    _ => {}
+                }
+            }
+            // Guarded on `sr.skipped` (always `true` for these two
+            // markers, always `false` for a real dispatch/branch/split/
+            // join/gate result) so a real agent turn that happens to
+            // output the literal text "pruned" or "cancelled" can never
+            // be misread as one of these markers.
+            if sr.skipped {
+                match sr.output.as_str() {
+                    "pruned" => {
+                        pruned.insert(sr.step_id.clone());
+                    }
+                    "cancelled" => {
+                        cancel_state.cancelled.insert(sr.step_id.clone());
+                    }
                     _ => {}
                 }
             }
@@ -1269,19 +1321,55 @@ async fn run_scheduler(
     // dispatched task is aborted, so a MockProvider-backed test agent
     // stops at its next await point) vs. Task 4's deeper agent-run
     // interruption.
+    //
+    // Task 4, spec §3 (the resume gap Task 3's own report flagged): a join
+    // that already fired pre-pause has its own MERGED `StepResult` on disk
+    // (`done[j]` is already `true`) — seed `resolved` with every such join
+    // up front so it's never re-drained, THEN replay every already-done
+    // node's arrival into whatever join(s) it directly feeds (exactly what
+    // `mark_done_and_track_joins` would have recorded live). Without this,
+    // a `wait: all` join with SOME (not all) inbound paths already done
+    // pre-pause resumes with `arrived`/`resolved_count` both at zero and
+    // can wait forever for arrivals that already happened.
+    let resolved_joins_from_disk: std::collections::BTreeSet<usize> = join_threshold
+        .keys()
+        .copied()
+        .filter(|&j| done[j])
+        .collect();
     let mut join_state = JoinScheduling {
         threshold: join_threshold,
         inbound_total: join_inbound_total,
         arrived: BTreeMap::new(),
         resolved_count: BTreeMap::new(),
-        resolved: std::collections::BTreeSet::new(),
+        resolved: resolved_joins_from_disk,
     };
-    let mut cancel_state = Cancellation {
-        cancelled: std::collections::BTreeSet::new(),
-        in_flight_abort: BTreeMap::new(),
-        task_id_to_index: BTreeMap::new(),
-        cancelled_by_us: std::collections::BTreeSet::new(),
-    };
+    let mut resume_join_worklist: Vec<usize> = Vec::new();
+    for sr in step_results.iter() {
+        if let Some(&i) = index_of.get(sr.step_id.as_str()) {
+            resume_join_worklist.extend(track_join_arrivals(
+                i,
+                !sr.skipped,
+                &successors,
+                &mut join_state,
+            ));
+        }
+    }
+    if !resume_join_worklist.is_empty() {
+        drain_joins(
+            resume_join_worklist,
+            wf,
+            opts,
+            run_id,
+            step_results,
+            &mut done,
+            &successors,
+            &predecessors,
+            &mut indegree,
+            &mut ready,
+            &mut join_state,
+            &mut cancel_state,
+        );
+    }
 
     let resume_paused_step_id: Option<&str> = opts
         .resume_from
@@ -1308,6 +1396,14 @@ async fn run_scheduler(
         // chain of instant no-ops (e.g. several `when:`-skips in a row)
         // still resolves in one pass, exactly like the sequential loop.
         while let Some(&i) = ready.iter().next() {
+            // Task 4, spec §8: a whole-run cancel stops launching NEW
+            // ready nodes immediately (harder than `pause_triggered`
+            // below, which only applies at THIS same boundary for the
+            // soft form) — leave `i` in `ready` (about to be abandoned
+            // anyway) and fall through to `cancel_finalize` below.
+            if cancel_requested(cancel) {
+                break;
+            }
             ready.remove(&i);
             let step = &wf.steps[i];
 
@@ -1808,12 +1904,42 @@ async fn run_scheduler(
             cancel_state.in_flight_abort.insert(i, abort_handle);
         }
 
+        // Task 4, spec §8: the ready-drain loop above only catches the
+        // cancel signal at ITS OWN boundary (between draining one
+        // ready-but-undispatched node and the next). A node with no
+        // predecessor ready to unblock it might sit here for a while with
+        // `in_flight` non-empty and `ready` empty — check again so a
+        // cancel fired while every currently-ready node had already been
+        // drained still gets caught before we settle in to await the next
+        // completion.
+        if cancel_requested(cancel) {
+            return cancel_finalize(opts, run_id, step_results, &mut in_flight, &mut cancel_state)
+                .await;
+        }
+
         if in_flight.is_empty() {
             break;
         }
 
-        let (i, node_result) = match in_flight.join_next().await.expect("in_flight is non-empty")
-        {
+        // Task 4, spec §8: race the next dispatch completion against the
+        // cancel signal itself, so a cancel fired WHILE we're awaiting a
+        // long-running in-flight node is caught immediately rather than
+        // only after that node happens to finish on its own.
+        let join_next_result = if let Some(token) = cancel {
+            tokio::select! {
+                res = in_flight.join_next() => res,
+                () = token.cancelled() => {
+                    return cancel_finalize(
+                        opts, run_id, step_results, &mut in_flight, &mut cancel_state,
+                    )
+                    .await;
+                }
+            }
+        } else {
+            in_flight.join_next().await
+        };
+
+        let (i, node_result) = match join_next_result.expect("in_flight is non-empty") {
             Ok(pair) => {
                 cancel_state.in_flight_abort.remove(&pair.0);
                 pair
@@ -1888,6 +2014,101 @@ async fn run_scheduler(
     }
 
     Ok(InnerOutcome::Done)
+}
+
+/// Task 4, spec §8: a whole-run cancel signal fired mid-schedule. Aborts
+/// every currently in-flight dispatched node (reuses Task 3's own
+/// `AbortHandle` map — no parallel cancellation mechanism is introduced)
+/// and drains the `JoinSet` to completion. A node that raced ahead and
+/// actually finished before its abort landed is still recorded with its
+/// REAL result — tokio's own documented behavior is that `.abort()` on an
+/// already-finished task is a no-op, so it surfaces as `Ok`, not `Err`,
+/// and there is no reason to discard a good result just because a cancel
+/// was in flight at the same moment.
+///
+/// **Deliberately does NOT persist anything for a node that was actually
+/// aborted mid-flight.** Spec §8 is explicit that restart-from-checkpoint
+/// means: a node that checkpointed (a fan-out's `completed_units`) picks
+/// up from its checkpoint; **a node with no checkpoint restarts CLEAN**.
+/// A plain aborted node has no checkpoint (a hard `.abort()` drops its
+/// future instantly — no graceful mid-turn checkpoint extraction is
+/// possible, unlike the cooperative `opts.pause` path `run_linear_step`/
+/// `run_fanout_step` already support), so the only spec-correct
+/// resume behavior is "not in `step_results` → re-runs on resume",
+/// EXACTLY the existing pause-time-in-flight contract (spec §3: "none of
+/// those are `done`, so they simply re-run"). This is why cancel here is
+/// NOT symmetric with a join's loser-cancellation (§5, `drain_joins`),
+/// which DOES persist a `"cancelled"` marker: a join loser is
+/// permanently moot (the join already resolved without it — re-running
+/// it later would be pointless), whereas a whole-run-cancelled node has
+/// no such permanent reason to stay dead.
+///
+/// **What this reaches, precisely (see this task's report for the full
+/// writeup):** the `tokio::spawn`ed task is aborted at its very next
+/// `.await` point — for a real agent dispatch that's wherever
+/// `rupu_agent::run_agent`'s own internal awaits are (a provider call, a
+/// tool run). The in-flight work is DROPPED, not gracefully interrupted
+/// mid-turn. A `for_each`/`distribute:` fan-out node's OWN
+/// `completed_units` checkpoint is unaffected by any of this: that
+/// mechanism is keyed off `opts.resume_from` (a cooperative-pause
+/// checkpoint built by [`run_fanout_step`] itself via `opts.pause`,
+/// independent of the scheduler-level hard-cancel signal here) and is
+/// exercised unchanged — see this task's report for how a fan-out node
+/// restarts from checkpoint under the scheduler.
+#[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
+async fn cancel_finalize(
+    opts: &OrchestratorRunOpts,
+    run_id: &str,
+    step_results: &mut Vec<StepResult>,
+    in_flight: &mut tokio::task::JoinSet<(usize, Result<NodeOutcome, RunWorkflowError>)>,
+    cancel_state: &mut Cancellation,
+) -> Result<InnerOutcome, RunWorkflowError> {
+    let to_abort: Vec<usize> = cancel_state.in_flight_abort.keys().copied().collect();
+    for i in &to_abort {
+        if let Some(handle) = cancel_state.in_flight_abort.remove(i) {
+            handle.abort();
+            cancel_state.cancelled_by_us.insert(*i);
+        }
+    }
+    let aborted = to_abort.len();
+    while let Some(joined) = in_flight.join_next().await {
+        match joined {
+            Ok((_, Ok(NodeOutcome::Completed(result)))) => {
+                persist_step_result(opts, run_id, &result);
+                step_results.push(result);
+            }
+            Ok((_, Ok(NodeOutcome::Paused { .. }))) => {
+                // A node independently noticed its OWN cooperative-pause
+                // check (`opts.pause`, unrelated to this cancel signal)
+                // while we were tearing down. There's no clean partial
+                // state to record for it here — the whole run is ending
+                // as `RunCancelled` regardless of which signal a given
+                // node happened to notice first.
+            }
+            Ok((_, Err(e))) => return Err(e),
+            Err(join_err) => {
+                let idx = cancel_state.task_id_to_index.remove(&join_err.id());
+                if join_err.is_cancelled() {
+                    if let Some(ix) = idx {
+                        if cancel_state.cancelled_by_us.remove(&ix) {
+                            // Genuinely aborted by this cancel — no
+                            // checkpoint to extract, no marker to
+                            // persist (see the doc comment above): the
+                            // node simply stays absent from
+                            // `step_results` so a resume re-runs it
+                            // clean.
+                            continue;
+                        }
+                    }
+                }
+                // A genuine panic, or a cancellation this function did
+                // NOT initiate — propagate rather than mask it behind
+                // `RunCancelled`.
+                return Err(RunWorkflowError::SchedulerTaskJoin(join_err));
+            }
+        }
+    }
+    Err(RunWorkflowError::RunCancelled { aborted })
 }
 
 /// Decrement node `i`'s successors' indegree (it just completed — sync
@@ -2126,6 +2347,27 @@ fn mark_done_and_track_joins(
 ) -> Vec<usize> {
     done[i] = true;
     unlock_successors(i, successors, indegree, ready, &joins.threshold);
+    track_join_arrivals(i, live, successors, joins)
+}
+
+/// The join-bookkeeping half of [`mark_done_and_track_joins`], split out
+/// (Task 4) so [`run_scheduler`]'s resume-seeding can REPLAY it for every
+/// node that's already `done` from a prior process's persisted
+/// `step_results` — exactly the accounting a join with some (not all)
+/// inbound paths already resolved pre-pause needs, or it resumes with
+/// `arrived`/`resolved_count` both at zero and can wait forever for
+/// arrivals that already happened. See [`mark_done_and_track_joins`] for
+/// what `live` must be at each live call site; the resume replay passes
+/// `!step_result.skipped` (every skip/prune/cancel marker sets `skipped:
+/// true`, matching exactly the `live: false` those call sites already
+/// pass).
+#[allow(dead_code)] // consumed only by run_scheduler, driven only by tests until a later task wires it in as the live path
+fn track_join_arrivals(
+    i: usize,
+    live: bool,
+    successors: &[Vec<usize>],
+    joins: &mut JoinScheduling,
+) -> Vec<usize> {
     let mut newly_satisfied = Vec::new();
     for &s in &successors[i] {
         if joins.resolved.contains(&s) {
@@ -7815,6 +8057,7 @@ mod dag_scheduler_golden {
                     workflow_default_continue,
                     None,
                     &mut step_results,
+                    None,
                 )
                 .await
             }
@@ -8128,7 +8371,7 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
         )
         .await
         .expect("scheduler must not hang")
@@ -8180,7 +8423,7 @@ steps:
         let resolved_inputs = BTreeMap::new();
         let mut step_results: Vec<StepResult> = Vec::new();
 
-        run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results)
+        run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None)
             .await
             .expect("scheduler must not error");
 
@@ -8213,7 +8456,7 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
         )
         .await
         .expect("scheduler must not hang")
@@ -8299,7 +8542,7 @@ steps:
 
         let err = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
         )
         .await
         .expect("scheduler must not hang")
@@ -8502,7 +8745,7 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
         )
         .await
         .expect("scheduler must not hang")
@@ -8570,7 +8813,7 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
         )
         .await
         .expect("scheduler must not hang")
@@ -8639,7 +8882,7 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
         )
         .await
         .expect("scheduler must not hang")
@@ -8711,7 +8954,7 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
         )
         .await
         .expect("scheduler must not hang")
@@ -8790,7 +9033,7 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
         )
         .await
         .expect("scheduler must not hang")
@@ -8870,7 +9113,7 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
         )
         .await
         .expect("scheduler must not hang")
@@ -8955,7 +9198,7 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
         )
         .await
         .expect("scheduler must not hang")
@@ -9028,7 +9271,7 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
         )
         .await
         .expect("scheduler must not hang")
@@ -9069,6 +9312,679 @@ steps:
         assert!(
             !calls.lock().unwrap().contains(&"loser".to_string()),
             "loser must never reach the StepFactory"
+        );
+    }
+}
+
+/// Task 4: per-node resume (rebuilding done/pruned/cancelled + join
+/// arrival bookkeeping from disk) and whole-run cancel/restart-from-
+/// checkpoint. See this task's report for the full design writeup.
+#[cfg(test)]
+mod resume_and_cancel {
+    use super::*;
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_providers::types::StopReason;
+    use rupu_tools::ToolContext;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// One `StepFactory` covering every test below: records every
+    /// dispatched step id (`calls`, in call order) and, separately, every
+    /// id that ran to completion PAST any configured `slow` delay
+    /// (`finished`) — the same "started but never finished" cancellation
+    /// proof `join_and_prune`'s `JoinTestFactory` uses.
+    struct RecordingFactory {
+        calls: Arc<Mutex<Vec<String>>>,
+        finished: Arc<Mutex<Vec<String>>>,
+        slow: &'static [(&'static str, u64)],
+    }
+
+    impl RecordingFactory {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                finished: Arc::new(Mutex::new(Vec::new())),
+                slow: &[],
+            }
+        }
+
+        fn slow(mut self, steps: &'static [(&'static str, u64)]) -> Self {
+            self.slow = steps;
+            self
+        }
+    }
+
+    #[async_trait]
+    impl StepFactory for RecordingFactory {
+        async fn build_opts_for_step(
+            &self,
+            step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: PathBuf,
+            transcript_path: PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> AgentRunOpts {
+            self.calls.lock().unwrap().push(step_id.to_string());
+            if let Some(&(_, ms)) = self.slow.iter().find(|&&(id, _)| id == step_id) {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
+            self.finished.lock().unwrap().push(step_id.to_string());
+
+            let turn = ScriptedTurn::AssistantText {
+                text: format!("step {step_id} agent {agent_name} echo: {rendered_prompt}"),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            };
+            let provider = MockProvider::new(vec![turn]);
+            AgentRunOpts {
+                agent_name: format!("ag-{agent_name}"),
+                agent_system_prompt: "echo".into(),
+                agent_tools: None,
+                provider: Box::new(provider),
+                provider_name: "mock".into(),
+                model: "mock-1".into(),
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                max_turns: 5,
+                decider: Arc::new(BypassDecider),
+                tool_context: ToolContext::default(),
+                user_message: rendered_prompt,
+                initial_messages: Vec::new(),
+                turn_index_offset: 0,
+                mode_str: "bypass".into(),
+                no_stream: true,
+                suppress_stream_stdout: true,
+                mcp_registry: None,
+                effort: None,
+                context_window: None,
+                output_format: None,
+                output_schema: None,
+                anthropic_task_budget: None,
+                anthropic_context_management: None,
+                anthropic_speed: None,
+                parent_run_id: None,
+                depth: 0,
+                dispatchable_agents: None,
+                step_id: step_id.to_string(),
+                on_tool_call,
+                on_stream_event: None,
+                concerns: None,
+                max_tokens: DEFAULT_MAX_TOKENS,
+                scope_name: None,
+                surface_tag: None,
+                context_window_tokens: None,
+                compact_at_percent: None,
+                pause: None,
+            }
+        }
+    }
+
+    fn opts_for(
+        wf: Workflow,
+        factory: RecordingFactory,
+        tmp: &tempfile::TempDir,
+        pause: Option<CancellationToken>,
+        resume_from: Option<ResumeState>,
+    ) -> OrchestratorRunOpts {
+        OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_resume_cancel".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: None,
+            workflow_yaml: None,
+            resume_from,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause,
+        }
+    }
+
+    const SPLIT_JOIN_ALL_WF: &str = r#"
+name: split-join-resume
+steps:
+  - id: fanout
+    split: [a, b, c]
+  - id: a
+    agent: worker
+    prompt: "do a"
+    next: [gathered]
+  - id: b
+    agent: worker
+    prompt: "do b"
+    next: [gathered]
+  - id: c
+    agent: worker
+    prompt: "do c"
+    next: [gathered]
+  - id: gathered
+    join: { wait: all }
+"#;
+
+    /// **Mid-DAG resume (spec §3, the Task-3-report gap).** Simulates a
+    /// pause after `fanout`/`a`/`b` completed but `c` was still in-flight:
+    /// hand-construct the on-disk shape (`step_results` pre-seeded with
+    /// exactly those 3 entries) and drive a FRESH `run_scheduler` call over
+    /// it. Resume must re-dispatch ONLY `c` (never `a`/`b` again), and
+    /// `gathered` (`wait: all` over 3 inbound) must fire EXACTLY ONCE,
+    /// merging all 3 — including the two seeded from resume, which never
+    /// went through a live `mark_done_and_track_joins` call in this
+    /// process. Without the resume-seeding fix, `gathered.threshold` (3)
+    /// is never reached (only `c`'s live arrival is ever recorded) and the
+    /// join never fires at all — the run would silently finish `Done`
+    /// with no `gathered` `StepResult`, not merely hang.
+    #[tokio::test]
+    async fn mid_dag_resume_reruns_only_the_in_flight_node_and_the_join_fires_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(SPLIT_JOIN_ALL_WF).unwrap();
+        let factory = RecordingFactory::new();
+        let calls = Arc::clone(&factory.calls);
+        let opts = opts_for(wf, factory, &tmp, None, None);
+        let resolved_inputs = BTreeMap::new();
+
+        let mut step_results = vec![
+            StepResult {
+                step_id: "fanout".into(),
+                success: true,
+                kind: crate::runs::StepKind::Branch,
+                ..Default::default()
+            },
+            StepResult {
+                step_id: "a".into(),
+                output: "out-a".into(),
+                success: true,
+                kind: crate::runs::StepKind::Linear,
+                ..Default::default()
+            },
+            StepResult {
+                step_id: "b".into(),
+                output: "out-b".into(),
+                success: true,
+                kind: crate::runs::StepKind::Linear,
+                ..Default::default()
+            },
+        ];
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+        )
+        .await
+        .expect("resume must not hang")
+        .expect("resume must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        assert_eq!(
+            calls.lock().unwrap().clone(),
+            vec!["c".to_string()],
+            "resume must re-dispatch ONLY the in-flight node, never a/b"
+        );
+
+        let gathered = step_results
+            .iter()
+            .find(|sr| sr.step_id == "gathered")
+            .expect("join must fire after the resumed node completes");
+        assert!(gathered.success);
+        assert_eq!(
+            gathered.items.len(),
+            3,
+            "wait:all must merge all 3 inbound paths, including the two seeded from resume"
+        );
+        let sub_ids: std::collections::BTreeSet<&str> =
+            gathered.items.iter().map(|it| it.sub_id.as_str()).collect();
+        assert_eq!(sub_ids, std::collections::BTreeSet::from(["a", "b", "c"]));
+    }
+
+    const BRANCH_PRUNE_RESUME_WF: &str = r#"
+name: branch-prune-resume
+steps:
+  - id: br
+    branch:
+      condition: "true"
+      then: [x]
+      else: [y]
+  - id: x
+    agent: worker
+    prompt: "x"
+    next: [reconverge]
+  - id: y
+    agent: worker
+    prompt: "y"
+    next: [reconverge, only_via_y]
+  - id: only_via_y
+    agent: worker
+    prompt: "only reachable via y"
+  - id: reconverge
+    agent: worker
+    prompt: "reconverge"
+"#;
+
+    /// **Pruned-node persistence across resume (spec §3).** On-disk shape
+    /// after the branch resolved and its entire pruned closure (`y`,
+    /// `only_via_y`) resolved — Task 3's own resolution is synchronous and
+    /// always persists the whole closure in one pass, so this is the only
+    /// shape a real pause can ever leave behind — but before the live
+    /// remainder (`reconverge`) was reached. Resume must dispatch ONLY
+    /// `reconverge`; the pruned nodes must never reach the `StepFactory`.
+    #[tokio::test]
+    async fn pruned_node_stays_pruned_across_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(BRANCH_PRUNE_RESUME_WF).unwrap();
+        let factory = RecordingFactory::new();
+        let calls = Arc::clone(&factory.calls);
+        let opts = opts_for(wf, factory, &tmp, None, None);
+        let resolved_inputs = BTreeMap::new();
+
+        let mut step_results = vec![
+            StepResult {
+                step_id: "br".into(),
+                output: "then".into(),
+                success: true,
+                kind: crate::runs::StepKind::Branch,
+                ..Default::default()
+            },
+            StepResult {
+                step_id: "x".into(),
+                output: "out-x".into(),
+                success: true,
+                kind: crate::runs::StepKind::Linear,
+                ..Default::default()
+            },
+            StepResult {
+                step_id: "y".into(),
+                output: "pruned".into(),
+                success: false,
+                skipped: true,
+                kind: crate::runs::StepKind::Linear,
+                ..Default::default()
+            },
+            StepResult {
+                step_id: "only_via_y".into(),
+                output: "pruned".into(),
+                success: false,
+                skipped: true,
+                kind: crate::runs::StepKind::Linear,
+                ..Default::default()
+            },
+        ];
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+        )
+        .await
+        .expect("resume must not hang")
+        .expect("resume must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        assert_eq!(
+            calls.lock().unwrap().clone(),
+            vec!["reconverge".to_string()],
+            "resume must dispatch ONLY the still-live remainder, never a pruned node"
+        );
+        let reconverge = step_results
+            .iter()
+            .find(|sr| sr.step_id == "reconverge")
+            .expect("reconverge must run on resume");
+        assert!(reconverge.success);
+    }
+
+    const JOIN_CANCEL_RESUME_WF: &str = r#"
+name: join-cancel-resume
+steps:
+  - id: fanout
+    split: [w, fast]
+  - id: w
+    agent: worker
+    prompt: "w"
+    next: [loser, y]
+  - id: loser
+    agent: worker
+    prompt: "loser"
+    next: [gathered]
+  - id: fast
+    agent: worker
+    prompt: "fast"
+    next: [gathered]
+  - id: gathered
+    join: { wait: any }
+  - id: y
+    agent: worker
+    prompt: "y"
+"#;
+
+    /// **Cancelled join-loser persistence across resume (spec §3+§5) —
+    /// "same for a loser-cancelled node" as the pruned test above.** `w` is
+    /// slow so `fast` wins `gathered`'s `wait: any`; `loser` (whose only
+    /// successor is the join) is cancelled, `w` survives (it also feeds
+    /// `y`, an unrelated live consumer) — the exact shape
+    /// `join_loser_cancellation_does_not_strand_an_ancestors_unrelated_consumer`
+    /// proves already persists a `"cancelled"` `StepResult` for `loser`
+    /// within a single run. This test's OWN job is the resume half: hand
+    /// that persisted run's full `step_results` to a fresh scheduler call
+    /// and confirm NOTHING gets re-dispatched — `loser` stays cancelled,
+    /// permanently, exactly like a pruned node (a join loser is
+    /// permanently moot; see `cancel_finalize`'s doc for why this is NOT
+    /// the same contract as a whole-run cancel's restart-clean node).
+    #[tokio::test]
+    async fn cancelled_join_loser_persists_across_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(JOIN_CANCEL_RESUME_WF).unwrap();
+        let resolved_inputs = BTreeMap::new();
+
+        let factory1 = RecordingFactory::new().slow(&[("w", 80)]);
+        let opts1 = opts_for(wf.clone(), factory1, &tmp, None, None);
+        let mut step_results: Vec<StepResult> = Vec::new();
+        let outcome1 = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts1, "", &resolved_inputs, false, None, &mut step_results, None),
+        )
+        .await
+        .expect("run 1 must not hang")
+        .expect("run 1 must not error");
+        assert!(matches!(outcome1, InnerOutcome::Done));
+        let loser = step_results
+            .iter()
+            .find(|sr| sr.step_id == "loser")
+            .expect("loser must resolve as cancelled within run 1");
+        assert!(loser.skipped && loser.output == "cancelled");
+
+        // Resume: a FRESH scheduler call + a FRESH factory (its own empty
+        // `calls`), seeded with run 1's full persisted `step_results`.
+        let factory2 = RecordingFactory::new();
+        let calls2 = Arc::clone(&factory2.calls);
+        let opts2 = opts_for(wf, factory2, &tmp, None, None);
+        let mut step_results2 = step_results.clone();
+        let outcome2 = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts2, "", &resolved_inputs, false, None, &mut step_results2, None),
+        )
+        .await
+        .expect("resume must not hang")
+        .expect("resume must not error");
+        assert!(matches!(outcome2, InnerOutcome::Done));
+        assert!(
+            calls2.lock().unwrap().is_empty(),
+            "resume must not re-dispatch anything, including the already-cancelled loser: {:?}",
+            calls2.lock().unwrap()
+        );
+        assert_eq!(
+            step_results2.len(),
+            step_results.len(),
+            "no new StepResults on resume — everything was already resolved"
+        );
+    }
+
+    const CANCEL_FANOUT_WF: &str = r#"
+name: cancel-mid-flight
+steps:
+  - id: fanout
+    split: [a, b]
+  - id: a
+    agent: worker
+    prompt: "a"
+  - id: b
+    agent: worker
+    prompt: "b"
+"#;
+
+    /// **Whole-run cancel stops every in-flight job (spec §8).** `a`/`b`
+    /// both dispatch concurrently (`split`'s fan-out) and sleep 300ms
+    /// before finishing; an external task fires the cancel token at 50ms —
+    /// reliably well before either finishes. Proof of a GENUINE mid-flight
+    /// abort (not merely "the run ended before they were scheduled"):
+    /// both appear in `calls` (dispatch started) but neither in `finished`
+    /// (never got past its sleep). Per `cancel_finalize`'s doc, neither
+    /// gets a `StepResult` — spec §8's "a node with no checkpoint restarts
+    /// clean" — so a resume would simply re-dispatch them, not skip them.
+    #[tokio::test]
+    async fn whole_run_cancel_aborts_in_flight_nodes_and_does_not_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(CANCEL_FANOUT_WF).unwrap();
+        let factory = RecordingFactory::new().slow(&[("a", 300), ("b", 300)]);
+        let calls = Arc::clone(&factory.calls);
+        let finished = Arc::clone(&factory.finished);
+        let opts = opts_for(wf, factory, &tmp, None, None);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let cancel_token = CancellationToken::new();
+        let trigger = cancel_token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(
+                &opts,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                Some(&cancel_token),
+            ),
+        )
+        .await
+        .expect("cancel must not hang");
+
+        match outcome {
+            Err(RunWorkflowError::RunCancelled { aborted }) => {
+                assert_eq!(aborted, 2, "both a and b must have been in-flight and aborted");
+            }
+            other => panic!("expected Err(RunCancelled), got {other:?}"),
+        }
+
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(
+            std::collections::BTreeSet::from_iter(calls.iter().cloned()),
+            std::collections::BTreeSet::from(["a".to_string(), "b".to_string()]),
+            "both must have been dispatched (started) before cancellation: {calls:?}"
+        );
+        let finished = finished.lock().unwrap().clone();
+        assert!(
+            finished.is_empty(),
+            "neither must have run to completion — genuinely aborted mid-flight: {finished:?}"
+        );
+        assert!(
+            !step_results.iter().any(|sr| sr.step_id == "a" || sr.step_id == "b"),
+            "a genuinely cancelled node must NOT be recorded — spec §8: restart clean, not permanently done: {step_results:?}"
+        );
+    }
+
+    const FANOUT_CHECKPOINT_WF: &str = r#"
+name: fanout-checkpoint
+steps:
+  - id: process
+    for_each: "a\nb\nc"
+    agent: worker
+    prompt: "Process {{ item }}"
+    max_parallel: 1
+    distribute:
+      hosts: [h1]
+"#;
+
+    /// Cancels the pause token right AFTER its FIRST dispatch returns a
+    /// real result — i.e. once unit 0's work is genuinely done, not from
+    /// inside its own dispatch (which would race `dispatch_one`'s
+    /// `agent_opts.pause` wiring for a LOCAL unit and risk flagging unit 0
+    /// itself as paused-mid-turn instead of completed). Lifted from
+    /// `tests/pause_resume_e2e.rs`'s `CancelFirstUnitDispatcher` — the
+    /// proven-correct way to land a mid-fan-out pause deterministically.
+    struct CancelFirstUnitDispatcher {
+        token: CancellationToken,
+        calls: Mutex<Vec<usize>>,
+    }
+    #[async_trait]
+    impl UnitDispatcher for CancelFirstUnitDispatcher {
+        async fn dispatch_unit(
+            &self,
+            unit: UnitDispatch,
+            _host: &str,
+        ) -> Result<UnitOutcome, RunError> {
+            let is_first = self.calls.lock().unwrap().is_empty();
+            self.calls.lock().unwrap().push(unit.index);
+            let outcome = UnitOutcome {
+                output: format!("out-{}", unit.index),
+                success: true,
+                error: None,
+                workspace_delta: None,
+            };
+            if is_first {
+                self.token.cancel();
+            }
+            Ok(outcome)
+        }
+    }
+
+    /// Records every dispatched `(index, host)` pair. No cancellation —
+    /// used for the resume pass.
+    #[derive(Default)]
+    struct RecordingUnitDispatcher {
+        calls: Mutex<Vec<usize>>,
+    }
+    #[async_trait]
+    impl UnitDispatcher for RecordingUnitDispatcher {
+        async fn dispatch_unit(
+            &self,
+            unit: UnitDispatch,
+            _host: &str,
+        ) -> Result<UnitOutcome, RunError> {
+            self.calls.lock().unwrap().push(unit.index);
+            Ok(UnitOutcome {
+                output: format!("out-{}", unit.index),
+                success: true,
+                error: None,
+                workspace_delta: None,
+            })
+        }
+    }
+
+    /// **Restart-from-checkpoint reuses `completed_units` unchanged under
+    /// the scheduler (spec §8).** Uses the EXISTING cooperative
+    /// `opts.pause` mechanism (not the new hard-cancel token above) to
+    /// land a pause after exactly the first unit — the only mechanism
+    /// that can extract a graceful mid-fan-out checkpoint at all (a hard
+    /// `.abort()` drops the future instantly with nothing to extract; see
+    /// `cancel_finalize`'s doc). Confirms `run_fanout_step`'s
+    /// `completed_units` replay — built for `run_steps_over` — works
+    /// unchanged when the SAME node is dispatched via `run_scheduler`
+    /// (`run_node` is shared by both drivers): resume replays unit 0 from
+    /// its checkpoint and dispatches ONLY units 1 and 2 fresh.
+    #[tokio::test]
+    async fn fanout_restarts_from_completed_units_checkpoint_under_scheduler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(FANOUT_CHECKPOINT_WF).unwrap();
+        let resolved_inputs = BTreeMap::new();
+
+        let token = CancellationToken::new();
+        let dispatcher1 = Arc::new(CancelFirstUnitDispatcher {
+            token: token.clone(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut opts1 = opts_for(
+            wf.clone(),
+            RecordingFactory::new(),
+            &tmp,
+            Some(token),
+            None,
+        );
+        opts1.unit_dispatcher = Some(dispatcher1.clone());
+        let mut step_results1: Vec<StepResult> = Vec::new();
+
+        let outcome1 = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts1, "", &resolved_inputs, false, None, &mut step_results1, None),
+        )
+        .await
+        .expect("phase 1 must not hang")
+        .expect("phase 1 must not error");
+
+        let fanout_completed_units = match outcome1 {
+            InnerOutcome::Paused {
+                step_id,
+                fanout_completed_units,
+                ..
+            } => {
+                assert_eq!(step_id, "process");
+                fanout_completed_units
+            }
+            other => panic!("expected a mid-fan-out pause, got {other:?}"),
+        };
+        assert_eq!(
+            fanout_completed_units.len(),
+            1,
+            "only the first unit should have completed before the cooperative pause landed"
+        );
+        assert!(fanout_completed_units.contains_key(&0));
+        assert_eq!(
+            dispatcher1.calls.lock().unwrap().clone(),
+            vec![0],
+            "only unit 0 should have reached the dispatcher"
+        );
+
+        let mut completed_units = std::collections::BTreeMap::new();
+        completed_units.insert("process".to_string(), fanout_completed_units);
+        let dispatcher2 = Arc::new(RecordingUnitDispatcher::default());
+        let mut opts2 = opts_for(
+            wf,
+            RecordingFactory::new(),
+            &tmp,
+            None,
+            Some(ResumeState {
+                run_id: String::new(),
+                prior_step_results: Vec::new(),
+                approved_step_id: String::new(),
+                completed_units,
+                reason: PauseReason::Manual,
+                paused_step: None,
+                rejected_reason: None,
+            }),
+        );
+        opts2.unit_dispatcher = Some(dispatcher2.clone());
+        let mut step_results2: Vec<StepResult> = Vec::new();
+        let outcome2 = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts2, "", &resolved_inputs, false, None, &mut step_results2, None),
+        )
+        .await
+        .expect("resume must not hang")
+        .expect("resume must not error");
+        assert!(matches!(outcome2, InnerOutcome::Done));
+
+        let process = step_results2
+            .iter()
+            .find(|sr| sr.step_id == "process")
+            .expect("process must complete on resume");
+        assert!(process.success);
+        assert_eq!(
+            process.items.len(),
+            3,
+            "all 3 units accounted for: 1 replayed from checkpoint + 2 freshly dispatched"
+        );
+
+        let mut calls2 = dispatcher2.calls.lock().unwrap().clone();
+        calls2.sort_unstable();
+        assert_eq!(
+            calls2,
+            vec![1, 2],
+            "only the 2 not-yet-completed units should be dispatched on resume: {calls2:?}"
         );
     }
 }
