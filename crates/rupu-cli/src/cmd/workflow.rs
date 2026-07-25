@@ -4279,6 +4279,7 @@ mod tests {
             started_at: Utc::now(),
             finished_at: None,
             error_message: None,
+            awaiting: Vec::new(),
             awaiting_step_id: Some("step_approve".into()),
             approval_prompt: Some("approve?".into()),
             awaiting_since: Some(Utc::now()),

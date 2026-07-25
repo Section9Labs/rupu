@@ -39,8 +39,13 @@ pub fn routes() -> Router<AppState> {
 /// Map an [`ApprovalError`] from the store's approve/reject flow to an
 /// [`ApiError`]:
 /// - `NotFound` → 404
-/// - `NotAwaiting` / `Expired` / `NoAwaitingStep` → 409 (the run isn't in a
-///   state where the decision can be recorded)
+/// - `NotAwaiting` / `Expired` / `NoAwaitingStep` / `AmbiguousGate` /
+///   `GateNotFound` → 409 (the run isn't in a state where the decision can
+///   be recorded as-is — `AmbiguousGate`/`GateNotFound` are rupu-orchestrator
+///   Task 5b-1's multi-gate awaiting-set additions (spec §7): this endpoint
+///   still calls the gate-id-less `approve`/`reject`, so it only ever sees
+///   these on a DAG run whose scheduler batch-parked >1 gate — a per-gate
+///   web approve/reject control is Task 5b-2's job, not wired up here yet)
 /// - everything else → 500
 fn map_approval_err(id: &str, e: ApprovalError) -> ApiError {
     match e {
@@ -48,7 +53,9 @@ fn map_approval_err(id: &str, e: ApprovalError) -> ApiError {
         ApprovalError::NotAwaiting(_)
         | ApprovalError::Expired(_)
         | ApprovalError::ExpiredRejected { .. }
-        | ApprovalError::NoAwaitingStep => ApiError::conflict(e.to_string()),
+        | ApprovalError::NoAwaitingStep
+        | ApprovalError::AmbiguousGate { .. }
+        | ApprovalError::GateNotFound { .. } => ApiError::conflict(e.to_string()),
         ApprovalError::Store(other) => ApiError::internal(other.to_string()),
     }
 }
@@ -771,6 +778,7 @@ pub(crate) fn synthesize_unpersisted_run(
         started_at: now,
         finished_at: Some(now),
         error_message,
+        awaiting: Vec::new(),
         awaiting_step_id: None,
         approval_prompt: None,
         awaiting_since: None,
@@ -1204,6 +1212,7 @@ mod tests {
             started_at: chrono::Utc::now(),
             finished_at: None,
             error_message: None,
+            awaiting: Vec::new(),
             awaiting_step_id: Some(step_id.into()),
             approval_prompt: Some("approve?".into()),
             awaiting_since: Some(chrono::Utc::now()),

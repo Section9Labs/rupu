@@ -31,6 +31,7 @@ fn make_run(id: &str) -> RunRecord {
         started_at: Utc::now(),
         finished_at: Some(Utc::now()),
         error_message: None,
+        awaiting: Vec::new(),
         awaiting_step_id: None,
         approval_prompt: None,
         awaiting_since: None,

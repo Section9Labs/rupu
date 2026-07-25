@@ -107,6 +107,7 @@ impl NodeMirror {
             started_at: Utc::now(),
             finished_at: None,
             error_message: None,
+            awaiting: Vec::new(),
             awaiting_step_id: None,
             approval_prompt: None,
             awaiting_since: None,

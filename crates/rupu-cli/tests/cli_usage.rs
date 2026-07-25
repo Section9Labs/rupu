@@ -124,6 +124,7 @@ fn sample_run_record(
         started_at,
         finished_at: Some(started_at + Duration::minutes(5)),
         error_message: None,
+        awaiting: Vec::new(),
         awaiting_step_id: None,
         approval_prompt: None,
         awaiting_since: None,

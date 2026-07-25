@@ -299,6 +299,7 @@ mod tests {
             started_at: chrono::Utc::now() - chrono::Duration::minutes(mins_ago),
             finished_at: None,
             error_message: None,
+            awaiting: Vec::new(),
             awaiting_step_id: None,
             approval_prompt: None,
             awaiting_since: None,

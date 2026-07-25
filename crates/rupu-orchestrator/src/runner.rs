@@ -451,6 +451,16 @@ pub struct AwaitingInfo {
     /// units. Empty for every pause shape except a manual pause that landed
     /// mid-fan-out.
     pub fanout_completed_units: std::collections::BTreeMap<usize, ItemResult>,
+    /// Every gate parked in this pause (Phase 2, Task 5b-1, spec §7).
+    /// `step_id`/`prompt`/`expires_at` above mirror this set's FIRST
+    /// element — the "single-gate convenience" existing callers (the CLI's
+    /// `result.awaiting.step_id`/`.prompt`) keep reading unchanged. Empty
+    /// for a `PauseReason::Manual` pause (the gate-awaiting-set model is
+    /// specific to approval gates); one element for every approval pause
+    /// through the legacy single-cursor loop or a DAG run whose batch-park
+    /// wave reached exactly one gate; more than one for a DAG run whose
+    /// wave reached several concurrent gates at once.
+    pub gates: Vec<crate::runs::AwaitingGate>,
 }
 
 /// Caller-supplied resume context. When `OrchestratorRunOpts.resume_from`
@@ -629,6 +639,7 @@ pub async fn run_workflow(
                 started_at: chrono::Utc::now(),
                 finished_at: None,
                 error_message: None,
+                awaiting: Vec::new(),
                 awaiting_step_id: None,
                 approval_prompt: None,
                 awaiting_since: None,
@@ -781,10 +792,13 @@ pub async fn run_workflow(
             Ok(InnerOutcome::Paused {
                 step_id,
                 prompt,
-                timeout_seconds,
                 reason,
                 seed,
                 fanout_completed_units,
+                gates,
+                // `timeout_seconds` is superseded by `gates` (each gate
+                // carries its own) for computing `expires_at` below.
+                ..
             }) => {
                 let now = chrono::Utc::now();
                 // Approval → non-terminal `AwaitingApproval` (existing shape).
@@ -793,14 +807,41 @@ pub async fn run_workflow(
                     PauseReason::Approval => crate::runs::RunStatus::AwaitingApproval,
                     PauseReason::Manual => crate::runs::RunStatus::Paused,
                 };
-                record.awaiting_step_id = Some(step_id.clone());
-                record.approval_prompt = match reason {
-                    PauseReason::Approval => Some(prompt.clone()),
-                    PauseReason::Manual => None,
+                // Batch-parking (Task 5b-1, spec §7): for an Approval pause,
+                // `gates` carries EVERY gate the scheduler reached in this
+                // drain wave (one element for the legacy single-cursor loop
+                // and for a DAG run whose wave reached exactly one gate;
+                // several for a DAG run whose wave reached concurrent gates
+                // on independent paths). All gates in one wave share the
+                // same `since` (this `now`) — the run paused once. A Manual
+                // pause is a single-step concept orthogonal to the gate
+                // model (`gates` is always empty for it, by construction —
+                // see `GateParked`'s doc) — `record.awaiting` stays EMPTY
+                // and only the legacy compat fields carry the paused-mid-
+                // step id, exactly as before this task.
+                let gate_set: Vec<crate::runs::AwaitingGate> = match reason {
+                    PauseReason::Approval => gates
+                        .iter()
+                        .map(|g| crate::runs::AwaitingGate {
+                            step_id: g.step_id.clone(),
+                            prompt: Some(g.prompt.clone()),
+                            since: now,
+                            expires_at: g
+                                .timeout_seconds
+                                .map(|secs| now + chrono::Duration::seconds(secs as i64)),
+                        })
+                        .collect(),
+                    PauseReason::Manual => Vec::new(),
                 };
-                record.awaiting_since = Some(now);
-                record.expires_at =
-                    timeout_seconds.map(|secs| now + chrono::Duration::seconds(secs as i64));
+                record.awaiting = gate_set;
+                if *reason == PauseReason::Approval {
+                    record.sync_awaiting_compat();
+                } else {
+                    record.awaiting_step_id = Some(step_id.clone());
+                    record.approval_prompt = None;
+                    record.awaiting_since = Some(now);
+                    record.expires_at = None;
+                }
                 record.runner_pid = None;
                 record.active_step_id = None;
                 record.active_step_kind = None;
@@ -824,6 +865,7 @@ pub async fn run_workflow(
                     reason: *reason,
                     resume_seed: seed.clone(),
                     fanout_completed_units: fanout_completed_units.clone(),
+                    gates: record.awaiting.clone(),
                 });
             }
             Err(e) => {
@@ -850,12 +892,28 @@ pub async fn run_workflow(
         reason,
         seed,
         fanout_completed_units,
+        gates,
     }) = &outcome
     {
         // No store but the run paused (approval gate or manual pause) — surface
         // the paused state to the caller anyway.
+        let now = chrono::Utc::now();
         let expires_at =
-            timeout_seconds.map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
+            timeout_seconds.map(|secs| now + chrono::Duration::seconds(secs as i64));
+        let gate_set: Vec<crate::runs::AwaitingGate> = match reason {
+            PauseReason::Approval => gates
+                .iter()
+                .map(|g| crate::runs::AwaitingGate {
+                    step_id: g.step_id.clone(),
+                    prompt: Some(g.prompt.clone()),
+                    since: now,
+                    expires_at: g
+                        .timeout_seconds
+                        .map(|secs| now + chrono::Duration::seconds(secs as i64)),
+                })
+                .collect(),
+            PauseReason::Manual => Vec::new(),
+        };
         awaiting = Some(AwaitingInfo {
             step_id: step_id.clone(),
             prompt: prompt.clone(),
@@ -863,6 +921,7 @@ pub async fn run_workflow(
             reason: *reason,
             resume_seed: seed.clone(),
             fanout_completed_units: fanout_completed_units.clone(),
+            gates: gate_set,
         });
     }
 
@@ -1025,7 +1084,30 @@ enum InnerOutcome {
         /// [`AwaitingInfo::fanout_completed_units`]). Empty except for a
         /// manual pause that landed mid-fan-out.
         fanout_completed_units: std::collections::BTreeMap<usize, ItemResult>,
+        /// Every gate parked in this pause (Task 5b-1, spec §7). For
+        /// every return site except `run_scheduler`'s batch-park path
+        /// this mirrors `step_id`/`prompt`/`timeout_seconds` as a single
+        /// element (the "single-gate convenience"); `run_scheduler`'s
+        /// batch-park path is the only producer of >1. Empty for a
+        /// `PauseReason::Manual` pause — see [`GateParked`]'s doc.
+        gates: Vec<GateParked>,
     },
+}
+
+/// One gate reached in a batch-park wave, carried on
+/// [`InnerOutcome::Paused`] until `run_workflow` turns it into a
+/// [`crate::runs::AwaitingGate`] (which needs a `since`/`expires_at`
+/// timestamp `run_workflow`, not the scheduler, computes — see that
+/// function's Paused-handling arm). Deliberately NOT reused for a
+/// `PauseReason::Manual` pause: the awaiting-SET model (spec §7) is
+/// specific to approval gates, a manual/cooperative pause is a single-step
+/// concept, so every Manual return site leaves this empty rather than
+/// synthesizing a manual "gate."
+#[derive(Debug, Clone)]
+struct GateParked {
+    step_id: String,
+    prompt: String,
+    timeout_seconds: Option<u64>,
 }
 
 /// The actual per-step loop, factored out so the surrounding
@@ -1419,6 +1501,18 @@ async fn run_scheduler(
     let mut in_flight: tokio::task::JoinSet<(usize, Result<NodeOutcome, RunWorkflowError>)> =
         tokio::task::JoinSet::new();
 
+    // Batch-parking (Task 5b-1, spec §7): every approval gate this wave
+    // reaches is recorded here instead of returning immediately. This lets
+    // the loop keep dispatching every OTHER ready node and keep draining
+    // `in_flight` to completion — a sibling on an unrelated concurrent path
+    // that's about to finish is never aborted just because some other path
+    // hit a gate. Deliberate non-goal: this is NOT full async parking
+    // ("keep computing indefinitely while a gate waits for a human") — the
+    // whole run still pauses once no further non-gate progress is
+    // possible (both `ready` and `in_flight` empty); it just pauses with
+    // EVERY gate reached in the wave in the set, not only the first.
+    let mut parked: Vec<GateParked> = Vec::new();
+
     loop {
         // Drain every currently-ready, not-yet-dispatched node. Resolving
         // one synchronously (skip / branch / split / gate-approved) can
@@ -1506,6 +1600,15 @@ async fn run_scheduler(
                     return Err(RunWorkflowError::PauseWithWorkspaceSync);
                 }
                 info!(step = %step.id, "cooperative pause at step boundary");
+                // Manual pause is a hard, immediate return (unlike the
+                // approval-gate batch-park above) — the awaiting-set model
+                // is specific to approval gates (spec §7), so any gate
+                // ALREADY collected into `parked` this wave is dropped
+                // here rather than folded into this Manual-reason pause
+                // (which the `gates` field below leaves empty). Nothing is
+                // corrupted: a dropped-but-parked gate was never persisted
+                // (no `StepResult`), so it simply re-parks on the next
+                // resume exactly as if this wave had reached it first.
                 return Ok(InnerOutcome::Paused {
                     step_id: step.id.clone(),
                     prompt: String::new(),
@@ -1513,6 +1616,7 @@ async fn run_scheduler(
                     reason: PauseReason::Manual,
                     seed: Vec::new(),
                     fanout_completed_units: std::collections::BTreeMap::new(),
+                    gates: Vec::new(),
                 });
             }
 
@@ -1679,14 +1783,18 @@ async fn run_scheduler(
                         },
                     );
                 }
-                return Ok(InnerOutcome::Paused {
+                // Batch-park (spec §7): record this gate and keep draining
+                // the rest of `ready` — do NOT return yet. A sibling on an
+                // independent path that also hits a gate in this same wave
+                // joins the same `parked` set instead of only ever seeing
+                // the first one; a sibling that's genuinely dispatchable
+                // still gets dispatched below in this same pass.
+                parked.push(GateParked {
                     step_id: step.id.clone(),
                     prompt,
                     timeout_seconds: ap.timeout_seconds,
-                    reason: PauseReason::Approval,
-                    seed: Vec::new(),
-                    fanout_completed_units: std::collections::BTreeMap::new(),
                 });
+                continue;
             }
 
             if let Some(approval) = &step.approval {
@@ -1719,14 +1827,13 @@ async fn run_scheduler(
                             },
                         );
                     }
-                    return Ok(InnerOutcome::Paused {
+                    // Batch-park (spec §7) — see the gate-node arm above.
+                    parked.push(GateParked {
                         step_id: step.id.clone(),
                         prompt,
                         timeout_seconds: approval.timeout_seconds,
-                        reason: PauseReason::Approval,
-                        seed: Vec::new(),
-                        fanout_completed_units: std::collections::BTreeMap::new(),
                     });
+                    continue;
                 }
             }
 
@@ -2055,6 +2162,9 @@ async fn run_scheduler(
                 seed,
                 fanout_completed_units,
             } => {
+                // Manual/mid-dispatch pause — same hard-return, `parked`-
+                // dropping contract as the step-boundary Manual pause
+                // above.
                 return Ok(InnerOutcome::Paused {
                     step_id,
                     prompt: String::new(),
@@ -2062,6 +2172,7 @@ async fn run_scheduler(
                     reason: PauseReason::Manual,
                     seed,
                     fanout_completed_units,
+                    gates: Vec::new(),
                 });
             }
             NodeOutcome::Completed(result) => {
@@ -2095,6 +2206,26 @@ async fn run_scheduler(
                 );
             }
         }
+    }
+
+    // The loop above only `break`s once BOTH `ready` and `in_flight` are
+    // empty — i.e. no further non-gate progress is possible (the batch-
+    // parking non-goal stated on `parked`'s declaration: this is NOT
+    // "keep computing while a gate waits", it's "pause once nothing else
+    // CAN run"). If any gate was reached along the way, the run pauses now
+    // with the FULL set; `step_id`/`prompt`/`timeout_seconds` mirror the
+    // first-reached gate for the single-gate callers (`AwaitingInfo`, the
+    // legacy CLI printer) that only ever look at those three fields.
+    if let Some(first) = parked.first() {
+        return Ok(InnerOutcome::Paused {
+            step_id: first.step_id.clone(),
+            prompt: first.prompt.clone(),
+            timeout_seconds: first.timeout_seconds,
+            reason: PauseReason::Approval,
+            seed: Vec::new(),
+            fanout_completed_units: std::collections::BTreeMap::new(),
+            gates: parked,
+        });
     }
 
     Ok(InnerOutcome::Done)
@@ -2819,6 +2950,7 @@ async fn run_steps_over(
                 reason: PauseReason::Manual,
                 seed: Vec::new(),
                 fanout_completed_units: std::collections::BTreeMap::new(),
+                gates: Vec::new(),
             });
         }
 
@@ -2931,11 +3063,16 @@ async fn run_steps_over(
             }
             return Ok(InnerOutcome::Paused {
                 step_id: step.id.clone(),
-                prompt,
+                prompt: prompt.clone(),
                 timeout_seconds: ap.timeout_seconds,
                 reason: PauseReason::Approval,
                 seed: Vec::new(),
                 fanout_completed_units: std::collections::BTreeMap::new(),
+                gates: vec![GateParked {
+                    step_id: step.id.clone(),
+                    prompt,
+                    timeout_seconds: ap.timeout_seconds,
+                }],
             });
         }
 
@@ -2977,11 +3114,16 @@ async fn run_steps_over(
                 }
                 return Ok(InnerOutcome::Paused {
                     step_id: step.id.clone(),
-                    prompt,
+                    prompt: prompt.clone(),
                     timeout_seconds: approval.timeout_seconds,
                     reason: PauseReason::Approval,
                     seed: Vec::new(),
                     fanout_completed_units: std::collections::BTreeMap::new(),
+                    gates: vec![GateParked {
+                        step_id: step.id.clone(),
+                        prompt,
+                        timeout_seconds: approval.timeout_seconds,
+                    }],
                 });
             }
         }
@@ -3092,6 +3234,7 @@ async fn run_steps_over(
                     reason: PauseReason::Manual,
                     seed,
                     fanout_completed_units,
+                    gates: Vec::new(),
                 });
             }
             NodeOutcome::Completed(result) => {
@@ -9722,6 +9865,215 @@ steps:
             dispatched.contains(&"a".to_string()) && dispatched.contains(&"b".to_string()),
             "both fork targets must have been dispatched post-approval: {dispatched:?}"
         );
+    }
+
+    /// Task 5b-1 (spec §7): TWO independent concurrent paths each hitting
+    /// their own gate — the scenario T5a's report named as the explicit
+    /// boundary it did NOT cover. `fanout` forks into three: `gate_a` and
+    /// `gate_b` (each gating its own downstream `a`/`b`), and `indep` — a
+    /// REAL dispatch with no gate on its path at all, artificially slowed
+    /// so it's still in-flight at the exact moment both gates park.
+    ///
+    /// This exercises the batch-parking contract end to end: both gates
+    /// land in ONE `Paused` with `awaiting.len() == 2` (not two separate
+    /// pause/resume round-trips), AND `indep` — the independent in-flight
+    /// sibling — is drained to completion rather than aborted when the
+    /// scheduler stops for the gates (the T5a sibling-stranding fix).
+    /// Uses a real disk-backed `RunStore` (unlike this module's other
+    /// tests) specifically to assert on the PERSISTED `RunRecord.awaiting`
+    /// set and `RunStatus`, not just the in-memory `AwaitingInfo`.
+    const NONLINEAR_TWO_GATE_WF: &str = r#"
+name: nonlinear-two-gate
+steps:
+  - id: fanout
+    split: [gate_a, gate_b, indep]
+  - id: gate_a
+    approval:
+      prompt: "Approve A?"
+    next: [a]
+  - id: gate_b
+    approval:
+      prompt: "Approve B?"
+    next: [b]
+  - id: indep
+    agent: worker
+    prompt: "independent work, no gate on this path"
+  - id: a
+    agent: worker
+    prompt: "do a"
+  - id: b
+    agent: worker
+    prompt: "do b"
+"#;
+
+    #[tokio::test]
+    async fn two_concurrent_gates_batch_park_in_one_pause_while_indep_sibling_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::runs::RunStore::new(tmp.path().join("runs")));
+        let wf = Workflow::parse(NONLINEAR_TWO_GATE_WF).unwrap();
+        assert!(is_nonlinear(&wf), "fixture must fork to exercise the DAG scheduler");
+
+        // --- Phase 1: fanout unlocks gate_a + gate_b + indep together.
+        // `indep` is slowed so it's still in-flight when both gates park in
+        // the same drain wave. ---
+        let factory1 = JoinTestFactory::new(&[("indep", 60)]);
+        let calls1 = Arc::clone(&factory1.calls);
+        let opts1 = OrchestratorRunOpts {
+            workflow: wf.clone(),
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_two_gate".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory1),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(NONLINEAR_TWO_GATE_WF.to_string()),
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+        let res1 = run_workflow(opts1).await.expect("a batch-park is Ok, not Err");
+        let run_id = res1.run_id.clone();
+
+        let awaiting = res1.awaiting.clone().expect("both gates must pause the run");
+        assert_eq!(awaiting.gates.len(), 2, "both gates must land in ONE pause");
+        let parked_ids: std::collections::BTreeSet<&str> =
+            awaiting.gates.iter().map(|g| g.step_id.as_str()).collect();
+        assert_eq!(
+            parked_ids,
+            std::collections::BTreeSet::from(["gate_a", "gate_b"])
+        );
+
+        // The independent sibling ran to completion — NOT aborted just
+        // because the two gates parked in the same wave.
+        let indep = result_for(&res1.step_results, "indep");
+        assert!(indep.success && !indep.skipped, "indep: {indep:?}");
+        assert!(
+            calls1.lock().unwrap().contains(&"indep".to_string()),
+            "indep must have reached the StepFactory"
+        );
+        // Neither gated path was ever reachable yet.
+        assert!(res1.step_results.iter().all(|sr| sr.step_id != "a" && sr.step_id != "b"));
+
+        // Persisted state: the RunRecord itself carries the full set.
+        let rec1 = store.load(&run_id).unwrap();
+        assert_eq!(rec1.status, crate::runs::RunStatus::AwaitingApproval);
+        assert_eq!(rec1.awaiting.len(), 2);
+        let rec1_ids: std::collections::BTreeSet<&str> =
+            rec1.awaiting.iter().map(|g| g.step_id.as_str()).collect();
+        assert_eq!(
+            rec1_ids,
+            std::collections::BTreeSet::from(["gate_a", "gate_b"])
+        );
+        // Derived-compat mirrors the FIRST gate in the set.
+        assert_eq!(rec1.awaiting_step_id.as_deref(), Some(rec1.awaiting[0].step_id.as_str()));
+
+        // --- Phase 2: approve gate_a only (by id, via the store) —
+        // gate_b must stay parked; the run must stay AwaitingApproval, NOT
+        // flip to Running. ---
+        store
+            .approve_gate(&run_id, "matt", chrono::Utc::now(), Some("gate_a"))
+            .expect("approve gate_a");
+        let rec2 = store.load(&run_id).unwrap();
+        assert_eq!(rec2.status, crate::runs::RunStatus::AwaitingApproval);
+        assert_eq!(rec2.awaiting.len(), 1);
+        assert_eq!(rec2.awaiting[0].step_id, "gate_b");
+
+        let factory2 = JoinTestFactory::new(&[]);
+        let calls2 = Arc::clone(&factory2.calls);
+        let opts2 = OrchestratorRunOpts {
+            workflow: wf.clone(),
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_two_gate".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory2),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(NONLINEAR_TWO_GATE_WF.to_string()),
+            resume_from: Some(ResumeState::from_approval(
+                run_id.clone(),
+                res1.step_results.clone(),
+                "gate_a".to_string(),
+            )),
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+        let res2 = run_workflow(opts2).await.expect("resume of gate_a's path is Ok");
+        // gate_b is still parked — the resumed run pauses AGAIN, it does
+        // not run to completion.
+        let awaiting2 = res2.awaiting.clone().expect("gate_b must still be parked");
+        assert_eq!(awaiting2.gates.len(), 1);
+        assert_eq!(awaiting2.gates[0].step_id, "gate_b");
+        let a = result_for(&res2.step_results, "a");
+        assert!(a.success && !a.skipped, "a must run once gate_a is approved: {a:?}");
+        assert!(
+            calls2.lock().unwrap().contains(&"a".to_string())
+                && !calls2.lock().unwrap().contains(&"b".to_string()),
+            "only a's path may run while gate_b is still parked: {:?}",
+            calls2.lock().unwrap()
+        );
+        let rec3 = store.load(&run_id).unwrap();
+        assert_eq!(rec3.status, crate::runs::RunStatus::AwaitingApproval);
+        assert_eq!(rec3.awaiting.len(), 1);
+        assert_eq!(rec3.awaiting[0].step_id, "gate_b");
+
+        // --- Phase 3: approve gate_b — the set empties, the run completes. ---
+        store
+            .approve_gate(&run_id, "matt", chrono::Utc::now(), Some("gate_b"))
+            .expect("approve gate_b");
+        let rec4 = store.load(&run_id).unwrap();
+        assert_eq!(rec4.status, crate::runs::RunStatus::Running);
+        assert!(rec4.awaiting.is_empty());
+
+        let factory3 = JoinTestFactory::new(&[]);
+        let calls3 = Arc::clone(&factory3.calls);
+        let opts3 = OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_two_gate".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory3),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(NONLINEAR_TWO_GATE_WF.to_string()),
+            resume_from: Some(ResumeState::from_approval(
+                run_id.clone(),
+                res2.step_results.clone(),
+                "gate_b".to_string(),
+            )),
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+        let res3 = run_workflow(opts3).await.expect("resume of gate_b's path completes");
+        assert!(res3.awaiting.is_none(), "the run must reach Done once both gates are resolved");
+        let b = result_for(&res3.step_results, "b");
+        assert!(b.success && !b.skipped, "b must run once gate_b is approved: {b:?}");
+        assert!(calls3.lock().unwrap().contains(&"b".to_string()));
+
+        let rec5 = store.load(&run_id).unwrap();
+        assert_eq!(rec5.status, crate::runs::RunStatus::Completed);
+        assert!(rec5.awaiting.is_empty());
+        assert!(rec5.awaiting_step_id.is_none());
     }
 }
 
