@@ -911,10 +911,9 @@ pub enum OnMax {
 /// ids that re-run together, sequentially, until `until` holds or
 /// `max_iterations` is reached. v1 is flat — loops don't nest and a step
 /// belongs to at most one loop (see [`WorkflowParseError::LoopNodeOverlap`]).
-/// Language + validation only in this crate; the actual iteration driver
-/// (the loop as a super-node in `run_scheduler`) is a follow-up task — see
-/// `crates/rupu-orchestrator/src/runner.rs`'s temporary
-/// `LoopRuntimeNotYetWired` gate.
+/// This crate defines the language + validation; the iteration driver (the
+/// loop as a super-node in `run_scheduler`, `run_loop_node`) lives in
+/// `crates/rupu-orchestrator/src/runner.rs` (Phase 3 Task 3).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LoopDef {
@@ -2109,9 +2108,9 @@ pub fn is_nonlinear(wf: &Workflow) -> bool {
     // A loop is a super-node collapsed from its members (spec §2b) —
     // inherently non-linear regardless of whether the outer graph forks
     // or reconverges. Checked first/unconditionally so a trivial single-
-    // chain-through-a-loop workflow still routes to the scheduler (which,
-    // as of this task, gates loop workflows with `LoopRuntimeNotYetWired`
-    // rather than silently mis-running them through `run_steps_inner`).
+    // chain-through-a-loop workflow still routes to the scheduler, which
+    // (Phase 3 Task 3) drives the loop for real via `run_loop_node`
+    // rather than silently mis-running it through `run_steps_inner`.
     if !wf.loops.is_empty() {
         return true;
     }

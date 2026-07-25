@@ -2633,33 +2633,54 @@ fn loop_forward_edges(wf: &Workflow, loop_name: &str) -> Vec<(String, String)> {
     let control_set: std::collections::BTreeSet<(String, String)> =
         control.iter().cloned().collect();
 
-    let mut adj: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    // The ACCEPTED graph, seeded with the control edges (Task 2 already
+    // proved that subgraph acyclic) and grown by every data edge accepted
+    // below — so a later data edge's cycle check sees every earlier
+    // accepted one, not just the control edges. `path_exists` answers "is
+    // there already a path from `from` to `to`" over this growing graph.
+    let mut adj: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (a, b) in &control {
-        adj.entry(a.as_str()).or_default().push(b.as_str());
+        adj.entry(a.clone()).or_default().push(b.clone());
     }
-    let is_control_ancestor = |a: &str, b: &str| -> bool {
-        if a == b {
-            return false;
+    fn path_exists(adj: &BTreeMap<String, Vec<String>>, from: &str, to: &str) -> bool {
+        if from == to {
+            return true;
         }
-        let mut stack = vec![a];
+        let mut stack = vec![from];
         let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         while let Some(n) = stack.pop() {
-            for &next in adj.get(n).map(|v| v.as_slice()).unwrap_or(&[]) {
-                if next == b {
+            for next in adj.get(n).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if next == to {
                     return true;
                 }
-                if seen.insert(next) {
-                    stack.push(next);
+                if seen.insert(next.as_str()) {
+                    stack.push(next.as_str());
                 }
             }
         }
         false
-    };
+    }
 
-    crate::workflow::loop_internal_edges(wf, loop_name)
-        .into_iter()
-        .filter(|(a, b)| control_set.contains(&(a.clone(), b.clone())) || is_control_ancestor(a, b))
-        .collect()
+    let mut forward = control.clone();
+    for (a, b) in crate::workflow::loop_internal_edges(wf, loop_name) {
+        if control_set.contains(&(a.clone(), b.clone())) {
+            continue; // already counted via `control` above
+        }
+        // spec §2d: a member->member DATA ref stays a real intra-iteration
+        // (forward) dependency UNLESS adding it would close a cycle over
+        // the internal control+data DAG accepted so far — i.e. there's
+        // already a path b -> ... -> a. Only THAT edge is the loop's
+        // controlled feedback back-reference (resolved from the prior
+        // iteration instead, in `run_loop_node`'s `extra_context`); every
+        // other data edge is scheduled exactly like `workflow_edges`
+        // schedules one everywhere else in this crate.
+        if path_exists(&adj, &b, &a) {
+            continue; // feedback — excluded from scheduling
+        }
+        adj.entry(a.clone()).or_default().push(b.clone());
+        forward.push((a, b));
+    }
+    forward
 }
 
 /// The bounded iteration driver (spec §2b-§2e). Runs `loop_def`'s member
@@ -9878,6 +9899,242 @@ loops:
             ship_result.rendered_prompt.contains("converged=true"),
             "ship must see loops.refine.converged == true: {}",
             ship_result.rendered_prompt
+        );
+    }
+
+    const CONTROL_FREE_FORWARD_WF: &str = r#"
+name: control-free-forward
+steps:
+  - id: gen
+    agent: generator
+    prompt: "gen"
+  - id: test
+    agent: tester
+    prompt: "test sees {{ steps.gen.output }}"
+loops:
+  refine:
+    nodes: [gen, test]
+    until: "{{ steps.test.output }}"
+    max_iterations: 2
+"#;
+
+    /// Post-review fix: `test` references `{{ steps.gen.output }}` with NO
+    /// `depends_on`/`next` between `gen` and `test` — a pure DATA edge,
+    /// no control edge at all. Spec §2d: a member->member data ref stays
+    /// a real INTRA-ITERATION dependency unless it would close a cycle;
+    /// `gen -> test` closes no cycle (there ISN'T even a control graph to
+    /// close one against), so it must be scheduled exactly like
+    /// `workflow_edges` schedules a data ref everywhere else in this
+    /// crate — `test` must see THIS iteration's `gen` output, never an
+    /// empty/prior-iteration read. Before the fix, `loop_forward_edges`
+    /// only kept a data edge when its source was a CONTROL ancestor of
+    /// the target; with zero control edges here that's vacuously false,
+    /// so the edge was wrongly dropped and `gen`/`test` ran with no real
+    /// ordering between them — `test`'s context snapshot (built
+    /// synchronously the moment it's popped from `ready`, alongside
+    /// `gen` rather than after it) would see `extra_context`'s
+    /// prior-iteration value (empty on iteration 0) instead of `gen`'s
+    /// real output. This test FAILS on that code (`test sees ` with an
+    /// empty tail) and PASSES once the edge is kept forward.
+    #[tokio::test]
+    async fn control_free_forward_data_dependency_schedules_gen_before_test_same_iteration() {
+        struct Factory {
+            calls: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl StepFactory for Factory {
+            async fn build_opts_for_step(
+                &self,
+                step_id: &str,
+                agent_name: &str,
+                rendered_prompt: String,
+                run_id: String,
+                workspace_id: String,
+                workspace_path: PathBuf,
+                transcript_path: PathBuf,
+                on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+            ) -> AgentRunOpts {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("{step_id}:{rendered_prompt}"));
+                let text = if step_id == "gen" {
+                    "genout".to_string()
+                } else {
+                    "true".to_string()
+                };
+                let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+                    text,
+                    stop: StopReason::EndTurn,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                }]);
+                AgentRunOpts {
+                    agent_name: format!("ag-{agent_name}"),
+                    agent_system_prompt: "echo".into(),
+                    agent_tools: None,
+                    provider: Box::new(provider),
+                    provider_name: "mock".into(),
+                    model: "mock-1".into(),
+                    run_id,
+                    workspace_id,
+                    workspace_path,
+                    transcript_path,
+                    max_turns: 5,
+                    decider: Arc::new(BypassDecider),
+                    tool_context: ToolContext::default(),
+                    user_message: rendered_prompt,
+                    initial_messages: Vec::new(),
+                    turn_index_offset: 0,
+                    mode_str: "bypass".into(),
+                    no_stream: true,
+                    suppress_stream_stdout: true,
+                    mcp_registry: None,
+                    effort: None,
+                    context_window: None,
+                    output_format: None,
+                    output_schema: None,
+                    anthropic_task_budget: None,
+                    anthropic_context_management: None,
+                    anthropic_speed: None,
+                    parent_run_id: None,
+                    depth: 0,
+                    dispatchable_agents: None,
+                    step_id: step_id.to_string(),
+                    on_tool_call,
+                    on_stream_event: None,
+                    concerns: None,
+                    max_tokens: DEFAULT_MAX_TOKENS,
+                    scope_name: None,
+                    surface_tag: None,
+                    context_window_tokens: None,
+                    compact_at_percent: None,
+                    pause: None,
+                }
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(CONTROL_FREE_FORWARD_WF).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let factory = Factory {
+            calls: Arc::clone(&calls),
+        };
+        let opts = OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_loop".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: None,
+            workflow_yaml: None,
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), run_workflow(opts))
+            .await
+            .expect("run must not hang")
+            .expect("a control-free forward data dependency must not deadlock or misorder");
+
+        let calls = calls.lock().unwrap().clone();
+        let test_call = calls
+            .iter()
+            .find(|c| c.starts_with("test:"))
+            .expect("test dispatched");
+        assert!(
+            test_call.contains("test sees genout"),
+            "test must read THIS iteration's real gen output via a genuine \
+             scheduling edge (not an empty/prior-iteration feedback read): {test_call}"
+        );
+    }
+
+    /// Unit-level proof of `loop_forward_edges`'s edge-selection rule
+    /// directly (no MockProvider dispatch needed): among 3 members, a
+    /// member->member data ref that does NOT close a cycle over the
+    /// control+data DAG accepted so far stays forward; the one that DOES
+    /// close a cycle is excluded as feedback.
+    #[test]
+    fn loop_forward_edges_keeps_non_cycle_closing_data_edges_and_drops_the_cycle_closer() {
+        let yaml = r#"
+name: three-member-mixed
+steps:
+  - id: gen
+    agent: g
+    prompt: gen
+  - id: test
+    agent: t
+    prompt: "{{ steps.gen.output }}"
+    depends_on: [gen]
+  - id: critique
+    agent: c
+    prompt: "{{ steps.test.output }} {{ steps.gen.output }}"
+    depends_on: [test]
+loops:
+  refine:
+    nodes: [gen, test, critique]
+    until: "{{ steps.critique.output }}"
+    max_iterations: 2
+"#;
+        let wf = Workflow::parse(yaml).unwrap();
+        let edges: std::collections::BTreeSet<(String, String)> =
+            loop_forward_edges(&wf, "refine").into_iter().collect();
+        assert!(edges.contains(&("gen".to_string(), "test".to_string())));
+        assert!(edges.contains(&("test".to_string(), "critique".to_string())));
+        // `critique` ALSO references `steps.gen` directly — a data edge
+        // that does NOT close a cycle (`gen` is already an ancestor of
+        // `critique` via `test`) — must stay forward, not be
+        // misclassified as feedback.
+        assert!(
+            edges.contains(&("gen".to_string(), "critique".to_string())),
+            "a non-cycle-closing data edge among 3+ members must stay forward: {edges:?}"
+        );
+    }
+
+    /// The companion negative case: `gen` reads `{{ steps.critique.output
+    /// }}` — adding `critique -> gen` to the control chain `gen -> test ->
+    /// critique` would close a cycle, so it must be excluded (the loop's
+    /// controlled feedback back-reference, spec §2d), while the two real
+    /// control edges stay forward.
+    #[test]
+    fn loop_forward_edges_drops_the_cycle_closing_feedback_edge() {
+        let yaml = r#"
+name: three-member-feedback
+steps:
+  - id: gen
+    agent: g
+    prompt: "{{ steps.critique.output }}"
+  - id: test
+    agent: t
+    prompt: test
+    depends_on: [gen]
+  - id: critique
+    agent: c
+    prompt: critique
+    depends_on: [test]
+loops:
+  refine:
+    nodes: [gen, test, critique]
+    until: "{{ steps.critique.output }}"
+    max_iterations: 2
+"#;
+        let wf = Workflow::parse(yaml).unwrap();
+        let edges: std::collections::BTreeSet<(String, String)> =
+            loop_forward_edges(&wf, "refine").into_iter().collect();
+        assert!(edges.contains(&("gen".to_string(), "test".to_string())));
+        assert!(edges.contains(&("test".to_string(), "critique".to_string())));
+        assert!(
+            !edges.contains(&("critique".to_string(), "gen".to_string())),
+            "the cycle-closing data edge must be excluded as feedback: {edges:?}"
         );
     }
 
