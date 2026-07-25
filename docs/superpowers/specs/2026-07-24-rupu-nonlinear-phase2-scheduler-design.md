@@ -1,7 +1,7 @@
 # Non-linear orchestration — Phase 2: the DAG scheduler (design)
 
 **Date:** 2026-07-24
-**Status:** Design; pending operator review + the decisions in §11.
+**Status:** Design — all decisions locked (§11). Ready to plan.
 **Parent:** the proposal + Phase 1 (`2026-07-24-rupu-nonlinear-orchestration-proposal.md`, `…-phase1-design.md`). Grounded in the orchestrator investigation.
 **Scope:** `crates/rupu-orchestrator` (runner + run-store + resume), and the small CP surface for approve/reject of a specific gate. Removes the Phase 1 honesty gate. **Existing linear workflows must produce byte-for-byte identical output.**
 
@@ -33,15 +33,19 @@ Generalize the single cursor to **per-node status**: `pending → ready → runn
 - **Persist:** keep `step_results.jsonl` (already keyed by `step_id`) as the source of `done`/`failed`/`skipped` on resume; a node not in it is not-yet-run. Branch **pruning** must also be persisted (which nodes the taken arms excluded) so resume doesn't re-run a pruned node — today's branch resume re-derives the skip-set from the branch's recorded `output` (`runner.rs:1005-1015`); generalize that.
 - **Resume:** rebuild done/failed/pruned from disk, recompute the ready-set, re-run only not-done reachable nodes. Multiple nodes may have been in-flight at pause — none of those are `done`, so they simply re-run (idempotent per the current model). `completed_units` (per-fan-out-unit checkpoint) is unchanged.
 
-## 4. Concurrency budget
+## 4. Concurrency — driven by the graph, not an artificial cap (operator-locked)
 
-A workflow-scope cap: `max_concurrency` (top-level, default sensible e.g. 4) governs how many nodes run at once across all paths — the per-step `Semaphore` promoted. Per-container `max_parallel` still governs a `parallel`/`for_each` node's *internal* fan-out (nested under the workflow cap).
+**Concurrency is mandatory and structural:** a `split` with N targets **automatically spins up N concurrent jobs**, and in general every node whose dependencies are met runs concurrently with every other ready node. The scheduler spins as many concurrent jobs as the graph's width demands — it does not serialize a fork. An **optional** top-level `max_concurrency` may cap the total in-flight count (for resource protection), but it defaults to unbounded (run everything the graph makes ready); it must never cap *below* a split's fan-out in a way that serializes the fork. Per-container `max_parallel` still governs a `parallel`/`for_each` node's *internal* fan-out.
 
-## 5. Join execution (all / any / count)
+## 5. Join execution — one rule (operator-locked)
 
-- `all` — ready when every inbound path is `done`.
-- `count: k` — ready when k inbound paths are `done`.
-- `any` — ready when the first inbound path is `done`; the losing in-flight paths are handled per **decision DP2** (cancel vs let-finish-and-ignore).
+**A join waits for a number of inbound paths and passes ALL the results it waited for to the next step.** Merging is universal — there is no separate "merge" vs "wait" mode; the join's output is always the collected results of the paths it waited for (a list / keyed-by-source structure downstream steps read via `steps.<join>.results`).
+
+- **`all`** (default) — ready when every inbound path is `done`; output = all N results merged.
+- **`count: k`** — ready when k inbound paths are `done`; output = those k results merged; the **remaining in-flight paths are cancelled**.
+- **`first`** (wire value `any`) — ready when the first inbound path is `done`; output = that 1 result; the **losing in-flight paths are cancelled**.
+
+Cancellation of the not-waited-for paths (in `first`/`count`) uses the same per-node cancellation-token mechanism as §8's cancel: their running jobs are **stopped** the moment the join's threshold is met.
 
 ## 6. Branch pruning
 
@@ -54,10 +58,9 @@ Today a run has ONE `awaiting_step_id`. In a DAG, **several gates can be parked 
 - **Approve/reject targets a specific gate id** — unblocks that gate's path; other gates stay parked; the scheduler continues the approved path.
 - The CP approve/reject API + the `cp serve` gate sweep (timeout routing) move from "the run's single awaiting step" to "a named gate." This is the largest ripple outside the runner.
 
-## 8. Pause / cancel of concurrent paths
+## 8. Cancel + restart-from-checkpoint (operator-locked)
 
-- **Pause** — stop dispatching new ready nodes; let in-flight nodes reach a safe boundary (or checkpoint fan-out units), persist per-node state, mark the run paused. Multiple in-flight nodes vs today's single `paused_step`.
-- **Cancel** — abort all in-flight nodes (cancellation tokens per dispatched node), mark cancelled. The orphan-reaper (`reap_if_orphaned`) stays as the backstop.
+Cancellation must be **reachable and restart-aware**: a cancel **stops every currently-running job** (a cancellation token per dispatched node, wired through `dispatch_one` so an in-flight agent run is interrupted, not just left detached), then the run can be **restarted, resuming each job from wherever its state allows** — a node that checkpointed (e.g. a fan-out unit list, `completed_units`) picks up from its checkpoint; a node with no checkpoint restarts clean; a `done` node is not re-run. This same mechanism powers `first`/`count` join loser-cancellation (§5) and pause. **Pause** is the soft form (stop launching new ready nodes, let in-flight reach a safe boundary, persist), leaving the run resumable. The orphan-reaper (`reap_if_orphaned`) stays as the backstop for a dead runner.
 
 ## 9. Remove the Phase 1 honesty gate
 
@@ -71,14 +74,17 @@ Delete `is_nonlinear`'s use as a runner gate (`NonlinearNotYetSupported`) — th
 - Approval: two concurrent gates park; approving one continues its path while the other waits; reject routes per `on_reject`; timeout sweep targets the right gate.
 - `#![deny(clippy::all)]`; no schema break for legacy run records (the `awaiting` field is additive with a migration from `awaiting_step_id`).
 
-## 11. Phasing + decisions for you
+## 11. Decisions (operator-locked, 2026-07-24)
 
-**Phasing** — Phase 2 is big; I'd split it:
-- **2a — sequential DAG execution.** The scheduler runs the DAG **one node at a time** in a topological order (no cross-path concurrency yet), with branch pruning + join semantics + per-node resume + the approval-set change. This makes non-linear workflows **run correctly** and de-risks the state/resume rewrite in isolation. Legacy output unchanged.
-- **2b — true concurrency.** Add the workflow-scope semaphore + concurrent dispatch + `any`-join cancellation + pause/cancel of parallel paths. This delivers "work at the same time on multiple paths."
+- **Concurrency is mandatory and structural** — no sequential stepping-stone. A `split` spins up N concurrent jobs automatically; the scheduler runs every ready node concurrently (§4). Phase 2 is one arc: the concurrent scheduler.
+- **`join` config** — `wait: all | first | { count: k }`; **always merges/passes the results of the paths it waited for** to the next step (§5). `first`/`count` **cancel** the not-waited-for in-flight paths.
+- **Cancel is restart-aware** — stops all running jobs; restart resumes each from its checkpoint where possible (§8). Same mechanism powers join loser-cancellation and pause.
+- **Approval-set** — `RunRecord.awaiting_step_id` → an awaiting **set**; approve/reject by gate id (§7). Required now that concurrent paths can each park a gate; ripples into the CP approve/reject API + the gate sweep.
+- **`max_concurrency`** — optional top-level cap, **default unbounded** (run everything the graph makes ready); must never serialize a split's fan-out.
 
-**Decisions:**
-- **DP1 — Phasing.** Do 2a then 2b (my lean — de-risks the resume/approval rewrite before adding concurrency), or one combined Phase 2? *(Note: `split`'s whole point is concurrent tracks, so 2a alone runs them sequentially-correct but not truly parallel — 2b is required to fully deliver the feature; 2a is a safety stepping stone.)*
-- **DP2 — `any`-join losers.** When `join: any` fires, **cancel** the losing in-flight paths (my lean — don't waste agent runs; needs per-node cancellation tokens) vs let them finish and ignore their results (simpler, wasteful).
-- **DP3 — Approval-set model.** Move `awaiting_step_id` → `awaiting: Vec<…>` with approve/reject-by-gate-id (my lean — required for concurrent gates) vs restrict Phase 2 to **at most one parked gate at a time** (simpler, but forbids a legitimate two-gates-parked DAG). I lean to the real model.
-- **DP4 — `max_concurrency` default.** A sensible default (e.g. 4) with a top-level override, vs unbounded (all ready nodes at once). My lean: **bounded default 4**, overridable.
+### Internal build order (not user-facing phases — one PR, sequenced tasks)
+1. Scheduler skeleton over a linear chain (output-equality vs the old loop) — proves the executor/dispatch boundary is preserved.
+2. Concurrent dispatch + split (N live jobs) + implicit all-join + `max_concurrency`.
+3. Branch pruning + explicit `join` (`all`/`first`/`count`) with merged results + loser-cancellation.
+4. Per-node state + resume (cancel/restart-from-checkpoint).
+5. Approval-set (`awaiting` list, approve/reject-by-gate-id, sweep) + remove the Phase 1 honesty gate.
