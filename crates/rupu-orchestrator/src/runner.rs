@@ -23,8 +23,8 @@ use crate::templates::{
     StepOutput,
 };
 use crate::workflow::{
-    effective_workspace_mode, is_nonlinear, yaml_scalar_to_string, InputType, Step, Workflow,
-    WorkflowParseError, WorkspaceMode,
+    effective_workspace_mode, is_nonlinear, workflow_edges, yaml_scalar_to_string, InputType,
+    Step, Workflow, WorkflowParseError, WorkspaceMode,
 };
 use async_trait::async_trait;
 use rupu_agent::{run_agent, AgentRunOpts, RunError, RunResult};
@@ -989,6 +989,125 @@ async fn run_steps_inner(
     approved_step_id: Option<&str>,
     step_results: &mut Vec<StepResult>,
 ) -> Result<InnerOutcome, RunWorkflowError> {
+    let order: Vec<&Step> = opts.workflow.steps.iter().collect();
+    run_steps_over(
+        &order,
+        opts,
+        run_id,
+        resolved_inputs,
+        workflow_default_continue,
+        approved_step_id,
+        step_results,
+    )
+    .await
+}
+
+/// Ready-set scheduler driver (Phase-2 DAG scheduler foundation): dispatches
+/// the workflow's steps in [`ready_set_order`]'s dependency-graph order
+/// (built from [`workflow_edges`]) instead of `opts.workflow.steps`' plain
+/// declaration order, but is otherwise IDENTICAL to [`run_steps_inner`] —
+/// same resume-skip / branch-skip / step-boundary-pause / `when:`-skip /
+/// approval-gate / branch-arm-selection / [`run_node`] dispatch, via the
+/// same shared [`run_steps_over`] body. For every workflow this crate can
+/// run today (`is_nonlinear(&opts.workflow) == false` — see that
+/// function's doc, which already covers every `.rupu/workflows/*.yaml`
+/// sample), [`ready_set_order`] provably returns EXACTLY
+/// `opts.workflow.steps`' own order (see this module's
+/// `dag_scheduler_golden` tests), so this driver is a byte-for-byte-proven
+/// stand-in for [`run_steps_inner`] — NOT yet wired as `run_workflow`'s
+/// live path. A later task in this arc switches the default driver once
+/// concurrency is layered on top of the ready set; until then this exists
+/// so `dag_scheduler_golden` (a `#[cfg(test)]` module in this file, not
+/// `tests/`, specifically so it can reach this and `run_steps_inner`
+/// directly without widening the crate's public API before the scheduler
+/// actually replaces anything) can prove the ready-set walk reproduces the
+/// loop exactly, before later tasks build concurrency on top of it.
+#[allow(dead_code)] // driven only by tests until a later task wires it in as the live path
+async fn run_scheduler(
+    opts: &OrchestratorRunOpts,
+    run_id: &str,
+    resolved_inputs: &BTreeMap<String, String>,
+    workflow_default_continue: bool,
+    approved_step_id: Option<&str>,
+    step_results: &mut Vec<StepResult>,
+) -> Result<InnerOutcome, RunWorkflowError> {
+    let order = ready_set_order(&opts.workflow);
+    run_steps_over(
+        &order,
+        opts,
+        run_id,
+        resolved_inputs,
+        workflow_default_continue,
+        approved_step_id,
+        step_results,
+    )
+    .await
+}
+
+/// Topologically order a workflow's steps via [`workflow_edges`]' DAG using
+/// a ready-set walk (Kahn's algorithm keyed by a `BTreeSet<usize>` of
+/// ready declaration-indices, so the GLOBALLY smallest-index ready node is
+/// always dispatched next — a per-batch sort isn't enough, since a later
+/// batch of newly-readied nodes can still contain a smaller index than one
+/// already queued from an earlier batch). Whenever declaration order is
+/// itself a valid topological order of the full edge set (control edges
+/// union inferred data edges — exactly the invariant `is_nonlinear`
+/// enforces for a workflow with explicit `next`/`split`/`join`, and the
+/// invariant every `.rupu/workflows/*.yaml` sample happens to satisfy even
+/// without explicit edges — see `dag_scheduler_golden`), this walk
+/// reproduces `wf.steps`' own order exactly: by induction, once steps
+/// `0..k` have been dispatched, step `k`'s predecessors (all indices `<
+/// k`) are already dispatched, so `k` is ready and is the smallest ready
+/// index, and is picked next.
+fn ready_set_order(wf: &Workflow) -> Vec<&Step> {
+    let edges = workflow_edges(wf);
+    let index_of: BTreeMap<&str, usize> = wf
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.id.as_str(), i))
+        .collect();
+    let n = wf.steps.len();
+    let mut indegree: Vec<usize> = vec![0; n];
+    let mut successors: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (a, b) in &edges {
+        if let (Some(&ai), Some(&bi)) = (index_of.get(a.as_str()), index_of.get(b.as_str())) {
+            successors[ai].push(bi);
+            indegree[bi] += 1;
+        }
+    }
+    let mut ready: std::collections::BTreeSet<usize> =
+        (0..n).filter(|&i| indegree[i] == 0).collect();
+    let mut order: Vec<&Step> = Vec::with_capacity(n);
+    while let Some(&i) = ready.iter().next() {
+        ready.remove(&i);
+        order.push(&wf.steps[i]);
+        for &s in &successors[i] {
+            indegree[s] -= 1;
+            if indegree[s] == 0 {
+                ready.insert(s);
+            }
+        }
+    }
+    order
+}
+
+/// The actual per-step loop body, shared by [`run_steps_inner`] (order =
+/// plain declaration order) and [`run_scheduler`] (order =
+/// [`ready_set_order`]'s dependency-graph walk) — see those functions'
+/// docs. Behavior is otherwise IDENTICAL to what was, before this
+/// extraction, `run_steps_inner`'s own body iterating
+/// `&opts.workflow.steps` directly; only the source of the iteration
+/// order changed.
+async fn run_steps_over(
+    order: &[&Step],
+    opts: &OrchestratorRunOpts,
+    run_id: &str,
+    resolved_inputs: &BTreeMap<String, String>,
+    workflow_default_continue: bool,
+    approved_step_id: Option<&str>,
+    step_results: &mut Vec<StepResult>,
+) -> Result<InnerOutcome, RunWorkflowError> {
     let already_done: std::collections::BTreeSet<String> =
         step_results.iter().map(|sr| sr.step_id.clone()).collect();
 
@@ -1007,7 +1126,7 @@ async fn run_steps_inner(
     // `when:`-skip shape.
     let mut branch_skipped: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
-    for step in &opts.workflow.steps {
+    for step in order.iter().copied() {
         // Resume: skip steps that already ran in the prior process.
         if already_done.contains(&step.id) {
             // If the already-done step is a `branch:` step, reconstruct the
@@ -1347,143 +1466,201 @@ async fn run_steps_inner(
                 );
             }
         }
-        let step_timer = std::time::Instant::now();
-
-        let dispatch_result: Result<StepResult, RunWorkflowError> = if step.panel.is_some() {
-            run_panel_step(run_id, step, &ctx, opts, effective_continue_on_error).await
-        } else if step.parallel.is_some() {
-            run_parallel_step(step, &ctx, opts, effective_continue_on_error).await
-        } else if step.for_each.is_some() {
-            // A distributed fan-out honors the cooperative pause token
-            // MID-UNIT (not just at the step boundary): a paused-incomplete
-            // fan-out unwinds here carrying the units that already succeeded,
-            // so the resumed run re-dispatches only the paused / not-yet-
-            // started ones.
-            match run_fanout_step(run_id, step, &ctx, opts, effective_continue_on_error).await {
-                Ok(FanoutStepOutcome::Paused {
+        match run_node(run_id, step, &ctx, opts, effective_continue_on_error).await? {
+            NodeOutcome::Paused {
+                step_id,
+                seed,
+                fanout_completed_units,
+            } => {
+                return Ok(InnerOutcome::Paused {
                     step_id,
-                    completed_units,
-                }) => {
-                    info!(step = %step_id, "cooperative pause mid-fan-out");
-                    if let Some(sink) = opts.event_sink.as_ref() {
-                        sink.emit(
-                            run_id,
-                            &crate::executor::Event::StepPaused {
-                                run_id: run_id.to_string(),
-                                step_id: step_id.clone(),
-                            },
-                        );
-                    }
-                    clear_active_step(opts, run_id, &step.id);
-                    return Ok(InnerOutcome::Paused {
-                        step_id,
-                        prompt: String::new(),
-                        timeout_seconds: None,
-                        reason: PauseReason::Manual,
-                        seed: Vec::new(),
-                        fanout_completed_units: completed_units,
-                    });
-                }
-                Ok(FanoutStepOutcome::Completed(sr)) => Ok(sr),
-                Err(e) => Err(e),
+                    prompt: String::new(),
+                    timeout_seconds: None,
+                    reason: PauseReason::Manual,
+                    seed,
+                    fanout_completed_units,
+                });
             }
-        } else if step.action.is_some() {
-            // Action steps never pause mid-run — a single dispatcher call is
-            // either fast enough to run to completion or fails outright; no
-            // cooperative-pause checkpoint shape exists for it.
-            match opts.action_dispatcher.as_ref() {
-                Some(dispatcher) => {
-                    execute_action_step(
-                        dispatcher,
-                        step,
-                        &ctx,
-                        render_mode(opts.strict_templates),
-                        effective_continue_on_error,
-                        &opts.transcript_dir,
-                    )
-                    .await
-                }
-                None => Err(RunWorkflowError::ActionDispatcherMissing {
-                    step: step.id.clone(),
-                }),
-            }
-        } else {
-            // The linear path is the only other shape that pauses mid-step
-            // (its agent run carries the cooperative pause token). A
-            // paused-incomplete step unwinds here into a manual-pause
-            // checkpoint carrying the seed.
-            match run_linear_step(run_id, step, &ctx, opts, effective_continue_on_error).await {
-                Ok(LinearStepOutcome::Paused { step_id, seed }) => {
-                    // A `workspace: sync` workflow is refused loudly here too
-                    // — checkpointing mid-step would drop in-flight deltas
-                    // the same way a step-boundary/fan-out pause would.
-                    // Mirrors the step-boundary guard above and the fan-out
-                    // guard in `run_fanout_step`.
-                    if workflow_has_sync_step(opts) {
-                        return Err(RunWorkflowError::PauseWithWorkspaceSync);
-                    }
-                    info!(step = %step_id, "cooperative pause mid-step");
-                    if let Some(sink) = opts.event_sink.as_ref() {
-                        sink.emit(
-                            run_id,
-                            &crate::executor::Event::StepPaused {
-                                run_id: run_id.to_string(),
-                                step_id: step_id.clone(),
-                            },
-                        );
-                    }
-                    clear_active_step(opts, run_id, &step.id);
-                    return Ok(InnerOutcome::Paused {
-                        step_id,
-                        prompt: String::new(),
-                        timeout_seconds: None,
-                        reason: PauseReason::Manual,
-                        seed,
-                        fanout_completed_units: std::collections::BTreeMap::new(),
-                    });
-                }
-                Ok(LinearStepOutcome::Completed(sr)) => Ok(sr),
-                Err(e) => Err(e),
-            }
-        };
-
-        let duration_ms = step_timer.elapsed().as_millis() as u64;
-
-        match &dispatch_result {
-            Ok(result) => {
-                if let Some(sink) = opts.event_sink.as_ref() {
-                    sink.emit(
-                        run_id,
-                        &crate::executor::Event::StepCompleted {
-                            run_id: run_id.to_string(),
-                            step_id: step.id.clone(),
-                            success: result.success,
-                            duration_ms,
-                            host: step.host.clone(),
-                        },
-                    );
-                }
-            }
-            Err(e) => {
-                if let Some(sink) = opts.event_sink.as_ref() {
-                    sink.emit(
-                        run_id,
-                        &crate::executor::Event::StepFailed {
-                            run_id: run_id.to_string(),
-                            step_id: step.id.clone(),
-                            error: e.to_string(),
-                        },
-                    );
-                }
+            NodeOutcome::Completed(result) => {
+                persist_step_result(opts, run_id, &result);
+                clear_active_step(opts, run_id, &step.id);
+                step_results.push(result);
             }
         }
-
-        let result = dispatch_result?;
-        persist_step_result(opts, run_id, &result);
-        clear_active_step(opts, run_id, &step.id);
-        step_results.push(result);
     }
     Ok(InnerOutcome::Done)
+}
+
+/// Outcome of dispatching one workflow node — panel / parallel / for_each /
+/// action / linear — via [`run_node`]. Distinct from [`InnerOutcome`]'s
+/// `Paused` variant, which ALSO covers the step-boundary and approval-gate
+/// pauses that happen in [`run_steps_over`] BEFORE `run_node` is ever
+/// called; those never produce a `NodeOutcome`.
+enum NodeOutcome {
+    /// The node ran to completion — success or a tolerated
+    /// (`continue_on_error`) failure.
+    Completed(StepResult),
+    /// A cooperative pause landed mid-dispatch (mid-fan-out or
+    /// mid-linear-step). Carries exactly the fields that vary for THIS
+    /// pause shape — `prompt` is always empty, `timeout_seconds` always
+    /// `None`, and `reason` is always [`PauseReason::Manual`] whenever a
+    /// pause reaches this point (see [`InnerOutcome::Paused`]'s doc), so
+    /// the caller fills those in when it re-wraps this into an
+    /// `InnerOutcome::Paused`.
+    Paused {
+        step_id: String,
+        seed: Vec<Message>,
+        fanout_completed_units: std::collections::BTreeMap<usize, ItemResult>,
+    },
+}
+
+/// Dispatch exactly one step (panel / parallel / for_each / action /
+/// linear) and return its outcome. Lifted verbatim out of
+/// [`run_steps_over`]'s per-step dispatch — a pure extraction, not a
+/// behavior change (see this crate's Phase-2 DAG-scheduler foundation
+/// work, `run_scheduler`).
+///
+/// The `StepCompleted`/`StepFailed` emission that used to sit immediately
+/// after this block inline in the loop now lives at the end of THIS
+/// function instead of in the caller, so it stays colocated with the point
+/// where `dispatch_result` is actually finalized — that matters because
+/// the two early `return`s below (the fan-out/linear "paused" arms,
+/// including the `workflow_has_sync_step` guard) bypass it entirely,
+/// exactly as they bypassed the equivalent code when it lived inline in
+/// the loop.
+async fn run_node(
+    run_id: &str,
+    step: &Step,
+    ctx: &StepContext,
+    opts: &OrchestratorRunOpts,
+    effective_continue_on_error: bool,
+) -> Result<NodeOutcome, RunWorkflowError> {
+    let step_timer = std::time::Instant::now();
+
+    let dispatch_result: Result<StepResult, RunWorkflowError> = if step.panel.is_some() {
+        run_panel_step(run_id, step, ctx, opts, effective_continue_on_error).await
+    } else if step.parallel.is_some() {
+        run_parallel_step(step, ctx, opts, effective_continue_on_error).await
+    } else if step.for_each.is_some() {
+        // A distributed fan-out honors the cooperative pause token
+        // MID-UNIT (not just at the step boundary): a paused-incomplete
+        // fan-out unwinds here carrying the units that already succeeded,
+        // so the resumed run re-dispatches only the paused / not-yet-
+        // started ones.
+        match run_fanout_step(run_id, step, ctx, opts, effective_continue_on_error).await {
+            Ok(FanoutStepOutcome::Paused {
+                step_id,
+                completed_units,
+            }) => {
+                info!(step = %step_id, "cooperative pause mid-fan-out");
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepPaused {
+                            run_id: run_id.to_string(),
+                            step_id: step_id.clone(),
+                        },
+                    );
+                }
+                clear_active_step(opts, run_id, &step.id);
+                return Ok(NodeOutcome::Paused {
+                    step_id,
+                    seed: Vec::new(),
+                    fanout_completed_units: completed_units,
+                });
+            }
+            Ok(FanoutStepOutcome::Completed(sr)) => Ok(sr),
+            Err(e) => Err(e),
+        }
+    } else if step.action.is_some() {
+        // Action steps never pause mid-run — a single dispatcher call is
+        // either fast enough to run to completion or fails outright; no
+        // cooperative-pause checkpoint shape exists for it.
+        match opts.action_dispatcher.as_ref() {
+            Some(dispatcher) => {
+                execute_action_step(
+                    dispatcher,
+                    step,
+                    ctx,
+                    render_mode(opts.strict_templates),
+                    effective_continue_on_error,
+                    &opts.transcript_dir,
+                )
+                .await
+            }
+            None => Err(RunWorkflowError::ActionDispatcherMissing {
+                step: step.id.clone(),
+            }),
+        }
+    } else {
+        // The linear path is the only other shape that pauses mid-step
+        // (its agent run carries the cooperative pause token). A
+        // paused-incomplete step unwinds here into a manual-pause
+        // checkpoint carrying the seed.
+        match run_linear_step(run_id, step, ctx, opts, effective_continue_on_error).await {
+            Ok(LinearStepOutcome::Paused { step_id, seed }) => {
+                // A `workspace: sync` workflow is refused loudly here too
+                // — checkpointing mid-step would drop in-flight deltas
+                // the same way a step-boundary/fan-out pause would.
+                // Mirrors the step-boundary guard above and the fan-out
+                // guard in `run_fanout_step`.
+                if workflow_has_sync_step(opts) {
+                    return Err(RunWorkflowError::PauseWithWorkspaceSync);
+                }
+                info!(step = %step_id, "cooperative pause mid-step");
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepPaused {
+                            run_id: run_id.to_string(),
+                            step_id: step_id.clone(),
+                        },
+                    );
+                }
+                clear_active_step(opts, run_id, &step.id);
+                return Ok(NodeOutcome::Paused {
+                    step_id,
+                    seed,
+                    fanout_completed_units: std::collections::BTreeMap::new(),
+                });
+            }
+            Ok(LinearStepOutcome::Completed(sr)) => Ok(sr),
+            Err(e) => Err(e),
+        }
+    };
+
+    let duration_ms = step_timer.elapsed().as_millis() as u64;
+
+    match &dispatch_result {
+        Ok(result) => {
+            if let Some(sink) = opts.event_sink.as_ref() {
+                sink.emit(
+                    run_id,
+                    &crate::executor::Event::StepCompleted {
+                        run_id: run_id.to_string(),
+                        step_id: step.id.clone(),
+                        success: result.success,
+                        duration_ms,
+                        host: step.host.clone(),
+                    },
+                );
+            }
+        }
+        Err(e) => {
+            if let Some(sink) = opts.event_sink.as_ref() {
+                sink.emit(
+                    run_id,
+                    &crate::executor::Event::StepFailed {
+                        run_id: run_id.to_string(),
+                        step_id: step.id.clone(),
+                        error: e.to_string(),
+                    },
+                );
+            }
+        }
+    }
+
+    Ok(NodeOutcome::Completed(dispatch_result?))
 }
 
 /// Append one step's record to the run's `step_results.jsonl`. A
@@ -5982,6 +6159,410 @@ steps:
             result.step_results[1].output, "done:then done:p",
             "step b ran with step a's real output, proving genuine sequential execution"
         );
+    }
+}
+
+/// Phase-2 DAG-scheduler foundation (task 1 of the arc — see
+/// `.superpowers/sdd/task-1-brief.md`): `run_scheduler` must reproduce
+/// `run_steps_inner` byte-for-byte over every real `.rupu/workflows/*.yaml`
+/// sample before anything downstream (concurrency, later tasks) builds on
+/// it. A `#[cfg(test)]` module in THIS file, not `tests/`, specifically so
+/// it can call `run_steps_inner` / `run_scheduler` / `InnerOutcome`
+/// directly without making any of them part of the crate's public API
+/// before the scheduler actually replaces the loop as the live path.
+#[cfg(test)]
+mod dag_scheduler_golden {
+    use super::*;
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_mcp::{McpPermission, ToolDispatcher};
+    use rupu_providers::types::StopReason;
+    use rupu_scm::{
+        Branch, Comment, CreatePr, Diff, FileContent, Platform, Pr, PrFilter, PrRef, Registry,
+        RepoConnector, RepoRef, ScmError,
+    };
+    use rupu_tools::{PermissionMode, ToolContext};
+
+    /// Echoes `step {id} agent {agent} echo: {prompt}` for every agent
+    /// dispatch, across every sample workflow — deterministic and
+    /// content-agnostic (mirrors `FakeFactory` in `tests/linear_runner.rs`).
+    /// A panel step's panelist output under this factory is plain prose,
+    /// not `{"findings": [...]}` JSON — but `parse_findings` treats
+    /// unparseable text as zero findings rather than an error (see that
+    /// function above), so panel steps still complete (with an empty
+    /// findings list, clearing any `gate:` threshold immediately) under
+    /// this factory. No panel-specific scripting is needed for this
+    /// golden set.
+    struct EchoFactory;
+
+    #[async_trait]
+    impl StepFactory for EchoFactory {
+        async fn build_opts_for_step(
+            &self,
+            step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: PathBuf,
+            transcript_path: PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> AgentRunOpts {
+            let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+                text: format!("step {step_id} agent {agent_name} echo: {rendered_prompt}"),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            }]);
+            AgentRunOpts {
+                agent_name: format!("ag-{agent_name}"),
+                agent_system_prompt: "echo".into(),
+                agent_tools: None,
+                provider: Box::new(provider),
+                provider_name: "mock".into(),
+                model: "mock-1".into(),
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                max_turns: 5,
+                decider: Arc::new(BypassDecider),
+                tool_context: ToolContext::default(),
+                user_message: rendered_prompt,
+                initial_messages: Vec::new(),
+                turn_index_offset: 0,
+                mode_str: "bypass".into(),
+                no_stream: true,
+                suppress_stream_stdout: true,
+                mcp_registry: None,
+                effort: None,
+                context_window: None,
+                output_format: None,
+                output_schema: None,
+                anthropic_task_budget: None,
+                anthropic_context_management: None,
+                anthropic_speed: None,
+                parent_run_id: None,
+                depth: 0,
+                dispatchable_agents: None,
+                step_id: step_id.to_string(),
+                on_tool_call,
+                on_stream_event: None,
+                concerns: None,
+                max_tokens: DEFAULT_MAX_TOKENS,
+                scope_name: None,
+                surface_tag: None,
+                context_window_tokens: None,
+                compact_at_percent: None,
+                pause: None,
+            }
+        }
+    }
+
+    /// Backs the one `action:` kind our sample workflows use
+    /// (`scm.prs.list` — a real top-level step in `action-demo.yaml`, and
+    /// `gate-demo.yaml`'s best-effort `notify:` hook). Every other
+    /// `RepoConnector` method is unreachable from these samples.
+    struct FakeConnector;
+
+    #[async_trait]
+    impl RepoConnector for FakeConnector {
+        fn platform(&self) -> Platform {
+            Platform::Github
+        }
+        async fn list_repos(&self) -> Result<Vec<rupu_scm::Repo>, ScmError> {
+            unimplemented!()
+        }
+        async fn get_repo(&self, _r: &RepoRef) -> Result<rupu_scm::Repo, ScmError> {
+            unimplemented!()
+        }
+        async fn list_branches(&self, _r: &RepoRef) -> Result<Vec<Branch>, ScmError> {
+            unimplemented!()
+        }
+        async fn create_branch(
+            &self,
+            _r: &RepoRef,
+            _name: &str,
+            _from_sha: &str,
+        ) -> Result<Branch, ScmError> {
+            unimplemented!()
+        }
+        async fn read_file(
+            &self,
+            _r: &RepoRef,
+            _path: &str,
+            _ref_: Option<&str>,
+        ) -> Result<FileContent, ScmError> {
+            unimplemented!()
+        }
+        async fn list_prs(&self, _r: &RepoRef, _f: PrFilter) -> Result<Vec<Pr>, ScmError> {
+            Ok(Vec::new())
+        }
+        async fn get_pr(&self, _p: &PrRef) -> Result<Pr, ScmError> {
+            unimplemented!()
+        }
+        async fn diff_pr(&self, _p: &PrRef) -> Result<Diff, ScmError> {
+            unimplemented!()
+        }
+        async fn comment_pr(&self, _p: &PrRef, _body: &str) -> Result<Comment, ScmError> {
+            unimplemented!()
+        }
+        async fn create_pr(&self, _r: &RepoRef, _opts: CreatePr) -> Result<Pr, ScmError> {
+            unimplemented!()
+        }
+        async fn clone_to(&self, _r: &RepoRef, _dir: &Path) -> Result<(), ScmError> {
+            unimplemented!()
+        }
+    }
+
+    fn build_dispatcher() -> Arc<ToolDispatcher> {
+        let mut reg = Registry::empty();
+        reg.insert_repo_connector(Platform::Github, Arc::new(FakeConnector));
+        Arc::new(ToolDispatcher::new(
+            Arc::new(reg),
+            McpPermission::new(PermissionMode::Bypass, vec!["*".into()]),
+        ))
+    }
+
+    /// Minimal `(inputs, issue, event)` fixture each sample workflow needs
+    /// to render without a `RenderError`/`UndeclaredInput` — derived by
+    /// reading each file's `inputs:` schema and `issue.*`/`event.*`
+    /// template references. Any file not listed needs none of the three.
+    fn fixture_for(
+        name: &str,
+    ) -> (
+        BTreeMap<String, String>,
+        Option<serde_json::Value>,
+        Option<serde_json::Value>,
+    ) {
+        match name {
+            "code-review-panel.yaml" => (
+                BTreeMap::from([("diff".to_string(), "+ x".to_string())]),
+                None,
+                None,
+            ),
+            "dispatch-demo.yaml" => (
+                BTreeMap::from([("subject".to_string(), "src/main.rs".to_string())]),
+                None,
+                None,
+            ),
+            "investigate-then-fix.yaml" => (
+                BTreeMap::from([("prompt".to_string(), "bug".to_string())]),
+                None,
+                None,
+            ),
+            "issue-supervisor-dispatch.yaml" => (
+                BTreeMap::new(),
+                Some(serde_json::json!({"number": 1, "ref": "github:acme/widget#1"})),
+                None,
+            ),
+            "issue-to-spec-and-plan.yaml" => (
+                BTreeMap::new(),
+                Some(serde_json::json!({
+                    "number": 1,
+                    "r": {"project": "acme/widget"},
+                    "title": "t",
+                    "labels": ["bug"],
+                    "body": "b",
+                })),
+                None,
+            ),
+            "issue-triage.yaml" => (
+                BTreeMap::new(),
+                Some(serde_json::json!({
+                    "number": 1,
+                    "ref": "github:acme/widget#1",
+                    "title": "t",
+                    "author": "alice",
+                    "labels": ["bug"],
+                    "body": "b",
+                })),
+                None,
+            ),
+            "phase-delivery-cycle.yaml" => (
+                BTreeMap::from([("phase".to_string(), "phase-1".to_string())]),
+                Some(serde_json::json!({"number": 1})),
+                None,
+            ),
+            "pr-code-review.yaml" => (
+                BTreeMap::new(),
+                None,
+                Some(serde_json::json!({
+                    "pull_request": {"diff": "+x", "number": 1, "url": "u", "head_sha": "abc"},
+                })),
+            ),
+            "quick-bugfix.yaml" => (
+                BTreeMap::from([("prompt".to_string(), "bug".to_string())]),
+                None,
+                None,
+            ),
+            "review-changed-files.yaml" => (
+                BTreeMap::from([("files".to_string(), "a.rs\nb.rs".to_string())]),
+                None,
+                None,
+            ),
+            _ => (BTreeMap::new(), None, None),
+        }
+    }
+
+    /// One comparable row of a step's golden result: exactly the fields
+    /// the task-1 brief calls for (id, output, success, skipped, kind), in
+    /// declaration/dispatch order.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct GoldenStep {
+        id: String,
+        output: String,
+        success: bool,
+        skipped: bool,
+        kind: crate::runs::StepKind,
+    }
+
+    impl From<&StepResult> for GoldenStep {
+        fn from(sr: &StepResult) -> Self {
+            GoldenStep {
+                id: sr.step_id.clone(),
+                output: sr.output.clone(),
+                success: sr.success,
+                skipped: sr.skipped,
+                kind: sr.kind,
+            }
+        }
+    }
+
+    /// `InnerOutcome`'s discriminant plus the paused step id (when any) —
+    /// enough to compare two runs' terminal state alongside their
+    /// `step_results` snapshot, without needing the full pause payload
+    /// (prompt / timeout / seed / fanout units) to be comparable.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum GoldenTerminal {
+        Done,
+        Paused(String),
+    }
+
+    /// Which of the two step-dispatch drivers `run_one` exercises.
+    #[derive(Debug, Clone, Copy)]
+    enum Driver {
+        /// `run_steps_inner` — today's live path (plain declaration order).
+        Loop,
+        /// `run_scheduler` — the ready-set walk this task adds, proven
+        /// (not yet wired as the live path).
+        Scheduler,
+    }
+
+    /// Every sample workflow's yaml file, read once per call (files are
+    /// tiny; simplicity over caching).
+    fn sample_workflow_files() -> Vec<(String, String)> {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.rupu/workflows");
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let name = p.file_name().unwrap().to_str().unwrap().to_string();
+            let raw = std::fs::read_to_string(&p).unwrap();
+            out.push((name, raw));
+        }
+        out.sort();
+        assert!(!out.is_empty(), "expected sample workflows under {dir}");
+        out
+    }
+
+    /// Run one sample workflow through `driver`, returning its terminal
+    /// state + `step_results` snapshot. In-memory only (`run_store: None`,
+    /// `run_id: ""`) — persistence is irrelevant to this comparison and
+    /// both helpers already no-op cleanly without a store.
+    async fn run_one(driver: Driver, name: &str, raw: &str) -> (GoldenTerminal, Vec<GoldenStep>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(raw).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
+        let (inputs, issue, event) = fixture_for(name);
+        let opts = OrchestratorRunOpts {
+            workflow: wf,
+            inputs,
+            workspace_id: format!("ws_{name}"),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(EchoFactory),
+            event,
+            issue,
+            issue_ref: None,
+            run_store: None,
+            workflow_yaml: None,
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: Some(build_dispatcher()),
+            pause: None,
+        };
+        let resolved_inputs = resolve_inputs(&opts.workflow, &opts.inputs)
+            .unwrap_or_else(|e| panic!("{name}: resolve_inputs failed: {e}"));
+        let workflow_default_continue = opts.workflow.defaults.continue_on_error.unwrap_or(false);
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = match driver {
+            Driver::Loop => {
+                run_steps_inner(
+                    &opts,
+                    "",
+                    &resolved_inputs,
+                    workflow_default_continue,
+                    None,
+                    &mut step_results,
+                )
+                .await
+            }
+            Driver::Scheduler => {
+                run_scheduler(
+                    &opts,
+                    "",
+                    &resolved_inputs,
+                    workflow_default_continue,
+                    None,
+                    &mut step_results,
+                )
+                .await
+            }
+        };
+
+        let terminal = match outcome {
+            Ok(InnerOutcome::Done) => GoldenTerminal::Done,
+            Ok(InnerOutcome::Paused { step_id, .. }) => GoldenTerminal::Paused(step_id),
+            Err(e) => panic!("{name}: run failed under {driver:?}: {e}"),
+        };
+        let snapshot = step_results.iter().map(GoldenStep::from).collect();
+        (terminal, snapshot)
+    }
+
+    /// Task-1 brief, steps 1-2: capture `run_steps_inner`'s `step_results`
+    /// (+ terminal state) for every sample workflow and prove the
+    /// MockProvider harness is deterministic — the golden baseline the
+    /// scheduler is proven against below stays meaningful only if running
+    /// the SAME workflow twice yields the SAME snapshot.
+    #[tokio::test]
+    async fn loop_snapshot_is_deterministic_for_every_sample_workflow() {
+        for (name, raw) in sample_workflow_files() {
+            let a = run_one(Driver::Loop, &name, &raw).await;
+            let b = run_one(Driver::Loop, &name, &raw).await;
+            assert_eq!(a, b, "{name}: run_steps_inner must be deterministic");
+        }
+    }
+
+    /// Task-1 brief, step 4: `run_scheduler`'s ready-set walk must
+    /// reproduce `run_steps_inner`'s declaration-order walk byte-for-byte
+    /// — same `step_results` (ids, outputs, success, skipped, kind, order)
+    /// AND the same terminal state (`Done`, or `Paused` at the same step)
+    /// — for every real `.rupu/workflows/*.yaml` sample.
+    #[tokio::test]
+    async fn scheduler_matches_loop_byte_for_byte_for_every_sample_workflow() {
+        for (name, raw) in sample_workflow_files() {
+            let golden = run_one(Driver::Loop, &name, &raw).await;
+            let scheduled = run_one(Driver::Scheduler, &name, &raw).await;
+            assert_eq!(
+                golden, scheduled,
+                "{name}: run_scheduler must reproduce run_steps_inner exactly"
+            );
+        }
     }
 }
 
