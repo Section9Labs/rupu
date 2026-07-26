@@ -23,6 +23,7 @@
     <div class="grp">Concepts</div>
     <a class="item" href="/docs/agents.html">Agents</a>
     <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
     <div class="grp">Platform</div>
@@ -85,8 +86,8 @@
 
     <h2>The built-in tools</h2>
     <p>
-      Every rupu <a class="link" href="/docs/agents.html">agent</a> ships with six built-in tools. They are the
-      bedrock surface an agent uses to read and change a workspace; no plugins are required.
+      Every rupu <a class="link" href="/docs/agents.html">agent</a> ships with a set of built-in tools. They are
+      the bedrock surface an agent uses to read and change a workspace; no plugins are required.
     </p>
     <table>
       <thead><tr><th>Tool</th><th>What it does</th><th>Kind</th></tr></thead>
@@ -97,8 +98,16 @@
         <tr><td><code>edit_file</code></td><td>Exact-match string replacement; errors if the string is not found</td><td>write</td></tr>
         <tr><td><code>grep</code></td><td>Search across the workspace (ripgrep-backed)</td><td>read</td></tr>
         <tr><td><code>glob</code></td><td>File-pattern matching</td><td>read</td></tr>
+        <tr><td><code>ast_grep</code></td><td>Structural (syntax-tree) code search — match by <em>shape</em>, not bytes, with <code class="inline">$VAR</code> metavariables across 20+ languages</td><td>read</td></tr>
       </tbody>
     </table>
+    <p>
+      <code class="inline">ast_grep</code> is the precise counterpart to <code class="inline">grep</code>: instead of
+      a regex over text, the agent writes a pattern in the code's own syntax — <code class="inline">impl Tool for $T</code>,
+      <code class="inline">async fn $F($$$) -&gt; Result&lt;$O&gt;</code> — and rupu matches it against the parsed
+      syntax tree. It takes a <code class="inline">pattern</code> plus a <code class="inline">lang</code>
+      (e.g. <code class="inline">rust</code>, <code class="inline">python</code>, <code class="inline">typescript</code>).
+    </p>
     <p>
       Two more built-ins let an agent <strong>call other agents as tools</strong>:
       <code class="inline">dispatch_agent</code> (one child, synchronously) and

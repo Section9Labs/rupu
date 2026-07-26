@@ -23,6 +23,7 @@
     <div class="grp">Concepts</div>
     <a class="item" href="/docs/agents.html">Agents</a>
     <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
     <div class="grp">Platform</div>
@@ -213,9 +214,60 @@ $ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class
       validation the orchestrator already applies.
     </p>
     <p>
+      <strong>Every step kind has its own shape.</strong> The Flow Designer paints
+      nodes as flowchart silhouettes rather than identical cards, so a workflow
+      still reads when it's zoomed out far enough to see whole: a
+      <code class="inline">branch</code> is a decision diamond, an
+      <code class="inline">action</code> connector a parallelogram, an approval
+      gate the trapezoid of a manual operation, a
+      <code class="inline">for_each</code> a hexagon, and
+      <code class="inline">parallel</code> / <code class="inline">panel</code> keep
+      growing rectangular bodies for their sub-steps. Connection handles anchor to
+      the silhouette itself, so nodes drag and wire by their real shape — and
+      shape carries the kind independently of colour.
+    </p>
+    <p>
+      <strong>A Blocks palette with its own tab.</strong> The rail is one tab bar —
+      <em>Blocks &middot; Step &middot; Settings &middot; Reference</em> — so the
+      palette and the editor no longer compete for height. Blocks sits on a dense
+      chip grid with a filter across both the step kinds and the whole connector
+      catalog, each chip previewing the silhouette it will place. Selecting a chip
+      shows what it does, its required fields, and a short example before you
+      commit it; drag-to-place or <strong>Add to canvas</strong> drops the node and
+      jumps you straight to its form.
+    </p>
+    <p>
+      <strong>Per-kind authoring forms.</strong> The Step tab renders the form the
+      selected node actually needs. Connector (<code class="inline">action</code>)
+      steps get a form generated from the tool catalog's own JSON schema — required
+      parameters marked, values that round-trip whether they're numbers, booleans,
+      lists, or <code class="inline">&#123;&#123; &hellip; &#125;&#125;</code>
+      expressions — so new tools appear in the editor with no editor changes.
+      Approval gates get editors for their notify hooks and their on-reject cleanup
+      steps; panels and branches get their sub-schemas, with constrained choices
+      (severity thresholds, minimums) instead of free text you can typo into a
+      failed run.
+    </p>
+    <p>
+      <strong>One visual language, author and run.</strong> The live run graph now
+      paints from the same kind palette as the editor, with connectors animating
+      along the active path — kind
+      colour carries identity while status stays the overlay, so a running step
+      pulses, a gate awaiting you glows amber, and a failure still reads as a
+      failure. Watching a run and editing it look like the same thing.
+    </p>
+    <div class="callout">
+      <strong>Opt in while it settles.</strong> The Flow Designer and the matching
+      run-graph visuals ship behind one switch —
+      <code class="inline">[cp]</code>'s
+      <code class="inline">workflow_editor_ui = "next"</code> in your config (the
+      default is <code class="inline">"classic"</code>, today's editor).
+    </div>
+    <p>
       Every expression field — a step's <code class="inline">prompt</code>,
-      <code class="inline">when</code>, or <code class="inline">for_each</code>,
-      a panel's subject — gets syntax highlighting and
+      <code class="inline">when</code>, a branch's
+      <code class="inline">condition</code>, or a panel's subject — gets syntax
+      highlighting and
       <strong>context-aware autocomplete</strong>. Inside
       <code class="inline">{{ &hellip; }}</code> it suggests the right vocabulary
       for where you are: declared <code class="inline">inputs</code>, the outputs

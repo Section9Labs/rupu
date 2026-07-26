@@ -23,6 +23,7 @@
     <div class="grp">Concepts</div>
     <a class="item" href="/docs/agents.html">Agents</a>
     <a class="item active" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
     <div class="grp">Platform</div>
@@ -57,7 +58,9 @@
       <li>fan one agent out across many items with <code class="inline">for_each:</code>;</li>
       <li>fan many specialist agents out over the same subject with <code class="inline">parallel:</code>;</li>
       <li>run structured review panels with an optional fix loop using <code class="inline">panel:</code>;</li>
-      <li>pause for a human gate with <code class="inline">approval:</code>;</li>
+      <li>route down one of two arms with <code class="inline">branch:</code>;</li>
+      <li>call an SCM, issue-tracker, or CI tool directly — no agent, no tokens — with <code class="inline">action:</code>;</li>
+      <li>pause for a human gate with <code class="inline">approval:</code>, and notify or clean up around it;</li>
       <li>start manually, on cron, or from an event trigger.</li>
     </ul>
     <p>
@@ -146,9 +149,13 @@
 
     <h2>Step kinds</h2>
     <p>
-      Every step has a unique <code class="inline">id</code> and exactly one execution shape. A step is either a
-      <strong>linear</strong> step, a <code class="inline">for_each:</code> fan-out, a
-      <code class="inline">parallel:</code> multi-agent fan-out, or a <code class="inline">panel:</code> review.
+      Every step has a unique <code class="inline">id</code> and exactly one execution shape. The shapes are
+      mutually exclusive and inferred from which block the step sets — a <strong>linear</strong> step, a
+      <code class="inline">for_each:</code> fan-out, a <code class="inline">parallel:</code> multi-agent fan-out,
+      a <code class="inline">panel:</code> review, a <code class="inline">branch:</code> routing decision, an
+      <code class="inline">action:</code> connector call, or a standalone <code class="inline">approval:</code>
+      gate. Not every step runs an agent: <code class="inline">branch:</code>,
+      <code class="inline">action:</code>, and gate steps are deterministic and cost no tokens.
     </p>
     <table>
       <thead><tr><th>Shape</th><th>Defining fields</th><th>What it does</th></tr></thead>
@@ -157,6 +164,9 @@
         <tr><td><code>for_each</code></td><td><code>for_each</code> (+ <code>agent</code>, <code>prompt</code>)</td><td>Renders a list and runs the same agent once per item, with <code class="inline">max_parallel</code> concurrency.</td></tr>
         <tr><td><code>parallel</code></td><td><code>parallel</code> (list of sub-steps)</td><td>Different specialists run concurrently over the subject. Each sub-step has its own <code>id</code> / <code>agent</code> / <code>prompt</code>; the parent must not set <code>agent</code> / <code>prompt</code>.</td></tr>
         <tr><td><code>panel</code></td><td><code>panel</code> (<code>panelists</code> + <code>subject</code>)</td><td>Several reviewer agents emit structured findings over one subject, with an optional <code>gate</code> review/fix loop.</td></tr>
+        <tr><td><code>branch</code></td><td><code>branch</code> (<code>condition</code> + <code>then</code> / <code>else</code>)</td><td>Evaluates a condition and skips the arm that wasn&rsquo;t taken. No agent, no tokens.</td></tr>
+        <tr><td><code>action</code></td><td><code>action</code> (+ <code>with</code>)</td><td>Calls one SCM / issue / CI tool from the MCP catalog directly — a deterministic API call, no agent, no tokens.</td></tr>
+        <tr><td><code>approval gate</code></td><td><code>approval</code> alone</td><td>A step whose only job is the human decision. Pauses the run, and can notify, auto-approve, route a timeout, or run cleanup on reject.</td></tr>
       </tbody>
     </table>
     <p>These fields apply to <em>any</em> step regardless of shape:</p>
@@ -168,9 +178,14 @@
         <tr><td><code>when</code></td><td>all</td><td>Minijinja expression reduced to truthy / falsy; falsy values are empty string, <code class="inline">false</code>, <code class="inline">0</code>, <code class="inline">no</code>, <code class="inline">off</code>.</td></tr>
         <tr><td><code>continue_on_error</code></td><td>all</td><td>Tolerate failure and keep going; inherits the workflow default.</td></tr>
         <tr><td><code>max_parallel</code></td><td><code>for_each</code>, <code>parallel</code>, <code>panel</code></td><td>Concurrency cap (at least 1).</td></tr>
-        <tr><td><code>approval</code></td><td>all</td><td>Human pause before the step dispatches (checked after <code class="inline">when:</code>).</td></tr>
+        <tr><td><code>approval</code></td><td>all</td><td>Human pause before the step dispatches (checked after <code class="inline">when:</code>). On a step with no other shape it becomes a gate node of its own.</td></tr>
       </tbody>
     </table>
+    <p>
+      The sections below cover the shapes you reach for day to day. For the complete field-by-field spec — every key,
+      its type, its defaults, and the parse-time rules — see the
+      <a class="link" href="/docs/workflow-reference.html">Authoring reference</a>.
+    </p>
 
     <h3>Conditional steps with <code class="inline">when:</code></h3>
     <p>
@@ -179,6 +194,80 @@
     </p>
     <pre class="code"><span class="k">when</span>: <span class="s">"&#123;&#123; steps.review.success &#125;&#125;"</span>
 <span class="k">when</span>: <span class="s">"&#123;&#123; steps.panel.max_severity == 'critical' &#125;&#125;"</span></pre>
+
+    <h3>Conditional routing with <code class="inline">branch:</code></h3>
+    <p>
+      Where <code class="inline">when:</code> gates one step at a time, <code class="inline">branch:</code> routes
+      the run down one of two arms. The step evaluates <code class="inline">condition</code> — a template
+      expression, truthy by the same rules as <code class="inline">when:</code> — then marks every step id in the
+      arm that <em>wasn&rsquo;t</em> taken to be skipped as the run walks past them. Steps in neither arm are the
+      rejoin point and always run.
+    </p>
+    <pre class="code">  - <span class="k">id</span>: <span class="s">triage</span>
+    <span class="k">agent</span>: <span class="s">classifier</span>
+    <span class="k">prompt</span>: <span class="s">"Is this report a security issue or a docs issue? Answer with one word."</span>
+  - <span class="k">id</span>: <span class="s">route</span>
+    <span class="k">branch</span>:
+      <span class="k">condition</span>: <span class="s">"&#123;&#123; 'security' in steps.triage.output &#125;&#125;"</span>
+      <span class="k">then</span>: [<span class="v">deep_scan</span>]      <span class="c"># runs when the condition is truthy</span>
+      <span class="k">else</span>: [<span class="v">doc_fix</span>]         <span class="c"># runs when it is falsy</span>
+  - <span class="k">id</span>: <span class="s">deep_scan</span>
+    <span class="k">agent</span>: <span class="s">security-reviewer</span>
+    <span class="k">prompt</span>: <span class="s">"Audit the reported behaviour end to end."</span>
+  - <span class="k">id</span>: <span class="s">doc_fix</span>
+    <span class="k">agent</span>: <span class="s">writer</span>
+    <span class="k">prompt</span>: <span class="s">"Correct the documentation."</span>
+  - <span class="k">id</span>: <span class="s">report</span>            <span class="c"># in neither arm — the rejoin, always runs</span>
+    <span class="k">agent</span>: <span class="s">writer</span>
+    <span class="k">prompt</span>: <span class="s">"&#123;&#123; steps.deep_scan.output &#125;&#125;&#123;&#123; steps.doc_fix.output &#125;&#125;"</span></pre>
+    <p>
+      A branch step sets no <code class="inline">agent</code> / <code class="inline">prompt</code> and no other
+      shape. Both <code class="inline">then</code> and <code class="inline">else</code> default to an empty list.
+      The rules are checked at parse time: every listed id must exist, must be declared <em>after</em> the branch
+      step (routing is forward-only), and no id may appear in both arms or name the branch itself. The lists are
+      the <strong>complete</strong> membership of each arm — if an arm contains a nested branch, list that nested
+      branch&rsquo;s steps too. <code class="inline">when:</code> is not allowed on a branch step; express the
+      condition in the branch instead. Downstream, <code class="inline">&#123;&#123; steps.route.output &#125;&#125;</code>
+      is the arm that was taken (<code class="inline">then</code> or <code class="inline">else</code>), and a
+      skipped step&rsquo;s output renders as the empty string — which is what makes the rejoin above work.
+    </p>
+
+    <h3>Connector steps with <code class="inline">action:</code></h3>
+    <p>
+      An <code class="inline">action:</code> step calls one tool from rupu&rsquo;s
+      <a class="link" href="/docs/mcp.html">MCP tool catalog</a> — open a pull request, comment on an issue,
+      dispatch a CI pipeline — <strong>directly</strong>. There is no agent and no model call: the parameters you
+      write are the request that gets made, so the step is deterministic, instant, and costs no tokens. Use it
+      wherever you would otherwise have asked an agent to make one predictable API call.
+    </p>
+    <pre class="code">  - <span class="k">id</span>: <span class="s">open_pr</span>
+    <span class="k">action</span>: <span class="v">scm.prs.create</span>
+    <span class="k">with</span>:
+      <span class="k">owner</span>: <span class="s">Section9Labs</span>
+      <span class="k">repo</span>: <span class="s">rupu</span>
+      <span class="k">title</span>: <span class="s">"fix: &#123;&#123; inputs.title &#125;&#125;"</span>
+      <span class="k">body</span>: <span class="s">"&#123;&#123; steps.implement.output &#125;&#125;"</span>
+      <span class="k">head</span>: <span class="s">"rupu/issue-&#123;&#123; issue.number &#125;&#125;"</span>
+      <span class="k">base</span>: <span class="s">main</span></pre>
+    <p>
+      <code class="inline">with:</code> values are minijinja-rendered at execution time, so they can reference
+      inputs, earlier steps, and the issue or event context. The tool&rsquo;s JSON response binds to
+      <code class="inline">&#123;&#123; steps.open_pr.output &#125;&#125;</code>, and
+      <code class="inline">when:</code> / <code class="inline">continue_on_error:</code> behave as on any step. An
+      optional <code class="inline">platform:</code> or <code class="inline">tracker:</code> key inside
+      <code class="inline">with:</code> picks a specific connector; omit it and the configured default is used.
+      Only string values are templated — a parameter the tool declares as a number or a boolean takes a literal
+      (<code class="inline">draft: true</code>, <code class="inline">number: 412</code>) and passes through as it
+      is written.
+    </p>
+    <div class="callout">
+      <strong>Checked before you run it.</strong> The tool name and every <code class="inline">with:</code> key are
+      validated at <em>parse</em> time against the static tool catalog — an unknown tool, an unknown parameter, or a
+      missing required one is a workflow error, not a run-time surprise, and no credentials are needed to lint it.
+      At run time the call goes through the same in-process tool layer and the same permission gating agents use:
+      in <code class="inline">readonly</code> mode a Write-class action step fails with an explicit message, and the
+      executed call is recorded in the run&rsquo;s audit trail.
+    </div>
 
     <h3>Human gates with <code class="inline">approval:</code></h3>
     <p>
@@ -191,6 +280,53 @@
   <span class="k">prompt</span>: <span class="s">|</span>
     <span class="s">About to deploy &#123;&#123; inputs.tag &#125;&#125;. Approve?</span>
   <span class="k">timeout_seconds</span>: <span class="v">3600</span></pre>
+    <p>
+      That inline form is still supported. A step that sets <code class="inline">approval:</code> and
+      <em>nothing else</em> — no agent, no prompt, no fan-out — is a <strong>gate node</strong>: a step of its own
+      whose only job is the decision, with its own id, its own place in the graph, and richer options.
+    </p>
+    <table>
+      <thead><tr><th>Gate field</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>prompt</code></td><td>What the approver reads, rendered with the usual template context.</td></tr>
+        <tr><td><code>auto_approve</code></td><td>Template expression evaluated when the gate is reached; truthy resolves the gate without pausing. Gate nodes only.</td></tr>
+        <tr><td><code>timeout_seconds</code></td><td>How long the gate waits before it expires.</td></tr>
+        <tr><td><code>on_timeout</code></td><td><code class="inline">approve</code>, <code class="inline">reject</code>, or <code class="inline">fail</code> (the default) when the gate expires. Requires <code class="inline">timeout_seconds</code>.</td></tr>
+        <tr><td><code>notify</code></td><td>Connector actions fired best-effort when the gate opens — e.g. comment on the issue that a human is needed. A failed hook is logged, never blocks the pause.</td></tr>
+        <tr><td><code>on_reject</code></td><td>Inline cleanup steps run after a reject, before the run ends. Plain agent steps and action steps only — no nested gates and no fan-out.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code">  - <span class="k">id</span>: <span class="s">merge_gate</span>
+    <span class="k">approval</span>:
+      <span class="k">prompt</span>: <span class="s">|</span>
+        <span class="s">&#123;&#123; steps.review.max_severity &#125;&#125; findings. Approve to open the PR.</span>
+      <span class="k">auto_approve</span>: <span class="s">"&#123;&#123; steps.review.max_severity == 'low' &#125;&#125;"</span>
+      <span class="k">timeout_seconds</span>: <span class="v">86400</span>
+      <span class="k">on_timeout</span>: <span class="v">reject</span>
+      <span class="k">notify</span>:                       <span class="c"># fired when the gate opens</span>
+        - <span class="k">action</span>: <span class="v">issues.comment</span>
+          <span class="k">with</span>:
+            <span class="k">project</span>: <span class="s">Section9Labs/rupu</span>
+            <span class="k">number</span>: <span class="v">412</span>
+            <span class="k">body</span>: <span class="s">"Approval needed at the merge gate for &#123;&#123; inputs.tag &#125;&#125;."</span>
+      <span class="k">on_reject</span>:                    <span class="c"># cleanup after a reject, then the run ends</span>
+        - <span class="k">id</span>: <span class="s">file_followup</span>
+          <span class="k">action</span>: <span class="v">issues.create</span>
+          <span class="k">with</span>:
+            <span class="k">project</span>: <span class="s">Section9Labs/rupu</span>
+            <span class="k">title</span>: <span class="s">"Merge gate rejected for &#123;&#123; inputs.tag &#125;&#125;"</span>
+            <span class="k">body</span>: <span class="s">"&#123;&#123; steps.review.output &#125;&#125;"</span></pre>
+    <p>
+      A gate node always pauses unless <code class="inline">auto_approve</code> resolves it
+      (<code class="inline">required:</code> is only meaningful on the legacy inline form). Its output is a small
+      JSON record — the <code class="inline">decision</code>
+      (<code class="inline">approved</code> / <code class="inline">rejected</code>), how it was reached
+      (<code class="inline">via</code>: <code class="inline">human</code>, <code class="inline">auto</code>, or
+      <code class="inline">timeout</code>), the reason, and a timestamp — so a later step can read
+      <code class="inline">&#123;&#123; steps.merge_gate.decision &#125;&#125;</code>. Everything nested under
+      <code class="inline">notify</code> and <code class="inline">on_reject</code> is validated at parse time with
+      the same rules as any other action or step.
+    </p>
 
     <h3>The <code class="inline">panel:</code> gate loop</h3>
     <p>
