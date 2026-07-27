@@ -187,7 +187,14 @@ export default function WorkflowRuns() {
     render: (r) => (
       <div
         className="flex items-center justify-end gap-1"
-        onClick={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          // The row is now link-wrapped (rowHref) — without both of these,
+          // this click either soft- or hard-navigates to the run instead of
+          // acting (stopPropagation alone does not block the enclosing
+          // <a>'s native default navigation action).
+          e.preventDefault();
+          e.stopPropagation();
+        }}
       >
         {archived ? (
           <Button

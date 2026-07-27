@@ -817,6 +817,9 @@ export interface AgentSummary {
   scope: string;
   usage: UsageSummary;
   run_count: number;
+  /** ISO-8601 timestamp of the agent's most recent run; `null`/absent when
+   *  the agent has never run. Mirrors `WorkflowSummary.last_run` exactly. */
+  last_run?: string | null;
 }
 
 export interface AgentDetail extends AgentSummary {
