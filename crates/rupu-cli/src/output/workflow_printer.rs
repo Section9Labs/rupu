@@ -624,7 +624,7 @@ pub fn attach_and_render_interactive_with(
                                     }
                                     continue;
                                 }
-                                match handle_workflow_approval_keypress(
+                                if let Some(outcome) = handle_workflow_approval_keypress(
                                     run_id,
                                     &record,
                                     &step_results_log,
@@ -632,10 +632,7 @@ pub fn attach_and_render_interactive_with(
                                     &mut state,
                                     key,
                                 )? {
-                                    Some(outcome) => {
-                                        break (outcome, Some(record), state.total_tokens);
-                                    }
-                                    None => {}
+                                    break (outcome, Some(record), state.total_tokens);
                                 }
                             }
                             _ => {}
@@ -3306,10 +3303,10 @@ fn summarize_compact_child_events(events: &[TxEvent]) -> CompactChildSummary {
                     out.model = model.clone();
                 }
             }
-            TxEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
-                if out.assistant_summary.is_none() {
-                    out.assistant_summary = Some(truncate_single_line(content, 84));
-                }
+            TxEvent::AssistantMessage { content, .. }
+                if !content.trim().is_empty() && out.assistant_summary.is_none() =>
+            {
+                out.assistant_summary = Some(truncate_single_line(content, 84));
             }
             TxEvent::ToolCall { .. } => {
                 out.tool_calls += 1;

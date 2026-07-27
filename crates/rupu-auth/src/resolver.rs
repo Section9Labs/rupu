@@ -702,8 +702,12 @@ mod resolver_named_tests {
     use rupu_providers::auth::AuthCredentials;
 
     /// Serialise all env-mutating tests through a single lock so they
-    /// cannot race each other over shared process-global env vars.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// cannot race each other over shared process-global env vars. This must
+    /// be an async-aware mutex (not `std::sync::Mutex`): the critical section
+    /// spans the `.await` on `KeychainResolver::get`, which itself reads the
+    /// env vars set just before it, so the guard genuinely has to be held
+    /// across the await point to keep the whole read serialized.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// RAII guard: removes the listed env vars on drop, even on panic.
     struct EnvGuard(Vec<&'static str>);
@@ -717,7 +721,7 @@ mod resolver_named_tests {
 
     #[tokio::test]
     async fn named_provider_reads_from_json_file() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = ENV_LOCK.lock().await;
         let _guard = EnvGuard(vec!["RUPU_AUTH_FILE", "RUPU_AUTH_BACKEND"]);
 
         let dir = tempfile::tempdir().unwrap();
@@ -739,7 +743,7 @@ mod resolver_named_tests {
 
     #[tokio::test]
     async fn named_provider_falls_back_to_env() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = ENV_LOCK.lock().await;
         let _guard = EnvGuard(vec!["RUPU_AUTH_FILE", "RUPU_AUTH_BACKEND", "RUPU_ACME_API_KEY"]);
 
         let dir = tempfile::tempdir().unwrap();

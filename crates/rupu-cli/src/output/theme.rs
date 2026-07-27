@@ -968,6 +968,12 @@ fn palette_from_base16(name: &str, author: Option<&str>, scheme: &Base16Scheme) 
     }
 }
 
+// The base16 spec defines exactly 16 fixed color slots (base00..base0F);
+// the argument count is inherent to the external spec, not a design smell.
+// Reshaping 8 call sites into a struct/array literal is a real refactor with
+// behavior risk (transposed hex colors would be a silent visual regression),
+// out of scope for a toolchain-pin sweep (I-5).
+#[allow(clippy::too_many_arguments)]
 fn base16(
     base00: &str,
     base01: &str,

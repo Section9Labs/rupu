@@ -205,19 +205,18 @@ pub(crate) fn history_rows_to_autoflow_cycles(
     rows: &[serde_json::Value],
 ) -> Vec<serde_json::Value> {
     use std::collections::BTreeMap;
+    // (mode, worker, earliest_at, latest_at, workflows, run_ids)
+    type CycleAccum = (
+        String,
+        Option<String>,
+        String,
+        String,
+        Vec<String>,
+        Vec<String>,
+    );
     // Preserve first-seen order (rows arrive newest-first from the CLI).
     let mut order: Vec<String> = Vec::new();
-    let mut by_cycle: BTreeMap<
-        String,
-        (
-            String,
-            Option<String>,
-            String,
-            String,
-            Vec<String>,
-            Vec<String>,
-        ),
-    > = BTreeMap::new();
+    let mut by_cycle: BTreeMap<String, CycleAccum> = BTreeMap::new();
     for row in rows {
         let cycle_id = match row.get("cycle_id").and_then(|v| v.as_str()) {
             Some(c) if !c.is_empty() && c != "-" => c.to_string(),
@@ -1227,11 +1226,10 @@ impl HostConnector for SshHostConnector {
             "--format".into(),
             "json".into(),
         ];
-        match scope {
-            // The CLI lists active sessions by default; `--archived` restricts
-            // to the archived scope. "active"/None → default (no flag).
-            Some("archived") => argv.push("--archived".into()),
-            _ => {}
+        // The CLI lists active sessions by default; `--archived` restricts
+        // to the archived scope. "active"/None → default (no flag).
+        if let Some("archived") = scope {
+            argv.push("--archived".into());
         }
         let cmd = build_remote_command(&argv);
         let out = self
