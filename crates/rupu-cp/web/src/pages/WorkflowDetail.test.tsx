@@ -100,7 +100,13 @@ describe('WorkflowDetail', () => {
     await waitFor(() => expect(saveBtn).not.toBeDisabled());
 
     fireEvent.click(saveBtn);
-    await waitFor(() => expect(saveSpy).toHaveBeenCalledWith('nightly', STUB_YAML));
+    // `scopeSelectorFor(DETAIL)` — DETAIL is `scope_kind: 'global'` — is
+    // threaded through so Save targets the exact resolved file, the same
+    // way Delete does (see the scope-threading tests below for the
+    // project-scoped case).
+    await waitFor(() =>
+      expect(saveSpy).toHaveBeenCalledWith('nightly', STUB_YAML, { scope_kind: 'global' }),
+    );
     // On success the draft re-syncs to the saved YAML → Save disabled again.
     await waitFor(() => expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled());
   });
@@ -156,19 +162,21 @@ describe('WorkflowDetail', () => {
 
   it('Delete (confirmed) calls deleteWorkflow and navigates to /workflows', async () => {
     vi.spyOn(api, 'getWorkflow').mockResolvedValue(DETAIL);
-    const delSpy = vi.spyOn(api, 'deleteWorkflow').mockResolvedValue();
+    const delSpy = vi.spyOn(api, 'deleteWorkflow').mockResolvedValue({ deleted: true, scope: 'global', scope_kind: 'global' });
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     renderPage();
 
     fireEvent.click(await screen.findByRole('button', { name: 'Delete nightly' }));
 
-    await waitFor(() => expect(delSpy).toHaveBeenCalledWith('nightly'));
+    await waitFor(() =>
+      expect(delSpy).toHaveBeenCalledWith('nightly', { scope_kind: 'global' }),
+    );
     expect(navigateMock).toHaveBeenCalledWith('/workflows');
   });
 
   it('Delete (cancelled at confirm) does nothing', async () => {
     vi.spyOn(api, 'getWorkflow').mockResolvedValue(DETAIL);
-    const delSpy = vi.spyOn(api, 'deleteWorkflow').mockResolvedValue();
+    const delSpy = vi.spyOn(api, 'deleteWorkflow').mockResolvedValue({ deleted: true, scope: 'global', scope_kind: 'global' });
     vi.spyOn(window, 'confirm').mockReturnValue(false);
     renderPage();
 
@@ -177,35 +185,80 @@ describe('WorkflowDetail', () => {
     expect(navigateMock).not.toHaveBeenCalled();
   });
 
-  // ── Scope: gated Delete + visible scope indicator ────────────────────────
-  // Root cause: the detail loader resolves the global layer FIRST, falling
-  // back to a registered project's `.rupu/workflows/` — so a project-scoped
-  // `nightly` can shadow a global `nightly` and this page silently renders
-  // the wrong layer's file with no signal it switched. `DELETE
-  // /api/workflows/:name` only ever resolves against the global workflows
-  // dir, so Delete here must be gated the same way the list already is (by
-  // `scope_kind`, never the display `scope` string, which is read from the
-  // WRONG place entirely before this fix — `workflow.scope`, a field
-  // `Workflow::parse` never produces).
+  // ── Scope: scope-aware Delete + visible scope indicator + named confirm ──
+  // `DELETE /api/workflows/:name` resolves project-aware (global-then-
+  // registered-projects — `resolve_workflow_scoped` in
+  // `rupu-cp/src/api/workflows.rs`), the SAME layer walk this page's
+  // `getWorkflow` load uses — so Delete is offered (and safe) for every
+  // scope, and the confirm dialog names the resolved layer before the
+  // operator confirms.
 
-  it('a project-scoped workflow shows a scope chip and no Delete button', async () => {
+  it('a project-scoped workflow shows a scope chip and a Delete button whose confirm names the project scope', async () => {
     vi.spyOn(api, 'getWorkflow').mockResolvedValue({
       ...DETAIL,
       scope: 'my-project',
       scope_kind: 'project',
     });
+    const delSpy = vi
+      .spyOn(api, 'deleteWorkflow')
+      .mockResolvedValue({ deleted: true, scope: 'my-project', scope_kind: 'project' });
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
     renderPage();
 
     expect(await screen.findByText('my-project')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Delete nightly' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Delete nightly' }));
+
+    expect(confirmSpy).toHaveBeenCalledWith(
+      expect.stringContaining('project: my-project'),
+    );
+    await waitFor(() =>
+      expect(delSpy).toHaveBeenCalledWith('nightly', { scope_kind: 'project' }),
+    );
   });
 
-  it('a global workflow shows a scope chip and a Delete button', async () => {
+  it('a global workflow shows a scope chip and a Delete button whose confirm names "global"', async () => {
     vi.spyOn(api, 'getWorkflow').mockResolvedValue(DETAIL);
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
     renderPage();
 
     expect(await screen.findByText('global')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Delete nightly' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Delete nightly' }));
+
+    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('global'));
+  });
+
+  // ── Scope: Save threads the same selector Delete does ────────────────────
+  // `PUT /api/workflows/:name` used to write unconditionally to the global
+  // layer; for a project-only workflow this silently created a hidden
+  // global shadow while the visible project file stayed unchanged (reading
+  // as "Save did nothing"). The fix threads `scopeSelectorFor(detail)`
+  // through `saveWorkflow` — the SAME shape `deleteWorkflow` already gets —
+  // so Save always targets the exact file this page resolved and is
+  // showing.
+
+  it('a project-scoped workflow threads scope_kind/scope_id on Save', async () => {
+    vi.spyOn(api, 'getWorkflow').mockResolvedValue({
+      ...DETAIL,
+      scope: 'my-project',
+      scope_kind: 'project',
+      scope_id: 'ws_a',
+    });
+    const saveSpy = vi
+      .spyOn(api, 'saveWorkflow')
+      .mockResolvedValue({ ...DETAIL, yaml: STUB_YAML, scope: 'my-project', scope_kind: 'project', scope_id: 'ws_a' });
+    renderPage();
+
+    fireEvent.click(await screen.findByTestId('stub-editor'));
+    const saveBtn = await screen.findByRole('button', { name: 'Save' });
+    await waitFor(() => expect(saveBtn).not.toBeDisabled());
+    fireEvent.click(saveBtn);
+
+    await waitFor(() =>
+      expect(saveSpy).toHaveBeenCalledWith('nightly', STUB_YAML, {
+        scope_kind: 'project',
+        scope_id: 'ws_a',
+      }),
+    );
   });
 
   // ── Autoflow enable/disable ──────────────────────────────────────────────
@@ -232,7 +285,9 @@ describe('WorkflowDetail', () => {
 
     fireEvent.click(disableBtn);
 
-    await waitFor(() => expect(setSpy).toHaveBeenCalledWith('nightly', false));
+    await waitFor(() =>
+      expect(setSpy).toHaveBeenCalledWith('nightly', false, { scope_kind: 'global' }),
+    );
     expect(await screen.findByRole('button', { name: 'Resume nightly' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Disable nightly' })).not.toBeInTheDocument();
   });
@@ -249,7 +304,9 @@ describe('WorkflowDetail', () => {
 
     fireEvent.click(resumeBtn);
 
-    await waitFor(() => expect(setSpy).toHaveBeenCalledWith('nightly', true));
+    await waitFor(() =>
+      expect(setSpy).toHaveBeenCalledWith('nightly', true, { scope_kind: 'global' }),
+    );
     expect(await screen.findByRole('button', { name: 'Disable nightly' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Resume nightly' })).not.toBeInTheDocument();
   });

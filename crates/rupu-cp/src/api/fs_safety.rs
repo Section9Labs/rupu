@@ -30,6 +30,33 @@ pub(crate) fn write_atomic(path: &FsPath, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// Confirm `path` (which must already exist) actually lives under `dir`
+/// (which must already exist), both canonicalized so a symlink can't fake
+/// containment.
+///
+/// This is defense in depth, not the primary guard, for the definition
+/// delete endpoints (`delete_agent` / `delete_workflow`): the resolver that
+/// produces `path` only ever joins a [`validate_name`]-checked identifier
+/// (no `/`, `.`, or `..`) onto a trusted directory, so `path` can never
+/// actually escape `dir` today. This check exists to catch a *future*
+/// resolver bug — a bad join, a wrong directory passed in — before it can
+/// ever delete a file outside the layer the caller believes it's operating
+/// on, mirroring `api::config::project_config_path`'s `starts_with`
+/// confinement guard for config writes.
+pub(crate) fn validate_within(path: &FsPath, dir: &FsPath) -> Result<(), ApiError> {
+    let dir_canon = dir
+        .canonicalize()
+        .map_err(|e| ApiError::internal(format!("could not resolve directory: {e}")))?;
+    let path_canon = path
+        .canonicalize()
+        .map_err(|e| ApiError::internal(format!("could not resolve path: {e}")))?;
+    if path_canon.starts_with(&dir_canon) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request("path escapes expected directory"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,5 +77,24 @@ mod tests {
         write_atomic(&path, b"hello").expect("write ok");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
         assert!(!path.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn validate_within_accepts_contained_rejects_escaped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inside = dir.join("a.md");
+        std::fs::write(&inside, "x").unwrap();
+        assert!(validate_within(&inside, &dir).is_ok());
+
+        let outside_dir = tmp.path().join("other");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let outside = outside_dir.join("b.md");
+        std::fs::write(&outside, "x").unwrap();
+        assert!(
+            validate_within(&outside, &dir).is_err(),
+            "a path outside `dir` must be rejected even though both exist"
+        );
     }
 }

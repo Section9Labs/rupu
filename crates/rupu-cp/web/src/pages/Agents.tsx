@@ -4,7 +4,7 @@
 import { useCallback, useEffect, useId, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Plus, Sparkles } from 'lucide-react';
-import { api, type AgentSummary, type ProviderModels } from '../lib/api';
+import { api, scopeSelectorFor, type AgentSummary, type ProviderModels } from '../lib/api';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import UsageBarChart from '../components/charts/UsageBarChart';
@@ -72,20 +72,33 @@ export default function Agents() {
   // Deletes by `slug` (file stem), never `name` (frontmatter display name) —
   // `DELETE /api/agents/:name` removes `<slug>.md` by file stem, and the two
   // can differ for hand- or CLI-authored files (see `AgentSummary.slug`'s
-  // doc comment). Only called for `scope === 'global'` rows: the endpoint
-  // only ever resolves against the GLOBAL agents dir, so it cannot safely
-  // target a project-scoped row (see `agentActionColumn`'s scope gate).
+  // doc comment). `scopeSelectorFor(agent)` threads the row's exact
+  // `scope_kind`/`scope_id` so the server targets THIS row's file even when
+  // another repo defines the same slug — the confirm dialog names the
+  // resolved layer so the operator knows exactly what's about to be removed.
   async function handleDelete(agent: AgentSummary) {
+    const scopeLabel = agent.scope_kind === 'project' ? `project: ${agent.scope}` : 'global';
     if (
       !window.confirm(
-        `Permanently delete the definition file for agent "${agent.name}"? This cannot be undone.`,
+        `Delete agent "${agent.name}" (${scopeLabel})? This removes the definition file. This cannot be undone.`,
       )
     ) {
       return;
     }
     try {
-      await api.deleteAgent(agent.slug ?? agent.name);
-      setActionError(null);
+      const result = await api.deleteAgent(agent.slug ?? agent.name, scopeSelectorFor(agent));
+      // Confirm the server actually removed the layer the operator was
+      // shown — never silently trust a bare "ok" as "removed what I saw."
+      if (
+        agent.scope_kind &&
+        (result.scope_kind !== agent.scope_kind || result.scope !== agent.scope)
+      ) {
+        setActionError(
+          `Deleted the ${result.scope_kind === 'project' ? `project (${result.scope})` : 'global'} definition — not the ${scopeLabel} one shown here.`,
+        );
+      } else {
+        setActionError(null);
+      }
       await load();
     } catch (e: unknown) {
       setActionError(e instanceof Error ? e.message : 'Delete failed');
@@ -375,19 +388,13 @@ function agentColumns(
  *  soft- or hard-navigates the link-wrapped row — stopPropagation alone does
  *  not block the enclosing `<a>`'s native default navigation.
  *
- *  Delete only renders for `scope_kind === 'global'` rows (the structured
- *  discriminator — NEVER the display `scope` string, which is a project's
- *  path basename and can legally equal the literal `"global"`; see
- *  `ScopeKind`'s doc comment): `DELETE /api/agents/:name` resolves ONLY
- *  against the global agents dir, so it cannot safely target a
- *  project-scoped row — a project row shadowing a same-named global
- *  definition would silently delete the WRONG (global) file instead.
- *  Run/Session stay available for every row: both resolve the agent
- *  project-aware (global-then-every-registered-project) and are
- *  non-destructive. Deleting a project-scoped definition is NOT currently
- *  supported anywhere in the CP (the detail page's Delete is gated the same
- *  way, for the same reason) — the filesystem or `rupu` CLI is the current
- *  workaround.
+ *  Delete renders for every row regardless of scope: `DELETE
+ *  /api/agents/:name` resolves project-aware (global-then-registered-
+ *  projects, by file stem — see `resolve_agent_scoped` in
+ *  `rupu-cp/src/api/agents.rs`), the same layer walk `getAgent` uses, so it
+ *  always removes the actual file the row/detail page displays rather than
+ *  a same-named file in a different layer. `handleDelete`'s confirm dialog
+ *  names the resolved scope before the operator confirms.
  */
 function agentActionColumn(
   onRun: (name: string) => void,
@@ -423,15 +430,13 @@ function agentActionColumn(
         >
           Session
         </Button>
-        {a.scope_kind === 'global' && (
-          <Button
-            variant="ring-danger"
-            onClick={() => void onDelete(a)}
-            aria-label={`Delete ${a.name}`}
-          >
-            Delete
-          </Button>
-        )}
+        <Button
+          variant="ring-danger"
+          onClick={() => void onDelete(a)}
+          aria-label={`Delete ${a.name}`}
+        >
+          Delete
+        </Button>
       </div>
     ),
   };
