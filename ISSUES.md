@@ -70,7 +70,7 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 | ID | Sev | Area | Title | Status |
 |---|---|---|---|---|
-| I-28 | P1 | rupu-cp web | Delete the classic agent-authoring UI; drop `[cp].agent_authoring_ui` | open |
+| I-28 | P1 | rupu-cp web | Delete the classic agent-authoring UI; drop `[cp].agent_authoring_ui` | fixed |
 | I-29 | P1 | rupu-cp web | Delete the classic workflow-editor UI; drop `[cp].workflow_editor_ui` | open |
 | I-30 | P1 | rupu-cp web | Collapse the run-graph classic/next dual paths to one | open |
 | I-31 | P2 | rupu-cp web | Remove both UI hooks and their localStorage overrides | open |
@@ -283,6 +283,56 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-28 — the classic agent-authoring UI is deleted
+
+**Symptom.** Two agent-authoring UIs shipped side by side, selected by
+`[cp].agent_authoring_ui` (default `"classic"`) with a `rupu.cp.agentUi`
+localStorage override. The `next` card-based Agent Builder was the proven one and
+the only one in actual use, but every change had to be made twice and the classic
+raw-editor path kept accruing tests asserting behavior nobody wanted.
+
+**Fix (web).** The `next` arm is now unconditional. Deleted:
+`hooks/useAgentAuthoringUi.ts` and its test; `function NewAgentModal`
+(`pages/Agents.tsx`, ~178 lines) with its render site and `createOpen` state; and
+the classic raw-`<CodeEditor>` Cancel/Save block in `pages/AgentDetail.tsx` along
+with its now-dead `draft`/`setDraft`/`save()`. `components/CodeEditor.tsx`,
+`CodeHighlight.tsx` and `api.generateAgent` were each checked for other importers
+and **kept** — all three are still reached from the surviving path.
+
+**Fix (config).** `[cp].agent_authoring_ui` is **deprecated, not deleted.**
+`CpConfig` is `#[serde(default, deny_unknown_fields)]`, so removing the field
+outright would make any `config.toml` still setting it fail to deserialize — and
+because several call paths load config with `.unwrap_or_default()`, that parse
+error silently discards *every other key the operator set*. This is the exact
+regression Arc 1 hit when `[retry]` was deleted, and it had to be reverted into a
+warn-only shim. The same shape is used here: `Option<toml::Value>` with
+`#[serde(default, skip_serializing)]`, so the key still parses, is ignored, never
+round-trips back out, and emits one `tracing::warn!` naming it.
+
+**Validation.** Observed at the consumer, not asserted structurally.
+*Config:* `cp_agent_authoring_ui_still_parses_with_sibling_cp_keys_intact` is the
+binding test — it sets the deprecated key **and** asserts sibling `[cp]` keys
+(`gate_sweep_interval_secs = 15`, `gate_sweep_enabled = false`,
+`max_workspace_bytes`) keep their **non-default** values. Without that sibling
+assertion the test would pass even if the whole config had been discarded, which
+is precisely how the Arc 1 regression slipped through. Plus
+`cp_deprecated_ui_keys_never_round_trip_back_out` and
+`cp_deprecated_ui_keys_emit_a_deprecation_warning_each` (hand-rolled
+`tracing::Subscriber`). RED was observed: reverting the shim produced 6 compile
+errors. *Web:* `npm run build` TypeScript-clean and `npx vitest run` green at
+180 files / 1887 tests, independently re-run by the orchestrator.
+`grep -rn "agentUi|useAgentAuthoringUi|rupu.cp.agentUi" crates/rupu-cp/web/src`
+returns zero hits. `/agents/new` was confirmed unconditionally routed
+(`App.tsx:77`), so the surviving entry point does not depend on the deleted flag.
+
+**Note on history.** Two agents ran concurrently and one committed with
+`git commit -a`, sweeping the other's staged hook deletions into `0e6730d3`;
+`7f70ab8f` re-deleted them correctly. The net tree was verified clean — the two
+files are gone, the working tree is empty, the suite is green — but the deletion's
+authorship is split across those two commits. Cosmetic only.
+
+---
 
 ### I-25 — a list command executes `on_reject` chains as a side effect
 
