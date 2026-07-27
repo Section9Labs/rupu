@@ -271,6 +271,38 @@ impl HostConnector for LocalHostConnector {
             .map_err(|e| map_approval_err(run_id, e))
     }
 
+    /// Move a terminal run into the archive scope. Delegates directly to
+    /// `RunStore::archive`, which already enforces the terminal-status +
+    /// not-already-archived guards (`RunStoreError::NotTerminal` /
+    /// `AlreadyExists`, both mapped to `HostConnectorError::Invalid` by
+    /// [`map_store_err`] — matching `pause_run`'s `Invalid → 409` mapping at
+    /// the API layer).
+    async fn archive_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
+        self.run_store
+            .archive(run_id)
+            .map_err(|e| map_store_err(run_id, e))
+    }
+
+    /// Move an archived run back to the active scope. Delegates directly to
+    /// `RunStore::restore`.
+    async fn restore_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
+        self.run_store
+            .restore(run_id)
+            .map_err(|e| map_store_err(run_id, e))
+    }
+
+    /// Permanently delete a run from either scope.
+    ///
+    /// Reuses [`crate::api::runs::delete_run_checked`] — the SAME
+    /// non-terminal-active guard the HTTP handler's local branch enforces
+    /// (`RunStore::delete` itself has no such guard; see its doc comment) —
+    /// so this connector's delete and the handler's local delete never
+    /// diverge on which runs may be removed.
+    async fn delete_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
+        crate::api::runs::delete_run_checked(&self.run_store, run_id)
+            .map_err(|e| map_store_err(run_id, e))
+    }
+
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
         // Verify the run exists before opening the tail.
         self.run_store
@@ -626,5 +658,70 @@ mod pause_resume_tests {
             .await
             .expect_err("resuming a running (non-paused) run should fail");
         assert!(matches!(err, HostConnectorError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn archive_run_moves_terminal_run_and_restore_brings_it_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (conn, store) = local(tmp.path().to_path_buf());
+        store
+            .create(record("run_local_archive", RunStatus::Completed), "name: x\n")
+            .unwrap();
+
+        conn.archive_run("run_local_archive").await.unwrap();
+        assert_eq!(store.list().unwrap().len(), 0);
+        assert_eq!(store.list_archived().unwrap().len(), 1);
+
+        conn.restore_run("run_local_archive").await.unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert_eq!(store.list_archived().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn archive_run_rejects_non_terminal_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (conn, store) = local(tmp.path().to_path_buf());
+        store
+            .create(record("run_local_archive_running", RunStatus::Running), "name: x\n")
+            .unwrap();
+
+        let err = conn
+            .archive_run("run_local_archive_running")
+            .await
+            .expect_err("archiving a non-terminal run should fail");
+        assert!(matches!(err, HostConnectorError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_run_removes_terminal_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (conn, store) = local(tmp.path().to_path_buf());
+        store
+            .create(record("run_local_delete", RunStatus::Completed), "name: x\n")
+            .unwrap();
+
+        conn.delete_run("run_local_delete").await.unwrap();
+        assert_eq!(store.list().unwrap().len(), 0);
+        assert!(matches!(
+            store.load("run_local_delete"),
+            Err(RunStoreError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_run_rejects_non_terminal_active_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (conn, store) = local(tmp.path().to_path_buf());
+        store
+            .create(record("run_local_delete_running", RunStatus::Running), "name: x\n")
+            .unwrap();
+
+        let err = conn
+            .delete_run("run_local_delete_running")
+            .await
+            .expect_err("deleting a non-terminal active run should fail");
+        assert!(matches!(err, HostConnectorError::Invalid(_)));
+        // Guard fired BEFORE any filesystem mutation.
+        assert_eq!(store.list().unwrap().len(), 1);
     }
 }

@@ -161,6 +161,31 @@ pub trait HostConnector: Send + Sync {
         Err(HostConnectorError::Unsupported("resume".into()))
     }
 
+    /// Move a terminal run into the archive scope (reversible). See
+    /// `RunStore::archive`. Non-terminal → `HostConnectorError::Invalid`;
+    /// missing → `NotFound`.
+    ///
+    /// The default impl returns [`HostConnectorError::Unsupported`] so
+    /// transports without an addressable per-run store of their own
+    /// (Bucket/Tunnel — those observe a central mirror scoped by
+    /// `worker_id`, not an independently archivable store) compile
+    /// unchanged. Local / SSH / HTTP override it.
+    async fn archive_run(&self, _run_id: &str) -> Result<(), HostConnectorError> {
+        Err(HostConnectorError::Unsupported("archive".into()))
+    }
+
+    /// Move an archived run back to the active scope. See `RunStore::restore`.
+    /// Default: see [`archive_run`](Self::archive_run).
+    async fn restore_run(&self, _run_id: &str) -> Result<(), HostConnectorError> {
+        Err(HostConnectorError::Unsupported("restore".into()))
+    }
+
+    /// Permanently delete a run (either scope). See `RunStore::delete`.
+    /// Default: see [`archive_run`](Self::archive_run).
+    async fn delete_run(&self, _run_id: &str) -> Result<(), HostConnectorError> {
+        Err(HostConnectorError::Unsupported("delete".into()))
+    }
+
     /// Open a live SSE byte stream of `events.jsonl` for the given run. Each
     /// `Ok(Bytes)` item is a `data: {json}\n\n` SSE frame. See Task 8 for
     /// host-aware observation built on top of this.
@@ -196,6 +221,27 @@ pub trait HostConnector: Send + Sync {
         _scope: Option<&str>,
     ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
         Err(HostConnectorError::Unsupported("session listing".into()))
+    }
+
+    /// Archive an active session on this host. The default impl returns
+    /// [`HostConnectorError::Unsupported`] so transports without session
+    /// enumeration/mutation (Local — routed through the `SessionMutator`
+    /// port instead, see `api/sessions.rs`; Bucket/Tunnel — no session
+    /// mirror) compile unchanged. SSH / HTTP override it.
+    async fn archive_session(&self, _id: &str) -> Result<(), HostConnectorError> {
+        Err(HostConnectorError::Unsupported("session archive".into()))
+    }
+
+    /// Restore a previously-archived session on this host.
+    /// Default: see [`archive_session`](Self::archive_session).
+    async fn restore_session(&self, _id: &str) -> Result<(), HostConnectorError> {
+        Err(HostConnectorError::Unsupported("session restore".into()))
+    }
+
+    /// Permanently delete a session (either scope) on this host.
+    /// Default: see [`archive_session`](Self::archive_session).
+    async fn delete_session(&self, _id: &str) -> Result<(), HostConnectorError> {
+        Err(HostConnectorError::Unsupported("session delete".into()))
     }
 
     /// List standalone/agent runs on this host (`GET /api/runs/agents`).

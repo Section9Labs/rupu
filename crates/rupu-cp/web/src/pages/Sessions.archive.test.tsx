@@ -66,7 +66,9 @@ describe('Sessions row archive/delete', () => {
     expect(archiveBtn.className).toMatch(/ring-1/);
     fireEvent.click(archiveBtn);
 
-    await waitFor(() => expect(archive).toHaveBeenCalledWith('sess-abc123'));
+    // Threads the row's own host_id (operator-reported gap: a fanned-out
+    // remote-host row must not silently hit the local session mutator).
+    await waitFor(() => expect(archive).toHaveBeenCalledWith('sess-abc123', 'local'));
     // Archive must NOT gate behind window.confirm.
     expect(confirmSpy).not.toHaveBeenCalled();
   });
@@ -84,7 +86,7 @@ describe('Sessions row archive/delete', () => {
     fireEvent.click(deleteBtn);
 
     expect(window.confirm).toHaveBeenCalled();
-    await waitFor(() => expect(del).toHaveBeenCalledWith('sess-abc123'));
+    await waitFor(() => expect(del).toHaveBeenCalledWith('sess-abc123', 'local'));
   });
 
   it('does not delete when confirm is cancelled', async () => {
@@ -116,6 +118,19 @@ describe('Sessions row archive/delete', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Archived' }));
 
     fireEvent.click(await screen.findByRole('button', { name: /restore session/i }));
-    await waitFor(() => expect(restore).toHaveBeenCalledWith('sess-abc123'));
+    await waitFor(() => expect(restore).toHaveBeenCalledWith('sess-abc123', 'local'));
+  });
+
+  it('archives a remote-host session with that host id, not local', async () => {
+    stubHosts();
+    const REMOTE_SESSION: SessionSummary = { ...ACTIVE_SESSION, host_id: 'host_prod' };
+    vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION]);
+    const archive = vi.spyOn(api, 'archiveSession').mockResolvedValue();
+
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: /archive session/i }));
+
+    await waitFor(() => expect(archive).toHaveBeenCalledWith('sess-abc123', 'host_prod'));
   });
 });

@@ -775,9 +775,28 @@ impl SshHostConnector {
 
     /// Issue a one-shot `rupu workflow <tail...>` command on the remote host.
     ///
-    /// Used by [`cancel_run`], [`approve_run`], and [`reject_run`].
+    /// Used by [`cancel_run`], [`approve_run`], [`reject_run`], and the
+    /// run archive/restore/delete overrides.
     async fn remote_workflow(&self, tail: &[&str]) -> Result<(), HostConnectorError> {
         let mut argv: Vec<String> = vec!["rupu".into(), "workflow".into()];
+        argv.extend(tail.iter().map(|s| s.to_string()));
+        let cmd = build_remote_command(&argv);
+        let out = self
+            .exec
+            .run(&cmd)
+            .await
+            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+        if !out.success {
+            return Err(HostConnectorError::Unreachable(out.stderr));
+        }
+        Ok(())
+    }
+
+    /// Issue a one-shot `rupu session <tail...>` command on the remote host.
+    /// The `rupu workflow`-prefixed sibling of [`remote_workflow`]; used by
+    /// the session archive/restore/delete overrides.
+    async fn remote_session(&self, tail: &[&str]) -> Result<(), HostConnectorError> {
+        let mut argv: Vec<String> = vec!["rupu".into(), "session".into()];
         argv.extend(tail.iter().map(|s| s.to_string()));
         let cmd = build_remote_command(&argv);
         let out = self
@@ -1196,6 +1215,28 @@ impl HostConnector for SshHostConnector {
         Ok(())
     }
 
+    /// Archive a terminal remote run via `rupu workflow archive-run <run_id>`.
+    async fn archive_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
+        self.remote_workflow(&["archive-run", run_id]).await
+    }
+
+    /// Restore an archived remote run via `rupu workflow restore-run <run_id>`.
+    async fn restore_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
+        self.remote_workflow(&["restore-run", run_id]).await
+    }
+
+    /// Permanently delete a remote run via
+    /// `rupu workflow delete-run <run_id> --force` (the CLI requires
+    /// `--force` to confirm; this connector always passes it since this IS
+    /// the confirmed delete path, one hop removed). Note the remote CLI's
+    /// own `delete-run` does not itself re-check terminal status the way the
+    /// LOCAL branch's `delete_run_checked` guard does — an existing gap in
+    /// `rupu workflow delete-run`, not introduced here.
+    async fn delete_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
+        self.remote_workflow(&["delete-run", run_id, "--force"])
+            .await
+    }
+
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
         mirror_stream_run_events(&self.run_store, &self.host_id, run_id).await
     }
@@ -1250,6 +1291,22 @@ impl HostConnector for SshHostConnector {
             .and_then(|r| r.as_array())
             .cloned()
             .unwrap_or_default())
+    }
+
+    /// Archive an active remote session via `rupu session archive <id>`.
+    async fn archive_session(&self, id: &str) -> Result<(), HostConnectorError> {
+        self.remote_session(&["archive", id]).await
+    }
+
+    /// Restore an archived remote session via `rupu session restore <id>`.
+    async fn restore_session(&self, id: &str) -> Result<(), HostConnectorError> {
+        self.remote_session(&["restore", id]).await
+    }
+
+    /// Permanently delete a remote session via
+    /// `rupu session delete <id> --force`.
+    async fn delete_session(&self, id: &str) -> Result<(), HostConnectorError> {
+        self.remote_session(&["delete", id, "--force"]).await
     }
 
     /// Standalone agent runs via `rupu transcript list --format json`, reshaped
@@ -2700,6 +2757,98 @@ mod tests {
 
         let err = conn
             .resume_run("run_01TESTRESUMEOFFLINE")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Unreachable(_)),
+            "expected Unreachable, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_archive_restore_delete_run_issue_remote_commands() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let run_id = "run_01TESTARCHIVEOK";
+
+        conn.archive_run(run_id).await.unwrap();
+        conn.restore_run(run_id).await.unwrap();
+        conn.delete_run(run_id).await.unwrap();
+
+        let cmds = fake.commands.lock().unwrap();
+        assert!(
+            cmds.iter().any(|c| c.contains("'workflow'")
+                && c.contains("'archive-run'")
+                && c.contains(&format!("'{run_id}'"))),
+            "archive-run command not found in: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("'workflow'")
+                && c.contains("'restore-run'")
+                && c.contains(&format!("'{run_id}'"))),
+            "restore-run command not found in: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("'workflow'")
+                && c.contains("'delete-run'")
+                && c.contains(&format!("'{run_id}'"))
+                && c.contains("'--force'")),
+            "delete-run command not found in: {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_archive_run_offline_surfaces_unreachable() {
+        let fake = std::sync::Arc::new(FakeExec::offline("connection refused"));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let err = conn
+            .archive_run("run_01TESTARCHIVEOFFLINE")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Unreachable(_)),
+            "expected Unreachable, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_archive_restore_delete_session_issue_remote_commands() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let id = "ses_01TESTARCHIVEOK";
+
+        conn.archive_session(id).await.unwrap();
+        conn.restore_session(id).await.unwrap();
+        conn.delete_session(id).await.unwrap();
+
+        let cmds = fake.commands.lock().unwrap();
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("'session'") && c.contains("'archive'") && c.contains(&format!("'{id}'"))),
+            "session archive command not found in: {cmds:?}"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("'session'") && c.contains("'restore'") && c.contains(&format!("'{id}'"))),
+            "session restore command not found in: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("'session'")
+                && c.contains("'delete'")
+                && c.contains(&format!("'{id}'"))
+                && c.contains("'--force'")),
+            "session delete command not found in: {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_archive_session_offline_surfaces_unreachable() {
+        let fake = std::sync::Arc::new(FakeExec::offline("connection refused"));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let err = conn
+            .archive_session("ses_01TESTARCHIVEOFFLINE")
             .await
             .unwrap_err();
         assert!(

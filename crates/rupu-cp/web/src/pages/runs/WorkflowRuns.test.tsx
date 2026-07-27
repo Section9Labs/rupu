@@ -302,7 +302,7 @@ describe('WorkflowRuns — table rules (fit columns)', () => {
 });
 
 describe('WorkflowRuns — row actions (ring buttons)', () => {
-  it('Archive fires api.archiveRun and refreshes the list', async () => {
+  it('Archive fires api.archiveRun with the row host and refreshes the list', async () => {
     stubDeps();
     vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([makeRun({ id: 'run_x' })]);
     const archiveSpy = vi.spyOn(api, 'archiveRun').mockResolvedValue(undefined);
@@ -311,10 +311,10 @@ describe('WorkflowRuns — row actions (ring buttons)', () => {
 
     fireEvent.click(screen.getByLabelText('Archive run run_x'));
 
-    await waitFor(() => expect(archiveSpy).toHaveBeenCalledWith('run_x'));
+    await waitFor(() => expect(archiveSpy).toHaveBeenCalledWith('run_x', 'local'));
   });
 
-  it('Delete confirms, then fires api.deleteRun', async () => {
+  it('Delete confirms, then fires api.deleteRun with the row host', async () => {
     stubDeps();
     vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([makeRun({ id: 'run_x' })]);
     const deleteSpy = vi.spyOn(api, 'deleteRun').mockResolvedValue(undefined);
@@ -324,7 +324,7 @@ describe('WorkflowRuns — row actions (ring buttons)', () => {
 
     fireEvent.click(screen.getByLabelText('Delete run run_x'));
 
-    await waitFor(() => expect(deleteSpy).toHaveBeenCalledWith('run_x'));
+    await waitFor(() => expect(deleteSpy).toHaveBeenCalledWith('run_x', 'local'));
   });
 
   it('Delete does nothing when the confirmation dialog is declined', async () => {
@@ -340,7 +340,7 @@ describe('WorkflowRuns — row actions (ring buttons)', () => {
     expect(deleteSpy).not.toHaveBeenCalled();
   });
 
-  it('Restore appears in Archived mode and fires api.restoreRun', async () => {
+  it('Restore appears in Archived mode and fires api.restoreRun with the row host', async () => {
     stubDeps();
     vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([]);
     vi.spyOn(api, 'getArchivedRuns').mockResolvedValue([makeRun({ id: 'run_arch' })]);
@@ -352,7 +352,38 @@ describe('WorkflowRuns — row actions (ring buttons)', () => {
 
     fireEvent.click(screen.getByLabelText('Restore run run_arch'));
 
-    await waitFor(() => expect(restoreSpy).toHaveBeenCalledWith('run_arch'));
+    await waitFor(() => expect(restoreSpy).toHaveBeenCalledWith('run_arch', 'local'));
+  });
+
+  // Operator-reported gap this task fixes: a fanned-out remote-host row's
+  // Archive/Delete must proxy to THAT host, not silently hit the local store.
+  it('Archive on a remote-host row fires api.archiveRun with that host id', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([
+      makeRun({ id: 'run_remote', host_id: 'host_prod' }),
+    ]);
+    const archiveSpy = vi.spyOn(api, 'archiveRun').mockResolvedValue(undefined);
+    renderPage();
+    await waitFor(() => expect(screen.getByText('deploy-prod')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText('Archive run run_remote'));
+
+    await waitFor(() => expect(archiveSpy).toHaveBeenCalledWith('run_remote', 'host_prod'));
+  });
+
+  it('Delete on a remote-host row fires api.deleteRun with that host id', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([
+      makeRun({ id: 'run_remote', host_id: 'host_prod' }),
+    ]);
+    const deleteSpy = vi.spyOn(api, 'deleteRun').mockResolvedValue(undefined);
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    renderPage();
+    await waitFor(() => expect(screen.getByText('deploy-prod')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText('Delete run run_remote'));
+
+    await waitFor(() => expect(deleteSpy).toHaveBeenCalledWith('run_remote', 'host_prod'));
   });
 });
 

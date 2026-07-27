@@ -1849,16 +1849,19 @@ export const api = {
     );
   },
   /** Archive a terminal run (hides it from the default run list). */
-  async archiveRun(id: string): Promise<void> {
-    await request(`/api/runs/${encodeURIComponent(id)}/archive`, { method: 'POST' });
+  async archiveRun(id: string, host?: string): Promise<void> {
+    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
+    await request(`/api/runs/${encodeURIComponent(id)}/archive${qs}`, { method: 'POST' });
   },
   /** Restore a previously-archived run back to the active list. */
-  async restoreRun(id: string): Promise<void> {
-    await request(`/api/runs/${encodeURIComponent(id)}/restore`, { method: 'POST' });
+  async restoreRun(id: string, host?: string): Promise<void> {
+    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
+    await request(`/api/runs/${encodeURIComponent(id)}/restore${qs}`, { method: 'POST' });
   },
   /** Permanently delete a run and its on-disk transcripts. */
-  async deleteRun(id: string): Promise<void> {
-    await request(`/api/runs/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  async deleteRun(id: string, host?: string): Promise<void> {
+    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
+    await request(`/api/runs/${encodeURIComponent(id)}${qs}`, { method: 'DELETE' });
   },
   /** List archived runs. Pass `kind = 'workflow'` to restrict to workflow-kind only. */
   getArchivedRuns(kind?: string): Promise<RunListRow[]> {
@@ -2178,16 +2181,19 @@ export const api = {
     });
   },
   /** Archive an active session (hides it from the active list). */
-  async archiveSession(id: string): Promise<void> {
-    await request(`/api/sessions/${encodeURIComponent(id)}/archive`, { method: 'POST' });
+  async archiveSession(id: string, host?: string): Promise<void> {
+    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
+    await request(`/api/sessions/${encodeURIComponent(id)}/archive${qs}`, { method: 'POST' });
   },
   /** Restore a previously-archived session back to the active list. */
-  async restoreSession(id: string): Promise<void> {
-    await request(`/api/sessions/${encodeURIComponent(id)}/restore`, { method: 'POST' });
+  async restoreSession(id: string, host?: string): Promise<void> {
+    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
+    await request(`/api/sessions/${encodeURIComponent(id)}/restore${qs}`, { method: 'POST' });
   },
   /** Permanently delete a session and its on-disk data. */
-  async deleteSession(id: string): Promise<void> {
-    await request(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  async deleteSession(id: string, host?: string): Promise<void> {
+    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
+    await request(`/api/sessions/${encodeURIComponent(id)}${qs}`, { method: 'DELETE' });
   },
 
   // --- Workers ---

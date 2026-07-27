@@ -694,27 +694,77 @@ async fn mutate_session(
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 
+/// Map a [`HostConnectorError`] from a proxied session archive/restore/
+/// delete call to an [`ApiError`], mirroring the local branch's
+/// [`crate::session_mutator::SessionMutateError`] mapping in [`mutate_session`]
+/// (`NotFound` → 404, `Invalid`-shaped → 409) plus `Unsupported` → 501 for a
+/// transport that genuinely can't do this (never a silent no-op).
+fn map_host_session_mutate_err(e: HostConnectorError) -> ApiError {
+    match e {
+        HostConnectorError::NotFound(m) => ApiError::not_found(m),
+        HostConnectorError::Invalid(m) => ApiError::conflict(m),
+        HostConnectorError::Unsupported(m) => ApiError::not_available(m),
+        other => ApiError::internal(other.to_string()),
+    }
+}
+
+/// `POST /api/sessions/:id/archive[?host=<id>]`.
+///
+/// Without `?host=` (or `?host=local`): unchanged — dispatches through the
+/// local [`crate::session_mutator::SessionMutator`] port (`mutate_session`).
+///
+/// With `?host=<remote-id>`: proxies via [`HostConnector::archive_session`]
+/// and returns `{ "ok": true, "id", "host_id": "<id>" }`.
 async fn archive_session(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<SessionHostQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::api::runs::validate_id(&id)?;
+    let host = q.host.as_deref().unwrap_or("local");
+    if host != "local" {
+        let conn = crate::api::runs::resolve_host(&s, host)?;
+        conn.archive_session(&id)
+            .await
+            .map_err(map_host_session_mutate_err)?;
+        return Ok(Json(serde_json::json!({ "ok": true, "id": id, "host_id": host })));
+    }
     mutate_session(&s, &id, crate::session_mutator::SessionAction::Archive).await
 }
 
+/// `POST /api/sessions/:id/restore[?host=<id>]`. See [`archive_session`]'s doc.
 async fn restore_session(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<SessionHostQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::api::runs::validate_id(&id)?;
+    let host = q.host.as_deref().unwrap_or("local");
+    if host != "local" {
+        let conn = crate::api::runs::resolve_host(&s, host)?;
+        conn.restore_session(&id)
+            .await
+            .map_err(map_host_session_mutate_err)?;
+        return Ok(Json(serde_json::json!({ "ok": true, "id": id, "host_id": host })));
+    }
     mutate_session(&s, &id, crate::session_mutator::SessionAction::Restore).await
 }
 
+/// `DELETE /api/sessions/:id[?host=<id>]`. See [`archive_session`]'s doc.
 async fn delete_session(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<SessionHostQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::api::runs::validate_id(&id)?;
+    let host = q.host.as_deref().unwrap_or("local");
+    if host != "local" {
+        let conn = crate::api::runs::resolve_host(&s, host)?;
+        conn.delete_session(&id)
+            .await
+            .map_err(map_host_session_mutate_err)?;
+        return Ok(Json(serde_json::json!({ "ok": true, "id": id, "host_id": host })));
+    }
     mutate_session(&s, &id, crate::session_mutator::SessionAction::Delete).await
 }
 
@@ -887,16 +937,28 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = AppState::new(tmp.path().to_path_buf(), Default::default())
             .with_session_mutator(Some(std::sync::Arc::new(StubMutator)));
-        let _ = archive_session(State(state.clone()), Path("s1".to_string()))
-            .await
-            .expect("ok");
-        let nf = archive_session(State(state.clone()), Path("missing".to_string()))
-            .await
-            .unwrap_err();
+        let _ = archive_session(
+            State(state.clone()),
+            Path("s1".to_string()),
+            Query(SessionHostQuery::default()),
+        )
+        .await
+        .expect("ok");
+        let nf = archive_session(
+            State(state.clone()),
+            Path("missing".to_string()),
+            Query(SessionHostQuery::default()),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(nf.0, axum::http::StatusCode::NOT_FOUND);
-        let conflict = archive_session(State(state.clone()), Path("active-running".to_string()))
-            .await
-            .unwrap_err();
+        let conflict = archive_session(
+            State(state.clone()),
+            Path("active-running".to_string()),
+            Query(SessionHostQuery::default()),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(conflict.0, axum::http::StatusCode::CONFLICT);
     }
 
@@ -904,9 +966,13 @@ mod tests {
     async fn archive_session_without_adapter_is_501() {
         let tmp = tempfile::tempdir().unwrap();
         let state = AppState::new(tmp.path().to_path_buf(), Default::default()); // no mutator
-        let err = archive_session(State(state), Path("s1".to_string()))
-            .await
-            .unwrap_err();
+        let err = archive_session(
+            State(state),
+            Path("s1".to_string()),
+            Query(SessionHostQuery::default()),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
     }
 
@@ -917,9 +983,13 @@ mod tests {
     async fn archive_session_traversal_id_is_bad_request() {
         let tmp = tempfile::tempdir().unwrap();
         let state = AppState::new(tmp.path().to_path_buf(), Default::default());
-        let err = archive_session(State(state), Path("../../etc".to_string()))
-            .await
-            .unwrap_err();
+        let err = archive_session(
+            State(state),
+            Path("../../etc".to_string()),
+            Query(SessionHostQuery::default()),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
     }
 
@@ -927,9 +997,13 @@ mod tests {
     async fn restore_session_traversal_id_is_bad_request() {
         let tmp = tempfile::tempdir().unwrap();
         let state = AppState::new(tmp.path().to_path_buf(), Default::default());
-        let err = restore_session(State(state), Path("../../etc".to_string()))
-            .await
-            .unwrap_err();
+        let err = restore_session(
+            State(state),
+            Path("../../etc".to_string()),
+            Query(SessionHostQuery::default()),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
     }
 
@@ -937,10 +1011,63 @@ mod tests {
     async fn delete_session_traversal_id_is_bad_request() {
         let tmp = tempfile::tempdir().unwrap();
         let state = AppState::new(tmp.path().to_path_buf(), Default::default());
-        let err = delete_session(State(state), Path("../../etc".to_string()))
-            .await
-            .unwrap_err();
+        let err = delete_session(
+            State(state),
+            Path("../../etc".to_string()),
+            Query(SessionHostQuery::default()),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn archive_session_absent_host_matches_explicit_host_local() {
+        // Back-compat proof, mirroring the runs.rs equivalent: an absent
+        // `?host=` and an explicit `?host=local` must both dispatch through
+        // the local `SessionMutator` port and produce the same response
+        // shape (no `host_id` key — unlike the remote branch).
+        let tmp = tempfile::tempdir().unwrap();
+        let state = AppState::new(tmp.path().to_path_buf(), Default::default())
+            .with_session_mutator(Some(std::sync::Arc::new(StubMutator)));
+
+        let absent = archive_session(
+            State(state.clone()),
+            Path("s1".to_string()),
+            Query(SessionHostQuery::default()),
+        )
+        .await
+        .expect("absent host should archive locally")
+        .0;
+        let explicit_local = archive_session(
+            State(state.clone()),
+            Path("s1".to_string()),
+            Query(SessionHostQuery {
+                host: Some("local".into()),
+            }),
+        )
+        .await
+        .expect("host=local should archive locally")
+        .0;
+
+        assert_eq!(absent, serde_json::json!({ "ok": true, "id": "s1" }));
+        assert_eq!(explicit_local, serde_json::json!({ "ok": true, "id": "s1" }));
+    }
+
+    #[tokio::test]
+    async fn archive_session_unknown_host_is_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = AppState::new(tmp.path().to_path_buf(), Default::default());
+        let err = archive_session(
+            State(state),
+            Path("s1".to_string()),
+            Query(SessionHostQuery {
+                host: Some("host_nonexistent".into()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
     }
 
     use crate::session_sender::{SendError, SendMessageRequest, SessionSender};

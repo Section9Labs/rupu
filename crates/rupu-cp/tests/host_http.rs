@@ -119,6 +119,85 @@ async fn cancel_run_posts_to_cancel_endpoint() {
 }
 
 #[tokio::test]
+async fn http_archive_restore_delete_run_round_trip() {
+    let server = httpmock::MockServer::start_async().await;
+    let archive_mock = server.mock(|when, then| {
+        when.method("POST").path("/api/runs/run_a/archive");
+        then.status(200)
+            .json_body(serde_json::json!({"ok": true, "id": "run_a", "archived": true}));
+    });
+    let restore_mock = server.mock(|when, then| {
+        when.method("POST").path("/api/runs/run_a/restore");
+        then.status(200)
+            .json_body(serde_json::json!({"ok": true, "id": "run_a", "archived": false}));
+    });
+    let delete_mock = server.mock(|when, then| {
+        when.method("DELETE").path("/api/runs/run_a");
+        then.status(200)
+            .json_body(serde_json::json!({"ok": true, "id": "run_a", "deleted": true}));
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    c.archive_run("run_a").await.unwrap();
+    c.restore_run("run_a").await.unwrap();
+    c.delete_run("run_a").await.unwrap();
+    archive_mock.assert();
+    restore_mock.assert();
+    delete_mock.assert();
+}
+
+#[tokio::test]
+async fn http_delete_run_not_found_maps_to_error() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("DELETE").path("/api/runs/run_ghost");
+        then.status(404);
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    assert!(matches!(
+        c.delete_run("run_ghost").await,
+        Err(HostConnectorError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn http_archive_run_non_terminal_maps_to_remote_conflict() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("POST").path("/api/runs/run_running/archive");
+        then.status(409).body("run run_running is not terminal");
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    assert!(matches!(
+        c.archive_run("run_running").await,
+        Err(HostConnectorError::Remote(409, _))
+    ));
+}
+
+#[tokio::test]
+async fn http_archive_restore_delete_session_round_trip() {
+    let server = httpmock::MockServer::start_async().await;
+    let archive_mock = server.mock(|when, then| {
+        when.method("POST").path("/api/sessions/sess_a/archive");
+        then.status(200).json_body(serde_json::json!({"ok": true, "id": "sess_a"}));
+    });
+    let restore_mock = server.mock(|when, then| {
+        when.method("POST").path("/api/sessions/sess_a/restore");
+        then.status(200).json_body(serde_json::json!({"ok": true, "id": "sess_a"}));
+    });
+    let delete_mock = server.mock(|when, then| {
+        when.method("DELETE").path("/api/sessions/sess_a");
+        then.status(200).json_body(serde_json::json!({"ok": true, "id": "sess_a"}));
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    c.archive_session("sess_a").await.unwrap();
+    c.restore_session("sess_a").await.unwrap();
+    c.delete_session("sess_a").await.unwrap();
+    archive_mock.assert();
+    restore_mock.assert();
+    delete_mock.assert();
+}
+
+#[tokio::test]
 async fn http_pause_resume_round_trip() {
     let server = httpmock::MockServer::start_async().await;
     let pause_mock = server.mock(|when, then| {

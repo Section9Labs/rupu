@@ -336,6 +336,35 @@ impl HostConnector for HttpHostConnector {
         .map(|_| ())
     }
 
+    /// POST to the remote CP's `POST /api/runs/:id/archive`.
+    async fn archive_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
+        self.send(
+            self.client
+                .post(self.url(&format!("/api/runs/{run_id}/archive")))
+                .json(&serde_json::json!({})),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// POST to the remote CP's `POST /api/runs/:id/restore`.
+    async fn restore_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
+        self.send(
+            self.client
+                .post(self.url(&format!("/api/runs/{run_id}/restore")))
+                .json(&serde_json::json!({})),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// DELETE to the remote CP's `DELETE /api/runs/:id`.
+    async fn delete_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
+        self.send(self.client.delete(self.url(&format!("/api/runs/{run_id}"))))
+            .await
+            .map(|_| ())
+    }
+
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
         let req = self
             .client
@@ -391,6 +420,35 @@ impl HostConnector for HttpHostConnector {
         }
         let v = self.proxy_get_json(&path).await?;
         Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
+    /// POST to the remote CP's `POST /api/sessions/:id/archive`.
+    async fn archive_session(&self, id: &str) -> Result<(), HostConnectorError> {
+        self.send(
+            self.client
+                .post(self.url(&format!("/api/sessions/{id}/archive")))
+                .json(&serde_json::json!({})),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// POST to the remote CP's `POST /api/sessions/:id/restore`.
+    async fn restore_session(&self, id: &str) -> Result<(), HostConnectorError> {
+        self.send(
+            self.client
+                .post(self.url(&format!("/api/sessions/{id}/restore")))
+                .json(&serde_json::json!({})),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// DELETE to the remote CP's `DELETE /api/sessions/:id`.
+    async fn delete_session(&self, id: &str) -> Result<(), HostConnectorError> {
+        self.send(self.client.delete(self.url(&format!("/api/sessions/{id}"))))
+            .await
+            .map(|_| ())
     }
 
     async fn list_agent_runs(&self) -> Result<Vec<serde_json::Value>, HostConnectorError> {
