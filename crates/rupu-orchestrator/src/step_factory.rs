@@ -309,12 +309,88 @@ impl StepFactory for DefaultStepFactory {
     }
 }
 
-/// `actions:` is a NARROWING filter (spec §2): a step can only ever
-/// reduce the agent's grant, never extend it. An EMPTY `actions:` means
-/// "no extra restriction" — compat-critical, since every existing
-/// workflow carries `actions: []` while relying on the agent's `tools:`.
-/// `agent_tools == None` means "unrestricted"; a non-empty allowlist
-/// still narrows that to exactly the listed tools.
+/// The agent runtime's builtin (non-connector) tool names — `bash`,
+/// `read_file`, `write_file`, `edit_file`, `ast_grep`, `grep`, `glob`,
+/// `dispatch_agent`, `dispatch_agents_parallel` today. Sourced live from
+/// [`rupu_agent::default_tool_registry`] rather than hardcoded so this
+/// stays in sync if the runtime's builtin set ever changes.
+fn builtin_tool_names() -> Vec<String> {
+    rupu_agent::default_tool_registry().known_tools()
+}
+
+/// The MCP connector catalog's tool names (spec §1/§2) — the SAME
+/// namespace `validate_step_actions` (`workflow.rs`) validates
+/// `actions:` entries against.
+fn catalog_tool_names() -> Vec<String> {
+    rupu_mcp::tools::tool_catalog()
+        .into_iter()
+        .map(|spec| spec.name.to_string())
+        .collect()
+}
+
+/// Push `name` onto `out` unless it's already present (keeps `expand_grant`
+/// stable-ordered without pulling in a `HashSet`/`BTreeSet` dependency for
+/// what are always small lists).
+fn push_unique(out: &mut Vec<String>, name: &str) {
+    if !out.iter().any(|existing| existing == name) {
+        out.push(name.to_string());
+    }
+}
+
+/// Resolve a grant (an agent's `tools:` list, or a synthetic `["*"]` for
+/// "unrestricted") into concrete names drawn from `universe` (spec §2:
+/// `BUILTINS ∪ CATALOG`).
+///
+/// - An exact entry passes through verbatim, even if it isn't in
+///   `universe` — the grant isn't re-validated here, so an agent granting
+///   a tool this build doesn't otherwise know about still keeps it.
+/// - `*` expands to every name in `universe`.
+/// - A `prefix*` wildcard (e.g. `scm.*`, `issues.*`) expands to every
+///   `universe` name starting with `prefix` — same semantics as
+///   `rupu-agent::runner::mcp_tool_name_matches_allowlist` (docs/scm.md).
+fn expand_grant(grant: &[String], universe: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in grant {
+        if entry == "*" {
+            for name in universe {
+                push_unique(&mut out, name);
+            }
+        } else if let Some(prefix) = entry.strip_suffix('*') {
+            for name in universe {
+                if name.starts_with(prefix) {
+                    push_unique(&mut out, name);
+                }
+            }
+        } else {
+            push_unique(&mut out, entry);
+        }
+    }
+    out
+}
+
+/// `actions:` narrows only the CONNECTOR (MCP catalog) portion of the
+/// agent's tool grant — builtins are never touched (spec §2, revised
+/// 2026-07-26 after the T1 review found the original `agent.tools ∩
+/// step.actions` formulation unimplementable: it deleted every builtin
+/// and collapsed a wildcard grant like `tools: [scm.*]` to `Some([])`).
+///
+/// ```text
+/// step.actions EMPTY  -> agent_tools, unchanged (compat-critical: every
+///                        existing workflow carries `actions: []` while
+///                        relying on the agent's `tools:`)
+/// step.actions NON-EMPTY:
+///     let g = expand(agent_tools)   // None (unrestricted) expands to
+///                                   // BUILTINS ∪ CATALOG, i.e. as if
+///                                   // the grant were ["*"]
+///     effective = (g \ CATALOG)                      // builtins/non-catalog: untouched
+///               ∪ (g ∩ CATALOG ∩ step.actions)        // connector subset: narrowed
+/// ```
+///
+/// A step can only ever narrow the connector subset, never extend it —
+/// `step.actions` is intersected with `g`, so a step naming a catalog
+/// tool the agent doesn't grant can't gain it (no escalation). An empty
+/// resulting connector intersection is legal (a step may allow zero
+/// connector calls) but never strips a builtin.
 pub(crate) fn narrow_agent_tools(
     agent_tools: Option<Vec<String>>,
     step_actions: &[String],
@@ -322,15 +398,33 @@ pub(crate) fn narrow_agent_tools(
     if step_actions.is_empty() {
         return agent_tools;
     }
-    match agent_tools {
-        None => Some(step_actions.to_vec()),
-        Some(granted) => Some(
-            granted
-                .into_iter()
-                .filter(|t| step_actions.iter().any(|a| a == t))
-                .collect(),
-        ),
+
+    let catalog = catalog_tool_names();
+    let mut universe = builtin_tool_names();
+    for name in &catalog {
+        push_unique(&mut universe, name);
     }
+    let is_catalog = |name: &str| catalog.iter().any(|c| c == name);
+
+    // `agent_tools == None` means unrestricted: expand as if granted `["*"]`.
+    let grant = agent_tools.unwrap_or_else(|| vec!["*".to_string()]);
+    let g = expand_grant(&grant, &universe);
+
+    let mut effective = Vec::new();
+    // (g \ CATALOG): builtins and any non-catalog name in the grant — untouched.
+    for name in &g {
+        if !is_catalog(name) {
+            push_unique(&mut effective, name);
+        }
+    }
+    // (g ∩ CATALOG ∩ step.actions): the narrowed connector subset.
+    for name in &g {
+        if is_catalog(name) && step_actions.iter().any(|a| a == name) {
+            push_unique(&mut effective, name);
+        }
+    }
+
+    Some(effective)
 }
 
 /// Construct a stub `LlmProvider` that errors on first call. Used when
@@ -551,28 +645,110 @@ mod concerns_resolution_tests {
 
 #[cfg(test)]
 mod narrow_agent_tools_tests {
-    use super::narrow_agent_tools;
+    use super::{builtin_tool_names, narrow_agent_tools};
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
 
     #[test]
-    fn empty_actions_leaves_the_agent_grant_untouched() {
-        let tools = Some(vec!["issues.list".to_string(), "issues.create".to_string()]);
+    fn empty_actions_returns_the_grant_verbatim_including_unexpanded_wildcards() {
+        let tools = Some(strs(&["issues.list", "issues.create"]));
         assert_eq!(narrow_agent_tools(tools.clone(), &[]), tools);
         assert_eq!(narrow_agent_tools(None, &[]), None);
+
+        // A wildcard grant with empty `actions:` must round-trip UN-expanded
+        // (spec: "empty means unrestricted... the agent's grant stands,
+        // verbatim") — not silently rewritten into its expansion.
+        let wildcard = Some(strs(&["scm.*"]));
+        assert_eq!(narrow_agent_tools(wildcard.clone(), &[]), wildcard);
     }
 
     #[test]
-    fn non_empty_actions_intersects_the_agent_grant() {
-        let tools = Some(vec!["issues.list".into(), "issues.create".into()]);
-        let got = narrow_agent_tools(tools, &["issues.list".to_string(), "issues.get".to_string()]);
-        // `issues.get` is NOT granted by the agent -> dropped (narrow only, never grant)
-        assert_eq!(got, Some(vec!["issues.list".to_string()]));
+    fn builtins_survive_a_connector_narrowing() {
+        // An agent granted [read_file, grep, bash, scm.prs.get, scm.prs.diff]
+        // + actions: [scm.prs.get] must KEEP read_file/grep/bash (never
+        // touched by `actions:`, per spec §2) and narrow to exactly one
+        // connector tool.
+        let granted = strs(&["read_file", "grep", "bash", "scm.prs.get", "scm.prs.diff"]);
+        let got = narrow_agent_tools(Some(granted), &strs(&["scm.prs.get"])).unwrap();
+
+        for builtin in ["read_file", "grep", "bash"] {
+            assert!(got.contains(&builtin.to_string()), "missing builtin {builtin} in {got:?}");
+        }
+        let connector_count = got
+            .iter()
+            .filter(|t| t.starts_with("scm.") || t.starts_with("issues.") || t.starts_with("github.") || t.starts_with("gitlab."))
+            .count();
+        assert_eq!(connector_count, 1, "expected exactly one connector tool, got {got:?}");
+        assert!(got.contains(&"scm.prs.get".to_string()));
+        assert!(!got.contains(&"scm.prs.diff".to_string()), "scm.prs.diff must be narrowed away: {got:?}");
     }
 
     #[test]
-    fn actions_narrow_an_unrestricted_agent() {
-        // agent_tools None == unrestricted; a step allowlist still narrows it
-        let got = narrow_agent_tools(None, &["issues.list".to_string()]);
-        assert_eq!(got, Some(vec!["issues.list".to_string()]));
+    fn wildcard_grant_narrows_to_the_named_tool_not_to_empty() {
+        // tools: [scm.*] + actions: [scm.prs.get] must yield [scm.prs.get]
+        // (plus any builtins — there are none in this grant), NEVER `[]`.
+        // This is exactly the case the original (wrong) raw-intersection
+        // formulation collapsed to `Some([])`.
+        let got = narrow_agent_tools(Some(strs(&["scm.*"])), &strs(&["scm.prs.get"])).unwrap();
+        assert_eq!(got, vec!["scm.prs.get".to_string()], "must not collapse to []: {got:?}");
+    }
+
+    #[test]
+    fn star_grant_keeps_all_builtins_and_narrows_the_catalog_to_one() {
+        // tools: ["*"] + actions: [issues.list] keeps every builtin and
+        // exactly `issues.list` of the catalog.
+        let got = narrow_agent_tools(Some(strs(&["*"])), &strs(&["issues.list"])).unwrap();
+        for builtin in builtin_tool_names() {
+            assert!(got.contains(&builtin), "missing builtin {builtin} in {got:?}");
+        }
+        let catalog_entries: Vec<&String> = got
+            .iter()
+            .filter(|t| !builtin_tool_names().contains(t))
+            .collect();
+        assert_eq!(
+            catalog_entries,
+            vec![&"issues.list".to_string()],
+            "expected exactly issues.list from the catalog, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn agent_tools_none_is_unrestricted_and_expands_before_narrowing() {
+        // agent_tools == None means unrestricted -> expand to BUILTINS ∪
+        // CATALOG, THEN narrow the connector subset. So an agent with no
+        // declared `tools:` still keeps every builtin when a step narrows
+        // its connector calls.
+        let got = narrow_agent_tools(None, &strs(&["issues.list"])).unwrap();
+        for builtin in builtin_tool_names() {
+            assert!(got.contains(&builtin), "missing builtin {builtin} in {got:?}");
+        }
+        assert!(got.contains(&"issues.list".to_string()));
+        assert!(!got.contains(&"issues.create".to_string()), "must narrow the catalog too: {got:?}");
+    }
+
+    #[test]
+    fn a_step_cannot_escalate_to_a_catalog_tool_the_agent_lacks() {
+        // A step naming a catalog tool the agent does NOT grant must not
+        // gain it — narrowing only ever shrinks, never extends.
+        let granted = strs(&["read_file"]);
+        let got = narrow_agent_tools(Some(granted), &strs(&["issues.list"])).unwrap();
+        assert_eq!(got, vec!["read_file".to_string()], "must not escalate: {got:?}");
+    }
+
+    #[test]
+    fn empty_connector_intersection_strips_no_builtins() {
+        // A step may legitimately allow zero connector calls (spec §2) —
+        // but it must never strip a builtin. Agent grants builtins only +
+        // a connector tool the step's `actions:` doesn't ask for.
+        let granted = strs(&["bash", "read_file", "grep"]);
+        let got = narrow_agent_tools(Some(granted), &strs(&["scm.prs.get"])).unwrap();
+        assert_eq!(
+            got,
+            vec!["bash".to_string(), "read_file".to_string(), "grep".to_string()],
+            "empty connector intersection must not strip builtins: {got:?}"
+        );
     }
 }
 

@@ -975,6 +975,27 @@ describe('StepForm — actions: picker (Task 3)', () => {
     fireEvent.click(screen.getByLabelText('Action issues.create'));
   });
 
+  it('a legacy/unknown actions: entry (not in the catalog) renders as a removable "unknown tool" chip, and removing it clears it (Minor 6)', () => {
+    const spy = vi.fn();
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'step', agent: 'issue-reporter', actions: ['issues.list', 'open_pr'] })}
+        agents={AGENTS_WITH_TOOLS}
+        problems={[]}
+        exprContext={EXPR}
+        tools={CATALOG}
+        onChange={spy}
+      />,
+    );
+    expect(screen.getByText('open_pr')).toBeInTheDocument();
+    expect(screen.getByText('unknown tool')).toBeInTheDocument();
+    // The known entry stays in the normal catalog checkbox list, not as a chip.
+    expect(screen.getByLabelText('Action issues.list')).toBeChecked();
+
+    fireEvent.click(screen.getByLabelText('Remove unknown action open_pr'));
+    expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({ actions: ['issues.list'] }));
+  });
+
   it('a for_each step also renders the actions control (agent-bearing)', () => {
     render(
       <StepForm
@@ -1013,6 +1034,21 @@ describe('StepForm — switchKind', () => {
     const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
     expect(last.kind).toBe('action');
     expect(last.action).toBe('');
+  });
+
+  it('switching a narrowed step to action drops actions: (a non-empty actions: on an action step is a save-time 400 the hidden control cannot clear)', () => {
+    const spy = vi.fn();
+    render(
+      <Harness
+        initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go', actions: ['issues.list'] })}
+        spy={spy}
+        workflowEditorUi="next"
+      />,
+    );
+    fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'action' } });
+    const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+    expect(last.kind).toBe('action');
+    expect(last.actions).toBeUndefined();
   });
 
   it('switching step -> for_each preserves agent and prompt (§8.3)', () => {

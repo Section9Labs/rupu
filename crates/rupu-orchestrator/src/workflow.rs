@@ -180,6 +180,8 @@ pub enum WorkflowParseError {
     ActionsUnknownTool { step: String, tool: String },
     #[error("step `{step}`: an `action:` step must not carry a non-empty `actions:` allowlist — its tool is already explicit")]
     ActionsOnActionStep { step: String },
+    #[error("step `{step}`: a non-empty `actions:` is not supported on a remote step (`host:`/`distribute:`) — the roster never reaches the remote dispatch payload, so it would be silently ignored; remove `actions:` or clear it to `[]`")]
+    ActionsUnsupportedOnRemoteStep { step: String },
     #[error("step `{step}`: edge target `{target}` is not a known step")]
     EdgeTargetUnknown { step: String, target: String },
     #[error("step `{step}`: an edge cannot target its own step")]
@@ -1375,12 +1377,26 @@ fn validate_action_step(
 /// `actions:` is a NARROWING allowlist for an AGENT step; an `action:`
 /// step's tool is explicit, so a non-empty list there is a shape error
 /// (an EMPTY list stays legal — it is already present repo-wide).
+///
+/// A `host:`/`distribute:` (remote/placed) step never reaches
+/// `build_opts_for_step` — its roster travels in `UnitDispatch`/
+/// `AgentLaunchRequest`, which carry no tool list — so a narrowed
+/// `actions:` there would be a silent no-op (fail-OPEN: the remote agent
+/// runs its full grant while the CP shows it as narrowed). Until the
+/// roster is threaded through the remote dispatch payload (spec §3b-bis,
+/// deferred), reject a NON-EMPTY `actions:` on such a step outright; an
+/// empty `actions:` stays legal.
 fn validate_step_actions(step: &Step) -> Result<(), WorkflowParseError> {
     if step.actions.is_empty() {
         return Ok(());
     }
     if step.action.is_some() {
         return Err(WorkflowParseError::ActionsOnActionStep {
+            step: step.id.clone(),
+        });
+    }
+    if step.host.is_some() || step.distribute.is_some() {
+        return Err(WorkflowParseError::ActionsUnsupportedOnRemoteStep {
             step: step.id.clone(),
         });
     }
@@ -2882,6 +2898,55 @@ steps:
     fn empty_actions_on_an_action_step_is_still_accepted() {
         let raw = "name: w\nsteps:\n  - id: s1\n    action: issues.list\n    with: { project: \"o/r\" }\n    actions: []\n";
         Workflow::parse(raw).expect("empty actions on an action step must stay legal (compat)");
+    }
+
+    // ── §3b-bis: remote (host:/distribute:) steps fail closed ────────────────
+
+    #[test]
+    fn non_empty_actions_on_a_host_step_is_rejected() {
+        // A `host:` unit never reaches `build_opts_for_step` — its roster
+        // travels in `AgentLaunchRequest`, which carries no tool list — so a
+        // narrowed `actions:` there would silently be a no-op (fail-open).
+        let raw = r#"
+name: w
+steps:
+  - id: s1
+    agent: a
+    prompt: p
+    host: some-host
+    actions: ["issues.list"]
+"#;
+        match Workflow::parse(raw).unwrap_err() {
+            WorkflowParseError::ActionsUnsupportedOnRemoteStep { step } => {
+                assert_eq!(step, "s1");
+            }
+            other => panic!("expected ActionsUnsupportedOnRemoteStep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_empty_actions_on_a_distribute_step_is_rejected() {
+        let raw = r#"
+name: w
+steps:
+  - id: s1
+    for_each: "x"
+    agent: a
+    prompt: p
+    distribute:
+      hosts: [h1]
+    actions: ["issues.list"]
+"#;
+        assert!(matches!(
+            Workflow::parse(raw).unwrap_err(),
+            WorkflowParseError::ActionsUnsupportedOnRemoteStep { .. }
+        ));
+    }
+
+    #[test]
+    fn empty_actions_on_a_host_step_is_still_accepted() {
+        let raw = "name: w\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n    host: some-host\n    actions: []\n";
+        Workflow::parse(raw).expect("empty actions on a remote step must stay legal (compat)");
     }
 
     #[test]

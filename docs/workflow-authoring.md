@@ -235,7 +235,7 @@ This is the practical way to get "agentic orchestration" without pretending the 
 | No stable artifacts | Later steps depend on vague prose | Write spec / plan files or emit structured output |
 | No explicit human gate | Risky actions happen too easily | Add `approval:` where ownership changes |
 | Huge prompts with hidden assumptions | Maintenance cost grows quickly | Keep prompts narrow and named |
-| Using `actions:` as a tool policy | It does not do that | Put tool limits in the agent file |
+| Listing a partial `actions:` on a step | It really narrows the agent's connector tools now — a partial list silently drops the rest | List every connector tool the step needs (or leave `actions:` empty/absent for the full agent grant) |
 | Parsing workflow handoffs from prose | Breaks under real automation | Declare `contracts:` and validate them |
 | Child autoflows with no owner precedence | Matching becomes non-deterministic | Use `autoflow.priority` intentionally |
 

@@ -276,7 +276,7 @@ Common fields:
 | Key | Type | Applies to | Notes |
 | --- | --- | --- | --- |
 | `id` | string | all steps | Unique within the workflow |
-| `actions` | array<string> | all steps | Action-protocol allowlist, not a tool allowlist |
+| `actions` | array<string> | agent steps (`step`/`for_each`) | Narrows this step's connector (MCP) tool calls — see below |
 | `when` | string | all steps | Minijinja expression reduced to truthy / falsy |
 | `continue_on_error` | bool | all steps | Tolerates failure and continues |
 | `max_parallel` | integer | `for_each`, `parallel`, `panel` | Concurrency cap, must be at least 1 |
@@ -285,17 +285,42 @@ Common fields:
 
 ### `actions`
 
-`actions:` is frequently misunderstood.
+`actions:` **does narrow tool access** — but only the connector (MCP catalog)
+portion of it. Builtin tools (`bash`, `read_file`, `write_file`, `edit_file`,
+`grep`, `glob`, `ast_grep`, `dispatch_agent`, `dispatch_agents_parallel`) are
+never touched by this field; they're governed entirely by the agent's own
+`tools:` and the run mode (`ask`/`bypass`/`readonly`).
 
-It does **not** control tool access. Tool access belongs in each agent's `tools:` list.
+Each entry must name a tool in the MCP catalog (`scm.*`, `issues.*`,
+`github.*`, `gitlab.*` — see `GET /api/tools`); an unknown entry is a
+parse-time error.
 
-`actions:` only allowlists action-protocol events emitted from agent output and recorded in the transcript. If you are not intentionally using the action protocol, set:
+Semantics:
+
+- **Empty (or absent) `actions:` means unrestricted** — the step runs with
+  the agent's full tool grant, unchanged. This is the compatibility default;
+  every workflow written before this field was enforced already relies on
+  it.
+- **A non-empty `actions:` narrows only the connector subset** of the
+  agent's grant to the intersection of the agent's tools and this list.
+  Builtins pass through untouched. A step can only ever shrink the
+  connector set — naming a catalog tool the agent doesn't grant does
+  **not** add it (no escalation).
+- **Not supported on a remote step** (`host:` / `distribute:`): a non-empty
+  `actions:` there is rejected at parse time, because the roster never
+  reaches the remote dispatch path today (it would otherwise be a silent
+  no-op).
 
 ```yaml
-actions: []
+# agent grants: [issues.list, issues.get, issues.comment, issues.create, issues.update_state]
+steps:
+  - id: triage
+    agent: issue-reporter
+    actions: [issues.list, issues.get]   # narrowed to read-only for THIS step
+  - id: report
+    agent: issue-reporter
+    actions: []                          # unrestricted — full agent grant
 ```
-
-That is the recommended default today.
 
 ### `when`
 
@@ -703,7 +728,7 @@ Common parse-time failures:
 
 Common design mistakes:
 
-- using `actions:` as if it were a tool allowlist
+- leaving a shipped `actions:` list incomplete — it now really narrows the connector subset, so a partial list silently drops the tools you forgot
 - making reviewers write-capable
 - building one giant workflow instead of using smaller workflows per phase
 - relying on fragile free-form prose when a downstream step needs structured output

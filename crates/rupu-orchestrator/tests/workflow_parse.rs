@@ -1,5 +1,11 @@
 use rupu_orchestrator::{is_approval_gate, TimeoutAction, Workflow};
 
+// `actions:` entries must name a real MCP catalog tool (validated by
+// `validate_step_actions`, `workflow.rs`) — this fixture predates that
+// validation and originally carried legacy Okesu-heritage verbs
+// (`log_finding` / `propose_edit`), which the catalog check now rejects.
+// This test isn't about `actions:` semantics; it just needs SOME valid
+// catalog names so the fixture parses.
 const SIMPLE: &str = r#"
 name: investigate-then-fix
 description: Investigate a bug then propose a fix.
@@ -7,13 +13,13 @@ steps:
   - id: investigate
     agent: investigator
     actions:
-      - log_finding
+      - issues.list
     prompt: |
       Investigate the bug: {{ inputs.prompt }}
   - id: propose
     agent: fixer
     actions:
-      - propose_edit
+      - issues.comment
     prompt: |
       Based on:
       {{ steps.investigate.output }}
@@ -27,7 +33,7 @@ fn parses_two_step_linear_workflow() {
     assert_eq!(wf.steps.len(), 2);
     assert_eq!(wf.steps[0].id, "investigate");
     assert_eq!(wf.steps[0].agent.as_deref(), Some("investigator"));
-    assert_eq!(wf.steps[0].actions, vec!["log_finding".to_string()]);
+    assert_eq!(wf.steps[0].actions, vec!["issues.list".to_string()]);
     assert!(wf.steps[1]
         .prompt
         .as_deref()

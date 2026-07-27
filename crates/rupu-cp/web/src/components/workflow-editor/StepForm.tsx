@@ -140,7 +140,13 @@ export default function StepForm({
     const base: StepNodeData = { id: d.id, kind };
     if (d.when !== undefined) base.when = d.when;
     if (d.continue_on_error !== undefined) base.continue_on_error = d.continue_on_error;
-    if (d.actions !== undefined) base.actions = d.actions;
+    // `actions:` is a NARROWING allowlist over an agent's tool grant — an
+    // `action:` step's tool is already explicit, so a non-empty `actions:`
+    // there is a parse error (spec §3b) the control doesn't even render for
+    // (ActionsField only mounts on step/for_each). Don't carry it across a
+    // switch TO `action`, or the emitted object would carry a value the user
+    // has no way to see or clear, and save would 400 with `ActionsOnActionStep`.
+    if (d.actions !== undefined && kind !== 'action') base.actions = d.actions;
     if (d.raw_passthrough !== undefined) base.raw_passthrough = d.raw_passthrough;
     // `next` is a GENERAL field (a node's outgoing successor edge), not
     // kind-specific — carry it across the switch EXCEPT to `branch` (its
@@ -393,11 +399,22 @@ function ActionsField({
   // unflagged rather than everything reading as ungranted.
   const grantedTools = agentName ? agents.find((a) => a.name === agentName)?.tools : undefined;
 
+  // A selected entry the catalog doesn't recognize (a stale/legacy verb, e.g.
+  // `open_pr`, or a typo) is invisible in the grouped catalog list below —
+  // it renders nowhere, so the user can't see or remove the very entry that
+  // breaks the parse (`ActionsUnknownTool`). Surface it as a removable chip
+  // instead of silently dropping it from the UI.
+  const unknownSelected = selected.filter((name) => !tools.some((t) => t.name === name));
+
   function toggle(name: string, on: boolean): void {
     const set = new Set(selected);
     if (on) set.add(name);
     else set.delete(name);
     patch({ actions: [...set] });
+  }
+
+  function remove(name: string): void {
+    patch({ actions: selected.filter((n) => n !== name) });
   }
 
   return (
@@ -438,6 +455,27 @@ function ActionsField({
           ))
         )}
       </div>
+      {unknownSelected.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {unknownSelected.map((name) => (
+            <span
+              key={name}
+              className="inline-flex items-center gap-1 rounded-full border border-err/30 bg-err-bg px-2 py-0.5 text-note text-err"
+            >
+              <span className="font-mono">{name}</span>
+              <span className="text-ink-mute">unknown tool</span>
+              <button
+                type="button"
+                onClick={() => remove(name)}
+                aria-label={`Remove unknown action ${name}`}
+                className="font-bold leading-none"
+              >
+                ×
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
