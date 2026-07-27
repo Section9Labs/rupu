@@ -13,7 +13,16 @@
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
-export type StepKind = 'step' | 'for_each' | 'parallel' | 'panel' | 'branch' | 'approval_gate' | 'action';
+export type StepKind =
+  | 'step'
+  | 'for_each'
+  | 'parallel'
+  | 'panel'
+  | 'branch'
+  | 'approval_gate'
+  | 'action'
+  | 'split'
+  | 'join';
 
 export interface SubStep {
   id: string;
@@ -84,6 +93,15 @@ export interface StepNodeData {
   // node carries no agent/prompt — it invokes an SCM/issue/CI tool with params.
   action?: string;
   with?: Record<string, unknown>;
+  // Non-linear orchestration fields (workflow.rs `Step.next`/`Step.split`/
+  // `Step.join`, Phase 1 language). `next` is a general field any step kind
+  // may carry (its explicit successor edges); `split`/`join` are mutually
+  // exclusive with agent/action/for_each/parallel/panel/branch/approval and
+  // each imply their own `kind` (see parseStepData). `joinWait` mirrors Rust's
+  // `JoinWait`: the bare keyword `'all'`/`'any'`, or the `{ count }` form.
+  next?: string[];
+  split?: string[];
+  joinWait?: 'all' | 'any' | { count: number };
   // Any step-level keys we don't model (e.g. `contract:`) are captured verbatim
   // here on load and spread back on emit, so unmodeled config is never dropped.
   raw_passthrough?: Record<string, unknown>;
@@ -189,20 +207,44 @@ function parsePanel(o: Record<string, unknown>): PanelCfg {
 // into `PanelCfg._rest` on load and re-emitted on save.
 const PANEL_KEYS = new Set<string>(['panelists', 'subject', 'prompt', 'max_parallel', 'gate']);
 
+/** Parse a `join.wait` value into the `StepNodeData.joinWait` shape. Mirrors
+ *  workflow.rs `JoinWait`'s `#[serde(untagged)]`: try the bare keyword
+ *  (`"all"`/`"any"`) first, then the `{ count }` map form. Returns `undefined`
+ *  for anything else (including absent — Rust defaults to `all` at execution
+ *  time, but the editor preserves "not specified" rather than synthesizing a
+ *  value that wasn't in the source, so a bare `join: {}` round-trips as-is). */
+function parseJoinWait(v: unknown): 'all' | 'any' | { count: number } | undefined {
+  const kw = asString(v);
+  if (kw === 'all' || kw === 'any') return kw;
+  const rec = asRecord(v);
+  if (rec) {
+    const count = asNumber(rec.count);
+    if (count !== undefined) return { count };
+  }
+  return undefined;
+}
+
 function parseStepData(raw: unknown, i: number): StepNodeData {
   const o = asRecord(raw) ?? {};
   const id = asString(o.id) ?? `step-${i}`;
 
-  // Kind precedence (most-specific first): panel > parallel > branch > action >
-  // for_each > approval_gate > step. A step matching none cleanly still becomes
-  // a plain `step` node carrying whatever it has. A branch/gate/action step has
-  // no agent/prompt of its own. The gate arm mirrors workflow.rs `is_approval_gate`:
-  // an `approval:` block AND no agent/prompt/for_each/parallel/panel/branch/action
-  // (the earlier arms already peeled those shapes off, so here we only re-check
-  // agent/prompt).
+  // Kind precedence (most-specific first): panel > parallel > branch > split >
+  // join > action > for_each > approval_gate > step. A step matching none
+  // cleanly still becomes a plain `step` node carrying whatever it has. A
+  // branch/split/join/gate/action step has no agent/prompt of its own. `split`/
+  // `join` mirror workflow.rs `validate_graph`'s `is_orch` check (a step
+  // declaring `split:`/`join:` carries no agent/action/for_each/parallel/
+  // panel/branch/approval work of its own) — presence of the key, even an
+  // empty `split: []` or bare `join: {}`, is what makes the node that kind,
+  // same as the `parallel`/`panel`/`branch` arms above it. The gate arm
+  // mirrors workflow.rs `is_approval_gate`: an `approval:` block AND no
+  // agent/prompt/for_each/parallel/panel/branch/action (the earlier arms
+  // already peeled those shapes off, so here we only re-check agent/prompt).
   const panelRaw = asRecord(o.panel);
   const parallelRaw = asArray(o.parallel);
   const branchRaw = asRecord(o.branch);
+  const splitRaw = asStringArray(o.split);
+  const joinRaw = asRecord(o.join);
   const actionName = asString(o.action);
   const forEach = asString(o.for_each);
   const approvalRaw = asRecord(o.approval);
@@ -212,11 +254,21 @@ function parseStepData(raw: unknown, i: number): StepNodeData {
   if (panelRaw) kind = 'panel';
   else if (parallelRaw) kind = 'parallel';
   else if (branchRaw) kind = 'branch';
+  else if (splitRaw !== undefined) kind = 'split';
+  else if (joinRaw) kind = 'join';
   else if (actionName !== undefined) kind = 'action';
   else if (forEach !== undefined) kind = 'for_each';
   else if (approvalRaw && agentName === undefined && promptText === undefined) kind = 'approval_gate';
 
   const data: StepNodeData = { id, kind };
+
+  if (splitRaw !== undefined) data.split = splitRaw;
+  if (joinRaw) {
+    const wait = parseJoinWait(joinRaw.wait);
+    if (wait !== undefined) data.joinWait = wait;
+  }
+  const nextArr = asStringArray(o.next);
+  if (nextArr && nextArr.length > 0) data.next = nextArr;
 
   if (agentName !== undefined) data.agent = agentName;
   if (promptText !== undefined) data.prompt = promptText;
@@ -297,6 +349,9 @@ const MODELLED_STEP_KEYS = new Set<string>([
   'approval',
   'action',
   'with',
+  'next',
+  'split',
+  'join',
 ]);
 
 // Keys this module models on a `branch:` block. Everything else is captured
@@ -337,10 +392,63 @@ export function extractStepRefs(data: StepNodeData): string[] {
 
 // ── deriveEdges ───────────────────────────────────────────────────────────────
 
-/** The ONE producer of canvas edges. Pure function of the ordered node list:
- *  (a) a chain edge between each consecutive pair (declared order),
- *  (b) a data-ref edge X->Y whenever Y references steps.X,
- *  (c) a branch-arm edge per then/else target (labeled true/false).
+/** A workflow "has explicit edges" (is a graph workflow rather than a legacy
+ *  linear one) when any node declares `next:`, `split:`, or `join:` — mirrors
+ *  workflow.rs `workflow_has_explicit_edges` exactly (non-empty `next`,
+ *  `split` present (any array, even empty), `join` present). Legacy edge-free
+ *  workflows keep displaying as the pre-existing linear chain (see
+ *  `deriveEdges`). Exported so callers (Tasks 5-7: the editor canvas, node
+ *  forms, add/connect affordances) can branch on the same distinction. */
+export function hasExplicitEdges(nodes: GraphNode[]): boolean {
+  return nodes.some((n) => (n.data.next && n.data.next.length > 0) || n.data.kind === 'split' || n.data.kind === 'join');
+}
+
+/** The legacy->graph migration primitive (spec 3d): a no-op when `nodes`
+ *  already has explicit edges (`hasExplicitEdges`); otherwise returns a copy
+ *  where every node's `next` is set to exactly what `deriveEdges`'s legacy
+ *  chain loop would already have drawn for it — `[the next node in list
+ *  order]`, and `[]` for the last node — so the derived edge SET is identical
+ *  before and after, just now explicit instead of implicit.
+ *
+ *  A `branch` node is left untouched (no `next` written, even `[]`): its
+ *  routing is its `then`/`else` targets, and `next` is not part of that
+ *  node's identity the way it is for every other kind.
+ *
+ *  Exists to fix the Critical bug where authoring the FIRST explicit edge on
+ *  a legacy multi-step workflow (a single `applyConnect`/
+ *  `applyAddConnectedNext` draw) flips `hasExplicitEdges` for the WHOLE
+ *  graph, and every OTHER node — which still has no explicit `next` of its
+ *  own — silently loses the implicit chain edge it used to derive from list
+ *  order. Callers run the current nodes through this BEFORE mutating the
+ *  node that's about to gain the new edge, so the pre-existing connections
+ *  survive as explicit `next` entries and the new edge applies on top of
+ *  that materialized base rather than a graph that just lost the rest of its
+ *  chain. */
+export function materializeLegacyChain(nodes: GraphNode[]): GraphNode[] {
+  if (hasExplicitEdges(nodes)) return nodes;
+  return nodes.map((n, i) => {
+    if (n.data.kind === 'branch') return n;
+    const next = i < nodes.length - 1 ? [nodes[i + 1].id] : [];
+    return { ...n, data: { ...n.data, next } };
+  });
+}
+
+/** The ONE producer of canvas edges. Pure function of the ordered node list,
+ *  branching on `hasExplicitEdges`:
+ *
+ *  **Graph mode** (any node has `next`/`split`/`join`): edges come ONLY from
+ *  explicit connections — (a) each node's `next` targets, (b) a `split`
+ *  node's fan-out targets, (c) a `branch` node's then/else arms — UNION (d)
+ *  inferred data-ref edges (X->Y whenever Y references steps.X). List order
+ *  contributes NOTHING; there is no consecutive-pair chain.
+ *
+ *  **Legacy mode** (no node has any of those): today's pre-existing
+ *  behavior, unchanged — (a) a chain edge between each consecutive pair
+ *  (declared order), (b) the same data-ref inference, (c) the same
+ *  branch-arm edges. This is the compat guarantee: an edge-free workflow
+ *  authored before non-linear orchestration existed still displays as the
+ *  linear chain it always did.
+ *
  *  graph.edges is ALWAYS this — never stored independently. */
 export function deriveEdges(nodes: GraphNode[]): GraphEdge[] {
   const ids = new Set(nodes.map((n) => n.id));
@@ -361,17 +469,37 @@ export function deriveEdges(nodes: GraphNode[]): GraphEdge[] {
     edges.push(e);
   };
 
-  // (a) base chain edges for ordering, then (b) data-ref edges X->Y whenever Y
-  // references steps.X and X exists. Dedupe collapses (b) onto (a).
-  for (let i = 0; i < nodes.length - 1; i++) addEdge(nodes[i].id, nodes[i + 1].id);
+  const graphMode = hasExplicitEdges(nodes);
+
+  if (graphMode) {
+    // (a) explicit `next` edges, (b) `split` fan-out edges.
+    for (const n of nodes) {
+      for (const t of n.data.next ?? []) {
+        if (ids.has(t)) addEdge(n.id, t);
+      }
+      if (n.data.kind === 'split') {
+        for (const t of n.data.split ?? []) {
+          if (ids.has(t)) addEdge(n.id, t);
+        }
+      }
+    }
+  } else {
+    // Legacy: a chain edge between each consecutive pair (declared order).
+    for (let i = 0; i < nodes.length - 1; i++) addEdge(nodes[i].id, nodes[i + 1].id);
+  }
+
+  // Data-ref edges X->Y whenever Y references steps.X and X exists — inferred
+  // in BOTH modes. Dedupe collapses onto any chain/next/split edge that
+  // already connects the same pair.
   for (const n of nodes) {
     for (const ref of extractStepRefs(n.data)) {
       if (ids.has(ref)) addEdge(ref, n.id);
     }
   }
 
-  // (c) branch-arm edges: a `branch` node points at each of its then/else
-  // targets with a label so the renderer can draw true/false arms distinctly.
+  // Branch-arm edges: a `branch` node points at each of its then/else targets
+  // with a label so the renderer can draw true/false arms distinctly — in
+  // BOTH modes (a branch is an explicit connection either way).
   for (const n of nodes) {
     if (n.data.kind !== 'branch') continue;
     for (const t of n.data.thenTargets ?? []) {
@@ -524,6 +652,24 @@ function nodeToStepObject(d: StepNodeData): Record<string, unknown> {
     if (d.when) o.when = d.when;
     if (d.continue_on_error === true) o.continue_on_error = true;
     if (d.actions && d.actions.length > 0) o.actions = d.actions;
+  } else if (d.kind === 'split') {
+    // `split` orchestration node — its whole identity is the `split:` array
+    // (fan-out targets); it carries no agent/prompt/action of its own.
+    o.split = d.split ?? [];
+    if (d.when) o.when = d.when;
+    if (d.continue_on_error === true) o.continue_on_error = true;
+    if (d.actions && d.actions.length > 0) o.actions = d.actions;
+  } else if (d.kind === 'join') {
+    // `join` (barrier) orchestration node — its whole identity is the
+    // `join:` block; it carries no agent/prompt/action of its own. `wait` is
+    // omitted when not set on load, so a bare `join: {}` round-trips as-is
+    // rather than gaining a synthesized default (see `parseJoinWait`).
+    const jo: Record<string, unknown> = {};
+    if (d.joinWait !== undefined) jo.wait = d.joinWait;
+    o.join = jo;
+    if (d.when) o.when = d.when;
+    if (d.continue_on_error === true) o.continue_on_error = true;
+    if (d.actions && d.actions.length > 0) o.actions = d.actions;
   } else if (d.kind === 'approval_gate') {
     // standalone gate NODE — its whole identity is the `approval:` block emitted
     // below; it carries no agent/prompt. `when` is still valid on a gate, so
@@ -549,6 +695,10 @@ function nodeToStepObject(d: StepNodeData): Record<string, unknown> {
     // data silently is worse than a validation error the user can act on.
     if (d.with !== undefined) o.with = d.with;
   }
+
+  // `next` (explicit successor edges) applies to any step kind — omitted
+  // when empty so a legacy node (no `next:` on load) round-trips clean.
+  if (d.next && d.next.length > 0) o.next = d.next;
 
   // Approval applies to any step kind. A gate NODE ALWAYS emits an `approval:`
   // block (it is the node's identity); other kinds emit only when there's an
@@ -755,6 +905,65 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
         if (there !== undefined && there > here) {
           add(n.id, `references steps.${ref} which runs later`);
         }
+      }
+    }
+  }
+
+  // Graph-mode checks (Phase 1 non-linear orchestration): only meaningful once
+  // a workflow has explicit edges at all — a legacy edge-free workflow can't
+  // author a cycle/dangling-target/degenerate-split-join through this
+  // vocabulary, so these mirror the backend's `validate_graph` gate exactly
+  // and never fire on a legacy workflow (spec §2/§4 compat).
+  if (hasExplicitEdges(g.nodes)) {
+    // Cycle: mirrors the backend's `WorkflowCycle` check. `sorted` (above)
+    // already ran Kahn's algorithm over `g.edges` (== `deriveEdges(g.nodes)`
+    // by the graph's own invariant); any node topoSort couldn't place still
+    // has unresolved in-degree, i.e. is part of a cycle. A reconverging
+    // diamond (a→b, a→c, b→d, c→d) is NOT a cycle — Kahn's tracks per-node
+    // in-degree, not pairwise adjacency, so it drains cleanly.
+    if ('cycle' in sorted) {
+      for (const id of sorted.cycle) add(id, 'part of a cycle — steps must form a DAG');
+    }
+
+    // Unknown edge target: a `next`/`split` id that isn't a known node.
+    for (const n of g.nodes) {
+      for (const t of n.data.next ?? []) {
+        if (!nodeIds.has(t)) add(n.id, `edge target \`${t}\` is not a known step`);
+      }
+      if (n.data.kind === 'split') {
+        for (const t of n.data.split ?? []) {
+          if (!nodeIds.has(t)) add(n.id, `edge target \`${t}\` is not a known step`);
+        }
+      }
+    }
+
+    // Self-loop: a `next`/`split` entry that targets the node's own id.
+    // Mirrors the backend's `EdgeSelfLoop` check exactly (workflow.rs). Reads
+    // the raw node fields directly rather than `g.edges` — `deriveEdges`'s
+    // `addEdge` silently drops `source === target` edges (correct for
+    // rendering, since there's nothing to draw), so a self-loop never reaches
+    // `g.edges` and the cycle/unknown-target checks above never see it.
+    for (const n of g.nodes) {
+      for (const t of n.data.next ?? []) {
+        if (t === n.id) add(n.id, 'an edge cannot target its own step');
+      }
+      if (n.data.kind === 'split') {
+        for (const t of n.data.split ?? []) {
+          if (t === n.id) add(n.id, 'an edge cannot target its own step');
+        }
+      }
+    }
+
+    // Degenerate split/join: fanning out to (or in from) fewer than 2 steps
+    // isn't doing real orchestration work — a plain `next` chain would do the
+    // same job with less ceremony. Low-severity (not a save-blocking error
+    // like the checks above), so distinct wording.
+    for (const n of g.nodes) {
+      if (n.data.kind === 'split') {
+        if ((n.data.split ?? []).length < 2) add(n.id, 'a split should fan out to 2+ steps');
+      } else if (n.data.kind === 'join') {
+        const inbound = g.edges.filter((e) => e.target === n.id).length;
+        if (inbound < 2) add(n.id, 'a join should have 2+ inbound paths');
       }
     }
   }

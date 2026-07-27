@@ -23,8 +23,8 @@ use crate::templates::{
     StepOutput,
 };
 use crate::workflow::{
-    effective_workspace_mode, yaml_scalar_to_string, InputType, Step, Workflow, WorkflowParseError,
-    WorkspaceMode,
+    effective_workspace_mode, is_nonlinear, yaml_scalar_to_string, InputType, Step, Workflow,
+    WorkflowParseError, WorkspaceMode,
 };
 use async_trait::async_trait;
 use rupu_agent::{run_agent, AgentRunOpts, RunError, RunResult};
@@ -173,6 +173,10 @@ pub enum RunWorkflowError {
         "action step `{step}` requires runtime wiring — this entry point does not provide an SCM dispatcher"
     )]
     ActionDispatcherMissing { step: String },
+    #[error(
+        "workflow `{name}` uses non-linear orchestration (split/join/fork), which requires the DAG scheduler — not yet available (Phase 2)"
+    )]
+    NonlinearNotYetSupported { name: String },
 }
 
 /// Trait the orchestrator uses to construct per-unit [`AgentRunOpts`].
@@ -537,6 +541,21 @@ impl ResumeState {
 pub async fn run_workflow(
     opts: OrchestratorRunOpts,
 ) -> Result<OrchestratorRunResult, RunWorkflowError> {
+    // Phase 2 gate: the linear runner below can only execute a workflow
+    // whose control flow is a single line (with today's skip-set branches).
+    // A workflow using split/join, a fork, or a reconverge needs the DAG
+    // scheduler, which doesn't exist yet. Reject it here — before the
+    // transcript dir is created, before inputs are resolved, and before any
+    // run-record is persisted — so no partial state or on-disk bookkeeping
+    // is left behind for a run that never truly started. Legacy/linear
+    // workflows (including branches and an explicit-but-linear `next`
+    // chain) are unaffected and fall through to run exactly as before.
+    if is_nonlinear(&opts.workflow) {
+        return Err(RunWorkflowError::NonlinearNotYetSupported {
+            name: opts.workflow.name.clone(),
+        });
+    }
+
     std::fs::create_dir_all(&opts.transcript_dir)?;
     let resolved_inputs = resolve_inputs(&opts.workflow, &opts.inputs)?;
     let workflow_default_continue = opts.workflow.defaults.continue_on_error.unwrap_or(false);
@@ -1785,6 +1804,9 @@ async fn fire_notify_hooks(
             distribute: None,
             host: None,
             workspace: None,
+            next: Vec::new(),
+            split: None,
+            join: None,
             action: Some(n.action.clone()),
             with: Some(n.with.clone()),
         };
@@ -5847,6 +5869,119 @@ steps:
         assert_eq!(step.items[1].output, "done: SLOW-1");
         assert_eq!(step.items[2].output, "done: ok-2");
         assert!(sink2.labels().contains(&"RunResumed".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2 gate — non-linear workflows are rejected before any execution
+    // -----------------------------------------------------------------------
+
+    const WF_SPLIT: &str = r#"
+name: nonlinear-split
+steps:
+  - id: s
+    split: [a, b]
+  - id: a
+    agent: x
+    prompt: p
+  - id: b
+    agent: x
+    prompt: p
+"#;
+
+    #[tokio::test]
+    async fn run_workflow_rejects_a_split_workflow_before_any_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = Arc::new(FakeUnitDispatcher::new());
+        let wf = Workflow::parse(WF_SPLIT).unwrap();
+        let opts = make_opts(wf, dir.path().to_path_buf(), dispatcher.clone());
+
+        let err = run_workflow(opts)
+            .await
+            .expect_err("split workflow must be rejected, not mis-run as a line");
+        assert!(
+            matches!(err, RunWorkflowError::NonlinearNotYetSupported { ref name } if name == "nonlinear-split"),
+            "expected NonlinearNotYetSupported, got: {err:?}"
+        );
+
+        // PanicFactory (wired into `make_opts`) never fires and the fake
+        // dispatcher was never called — proof the gate fired before the
+        // linear loop dispatched anything.
+        assert!(dispatcher.calls.lock().unwrap().is_empty());
+        // No transcript dir side effect either — the gate is the very
+        // first statement in `run_workflow`, ahead of `create_dir_all`.
+        assert!(!dir.path().join("run.json").exists());
+    }
+
+    /// Hands out a fresh `MockProvider` per call (unlike `OneShotFactory`,
+    /// which panics on a second call) — needed here because the linear
+    /// chain has two real (non-placed) agent steps, each dispatched
+    /// through `build_opts_for_step`. Output is deterministic from the
+    /// rendered prompt so downstream assertions can prove genuine
+    /// sequential execution rather than a stubbed pass-through.
+    struct PerCallMockFactory;
+    #[async_trait]
+    impl StepFactory for PerCallMockFactory {
+        async fn build_opts_for_step(
+            &self,
+            _step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: PathBuf,
+            transcript_path: PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> AgentRunOpts {
+            let provider = Box::new(MockProvider::new(vec![ScriptedTurn::AssistantText {
+                text: format!("done:{rendered_prompt}"),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            }]));
+            make_agent_opts(
+                provider,
+                agent_name,
+                rendered_prompt,
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                on_tool_call,
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn run_workflow_still_runs_a_linear_chain_with_explicit_next() {
+        // Same `next:`-bearing shape Task 1/2 introduced, but strictly
+        // linear (no fork/reconverge/split/join) — must run exactly as
+        // before, proving the gate doesn't over-fire on graph-schema use.
+        let yaml = r#"
+name: linear-with-next
+steps:
+  - id: a
+    agent: x
+    prompt: p
+    next: [b]
+  - id: b
+    agent: x
+    prompt: "then {{ steps.a.output }}"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = Arc::new(FakeUnitDispatcher::new());
+        let wf = Workflow::parse(yaml).unwrap();
+        let mut opts = make_opts(wf, dir.path().to_path_buf(), dispatcher);
+        opts.factory = Arc::new(PerCallMockFactory);
+
+        let result = run_workflow(opts)
+            .await
+            .expect("linear chain with explicit next must run past the gate to completion");
+        assert_eq!(result.step_results.len(), 2);
+        assert_eq!(result.step_results[0].output, "done:p");
+        assert_eq!(
+            result.step_results[1].output, "done:then done:p",
+            "step b ran with step a's real output, proving genuine sequential execution"
+        );
     }
 }
 

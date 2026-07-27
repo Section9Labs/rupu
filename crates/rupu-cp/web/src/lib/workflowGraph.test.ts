@@ -860,6 +860,143 @@ describe('validateGraph', () => {
     const problems = validateGraph(g);
     expect((problems.gate ?? []).some((m) => /on_reject/.test(m))).toBe(false);
   });
+
+  // ── graph-mode checks (Task 7): cycle / unknown edge target / split-join degree ──
+
+  it('flags a cycle', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p', next: ['b'] },
+        { id: 'b', agent: 'x', prompt: 'p', next: ['a'] },
+      ],
+    });
+    expect(Object.values(validateGraph(g)).flat().some((m) => /cycle/i.test(m))).toBe(true);
+  });
+
+  it('flags an unknown `next` edge target', () => {
+    const g = yamlToGraph({ name: 'w', steps: [{ id: 'a', agent: 'x', prompt: 'p', next: ['ghost'] }] });
+    expect(Object.values(validateGraph(g)).flat().some((m) => /ghost|unknown|not a known/i.test(m))).toBe(true);
+  });
+
+  it('flags an unknown `split` edge target', () => {
+    const g = yamlToGraph({ name: 'w', steps: [{ id: 's', split: ['ghost'] }] });
+    const problems = validateGraph(g);
+    expect(problems.s.some((m) => /ghost/.test(m) && /not a known step/.test(m))).toBe(true);
+  });
+
+  it('flags a `next` edge that targets its own step (self-loop)', () => {
+    const g = yamlToGraph({ name: 'w', steps: [{ id: 'a', agent: 'x', prompt: 'p', next: ['a'] }] });
+    expect(validateGraph(g).a).toEqual(expect.arrayContaining(['an edge cannot target its own step']));
+  });
+
+  it('flags a `split` edge that targets its own step (self-loop)', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 's', split: ['s', 'b'] },
+        { id: 'b', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(validateGraph(g).s).toEqual(expect.arrayContaining(['an edge cannot target its own step']));
+  });
+
+  it('does not flag a normal graph (no self-target) with the self-loop message', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p', next: ['b'] },
+        { id: 'b', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(Object.values(validateGraph(g)).flat().some((m) => /cannot target its own step/.test(m))).toBe(false);
+  });
+
+  it('does not run the self-loop check on a legacy workflow (no explicit edges)', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(hasExplicitEdges(g.nodes)).toBe(false);
+    expect(Object.values(validateGraph(g)).flat().some((m) => /cannot target its own step/.test(m))).toBe(false);
+  });
+
+  it('does NOT flag a reconverging diamond (a→b, a→c, b→d, c→d) as a cycle', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p', next: ['b', 'c'] },
+        { id: 'b', agent: 'x', prompt: 'p', next: ['d'] },
+        { id: 'c', agent: 'x', prompt: 'p', next: ['d'] },
+        { id: 'd', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(Object.values(validateGraph(g)).flat().some((m) => /cycle/i.test(m))).toBe(false);
+  });
+
+  it('does not run cycle detection on a legacy workflow (no explicit edges)', () => {
+    // Chain a->b (legacy consecutive-pair edge) + data-ref edge b->a (a's
+    // prompt references steps.b) is a genuine cycle in `deriveEdges`, but
+    // this workflow has no `next`/`split`/`join` anywhere, so `hasExplicitEdges`
+    // is false and the new graph-mode checks must not fire.
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'uses steps.b' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(Object.values(validateGraph(g)).flat().some((m) => /part of a cycle/i.test(m))).toBe(false);
+  });
+
+  it('flags a split with fewer than 2 targets', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 's', split: ['a'] },
+        { id: 'a', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(validateGraph(g).s).toEqual(expect.arrayContaining(['a split should fan out to 2+ steps']));
+  });
+
+  it('does not flag a split with 2+ targets', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 's', split: ['a', 'b'] },
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect((validateGraph(g).s ?? []).some((m) => /fan out/.test(m))).toBe(false);
+  });
+
+  it('flags a join with fewer than 2 inbound edges', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p', next: ['j'] },
+        { id: 'j', join: {} },
+      ],
+    });
+    expect(validateGraph(g).j).toEqual(expect.arrayContaining(['a join should have 2+ inbound paths']));
+  });
+
+  it('does not flag a join with 2+ inbound edges', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p', next: ['j'] },
+        { id: 'b', agent: 'x', prompt: 'p', next: ['j'] },
+        { id: 'j', join: {} },
+      ],
+    });
+    expect((validateGraph(g).j ?? []).some((m) => /inbound/.test(m))).toBe(false);
+  });
 });
 
 // ── fold-in (review Minor): `with:` on a non-action step/for_each node ──────
@@ -1095,7 +1232,7 @@ describe('convertInlineApprovalToGate', () => {
   });
 });
 
-import { deriveEdges, withDerivedEdges } from './workflowGraph';
+import { deriveEdges, withDerivedEdges, hasExplicitEdges, materializeLegacyChain } from './workflowGraph';
 
 describe('deriveEdges', () => {
   // NOTE: as of this writing, no *.yaml under .rupu/workflows/ actually
@@ -1191,5 +1328,168 @@ describe('serialization totality', () => {
     const corrupted = { ...g, edges: [] };
     const out = graphToWorkflowObject(corrupted) as { obj: Record<string, unknown> };
     expect((out.obj.steps as Record<string, unknown>[]).map((s) => s.id)).toEqual(['b', 'a']);
+  });
+});
+
+describe('explicit-edge model', () => {
+  it('derives edges from next: not from list order', () => {
+    // two steps, NO next → no chain edge (graph mode is off, but the key change:
+    // when next IS present, order does not add edges). Use an explicit-next case:
+    const g = yamlToGraph({ name: 'w', steps: [
+      { id: 'a', agent: 'x', prompt: 'p', next: ['c'] },
+      { id: 'b', agent: 'x', prompt: 'p' },     // no next → terminal in graph mode
+      { id: 'c', agent: 'x', prompt: 'p' },
+    ]});
+    const e = deriveEdges(g.nodes);
+    expect(e).toContainEqual(expect.objectContaining({ source: 'a', target: 'c' }));
+    // a→b is NOT an edge just because b follows a in the list
+    expect(e.some((x) => x.source === 'a' && x.target === 'b')).toBe(false);
+  });
+
+  it('a legacy workflow (no explicit edges) still shows the linear chain', () => {
+    const g = yamlToGraph({ name: 'w', steps: [
+      { id: 'a', agent: 'x', prompt: 'p' }, { id: 'b', agent: 'x', prompt: 'p' },
+    ]});
+    expect(deriveEdges(g.nodes)).toContainEqual(expect.objectContaining({ source: 'a', target: 'b' }));
+  });
+
+  it('a data reference infers an edge', () => {
+    const g = yamlToGraph({ name: 'w', steps: [
+      { id: 'a', agent: 'x', prompt: 'p', next: ['z'] },
+      { id: 'b', agent: 'x', prompt: 'use {{ steps.a.output }}' },
+      { id: 'z', agent: 'x', prompt: 'p' },
+    ]});
+    expect(deriveEdges(g.nodes)).toContainEqual(expect.objectContaining({ source: 'a', target: 'b' }));
+  });
+
+  it('round-trips next/split/join', () => {
+    const input = { name: 'w', steps: [
+      { id: 's', split: ['a', 'b'] },
+      { id: 'a', agent: 'x', prompt: 'p', next: ['j'] },
+      { id: 'b', agent: 'x', prompt: 'p', next: ['j'] },
+      { id: 'j', join: { wait: 'all' } },
+    ]};
+    const out = graphToWorkflowObject(yamlToGraph(input)) as { obj: any };
+    expect(out.obj.steps.find((s: any) => s.id === 's').split).toEqual(['a', 'b']);
+    expect(out.obj.steps.find((s: any) => s.id === 'j').join).toEqual({ wait: 'all' });
+  });
+
+  it('hasExplicitEdges is false for a legacy workflow and true when any node has next/split/join', () => {
+    const legacy = yamlToGraph({ name: 'w', steps: [{ id: 'a', agent: 'x', prompt: 'p' }, { id: 'b', agent: 'x', prompt: 'p' }] });
+    expect(hasExplicitEdges(legacy.nodes)).toBe(false);
+
+    const withNext = yamlToGraph({ name: 'w', steps: [{ id: 'a', agent: 'x', prompt: 'p', next: ['b'] }, { id: 'b', agent: 'x', prompt: 'p' }] });
+    expect(hasExplicitEdges(withNext.nodes)).toBe(true);
+
+    const withSplit = yamlToGraph({ name: 'w', steps: [{ id: 's', split: ['a'] }, { id: 'a', agent: 'x', prompt: 'p' }] });
+    expect(hasExplicitEdges(withSplit.nodes)).toBe(true);
+
+    const withJoin = yamlToGraph({ name: 'w', steps: [{ id: 'j', join: { wait: 'any' } }] });
+    expect(hasExplicitEdges(withJoin.nodes)).toBe(true);
+  });
+
+  it('materializeLegacyChain writes each node\'s array-order successor into an explicit `next`, leaving derived edges identical', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+        { id: 'c', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(hasExplicitEdges(g.nodes)).toBe(false);
+    const before = deriveEdges(g.nodes);
+
+    const materialized = materializeLegacyChain(g.nodes);
+
+    expect(hasExplicitEdges(materialized)).toBe(true);
+    expect(materialized.find((n) => n.id === 'a')!.data.next).toEqual(['b']);
+    expect(materialized.find((n) => n.id === 'b')!.data.next).toEqual(['c']);
+    expect(materialized.find((n) => n.id === 'c')!.data.next).toEqual([]);
+    // Same edge SET before/after — materialization only makes the existing
+    // chain explicit, it never changes what deriveEdges produces.
+    expect(deriveEdges(materialized)).toEqual(before);
+  });
+
+  it('materializeLegacyChain leaves a branch node without a `next` (its identity is then/else, not next)', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'br', branch: { condition: 'x' } },
+        { id: 't', agent: 'a', prompt: 'p' },
+      ],
+    });
+    const materialized = materializeLegacyChain(g.nodes);
+    expect(materialized.find((n) => n.id === 'br')!.data.next).toBeUndefined();
+    expect(materialized.find((n) => n.id === 't')!.data.next).toEqual([]);
+  });
+
+  it('materializeLegacyChain is a no-op on an already-graph-mode graph (returns equivalent nodes)', () => {
+    const g = yamlToGraph({
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p', next: ['b'] },
+        { id: 'b', agent: 'x', prompt: 'p' },
+      ],
+    });
+    expect(hasExplicitEdges(g.nodes)).toBe(true);
+    const materialized = materializeLegacyChain(g.nodes);
+    expect(materialized).toBe(g.nodes); // same reference — an explicit early return, not a defensive copy
+    expect(materialized).toEqual(g.nodes);
+  });
+
+  it('a legacy workflow LOADED and serialized without any edit still emits no `next` — materialization only happens on an edit, never on load (round-trip guard for the legacy->graph migration fix)', () => {
+    const input = {
+      name: 'w',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'b', agent: 'x', prompt: 'p' },
+        { id: 'c', agent: 'x', prompt: 'p' },
+      ],
+    };
+    expectRoundTrip(input);
+    const out = graphToWorkflowObject(yamlToGraph(input)) as { obj: any };
+    for (const s of out.obj.steps) expect('next' in s).toBe(false);
+  });
+
+  it('a split node fans out to its split targets as edges', () => {
+    const g = yamlToGraph({ name: 'w', steps: [
+      { id: 's', split: ['a', 'b'] },
+      { id: 'a', agent: 'x', prompt: 'p', next: ['j'] },
+      { id: 'b', agent: 'x', prompt: 'p', next: ['j'] },
+      { id: 'j', join: { wait: 'all' } },
+    ]});
+    const e = deriveEdges(g.nodes);
+    expect(e).toContainEqual(expect.objectContaining({ source: 's', target: 'a' }));
+    expect(e).toContainEqual(expect.objectContaining({ source: 's', target: 'b' }));
+    expect(e).toContainEqual(expect.objectContaining({ source: 'a', target: 'j' }));
+    expect(e).toContainEqual(expect.objectContaining({ source: 'b', target: 'j' }));
+  });
+
+  it('parses next/split/join into StepNodeData and classifies kind', () => {
+    const g = yamlToGraph({ name: 'w', steps: [
+      { id: 's', split: ['a', 'b'] },
+      { id: 'a', agent: 'x', prompt: 'p', next: ['j'] },
+      { id: 'j', join: { wait: { count: 2 } } },
+    ]});
+    const s = g.nodes.find((n) => n.id === 's') as GraphNode;
+    const a = g.nodes.find((n) => n.id === 'a') as GraphNode;
+    const j = g.nodes.find((n) => n.id === 'j') as GraphNode;
+    expect(s.data.kind).toBe('split');
+    expect(s.data.split).toEqual(['a', 'b']);
+    expect(a.data.next).toEqual(['j']);
+    expect(j.data.kind).toBe('join');
+    expect(j.data.joinWait).toEqual({ count: 2 });
+  });
+
+  it('a legacy workflow with next/split/join omitted round-trips without those keys', () => {
+    const input = { name: 'w', steps: [{ id: 'a', agent: 'x', prompt: 'p' }, { id: 'b', agent: 'x', prompt: 'p' }] };
+    expectRoundTrip(input);
+    const out = graphToWorkflowObject(yamlToGraph(input)) as { obj: any };
+    for (const s of out.obj.steps) {
+      expect('next' in s).toBe(false);
+      expect('split' in s).toBe(false);
+      expect('join' in s).toBe(false);
+    }
   });
 });

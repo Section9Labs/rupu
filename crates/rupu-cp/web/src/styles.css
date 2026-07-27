@@ -689,6 +689,19 @@
 }
 .wfx-palette-rail-grid .wfx-pl { font-size: 10px; }
 
+/* Work / Orchestration grouping (Task 6) — a light section over the same
+ * chip grid, not a restructure: each non-empty KIND_FAMILY gets its own
+ * small subheading, same spacing rhythm as `.wfx-palette-rail-label` above. */
+.wfx-palette-family + .wfx-palette-family { margin-top: 10px; }
+.wfx-palette-family-label {
+  padding: 0 2px 5px;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: rgb(var(--c-ink-mute));
+}
+
 /* Tighter connector chips in the rail specifically (the float dock's chips
  * stay at their original, roomier size). */
 .wfx-palette-rail .wfx-palette-group { gap: 4px; }

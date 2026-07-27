@@ -2,9 +2,10 @@
 //
 // Each node KIND paints a flowchart symbol (see kindVisuals.KIND_SHAPE):
 // step→rect, branch→vhex, action→parallelogram, approval_gate→trapezoid,
-// for_each→hexagon, parallel→subroutine, panel→stacked. This module owns the
-// geometry only — no React, no DOM, no colour. The component paints `path`
-// (plus `extra`) into an SVG layer and positions its content inside `safe`.
+// for_each→hexagon, parallel→subroutine, panel→stacked, split→fanout,
+// join→fanin. This module owns the geometry only — no React, no DOM, no
+// colour. The component paints `path` (plus `extra`) into an SVG layer and
+// positions its content inside `safe`.
 //
 // Two rules encoded here, both from the approved design:
 //  1. `safe` is inscribed at the shape's NARROWEST row, so text can never
@@ -36,6 +37,12 @@ const Q = 22;
 const RAIL = 11;
 /** Offset of a stacked shape's layers behind its body. */
 const LAYER = 9;
+/** How far a fanout/fanin's single point's OPPOSITE corners are pulled in
+ *  from the box edge — the fan-shape counterpart of `POINT`/`TAPER`, but
+ *  cutting from only ONE side of the box (the pointed side) rather than
+ *  both, since the other side stays a flat, full-height edge (see the
+ *  `fanout`/`fanin` cases below). */
+const FAN = 30;
 
 export type ShapeName =
   | 'rect'
@@ -44,7 +51,9 @@ export type ShapeName =
   | 'trapezoid'
   | 'hexagon'
   | 'subroutine'
-  | 'stacked';
+  | 'stacked'
+  | 'fanout'
+  | 'fanin';
 
 /** Where content may live, in box coordinates. */
 export interface SafeRect {
@@ -338,6 +347,55 @@ export function shapeFor(shape: ShapeName, w: number, h: number): NodeShape {
         // stack layers peeking out), so the default right:0 handle lands on
         // the decorative layer stroke, not the body — inset by `layer + I`.
         sources: [{ anchor: { side: 'right', offset: '50%', inset: layer + I } }],
+      };
+    }
+
+    case 'fanout': {
+      // split ("one in, many out"): a flat vertical left edge (the single
+      // inbound side, un-tapered — same box-edge flush left edge as `rect`)
+      // fanning to a single point on the right. Placeholder geometry (Task 6
+      // brief) standing in for a real fan-out symbol; a later pass may
+      // refine the exact silhouette.
+      const fan = clampInset(FAN, w, EDGE_CLAMP_FRACTION);
+      const points: [number, number][] = [
+        [I, I],
+        [w - fan, I],
+        [w - I, h / 2],
+        [w - fan, h - I],
+        [I, h - I],
+      ];
+      // The right boundary is narrowest (x = w-fan) at y=I/y=h-I and widens
+      // toward the point (x = w-I) at y=h/2 — so a safe rect spanning the
+      // FULL height (like `rect`'s) stays inside at every row as long as its
+      // right edge clears `w-fan` (the global minimum of that boundary),
+      // with the left edge flush like `rect`'s (no left-side taper here).
+      return {
+        ...base,
+        points,
+        path: toPath(points),
+        extra: [],
+        safe: { x: 15, y: 11, w: w - fan - 22, h: h - 22 },
+      };
+    }
+
+    case 'fanin': {
+      // join ("many in, one out"): the mirror of `fanout` — a single point on
+      // the left fanning in from a flat vertical right edge (the single
+      // outbound side). Same placeholder status as `fanout` above.
+      const fan = clampInset(FAN, w, EDGE_CLAMP_FRACTION);
+      const points: [number, number][] = [
+        [w - I, I],
+        [fan, I],
+        [I, h / 2],
+        [fan, h - I],
+        [w - I, h - I],
+      ];
+      return {
+        ...base,
+        points,
+        path: toPath(points),
+        extra: [],
+        safe: { x: fan + 7, y: 11, w: w - fan - 22, h: h - 22 },
       };
     }
 
