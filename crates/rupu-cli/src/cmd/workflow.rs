@@ -2632,6 +2632,10 @@ pub(crate) async fn resume_run(
         }
     };
 
+    // Hoisted above the dispatcher build: sub-agent dispatch resolves its
+    // provider/model through the same config-derived defaults the step
+    // factory below uses (ISSUES.md I-8).
+    let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
     let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
         global.clone(),
         project_root.clone(),
@@ -2642,10 +2646,12 @@ pub(crate) async fn resume_run(
         Arc::clone(&mcp_registry),
         Arc::clone(&store),
         event_sink_for_resume.clone(),
+        cfg.default_provider.clone(),
+        cfg.default_model.clone(),
+        openai_compatible.clone(),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let action_dispatcher = crate::resume::action_dispatcher_for(&mcp_registry, &mode_str);
-    let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
     let factory = Arc::new(DefaultStepFactory {
         workflow: workflow.clone(),
         global: global.clone(),
@@ -4009,6 +4015,10 @@ async fn execute_workflow_invocation(
         }
     };
 
+    // Hoisted above the dispatcher build: sub-agent dispatch resolves its
+    // provider/model through the same config-derived defaults the step
+    // factory below uses (ISSUES.md I-8).
+    let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
     let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
         global.clone(),
         ctx.project_root.clone(),
@@ -4019,6 +4029,9 @@ async fn execute_workflow_invocation(
         Arc::clone(&mcp_registry),
         Arc::clone(&run_store),
         event_sink_for_run.clone(),
+        cfg.default_provider.clone(),
+        cfg.default_model.clone(),
+        openai_compatible.clone(),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     // Shared across this run's initial `opts` AND the inline
@@ -4028,7 +4041,6 @@ async fn execute_workflow_invocation(
     // pause/resume boundary too.
     let action_dispatcher = crate::resume::action_dispatcher_for(&mcp_registry, &ctx.mode);
 
-    let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
     let factory = Arc::new(DefaultStepFactory {
         workflow: workflow.clone(),
         global: global.clone(),

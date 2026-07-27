@@ -26,7 +26,6 @@ against the code before being recorded.
 
 | ID | Sev | Area | Title | Status |
 |---|---|---|---|---|
-| I-8 | P0 | rupu-cli | `dispatch_agent` hardcodes provider/model — the 4th I-1/I-2 site, never fixed | open |
 | I-9 | P1 | rupu-providers | `[providers.*].timeout_ms` has no consumer | open |
 | I-10 | P1 | rupu-providers | `[providers.*].max_retries` has no consumer; real retry budget is a hardcoded 1 | open |
 | I-11 | P1 | rupu-providers | `[providers.*].max_concurrency` never throttles LLM calls (semaphore is SCM-only) | open |
@@ -120,29 +119,6 @@ against the code before being recorded.
 ---
 
 ## Open
-
-### I-8 — `dispatch_agent` hardcodes provider and model (the unfixed 4th I-1/I-2 site)
-
-**Symptom.** A sub-agent dispatched via `dispatch_agent` /
-`dispatch_agents_parallel` ignores `default_provider` and `default_model`, and
-cannot use a config-declared openai-compatible provider.
-
-**Root cause.** `crates/rupu-cli/src/cmd/dispatch.rs:157-162` still does
-`spec.provider.clone().unwrap_or_else(|| "anthropic".into())` and
-`unwrap_or_else(|| "claude-sonnet-4-6".into())`, calling
-`provider_factory::build_for_provider` without a `Config`. The struct has no
-`Config` field at all.
-
-**Impact.** I-1 and I-2 are recorded as fixed "at all three call sites"
-(`run.rs`, `session.rs`, `step_factory.rs`). There is a fourth. The same
-silent-noop the original fix set out to eliminate is still live on the
-sub-agent path, and this file's own "Fixed" section overstates the coverage.
-
-**Fix.** Thread `Config` into the dispatch tool and route through
-`provider_factory::resolve_provider_name()` / `resolve_model()` like the other
-three sites.
-
----
 
 ### I-9 … I-14, I-17, I-19, I-20 — dead configuration
 
@@ -345,6 +321,77 @@ whether global `default_model` is meant to be provider-agnostic.
 
 ## Fixed
 
+### I-8 — `dispatch_agent` hardcoded provider and model (the unfixed 4th I-1/I-2 site)
+
+**Symptom.** A sub-agent dispatched via `dispatch_agent` /
+`dispatch_agents_parallel` ignored `default_provider` and `default_model`, and
+could not use a config-declared openai-compatible provider.
+
+**Root cause.** `crates/rupu-cli/src/cmd/dispatch.rs:186-190` did
+`spec.provider.clone().unwrap_or_else(|| "anthropic".into())` and
+`unwrap_or_else(|| "claude-sonnet-4-6".into())`, calling
+`provider_factory::build_for_provider` without any config. `CliAgentDispatcher`
+(`:26-30`) had no config-derived field at all.
+
+**Impact.** I-1 and I-2 were recorded as fixed "at all three call sites"
+(`run.rs`, `session.rs`, `step_factory.rs`). There was a fourth. The same
+silent-noop the original fix set out to eliminate was still live on the
+sub-agent path, and this file's own "Fixed" section overstated the coverage
+(both entries are corrected below).
+
+**Fix.** PR (branch `arc1/config-integrity`).
+
+1. `CliAgentDispatcher` gained the three config-derived fields
+   `DefaultStepFactory` already carries — `default_provider: Option<String>`,
+   `default_model: Option<String>`, and the `openai_compatible:
+   HashMap<String, OpenAiCompatibleParams>` map. Nothing re-reads
+   `config.toml` inside `dispatch()`: the values are threaded in from the
+   caller, which has already loaded config through `layer_files_locked`
+   (I-7), so the policy lock applies to sub-agent dispatch too.
+2. The hardcoded block was replaced with the exact sequence `cmd/run.rs` and
+   `step_factory.rs` use: `provider_factory::resolve_provider_name` →
+   `openai_compatible` lookup → `provider_factory::resolve_model` →
+   `build_for_provider_with_config` with a `ProviderConfig` carrying
+   `spec.anthropic_oauth_prefix` + the resolved openai-compatible params.
+   A build failure still surfaces as `DispatchError::ProviderBuild` — the
+   unknown-provider case stays loud rather than falling back to Anthropic.
+3. All **four** construction sites were updated to pass
+   `cfg.default_provider` / `cfg.default_model` /
+   `provider_factory::openai_compatible_map(&cfg.providers)`:
+   `crates/rupu-cli/src/cmd/run.rs:686` (bare `rupu run`),
+   `crates/rupu-cli/src/cmd/workflow.rs:4022` (`rupu workflow run`),
+   `crates/rupu-cli/src/cmd/workflow.rs:2639` and
+   `crates/rupu-cli/src/resume.rs:218` (both resume paths). Each of the
+   latter three already computed the same `openai_compatible` map for its
+   `DefaultStepFactory`; the map was hoisted above the dispatcher build and
+   shared, so a dispatched sub-agent and a workflow step now resolve from
+   byte-identical inputs.
+
+**Validation.** `cargo test -p rupu-cli --lib cmd::dispatch` — 8 tests (4
+pre-existing, 3 new). The seam is real persisted output, not a mock internal:
+`run_agent` writes the resolved pair into the child's own transcript as
+`Event::RunStart { provider, model }` (`crates/rupu-agent/src/runner.rs:739`),
+so the new tests dispatch a child for real under `RUPU_MOCK_PROVIDER_SCRIPT`
+and read that event back off disk.
+
+- `dispatch_honors_config_default_provider_and_model` — the binding assertion.
+  A child agent whose frontmatter pins **neither** `provider:` nor `model:`,
+  dispatched with `default_provider = "cfg-provider"` / `default_model =
+  "cfg-model"`, must record `cfg-provider` / `cfg-model`. On the pre-fix code
+  it fails with `left: "claude-sonnet-4-6", right: "cfg-model"` — the exact
+  hardcoded fallback.
+- `dispatch_agent_frontmatter_overrides_config_defaults` — the control:
+  a pinned `provider:`/`model:` still wins over the config defaults.
+- `dispatch_resolves_openai_compatible_provider_default_model` — a child on a
+  config-declared `oracle` provider with no `model:` resolves that provider's
+  `default_model`, proving the openai-compatible map is actually consulted
+  (this is the capability the sub-agent path could not reach at all before).
+
+`cargo build --workspace` is clean after the constructor-signature change, and
+`grep -rn "CliAgentDispatcher::new(" --include="*.rs" crates` returns exactly the
+four production sites plus the six in-file test constructions — there is no
+fifth production site left un-threaded.
+
 ### I-7 — `[policy].lock` is not enforced anywhere outside the web UI
 
 **Symptom.** An administrator locks `permission_mode` globally. The CP Settings
@@ -527,6 +574,13 @@ endpoint. A textbook silent-noop.
 single resolution point (`spec.provider → cfg.default_provider → "anthropic"`)
 and routed all three call sites through it.
 
+**Correction (I-8).** "All three call sites" was wrong: there was a **fourth**,
+`crates/rupu-cli/src/cmd/dispatch.rs` (sub-agent dispatch via `dispatch_agent` /
+`dispatch_agents_parallel`), which kept the hardcoded
+`unwrap_or_else(|| "anthropic".into())` and never received a config. It was
+closed separately as **I-8** (see above); provider resolution is only genuinely
+single-pointed as of that fix.
+
 ### I-2 — `default_model` was ignored on the workflow path
 
 **Symptom.** The same agent resolved to a different model under `rupu run` than
@@ -547,3 +601,12 @@ misleading.
 **Fix.** PR — extracted `provider_factory::resolve_model()` as the single
 resolution point and threaded `default_provider` / `default_model` into
 `DefaultStepFactory` so the workflow path resolves identically to `rupu run`.
+
+**Correction (I-8).** As with I-1, the recorded three call sites were not all of
+them. `crates/rupu-cli/src/cmd/dispatch.rs` was a **fourth**, still going
+straight from `spec.model` to a hardcoded `"claude-sonnet-4-6"` with no
+`cfg.default_model` and no openai-compatible fallback, so the "same agent, same
+model regardless of invocation" guarantee did not hold for a dispatched
+sub-agent. Closed as **I-8** (see above), which threads the same three
+config-derived values into `CliAgentDispatcher` that `DefaultStepFactory`
+carries.

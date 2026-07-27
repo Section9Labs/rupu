@@ -693,6 +693,9 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         Arc::clone(&scm_registry),
         Arc::clone(&run_store),
         None,
+        cfg.default_provider.clone(),
+        cfg.default_model.clone(),
+        provider_factory::openai_compatible_map(&cfg.providers),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
 

@@ -43,6 +43,20 @@ pub struct CliAgentDispatcher {
     /// contexts with no run-level events.jsonl (e.g. some test harnesses)
     /// — emission is then a no-op and behavior is unchanged.
     event_sink: Option<Arc<dyn EventSink>>,
+    /// `default_provider` from `config.toml`. Used when the dispatched
+    /// agent pins no `provider:`. `None` falls back to
+    /// `provider_factory::FALLBACK_PROVIDER`.
+    default_provider: Option<String>,
+    /// `default_model` from `config.toml`. Used when the dispatched agent
+    /// pins no `model:` — without it a sub-agent resolved a different model
+    /// than the very same agent would as a top-level `rupu run` or a
+    /// workflow step (ISSUES.md I-8, the fourth I-1/I-2 site).
+    default_model: Option<String>,
+    /// OpenAI-compatible provider params resolved from `config.toml`, keyed
+    /// by provider name. Lets a dispatched sub-agent reach a config-declared
+    /// `[providers.<name>] kind = "openai-compatible"` endpoint the same way
+    /// `rupu run` and workflow steps do. Empty when none are declared.
+    openai_compatible: std::collections::HashMap<String, provider_factory::OpenAiCompatibleParams>,
 }
 
 impl std::fmt::Debug for CliAgentDispatcher {
@@ -69,6 +83,12 @@ impl CliAgentDispatcher {
         mcp_registry: Arc<rupu_scm::Registry>,
         run_store: Arc<RunStore>,
         event_sink: Option<Arc<dyn EventSink>>,
+        default_provider: Option<String>,
+        default_model: Option<String>,
+        openai_compatible: std::collections::HashMap<
+            String,
+            provider_factory::OpenAiCompatibleParams,
+        >,
     ) -> Arc<Self> {
         let arc = Arc::new(Self {
             global,
@@ -81,6 +101,9 @@ impl CliAgentDispatcher {
             run_store,
             self_dyn: OnceLock::new(),
             event_sink,
+            default_provider,
+            default_model,
+            openai_compatible,
         });
         let dyn_arc: Arc<dyn AgentDispatcher> = arc.clone();
         let _ = arc.self_dyn.set(dyn_arc);
@@ -183,16 +206,36 @@ impl AgentDispatcher for CliAgentDispatcher {
             );
         }
 
-        let provider_name = spec.provider.clone().unwrap_or_else(|| "anthropic".into());
-        let model = spec
-            .model
-            .clone()
-            .unwrap_or_else(|| "claude-sonnet-4-6".into());
-        let provider = match provider_factory::build_for_provider(
+        // Provider/model resolution goes through the SHARED resolvers, the
+        // same sequence `rupu run` (`cmd/run.rs`), `rupu session` and
+        // `DefaultStepFactory` use. This used to hardcode
+        // `anthropic`/`claude-sonnet-4-6`, so a dispatched sub-agent that
+        // pinned neither ignored `default_provider`/`default_model` and could
+        // never reach a config-declared openai-compatible provider — the same
+        // agent resolved differently depending on how it was launched
+        // (ISSUES.md I-8, the fourth I-1/I-2 call site).
+        let provider_name = provider_factory::resolve_provider_name(
+            spec.provider.as_deref(),
+            self.default_provider.as_deref(),
+        );
+        let oai_params = self.openai_compatible.get(&provider_name).cloned();
+        // Prefer the agent's pinned model; for an openai-compatible provider
+        // fall back to its configured default_model.
+        let model = provider_factory::resolve_model(
+            spec.model.as_deref(),
+            self.default_model.as_deref(),
+            oai_params.as_ref().map(|p| p.default_model.as_str()),
+        );
+        let provider_config = provider_factory::ProviderConfig {
+            anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
+            openai_compatible: oai_params,
+        };
+        let provider = match provider_factory::build_for_provider_with_config(
             &provider_name,
             &model,
             spec.auth,
             self.resolver.as_ref(),
+            &provider_config,
         )
         .await
         {
@@ -498,6 +541,9 @@ mod tests {
             mcp_registry,
             run_store,
             Some(sink.clone() as Arc<dyn EventSink>),
+            None,
+            None,
+            std::collections::HashMap::new(),
         );
 
         std::env::set_var(
@@ -590,6 +636,9 @@ mod tests {
             mcp_registry,
             run_store,
             None,
+            None,
+            None,
+            std::collections::HashMap::new(),
         );
 
         std::env::set_var(
@@ -605,6 +654,240 @@ mod tests {
             result.is_ok(),
             "dispatch with no event sink should behave exactly as before"
         );
+    }
+
+    /// Regression for ISSUES.md I-8: `dispatch()` was the FOURTH I-1/I-2
+    /// call site and hardcoded `anthropic` / `claude-sonnet-4-6`, ignoring
+    /// `default_provider` / `default_model` from `config.toml` entirely (the
+    /// I-1/I-2 fix only covered `cmd/run.rs`, `cmd/session.rs` and
+    /// `step_factory.rs`). The child agent here declares NEITHER `provider:`
+    /// nor `model:`, so the config-derived defaults threaded into the
+    /// dispatcher must supply both.
+    ///
+    /// Observation seam: `run_agent` writes the resolved pair verbatim into
+    /// the child's own transcript as `Event::RunStart { provider, model }`
+    /// (`rupu-agent/src/runner.rs:739`), so the assertion reads real
+    /// persisted output rather than any mock internals.
+    #[tokio::test]
+    async fn dispatch_honors_config_default_provider_and_model() {
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join("global");
+        std::fs::create_dir_all(global.join("agents")).unwrap();
+        // NOTE: no `provider:` and no `model:` in the frontmatter.
+        std::fs::write(
+            global.join("agents/child.md"),
+            "---\nname: child\nmaxTurns: 3\n---\nyou are a child agent.",
+        )
+        .unwrap();
+
+        let runs_dir = dir.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let run_store = Arc::new(RunStore::new(runs_dir));
+
+        let workspace_path = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+
+        let resolver = Arc::new(rupu_auth::KeychainResolver::new());
+        let mcp_registry = Arc::new(rupu_scm::Registry::default());
+
+        let dispatcher = CliAgentDispatcher::new(
+            global,
+            None,
+            "ws_test".into(),
+            workspace_path,
+            resolver,
+            "bypass".into(),
+            mcp_registry,
+            run_store,
+            None,
+            Some("cfg-provider".to_string()),
+            Some("cfg-model".to_string()),
+            std::collections::HashMap::new(),
+        );
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
+        );
+        let result = dispatcher
+            .dispatch("child", "do the thing".into(), "parent_run_1", 0)
+            .await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+
+        let outcome = result.expect("dispatch should succeed against the mock provider");
+
+        let events: Vec<Event> = JsonlReader::iter(&outcome.transcript_path)
+            .expect("child transcript readable")
+            .filter_map(Result::ok)
+            .collect();
+
+        let (provider, model) = events
+            .iter()
+            .find_map(|e| match e {
+                Event::RunStart {
+                    provider, model, ..
+                } => Some((provider.clone(), model.clone())),
+                _ => None,
+            })
+            .expect("child transcript must carry a RunStart");
+
+        assert_eq!(
+            model, "cfg-model",
+            "dispatch must resolve the model through config's default_model, not the hardcoded fallback"
+        );
+        assert_eq!(
+            provider, "cfg-provider",
+            "dispatch must resolve the provider through config's default_provider, not the hardcoded fallback"
+        );
+    }
+
+    /// Agent frontmatter still wins over the config defaults — the
+    /// precedence `resolve_provider_name`/`resolve_model` encode.
+    #[tokio::test]
+    async fn dispatch_agent_frontmatter_overrides_config_defaults() {
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join("global");
+        std::fs::create_dir_all(global.join("agents")).unwrap();
+        std::fs::write(
+            global.join("agents/child.md"),
+            "---\nname: child\nprovider: pinned-provider\nmodel: pinned-model\nmaxTurns: 3\n---\nyou are a child agent.",
+        )
+        .unwrap();
+
+        let runs_dir = dir.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let run_store = Arc::new(RunStore::new(runs_dir));
+
+        let workspace_path = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+
+        let resolver = Arc::new(rupu_auth::KeychainResolver::new());
+        let mcp_registry = Arc::new(rupu_scm::Registry::default());
+
+        let dispatcher = CliAgentDispatcher::new(
+            global,
+            None,
+            "ws_test".into(),
+            workspace_path,
+            resolver,
+            "bypass".into(),
+            mcp_registry,
+            run_store,
+            None,
+            Some("cfg-provider".to_string()),
+            Some("cfg-model".to_string()),
+            std::collections::HashMap::new(),
+        );
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
+        );
+        let result = dispatcher
+            .dispatch("child", "do the thing".into(), "parent_run_1", 0)
+            .await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+
+        let outcome = result.expect("dispatch should succeed against the mock provider");
+
+        let events: Vec<Event> = JsonlReader::iter(&outcome.transcript_path)
+            .expect("child transcript readable")
+            .filter_map(Result::ok)
+            .collect();
+
+        let (provider, model) = events
+            .iter()
+            .find_map(|e| match e {
+                Event::RunStart {
+                    provider, model, ..
+                } => Some((provider.clone(), model.clone())),
+                _ => None,
+            })
+            .expect("child transcript must carry a RunStart");
+
+        assert_eq!(model, "pinned-model");
+        assert_eq!(provider, "pinned-provider");
+    }
+
+    /// A config-declared `kind = "openai-compatible"` provider must be
+    /// reachable from a dispatched sub-agent: the params come from the
+    /// threaded-in map, and its `default_model` is the last fallback before
+    /// `FALLBACK_MODEL` when neither the agent nor `default_model` pins one.
+    #[tokio::test]
+    async fn dispatch_resolves_openai_compatible_provider_default_model() {
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join("global");
+        std::fs::create_dir_all(global.join("agents")).unwrap();
+        std::fs::write(
+            global.join("agents/child.md"),
+            "---\nname: child\nprovider: oracle\nmaxTurns: 3\n---\nyou are a child agent.",
+        )
+        .unwrap();
+
+        let runs_dir = dir.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let run_store = Arc::new(RunStore::new(runs_dir));
+
+        let workspace_path = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+
+        let resolver = Arc::new(rupu_auth::KeychainResolver::new());
+        let mcp_registry = Arc::new(rupu_scm::Registry::default());
+
+        let mut oai = std::collections::HashMap::new();
+        oai.insert(
+            "oracle".to_string(),
+            provider_factory::OpenAiCompatibleParams {
+                base_url: "https://example.invalid/v1".to_string(),
+                default_model: "oracle-default".to_string(),
+                stream: false,
+                models: Vec::new(),
+            },
+        );
+
+        let dispatcher = CliAgentDispatcher::new(
+            global,
+            None,
+            "ws_test".into(),
+            workspace_path,
+            resolver,
+            "bypass".into(),
+            mcp_registry,
+            run_store,
+            None,
+            None,
+            None,
+            oai,
+        );
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
+        );
+        let result = dispatcher
+            .dispatch("child", "do the thing".into(), "parent_run_1", 0)
+            .await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+
+        let outcome = result.expect("dispatch should succeed against the mock provider");
+
+        let events: Vec<Event> = JsonlReader::iter(&outcome.transcript_path)
+            .expect("child transcript readable")
+            .filter_map(Result::ok)
+            .collect();
+
+        let (provider, model) = events
+            .iter()
+            .find_map(|e| match e {
+                Event::RunStart {
+                    provider, model, ..
+                } => Some((provider.clone(), model.clone())),
+                _ => None,
+            })
+            .expect("child transcript must carry a RunStart");
+
+        assert_eq!(provider, "oracle");
+        assert_eq!(model, "oracle-default");
     }
 
     /// IMPORTANT 4 fallback: `dispatch()` cannot thread the parent step's
@@ -643,6 +926,9 @@ mod tests {
             mcp_registry,
             run_store,
             None,
+            None,
+            None,
+            std::collections::HashMap::new(),
         );
 
         std::env::set_var(

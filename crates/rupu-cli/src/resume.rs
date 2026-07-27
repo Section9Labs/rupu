@@ -211,6 +211,10 @@ async fn rebuild_opts_from_disk(
         }
     };
 
+    // Hoisted above the dispatcher build: sub-agent dispatch resolves its
+    // provider/model through the same config-derived defaults the step
+    // factory below uses (ISSUES.md I-8).
+    let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
     let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
         global.clone(),
         project_root.clone(),
@@ -221,10 +225,12 @@ async fn rebuild_opts_from_disk(
         Arc::clone(&mcp_registry),
         Arc::clone(&store_arc),
         event_sink_for_resume.clone(),
+        cfg.default_provider.clone(),
+        cfg.default_model.clone(),
+        openai_compatible.clone(),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let action_dispatcher = action_dispatcher_for(&mcp_registry, &mode_str);
-    let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
     let factory = Arc::new(DefaultStepFactory {
         workflow: workflow.clone(),
         global: global.clone(),
