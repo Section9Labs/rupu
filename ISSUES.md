@@ -373,24 +373,36 @@ the web form and false of the tool.
    global-wins-when-locked precedence and the dotted-key encoding are the
    single implementation in `resolve.rs`, not a second copy.
 2. Every **policy-bearing** `layer_files` call site in `rupu-cli` moved to
-   `layer_files_locked` — 29 of the 42 non-test sites: `resume.rs`, `cmd/run.rs`
+   `layer_files_locked` — 30 of the 42 non-test sites: `resume.rs`, `cmd/run.rs`
    (×3), `cmd/session.rs` (×5), `cmd/workflow.rs` (×4), `cmd/cp.rs` (×2),
    `cmd/cron.rs` (×2), `cmd/issues.rs` (×2), `cmd/auth.rs` (×2),
    `cmd/repos.rs`, `cmd/mcp.rs`, `cmd/update.rs`, `cmd/webhook.rs`,
-   `cmd/agent.rs`, `cmd/usage.rs`, `cmd/autoflow.rs`, `cmd/transcript.rs`.
+   `cmd/agent.rs`, `cmd/usage.rs`, `cmd/autoflow.rs`, `cmd/transcript.rs`,
+   `cmd/editor.rs`.
    The rule applied: **migrate** whenever the loaded `Config` escapes the
    function or feeds a non-`[ui]` key (permission mode, provider/model,
    `[scm]`/`[issues]`, `[triggers]`, `[cp]`, `[storage]` retention,
    `[pricing]`, `[update]`); **leave** only where the `Config` is local to the
    function and nothing but `cfg.ui` is read.
 
-   The 13 deliberate leaves are UI-preference-only loads (theme / color /
-   pager / live-view / `[ui].editor`) and each now carries the marker comment
+   The 12 deliberate leaves are UI-preference-only loads (theme / color /
+   pager / live-view) and each now carries the marker comment
    `// UI prefs only — lock does not apply (I-7)`: `cmd/ui.rs`,
-   `cmd/session.rs:show`, `cmd/cron.rs:ui_prefs`, `cmd/editor.rs`,
+   `cmd/session.rs:show`, `cmd/cron.rs:ui_prefs`,
    `cmd/workflow.rs:show`, `cmd/transcript.rs` (×2), `cmd/autoflow.rs`,
    `cmd/auth.rs:auth_ui_prefs`, `output/diag.rs`, `cmd/watch.rs`,
    `output/workflow_printer.rs`, `cmd/repos.rs:tracked`.
+
+   **Follow-up (2026-07-27).** `cmd/editor.rs` was originally left on
+   `layer_files` under the same "UI prefs only" annotation, on the mistaken
+   premise that `[ui].editor` is a display preference. It is not:
+   `resolve_editor` (`editor.rs:49-73`) returns it as the **program name**
+   `open_for_edit` spawns as a subprocess for `rupu agent edit` / `rupu
+   workflow create`, so an unlocked project config could choose which binary
+   executes on a locked installation — exactly the governance hole this issue
+   closes. Moved to `layer_files_locked`; regression test
+   `layer_files_locked_keeps_a_locked_global_ui_editor` added to
+   `crates/rupu-cli/tests/policy_lock.rs` (now 4 tests).
 
 **Validation.** `cargo test -p rupu-cli --test policy_lock` — 3 tests. The two
 that prove the migration drive a **real CLI command** rather than the config
@@ -406,9 +418,23 @@ still applies and the write goes through.
 `layer_files_locked_keeps_the_locked_global_value` pins the library contract.
 
 Completeness is enforced by grep: `grep -rn "layer_files(" --include="*.rs"
-crates/rupu-cli | grep -v test` returns only the 13 UI-preference sites, every
+crates/rupu-cli | grep -v test` returns only the 12 UI-preference sites, every
 one of them carrying the `// UI prefs only — lock does not apply (I-7)`
 comment.
+
+**Notes — known behavior deltas from routing a site through `layer_files_locked`
+(i.e. through `resolve()`) instead of `layer_files`:** (a) a project-declared
+`[policy].lock` no longer lands in the resolved config — the lock list is
+pinned to the global one (this is the existing CP behavior); (b) a
+scalar-vs-table structural conflict between layers now surfaces as
+`LayerError::Invalid` instead of a serde `Layered` error — both were errors
+before and after; (c) `resolve()`'s `flatten` treats a `Value::Table` with no
+leaf keys as contributing nothing, so a config section declared but left empty
+(e.g. `[providers.foo]` with no keys under it) — which survived plain
+`layer_files` layering as a defaulted map entry — disappears from the config
+produced by a migrated site; this is believed harmless in practice (an empty
+section carries no settings to act on) but is an undisclosed behavior change
+and is recorded here for completeness.
 
 ### I-6 — `rupu config set` corrupts `config.toml`, then silently wipes it
 

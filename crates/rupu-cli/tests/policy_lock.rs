@@ -134,3 +134,38 @@ fn layer_files_locked_keeps_the_locked_global_value() {
     let cfg = rupu_config::layer_files_locked(Some(&global), Some(&project)).unwrap();
     assert_eq!(cfg.permission_mode.as_deref(), Some("readonly"));
 }
+
+/// Regression for the I-7 follow-up: `crates/rupu-cli/src/cmd/editor.rs` was
+/// wrongly annotated `// UI prefs only — lock does not apply (I-7)` even
+/// though `[ui].editor` is the program name `open_for_edit` spawns as a
+/// subprocess on `rupu agent edit` / `rupu workflow create` — exactly the
+/// kind of governance-relevant value the lock exists to protect. `editor.rs`'s
+/// `resolve_editor` is not reachable from an integration test (it is a
+/// private fn resolving env vars + cwd as a side effect), so this pins the
+/// same fixture shape through `layer_files_locked` directly: a global
+/// `ui.editor` locked via `[policy] lock = ["ui.editor"]` must survive a
+/// conflicting project `ui.editor`. The call-site swap itself (`editor.rs`
+/// now calling `layer_files_locked` instead of `layer_files`) is verified by
+/// the I-7 completeness grep, not by this test.
+#[test]
+fn layer_files_locked_keeps_a_locked_global_ui_editor() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let global = dir.path().join("config.toml");
+    let project_dir = dir.path().join("proj/.rupu");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let project = project_dir.join("config.toml");
+    std::fs::write(
+        &global,
+        "[ui]\neditor = \"locked-editor\"\n[policy]\nlock = [\"ui.editor\"]\n",
+    )
+    .unwrap();
+    std::fs::write(&project, "[ui]\neditor = \"project-editor\"\n").unwrap();
+
+    let cfg = rupu_config::layer_files_locked(Some(&global), Some(&project)).unwrap();
+    assert_eq!(
+        cfg.ui.editor.as_deref(),
+        Some("locked-editor"),
+        "a LOCKED global ui.editor must survive a conflicting project override — \
+         ui.editor is the program name spawned as a subprocess, not a display preference"
+    );
+}
