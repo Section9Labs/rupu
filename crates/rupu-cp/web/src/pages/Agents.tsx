@@ -375,14 +375,19 @@ function agentColumns(
  *  soft- or hard-navigates the link-wrapped row — stopPropagation alone does
  *  not block the enclosing `<a>`'s native default navigation.
  *
- *  Delete only renders for `scope === 'global'` rows: `DELETE
- *  /api/agents/:name` resolves ONLY against the global agents dir, so it
- *  cannot safely target a project-scoped row — a project row shadowing a
- *  same-named global definition would silently delete the WRONG (global)
- *  file instead. Run/Session stay available for every row: both resolve the
- *  agent project-aware (global-then-every-registered-project) and are
- *  non-destructive. Deletion for project-scoped defs remains available on
- *  the agent detail page.
+ *  Delete only renders for `scope_kind === 'global'` rows (the structured
+ *  discriminator — NEVER the display `scope` string, which is a project's
+ *  path basename and can legally equal the literal `"global"`; see
+ *  `ScopeKind`'s doc comment): `DELETE /api/agents/:name` resolves ONLY
+ *  against the global agents dir, so it cannot safely target a
+ *  project-scoped row — a project row shadowing a same-named global
+ *  definition would silently delete the WRONG (global) file instead.
+ *  Run/Session stay available for every row: both resolve the agent
+ *  project-aware (global-then-every-registered-project) and are
+ *  non-destructive. Deleting a project-scoped definition is NOT currently
+ *  supported anywhere in the CP (the detail page's Delete is gated the same
+ *  way, for the same reason) — the filesystem or `rupu` CLI is the current
+ *  workaround.
  */
 function agentActionColumn(
   onRun: (name: string) => void,
@@ -418,7 +423,7 @@ function agentActionColumn(
         >
           Session
         </Button>
-        {a.scope === 'global' && (
+        {a.scope_kind === 'global' && (
           <Button
             variant="ring-danger"
             onClick={() => void onDelete(a)}

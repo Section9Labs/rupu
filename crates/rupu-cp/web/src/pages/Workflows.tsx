@@ -419,13 +419,18 @@ function workflowColumns(
       // Its own real buttons (Run/Delete) — keep them independently
       // focusable/announced (I7) rather than swallowed by the row link.
       interactive: true,
-      // Delete only renders for `scope === 'global'` rows: `DELETE
+      // Delete only renders for `scope_kind === 'global'` rows (the
+      // structured discriminator — NEVER the display `scope` string, which is
+      // a project's path basename and can legally equal the literal
+      // `"global"`; see `ScopeKind`'s doc comment): `DELETE
       // /api/workflows/:name` resolves ONLY against the global workflows
       // dir — a project row shadowing a same-named global definition would
       // silently delete the WRONG (global) file instead. Run stays
       // available for every row (project-aware resolution, non-destructive).
-      // Deletion for project-scoped defs remains available on the workflow
-      // detail page.
+      // Deleting a project-scoped definition is NOT currently supported
+      // anywhere in the CP (the detail page's Delete is gated the same way,
+      // for the same reason) — the filesystem or `rupu` CLI is the current
+      // workaround.
       render: (w) => (
         <div
           className="flex items-center justify-end gap-1"
@@ -446,7 +451,7 @@ function workflowColumns(
           >
             Run
           </button>
-          {w.scope === 'global' && (
+          {w.scope_kind === 'global' && (
             <Button
               variant="ring-danger"
               onClick={() => void onDelete(w.name)}

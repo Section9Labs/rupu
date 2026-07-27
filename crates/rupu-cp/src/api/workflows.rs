@@ -1,6 +1,6 @@
 use crate::{
     api::fs_safety,
-    api::repo_scope::distinct_repo_workspaces,
+    api::repo_scope::{distinct_repo_workspaces, ScopeKind},
     error::{ApiError, ApiResult},
     host::connector::HostConnectorError,
     launcher::LaunchError,
@@ -49,17 +49,29 @@ fn repo_store(s: &AppState) -> RepoRegistryStore {
     }
 }
 
-/// Resolve `name` to a workflow YAML path: the global layer first, then
-/// (if absent there) each registered project's `<path>/.rupu/workflows/`, in
-/// `store().list()` order. First match wins; a later task may thread the
-/// resolved scope through to the caller for a disambiguating URL.
-///
-/// `pub(crate)` so `api::autoflows`'s enable/disable endpoint can reuse the
-/// same project-aware resolution rather than re-deriving it.
-pub(crate) fn resolve_workflow_path(s: &AppState, name: &str) -> Option<std::path::PathBuf> {
+/// Scope tag for a registered project: the workspace path's basename,
+/// falling back to the workspace id if the path has no basename (e.g. `/`).
+/// Mirrors `api::agents::project_scope_name`.
+fn project_scope_name(w: &rupu_workspace::Workspace) -> String {
+    std::path::Path::new(&w.path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| w.id.clone())
+}
+
+/// Resolve `name` to a workflow YAML path together with the scope layer it
+/// resolved from: the global layer first (`"global"`, [`ScopeKind::Global`]),
+/// then (if absent there) each registered project's
+/// `<path>/.rupu/workflows/`, in `store().list()` order (the project's path
+/// basename, [`ScopeKind::Project`]). First match wins. `None` when `name`
+/// resolves in neither layer.
+pub(crate) fn resolve_workflow_scoped(
+    s: &AppState,
+    name: &str,
+) -> Option<(std::path::PathBuf, String, ScopeKind)> {
     let global = workflows_dir(s).join(format!("{name}.yaml"));
     if global.exists() {
-        return Some(global);
+        return Some((global, "global".to_string(), ScopeKind::Global));
     }
     for w in store(s).list().unwrap_or_default() {
         let candidate = std::path::Path::new(&w.path)
@@ -67,16 +79,31 @@ pub(crate) fn resolve_workflow_path(s: &AppState, name: &str) -> Option<std::pat
             .join("workflows")
             .join(format!("{name}.yaml"));
         if candidate.exists() {
-            return Some(candidate);
+            return Some((candidate, project_scope_name(&w), ScopeKind::Project));
         }
     }
     None
 }
 
+/// Path-only convenience wrapper over [`resolve_workflow_scoped`], for
+/// callers that only need the resolved path, not which layer it came from.
+///
+/// `pub(crate)` so `api::autoflows`'s enable/disable endpoint can reuse the
+/// same project-aware resolution rather than re-deriving it.
+pub(crate) fn resolve_workflow_path(s: &AppState, name: &str) -> Option<std::path::PathBuf> {
+    resolve_workflow_scoped(s, name).map(|(path, _, _)| path)
+}
+
 #[derive(Serialize)]
 pub(crate) struct WorkflowDto {
     pub(crate) name: String,
+    /// DISPLAY ONLY — a workspace path's basename for a project row, and can
+    /// therefore legally equal the literal string `"global"`. Destructive
+    /// gates must key off `scope_kind`, never this field — see
+    /// `repo_scope::ScopeKind`'s doc comment.
     pub(crate) scope: String,
+    /// Structured scope discriminator backing every Delete gate.
+    pub(crate) scope_kind: ScopeKind,
     /// Aggregate token + cost usage across every run attributed to this
     /// workflow name. `RunRecord` records `workflow_name` alone (not which
     /// scope's definition produced the run), so `usage`/`run_count`/
@@ -96,6 +123,7 @@ pub(crate) struct WorkflowDto {
 pub(crate) fn scan_workflow_names(
     dir: &std::path::Path,
     scope: impl Into<String>,
+    scope_kind: ScopeKind,
 ) -> Vec<WorkflowDto> {
     let scope = scope.into();
     if !dir.is_dir() {
@@ -124,6 +152,7 @@ pub(crate) fn scan_workflow_names(
         .map(|name| WorkflowDto {
             name,
             scope: scope.clone(),
+            scope_kind,
             usage: crate::usage::UsageSummary::default(),
             run_count: 0,
             last_run: None,
@@ -144,7 +173,11 @@ pub(crate) fn scan_workflow_names(
 /// `scope`). With no registered projects this is byte-for-byte the prior
 /// global-only behavior.
 async fn list_workflows(State(s): State<AppState>) -> ApiResult<Json<Vec<WorkflowDto>>> {
-    let mut rows = scan_workflow_names(&s.global_dir.join("workflows"), "global");
+    let mut rows = scan_workflow_names(
+        &s.global_dir.join("workflows"),
+        "global",
+        ScopeKind::Global,
+    );
 
     let workspaces = store(&s).list().unwrap_or_default();
     let repos = distinct_repo_workspaces(workspaces, &repo_store(&s));
@@ -153,7 +186,7 @@ async fn list_workflows(State(s): State<AppState>) -> ApiResult<Json<Vec<Workflo
         let dir = std::path::Path::new(&r.workspace.path)
             .join(".rupu")
             .join("workflows");
-        project_rows.extend(scan_workflow_names(&dir, r.scope));
+        project_rows.extend(scan_workflow_names(&dir, r.scope, ScopeKind::Project));
     }
 
     let project_names: std::collections::BTreeSet<&str> =
@@ -195,13 +228,17 @@ async fn list_workflows(State(s): State<AppState>) -> ApiResult<Json<Vec<Workflo
 }
 
 /// Load workflow `name` and build the full detail DTO (`workflow` + raw `yaml` +
-/// aggregate `usage`). Shared by GET / PUT / POST.
+/// aggregate `usage` + resolved `scope`/`scope_kind`). Shared by GET / PUT / POST.
 ///
 /// Project-aware: resolves `name` in the global layer first, falling back to
 /// every registered project's `.rupu/workflows/` (first match) so a
-/// project-only workflow's detail route doesn't 404.
+/// project-only workflow's detail route doesn't 404. The resolved layer is
+/// carried on the response's `scope`/`scope_kind` — callers (the CP detail
+/// page) use `scope_kind` to gate Delete, since `DELETE /api/workflows/:name`
+/// only ever resolves against the global layer regardless of which layer
+/// this GET resolved.
 fn load_detail(s: &AppState, name: &str) -> ApiResult<Json<serde_json::Value>> {
-    let path = resolve_workflow_path(s, name)
+    let (path, scope, scope_kind) = resolve_workflow_scoped(s, name)
         .ok_or_else(|| ApiError::not_found(format!("workflow {name} not found")))?;
     let yaml = std::fs::read_to_string(&path).map_err(|e| ApiError::internal(e.to_string()))?;
     let workflow = Workflow::parse(&yaml).map_err(|e| ApiError::internal(e.to_string()))?;
@@ -213,9 +250,13 @@ fn load_detail(s: &AppState, name: &str) -> ApiResult<Json<serde_json::Value>> {
             .map(|r| crate::usage::summarize_run(&s.run_store, &r.id, &s.pricing)),
     );
 
-    Ok(Json(
-        serde_json::json!({ "workflow": workflow, "yaml": yaml, "usage": usage }),
-    ))
+    Ok(Json(serde_json::json!({
+        "workflow": workflow,
+        "yaml": yaml,
+        "usage": usage,
+        "scope": scope,
+        "scope_kind": scope_kind,
+    })))
 }
 
 async fn get_workflow(
@@ -755,6 +796,33 @@ mod tests {
             .await
             .expect("project-only workflow should resolve via detail");
         assert_eq!(resp.0["yaml"], serde_json::json!(VALID_YAML));
+        // Resolved layer must be surfaced — the detail page's Delete gate and
+        // scope indicator both key off these.
+        let expected_scope = proj
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(resp.0["scope"], serde_json::json!(expected_scope));
+        assert_eq!(resp.0["scope_kind"], serde_json::json!("project"));
+    }
+
+    /// A GLOBAL workflow's detail response is tagged `scope_kind: "global"` —
+    /// the counterpart to `workflow_detail_resolves_project_def`'s project
+    /// case. The CP detail page's Delete gate keys off this field.
+    #[tokio::test]
+    async fn workflow_detail_global_is_scope_kind_global() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        std::fs::create_dir_all(workflows_dir(&s)).unwrap();
+        std::fs::write(wf_path(&s, "demo"), VALID_YAML).unwrap();
+
+        let resp = get_workflow(State(s), Path("demo".into()))
+            .await
+            .expect("global workflow should resolve");
+        assert_eq!(resp.0["scope"], serde_json::json!("global"));
+        assert_eq!(resp.0["scope_kind"], serde_json::json!("global"));
     }
 
     #[tokio::test]

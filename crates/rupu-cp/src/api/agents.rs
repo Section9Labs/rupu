@@ -1,7 +1,7 @@
 use crate::{
     agent_launcher::{AgentLaunchError, AgentLaunchRequest, AgentLauncher},
     api::fs_safety::{validate_name, write_atomic},
-    api::repo_scope::distinct_repo_workspaces,
+    api::repo_scope::{distinct_repo_workspaces, ScopeKind},
     error::{ApiError, ApiResult},
     host::connector::HostConnectorError,
     session_starter::{SessionStartError, SessionStartRequest, SessionStarter},
@@ -131,10 +131,12 @@ pub(crate) fn agent_slug_map(dir: &FsPath) -> std::collections::HashMap<String, 
     out
 }
 
-/// Build the detail DTO from a loaded spec, tagged with `scope` and `slug`.
+/// Build the detail DTO from a loaded spec, tagged with `scope`/`scope_kind`
+/// and `slug`.
 fn detail_from_spec(
     spec: rupu_agent::spec::AgentSpec,
     scope: impl Into<String>,
+    scope_kind: ScopeKind,
     slug: impl Into<String>,
 ) -> AgentDetailDto {
     let system_prompt = spec.system_prompt.clone();
@@ -142,7 +144,7 @@ fn detail_from_spec(
     AgentDetailDto {
         system_prompt,
         raw,
-        summary: AgentDto::from_spec(spec, scope, slug),
+        summary: AgentDto::from_spec(spec, scope, scope_kind, slug),
     }
 }
 
@@ -150,14 +152,17 @@ fn detail_from_spec(
 ///
 /// Project-aware: resolves `name` in the global layer first, falling back to
 /// every registered project's `.rupu/agents/` (first match) so a
-/// project-only agent's detail route doesn't 404.
+/// project-only agent's detail route doesn't 404. The resolved layer is
+/// carried on the returned DTO's `scope_kind` — callers (the CP detail page)
+/// use it to gate Delete, since `DELETE /api/agents/:name` only ever resolves
+/// against the global layer regardless of which layer this GET resolved.
 fn load_detail(s: &AppState, name: &str) -> ApiResult<AgentDetailDto> {
     match load_agent(&s.global_dir, None, name) {
         Ok(spec) => {
             let slug = agent_slug_map(&s.global_dir)
                 .remove(name)
                 .unwrap_or_else(|| name.to_string());
-            Ok(detail_from_spec(spec, "global", slug))
+            Ok(detail_from_spec(spec, "global", ScopeKind::Global, slug))
         }
         Err(AgentLoadError::NotFound(_)) => {
             for w in store(s).list().unwrap_or_default() {
@@ -166,7 +171,12 @@ fn load_detail(s: &AppState, name: &str) -> ApiResult<AgentDetailDto> {
                     let slug = agent_slug_map(&rupu_dir)
                         .remove(name)
                         .unwrap_or_else(|| name.to_string());
-                    return Ok(detail_from_spec(spec, project_scope_name(&w), slug));
+                    return Ok(detail_from_spec(
+                        spec,
+                        project_scope_name(&w),
+                        ScopeKind::Project,
+                        slug,
+                    ));
                 }
             }
             Err(ApiError::not_found(format!("agent {name} not found")))
@@ -204,7 +214,14 @@ pub(crate) struct AgentDto {
     pub(crate) tools: Vec<String>,
     /// `"project"` when the spec was loaded from `<project>/.rupu/agents`,
     /// else `"global"`. Defaults to `"global"` for the global-only endpoints.
+    /// DISPLAY ONLY for a project row — it's a workspace path's basename and
+    /// can legally collide with the literal string `"global"`. Destructive
+    /// gates must key off `scope_kind`, never this field — see
+    /// [`ScopeKind`]'s doc comment.
     pub(crate) scope: String,
+    /// Structured scope discriminator backing every Delete gate. See
+    /// [`ScopeKind`].
+    pub(crate) scope_kind: ScopeKind,
     /// Aggregate token + cost usage across every run attributed to this agent.
     /// Defaults to empty; populated only by the list handler. Usage is
     /// grouped by agent NAME alone (the transcript rows the breakdown is
@@ -251,6 +268,7 @@ impl AgentDto {
     pub(crate) fn from_spec(
         spec: rupu_agent::spec::AgentSpec,
         scope: impl Into<String>,
+        scope_kind: ScopeKind,
         slug: impl Into<String>,
     ) -> Self {
         AgentDto {
@@ -263,6 +281,7 @@ impl AgentDto {
             max_tokens: spec.max_tokens,
             tools: spec.tools.unwrap_or_default(),
             scope: scope.into(),
+            scope_kind,
             usage: crate::usage::UsageSummary::default(),
             run_count: 0,
             last_run: None,
@@ -306,7 +325,7 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
                 .get(&spec.name)
                 .cloned()
                 .unwrap_or_else(|| spec.name.clone());
-            AgentDto::from_spec(spec, "global", slug)
+            AgentDto::from_spec(spec, "global", ScopeKind::Global, slug)
         })
         .collect();
 
@@ -324,7 +343,7 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
                         .get(&spec.name)
                         .cloned()
                         .unwrap_or_else(|| spec.name.clone());
-                    AgentDto::from_spec(spec, scope.clone(), slug)
+                    AgentDto::from_spec(spec, scope.clone(), ScopeKind::Project, slug)
                 }));
             }
             Err(err) => {
@@ -977,6 +996,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "code-reviewer");
         assert_eq!(rows[0].scope, "global");
+        assert_eq!(rows[0].scope_kind, crate::api::repo_scope::ScopeKind::Global);
     }
 
     #[tokio::test]
@@ -1000,6 +1020,10 @@ mod tests {
             .into_owned();
         assert_eq!(rows[0].name, "code-reviewer");
         assert_eq!(rows[0].scope, expected_scope);
+        assert_eq!(
+            rows[0].scope_kind,
+            crate::api::repo_scope::ScopeKind::Project
+        );
     }
 
     #[tokio::test]
@@ -1025,6 +1049,31 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(resp.0.summary.scope, expected_scope);
+        // Project-only detail must be tagged `scope_kind: Project` — the CP
+        // detail page's Delete gate keys off this, never the display `scope`.
+        assert_eq!(
+            resp.0.summary.scope_kind,
+            crate::api::repo_scope::ScopeKind::Project
+        );
+    }
+
+    /// A GLOBAL agent's detail DTO is tagged `scope_kind: Global` — the
+    /// counterpart to `agent_detail_resolves_project_def`'s Project case.
+    /// The CP detail page's Delete gate keys off this field.
+    #[tokio::test]
+    async fn agent_detail_global_is_scope_kind_global() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        save_agent_file(&s.global_dir, "code-reviewer", VALID_MD).expect("seed");
+
+        let resp = get_agent(State(s), Path("code-reviewer".into()))
+            .await
+            .expect("global agent should resolve");
+        assert_eq!(resp.0.summary.scope, "global");
+        assert_eq!(
+            resp.0.summary.scope_kind,
+            crate::api::repo_scope::ScopeKind::Global
+        );
     }
 
     #[tokio::test]

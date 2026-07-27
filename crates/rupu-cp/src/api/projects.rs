@@ -1,6 +1,7 @@
 use crate::{
     api::agents::AgentDto,
     api::autoflows::{scan_autoflow_defs, AutoflowDefRow},
+    api::repo_scope::ScopeKind,
     api::runs::RunListRow,
     api::workflows::{scan_workflow_names, WorkflowDto},
     error::{ApiError, ApiResult},
@@ -341,8 +342,15 @@ async fn project_coverage_assessed(
 
 /// `GET /api/projects/:ws_id/agents` — global agents merged with the project's
 /// local `<path>/.rupu/agents/*.md`. Project entries shadow globals by name.
-/// Each row is tagged `scope: "project" | "global"`: a name is `"project"` iff
-/// `<path>/.rupu/agents/<name>.md` exists on disk.
+/// Each row is tagged `scope: "project" | "global"` (+ structured
+/// `scope_kind`): a spec's frontmatter `name` is `"project"` iff SOME file
+/// under the project layer's `agents/` dir parses to that `name` — checked
+/// via `project_slugs` (keyed by parsed `name`, mapping to that file's STEM),
+/// not by re-deriving a candidate path from `name` itself. The latter assumed
+/// the file stem equals the frontmatter name, which mislabels a project
+/// agent whose stem differs from its name (hand- or CLI-authored files) as
+/// `scope: "global"` — the same name-vs-stem confusion `agent_slug_map`
+/// exists to avoid for `slug`.
 async fn project_agents(
     State(s): State<AppState>,
     Path(ws_id): Path<String>,
@@ -352,16 +360,18 @@ async fn project_agents(
     let rupu_dir = std::path::Path::new(&w.path).join(".rupu");
     let specs = rupu_agent::loader::load_agents(&s.global_dir, Some(&rupu_dir))
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    let project_agents_dir = rupu_dir.join("agents");
     let global_slugs = crate::api::agents::agent_slug_map(&s.global_dir);
     let project_slugs = crate::api::agents::agent_slug_map(&rupu_dir);
     let dtos = specs
         .into_iter()
         .map(|spec| {
-            // Project iff the same-named file exists under the project layer.
-            let local = project_agents_dir.join(format!("{}.md", spec.name));
-            let scope = if local.is_file() { "project" } else { "global" };
-            let slugs = if scope == "project" {
+            let is_project = project_slugs.contains_key(&spec.name);
+            let (scope, scope_kind) = if is_project {
+                ("project", ScopeKind::Project)
+            } else {
+                ("global", ScopeKind::Global)
+            };
+            let slugs = if is_project {
                 &project_slugs
             } else {
                 &global_slugs
@@ -370,7 +380,7 @@ async fn project_agents(
                 .get(&spec.name)
                 .cloned()
                 .unwrap_or_else(|| spec.name.clone());
-            AgentDto::from_spec(spec, scope, slug)
+            AgentDto::from_spec(spec, scope, scope_kind, slug)
         })
         .collect();
     Ok(Json(dtos))
@@ -397,11 +407,15 @@ async fn project_workflows(
     Path(ws_id): Path<String>,
 ) -> ApiResult<Json<Vec<WorkflowDto>>> {
     let w = load_workspace(&s, &ws_id)?;
-    let global = scan_workflow_names(&s.global_dir.join("workflows"), "global");
+    let global = scan_workflow_names(
+        &s.global_dir.join("workflows"),
+        "global",
+        ScopeKind::Global,
+    );
     let project_dir = std::path::Path::new(&w.path)
         .join(".rupu")
         .join("workflows");
-    let project = scan_workflow_names(&project_dir, "project");
+    let project = scan_workflow_names(&project_dir, "project", ScopeKind::Project);
     Ok(Json(merge_workflow_dtos(global, project)))
 }
 
@@ -493,5 +507,67 @@ mod tests {
         };
         let v = serde_json::to_value(&detail).unwrap();
         assert!(v.get("usage").is_some());
+    }
+
+    fn test_state(tmp: &tempfile::TempDir) -> AppState {
+        AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        )
+        .with_workspace_dir(tmp.path().to_path_buf())
+    }
+
+    /// Register a workspace record `<global_dir>/workspaces/<id>.toml` whose
+    /// `path` points at `project_root`. Mirrors the identical helper in
+    /// `api::agents`/`api::workflows`'s test modules.
+    fn register_workspace(tmp: &tempfile::TempDir, id: &str, project_root: &std::path::Path) {
+        std::fs::create_dir_all(tmp.path().join("workspaces")).unwrap();
+        std::fs::write(
+            tmp.path().join("workspaces").join(format!("{id}.toml")),
+            format!(
+                "id = \"{id}\"\npath = \"{}\"\ncreated_at = \"2026-01-01T00:00:00Z\"\n",
+                project_root.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    /// MINOR fix: `project_agents` must label an agent as `scope: "project"`
+    /// by whether its frontmatter `name` matches SOME project-layer file (via
+    /// `project_slugs`, keyed by parsed name), not by re-deriving
+    /// `<project>/agents/<name>.md` and checking that exact path exists. The
+    /// latter assumes the file stem equals the frontmatter name — false for a
+    /// project agent hand- or CLI-authored under a different filename — and
+    /// mislabels it `scope: "global"` even though it only exists in the
+    /// project layer.
+    #[tokio::test]
+    async fn project_agents_labels_by_parsed_name_not_reconstructed_stem_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp); // no global agents
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_agents = proj.path().join(".rupu").join("agents");
+        std::fs::create_dir_all(&proj_agents).unwrap();
+        // File stem ("my-file-stem") deliberately differs from the parsed
+        // frontmatter `name` ("code-reviewer") — `project_agents_dir.join(
+        // format!("{}.md", spec.name))` would look for `code-reviewer.md`,
+        // which does not exist, and wrongly conclude "global".
+        std::fs::write(
+            proj_agents.join("my-file-stem.md"),
+            "---\nname: code-reviewer\nmodel: opus\n---\nReview code carefully.\n",
+        )
+        .unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+        let w = store(&s).list().unwrap().into_iter().next().unwrap();
+
+        let Json(rows) = project_agents(State(s), Path(w.id)).await.expect("ok");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "code-reviewer");
+        assert_eq!(rows[0].slug, "my-file-stem");
+        assert_eq!(
+            rows[0].scope, "project",
+            "must be labeled project-scoped even though its file stem differs from its name"
+        );
+        assert_eq!(rows[0].scope_kind, ScopeKind::Project);
     }
 }

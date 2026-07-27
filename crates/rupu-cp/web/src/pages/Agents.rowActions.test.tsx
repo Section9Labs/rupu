@@ -52,7 +52,7 @@ const USAGE = {
 };
 
 const ROWS: AgentSummary[] = [
-  { name: 'reviewer', scope: 'global', usage: USAGE, run_count: 2 },
+  { name: 'reviewer', scope: 'global', scope_kind: 'global', usage: USAGE, run_count: 2 },
 ];
 
 afterEach(() => {

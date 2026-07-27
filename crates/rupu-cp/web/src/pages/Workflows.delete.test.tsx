@@ -46,7 +46,7 @@ const USAGE = {
 };
 
 const ROWS: WorkflowSummary[] = [
-  { name: 'nightly-sweep', scope: 'global', usage: USAGE, run_count: 3, last_run: null },
+  { name: 'nightly-sweep', scope: 'global', scope_kind: 'global', usage: USAGE, run_count: 3, last_run: null },
 ];
 
 afterEach(() => {

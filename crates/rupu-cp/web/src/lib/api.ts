@@ -811,6 +811,26 @@ export function windowFromDayRange(startDay: string, endDay: string): UsageWindo
 }
 
 // ---------------------------------------------------------------------------
+// Scope discriminator
+// ---------------------------------------------------------------------------
+
+/**
+ * Structured scope discriminator — mirrors `rupu_cp::api::repo_scope::ScopeKind`.
+ * Independent of the display `scope` string on the same row/detail DTO: that
+ * string is a workspace path's BASENAME (for a project row) and can legally
+ * equal the literal `"global"` for a project registered at a path whose last
+ * segment happens to be named `global`. Any destructive-action gate (the
+ * Agents/Workflows list and detail Delete buttons) must key off
+ * `scope_kind`, never `scope === 'global'` — see the Rust type's doc comment.
+ *
+ * Optional on every DTO below (mirroring `AgentSummary.slug`'s pattern) so
+ * literal test fixtures that predate this field don't need updating; a gate
+ * reading `undefined` fails closed (no Delete offered) rather than assuming
+ * global.
+ */
+export type ScopeKind = 'global' | 'project';
+
+// ---------------------------------------------------------------------------
 // Agents
 // ---------------------------------------------------------------------------
 
@@ -846,6 +866,9 @@ export interface AgentSummary {
    * defs with the project name.
    */
   scope: string;
+  /** Structured scope discriminator — gate Delete on THIS, never `scope`.
+   *  See `ScopeKind`'s doc comment. */
+  scope_kind?: ScopeKind;
   usage: UsageSummary;
   run_count: number;
   /** ISO-8601 timestamp of the agent's most recent run; `null`/absent when
@@ -883,17 +906,29 @@ export interface ToolSpec {
 
 export interface WorkflowSummary {
   name: string;
+  /** DISPLAY ONLY — see `ScopeKind`'s doc comment; gate Delete on
+   *  `scope_kind`, never this field. */
   scope: string;
+  scope_kind?: ScopeKind;
   usage: UsageSummary;
   run_count: number;
   last_run?: string | null;
 }
 
 export interface WorkflowDetail {
-  /** Parsed Workflow object — typed loosely; the UI inspects what it needs. */
+  /** Parsed Workflow object — typed loosely; the UI inspects what it needs.
+   *  Does NOT carry `scope`/`scope_kind` — those are resolved by the detail
+   *  loader (which layer `GET /api/workflows/:name` found the file in), not
+   *  parsed from the YAML itself, and are surfaced as sibling top-level
+   *  fields below instead. */
   workflow: Record<string, unknown>;
   yaml: string;
   usage?: UsageSummary;
+  /** Resolved layer's display scope (`"global"` or a project's path
+   *  basename) — DISPLAY ONLY, see `ScopeKind`'s doc comment. */
+  scope?: string;
+  /** Structured scope discriminator — gate Delete on THIS, never `scope`. */
+  scope_kind?: ScopeKind;
 }
 
 /** Permission mode a launched run starts in. */
