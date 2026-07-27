@@ -85,6 +85,14 @@ function runDurationMs(run: RunListRow): number | null {
 
 const RUN_COLUMNS: Column<RunListRow>[] = [
   {
+    key: 'status',
+    header: 'Status',
+    fit: true,
+    sortable: true,
+    sortValue: (r) => r.status,
+    render: (r) => <StatusPill status={r.status} />,
+  },
+  {
     key: 'workflow',
     header: 'Workflow',
     subject: true,
@@ -106,14 +114,6 @@ const RUN_COLUMNS: Column<RunListRow>[] = [
     sortable: true,
     sortValue: (r) => r.trigger,
     render: (r) => <TriggerChip trigger={r.trigger} />,
-  },
-  {
-    key: 'status',
-    header: 'Status',
-    fit: true,
-    sortable: true,
-    sortValue: (r) => r.status,
-    render: (r) => <StatusPill status={r.status} />,
   },
   {
     key: 'in',

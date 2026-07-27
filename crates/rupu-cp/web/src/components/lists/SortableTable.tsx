@@ -43,14 +43,15 @@ export interface Column<T> {
   titleValue?: (row: T) => string;
   /** This column renders its OWN interactive controls (buttons, links to a
    *  different destination than the row) — typically a row-actions column.
-   *  On a `rowHref` table, SortableTable normally makes every non-subject
-   *  cell's wrapping link mouse-only (`tabIndex=-1` + `aria-hidden`, I7) so
-   *  a row is one accessible tab stop; that would also swallow this
-   *  column's own controls from the accessibility tree, which is worse than
-   *  the duplicate-link problem it fixes. Set `interactive: true` to skip
-   *  that treatment for this column so its controls stay independently
-   *  focusable/announced (mouse behavior is unaffected either way — the
-   *  wrapping link and the row click handler are unchanged). */
+   *  On a `rowHref` table, SortableTable normally wraps every cell's content
+   *  in the row's own link so the whole row is clickable; for a column whose
+   *  content is sometimes `null` (e.g. an action button that only appears
+   *  conditionally), that wrapping link would render with no content and no
+   *  accessible name, and any button the column DOES render would nest
+   *  inside it (`<button>` inside `<a>`). Set `interactive: true` to render
+   *  this column as a plain, unwrapped cell instead — its own controls stay
+   *  independently focusable/announced and there is no nested/empty anchor.
+   *  Row click-through for other columns is unaffected. */
   interactive?: boolean;
   render: (row: T) => React.ReactNode;
 }
@@ -266,15 +267,22 @@ export default function SortableTable<T>({
                     const alignCls = cellClass(col);
                     // When the whole row is a link, each cell wraps its content in
                     // a block <Link> so the entire row is clickable (and every cell
-                    // is a navigation target) without nesting anchors. Pages that
-                    // use rowHref render plain content (no inner links); pages with
-                    // per-column links / interactive cells omit rowHref.
+                    // is a navigation target) without nesting anchors — EXCEPT a
+                    // column marked `interactive`, which carries its own real
+                    // controls (and sometimes renders nothing at all): wrapping
+                    // it in the row link would nest a <button> inside an <a>, or
+                    // render an empty anchor with no accessible name when the
+                    // column's content is conditionally `null`. Those columns
+                    // always get the plain, unwrapped `<td>` branch below. Pages
+                    // that use rowHref render plain content (no inner links) for
+                    // their non-interactive cells; pages with per-column links
+                    // omit rowHref entirely.
                     const isSubjectCell = col.key === subjectKey;
-                    // I7: mouse-only for every non-subject cell EXCEPT ones
-                    // marked `interactive` — those carry their own real
-                    // controls, which must stay in the accessibility tree.
-                    const isMouseOnlyCell = !isSubjectCell && !col.interactive;
-                    return href ? (
+                    // I7: mouse-only for every non-subject cell reached in the
+                    // link-wrapped branch (interactive columns never reach it —
+                    // see the `href && !col.interactive` gate below).
+                    const isMouseOnlyCell = !isSubjectCell;
+                    return href && !col.interactive ? (
                       <td key={col.key} className={alignCls}>
                         <Link
                           to={href}

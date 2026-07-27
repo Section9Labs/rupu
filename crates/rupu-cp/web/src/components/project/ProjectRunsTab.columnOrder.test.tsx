@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
-// ProjectRunsTab — Turns-before-Duration fix (I6): this was the only
-// run-like table left disagreeing with the canonical run-table standard
-// after table-standardization Task 3 put Turns before Duration everywhere
-// else. Pure reorder — see ProjectRunsTab.test.tsx for behavioral coverage.
+// ProjectRunsTab — status-first column order: this table now mirrors the
+// canonical run-table standard (status leads every top-level run table, per
+// pages/runs/WorkflowRuns.tsx) after the final re-review moved Status from
+// slot 4 to slot 1. Pure reorder — see ProjectRunsTab.test.tsx for
+// behavioral coverage.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
@@ -35,7 +36,7 @@ const ROW: RunListRow = {
 };
 
 describe('ProjectRunsTab — column order', () => {
-  it('renders headers as Workflow, Run, Trigger, Status, In, Out, Cached, Cost, Turns, Duration, Started', async () => {
+  it('renders headers as Status, Workflow, Run, Trigger, In, Out, Cached, Cost, Turns, Duration, Started', async () => {
     vi.spyOn(api, 'getProjectRuns').mockResolvedValue([ROW]);
     // ProjectUsageTimeline (Task U4) fetches independently of the run list
     // above — mock it too so this test isn't tripped up by an unmocked call.
@@ -53,10 +54,10 @@ describe('ProjectRunsTab — column order', () => {
       (th) => th.textContent?.trim() ?? '',
     );
     expect(headers).toEqual([
+      'Status',
       'Workflow',
       'Run',
       'Trigger',
-      'Status',
       'In',
       'Out',
       'Cached',

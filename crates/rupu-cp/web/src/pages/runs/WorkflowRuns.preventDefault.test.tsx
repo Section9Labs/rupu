@@ -1,11 +1,18 @@
 // @vitest-environment jsdom
 // WorkflowRuns — action-column preventDefault bug (table-standardization
-// Task 5 follow-up from Task 4). `SortableTable` link-wraps every cell in a
-// block <Link> now that WorkflowRuns has `rowHref`; the action column's
-// buttons only called `stopPropagation()`, not `preventDefault()`. In a real
-// browser this still triggers the enclosing <a>'s native default navigation
-// to the run-detail route (mirrors the fix already applied to Sessions.tsx
-// and Workflows.tsx — see their action-button doc comments).
+// Task 5 follow-up from Task 4). The action column's buttons only called
+// `stopPropagation()`, not `preventDefault()`.
+//
+// A later a11y fix (SortableTable's `interactive` columns, final re-review)
+// changed how this cell is wrapped: `interactive` columns now render as a
+// plain, unwrapped `<td>` (never link-wrapped) instead of a mouse-only `<a>`
+// like every other non-subject cell — so the Archive/Delete buttons here are
+// no longer nested inside an anchor at all, and there is no enclosing <a>
+// whose default navigation to worry about. The `preventDefault()` call is
+// still present in the button handlers (harmless, and still exercised by
+// this test) and this test still proves it fires; it's just no longer load
+// bearing for row navigation, since the interactive cell was never wrapped
+// in the first place.
 //
 // jsdom doesn't perform real cross-document navigation (it logs "Not
 // implemented: navigation to another Document" and leaves `window.location`
@@ -84,7 +91,9 @@ describe('WorkflowRuns — action buttons call preventDefault (not just stopProp
     await waitFor(() => expect(screen.getByText('deploy-prod')).toBeInTheDocument());
 
     const button = screen.getByLabelText('Archive run run_x');
-    expect(button.closest('a')).not.toBeNull(); // sanity: it IS inside the rowHref link
+    // sanity: the action column is `interactive`, so SortableTable renders
+    // it as a plain cell — no enclosing <a> to nest inside.
+    expect(button.closest('a')).toBeNull();
     const notCanceled = fireEvent.click(button);
 
     // dispatchEvent (what fireEvent.click returns) is false iff preventDefault

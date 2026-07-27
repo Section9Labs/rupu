@@ -220,4 +220,46 @@ describe('SortableTable', () => {
     // Still present (and pointing at the row href) for mouse clicks.
     expect(costLink).toHaveAttribute('href', '/things/b');
   });
+
+  // Final re-review: an `interactive` column must render as a plain,
+  // unwrapped cell (not link-wrapped at all) so its own controls stay
+  // queryable/focusable by role, and so a column that sometimes renders
+  // `null` (e.g. a conditional action button) never produces an empty
+  // anchor with no accessible name. The rest of the row must still
+  // navigate via rowHref.
+  it('renders an interactive column as a plain cell — its controls stay queryable/focusable, and the rest of the row still navigates', () => {
+    const columns: Column<Row>[] = [
+      { key: 'name', header: 'Name', subject: true, render: (r) => <span>{r.name}</span> },
+      {
+        key: 'action',
+        header: '',
+        interactive: true,
+        render: (r) => (r.name === 'Beta' ? <button type="button">Open</button> : null),
+      },
+    ];
+    renderTable({ columns, rowHref: (r) => `/things/${r.id}` });
+
+    const betaRow = screen.getAllByRole('row')[1]; // Beta
+    const alphaRow = screen.getAllByRole('row')[2]; // Alpha
+
+    // Exactly one link per row (the subject cell) — the interactive column
+    // is never link-wrapped, so it never adds a second anchor.
+    expect(within(betaRow).getAllByRole('link')).toHaveLength(1);
+    expect(within(alphaRow).getAllByRole('link')).toHaveLength(1);
+
+    // The button in the interactive column stays independently queryable
+    // and focusable by role — not swallowed inside a mouse-only anchor.
+    const openButton = within(betaRow).getByRole('button', { name: 'Open' });
+    expect(openButton).toBeInTheDocument();
+    expect(openButton.closest('a')).toBeNull();
+
+    // Alpha's interactive cell renders null — no empty, unnamed anchor.
+    const alphaCells = within(alphaRow).getAllByRole('cell');
+    const alphaActionCell = alphaCells[1];
+    expect(alphaActionCell.querySelector('a')).toBeNull();
+
+    // The subject cell still carries the row's real navigation link.
+    const nameLink = within(betaRow).getByRole('link');
+    expect(nameLink).toHaveAttribute('href', '/things/b');
+  });
 });

@@ -86,4 +86,21 @@ describe('HostDetail — run rows adopt whole-row navigation (rowHref)', () => {
     expect(idCell.className).not.toMatch(/brand-600/);
     expect(idCell.className).not.toMatch(/hover:underline/);
   });
+
+  // Final re-review: HostDetail's run table now leads with Status, matching
+  // the canonical status-first order every other top-level run table
+  // follows (pages/runs/WorkflowRuns.tsx is the reference implementation).
+  it('renders run-table headers as Status, Workflow, Run, Started', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([HOST]);
+    vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([RUN]);
+
+    const { container } = renderPage();
+
+    await waitFor(() => expect(screen.getByText('deploy-prod')).toBeInTheDocument());
+
+    const headers = Array.from(container.querySelectorAll('thead th')).map(
+      (th) => th.textContent?.trim() ?? '',
+    );
+    expect(headers).toEqual(['Status', 'Workflow', 'Run', 'Started']);
+  });
 });

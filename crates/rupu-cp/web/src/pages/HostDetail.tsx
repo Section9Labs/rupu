@@ -40,15 +40,12 @@ function runHref(r: RunListRow): string {
 
 const RUN_COLUMNS: Column<RunListRow>[] = [
   {
-    key: 'id',
-    header: 'Run',
+    key: 'status',
+    header: 'Status',
     fit: true,
-    // Plain content — row-level navigation is `rowHref` (SortableTable
-    // link-wraps the whole row); an inline <Link> here would nest an <a>
-    // inside SortableTable's own <a>.
-    render: (r) => (
-      <span className="text-sm font-mono text-ink-dim">{r.id.slice(0, 10)}…</span>
-    ),
+    sortable: true,
+    sortValue: (r) => r.status,
+    render: (r) => <StatusPill status={r.status} size="xs" />,
   },
   {
     key: 'workflow',
@@ -60,12 +57,15 @@ const RUN_COLUMNS: Column<RunListRow>[] = [
     render: (r) => <span className="text-sm text-ink">{r.workflow_name}</span>,
   },
   {
-    key: 'status',
-    header: 'Status',
+    key: 'id',
+    header: 'Run',
     fit: true,
-    sortable: true,
-    sortValue: (r) => r.status,
-    render: (r) => <StatusPill status={r.status} size="xs" />,
+    // Plain content — row-level navigation is `rowHref` (SortableTable
+    // link-wraps the whole row); an inline <Link> here would nest an <a>
+    // inside SortableTable's own <a>.
+    render: (r) => (
+      <span className="text-sm font-mono text-ink-dim">{r.id.slice(0, 10)}…</span>
+    ),
   },
   {
     key: 'started',

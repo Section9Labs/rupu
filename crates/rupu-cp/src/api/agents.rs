@@ -170,7 +170,7 @@ pub(crate) struct AgentDto {
     /// - This field is TRANSCRIPT-DERIVED: a `RunRecord` carries no "agent(s)
     ///   this run used" field, so a run only counts here if at least one of
     ///   its transcripts is readable AND contains a `Usage` event naming this
-    ///   agent (see `last_run_by_agent` / the per-run loop in `list_agents`).
+    ///   agent (see the per-run loop in `list_agents`).
     ///
     /// Consequence: an agent whose run died before the first LLM call, or
     /// whose transcripts were pruned or live on an unreachable remote host,
@@ -276,10 +276,9 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
     // are strictly additive and every transcript still lands in exactly one
     // run's batch). `last_run` is folded from the SAME per-run rows (their
     // `agent` field names who the run's usage attributes to; `run.started_at`
-    // is the candidate timestamp) instead of a second re-aggregation pass —
-    // this used to be `last_run_by_agent`, which re-walked every run's
-    // transcripts a second time over the exact same files `all_rows` had just
-    // read.
+    // is the candidate timestamp) instead of a second re-aggregation pass
+    // that re-walks every run's transcripts a second time over the exact
+    // same files `all_rows` had just read.
     let runs = s.run_store.list().unwrap_or_default();
     let mut all_rows: Vec<rupu_transcript::UsageRow> = Vec::new();
     let mut last_runs: std::collections::BTreeMap<String, String> =
