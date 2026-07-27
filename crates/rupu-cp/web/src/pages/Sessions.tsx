@@ -22,7 +22,7 @@
 // replacing) the Active/Archived pill above it.
 
 import { useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { MessageSquare, RefreshCw } from 'lucide-react';
 import { api, type SessionSummary } from '../lib/api';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
@@ -67,7 +67,18 @@ const TAB_OPTIONS: FilterPillOption[] = [
   { value: 'archived', label: 'Archived' },
 ];
 
+/** Build the detail link for a session, including ?host= for remote sessions
+ *  (mirrors WorkflowRuns.tsx's `runHref`). */
+function sessionHref(s: SessionSummary): string {
+  const hid = s.host_id;
+  if (hid && hid !== 'local') {
+    return `/sessions/${encodeURIComponent(s.session_id)}?host=${encodeURIComponent(hid)}`;
+  }
+  return `/sessions/${encodeURIComponent(s.session_id)}`;
+}
+
 export default function Sessions() {
+  const navigate = useNavigate();
   const [tab, setTab] = useState<Tab>('active');
   // Default to 'local' → fast server-side path; ALL_HOSTS → fan-out.
   const [hostFilter, setHostFilter] = useState<string>('local');
@@ -130,7 +141,7 @@ export default function Sessions() {
   }
 
   // Action column — changes shape based on the current tab (active vs archived).
-  const actionColumn = buildActionColumn(tab, handleRowArchive, handleRowRestore, handleRowDelete);
+  const actionColumn = buildActionColumn(tab, navigate, handleRowArchive, handleRowRestore, handleRowDelete);
   const columns: Column<SessionSummary>[] = [...SESSION_BASE_COLUMNS, actionColumn];
   const bannerError = error ?? actionError;
 
@@ -210,6 +221,7 @@ export default function Sessions() {
             columns={columns}
             rows={visible}
             rowKey={(s) => s.session_id}
+            rowHref={sessionHref}
           />
           {(loading || hasMore || ended) && (
             <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
@@ -258,19 +270,12 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
     key: 'session',
     header: 'Session',
     fit: true,
-    render: (s) => {
-      const hostSuffix = s.host_id && s.host_id !== 'local'
-        ? `?host=${encodeURIComponent(s.host_id)}`
-        : '';
-      return (
-        <Link
-          to={`/sessions/${encodeURIComponent(s.session_id)}${hostSuffix}`}
-          className="text-note text-ink-mute font-mono hover:underline"
-        >
-          {shortId(s.session_id)}
-        </Link>
-      );
-    },
+    // Plain content — row-level navigation is `rowHref` (SortableTable
+    // link-wraps the whole row); an inline <Link> here would nest an <a>
+    // inside SortableTable's own <a>.
+    render: (s) => (
+      <span className="text-note text-ink-mute font-mono">{shortId(s.session_id)}</span>
+    ),
   },
   {
     key: 'host',
@@ -371,6 +376,7 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
 /** Build the per-row action column. Recreated whenever the tab changes. */
 function buildActionColumn(
   tab: Tab,
+  navigate: ReturnType<typeof useNavigate>,
   onArchive: (id: string) => void,
   onRestore: (id: string) => void,
   onDelete: (id: string) => void,
@@ -383,16 +389,27 @@ function buildActionColumn(
     render: (s) => (
       <div
         className="flex items-center justify-end gap-1"
-        onClick={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          // The row is now link-wrapped (rowHref) — without both of these,
+          // a click here either soft- or hard-navigates to the session
+          // instead of acting (stopPropagation alone does not block the
+          // enclosing <a>'s native default navigation action).
+          e.preventDefault();
+          e.stopPropagation();
+        }}
       >
         {s.active_run_id && (
-          <Link
-            to={`/runs/${encodeURIComponent(s.active_run_id)}`}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              navigate(`/runs/${encodeURIComponent(s.active_run_id!)}`);
+            }}
             className="inline-flex items-center rounded px-2 py-0.5 text-note font-medium ring-1 bg-info-bg text-info ring-info/30 hover:bg-info-bg"
-            onClick={(e) => e.stopPropagation()}
           >
             active run
-          </Link>
+          </button>
         )}
         {tab === 'active' ? (
           <Button

@@ -9,9 +9,14 @@
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { api, type SessionSummary } from '../../lib/api';
 import ProjectSessionsTab from './ProjectSessionsTab';
+
+function LocationProbe() {
+  const loc = useLocation();
+  return <div data-testid="loc">{loc.pathname + loc.search}</div>;
+}
 
 afterEach(() => {
   cleanup();
@@ -250,6 +255,33 @@ describe('ProjectSessionsTab — usage bar chart strip', () => {
     // UsageBarChart renders each bar's label — both sessions have usage.
     const labels = screen.getAllByText('fix-bug');
     expect(labels.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe('ProjectSessionsTab — whole-row navigation (rowHref, Task 4)', () => {
+  it('renders each row as a link to /sessions/:id', async () => {
+    mockSessions();
+    renderTab();
+
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    const link = screen.getByText('fix-bug').closest('a');
+    expect(link).toHaveAttribute('href', '/sessions/sess-active-1');
+  });
+
+  it('clicking "active run" navigates to the run, not the session row', async () => {
+    mockSessions([{ ...ROWS[0], active_run_id: 'run-xyz' }]);
+
+    render(
+      <MemoryRouter>
+        <ProjectSessionsTab wsId="x" />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText('active run'));
+
+    expect(screen.getByTestId('loc')).toHaveTextContent('/runs/run-xyz');
   });
 });
 

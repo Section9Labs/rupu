@@ -3,7 +3,6 @@
 // base URL, token) and a per-row Remove action (local host is immutable).
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
 import { api, type HostView, type HostTransportKind } from '../lib/api';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { SectionHeader } from '../components/lists/SectionHeader';
@@ -90,13 +89,14 @@ function buildColumns(onRemove: (id: string) => void): Column<HostView>[] {
       // local pinned first (asc): prefix \x00 so it sorts before any real name.
       sortValue: (h) => (h.transport_kind === 'local' ? '\x00' + h.name : '\x01' + h.name),
       titleValue: (h) => h.name,
+      // Plain content — row-level navigation is `rowHref` (SortableTable
+      // link-wraps the whole row); an inline <Link> here would nest an <a>
+      // inside SortableTable's own <a>.
       render: (h) => (
-        <Link to={`/hosts/${encodeURIComponent(h.id)}`} className="block group">
-          <div className="text-sm font-medium text-ink group-hover:text-brand-600 truncate">
-            {h.name}
-          </div>
+        <div>
+          <div className="text-sm font-medium text-ink truncate">{h.name}</div>
           <div className="text-note text-ink-mute font-mono truncate">{shortId(h.id)}</div>
-        </Link>
+        </div>
       ),
     },
     {
@@ -170,7 +170,16 @@ function buildColumns(onRemove: (id: string) => void): Column<HostView>[] {
           <button
             type="button"
             aria-label={`Remove host ${h.name}`}
-            onClick={() => onRemove(h.id)}
+            onClick={(e) => {
+              // The row is now link-wrapped (rowHref) — without both of
+              // these, this click either soft- or hard-navigates to the
+              // host detail page instead of removing it (stopPropagation
+              // alone does not block the enclosing <a>'s native default
+              // navigation action).
+              e.preventDefault();
+              e.stopPropagation();
+              onRemove(h.id);
+            }}
             className="text-note text-err hover:text-err hover:underline"
           >
             Remove
@@ -651,6 +660,7 @@ export default function Hosts() {
             columns={columns}
             rows={hosts}
             rowKey={(h) => h.id}
+            rowHref={(h) => `/hosts/${encodeURIComponent(h.id)}`}
             initialSort={{ key: 'name', dir: 'asc' }}
           />
         </section>

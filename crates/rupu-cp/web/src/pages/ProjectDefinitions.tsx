@@ -49,14 +49,10 @@ const AGENT_COLUMNS: Column<AgentSummary>[] = [
     header: 'Name',
     sortable: true,
     sortValue: (a) => a.name,
-    render: (a) => (
-      <Link
-        to={`/agents/${encodeURIComponent(a.name)}`}
-        className="text-sm font-medium text-ink truncate hover:underline"
-      >
-        {a.name}
-      </Link>
-    ),
+    // Plain content — row-level navigation is `rowHref` (SortableTable
+    // link-wraps the whole row); an inline <Link> here would nest an <a>
+    // inside SortableTable's own <a>.
+    render: (a) => <span className="text-sm font-medium text-ink truncate">{a.name}</span>,
   },
   {
     key: 'scope',
@@ -107,14 +103,10 @@ const WORKFLOW_COLUMNS: Column<WorkflowSummary>[] = [
     header: 'Name',
     sortable: true,
     sortValue: (w) => w.name,
-    render: (w) => (
-      <Link
-        to={`/workflows/${encodeURIComponent(w.name)}`}
-        className="text-sm font-medium text-ink truncate hover:underline"
-      >
-        {w.name}
-      </Link>
-    ),
+    // Plain content — row-level navigation is `rowHref` (SortableTable
+    // link-wraps the whole row); an inline <Link> here would nest an <a>
+    // inside SortableTable's own <a>.
+    render: (w) => <span className="text-sm font-medium text-ink truncate">{w.name}</span>,
   },
   {
     key: 'scope',
@@ -132,14 +124,10 @@ const AUTOFLOW_COLUMNS: Column<AutoflowDefRow>[] = [
     header: 'Name',
     sortable: true,
     sortValue: (d) => d.name,
-    render: (d) => (
-      <Link
-        to={`/workflows/${encodeURIComponent(d.slug)}`}
-        className="text-sm font-medium text-ink truncate hover:underline"
-      >
-        {d.name}
-      </Link>
-    ),
+    // Plain content — row-level navigation is `rowHref` (SortableTable
+    // link-wraps the whole row); an inline <Link> here would nest an <a>
+    // inside SortableTable's own <a>.
+    render: (d) => <span className="text-sm font-medium text-ink truncate">{d.name}</span>,
   },
   {
     key: 'trigger',
@@ -270,6 +258,7 @@ function AgentsTab({ agents }: { agents: AgentSummary[] | null }) {
       columns={AGENT_COLUMNS}
       rows={agents}
       rowKey={(a) => a.name}
+      rowHref={(a) => `/agents/${encodeURIComponent(a.name)}`}
       initialSort={{ key: 'name', dir: 'asc' }}
     />
   );
@@ -283,6 +272,7 @@ function WorkflowsTab({ workflows }: { workflows: WorkflowSummary[] | null }) {
       columns={WORKFLOW_COLUMNS}
       rows={workflows}
       rowKey={(w) => w.name}
+      rowHref={(w) => `/workflows/${encodeURIComponent(w.name)}`}
       initialSort={{ key: 'name', dir: 'asc' }}
     />
   );
@@ -296,6 +286,7 @@ function AutoflowsTab({ autoflows }: { autoflows: AutoflowDefRow[] | null }) {
       columns={AUTOFLOW_COLUMNS}
       rows={autoflows}
       rowKey={(d) => d.name}
+      rowHref={(d) => `/workflows/${encodeURIComponent(d.slug)}`}
       initialSort={{ key: 'name', dir: 'asc' }}
     />
   );

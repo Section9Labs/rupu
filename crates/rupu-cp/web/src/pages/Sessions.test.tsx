@@ -7,10 +7,15 @@
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { api } from '../lib/api';
 import type { SessionSummary, HostView } from '../lib/api';
 import Sessions from './Sessions';
+
+function LocationProbe() {
+  const loc = useLocation();
+  return <div data-testid="loc">{loc.pathname + loc.search}</div>;
+}
 
 afterEach(() => {
   cleanup();
@@ -335,6 +340,58 @@ describe('Sessions — status cell uses the shared SessionStatusPill', () => {
     const pill = screen.getByText('Stopped');
     expect(pill).toBeInTheDocument();
     expect(pill).not.toHaveAttribute('data-motion', 'rg-pulse-run');
+  });
+});
+
+// ── Task 4 (table-standardization plan): whole-row navigation ──────────────
+
+describe('Sessions — whole-row navigation (rowHref)', () => {
+  it('renders each row as a link to /sessions/:id (with ?host= for a remote session)', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    const link = screen.getByText('fix-bug').closest('a');
+    expect(link).toHaveAttribute('href', `/sessions/${REMOTE_SESSION.session_id}?host=host_prod`);
+  });
+
+  it('clicking Archive does not navigate the row', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION]);
+    vi.spyOn(api, 'archiveSession').mockResolvedValue(undefined);
+
+    render(
+      <MemoryRouter>
+        <Sessions />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText(`Archive session ${REMOTE_SESSION.session_id}`));
+
+    expect(vi.mocked(api.archiveSession)).toHaveBeenCalledWith(REMOTE_SESSION.session_id);
+    expect(screen.getByTestId('loc')).toHaveTextContent('/');
+  });
+
+  it('clicking "active run" navigates to the run, not the session row', async () => {
+    stubDeps();
+    const withActiveRun: SessionSummary = { ...REMOTE_SESSION, active_run_id: 'run-xyz' };
+    vi.spyOn(api, 'getSessions').mockResolvedValue([withActiveRun]);
+
+    render(
+      <MemoryRouter>
+        <Sessions />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText('active run'));
+
+    expect(screen.getByTestId('loc')).toHaveTextContent('/runs/run-xyz');
   });
 });
 

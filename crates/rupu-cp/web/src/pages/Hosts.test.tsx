@@ -6,10 +6,15 @@
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { api, type HostView } from '../lib/api';
 
 import Hosts from './Hosts';
+
+function LocationProbe() {
+  const loc = useLocation();
+  return <div data-testid="loc">{loc.pathname + loc.search}</div>;
+}
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -168,6 +173,46 @@ describe('Hosts page', () => {
 
     // List must refresh after a successful add (initial load + post-add refresh)
     await waitFor(() => expect(vi.mocked(api.getHosts)).toHaveBeenCalledTimes(2));
+  });
+
+  // ── Task 4 (table-standardization plan): whole-row navigation ────────────
+
+  it('renders each row as a link to /hosts/:id (rowHref adoption)', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+
+    render(
+      <MemoryRouter initialEntries={['/hosts']}>
+        <Hosts />
+      </MemoryRouter>,
+    );
+
+    await screen.findByText('prod-east');
+    const link = screen.getByText('prod-east').closest('a');
+    expect(link).toHaveAttribute('href', '/hosts/host-abc123');
+
+    // The subject cell already carried its own inline <Link> before this
+    // task — prove the WHOLE row is now link-wrapped (not just that one
+    // cell) by checking a plain, never-linked cell (the transport chip).
+    const transportLink = screen.getByText('http-cp').closest('a');
+    expect(transportLink).toHaveAttribute('href', '/hosts/host-abc123');
+  });
+
+  it('clicking Remove does not navigate the row', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'removeHost').mockResolvedValue(undefined);
+
+    render(
+      <MemoryRouter initialEntries={['/hosts']}>
+        <Hosts />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    await screen.findByText('prod-east');
+    fireEvent.click(screen.getByRole('button', { name: 'Remove host prod-east' }));
+
+    expect(vi.mocked(api.removeHost)).toHaveBeenCalledWith('host-abc123');
+    expect(screen.getByTestId('loc')).toHaveTextContent('/hosts');
   });
 
   it('shows loading state before data arrives', () => {

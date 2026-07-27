@@ -22,7 +22,7 @@
 // the Scope pill above it.
 
 import { useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { MessageSquare } from 'lucide-react';
 import { api, type SessionSummary } from '../../lib/api';
 import SortableTable, { type Column } from '../lists/SortableTable';
@@ -85,7 +85,10 @@ function sessionDurationMs(s: SessionSummary): number | null {
   return Math.max(0, end - start);
 }
 
-const SESSION_COLUMNS: Column<SessionSummary>[] = [
+/** Build the session columns. Recreated whenever `navigate` changes (it's a
+ *  stable react-router identity, so effectively once). */
+function buildSessionColumns(navigate: ReturnType<typeof useNavigate>): Column<SessionSummary>[] {
+  return [
   {
     key: 'status',
     header: 'Status',
@@ -107,13 +110,11 @@ const SESSION_COLUMNS: Column<SessionSummary>[] = [
     key: 'session',
     header: 'Session',
     fit: true,
+    // Plain content — row-level navigation is `rowHref` (SortableTable
+    // link-wraps the whole row); an inline <Link> here would nest an <a>
+    // inside SortableTable's own <a>.
     render: (s) => (
-      <Link
-        to={`/sessions/${encodeURIComponent(s.session_id)}`}
-        className="text-note text-ink-mute font-mono hover:underline"
-      >
-        {shortId(s.session_id, 10)}
-      </Link>
+      <span className="text-note text-ink-mute font-mono">{shortId(s.session_id, 10)}</span>
     ),
   },
   {
@@ -207,18 +208,29 @@ const SESSION_COLUMNS: Column<SessionSummary>[] = [
     align: 'right',
     render: (s) =>
       s.active_run_id ? (
-        <Link
-          to={`/runs/${encodeURIComponent(s.active_run_id)}`}
+        <button
+          type="button"
+          onClick={(e) => {
+            // The row is now link-wrapped (rowHref) — without both of
+            // these, this click either soft- or hard-navigates to the
+            // session instead of the run (stopPropagation alone does not
+            // block the enclosing <a>'s native default navigation action).
+            e.preventDefault();
+            e.stopPropagation();
+            navigate(`/runs/${encodeURIComponent(s.active_run_id!)}`);
+          }}
           className="inline-flex items-center rounded px-2 py-0.5 text-note font-medium ring-1 bg-info-bg text-info ring-info/30 hover:bg-info-bg"
-          onClick={(e) => e.stopPropagation()}
         >
           active run
-        </Link>
+        </button>
       ) : null,
   },
-];
+  ];
+}
 
 export default function ProjectSessionsTab({ wsId }: { wsId: string }) {
+  const navigate = useNavigate();
+  const sessionColumns = buildSessionColumns(navigate);
   const [scope, setScope] = useState<ScopeFilter>('all');
   const [query, setQuery] = useState('');
 
@@ -301,9 +313,10 @@ export default function ProjectSessionsTab({ wsId }: { wsId: string }) {
               source order already satisfies the default. Headers re-sort
               client-side. */}
           <SortableTable<SessionSummary>
-            columns={SESSION_COLUMNS}
+            columns={sessionColumns}
             rows={visible}
             rowKey={(s) => s.session_id}
+            rowHref={(s) => `/sessions/${encodeURIComponent(s.session_id)}`}
           />
         </div>
       )}
