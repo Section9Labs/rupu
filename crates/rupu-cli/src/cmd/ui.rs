@@ -640,6 +640,7 @@ async fn themes(global_format: Option<crate::output::formats::OutputFormat>) -> 
     let project_root = std::env::current_dir()
         .ok()
         .and_then(|pwd| crate::paths::project_root_for(&pwd).ok().flatten());
+    // UI prefs only — lock does not apply (I-7)
     let cfg = rupu_config::layer_files(
         Some(&global.join("config.toml")),
         project_root

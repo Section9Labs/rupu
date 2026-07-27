@@ -198,6 +198,7 @@ export function GeneralTab({ prov, lockList, fieldValue, onChange, onToggleLock,
           label="Log level"
           dottedKey="log_level"
           kind="select"
+          help="Default tracing filter for the rupu CLI. The RUPU_LOG environment variable overrides it for a single invocation."
           options={['trace', 'debug', 'info', 'warn', 'error']}
           value={fieldValue('log_level')}
           provenance={prov.log_level}
@@ -211,15 +212,45 @@ export function GeneralTab({ prov, lockList, fieldValue, onChange, onToggleLock,
   );
 }
 
-const PROVIDER_FIELDS: Array<{ key: string; label: string; kind: ConfigFieldProps['kind'] }> = [
+const PROVIDER_FIELDS: Array<{
+  key: string;
+  label: string;
+  kind: ConfigFieldProps['kind'];
+  help?: string;
+}> = [
   { key: 'kind', label: 'Kind', kind: 'text' },
   { key: 'base_url', label: 'Base URL', kind: 'text' },
   { key: 'default_model', label: 'Default model', kind: 'text' },
-  { key: 'org_id', label: 'Org id', kind: 'text' },
-  { key: 'region', label: 'Region', kind: 'text' },
-  { key: 'timeout_ms', label: 'Timeout (ms)', kind: 'number' },
-  { key: 'max_retries', label: 'Max retries', kind: 'number' },
-  { key: 'max_concurrency', label: 'Max concurrency', kind: 'number' },
+  {
+    key: 'org_id',
+    label: 'Org id',
+    kind: 'text',
+    help: 'OpenAI only — sent as the OpenAI-Organization header on the platform API.',
+  },
+  {
+    key: 'region',
+    label: 'Region',
+    kind: 'text',
+    help: 'Accepted but currently unused: no shipped Gemini client targets a regional Vertex endpoint.',
+  },
+  {
+    key: 'timeout_ms',
+    label: 'Timeout (ms)',
+    kind: 'number',
+    help: 'Inactivity deadline (connect + read). Default 120000. Long streaming replies are not cut off.',
+  },
+  {
+    key: 'max_retries',
+    label: 'Max retries',
+    kind: 'number',
+    help: 'Retries after the first attempt on rate-limit / transient / 5xx errors. Default 1.',
+  },
+  {
+    key: 'max_concurrency',
+    label: 'Max concurrency',
+    kind: 'number',
+    help: 'Max in-flight LLM calls to this provider. Defaults: anthropic 4, openai 8, gemini 4, copilot 4.',
+  },
   { key: 'stream', label: 'Stream', kind: 'boolean' },
 ];
 
@@ -247,6 +278,7 @@ export function ProvidersTab({ eff, prov, lockList, fieldValue, onChange, onTogg
                 label={f.label}
                 dottedKey={dottedKey}
                 kind={f.kind}
+                help={f.help}
                 value={fieldValue(dottedKey)}
                 provenance={prov[dottedKey]}
                 locked={lockList.includes(dottedKey)}

@@ -245,10 +245,15 @@ pub async fn run(args: Vec<String>) -> ExitCode {
                 action: cmd::autoflow::Action::Run { .. }
             }
     );
+    // Load config BEFORE logging init so `log_level` can act as the
+    // `RUPU_LOG` fallback (ISSUES.md I-14). This is the same cheap layered
+    // read the update-notice block below does; it is reused there.
+    let cli_cfg = cmd::update::load_cli_config();
+    let cfg_log_level = cli_cfg.log_level.as_deref();
     if is_output_cmd {
-        logging::init_to_file();
+        logging::init_to_file(cfg_log_level);
     } else {
-        logging::init();
+        logging::init(cfg_log_level);
     }
 
     // Passive "update available" notice: interactive, non-structured
@@ -262,7 +267,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
             .map(|format| format != output::formats::OutputFormat::Table)
             .unwrap_or(false);
         let is_tty = update_notice::stderr_is_tty();
-        let cfg = cmd::update::load_cli_config();
+        let cfg = &cli_cfg;
         let channel = cfg
             .update
             .channel

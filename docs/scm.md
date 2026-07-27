@@ -117,6 +117,13 @@ max_concurrency = 6
 clone_protocol = "https"
 ```
 
+### Field reference
+
+- **`base_url`** (`Option<String>`): API root — override for GHES / self-hosted GitLab. Note the *clone* paths still use the public host; self-hosted clone URLs are tracked separately in `TODO.md`.
+- **`timeout_ms`** (`Option<u64>`): total per-request deadline for this platform's HTTP calls. Default: `30000`. `0` is treated as unset.
+- **`max_concurrency`** (`Option<usize>`): per-platform semaphore size. Defaults: github 8, gitlab 6.
+- **`clone_protocol`** (`"https" | "ssh"`): how `clone_to` reaches the remote. Default `https` (token embedded in the URL). `ssh` produces `git@<host>:<owner>/<repo>.git` and drops the token entirely — authentication is your SSH agent and `~/.ssh/config`. SSH clones shell out to the system `git` so host aliases, `IdentityFile`, `ProxyJump`, and agent forwarding apply; `git` must be on `PATH`. An unrecognized value logs a warning and falls back to `https`.
+
 ## Concurrency, caching, retry
 
 | Platform | Concurrency | Cache TTL | Retry budget |

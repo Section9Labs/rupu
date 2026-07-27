@@ -1950,6 +1950,7 @@ fn retained_workflow_ui_prefs() -> anyhow::Result<UiPrefs> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
+    // UI prefs only — lock does not apply (I-7)
     let cfg = rupu_config::layer_files(
         Some(&global.join("config.toml")),
         project_root

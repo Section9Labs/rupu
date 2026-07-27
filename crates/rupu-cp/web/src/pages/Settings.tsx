@@ -2,7 +2,7 @@
 // view (effective values + per-key provenance) and renders it as a tabbed
 // form: General / Providers / Autoflow / SCM-Issues / Pricing / CP-Runtime.
 // Each typed field shows its resolved value, a provenance badge (which layer
-// won: global/project/env/default), and a lock toggle that adds/removes the
+// won: global/project/default), and a lock toggle that adds/removes the
 // key from the GLOBAL `[policy].lock` enforced-key list (`PUT
 // /api/config/policy`, applied immediately — independent of the Save button).
 // Edited fields accumulate in a `patch` and are submitted together via `Save

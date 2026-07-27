@@ -304,6 +304,7 @@ fn resolve_watch_prefs(view: Option<LiveViewMode>) -> UiPrefs {
     let cfg = global
         .as_deref()
         .map(|global| {
+            // UI prefs only — lock does not apply (I-7)
             rupu_config::layer_files(
                 Some(&global.join("config.toml")),
                 project_root

@@ -32,6 +32,12 @@ pub struct ProviderConfig {
     /// OpenAI-compatible endpoint. Populated by callers that have a
     /// loaded `rupu_config::Config` (e.g. `rupu run`).
     pub openai_compatible: Option<OpenAiCompatibleParams>,
+    /// Resolved `[providers.<name>]` runtime knobs — `timeout_ms`,
+    /// `max_retries`, `max_concurrency`, `org_id`, `region` (ISSUES.md
+    /// I-9/I-10/I-11/I-12). `None` means "no config for this provider": the
+    /// factory then applies `ProviderTuning::for_provider(name)`, i.e. the
+    /// documented defaults. Build it with [`provider_tuning`].
+    pub tuning: Option<rupu_providers::ProviderTuning>,
 }
 
 /// Everything the factory needs to build an `OpenAiCompatibleClient`,
@@ -85,6 +91,39 @@ pub fn openai_compatible_map(
     providers
         .keys()
         .filter_map(|name| openai_compatible_params(name, providers).map(|p| (name.clone(), p)))
+        .collect()
+}
+
+/// Resolve `[providers.<name>]` into the runtime knobs the provider clients
+/// and decorators consume. Absent keys collapse to the documented defaults
+/// here, so no consumer re-implements defaulting.
+///
+/// This is the single adapter between `rupu-config` and `rupu-providers`;
+/// `rupu-providers` does not depend on `rupu-config` (hexagonal rule 1).
+pub fn provider_tuning(
+    name: &str,
+    providers: &std::collections::BTreeMap<String, rupu_config::ProviderConfig>,
+) -> rupu_providers::ProviderTuning {
+    use rupu_providers::tuning;
+    let p = providers.get(name);
+    rupu_providers::ProviderTuning {
+        timeout: tuning::client_timeout(p.and_then(|p| p.timeout_ms)),
+        max_retries: tuning::retry_budget(p.and_then(|p| p.max_retries)),
+        max_concurrency: tuning::concurrency_permits(name, p.and_then(|p| p.max_concurrency)),
+        org_id: p.and_then(|p| p.org_id.clone()),
+        region: p.and_then(|p| p.region.clone()),
+    }
+}
+
+/// [`provider_tuning`] for every declared `[providers.<name>]`, keyed by name.
+/// Used by the workflow runner and the sub-agent dispatcher, which resolve a
+/// provider name per step rather than once up front.
+pub fn provider_tuning_map(
+    providers: &std::collections::BTreeMap<String, rupu_config::ProviderConfig>,
+) -> std::collections::HashMap<String, rupu_providers::ProviderTuning> {
+    providers
+        .keys()
+        .map(|name| (name.clone(), provider_tuning(name, providers)))
         .collect()
 }
 
@@ -217,11 +256,15 @@ pub async fn build_for_provider_with_config(
                 provider: name.to_string(),
                 source,
             })?;
+    let tuning = config
+        .tuning
+        .clone()
+        .unwrap_or_else(|| rupu_providers::ProviderTuning::for_provider(name));
     let client = match name {
-        "anthropic" => build_anthropic(creds, model, config).await?,
-        "openai" | "openai_codex" | "codex" => build_openai(creds, model).await?,
-        "gemini" | "google_gemini" => build_gemini(creds, model).await?,
-        "copilot" | "github_copilot" => build_copilot(creds, model).await?,
+        "anthropic" => build_anthropic(creds, model, config, &tuning).await?,
+        "openai" | "openai_codex" | "codex" => build_openai(creds, model, &tuning).await?,
+        "gemini" | "google_gemini" => build_gemini(creds, model, &tuning).await?,
+        "copilot" | "github_copilot" => build_copilot(creds, model, &tuning).await?,
         "local" => return Err(FactoryError::NotWiredInV0("local".to_string())),
         _ => {
             if let Some(params) = &config.openai_compatible {
@@ -229,19 +272,63 @@ pub async fn build_for_provider_with_config(
                     rupu_providers::auth::AuthCredentials::ApiKey { key } => key.clone(),
                     rupu_providers::auth::AuthCredentials::OAuth { access, .. } => access.clone(),
                 };
-                Box::new(rupu_providers::OpenAiCompatibleClient::new(
-                    &params.base_url,
-                    &key,
-                    &params.default_model,
-                    params.models.clone(),
-                    params.stream,
-                )) as Box<dyn LlmProvider>
+                Box::new(
+                    rupu_providers::OpenAiCompatibleClient::new(
+                        &params.base_url,
+                        &key,
+                        &params.default_model,
+                        params.models.clone(),
+                        params.stream,
+                    )
+                    .with_tuning(&tuning),
+                ) as Box<dyn LlmProvider>
             } else {
                 return Err(FactoryError::UnknownProvider(name.to_string()));
             }
         }
     };
-    Ok((mode, client))
+    Ok((mode, decorate(client, name, &tuning)))
+}
+
+/// Apply the tuning decorators that make `max_retries` and `max_concurrency`
+/// observable on every call (ISSUES.md I-10 / I-11).
+///
+/// **Ordering matters.** Throttle wraps the raw client, retry wraps throttle —
+/// `RetryingProvider(ThrottledProvider(client))`. Each retry attempt therefore
+/// acquires its own permit and drops it the moment that attempt returns, so the
+/// exponential backoff sleeps *outside* the semaphore. The inverse nesting
+/// (throttle outermost) parks a permit in `tokio::time::sleep` for the whole
+/// 2s/4s/8s ladder, which under rate limiting starves every other caller of the
+/// same provider — `tuned::tests::a_backoff_sleep_does_not_hold_a_concurrency_permit`
+/// and its `..._inverted_order_...` counterpart pin both halves of that claim.
+///
+/// Anthropic is the one provider NOT given a `RetryingProvider`: it has its own
+/// in-client 429 loop, already driven by `tuning.max_retries` via
+/// `AnthropicClient::with_tuning`, and stacking the two would silently square
+/// the budget. That native loop *does* sleep inside the permit — the wrappers
+/// cannot reach inside a client — so anthropic keeps the starvation shape this
+/// ordering removes for everyone else. Fixing it means teaching
+/// `AnthropicClient` to release/reacquire around its own backoff; tracked as a
+/// follow-up rather than papered over here.
+fn decorate(
+    client: Box<dyn LlmProvider>,
+    name: &str,
+    tuning: &rupu_providers::ProviderTuning,
+) -> Box<dyn LlmProvider> {
+    let throttled = rupu_providers::ThrottledProvider::wrap(client, name, tuning);
+    if provider_has_native_retry(name) {
+        Box::new(throttled)
+    } else {
+        Box::new(rupu_providers::RetryingProvider::new(
+            Box::new(throttled),
+            tuning.max_retries,
+        ))
+    }
+}
+
+/// True for providers whose client already spends `tuning.max_retries` itself.
+fn provider_has_native_retry(name: &str) -> bool {
+    name == "anthropic"
 }
 
 fn build_mock_from_script(json: &str) -> Result<Box<dyn LlmProvider>, FactoryError> {
@@ -255,6 +342,7 @@ async fn build_anthropic(
     creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
     config: &ProviderConfig,
+    tuning: &rupu_providers::ProviderTuning,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
     // Convert the resolved credential into an Anthropic AuthMethod so OAuth
     // tokens travel via `Authorization: Bearer …` and API keys via
@@ -279,6 +367,7 @@ async fn build_anthropic(
         Ok(url) => rupu_providers::anthropic::AnthropicClient::from_auth_with_url(auth, url),
         Err(_) => rupu_providers::anthropic::AnthropicClient::from_auth(auth),
     }
+    .with_tuning(tuning)
     .with_oauth_account_uuid(account_uuid);
     if let Some(enabled) = config.anthropic_oauth_system_prefix {
         client = client.with_oauth_system_prefix(enabled);
@@ -294,15 +383,18 @@ async fn build_anthropic(
 async fn build_openai(
     creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
+    tuning: &rupu_providers::ProviderTuning,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
     let client = rupu_providers::openai_codex::OpenAiCodexClient::new(creds, None)
-        .map_err(|e| FactoryError::Other(format!("openai client init: {e}")))?;
+        .map_err(|e| FactoryError::Other(format!("openai client init: {e}")))?
+        .with_tuning(tuning);
     Ok(Box::new(client))
 }
 
 async fn build_gemini(
     creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
+    tuning: &rupu_providers::ProviderTuning,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
     // Branch on credential shape:
     // - `ApiKey` → AI Studio (`generativelanguage.googleapis.com`,
@@ -325,16 +417,19 @@ async fn build_gemini(
             .unwrap_or(GeminiVariant::GeminiCli),
     };
     let client = GoogleGeminiClient::new(creds, variant, None)
-        .map_err(|e| FactoryError::Other(format!("gemini client init: {e}")))?;
+        .map_err(|e| FactoryError::Other(format!("gemini client init: {e}")))?
+        .with_tuning(tuning);
     Ok(Box::new(client))
 }
 
 async fn build_copilot(
     creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
+    tuning: &rupu_providers::ProviderTuning,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
     let client = rupu_providers::github_copilot::GithubCopilotClient::new(creds, None)
-        .map_err(|e| FactoryError::Other(format!("copilot client init: {e}")))?;
+        .map_err(|e| FactoryError::Other(format!("copilot client init: {e}")))?
+        .with_tuning(tuning);
     Ok(Box::new(client))
 }
 
@@ -369,6 +464,71 @@ mod tests {
         assert_eq!(p.models[0].context_window, 131072);
         // A name without kind=openai-compatible yields None.
         assert!(openai_compatible_params("anthropic", &providers).is_none());
+    }
+
+    #[test]
+    fn provider_tuning_reads_every_configured_knob() {
+        use std::collections::BTreeMap;
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "openai".to_string(),
+            rupu_config::ProviderConfig {
+                timeout_ms: Some(9_000),
+                max_retries: Some(4),
+                max_concurrency: Some(3),
+                org_id: Some("org-abc123".into()),
+                region: Some("us-central1".into()),
+                ..Default::default()
+            },
+        );
+        let t = provider_tuning("openai", &providers);
+        assert_eq!(t.timeout, std::time::Duration::from_millis(9_000));
+        assert_eq!(t.max_retries, 4);
+        assert_eq!(t.max_concurrency, 3);
+        assert_eq!(t.org_id.as_deref(), Some("org-abc123"));
+        assert_eq!(t.region.as_deref(), Some("us-central1"));
+    }
+
+    #[test]
+    fn provider_tuning_falls_back_to_documented_defaults() {
+        use std::collections::BTreeMap;
+        let providers = BTreeMap::new();
+        let t = provider_tuning("openai", &providers);
+        assert_eq!(t.timeout, std::time::Duration::from_millis(120_000));
+        assert_eq!(t.max_retries, 1);
+        // Per-vendor permit table, not a flat default.
+        assert_eq!(t.max_concurrency, 8);
+        assert_eq!(provider_tuning("anthropic", &providers).max_concurrency, 4);
+        assert!(t.org_id.is_none());
+    }
+
+    #[test]
+    fn provider_tuning_map_covers_every_declared_provider() {
+        use std::collections::BTreeMap;
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "anthropic".to_string(),
+            rupu_config::ProviderConfig {
+                max_concurrency: Some(2),
+                ..Default::default()
+            },
+        );
+        providers.insert("openai".to_string(), Default::default());
+        let map = provider_tuning_map(&providers);
+        assert_eq!(map["anthropic"].max_concurrency, 2);
+        assert_eq!(map["openai"].max_concurrency, 8);
+        assert!(!map.contains_key("gemini"));
+    }
+
+    #[test]
+    fn only_anthropic_skips_the_retry_decorator() {
+        // Anthropic spends `max_retries` inside its own 429 loop; wrapping it
+        // in RetryingProvider too would square the budget.
+        assert!(provider_has_native_retry("anthropic"));
+        assert!(!provider_has_native_retry("openai"));
+        assert!(!provider_has_native_retry("gemini"));
+        assert!(!provider_has_native_retry("copilot"));
+        assert!(!provider_has_native_retry("oracle"));
     }
 
     #[test]

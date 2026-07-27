@@ -8,6 +8,7 @@
 //!
 //! Spec: `docs/superpowers/specs/2026-05-03-rupu-slice-b2-scm-design.md`.
 
+pub mod client_options;
 pub mod clone;
 pub mod connectors;
 pub mod error;
@@ -17,6 +18,7 @@ pub mod registry;
 pub mod types;
 pub mod weburl;
 
+pub use client_options::{clone_url, scm_timeout, CloneProtocol, ScmClientOptions};
 pub use clone::{clone_repo_ref, CloneError};
 pub use connectors::{IssueConnector, RepoConnector};
 pub use error::{classify_scm_error, ScmError};

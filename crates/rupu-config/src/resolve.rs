@@ -1,7 +1,15 @@
 //! Provenance-aware config resolution with policy-lock enforcement.
-//! A key listed in the GLOBAL `[policy].lock` takes its GLOBAL value over
-//! project + env: locked-global > env > project > global > default. Non-locked
-//! keys keep env > project > global > default.
+//! A key listed in the GLOBAL `[policy].lock` takes its GLOBAL value over the
+//! project layer: locked-global > project > global > default. Non-locked keys
+//! keep project > global > default.
+//!
+//! There is deliberately no environment tier. One existed until ISSUES.md I-20:
+//! `resolve()` took an `env: &BTreeMap<String, Value>` and ranked it above
+//! `project`, but every production caller passed an empty map, so `KeySource::Env`
+//! was unreachable and the CP Settings UI advertised an `env` provenance badge
+//! that could never render. Environment variables that *do* affect rupu
+//! (`RUPU_LOG`, `RUPU_MOCK_PROVIDER_SCRIPT`, …) are read at their consumer, not
+//! merged into `Config`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -17,7 +25,6 @@ use crate::layer::{read_optional_toml, LayerError};
 pub enum KeySource {
     Global,
     Project,
-    Env,
     Default,
 }
 
@@ -141,11 +148,7 @@ fn dotted(parts: &[String]) -> String {
         .join(".")
 }
 
-pub fn resolve(
-    global: Option<&Path>,
-    project: Option<&Path>,
-    env: &BTreeMap<String, Value>,
-) -> Result<Resolved, LayerError> {
+pub fn resolve(global: Option<&Path>, project: Option<&Path>) -> Result<Resolved, LayerError> {
     let g = read_optional_toml(global)?; // Option<Value>
     let p = read_optional_toml(project)?;
 
@@ -157,19 +160,6 @@ pub fn resolve(
     if let Some(p) = &p {
         flatten(&[], p, &mut fp);
     }
-    // Env overrides arrive keyed by dotted config path (simple keys — env never
-    // carries a dotted model id), so splitting them into segments is safe and
-    // lets them share the segment-path key space with `fg`/`fp`.
-    let fe: BTreeMap<Vec<String>, Value> = env
-        .iter()
-        .map(|(k, v)| {
-            (
-                k.split('.').map(String::from).collect::<Vec<_>>(),
-                v.clone(),
-            )
-        })
-        .collect();
-
     // Locks come from the GLOBAL layer only. `[policy].lock` is a two-segment key.
     let lock: Vec<String> = fg
         .iter()
@@ -181,29 +171,21 @@ pub fn resolve(
 
     let mut winners: BTreeMap<Vec<String>, Value> = BTreeMap::new();
     let mut provenance: BTreeMap<String, KeyProvenance> = BTreeMap::new();
-    let all_keys: std::collections::BTreeSet<Vec<String>> = fg
-        .keys()
-        .chain(fp.keys())
-        .chain(fe.keys())
-        .cloned()
-        .collect();
+    let all_keys: std::collections::BTreeSet<Vec<String>> =
+        fg.keys().chain(fp.keys()).cloned().collect();
 
     for key in all_keys {
         let key_dotted = dotted(&key);
         let locked = is_locked(&key_dotted);
-        // Precedence: locked ⇒ global wins if present; else env > project > global.
+        // Precedence: locked ⇒ global wins if present; else project > global.
         let (val, source) = if locked {
             if let Some(v) = fg.get(&key) {
                 (Some(v.clone()), KeySource::Global)
-            } else if let Some(v) = fe.get(&key) {
-                (Some(v.clone()), KeySource::Env)
             } else if let Some(v) = fp.get(&key) {
                 (Some(v.clone()), KeySource::Project)
             } else {
                 (None, KeySource::Default)
             }
-        } else if let Some(v) = fe.get(&key) {
-            (Some(v.clone()), KeySource::Env)
         } else if let Some(v) = fp.get(&key) {
             (Some(v.clone()), KeySource::Project)
         } else if let Some(v) = fg.get(&key) {
@@ -249,7 +231,6 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use std::io::Write;
 
     fn write_toml(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
@@ -264,7 +245,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let g = write_toml(d.path(), "g.toml", "default_model = \"global-m\"\n");
         let p = write_toml(d.path(), "p.toml", "default_model = \"project-m\"\n");
-        let r = resolve(Some(&g), Some(&p), &BTreeMap::new()).unwrap();
+        let r = resolve(Some(&g), Some(&p)).unwrap();
         assert_eq!(r.config.default_model.as_deref(), Some("project-m"));
         let prov = r.provenance.get("default_model").unwrap();
         assert!(matches!(prov.source, KeySource::Project));
@@ -280,7 +261,7 @@ mod tests {
             "permission_mode = \"ask\"\n[policy]\nlock = [\"permission_mode\"]\n",
         );
         let p = write_toml(d.path(), "p.toml", "permission_mode = \"bypass\"\n");
-        let r = resolve(Some(&g), Some(&p), &BTreeMap::new()).unwrap();
+        let r = resolve(Some(&g), Some(&p)).unwrap();
         // Locked: the global value wins over the project override.
         assert_eq!(r.config.permission_mode.as_deref(), Some("ask"));
         let prov = r.provenance.get("permission_mode").unwrap();
@@ -297,23 +278,23 @@ mod tests {
             "[autoflow]\nmax_active = 2\n[policy]\nlock = [\"autoflow.max_active\"]\n",
         );
         let p = write_toml(d.path(), "p.toml", "[autoflow]\nmax_active = 99\n");
-        let r = resolve(Some(&g), Some(&p), &BTreeMap::new()).unwrap();
+        let r = resolve(Some(&g), Some(&p)).unwrap();
         assert_eq!(r.config.autoflow.max_active, Some(2));
         assert!(r.provenance.get("autoflow.max_active").unwrap().locked);
     }
 
+    /// I-20: the env tier is gone. Provenance for an unlocked key that both
+    /// layers set is `Project` — there is no source that can outrank it.
     #[test]
-    fn env_overrides_project_when_unlocked() {
+    fn project_wins_when_unlocked_and_no_env_tier_exists() {
         let d = tempfile::tempdir().unwrap();
         let g = write_toml(d.path(), "g.toml", "log_level = \"info\"\n");
         let p = write_toml(d.path(), "p.toml", "log_level = \"debug\"\n");
-        let mut env = BTreeMap::new();
-        env.insert("log_level".to_string(), toml::Value::String("trace".into()));
-        let r = resolve(Some(&g), Some(&p), &env).unwrap();
-        assert_eq!(r.config.log_level.as_deref(), Some("trace"));
+        let r = resolve(Some(&g), Some(&p)).unwrap();
+        assert_eq!(r.config.log_level.as_deref(), Some("debug"));
         assert!(matches!(
             r.provenance.get("log_level").unwrap().source,
-            KeySource::Env
+            KeySource::Project
         ));
     }
 
@@ -321,11 +302,11 @@ mod tests {
     fn cp_section_parses_and_defaults() {
         let d = tempfile::tempdir().unwrap();
         let g = write_toml(d.path(), "g.toml", "[cp]\nmax_workspace_bytes = 1048576\n");
-        let r = resolve(Some(&g), None, &BTreeMap::new()).unwrap();
+        let r = resolve(Some(&g), None).unwrap();
         assert_eq!(r.config.cp.max_workspace_bytes, Some(1_048_576));
         // absent ⇒ None
         let g2 = write_toml(d.path(), "g2.toml", "default_model = \"x\"\n");
-        let r2 = resolve(Some(&g2), None, &BTreeMap::new()).unwrap();
+        let r2 = resolve(Some(&g2), None).unwrap();
         assert_eq!(r2.config.cp.max_workspace_bytes, None);
     }
 
@@ -345,7 +326,7 @@ mod tests {
              output_per_mtok = 1.42\n\
              cached_input_per_mtok = 0.82\n",
         );
-        let r = resolve(Some(&g), None, &BTreeMap::new())
+        let r = resolve(Some(&g), None)
             .expect("dotted model key must resolve, not error");
         let mp = r
             .config
@@ -374,7 +355,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let g = write_toml(d.path(), "g.toml", "default_model = \"x\"\n");
         let p = write_toml(d.path(), "p.toml", "[default_model]\nk = \"y\"\n");
-        let r = resolve(Some(&g), Some(&p), &BTreeMap::new());
+        let r = resolve(Some(&g), Some(&p));
         assert!(r.is_err(), "expected Err, got {r:?}");
     }
 
@@ -392,7 +373,7 @@ mod tests {
             "p.toml",
             "permission_mode = \"bypass\"\n[policy]\nlock = []\n",
         );
-        let r = resolve(Some(&g), Some(&p), &BTreeMap::new()).unwrap();
+        let r = resolve(Some(&g), Some(&p)).unwrap();
         // The resolved lock list reflects the GLOBAL list, not the project's.
         assert_eq!(r.config.policy.lock, vec!["permission_mode".to_string()]);
         // Provenance for policy.lock must be Global.
@@ -415,7 +396,7 @@ mod tests {
         );
         let p = write_toml(d.path(), "p.toml", "log_level = \"debug\"\n");
         let via_layer = crate::layer_files(Some(&g), Some(&p)).unwrap();
-        let via_resolve = resolve(Some(&g), Some(&p), &BTreeMap::new())
+        let via_resolve = resolve(Some(&g), Some(&p))
             .unwrap()
             .config;
         assert_eq!(via_layer, via_resolve);

@@ -241,10 +241,21 @@ const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 /// the wire keeps rupu's requests in the same Cloudflare/WAF
 /// classification bucket as claude-code traffic.
 fn build_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .http1_only()
-        .build()
-        .expect("reqwest build")
+    build_http_client_with_timeout(None)
+}
+
+/// `build_http_client` with an optional inactivity deadline from
+/// `[providers.anthropic].timeout_ms` (ISSUES.md I-9).
+///
+/// Applied as connect + read timeouts, never as reqwest's total `timeout`:
+/// a total deadline would abort a long generation mid-stream. `None` keeps
+/// the historical no-deadline client (used by every non-factory constructor).
+fn build_http_client_with_timeout(timeout: Option<std::time::Duration>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder().http1_only();
+    if let Some(t) = timeout {
+        builder = builder.connect_timeout(t).read_timeout(t);
+    }
+    builder.build().expect("reqwest build")
 }
 
 /// Whether the model string carries the explicit 1M-context opt-in
@@ -631,6 +642,10 @@ pub struct AnthropicClient {
     /// opt-out via `anthropicOauthPrefix: false` in agent frontmatter.
     /// Has no effect on api-key requests.
     oauth_system_prefix_enabled: bool,
+    /// Per-request 429 retry budget. Defaults to [`MAX_RATE_LIMIT_RETRIES`];
+    /// `[providers.anthropic].max_retries` overrides it via
+    /// [`AnthropicClient::with_tuning`] (ISSUES.md I-10).
+    max_rate_limit_retries: u32,
 }
 
 impl AnthropicClient {
@@ -644,7 +659,25 @@ impl AnthropicClient {
             credential_store: None,
             oauth_account_uuid: None,
             oauth_system_prefix_enabled: true,
+            max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
         }
+    }
+
+    /// Apply `[providers.anthropic]` tuning: rebuild the HTTP client with the
+    /// configured inactivity deadline (I-9) and adopt the configured 429 retry
+    /// budget (I-10). The factory calls this for every client it builds, which
+    /// is why the Anthropic client is the one provider NOT wrapped in
+    /// `RetryingProvider` — it has its own in-client retry loop and wrapping
+    /// would multiply the budget.
+    pub fn with_tuning(mut self, tuning: &crate::tuning::ProviderTuning) -> Self {
+        self.client = build_http_client_with_timeout(Some(tuning.timeout));
+        self.max_rate_limit_retries = tuning.max_retries;
+        self
+    }
+
+    /// The 429 retry budget this client will actually spend.
+    pub fn max_rate_limit_retries(&self) -> u32 {
+        self.max_rate_limit_retries
     }
 
     /// Set the OAuth account UUID. Used by the factory after reading it
@@ -674,6 +707,7 @@ impl AnthropicClient {
             credential_store: None,
             oauth_account_uuid: None,
             oauth_system_prefix_enabled: true,
+            max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
         }
     }
 
@@ -690,6 +724,7 @@ impl AnthropicClient {
             credential_store: Some(store),
             oauth_account_uuid: None,
             oauth_system_prefix_enabled: true,
+            max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
         }
     }
 
@@ -714,6 +749,7 @@ impl AnthropicClient {
             credential_store: None,
             oauth_account_uuid: None,
             oauth_system_prefix_enabled: true,
+            max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
         }
     }
 
@@ -729,6 +765,7 @@ impl AnthropicClient {
             credential_store: None,
             oauth_account_uuid: None,
             oauth_system_prefix_enabled: true,
+            max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
         }
     }
 
@@ -949,7 +986,7 @@ impl AnthropicClient {
         let body = self.build_request_body(request, false);
 
         let mut last_err = None;
-        for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
+        for attempt in 0..=self.max_rate_limit_retries {
             if attempt > 0 {
                 let backoff = INITIAL_BACKOFF_MS * 2u64.pow(attempt - 1);
                 warn!(
@@ -1061,7 +1098,7 @@ impl AnthropicClient {
             let response = {
                 let mut last_err = None;
                 let mut got_response = None;
-                for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
+                for attempt in 0..=self.max_rate_limit_retries {
                     if attempt > 0 {
                         let backoff = INITIAL_BACKOFF_MS * 2u64.pow(attempt - 1);
                         warn!(
@@ -3399,6 +3436,72 @@ mod tests {
         assert!(models.iter().any(|m| m.id == "claude-opus-4-1-20250805"));
         assert!(models.iter().any(|m| m.id == "claude-sonnet-4-6"));
         assert!(models.iter().all(|m| m.provider == ProviderId::Anthropic));
+    }
+
+    // ── [providers.anthropic] tuning (ISSUES.md I-9 / I-10) ──────────
+
+    #[test]
+    fn tuning_sets_the_retry_budget_the_client_will_spend() {
+        let client = AnthropicClient::new("k".into());
+        // Historical default, unchanged for non-factory constructors.
+        assert_eq!(client.max_rate_limit_retries(), 1);
+        let tuned = AnthropicClient::new("k".into()).with_tuning(
+            &crate::tuning::ProviderTuning {
+                max_retries: 4,
+                ..crate::tuning::ProviderTuning::for_provider("anthropic")
+            },
+        );
+        assert_eq!(tuned.max_rate_limit_retries(), 4);
+    }
+
+    /// The budget is observable AT THE CONSUMER: with `max_retries = 0` a
+    /// rate-limited request is issued exactly once, where the historical
+    /// hardcoded budget of 1 would have issued it twice.
+    #[tokio::test]
+    async fn max_retries_zero_issues_exactly_one_request() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(POST).path("/v1/messages");
+            then.status(429)
+                .header("content-type", "application/json")
+                .body(r#"{"error":{"type":"rate_limit_error"}}"#);
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages", server.url("")),
+        )
+        .with_tuning(&crate::tuning::ProviderTuning {
+            max_retries: 0,
+            ..crate::tuning::ProviderTuning::for_provider("anthropic")
+        });
+        let _ = client.send(&make_request(None)).await;
+        m.assert_hits(1);
+    }
+
+    /// …and with `max_retries = 1` the same 429 is retried once (two hits).
+    /// This is the assertion that the config value, not a constant, drives
+    /// the loop. It sleeps out one 2s backoff.
+    #[tokio::test]
+    async fn max_retries_one_issues_two_requests() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(POST).path("/v1/messages");
+            then.status(429)
+                .header("content-type", "application/json")
+                .body(r#"{"error":{"type":"rate_limit_error"}}"#);
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages", server.url("")),
+        )
+        .with_tuning(&crate::tuning::ProviderTuning {
+            max_retries: 1,
+            ..crate::tuning::ProviderTuning::for_provider("anthropic")
+        });
+        let _ = client.send(&make_request(None)).await;
+        m.assert_hits(2);
     }
 
     #[tokio::test]

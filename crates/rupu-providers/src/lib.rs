@@ -38,6 +38,8 @@ pub mod routing_history;
 pub mod smart_router;
 pub mod sse;
 pub mod task_classifier;
+pub mod tuned;
+pub mod tuning;
 pub mod types;
 
 pub use anthropic::AnthropicClient;
@@ -68,6 +70,8 @@ pub use router::ProviderRouter;
 pub use routing_history::RoutingHistory;
 pub use smart_router::SmartRouter;
 pub use task_classifier::TaskType;
+pub use tuned::{RetryingProvider, ThrottledProvider};
+pub use tuning::ProviderTuning;
 pub use types::*;
 
 /// Discover all providers with valid credentials.

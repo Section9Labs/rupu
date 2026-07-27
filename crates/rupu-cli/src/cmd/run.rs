@@ -332,11 +332,28 @@ async fn list(
 ) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
-    // Resolve pricing exactly the way `show()` (above) does: global-only,
-    // falling back to defaults on a missing/malformed config.toml rather
-    // than failing the command.
+    // Resolve pricing exactly the way `show()` (below) does: global-only.
+    // A MISSING config.toml is fine — `layer_files_locked` already treats
+    // that as an empty layer and resolves `PricingConfig::default()` with
+    // no error. A PRESENT but malformed one (ISSUES.md I-21) must fail the
+    // command instead: these rows carry `usage`-derived cost figures a
+    // user reads and trusts, so a config.toml typo must never silently
+    // substitute default rates and print a wrong dollar amount as if it
+    // were authoritative. (Contrast the `[ui]`-prefs fallback in
+    // `cmd/workflow.rs` / `cmd/cron.rs`, which is fine to swallow — a
+    // wrong pager/theme default has no correctness stakes.)
     let global_cfg_path = global.join("config.toml");
-    let cfg = rupu_config::layer_files(Some(&global_cfg_path), None).unwrap_or_default();
+    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), None).map_err(|e| {
+        tracing::warn!(
+            path = %global_cfg_path.display(),
+            error = %e,
+            "config.toml failed to parse; refusing to compute run costs from default pricing"
+        );
+        anyhow::anyhow!(
+            "failed to load {}: {e} (run cost figures cannot be trusted from a malformed config; fix or remove the file)",
+            global_cfg_path.display()
+        )
+    })?;
 
     let mut all: Vec<_> = store
         .list()?
@@ -390,10 +407,13 @@ async fn list(
 /// `rupu run show <id>` — one run's detail, as rupu-cp's wire shape.
 ///
 /// Resolves `PricingConfig` global-only (no project layering), mirroring
-/// [`list`]'s global-only `RunStore` resolution and rupu-cp's own
-/// `load_pricing` (`crates/rupu-cp/src/lib.rs`): a missing/malformed
-/// `config.toml` falls back to `PricingConfig::default()` rather than
-/// failing the command.
+/// [`list`]'s global-only `RunStore` resolution. A MISSING `config.toml`
+/// resolves to `PricingConfig::default()` with no error — that's the
+/// expected fresh-install case. A PRESENT but malformed one FAILS the
+/// command (ISSUES.md I-21): this run's cost figures are numbers a user
+/// reads and trusts, so a config.toml typo must never silently substitute
+/// default rates and print a wrong dollar amount as if it were
+/// authoritative.
 async fn show(
     run_id: String,
     global_format: Option<crate::output::formats::OutputFormat>,
@@ -401,7 +421,17 @@ async fn show(
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
     let global_cfg_path = global.join("config.toml");
-    let cfg = rupu_config::layer_files(Some(&global_cfg_path), None).unwrap_or_default();
+    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), None).map_err(|e| {
+        tracing::warn!(
+            path = %global_cfg_path.display(),
+            error = %e,
+            "config.toml failed to parse; refusing to compute run cost from default pricing"
+        );
+        anyhow::anyhow!(
+            "failed to load {}: {e} (run cost figures cannot be trusted from a malformed config; fix or remove the file)",
+            global_cfg_path.display()
+        )
+    })?;
 
     // Emit rupu-cp's own detail payload verbatim — do NOT re-shape it here.
     // See `query_run_detail`'s doc comment (crates/rupu-cp/src/api/runs.rs)
@@ -470,7 +500,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // Resolve config (global + project).
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
     let prefs = UiPrefs::resolve(&cfg.ui, false, None, None, args.view);
 
     // Resolve permission mode.
@@ -531,6 +561,10 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
         openai_compatible: oai_params,
+        tuning: Some(provider_factory::provider_tuning(
+            &provider_name,
+            &cfg.providers,
+        )),
     };
     let (_resolved_auth, provider) = provider_factory::build_for_provider_with_config(
         &provider_name,
@@ -693,6 +727,10 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         Arc::clone(&scm_registry),
         Arc::clone(&run_store),
         None,
+        cfg.default_provider.clone(),
+        cfg.default_model.clone(),
+        provider_factory::openai_compatible_map(&cfg.providers),
+        provider_factory::provider_tuning_map(&cfg.providers),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
 
@@ -1334,6 +1372,69 @@ mod tests {
         assert!(
             !started.contains("+00:00"),
             "must NOT use .to_rfc3339()'s +00:00 offset — it sorts before 'Z': {started}"
+        );
+    }
+
+    /// I-21: a malformed `config.toml` must fail `rupu run list`/`rupu run
+    /// show` rather than silently substituting `PricingConfig::default()`
+    /// and printing a cost figure computed from the wrong rates as if it
+    /// were authoritative.
+    #[tokio::test]
+    async fn malformed_config_surfaces_on_the_pricing_path() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let global = tmp.path().join("home");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::write(global.join("config.toml"), "not valid toml [[[").unwrap();
+
+        let old_home = std::env::var_os("RUPU_HOME");
+        std::env::set_var("RUPU_HOME", &global);
+
+        let list_result = list(10, None, None).await;
+        let show_result = show("run_missing".to_string(), None).await;
+
+        match old_home {
+            Some(v) => std::env::set_var("RUPU_HOME", v),
+            None => std::env::remove_var("RUPU_HOME"),
+        }
+
+        assert!(
+            list_result.is_err(),
+            "`rupu run list` must fail on a malformed config.toml, not fall back to default \
+             pricing: {list_result:?}"
+        );
+        assert!(
+            show_result.is_err(),
+            "`rupu run show` must fail on a malformed config.toml, not fall back to default \
+             pricing: {show_result:?}"
+        );
+    }
+
+    /// Regression guard: a config.toml that simply doesn't exist yet (the
+    /// common fresh-install case) must still resolve pricing defaults with
+    /// no error — only a PRESENT-but-malformed file should fail the
+    /// command.
+    #[tokio::test]
+    async fn missing_config_file_still_falls_back_without_erroring() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let global = tmp.path().join("home");
+        std::fs::create_dir_all(&global).unwrap();
+        // Deliberately no config.toml written under `global`.
+
+        let old_home = std::env::var_os("RUPU_HOME");
+        std::env::set_var("RUPU_HOME", &global);
+
+        let list_result = list(10, None, None).await;
+
+        match old_home {
+            Some(v) => std::env::set_var("RUPU_HOME", v),
+            None => std::env::remove_var("RUPU_HOME"),
+        }
+
+        assert!(
+            list_result.is_ok(),
+            "a missing (not malformed) config.toml must not fail the command: {list_result:?}"
         );
     }
 }

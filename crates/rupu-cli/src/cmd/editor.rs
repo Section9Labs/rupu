@@ -82,6 +82,9 @@ fn config_editor() -> Option<String> {
     let pwd = std::env::current_dir().ok()?;
     let project_root = crate::paths::project_root_for(&pwd).ok().flatten();
     let project_cfg = project_root.map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).ok()?;
+    // `[ui].editor` is spawned as a subprocess by `open_for_edit` above — it
+    // is policy-bearing (I-7), not a display preference, so a locked global
+    // value must survive a conflicting project config.
+    let cfg = rupu_config::layer_files_locked(Some(&global_cfg), project_cfg.as_deref()).ok()?;
     cfg.ui.editor
 }

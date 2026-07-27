@@ -20,7 +20,6 @@ import { Lock, Unlock } from 'lucide-react';
 export const SOURCE_CLASS: Record<KeyProvenance['source'], string> = {
   global: 'bg-info-bg text-info ring-info/30',
   project: 'bg-ok-bg text-ok ring-ok/30',
-  env: 'bg-warn-bg text-warn ring-warn/30',
   default: 'bg-surface text-ink-mute ring-border',
 };
 

@@ -89,9 +89,8 @@ impl DefinitionGenerator for RuntimeDefinitionGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::Mutex;
+    use crate::test_support::ENV_LOCK;
 
-    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
     const VALID_AGENT_MD: &str = "---\nname: a\ndescription: d\nprovider: anthropic\nmodel: claude-sonnet-4-6\n---\n\nbody\n";
 
     #[tokio::test]

@@ -141,7 +141,7 @@ fn load_cli_config() -> rupu_config::Config {
     let pwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_root = paths::project_root_for(&pwd).ok().flatten();
     let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())
+    rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())
         .unwrap_or_default()
 }
 

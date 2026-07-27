@@ -1461,6 +1461,7 @@ async fn list(
     let cfg = {
         let global_cfg = global.join("config.toml");
         let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
+        // UI prefs only — lock does not apply (I-7)
         rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default()
     };
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None);
@@ -1515,6 +1516,7 @@ async fn show(
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
+    // UI prefs only — lock does not apply (I-7)
     let cfg = rupu_config::layer_files(
         Some(&global.join("config.toml")),
         project_root
@@ -1864,7 +1866,7 @@ fn prune_cutoff(
         value.to_string()
     } else {
         let path = global.join("config.toml");
-        let cfg = rupu_config::layer_files(Some(&path), None)?;
+        let cfg = rupu_config::layer_files_locked(Some(&path), None)?;
         cfg.storage
             .archived_transcript_retention
             .unwrap_or_else(|| "30d".to_string())

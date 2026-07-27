@@ -38,6 +38,18 @@ pub struct GithubCopilotClient {
 }
 
 impl GithubCopilotClient {
+    /// Apply `[providers.<name>]` tuning — currently the `timeout_ms`
+    /// inactivity deadline (ISSUES.md I-9) on this client's HTTP stack.
+    /// Applied as connect + read timeouts so a long streaming generation is
+    /// never cut off mid-flight. A builder failure leaves the existing client
+    /// in place rather than panicking on user-supplied config.
+    pub fn with_tuning(mut self, tuning: &crate::tuning::ProviderTuning) -> Self {
+        if let Ok(client) = tuning.http_client_builder().build() {
+            self.client = client;
+        }
+        self
+    }
+
     /// Create from resolved AuthCredentials.
     pub fn new(
         creds: AuthCredentials,

@@ -37,7 +37,6 @@ const MOCK_CONFIG: ConfigView = {
     permission_mode: 'ask',
     log_level: null,
     bash: { timeout_secs: null, env_allowlist: null },
-    retry: { max_attempts: null, initial_delay_ms: null },
     providers: {},
     scm: { default: null },
     issues: { default: null },

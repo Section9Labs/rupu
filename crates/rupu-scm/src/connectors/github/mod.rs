@@ -42,10 +42,10 @@ pub async fn try_build(
         rupu_providers::auth::AuthCredentials::ApiKey { key } => key,
         rupu_providers::auth::AuthCredentials::OAuth { access, .. } => access,
     };
-    let platform_cfg = cfg.scm.platforms.get("github");
-    let base_url = platform_cfg.and_then(|p| p.base_url.clone());
-    let max_conc = platform_cfg.and_then(|p| p.max_concurrency);
-    let client = GithubClient::new(token, base_url, max_conc);
+    let opts = crate::client_options::ScmClientOptions::from_platform_config(
+        cfg.scm.platforms.get("github"),
+    );
+    let client = GithubClient::with_options(token, &opts);
     let repo: Arc<dyn RepoConnector> = Arc::new(repo::GithubRepoConnector::new(client.clone()));
     let issues: Arc<dyn IssueConnector> =
         Arc::new(issues::GithubIssueConnector::new(client.clone()));

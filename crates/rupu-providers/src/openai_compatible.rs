@@ -35,6 +35,18 @@ pub struct OpenAiCompatibleClient {
 }
 
 impl OpenAiCompatibleClient {
+    /// Apply `[providers.<name>]` tuning — currently the `timeout_ms`
+    /// inactivity deadline (ISSUES.md I-9) on this client's HTTP stack.
+    /// Applied as connect + read timeouts so a long streaming generation is
+    /// never cut off mid-flight. A builder failure leaves the existing client
+    /// in place rather than panicking on user-supplied config.
+    pub fn with_tuning(mut self, tuning: &crate::tuning::ProviderTuning) -> Self {
+        if let Ok(client) = tuning.http_client_builder().build() {
+            self.client = client;
+        }
+        self
+    }
+
     /// * `base_url` — endpoint root, with or without a trailing `/v1`
     ///   (e.g. `http://192.29.35.246:8080` or `…/v1`).
     /// * `api_key` — static Bearer key.

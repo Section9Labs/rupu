@@ -71,6 +71,24 @@ pub fn layer_files(global: Option<&Path>, project: Option<&Path>) -> Result<Conf
     Ok(cfg)
 }
 
+/// Like [`layer_files`], but a key named in the **global** `[policy].lock`
+/// keeps its global value even when the project config sets it.
+///
+/// `layer_files` performs plain project-over-global layering and is correct
+/// for non-policy reads. Every path that honors operator policy must use
+/// this instead — see ISSUES.md I-7, where lock enforcement existed only
+/// inside `resolve()` (6 call sites, all in rupu-cp) while 43 CLI loads
+/// bypassed it and let a project config silently override a locked global
+/// key. This delegates entirely to `resolve()` for the actual lock
+/// precedence and dotted-key handling rather than reimplementing them.
+pub fn layer_files_locked(
+    global: Option<&Path>,
+    project: Option<&Path>,
+) -> Result<Config, LayerError> {
+    let resolved = crate::resolve::resolve(global, project)?;
+    Ok(resolved.config)
+}
+
 fn read_toml_file(path: &Path) -> Result<Value, LayerError> {
     let text = std::fs::read_to_string(path).map_err(|e| LayerError::Io {
         path: path.display().to_string(),
