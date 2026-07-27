@@ -8729,9 +8729,9 @@ async fn claims(
 const AUTOFLOW_TEMPLATE: &str = r#"name: {{name}}
 description: # one-line summary of what this autoflow does
 
-# Autoflow turns this workflow into a reconciler-driven loop:
-# the autoflow worker picks issues matching `selector` and runs
-# the steps below on a cadence triggered by `wake_on`.
+# Autoflow turns this workflow into a reconciler-driven loop: the autoflow
+# worker picks issues matching `selector` and runs the steps below — woken by
+# the events in `wake_on`, and swept again every `reconcile_every`.
 autoflow:
   enabled: true
   entity: issue
@@ -8740,10 +8740,18 @@ autoflow:
     states: ["open"]
     labels_all: ["autoflow"]
     limit: 100
+  # Event names that wake this autoflow (a list — see `rupu cron events`).
   wake_on:
-    cron: "*/5 * * * *"
+    - github.issue.opened
+    - github.issue.labeled
+  # Safety-net sweep cadence, independent of events.
+  reconcile_every: "10m"
+  claim:
+    key: issue
+    ttl: "3h"
   workspace:
-    strategy: cached_clone
+    strategy: worktree            # worktree | in_place
+    branch: "rupu/issue-{{ issue.number }}"
 
 # Optional inputs become `{{ inputs.<key> }}` in step prompts.
 # Autoflows additionally expose `{{ issue.* }}` for the bound issue.
@@ -12164,6 +12172,39 @@ fn format_contenders(contenders: &[AutoflowContender]) -> String {
 mod tests {
     use super::*;
     use crate::cmd::autoflow_wake;
+
+    /// Everything the `rupu autoflow create` scaffold writes must be
+    /// schema-valid. It regressed once (`wake_on:` emitted as a mapping and a
+    /// non-existent `workspace.strategy: cached_clone`), so every field the
+    /// template writes is asserted against the parsed model here.
+    ///
+    /// The scaffold deliberately leaves `agent:` blank for the author to fill
+    /// in (that is what the post-write re-parse check nudges about), so the
+    /// test supplies one — exactly as a user would in the editor — and then
+    /// asserts the rest of the document is valid.
+    #[test]
+    fn autoflow_create_template_parses() {
+        let yaml = AUTOFLOW_TEMPLATE
+            .replace("{{name}}", "scaffold-check")
+            .replace(
+                "agent: # agent name from `rupu agent list`",
+                "agent: triager",
+            );
+        let wf = Workflow::parse(&yaml).expect("scaffold template must parse");
+
+        assert_eq!(wf.name, "scaffold-check");
+        let af = wf.autoflow.as_ref().expect("template declares an autoflow");
+        assert!(af.enabled);
+        // `wake_on` is a list of event names — never a mapping.
+        assert!(
+            !af.wake_on.is_empty(),
+            "scaffold should seed at least one wake_on event"
+        );
+        assert_eq!(af.reconcile_every.as_deref(), Some("10m"));
+        let ws = af.workspace.as_ref().expect("template sets a workspace");
+        assert_eq!(ws.strategy, AutoflowWorkspaceStrategy::Worktree);
+    }
+
     use crate::test_support::{ensure_crypto_provider, ENV_LOCK};
     use httpmock::Method::{GET, POST};
     use httpmock::MockServer;
