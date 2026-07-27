@@ -219,7 +219,19 @@ git commit -m "fix(cli): on_reject cleanup inherits the run's permission mode (I
 
 **Operator decision (settled):** listing finalizes state only. The `cp serve` gate sweep — default-on at 60s — owns chain execution. Keep the `approve` and `reject` command paths executing chains as they do now; only the **listing** path changes.
 
-Because the sweep also calls `expire_if_overdue`, and that call is what flips the run terminal, there is a real ordering consequence to handle: if the listing expires a gate to `Rejected` first, the sweep will later see an already-terminal run and skip it, so the chain never runs at all. **Verify this** — read `run_gate_sweep`'s decision logic in `crates/rupu-cli/src/cmd/cp.rs` — and if it holds, the listing path must *not* expire timeout-**reject** gates either; it should leave those for the sweep and only expire the `fail` case (which has no chain). State what you found and what you did.
+Because the sweep also calls `expire_if_overdue`, and that call is what flips the run terminal, there is a real ordering consequence. **This has now been verified against the code — do not re-derive it, implement it:**
+
+`sweep_decision` (`crates/rupu-cli/src/cmd/cp.rs:337`) branches on `RunStatus::AwaitingApproval` and falls through to `_ => SweepAction::Skip` (`:366`) for every other status. So once the listing expires a reject-timeout gate to `Rejected`, the sweep classifies it `Skip` on every later tick and **the `on_reject` chain never runs at all**. Simply deleting the listing's cleanup call while leaving its expiry call in place would therefore trade a side-effecting read for a silently-dropped cleanup — a worse bug.
+
+The required shape, per `on_timeout`:
+
+| `on_timeout` | Listing behavior | Why |
+|---|---|---|
+| `reject` | **Do not call `expire_if_overdue` at all.** Leave the run `AwaitingApproval`. | Preserves the `AwaitingApproval` status the sweep's `ExpireThenCleanupReject` arm requires. The sweep expires it *and* runs the chain. |
+| `approve` | Call it; keep the existing informational `println!`. | `expire_if_overdue` deliberately leaves the record `AwaitingApproval` on this arm (see `cp.rs:311-313`), so the sweep still sees it. No side effect today beyond the print. |
+| `fail` / unset | Call it. | Finalized inside the expire call itself; there is no chain to run. |
+
+So the listing keeps lazy expiry for the two harmless cases, stops executing chains entirely, and hands the `reject` case to the sweep untouched. Note in the code comment that a `reject` gate is now resolved only by `rupu cp serve`'s sweep — and that if the sweep is disabled (`[cp].gate_sweep_enabled = false`) such a gate stays parked until an operator runs `rupu workflow reject`. State in your report what you found and what you did.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -247,67 +259,59 @@ git commit -m "fix(cli): workflow runs listing no longer executes cleanup chains
 
 ---
 
-### Task 4: I-26 — narrow an action step by its own `actions:`, and fix the lying comment
+### Task 4: I-26 — make `action_dispatcher_for`'s doc comment true
+
+> **Scope corrected 2026-07-27 after verification against the code. The original task ("narrow an action step by its own `actions:`") rested on a false premise and must NOT be implemented as written.** What follows is the verified replacement.
 
 **Files:**
-- Modify: `crates/rupu-cli/src/resume.rs` (`action_dispatcher_for` — the `vec!["*".into()]` allowlist and its doc comment), plus wherever the per-step dispatcher is selected in `crates/rupu-orchestrator/src/runner.rs`'s action arm
-- Test: `crates/rupu-orchestrator/tests/action_step.rs` (exists, from the gate/action arc)
+- Modify: `crates/rupu-cli/src/resume.rs` (the doc comment on `action_dispatcher_for`, `:19-26`)
+- Test: none required — the invariant this documents is already enforced and already covered (see below)
 
-**Interfaces:**
-- Consumes: `Step.actions: Vec<String>` — already enforced for *agent* steps via `step_factory::narrow_agent_tools` (`crates/rupu-orchestrator/src/step_factory.rs:246,407`) since #533/#537.
-- Produces: an action step whose own `actions:` list is non-empty may only invoke a tool named in it; an empty `actions:` keeps today's behavior (any catalog tool).
+**What was verified:**
 
-The doc comment on `action_dispatcher_for` currently claims an `action:` step "sees exactly the same allow/deny surface a `tools:`-using agent step would" — false, since the agent path narrows and this one passes `["*"]`.
+1. **A step cannot carry both `action:` and a non-empty `actions:`.** `validate_step_actions` (`crates/rupu-orchestrator/src/workflow.rs:1389`) returns `WorkflowParseError::ActionsOnActionStep` for exactly that combination, with the message *"an `action:` step must not carry a non-empty `actions:` allowlist — its tool is already explicit"*. A parse test at `workflow.rs:2887` already asserts it. **The original Task 4 test workflow (`action: scm.prs.create` + `actions: ["issues.comment"]`) would fail to parse rather than produce a permission denial** — there is nothing to narrow, so the "narrowing" fix is not merely hard, it is meaningless.
 
-Scope judgment: **at minimum** correct the comment (that is a pure-truth fix and non-negotiable). The narrowing is the better fix and is preferred; if it turns out to require threading the step through a seam that doesn't exist, implement the comment fix, file the narrowing as a new issue, and say so — do not leave the comment lying either way.
+2. **The `["*"]` allowlist is not reachable by an agent step.** `opts.action_dispatcher` has exactly three production consumers — `runner.rs:4293` (the action-step arm), `:4700` (`fire_notify_hooks`) and `:4923` (the second action arm) — and all three funnel into `execute_action_step`, whose only dispatch is `dispatcher.call(tool, args)` where `tool = step.action`. Agent-step tool calls go through the `rupu-tools` registry and the `DefaultStepFactory`'s own narrowing (`step_factory.rs:246,407`), never through this dispatcher.
 
-- [ ] **Step 1: Write the failing test**
+3. Every tool named in an `action:` is validated against the live MCP catalog at parse time by `validate_action_step` (`workflow.rs:1324`, called at `:1587`, and at `:1536` for notify hooks).
 
-```rust
-// ISSUES.md I-26: a step's own `actions:` must narrow what its `action:` can call.
-#[tokio::test]
-async fn a_step_actions_allowlist_narrows_its_own_action_call() {
-    // A workflow step: action: scm.prs.create, actions: ["issues.comment"].
-    // Assert the dispatch is REFUSED (permission denied naming the tool),
-    // and the fake connector recorded zero create calls.
-}
+Together those three make `["*"]` **sound**: the only tool this dispatcher can ever be asked for is one that is explicit in the workflow source and catalog-validated. The permission mode passed alongside it is still live and still enforced (a `readonly` run refuses Write-classified tools).
 
-#[tokio::test]
-async fn an_empty_actions_list_leaves_the_action_unnarrowed() {
-    // Same step with actions: [] — the call succeeds (today's behavior).
-}
-```
+So the single real defect is the doc comment's claim that an `action:` step *"sees exactly the same allow/deny surface a `tools:`-using agent step would"*. That is false — an agent step's surface is its `tools:` list narrowed by `actions:`; this one is `["*"]` constrained by the workflow source instead.
 
-Use the existing fake-connector + `ToolDispatcher` harness in `action_step.rs`.
+- [ ] **Step 1: Rewrite the doc comment** so it states the actual invariant: the allowlist is deliberately unconstrained because the dispatcher is only ever called with an explicit, parse-validated `step.action`; a non-empty `actions:` on an action step is a parse error (`ActionsOnActionStep`); and the **mode** half genuinely does match the agent path. Do not claim parity with the agent allowlist. Reference `ActionsOnActionStep` by name so the next reader can find the enforcement.
 
-- [ ] **Step 2: RED**, **Step 3: implement**, **Step 4: GREEN**
-- [ ] **Step 5: Close I-26 and commit**
+- [ ] **Step 2: Verify** — `cargo build --workspace`, `cargo test -p rupu-orchestrator -p rupu-cli`. No behavior changes, so no new test; cite `workflow.rs:2887` as the existing coverage of the invariant.
+
+- [ ] **Step 3: File the defense-in-depth follow-up.** Narrowing the allowlist to `vec![step.action]` would remove reliance on that invariant, but the dispatcher is built once per run (`resume.rs:27`) while the tool is per-step, and `execute_action_step` receives `&ToolDispatcher` rather than the registry — so it needs a signature change across three call sites. Sound today, worth hardening later. File as a new issue in `ISSUES.md` (next free ID) marked P2, and reference it from the I-26 closure.
+
+- [ ] **Step 4: Close I-26 and commit.** The closure must record that the narrowing half was withdrawn as based on a false premise, and name `ActionsOnActionStep` as the reason.
 
 ```bash
-git commit -m "fix(orchestrator): a step's actions: narrows its own action: call (I-26)"
+git commit -m "docs(cli): correct action_dispatcher_for's allow-surface comment (I-26)"
 ```
 
 ---
 
 ### Task 5: I-27 — delete the dead action-protocol validator
 
-**Files:**
-- Modify: `crates/rupu-orchestrator/src/action_protocol.rs` (delete `validate_actions`), `crates/rupu-orchestrator/src/lib.rs` (drop the re-export), `crates/rupu-agent/src/action.rs:21` (delete the `ActionValidator` stub), `crates/rupu-agent/src/lib.rs:29` (drop that re-export)
-- Delete: `crates/rupu-orchestrator/tests/action_allowlist.rs` if it tests only the deleted fn — check first; keep any test that covers something still live
+> **Already satisfied — verified 2026-07-27. No code change required; this task is a tracker closure only.**
 
-**Interfaces:** removes `validate_actions` and `ActionValidator` from both crates' public surfaces. Confirm no external caller with:
-`grep -rn "validate_actions\|ActionValidator" --include="*.rs" crates`
-Expected before deletion: only the declarations, the re-exports, and `action_allowlist.rs`'s tests.
+Commit `28ec5cc3` ("chore: delete the dead legacy action protocol (open_pr/file_write vocabulary)"), landed during Arc 1 and confirmed an ancestor of this branch, already removed exactly the five files this task named:
 
-**Do not touch the docs here** — README / `docs/agent-format.md` / `docs/triggers.md` all describe this non-existent check, but those corrections belong to **I-51 in Arc 6**, which owns the whole `actions:` documentation contradiction. Note in the I-27 closure that the prose fix is tracked there, so the two don't collide.
-
-- [ ] **Step 1: Prove it's dead** — paste the grep output showing no production caller into the report. This is the validation for a deletion; there is no behavior to test.
-- [ ] **Step 2: Delete**, **Step 3: verify** — `cargo build --workspace` and `cargo test -p rupu-orchestrator -p rupu-agent` clean.
-- [ ] **Step 4: Close I-27 and commit**
-
-```bash
-git commit -m "refactor(orchestrator,agent): delete the never-called action-protocol validator (I-27)"
 ```
+crates/rupu-agent/src/action.rs                    | 21 ---
+crates/rupu-agent/src/lib.rs                       |  3 --
+crates/rupu-orchestrator/src/action_protocol.rs    | 33 ---
+crates/rupu-orchestrator/src/lib.rs                | 13 +--
+crates/rupu-orchestrator/tests/action_allowlist.rs | 35 ---
+```
+
+`grep -rn "validate_actions\|ActionValidator" --include="*.rs" crates` now returns **zero hits**. I-27 was fixed without being closed in the tracker.
+
+Note for the reader: `validate_action_step` (`crates/rupu-orchestrator/src/workflow.rs:1324`) survives and is **live** — it is the catalog validator for `action:` steps and notify hooks, unrelated to the deleted `validate_actions`. Do not delete it.
+
+- [ ] **Step 1: Close I-27** in `ISSUES.md` citing `28ec5cc3` as the fix and the empty grep as the validation. Note in the closure that the prose corrections (README ×2, `docs/agent-format.md`, `docs/triggers.md` all still describe the deleted check) are owned by **I-51 in Arc 6**, so the two do not collide.
 
 ---
 
@@ -357,3 +361,4 @@ Green modulo the known-red baseline. Compare any failure against a clean checkou
 
 - **The `actions:` documentation contradiction** (README ×2, `docs/agent-format.md`, `docs/triggers.md`) — Arc 6, **I-51**. Task 5 deletes the code; Arc 6 fixes the prose.
 - **I-73** (`[scm.default].owner`/`.repo` and `[issues.default].project` still inert) — not safety; schedule with Arc 6 or a follow-up config pass.
+- **Reject-timeout gates depend on `cp serve` after Task 3** — file as a new issue during close-out (next free ID) and mirror into `ISSUES.md`. Task 3 makes the sweep the *only* resolver of an `on_timeout: reject` gate. That is correct for the side-effect-free-read goal, but it means a CLI-only operator who never starts `rupu cp serve` (or who sets `[cp].gate_sweep_enabled = false`) now has such gates park indefinitely, where lazy expiry previously resolved them on the next `rupu workflow runs`. Not a blocker and not a regression in *safety*, but it is a real behavior change for a whole class of user. Candidate remedies to evaluate later, not in this arc: run the chain from `rupu workflow reject` only (already true) and document the dependency, or add an explicit opt-in `rupu workflow runs --resolve-expired`.
