@@ -100,7 +100,13 @@ describe('WorkflowDetail', () => {
     await waitFor(() => expect(saveBtn).not.toBeDisabled());
 
     fireEvent.click(saveBtn);
-    await waitFor(() => expect(saveSpy).toHaveBeenCalledWith('nightly', STUB_YAML));
+    // `scopeSelectorFor(DETAIL)` — DETAIL is `scope_kind: 'global'` — is
+    // threaded through so Save targets the exact resolved file, the same
+    // way Delete does (see the scope-threading tests below for the
+    // project-scoped case).
+    await waitFor(() =>
+      expect(saveSpy).toHaveBeenCalledWith('nightly', STUB_YAML, { scope_kind: 'global' }),
+    );
     // On success the draft re-syncs to the saved YAML → Save disabled again.
     await waitFor(() => expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled());
   });
@@ -219,6 +225,40 @@ describe('WorkflowDetail', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Delete nightly' }));
 
     expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('global'));
+  });
+
+  // ── Scope: Save threads the same selector Delete does ────────────────────
+  // `PUT /api/workflows/:name` used to write unconditionally to the global
+  // layer; for a project-only workflow this silently created a hidden
+  // global shadow while the visible project file stayed unchanged (reading
+  // as "Save did nothing"). The fix threads `scopeSelectorFor(detail)`
+  // through `saveWorkflow` — the SAME shape `deleteWorkflow` already gets —
+  // so Save always targets the exact file this page resolved and is
+  // showing.
+
+  it('a project-scoped workflow threads scope_kind/scope_id on Save', async () => {
+    vi.spyOn(api, 'getWorkflow').mockResolvedValue({
+      ...DETAIL,
+      scope: 'my-project',
+      scope_kind: 'project',
+      scope_id: 'ws_a',
+    });
+    const saveSpy = vi
+      .spyOn(api, 'saveWorkflow')
+      .mockResolvedValue({ ...DETAIL, yaml: STUB_YAML, scope: 'my-project', scope_kind: 'project', scope_id: 'ws_a' });
+    renderPage();
+
+    fireEvent.click(await screen.findByTestId('stub-editor'));
+    const saveBtn = await screen.findByRole('button', { name: 'Save' });
+    await waitFor(() => expect(saveBtn).not.toBeDisabled());
+    fireEvent.click(saveBtn);
+
+    await waitFor(() =>
+      expect(saveSpy).toHaveBeenCalledWith('nightly', STUB_YAML, {
+        scope_kind: 'project',
+        scope_id: 'ws_a',
+      }),
+    );
   });
 
   // ── Autoflow enable/disable ──────────────────────────────────────────────

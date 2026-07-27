@@ -1995,9 +1995,17 @@ export const api = {
    * server-side; nothing is written on error. Throws `ApiError` with the parse
    * error message (400) — including when the frontmatter `name` mismatches the
    * route — and resolves to the reloaded `AgentDetail` on success.
+   *
+   * `target` (build via `scopeSelectorFor(agent)`) pins the write to the
+   * EXACT row's file — the SAME shape `deleteAgent` takes — so saving a
+   * project-scoped agent edits the project file, never a same-named global
+   * file it shadows. Omit only for back-compat callers that want the
+   * server's implicit (project-first) resolution; 404 if `target` is given
+   * and doesn't match (no fallback to another layer once a scope is
+   * explicitly requested).
    */
-  saveAgent(name: string, raw: string): Promise<AgentDetail> {
-    return request<AgentDetail>(`/api/agents/${encodeURIComponent(name)}`, {
+  saveAgent(name: string, raw: string, target?: ScopeSelector): Promise<AgentDetail> {
+    return request<AgentDetail>(`/api/agents/${encodeURIComponent(name)}${scopeQueryString(target)}`, {
       method: 'PUT',
       body: JSON.stringify({ raw }),
     });
@@ -2044,9 +2052,17 @@ export const api = {
    * server-side; nothing is written on error. Throws `ApiError` with the parse
    * error message (400) — including when the parsed `name` mismatches the route
    * — and resolves to the reloaded `WorkflowDetail` on success.
+   *
+   * `target` (build via `scopeSelectorFor(workflow)`) pins the write to the
+   * EXACT row's file — the SAME shape `deleteWorkflow` takes — so saving a
+   * project-scoped workflow edits the project file, never a same-named
+   * global file it shadows. Omit only for back-compat callers that want the
+   * server's implicit (project-first) resolution; 404 if `target` is given
+   * and doesn't match (no fallback to another layer once a scope is
+   * explicitly requested).
    */
-  saveWorkflow(name: string, raw: string): Promise<WorkflowDetail> {
-    return request<WorkflowDetail>(`/api/workflows/${encodeURIComponent(name)}`, {
+  saveWorkflow(name: string, raw: string, target?: ScopeSelector): Promise<WorkflowDetail> {
+    return request<WorkflowDetail>(`/api/workflows/${encodeURIComponent(name)}${scopeQueryString(target)}`, {
       method: 'PUT',
       body: JSON.stringify({ raw }),
     });

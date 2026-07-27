@@ -70,7 +70,11 @@ export default function AgentDetailPage() {
     setSaving(true);
     setSaveError(null);
     try {
-      const updated = await api.saveAgent(name, raw);
+      // `scopeSelectorFor(agent)` threads the resolved `scope_kind`/
+      // `scope_id` so Save targets THIS exact file — mirrors `remove()`'s
+      // Delete call below. Without it a project-scoped Save would silently
+      // create a hidden global shadow instead of editing the file shown.
+      const updated = await api.saveAgent(name, raw, scopeSelectorFor(agent));
       setAgent(updated);
       setDraft(updated.raw);
       setEditing(false);

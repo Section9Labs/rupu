@@ -109,7 +109,13 @@ describe('AgentDetail edit/delete', () => {
     expect(saveBtn).not.toBeDisabled();
     fireEvent.click(saveBtn);
 
-    await waitFor(() => expect(saveSpy).toHaveBeenCalledWith('reviewer', next));
+    // `scopeSelectorFor(AGENT)` — AGENT is `scope_kind: 'global'` — is
+    // threaded through so Save targets the exact resolved file, the same
+    // way Delete does (see the scope-threading test below for the
+    // project-scoped case).
+    await waitFor(() =>
+      expect(saveSpy).toHaveBeenCalledWith('reviewer', next, { scope_kind: 'global' }),
+    );
     // On success the editor closes (read-only highlight returns).
     await waitFor(() => expect(screen.queryByTestId('code-editor')).not.toBeInTheDocument());
   });
@@ -197,6 +203,44 @@ describe('AgentDetail edit/delete', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Delete reviewer' }));
 
     expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('global'));
+  });
+
+  // ── Scope: Save threads the same selector Delete does ────────────────────
+  // `PUT /api/agents/:name` used to write unconditionally to the global
+  // layer; for a project-only agent this silently created a hidden global
+  // shadow while the visible project file stayed unchanged (reading as
+  // "Save did nothing"). The fix threads `scopeSelectorFor(agent)` through
+  // `saveAgent` — the SAME shape `deleteAgent` already gets — so Save
+  // always targets the exact file this page resolved and is showing.
+
+  it('a project-scoped agent threads scope_kind/scope_id on Save', async () => {
+    vi.spyOn(api, 'getAgent').mockResolvedValue({
+      ...AGENT,
+      scope: 'my-project',
+      scope_kind: 'project',
+      scope_id: 'ws_a',
+    });
+    const next = `${RAW}\nMore guidance.\n`;
+    const saveSpy = vi.spyOn(api, 'saveAgent').mockResolvedValue({
+      ...AGENT,
+      raw: next,
+      scope: 'my-project',
+      scope_kind: 'project',
+      scope_id: 'ws_a',
+    });
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit definition' }));
+    const editor = (await screen.findByTestId('code-editor')) as HTMLTextAreaElement;
+    fireEvent.change(editor, { target: { value: next } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() =>
+      expect(saveSpy).toHaveBeenCalledWith('reviewer', next, {
+        scope_kind: 'project',
+        scope_id: 'ws_a',
+      }),
+    );
   });
 
   it('flag unset (default): Edit still shows the classic code editor, not the Agent Builder', async () => {
