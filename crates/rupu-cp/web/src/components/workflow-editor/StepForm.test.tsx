@@ -889,6 +889,107 @@ describe('StepForm — action body (Task 5)', () => {
   });
 });
 
+describe('StepForm — actions: picker (Task 3)', () => {
+  const CATALOG = [
+    { name: 'issues.list', description: 'List issues', input_schema: {}, kind: 'read' as const },
+    { name: 'issues.create', description: 'Create an issue', input_schema: {}, kind: 'write' as const },
+    { name: 'scm.repos.list', description: 'List repos', input_schema: {}, kind: 'read' as const },
+  ];
+
+  const AGENTS_WITH_TOOLS: AgentSummary[] = [
+    {
+      name: 'issue-reporter',
+      tools: ['issues.list'],
+      usage: { tokens_in: 0, tokens_out: 0, tokens_cached: 0, cost_usd: 0 },
+      run_count: 0,
+    },
+  ] as unknown as AgentSummary[];
+
+  it('an agent step renders the actions control listing catalog tools, and selecting one writes actions: [...]', () => {
+    const spy = vi.fn();
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'step', agent: 'issue-reporter' })}
+        agents={AGENTS_WITH_TOOLS}
+        problems={[]}
+        exprContext={EXPR}
+        tools={CATALOG}
+        onChange={spy}
+      />,
+    );
+    expect(screen.getByLabelText('Action issues.list')).toBeInTheDocument();
+    expect(screen.getByLabelText('Action issues.create')).toBeInTheDocument();
+    expect(screen.getByLabelText('Action scm.repos.list')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText('Action issues.list'));
+    expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({ actions: ['issues.list'] }));
+  });
+
+  it('an action: step shows NO actions control (spec §3b)', () => {
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'action', action: 'issues.list', with: {} })}
+        agents={AGENTS_WITH_TOOLS}
+        problems={[]}
+        exprContext={EXPR}
+        tools={CATALOG}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.queryByLabelText('Action issues.list')).not.toBeInTheDocument();
+    expect(screen.queryByText(/unrestricted/)).not.toBeInTheDocument();
+  });
+
+  it('empty actions: reads "unrestricted — inherits <agent>\'s tools", naming the inherited agent', () => {
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'step', agent: 'issue-reporter', actions: [] })}
+        agents={AGENTS_WITH_TOOLS}
+        problems={[]}
+        exprContext={EXPR}
+        tools={CATALOG}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.getByText("unrestricted — inherits issue-reporter's tools")).toBeInTheDocument();
+  });
+
+  it('a tool NOT granted by the selected agent is still selectable but flagged "not granted by <agent>"', () => {
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'step', agent: 'issue-reporter' })}
+        agents={AGENTS_WITH_TOOLS}
+        problems={[]}
+        exprContext={EXPR}
+        tools={CATALOG}
+        onChange={() => {}}
+      />,
+    );
+    // issue-reporter only grants issues.list — issues.create is NOT granted.
+    const flagged = screen.getByLabelText('Action issues.create').closest('label');
+    expect(flagged).toHaveTextContent('not granted by issue-reporter');
+    // The granted tool carries no such flag.
+    const grantedLabel = screen.getByLabelText('Action issues.list').closest('label');
+    expect(grantedLabel).not.toHaveTextContent('not granted by');
+    // Still selectable despite not being granted.
+    fireEvent.click(screen.getByLabelText('Action issues.create'));
+  });
+
+  it('a for_each step also renders the actions control (agent-bearing)', () => {
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'for_each', agent: 'issue-reporter', for_each: 'inputs.items' })}
+        agents={AGENTS_WITH_TOOLS}
+        problems={[]}
+        exprContext={EXPR}
+        tools={CATALOG}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.getByLabelText('Action issues.list')).toBeInTheDocument();
+  });
+});
+
 describe('StepForm — switchKind', () => {
   it('switching to branch seeds an empty condition + empty then/else (F.1)', () => {
     const spy = vi.fn();

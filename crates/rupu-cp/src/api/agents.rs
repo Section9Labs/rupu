@@ -141,6 +141,15 @@ pub(crate) struct AgentDto {
     pub(crate) effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_tokens: Option<u32>,
+    /// The agent's frontmatter `tools:` allowlist — the runtime grant a step's
+    /// `actions:` narrows (never extends) per the step-`actions:`-enforcement
+    /// design. An agent whose frontmatter omits `tools:` (unrestricted — every
+    /// catalog tool is available) serializes this as an empty array; the wire
+    /// shape doesn't distinguish "no tools" from "unrestricted", but that's
+    /// unambiguous for authoring: the workflow-editor picker treats an empty
+    /// list here the same as "nothing to flag against" (every step `actions:`
+    /// entry is shown, none of them get the "not granted" flag).
+    pub(crate) tools: Vec<String>,
     /// `"project"` when the spec was loaded from `<project>/.rupu/agents`,
     /// else `"global"`. Defaults to `"global"` for the global-only endpoints.
     pub(crate) scope: String,
@@ -169,6 +178,7 @@ impl AgentDto {
             model: spec.model,
             effort: spec.effort.map(|e| format!("{e:?}")),
             max_tokens: spec.max_tokens,
+            tools: spec.tools.unwrap_or_default(),
             scope: scope.into(),
             usage: crate::usage::UsageSummary::default(),
             run_count: 0,
@@ -792,6 +802,39 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    /// `GET /api/agents` exposes the agent's frontmatter `tools:` allowlist —
+    /// additive DTO field consumed by the workflow-editor `actions:` picker
+    /// (step-actions-enforcement design §3d) to flag a step action the
+    /// selected agent doesn't grant.
+    #[tokio::test]
+    async fn list_agents_exposes_frontmatter_tools() {
+        const WITH_TOOLS_MD: &str = "---\nname: issue-reporter\ntools: [issues.list, issues.comment, issues.create]\n---\nTriage issues.\n";
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        save_agent_file(&s.global_dir, "issue-reporter", WITH_TOOLS_MD).expect("seed");
+
+        let Json(rows) = list_agents(State(s)).await.expect("ok");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].tools,
+            vec!["issues.list".to_string(), "issues.comment".to_string(), "issues.create".to_string()]
+        );
+    }
+
+    /// An agent whose frontmatter omits `tools:` entirely (unrestricted) still
+    /// serializes a (empty) `tools` array rather than erroring or omitting the
+    /// field — the DTO field is unconditional, not `Option`.
+    #[tokio::test]
+    async fn list_agents_without_tools_frontmatter_is_empty_array() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        save_agent_file(&s.global_dir, "code-reviewer", VALID_MD).expect("seed");
+
+        let Json(rows) = list_agents(State(s)).await.expect("ok");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tools, Vec::<String>::new());
     }
 
     #[tokio::test]

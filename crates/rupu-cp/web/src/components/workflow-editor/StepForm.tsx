@@ -226,6 +226,7 @@ export default function StepForm({
           patch={patch}
           exprContext={exprContext}
           workflowEditorUi={workflowEditorUi}
+          tools={tools}
         />
       )}
       {d.kind === 'parallel' && (
@@ -334,6 +335,113 @@ function AgentSelect({
   );
 }
 
+// ── actions: (per-step tool-grant narrowing, agent steps only) ──────────────
+
+/** Catalog prefix a tool name groups under (`issues.list` -> `issues`). Falls
+ *  back to the whole name for a tool with no `.` (none exist in the catalog
+ *  today, but this keeps the grouping total rather than dropping it). */
+function toolPrefix(name: string): string {
+  const i = name.indexOf('.');
+  return i === -1 ? name : name.slice(0, i);
+}
+
+/** Group the catalog by prefix (`issues.*` / `scm.*` / `github.*` /
+ *  `gitlab.*`), preserving catalog order both across groups and within one. */
+function groupToolsByPrefix(tools: ToolSpec[]): Array<[string, ToolSpec[]]> {
+  const order: string[] = [];
+  const byPrefix = new Map<string, ToolSpec[]>();
+  for (const t of tools) {
+    const prefix = toolPrefix(t.name);
+    if (!byPrefix.has(prefix)) {
+      byPrefix.set(prefix, []);
+      order.push(prefix);
+    }
+    byPrefix.get(prefix)!.push(t);
+  }
+  return order.map((prefix) => [prefix, byPrefix.get(prefix)!]);
+}
+
+/** `actions:` narrowing picker (step-actions-enforcement design §3d). Renders
+ *  on agent-bearing linear steps only (`step`/`for_each` — the only kinds
+ *  with a single, well-defined `agent:` to cross-reference "not granted by"
+ *  against; NEVER on an `action:` step, where a non-empty `actions:` is a
+ *  parse error per spec §3b, so `LinearFields` is the only caller).
+ *
+ *  Fed by `GET /api/tools` (the `tools` prop, already threaded through
+ *  WorkflowEditor); cross-referenced against the selected agent's frontmatter
+ *  `tools:` (the `AgentSummary.tools` field `/api/agents` now exposes) so a
+ *  tool the agent does NOT grant is still selectable but flagged — it will be
+ *  narrowed away at runtime (spec §3c), so the mistake is worth surfacing at
+ *  authoring time rather than hiding it. Writes through the existing
+ *  `StepNodeData.actions` path (`workflowGraph.ts`'s `nodeToStepObject`
+ *  already emits it for step/for_each, omitting it entirely when empty). */
+function ActionsField({
+  d,
+  agents,
+  tools,
+  patch,
+}: {
+  d: StepNodeData;
+  agents: AgentSummary[];
+  tools: ToolSpec[];
+  patch: (p: Partial<StepNodeData>) => void;
+}) {
+  const selected = d.actions ?? [];
+  const agentName = d.agent;
+  // `undefined` (no agent picked yet, or a picked agent /api/agents doesn't
+  // know about) means "nothing to flag against" — every tool renders
+  // unflagged rather than everything reading as ungranted.
+  const grantedTools = agentName ? agents.find((a) => a.name === agentName)?.tools : undefined;
+
+  function toggle(name: string, on: boolean): void {
+    const set = new Set(selected);
+    if (on) set.add(name);
+    else set.delete(name);
+    patch({ actions: [...set] });
+  }
+
+  return (
+    <div className="space-y-1.5">
+      <span className={labelCls}>Actions (optional narrowing)</span>
+      <p className="text-note text-ink-mute">
+        {selected.length === 0
+          ? `unrestricted — inherits ${agentName || 'the agent'}'s tools`
+          : `narrowed to ${selected.length} of ${agentName || 'the agent'}'s tools`}
+      </p>
+      <div className="space-y-2 rounded-md border border-border bg-surface p-2.5">
+        {tools.length === 0 ? (
+          <p className="text-ui text-ink-mute">No tools in the catalog.</p>
+        ) : (
+          groupToolsByPrefix(tools).map(([prefix, group]) => (
+            <div key={prefix} className="space-y-1">
+              <span className="block text-note font-mono uppercase tracking-wide text-ink-mute">
+                {prefix}.*
+              </span>
+              {group.map((t) => {
+                const isGranted = grantedTools === undefined || grantedTools.includes(t.name);
+                return (
+                  <label key={t.name} className={checkLabelCls}>
+                    <input
+                      type="checkbox"
+                      checked={selected.includes(t.name)}
+                      onChange={(e) => toggle(t.name, e.target.checked)}
+                      aria-label={`Action ${t.name}`}
+                    />
+                    <span className="font-mono">{t.name}</span>
+                    {!isGranted && (
+                      <span className="text-note text-err">not granted by {agentName}</span>
+                    )}
+                  </label>
+                );
+              })}
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── step / for_each ──────────────────────────────────────────────────────────
 
 function LinearFields({
@@ -342,12 +450,14 @@ function LinearFields({
   patch,
   exprContext,
   workflowEditorUi,
+  tools,
 }: {
   d: StepNodeData;
   agents: AgentSummary[];
   patch: (p: Partial<StepNodeData>) => void;
   exprContext: StepExprContext;
   workflowEditorUi: WorkflowEditorUi;
+  tools: ToolSpec[];
 }) {
   return (
     <>
@@ -355,6 +465,8 @@ function LinearFields({
         <span className={labelCls}>Agent</span>
         <AgentSelect value={d.agent} agents={agents} ariaLabel="Agent" onChange={(v) => patch({ agent: v })} />
       </label>
+
+      <ActionsField d={d} agents={agents} tools={tools} patch={patch} />
 
       <label className="block">
         <span className={labelCls}>Prompt</span>
