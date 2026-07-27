@@ -292,6 +292,7 @@ mod tests {
             trigger_source: "test".into(),
             target: None,
             workspace_strategy: None,
+            pid: None,
         };
         crate::standalone_run_metadata::write_metadata(
             &crate::standalone_run_metadata::metadata_path_for_run(

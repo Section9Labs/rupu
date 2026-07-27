@@ -3115,8 +3115,36 @@ async fn delete_run(run_id: &str, force: bool) -> anyhow::Result<()> {
     }
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
-    store.delete(run_id)?;
+    delete_run_with_store(&store, run_id)?;
     println!("deleted run {run_id}");
+    Ok(())
+}
+
+/// Shared guard+delete for `rupu workflow delete-run`: refuses a non-terminal
+/// run even under `--force` — `--force` only skips the "did you mean it"
+/// confirmation this command otherwise requires (see the bail above); it was
+/// never meant to authorize deleting a live run's directory out from under
+/// the process still writing to it. Mirrors
+/// `rupu_cp::api::runs::delete_run_checked`'s guard exactly, so this CLI verb
+/// and the CP's local branch never diverge — and, by extension, neither does
+/// the SSH `HostConnector::delete_run` path, which shells this exact command
+/// one hop removed (`crates/rupu-cp/src/host/ssh.rs`'s `delete_run`).
+///
+/// `pub(crate)` so tests can drive it against a temp `RunStore` directly,
+/// the same shape as `cancel_with_store`/`pause_with_store` above.
+pub(crate) fn delete_run_with_store(
+    store: &rupu_orchestrator::RunStore,
+    run_id: &str,
+) -> anyhow::Result<()> {
+    if let Ok(rec) = store.load(run_id) {
+        if !rec.status.is_terminal() {
+            anyhow::bail!(
+                "run {run_id} is not terminal ({}) — cancel it first",
+                rec.status.as_str()
+            );
+        }
+    }
+    store.delete(run_id)?;
     Ok(())
 }
 
@@ -4586,6 +4614,41 @@ mod tests {
     async fn delete_run_requires_force() {
         let err = delete_run("run_x", false).await.unwrap_err();
         assert!(err.to_string().contains("--force"));
+    }
+
+    // I2 (final-review finding): `rupu workflow delete-run --force` must
+    // still refuse a non-terminal run — `--force` only bypasses the missing
+    // flag `bail!` above, it never authorized deleting a live run's
+    // directory out from under the process still writing it. Before this
+    // fix `delete_run` called `store.delete` directly with no such guard,
+    // which the SSH `HostConnector::delete_run` path inherited verbatim.
+    #[test]
+    fn delete_run_with_store_refuses_non_terminal_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let record = sample_run_record(RunStatus::Running, Some(999_999));
+        store.create(record, "name: sample\nsteps: []\n").unwrap();
+
+        let err = delete_run_with_store(&store, "run_test_cancel").unwrap_err();
+        assert!(
+            err.to_string().contains("not terminal"),
+            "unexpected error: {err}"
+        );
+
+        // The run directory must survive the refused delete.
+        assert!(store.load("run_test_cancel").is_ok());
+    }
+
+    #[test]
+    fn delete_run_with_store_allows_terminal_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let record = sample_run_record(RunStatus::Completed, None);
+        store.create(record, "name: sample\nsteps: []\n").unwrap();
+
+        delete_run_with_store(&store, "run_test_cancel").unwrap();
+
+        assert!(store.load("run_test_cancel").is_err());
     }
 
     #[test]

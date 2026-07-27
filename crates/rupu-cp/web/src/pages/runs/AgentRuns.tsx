@@ -133,6 +133,12 @@ export default function AgentRuns() {
   }
 
   async function handleStandaloneArchive(runId: string, host?: string) {
+    if (
+      !window.confirm(
+        `Archive run ${runId}? Archived agent runs are hidden from the CP and can only be restored from the shell.`,
+      )
+    )
+      return;
     try {
       await api.archiveTranscript(runId, host);
       setActionError(null);
@@ -162,7 +168,10 @@ export default function AgentRuns() {
     handleStandaloneDelete,
   );
   const columns: Column<AgentRunRow>[] = [...AGENT_RUN_COLUMNS, actionColumn];
-  const bannerError = error ?? actionError;
+  // A fresh action error (e.g. this click's Archive/Delete refusal) must win
+  // over a stale fetch error from an earlier load — never the other way
+  // around, or the operator sees the wrong banner for what just happened.
+  const bannerError = actionError ?? error;
 
   // Source pill — client-side (the wire payload already carries `source` per
   // row; no extra server round-trip needed).

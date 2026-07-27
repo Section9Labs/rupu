@@ -41,6 +41,9 @@ pub(crate) fn build_argv(id: &str, action: TranscriptAction) -> Vec<String> {
 ///   archive|delete' instead"` → [`TranscriptMutateError::Invalid`] (this is
 ///   the safety-critical case: a session-owned transcript must be refused,
 ///   never silently clobbered)
+/// - `"cannot {action} transcript {id}: it is still running (owning process
+///   {pid} is alive)"` → [`TranscriptMutateError::Invalid`] (I4: refuse an
+///   in-flight standalone run, not just a session-owned one)
 /// - `"transcript not found: {id}"` → [`TranscriptMutateError::NotFound`]
 /// - `"transcript already archived: {id}"` → [`TranscriptMutateError::Invalid`]
 /// - `"transcript delete requires --force"` → [`TranscriptMutateError::Invalid`]
@@ -51,7 +54,10 @@ pub(crate) fn classify_failure(action: TranscriptAction, stderr: &str) -> Transc
         TranscriptMutateError::Invalid(stderr.trim().to_string())
     } else if s.contains("not found") {
         TranscriptMutateError::NotFound(stderr.trim().to_string())
-    } else if s.contains("already archived") || s.contains("requires --force") {
+    } else if s.contains("already archived")
+        || s.contains("requires --force")
+        || s.contains("still running")
+    {
         TranscriptMutateError::Invalid(stderr.trim().to_string())
     } else {
         TranscriptMutateError::Failed {
@@ -140,6 +146,14 @@ mod tests {
         assert!(matches!(
             classify_failure(TranscriptAction::Delete, "disk error writing metadata"),
             TranscriptMutateError::Failed { .. }
+        ));
+        // Invalid: I4's in-flight liveness refusal (not just session-owned).
+        assert!(matches!(
+            classify_failure(
+                TranscriptAction::Delete,
+                "cannot delete transcript run_abc: it is still running (owning process 4242 is alive)"
+            ),
+            TranscriptMutateError::Invalid(_)
         ));
     }
 }

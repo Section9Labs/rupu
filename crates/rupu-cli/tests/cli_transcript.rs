@@ -88,6 +88,18 @@ fn write_metadata_sidecar(
     run_id: &str,
     session_id: Option<&str>,
 ) -> std::path::PathBuf {
+    write_metadata_sidecar_with_pid(dir, run_id, session_id, None)
+}
+
+/// Like [`write_metadata_sidecar`] but lets the caller set the liveness
+/// `pid` — used by the I4 in-flight-run tests below (`Some(current pid)` to
+/// simulate a still-running owner, `Some(dead pid)` for a finished one).
+fn write_metadata_sidecar_with_pid(
+    dir: &std::path::Path,
+    run_id: &str,
+    session_id: Option<&str>,
+    pid: Option<u32>,
+) -> std::path::PathBuf {
     let path = metadata_path_for_run(dir, run_id);
     write_metadata(
         &path,
@@ -105,6 +117,7 @@ fn write_metadata_sidecar(
             trigger_source: "run_cli".into(),
             target: None,
             workspace_strategy: None,
+            pid,
         },
     )
     .unwrap();
@@ -472,6 +485,55 @@ async fn delete_requires_force_and_refuses_session_managed_transcripts() {
 
     assert!(!transcripts_dir.join("run_delete123.jsonl").exists());
     assert!(!metadata_path_for_run(&transcripts_dir, "run_delete123").exists());
+}
+
+// I4 (final-review finding): `rupu run` writes `.meta.json` BEFORE the agent
+// loop starts, and standalone metadata carries no status field — so without
+// a liveness guard, an in-flight run is archived/deleted mid-write just like
+// a finished one. Both verbs must refuse while the metadata's `pid` is alive,
+// and the on-disk files must survive the refused call.
+#[tokio::test]
+async fn archive_and_delete_refuse_a_live_standalone_run() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("transcripts").create_dir_all().unwrap();
+
+    let transcripts_dir = global.path().join("transcripts");
+    write_transcript(&transcripts_dir, "run_live01", "archive-agent", 61);
+    // This test process is alive for the whole test body, so its own pid is
+    // a reliable "still running" fixture across the child `rupu` process's
+    // `kill -0` check (pids are a system-wide identifier, not confined to
+    // whichever process is doing the checking).
+    write_metadata_sidecar_with_pid(
+        &transcripts_dir,
+        "run_live01",
+        None,
+        Some(std::process::id()),
+    );
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["transcript", "archive", "run_live01"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("still running"));
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["transcript", "delete", "run_live01", "--force"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("still running"));
+
+    // The refused calls must not have touched the on-disk transcript/metadata.
+    assert!(transcripts_dir.join("run_live01.jsonl").is_file());
+    assert!(metadata_path_for_run(&transcripts_dir, "run_live01").is_file());
 }
 
 #[tokio::test]

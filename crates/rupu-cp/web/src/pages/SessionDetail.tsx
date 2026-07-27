@@ -131,7 +131,7 @@ export default function SessionDetailPage() {
     setActionPending(true);
     setActionError(null);
     try {
-      await api.archiveSession(id);
+      await api.archiveSession(id, host);
       navigate('/sessions');
     } catch (e: unknown) {
       setActionError(e instanceof Error ? e.message : 'Archive failed');
@@ -144,7 +144,7 @@ export default function SessionDetailPage() {
     setActionPending(true);
     setActionError(null);
     try {
-      await api.restoreSession(id);
+      await api.restoreSession(id, host);
       navigate('/sessions');
     } catch (e: unknown) {
       setActionError(e instanceof Error ? e.message : 'Restore failed');
@@ -158,7 +158,7 @@ export default function SessionDetailPage() {
     setActionPending(true);
     setActionError(null);
     try {
-      await api.deleteSession(id);
+      await api.deleteSession(id, host);
       navigate('/sessions');
     } catch (e: unknown) {
       setActionError(e instanceof Error ? e.message : 'Delete failed');

@@ -728,8 +728,11 @@ export default function AutoflowRuns() {
     },
   ];
 
+  // A fresh action error (e.g. this click's Archive/Delete refusal) must win
+  // over a stale fetch error from an earlier load — never the other way
+  // around, or the operator sees the wrong banner for what just happened.
   const bannerError =
-    (tab === 'runs' ? events.error : tab === 'cycles' ? cycles.error : claims.error) ?? actionError;
+    actionError ?? (tab === 'runs' ? events.error : tab === 'cycles' ? cycles.error : claims.error);
   const refreshing = events.loading || cycles.loading;
 
   // Find — narrows whichever tab is active over ITS OWN searchable fields:

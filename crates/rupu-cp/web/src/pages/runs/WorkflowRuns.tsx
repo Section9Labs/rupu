@@ -232,7 +232,10 @@ export default function WorkflowRuns() {
   };
 
   const columns: Column<RunListRow>[] = [...WORKFLOW_RUN_COLUMNS, actionColumn];
-  const bannerError = error ?? actionError;
+  // A fresh action error (e.g. this click's Archive/Delete refusal) must win
+  // over a stale fetch error from an earlier load — never the other way
+  // around, or the operator sees the wrong banner for what just happened.
+  const bannerError = actionError ?? error;
 
   return (
     <div className="p-8">

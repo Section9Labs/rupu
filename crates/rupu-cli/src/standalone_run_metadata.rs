@@ -34,6 +34,18 @@ pub struct StandaloneRunMetadata {
     pub target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub workspace_strategy: Option<String>,
+    /// The OS pid of the `rupu run`/`rupu session` process that owns this
+    /// transcript, captured when the metadata is first written — BEFORE the
+    /// agent loop starts (see `cmd/run.rs`). A liveness signal only: once
+    /// the process exits (success, failure, or crash) the pid is dead and
+    /// `rupu_orchestrator::runs::pid_is_running` returns `false`, the same
+    /// dead-pid technique `RunStore::reap_if_orphaned` and
+    /// `ensure_session_not_running` use. `None` for metadata written before
+    /// this field existed — those carry no liveness signal, so the guard
+    /// that reads this field treats a missing pid as "no information,
+    /// proceed" rather than blocking unconditionally.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pid: Option<u32>,
 }
 
 impl StandaloneRunMetadata {
@@ -85,6 +97,7 @@ mod tests {
             trigger_source: "run_cli".into(),
             target: Some("github:Section9Labs/rupu/issues/42".into()),
             workspace_strategy: Some("direct_checkout".into()),
+            pid: Some(4242),
         };
 
         write_metadata(&path, &metadata).unwrap();

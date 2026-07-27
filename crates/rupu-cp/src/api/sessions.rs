@@ -703,6 +703,10 @@ fn map_host_session_mutate_err(e: HostConnectorError) -> ApiError {
     match e {
         HostConnectorError::NotFound(m) => ApiError::not_found(m),
         HostConnectorError::Invalid(m) => ApiError::conflict(m),
+        // A remote CP-of-CP hop (HttpHostConnector) already mapped ITS OWN
+        // local refusal to 409 before it reached us — preserve that status
+        // rather than flattening it into a 500 below.
+        HostConnectorError::Remote(409, m) => ApiError::conflict(m),
         HostConnectorError::Unsupported(m) => ApiError::not_available(m),
         other => ApiError::internal(other.to_string()),
     }
@@ -1174,5 +1178,14 @@ mod tests {
         .await
         .expect_err("empty prompt should error");
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    // Minor finding: a remote CP-of-CP hop's own 409 refusal must surface as
+    // 409 here too, not fall through to the generic 500 `other` arm.
+    #[test]
+    fn map_host_session_mutate_err_preserves_remote_409_as_conflict() {
+        let err =
+            map_host_session_mutate_err(HostConnectorError::Remote(409, "still running".into()));
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
     }
 }

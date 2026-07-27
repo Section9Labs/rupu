@@ -205,10 +205,11 @@ describe('AgentRuns — session-sourced row actions target the SESSION endpoint'
 });
 
 describe('AgentRuns — standalone-sourced row actions target the TRANSCRIPT endpoint', () => {
-  it('Archive calls api.archiveTranscript with run_id and the row host', async () => {
+  it('Archive calls api.archiveTranscript with run_id and the row host, when confirmed', async () => {
     stubDeps();
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([STANDALONE_ROW]);
     const archiveSpy = vi.spyOn(api, 'archiveTranscript').mockResolvedValue(undefined);
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
 
     renderPage();
     await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
@@ -217,6 +218,28 @@ describe('AgentRuns — standalone-sourced row actions target the TRANSCRIPT end
 
     await waitFor(() =>
       expect(archiveSpy).toHaveBeenCalledWith(STANDALONE_ROW.run_id, STANDALONE_ROW.host_id),
+    );
+  });
+
+  // I3 (final-review finding): unlike every other destructive/hiding action
+  // on this page, standalone Archive had NO confirm() — and unlike sessions
+  // (whose collector scans both active + archived dirs), an archived
+  // standalone run disappears from the CP entirely with no restore verb. The
+  // confirm copy must say so.
+  it('Archive is confirm-gated: stubbed confirm() false ⇒ no API call', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([STANDALONE_ROW]);
+    const archiveSpy = vi.spyOn(api, 'archiveTranscript').mockResolvedValue(undefined);
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText(`Archive run ${STANDALONE_ROW.run_id}`));
+
+    expect(archiveSpy).not.toHaveBeenCalled();
+    expect(confirmSpy).toHaveBeenCalledWith(
+      expect.stringContaining('hidden from the CP'),
     );
   });
 

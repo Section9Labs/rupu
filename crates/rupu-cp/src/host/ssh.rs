@@ -517,6 +517,39 @@ fn map_remote_err(e: RemoteExecError) -> HostConnectorError {
     }
 }
 
+/// Classify a nonzero-exit `rupu workflow|session|transcript <verb>` failure
+/// from [`SshHostConnector::remote_workflow`] / `remote_session` /
+/// `remote_transcript`.
+///
+/// Those three helpers previously mapped EVERY nonzero exit to
+/// `Unreachable`, which is right for an actual SSH/transport failure but
+/// wrong for a load-bearing safety refusal the remote CLI printed to
+/// stderr and exited nonzero for — e.g. "is managed by session", "is not
+/// terminal", or the standalone-transcript liveness guard's "appears to
+/// still be running". `Unreachable` lands the caller in the generic
+/// `other => 500` arm of `map_host_mutate_err` / `map_host_session_mutate_err`
+/// / `map_host_transcript_mutate_err`, silently downgrading an intentional
+/// 409 refusal into an opaque server error. Recognize those refusal shapes
+/// here and reclassify as `Invalid`, which those three mapping functions
+/// already turn into a 409 — the same status code the LOCAL (non-SSH) branch
+/// returns for the identical refusal.
+fn classify_remote_cli_failure(stderr: &str) -> HostConnectorError {
+    let lower = stderr.to_ascii_lowercase();
+    const REFUSAL_MARKERS: &[&str] = &[
+        "is managed by session",
+        "is not terminal",
+        "cancel it first",
+        "still running",
+        "appears to be running",
+        "while the worker is still running",
+    ];
+    if REFUSAL_MARKERS.iter().any(|m| lower.contains(m)) {
+        HostConnectorError::Invalid(stderr.trim().to_string())
+    } else {
+        HostConnectorError::Unreachable(stderr.trim().to_string())
+    }
+}
+
 // ── SshHostConnector ──────────────────────────────────────────────────────────
 
 /// [`HostConnector`] backed by SSH transport.
@@ -787,7 +820,7 @@ impl SshHostConnector {
             .await
             .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
         if !out.success {
-            return Err(HostConnectorError::Unreachable(out.stderr));
+            return Err(classify_remote_cli_failure(&out.stderr));
         }
         Ok(())
     }
@@ -805,7 +838,7 @@ impl SshHostConnector {
             .await
             .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
         if !out.success {
-            return Err(HostConnectorError::Unreachable(out.stderr));
+            return Err(classify_remote_cli_failure(&out.stderr));
         }
         Ok(())
     }
@@ -823,7 +856,7 @@ impl SshHostConnector {
             .await
             .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
         if !out.success {
-            return Err(HostConnectorError::Unreachable(out.stderr));
+            return Err(classify_remote_cli_failure(&out.stderr));
         }
         Ok(())
     }
@@ -1246,10 +1279,13 @@ impl HostConnector for SshHostConnector {
     /// Permanently delete a remote run via
     /// `rupu workflow delete-run <run_id> --force` (the CLI requires
     /// `--force` to confirm; this connector always passes it since this IS
-    /// the confirmed delete path, one hop removed). Note the remote CLI's
-    /// own `delete-run` does not itself re-check terminal status the way the
-    /// LOCAL branch's `delete_run_checked` guard does — an existing gap in
-    /// `rupu workflow delete-run`, not introduced here.
+    /// the confirmed delete path, one hop removed). The remote CLI's own
+    /// `delete-run` now re-checks terminal status itself
+    /// (`delete_run_with_store` in `cmd/workflow.rs`, mirroring the LOCAL
+    /// branch's `delete_run_checked` guard) and refuses — even under
+    /// `--force` — to remove a non-terminal run's directory out from under a
+    /// process still writing it. `remote_workflow` classifies that refusal's
+    /// stderr as `HostConnectorError::Invalid` (409), not `Unreachable`.
     async fn delete_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
         self.remote_workflow(&["delete-run", run_id, "--force"])
             .await
@@ -1652,6 +1688,35 @@ mod tests {
         assert_eq!(shell_escape("it's"), r#"'it'\''s'"#);
         assert_eq!(shell_escape("a;rm -rf /"), "'a;rm -rf /'");
         assert_eq!(shell_escape("$HOME"), "'$HOME'");
+    }
+
+    // Minor finding: a load-bearing safety refusal shelled over SSH must
+    // classify as `Invalid` (→ 409 downstream), not `Unreachable` (→ 500).
+    #[test]
+    fn classify_remote_cli_failure_recognizes_session_ownership_refusal() {
+        let err = classify_remote_cli_failure(
+            "Error: transcript run_x is managed by session ses_1; use `rupu session archive|delete` instead",
+        );
+        assert!(matches!(err, HostConnectorError::Invalid(m) if m.contains("is managed by session")));
+    }
+
+    #[test]
+    fn classify_remote_cli_failure_recognizes_non_terminal_refusal() {
+        let err =
+            classify_remote_cli_failure("Error: run run_x is not terminal (running) — cancel it first");
+        assert!(matches!(err, HostConnectorError::Invalid(_)));
+    }
+
+    #[test]
+    fn classify_remote_cli_failure_recognizes_liveness_refusal() {
+        let err = classify_remote_cli_failure("Error: transcript run_x appears to be running");
+        assert!(matches!(err, HostConnectorError::Invalid(_)));
+    }
+
+    #[test]
+    fn classify_remote_cli_failure_falls_back_to_unreachable() {
+        let err = classify_remote_cli_failure("ssh: connect to host edge port 22: Connection refused");
+        assert!(matches!(err, HostConnectorError::Unreachable(_)));
     }
 
     #[test]
