@@ -431,3 +431,23 @@ describe('WorkflowRuns — Find', () => {
     expect(screen.queryByText('deploy-prod')).not.toBeInTheDocument();
   });
 });
+
+// ── Table standardization Task 3: Turns before Duration, matching Sessions ──
+
+describe('WorkflowRuns — Turns/Duration column order (table-standardization Task 3)', () => {
+  it('Turns precedes Duration in the header row (matches the canonical Sessions order)', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([makeRun({})]);
+
+    const { container } = renderPage();
+    await waitFor(() => expect(screen.getByText('deploy-prod')).toBeInTheDocument());
+
+    const headers = Array.from(container.querySelectorAll('thead th')).map(
+      (th) => th.textContent?.trim() ?? '',
+    );
+    const turnsIdx = headers.indexOf('Turns');
+    const durationIdx = headers.indexOf('Duration');
+    expect(turnsIdx).toBeGreaterThanOrEqual(0);
+    expect(durationIdx).toBeGreaterThan(turnsIdx);
+  });
+});

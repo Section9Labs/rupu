@@ -4,10 +4,17 @@
 // polls every 5 s (page 0 only, spliced back over the head of the list, same
 // as WorkflowRuns/AgentRuns' "Running" tab — see `usePagedList`'s doc comment
 // for why that doesn't reset a scrolled view). Each row links to
-// /sessions/:id. Status is `unknown` on the wire, coerced via
-// lib/sessionStatus — a distinct vocabulary from the run-status enum
-// `StatusPill` renders, so this page keeps its own dot+label rendering
-// rather than routing through StatusPill.
+// /sessions/:id.
+//
+// Column order + status glyph now match the canonical run-table standard
+// (`docs/superpowers/plans/2026-07-24-rupu-cp-table-standardization.md`
+// Task 3): Status leads via the shared `SessionStatusPill` (Task 2), then
+// Agent (subject) → Session id → Host → Model → In/Out/Cached/Cost →
+// Turns → Duration → Started → actions. Status is `unknown` on the wire —
+// `toPillStatus` below coerces it to `SessionStatusPill`'s narrow 4-value
+// union via `lib/sessionStatus`'s existing label/tone helpers, folding the
+// `neutral` fallback tone (garbage/unrecognized input) onto `stopped` (the
+// same quiet slate visual `sessionStatusTone` already gives `neutral`).
 //
 // Find (2026-07-23 operator feedback amendment #1): a `SearchInput` in the
 // FilterBar's search slot narrows the loaded rows client-side, live per
@@ -28,12 +35,30 @@ import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
 import HostSelect, { ALL_HOSTS } from '../components/HostSelect';
+import { SessionStatusPill } from '../components/StatusPill';
 import { usePagedList } from '../lib/usePagedList';
 import { cn } from '../lib/cn';
-import { durationBetween } from '../lib/time';
+import { durationBetween, relativeTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
-import { sessionStatusDot, sessionStatusLabel } from '../lib/sessionStatus';
+import {
+  isSessionStatusValue,
+  sessionStatusLabel,
+  sessionStatusTone,
+  type SessionStatusValue,
+} from '../lib/sessionStatus';
 import { shortId } from '../lib/shortId';
+
+/** Coerce the wire's `unknown` session status into `SessionStatusPill`'s
+ *  narrow 4-value union. Exact vocabulary matches pass through; anything
+ *  else falls back to the same tone `sessionStatusTone` already resolves it
+ *  to, with `neutral` (its catch-all for unrecognized input) folded onto
+ *  `stopped` — never crashes, never invents a 5th status. */
+function toPillStatus(status: unknown): SessionStatusValue {
+  const label = sessionStatusLabel(status).toLowerCase();
+  if (isSessionStatusValue(label)) return label;
+  const tone = sessionStatusTone(status);
+  return tone === 'neutral' ? 'stopped' : tone;
+}
 
 type Tab = 'active' | 'archived';
 
@@ -218,12 +243,7 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
     fit: true,
     sortable: true,
     sortValue: (s) => sessionStatusLabel(s.status),
-    render: (s) => (
-      <span className="flex items-center gap-1.5">
-        <span className={cn('inline-block w-2 h-2 rounded-full', sessionStatusDot(s.status))} />
-        <span className="text-note text-ink-dim">{sessionStatusLabel(s.status)}</span>
-      </span>
-    ),
+    render: (s) => <SessionStatusPill status={toPillStatus(s.status)} />,
   },
   {
     key: 'agent',
@@ -336,6 +356,15 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
     render: (s) => (
       <span className="text-ink-dim">{durationBetween(s.created_at, s.updated_at)}</span>
     ),
+  },
+  {
+    key: 'started',
+    header: 'Started',
+    align: 'right',
+    fit: true,
+    sortable: true,
+    sortValue: (s) => (s.created_at ? Date.parse(s.created_at) : null),
+    render: (s) => <span className="text-ink-mute">{relativeTime(s.created_at)}</span>,
   },
 ];
 

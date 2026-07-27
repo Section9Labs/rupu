@@ -261,6 +261,83 @@ describe('Sessions — kit loading/empty/error states', () => {
   });
 });
 
+// ── Task 3 (2026-07-24 table-standardization plan): canonical column order,
+// the shared SessionStatusPill, and the new Started column ────────────────
+
+describe('Sessions — canonical run-table column order', () => {
+  it('renders headers in the canonical order: Status, Agent, Session, Host, Model, In, Out, Cached, Cost, Turns, Duration, Started, (actions)', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION]);
+
+    const { container } = renderPage();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    const headers = Array.from(container.querySelectorAll('thead th')).map(
+      (th) => th.textContent?.trim() ?? '',
+    );
+    expect(headers).toEqual([
+      'Status',
+      'Agent',
+      'Session',
+      'Host',
+      'Model',
+      'In',
+      'Out',
+      'Cached',
+      'Cost',
+      'Turns',
+      'Duration',
+      'Started',
+      '',
+    ]);
+  });
+
+  it('renders a Started cell with relativeTime(created_at)', async () => {
+    // Real timers throughout — usePagedList's polling + testing-library's
+    // waitFor both rely on real timers, so fake system time would hang them.
+    // Instead pin `created_at` a known 3 minutes before the real "now".
+    const threeMinAgo = new Date(Date.now() - 3 * 60_000).toISOString();
+    stubDeps();
+    vi.spyOn(api, 'getSessions').mockResolvedValue([
+      { ...REMOTE_SESSION, created_at: threeMinAgo },
+    ]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    expect(screen.getByText('3m ago')).toBeInTheDocument();
+  });
+});
+
+describe('Sessions — status cell uses the shared SessionStatusPill', () => {
+  it('a "running"-like status renders the shared pill with the motion marker', async () => {
+    stubDeps();
+    // rupu-cli's raw session status ("active") is not one of the four
+    // canonical values (idle|running|failed|stopped) — this also exercises
+    // the coercion path (sessionStatusTone maps "active" -> "running").
+    vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    const pill = screen.getByText('Running');
+    expect(pill).toHaveAttribute('data-motion', 'rg-pulse-run');
+  });
+
+  it('an unknown/garbage status value renders without crashing (falls back to a static pill)', async () => {
+    stubDeps();
+    const garbageSession: SessionSummary = { ...REMOTE_SESSION, status: 'zzz-not-a-real-status' };
+    vi.spyOn(api, 'getSessions').mockResolvedValue([garbageSession]);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    const pill = screen.getByText('Stopped');
+    expect(pill).toBeInTheDocument();
+    expect(pill).not.toHaveAttribute('data-motion', 'rg-pulse-run');
+  });
+});
+
 // ── Amendment #1 (2026-07-23 feedback round): Find on every table ──────────
 
 describe('Sessions — Find', () => {

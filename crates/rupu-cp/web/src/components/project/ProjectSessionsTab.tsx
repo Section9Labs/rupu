@@ -10,6 +10,12 @@
 // Ported from pages/ProjectSessions.tsx, reshaped into a self-contained
 // component keyed off the `wsId` prop. Rows render via the shared SortableTable.
 //
+// Column order + status glyph match the canonical run-table standard
+// (`docs/superpowers/plans/2026-07-24-rupu-cp-table-standardization.md`
+// Task 3) — see `pages/Sessions.tsx`'s header comment for the full rationale;
+// `toPillStatus` here is the same coercion, duplicated locally rather than
+// shared since Task 3 is scoped to these two files only.
+//
 // Find (parity with Sessions' 2026-07-23 amendment): a `SearchInput` in the
 // FilterBar's search slot narrows the loaded rows client-side, live per
 // keystroke, over agent name / session id — composing with (not replacing)
@@ -27,12 +33,27 @@ import { SearchInput } from '../ui/SearchInput';
 import { EmptyState } from '../ui/EmptyState';
 import { ErrorBanner } from '../ui/ErrorBanner';
 import { Spinner } from '../ui/Spinner';
+import { SessionStatusPill } from '../StatusPill';
 import { usePagedList } from '../../lib/usePagedList';
-import { durationBetween } from '../../lib/time';
+import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
-import { sessionStatusDot, sessionStatusLabel, sessionStatusTone } from '../../lib/sessionStatus';
+import {
+  isSessionStatusValue,
+  sessionStatusLabel,
+  sessionStatusTone,
+  type SessionStatusValue,
+} from '../../lib/sessionStatus';
 import { shortId } from '../../lib/shortId';
-import { cn } from '../../lib/cn';
+
+/** Coerce the wire's `unknown` session status into `SessionStatusPill`'s
+ *  narrow 4-value union — see `pages/Sessions.tsx`'s `toPillStatus` for the
+ *  full rationale (identical logic, duplicated per this task's file scope). */
+function toPillStatus(status: unknown): SessionStatusValue {
+  const label = sessionStatusLabel(status).toLowerCase();
+  if (isSessionStatusValue(label)) return label;
+  const tone = sessionStatusTone(status);
+  return tone === 'neutral' ? 'stopped' : tone;
+}
 
 // --- Scope filter -----------------------------------------------------------
 
@@ -71,12 +92,7 @@ const SESSION_COLUMNS: Column<SessionSummary>[] = [
     fit: true,
     sortable: true,
     sortValue: (s) => sessionStatusLabel(s.status),
-    render: (s) => (
-      <span className="flex items-center gap-1.5">
-        <span className={cn('inline-block w-2 h-2 rounded-full', sessionStatusDot(s.status))} />
-        <span className="text-note text-ink-dim">{sessionStatusLabel(s.status)}</span>
-      </span>
-    ),
+    render: (s) => <SessionStatusPill status={toPillStatus(s.status)} />,
   },
   {
     key: 'agent',
@@ -174,6 +190,15 @@ const SESSION_COLUMNS: Column<SessionSummary>[] = [
     render: (s) => (
       <span className="text-ink-dim">{durationBetween(s.created_at, s.updated_at)}</span>
     ),
+  },
+  {
+    key: 'started',
+    header: 'Started',
+    align: 'right',
+    fit: true,
+    sortable: true,
+    sortValue: (s) => (s.created_at ? Date.parse(s.created_at) : null),
+    render: (s) => <span className="text-ink-mute">{relativeTime(s.created_at)}</span>,
   },
   {
     key: 'action',

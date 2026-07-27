@@ -181,6 +181,66 @@ describe('ProjectSessionsTab — table rules (fit/subject columns)', () => {
   });
 });
 
+describe('ProjectSessionsTab — Task 3: canonical column order + shared pill', () => {
+  it('renders headers in the canonical order (no Host slot — project tabs are already scoped): Status, Agent, Session, Model, In, Out, Cached, Cost, Turns, Duration, Started, (actions)', async () => {
+    mockSessions();
+    const { container } = renderTab();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    const headers = Array.from(container.querySelectorAll('thead th')).map(
+      (th) => th.textContent?.trim() ?? '',
+    );
+    expect(headers).toEqual([
+      'Status',
+      'Agent',
+      'Session',
+      'Model',
+      'In',
+      'Out',
+      'Cached',
+      'Cost',
+      'Turns',
+      'Duration',
+      'Started',
+      '',
+    ]);
+  });
+
+  it('renders a Started cell with relativeTime(created_at)', async () => {
+    // Real timers throughout — usePagedList's polling + testing-library's
+    // waitFor both rely on real timers, so fake system time would hang them.
+    // Instead pin `created_at` a known 3 minutes before the real "now".
+    const threeMinAgo = new Date(Date.now() - 3 * 60_000).toISOString();
+    mockSessions([{ ...ROWS[0], created_at: threeMinAgo }]);
+
+    renderTab();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    expect(screen.getAllByText('3m ago').length).toBeGreaterThan(0);
+  });
+
+  it('the status cell uses the shared SessionStatusPill (motion marker for a running-like status)', async () => {
+    mockSessions();
+    renderTab();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    // ROWS[0]'s raw status is "active" (rupu-cli vocabulary quirk, not one of
+    // the four canonical values) — exercises the coercion path.
+    const pill = screen.getByText('Running');
+    expect(pill).toHaveAttribute('data-motion', 'rg-pulse-run');
+  });
+
+  it('an unknown/garbage status value renders without crashing', async () => {
+    mockSessions([{ ...ROWS[0], status: 'totally-unrecognized' }]);
+    renderTab();
+
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    const pill = screen.getByText('Stopped');
+    expect(pill).toBeInTheDocument();
+    expect(pill).not.toHaveAttribute('data-motion', 'rg-pulse-run');
+  });
+});
+
 describe('ProjectSessionsTab — usage bar chart strip', () => {
   it('renders a usage bar for each priced session', async () => {
     mockSessions();

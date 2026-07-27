@@ -415,6 +415,15 @@ const WORKFLOW_RUN_COLUMNS: Column<RunListRow>[] = [
     render: (r) => <span className="text-ink font-medium">{formatCost(r.usage.cost_usd)}</span>,
   },
   {
+    key: 'turns',
+    header: 'Turns',
+    align: 'right',
+    fit: true,
+    sortable: true,
+    sortValue: (r) => r.turns,
+    render: (r) => <span className="text-ink">{r.turns ? String(r.turns) : '—'}</span>,
+  },
+  {
     key: 'duration',
     header: 'Duration',
     align: 'right',
@@ -428,15 +437,6 @@ const WORKFLOW_RUN_COLUMNS: Column<RunListRow>[] = [
           : durationBetween(r.started_at, r.finished_at)}
       </span>
     ),
-  },
-  {
-    key: 'turns',
-    header: 'Turns',
-    align: 'right',
-    fit: true,
-    sortable: true,
-    sortValue: (r) => r.turns,
-    render: (r) => <span className="text-ink">{r.turns ? String(r.turns) : '—'}</span>,
   },
   {
     key: 'started',

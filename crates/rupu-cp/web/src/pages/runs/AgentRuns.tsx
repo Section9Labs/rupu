@@ -361,15 +361,6 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
     render: (r) => <span className="text-ink font-medium">{formatCost(r.usage.cost_usd)}</span>,
   },
   {
-    key: 'duration',
-    header: 'Duration',
-    fit: true,
-    align: 'right',
-    sortable: true,
-    sortValue: (r) => r.duration_ms ?? null,
-    render: (r) => <span className="text-ink-dim">{formatDuration(r.duration_ms)}</span>,
-  },
-  {
     key: 'turns',
     header: 'Turns',
     fit: true,
@@ -377,6 +368,15 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
     sortable: true,
     sortValue: (r) => r.turns,
     render: (r) => <span className="text-ink">{r.turns ? String(r.turns) : '—'}</span>,
+  },
+  {
+    key: 'duration',
+    header: 'Duration',
+    fit: true,
+    align: 'right',
+    sortable: true,
+    sortValue: (r) => r.duration_ms ?? null,
+    render: (r) => <span className="text-ink-dim">{formatDuration(r.duration_ms)}</span>,
   },
   {
     key: 'started',
