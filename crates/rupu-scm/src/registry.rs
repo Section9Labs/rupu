@@ -34,6 +34,38 @@ pub struct Registry {
     configured_default_tracker: Option<IssueTracker>,
 }
 
+/// Outcome of resolving a configured default (`[scm.default].platform` /
+/// `[issues.default].tracker`) against the connectors actually
+/// registered in a `Registry`. Kept as a pure, dependency-free helper
+/// (see [`resolve_configured_default`]) so the "configured but no live
+/// connector" case — which must log a WARN per ISSUES.md I-15 — can be
+/// unit-tested without a tracing-capture harness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefaultResolution<T> {
+    /// A default was configured and a matching connector is registered.
+    ConfiguredAndAvailable(T),
+    /// A default was configured but no matching connector is registered
+    /// (e.g. `platform = "gitlab"` with no GitLab credentials). Callers
+    /// must warn here — silently falling back would be indistinguishable
+    /// from the "nothing configured" case.
+    ConfiguredButUnavailable(T),
+    /// No default was configured; fall back silently.
+    Unset,
+}
+
+/// Classify a configured default (`Some`/`None`) against an
+/// availability check, without any logging side effect.
+fn resolve_configured_default<T: Copy>(
+    configured: Option<T>,
+    is_available: impl FnOnce(T) -> bool,
+) -> DefaultResolution<T> {
+    match configured {
+        Some(v) if is_available(v) => DefaultResolution::ConfiguredAndAvailable(v),
+        Some(v) => DefaultResolution::ConfiguredButUnavailable(v),
+        None => DefaultResolution::Unset,
+    }
+}
+
 impl Registry {
     /// Discover connectors from configured credentials. Each platform
     /// is probed independently; missing credentials are logged at INFO
@@ -240,12 +272,24 @@ impl Registry {
     /// platform that actually has a registered connector; otherwise
     /// falls back to the registration-order preference (GitHub, then
     /// GitLab) — the same fallback used when no `[scm.default]` is
-    /// configured at all.
+    /// configured at all. If `[scm.default].platform` names a platform
+    /// with no live connector (e.g. GitLab configured but no GitLab
+    /// credentials), that mismatch is logged at WARN — see
+    /// ISSUES.md I-15 — so the fallback isn't indistinguishable from the
+    /// "nothing configured" case in the logs.
     pub fn default_platform(&self) -> Option<Platform> {
-        if let Some(p) = self.configured_default_platform {
-            if self.repo_connectors.contains_key(&p) {
-                return Some(p);
+        match resolve_configured_default(self.configured_default_platform, |p| {
+            self.repo_connectors.contains_key(&p)
+        }) {
+            DefaultResolution::ConfiguredAndAvailable(p) => return Some(p),
+            DefaultResolution::ConfiguredButUnavailable(p) => {
+                warn!(
+                    configured = %p,
+                    "scm.default.platform is configured but has no registered connector; \
+                     falling back to registration-order preference"
+                );
             }
+            DefaultResolution::Unset => {}
         }
         if self.repo_connectors.contains_key(&Platform::Github) {
             Some(Platform::Github)
@@ -261,12 +305,22 @@ impl Registry {
     /// tracker that actually has a registered connector; otherwise falls
     /// back to the registration-order preference (GitHub, GitLab,
     /// Linear, Jira) — the same fallback used when no `[issues.default]`
-    /// is configured at all.
+    /// is configured at all. If `[issues.default].tracker` names a
+    /// tracker with no live connector, that mismatch is logged at WARN —
+    /// see ISSUES.md I-15.
     pub fn default_tracker(&self) -> Option<IssueTracker> {
-        if let Some(t) = self.configured_default_tracker {
-            if self.issue_connectors.contains_key(&t) {
-                return Some(t);
+        match resolve_configured_default(self.configured_default_tracker, |t| {
+            self.issue_connectors.contains_key(&t)
+        }) {
+            DefaultResolution::ConfiguredAndAvailable(t) => return Some(t),
+            DefaultResolution::ConfiguredButUnavailable(t) => {
+                warn!(
+                    configured = %t,
+                    "issues.default.tracker is configured but has no registered connector; \
+                     falling back to registration-order preference"
+                );
             }
+            DefaultResolution::Unset => {}
         }
         [
             IssueTracker::Github,
@@ -394,6 +448,30 @@ mod tests {
         ) -> Result<(), ScmError> {
             unimplemented!()
         }
+    }
+
+    #[test]
+    fn resolve_configured_default_distinguishes_unset_available_and_unavailable() {
+        // I-15 follow-up: `default_platform`/`default_tracker` warn when a
+        // configured default names something with no live connector, so
+        // that case must be distinguishable from "nothing configured" —
+        // this is exactly what `resolve_configured_default` exists to
+        // make unit-testable without a tracing-capture harness (the crate
+        // has none). This test is the "warn path is taken" assertion:
+        // `ConfiguredButUnavailable` is the variant `default_platform`/
+        // `default_tracker` match on to emit `tracing::warn!`.
+        assert_eq!(
+            resolve_configured_default(None::<Platform>, |_| true),
+            DefaultResolution::Unset
+        );
+        assert_eq!(
+            resolve_configured_default(Some(Platform::Gitlab), |p| p == Platform::Gitlab),
+            DefaultResolution::ConfiguredAndAvailable(Platform::Gitlab)
+        );
+        assert_eq!(
+            resolve_configured_default(Some(Platform::Gitlab), |p| p == Platform::Github),
+            DefaultResolution::ConfiguredButUnavailable(Platform::Gitlab)
+        );
     }
 
     #[test]

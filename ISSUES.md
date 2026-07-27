@@ -313,11 +313,32 @@ were reachable and both are now included in the default-tracker fallback. The
 stale "Wiring... lands in Task 19" comment at `registry.rs:207-208` is
 rewritten to describe current behavior.
 
-**Validation.** `cargo test -p rupu-scm --lib` — 47 tests, all passing (6 new,
-in `registry::tests`). Binding assertions, built via the existing
-`Registry::empty()` + `insert_repo_connector` test seam plus a new
-`insert_issue_connector` equivalent (fake `RepoConnector`/`IssueConnector`
-impls, no real credentials/network):
+**Follow-up (same PR, review round).** The initial fix above left the
+"configured-but-unavailable" fallback silent — indistinguishable in the logs
+from the "nothing configured" case, i.e. the same silent-wrong-behavior shape
+this issue exists to close (a user asking for GitLab and quietly getting
+GitHub with no trace of why). `default_platform()` / `default_tracker()` now
+log a `tracing::warn!` naming both the configured value and the fact that it
+has no live connector before falling back — matching the WARN level
+`Registry::discover` already uses for connector-build errors. The fallback
+behavior itself is unchanged (still warn-and-fall-back, not `None`/error):
+returning `None` here would make the existing "no platform arg and no
+`[scm.default]` configured" error message actively misleading when a platform
+*is* configured but just unavailable. The decision logic was extracted into a
+pure `resolve_configured_default` helper (returns a
+`DefaultResolution::{ConfiguredAndAvailable, ConfiguredButUnavailable, Unset}`
+enum) precisely so the warn-triggering branch is unit-testable — the crate
+has no tracing-capture harness (no `tracing-test` or equivalent dev-dep).
+
+**Validation.** `cargo test -p rupu-scm --lib` — 42 tests, all passing (7 new
+in `registry::tests`, including
+`resolve_configured_default_distinguishes_unset_available_and_unavailable`,
+which asserts the `ConfiguredButUnavailable` variant — the one that drives
+the new WARN log — is returned when a configured value has no matching
+connector, distinct from both `Unset` and `ConfiguredAndAvailable`). Binding
+assertions, built via the existing `Registry::empty()` + `insert_repo_connector`
+test seam plus a new `insert_issue_connector` equivalent (fake
+`RepoConnector`/`IssueConnector` impls, no real credentials/network):
 `default_platform_prefers_the_configured_value` registers both GitHub and
 GitLab connectors, sets `configured_default_platform = Some(Gitlab)`, and
 asserts `default_platform() == Some(Gitlab)`;
@@ -331,6 +352,11 @@ config) and asserts `default_tracker() == Some(Linear)`;
 `default_tracker_falls_back_when_config_is_unset` mirror the platform cases
 for trackers. `cargo build --workspace` and `cargo clippy -p rupu-scm --lib
 --tests` are both clean.
+
+**Noted, not fixed here.** `insert_repo_connector` / `insert_issue_connector`
+are documented "Test/internal" but carry no `#[cfg(test)]` /
+`#[cfg(feature = "test-helpers")]` gate, unlike `empty()` one line below them.
+Pre-existing, out of scope for this fix; flagged for a follow-up issue.
 
 ---
 
