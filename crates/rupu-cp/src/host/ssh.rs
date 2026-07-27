@@ -516,6 +516,39 @@ fn map_remote_err(e: RemoteExecError) -> HostConnectorError {
     }
 }
 
+/// Classify a nonzero-exit `rupu workflow|session|transcript <verb>` failure
+/// from [`SshHostConnector::remote_workflow`] / `remote_session` /
+/// `remote_transcript`.
+///
+/// Those three helpers previously mapped EVERY nonzero exit to
+/// `Unreachable`, which is right for an actual SSH/transport failure but
+/// wrong for a load-bearing safety refusal the remote CLI printed to
+/// stderr and exited nonzero for — e.g. "is managed by session", "is not
+/// terminal", or the standalone-transcript liveness guard's "appears to
+/// still be running". `Unreachable` lands the caller in the generic
+/// `other => 500` arm of `map_host_mutate_err` / `map_host_session_mutate_err`
+/// / `map_host_transcript_mutate_err`, silently downgrading an intentional
+/// 409 refusal into an opaque server error. Recognize those refusal shapes
+/// here and reclassify as `Invalid`, which those three mapping functions
+/// already turn into a 409 — the same status code the LOCAL (non-SSH) branch
+/// returns for the identical refusal.
+fn classify_remote_cli_failure(stderr: &str) -> HostConnectorError {
+    let lower = stderr.to_ascii_lowercase();
+    const REFUSAL_MARKERS: &[&str] = &[
+        "is managed by session",
+        "is not terminal",
+        "cancel it first",
+        "still running",
+        "appears to be running",
+        "while the worker is still running",
+    ];
+    if REFUSAL_MARKERS.iter().any(|m| lower.contains(m)) {
+        HostConnectorError::Invalid(stderr.trim().to_string())
+    } else {
+        HostConnectorError::Unreachable(stderr.trim().to_string())
+    }
+}
+
 // ── SshHostConnector ──────────────────────────────────────────────────────────
 
 /// [`HostConnector`] backed by SSH transport.
@@ -774,7 +807,8 @@ impl SshHostConnector {
 
     /// Issue a one-shot `rupu workflow <tail...>` command on the remote host.
     ///
-    /// Used by [`cancel_run`], [`approve_run`], and [`reject_run`].
+    /// Used by [`cancel_run`], [`approve_run`], [`reject_run`], and the
+    /// run archive/restore/delete overrides.
     async fn remote_workflow(&self, tail: &[&str]) -> Result<(), HostConnectorError> {
         let mut argv: Vec<String> = vec!["rupu".into(), "workflow".into()];
         argv.extend(tail.iter().map(|s| s.to_string()));
@@ -785,7 +819,43 @@ impl SshHostConnector {
             .await
             .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
         if !out.success {
-            return Err(HostConnectorError::Unreachable(out.stderr));
+            return Err(classify_remote_cli_failure(&out.stderr));
+        }
+        Ok(())
+    }
+
+    /// Issue a one-shot `rupu session <tail...>` command on the remote host.
+    /// The `rupu workflow`-prefixed sibling of [`remote_workflow`]; used by
+    /// the session archive/restore/delete overrides.
+    async fn remote_session(&self, tail: &[&str]) -> Result<(), HostConnectorError> {
+        let mut argv: Vec<String> = vec!["rupu".into(), "session".into()];
+        argv.extend(tail.iter().map(|s| s.to_string()));
+        let cmd = build_remote_command(&argv);
+        let out = self
+            .exec
+            .run(&cmd)
+            .await
+            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+        if !out.success {
+            return Err(classify_remote_cli_failure(&out.stderr));
+        }
+        Ok(())
+    }
+
+    /// Issue a one-shot `rupu transcript <tail...>` command on the remote
+    /// host. The `rupu session`-prefixed sibling of [`remote_session`]; used
+    /// by the transcript archive/delete overrides.
+    async fn remote_transcript(&self, tail: &[&str]) -> Result<(), HostConnectorError> {
+        let mut argv: Vec<String> = vec!["rupu".into(), "transcript".into()];
+        argv.extend(tail.iter().map(|s| s.to_string()));
+        let cmd = build_remote_command(&argv);
+        let out = self
+            .exec
+            .run(&cmd)
+            .await
+            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+        if !out.success {
+            return Err(classify_remote_cli_failure(&out.stderr));
         }
         Ok(())
     }
@@ -1195,6 +1265,31 @@ impl HostConnector for SshHostConnector {
         Ok(())
     }
 
+    /// Archive a terminal remote run via `rupu workflow archive-run <run_id>`.
+    async fn archive_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
+        self.remote_workflow(&["archive-run", run_id]).await
+    }
+
+    /// Restore an archived remote run via `rupu workflow restore-run <run_id>`.
+    async fn restore_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
+        self.remote_workflow(&["restore-run", run_id]).await
+    }
+
+    /// Permanently delete a remote run via
+    /// `rupu workflow delete-run <run_id> --force` (the CLI requires
+    /// `--force` to confirm; this connector always passes it since this IS
+    /// the confirmed delete path, one hop removed). The remote CLI's own
+    /// `delete-run` now re-checks terminal status itself
+    /// (`delete_run_with_store` in `cmd/workflow.rs`, mirroring the LOCAL
+    /// branch's `delete_run_checked` guard) and refuses — even under
+    /// `--force` — to remove a non-terminal run's directory out from under a
+    /// process still writing it. `remote_workflow` classifies that refusal's
+    /// stderr as `HostConnectorError::Invalid` (409), not `Unreachable`.
+    async fn delete_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
+        self.remote_workflow(&["delete-run", run_id, "--force"])
+            .await
+    }
+
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
         mirror_stream_run_events(&self.run_store, &self.host_id, run_id).await
     }
@@ -1248,6 +1343,33 @@ impl HostConnector for SshHostConnector {
             .and_then(|r| r.as_array())
             .cloned()
             .unwrap_or_default())
+    }
+
+    /// Archive an active remote session via `rupu session archive <id>`.
+    async fn archive_session(&self, id: &str) -> Result<(), HostConnectorError> {
+        self.remote_session(&["archive", id]).await
+    }
+
+    /// Restore an archived remote session via `rupu session restore <id>`.
+    async fn restore_session(&self, id: &str) -> Result<(), HostConnectorError> {
+        self.remote_session(&["restore", id]).await
+    }
+
+    /// Permanently delete a remote session via
+    /// `rupu session delete <id> --force`.
+    async fn delete_session(&self, id: &str) -> Result<(), HostConnectorError> {
+        self.remote_session(&["delete", id, "--force"]).await
+    }
+
+    /// Archive a standalone remote transcript via `rupu transcript archive <id>`.
+    async fn archive_transcript(&self, id: &str) -> Result<(), HostConnectorError> {
+        self.remote_transcript(&["archive", id]).await
+    }
+
+    /// Permanently delete a remote transcript via
+    /// `rupu transcript delete <id> --force`.
+    async fn delete_transcript(&self, id: &str) -> Result<(), HostConnectorError> {
+        self.remote_transcript(&["delete", id, "--force"]).await
     }
 
     /// Standalone agent runs via `rupu transcript list --format json`, reshaped
@@ -1564,6 +1686,35 @@ mod tests {
         assert_eq!(shell_escape("it's"), r#"'it'\''s'"#);
         assert_eq!(shell_escape("a;rm -rf /"), "'a;rm -rf /'");
         assert_eq!(shell_escape("$HOME"), "'$HOME'");
+    }
+
+    // Minor finding: a load-bearing safety refusal shelled over SSH must
+    // classify as `Invalid` (→ 409 downstream), not `Unreachable` (→ 500).
+    #[test]
+    fn classify_remote_cli_failure_recognizes_session_ownership_refusal() {
+        let err = classify_remote_cli_failure(
+            "Error: transcript run_x is managed by session ses_1; use `rupu session archive|delete` instead",
+        );
+        assert!(matches!(err, HostConnectorError::Invalid(m) if m.contains("is managed by session")));
+    }
+
+    #[test]
+    fn classify_remote_cli_failure_recognizes_non_terminal_refusal() {
+        let err =
+            classify_remote_cli_failure("Error: run run_x is not terminal (running) — cancel it first");
+        assert!(matches!(err, HostConnectorError::Invalid(_)));
+    }
+
+    #[test]
+    fn classify_remote_cli_failure_recognizes_liveness_refusal() {
+        let err = classify_remote_cli_failure("Error: transcript run_x appears to be running");
+        assert!(matches!(err, HostConnectorError::Invalid(_)));
+    }
+
+    #[test]
+    fn classify_remote_cli_failure_falls_back_to_unreachable() {
+        let err = classify_remote_cli_failure("ssh: connect to host edge port 22: Connection refused");
+        assert!(matches!(err, HostConnectorError::Unreachable(_)));
     }
 
     #[test]
@@ -2698,6 +2849,138 @@ mod tests {
 
         let err = conn
             .resume_run("run_01TESTRESUMEOFFLINE")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Unreachable(_)),
+            "expected Unreachable, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_archive_restore_delete_run_issue_remote_commands() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let run_id = "run_01TESTARCHIVEOK";
+
+        conn.archive_run(run_id).await.unwrap();
+        conn.restore_run(run_id).await.unwrap();
+        conn.delete_run(run_id).await.unwrap();
+
+        let cmds = fake.commands.lock().unwrap();
+        assert!(
+            cmds.iter().any(|c| c.contains("'workflow'")
+                && c.contains("'archive-run'")
+                && c.contains(&format!("'{run_id}'"))),
+            "archive-run command not found in: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("'workflow'")
+                && c.contains("'restore-run'")
+                && c.contains(&format!("'{run_id}'"))),
+            "restore-run command not found in: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("'workflow'")
+                && c.contains("'delete-run'")
+                && c.contains(&format!("'{run_id}'"))
+                && c.contains("'--force'")),
+            "delete-run command not found in: {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_archive_run_offline_surfaces_unreachable() {
+        let fake = std::sync::Arc::new(FakeExec::offline("connection refused"));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let err = conn
+            .archive_run("run_01TESTARCHIVEOFFLINE")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Unreachable(_)),
+            "expected Unreachable, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_archive_restore_delete_session_issue_remote_commands() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let id = "ses_01TESTARCHIVEOK";
+
+        conn.archive_session(id).await.unwrap();
+        conn.restore_session(id).await.unwrap();
+        conn.delete_session(id).await.unwrap();
+
+        let cmds = fake.commands.lock().unwrap();
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("'session'") && c.contains("'archive'") && c.contains(&format!("'{id}'"))),
+            "session archive command not found in: {cmds:?}"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("'session'") && c.contains("'restore'") && c.contains(&format!("'{id}'"))),
+            "session restore command not found in: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("'session'")
+                && c.contains("'delete'")
+                && c.contains(&format!("'{id}'"))
+                && c.contains("'--force'")),
+            "session delete command not found in: {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_archive_session_offline_surfaces_unreachable() {
+        let fake = std::sync::Arc::new(FakeExec::offline("connection refused"));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let err = conn
+            .archive_session("ses_01TESTARCHIVEOFFLINE")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Unreachable(_)),
+            "expected Unreachable, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_archive_delete_transcript_issue_remote_commands() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let id = "run_01TESTTRANSCRIPTOK";
+
+        conn.archive_transcript(id).await.unwrap();
+        conn.delete_transcript(id).await.unwrap();
+
+        let cmds = fake.commands.lock().unwrap();
+        assert!(
+            cmds.iter().any(|c| c.contains("'transcript'")
+                && c.contains("'archive'")
+                && c.contains(&format!("'{id}'"))),
+            "transcript archive command not found in: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("'transcript'")
+                && c.contains("'delete'")
+                && c.contains(&format!("'{id}'"))
+                && c.contains("'--force'")),
+            "transcript delete command not found in: {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_archive_transcript_offline_surfaces_unreachable() {
+        let fake = std::sync::Arc::new(FakeExec::offline("connection refused"));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let err = conn
+            .archive_transcript("run_01TESTTRANSCRIPTOFFLINE")
             .await
             .unwrap_err();
         assert!(

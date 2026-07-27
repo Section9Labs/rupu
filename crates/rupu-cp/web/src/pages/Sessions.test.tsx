@@ -375,7 +375,10 @@ describe('Sessions — whole-row navigation (rowHref)', () => {
 
     fireEvent.click(screen.getByLabelText(`Archive session ${REMOTE_SESSION.session_id}`));
 
-    expect(vi.mocked(api.archiveSession)).toHaveBeenCalledWith(REMOTE_SESSION.session_id);
+    expect(vi.mocked(api.archiveSession)).toHaveBeenCalledWith(
+      REMOTE_SESSION.session_id,
+      REMOTE_SESSION.host_id,
+    );
     expect(screen.getByTestId('loc')).toHaveTextContent('/');
   });
 

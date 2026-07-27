@@ -364,6 +364,293 @@ async fn readonly_local_launch_agent_still_returns_501() {
     assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
 }
 
+// ── Archive / restore / delete run via remote host ────────────────────────────
+
+#[tokio::test]
+async fn archive_run_with_remote_host_proxies_and_returns_host_id() {
+    let remote = httpmock::MockServer::start_async().await;
+    let m = remote.mock(|when, then| {
+        when.method("POST").path("/api/runs/run_arch/archive");
+        then.status(200)
+            .json_body(serde_json::json!({ "ok": true, "id": "run_arch", "archived": true }));
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (addr, host_id) = spawn_with_remote(tmp.path(), &remote.base_url()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/api/runs/run_arch/archive?host={host_id}"
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["host_id"], host_id);
+    m.assert();
+}
+
+#[tokio::test]
+async fn restore_run_with_remote_host_proxies_and_returns_host_id() {
+    let remote = httpmock::MockServer::start_async().await;
+    let m = remote.mock(|when, then| {
+        when.method("POST").path("/api/runs/run_arch/restore");
+        then.status(200)
+            .json_body(serde_json::json!({ "ok": true, "id": "run_arch", "archived": false }));
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (addr, host_id) = spawn_with_remote(tmp.path(), &remote.base_url()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/api/runs/run_arch/restore?host={host_id}"
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["host_id"], host_id);
+    m.assert();
+}
+
+#[tokio::test]
+async fn delete_run_with_remote_host_proxies_and_returns_host_id() {
+    let remote = httpmock::MockServer::start_async().await;
+    let m = remote.mock(|when, then| {
+        when.method("DELETE").path("/api/runs/run_del");
+        then.status(200)
+            .json_body(serde_json::json!({ "ok": true, "id": "run_del", "deleted": true }));
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (addr, host_id) = spawn_with_remote(tmp.path(), &remote.base_url()).await;
+
+    let resp = reqwest::Client::new()
+        .delete(format!("http://{addr}/api/runs/run_del?host={host_id}"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["host_id"], host_id);
+    m.assert();
+}
+
+/// A remote-host archive/restore/delete request must NOT touch the local run
+/// store at all — proven by creating a LOCAL run with the same id the remote
+/// mock uses and asserting it is untouched (still present, still active)
+/// after the proxied call.
+#[tokio::test]
+async fn archive_run_with_remote_host_does_not_touch_local_run_store() {
+    let remote = httpmock::MockServer::start_async().await;
+    let m = remote.mock(|when, then| {
+        when.method("POST").path("/api/runs/run_shared_id/archive");
+        then.status(200)
+            .json_body(serde_json::json!({ "ok": true, "id": "run_shared_id", "archived": true }));
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = AppState::new(tmp.path().into(), rupu_config::PricingConfig::default())
+        .with_launcher(Some(Arc::new(MockLauncher)));
+    let local_store = state.run_store.clone();
+    let host = state
+        .hosts
+        .add_host("test-remote", &remote.base_url(), None)
+        .expect("add_host should succeed");
+    let host_id = host.id.clone();
+
+    // Seed a LOCAL run under the same id the remote mock uses.
+    local_store
+        .create(
+            local_terminal_record("run_shared_id"),
+            "name: x\n",
+        )
+        .unwrap();
+
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/api/runs/run_shared_id/archive?host={host_id}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    m.assert();
+
+    // The LOCAL run must be completely untouched — still active, not archived.
+    assert_eq!(local_store.list().unwrap().len(), 1, "local run must still be active");
+    assert_eq!(local_store.list_archived().unwrap().len(), 0, "local archive scope must stay empty");
+}
+
+fn local_terminal_record(id: &str) -> rupu_orchestrator::RunRecord {
+    rupu_orchestrator::RunRecord {
+        id: id.into(),
+        workflow_name: "wf".into(),
+        status: rupu_orchestrator::RunStatus::Completed,
+        inputs: Default::default(),
+        event: None,
+        workspace_id: "ws_1".into(),
+        workspace_path: std::path::PathBuf::from("/tmp/proj"),
+        transcript_dir: std::path::PathBuf::from("/tmp/proj/.rupu/transcripts"),
+        started_at: chrono::Utc::now(),
+        finished_at: Some(chrono::Utc::now()),
+        error_message: None,
+        awaiting: Vec::new(),
+        awaiting_step_id: None,
+        approval_prompt: None,
+        awaiting_since: None,
+        expires_at: None,
+        issue_ref: None,
+        issue: None,
+        parent_run_id: None,
+        backend_id: None,
+        worker_id: None,
+        artifact_manifest_path: None,
+        runner_pid: None,
+        source_wake_id: None,
+        active_step_id: None,
+        active_step_kind: None,
+        active_step_agent: None,
+        active_step_transcript_path: None,
+        resume_requested_at: None,
+        resume_claimed_at: None,
+        resume_claimed_by: None,
+        resume_mode: None,
+        resume_gate_id: None,
+        final_output: None,
+        loop_progress: Default::default(),
+    }
+}
+
+// ── Archive / restore / delete session via remote host ────────────────────────
+
+struct StubSessionMutator;
+
+#[async_trait::async_trait]
+impl rupu_cp::session_mutator::SessionMutator for StubSessionMutator {
+    async fn mutate(
+        &self,
+        _id: &str,
+        _action: rupu_cp::session_mutator::SessionAction,
+    ) -> Result<(), rupu_cp::session_mutator::SessionMutateError> {
+        Ok(())
+    }
+}
+
+async fn spawn_with_remote_and_session_mutator(
+    dir: &std::path::Path,
+    remote_url: &str,
+) -> (std::net::SocketAddr, String) {
+    let state = AppState::new(dir.into(), rupu_config::PricingConfig::default())
+        .with_launcher(Some(Arc::new(MockLauncher)))
+        .with_session_mutator(Some(Arc::new(StubSessionMutator)));
+    let host = state
+        .hosts
+        .add_host("test-remote", remote_url, None)
+        .expect("add_host should succeed");
+    let host_id = host.id.clone();
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, host_id)
+}
+
+#[tokio::test]
+async fn archive_session_with_remote_host_proxies_and_returns_host_id() {
+    let remote = httpmock::MockServer::start_async().await;
+    let m = remote.mock(|when, then| {
+        when.method("POST").path("/api/sessions/sess_arch/archive");
+        then.status(200)
+            .json_body(serde_json::json!({ "ok": true, "id": "sess_arch" }));
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (addr, host_id) = spawn_with_remote_and_session_mutator(tmp.path(), &remote.base_url()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/api/sessions/sess_arch/archive?host={host_id}"
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["host_id"], host_id);
+    m.assert();
+}
+
+#[tokio::test]
+async fn delete_session_with_remote_host_proxies_and_returns_host_id() {
+    let remote = httpmock::MockServer::start_async().await;
+    let m = remote.mock(|when, then| {
+        when.method("DELETE").path("/api/sessions/sess_del");
+        then.status(200)
+            .json_body(serde_json::json!({ "ok": true, "id": "sess_del" }));
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (addr, host_id) = spawn_with_remote_and_session_mutator(tmp.path(), &remote.base_url()).await;
+
+    let resp = reqwest::Client::new()
+        .delete(format!("http://{addr}/api/sessions/sess_del?host={host_id}"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["host_id"], host_id);
+    m.assert();
+}
+
+/// Local (absent `?host=`) archive/delete-session still dispatches through
+/// the local `SessionMutator` port, completely bypassing the remote — proof
+/// the back-compat local path is untouched by the new host-threading.
+#[tokio::test]
+async fn archive_session_absent_host_still_uses_local_mutator_not_remote() {
+    let remote = httpmock::MockServer::start_async().await;
+    // No mock registered — if the local path accidentally proxied, the
+    // remote's default httpmock behavior (connection accepted, 404-ish
+    // response) would surface as an error instead of `ok: true`.
+    let tmp = tempfile::tempdir().unwrap();
+    let (addr, _host_id) = spawn_with_remote_and_session_mutator(tmp.path(), &remote.base_url()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/sessions/sess_local/archive"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    // No host_id key on the local branch — unlike the remote branch above.
+    assert!(body.get("host_id").is_none());
+}
+
 // ── Unknown host → 404 ───────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -396,6 +683,52 @@ async fn unknown_host_in_cancel_returns_404() {
     let resp = reqwest::Client::new()
         .post(format!(
             "http://{addr}/api/runs/run_x/cancel?host=host_nonexistent"
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn unknown_host_in_archive_run_returns_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn_readonly(tmp.path()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/api/runs/run_x/archive?host=host_nonexistent"
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn unknown_host_in_delete_run_returns_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn_readonly(tmp.path()).await;
+
+    let resp = reqwest::Client::new()
+        .delete(format!("http://{addr}/api/runs/run_x?host=host_nonexistent"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn unknown_host_in_archive_session_returns_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn_readonly(tmp.path()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/api/sessions/sess_x/archive?host=host_nonexistent"
         ))
         .send()
         .await

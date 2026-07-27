@@ -166,6 +166,47 @@ describe('SessionDetail host-aware', () => {
     expect(await screen.findByText('on h1')).toBeInTheDocument();
   });
 
+  // Operator-reported gap this task fixes: Archive/Delete/Restore omitted
+  // `host`, silently hitting the local session store when viewing a
+  // remote-host session.
+  it('with ?host=h1, Archive fires api.archiveSession with the host', async () => {
+    stubApi(ACTIVE_SESSION);
+    const archiveSpy = vi.spyOn(api, 'archiveSession').mockResolvedValue(undefined);
+
+    renderPage('?host=h1');
+
+    const archiveBtn = await screen.findByLabelText('Archive session');
+    fireEvent.click(archiveBtn);
+
+    await waitFor(() => expect(archiveSpy).toHaveBeenCalledWith('sess-1', 'h1'));
+  });
+
+  it('with ?host=h1, Delete fires api.deleteSession with the host', async () => {
+    stubApi(ACTIVE_SESSION);
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const deleteSpy = vi.spyOn(api, 'deleteSession').mockResolvedValue(undefined);
+
+    renderPage('?host=h1');
+
+    const deleteBtn = await screen.findByLabelText('Delete session');
+    fireEvent.click(deleteBtn);
+
+    await waitFor(() => expect(deleteSpy).toHaveBeenCalledWith('sess-1', 'h1'));
+  });
+
+  it('with ?host=h1, Restore fires api.restoreSession with the host', async () => {
+    const archivedSession: SessionSummary = { ...ACTIVE_SESSION, scope: 'archived' };
+    stubApi(archivedSession);
+    const restoreSpy = vi.spyOn(api, 'restoreSession').mockResolvedValue(undefined);
+
+    renderPage('?host=h1');
+
+    const restoreBtn = await screen.findByLabelText('Restore session');
+    fireEvent.click(restoreBtn);
+
+    await waitFor(() => expect(restoreSpy).toHaveBeenCalledWith('sess-1', 'h1'));
+  });
+
   it('no host chip when no ?host param', async () => {
     stubApi(ACTIVE_SESSION);
 

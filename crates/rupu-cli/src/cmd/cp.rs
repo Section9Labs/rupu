@@ -183,6 +183,14 @@ pub async fn handle(action: Action) -> ExitCode {
                 Arc::new(crate::cp_session_mutator::SubprocessSessionMutator { exe: exe.clone() }),
             );
 
+            // Adapter for rupu-cp's TranscriptMutator port: shells
+            // `rupu transcript archive|delete <id>` using this same binary.
+            let transcript_mutator: Option<
+                Arc<dyn rupu_cp::transcript_mutator::TranscriptMutator>,
+            > = Some(Arc::new(
+                crate::cp_transcript_mutator::SubprocessTranscriptMutator { exe: exe.clone() },
+            ));
+
             // Adapter for rupu-cp's SessionStarter port: shells
             // `rupu session start <agent> … --detach` using this same binary.
             let session_starter: Option<Arc<dyn rupu_cp::session_starter::SessionStarter>> = Some(
@@ -219,6 +227,7 @@ pub async fn handle(action: Action) -> ExitCode {
                 session_starter,
                 generator,
                 session_mutator,
+                transcript_mutator,
             })
             .await;
 

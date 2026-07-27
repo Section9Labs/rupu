@@ -502,6 +502,9 @@ export default function AutoflowRuns() {
   const [tab, setTab] = useState<Tab>('runs');
   // Default to 'local' → fast server-side path; ALL_HOSTS → fan-out.
   const [hostFilter, setHostFilter] = useState<string>('local');
+  // Row-action (archive/delete) failures — kept separate from the
+  // list-fetch error each tab's own hook owns, but shown in the same banner.
+  const [actionError, setActionError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
 
   // The primary "Runs" (events) feed and the "Cycles" feed each get their own
@@ -540,6 +543,82 @@ export default function AutoflowRuns() {
     deps: [tab],
     poll: false,
   });
+
+  // Row actions on the Runs tab (runs-section row-actions plan, Task 3) —
+  // ONLY for events carrying a `run_id` (`kind: "run_launched"`): those ARE
+  // genuine workflow runs, so Archive/Delete delegate to the EXISTING
+  // api.archiveRun/deleteRun (no new endpoint). Events without a `run_id`
+  // (awaiting_human / awaiting_external / cycle_failed) are pure scheduling
+  // signals with nothing on disk to address — `runActionColumn` below
+  // renders nothing for those rows rather than a dead/disabled button.
+  async function handleEventRunArchive(runId: string, host?: string) {
+    try {
+      await api.archiveRun(runId, host);
+      setActionError(null);
+      events.refresh();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Archive failed');
+    }
+  }
+
+  async function handleEventRunDelete(runId: string, host?: string) {
+    if (
+      !window.confirm(
+        'Permanently delete this run and its transcripts? This cannot be undone. The autoflow event history entry stays, with its run reference now dangling.',
+      )
+    )
+      return;
+    try {
+      await api.deleteRun(runId, host);
+      setActionError(null);
+      events.refresh();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Delete failed');
+    }
+  }
+
+  // `interactive: true` (no header label) so SortableTable renders an
+  // unwrapped cell — see AgentRuns.tsx's `buildAgentRunActionColumn` doc
+  // comment for why every button still calls both `preventDefault()` and
+  // `stopPropagation()`.
+  const runActionColumn: Column<AutoflowEventRow> = {
+    key: 'action',
+    header: '',
+    fit: true,
+    align: 'right',
+    interactive: true,
+    render: (e) => {
+      if (!e.run_id) return null;
+      const runId = e.run_id;
+      return (
+        <div className="flex items-center justify-end gap-1">
+          <Button
+            variant="ring"
+            onClick={(ev) => {
+              ev.preventDefault();
+              ev.stopPropagation();
+              void handleEventRunArchive(runId, e.host_id);
+            }}
+            aria-label={`Archive run ${runId}`}
+          >
+            Archive
+          </Button>
+          <Button
+            variant="ring-danger"
+            onClick={(ev) => {
+              ev.preventDefault();
+              ev.stopPropagation();
+              void handleEventRunDelete(runId, e.host_id);
+            }}
+            aria-label={`Delete run ${runId}`}
+          >
+            Delete
+          </Button>
+        </div>
+      );
+    },
+  };
+  const runColumns: Column<AutoflowEventRow>[] = [...EVENT_COLUMNS, runActionColumn];
 
   // Claims columns close over claims.refresh for the row actions.
   const claimColumns: Column<AutoflowClaim>[] = [
@@ -649,7 +728,11 @@ export default function AutoflowRuns() {
     },
   ];
 
-  const bannerError = tab === 'runs' ? events.error : tab === 'cycles' ? cycles.error : claims.error;
+  // A fresh action error (e.g. this click's Archive/Delete refusal) must win
+  // over a stale fetch error from an earlier load — never the other way
+  // around, or the operator sees the wrong banner for what just happened.
+  const bannerError =
+    actionError ?? (tab === 'runs' ? events.error : tab === 'cycles' ? cycles.error : claims.error);
   const refreshing = events.loading || cycles.loading;
 
   // Find — narrows whichever tab is active over ITS OWN searchable fields:
@@ -743,7 +826,7 @@ export default function AutoflowRuns() {
         ) : (
           <section>
             <SortableTable<AutoflowEventRow>
-              columns={EVENT_COLUMNS}
+              columns={runColumns}
               rows={visibleEvents}
               rowKey={(e) => e.event_id}
               rowHref={eventHref}

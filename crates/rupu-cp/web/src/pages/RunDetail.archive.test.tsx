@@ -104,7 +104,7 @@ describe('RunDetail archive/delete', () => {
     const archiveBtn = await screen.findByRole('button', { name: /archive/i });
     fireEvent.click(archiveBtn);
 
-    await waitFor(() => expect(archive).toHaveBeenCalledWith('run_01X'));
+    await waitFor(() => expect(archive).toHaveBeenCalledWith('run_01X', undefined));
     // Archive must NOT gate behind window.confirm.
     expect(confirmSpy).not.toHaveBeenCalled();
     // Navigation to /runs after success.
@@ -122,7 +122,7 @@ describe('RunDetail archive/delete', () => {
     fireEvent.click(deleteBtn);
 
     expect(window.confirm).toHaveBeenCalled();
-    await waitFor(() => expect(del).toHaveBeenCalledWith('run_01X'));
+    await waitFor(() => expect(del).toHaveBeenCalledWith('run_01X', undefined));
     await waitFor(() => expect(screen.getByTestId('runs-list')).toBeInTheDocument());
   });
 

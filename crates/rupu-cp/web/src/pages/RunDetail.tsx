@@ -594,7 +594,7 @@ export default function RunDetail() {
     setActionPending(true);
     setActionError(null);
     try {
-      await api.archiveRun(id);
+      await api.archiveRun(id, host);
       navigate('/runs');
     } catch (e: unknown) {
       setActionError(e instanceof Error ? e.message : 'Archive failed');
@@ -608,7 +608,7 @@ export default function RunDetail() {
     setActionPending(true);
     setActionError(null);
     try {
-      await api.deleteRun(id);
+      await api.deleteRun(id, host);
       navigate('/runs');
     } catch (e: unknown) {
       setActionError(e instanceof Error ? e.message : 'Delete failed');

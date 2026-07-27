@@ -742,6 +742,10 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             None
         },
         workspace_strategy,
+        // Captured here, before the agent loop starts — the liveness signal
+        // `rupu transcript archive|delete` checks (I4: an in-flight run must
+        // not be labelled done and deleted mid-write).
+        pid: Some(std::process::id()),
     };
     write_metadata(&metadata_path_for_run(&transcripts, &run_id), &metadata)?;
 

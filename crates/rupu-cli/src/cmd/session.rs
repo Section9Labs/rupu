@@ -6742,6 +6742,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         trigger_source: "session_turn".into(),
         target: session.target.clone(),
         workspace_strategy: session.workspace_strategy.clone(),
+        pid: Some(std::process::id()),
     };
     write_metadata(
         &metadata_path_for_run(&session.transcripts_dir, &args.run_id),

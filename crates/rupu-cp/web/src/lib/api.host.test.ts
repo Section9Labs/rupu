@@ -393,6 +393,119 @@ describe('host param: startSession', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// host param threaded through run archive/restore/delete
+// ---------------------------------------------------------------------------
+
+describe('host param: archiveRun', () => {
+  it('omits ?host when not provided (backward compat)', async () => {
+    mockFetch(200, { ok: true, id: 'r1', archived: true });
+    const fetchSpy = vi.mocked(fetch);
+    await api.archiveRun('r1');
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/runs/r1/archive');
+    expect(init.method).toBe('POST');
+  });
+
+  it('appends ?host=<id> when provided', async () => {
+    mockFetch(200, { ok: true, id: 'r1', archived: true, host_id: 'h-abc' });
+    const fetchSpy = vi.mocked(fetch);
+    await api.archiveRun('r1', 'h-abc');
+    const [url] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/runs/r1/archive?host=h-abc');
+  });
+});
+
+describe('host param: restoreRun', () => {
+  it('omits ?host when not provided', async () => {
+    mockFetch(200, { ok: true, id: 'r1', archived: false });
+    const fetchSpy = vi.mocked(fetch);
+    await api.restoreRun('r1');
+    const [url] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/runs/r1/restore');
+  });
+
+  it('appends ?host=<id> when provided', async () => {
+    mockFetch(200, { ok: true, id: 'r1', archived: false, host_id: 'h-abc' });
+    const fetchSpy = vi.mocked(fetch);
+    await api.restoreRun('r1', 'h-abc');
+    const [url] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/runs/r1/restore?host=h-abc');
+  });
+});
+
+describe('host param: deleteRun', () => {
+  it('omits ?host when not provided', async () => {
+    mockFetch(200, { ok: true, id: 'r1', deleted: true });
+    const fetchSpy = vi.mocked(fetch);
+    await api.deleteRun('r1');
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/runs/r1');
+    expect(init.method).toBe('DELETE');
+  });
+
+  it('appends ?host=<id> when provided', async () => {
+    mockFetch(200, { ok: true, id: 'r1', deleted: true, host_id: 'h-abc' });
+    const fetchSpy = vi.mocked(fetch);
+    await api.deleteRun('r1', 'h-abc');
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/runs/r1?host=h-abc');
+    expect(init.method).toBe('DELETE');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// host param threaded through session archive/restore/delete
+// ---------------------------------------------------------------------------
+
+describe('host param: archiveSession', () => {
+  it('omits ?host when not provided', async () => {
+    mockFetch(200, { ok: true, id: 's1' });
+    const fetchSpy = vi.mocked(fetch);
+    await api.archiveSession('s1');
+    const [url] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/sessions/s1/archive');
+  });
+
+  it('appends ?host=<id> when provided', async () => {
+    mockFetch(200, { ok: true, id: 's1', host_id: 'h-abc' });
+    const fetchSpy = vi.mocked(fetch);
+    await api.archiveSession('s1', 'h-abc');
+    const [url] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/sessions/s1/archive?host=h-abc');
+  });
+});
+
+describe('host param: restoreSession', () => {
+  it('appends ?host=<id> when provided', async () => {
+    mockFetch(200, { ok: true, id: 's1', host_id: 'h-abc' });
+    const fetchSpy = vi.mocked(fetch);
+    await api.restoreSession('s1', 'h-abc');
+    const [url] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/sessions/s1/restore?host=h-abc');
+  });
+});
+
+describe('host param: deleteSession', () => {
+  it('omits ?host when not provided', async () => {
+    mockFetch(200, { ok: true, id: 's1' });
+    const fetchSpy = vi.mocked(fetch);
+    await api.deleteSession('s1');
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/sessions/s1');
+    expect(init.method).toBe('DELETE');
+  });
+
+  it('appends ?host=<id> when provided', async () => {
+    mockFetch(200, { ok: true, id: 's1', host_id: 'h-abc' });
+    const fetchSpy = vi.mocked(fetch);
+    await api.deleteSession('s1', 'h-abc');
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/sessions/s1?host=h-abc');
+    expect(init.method).toBe('DELETE');
+  });
+});
+
 describe('host param: sendSessionMessage', () => {
   it('appends ?host= query param and keeps host out of body', async () => {
     mockFetch(200, { run_id: 'r-turn' });

@@ -64,6 +64,9 @@ export default function AgentRuns() {
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('standalone');
   // Default to 'local' → fast server-side path; ALL_HOSTS → fan-out.
   const [hostFilter, setHostFilter] = useState<string>('local');
+  // Row-action (archive/restore/delete) failures — kept separate from the
+  // list-fetch error the hook owns, but shown in the same banner.
+  const [actionError, setActionError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
 
   const { rows, loading, error, hasMore, sentinelRef, refresh } = usePagedList<AgentRunRow>({
@@ -74,6 +77,101 @@ export default function AgentRuns() {
     deps: [tab, hostFilter],
     poll: tab === 'active',
   });
+
+  // Row-level actions (runs-section row-actions plan, Task 3). Keyed off
+  // `source`:
+  //   - 'session' rows act on the WHOLE session via `r.session_id` (never
+  //     `r.run_id`) — a row here is one TURN, but Archive/Restore/Delete
+  //     apply to the entire session and every one of its turns. This page
+  //     has no active/archived scoping of its own to know a session's
+  //     current state (unlike Sessions.tsx/WorkflowRuns.tsx), so every
+  //     session row renders Archive AND Restore — the operator picks
+  //     whichever matches; a wrong pick just surfaces as a normal action
+  //     error. Multiple rows can share one `session_id` (one row per turn);
+  //     each acts independently on that SAME shared session (simplest
+  //     option — the confirm copy already names the whole session, so a
+  //     second click from another row of the same session is a harmless
+  //     re-archive/re-delete attempt, not a surprise).
+  //   - 'standalone' rows act on the standalone transcript via `r.run_id`,
+  //     through Task 2's new /api/transcripts routes. No Restore — `rupu
+  //     transcript restore` doesn't exist.
+  async function handleSessionArchive(sessionId: string, host?: string) {
+    if (!window.confirm(`Archive session ${sessionId} and all of its turns?`)) return;
+    try {
+      await api.archiveSession(sessionId, host);
+      setActionError(null);
+      refresh();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Archive failed');
+    }
+  }
+
+  async function handleSessionRestore(sessionId: string, host?: string) {
+    try {
+      await api.restoreSession(sessionId, host);
+      setActionError(null);
+      refresh();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Restore failed');
+    }
+  }
+
+  async function handleSessionDelete(sessionId: string, host?: string) {
+    if (
+      !window.confirm(
+        `Permanently delete session ${sessionId} and all of its turns, including their transcripts? This cannot be undone.`,
+      )
+    )
+      return;
+    try {
+      await api.deleteSession(sessionId, host);
+      setActionError(null);
+      refresh();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Delete failed');
+    }
+  }
+
+  async function handleStandaloneArchive(runId: string, host?: string) {
+    if (
+      !window.confirm(
+        `Archive run ${runId}? Archived agent runs are hidden from the CP and can only be restored from the shell.`,
+      )
+    )
+      return;
+    try {
+      await api.archiveTranscript(runId, host);
+      setActionError(null);
+      refresh();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Archive failed');
+    }
+  }
+
+  async function handleStandaloneDelete(runId: string, host?: string) {
+    if (!window.confirm('Permanently delete this run and its transcript? This cannot be undone.'))
+      return;
+    try {
+      await api.deleteTranscript(runId, host);
+      setActionError(null);
+      refresh();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Delete failed');
+    }
+  }
+
+  const actionColumn = buildAgentRunActionColumn(
+    handleSessionArchive,
+    handleSessionRestore,
+    handleSessionDelete,
+    handleStandaloneArchive,
+    handleStandaloneDelete,
+  );
+  const columns: Column<AgentRunRow>[] = [...AGENT_RUN_COLUMNS, actionColumn];
+  // A fresh action error (e.g. this click's Archive/Delete refusal) must win
+  // over a stale fetch error from an earlier load — never the other way
+  // around, or the operator sees the wrong banner for what just happened.
+  const bannerError = actionError ?? error;
 
   // Source pill — client-side (the wire payload already carries `source` per
   // row; no extra server round-trip needed).
@@ -141,7 +239,7 @@ export default function AgentRuns() {
       />
 
       <div className="mt-5">
-        {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
+        {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
         {loading && rows.length === 0 ? (
           <div className="py-16 flex items-center justify-center">
@@ -170,7 +268,7 @@ export default function AgentRuns() {
               }))} />
             </div>
             <SortableTable<AgentRunRow>
-              columns={AGENT_RUN_COLUMNS}
+              columns={columns}
               rows={visible}
               rowKey={(r) => r.run_id}
               rowHref={agentRunHref}
@@ -409,3 +507,98 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
     ),
   },
 ];
+
+/** Build the trailing row-actions column — the ONE per-row column shape
+ *  varies by `r.source` (see the handler doc comment in `AgentRuns` above).
+ *  `interactive: true` (no header label) so SortableTable renders it as a
+ *  plain, unwrapped cell — its own buttons stay independently focusable
+ *  rather than nesting inside the row's `rowHref` link. Every button still
+ *  calls both `preventDefault()` and `stopPropagation()` (belt-and-braces
+ *  with `interactive`'s unwrapped-cell behavior — mirrors
+ *  WorkflowRuns.tsx's action column). */
+function buildAgentRunActionColumn(
+  onSessionArchive: (sessionId: string, host?: string) => void,
+  onSessionRestore: (sessionId: string, host?: string) => void,
+  onSessionDelete: (sessionId: string, host?: string) => void,
+  onStandaloneArchive: (runId: string, host?: string) => void,
+  onStandaloneDelete: (runId: string, host?: string) => void,
+): Column<AgentRunRow> {
+  return {
+    key: 'action',
+    header: '',
+    fit: true,
+    align: 'right',
+    interactive: true,
+    render: (r) => {
+      if (r.source === 'session' && r.session_id) {
+        const sessionId = r.session_id;
+        return (
+          <div className="flex items-center justify-end gap-1">
+            <Button
+              variant="ring"
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                void onSessionArchive(sessionId, r.host_id);
+              }}
+              aria-label={`Archive session ${sessionId}`}
+            >
+              Archive
+            </Button>
+            <Button
+              variant="ring"
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                void onSessionRestore(sessionId, r.host_id);
+              }}
+              aria-label={`Restore session ${sessionId}`}
+            >
+              Restore
+            </Button>
+            <Button
+              variant="ring-danger"
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                void onSessionDelete(sessionId, r.host_id);
+              }}
+              aria-label={`Delete session ${sessionId}`}
+            >
+              Delete
+            </Button>
+          </div>
+        );
+      }
+      // Standalone (or a session row missing session_id, which shouldn't
+      // happen on the wire — falls back to the transcript action rather
+      // than rendering nothing).
+      return (
+        <div className="flex items-center justify-end gap-1">
+          <Button
+            variant="ring"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              void onStandaloneArchive(r.run_id, r.host_id);
+            }}
+            aria-label={`Archive run ${r.run_id}`}
+          >
+            Archive
+          </Button>
+          <Button
+            variant="ring-danger"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              void onStandaloneDelete(r.run_id, r.host_id);
+            }}
+            aria-label={`Delete run ${r.run_id}`}
+          >
+            Delete
+          </Button>
+        </div>
+      );
+    },
+  };
+}

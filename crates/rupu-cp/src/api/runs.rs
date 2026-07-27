@@ -1126,15 +1126,66 @@ fn map_run_store_err(id: &str, e: RunStoreError) -> ApiError {
     }
 }
 
-/// `POST /api/runs/:id/archive` — move a terminal run to the archive scope.
+/// Shared guard+delete: refuse to delete a non-terminal ACTIVE run, then
+/// delegate to `RunStore::delete` (which itself has no such guard — see its
+/// doc comment; archived runs are always terminal, so `load` returning
+/// `NotFound` for them just skips the guard).
 ///
-/// Non-terminal runs yield 409. The run's directory (including transcripts)
-/// is renamed into `<global>/runs-archive/<id>`.
+/// Used by both the local branch of `delete_run` below and
+/// [`crate::host::local::LocalHostConnector::delete_run`], so the two never
+/// diverge on which runs may be removed.
+pub(crate) fn delete_run_checked(store: &RunStore, id: &str) -> Result<(), RunStoreError> {
+    if let Ok(rec) = store.load(id) {
+        if !rec.status.is_terminal() {
+            return Err(RunStoreError::NotTerminal(id.to_string()));
+        }
+    }
+    store.delete(id)
+}
+
+/// Map a [`HostConnectorError`] from a proxied archive/restore/delete call
+/// to an [`ApiError`], mirroring `pause_run`/`resume_run`'s table exactly:
+/// `NotFound` → 404, `Invalid` → 409 (non-terminal / already-archived —
+/// the same conflict semantics as the local branch's `RunStoreError`
+/// mapping), `Unsupported` → 501 (a transport that genuinely can't do this,
+/// surfaced as a real error rather than a silent no-op), everything else →
+/// 500.
+fn map_host_mutate_err(e: HostConnectorError) -> ApiError {
+    match e {
+        HostConnectorError::NotFound(m) => ApiError::not_found(m),
+        HostConnectorError::Invalid(m) => ApiError::conflict(m),
+        // A remote CP-of-CP hop (HttpHostConnector) already mapped ITS OWN
+        // local refusal to 409 before it reached us — preserve that status
+        // rather than flattening it into a 500 below.
+        HostConnectorError::Remote(409, m) => ApiError::conflict(m),
+        HostConnectorError::Unsupported(m) => ApiError::not_available(m),
+        other => ApiError::internal(other.to_string()),
+    }
+}
+
+/// `POST /api/runs/:id/archive[?host=<id>]` — move a terminal run to the
+/// archive scope.
+///
+/// Without `?host=` (or `?host=local`): unchanged — non-terminal runs yield
+/// 409; the run's directory (including transcripts) is renamed into
+/// `<global>/runs-archive/<id>`.
+///
+/// With `?host=<remote-id>`: proxies via [`HostConnector::archive_run`] and
+/// returns `{ "ok": true, "id", "archived": true, "host_id": "<id>" }`.
 async fn archive_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<RunControlQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_id(&id)?;
+    let host = q.host.as_deref().unwrap_or("local");
+    if host != "local" {
+        let conn = resolve_host(&s, host)?;
+        conn.archive_run(&id).await.map_err(map_host_mutate_err)?;
+        return Ok(Json(
+            serde_json::json!({ "ok": true, "id": id, "archived": true, "host_id": host }),
+        ));
+    }
     s.run_store
         .archive(&id)
         .map_err(|e| map_run_store_err(&id, e))?;
@@ -1143,14 +1194,28 @@ async fn archive_run(
     ))
 }
 
-/// `POST /api/runs/:id/restore` — move an archived run back to the active scope.
+/// `POST /api/runs/:id/restore[?host=<id>]` — move an archived run back to
+/// the active scope.
 ///
-/// Returns 404 if the run is not in the archive.
+/// Without `?host=` (or `?host=local`): unchanged — 404 if the run is not
+/// in the archive.
+///
+/// With `?host=<remote-id>`: proxies via [`HostConnector::restore_run`] and
+/// returns `{ "ok": true, "id", "archived": false, "host_id": "<id>" }`.
 async fn restore_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<RunControlQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_id(&id)?;
+    let host = q.host.as_deref().unwrap_or("local");
+    if host != "local" {
+        let conn = resolve_host(&s, host)?;
+        conn.restore_run(&id).await.map_err(map_host_mutate_err)?;
+        return Ok(Json(
+            serde_json::json!({ "ok": true, "id": id, "archived": false, "host_id": host }),
+        ));
+    }
     s.run_store
         .restore(&id)
         .map_err(|e| map_run_store_err(&id, e))?;
@@ -1159,29 +1224,29 @@ async fn restore_run(
     ))
 }
 
-/// `DELETE /api/runs/:id` — permanently remove a run from either scope.
+/// `DELETE /api/runs/:id[?host=<id>]` — permanently remove a run from
+/// either scope.
 ///
-/// Non-terminal runs in the active scope yield 409. Archived runs are
-/// already terminal, so the guard is skipped for them (load returns
-/// `NotFound` for archived runs; the guard is omitted, and delete
-/// resolves the archive scope).
+/// Without `?host=` (or `?host=local`): unchanged — non-terminal runs in
+/// the active scope yield 409 (see [`delete_run_checked`]).
+///
+/// With `?host=<remote-id>`: proxies via [`HostConnector::delete_run`] and
+/// returns `{ "ok": true, "id", "deleted": true, "host_id": "<id>" }`.
 async fn delete_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<RunControlQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_id(&id)?;
-    // Guard: refuse to delete a non-terminal active run.
-    // `load` only checks the active scope; archived runs are always terminal.
-    if let Ok(rec) = s.run_store.load(&id) {
-        if !rec.status.is_terminal() {
-            return Err(ApiError::conflict(format!(
-                "run {id} is not terminal — cancel it first"
-            )));
-        }
+    let host = q.host.as_deref().unwrap_or("local");
+    if host != "local" {
+        let conn = resolve_host(&s, host)?;
+        conn.delete_run(&id).await.map_err(map_host_mutate_err)?;
+        return Ok(Json(
+            serde_json::json!({ "ok": true, "id": id, "deleted": true, "host_id": host }),
+        ));
     }
-    s.run_store
-        .delete(&id)
-        .map_err(|e| map_run_store_err(&id, e))?;
+    delete_run_checked(&s.run_store, &id).map_err(|e| map_run_store_err(&id, e))?;
     Ok(Json(
         serde_json::json!({ "ok": true, "id": id, "deleted": true }),
     ))
@@ -1919,19 +1984,31 @@ mod tests {
         s.run_store.create(rec, "name: x\n").unwrap();
 
         // archive — run moves from active → archive scope
-        let _ = archive_run(State(s.clone()), Path(id.clone()))
-            .await
-            .expect("archive ok");
+        let _ = archive_run(
+            State(s.clone()),
+            Path(id.clone()),
+            Query(RunControlQuery { host: None, gate: None }),
+        )
+        .await
+        .expect("archive ok");
         assert_eq!(s.run_store.list().unwrap().len(), 0);
         assert_eq!(s.run_store.list_archived().unwrap().len(), 1);
 
         // delete (from archive)
-        let _ = delete_run(State(s.clone()), Path(id.clone()))
-            .await
-            .expect("delete ok");
-        let err = delete_run(State(s.clone()), Path(id.clone()))
-            .await
-            .unwrap_err();
+        let _ = delete_run(
+            State(s.clone()),
+            Path(id.clone()),
+            Query(RunControlQuery { host: None, gate: None }),
+        )
+        .await
+        .expect("delete ok");
+        let err = delete_run(
+            State(s.clone()),
+            Path(id.clone()),
+            Query(RunControlQuery { host: None, gate: None }),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
     }
 
@@ -1994,9 +2071,13 @@ mod tests {
     async fn archive_run_traversal_id_is_bad_request() {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
-        let err = archive_run(State(s.clone()), Path("../../etc".into()))
-            .await
-            .unwrap_err();
+        let err = archive_run(
+            State(s.clone()),
+            Path("../../etc".into()),
+            Query(RunControlQuery { host: None, gate: None }),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
         // No filesystem side-effects: archive dir stays empty.
         assert_eq!(s.run_store.list_archived().unwrap().len(), 0);
@@ -2006,9 +2087,13 @@ mod tests {
     async fn restore_run_traversal_id_is_bad_request() {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
-        let err = restore_run(State(s), Path("../../etc".into()))
-            .await
-            .unwrap_err();
+        let err = restore_run(
+            State(s),
+            Path("../../etc".into()),
+            Query(RunControlQuery { host: None, gate: None }),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
     }
 
@@ -2016,9 +2101,13 @@ mod tests {
     async fn delete_run_traversal_id_is_bad_request() {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
-        let err = delete_run(State(s), Path("../../etc".into()))
-            .await
-            .unwrap_err();
+        let err = delete_run(
+            State(s),
+            Path("../../etc".into()),
+            Query(RunControlQuery { host: None, gate: None }),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
     }
 
@@ -2030,8 +2119,73 @@ mod tests {
         rec.status = RunStatus::Running;
         let id = rec.id.clone();
         s.run_store.create(rec, "name: x\n").unwrap();
-        let err = archive_run(State(s.clone()), Path(id)).await.unwrap_err();
+        let err = archive_run(
+            State(s.clone()),
+            Path(id),
+            Query(RunControlQuery { host: None, gate: None }),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn archive_run_absent_host_matches_explicit_host_local() {
+        // Back-compat proof: an absent `?host=` param and an explicit
+        // `?host=local` must hit the exact same local branch and produce the
+        // exact same response shape (no `host_id` key injected — unlike the
+        // remote branch).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .create(terminal_record("run_01ABSENT"), "name: x\n")
+            .unwrap();
+        s.run_store
+            .create(terminal_record("run_01EXPLICITLOCAL"), "name: x\n")
+            .unwrap();
+
+        let absent = archive_run(
+            State(s.clone()),
+            Path("run_01ABSENT".into()),
+            Query(RunControlQuery { host: None, gate: None }),
+        )
+        .await
+        .expect("absent host should archive locally")
+        .0;
+        let explicit_local = archive_run(
+            State(s.clone()),
+            Path("run_01EXPLICITLOCAL".into()),
+            Query(RunControlQuery {
+                host: Some("local".into()),
+                gate: None,
+            }),
+        )
+        .await
+        .expect("host=local should archive locally")
+        .0;
+
+        assert_eq!(absent["archived"], serde_json::json!(true));
+        assert_eq!(absent.get("host_id"), None);
+        assert_eq!(explicit_local["archived"], serde_json::json!(true));
+        assert_eq!(explicit_local.get("host_id"), None);
+        assert_eq!(s.run_store.list_archived().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn archive_run_unknown_host_is_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let err = archive_run(
+            State(s),
+            Path("run_01UNKNOWNHOST".into()),
+            Query(RunControlQuery {
+                host: Some("host_nonexistent".into()),
+                gate: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
     }
 
     #[test]
@@ -2513,5 +2667,20 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    // Minor finding: a remote CP-of-CP hop's own 409 refusal (HttpHostConnector
+    // already turned it into `Remote(409, body)`) must surface as 409 here
+    // too, not fall through to the generic 500 `other` arm.
+    #[test]
+    fn map_host_mutate_err_preserves_remote_409_as_conflict() {
+        let err = map_host_mutate_err(HostConnectorError::Remote(409, "not terminal".into()));
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn map_host_mutate_err_still_500s_other_remote_statuses() {
+        let err = map_host_mutate_err(HostConnectorError::Remote(500, "boom".into()));
+        assert_eq!(err.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

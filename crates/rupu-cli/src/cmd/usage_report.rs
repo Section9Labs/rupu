@@ -627,6 +627,9 @@ fn backfill_metadata_from_workspace(
         trigger_source: "run_cli".into(),
         target: None,
         workspace_strategy,
+        // Backfilled reconstruction for a transcript with no metadata file
+        // at all — no real pid to report, so no liveness signal either.
+        pid: None,
     }
 }
 
@@ -874,6 +877,7 @@ mod tests {
                 trigger_source: "run_cli".into(),
                 target: Some("github:Section9Labs/rupu/issues/42".into()),
                 workspace_strategy: Some("direct_checkout".into()),
+                pid: None,
             },
         )
         .unwrap();
