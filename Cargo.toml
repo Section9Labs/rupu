@@ -29,7 +29,7 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/section9labs/rupu"
 authors = ["Section9Labs"]
-rust-version = "1.88"
+rust-version = "1.95"
 
 [workspace.dependencies]
 # Async runtime

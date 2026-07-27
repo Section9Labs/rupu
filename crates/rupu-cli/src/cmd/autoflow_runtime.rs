@@ -771,6 +771,10 @@ fn finalize_cycle_record(
     record.cleaned_claims = report.cleaned_claims;
 }
 
+// Args are independent event-building inputs; bundling into a params struct
+// is a real refactor with behavior risk, out of scope for a toolchain-pin
+// sweep (I-5).
+#[allow(clippy::too_many_arguments)]
 fn append_issue_history_events(
     events: &mut Vec<AutoflowCycleEvent>,
     issue_result: &anyhow::Result<bool>,

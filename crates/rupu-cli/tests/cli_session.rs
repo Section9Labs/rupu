@@ -337,7 +337,7 @@ async fn session_archive_restore_round_trip_moves_owned_transcripts() {
         .assert()
         .success();
 
-    assert!(home.join("sessions/ses_archive01").is_dir() == false);
+    assert!(!home.join("sessions/ses_archive01").is_dir());
     assert!(home
         .join("sessions-archive/ses_archive01/session.json")
         .is_file());

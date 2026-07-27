@@ -4,7 +4,7 @@ rupu uses a build-locally-and-upload runbook for releases. There is no automated
 
 ## What you need
 
-- A workstation with Rust ≥ MSRV (currently 1.88).
+- A workstation with Rust ≥ MSRV (currently 1.95).
 - `gh` authenticated (`gh auth status`).
 - Push access to `Section9Labs/rupu`.
 

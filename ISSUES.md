@@ -321,33 +321,6 @@ default rates are in use). Leave the UI-preference sites as they are.
 
 ---
 
-### I-5 — `rust-toolchain.toml` is not honored on this box; clippy is red under 1.95
-
-**Symptom.** `cargo clippy` fails on a clean `main` in crates unrelated to any
-change, e.g.:
-
-- `crates/rupu-config/src/config.rs:150` — `unnecessary_map_or` (fixed in
-  passing, see I-1/I-2 PR)
-- `crates/rupu-orchestrator/src/runner.rs:3262` — `items_after_test_module`
-- `crates/rupu-cp/src/host/ssh.rs:193` — `type_complexity`
-- `crates/rupu-cp/src/host/ssh.rs:1041` — `single_match`
-
-**Root cause.** `rustup` is not installed, so `rust-toolchain.toml`'s
-`channel = "1.88"` pin is silently ignored and the Homebrew `rustc 1.95.0` is
-used instead. These lints post-date 1.88, so CI (which does honor the pin) stays
-green while local clippy is red.
-
-**Impact.** Real, and it compounds: because clippy lints workspace path
-dependencies, a red crate blocks linting of every crate that depends on it —
-`rupu-cp` being red means `rupu-cli` cannot be linted locally at all. Local
-clippy is therefore not usable as a pre-push gate.
-
-**Fix.** Either install `rustup` so the pin applies, or bump the pinned
-toolchain and clear the new lints in one sweep. The second is probably better
-long-term, but it is a workspace-wide change and wants its own PR.
-
----
-
 ### I-4 — Four `linear_runner` tests fail on a clean `main`
 
 **Symptom.** `cargo test -p rupu-orchestrator --test linear_runner` reports
@@ -366,9 +339,11 @@ All four assert on an error message propagating out of a failed step, e.g.
 which suggests the failing steps are retrying against a real network endpoint
 and ultimately failing with a timeout/transport message instead of the
 simulated one — i.e. the mock isn't intercepting, or a retry wrapper is
-rewriting the error. Worth checking against the retry config and whether these
-tests are toolchain-sensitive (this box runs Homebrew Rust 1.95 vs. the pinned
-1.88).
+rewriting the error. Worth checking against the retry config. **Not a
+toolchain gap:** I-5 bumped the pin to 1.95, so this box's Homebrew rustc now
+matches the pinned/CI toolchain exactly, and the same 24-passed/4-failed
+split reproduces unchanged under it — these four failures have some other
+cause and still need diagnosis.
 
 **Impact.** The orchestrator test baseline is red, so a real regression in step
 error propagation would be invisible — it looks like the pre-existing noise.
@@ -457,3 +432,27 @@ misleading.
 **Fix.** PR — extracted `provider_factory::resolve_model()` as the single
 resolution point and threaded `default_provider` / `default_model` into
 `DefaultStepFactory` so the workflow path resolves identically to `rupu run`.
+
+---
+
+### I-5 — `rust-toolchain.toml` is not honored on this box; clippy is red under 1.95
+
+**Symptom.** `cargo clippy` failed on a clean `main` in crates unrelated to any
+change (`rupu-config`, `rupu-orchestrator`, `rupu-cp`, `rupu-cli`, `rupu-app`),
+because the pinned toolchain was silently ignored locally.
+
+**Root cause.** `rustup` is not installed, so `rust-toolchain.toml`'s
+`channel = "1.88"` pin was silently ignored and the Homebrew `rustc 1.95.0` was
+used instead. Lints that post-date 1.88 made CI (which honored the pin) stay
+green while local clippy was red.
+
+**Fix.** (PR: pin-toolchain-1.95) Bumped the pinned toolchain to 1.95 at all
+four sites (`rust-toolchain.toml`, workspace `Cargo.toml` `rust-version`,
+`.github/workflows/nightly-live-tests.yml`, `docs/RELEASING.md`) so declared
+== actual, then cleared every clippy lint 1.95 surfaces workspace-wide in the
+same sweep — including a real `MutexGuard`-held-across-`.await` hazard in
+`rupu-auth`'s test-only `ENV_LOCK` (switched to `tokio::sync::Mutex`, which is
+built to be held across an await point, instead of papering over it).
+`cargo clippy --workspace --all-targets` is clean; `cargo build --workspace`
+is clean; `rupu-auth`/`rupu-config`/`rupu-orchestrator`/`rupu-cp` `--lib`
+suites are green.

@@ -193,6 +193,6 @@ mod tests {
         state.set_input("repo", "value");
         assert_eq!(state.inputs.get("repo").map(|s| s.as_str()), Some("value"));
         state.set_input("repo", "");
-        assert!(state.inputs.get("repo").is_none());
+        assert!(!state.inputs.contains_key("repo"));
     }
 }

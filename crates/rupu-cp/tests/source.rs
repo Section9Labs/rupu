@@ -316,7 +316,7 @@ async fn get_source_clamps_context_to_bounded_window() {
     // The window is bounded to at most 2*200+1 = 401 lines despite the huge
     // requested context.
     assert!(
-        end - start + 1 <= 401,
+        end - start < 401,
         "window {start}..={end} exceeds the 401-line clamp"
     );
     assert!(n_lines <= 401, "{n_lines} lines exceeds the 401-line clamp");

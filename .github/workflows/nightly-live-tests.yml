@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.88"
+          toolchain: "1.95"
       - name: Cargo build (providers + scm)
         run: cargo build -p rupu-providers -p rupu-scm --tests
       - name: Live smoke (LLM providers)

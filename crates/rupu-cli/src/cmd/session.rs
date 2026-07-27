@@ -948,11 +948,6 @@ fn render_session_show_transcript_event_rows(
         for (idx, segment) in wrapped.into_iter().enumerate() {
             let text = if idx == 0 {
                 format!("{prefix}{segment}")
-            } else if line.continuation {
-                let mut continuation = String::new();
-                let _ = palette::write_colored(&mut continuation, "│", DIM);
-                continuation.push_str("    ");
-                format!("{continuation}{segment}")
             } else {
                 let mut continuation = String::new();
                 let _ = palette::write_colored(&mut continuation, "│", DIM);
@@ -3240,7 +3235,7 @@ fn session_caret_visible() -> bool {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| (duration.as_millis() / 530) as u64)
         .unwrap_or(0);
-    tick % 2 == 0
+    tick.is_multiple_of(2)
 }
 
 fn render_session_screen_rows(rows: &[String]) -> anyhow::Result<()> {
@@ -3499,7 +3494,7 @@ fn estimate_stream_output_tokens(streamed_chars: usize) -> u64 {
     if streamed_chars == 0 {
         0
     } else {
-        ((streamed_chars as u64) + 3) / 4
+        (streamed_chars as u64).div_ceil(4)
     }
 }
 
@@ -3651,7 +3646,7 @@ fn render_session_entry_rows(
                 "agent",
                 role_color,
                 Some((role_glyph, role_color)),
-                streaming_detail.as_deref(),
+                streaming_detail,
                 width,
             );
             if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
@@ -4189,10 +4184,12 @@ fn resolve_inline_session_aliases(
         return;
     }
     match argv[0].as_str() {
-        "session" if argv.get(1).is_some_and(|value| value == "show") => {
-            if argv.get(2).is_none() || argv.get(2).is_some_and(|value| value == "current") {
-                argv.insert(2, session.session_id.clone());
-            }
+        "session"
+            if argv.get(1).is_some_and(|value| value == "show")
+                && (argv.get(2).is_none()
+                    || argv.get(2).is_some_and(|value| value == "current")) =>
+        {
+            argv.insert(2, session.session_id.clone());
         }
         "transcript" if argv.get(1).is_some_and(|value| value == "show") => {
             if let Some(run_id) = inline_session_run_alias(session, state, argv.get(2)) {
@@ -4236,8 +4233,7 @@ fn command_supports_view(argv: &[String]) -> bool {
     matches!(
         argv,
         [root, sub, ..]
-            if (root == "session" && sub == "show")
-                || (root == "transcript" && sub == "show")
+            if ((root == "transcript" || root == "session") && sub == "show")
                 || (root == "workflow" && (sub == "show" || sub == "show-run"))
     )
 }
@@ -4939,7 +4935,7 @@ fn append_session_coverage_lines(state: &mut SessionInteractiveState, session: &
     );
     // Show the worst-offending concerns (top 5 by gap-file count).
     let mut sorted: Vec<&rupu_coverage::ConcernCoverage> = report.concerns.iter().collect();
-    sorted.sort_by(|a, b| b.gap_files.len().cmp(&a.gap_files.len()));
+    sorted.sort_by_key(|b| std::cmp::Reverse(b.gap_files.len()));
     for c in sorted.iter().take(5).filter(|c| !c.is_complete()) {
         state.push_line(
             crate::output::palette::Status::Awaiting,
@@ -6202,10 +6198,10 @@ fn reactivate_stopped(session: &mut SessionRecord) -> bool {
 }
 
 fn stop_session_in_place(global: &Path, session_id: &str) -> anyhow::Result<()> {
-    let (mut session, scope) = read_session(&global, session_id)?;
+    let (mut session, scope) = read_session(global, session_id)?;
     ensure_active_scope(scope, "session stop")?;
     if reconcile_stale_session(&mut session) {
-        write_session(&global, scope, &session)?;
+        write_session(global, scope, &session)?;
     }
     if let Some(pid) = session
         .active_pid
@@ -6238,7 +6234,7 @@ fn stop_session_in_place(global: &Path, session_id: &str) -> anyhow::Result<()> 
         run.status = Some(RunStatus::Aborted);
         run.error = Some("stopped by operator".into());
     }
-    write_session(&global, scope, &session)?;
+    write_session(global, scope, &session)?;
     clear_session_live_usage(global, scope, session_id)?;
     clear_session_turn_queue(global, scope, session_id)?;
     Ok(())
@@ -6643,6 +6639,9 @@ async fn run_compact_request(
 }
 
 /// Update session bookkeeping after a compact pseudo-turn completes.
+// Args are independent bookkeeping inputs; bundling into a params struct is a
+// real refactor with behavior risk, out of scope for a toolchain-pin sweep (I-5).
+#[allow(clippy::too_many_arguments)]
 fn finalize_compact_run(
     global: &Path,
     scope: SessionScope,

@@ -1118,14 +1118,12 @@ fn truncate_plain_single_line(value: &str, max: usize) -> String {
     if visible_len(value) <= max {
         return value.to_string();
     }
-    let mut visible = 0usize;
     let mut out = String::new();
-    for ch in value.chars() {
+    for (visible, ch) in value.chars().enumerate() {
         if visible + 1 >= max {
             break;
         }
         out.push(ch);
-        visible += 1;
     }
     out.push('…');
     out

@@ -1804,47 +1804,48 @@ mod tests {
     }
 
     fn fanout_state(active: bool) -> LiveRunState {
-        let mut units = Vec::new();
-        units.push(UnitState {
-            key: "conf-manager".into(),
-            status: NodeStatus::Complete,
-            tokens: 210_000,
-            elapsed_secs: 12,
-            transcript_path: Some(std::path::PathBuf::from("/runs/conf-manager.jsonl")),
-            sub_run_id: None,
-        });
-        units.push(UnitState {
-            key: "tlb-agent".into(),
-            status: NodeStatus::Complete,
-            tokens: 180_000,
-            elapsed_secs: 11,
-            transcript_path: Some(std::path::PathBuf::from("/runs/tlb-agent.jsonl")),
-            sub_run_id: None,
-        });
-        units.push(UnitState {
-            key: "app-gw".into(),
-            status: NodeStatus::Working,
-            tokens: 120_000,
-            elapsed_secs: 8,
-            transcript_path: Some(std::path::PathBuf::from("/runs/app-gw.jsonl")),
-            sub_run_id: None,
-        });
-        units.push(UnitState {
-            key: "rtc".into(),
-            status: NodeStatus::Waiting,
-            tokens: 0,
-            elapsed_secs: 0,
-            transcript_path: None,
-            sub_run_id: None,
-        });
-        units.push(UnitState {
-            key: "auth".into(),
-            status: NodeStatus::Waiting,
-            tokens: 0,
-            elapsed_secs: 0,
-            transcript_path: None,
-            sub_run_id: None,
-        });
+        let units = vec![
+            UnitState {
+                key: "conf-manager".into(),
+                status: NodeStatus::Complete,
+                tokens: 210_000,
+                elapsed_secs: 12,
+                transcript_path: Some(std::path::PathBuf::from("/runs/conf-manager.jsonl")),
+                sub_run_id: None,
+            },
+            UnitState {
+                key: "tlb-agent".into(),
+                status: NodeStatus::Complete,
+                tokens: 180_000,
+                elapsed_secs: 11,
+                transcript_path: Some(std::path::PathBuf::from("/runs/tlb-agent.jsonl")),
+                sub_run_id: None,
+            },
+            UnitState {
+                key: "app-gw".into(),
+                status: NodeStatus::Working,
+                tokens: 120_000,
+                elapsed_secs: 8,
+                transcript_path: Some(std::path::PathBuf::from("/runs/app-gw.jsonl")),
+                sub_run_id: None,
+            },
+            UnitState {
+                key: "rtc".into(),
+                status: NodeStatus::Waiting,
+                tokens: 0,
+                elapsed_secs: 0,
+                transcript_path: None,
+                sub_run_id: None,
+            },
+            UnitState {
+                key: "auth".into(),
+                status: NodeStatus::Waiting,
+                tokens: 0,
+                elapsed_secs: 0,
+                transcript_path: None,
+                sub_run_id: None,
+            },
+        ];
         let assess = StepState {
             id: "assess".into(),
             kind: StepKind::ForEach,
