@@ -68,8 +68,10 @@ pub struct ResumeOutcome {
 /// borrow.
 ///
 /// `mode` overrides the permission mode for the resumed run (`ask` /
-/// `bypass` / `readonly`); `None` defaults to `ask`, matching the CLI's
-/// `--mode`-absent behavior.
+/// `bypass` / `readonly`). `None` falls back through
+/// `record.resume_mode` then `record.permission_mode` (the run's own
+/// launch mode, ISSUES.md I-24) before defaulting to `ask` — see
+/// [`rebuild_opts_from_disk`]'s precedence.
 pub async fn resume_run(
     store: &RunStore,
     run_id: &str,
@@ -193,7 +195,21 @@ async fn rebuild_opts_from_disk(
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
     let mcp_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
 
-    let mode_str = mode.unwrap_or("ask").to_string();
+    // ISSUES.md I-24: precedence, most specific first — an explicit
+    // `--mode` on the calling command (if one exists; `reject` has none),
+    // then `record.resume_mode` (set by the web-resume path), then
+    // `record.permission_mode` (the run's own launch mode, persisted at
+    // creation — see `run_workflow`'s fresh-record write), then `"ask"`.
+    // Before this fell straight to `mode.unwrap_or("ask")`: a run launched
+    // `--mode readonly` had no persisted trace of that mode anywhere but
+    // `resume_mode` (which only the web-resume path ever sets), so its
+    // `on_reject` cleanup silently ran under `ask` — permitting Write
+    // tools a `readonly` launch had denied.
+    let mode_str = mode
+        .map(str::to_string)
+        .or_else(|| record.resume_mode.clone())
+        .or_else(|| record.permission_mode.clone())
+        .unwrap_or_else(|| "ask".to_string());
 
     // Hoisted above the dispatcher build so `CliAgentDispatcher` can be
     // handed a clone of the same sink and emit `DispatchStarted` /

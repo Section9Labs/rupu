@@ -58,7 +58,7 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 |---|---|---|---|---|
 | I-22 | P1 | rupu-tools | `grep` and `ast_grep` escape the workspace — no `path_scope` containment | fixed |
 | I-23 | P0 | docs/autoflow | The autoflow author allowlist is undocumented and defaults to no restriction | open |
-| I-24 | P1 | rupu-cli | `on_reject` cleanup runs at `ask` mode regardless of the run's original mode | open |
+| I-24 | P1 | rupu-cli | `on_reject` cleanup runs at `ask` mode regardless of the run's original mode | fixed |
 | I-25 | P1 | rupu-cli | `rupu workflow runs` — a list command — executes `on_reject` chains as a side effect | open |
 | I-26 | P1 | rupu-cli | Action steps get allowlist `["*"]`; the code comment claims parity with agent `tools:` | open |
 | I-27 | P2 | rupu-orchestrator | `action_protocol::validate_actions` is dead code; three docs describe a check that never runs | open |
@@ -159,28 +159,6 @@ assumed here.
 
 ---
 
-### I-24 — `on_reject` cleanup runs at `ask` mode regardless of the run's mode
-
-**Symptom.** A workflow deliberately launched with `--mode readonly` has its
-gate rejected; the `on_reject` cleanup chain then executes with **write** tools
-enabled.
-
-**Root cause.** The run's original `--mode` is never persisted on `RunRecord`
-(only `resume_mode`, set by the web-resume path). `rupu workflow reject` has no
-`--mode` flag and passes `None`; `rebuild_opts_from_disk` then does
-`mode.unwrap_or("ask")`, and `parse_mode_for_runtime` maps anything that isn't
-`bypass`/`readonly` to `Ask`, which permits Write tools.
-
-**Impact.** A readonly guarantee silently stops applying at exactly the moment a
-human rejected the work — the cleanup chain can post comments, push branches, or
-call any Write connector the agent's grant allows.
-
-**Fix.** Persist the run's effective permission mode on `RunRecord` at start and
-have every cleanup-opts rebuild inherit it, defaulting to the *run's* mode
-rather than `ask`.
-
----
-
 ### I-25 — a list command executes `on_reject` chains as a side effect
 
 **Symptom.** `rupu workflow runs` — a read-only-looking listing — can post
@@ -190,8 +168,10 @@ GitHub comments and run agent steps.
 timeout-reject branch invokes the full `run_reject_cleanup` chain inline.
 
 **Impact.** A command whose name and output imply pure observation has
-side effects on external systems. Compounded by I-24: those side effects run at
-`ask` mode regardless of how the original run was launched.
+side effects on external systems. Previously compounded by I-24 (now fixed):
+those side effects used to run at `ask` mode regardless of how the original run
+was launched; they now correctly inherit the run's own launch mode, but the
+listing path still shouldn't be the one running them at all.
 
 **Fix.** Either move timeout-driven cleanup exclusively to the `cp serve` gate
 sweep (which exists and is default-on), or keep the lazy expiry but have the
@@ -352,6 +332,87 @@ exercised the real binary rather than being gated; they still self-gate via
 rather than a failure. `cargo build --workspace`, `cargo clippy -p rupu-tools
 --lib --tests`, and `rustfmt --edition 2021 --check` on both changed files are
 all clean.
+
+---
+
+### I-24 — `on_reject` cleanup runs at `ask` mode regardless of the run's mode
+
+**Symptom.** A workflow deliberately launched with `--mode readonly` has its
+gate rejected; the `on_reject` cleanup chain then executes with **write** tools
+enabled.
+
+**Root cause.** The run's original `--mode` is never persisted on `RunRecord`
+(only `resume_mode`, set by the web-resume path). `rupu workflow reject` has no
+`--mode` flag and passes `None`; `rebuild_opts_from_disk` then does
+`mode.unwrap_or("ask")`, and `parse_mode_for_runtime` maps anything that isn't
+`bypass`/`readonly` to `Ask`, which permits Write tools.
+
+**Impact.** A readonly guarantee silently stops applying at exactly the moment a
+human rejected the work — the cleanup chain can post comments, push branches, or
+call any Write connector the agent's grant allows.
+
+**Fix.** PR (branch `arc2/safety`). Added `RunRecord.permission_mode:
+Option<String>` (`crates/rupu-orchestrator/src/runs.rs`, `#[serde(default,
+skip_serializing_if = "Option::is_none")]` so every pre-existing `run.json`
+still deserializes, reading back as `None`). Populated at fresh-run creation in
+`run_workflow` (`crates/rupu-orchestrator/src/runner.rs`) from a new
+`StepFactory::permission_mode(&self) -> Option<&str>` trait method (default
+`None`, so no other `StepFactory` impl needs a change); `DefaultStepFactory`
+implements it as `Some(&self.mode_str)`, and `rupu run`'s own `RunRecord` write
+(`crates/rupu-cli/src/cmd/run.rs`) sets it the same way for consistency, though
+that path has no `on_reject` chain of its own. `rebuild_opts_from_disk`
+(`crates/rupu-cli/src/resume.rs`, shared by both the reject-cleanup and
+approve-resume rebuilds) now resolves the effective mode with explicit
+precedence: an explicit `--mode` on the calling command (if one exists —
+`reject` has none, `approve` does) → `record.resume_mode` (the web-resume path)
+→ `record.permission_mode` (new) → `"ask"`.
+  A second, closely-related gap surfaced while writing the validation test
+below and was fixed alongside it (same PR, same file):
+  `DefaultStepFactory::build_opts_for_step` unconditionally built its agent's
+  `PermissionDecider` as `Arc::new(BypassDecider)` — a decider whose own doc
+  comment calls it a "Test/CI decider: always Allow regardless of mode" — so
+  no workflow step's tool calls, cleanup or otherwise, ever actually honored
+  `--mode readonly`/`ask` at the tool layer; only `action:` steps' separate MCP
+  permission gate did. Added `rupu_agent::runner::ReadonlyDecider` (denies
+  `bash`/`write_file`/`edit_file`, non-interactive so it's safe unattended) and
+  had `DefaultStepFactory` select it when `mode_str == "readonly"`. Without
+  this, I-24's fix would have had no observable effect: the mode would reach
+  `rebuild_opts_from_disk` correctly but still hit an always-Allow decider.
+  `ask`/`bypass` semantics for workflow steps are unchanged by this — a
+  workflow has no per-step operator to prompt, so `ask` still permits writes
+  there, exactly as documented in this write-up's "Root cause" above.
+  Separately, `DefaultStepFactory::build_opts_for_step`'s step lookup
+  (`crates/rupu-orchestrator/src/step_factory.rs`) only searched top-level
+  `workflow.steps`, so any `on_reject:` cleanup sub-step dispatched through the
+  real factory (rather than a test's fake one) panicked with `step_id from
+  orchestrator must match a workflow step` — an on_reject sub-step's id lives
+  nested under its gate's `approval.on_reject`, never in `workflow.steps`
+  itself. This is a distinct, pre-existing gap (parked, real, and unrelated to
+  the mode fallback) that blocked validating I-24 with a real agent step at
+  all; the lookup now falls back to searching every gate's `on_reject` chain
+  before giving up.
+
+**Validation.** `crates/rupu-cli/tests/reject_mode_inheritance.rs`
+(`reject_cleanup_inherits_a_readonly_run_mode`) drives `rupu_cli::run(...)` end
+to end: launches a single-gate workflow with `--mode readonly`, whose
+`on_reject` chain has one agent step that attempts `write_file`, then rejects
+the parked gate via a second `rupu_cli::run(...)` call with no `--mode`. The
+binding assertion is the filesystem effect, not a config value: the file the
+cleanup step would have written does not exist, and the run still ends
+`Rejected`. Confirmed genuinely RED pre-fix (temporarily reverting the
+`rebuild_opts_from_disk` precedence back to `mode.unwrap_or("ask")` reproduces
+the file being created) and GREEN with the fix restored. A second test,
+`runs::tests::record_json_with_no_permission_mode_key_deserializes_as_none`
+(`crates/rupu-orchestrator/src/runs.rs`), deserializes a hand-written
+`run.json` JSON payload with no `permission_mode` key at all and asserts it
+loads with the field as `None` — proving the back-compat contract, not just
+the round-trip of a struct the code itself produced. `cargo test -p rupu-cli -p
+rupu-orchestrator` is clean except the pre-existing baseline (4 `linear_runner.rs`
+tests; ANSI/terminal-color-detection assertions across `output::printer` and
+several other integration tests, all traced to this worktree's toolchain
+mismatch — see `project_rupu_toolchain_mismatch` — and confirmed unrelated by
+inspecting the diff against every failing file). `cargo build --workspace` and
+`cargo test -p rupu-cp` are both clean.
 
 ---
 

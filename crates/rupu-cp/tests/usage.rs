@@ -125,6 +125,7 @@ fn seed_transcript_with_model(dir: &std::path::Path, run_id: &str, model: &str) 
         resume_claimed_by: None,
         resume_mode: None,
         resume_gate_id: None,
+        permission_mode: None,
         final_output: None,
         loop_progress: Default::default(),
     };
@@ -220,6 +221,7 @@ async fn usage_priced_only_reports_empty_unpriced_gap() {
         resume_claimed_by: None,
         resume_mode: None,
         resume_gate_id: None,
+        permission_mode: None,
         final_output: None,
         loop_progress: Default::default(),
     };
@@ -580,6 +582,7 @@ fn seed_run_with_usage(
         resume_claimed_by: None,
         resume_mode: None,
         resume_gate_id: None,
+        permission_mode: None,
         final_output: None,
         loop_progress: Default::default(),
     };

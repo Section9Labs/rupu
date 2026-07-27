@@ -536,6 +536,32 @@ impl PermissionDecider for BypassDecider {
     }
 }
 
+/// Deny writers (`bash`/`write_file`/`edit_file`), allow everything else.
+/// No interactive prompt — unlike `rupu run`'s own `ask` decider, this
+/// never blocks on stdin, so it's safe for an unattended context (a
+/// workflow step has no per-step operator to prompt). `DefaultStepFactory`
+/// (`rupu-orchestrator`) selects this for a workflow step whose run
+/// launched `--mode readonly`, so a workflow's own tool calls — including
+/// an `on_reject` cleanup step's (ISSUES.md I-24) — actually honor the
+/// mode instead of the `BypassDecider` every workflow step used
+/// unconditionally before this existed.
+pub struct ReadonlyDecider;
+
+impl PermissionDecider for ReadonlyDecider {
+    fn decide(
+        &self,
+        _mode: PermissionMode,
+        tool: &str,
+        _input: &serde_json::Value,
+        _workspace_path: &str,
+    ) -> Result<PermissionDecision, RunError> {
+        match tool {
+            "bash" | "write_file" | "edit_file" => Ok(PermissionDecision::Deny),
+            _ => Ok(PermissionDecision::Allow),
+        }
+    }
+}
+
 /// Inputs to a single agent run.
 pub struct AgentRunOpts {
     pub agent_name: String,

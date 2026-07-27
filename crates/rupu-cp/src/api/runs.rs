@@ -840,6 +840,7 @@ pub(crate) fn synthesize_unpersisted_run(
         resume_claimed_by: None,
         resume_mode: None,
         resume_gate_id: None,
+        permission_mode: None,
         final_output: None,
         loop_progress: Default::default(),
     };
@@ -1341,6 +1342,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            permission_mode: None,
             final_output: None,
             loop_progress: Default::default(),
         }

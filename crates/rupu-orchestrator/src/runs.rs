@@ -272,6 +272,20 @@ pub struct RunRecord {
     /// when `None`. Cleared by [`RunStore::clear_resume`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_gate_id: Option<String>,
+    /// The effective permission mode (`ask` / `bypass` / `readonly`) this
+    /// run was launched with, persisted once at fresh-run creation
+    /// (ISSUES.md I-24). Read by `rebuild_opts_from_disk`
+    /// (`crates/rupu-cli/src/resume.rs`) as the fallback under
+    /// `resume_mode` when rebuilding the runtime for an `on_reject`
+    /// cleanup chain or an approve-resume — without this, a run launched
+    /// `--mode readonly` had no persisted trace of that mode, so its
+    /// cleanup chain silently fell back to `ask` (which permits Write
+    /// tools), a privilege escalation across a mode boundary. `None` for
+    /// every `run.json` written before this field existed
+    /// (`#[serde(default)]` on load) and for any construction path that
+    /// doesn't track a single mode string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
     /// Final assistant text for an agent run (set by `rupu run`); `None` for
     /// workflow runs and older records. Carried by the mirror so a remotely
     /// dispatched unit's output is retrievable centrally.
@@ -2404,6 +2418,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            permission_mode: None,
             final_output: None,
             loop_progress: BTreeMap::new(),
         }
@@ -3220,6 +3235,35 @@ mod tests {
         assert_eq!(gates.len(), 1, "normalizes to a one-element set on demand");
         assert_eq!(gates[0].step_id, "deploy");
         assert_eq!(gates[0].prompt.as_deref(), Some("ok?"));
+    }
+
+    #[test]
+    fn record_json_with_no_permission_mode_key_deserializes_as_none() {
+        // ISSUES.md I-24: `permission_mode` is new — every `run.json`
+        // written before this task has no such key in the file at all.
+        // `#[serde(default)]` must produce `None` from a wholly ABSENT
+        // key, not error. Hand-written JSON (not built via `RunRecord`
+        // itself), mirroring `record_json_with_no_awaiting_key_at_all_
+        // deserializes_and_normalizes` above for the same reason: a
+        // struct-built record always round-trips its own fields, which
+        // doesn't prove the absent-key case a genuine pre-existing
+        // on-disk file exercises.
+        let json = r#"{
+            "id": "run_hand_written_pre_i24",
+            "workflow_name": "investigate-then-fix",
+            "status": "completed",
+            "inputs": {},
+            "workspace_id": "ws_1",
+            "workspace_path": "/tmp/proj",
+            "transcript_dir": "/tmp/proj/.rupu/transcripts",
+            "started_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let rec: RunRecord =
+            serde_json::from_str(json).expect("no `permission_mode` key must still parse");
+        assert_eq!(
+            rec.permission_mode, None,
+            "absent key must default to None, not error"
+        );
     }
 
     #[test]

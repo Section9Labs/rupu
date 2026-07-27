@@ -992,6 +992,10 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            // ISSUES.md I-24: `rupu run` has no on_reject cleanup path of
+            // its own, but recording the launch mode here keeps this
+            // record consistent with the workflow-run creation site.
+            permission_mode: Some(mode_str.to_string()),
             loop_progress: Default::default(),
         };
         match store.create(rec, "") {
@@ -1321,6 +1325,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            permission_mode: None,
             loop_progress: Default::default(),
         };
         rupu_cp::api::runs::RunListRow::from(&rec)

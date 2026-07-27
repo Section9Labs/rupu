@@ -12,7 +12,8 @@ use crate::runner::StepFactory;
 use crate::workflow::Workflow;
 use async_trait::async_trait;
 use rupu_agent::{
-    runner::BypassDecider, runner::PermissionDecider, AgentRunOpts, OnToolCallCallback,
+    runner::BypassDecider, runner::PermissionDecider, runner::ReadonlyDecider, AgentRunOpts,
+    OnToolCallCallback,
 };
 use rupu_runtime::provider_factory;
 use rupu_tools::{AgentDispatcher, ToolContext};
@@ -151,12 +152,30 @@ impl StepFactory for DefaultStepFactory {
         // unknown step ids surface clearly, but we drive the agent
         // load off `agent_name` (which differs from the parent's
         // `agent:` for `parallel:` sub-steps).
+        //
+        // An `on_reject:` cleanup sub-step's id is NOT in `workflow.steps`
+        // — it lives nested under its gate's `approval.on_reject`
+        // (`crate::workflow::Approval::on_reject`), the same way a
+        // `parallel:`/`for_each:` sub-step's agent differs from its
+        // parent's. `run_reject_cleanup` dispatches those sub-steps
+        // through this same factory (`dispatch_one` with the sub-step's
+        // own id), so the lookup falls back to searching every gate's
+        // cleanup chain before giving up.
         let step = self
             .workflow
             .steps
             .iter()
             .find(|s| s.id == step_id)
-            .expect("step_id from orchestrator must match a workflow step");
+            .or_else(|| {
+                self.workflow.steps.iter().find_map(|s| {
+                    s.approval
+                        .as_ref()
+                        .and_then(|a| a.on_reject.iter().find(|sub| sub.id == step_id))
+                })
+            })
+            .expect(
+                "step_id from orchestrator must match a workflow step or an on_reject cleanup sub-step",
+            );
 
         // The agent loader takes the parent of `agents/`. For the
         // project layer that's `<project>/.rupu`; the global layer is
@@ -269,7 +288,16 @@ impl StepFactory for DefaultStepFactory {
             workspace_path: workspace_path.clone(),
             transcript_path,
             max_turns: spec.max_turns.unwrap_or(50),
-            decider: Arc::new(BypassDecider) as Arc<dyn PermissionDecider>,
+            // `readonly` gets a real, non-interactive deny-writers decider
+            // (ISSUES.md I-24 needs this to be observable at the tool
+            // layer); `ask`/`bypass` keep the existing unconditional-allow
+            // behavior — prompting mid-workflow has no operator to answer,
+            // so `ask` in a workflow context is unchanged by this fix.
+            decider: if self.mode_str == "readonly" {
+                Arc::new(ReadonlyDecider) as Arc<dyn PermissionDecider>
+            } else {
+                Arc::new(BypassDecider) as Arc<dyn PermissionDecider>
+            },
             tool_context: ToolContext {
                 workspace_path,
                 bash_env_allowlist: self.bash_env_allowlist.clone(),
@@ -336,6 +364,10 @@ impl StepFactory for DefaultStepFactory {
             compact_at_percent: spec.compact_at_percent,
             pause: None,
         }
+    }
+
+    fn permission_mode(&self) -> Option<&str> {
+        Some(self.mode_str.as_str())
     }
 }
 
