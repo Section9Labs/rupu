@@ -405,17 +405,35 @@ just see all their settings quietly stop applying.
 helpers in `crates/rupu-cli/src/cmd/config.rs` that split a dotted key on `.`
 and descend/create intermediate tables, replacing the top-level-only
 `t.insert(key.to_string(), parsed)`. `set_path` refuses to overwrite an
-existing non-table with a table rather than silently discarding it. `set`'s
-read path no longer falls back to an empty table on a parse error — a
+existing non-table with a table, and (follow-up) also refuses to overwrite an
+existing **table** with a scalar — both directions were the same
+silent-subtree-loss shape and both now name the offending key in the error.
+`set`'s read path no longer falls back to an empty table on a parse error — a
 malformed `config.toml` now aborts the write with `anyhow::bail!` instead of
 being replaced.
 
 **Validation.** `cargo test -p rupu-cli --lib cmd::config` —
-`cmd::config::tests`, 5 tests, all observing real `Value` mutation/traversal
+`cmd::config::tests`, 7 tests, all observing real `Value` mutation/traversal
 (not just parsing): `set_path_descends_into_a_nested_table`,
 `set_path_creates_missing_intermediate_tables`,
 `set_path_refuses_to_overwrite_a_scalar_with_a_table`,
+`set_path_refuses_to_overwrite_an_existing_table_with_a_scalar`,
+`set_path_still_overwrites_an_existing_scalar_with_a_scalar`,
 `get_path_reads_a_nested_key`, `a_top_level_key_still_works`.
+
+`cargo test -p rupu-cli --test cli_config` exercises the real `async fn set()`
+read path end-to-end (writes files under a temp `RUPU_HOME`, invokes
+`rupu_cli::run([...])`), closing the gap the unit tests alone left open —
+defect (2) above (fall back to an empty table on a parse error) was only
+proven at the pure-helper level until now:
+`config_set_on_a_malformed_file_fails_and_leaves_the_file_untouched` writes a
+deliberately invalid `config.toml`, asserts it actually fails
+`toml::from_str` first (fixture sanity check), then asserts `config set`
+exits non-zero AND that the file's bytes on disk are byte-for-byte identical
+to what was written before the call — the anti-wipe guarantee.
+`config_set_on_a_valid_file_adds_a_key_without_disturbing_existing_ones` is
+the mirror-image positive case: a valid file with a top-level key and a
+nested table both survive a `config set` that adds an unrelated new key.
 
 ### I-1 — `default_provider` in `config.toml` was dead config
 

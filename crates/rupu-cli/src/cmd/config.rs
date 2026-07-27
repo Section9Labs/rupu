@@ -83,8 +83,10 @@ fn get_path<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
 }
 
 /// Write a dotted key (`ui.theme`), creating intermediate tables as needed.
-/// Refuses to replace an existing non-table with a table — that would silently
-/// discard the user's value.
+/// Refuses to replace an existing non-table with a table, and refuses to
+/// replace an existing table with a scalar — both directions would silently
+/// discard the user's value(s). Overwriting an existing scalar with another
+/// scalar is the normal case and still works.
 fn set_path(v: &mut Value, key: &str, val: Value) -> anyhow::Result<()> {
     let segs: Vec<&str> = key.split('.').collect();
     let (last, parents) = segs.split_last().expect("split always yields one segment");
@@ -101,9 +103,15 @@ fn set_path(v: &mut Value, key: &str, val: Value) -> anyhow::Result<()> {
         }
         cur = cur.get_mut(*seg).expect("just inserted");
     }
-    cur.as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("cannot set `{key}`: parent is not a table"))?
-        .insert((*last).to_string(), val);
+    let table = cur
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("cannot set `{key}`: parent is not a table"))?;
+    if matches!(table.get(*last), Some(Value::Table(_))) && !matches!(val, Value::Table(_)) {
+        anyhow::bail!(
+            "cannot set `{key}`: `{last}` is an existing table, refusing to overwrite it with a scalar"
+        );
+    }
+    table.insert((*last).to_string(), val);
     Ok(())
 }
 
@@ -146,6 +154,32 @@ mod tests {
         let mut v: Value = toml::from_str("log_level = \"warn\"\n").unwrap();
         let err = set_path(&mut v, "log_level.nested", Value::Integer(1)).unwrap_err();
         assert!(err.to_string().contains("log_level"), "got: {err}");
+    }
+
+    #[test]
+    fn set_path_refuses_to_overwrite_an_existing_table_with_a_scalar() {
+        let mut v: Value = toml::from_str("[ui]\ntheme = \"dracula\"\n").unwrap();
+        let err = set_path(&mut v, "ui", Value::String("dracula".into())).unwrap_err();
+        assert!(err.to_string().contains("ui"), "got: {err}");
+        // The table must survive untouched — not partially or fully replaced.
+        assert_eq!(
+            v.get("ui")
+                .and_then(|u| u.get("theme"))
+                .and_then(|t| t.as_str()),
+            Some("dracula"),
+            "existing table must be left intact after the refused write"
+        );
+    }
+
+    #[test]
+    fn set_path_still_overwrites_an_existing_scalar_with_a_scalar() {
+        let mut v: Value = toml::from_str("log_level = \"warn\"\n").unwrap();
+        set_path(&mut v, "log_level", Value::String("debug".into())).unwrap();
+        assert_eq!(
+            v.get("log_level").and_then(|t| t.as_str()),
+            Some("debug"),
+            "scalar-over-scalar is the normal case and must still succeed"
+        );
     }
 
     #[test]
