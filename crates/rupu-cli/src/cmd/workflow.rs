@@ -1863,11 +1863,15 @@ fn gate_on_timeout_for_step(
     rupu_orchestrator::gate_timeout_action(&workflow, step_id)
 }
 
-/// Cheap pre-check for the reject-cleanup path (`rupu workflow reject`, the
-/// timeout-reject branch of `approve`, and the `runs` listing's lazy-expiry
-/// sweep): parse the run's persisted workflow snapshot only (no
-/// config/resolver/MCP-registry/dispatcher rebuild) and return the rejected
-/// step's `on_reject` chain length.
+/// Cheap pre-check for the reject-cleanup path (`rupu workflow reject` and
+/// the timeout-reject branch of `approve`): parse the run's persisted
+/// workflow snapshot only (no config/resolver/MCP-registry/dispatcher
+/// rebuild) and return the rejected step's `on_reject` chain length.
+///
+/// **Not** called by the `runs` listing (ISSUES.md I-25): a listing command
+/// must not execute cleanup chains, so it skips `on_timeout: reject` gates
+/// entirely rather than pre-checking whether they have anything to clean
+/// up — see the comment at that call site.
 ///
 /// `Some(0)` means "definitely nothing to run" — a legacy inline-approval
 /// step, or a gate node with an empty (or absent) `on_reject:` — so the
@@ -1912,7 +1916,41 @@ async fn runs(
     let now = chrono::Utc::now();
     for r in &mut all {
         let on_timeout = gate_on_timeout_for(&store, r);
-        let step_id_before_expiry = r.awaiting_step_id.clone();
+
+        // ISSUES.md I-25: `rupu workflow runs` is a *listing* command and
+        // must have no external side effects — merely running it must
+        // never post comments, open PRs, or run agent steps against
+        // external systems. `expire_if_overdue` itself is safe to call
+        // lazily here for `on_timeout: approve` (it deliberately leaves the
+        // record `AwaitingApproval`; nothing but an informational
+        // `println!` follows) and for `fail`/unset (the record is fully
+        // finalized inside the expire call itself — there is no cleanup
+        // chain to run). `reject` is the one case that is NOT safe: this
+        // listing must never itself execute the gate's `on_reject` chain,
+        // and it also must not even flip the record to `Rejected`, because
+        // that finalization and the chain execution are supposed to
+        // happen together and only the `cp serve` gate sweep is allowed to
+        // do both. `sweep_decision` (`crates/rupu-cli/src/cmd/cp.rs`) only
+        // ever produces `ExpireThenCleanupReject` for a run still
+        // `AwaitingApproval`; every other status falls through to `Skip`.
+        // So if this listing expired the run to `Rejected` on its own (as
+        // it used to, right before running the chain inline), the sweep
+        // would classify it `Skip` on every later tick and the
+        // `on_reject` chain would never run at all — trading a
+        // side-effecting read for a silently dropped cleanup, which is
+        // worse. We therefore skip calling `expire_if_overdue` entirely
+        // for `on_timeout: reject`: the run stays parked `AwaitingApproval`
+        // and resolving it (expiring it AND running its `on_reject` chain,
+        // together, in the same tick) becomes solely the `cp serve` gate
+        // sweep's job. If the sweep is disabled
+        // (`[cp].gate_sweep_enabled = false`) or `rupu cp serve` is never
+        // started, such a gate simply stays parked until an operator runs
+        // `rupu workflow reject` by hand — there is no other path that
+        // will resolve it.
+        if on_timeout == Some(rupu_orchestrator::TimeoutAction::Reject) {
+            continue;
+        }
+
         match store.expire_if_overdue(r, now, on_timeout) {
             Ok(Some(rupu_orchestrator::TimeoutAction::Approve)) => {
                 println!(
@@ -1921,47 +1959,10 @@ async fn runs(
                     r.id
                 );
             }
-            Ok(Some(rupu_orchestrator::TimeoutAction::Reject)) => {
-                let step_id = step_id_before_expiry.unwrap_or_default();
-                let reason = r
-                    .error_message
-                    .clone()
-                    .unwrap_or_else(|| "approval expired".into());
-                println!(
-                    "rupu: gate timed out (on_timeout: reject) — run {} auto-rejected at step `{}`",
-                    r.id, step_id
-                );
-                if cheap_on_reject_chain_len(&store, &r.id, &step_id) != Some(0) {
-                    match crate::resume::build_reject_cleanup_opts(
-                        &store, &r.id, &step_id, &reason, None,
-                    )
-                    .await
-                    {
-                        Ok((opts, chain_len)) => {
-                            match rupu_orchestrator::runner::run_reject_cleanup(
-                                opts, &step_id, &reason, "timeout",
-                            )
-                            .await
-                            {
-                                Ok(()) => {
-                                    if chain_len > 0 {
-                                        println!("cleanup: {chain_len} step(s) executed");
-                                    }
-                                }
-                                Err(e) => eprintln!(
-                                    "warning: on_reject cleanup chain errored for run {}: {e}",
-                                    r.id
-                                ),
-                            }
-                        }
-                        Err(e) => eprintln!(
-                            "warning: could not load workflow for on_reject cleanup on run {}: {e} \
-                             (run is already correctly rejected)",
-                            r.id
-                        ),
-                    }
-                }
-            }
+            // Unreachable: `on_timeout == Some(Reject)` is filtered out
+            // above before this call, so `expire_if_overdue` can never
+            // return `Reject` here.
+            Ok(Some(rupu_orchestrator::TimeoutAction::Reject)) => {}
             Ok(Some(rupu_orchestrator::TimeoutAction::Fail)) | Ok(None) => {}
             Err(e) => {
                 eprintln!("warning: expiry check failed for run {}: {e}", r.id);
