@@ -1,5 +1,8 @@
 use crate::{
-    api::{fs_safety, repo_scope::distinct_repo_workspaces},
+    api::{
+        fs_safety,
+        repo_scope::{distinct_repo_workspaces, ScopeKind},
+    },
     config_write::write_atomic_raw,
     error::{ApiError, ApiResult},
     state::AppState,
@@ -32,8 +35,14 @@ pub(crate) struct AutoflowDefRow {
     /// `TriggerKind` as a lowercase string: `"manual"`, `"cron"`, or `"event"`.
     pub(crate) trigger: String,
     /// `"global"` or the registered project's name, depending on the layer
-    /// the file came from.
+    /// the file came from. DISPLAY ONLY — it's a workspace path's basename
+    /// and can legally collide with the literal string `"global"`. Gates
+    /// (e.g. the Enable/Disable toggle) must key off `scope_kind`, never
+    /// this field — see [`ScopeKind`]'s doc comment.
     pub(crate) scope: String,
+    /// Structured scope discriminator backing the Enable/Disable toggle
+    /// gate. See [`ScopeKind`].
+    pub(crate) scope_kind: ScopeKind,
     /// Whether `autoflow.enabled` is currently `true` in the on-disk YAML.
     /// A workflow with no `autoflow:` block at all is excluded from the scan
     /// entirely (see [`scan_autoflow_defs`]) — this field only distinguishes
@@ -66,6 +75,7 @@ fn repo_store(s: &AppState) -> RepoRegistryStore {
 pub(crate) fn scan_autoflow_defs(
     dir: &std::path::Path,
     scope: impl Into<String>,
+    scope_kind: ScopeKind,
 ) -> Vec<AutoflowDefRow> {
     let scope = scope.into();
     if !dir.is_dir() {
@@ -127,6 +137,7 @@ pub(crate) fn scan_autoflow_defs(
                 slug,
                 trigger,
                 scope: scope.clone(),
+                scope_kind,
                 enabled,
             })
         })
@@ -158,7 +169,7 @@ pub(crate) fn scan_autoflow_defs(
 /// A missing workflows directory → `[]` (not an error).
 /// An unparseable YAML file is skipped with a `tracing::warn!`.
 async fn list_autoflow_defs(State(s): State<AppState>) -> ApiResult<Json<Vec<AutoflowDefRow>>> {
-    let mut rows = scan_autoflow_defs(&s.global_dir.join("workflows"), "global");
+    let mut rows = scan_autoflow_defs(&s.global_dir.join("workflows"), "global", ScopeKind::Global);
 
     let workspaces = store(&s).list().unwrap_or_default();
     let repos = distinct_repo_workspaces(workspaces, &repo_store(&s));
@@ -167,7 +178,7 @@ async fn list_autoflow_defs(State(s): State<AppState>) -> ApiResult<Json<Vec<Aut
         let dir = std::path::Path::new(&r.workspace.path)
             .join(".rupu")
             .join("workflows");
-        project_rows.extend(scan_autoflow_defs(&dir, r.scope));
+        project_rows.extend(scan_autoflow_defs(&dir, r.scope, ScopeKind::Project));
     }
 
     let project_names: std::collections::BTreeSet<&str> =
@@ -376,11 +387,42 @@ mod tests {
         )
         .expect("write");
 
-        let rows = scan_autoflow_defs(dir.path(), "global");
+        let rows = scan_autoflow_defs(dir.path(), "global", ScopeKind::Global);
         assert_eq!(rows.len(), 1, "the autoflow should be returned");
         assert_eq!(rows[0].name, "parsed-name");
         assert_eq!(rows[0].slug, "my-file-stem");
         assert!(rows[0].enabled, "autoflow.enabled: true in the source YAML");
+    }
+
+    /// The structured `scope_kind` is caller-supplied, never inferred from
+    /// the display `scope` string — a project row can legally carry a
+    /// display `scope` of literally `"global"` (a workspace registered at a
+    /// path ending in `/global`), and it must still come back tagged
+    /// `ScopeKind::Project`. A true global row must come back
+    /// `ScopeKind::Global`. See [`ScopeKind`]'s doc comment for why this
+    /// distinction exists.
+    #[test]
+    fn scope_kind_is_independent_of_the_display_scope_string() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nightly.yaml");
+        std::fs::write(
+            &path,
+            "name: nightly\nautoflow:\n  enabled: true\nsteps:\n  - id: s1\n    agent: ag\n    actions: []\n    prompt: p\n",
+        )
+        .expect("write");
+
+        // A project registered at a path whose basename happens to be
+        // "global" still gets ScopeKind::Project.
+        let project_rows = scan_autoflow_defs(dir.path(), "global", ScopeKind::Project);
+        assert_eq!(project_rows.len(), 1);
+        assert_eq!(project_rows[0].scope, "global");
+        assert_eq!(project_rows[0].scope_kind, ScopeKind::Project);
+
+        // A genuinely global row gets ScopeKind::Global.
+        let global_rows = scan_autoflow_defs(dir.path(), "global", ScopeKind::Global);
+        assert_eq!(global_rows.len(), 1);
+        assert_eq!(global_rows[0].scope, "global");
+        assert_eq!(global_rows[0].scope_kind, ScopeKind::Global);
     }
 
     #[test]
@@ -393,7 +435,7 @@ mod tests {
         )
         .expect("write");
 
-        let rows = scan_autoflow_defs(dir.path(), "global");
+        let rows = scan_autoflow_defs(dir.path(), "global", ScopeKind::Global);
         assert_eq!(
             rows.len(),
             1,
@@ -413,7 +455,7 @@ mod tests {
         )
         .expect("write");
 
-        let rows = scan_autoflow_defs(dir.path(), "global");
+        let rows = scan_autoflow_defs(dir.path(), "global", ScopeKind::Global);
         assert_eq!(
             rows.len(),
             0,

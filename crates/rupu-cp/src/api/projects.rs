@@ -442,11 +442,11 @@ async fn project_autoflows(
     Path(ws_id): Path<String>,
 ) -> ApiResult<Json<Vec<AutoflowDefRow>>> {
     let w = load_workspace(&s, &ws_id)?;
-    let global = scan_autoflow_defs(&s.global_dir.join("workflows"), "global");
+    let global = scan_autoflow_defs(&s.global_dir.join("workflows"), "global", ScopeKind::Global);
     let project_dir = std::path::Path::new(&w.path)
         .join(".rupu")
         .join("workflows");
-    let project = scan_autoflow_defs(&project_dir, "project");
+    let project = scan_autoflow_defs(&project_dir, "project", ScopeKind::Project);
     Ok(Json(merge_autoflow_defs(global, project)))
 }
 

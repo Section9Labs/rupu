@@ -579,7 +579,14 @@ export interface AutoflowDefRow {
    *  is keyed by. May differ from `name` (the parsed display name). */
   slug: string;
   trigger: string;
+  /** DISPLAY ONLY — see `ScopeKind`'s doc comment; gate the Enable/Disable
+   *  toggle on `scope_kind`, never this field. */
   scope: string;
+  /** Structured scope discriminator — gate the Enable/Disable toggle on
+   *  THIS, never `scope`. See `ScopeKind`'s doc comment. Optional so literal
+   *  test fixtures that predate this field don't need updating; a gate
+   *  reading `undefined` fails closed (no toggle offered). */
+  scope_kind?: ScopeKind;
   /** Whether `autoflow.enabled` is currently `true` in the on-disk YAML. A
    *  workflow with no `autoflow:` block at all never appears in this list at
    *  all — this only distinguishes enabled vs. disabled among rows that DO

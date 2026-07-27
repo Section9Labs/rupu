@@ -26,6 +26,7 @@ const ENABLED_ROW: AutoflowDefRow = {
   slug: 'nightly-sweep',
   trigger: 'cron',
   scope: 'global',
+  scope_kind: 'global',
   enabled: true,
 };
 
@@ -34,6 +35,7 @@ const DISABLED_ROW: AutoflowDefRow = {
   slug: 'stale-cleanup',
   trigger: 'cron',
   scope: 'global',
+  scope_kind: 'global',
   enabled: false,
 };
 

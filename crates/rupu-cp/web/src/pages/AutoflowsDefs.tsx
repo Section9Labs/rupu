@@ -106,20 +106,24 @@ function defColumns(onToggle: (d: AutoflowDefRow) => void): Column<AutoflowDefRo
       // Its own real button (Enable/Disable) — keep it independently
       // focusable/announced (I7) rather than swallowed by the row link.
       //
-      // Gated to `scope === 'global'`: `POST /api/autoflows/:name/enable|
-      // disable` resolves `:name` via `resolve_workflow_path` (global-first,
-      // then EVERY registered workspace), which is NOT the same resolution
-      // the list uses (`distinct_repo_workspaces` — one representative
-      // worktree per repo). For a project-scoped row that mismatch means
-      // the toggle can silently flip the global copy or a non-representative
-      // worktree's copy instead of the file the row actually shows — the
-      // list then re-renders unchanged (or a different row changes), which
-      // reads as "the toggle did nothing" and a second click compounds the
+      // Gated on `scope_kind === 'global'`, NEVER the display `scope`
+      // string: `scope` is a workspace path's basename and can legally
+      // collide with the literal string `"global"` (a project registered at
+      // a path ending in `/global`) — see `ScopeKind`'s doc comment in
+      // `lib/api.ts`. `POST /api/autoflows/:name/enable|disable` resolves
+      // `:name` via `resolve_workflow_path` (global-first, then EVERY
+      // registered workspace), which is NOT the same resolution the list
+      // uses (`distinct_repo_workspaces` — one representative worktree per
+      // repo). For a project-scoped row that mismatch means the toggle can
+      // silently flip the global copy or a non-representative worktree's
+      // copy instead of the file the row actually shows — the list then
+      // re-renders unchanged (or a different row changes), which reads as
+      // "the toggle did nothing" and a second click compounds the
       // wrong-file write. A project-scoped row instead shows the (already
       // present, read-only) Enabled column state with no toggle at all.
       interactive: true,
       render: (d) =>
-        d.scope === 'global' ? (
+        d.scope_kind === 'global' ? (
           <div
             className="flex items-center justify-end"
             onClick={(e) => {

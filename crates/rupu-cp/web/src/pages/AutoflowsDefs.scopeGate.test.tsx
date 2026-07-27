@@ -11,7 +11,14 @@
 // non-representative worktree's copy instead of the file the row actually
 // shows — `load()` then re-renders unchanged state, reading as "the toggle
 // did nothing," and a second click compounds the wrong-file write. Gating
-// the toggle to `scope === 'global'` closes that gap.
+// the toggle to `scope_kind === 'global'` closes that gap.
+//
+// The gate keys off `scope_kind`, NEVER the display `scope` string: `scope`
+// is a workspace path's basename and can legally collide with the literal
+// string `"global"` (a project registered at a path ending in `/global`) —
+// see `ScopeKind`'s doc comment in `lib/api.ts`. A row with that collision
+// (display `scope: 'global'`, structured `scope_kind: 'project'`) must still
+// render with no toggle.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -33,6 +40,7 @@ describe('AutoflowsDefs — scope-gated toggle', () => {
       slug: 'issue-triage',
       trigger: 'event',
       scope: 'my-project',
+      scope_kind: 'project',
       enabled: true,
     };
     vi.spyOn(api, 'getAutoflowDefs').mockResolvedValue([ROW]);
@@ -52,12 +60,40 @@ describe('AutoflowsDefs — scope-gated toggle', () => {
     expect(screen.queryByRole('button', { name: 'Enable issue-triage' })).not.toBeInTheDocument();
   });
 
-  it('shows the toggle button for a global row', async () => {
+  it('shows the Enabled chip but no toggle for a project row whose display scope collides with the literal "global"', async () => {
+    // A workspace registered at a path ending in `/global` produces exactly
+    // this: display `scope === 'global'` but structured `scope_kind ===
+    // 'project'`. Gating on the display string alone would wrongly offer
+    // the toggle here.
+    const ROW: AutoflowDefRow = {
+      name: 'issue-triage',
+      slug: 'issue-triage',
+      trigger: 'event',
+      scope: 'global',
+      scope_kind: 'project',
+      enabled: true,
+    };
+    vi.spyOn(api, 'getAutoflowDefs').mockResolvedValue([ROW]);
+
+    render(
+      <MemoryRouter initialEntries={['/build/autoflows']}>
+        <AutoflowsDefs />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText('issue-triage')).toBeInTheDocument());
+
+    expect(screen.getAllByText('Enabled').length).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByRole('button', { name: 'Disable issue-triage' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Enable issue-triage' })).not.toBeInTheDocument();
+  });
+
+  it('shows the toggle button for a genuinely global row', async () => {
     const ROW: AutoflowDefRow = {
       name: 'nightly-sweep',
       slug: 'nightly-sweep',
       trigger: 'cron',
       scope: 'global',
+      scope_kind: 'global',
       enabled: true,
     };
     vi.spyOn(api, 'getAutoflowDefs').mockResolvedValue([ROW]);
