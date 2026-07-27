@@ -38,6 +38,20 @@ against the code before being recorded.
 | I-20 | P2 | rupu-config | `resolve()`'s env-override tier is never populated; `KeySource::Env` is unreachable | fixed |
 | I-21 | P2 | rupu-cli | A malformed `config.toml` is silently swallowed on the pricing paths, printing wrong costs | open |
 
+### Found during Arc 1 (unscheduled)
+
+Discovered while fixing Arc 1 and recorded here rather than carried in a report —
+the anti-orphan rule applies to findings made *during* the work, not just to
+planned deferrals. None are regressions from Arc 1; all pre-date it.
+
+| ID | Sev | Area | Title | Status |
+|---|---|---|---|---|
+| I-73 | P1 | rupu-scm | `[scm.default].owner`/`.repo` and `[issues.default].project` are still inert — I-15 wired only `platform`/`tracker` | open |
+| I-74 | P1 | rupu-orchestrator | `generate.rs:167` calls `build_for_provider` without `ProviderConfig`, so `generate` ignores all `[providers.*]` tuning | open |
+| I-75 | P2 | rupu-providers | Anthropic's in-client 429 loop sleeps while holding its concurrency permit (it isn't wrapped in `RetryingProvider`) | open |
+| I-76 | P2 | rupu-providers | The provider decorators don't forward `list_models`; a factory-built `Box<dyn LlmProvider>` would silently return `vec![]` | open |
+| I-77 | P2 | rupu-scm | `insert_repo_connector`/`insert_issue_connector` are documented "test/internal" but carry no `#[cfg]` gate, unlike `empty()` | open |
+
 ### Arc 2 — safety
 
 | ID | Sev | Area | Title | Status |
