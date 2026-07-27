@@ -4560,21 +4560,23 @@ fn render_action_args(
 /// `continue_on_error` — same as every other step shape's render failures,
 /// which are treated as author/config errors, not runtime tool failures.
 ///
-/// Writes exactly one audit-trail transcript line at a fresh path under
-/// `transcript_dir` — an `Event::ActionEmitted` record, the same envelope
-/// shape agent-run transcripts already carry for this event (see
+/// Writes exactly two audit-trail transcript lines at a fresh path under
+/// `transcript_dir`: an `Event::ActionEmitted` record (the same envelope
+/// shape agent-run transcripts already carry for this event — see
 /// `output/workflow_printer.rs` / `output/live_run.rs`, which render it
-/// today with no production writer yet). `allowed` is `false` only for a
-/// `McpError::PermissionDenied` (the call never reached the connector);
-/// any other dispatch error still reached the connector, so `allowed:
-/// true, applied: false`. The line is written once, after the dispatch
-/// call resolves and before the `continue_on_error` branch, so both the
-/// tolerated-failure and hard-abort paths get the same audit record. No
-/// `run_start` preamble: `JsonlReader`'s `read_transcript_run_start` /
-/// `JsonlReader::summary` both tolerate (rather than error on) a first
-/// line that isn't `RunStart` — an action step has no
-/// agent/provider/model to put in one anyway, so a bare single-line file
-/// is the correct shape, not a gap.
+/// today with no production writer yet) followed by an `Event::ToolAudit`
+/// record (spec §4a/§4b's catalog-call audit trail — `ToolAudit`, NOT
+/// `ActionEmitted`, is what the CP transcript panel actually renders a
+/// badge from). `allowed` is `false` only for a `McpError::PermissionDenied`
+/// (the call never reached the connector); any other dispatch error still
+/// reached the connector, so `allowed: true, applied: false`. Both lines
+/// are written once, after the dispatch call resolves and before the
+/// `continue_on_error` branch, so both the tolerated-failure and
+/// hard-abort paths get the same audit record. No `run_start` preamble:
+/// `JsonlReader`'s `read_transcript_run_start` / `JsonlReader::summary`
+/// both tolerate (rather than error on) a first line that isn't
+/// `RunStart` — an action step has no agent/provider/model to put in one
+/// anyway, so a bare single-line file is the correct shape, not a gap.
 async fn execute_action_step(
     dispatcher: &rupu_mcp::ToolDispatcher,
     step: &Step,
@@ -4608,9 +4610,11 @@ async fn execute_action_step(
     // re-deriving it from `allowed` — the SAME classifier the agent-tool-call
     // audit path would use if action nodes had an agent grant to check.
     // An action node's tool is always explicit (it IS `step.action`), so
-    // `declared`/`granted`/`restricted` are always `true` here — there is
-    // no separate allowlist to narrow against (T1's `ActionsOnActionStep`
-    // validation already forbids a non-empty `actions:` on an action step).
+    // `declared`/`granted` are always `true` here — there is no separate
+    // allowlist to narrow against. `restricted` is `false`: it means "the
+    // step had a non-empty `actions:` list", and T1's `ActionsOnActionStep`
+    // validation already forbids a non-empty `actions:` on an action step,
+    // so `true` here would contradict its own definition.
     let tool_audit_blocked = rupu_mcp::ToolDispatcher::is_blocked(&call_result);
     match JsonlWriter::create(&transcript_path) {
         Ok(mut writer) => {
@@ -4627,7 +4631,7 @@ async fn execute_action_step(
                 declared: true,
                 granted: true,
                 blocked: tool_audit_blocked,
-                restricted: true,
+                restricted: false,
             }) {
                 warn!(step = %step.id, error = %e, "failed to write tool_audit transcript line");
             } else if let Err(e) = writer.flush() {

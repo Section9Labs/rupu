@@ -16,7 +16,7 @@ use rupu_orchestrator::executor::{Event as OrchEvent, EventSink};
 use rupu_orchestrator::RunStore;
 use rupu_runtime::provider_factory;
 use rupu_tools::{AgentDispatcher, DispatchError, DispatchOutcome, ToolContext};
-use rupu_transcript::{Event as TxEvent, JsonlReader};
+use rupu_transcript::{Event as TxEvent, JsonlReader, JsonlWriter};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -130,6 +130,35 @@ impl AgentDispatcher for CliAgentDispatcher {
         parent_run_id: &str,
         parent_depth: u32,
     ) -> Result<DispatchOutcome, DispatchError> {
+        // KNOWN LIMITATION (tool_audit design §4/review IMPORTANT 4): the
+        // `AgentDispatcher::dispatch` trait (rupu-tools) takes no narrowed
+        // tool roster and no audit callback, and this is the ONLY
+        // production impl — `dispatch_agent`/`dispatch_agents_parallel`
+        // call straight into it via `ctx.dispatcher`. So a step narrowed by
+        // `actions:` (e.g. read-only `issues.*`) whose agent retains
+        // `dispatch_agent` (a builtin, itself correctly exempt from
+        // narrowing per spec §2) can have its CHILD agent run with the
+        // child's OWN unrestricted `tools:` grant — `agent_tools:
+        // spec.tools.clone()` below never intersects with whatever the
+        // calling step narrowed — and every catalog call the child makes
+        // is invisible to this run's `tool_audit` trail (the child gets
+        // its own transcript/audit machinery, but nothing here ties it
+        // back to the parent step's narrowing). Threading the narrowed
+        // roster + an audit callback through would require changing the
+        // `AgentDispatcher` trait signature and `ToolContext` (rupu-tools,
+        // a port crate `rupu-agent` itself must not gain a reverse
+        // dependency on) plus every impl/mock — out of scope for this
+        // fix. Never silent: warn on every dispatch, and leave a
+        // transcript-visible notice on the child's own run (below).
+        tracing::warn!(
+            child_agent = agent_name,
+            parent_run_id,
+            "dispatch_agent bypasses step `actions:` narrowing: the child inherits its OWN \
+             agent's `tools:` grant verbatim, not the parent step's narrowed roster, and its \
+             tool calls are not covered by the parent step's tool_audit trail (known \
+             limitation — see docs/superpowers/specs/2026-07-26-rupu-step-actions-enforcement-design.md)"
+        );
+
         let project_agents_parent = self.project_root.as_ref().map(|p| p.join(".rupu"));
         let spec =
             rupu_agent::load_agent(&self.global, project_agents_parent.as_deref(), agent_name)
@@ -253,6 +282,8 @@ impl AgentDispatcher for CliAgentDispatcher {
         };
         let duration_ms = started.elapsed().as_millis() as u64;
 
+        write_delegation_narrowing_notice(&transcript_path, agent_name, parent_run_id);
+
         let output = read_final_assistant_text(&transcript_path).unwrap_or_default();
 
         self.emit_dispatch_completed(
@@ -272,6 +303,66 @@ impl AgentDispatcher for CliAgentDispatcher {
             tokens_used: run_result.total_tokens_in + run_result.total_tokens_out,
             duration_ms,
         })
+    }
+}
+
+/// Append a transcript-visible notice to the CHILD's OWN transcript
+/// recording that its tool calls are not covered by the parent step's
+/// `actions:` narrowing or `tool_audit` trail (IMPORTANT 4's fallback —
+/// see the doc comment on `dispatch()`). Written AFTER `run_agent`
+/// returns (appending before it would be wiped: `run_agent` truncates
+/// `transcript_path` via `JsonlWriter::create` as its very first step).
+///
+/// Deliberately reuses the plain `ToolCall`/`ToolResult` shapes (already
+/// rendered by the CP transcript panel with zero new frontend code)
+/// rather than overloading `Event::ToolAudit`'s `declared`/`granted`/
+/// `blocked`/`restricted` fields — this call site has no way to know
+/// whether the parent step was actually narrowed, so inventing values
+/// for those fields would itself be a false record in an audit trail
+/// that must never lie. No `error:` set either: this is a known
+/// architectural limitation, not necessarily evidence anything went
+/// wrong on this particular call, so it renders as a neutral note, not
+/// an alarm.
+///
+/// Best-effort: a write failure is logged and swallowed, same as every
+/// other observability side-channel in this arc — never allowed to
+/// fail the dispatch it's annotating.
+fn write_delegation_narrowing_notice(transcript_path: &Path, child_agent: &str, parent_run_id: &str) {
+    let call_id = format!("delegation_narrowing_notice_{child_agent}");
+    let note = format!(
+        "KNOWN LIMITATION: this child agent (`{child_agent}`, dispatched from parent run \
+         `{parent_run_id}`) was launched via `dispatch_agent` with its OWN agent's `tools:` \
+         grant verbatim. If the parent workflow step declared a non-empty `actions:` \
+         allowlist, that narrowing was NOT applied to this child, and none of the child's \
+         own tool calls are covered by the parent step's `tool_audit` trail. See \
+         docs/superpowers/specs/2026-07-26-rupu-step-actions-enforcement-design.md."
+    );
+    match JsonlWriter::append(transcript_path) {
+        Ok(mut w) => {
+            let write_result = w
+                .write(&TxEvent::ToolCall {
+                    call_id: call_id.clone(),
+                    tool: "dispatch_agent_narrowing_notice".to_string(),
+                    input: serde_json::json!({ "child_agent": child_agent, "parent_run_id": parent_run_id }),
+                })
+                .and_then(|_| {
+                    w.write(&TxEvent::ToolResult {
+                        call_id,
+                        output: note,
+                        error: None,
+                        duration_ms: 0,
+                        structured: None,
+                    })
+                });
+            if let Err(e) = write_result {
+                tracing::warn!(error = %e, "failed to write delegation-narrowing notice");
+            } else if let Err(e) = w.flush() {
+                tracing::warn!(error = %e, "failed to flush delegation-narrowing notice");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to open child transcript for delegation-narrowing notice");
+        }
     }
 }
 
@@ -514,5 +605,86 @@ mod tests {
             result.is_ok(),
             "dispatch with no event sink should behave exactly as before"
         );
+    }
+
+    /// IMPORTANT 4 fallback: `dispatch()` cannot thread the parent step's
+    /// `actions:` narrowing (or an audit callback) into the child launch
+    /// (see the doc comment on `dispatch()` for why), so it must never be
+    /// a SILENT bypass. Assert the child's own transcript carries a
+    /// visible notice recording the limitation.
+    #[tokio::test]
+    async fn dispatch_leaves_a_visible_delegation_narrowing_notice_on_the_child_transcript() {
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join("global");
+        std::fs::create_dir_all(global.join("agents")).unwrap();
+        std::fs::write(
+            global.join("agents/child.md"),
+            "---\nname: child\nprovider: anthropic\nmodel: claude-sonnet-4-6\nmaxTurns: 3\n---\nyou are a child agent.",
+        )
+        .unwrap();
+
+        let runs_dir = dir.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let run_store = Arc::new(RunStore::new(runs_dir));
+
+        let workspace_path = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+
+        let resolver = Arc::new(rupu_auth::KeychainResolver::new());
+        let mcp_registry = Arc::new(rupu_scm::Registry::default());
+
+        let dispatcher = CliAgentDispatcher::new(
+            global,
+            None,
+            "ws_test".into(),
+            workspace_path,
+            resolver,
+            "bypass".into(),
+            mcp_registry,
+            run_store,
+            None,
+        );
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
+        );
+        let result = dispatcher
+            .dispatch("child", "do the thing".into(), "parent_run_1", 0)
+            .await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+
+        let outcome = result.expect("dispatch should succeed against the mock provider");
+
+        let events: Vec<Event> = JsonlReader::iter(&outcome.transcript_path)
+            .expect("child transcript readable")
+            .filter_map(Result::ok)
+            .collect();
+
+        let notice_call = events.iter().any(|e| {
+            matches!(
+                e,
+                Event::ToolCall { tool, .. } if tool == "dispatch_agent_narrowing_notice"
+            )
+        });
+        assert!(
+            notice_call,
+            "expected a dispatch_agent_narrowing_notice ToolCall on the child transcript; got {events:?}"
+        );
+        let notice_result = events.iter().any(|e| {
+            matches!(
+                e,
+                Event::ToolResult { output, error, .. }
+                    if error.is_none() && output.contains("KNOWN LIMITATION")
+            )
+        });
+        assert!(
+            notice_result,
+            "expected the paired ToolResult carrying the limitation text; got {events:?}"
+        );
+
+        // The real final-answer extraction must be unaffected by the
+        // notice (it only scans AssistantMessage events).
+        assert_eq!(outcome.output, "child done");
     }
 }

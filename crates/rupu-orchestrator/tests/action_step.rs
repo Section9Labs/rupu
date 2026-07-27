@@ -345,15 +345,18 @@ async fn happy_path_action_step_dispatches_through_tool_dispatcher() {
     assert_eq!(data["payload"]["body"], "done: hello world");
 
     // The NEW tool_audit line (2026-07-26 audit-trail design): an
-    // action node's tool is always explicit, so declared/granted/
-    // restricted are all `true`; the call succeeded, so blocked is
-    // `false`.
+    // action node's tool is always explicit, so declared/granted are
+    // both `true`; `restricted` is `false` (it means "the step had a
+    // non-empty `actions:` list", and T1 forbids a non-empty `actions:`
+    // on an action step — `true` here would contradict its own
+    // definition, review IMPORTANT-4-adjacent minor fix); the call
+    // succeeded, so blocked is `false`.
     let audit = &lines[1]["data"];
     assert_eq!(lines[1]["type"], "tool_audit");
     assert_eq!(audit["tool"], "scm.prs.comment");
     assert_eq!(audit["declared"], true);
     assert_eq!(audit["granted"], true);
-    assert_eq!(audit["restricted"], true);
+    assert_eq!(audit["restricted"], false);
     assert_eq!(audit["blocked"], false);
 }
 
@@ -654,7 +657,7 @@ steps:
     assert_eq!(audit["tool"], "scm.prs.comment");
     assert_eq!(audit["declared"], true);
     assert_eq!(audit["granted"], true);
-    assert_eq!(audit["restricted"], true);
+    assert_eq!(audit["restricted"], false);
     assert_eq!(audit["blocked"], true, "a readonly-mode permission denial must read as blocked:true");
 }
 

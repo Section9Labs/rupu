@@ -379,6 +379,76 @@ describe('buildTranscriptView — tool_audit', () => {
     expect(tools[0].audit).toEqual({ declared: true, granted: true, blocked: false, restricted: true });
   });
 
+  it('attributes each audit to its own card when a turn has 2 tool_calls (disk order: call A, call B, audit A, result A, audit B, result B)', () => {
+    // Reproduces run_agent's real on-disk ordering: ALL of a turn's
+    // tool_call events are written up front (the "collect tool_uses"
+    // loop), THEN the dispatch loop runs each in sequence emitting that
+    // call's audit + result before moving to the next. A naive
+    // single-slot / last-call-wins pairing scheme attaches call A's audit
+    // to call B's card and spills call B's audit into a third, phantom
+    // standalone card.
+    const callA: TranscriptEvent = {
+      type: 'tool_call',
+      data: { call_id: 'a1', tool: 'issues.create', input: { title: 'A' } },
+    };
+    const callB: TranscriptEvent = {
+      type: 'tool_call',
+      data: { call_id: 'b1', tool: 'scm.prs.comment', input: { body: 'B' } },
+    };
+    const auditA = auditEvent({ tool: 'issues.create', declared: true, granted: true, blocked: false, restricted: true });
+    const resultA: TranscriptEvent = { type: 'tool_result', data: { call_id: 'a1', output: 'ok-a', duration_ms: 1 } };
+    const auditB = auditEvent({ tool: 'scm.prs.comment', declared: false, granted: true, blocked: true, restricted: true });
+    const resultB: TranscriptEvent = { type: 'tool_result', data: { call_id: 'b1', output: '', error: 'permission_denied', duration_ms: 1 } };
+
+    const view = buildTranscriptView([
+      RUN_START,
+      ASSISTANT,
+      callA,
+      callB,
+      auditA,
+      resultA,
+      auditB,
+      resultB,
+    ]);
+    const tools = view.turns.flatMap((t) => t.tools);
+    // Exactly 2 cards — no third, phantom standalone card.
+    expect(tools).toHaveLength(2);
+
+    const cardA = tools.find((t) => t.tool === 'issues.create')!;
+    expect(cardA.audit).toEqual({ declared: true, granted: true, blocked: false, restricted: true });
+    expect(cardA.output).toBe('ok-a');
+
+    const cardB = tools.find((t) => t.tool === 'scm.prs.comment')!;
+    expect(cardB.audit).toEqual({ declared: false, granted: true, blocked: true, restricted: true });
+    expect(cardB.error).toBe('permission_denied');
+  });
+
+  it('attributes 2 audits for the SAME tool called twice in one turn, FIFO', () => {
+    const call1: TranscriptEvent = { type: 'tool_call', data: { call_id: 'x1', tool: 'issues.comment', input: { body: '1' } } };
+    const call2: TranscriptEvent = { type: 'tool_call', data: { call_id: 'x2', tool: 'issues.comment', input: { body: '2' } } };
+    const audit1 = auditEvent({ tool: 'issues.comment', declared: true, granted: true, blocked: false, restricted: true });
+    const result1: TranscriptEvent = { type: 'tool_result', data: { call_id: 'x1', output: 'r1', duration_ms: 1 } };
+    const audit2 = auditEvent({ tool: 'issues.comment', declared: true, granted: true, blocked: true, restricted: true });
+    const result2: TranscriptEvent = { type: 'tool_result', data: { call_id: 'x2', output: '', error: 'permission_denied', duration_ms: 1 } };
+
+    const view = buildTranscriptView([
+      RUN_START,
+      ASSISTANT,
+      call1,
+      call2,
+      audit1,
+      result1,
+      audit2,
+      result2,
+    ]);
+    const tools = view.turns.flatMap((t) => t.tools);
+    expect(tools).toHaveLength(2);
+    expect(tools[0].callId).toBe('x1');
+    expect(tools[0].audit?.blocked).toBe(false);
+    expect(tools[1].callId).toBe('x2');
+    expect(tools[1].audit?.blocked).toBe(true);
+  });
+
   it('does not carry an audit onto an unrelated later tool_call', () => {
     const call1: TranscriptEvent = { type: 'tool_call', data: { call_id: 'c1', tool: 'issues.list', input: {} } };
     const call2: TranscriptEvent = { type: 'tool_call', data: { call_id: 'c2', tool: 'issues.get', input: {} } };

@@ -2,11 +2,13 @@
 //!
 //! A workflow is a YAML file declaring a list of `steps:`, each
 //! pointing at an agent with a prompt template and an `actions:`
-//! allowlist that narrows the agent's tool grant for that step
-//! (validated against the MCP tool catalog and enforced in
-//! `step_factory.rs`). The runner executes steps in order; the
-//! previous step's output is available as `{{ steps.<id>.output }}`
-//! in the next step's prompt template (rendered with minijinja).
+//! allowlist that narrows only the CONNECTOR (MCP catalog) subset of
+//! the agent's tool grant for that step — builtins (`bash`,
+//! `read_file`, …) are unaffected (validated against the MCP tool
+//! catalog and enforced in `step_factory.rs`). The runner executes
+//! steps in order; the previous step's output is available as
+//! `{{ steps.<id>.output }}` in the next step's prompt template
+//! (rendered with minijinja).
 
 pub mod cron_schedule;
 pub mod event_match;

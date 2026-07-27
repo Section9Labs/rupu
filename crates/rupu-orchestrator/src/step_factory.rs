@@ -543,17 +543,32 @@ fn emit_tool_audit(
 /// The original hook, when present, still fires first and unchanged
 /// (same `blocked` value it always would have received under the new
 /// 3-arg signature).
+///
+/// **Catalog-only** (spec §4a/§4b: "per **catalog** call"; §2 revised —
+/// builtins are exempt from narrowing entirely). A builtin call (`bash`,
+/// `read_file`, …) or a genuinely hallucinated non-catalog name is NOT a
+/// catalog call, so no `tool_audit` line is written for it. Without this
+/// filter, every builtin call on a narrowed step produced
+/// `{restricted:true, declared:false, granted:true, blocked:false}` — the
+/// exact signature that means "narrowed away", which is false for a
+/// builtin (builtins are never narrowed, per §2). It also flooded the
+/// transcript with one write/flush per builtin call, and gave a
+/// hallucinated tool name a red `blocked:true` audit line even though it
+/// was never a real permission decision.
 fn wrap_on_tool_call_with_audit(
     inner: Option<OnToolCallCallback>,
     transcript_path: PathBuf,
     step_actions: Vec<String>,
     pre_narrow_tools: Option<Vec<String>>,
 ) -> OnToolCallCallback {
+    let catalog = catalog_tool_names();
     Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
         if let Some(cb) = inner.as_ref() {
             cb(step_id, tool_name, blocked);
         }
-        emit_tool_audit(&transcript_path, tool_name, &step_actions, &pre_narrow_tools, blocked);
+        if catalog.iter().any(|c| c == tool_name) {
+            emit_tool_audit(&transcript_path, tool_name, &step_actions, &pre_narrow_tools, blocked);
+        }
     })
 }
 
@@ -1033,6 +1048,48 @@ steps:
         assert_eq!(lines[0]["data"]["restricted"], false, "actions: [] -> unrestricted");
         assert_eq!(lines[0]["data"]["granted"], true, "issues.list IS in the agent's grant");
         assert_eq!(lines[0]["data"]["blocked"], false);
+    }
+
+    #[tokio::test]
+    async fn builtin_tool_call_on_a_narrowed_step_emits_no_tool_audit() {
+        // Regression (tool_audit IMPORTANT 3): spec §4a/§4b say "per
+        // **catalog** call", and §2 (revised) exempts builtins from
+        // narrowing entirely. Before this fix, EVERY tool call — builtin
+        // or catalog — got an audit line, so a `bash` call on a step
+        // narrowed to `[issues.list]` wrote
+        // `{restricted:true, declared:false, granted:true, blocked:false}`
+        // — the exact signature that means "narrowed away", which is
+        // false for a builtin. `bash` must produce NO tool_audit line at
+        // all.
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_agent(tmp.path());
+        let f = factory(tmp.path().to_path_buf());
+        let transcript_path = tmp.path().join("transcript_builtin.jsonl");
+
+        let opts = f
+            .build_opts_for_step(
+                "narrowed",
+                "ag",
+                "prompt".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                transcript_path.clone(),
+                None,
+            )
+            .await;
+        let cb = opts.on_tool_call.expect("always wired");
+
+        // A builtin call on the same narrowed step: no audit line.
+        cb("narrowed", "bash", false);
+        let lines = read_tool_audit_lines(&transcript_path);
+        assert_eq!(lines.len(), 0, "a builtin call must not be audited: {lines:?}");
+
+        // A catalog call on the same step: exactly one audit line.
+        cb("narrowed", "issues.list", false);
+        let lines = read_tool_audit_lines(&transcript_path);
+        assert_eq!(lines.len(), 1, "a catalog call must be audited: {lines:?}");
+        assert_eq!(lines[0]["data"]["tool"], "issues.list");
     }
 
     const WF_UNGRANTED: &str = r#"

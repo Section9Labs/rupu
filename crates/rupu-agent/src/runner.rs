@@ -1230,16 +1230,20 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                         continue;
                     }
                 };
-                if let Some(cb) = opts.on_tool_call.as_ref() {
-                    // Flush first so a concurrently-appending side
-                    // writer (the orchestrator's tool_audit closure)
-                    // that fires from `cb` reliably lands AFTER this
-                    // call's `ToolCall` event in on-disk order.
-                    writer.flush()?;
-                    cb(&opts.step_id, &tool_name, false);
-                }
+                // The audit callback fires AFTER `invoke` resolves, not
+                // before: the mode check (readonly blocks writes) lives
+                // inside `invoke` (McpToolAdapter -> ToolDispatcher ->
+                // McpPermission::check), so firing beforehand with a
+                // hardcoded `blocked: false` recorded a per-mode denial as
+                // an allowed call — a false negative in the audit trail
+                // (spec §4a/§4b; a readonly-mode write denial MUST show
+                // `blocked: true`). `blocked` is derived from the actual
+                // outcome below. Exactly one callback invocation per call,
+                // same as before.
                 let started_tool = Instant::now();
-                match tool.invoke(input.clone(), &opts.tool_context).await {
+                let invoke_result = tool.invoke(input.clone(), &opts.tool_context).await;
+                let blocked = matches!(invoke_result, Err(rupu_tools::ToolError::PermissionDenied));
+                match invoke_result {
                     Ok(out) => {
                         let clamped_stdout = clamp_tool_result_text(&out.stdout);
                         writer.write(&Event::ToolResult {
@@ -1288,6 +1292,14 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                         })?;
                         tool_results.push((call_id, String::new(), Some(msg)));
                     }
+                }
+                if let Some(cb) = opts.on_tool_call.as_ref() {
+                    // Flush first so a concurrently-appending side writer
+                    // (the orchestrator's tool_audit closure) that fires
+                    // from `cb` reliably lands AFTER this call's
+                    // `ToolResult` event in on-disk order.
+                    writer.flush()?;
+                    cb(&opts.step_id, &tool_name, blocked);
                 }
             }
 
@@ -1669,6 +1681,110 @@ mod on_tool_call_tests {
             )
         });
         assert!(saw_tool_error, "expected a tool-error ToolResult for the denied call; got {events:?}");
+    }
+
+    #[tokio::test]
+    async fn readonly_mode_mcp_write_denial_fires_on_tool_call_with_blocked_true() {
+        // Regression (tool_audit CRITICAL 1): the mode check (readonly
+        // blocks write tools) lives INSIDE `McpToolAdapter::invoke` ->
+        // `ToolDispatcher::call` -> `McpPermission::check`, not in the
+        // registry-lookup fast path `denied_tool_call_...` above covers.
+        // `issues.create` IS in the registry (agent_tools: None ->
+        // unrestricted -> every catalog tool registered), so this call
+        // reaches `tool.invoke`, and readonly mode denies it there. Before
+        // the fix, `on_tool_call` fired BEFORE `invoke` with a hardcoded
+        // `blocked: false` — a false negative in the audit trail for
+        // exactly this case. It must now report `blocked: true`.
+        let calls: Arc<Mutex<Vec<(String, String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let cb: OnToolCallCallback = Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
+            calls_clone
+                .lock()
+                .unwrap()
+                .push((step_id.to_string(), tool_name.to_string(), blocked));
+        });
+
+        let tmp_dir = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp_dir.path().join("run_test_readonly_denied.jsonl");
+
+        let provider = MockProvider::new(vec![
+            ScriptedTurn::AssistantToolUse {
+                text: None,
+                tool_id: "call_issues_create_1".into(),
+                tool_name: "issues.create".into(),
+                tool_input: serde_json::json!({
+                    "repo": "acme/widgets",
+                    "title": "t",
+                    "body": "b"
+                }),
+                stop: StopReason::ToolUse,
+            },
+            ScriptedTurn::AssistantText {
+                text: "done".into(),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]);
+
+        let opts = AgentRunOpts {
+            agent_name: "test-agent".into(),
+            agent_system_prompt: "test".into(),
+            agent_tools: None,
+            provider: Box::new(provider),
+            provider_name: "mock".into(),
+            model: "mock-1".into(),
+            run_id: "run_readonly_denied".into(),
+            workspace_id: "ws_test".into(),
+            workspace_path: tmp_dir.path().to_path_buf(),
+            transcript_path,
+            max_turns: 5,
+            decider: Arc::new(BypassDecider),
+            tool_context: rupu_tools::ToolContext {
+                workspace_path: tmp_dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            user_message: "test prompt".into(),
+            initial_messages: Vec::new(),
+            turn_index_offset: 0,
+            mode_str: "readonly".into(),
+            no_stream: true,
+            suppress_stream_stdout: false,
+            mcp_registry: Some(Arc::new(Registry::default())),
+            effort: None,
+            context_window: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
+            step_id: "s1".into(),
+            on_tool_call: Some(cb),
+            on_stream_event: None,
+            concerns: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            scope_name: None,
+            surface_tag: None,
+            context_window_tokens: None,
+            compact_at_percent: None,
+            pause: None,
+        };
+
+        let result = run_agent(opts)
+            .await
+            .expect("a denied tool call must not fail the whole run");
+        assert_eq!(result.status, RunStatus::Ok, "run must complete Ok");
+
+        let log = calls.lock().unwrap();
+        assert_eq!(log.len(), 1, "expected exactly one on_tool_call, got {log:?}");
+        assert_eq!(
+            log[0],
+            ("s1".to_string(), "issues.create".to_string(), true),
+            "readonly-mode write denial must report blocked: true, got {log:?}"
+        );
     }
 
     #[tokio::test]
