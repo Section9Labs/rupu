@@ -56,7 +56,7 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 | ID | Sev | Area | Title | Status |
 |---|---|---|---|---|
-| I-22 | P1 | rupu-tools | `grep` and `ast_grep` escape the workspace — no `path_scope` containment | open |
+| I-22 | P1 | rupu-tools | `grep` and `ast_grep` escape the workspace — no `path_scope` containment | fixed |
 | I-23 | P0 | docs/autoflow | The autoflow author allowlist is undocumented and defaults to no restriction | open |
 | I-24 | P1 | rupu-cli | `on_reject` cleanup runs at `ask` mode regardless of the run's original mode | open |
 | I-25 | P1 | rupu-cli | `rupu workflow runs` — a list command — executes `on_reject` chains as a side effect | open |
@@ -131,33 +131,6 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 ---
 
 ## Open
-
-### I-22 — `grep` and `ast_grep` escape the workspace
-
-**Symptom.** An agent-supplied `path` argument reads outside the workspace:
-`path: "/etc"` (absolute) or `path: "../.."` both leave the sandbox. The write
-tools refuse the same input.
-
-**Root cause.** Both tools build their search root with a bare join and no
-containment check — `crates/rupu-tools/src/grep.rs:74` and
-`crates/rupu-tools/src/ast_grep.rs:150`, each
-`.map(|p| ctx.workspace_path.join(p))`. `Path::join` *replaces* the base when
-the argument is absolute, and does not normalize `..`. The crate already has
-the guard: `path_scope::is_inside` (`crates/rupu-tools/src/path_scope.rs:9`)
-canonicalizes both ends and is used by `read_file.rs:60`, `write_file.rs`, and
-`edit_file.rs`. The two search tools were simply never wired to it.
-
-**Impact.** The workspace boundary is a containment guarantee the write tools
-enforce and the read tools don't, so an agent can read `/etc`, `~/.ssh`, or a
-sibling repo through `grep`. Bounded by being read-only and still
-permission-gated, but it is a real escape from a documented boundary.
-
-**Fix.** Apply the same `is_inside` check both tools' siblings use, returning
-the same "escapes workspace" error shape. Note `glob` is **not** affected — it
-takes no user-supplied path and walks only `ctx.workspace_path`
-(`glob.rs:54`); the original TODO naming it was wrong.
-
----
 
 ### I-23 — the autoflow author allowlist is undocumented and defaults to open
 
@@ -530,6 +503,55 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-22 — `grep` and `ast_grep` escape the workspace
+
+**Symptom.** An agent-supplied `path` argument reads outside the workspace:
+`path: "/etc"` (absolute) or `path: "../.."` both leave the sandbox. The write
+tools refuse the same input.
+
+**Root cause.** Both tools built their search root with a bare join and no
+containment check — `crates/rupu-tools/src/grep.rs:74` and
+`crates/rupu-tools/src/ast_grep.rs:150`, each
+`.map(|p| ctx.workspace_path.join(p))`. `Path::join` *replaces* the base when
+the argument is absolute, and does not normalize `..`. The crate already had
+the guard: `path_scope::is_inside` (`crates/rupu-tools/src/path_scope.rs:9`)
+canonicalizes both ends and is used by `read_file.rs:60`, `write_file.rs`, and
+`edit_file.rs`. The two search tools were simply never wired to it.
+
+**Impact.** The workspace boundary is a containment guarantee the write tools
+enforce and the read tools don't, so an agent could read `/etc`, `~/.ssh`, or a
+sibling repo through `grep`. Bounded by being read-only and still
+permission-gated, but it was a real escape from a documented boundary.
+
+**Fix.** PR (branch `arc2/safety`). Added the same `path_scope::is_inside`
+containment check `read_file`/`write_file`/`edit_file` already use, immediately
+after computing `search_path` in both `crates/rupu-tools/src/grep.rs` and
+`crates/rupu-tools/src/ast_grep.rs`. A path that resolves outside the
+workspace root now returns `ToolOutput { error: Some("path {P} escapes
+workspace"), .. }` before `rg`/`ast-grep` is ever spawned — no external command
+runs against a rejected path, so nothing outside the workspace is even
+attempted, let alone read. `glob` was left untouched: confirmed it takes no
+user-supplied path and walks only `ctx.workspace_path` (`glob.rs:54`); the
+original TODO naming it as affected was wrong.
+
+**Validation.** `cargo test -p rupu-tools --lib` — 23 tests, 6 new (a
+three-test trio per tool, added as in-file `#[cfg(test)] mod tests`):
+`grep::tests::an_absolute_path_is_refused` / `a_parent_traversal_is_refused` /
+`an_in_workspace_path_still_searches`, mirrored in `ast_grep::tests`. Each
+absolute/traversal test asserts both the refusal string (`"escapes
+workspace"`) on `ToolOutput.error` AND that the outside file's name
+(`outside.txt` / `outside.rs`) never appears in `ToolOutput.stdout`, so the
+refusal can't leak partial results gathered before the guard fired. The
+in-workspace test proves the guard doesn't regress a legitimate search.
+`ast-grep` was present on PATH in this environment (Homebrew), so its tests
+exercised the real binary rather than being gated; they still self-gate via
+`which::which("ast-grep")` so a box without the binary degrades to a skip
+rather than a failure. `cargo build --workspace`, `cargo clippy -p rupu-tools
+--lib --tests`, and `rustfmt --edition 2021 --check` on both changed files are
+all clean.
+
+---
 
 ### I-9 … I-14, I-17, I-20 — dead configuration
 
