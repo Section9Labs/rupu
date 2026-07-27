@@ -85,30 +85,38 @@ fn empty_config_is_valid() {
     assert_eq!(cfg.default_provider, None);
 }
 
+/// I-28 migration shim: `[cp].agent_authoring_ui` used to select the CP web
+/// app's classic-vs-next agent-authoring UI. The classic UI is gone and the
+/// key is now accepted-as-a-no-op (not "gone" -- `deny_unknown_fields` would
+/// otherwise reject any config.toml still carrying it). This test only
+/// proves the key no longer drives anything; it does not assert a "classic"
+/// default because there is no longer a UI selection to default.
 #[test]
-fn cp_config_defaults_agent_authoring_ui_to_classic() {
+fn cp_config_agent_authoring_ui_is_accepted_as_a_no_op() {
     let cfg: rupu_config::policy_config::CpConfig = toml::from_str("").expect("empty [cp] parses");
-    assert_eq!(cfg.agent_authoring_ui, "classic");
+    assert!(cfg.agent_authoring_ui.is_none());
 }
 
 #[test]
-fn cp_config_accepts_next_agent_authoring_ui() {
+fn cp_config_accepts_next_agent_authoring_ui_as_a_no_op() {
     let cfg: rupu_config::policy_config::CpConfig =
         toml::from_str("agent_authoring_ui = \"next\"").unwrap();
-    assert_eq!(cfg.agent_authoring_ui, "next");
+    assert!(cfg.agent_authoring_ui.is_some());
 }
 
+/// I-29 migration shim: `[cp].workflow_editor_ui` -- same shape as
+/// `agent_authoring_ui` above, see that test's doc comment.
 #[test]
-fn cp_config_defaults_workflow_editor_ui_to_classic() {
+fn cp_config_workflow_editor_ui_is_accepted_as_a_no_op() {
     let cfg: rupu_config::policy_config::CpConfig = toml::from_str("").expect("empty [cp] parses");
-    assert_eq!(cfg.workflow_editor_ui, "classic");
+    assert!(cfg.workflow_editor_ui.is_none());
 }
 
 #[test]
-fn cp_config_accepts_next_workflow_editor_ui() {
+fn cp_config_accepts_next_workflow_editor_ui_as_a_no_op() {
     let cfg: rupu_config::policy_config::CpConfig =
         toml::from_str("workflow_editor_ui = \"next\"").unwrap();
-    assert_eq!(cfg.workflow_editor_ui, "next");
+    assert!(cfg.workflow_editor_ui.is_some());
 }
 
 #[test]
@@ -237,4 +245,161 @@ fn retry_survives_layer_files_and_the_lock_aware_loader() {
         .expect("`[retry]` must not fail the lock-aware loader");
     assert_eq!(locked.default_model.as_deref(), Some("g"));
     assert_eq!(locked.log_level.as_deref(), Some("debug"));
+}
+
+/// I-28/I-29 migration shim: a `config.toml` that still sets
+/// `[cp].agent_authoring_ui` must parse, and every *other* `[cp]` key in the
+/// same file must survive with its value intact. `gate_sweep_interval_secs`
+/// is asserted against a non-default value (60 is the compiled default) --
+/// this is the assertion that would have caught the Arc 1 `[retry]`
+/// regression, where `.unwrap_or_default()` silently discarded the entire
+/// config on a parse failure. A test that only checks "did it parse" cannot
+/// distinguish "the whole config loaded" from "the whole config was
+/// silently replaced by defaults".
+#[test]
+fn cp_agent_authoring_ui_still_parses_with_sibling_cp_keys_intact() {
+    let toml = r#"
+        [cp]
+        agent_authoring_ui = "next"
+        gate_sweep_interval_secs = 15
+        gate_sweep_enabled = false
+        max_workspace_bytes = 1048576
+    "#;
+    let cfg: Config = toml::from_str(toml).expect("`[cp].agent_authoring_ui` must not fail the parse");
+
+    // The deprecated key is accepted opaquely...
+    assert!(cfg.cp.agent_authoring_ui.is_some());
+
+    // ...and every sibling `[cp]` key in the same table kept its own
+    // (non-default) value rather than the whole section silently resetting.
+    assert_eq!(cfg.cp.gate_sweep_interval_secs, 15);
+    assert!(!cfg.cp.gate_sweep_enabled);
+    assert_eq!(cfg.cp.max_workspace_bytes, Some(1_048_576));
+
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
+fn cp_workflow_editor_ui_still_parses_with_sibling_cp_keys_intact() {
+    let toml = r#"
+        [cp]
+        workflow_editor_ui = "next"
+        gate_sweep_interval_secs = 15
+        gate_sweep_enabled = false
+        max_workspace_bytes = 1048576
+    "#;
+    let cfg: Config =
+        toml::from_str(toml).expect("`[cp].workflow_editor_ui` must not fail the parse");
+
+    assert!(cfg.cp.workflow_editor_ui.is_some());
+
+    assert_eq!(cfg.cp.gate_sweep_interval_secs, 15);
+    assert!(!cfg.cp.gate_sweep_enabled);
+    assert_eq!(cfg.cp.max_workspace_bytes, Some(1_048_576));
+
+    assert!(cfg.validate().is_ok());
+}
+
+/// Deprecated keys round-trip out of any TOML rewrite (`skip_serializing`),
+/// mirroring the `[retry]` shim's contract.
+#[test]
+fn cp_deprecated_ui_keys_never_round_trip_back_out() {
+    let toml = r#"
+        [cp]
+        agent_authoring_ui = "next"
+        workflow_editor_ui = "next"
+    "#;
+    let cfg: Config = toml::from_str(toml).expect("parse");
+    let round_tripped = toml::to_string(&cfg).expect("serialize");
+    assert!(
+        !round_tripped.contains("agent_authoring_ui"),
+        "deprecated key must not be re-serialized: {round_tripped}"
+    );
+    assert!(
+        !round_tripped.contains("workflow_editor_ui"),
+        "deprecated key must not be re-serialized: {round_tripped}"
+    );
+}
+
+/// A minimal `tracing::Subscriber` that records every event's fields as a
+/// single formatted string, so tests can assert a specific `tracing::warn!`
+/// fired without pulling in an extra dev-dependency crate.
+mod capture {
+    use std::fmt;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing::{span, Event, Metadata, Subscriber};
+
+    #[derive(Clone, Default)]
+    pub struct CapturingSubscriber {
+        pub messages: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct FieldVisitor(String);
+
+    impl Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            if !self.0.is_empty() {
+                self.0.push(' ');
+            }
+            self.0.push_str(&format!("{}={:?}", field.name(), value));
+        }
+    }
+
+    impl Subscriber for CapturingSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = FieldVisitor(String::new());
+            event.record(&mut visitor);
+            self.messages.lock().unwrap().push(visitor.0);
+        }
+
+        fn enter(&self, _span: &span::Id) {}
+
+        fn exit(&self, _span: &span::Id) {}
+    }
+}
+
+/// The second half of the binding test: presence of either deprecated key
+/// must emit a one-line `tracing::warn!` naming it, mirroring `[retry]`'s
+/// `warn_deprecated_keys` contract.
+#[test]
+fn cp_deprecated_ui_keys_emit_a_deprecation_warning_each() {
+    let cfg: Config = toml::from_str(
+        r#"
+        [cp]
+        agent_authoring_ui = "next"
+        workflow_editor_ui = "next"
+    "#,
+    )
+    .expect("parse");
+
+    let subscriber = capture::CapturingSubscriber::default();
+    let messages = subscriber.messages.clone();
+    tracing::subscriber::with_default(subscriber, || {
+        cfg.validate().expect("validate");
+    });
+
+    let logs = messages.lock().unwrap();
+    let joined = logs.join("\n");
+    assert!(
+        joined.contains("cp.agent_authoring_ui"),
+        "expected a deprecation warning naming cp.agent_authoring_ui, got: {joined}"
+    );
+    assert!(
+        joined.contains("cp.workflow_editor_ui"),
+        "expected a deprecation warning naming cp.workflow_editor_ui, got: {joined}"
+    );
 }

@@ -157,6 +157,26 @@ impl Config {
                  reject it."
             );
         }
+        if self.cp.agent_authoring_ui.is_some() {
+            tracing::warn!(
+                key = "cp.agent_authoring_ui",
+                "config.toml still declares `[cp].agent_authoring_ui`. The CP web \
+                 app's classic agent-authoring UI has been deleted; the \"next\" UI \
+                 is now the only UI and this key is accepted as a no-op so the rest \
+                 of your config still loads. Delete `[cp].agent_authoring_ui`. A \
+                 future release will reject it."
+            );
+        }
+        if self.cp.workflow_editor_ui.is_some() {
+            tracing::warn!(
+                key = "cp.workflow_editor_ui",
+                "config.toml still declares `[cp].workflow_editor_ui`. The CP web \
+                 app's classic workflow-editor UI has been deleted; the \"next\" UI \
+                 is now the only UI and this key is accepted as a no-op so the rest \
+                 of your config still loads. Delete `[cp].workflow_editor_ui`. A \
+                 future release will reject it."
+            );
+        }
     }
 
     /// Validate cross-field invariants not expressible in serde.
