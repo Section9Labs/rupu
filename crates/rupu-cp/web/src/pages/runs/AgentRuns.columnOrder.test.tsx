@@ -1,8 +1,10 @@
 // @vitest-environment jsdom
 // AgentRuns — canonical run-table column order (table-standardization
 // follow-up, I1): Status leads, then Subject (Agent) → ID (Run) → Source
-// → Host → usage → Turns → Duration → Started. Pure reorder — see
-// AgentRuns.test.tsx for behavioral coverage.
+// → Host → usage → Turns → Duration → Started → row actions (trailing,
+// unlabeled — runs-section row-actions plan Task 3). Pure reorder — see
+// AgentRuns.test.tsx for behavioral coverage and AgentRuns.actions.test.tsx
+// for the row-actions themselves.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
@@ -73,6 +75,7 @@ describe('AgentRuns — canonical column order', () => {
       'Turns',
       'Duration',
       'Started',
+      '', // row-actions column (unlabeled) — Task 3
     ]);
   });
 });
