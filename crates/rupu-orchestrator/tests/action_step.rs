@@ -336,13 +336,28 @@ async fn happy_path_action_step_dispatches_through_tool_dispatcher() {
         comment.transcript_path
     );
     let lines = read_transcript_lines(&comment.transcript_path);
-    assert_eq!(lines.len(), 1, "exactly one audit line; got {lines:?}");
+    assert_eq!(lines.len(), 2, "action_emitted + tool_audit lines; got {lines:?}");
     let data = &lines[0]["data"];
     assert_eq!(lines[0]["type"], "action_emitted");
     assert_eq!(data["kind"], "scm.prs.comment");
     assert_eq!(data["applied"], true);
     assert_eq!(data["allowed"], true);
     assert_eq!(data["payload"]["body"], "done: hello world");
+
+    // The NEW tool_audit line (2026-07-26 audit-trail design): an
+    // action node's tool is always explicit, so declared/granted are
+    // both `true`; `restricted` is `false` (it means "the step had a
+    // non-empty `actions:` list", and T1 forbids a non-empty `actions:`
+    // on an action step — `true` here would contradict its own
+    // definition, review IMPORTANT-4-adjacent minor fix); the call
+    // succeeded, so blocked is `false`.
+    let audit = &lines[1]["data"];
+    assert_eq!(lines[1]["type"], "tool_audit");
+    assert_eq!(audit["tool"], "scm.prs.comment");
+    assert_eq!(audit["declared"], true);
+    assert_eq!(audit["granted"], true);
+    assert_eq!(audit["restricted"], false);
+    assert_eq!(audit["blocked"], false);
 }
 
 // ---------------------------------------------------------------------------
@@ -511,7 +526,7 @@ steps:
     // `output/live_run.rs` consumers already reading it that way.
     assert!(comment.transcript_path.exists());
     let lines = read_transcript_lines(&comment.transcript_path);
-    assert_eq!(lines.len(), 1, "exactly one audit line; got {lines:?}");
+    assert_eq!(lines.len(), 2, "action_emitted + tool_audit lines; got {lines:?}");
     let data = &lines[0]["data"];
     assert_eq!(lines[0]["type"], "action_emitted");
     assert_eq!(data["kind"], "scm.prs.comment");
@@ -521,6 +536,13 @@ steps:
         data["reason"].as_str().unwrap_or_default().contains("boom"),
         "reason must carry the connector's error string; got {data:?}"
     );
+
+    // A connector-level failure (not a permission denial) must NOT read
+    // as `blocked: true` in the audit trail — the call reached the
+    // connector; it just failed there.
+    let audit = &lines[1]["data"];
+    assert_eq!(lines[1]["type"], "tool_audit");
+    assert_eq!(audit["blocked"], false, "a connector error is not a permission denial");
 
     let after = &res.step_results[1];
     assert_eq!(after.step_id, "after");
@@ -570,6 +592,73 @@ async fn readonly_mode_blocks_write_tool_before_the_connector_is_called() {
         connector.calls.lock().unwrap().is_empty(),
         "a denied call must never reach the connector"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Case 4b — same denial, but `continue_on_error: true` so the run
+// surfaces a `StepResult` we can inspect: the tool_audit line must read
+// `blocked: true`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn readonly_mode_denial_writes_tool_audit_blocked_true() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let yaml = r#"
+name: action-readonly-tolerated
+steps:
+  - id: comment
+    action: scm.prs.comment
+    continue_on_error: true
+    with:
+      platform: github
+      owner: acme
+      repo: widget
+      number: 3
+      body: "oops"
+"#;
+    let wf = Workflow::parse(yaml).unwrap();
+    let (dispatcher, connector) = dispatcher_with_connector(PermissionMode::Readonly, false);
+
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_action_readonly_tolerated".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(yaml.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: Some(dispatcher),
+        pause: None,
+    };
+
+    let res = run_workflow(opts).await.expect("continue_on_error tolerates the denial");
+    assert!(connector.calls.lock().unwrap().is_empty(), "a denied call must never reach the connector");
+
+    let comment = &res.step_results[0];
+    assert!(!comment.success, "a permission denial must record as a failure");
+    assert!(comment.transcript_path.exists());
+    let lines = read_transcript_lines(&comment.transcript_path);
+    assert_eq!(lines.len(), 2, "action_emitted + tool_audit lines; got {lines:?}");
+    assert_eq!(lines[0]["type"], "action_emitted");
+    assert_eq!(lines[0]["data"]["allowed"], false);
+
+    let audit = &lines[1]["data"];
+    assert_eq!(lines[1]["type"], "tool_audit");
+    assert_eq!(audit["tool"], "scm.prs.comment");
+    assert_eq!(audit["declared"], true);
+    assert_eq!(audit["granted"], true);
+    assert_eq!(audit["restricted"], false);
+    assert_eq!(audit["blocked"], true, "a readonly-mode permission denial must read as blocked:true");
 }
 
 // ---------------------------------------------------------------------------

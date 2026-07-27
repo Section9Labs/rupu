@@ -1898,6 +1898,12 @@ enum SessionEntry {
         applied: bool,
         reason: Option<String>,
     },
+    ToolAudit {
+        tool: String,
+        declared: bool,
+        granted: bool,
+        blocked: bool,
+    },
     GateRequested {
         gate_id: String,
         prompt: String,
@@ -2367,6 +2373,20 @@ impl SessionInteractiveState {
                     allowed: *allowed,
                     applied: *applied,
                     reason: reason.clone(),
+                });
+            }
+            TranscriptEvent::ToolAudit {
+                tool,
+                declared,
+                granted,
+                blocked,
+                ..
+            } => {
+                self.push_entry(SessionEntry::ToolAudit {
+                    tool: tool.clone(),
+                    declared: *declared,
+                    granted: *granted,
+                    blocked: *blocked,
                 });
             }
             TranscriptEvent::GateRequested {
@@ -3827,6 +3847,16 @@ fn render_session_entry_rows(
                 width,
             )
         }
+        SessionEntry::ToolAudit { tool, declared, granted, blocked } => {
+            let status = if *blocked { Status::Failed } else { Status::Complete };
+            let detail = format!("{tool}  ·  declared={declared} granted={granted} blocked={blocked}");
+            render_nested_event_rows(
+                next_is_nested,
+                status,
+                retained_session_event_line_raw(status, "tool audit", &detail),
+                width,
+            )
+        }
         SessionEntry::GateRequested {
             gate_id,
             prompt,
@@ -4035,6 +4065,7 @@ fn session_entry_is_nested(entry: Option<&SessionEntry>) -> bool {
                 | SessionEntry::FileEdit { .. }
                 | SessionEntry::CommandRun { .. }
                 | SessionEntry::ActionEmitted { .. }
+                | SessionEntry::ToolAudit { .. }
                 | SessionEntry::GateRequested { .. }
         )
     )
@@ -4547,6 +4578,24 @@ fn transcript_event_lines(
                         Status::Failed
                     },
                     "action",
+                    &detail,
+                ),
+                continuation: false,
+            }]
+        }
+        TranscriptEvent::ToolAudit {
+            tool,
+            declared,
+            granted,
+            blocked,
+            ..
+        } => {
+            let detail = format!("{tool}  ·  declared={declared} granted={granted} blocked={blocked}");
+            vec![SessionViewLine {
+                status: if *blocked { Status::Failed } else { Status::Complete },
+                text: retained_session_event_line_raw(
+                    if *blocked { Status::Failed } else { Status::Complete },
+                    "tool audit",
                     &detail,
                 ),
                 continuation: false,

@@ -97,6 +97,12 @@ pub enum ActivityKind {
     Finding,
     Coverage,
     Text,
+    /// A `tool_audit` line recording a DENIED catalog call (step
+    /// `actions:` narrowing or the run's permission mode). Without this,
+    /// `workflow run`'s live focus feed was the only one of the 6
+    /// tool_audit-consuming surfaces that never showed a blocked call —
+    /// `map_transcript_event` returned `None` for every `ToolAudit` event.
+    Blocked,
 }
 
 impl ActivityKind {
@@ -106,6 +112,7 @@ impl ActivityKind {
             ActivityKind::Finding => '⚑',
             ActivityKind::Coverage => '✓',
             ActivityKind::Text => '·',
+            ActivityKind::Blocked => '✕',
         }
     }
 
@@ -115,6 +122,7 @@ impl ActivityKind {
             ActivityKind::Finding => palette::SEV_HIGH,
             ActivityKind::Coverage => COMPLETE,
             ActivityKind::Text => DIM,
+            ActivityKind::Blocked => palette::FAILED,
         }
     }
 }
@@ -1740,6 +1748,15 @@ pub fn map_transcript_event(
                 None
             }
         }
+        // A denied catalog call (step `actions:` narrowing or the run's
+        // permission mode) — the ONE tool_audit outcome operators must
+        // never miss. Allowed calls stay silent here (the paired
+        // `ToolCall` line above already surfaced the attempt); we're not
+        // duplicating the whole audit trail into the focus feed, just
+        // making sure a denial is never invisible.
+        Tx::ToolAudit { tool, blocked, .. } if *blocked => {
+            Some((ActivityKind::Blocked, format!("{tool}  blocked")))
+        }
         _ => None,
     }
 }
@@ -2126,6 +2143,39 @@ mod tests {
         assert_eq!(kind, ActivityKind::Finding);
         assert!(text.starts_with("HIGH"), "{text:?}");
         assert!(text.contains("path traversal"), "{text:?}");
+    }
+
+    #[test]
+    fn map_transcript_blocked_tool_audit_surfaces_as_blocked() {
+        // Regression (minor fix, tool_audit review): `workflow run`'s live
+        // focus feed used to return `None` for EVERY `ToolAudit` event, so
+        // it was the only one of the 6 tool_audit-consuming surfaces that
+        // never showed a blocked call. A denial must now surface.
+        let ev = rupu_transcript::Event::ToolAudit {
+            tool: "issues.create".into(),
+            declared: true,
+            granted: true,
+            blocked: true,
+            restricted: true,
+        };
+        let (kind, text) = map_transcript_event(&ev, ts(0)).unwrap();
+        assert_eq!(kind, ActivityKind::Blocked);
+        assert!(text.contains("issues.create"), "{text:?}");
+        assert!(text.contains("blocked"), "{text:?}");
+    }
+
+    #[test]
+    fn map_transcript_allowed_tool_audit_stays_silent() {
+        // An allowed call's `tool_audit` line adds no signal beyond the
+        // `ToolCall` line already shown — must not duplicate the feed.
+        let ev = rupu_transcript::Event::ToolAudit {
+            tool: "issues.list".into(),
+            declared: false,
+            granted: true,
+            blocked: false,
+            restricted: false,
+        };
+        assert!(map_transcript_event(&ev, ts(0)).is_none());
     }
 
     #[test]

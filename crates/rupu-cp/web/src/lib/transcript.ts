@@ -19,6 +19,7 @@ export type TranscriptEvent =
   | { type: 'file_edit'; data: Record<string, unknown> }
   | { type: 'command_run'; data: Record<string, unknown> }
   | { type: 'action_emitted'; data: Record<string, unknown> }
+  | { type: 'tool_audit'; data: { tool: string; declared: boolean; granted: boolean; blocked: boolean; restricted: boolean } }
   | { type: 'gate_requested'; data: Record<string, unknown> }
   | { type: 'turn_end'; data: { tokens_in?: number | null; tokens_out?: number | null } }
   | { type: 'usage'; data: { input_tokens: number; output_tokens: number; cached_tokens: number } }

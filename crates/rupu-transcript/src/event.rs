@@ -100,6 +100,37 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         error: Option<String>,
     },
+    /// Per-catalog-tool-call audit trail (step `actions:` enforcement,
+    /// 2026-07-26 design). Emitted from two choke points: the agent
+    /// runtime's `on_tool_call` hook (wrapped in
+    /// `rupu-orchestrator::step_factory`) for agent-driven MCP calls, and
+    /// `execute_action_step` for `action:`-node calls. NEVER confuse this
+    /// with `ActionEmitted` (the older, `action:`-step-only envelope) —
+    /// `ToolAudit` is the general catalog-call audit line and is emitted
+    /// *alongside* `ActionEmitted` for action steps, not instead of it.
+    ToolAudit {
+        /// The MCP catalog tool name (e.g. `issues.create`).
+        tool: String,
+        /// Whether `tool` appears in the step's `actions:` allowlist.
+        /// `false` both when `actions:` is empty/absent (the step is
+        /// unrestricted — NOT a violation) and when `actions:` is
+        /// non-empty but doesn't name this tool. Use `restricted` to
+        /// tell those two apart.
+        declared: bool,
+        /// Whether `tool` is covered by the agent's `tools:` grant
+        /// (wildcard-expanded, evaluated BEFORE any `actions:`
+        /// narrowing — see `rupu-orchestrator::step_factory::
+        /// narrow_agent_tools`). For an `action:` node (no agent
+        /// grant concept applies) this is always `true`.
+        granted: bool,
+        /// Whether the call was actually denied — either narrowed out
+        /// of the agent's roster (never reached the registry) or
+        /// denied by the MCP mode/permission gate.
+        blocked: bool,
+        /// Whether the step declared a non-empty `actions:` allowlist
+        /// at all (disambiguates `declared: false`; see its doc).
+        restricted: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +160,31 @@ pub enum FileEditKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_audit_roundtrips_with_the_adjacently_tagged_shape() {
+        // The CP web reads this as `{"type":"tool_audit","data":{...}}` —
+        // the SAME tag="type"/content="data" envelope every other Event
+        // variant gets (see `rupu-cp/web/src/lib/transcript.ts`'s doc
+        // comment). Assert the wire shape explicitly so this never
+        // regresses to a flat `{"type":...,"tool":...}` shape.
+        let e = Event::ToolAudit {
+            tool: "issues.create".into(),
+            declared: false,
+            granted: true,
+            blocked: false,
+            restricted: false,
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["type"], "tool_audit");
+        assert_eq!(v["data"]["tool"], "issues.create");
+        assert_eq!(v["data"]["granted"], true);
+        assert_eq!(v["data"]["blocked"], false);
+
+        let back: Event = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, e);
+    }
 
     #[test]
     fn tool_result_structured_roundtrips_and_is_omitted_when_none() {

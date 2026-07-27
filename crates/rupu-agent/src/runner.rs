@@ -85,11 +85,19 @@ fn is_retryable_provider_error(e: &rupu_providers::ProviderError) -> bool {
 pub const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 /// Callback invoked by `run_agent` immediately before each tool
-/// dispatch. The runner translates this into `Event::StepWorking
-/// { note: Some(tool_name) }` so the Graph view can pulse the
-/// active node. Called from the agent's tokio task — must be
+/// dispatch (`step_id`, `tool_name`, `blocked`). The runner translates
+/// this into `Event::StepWorking { note: Some(tool_name) }` so the
+/// Graph view can pulse the active node; `rupu-orchestrator`'s
+/// `step_factory` additionally wraps this to emit a `tool_audit`
+/// transcript event (declared/granted/blocked — see the step
+/// `actions:` enforcement design). `blocked == true` means the tool
+/// call was denied — either narrowed out of `agent_tools` (never
+/// reached the tool registry; see the `registry.get` deny site below)
+/// or, on the `Ok` path, not denied at all (`false`). A denied call
+/// still gets a tool-error `ToolResult` fed back to the model — it
+/// does NOT fail the run. Called from the agent's tokio task — must be
 /// non-blocking.
-pub type OnToolCallCallback = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
+pub type OnToolCallCallback = std::sync::Arc<dyn Fn(&str, &str, bool) + Send + Sync>;
 pub type OnStreamEventCallback = std::sync::Arc<dyn Fn(StreamEvent) + Send + Sync>;
 
 fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> &str {
@@ -711,7 +719,22 @@ enum LoopOutcome {
 /// Drive one agent run to completion. Writes a JSONL transcript at
 /// `opts.transcript_path` and returns turn/token counts on success.
 pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
-    let mut writer = JsonlWriter::create(&opts.transcript_path)?;
+    // Truncate/create a fresh, empty transcript, then hold an
+    // APPEND-mode writer for the rest of the run. This is deliberate,
+    // not equivalent-by-accident to `JsonlWriter::create`: the
+    // orchestrator's `step_factory` wraps `on_tool_call` to
+    // independently append `Event::ToolAudit` lines to this SAME path
+    // via `JsonlWriter::append` on every tool dispatch (see
+    // `OnToolCallCallback`'s doc). `JsonlWriter`'s own docs warn that
+    // two writers on the same *non-append* file corrupt it — a
+    // non-append `File` tracks its own write cursor independently of
+    // any other fd's writes, so a second writer's insert silently gets
+    // overwritten by this writer's next flush. Opening in O_APPEND
+    // mode on BOTH sides makes every `write()` land atomically at the
+    // current end-of-file regardless of buffering/flush timing, so the
+    // two writers can safely interleave.
+    JsonlWriter::create(&opts.transcript_path)?;
+    let mut writer = JsonlWriter::append(&opts.transcript_path)?;
     let started = Instant::now();
     writer.write(&Event::RunStart {
         run_id: opts.run_id.clone(),
@@ -1185,6 +1208,17 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 let tool: Arc<dyn Tool> = match registry.get(&tool_name) {
                     Some(t) => t,
                     None => {
+                        // Not in the registry: either a genuinely unknown
+                        // tool name or one narrowed out of `agent_tools`
+                        // (never inserted — see the registration loop
+                        // above). Either way this is a DENIAL: report it
+                        // to the callback as `blocked` (the audit trail's
+                        // sole signal for this) and feed the model a tool
+                        // error so it can adapt, WITHOUT failing the run.
+                        if let Some(cb) = opts.on_tool_call.as_ref() {
+                            writer.flush()?;
+                            cb(&opts.step_id, &tool_name, true);
+                        }
                         writer.write(&Event::ToolResult {
                             call_id: call_id.clone(),
                             output: String::new(),
@@ -1196,11 +1230,20 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                         continue;
                     }
                 };
-                if let Some(cb) = opts.on_tool_call.as_ref() {
-                    cb(&opts.step_id, &tool_name);
-                }
+                // The audit callback fires AFTER `invoke` resolves, not
+                // before: the mode check (readonly blocks writes) lives
+                // inside `invoke` (McpToolAdapter -> ToolDispatcher ->
+                // McpPermission::check), so firing beforehand with a
+                // hardcoded `blocked: false` recorded a per-mode denial as
+                // an allowed call — a false negative in the audit trail
+                // (spec §4a/§4b; a readonly-mode write denial MUST show
+                // `blocked: true`). `blocked` is derived from the actual
+                // outcome below. Exactly one callback invocation per call,
+                // same as before.
                 let started_tool = Instant::now();
-                match tool.invoke(input.clone(), &opts.tool_context).await {
+                let invoke_result = tool.invoke(input.clone(), &opts.tool_context).await;
+                let blocked = matches!(invoke_result, Err(rupu_tools::ToolError::PermissionDenied));
+                match invoke_result {
                     Ok(out) => {
                         let clamped_stdout = clamp_tool_result_text(&out.stdout);
                         writer.write(&Event::ToolResult {
@@ -1249,6 +1292,14 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                         })?;
                         tool_results.push((call_id, String::new(), Some(msg)));
                     }
+                }
+                if let Some(cb) = opts.on_tool_call.as_ref() {
+                    // Flush first so a concurrently-appending side writer
+                    // (the orchestrator's tool_audit closure) that fires
+                    // from `cb` reliably lands AFTER this call's
+                    // `ToolResult` event in on-disk order.
+                    writer.flush()?;
+                    cb(&opts.step_id, &tool_name, blocked);
                 }
             }
 
@@ -1432,11 +1483,11 @@ mod on_tool_call_tests {
     async fn on_tool_call_fires_once_per_tool_invocation() {
         let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let calls_clone = calls.clone();
-        let cb: OnToolCallCallback = Arc::new(move |step_id: &str, tool_name: &str| {
+        let cb: OnToolCallCallback = Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
             calls_clone
                 .lock()
                 .unwrap()
-                .push(format!("{step_id}:{tool_name}"));
+                .push(format!("{step_id}:{tool_name}:{blocked}"));
         });
 
         // Two-turn script: turn 0 → tool use (read_file), turn 1 → final text.
@@ -1522,6 +1573,217 @@ mod on_tool_call_tests {
             log[0].starts_with("s1:"),
             "expected step_id 's1' prefix, got {}",
             log[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_tool_call_fires_on_tool_call_with_blocked_true_and_does_not_fail_the_run() {
+        // `agent_tools` narrows the roster to `read_file` only, so `bash`
+        // is never inserted into the registry (see the `filter_to` call
+        // above `run_agent`'s dispatch loop). The model calls `bash`
+        // anyway (e.g. a step's `actions:` narrowed it away after the
+        // model's context still remembers it, or a hallucinated call) —
+        // this must fire `on_tool_call` with `blocked == true`, feed the
+        // model a tool error, and let the run complete normally (NOT a
+        // hard run failure).
+        let calls: Arc<Mutex<Vec<(String, String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let cb: OnToolCallCallback = Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
+            calls_clone
+                .lock()
+                .unwrap()
+                .push((step_id.to_string(), tool_name.to_string(), blocked));
+        });
+
+        let tmp_dir = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp_dir.path().join("run_test_denied.jsonl");
+
+        let provider = MockProvider::new(vec![
+            ScriptedTurn::AssistantToolUse {
+                text: None,
+                tool_id: "call_bash_1".into(),
+                tool_name: "bash".into(),
+                tool_input: serde_json::json!({ "command": "echo hi" }),
+                stop: StopReason::ToolUse,
+            },
+            ScriptedTurn::AssistantText {
+                text: "done".into(),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]);
+
+        let opts = AgentRunOpts {
+            agent_name: "test-agent".into(),
+            agent_system_prompt: "test".into(),
+            agent_tools: Some(vec!["read_file".to_string()]),
+            provider: Box::new(provider),
+            provider_name: "mock".into(),
+            model: "mock-1".into(),
+            run_id: "run_test_denied".into(),
+            workspace_id: "ws_test".into(),
+            workspace_path: tmp_dir.path().to_path_buf(),
+            transcript_path: transcript_path.clone(),
+            max_turns: 5,
+            decider: Arc::new(BypassDecider),
+            tool_context: rupu_tools::ToolContext {
+                workspace_path: tmp_dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            user_message: "test prompt".into(),
+            initial_messages: Vec::new(),
+            turn_index_offset: 0,
+            mode_str: "bypass".into(),
+            no_stream: true,
+            suppress_stream_stdout: false,
+            mcp_registry: None,
+            effort: None,
+            context_window: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
+            step_id: "s1".into(),
+            on_tool_call: Some(cb),
+            on_stream_event: None,
+            concerns: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            scope_name: None,
+            surface_tag: None,
+            context_window_tokens: None,
+            compact_at_percent: None,
+            pause: None,
+        };
+
+        let result = run_agent(opts)
+            .await
+            .expect("a denied tool call must not fail the whole run");
+        assert_eq!(result.status, RunStatus::Ok, "run must complete Ok");
+
+        let log = calls.lock().unwrap();
+        assert_eq!(log.len(), 1, "expected exactly one on_tool_call, got {log:?}");
+        assert_eq!(log[0], ("s1".to_string(), "bash".to_string(), true));
+
+        // The model got a tool error back, not a hard failure.
+        let events: Vec<Event> = rupu_transcript::JsonlReader::iter(&transcript_path)
+            .expect("transcript readable")
+            .filter_map(Result::ok)
+            .collect();
+        let saw_tool_error = events.iter().any(|e| {
+            matches!(
+                e,
+                Event::ToolResult { error: Some(msg), .. } if msg.contains("unknown tool: bash")
+            )
+        });
+        assert!(saw_tool_error, "expected a tool-error ToolResult for the denied call; got {events:?}");
+    }
+
+    #[tokio::test]
+    async fn readonly_mode_mcp_write_denial_fires_on_tool_call_with_blocked_true() {
+        // Regression (tool_audit CRITICAL 1): the mode check (readonly
+        // blocks write tools) lives INSIDE `McpToolAdapter::invoke` ->
+        // `ToolDispatcher::call` -> `McpPermission::check`, not in the
+        // registry-lookup fast path `denied_tool_call_...` above covers.
+        // `issues.create` IS in the registry (agent_tools: None ->
+        // unrestricted -> every catalog tool registered), so this call
+        // reaches `tool.invoke`, and readonly mode denies it there. Before
+        // the fix, `on_tool_call` fired BEFORE `invoke` with a hardcoded
+        // `blocked: false` — a false negative in the audit trail for
+        // exactly this case. It must now report `blocked: true`.
+        let calls: Arc<Mutex<Vec<(String, String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let cb: OnToolCallCallback = Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
+            calls_clone
+                .lock()
+                .unwrap()
+                .push((step_id.to_string(), tool_name.to_string(), blocked));
+        });
+
+        let tmp_dir = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp_dir.path().join("run_test_readonly_denied.jsonl");
+
+        let provider = MockProvider::new(vec![
+            ScriptedTurn::AssistantToolUse {
+                text: None,
+                tool_id: "call_issues_create_1".into(),
+                tool_name: "issues.create".into(),
+                tool_input: serde_json::json!({
+                    "repo": "acme/widgets",
+                    "title": "t",
+                    "body": "b"
+                }),
+                stop: StopReason::ToolUse,
+            },
+            ScriptedTurn::AssistantText {
+                text: "done".into(),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]);
+
+        let opts = AgentRunOpts {
+            agent_name: "test-agent".into(),
+            agent_system_prompt: "test".into(),
+            agent_tools: None,
+            provider: Box::new(provider),
+            provider_name: "mock".into(),
+            model: "mock-1".into(),
+            run_id: "run_readonly_denied".into(),
+            workspace_id: "ws_test".into(),
+            workspace_path: tmp_dir.path().to_path_buf(),
+            transcript_path,
+            max_turns: 5,
+            decider: Arc::new(BypassDecider),
+            tool_context: rupu_tools::ToolContext {
+                workspace_path: tmp_dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            user_message: "test prompt".into(),
+            initial_messages: Vec::new(),
+            turn_index_offset: 0,
+            mode_str: "readonly".into(),
+            no_stream: true,
+            suppress_stream_stdout: false,
+            mcp_registry: Some(Arc::new(Registry::default())),
+            effort: None,
+            context_window: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
+            step_id: "s1".into(),
+            on_tool_call: Some(cb),
+            on_stream_event: None,
+            concerns: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            scope_name: None,
+            surface_tag: None,
+            context_window_tokens: None,
+            compact_at_percent: None,
+            pause: None,
+        };
+
+        let result = run_agent(opts)
+            .await
+            .expect("a denied tool call must not fail the whole run");
+        assert_eq!(result.status, RunStatus::Ok, "run must complete Ok");
+
+        let log = calls.lock().unwrap();
+        assert_eq!(log.len(), 1, "expected exactly one on_tool_call, got {log:?}");
+        assert_eq!(
+            log[0],
+            ("s1".to_string(), "issues.create".to_string(), true),
+            "readonly-mode write denial must report blocked: true, got {log:?}"
         );
     }
 

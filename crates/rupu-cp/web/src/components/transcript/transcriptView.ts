@@ -11,6 +11,19 @@
  *     `write_file` / `edit_file` tool; the next `command_run` onto the
  *     preceding `bash` tool.
  *   • findings are built from `report_finding` tool_calls (NOT `action_emitted`).
+ *   • `tool_audit` (step `actions:` enforcement's audit trail) is paired onto
+ *     a `tool_call` of the SAME tool name, FIFO per name — NOT by adjacency.
+ *     A single turn can carry >1 `tool_use` block; `run_agent` writes every
+ *     `tool_call` for the turn before dispatching any of them, so on disk the
+ *     order is `call A, call B, audit A, result A, audit B, result B` — a
+ *     "last tool_call wins" adjacency scheme would attach A's audit to B's
+ *     card and orphan B's audit into a phantom standalone card. Matching by
+ *     `data.tool` (present on every `tool_audit`) against a FIFO queue keyed
+ *     by tool name gets each audit onto its own call, including when the same
+ *     tool is called twice in one turn. When the queue for that name is empty
+ *     (an action-node call has no `tool_call`/`tool_result` shape at all),
+ *     the audit is surfaced as a standalone entry so it's never silently
+ *     dropped.
  *   • each tool is classified into a `ToolKind` from its tool name.
  *   • tools are grouped into turns, a new turn starting at each
  *     `assistant_message` (tools before the first assistant land in a leading
@@ -85,6 +98,27 @@ export interface ToolView {
   terminal?: { command: string; cwd: string; exitCode: number };
   /** kind === 'ast_grep' (from the paired `tool_result.data.structured`). */
   structured?: unknown;
+  /**
+   * The `tool_audit` record for this call, when one was emitted (step
+   * `actions:` enforcement, 2026-07-26 design). Paired onto a `tool_call`
+   * of the SAME tool name via a FIFO queue (see the module doc) — never by
+   * adjacency, since a turn can carry >1 `tool_use` block and all of a
+   * turn's `tool_call`s are written before any of their audits/results.
+   */
+  audit?: ToolAuditView;
+}
+
+export interface ToolAuditView {
+  /** In the step's `actions:` allowlist. `false` also when the step
+   * is unrestricted — see `restricted`. */
+  declared: boolean;
+  /** Covered by the agent's `tools:` grant (pre-narrowing). */
+  granted: boolean;
+  /** The call was actually denied. */
+  blocked: boolean;
+  /** The step declared a non-empty `actions:` allowlist at all
+   * (disambiguates `declared: false`). */
+  restricted: boolean;
 }
 
 export interface TurnView {
@@ -221,6 +255,10 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
   // `file_edit` / `command_run` (matched by adjacency).
   let pendingDiff: ToolView | null = null;
   let pendingTerminal: ToolView | null = null;
+  // Tool_calls awaiting their `tool_audit` line, queued FIFO per tool NAME
+  // (not a single slot — see the module doc for why adjacency/last-call-wins
+  // misattributes when a turn has >1 tool_use of possibly-mixed names).
+  const pendingAuditsByTool = new Map<string, ToolView[]>();
 
   function ensureTurn(): TurnView {
     if (current === null) {
@@ -281,6 +319,15 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
         // Arm adjacency pairing for the next file_edit / command_run.
         pendingDiff = kind === 'diff' ? view : null;
         pendingTerminal = kind === 'terminal' ? view : null;
+        // Queue this call for a possible tool_audit line, FIFO per tool
+        // name (agent tool calls only — action-node calls have no
+        // tool_call at all, see the tool_audit case's standalone fallback).
+        const queue = pendingAuditsByTool.get(tool);
+        if (queue) {
+          queue.push(view);
+        } else {
+          pendingAuditsByTool.set(tool, [view]);
+        }
 
         ensureTurn().tools.push(view);
         break;
@@ -299,6 +346,29 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
           if (data.structured !== undefined) view.structured = data.structured;
         }
         // An unpaired result carries no tool_call to render against; ignore.
+        break;
+      }
+
+      case 'tool_audit': {
+        const audit: ToolAuditView = {
+          declared: data.declared === true,
+          granted: data.granted === true,
+          blocked: data.blocked === true,
+          restricted: data.restricted === true,
+        };
+        const tool = asString(data.tool) ?? '';
+        const queue = pendingAuditsByTool.get(tool);
+        const target = queue && queue.length > 0 ? queue.shift() : undefined;
+        if (target) {
+          target.audit = audit;
+        } else {
+          // No queued tool_call of this name to attach to — this is an
+          // action-node call (execute_action_step's tool_audit has no
+          // accompanying tool_call/tool_result shape at all). Surface
+          // it as a standalone entry so the audit line is never
+          // silently dropped.
+          ensureTurn().tools.push({ tool, input: undefined, kind: classify(tool), audit });
+        }
         break;
       }
 

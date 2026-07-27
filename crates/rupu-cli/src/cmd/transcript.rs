@@ -849,6 +849,22 @@ fn transcript_event_lines(
                 transcript_event_text(status, "action", &detail),
             )]
         }
+        TranscriptEvent::ToolAudit {
+            tool,
+            declared,
+            granted,
+            blocked,
+            ..
+        } => {
+            let status = if *blocked { Status::Failed } else { Status::Complete };
+            let detail = format!("{tool}  ·  declared={declared} granted={granted} blocked={blocked}");
+            vec![transcript_event_line(
+                status,
+                0,
+                false,
+                transcript_event_text(status, "tool audit", &detail),
+            )]
+        }
         TranscriptEvent::GateRequested {
             gate_id,
             prompt,
@@ -1202,6 +1218,17 @@ pub(crate) fn render_pretty_transcript_event(
                 detail.push_str(&truncate_single_line(reason, 64));
             }
             printer.sideband_event(status, "action", Some(&detail));
+        }
+        TranscriptEvent::ToolAudit {
+            tool,
+            declared,
+            granted,
+            blocked,
+            ..
+        } => {
+            let status = if *blocked { Status::Failed } else { Status::Complete };
+            let detail = format!("{tool}  ·  declared={declared} granted={granted} blocked={blocked}");
+            printer.sideband_event(status, "tool audit", Some(&detail));
         }
         TranscriptEvent::GateRequested {
             gate_id,

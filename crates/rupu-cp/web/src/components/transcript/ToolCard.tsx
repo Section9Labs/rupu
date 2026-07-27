@@ -28,7 +28,7 @@
 import { useState } from 'react';
 import type { ReactNode } from 'react';
 import { ChevronRight, ChevronDown } from 'lucide-react';
-import type { ToolView, FindingView } from './transcriptView';
+import type { ToolView, FindingView, ToolAuditView } from './transcriptView';
 import FindingCard from './FindingCard';
 import SourcePreview from './SourcePreview';
 import AstTree from './AstTree';
@@ -304,6 +304,45 @@ function StatusBadge({ tool }: { tool: ToolView }) {
   );
 }
 
+/**
+ * Marks a `tool_audit` outcome (step `actions:` enforcement's audit
+ * trail). `blocked: true` is the case that matters most — a denied
+ * call — and gets an error-tinted badge; `declared && !granted` (spec
+ * §3c's authoring-mistake case) gets a warn-tinted badge even when the
+ * call itself wasn't blocked; otherwise a neutral "audited" marker
+ * confirms the trail exists without implying anything went wrong.
+ */
+function AuditBadge({ audit }: { audit: ToolAuditView }) {
+  if (audit.blocked) {
+    return (
+      <span
+        className="inline-flex items-center rounded px-1.5 py-0.5 text-meta font-semibold bg-err-bg text-err ring-1 ring-inset ring-err/30"
+        title="This tool call was denied (narrowed out of the step's actions: allowlist, or refused by the run's permission mode)."
+      >
+        blocked
+      </span>
+    );
+  }
+  if (audit.declared && !audit.granted) {
+    return (
+      <span
+        className="inline-flex items-center rounded px-1.5 py-0.5 text-meta font-semibold bg-warn-bg text-warn ring-1 ring-inset ring-warn/30"
+        title="This step's actions: names a tool the agent's tools: grant does not cover — narrowed away, likely an authoring mistake."
+      >
+        not granted
+      </span>
+    );
+  }
+  return (
+    <span
+      className="inline-flex items-center rounded px-1.5 py-0.5 text-meta bg-surface text-ink-mute"
+      title="Audited catalog tool call — declared/granted/blocked all clean."
+    >
+      audited
+    </span>
+  );
+}
+
 function CardHeader({ tool, summary }: { tool: ToolView; summary: string }) {
   return (
     <div className="flex items-center gap-2 min-w-0 px-3 py-1.5 bg-surface border-b border-border">
@@ -319,8 +358,9 @@ function CardHeader({ tool, summary }: { tool: ToolView; summary: string }) {
         </span>
       )}
 
-      {/* Right-side badge */}
-      <span className="shrink-0 ml-auto">
+      {/* Right-side badges */}
+      <span className="shrink-0 ml-auto flex items-center gap-1.5">
+        {tool.audit && <AuditBadge audit={tool.audit} />}
         <StatusBadge tool={tool} />
       </span>
     </div>
