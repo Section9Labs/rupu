@@ -2664,6 +2664,8 @@ pub(crate) async fn resume_run(
         openai_compatible,
         default_provider: cfg.default_provider.clone(),
         default_model: cfg.default_model.clone(),
+        bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
+        bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
     });
 
     // A cooperatively-paused run may carry a persisted mid-step seed
@@ -4053,6 +4055,8 @@ async fn execute_workflow_invocation(
         openai_compatible,
         default_provider: cfg.default_provider.clone(),
         default_model: cfg.default_model.clone(),
+        bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
+        bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
     });
 
     let workflow_for_resume = workflow.clone();

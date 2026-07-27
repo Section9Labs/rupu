@@ -109,13 +109,18 @@ impl AppExecutor {
             // TODO: the GUI path never loads a real `rupu_config::Config` (see
             // `build_executor`, which passes `Config::default()`), so neither
             // config-declared openai-compatible providers nor
-            // `default_provider` / `default_model` reach a step here. A custom
-            // provider like `oracle` still fails loudly with "unknown
-            // provider", and the defaults below stay `None` — both as before.
-            // Fixing this means loading the layered config in `build_executor`.
+            // `default_provider` / `default_model` / `[bash]` reach a step
+            // here. A custom provider like `oracle` still fails loudly with
+            // "unknown provider", and the defaults below stay the same
+            // values `Config::default()` would resolve to (120s / empty
+            // allowlist) — no behavior change from before this field
+            // existed. Fixing this means loading the layered config in
+            // `build_executor`.
             openai_compatible: std::collections::HashMap::new(),
             default_provider: None,
             default_model: None,
+            bash_timeout_secs: 120,
+            bash_env_allowlist: Vec::new(),
         });
 
         let handle = self

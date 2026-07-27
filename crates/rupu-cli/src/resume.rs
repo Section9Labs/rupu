@@ -243,6 +243,8 @@ async fn rebuild_opts_from_disk(
         openai_compatible,
         default_provider: cfg.default_provider.clone(),
         default_model: cfg.default_model.clone(),
+        bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
+        bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
     });
 
     let opts = OrchestratorRunOpts {

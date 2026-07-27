@@ -35,7 +35,6 @@ against the code before being recorded.
 | I-15 | P1 | rupu-scm | `[scm.default]` / `[issues.default]` are inert; platform choice is hardcoded GitHub-then-GitLab | open |
 | I-16 | P1 | rupu-scm | `[scm.*].clone_protocol` is inert — clones always use HTTPS despite the UI dropdown | open |
 | I-17 | P2 | rupu-scm | `[scm.*].timeout_ms` has no consumer | open |
-| I-18 | P1 | rupu-orchestrator | `[bash]` config is dropped on the workflow path (works under `run`/`session`) | open |
 | I-19 | P1 | rupu-app | The desktop app passes `Config::default()` — all user config is inert there | open |
 | I-20 | P2 | rupu-config | `resolve()`'s env-override tier is never populated; `KeySource::Env` is unreachable | open |
 | I-21 | P2 | rupu-cli | A malformed `config.toml` is silently swallowed on the pricing paths, printing wrong costs | open |
@@ -194,26 +193,6 @@ separately in `TODO.md`.
 
 ---
 
-### I-18 — `[bash]` config is dropped on the workflow path
-
-**Symptom.** `[bash].timeout_secs` and `[bash].env_allowlist` apply under
-`rupu run` and `rupu session`, and are silently ignored under
-`rupu workflow run`.
-
-**Root cause.** `crates/rupu-orchestrator/src/step_factory.rs:245-246` hardcodes
-`bash_env_allowlist: Vec::new(), bash_timeout_secs: 120`. `DefaultStepFactory`
-carries no `Config` (`step_factory.rs:36-50`). The values are read correctly at
-`cmd/session.rs:6705-6706` and `cmd/run.rs:574-575`.
-
-**Impact.** Precisely the I-2 shape: the same agent behaves differently depending
-on how it is invoked. A workflow step gets a 120s bash timeout and an empty env
-allowlist no matter what the user configured.
-
-**Fix.** Thread the `[bash]` config into `DefaultStepFactory` alongside the
-provider/model values I-2 already added.
-
----
-
 ### I-21 — a malformed `config.toml` silently yields wrong cost figures
 
 **Symptom.** A typo in `[pricing]` makes `rupu run list` / `rupu run show` print
@@ -320,6 +299,52 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-18 — `[bash]` config was dropped on the workflow path
+
+**Symptom.** `[bash].timeout_secs` and `[bash].env_allowlist` applied under
+`rupu run` and `rupu session`, and were silently ignored under
+`rupu workflow run`.
+
+**Root cause.** `crates/rupu-orchestrator/src/step_factory.rs:245-246` hardcoded
+`bash_env_allowlist: Vec::new(), bash_timeout_secs: 120`. `DefaultStepFactory`
+carried no `Config` (`step_factory.rs:36-50`). The values were read correctly at
+`cmd/session.rs:6705-6706` and `cmd/run.rs:574-575`.
+
+**Impact.** Precisely the I-2 shape: the same agent behaved differently
+depending on how it was invoked. A workflow step got a 120s bash timeout and an
+empty env allowlist no matter what the user configured.
+
+**Fix.** PR (branch `arc1/config-integrity`). `DefaultStepFactory` gained two
+fields — `bash_timeout_secs: u64` and `bash_env_allowlist: Vec<String>` — used
+directly at the `ToolContext` construction that previously hardcoded them.
+Nothing re-reads `config.toml` inside the factory: the values are threaded in
+from the callers, mirroring the I-2/I-8 approach.
+
+- `crates/rupu-cli/src/cmd/workflow.rs:2655` (resume path) and `:4044` (fresh
+  run) and `crates/rupu-cli/src/resume.rs:234` (out-of-process resume) all
+  already had `cfg` in scope for `default_provider`/`default_model` and now
+  additionally pass `cfg.bash.timeout_secs.unwrap_or(120)` /
+  `cfg.bash.env_allowlist.clone().unwrap_or_default()` — the same fallback
+  `cmd/run.rs`/`cmd/session.rs` apply.
+- `crates/rupu-app/src/executor/mod.rs:100` (the GUI executor) has no real
+  `Config` yet — that gap is tracked separately as I-19, still open — so it
+  keeps the same `120`/empty values it already produced; the existing TODO
+  comment was extended to note `[bash]` alongside `default_provider`/
+  `default_model` as inert there. No behavior change at that site.
+
+**Validation.** `cargo test -p rupu-orchestrator --lib` — 365 tests, all
+passing (1 new). `bash_config_reaches_the_step_opts`
+(`crates/rupu-orchestrator/src/step_factory.rs`) is the binding assertion: a
+`DefaultStepFactory` built with `bash_timeout_secs = 42` and
+`bash_env_allowlist = ["FOO"]` is driven through the real
+`build_opts_for_step`, and the returned `AgentRunOpts.tool_context` is asserted
+to carry `bash_timeout_secs == 42` and `bash_env_allowlist` containing `"FOO"`
+— not the old hardcoded `120` / empty. It fails to compile on the pre-fix
+struct (no such fields), which is the RED this test drove.
+`cargo build --workspace` is clean after the constructor-signature change;
+`grep -rn "DefaultStepFactory {" --include="*.rs" crates` confirms every
+production and test construction site was updated — no site left un-threaded.
 
 ### I-8 — `dispatch_agent` hardcoded provider and model (the unfixed 4th I-1/I-2 site)
 

@@ -69,6 +69,16 @@ pub struct DefaultStepFactory {
     /// `model:`. Threaded in so a workflow step resolves the same model
     /// `rupu run` would for the same agent (ISSUES.md I-2).
     pub default_model: Option<String>,
+    /// `[bash].timeout_secs` from `config.toml`. Threaded in so a workflow
+    /// step's `bash` calls honor the same timeout `rupu run`/`rupu session`
+    /// apply for the same agent (ISSUES.md I-18 — this used to hardcode
+    /// 120 here regardless of config).
+    pub bash_timeout_secs: u64,
+    /// `[bash].env_allowlist` from `config.toml`. Threaded in so a workflow
+    /// step's `bash` calls forward the same extra env vars `rupu
+    /// run`/`rupu session` do for the same agent (ISSUES.md I-18 — this
+    /// used to hardcode an empty allowlist here regardless of config).
+    pub bash_env_allowlist: Vec<String>,
 }
 
 /// Resolve a step's agent spec from a `load_agent` result. On success the
@@ -255,8 +265,8 @@ impl StepFactory for DefaultStepFactory {
             decider: Arc::new(BypassDecider) as Arc<dyn PermissionDecider>,
             tool_context: ToolContext {
                 workspace_path,
-                bash_env_allowlist: Vec::new(),
-                bash_timeout_secs: 120,
+                bash_env_allowlist: self.bash_env_allowlist.clone(),
+                bash_timeout_secs: self.bash_timeout_secs,
                 // Sub-agent dispatch wiring. The dispatcher is set on
                 // the factory by the workflow runner before
                 // `run_workflow` starts; the per-step ToolContext
@@ -937,6 +947,8 @@ steps:
             openai_compatible: std::collections::HashMap::new(),
             default_provider: None,
             default_model: None,
+            bash_timeout_secs: 120,
+            bash_env_allowlist: Vec::new(),
         }
     }
 
@@ -999,6 +1011,47 @@ steps:
             opts.agent_tools,
             Some(vec!["issues.list".to_string(), "issues.create".to_string()]),
             "actions: [] must leave the agent's full grant untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_config_reaches_the_step_opts() {
+        // Regression for ISSUES.md I-18: the workflow path hardcoded a 120s
+        // bash timeout and an empty env allowlist at build_opts_for_step's
+        // ToolContext construction, so `[bash]` config silently applied
+        // under `rupu run`/`rupu session` but not under `rupu workflow run`.
+        // A DefaultStepFactory carrying bash_timeout_secs = 42 and
+        // env_allowlist = ["FOO"] must produce an AgentRunOpts whose
+        // tool_context carries BOTH through — not 120 / empty.
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_agent(tmp.path());
+        let mut f = factory(tmp.path().to_path_buf());
+        f.bash_timeout_secs = 42;
+        f.bash_env_allowlist = vec!["FOO".to_string()];
+
+        let opts = f
+            .build_opts_for_step(
+                "unrestricted",
+                "ag",
+                "prompt".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                tmp.path().join("transcript_bash_config.jsonl"),
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            opts.tool_context.bash_timeout_secs, 42,
+            "bash_timeout_secs must flow from the factory, not hardcode 120"
+        );
+        assert!(
+            opts.tool_context
+                .bash_env_allowlist
+                .contains(&"FOO".to_string()),
+            "bash_env_allowlist must flow from the factory, not hardcode empty: {:?}",
+            opts.tool_context.bash_env_allowlist
         );
     }
 
@@ -1119,6 +1172,8 @@ steps:
             openai_compatible: std::collections::HashMap::new(),
             default_provider: None,
             default_model: None,
+            bash_timeout_secs: 120,
+            bash_env_allowlist: Vec::new(),
         };
         let transcript_path = tmp.path().join("transcript_declared.jsonl");
 
@@ -1169,6 +1224,8 @@ steps:
             openai_compatible: std::collections::HashMap::new(),
             default_provider: None,
             default_model: None,
+            bash_timeout_secs: 120,
+            bash_env_allowlist: Vec::new(),
         };
         let transcript_path = tmp.path().join("transcript_ungranted.jsonl");
 
@@ -1240,6 +1297,8 @@ steps:
             openai_compatible: std::collections::HashMap::new(),
             default_provider: None,
             default_model: None,
+            bash_timeout_secs: 120,
+            bash_env_allowlist: Vec::new(),
         };
         let transcript_path = tmp.path().join("transcript_wildcard.jsonl");
 
