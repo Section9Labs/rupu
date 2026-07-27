@@ -1,14 +1,14 @@
 use crate::{
     api::{
         fs_safety,
-        repo_scope::{distinct_repo_workspaces, ScopeKind},
+        repo_scope::{distinct_repo_workspaces, ScopeKind, ScopeQuery},
     },
     config_write::write_atomic_raw,
     error::{ApiError, ApiResult},
     state::AppState,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::{get, post},
     Json, Router,
 };
@@ -43,6 +43,14 @@ pub(crate) struct AutoflowDefRow {
     /// Structured scope discriminator backing the Enable/Disable toggle
     /// gate. See [`ScopeKind`].
     pub(crate) scope_kind: ScopeKind,
+    /// The underlying registered workspace's unique `id` for a Project row
+    /// (`None` for a Global row). Unlike `scope` (a path basename, which can
+    /// collide between two different repos), this is the genuinely unique
+    /// identifier for "which repo" — pass it back as the `scope_id` query
+    /// param on the enable/disable endpoint to pin the action to THIS row's
+    /// file when another repo defines the same `name`. See
+    /// `repo_scope::ScopeQuery`'s doc comment.
+    pub(crate) scope_id: Option<String>,
     /// Whether `autoflow.enabled` is currently `true` in the on-disk YAML.
     /// A workflow with no `autoflow:` block at all is excluded from the scan
     /// entirely (see [`scan_autoflow_defs`]) — this field only distinguishes
@@ -76,6 +84,7 @@ pub(crate) fn scan_autoflow_defs(
     dir: &std::path::Path,
     scope: impl Into<String>,
     scope_kind: ScopeKind,
+    scope_id: Option<String>,
 ) -> Vec<AutoflowDefRow> {
     let scope = scope.into();
     if !dir.is_dir() {
@@ -138,6 +147,7 @@ pub(crate) fn scan_autoflow_defs(
                 trigger,
                 scope: scope.clone(),
                 scope_kind,
+                scope_id: scope_id.clone(),
                 enabled,
             })
         })
@@ -169,7 +179,12 @@ pub(crate) fn scan_autoflow_defs(
 /// A missing workflows directory → `[]` (not an error).
 /// An unparseable YAML file is skipped with a `tracing::warn!`.
 async fn list_autoflow_defs(State(s): State<AppState>) -> ApiResult<Json<Vec<AutoflowDefRow>>> {
-    let mut rows = scan_autoflow_defs(&s.global_dir.join("workflows"), "global", ScopeKind::Global);
+    let mut rows = scan_autoflow_defs(
+        &s.global_dir.join("workflows"),
+        "global",
+        ScopeKind::Global,
+        None,
+    );
 
     let workspaces = store(&s).list().unwrap_or_default();
     let repos = distinct_repo_workspaces(workspaces, &repo_store(&s));
@@ -178,7 +193,8 @@ async fn list_autoflow_defs(State(s): State<AppState>) -> ApiResult<Json<Vec<Aut
         let dir = std::path::Path::new(&r.workspace.path)
             .join(".rupu")
             .join("workflows");
-        project_rows.extend(scan_autoflow_defs(&dir, r.scope, ScopeKind::Project));
+        let scope_id = Some(r.workspace.id.clone());
+        project_rows.extend(scan_autoflow_defs(&dir, r.scope, ScopeKind::Project, scope_id));
     }
 
     let project_names: std::collections::BTreeSet<&str> =
@@ -199,12 +215,15 @@ pub(crate) struct SetEnabledResponse {
 
 /// `POST /api/autoflows/:name/enable` — flip `autoflow.enabled` to `true` in
 /// the on-disk workflow YAML. See [`set_autoflow_enabled`] for the shared
-/// implementation and its guarantees.
+/// implementation and its guarantees. Accepts the same optional
+/// `?scope_kind=&scope_id=` query params `DELETE /api/workflows/:name` does
+/// (see [`ScopeQuery`]'s doc comment).
 async fn enable_autoflow(
     State(s): State<AppState>,
     Path(name): Path<String>,
+    Query(q): Query<ScopeQuery>,
 ) -> ApiResult<Json<SetEnabledResponse>> {
-    set_autoflow_enabled(&s, &name, true).await
+    set_autoflow_enabled(&s, &name, true, q.scope_kind, q.scope_id.as_deref()).await
 }
 
 /// `POST /api/autoflows/:name/disable` — flip `autoflow.enabled` to `false`.
@@ -212,8 +231,9 @@ async fn enable_autoflow(
 async fn disable_autoflow(
     State(s): State<AppState>,
     Path(name): Path<String>,
+    Query(q): Query<ScopeQuery>,
 ) -> ApiResult<Json<SetEnabledResponse>> {
-    set_autoflow_enabled(&s, &name, false).await
+    set_autoflow_enabled(&s, &name, false, q.scope_kind, q.scope_id.as_deref()).await
 }
 
 /// Shared enable/disable implementation.
@@ -227,11 +247,23 @@ async fn disable_autoflow(
 ///   `api::workflows` (`write_workflow`, `create_workflow`,
 ///   `delete_workflow`) — a traversal name is rejected outright rather than
 ///   resolved against the workflows dir.
-/// - **Project-aware**: resolves `:name` to a workflow YAML path via
-///   [`super::workflows::resolve_workflow_path`] — the same global-then-
-///   registered-projects resolution `GET /api/workflows/:name` uses — so an
-///   autoflow defined only inside a registered project's `.rupu/workflows/`
-///   is reachable, not just global ones. 404 if no file resolves.
+/// - **Project-aware**: when `scope_kind`/`scope_id` are absent, resolves
+///   `:name` to a workflow YAML path via
+///   [`super::workflows::resolve_workflow_path`] — the SAME project-first
+///   resolution `GET`/`DELETE /api/workflows/:name` use — so an autoflow
+///   defined only inside a registered project's `.rupu/workflows/` is
+///   reachable, not just global ones, AND (for a name defined in both
+///   layers) the toggle flips the SAME file the list shows, never a hidden
+///   shadowed layer. When present, resolves EXPLICITLY via
+///   [`super::workflows::resolve_workflow_path_explicit`] instead — pinned
+///   to exactly that layer/workspace, 404 on any mismatch. Either way, that
+///   resolver picks the SAME representative worktree
+///   `list_autoflow_defs`/`list_workflows` show for a repo with multiple
+///   registered worktrees (`distinct_repo_workspaces`), so a project-scoped
+///   toggle always flips the file the row actually displays rather than a
+///   different, non-representative worktree's copy — the toggle no longer
+///   needs to be hidden on non-global rows for that reason (see the CP
+///   Workflows/AutoflowsDefs list columns).
 /// - **Targeted edit, not a round-trip**: [`set_autoflow_enabled_in_yaml`]
 ///   rewrites only the `enabled:` scalar line inside the `autoflow:` block
 ///   (or inserts one, if the block omits it — `enabled` is `#[serde(default)]`
@@ -248,10 +280,17 @@ async fn disable_autoflow(
 /// - **Backup + atomic**: persisted via [`write_atomic_raw`] (backup to
 ///   `<path>.bak`, write-then-rename), not `config_write::write_atomic` —
 ///   that helper's `validate_toml` gate would reject YAML outright.
+/// - **Local-only, no `?host=`**: unlike the run-launch endpoints, this
+///   never proxies to a remote host — see
+///   `workflows::resolve_workflow_scoped`'s doc comment for why that's
+///   correct (workflow definitions live only on this CP process's own
+///   filesystem).
 async fn set_autoflow_enabled(
     s: &AppState,
     name: &str,
     enabled: bool,
+    scope_kind: Option<ScopeKind>,
+    scope_id: Option<&str>,
 ) -> ApiResult<Json<SetEnabledResponse>> {
     s.launcher.as_ref().ok_or_else(|| {
         ApiError::not_available("enabling/disabling an autoflow requires `rupu cp serve`")
@@ -263,8 +302,14 @@ async fn set_autoflow_enabled(
     // `create_workflow`, `delete_workflow`).
     fs_safety::validate_name(name)?;
 
-    let path = super::workflows::resolve_workflow_path(s, name)
-        .ok_or_else(|| ApiError::not_found(format!("autoflow {name} not found")))?;
+    let path = match scope_kind {
+        Some(kind) => super::workflows::resolve_workflow_path_explicit(s, name, kind, scope_id)
+            .ok_or_else(|| {
+                ApiError::not_found(format!("autoflow {name} not found in the requested scope"))
+            })?,
+        None => super::workflows::resolve_workflow_path(s, name)
+            .ok_or_else(|| ApiError::not_found(format!("autoflow {name} not found")))?,
+    };
     let existing = std::fs::read_to_string(&path).map_err(|e| ApiError::internal(e.to_string()))?;
 
     // The file must already be an autoflow (not just any workflow) — mirrors
@@ -387,7 +432,7 @@ mod tests {
         )
         .expect("write");
 
-        let rows = scan_autoflow_defs(dir.path(), "global", ScopeKind::Global);
+        let rows = scan_autoflow_defs(dir.path(), "global", ScopeKind::Global, None);
         assert_eq!(rows.len(), 1, "the autoflow should be returned");
         assert_eq!(rows[0].name, "parsed-name");
         assert_eq!(rows[0].slug, "my-file-stem");
@@ -413,13 +458,13 @@ mod tests {
 
         // A project registered at a path whose basename happens to be
         // "global" still gets ScopeKind::Project.
-        let project_rows = scan_autoflow_defs(dir.path(), "global", ScopeKind::Project);
+        let project_rows = scan_autoflow_defs(dir.path(), "global", ScopeKind::Project, None);
         assert_eq!(project_rows.len(), 1);
         assert_eq!(project_rows[0].scope, "global");
         assert_eq!(project_rows[0].scope_kind, ScopeKind::Project);
 
         // A genuinely global row gets ScopeKind::Global.
-        let global_rows = scan_autoflow_defs(dir.path(), "global", ScopeKind::Global);
+        let global_rows = scan_autoflow_defs(dir.path(), "global", ScopeKind::Global, None);
         assert_eq!(global_rows.len(), 1);
         assert_eq!(global_rows[0].scope, "global");
         assert_eq!(global_rows[0].scope_kind, ScopeKind::Global);
@@ -435,7 +480,7 @@ mod tests {
         )
         .expect("write");
 
-        let rows = scan_autoflow_defs(dir.path(), "global", ScopeKind::Global);
+        let rows = scan_autoflow_defs(dir.path(), "global", ScopeKind::Global, None);
         assert_eq!(
             rows.len(),
             1,
@@ -455,7 +500,7 @@ mod tests {
         )
         .expect("write");
 
-        let rows = scan_autoflow_defs(dir.path(), "global", ScopeKind::Global);
+        let rows = scan_autoflow_defs(dir.path(), "global", ScopeKind::Global, None);
         assert_eq!(
             rows.len(),
             0,
@@ -705,7 +750,7 @@ mod tests {
         let path = seed_global_autoflow(&tmp, "nightly.yaml", AUTOFLOW_ENABLED_TRUE);
         let s = with_dummy_launcher(test_state(&tmp));
 
-        let resp = disable_autoflow(State(s), Path("nightly".into()))
+        let resp = disable_autoflow(State(s), Path("nightly".into()), Query(ScopeQuery::default()))
             .await
             .expect("disable should succeed");
         assert!(!resp.0.enabled);
@@ -735,7 +780,7 @@ mod tests {
         let path = seed_global_autoflow(&tmp, "nightly.yaml", AUTOFLOW_ENABLED_FALSE);
         let s = with_dummy_launcher(test_state(&tmp));
 
-        let resp = enable_autoflow(State(s), Path("nightly".into()))
+        let resp = enable_autoflow(State(s), Path("nightly".into()), Query(ScopeQuery::default()))
             .await
             .expect("enable should succeed");
         assert!(resp.0.enabled);
@@ -745,13 +790,161 @@ mod tests {
         assert!(parsed.autoflow.expect("still an autoflow").enabled);
     }
 
+    /// Proves the toggle-scope-caveat fix end-to-end: for a repo with
+    /// several registered worktrees, disabling a project-scoped autoflow
+    /// must edit the SAME worktree's copy `list_autoflow_defs` shows as the
+    /// row's `scope` (the deterministic representative — see
+    /// `repo_scope::distinct_repo_workspaces`), leaving every other
+    /// worktree's copy untouched. Before `resolve_workflow_path` was
+    /// switched to `distinct_repo_workspaces`, this could silently flip a
+    /// non-representative worktree's copy instead.
+    #[tokio::test]
+    async fn disable_project_scoped_targets_the_same_representative_worktree_the_list_uses() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("workflows")).unwrap(); // empty global
+
+        let remote = "git@github.com:acme/widgets.git";
+        let mut worktree_paths = std::collections::BTreeMap::new();
+        for name in ["worktree-a", "worktree-b", "worktree-c"] {
+            let root = tmp.path().join(name);
+            let workflows = root.join(".rupu").join("workflows");
+            std::fs::create_dir_all(&workflows).unwrap();
+            let path = workflows.join("issue-triage.yaml");
+            std::fs::write(&path, AUTOFLOW_ENABLED_TRUE.replace("nightly", "issue-triage")).unwrap();
+            worktree_paths.insert(name.to_string(), path);
+            register_workspace_with_remote(&tmp, &format!("ws_{name}"), &root, Some(remote));
+        }
+
+        let s = with_dummy_launcher(test_state(&tmp));
+
+        // The list names "worktree-a" as the representative (deterministic
+        // path-sort tie-break, no tracked-repo record).
+        let Json(rows) = list_autoflow_defs(State(s.clone())).await.expect("ok");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].scope, "worktree-a");
+
+        let resp = disable_autoflow(State(s), Path("issue-triage".into()), Query(ScopeQuery::default()))
+            .await
+            .expect("disable should succeed");
+        assert!(!resp.0.enabled);
+
+        let a_disk = std::fs::read_to_string(&worktree_paths["worktree-a"]).unwrap();
+        assert!(
+            a_disk.contains("enabled: false"),
+            "the REPRESENTATIVE worktree's file must be the one edited"
+        );
+        for other in ["worktree-b", "worktree-c"] {
+            let on_disk = std::fs::read_to_string(&worktree_paths[other]).unwrap();
+            assert!(
+                on_disk.contains("enabled: true"),
+                "a non-representative worktree's copy must be left untouched"
+            );
+        }
+    }
+
+    /// Critical 1 for the toggle: a name defined in BOTH the global and a
+    /// project layer must have its list row shadowed by the project one (same
+    /// invariant `list_workflows`/`list_agents` uphold), and the (no
+    /// explicit-scope) toggle must flip that SAME project file — never the
+    /// hidden global one — mirroring the two Delete regression tests in
+    /// `api::workflows`/`api::agents`.
+    #[tokio::test]
+    async fn disable_with_name_in_both_layers_flips_project_leaves_global_intact() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let global_path = seed_global_autoflow(
+            &tmp,
+            "shared-name.yaml",
+            &AUTOFLOW_ENABLED_TRUE.replace("nightly", "shared-name"),
+        );
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_workflows = proj.path().join(".rupu").join("workflows");
+        std::fs::create_dir_all(&proj_workflows).unwrap();
+        let proj_path = proj_workflows.join("shared-name.yaml");
+        std::fs::write(&proj_path, AUTOFLOW_ENABLED_TRUE.replace("nightly", "shared-name")).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let s = with_dummy_launcher(test_state(&tmp));
+
+        let Json(rows) = list_autoflow_defs(State(s.clone())).await.expect("ok");
+        assert_eq!(rows.len(), 1, "the project row shadows the global one");
+        assert_eq!(rows[0].scope_kind, ScopeKind::Project);
+
+        let resp = disable_autoflow(
+            State(s),
+            Path("shared-name".into()),
+            Query(ScopeQuery::default()),
+        )
+        .await
+        .expect("disable should succeed");
+        assert!(!resp.0.enabled);
+
+        let proj_disk = std::fs::read_to_string(&proj_path).unwrap();
+        assert!(
+            proj_disk.contains("enabled: false"),
+            "the PROJECT file (the one the list showed) must be the one flipped"
+        );
+        let global_disk = std::fs::read_to_string(&global_path).unwrap();
+        assert!(
+            global_disk.contains("enabled: true"),
+            "the shadowed GLOBAL file must be left untouched"
+        );
+    }
+
+    /// Critical 2 for the toggle: an explicit `scope_id` disambiguates which
+    /// of two repos defining the same autoflow name gets flipped.
+    #[tokio::test]
+    async fn disable_with_explicit_scope_id_targets_one_repo_of_two_with_the_same_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("workflows")).unwrap(); // empty global
+
+        let proj_x = tmp.path().join("proj-x");
+        let workflows_x = proj_x.join(".rupu").join("workflows");
+        std::fs::create_dir_all(&workflows_x).unwrap();
+        let path_x = workflows_x.join("foo.yaml");
+        std::fs::write(&path_x, AUTOFLOW_ENABLED_TRUE.replace("nightly", "foo")).unwrap();
+        register_workspace_with_remote(&tmp, "ws_x", &proj_x, Some("git@github.com:acme/x.git"));
+
+        let proj_y = tmp.path().join("proj-y");
+        let workflows_y = proj_y.join(".rupu").join("workflows");
+        std::fs::create_dir_all(&workflows_y).unwrap();
+        let path_y = workflows_y.join("foo.yaml");
+        std::fs::write(&path_y, AUTOFLOW_ENABLED_TRUE.replace("nightly", "foo")).unwrap();
+        register_workspace_with_remote(&tmp, "ws_y", &proj_y, Some("git@github.com:acme/y.git"));
+
+        let s = with_dummy_launcher(test_state(&tmp));
+
+        let Json(rows) = list_autoflow_defs(State(s.clone())).await.expect("ok");
+        assert_eq!(rows.len(), 2, "different repos are distinct rows");
+
+        let resp = disable_autoflow(
+            State(s),
+            Path("foo".into()),
+            Query(ScopeQuery {
+                scope_kind: Some(ScopeKind::Project),
+                scope_id: Some("ws_y".to_string()),
+            }),
+        )
+        .await
+        .expect("explicit-scope disable should succeed");
+        assert!(!resp.0.enabled);
+
+        let y_disk = std::fs::read_to_string(&path_y).unwrap();
+        assert!(y_disk.contains("enabled: false"), "repo Y's file must be flipped");
+        let x_disk = std::fs::read_to_string(&path_x).unwrap();
+        assert!(
+            x_disk.contains("enabled: true"),
+            "repo X's same-named file must survive untouched"
+        );
+    }
+
     #[tokio::test]
     async fn enable_requires_launcher() {
         let tmp = tempfile::TempDir::new().unwrap();
         seed_global_autoflow(&tmp, "nightly.yaml", AUTOFLOW_ENABLED_FALSE);
         let s = test_state(&tmp); // no launcher installed — read-only deploy
 
-        let err = enable_autoflow(State(s), Path("nightly".into()))
+        let err = enable_autoflow(State(s), Path("nightly".into()), Query(ScopeQuery::default()))
             .await
             .expect_err("no launcher should be rejected");
         assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
@@ -763,7 +956,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("workflows")).unwrap();
         let s = with_dummy_launcher(test_state(&tmp));
 
-        let err = enable_autoflow(State(s), Path("does-not-exist".into()))
+        let err = enable_autoflow(State(s), Path("does-not-exist".into()), Query(ScopeQuery::default()))
             .await
             .expect_err("unknown name should 404");
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
@@ -780,7 +973,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("workflows")).unwrap();
         let s = with_dummy_launcher(test_state(&tmp));
 
-        let err = enable_autoflow(State(s), Path("../evil".into()))
+        let err = enable_autoflow(State(s), Path("../evil".into()), Query(ScopeQuery::default()))
             .await
             .expect_err("traversal name must be rejected");
         assert_eq!(
@@ -808,7 +1001,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("workflows")).unwrap();
         let s = with_dummy_launcher(test_state(&tmp));
 
-        let err = disable_autoflow(State(s), Path("../evil".into()))
+        let err = disable_autoflow(State(s), Path("../evil".into()), Query(ScopeQuery::default()))
             .await
             .expect_err("traversal name must be rejected");
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
@@ -829,7 +1022,7 @@ mod tests {
         let path = seed_global_autoflow(&tmp, "nightly.yaml", body);
         let s = with_dummy_launcher(test_state(&tmp));
 
-        let err = enable_autoflow(State(s), Path("nightly".into()))
+        let err = enable_autoflow(State(s), Path("nightly".into()), Query(ScopeQuery::default()))
             .await
             .expect_err("unsupported edit should be rejected");
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);

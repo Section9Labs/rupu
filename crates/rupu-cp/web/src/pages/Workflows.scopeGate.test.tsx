@@ -1,27 +1,22 @@
 // @vitest-environment jsdom
-// Workflows list — Delete must only be offered for GLOBAL rows.
+// Workflows list — Delete now renders for EVERY row regardless of scope, and
+// the confirm dialog names the resolved scope.
 //
-// Root cause this guards against: `DELETE /api/workflows/:name` resolves
-// ONLY against the global workflows dir (`workflows_dir` in
-// rupu-cp/src/api/workflows.rs), but the list merges project-local rows
-// that SHADOW a same-named global row. Before this fix, a project-scoped
-// row's Delete button silently removed the hidden GLOBAL file and returned
-// `{deleted:true}` even though the row itself never disappears from the
-// list — the wrong file destroyed, no error surfaced. Gating Delete to
-// `scope_kind === 'global'` closes that gap. Deleting a project-scoped
-// definition is NOT currently supported anywhere in the CP (the detail
-// page's Delete is gated the same way) — the filesystem or `rupu` CLI is
-// the current workaround.
-//
-// The gate keys off the STRUCTURED `scope_kind` discriminator, never the
-// display `scope` string — `scope` is a project's path basename and can
-// legally equal the literal string `"global"` for a project registered at a
-// path whose last segment is named `global`, which would defeat a
-// `scope === 'global'` gate.
+// History: `DELETE /api/workflows/:name` used to resolve ONLY against the
+// global workflows dir (`workflows_dir` in rupu-cp/src/api/workflows.rs),
+// while the list merges project-local rows that can shadow a same-named
+// global row — clicking Delete on a project-scoped row therefore silently
+// removed the hidden GLOBAL file. The fix was to hide Delete on non-global
+// rows (`scope_kind === 'global'` gate) rather than fix the endpoint —
+// exactly the operator complaint this PR addresses ("no delete of the
+// agent/workflow"), since most real workflows are project-scoped. The real
+// fix is `resolve_workflow_scoped` (rupu-cp/src/api/workflows.rs) — the
+// endpoint now resolves the SAME global-then-registered-projects way the
+// detail GET does — so Delete is safe (and offered) for every row.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, cleanup, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api, type WorkflowSummary } from '../lib/api';
 
@@ -57,8 +52,8 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('Workflows — scope-gated Delete', () => {
-  it('renders no Delete button for a project-scoped row (Run stays)', async () => {
+describe('Workflows — scope-aware Delete', () => {
+  it('renders a Delete button for a project-scoped row (Run stays too)', async () => {
     const ROWS: WorkflowSummary[] = [
       {
         name: 'nightly-sweep',
@@ -79,10 +74,42 @@ describe('Workflows — scope-gated Delete', () => {
     await waitFor(() => expect(screen.getByText('nightly-sweep')).toBeInTheDocument());
 
     expect(screen.getByRole('button', { name: 'Run nightly-sweep' })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Delete nightly-sweep' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Delete nightly-sweep' })).toBeInTheDocument();
   });
 
-  it('renders a Delete button for a global row', async () => {
+  it("the confirm dialog names the project scope for a project-scoped row's Delete", async () => {
+    const ROWS: WorkflowSummary[] = [
+      {
+        name: 'nightly-sweep',
+        scope: 'my-project',
+        scope_kind: 'project',
+        usage: USAGE,
+        run_count: 0,
+        last_run: null,
+      },
+    ];
+    vi.spyOn(api, 'getWorkflows').mockResolvedValue(ROWS);
+    const deleteSpy = vi
+      .spyOn(api, 'deleteWorkflow')
+      .mockResolvedValue({ deleted: true, scope: 'my-project', scope_kind: 'project' });
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+
+    render(
+      <MemoryRouter initialEntries={['/workflows']}>
+        <Workflows />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText('nightly-sweep')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete nightly-sweep' }));
+
+    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('project: my-project'));
+    await waitFor(() =>
+      expect(deleteSpy).toHaveBeenCalledWith('nightly-sweep', { scope_kind: 'project' }),
+    );
+  });
+
+  it('the confirm dialog names "global" for a global row\'s Delete', async () => {
     const ROWS: WorkflowSummary[] = [
       {
         name: 'nightly-sweep',
@@ -94,6 +121,7 @@ describe('Workflows — scope-gated Delete', () => {
       },
     ];
     vi.spyOn(api, 'getWorkflows').mockResolvedValue(ROWS);
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
 
     render(
       <MemoryRouter initialEntries={['/workflows']}>
@@ -102,17 +130,17 @@ describe('Workflows — scope-gated Delete', () => {
     );
     await waitFor(() => expect(screen.getByText('nightly-sweep')).toBeInTheDocument());
 
-    expect(screen.getByRole('button', { name: 'Delete nightly-sweep' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Delete nightly-sweep' }));
+
+    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('global'));
   });
 
-  it('renders no Delete for a project row whose workspace basename is literally "global" (proves the scope_kind gate, not the display string)', async () => {
+  it('renders Delete for a project row whose workspace basename is literally "global" (display `scope` never gates anything)', async () => {
     const ROWS: WorkflowSummary[] = [
       {
         name: 'nightly-sweep',
         // Display `scope` collides with the literal global sentinel, but
-        // `scope_kind` correctly says this is a PROJECT row — the gate must
-        // key off `scope_kind`, or this row would wrongly offer Delete and
-        // destroy the real global `nightly-sweep.yaml` instead.
+        // `scope_kind` correctly says this is a PROJECT row.
         scope: 'global',
         scope_kind: 'project',
         usage: USAGE,
@@ -121,6 +149,7 @@ describe('Workflows — scope-gated Delete', () => {
       },
     ];
     vi.spyOn(api, 'getWorkflows').mockResolvedValue(ROWS);
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
 
     render(
       <MemoryRouter initialEntries={['/workflows']}>
@@ -129,6 +158,7 @@ describe('Workflows — scope-gated Delete', () => {
     );
     await waitFor(() => expect(screen.getByText('nightly-sweep')).toBeInTheDocument());
 
-    expect(screen.queryByRole('button', { name: 'Delete nightly-sweep' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Delete nightly-sweep' }));
+    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('project: global'));
   });
 });

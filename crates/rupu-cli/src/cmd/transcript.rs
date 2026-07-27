@@ -1563,6 +1563,7 @@ async fn archive(run_id: &str) -> anyhow::Result<()> {
     }
     let mut metadata = load_metadata_if_present(&location)?;
     ensure_standalone_transcript(run_id, metadata.as_ref())?;
+    ensure_standalone_not_running(run_id, "archive", metadata.as_ref())?;
     let archived_dir = paths::archived_transcripts_dir(
         location
             .transcript_path
@@ -1589,7 +1590,9 @@ async fn delete(args: DeleteArgs) -> anyhow::Result<()> {
         anyhow::bail!("transcript delete requires --force");
     }
     let location = locate_transcript(&args.run_id)?;
-    ensure_standalone_transcript(&args.run_id, load_metadata_if_present(&location)?.as_ref())?;
+    let metadata = load_metadata_if_present(&location)?;
+    ensure_standalone_transcript(&args.run_id, metadata.as_ref())?;
+    ensure_standalone_not_running(&args.run_id, "delete", metadata.as_ref())?;
     remove_file_if_exists(&location.transcript_path)?;
     remove_file_if_exists(&location.metadata_path)?;
     println!("deleted transcript {}", args.run_id);
@@ -1754,6 +1757,36 @@ fn ensure_standalone_transcript(
     Ok(())
 }
 
+/// Refuse to archive/delete a standalone transcript whose owning process is
+/// still alive — `rupu run` writes `.meta.json` BEFORE the agent loop
+/// starts, and standalone metadata carries no status field, so an in-flight
+/// run is otherwise indistinguishable from a finished one (the CP's
+/// `agent_in_lifecycle` even labels it "Completed" by default). Mirrors
+/// `ensure_session_not_running`'s dead-pid check
+/// (`rupu_orchestrator::runs::pid_is_running`, the same primitive
+/// `RunStore::reap_if_orphaned` uses) against the `pid` captured in
+/// `StandaloneRunMetadata`.
+///
+/// A `None` metadata or `None` pid means no liveness signal is available
+/// (no metadata file, or metadata predating this field) — proceeds rather
+/// than blocking unconditionally, matching `ensure_standalone_transcript`'s
+/// same "no metadata → no guard" shape above.
+fn ensure_standalone_not_running(
+    run_id: &str,
+    action: &str,
+    metadata: Option<&crate::standalone_run_metadata::StandaloneRunMetadata>,
+) -> anyhow::Result<()> {
+    let Some(pid) = metadata.and_then(|m| m.pid) else {
+        return Ok(());
+    };
+    if rupu_orchestrator::runs::pid_is_running(pid) {
+        anyhow::bail!(
+            "cannot {action} transcript {run_id}: it is still running (owning process {pid} is alive)"
+        );
+    }
+    Ok(())
+}
+
 fn load_metadata_if_present(
     location: &TranscriptLocation,
 ) -> anyhow::Result<Option<crate::standalone_run_metadata::StandaloneRunMetadata>> {
@@ -1890,5 +1923,56 @@ mod tests {
     #[test]
     fn one_line_preview_empty_after_trim() {
         assert_eq!(one_line_preview("   \n\n  ", 60), "");
+    }
+
+    fn sample_metadata(pid: Option<u32>) -> crate::standalone_run_metadata::StandaloneRunMetadata {
+        crate::standalone_run_metadata::StandaloneRunMetadata {
+            version: crate::standalone_run_metadata::StandaloneRunMetadata::VERSION,
+            run_id: "run_live".into(),
+            session_id: None,
+            archived_at: None,
+            workspace_path: PathBuf::from("/tmp/repo"),
+            project_root: None,
+            repo_ref: None,
+            issue_ref: None,
+            backend_id: "local_checkout".into(),
+            worker_id: Some("worker_local_cli".into()),
+            trigger_source: "run_cli".into(),
+            target: None,
+            workspace_strategy: None,
+            pid,
+        }
+    }
+
+    // I4 (final-review finding): a standalone run's `.meta.json` is written
+    // before the agent loop starts and carries no status field, so an
+    // in-flight run is otherwise indistinguishable from a finished one.
+    // `ensure_standalone_not_running` refuses archive/delete while the
+    // captured pid is still alive.
+    #[test]
+    fn ensure_standalone_not_running_refuses_a_live_pid() {
+        // Our own pid is guaranteed alive for the duration of the test.
+        let own_pid = std::process::id();
+        let meta = sample_metadata(Some(own_pid));
+        let err = ensure_standalone_not_running("run_live", "delete", Some(&meta)).unwrap_err();
+        assert!(err.to_string().contains("still running"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn ensure_standalone_not_running_allows_a_dead_pid() {
+        // pid 1 owned by init/launchd is never our process and, for any pid
+        // that IS dead, `pid_is_running` (kill -0) returns false. Use an
+        // implausibly large pid instead, which is reliably not a running
+        // process on any platform this test runs on.
+        let dead_pid = 999_999;
+        let meta = sample_metadata(Some(dead_pid));
+        ensure_standalone_not_running("run_done", "delete", Some(&meta)).unwrap();
+    }
+
+    #[test]
+    fn ensure_standalone_not_running_allows_missing_pid_signal() {
+        let meta = sample_metadata(None);
+        ensure_standalone_not_running("run_legacy", "archive", Some(&meta)).unwrap();
+        ensure_standalone_not_running("run_no_meta", "archive", None).unwrap();
     }
 }

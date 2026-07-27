@@ -21,9 +21,6 @@ use rupu_cp::node::{Frame, NodeError, NodeRegistry};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-// Used by WS endpoint integration tests below.
-use axum;
-
 // ── register + get ────────────────────────────────────────────────────────────
 
 #[test]
@@ -725,7 +722,7 @@ async fn send_frame(
     use futures_util::SinkExt as _;
     use tokio_tungstenite::tungstenite::Message;
     let text = serde_json::to_string(frame).unwrap();
-    ws.send(Message::Text(text.into())).await.unwrap();
+    ws.send(Message::Text(text)).await.unwrap();
 }
 
 /// Receive the next text message from the WS and deserialise it as a [`Frame`].

@@ -86,8 +86,9 @@ pub enum PagerMode {
     Never,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum LiveViewMode {
+    #[default]
     Focused,
     Compact,
     Full,
@@ -120,12 +121,6 @@ impl LiveViewMode {
 
     pub fn hides_assistant_output(self) -> bool {
         matches!(self, Self::Compact)
-    }
-}
-
-impl Default for LiveViewMode {
-    fn default() -> Self {
-        Self::Focused
     }
 }
 
@@ -771,7 +766,7 @@ async fn show(
 }
 
 async fn validate(
-    path: &PathBuf,
+    path: &Path,
     global_format: Option<crate::output::formats::OutputFormat>,
 ) -> anyhow::Result<()> {
     let global = crate::paths::global_dir()?;

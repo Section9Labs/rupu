@@ -3,7 +3,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { Inbox, RefreshCw } from 'lucide-react';
-import { api, type AutoflowDefRow } from '../lib/api';
+import { api, scopeSelectorFor, type AutoflowDefRow } from '../lib/api';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { Button } from '../components/ui/Button';
@@ -106,50 +106,42 @@ function defColumns(onToggle: (d: AutoflowDefRow) => void): Column<AutoflowDefRo
       // Its own real button (Enable/Disable) — keep it independently
       // focusable/announced (I7) rather than swallowed by the row link.
       //
-      // Gated on `scope_kind === 'global'`, NEVER the display `scope`
-      // string: `scope` is a workspace path's basename and can legally
-      // collide with the literal string `"global"` (a project registered at
-      // a path ending in `/global`) — see `ScopeKind`'s doc comment in
-      // `lib/api.ts`. `POST /api/autoflows/:name/enable|disable` resolves
-      // `:name` via `resolve_workflow_path` (global-first, then EVERY
-      // registered workspace), which is NOT the same resolution the list
-      // uses (`distinct_repo_workspaces` — one representative worktree per
-      // repo). For a project-scoped row that mismatch means the toggle can
-      // silently flip the global copy or a non-representative worktree's
-      // copy instead of the file the row actually shows — the list then
-      // re-renders unchanged (or a different row changes), which reads as
-      // "the toggle did nothing" and a second click compounds the
-      // wrong-file write. A project-scoped row instead shows the (already
-      // present, read-only) Enabled column state with no toggle at all.
+      // Renders for every row regardless of scope: `POST
+      // /api/autoflows/:name/enable|disable` resolves `:name` via
+      // `resolve_workflow_path`, which now uses the SAME representative-
+      // worktree selection (`distinct_repo_workspaces`) this list itself
+      // uses to build its rows — so the toggle always flips the exact file
+      // the row displays, never a different worktree's copy or the global
+      // layer. See `set_autoflow_enabled`'s doc comment in
+      // `rupu-cp/src/api/autoflows.rs`.
       interactive: true,
-      render: (d) =>
-        d.scope_kind === 'global' ? (
-          <div
-            className="flex items-center justify-end"
-            onClick={(e) => {
-              // The row is link-wrapped (rowHref) — without both of these,
-              // this click either soft- or hard-navigates to the workflow
-              // instead of toggling it (stopPropagation alone does not block
-              // the enclosing <a>'s native default navigation action).
-              e.preventDefault();
-              e.stopPropagation();
-            }}
-          >
-            {d.enabled ? (
-              <Button
-                variant="ring-danger"
-                onClick={() => onToggle(d)}
-                aria-label={`Disable ${d.name}`}
-              >
-                Disable
-              </Button>
-            ) : (
-              <Button variant="ring" onClick={() => onToggle(d)} aria-label={`Enable ${d.name}`}>
-                Enable
-              </Button>
-            )}
-          </div>
-        ) : null,
+      render: (d) => (
+        <div
+          className="flex items-center justify-end"
+          onClick={(e) => {
+            // The row is link-wrapped (rowHref) — without both of these,
+            // this click either soft- or hard-navigates to the workflow
+            // instead of toggling it (stopPropagation alone does not block
+            // the enclosing <a>'s native default navigation action).
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+        >
+          {d.enabled ? (
+            <Button
+              variant="ring-danger"
+              onClick={() => onToggle(d)}
+              aria-label={`Disable ${d.name}`}
+            >
+              Disable
+            </Button>
+          ) : (
+            <Button variant="ring" onClick={() => onToggle(d)} aria-label={`Enable ${d.name}`}>
+              Enable
+            </Button>
+          )}
+        </div>
+      ),
     },
   ];
 }
@@ -185,9 +177,12 @@ export default function AutoflowsDefs() {
   // Row action: flip `autoflow.enabled` — keyed by `slug` (file stem), the
   // same identifier `resolve_workflow_path` resolves `POST
   // /api/autoflows/:name/enable|disable` against server-side.
+  // `scopeSelectorFor(d)` threads the row's exact `scope_kind`/`scope_id` so
+  // the toggle targets THIS row's file even when another repo defines the
+  // same name.
   async function handleToggle(d: AutoflowDefRow) {
     try {
-      await api.setAutoflowEnabled(d.slug, !d.enabled);
+      await api.setAutoflowEnabled(d.slug, !d.enabled, scopeSelectorFor(d));
       setActionError(null);
       await load();
     } catch (e) {

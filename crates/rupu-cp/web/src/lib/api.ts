@@ -579,14 +579,21 @@ export interface AutoflowDefRow {
    *  is keyed by. May differ from `name` (the parsed display name). */
   slug: string;
   trigger: string;
-  /** DISPLAY ONLY — see `ScopeKind`'s doc comment; gate the Enable/Disable
-   *  toggle on `scope_kind`, never this field. */
+  /** DISPLAY ONLY — see `ScopeKind`'s doc comment. */
   scope: string;
-  /** Structured scope discriminator — gate the Enable/Disable toggle on
-   *  THIS, never `scope`. See `ScopeKind`'s doc comment. Optional so literal
-   *  test fixtures that predate this field don't need updating; a gate
-   *  reading `undefined` fails closed (no toggle offered). */
+  /** Structured scope discriminator — the correct field to read scope off
+   *  of for display (the scope chip). See `ScopeKind`'s doc comment: the
+   *  Enable/Disable toggle is no longer gated on this — the backend
+   *  resolver it calls through
+   *  (`resolve_workflow_path`/`distinct_repo_workspaces`) now always
+   *  targets the same file this row displays, for every scope. */
   scope_kind?: ScopeKind;
+  /** The underlying registered workspace's unique `id` for a Project row
+   *  (absent for a Global row). Pass this back (with `scope_kind`) as the
+   *  enable/disable endpoint's `scope_id` query param to pin the toggle to
+   *  THIS row's file when another repo defines the same `name` — see
+   *  `ScopeSelector`'s doc comment. */
+  scope_id?: string | null;
   /** Whether `autoflow.enabled` is currently `true` in the on-disk YAML. A
    *  workflow with no `autoflow:` block at all never appears in this list at
    *  all — this only distinguishes enabled vs. disabled among rows that DO
@@ -826,16 +833,75 @@ export function windowFromDayRange(startDay: string, endDay: string): UsageWindo
  * Independent of the display `scope` string on the same row/detail DTO: that
  * string is a workspace path's BASENAME (for a project row) and can legally
  * equal the literal `"global"` for a project registered at a path whose last
- * segment happens to be named `global`. Any destructive-action gate (the
- * Agents/Workflows list and detail Delete buttons) must key off
- * `scope_kind`, never `scope === 'global'` — see the Rust type's doc comment.
+ * segment happens to be named `global`.
+ *
+ * `DELETE /api/agents/:name` and `DELETE /api/workflows/:name` (and the
+ * autoflow enable/disable endpoints) resolve project-aware — project-first,
+ * then global, the SAME precedence the GET/list endpoints' shadowing uses —
+ * so these actions are safe for every row regardless of scope; `scope_kind`
+ * is no longer a gate on whether Delete/Enable/Disable renders. It's still
+ * the correct field to read scope OFF of for display purposes (the scope
+ * chip, and naming the layer in a delete confirmation dialog), since
+ * `scope` alone can't be trusted to mean "global."
+ *
+ * On its own it does NOT disambiguate a name shared by two DIFFERENT repos
+ * (both rows carry `scope_kind: 'project'`) — for that, pair it with
+ * `scope_id` (see [`ScopeSelector`]).
  *
  * Optional on every DTO below (mirroring `AgentSummary.slug`'s pattern) so
- * literal test fixtures that predate this field don't need updating; a gate
- * reading `undefined` fails closed (no Delete offered) rather than assuming
- * global.
+ * literal test fixtures that predate this field don't need updating.
  */
 export type ScopeKind = 'global' | 'project';
+
+/**
+ * Explicit scope target for `DELETE /api/agents/:name`, `DELETE
+ * /api/workflows/:name`, and the autoflow enable/disable endpoints — mirrors
+ * `rupu_cp::api::repo_scope::ScopeQuery`. Sent as `?scope_kind=&scope_id=`
+ * query params so the server resolves EXACTLY the row the operator acted on
+ * rather than re-deriving "the" match for a bare name, which is ambiguous
+ * when two different repos define the same name (see `ScopeKind`'s doc
+ * comment). `scope_id` is the row's underlying registered workspace `id`
+ * (present on Project rows only — see e.g. `AgentSummary.scope_id`), NOT the
+ * display `scope` string, which can collide across repos.
+ */
+export interface ScopeSelector {
+  scope_kind: ScopeKind;
+  scope_id?: string | null;
+}
+
+/** Build the `ScopeSelector` for a row/detail object that carries
+ *  `scope_kind`/`scope_id`, or `undefined` when the row has no `scope_kind`
+ *  at all (older fixtures) — callers pass the result straight through to
+ *  `deleteAgent`/`deleteWorkflow`/`setAutoflowEnabled`, which fall back to
+ *  the server's implicit (project-first) resolution when `undefined`. */
+export function scopeSelectorFor(row: {
+  scope_kind?: ScopeKind;
+  scope_id?: string | null;
+}): ScopeSelector | undefined {
+  if (!row.scope_kind) return undefined;
+  return { scope_kind: row.scope_kind, scope_id: row.scope_id ?? undefined };
+}
+
+/** Serialize a `ScopeSelector` to a `?scope_kind=&scope_id=` query string
+ *  (including the leading `?`), or `''` when `target` is `undefined`. */
+function scopeQueryString(target?: ScopeSelector): string {
+  if (!target) return '';
+  const q = new URLSearchParams();
+  q.set('scope_kind', target.scope_kind);
+  if (target.scope_id) q.set('scope_id', target.scope_id);
+  return `?${q.toString()}`;
+}
+
+/** Response shape shared by `DELETE /api/agents/:name` and `DELETE
+ *  /api/workflows/:name` — the resolved layer the server actually removed,
+ *  which may differ from the caller's expectation if (and only if) no
+ *  `ScopeSelector` was sent and the implicit resolver's project-first
+ *  fallback picked a different row than intended. */
+export interface DeleteResult {
+  deleted: boolean;
+  scope: string;
+  scope_kind: ScopeKind;
+}
 
 // ---------------------------------------------------------------------------
 // Agents
@@ -873,9 +939,14 @@ export interface AgentSummary {
    * defs with the project name.
    */
   scope: string;
-  /** Structured scope discriminator — gate Delete on THIS, never `scope`.
-   *  See `ScopeKind`'s doc comment. */
+  /** Structured scope discriminator — see `ScopeKind`'s doc comment. */
   scope_kind?: ScopeKind;
+  /** The underlying registered workspace's unique `id` for a Project row
+   *  (absent for a Global row). Pass this back (with `scope_kind`) via
+   *  `scopeSelectorFor(agent)` to `api.deleteAgent` to pin Delete to THIS
+   *  row's file when another repo defines the same `name`/`slug` — see
+   *  `ScopeSelector`'s doc comment. */
+  scope_id?: string | null;
   usage: UsageSummary;
   run_count: number;
   /** ISO-8601 timestamp of the agent's most recent run; `null`/absent when
@@ -913,13 +984,30 @@ export interface ToolSpec {
 
 export interface WorkflowSummary {
   name: string;
-  /** DISPLAY ONLY — see `ScopeKind`'s doc comment; gate Delete on
-   *  `scope_kind`, never this field. */
+  /** DISPLAY ONLY — see `ScopeKind`'s doc comment. */
   scope: string;
   scope_kind?: ScopeKind;
+  /** The underlying registered workspace's unique `id` for a Project row
+   *  (absent for a Global row). Pass this back (with `scope_kind`) via
+   *  `scopeSelectorFor(workflow)` to `api.deleteWorkflow`/
+   *  `api.setAutoflowEnabled` to pin the action to THIS row's file when
+   *  another repo defines the same `name` — see `ScopeSelector`'s doc
+   *  comment. */
+  scope_id?: string | null;
   usage: UsageSummary;
   run_count: number;
   last_run?: string | null;
+  /** `null`/absent when the workflow has no top-level `autoflow:` block at
+   *  all (a plain, manually-launched workflow); `true`/`false` mirroring
+   *  the on-disk `autoflow.enabled` when it does — both enabled AND
+   *  disabled autoflows carry a boolean here, so the row can offer an
+   *  Enable/Disable toggle in either direction (reuses
+   *  `api.setAutoflowEnabled`, the same call `AutoflowsDefs.tsx` uses).
+   *  Drives the "Autoflow" badge: render it whenever this is not
+   *  null/undefined. Optional/nullable so literal test fixtures that
+   *  predate this field don't need updating (treated as "not an
+   *  autoflow"). Mirrors `AutoflowDefRow.enabled`. */
+  autoflow_enabled?: boolean | null;
 }
 
 export interface WorkflowDetail {
@@ -934,8 +1022,12 @@ export interface WorkflowDetail {
   /** Resolved layer's display scope (`"global"` or a project's path
    *  basename) — DISPLAY ONLY, see `ScopeKind`'s doc comment. */
   scope?: string;
-  /** Structured scope discriminator — gate Delete on THIS, never `scope`. */
+  /** Structured scope discriminator — see `ScopeKind`'s doc comment. */
   scope_kind?: ScopeKind;
+  /** The underlying registered workspace's unique `id` for a Project-scoped
+   *  resolution (absent/`null` for Global). See `ScopeSelector`'s doc
+   *  comment. */
+  scope_id?: string | null;
 }
 
 /** Permission mode a launched run starts in. */
@@ -1757,16 +1849,36 @@ export const api = {
     );
   },
   /** Archive a terminal run (hides it from the default run list). */
-  async archiveRun(id: string): Promise<void> {
-    await request(`/api/runs/${encodeURIComponent(id)}/archive`, { method: 'POST' });
+  async archiveRun(id: string, host?: string): Promise<void> {
+    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
+    await request(`/api/runs/${encodeURIComponent(id)}/archive${qs}`, { method: 'POST' });
   },
   /** Restore a previously-archived run back to the active list. */
-  async restoreRun(id: string): Promise<void> {
-    await request(`/api/runs/${encodeURIComponent(id)}/restore`, { method: 'POST' });
+  async restoreRun(id: string, host?: string): Promise<void> {
+    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
+    await request(`/api/runs/${encodeURIComponent(id)}/restore${qs}`, { method: 'POST' });
   },
   /** Permanently delete a run and its on-disk transcripts. */
-  async deleteRun(id: string): Promise<void> {
-    await request(`/api/runs/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  async deleteRun(id: string, host?: string): Promise<void> {
+    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
+    await request(`/api/runs/${encodeURIComponent(id)}${qs}`, { method: 'DELETE' });
+  },
+  /**
+   * Archive a STANDALONE agent-run transcript (row-actions Task 3, backed by
+   * Task 2's `POST /api/transcripts/:id/archive`). `id` is the row's
+   * `run_id` — pass this only for an `AgentRunRow` with `source ===
+   * 'standalone'`; a session-owned transcript refuses with a 409. No
+   * `restoreTranscript` counterpart: `rupu transcript restore` doesn't exist.
+   */
+  async archiveTranscript(id: string, host?: string): Promise<void> {
+    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
+    await request(`/api/transcripts/${encodeURIComponent(id)}/archive${qs}`, { method: 'POST' });
+  },
+  /** Permanently delete a STANDALONE agent-run transcript (Task 2's `DELETE
+   *  /api/transcripts/:id`). See `archiveTranscript`'s doc for `id`. */
+  async deleteTranscript(id: string, host?: string): Promise<void> {
+    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
+    await request(`/api/transcripts/${encodeURIComponent(id)}${qs}`, { method: 'DELETE' });
   },
   /** List archived runs. Pass `kind = 'workflow'` to restrict to workflow-kind only. */
   getArchivedRuns(kind?: string): Promise<RunListRow[]> {
@@ -1850,12 +1962,25 @@ export const api = {
   /**
    * Enable or disable an autoflow — writes `autoflow.enabled` to the on-disk
    * workflow YAML. Throws `ApiError` (501) when this deploy has no launcher
-   * (`rupu cp serve` not running), or (404) when `name` doesn't resolve to a
-   * known autoflow. Resolves to the updated `{ name, enabled }` state.
+   * (`rupu cp serve` not running), (404) when `name` doesn't resolve to a
+   * known autoflow — including a 404 when `target` is given but doesn't
+   * match any row (the server never falls back to a different layer once an
+   * explicit scope is requested). Resolves to the updated `{ name, enabled }`
+   * state.
+   *
+   * `target` (build via `scopeSelectorFor(row)`) pins the request to the
+   * EXACT row's file — required to disambiguate a name shared by two
+   * different repos (see `ScopeSelector`'s doc comment); omit it only for
+   * back-compat call sites that still want the server's implicit
+   * (project-first) resolution.
    */
-  setAutoflowEnabled(name: string, enabled: boolean): Promise<SetAutoflowEnabledResponse> {
+  setAutoflowEnabled(
+    name: string,
+    enabled: boolean,
+    target?: ScopeSelector,
+  ): Promise<SetAutoflowEnabledResponse> {
     return request<SetAutoflowEnabledResponse>(
-      `/api/autoflows/${encodeURIComponent(name)}/${enabled ? 'enable' : 'disable'}`,
+      `/api/autoflows/${encodeURIComponent(name)}/${enabled ? 'enable' : 'disable'}${scopeQueryString(target)}`,
       { method: 'POST' },
     );
   },
@@ -1890,9 +2015,17 @@ export const api = {
    * server-side; nothing is written on error. Throws `ApiError` with the parse
    * error message (400) — including when the frontmatter `name` mismatches the
    * route — and resolves to the reloaded `AgentDetail` on success.
+   *
+   * `target` (build via `scopeSelectorFor(agent)`) pins the write to the
+   * EXACT row's file — the SAME shape `deleteAgent` takes — so saving a
+   * project-scoped agent edits the project file, never a same-named global
+   * file it shadows. Omit only for back-compat callers that want the
+   * server's implicit (project-first) resolution; 404 if `target` is given
+   * and doesn't match (no fallback to another layer once a scope is
+   * explicitly requested).
    */
-  saveAgent(name: string, raw: string): Promise<AgentDetail> {
-    return request<AgentDetail>(`/api/agents/${encodeURIComponent(name)}`, {
+  saveAgent(name: string, raw: string, target?: ScopeSelector): Promise<AgentDetail> {
+    return request<AgentDetail>(`/api/agents/${encodeURIComponent(name)}${scopeQueryString(target)}`, {
       method: 'PUT',
       body: JSON.stringify({ raw }),
     });
@@ -1907,11 +2040,24 @@ export const api = {
       body: JSON.stringify({ raw }),
     });
   },
-  /** Delete an agent definition. 404 if absent. */
-  async deleteAgent(name: string): Promise<void> {
-    await request<{ deleted: boolean }>(`/api/agents/${encodeURIComponent(name)}`, {
-      method: 'DELETE',
-    });
+  /** Delete an agent definition — by `slug` (file stem), not frontmatter
+   *  `name`; see `AgentSummary.slug`'s doc comment. Resolves project-aware
+   *  (project-first, then global — same precedence `getAgent` uses), so this
+   *  is safe to call for any row regardless of scope. 404 if absent, or if
+   *  `target` is given and doesn't match (no fallback to another layer once
+   *  a scope is explicitly requested).
+   *
+   *  `target` (build via `scopeSelectorFor(agent)`) pins the request to the
+   *  EXACT row's file — required to disambiguate a slug shared by two
+   *  different repos; omit it only for back-compat callers that want the
+   *  server's implicit (project-first) resolution. Returns the resolved
+   *  `scope`/`scope_kind` so the caller can confirm which layer's file was
+   *  ACTUALLY removed rather than assuming it matched what was shown. */
+  async deleteAgent(name: string, target?: ScopeSelector): Promise<DeleteResult> {
+    return request<DeleteResult>(
+      `/api/agents/${encodeURIComponent(name)}${scopeQueryString(target)}`,
+      { method: 'DELETE' },
+    );
   },
 
   // --- Workflows ---
@@ -1926,9 +2072,17 @@ export const api = {
    * server-side; nothing is written on error. Throws `ApiError` with the parse
    * error message (400) — including when the parsed `name` mismatches the route
    * — and resolves to the reloaded `WorkflowDetail` on success.
+   *
+   * `target` (build via `scopeSelectorFor(workflow)`) pins the write to the
+   * EXACT row's file — the SAME shape `deleteWorkflow` takes — so saving a
+   * project-scoped workflow edits the project file, never a same-named
+   * global file it shadows. Omit only for back-compat callers that want the
+   * server's implicit (project-first) resolution; 404 if `target` is given
+   * and doesn't match (no fallback to another layer once a scope is
+   * explicitly requested).
    */
-  saveWorkflow(name: string, raw: string): Promise<WorkflowDetail> {
-    return request<WorkflowDetail>(`/api/workflows/${encodeURIComponent(name)}`, {
+  saveWorkflow(name: string, raw: string, target?: ScopeSelector): Promise<WorkflowDetail> {
+    return request<WorkflowDetail>(`/api/workflows/${encodeURIComponent(name)}${scopeQueryString(target)}`, {
       method: 'PUT',
       body: JSON.stringify({ raw }),
     });
@@ -1962,11 +2116,23 @@ export const api = {
   generateModels(): Promise<ProviderModels[]> {
     return request<ProviderModels[]>('/api/generate/models');
   },
-  /** Delete a workflow definition. 404 if absent. */
-  async deleteWorkflow(name: string): Promise<void> {
-    await request<{ deleted: boolean }>(`/api/workflows/${encodeURIComponent(name)}`, {
-      method: 'DELETE',
-    });
+  /** Delete a workflow definition. Resolves project-aware (project-first,
+   *  then global — same precedence `getWorkflow` uses), so this is safe to
+   *  call for any row regardless of scope. 404 if absent, or if `target` is
+   *  given and doesn't match (no fallback to another layer once a scope is
+   *  explicitly requested).
+   *
+   *  `target` (build via `scopeSelectorFor(workflow)`) pins the request to
+   *  the EXACT row's file — required to disambiguate a name shared by two
+   *  different repos; omit it only for back-compat callers that want the
+   *  server's implicit (project-first) resolution. Returns the resolved
+   *  `scope`/`scope_kind` so the caller can confirm which layer's file was
+   *  ACTUALLY removed rather than assuming it matched what was shown. */
+  async deleteWorkflow(name: string, target?: ScopeSelector): Promise<DeleteResult> {
+    return request<DeleteResult>(
+      `/api/workflows/${encodeURIComponent(name)}${scopeQueryString(target)}`,
+      { method: 'DELETE' },
+    );
   },
   /** Parse-check a workflow YAML server-side (writes nothing). Resolves
    *  {ok:true} on 200, or {ok:false, error} when the server returns 400. */
@@ -2032,16 +2198,19 @@ export const api = {
     });
   },
   /** Archive an active session (hides it from the active list). */
-  async archiveSession(id: string): Promise<void> {
-    await request(`/api/sessions/${encodeURIComponent(id)}/archive`, { method: 'POST' });
+  async archiveSession(id: string, host?: string): Promise<void> {
+    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
+    await request(`/api/sessions/${encodeURIComponent(id)}/archive${qs}`, { method: 'POST' });
   },
   /** Restore a previously-archived session back to the active list. */
-  async restoreSession(id: string): Promise<void> {
-    await request(`/api/sessions/${encodeURIComponent(id)}/restore`, { method: 'POST' });
+  async restoreSession(id: string, host?: string): Promise<void> {
+    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
+    await request(`/api/sessions/${encodeURIComponent(id)}/restore${qs}`, { method: 'POST' });
   },
   /** Permanently delete a session and its on-disk data. */
-  async deleteSession(id: string): Promise<void> {
-    await request(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  async deleteSession(id: string, host?: string): Promise<void> {
+    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
+    await request(`/api/sessions/${encodeURIComponent(id)}${qs}`, { method: 'DELETE' });
   },
 
   // --- Workers ---

@@ -23,6 +23,7 @@ pub mod sessions;
 pub mod source;
 pub mod tools;
 pub mod transcript;
+pub mod transcripts;
 pub mod usage;
 pub mod usage_outliers;
 pub mod workers;

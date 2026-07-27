@@ -4,7 +4,7 @@
 import { useCallback, useEffect, useId, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Plus, Sparkles, Workflow as WorkflowIcon } from 'lucide-react';
-import { api, type ProviderModels, type WorkflowSummary } from '../lib/api';
+import { api, scopeSelectorFor, type ProviderModels, type WorkflowSummary } from '../lib/api';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import LauncherSheet from '../components/LauncherSheet';
@@ -14,6 +14,7 @@ import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
+import { EnabledChip } from './AutoflowsDefs';
 import UsageBarChart from '../components/charts/UsageBarChart';
 import { formatTokens, formatCost } from '../lib/usage';
 import { relativeTime } from '../lib/time';
@@ -59,24 +60,55 @@ export default function Workflows() {
 
   // Row action: delete the workflow's YAML definition file — same
   // confirm-then-call-then-refresh shape as Sessions.tsx's row Delete.
-  async function handleDelete(name: string) {
+  //
+  // `scopeSelectorFor(w)` threads the row's exact `scope_kind`/`scope_id` so
+  // `DELETE /api/workflows/:name` targets THIS row's file even when another
+  // repo defines the same name — the confirm dialog names the resolved
+  // layer before the operator confirms.
+  async function handleDelete(w: WorkflowSummary) {
+    const scopeLabel = w.scope_kind === 'project' ? `project: ${w.scope}` : 'global';
     if (
       !window.confirm(
-        `Permanently delete the YAML definition file for workflow "${name}"? This cannot be undone.`,
+        `Delete workflow "${w.name}" (${scopeLabel})? This removes the definition file. This cannot be undone.`,
       )
     ) {
       return;
     }
     try {
-      await api.deleteWorkflow(name);
-      setActionError(null);
+      const result = await api.deleteWorkflow(w.name, scopeSelectorFor(w));
+      // Confirm the server actually removed the layer the operator was
+      // shown — never silently trust a bare "ok" as "removed what I saw."
+      if (w.scope_kind && (result.scope_kind !== w.scope_kind || result.scope !== w.scope)) {
+        setActionError(
+          `Deleted the ${result.scope_kind === 'project' ? `project (${result.scope})` : 'global'} definition — not the ${scopeLabel} one shown here.`,
+        );
+      } else {
+        setActionError(null);
+      }
       await load();
     } catch (e: unknown) {
       setActionError(e instanceof Error ? e.message : 'Delete failed');
     }
   }
 
-  const columns = useMemo(() => workflowColumns(setLaunching, handleDelete), []);
+  // Row action: flip `autoflow.enabled` for a row that IS an autoflow
+  // (`autoflow_enabled !== null`) — reuses `api.setAutoflowEnabled`, the
+  // same call `AutoflowsDefs.tsx`'s toggle uses, threading `scopeSelectorFor`
+  // the same way `handleDelete` above does.
+  async function handleToggleAutoflow(w: WorkflowSummary) {
+    try {
+      await api.setAutoflowEnabled(w.name, !w.autoflow_enabled, scopeSelectorFor(w));
+      setActionError(null);
+      await load();
+    } catch (e: unknown) {
+      setActionError(e instanceof Error ? e.message : 'Failed to update autoflow');
+    }
+  }
+
+  const columns = useMemo(
+    () => workflowColumns(setLaunching, handleDelete, handleToggleAutoflow),
+    [],
+  );
   const bannerError = error ?? actionError;
 
   const sorted = (workflows ?? []).slice().sort((a, b) => a.name.localeCompare(b.name));
@@ -342,9 +374,23 @@ function NewWorkflowModal({ onClose }: { onClose: () => void }) {
   );
 }
 
+/** Small "Autoflow" marker — mirrors the chip `WorkflowDetail.tsx`'s header
+ *  shows for the same purpose (lets the operator tell workflows from
+ *  autoflows at a glance). Rendered next to the Enabled/Disabled state,
+ *  which reuses `AutoflowsDefs.tsx`'s `EnabledChip` so the two lists agree
+ *  on how that state looks. */
+function AutoflowBadge() {
+  return (
+    <span className="inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1 bg-violet-50 text-violet-700 ring-violet-200">
+      Autoflow
+    </span>
+  );
+}
+
 function workflowColumns(
   onRun: (name: string) => void,
-  onDelete: (name: string) => void,
+  onDelete: (w: WorkflowSummary) => void,
+  onToggleAutoflow: (w: WorkflowSummary) => void,
 ): Column<WorkflowSummary>[] {
   return [
     {
@@ -357,7 +403,17 @@ function workflowColumns(
       // Plain content — row-level navigation is `rowHref` (SortableTable
       // link-wraps the whole row); an inline <Link> here would nest an <a>
       // inside SortableTable's own <a>.
-      render: (w) => <span className="text-sm font-medium text-ink">{w.name}</span>,
+      render: (w) => (
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-sm font-medium text-ink">{w.name}</span>
+          {w.autoflow_enabled !== null && w.autoflow_enabled !== undefined && (
+            <>
+              <AutoflowBadge />
+              <EnabledChip enabled={w.autoflow_enabled} />
+            </>
+          )}
+        </div>
+      ),
     },
     {
       key: 'scope',
@@ -416,21 +472,18 @@ function workflowColumns(
       header: '',
       align: 'right',
       fit: true,
-      // Its own real buttons (Run/Delete) — keep them independently
-      // focusable/announced (I7) rather than swallowed by the row link.
+      // Its own real buttons (Run/Enable-Disable/Delete) — keep them
+      // independently focusable/announced (I7) rather than swallowed by the
+      // row link.
       interactive: true,
-      // Delete only renders for `scope_kind === 'global'` rows (the
-      // structured discriminator — NEVER the display `scope` string, which is
-      // a project's path basename and can legally equal the literal
-      // `"global"`; see `ScopeKind`'s doc comment): `DELETE
-      // /api/workflows/:name` resolves ONLY against the global workflows
-      // dir — a project row shadowing a same-named global definition would
-      // silently delete the WRONG (global) file instead. Run stays
-      // available for every row (project-aware resolution, non-destructive).
-      // Deleting a project-scoped definition is NOT currently supported
-      // anywhere in the CP (the detail page's Delete is gated the same way,
-      // for the same reason) — the filesystem or `rupu` CLI is the current
-      // workaround.
+      // Delete and the Enable/Disable toggle render for every row
+      // regardless of scope: both `DELETE /api/workflows/:name` and
+      // `POST /api/autoflows/:name/enable|disable` resolve project-aware
+      // via the SAME representative-worktree selection the list itself uses
+      // (`resolve_workflow_scoped` / `distinct_repo_workspaces` in
+      // `rupu-cp/src/api/workflows.rs`), so both always act on the exact
+      // file this row displays. `onDelete`'s confirm dialog names the
+      // resolved scope before the operator confirms.
       render: (w) => (
         <div
           className="flex items-center justify-end gap-1"
@@ -451,15 +504,32 @@ function workflowColumns(
           >
             Run
           </button>
-          {w.scope_kind === 'global' && (
-            <Button
-              variant="ring-danger"
-              onClick={() => void onDelete(w.name)}
-              aria-label={`Delete ${w.name}`}
-            >
-              Delete
-            </Button>
-          )}
+          {w.autoflow_enabled !== null &&
+            w.autoflow_enabled !== undefined &&
+            (w.autoflow_enabled ? (
+              <Button
+                variant="ring-danger"
+                onClick={() => void onToggleAutoflow(w)}
+                aria-label={`Disable ${w.name}`}
+              >
+                Disable
+              </Button>
+            ) : (
+              <Button
+                variant="ring"
+                onClick={() => void onToggleAutoflow(w)}
+                aria-label={`Enable ${w.name}`}
+              >
+                Enable
+              </Button>
+            ))}
+          <Button
+            variant="ring-danger"
+            onClick={() => void onDelete(w)}
+            aria-label={`Delete ${w.name}`}
+          >
+            Delete
+          </Button>
         </div>
       ),
     },

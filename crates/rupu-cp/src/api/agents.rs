@@ -1,14 +1,14 @@
 use crate::{
     agent_launcher::{AgentLaunchError, AgentLaunchRequest, AgentLauncher},
-    api::fs_safety::{validate_name, write_atomic},
-    api::repo_scope::{distinct_repo_workspaces, ScopeKind},
+    api::fs_safety::{validate_name, validate_within, write_atomic},
+    api::repo_scope::{distinct_repo_workspaces, ScopeKind, ScopeQuery},
     error::{ApiError, ApiResult},
     host::connector::HostConnectorError,
     session_starter::{SessionStartError, SessionStartRequest, SessionStarter},
     state::AppState,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::{get, post},
     Json, Router,
 };
@@ -47,23 +47,131 @@ fn repo_store(s: &AppState) -> RepoRegistryStore {
     }
 }
 
-/// Scope tag for a registered project: the workspace path's basename,
-/// falling back to the workspace id if the path has no basename (e.g. `/`).
-/// Used by [`load_detail`]'s single-name fallback lookup, which walks every
-/// registered workspace (not deduped by repo — the first workspace with a
-/// matching file wins, same as before).
-fn project_scope_name(w: &rupu_workspace::Workspace) -> String {
-    std::path::Path::new(&w.path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| w.id.clone())
+/// Resolve agent file-STEM `slug` to its on-disk path, the directory that
+/// contains it, and the scope layer it resolved from: one representative
+/// workspace per distinct repo among the registered projects FIRST (see
+/// [`distinct_repo_workspaces`] — many registered workspaces are autoflow
+/// run-worktrees of the very same repo, each carrying an identical copy of
+/// `.rupu/agents/`, so this avoids resolving against a stale
+/// non-representative worktree), falling back to the global agents dir only
+/// when no registered project defines `slug`. First match wins; `None` when
+/// `slug` resolves in neither layer.
+///
+/// PROJECT-FIRST is deliberate: every list this resolver backs
+/// ([`list_agents`]) shadows a same-named GLOBAL row WITH the project row,
+/// and the CLI runtime resolves the same way. A global-first resolver — the
+/// prior implementation — silently disagreed with what the list showed the
+/// operator: for a slug present in BOTH layers, Delete would remove the
+/// hidden global file while the visible project row survived. See
+/// `workflows::resolve_workflow_scoped`'s doc comment for the identical
+/// reasoning (and the data-loss bug this fixes).
+///
+/// Backs `DELETE /api/agents/:name` ([`delete_agent`]) and, as of this
+/// change, [`load_detail`]'s fast path too — keyed by file STEM rather than
+/// frontmatter `name` (a hand- or CLI-authored `.md` file's stem can differ
+/// from its own frontmatter `name`, and resolving "by name" in that case
+/// would 404 or remove an unrelated file that happens to share a name — see
+/// [`AgentDto::slug`]'s doc comment).
+///
+/// Two DIFFERENT repos can each define an agent with the same `slug`; this
+/// resolver can only ever return the first it finds (deterministic —
+/// `distinct_repo_workspaces` sorts by `scope`). A caller that needs to pin
+/// down one specific repo's row unambiguously should use
+/// [`resolve_agent_scoped_explicit`] instead, which every mutating web-UI
+/// caller now does (see [`delete_agent`]) by threading the row's `scope_id`.
+///
+/// No `host`/remote concept here, unlike `run_agent`/`start_session` below:
+/// `s.global_dir` and every registered workspace's `path` are local
+/// filesystem paths on THIS `rupu cp` process's own host — agent
+/// definitions are never fetched from or proxied to a remote host, so this
+/// resolver (and therefore [`delete_agent`]) is correctly host-unaware.
+pub(crate) fn resolve_agent_scoped(
+    s: &AppState,
+    slug: &str,
+) -> Option<(PathBuf, PathBuf, String, ScopeKind, Option<String>)> {
+    let workspaces = store(s).list().unwrap_or_default();
+    for r in distinct_repo_workspaces(workspaces, &repo_store(s)) {
+        let proj_dir = std::path::Path::new(&r.workspace.path)
+            .join(".rupu")
+            .join("agents");
+        let candidate = proj_dir.join(format!("{slug}.md"));
+        if candidate.exists() {
+            return Some((
+                candidate,
+                proj_dir,
+                r.scope,
+                ScopeKind::Project,
+                Some(r.workspace.id),
+            ));
+        }
+    }
+    let dir = agents_dir(s);
+    let global = dir.join(format!("{slug}.md"));
+    if global.exists() {
+        return Some((global, dir, "global".to_string(), ScopeKind::Global, None));
+    }
+    None
 }
 
-/// Pure core of `PUT /api/agents/:name`: validate the url name, parse + validate
-/// the raw `.md` (no write on parse failure), enforce frontmatter-name ==
-/// url-name, then atomically write to `<global_dir>/agents/<name>.md`. Returns
-/// the written path.
+/// Resolve agent file-STEM `slug` restricted to an EXPLICIT scope — the
+/// disambiguating counterpart to [`resolve_agent_scoped`]'s implicit
+/// (project-first, then global) walk. Mirrors
+/// `workflows::resolve_workflow_scoped_explicit` exactly; see its doc
+/// comment for the full contract (global-only vs. one workspace pinned by
+/// `scope_id`, `None` on any mismatch rather than a fallback).
+pub(crate) fn resolve_agent_scoped_explicit(
+    s: &AppState,
+    slug: &str,
+    scope_kind: ScopeKind,
+    scope_id: Option<&str>,
+) -> Option<(PathBuf, PathBuf, String, ScopeKind)> {
+    match scope_kind {
+        ScopeKind::Global => {
+            let dir = agents_dir(s);
+            let global = dir.join(format!("{slug}.md"));
+            if global.exists() {
+                Some((global, dir, "global".to_string(), ScopeKind::Global))
+            } else {
+                None
+            }
+        }
+        ScopeKind::Project => {
+            let scope_id = scope_id?;
+            let workspaces = store(s).list().unwrap_or_default();
+            let r = distinct_repo_workspaces(workspaces, &repo_store(s))
+                .into_iter()
+                .find(|r| r.workspace.id == scope_id)?;
+            let proj_dir = std::path::Path::new(&r.workspace.path)
+                .join(".rupu")
+                .join("agents");
+            let candidate = proj_dir.join(format!("{slug}.md"));
+            if candidate.exists() {
+                Some((candidate, proj_dir, r.scope, ScopeKind::Project))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Pure core of the LEGACY (global-only) `PUT /api/agents/:name` path: validate
+/// the url name, parse + validate the raw `.md` (no write on parse failure),
+/// enforce frontmatter-name == url-name, then atomically write to
+/// `<global_dir>/agents/<name>.md`. Returns the written path.
+///
+/// Scope-aware writes (an explicit `?scope_kind=&scope_id=` selector, or an
+/// implicit resolution to an existing PROJECT file) go through
+/// [`save_agent_file_at`] instead — see [`write_agent`].
 fn save_agent_file(global_dir: &FsPath, url_name: &str, raw: &str) -> Result<PathBuf, ApiError> {
+    save_agent_file_at(url_name, raw, &global_dir.join("agents"))
+}
+
+/// Core of `PUT /api/agents/:name`, parameterized on the TARGET directory
+/// (global agents dir, or one project's `.rupu/agents`) rather than always
+/// `<global_dir>/agents`. Validates the url name, parses + validates the raw
+/// `.md` (no write on parse failure), enforces frontmatter-name == url-name,
+/// then atomically writes `<dir>/<url_name>.md`. Returns the written path.
+fn save_agent_file_at(url_name: &str, raw: &str, dir: &FsPath) -> Result<PathBuf, ApiError> {
     validate_name(url_name)?;
     let spec =
         rupu_agent::AgentSpec::parse(raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -72,10 +180,16 @@ fn save_agent_file(global_dir: &FsPath, url_name: &str, raw: &str) -> Result<Pat
             "frontmatter name must equal the agent name",
         ));
     }
-    let dir = global_dir.join("agents");
-    std::fs::create_dir_all(&dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    std::fs::create_dir_all(dir).map_err(|e| ApiError::internal(e.to_string()))?;
     let target = dir.join(format!("{url_name}.md"));
     write_atomic(&target, raw.as_bytes()).map_err(|e| ApiError::internal(e.to_string()))?;
+    // Defense in depth, mirroring `delete_agent`'s `validate_within` — run
+    // AFTER the write here (rather than before, as delete does) because
+    // `target` may not exist yet on disk when this is a genuine create.
+    // `target`/`dir` are always constructed from a `validate_name`-checked
+    // identifier joined onto a trusted directory, so this can never actually
+    // fire today; see `validate_within`'s doc comment.
+    validate_within(&target, dir)?;
     Ok(target)
 }
 
@@ -131,54 +245,99 @@ pub(crate) fn agent_slug_map(dir: &FsPath) -> std::collections::HashMap<String, 
     out
 }
 
-/// Build the detail DTO from a loaded spec, tagged with `scope`/`scope_kind`
-/// and `slug`.
+/// Build the detail DTO from a loaded spec, tagged with `scope`/`scope_kind`/
+/// `scope_id` and `slug`.
 fn detail_from_spec(
     spec: rupu_agent::spec::AgentSpec,
     scope: impl Into<String>,
     scope_kind: ScopeKind,
     slug: impl Into<String>,
+    scope_id: Option<String>,
 ) -> AgentDetailDto {
     let system_prompt = spec.system_prompt.clone();
     let raw = spec.raw.clone();
     AgentDetailDto {
         system_prompt,
         raw,
-        summary: AgentDto::from_spec(spec, scope, scope_kind, slug),
+        summary: AgentDto::from_spec(spec, scope, scope_kind, slug, scope_id),
     }
 }
 
 /// Load agent `name` and build the full detail DTO. Shared by GET / PUT / POST.
 ///
-/// Project-aware: resolves `name` in the global layer first, falling back to
-/// every registered project's `.rupu/agents/` (first match) so a
-/// project-only agent's detail route doesn't 404. The resolved layer is
-/// carried on the returned DTO's `scope_kind` — callers (the CP detail page)
-/// use it to gate Delete, since `DELETE /api/agents/:name` only ever resolves
-/// against the global layer regardless of which layer this GET resolved.
+/// Resolution has two tiers:
+///
+/// 1. **Fast/common path** — `name` is checked as a file STEM via
+///    [`resolve_agent_scoped`], the EXACT resolver `DELETE /api/agents/:name`
+///    uses (project-first, then global — see its doc comment). This covers
+///    the overwhelming common case, since every agent created or saved
+///    through this API enforces `frontmatter name == url name == file stem`
+///    (see [`save_agent_file`]/[`create_agent_file`]).
+/// 2. **Fallback** — only when NO file's stem is `name` does this fall back
+///    to matching by parsed FRONTMATTER `name` instead, for hand- or
+///    CLI-authored files whose stem legitimately differs from their `name:`
+///    (see [`AgentDto::slug`]'s doc comment). Also project-first: one
+///    representative workspace per distinct repo (via
+///    [`distinct_repo_workspaces`] — the SAME representative-selection
+///    [`resolve_agent_scoped`] uses), THEN the global layer.
+///
+/// This used to be two independently-implemented resolvers with a doc
+/// comment incorrectly claiming they resolved "the same way": this function
+/// matched frontmatter name across EVERY raw registered workspace in
+/// whatever order the store listed them, while `resolve_agent_scoped`
+/// matched file stem against one deterministic representative per repo —
+/// neither the matching key nor the workspace-selection axis actually
+/// agreed. Routing the common (name == stem) case through the real
+/// `resolve_agent_scoped` resolver, and putting the fallback path onto the
+/// same deterministic per-repo selection, unifies both axes except where
+/// they must differ by design: `DELETE` always keys on file stem, while
+/// `GET`/detail prefers file-stem but still finds a stem-mismatched file by
+/// frontmatter name, because switching `GET` to stem-only would break
+/// existing `/agents/:name` links built from frontmatter `name`
+/// (`Agents.tsx`'s row links, `NewAgentModal`'s post-create navigation) for
+/// that rare hand-authored-mismatch case.
+///
+/// The resolved layer is carried on the returned DTO's `scope`/`scope_kind`/
+/// `scope_id`, which the CP detail page shows (scope chip + naming the layer
+/// in the delete confirmation) and threads back on its own Delete call when
+/// no explicit scope is otherwise available.
 fn load_detail(s: &AppState, name: &str) -> ApiResult<AgentDetailDto> {
+    if let Some((path, _dir, scope, scope_kind, scope_id)) = resolve_agent_scoped(s, name) {
+        let spec = rupu_agent::AgentSpec::parse_file(&path)
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        return Ok(detail_from_spec(
+            spec,
+            scope,
+            scope_kind,
+            name.to_string(),
+            scope_id,
+        ));
+    }
+
+    let workspaces = store(s).list().unwrap_or_default();
+    for r in distinct_repo_workspaces(workspaces, &repo_store(s)) {
+        let rupu_dir = std::path::Path::new(&r.workspace.path).join(".rupu");
+        if let Ok(spec) = load_agent(&rupu_dir, None, name) {
+            let slug = agent_slug_map(&rupu_dir)
+                .remove(name)
+                .unwrap_or_else(|| name.to_string());
+            return Ok(detail_from_spec(
+                spec,
+                r.scope,
+                ScopeKind::Project,
+                slug,
+                Some(r.workspace.id),
+            ));
+        }
+    }
     match load_agent(&s.global_dir, None, name) {
         Ok(spec) => {
             let slug = agent_slug_map(&s.global_dir)
                 .remove(name)
                 .unwrap_or_else(|| name.to_string());
-            Ok(detail_from_spec(spec, "global", ScopeKind::Global, slug))
+            Ok(detail_from_spec(spec, "global", ScopeKind::Global, slug, None))
         }
         Err(AgentLoadError::NotFound(_)) => {
-            for w in store(s).list().unwrap_or_default() {
-                let rupu_dir = std::path::Path::new(&w.path).join(".rupu");
-                if let Ok(spec) = load_agent(&rupu_dir, None, name) {
-                    let slug = agent_slug_map(&rupu_dir)
-                        .remove(name)
-                        .unwrap_or_else(|| name.to_string());
-                    return Ok(detail_from_spec(
-                        spec,
-                        project_scope_name(&w),
-                        ScopeKind::Project,
-                        slug,
-                    ));
-                }
-            }
             Err(ApiError::not_found(format!("agent {name} not found")))
         }
         Err(other) => Err(ApiError::internal(other.to_string())),
@@ -222,6 +381,14 @@ pub(crate) struct AgentDto {
     /// Structured scope discriminator backing every Delete gate. See
     /// [`ScopeKind`].
     pub(crate) scope_kind: ScopeKind,
+    /// The underlying registered workspace's unique `id` for a Project row
+    /// (`None` for a Global row). Unlike `scope` (a path basename, which can
+    /// collide between two different repos), this is the genuinely unique
+    /// identifier for "which repo" — pass it back as the `scope_id` query
+    /// param on `DELETE` to pin the action to THIS row's file when another
+    /// repo defines the same `name`/`slug`. See `repo_scope::ScopeQuery`'s
+    /// doc comment.
+    pub(crate) scope_id: Option<String>,
     /// Aggregate token + cost usage across every run attributed to this agent.
     /// Defaults to empty; populated only by the list handler. Usage is
     /// grouped by agent NAME alone (the transcript rows the breakdown is
@@ -264,12 +431,14 @@ pub(crate) struct AgentDto {
 
 impl AgentDto {
     /// Map a loaded [`rupu_agent::spec::AgentSpec`] to the wire DTO, tagging
-    /// it with the given scope and file-stem slug.
+    /// it with the given scope, file-stem slug, and (for a Project row) the
+    /// underlying workspace's unique id.
     pub(crate) fn from_spec(
         spec: rupu_agent::spec::AgentSpec,
         scope: impl Into<String>,
         scope_kind: ScopeKind,
         slug: impl Into<String>,
+        scope_id: Option<String>,
     ) -> Self {
         AgentDto {
             name: spec.name,
@@ -282,6 +451,7 @@ impl AgentDto {
             tools: spec.tools.unwrap_or_default(),
             scope: scope.into(),
             scope_kind,
+            scope_id,
             usage: crate::usage::UsageSummary::default(),
             run_count: 0,
             last_run: None,
@@ -325,7 +495,7 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
                 .get(&spec.name)
                 .cloned()
                 .unwrap_or_else(|| spec.name.clone());
-            AgentDto::from_spec(spec, "global", ScopeKind::Global, slug)
+            AgentDto::from_spec(spec, "global", ScopeKind::Global, slug, None)
         })
         .collect();
 
@@ -334,6 +504,7 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
     let mut project_dtos: Vec<AgentDto> = Vec::new();
     for r in repos {
         let scope = r.scope;
+        let scope_id = r.workspace.id.clone();
         let rupu_dir = std::path::Path::new(&r.workspace.path).join(".rupu");
         match load_agents(&rupu_dir, None) {
             Ok(specs) => {
@@ -343,7 +514,13 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
                         .get(&spec.name)
                         .cloned()
                         .unwrap_or_else(|| spec.name.clone());
-                    AgentDto::from_spec(spec, scope.clone(), ScopeKind::Project, slug)
+                    AgentDto::from_spec(
+                        spec,
+                        scope.clone(),
+                        ScopeKind::Project,
+                        slug,
+                        Some(scope_id.clone()),
+                    )
                 }));
             }
             Err(err) => {
@@ -451,44 +628,132 @@ struct AgentWriteBody {
     raw: String,
 }
 
-/// `PUT /api/agents/:name` — overwrite (or create) the global agent definition
-/// `:name`. The raw `.md` is validated by [`rupu_agent::AgentSpec::parse`]
-/// before any write; the frontmatter `name:` must equal `:name`. Returns the
-/// reloaded detail DTO.
+/// `PUT /api/agents/:name` — overwrite (or create) the agent definition
+/// `:name` (a file STEM — see [`AgentDto::slug`]). The raw `.md` is validated
+/// by [`rupu_agent::AgentSpec::parse`] before any write; the frontmatter
+/// `name:` must equal `:name`.
+///
+/// Accepts optional `?scope_kind=global|project&scope_id=<workspace id>`
+/// query params (see [`ScopeQuery`]'s doc comment) — the SAME selector
+/// [`delete_agent`] takes.
+///
+/// - An explicit selector resolves STRICTLY via
+///   [`resolve_agent_scoped_explicit`] and writes to that ONE layer; 404 on
+///   any mismatch (wrong layer, absent file, unknown `scope_id`) rather than
+///   a silent fallback to another layer — exactly like `DELETE`, and nothing
+///   is written when it 404s.
+/// - No selector (older clients, or a name not yet known to resolve
+///   anywhere): resolves via the implicit project-first walk
+///   [`resolve_agent_scoped`] — the SAME resolver `DELETE` uses (by file
+///   stem). A name that already resolves (in EITHER layer) is overwritten IN
+///   PLACE there; a name that resolves NOWHERE is created fresh in the
+///   global layer (unchanged behavior for a genuinely new definition).
+///
+/// This closes the operator-visible bug where the old global-only PUT wrote
+/// an edit to a HIDDEN new global file while a same-named PROJECT file (the
+/// one the editor was actually showing) was left untouched — reading as
+/// "Save did nothing" while quietly leaving a shadow copy the list would
+/// never surface. See `workflows::resolve_workflow_scoped`'s doc comment for
+/// the identical reasoning `DELETE` already applies.
+///
+/// Returns the reloaded detail DTO — [`load_detail`] resolves the SAME
+/// project-first way, so the response always echoes the file this handler
+/// actually just wrote.
 async fn write_agent(
     State(s): State<AppState>,
     Path(name): Path<String>,
+    Query(q): Query<ScopeQuery>,
     Json(body): Json<AgentWriteBody>,
 ) -> ApiResult<Json<AgentDetailDto>> {
-    save_agent_file(&s.global_dir, &name, &body.raw)?;
+    match q.scope_kind {
+        Some(kind) => {
+            let (_path, dir, _scope, _kind) =
+                resolve_agent_scoped_explicit(&s, &name, kind, q.scope_id.as_deref())
+                    .ok_or_else(|| {
+                        ApiError::not_found(format!(
+                            "agent {name} not found in the requested scope"
+                        ))
+                    })?;
+            save_agent_file_at(&name, &body.raw, &dir)?;
+        }
+        None => match resolve_agent_scoped(&s, &name) {
+            Some((_path, dir, _scope, _kind, _scope_id)) => {
+                save_agent_file_at(&name, &body.raw, &dir)?;
+            }
+            None => {
+                save_agent_file(&s.global_dir, &name, &body.raw)?;
+            }
+        },
+    }
     Ok(Json(load_detail(&s, &name)?))
 }
 
-/// `POST /api/agents` — create a new global agent. The name is taken from the
-/// parsed frontmatter; fails with 409 if a definition with that name already
-/// exists. Returns the reloaded detail DTO.
+/// `POST /api/agents` — create a new agent. The name is taken from the parsed
+/// frontmatter; fails with 409 if a definition with that name already
+/// resolves ANYWHERE (project-first, then global — the SAME resolver
+/// `DELETE`/`PUT` use, by file stem), not just the global layer, so create
+/// can never silently shadow an existing PROJECT definition with a brand-new
+/// global file of the same name. Always writes into the global layer
+/// (creating directly into a specific project via this endpoint is not
+/// supported). Returns the reloaded detail DTO.
 async fn create_agent(
     State(s): State<AppState>,
     Json(body): Json<AgentWriteBody>,
 ) -> ApiResult<Json<AgentDetailDto>> {
-    create_agent_file(&s.global_dir, &body.raw)?;
     let spec = rupu_agent::AgentSpec::parse(&body.raw)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    validate_name(&spec.name)?;
+    if resolve_agent_scoped(&s, &spec.name).is_some() {
+        return Err(ApiError::conflict("agent already exists"));
+    }
+    create_agent_file(&s.global_dir, &body.raw)?;
     Ok(Json(load_detail(&s, &spec.name)?))
 }
 
-/// `DELETE /api/agents/:name` — remove the global agent definition `:name`.
+/// `DELETE /api/agents/:name` — remove the agent definition whose file STEM
+/// is `:name` (see [`AgentDto::slug`]).
+///
+/// Accepts optional `?scope_kind=global|project&scope_id=<workspace id>`
+/// query params (see [`ScopeQuery`]'s doc comment). When present, resolution
+/// is EXPLICIT via [`resolve_agent_scoped_explicit`] — restricted to exactly
+/// that layer/workspace, 404 on any mismatch rather than falling back to
+/// another layer. When absent (older clients), falls back to the implicit
+/// project-first resolver [`resolve_agent_scoped`] — a project-scoped
+/// agent's Delete row-action therefore removes the actual project file the
+/// row/detail page displays, not a same-named global file it shadows — the
+/// data-loss bug PR #536 worked around by hiding Delete on non-global rows
+/// entirely, and a LATER bug this fixes: the implicit resolver briefly
+/// resolved global-first, backwards from what the list/CLI runtime prefer —
+/// see [`resolve_agent_scoped`]'s doc comment.
+///
+/// Returns the resolved `scope`/`scope_kind` alongside `deleted: true` so the
+/// caller can confirm which layer's file was actually removed. Local-only,
+/// no `?host=` — see [`resolve_agent_scoped`]'s doc comment.
 async fn delete_agent(
     State(s): State<AppState>,
     Path(name): Path<String>,
+    Query(q): Query<ScopeQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_name(&name)?;
-    let target = agents_dir(&s).join(format!("{name}.md"));
-    if !target.exists() {
-        return Err(ApiError::not_found(format!("agent {name} not found")));
-    }
+    let (target, dir, scope, scope_kind) = match q.scope_kind {
+        Some(kind) => resolve_agent_scoped_explicit(&s, &name, kind, q.scope_id.as_deref())
+            .ok_or_else(|| {
+                ApiError::not_found(format!("agent {name} not found in the requested scope"))
+            })?,
+        None => {
+            let (target, dir, scope, scope_kind, _scope_id) = resolve_agent_scoped(&s, &name)
+                .ok_or_else(|| ApiError::not_found(format!("agent {name} not found")))?;
+            (target, dir, scope, scope_kind)
+        }
+    };
+    // Defense in depth — see `validate_within`'s doc comment.
+    validate_within(&target, &dir)?;
     std::fs::remove_file(&target).map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(serde_json::json!({ "deleted": true })))
+    Ok(Json(serde_json::json!({
+        "deleted": true,
+        "scope": scope,
+        "scope_kind": scope_kind,
+    })))
 }
 
 /// Request body for `POST /api/agents/:name/run`. All fields optional; a
@@ -801,6 +1066,231 @@ mod tests {
         assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
     }
 
+    /// A slug that already resolves in a PROJECT must not be silently
+    /// shadowed by a brand-new global file of the same name — `POST` must
+    /// 409, project-aware, not just "absent from global."
+    #[tokio::test]
+    async fn post_conflicts_on_project_only_name_without_creating_a_global_shadow() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp); // no global agents
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_agents = proj.path().join(".rupu").join("agents");
+        std::fs::create_dir_all(&proj_agents).unwrap();
+        std::fs::write(proj_agents.join("code-reviewer.md"), VALID_MD).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        // `AgentDetailDto` (the `Ok` payload) doesn't implement `Debug`, so
+        // `expect_err` isn't usable here — match explicitly instead.
+        let err = match create_agent(State(s.clone()), Json(AgentWriteBody { raw: VALID_MD.into() })).await {
+            Err(e) => e,
+            Ok(_) => panic!("must conflict against the project-only definition"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+        assert!(
+            !agents_dir(&s).join("code-reviewer.md").exists(),
+            "no hidden global shadow must be created"
+        );
+    }
+
+    // ── PUT scope-awareness (write-path parity with DELETE) ───────────────
+    //
+    // `write_agent` used to unconditionally write to the GLOBAL layer, then
+    // return `load_detail`, which (like `DELETE`) resolves project-first. For
+    // a project-only agent this meant: PUT silently created a HIDDEN new
+    // global file holding the edit, while `load_detail` echoed back the
+    // UNCHANGED project file — reading as "Save did nothing" while quietly
+    // leaving a shadow copy the list would never show. These tests are the
+    // seeded-collision regression suite for the fix: an explicit
+    // `?scope_kind=&scope_id=` selector (the SAME shape `DELETE` takes) pins
+    // the write to exactly one layer, 404ing rather than falling back, and —
+    // even with NO selector — a name that already resolves somewhere is
+    // edited IN PLACE there rather than shadowed.
+
+    /// (a) Saving a PROJECT-scoped def with an explicit project selector
+    /// writes the PROJECT file and creates NO global file.
+    #[tokio::test]
+    async fn put_explicit_project_selector_writes_project_creates_no_global() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp); // no global agents
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_agents = proj.path().join(".rupu").join("agents");
+        std::fs::create_dir_all(&proj_agents).unwrap();
+        std::fs::write(proj_agents.join("code-reviewer.md"), VALID_MD).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let edited = format!("{VALID_MD}\nEdited.\n");
+        let resp = write_agent(
+            State(s.clone()),
+            Path("code-reviewer".into()),
+            Query(ScopeQuery {
+                scope_kind: Some(ScopeKind::Project),
+                scope_id: Some("ws_a".to_string()),
+            }),
+            Json(AgentWriteBody { raw: edited.clone() }),
+        )
+        .await
+        .expect("explicit project-scoped put should succeed");
+        assert_eq!(
+            resp.0.summary.scope_kind,
+            ScopeKind::Project
+        );
+        assert_eq!(
+            std::fs::read_to_string(proj_agents.join("code-reviewer.md")).unwrap(),
+            edited,
+            "the PROJECT file must hold the edit"
+        );
+        assert!(
+            !agents_dir(&s).join("code-reviewer.md").exists(),
+            "no hidden GLOBAL file must be created"
+        );
+    }
+
+    /// (b) Same slug present in BOTH layers, explicit project selector → the
+    /// project file changes, the global file is byte-unchanged.
+    #[tokio::test]
+    async fn put_explicit_project_selector_with_slug_in_both_layers_leaves_global_untouched() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        const GLOBAL_MD: &str = "---\nname: shared-name\nmodel: opus\n---\nGlobal copy.\n";
+        save_agent_file(&s.global_dir, "shared-name", GLOBAL_MD).expect("seed global");
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_agents = proj.path().join(".rupu").join("agents");
+        std::fs::create_dir_all(&proj_agents).unwrap();
+        const PROJECT_MD: &str = "---\nname: shared-name\nmodel: opus\n---\nProject copy.\n";
+        std::fs::write(proj_agents.join("shared-name.md"), PROJECT_MD).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let edited = "---\nname: shared-name\nmodel: opus\n---\nProject copy, edited.\n";
+        let resp = write_agent(
+            State(s.clone()),
+            Path("shared-name".into()),
+            Query(ScopeQuery {
+                scope_kind: Some(ScopeKind::Project),
+                scope_id: Some("ws_a".to_string()),
+            }),
+            Json(AgentWriteBody { raw: edited.to_string() }),
+        )
+        .await
+        .expect("explicit project-scoped put should succeed");
+        assert_eq!(resp.0.summary.scope_kind, ScopeKind::Project);
+        assert_eq!(
+            std::fs::read_to_string(proj_agents.join("shared-name.md")).unwrap(),
+            edited,
+            "the PROJECT file must hold the edit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(agents_dir(&s).join("shared-name.md")).unwrap(),
+            GLOBAL_MD,
+            "the GLOBAL file must be byte-unchanged"
+        );
+    }
+
+    /// (c) An explicit selector pointing at a layer that doesn't hold the
+    /// def → 404, and NOTHING is written anywhere.
+    #[tokio::test]
+    async fn put_explicit_scope_mismatch_404s_and_writes_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        const GLOBAL_MD: &str = "---\nname: shared-name\nmodel: opus\n---\nGlobal copy.\n";
+        save_agent_file(&s.global_dir, "shared-name", GLOBAL_MD).expect("seed global");
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_agents = proj.path().join(".rupu").join("agents");
+        std::fs::create_dir_all(&proj_agents).unwrap();
+        const PROJECT_MD: &str = "---\nname: shared-name\nmodel: opus\n---\nProject copy.\n";
+        std::fs::write(proj_agents.join("shared-name.md"), PROJECT_MD).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        // `AgentDetailDto` (the `Ok` payload) doesn't implement `Debug`, so
+        // `expect_err` isn't usable here — match explicitly instead.
+        let err = match write_agent(
+            State(s.clone()),
+            Path("shared-name".into()),
+            Query(ScopeQuery {
+                scope_kind: Some(ScopeKind::Project),
+                scope_id: Some("no-such-workspace".to_string()),
+            }),
+            Json(AgentWriteBody {
+                raw: "---\nname: shared-name\nmodel: opus\n---\nShould not land.\n".to_string(),
+            }),
+        )
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("mismatched explicit scope must 404, never fall back"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            std::fs::read_to_string(agents_dir(&s).join("shared-name.md")).unwrap(),
+            GLOBAL_MD,
+            "global file untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(proj_agents.join("shared-name.md")).unwrap(),
+            PROJECT_MD,
+            "project file untouched"
+        );
+    }
+
+    /// (d) No selector + slug resolves only in a project → writes the
+    /// PROJECT file, still no global shadow created.
+    #[tokio::test]
+    async fn put_no_selector_project_only_slug_writes_project_no_global_shadow() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp); // no global agents
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_agents = proj.path().join(".rupu").join("agents");
+        std::fs::create_dir_all(&proj_agents).unwrap();
+        std::fs::write(proj_agents.join("code-reviewer.md"), VALID_MD).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let edited = format!("{VALID_MD}\nEdited.\n");
+        let resp = write_agent(
+            State(s.clone()),
+            Path("code-reviewer".into()),
+            Query(ScopeQuery::default()),
+            Json(AgentWriteBody { raw: edited.clone() }),
+        )
+        .await
+        .expect("implicit project-first put should succeed");
+        assert_eq!(resp.0.summary.scope_kind, ScopeKind::Project);
+        assert_eq!(
+            std::fs::read_to_string(proj_agents.join("code-reviewer.md")).unwrap(),
+            edited,
+            "the PROJECT file must hold the edit"
+        );
+        assert!(
+            !agents_dir(&s).join("code-reviewer.md").exists(),
+            "no hidden GLOBAL shadow must be created"
+        );
+    }
+
+    /// (e) No selector + slug resolves nowhere → creates in global
+    /// (unchanged creation behavior).
+    #[tokio::test]
+    async fn put_no_selector_unresolved_slug_creates_in_global() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+
+        let resp = write_agent(
+            State(s.clone()),
+            Path("code-reviewer".into()),
+            Query(ScopeQuery::default()),
+            Json(AgentWriteBody { raw: VALID_MD.to_string() }),
+        )
+        .await
+        .expect("put ok");
+        assert_eq!(resp.0.summary.scope_kind, ScopeKind::Global);
+        assert_eq!(
+            std::fs::read_to_string(agents_dir(&s).join("code-reviewer.md")).unwrap(),
+            VALID_MD
+        );
+    }
+
     #[test]
     fn delete_present_then_absent() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -809,17 +1299,245 @@ mod tests {
 
         let body = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(delete_agent(State(s.clone()), Path("code-reviewer".into())))
+            .block_on(delete_agent(
+                State(s.clone()),
+                Path("code-reviewer".into()),
+                Query(ScopeQuery::default()),
+            ))
             .expect("delete ok");
         assert_eq!(body.0["deleted"], serde_json::json!(true));
+        assert_eq!(body.0["scope"], serde_json::json!("global"));
+        assert_eq!(body.0["scope_kind"], serde_json::json!("global"));
         assert!(!agents_dir(&s).join("code-reviewer.md").exists());
 
         // Second delete → not found.
         let err = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(delete_agent(State(s.clone()), Path("code-reviewer".into())))
+            .block_on(delete_agent(
+                State(s.clone()),
+                Path("code-reviewer".into()),
+                Query(ScopeQuery::default()),
+            ))
             .expect_err("absent");
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// Regression for the operator complaint this PR fixes: a project-scoped
+    /// agent's Delete row-action must remove the actual PROJECT file, not a
+    /// same-named global one (or, if there is no name collision, an
+    /// unrelated global definition must be left byte-for-byte untouched).
+    #[tokio::test]
+    async fn delete_removes_project_file_leaves_unrelated_global_untouched() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        // An unrelated global agent — must survive the project-scoped delete.
+        const KEEPER_MD: &str = "---\nname: keeper\nmodel: opus\n---\nStays put.\n";
+        save_agent_file(&s.global_dir, "keeper", KEEPER_MD).expect("seed global");
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_agents = proj.path().join(".rupu").join("agents");
+        std::fs::create_dir_all(&proj_agents).unwrap();
+        const REVIEWER_MD: &str = "---\nname: reviewer\nmodel: opus\n---\nProject reviewer.\n";
+        std::fs::write(proj_agents.join("reviewer.md"), REVIEWER_MD).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let resp = delete_agent(
+            State(s.clone()),
+            Path("reviewer".into()),
+            Query(ScopeQuery::default()),
+        )
+        .await
+        .expect("project-scoped delete should succeed");
+        assert_eq!(resp.0["deleted"], serde_json::json!(true));
+        assert_eq!(resp.0["scope_kind"], serde_json::json!("project"));
+        assert!(
+            !proj_agents.join("reviewer.md").exists(),
+            "the PROJECT file must be removed"
+        );
+        assert!(
+            agents_dir(&s).join("keeper.md").exists(),
+            "an unrelated GLOBAL agent must be left untouched"
+        );
+    }
+
+    /// Vice-versa of the above: deleting a global agent must leave a
+    /// differently-named project agent untouched.
+    #[tokio::test]
+    async fn delete_removes_global_file_leaves_unrelated_project_untouched() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        const REVIEWER_MD: &str = "---\nname: reviewer\nmodel: opus\n---\nGlobal reviewer.\n";
+        save_agent_file(&s.global_dir, "reviewer", REVIEWER_MD).expect("seed global");
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_agents = proj.path().join(".rupu").join("agents");
+        std::fs::create_dir_all(&proj_agents).unwrap();
+        const OTHER_MD: &str = "---\nname: other\nmodel: opus\n---\nProject-only agent.\n";
+        std::fs::write(proj_agents.join("other.md"), OTHER_MD).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let resp = delete_agent(
+            State(s.clone()),
+            Path("reviewer".into()),
+            Query(ScopeQuery::default()),
+        )
+        .await
+        .expect("global delete should succeed");
+        assert_eq!(resp.0["scope_kind"], serde_json::json!("global"));
+        assert!(!agents_dir(&s).join("reviewer.md").exists());
+        assert!(
+            proj_agents.join("other.md").exists(),
+            "an unrelated PROJECT agent must be left untouched"
+        );
+    }
+
+    /// A traversal-y `:name` must be rejected by `validate_name` before any
+    /// disk access — mirrors `api::autoflows`'s identical guard.
+    #[tokio::test]
+    async fn delete_rejects_traversal_name_before_any_disk_access() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        // A file a successful traversal *would* reach: sibling of the global
+        // agents dir, i.e. `<global_dir>/evil.md` via `../evil` from inside
+        // `<global_dir>/agents/`.
+        let outside_target = tmp.path().join("evil.md");
+        std::fs::write(&outside_target, VALID_MD).unwrap();
+
+        let err = delete_agent(
+            State(s),
+            Path("../evil".into()),
+            Query(ScopeQuery::default()),
+        )
+        .await
+        .expect_err("traversal name must be rejected");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            outside_target.exists(),
+            "the out-of-tree file must be byte-for-byte untouched"
+        );
+    }
+
+    // ── Critical 1: project-first precedence for a slug shared by BOTH
+    //    layers ─────────────────────────────────────────────────────────
+    //
+    // The list always shadows a same-named GLOBAL row WITH the project row,
+    // so Delete on the row the operator sees must remove the PROJECT file,
+    // never the hidden global one.
+
+    #[tokio::test]
+    async fn delete_with_slug_in_both_layers_removes_project_leaves_global_intact() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        const GLOBAL_MD: &str = "---\nname: shared-name\nmodel: opus\n---\nGlobal copy.\n";
+        save_agent_file(&s.global_dir, "shared-name", GLOBAL_MD).expect("seed global");
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_agents = proj.path().join(".rupu").join("agents");
+        std::fs::create_dir_all(&proj_agents).unwrap();
+        const PROJECT_MD: &str = "---\nname: shared-name\nmodel: opus\n---\nProject copy.\n";
+        std::fs::write(proj_agents.join("shared-name.md"), PROJECT_MD).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        // The list shadows the global row with the project row.
+        let Json(rows) = list_agents(State(s.clone())).await.expect("ok");
+        assert_eq!(rows.len(), 1, "the project row shadows the global one");
+        assert_eq!(rows[0].scope_kind, ScopeKind::Project);
+
+        // No explicit scope query — the implicit (project-first) resolver
+        // must match what the list showed.
+        let resp = delete_agent(
+            State(s.clone()),
+            Path("shared-name".into()),
+            Query(ScopeQuery::default()),
+        )
+        .await
+        .expect("delete should succeed");
+        assert_eq!(resp.0["scope_kind"], serde_json::json!("project"));
+        assert!(
+            !proj_agents.join("shared-name.md").exists(),
+            "the PROJECT file (the one the list/operator saw) must be removed"
+        );
+        assert!(
+            agents_dir(&s).join("shared-name.md").exists(),
+            "the shadowed GLOBAL file must survive untouched"
+        );
+    }
+
+    // ── Critical 2: `scope_id` disambiguates a slug shared by TWO repos ──
+
+    #[tokio::test]
+    async fn delete_with_explicit_scope_id_targets_one_repo_of_two_with_the_same_slug() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp); // no global agents
+
+        let proj_x = tmp.path().join("proj-x");
+        let agents_x = proj_x.join(".rupu").join("agents");
+        std::fs::create_dir_all(&agents_x).unwrap();
+        std::fs::write(agents_x.join("code-reviewer.md"), VALID_MD).unwrap();
+        register_workspace_with_remote(&tmp, "ws_x", &proj_x, Some("git@github.com:acme/x.git"));
+
+        let proj_y = tmp.path().join("proj-y");
+        let agents_y = proj_y.join(".rupu").join("agents");
+        std::fs::create_dir_all(&agents_y).unwrap();
+        std::fs::write(agents_y.join("code-reviewer.md"), VALID_MD).unwrap();
+        register_workspace_with_remote(&tmp, "ws_y", &proj_y, Some("git@github.com:acme/y.git"));
+
+        // Both rows appear — confirm the ambiguity is real before resolving
+        // it with an explicit scope_id.
+        let Json(rows) = list_agents(State(s.clone())).await.expect("ok");
+        assert_eq!(rows.len(), 2);
+
+        let resp = delete_agent(
+            State(s.clone()),
+            Path("code-reviewer".into()),
+            Query(ScopeQuery {
+                scope_kind: Some(ScopeKind::Project),
+                scope_id: Some("ws_y".to_string()),
+            }),
+        )
+        .await
+        .expect("explicit-scope delete should succeed");
+        assert_eq!(resp.0["scope"], serde_json::json!("proj-y"));
+        assert!(
+            !agents_y.join("code-reviewer.md").exists(),
+            "repo Y's file must be removed"
+        );
+        assert!(
+            agents_x.join("code-reviewer.md").exists(),
+            "repo X's same-named file must survive untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_explicit_scope_mismatch_404s_and_leaves_every_file_untouched() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        const GLOBAL_MD: &str = "---\nname: shared-name\nmodel: opus\n---\nGlobal copy.\n";
+        save_agent_file(&s.global_dir, "shared-name", GLOBAL_MD).expect("seed global");
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_agents = proj.path().join(".rupu").join("agents");
+        std::fs::create_dir_all(&proj_agents).unwrap();
+        const PROJECT_MD: &str = "---\nname: shared-name\nmodel: opus\n---\nProject copy.\n";
+        std::fs::write(proj_agents.join("shared-name.md"), PROJECT_MD).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let err = delete_agent(
+            State(s.clone()),
+            Path("shared-name".into()),
+            Query(ScopeQuery {
+                scope_kind: Some(ScopeKind::Project),
+                scope_id: Some("no-such-workspace".to_string()),
+            }),
+        )
+        .await
+        .expect_err("mismatched explicit scope must 404, never fall back");
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+        assert!(agents_dir(&s).join("shared-name.md").exists(), "global file untouched");
+        assert!(
+            proj_agents.join("shared-name.md").exists(),
+            "project file untouched"
+        );
     }
 
     struct MockStarter {

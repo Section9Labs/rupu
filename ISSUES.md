@@ -132,30 +132,201 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 ## Open
 
-### I-5 — `rust-toolchain.toml` is not honored on this box; clippy is red under 1.95
+### I-6 — `rupu config set` corrupts `config.toml`, then silently wipes it
 
-**Symptom.** `cargo clippy` fails on a clean `main` in crates unrelated to any
-change, e.g.:
+**Symptom.** Two commands destroy a user's configuration:
 
-- `crates/rupu-config/src/config.rs:150` — `unnecessary_map_or` (fixed in
-  passing, see I-1/I-2 PR)
-- `crates/rupu-orchestrator/src/runner.rs:3262` — `items_after_test_module`
-- `crates/rupu-cp/src/host/ssh.rs:193` — `type_complexity`
-- `crates/rupu-cp/src/host/ssh.rs:1041` — `single_match`
+```
+$ rupu config set ui.theme dracula     # writes a literal "ui.theme" top-level key
+$ rupu config set log_level debug      # config.toml is now an empty file
+```
 
-**Root cause.** `rustup` is not installed, so `rust-toolchain.toml`'s
-`channel = "1.88"` pin is silently ignored and the Homebrew `rustc 1.95.0` is
-used instead. These lints post-date 1.88, so CI (which does honor the pin) stays
-green while local clippy is red.
+**Root cause.** Two independent defects in `crates/rupu-cli/src/cmd/config.rs`:
 
-**Impact.** Real, and it compounds: because clippy lints workspace path
-dependencies, a red crate blocks linting of every crate that depends on it —
-`rupu-cp` being red means `rupu-cli` cannot be linted locally at all. Local
-clippy is therefore not usable as a pre-push gate.
+1. `set` operates on the top-level table only — `t.insert(key.to_string(), parsed)`
+   (`config.rs:66`) inserts the dotted string `"ui.theme"` as a key rather than
+   descending into `[ui]`. `Config` is `#[serde(default, deny_unknown_fields)]`
+   (`crates/rupu-config/src/config.rs:22`), so the file no longer loads.
+2. The *next* `set` reads that now-invalid file with
+   `toml::from_str(&text).unwrap_or_else(|_| Value::Table(Default::default()))`
+   (`config.rs:54`) — on a parse failure it starts from an **empty table** and
+   writes it back, discarding every remaining setting.
 
-**Fix.** Either install `rustup` so the pin applies, or bump the pinned
-toolchain and clear the new lints in one sweep. The second is probably better
-long-term, but it is a workspace-wide change and wants its own PR.
+`get` has the same top-level-only limitation (`config.rs:42`) but is read-only.
+
+**Impact.** Data loss on the most natural input. `README.md:283` advertises the
+command as "Read / write rupu configuration"; only the clap help mentions the
+top-level restriction. Downstream, the corrupted file either hard-errors
+(`cmd/run.rs:473`) or is silently swallowed (`cmd/run.rs:339`), so the user may
+just see all their settings quietly stop applying.
+
+**Fix.** Descend dotted paths on both `get` and `set` (the CP web already does
+this — `crates/rupu-cp/src/api/config.rs` handles dotted keys). Never fall back
+to an empty table on a parse error: fail loudly and leave the file untouched.
+
+---
+
+### I-7 — `[policy].lock` is not enforced anywhere outside the web UI
+
+**Symptom.** An administrator locks `permission_mode` globally. The CP Settings
+UI shows the field locked and refuses to edit it. A project-level
+`.rupu/config.toml` still overrides it for every `rupu run`, `rupu session` and
+`rupu workflow run`.
+
+**Root cause.** Lock enforcement lives entirely inside `rupu_config::resolve`
+(`crates/rupu-config/src/resolve.rs:180-197`, `is_locked` → global-wins
+precedence). `resolve()` has **6 call sites, all in rupu-cp**
+(`crates/rupu-cp/src/state.rs`, `crates/rupu-cp/src/api/config.rs`). Every CLI
+path loads configuration through `rupu_config::layer_files` instead — **43 call
+sites** — which performs ordinary project-over-global layering and never
+consults `[policy].lock`.
+
+**Impact.** The one mechanism presented as a governance control is a UI-only
+affordance. `ConfigEditor.tsx:7-14` tells the operator "a field whose resolved
+value is enforced by the global policy lock cannot be edited", which is true of
+the web form and false of the tool.
+
+**Fix.** Route CLI config loading through a single lock-aware resolver so
+`layer_files` is no longer used directly for policy-bearing keys. Validate with a
+test that a locked global key survives a conflicting project config on a CLI
+code path — not only through `resolve()`.
+
+---
+
+### I-8 — `dispatch_agent` hardcodes provider and model (the unfixed 4th I-1/I-2 site)
+
+**Symptom.** A sub-agent dispatched via `dispatch_agent` /
+`dispatch_agents_parallel` ignores `default_provider` and `default_model`, and
+cannot use a config-declared openai-compatible provider.
+
+**Root cause.** `crates/rupu-cli/src/cmd/dispatch.rs:157-162` still does
+`spec.provider.clone().unwrap_or_else(|| "anthropic".into())` and
+`unwrap_or_else(|| "claude-sonnet-4-6".into())`, calling
+`provider_factory::build_for_provider` without a `Config`. The struct has no
+`Config` field at all.
+
+**Impact.** I-1 and I-2 are recorded as fixed "at all three call sites"
+(`run.rs`, `session.rs`, `step_factory.rs`). There is a fourth. The same
+silent-noop the original fix set out to eliminate is still live on the
+sub-agent path, and this file's own "Fixed" section overstates the coverage.
+
+**Fix.** Thread `Config` into the dispatch tool and route through
+`provider_factory::resolve_provider_name()` / `resolve_model()` like the other
+three sites.
+
+---
+
+### I-9 … I-14, I-17, I-19, I-20 — dead configuration
+
+Nine keys parse, are documented, and in several cases are editable in the CP
+Settings UI, yet have **no runtime consumer**. Proof for each is a workspace-wide
+grep (excluding `crates/rupu-config/` and tests) returning zero hits.
+
+| ID | Key | Declared | Documented as working | Reality |
+|---|---|---|---|---|
+| I-9 | `[providers.*].timeout_ms` | `provider_config.rs:23` | `docs/providers.md:111` ("Default: `120000`") + `ConfigEditor.tsx:220` | vendor default always used |
+| I-10 | `[providers.*].max_retries` | `provider_config.rs:25` | `docs/providers.md:112` ("Default: `5`") | real budget is a hardcoded 1 (`anthropic.rs:213`) |
+| I-11 | `[providers.*].max_concurrency` | `provider_config.rs:27` | `docs/providers.md:113` + `concurrency.rs:6` | `semaphore_for` is called only by SCM clients; **no LLM call ever acquires a permit** |
+| I-12 | `[providers.*].org_id`, `.region` | `provider_config.rs:19,21` | `docs/providers/openai.md:20`, `gemini.md:23` | org-scoped keys and non-default Vertex regions are unreachable |
+| I-13 | `[retry]` (whole section) | `config.rs:113-116` | — | inert top-level section |
+| I-14 | `log_level` | `config.rs:27` | `ConfigEditor.tsx:199-207`, with a lock toggle | logging reads only `RUPU_LOG` (`logging.rs:25`) |
+| I-17 | `[scm.*].timeout_ms` | `scm_config.rs:46` | `docs/scm.md:109-119` | no consumer (sibling `base_url`/`max_concurrency` *are* consumed) |
+| I-19 | all of it, in rupu-app | — | — | `executor/mod.rs:210` passes `Config::default()`; self-admitted at `:109-115` |
+| I-20 | `resolve()` env tier | `resolve.rs:144-171` | — | both callers pass an empty map; `KeySource::Env` is unreachable |
+
+**Impact.** Exactly the I-1 shape, ~9×. A user reads the docs, sets a value,
+sees it accepted (and in four cases sees it in the web UI), and gets different
+behavior than documented — with no error.
+
+**Fix.** For each: wire it to its consumer, or delete the key and its
+documentation and UI field. Deleting is a legitimate outcome — an honestly absent
+knob beats a knob that lies. Validation must observe the value *at the consumer*;
+a parse test cannot see this class of defect.
+
+---
+
+### I-15 — `[scm.default]` / `[issues.default]` are inert
+
+**Symptom.** A user with both GitHub and GitLab credentials sets
+`[scm.default] platform = "gitlab"`. Every tool call that omits `platform` still
+goes to GitHub.
+
+**Root cause.** `Registry::default_platform` / `default_tracker`
+(`crates/rupu-scm/src/registry.rs:206-230`) implement a hardcoded
+GitHub-then-GitLab preference over registered connectors and never read
+`ScmDefault` / `IssuesDefault` (`crates/rupu-config/src/scm_config.rs:24-38`),
+which have no consumer anywhere. The code says so: *"Wiring to `[scm.default]`
+config lands in Task 19; this is the v0 'first registered' fallback"*
+(`registry.rs:207-208`).
+
+**Impact.** The key is written into every `rupu init` config
+(`crates/rupu-cli/src/templates.rs:155`), documented as functional
+(`docs/scm.md:100-107`), and *named in the error message users see when it is
+missing* (`crates/rupu-mcp/src/tools/scm_repos.rs:73`: "no platform arg and no
+`[scm.default]` configured"). A GitLab-primary shop silently operates against
+GitHub. `default_tracker` additionally ignores Linear even when registered.
+
+**Fix.** Read the config values, falling back to the current preference only when
+unset. Include `IssueTracker::Linear` in the fallback.
+
+---
+
+### I-16 — `[scm.*].clone_protocol` is inert
+
+**Symptom.** A user on SSH-only infrastructure selects "ssh" from the
+`clone_protocol` dropdown in CP Settings. Clones still go over HTTPS.
+
+**Root cause.** `clone_protocol` (`crates/rupu-config/src/scm_config.rs:51`) has
+no consumer. The clone paths hardcode HTTPS with an embedded token —
+`connectors/gitlab/repo.rs:477-479`, `connectors/github/repo.rs:442`.
+
+**Impact.** Documented at `docs/scm.md:109-119` and given a dedicated
+`https`/`ssh` dropdown at `ConfigEditor.tsx:374,463`. Clones fail or use the
+wrong credentials on hosts that only permit SSH.
+
+**Fix.** Honor the setting in both connectors' clone paths. Note this overlaps
+the self-hosted-host defect (clone URLs also ignore `base_url`), tracked
+separately in `TODO.md`.
+
+---
+
+### I-18 — `[bash]` config is dropped on the workflow path
+
+**Symptom.** `[bash].timeout_secs` and `[bash].env_allowlist` apply under
+`rupu run` and `rupu session`, and are silently ignored under
+`rupu workflow run`.
+
+**Root cause.** `crates/rupu-orchestrator/src/step_factory.rs:245-246` hardcodes
+`bash_env_allowlist: Vec::new(), bash_timeout_secs: 120`. `DefaultStepFactory`
+carries no `Config` (`step_factory.rs:36-50`). The values are read correctly at
+`cmd/session.rs:6705-6706` and `cmd/run.rs:574-575`.
+
+**Impact.** Precisely the I-2 shape: the same agent behaves differently depending
+on how it is invoked. A workflow step gets a 120s bash timeout and an empty env
+allowlist no matter what the user configured.
+
+**Fix.** Thread the `[bash]` config into `DefaultStepFactory` alongside the
+provider/model values I-2 already added.
+
+---
+
+### I-21 — a malformed `config.toml` silently yields wrong cost figures
+
+**Symptom.** A typo in `[pricing]` makes `rupu run list` / `rupu run show` print
+costs computed from default rates, with no warning.
+
+**Root cause.** `crates/rupu-cli/src/cmd/run.rs:339,404` —
+`layer_files(...).unwrap_or_default()` discards a real `LayerError::Parse`
+(`crates/rupu-config/src/layer.rs:23-28`) and feeds `cfg.pricing` into
+`query_run_detail`. The fallback is deliberate per the comment at `run.rs:335`,
+but it was reasoned about for UI preferences, not for numbers the user reads.
+
+**Impact.** Wrong dollar figures presented as authoritative. The same pattern at
+`cmd/workflow.rs:993` and `cmd/cron.rs:281` affects only UI preferences and is
+harmless.
+
+**Fix.** On the pricing paths, surface the parse error (or at minimum warn that
+default rates are in use). Leave the UI-preference sites as they are.
 
 ---
 
@@ -177,9 +348,11 @@ All four assert on an error message propagating out of a failed step, e.g.
 which suggests the failing steps are retrying against a real network endpoint
 and ultimately failing with a timeout/transport message instead of the
 simulated one — i.e. the mock isn't intercepting, or a retry wrapper is
-rewriting the error. Worth checking against the retry config and whether these
-tests are toolchain-sensitive (this box runs Homebrew Rust 1.95 vs. the pinned
-1.88).
+rewriting the error. Worth checking against the retry config. **Not a
+toolchain gap:** I-5 bumped the pin to 1.95, so this box's Homebrew rustc now
+matches the pinned/CI toolchain exactly, and the same 24-passed/4-failed
+split reproduces unchanged under it — these four failures have some other
+cause and still need diagnosis.
 
 **Impact.** The orchestrator test baseline is red, so a real regression in step
 error propagation would be invisible — it looks like the pre-existing noise.
@@ -991,3 +1164,26 @@ passing (2 new):
 
 Both tests hold `crate::test_support::ENV_LOCK` for the `RUPU_HOME`
 mutation, mirroring the existing pattern in `cmd/cron.rs`/`cmd/webhook.rs`.
+---
+
+### I-5 — `rust-toolchain.toml` is not honored on this box; clippy is red under 1.95
+
+**Symptom.** `cargo clippy` failed on a clean `main` in crates unrelated to any
+change (`rupu-config`, `rupu-orchestrator`, `rupu-cp`, `rupu-cli`, `rupu-app`),
+because the pinned toolchain was silently ignored locally.
+
+**Root cause.** `rustup` is not installed, so `rust-toolchain.toml`'s
+`channel = "1.88"` pin was silently ignored and the Homebrew `rustc 1.95.0` was
+used instead. Lints that post-date 1.88 made CI (which honored the pin) stay
+green while local clippy was red.
+
+**Fix.** (PR: pin-toolchain-1.95) Bumped the pinned toolchain to 1.95 at all
+four sites (`rust-toolchain.toml`, workspace `Cargo.toml` `rust-version`,
+`.github/workflows/nightly-live-tests.yml`, `docs/RELEASING.md`) so declared
+== actual, then cleared every clippy lint 1.95 surfaces workspace-wide in the
+same sweep — including a real `MutexGuard`-held-across-`.await` hazard in
+`rupu-auth`'s test-only `ENV_LOCK` (switched to `tokio::sync::Mutex`, which is
+built to be held across an await point, instead of papering over it).
+`cargo clippy --workspace --all-targets` is clean; `cargo build --workspace`
+is clean; `rupu-auth`/`rupu-config`/`rupu-orchestrator`/`rupu-cp` `--lib`
+suites are green.

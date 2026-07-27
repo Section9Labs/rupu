@@ -48,6 +48,7 @@ fn step_working_flips_node_to_working() {
             run_id: "r1".into(),
             step_id: "s1".into(),
             note: Some("gh_pr_list".into()),
+            transcript_path: None,
         });
     assert_eq!(model.nodes.get("s1"), Some(&NodeStatus::Working));
 }

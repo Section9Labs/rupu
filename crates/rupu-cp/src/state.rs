@@ -38,6 +38,10 @@ pub struct AppState {
     /// Optional session-mutator port. Defaults to `None`; rupu-cli's `cp serve`
     /// installs a subprocess adapter via [`AppState::with_session_mutator`].
     pub session_mutator: Option<Arc<dyn crate::session_mutator::SessionMutator>>,
+    /// Optional transcript-mutator port (standalone agent-run transcripts).
+    /// Defaults to `None`; rupu-cli's `cp serve` installs a subprocess
+    /// adapter via [`AppState::with_transcript_mutator`].
+    pub transcript_mutator: Option<Arc<dyn crate::transcript_mutator::TranscriptMutator>>,
     /// Host registry. Defaults to a local-only registry (no launchers) so that
     /// read-only `rupu cp` works without a running daemon. `cp serve` replaces
     /// this with a fully-wired registry via [`AppState::with_hosts`].
@@ -118,6 +122,7 @@ impl AppState {
             session_starter: None,
             generator: None,
             session_mutator: None,
+            transcript_mutator: None,
             hosts,
             run_location_cache: Arc::new(Mutex::new(HashMap::new())),
             node_registry,
@@ -184,6 +189,15 @@ impl AppState {
         m: Option<Arc<dyn crate::session_mutator::SessionMutator>>,
     ) -> Self {
         self.session_mutator = m;
+        self
+    }
+
+    /// Install a transcript-mutator adapter (or clear it with `None`).
+    pub fn with_transcript_mutator(
+        mut self,
+        m: Option<Arc<dyn crate::transcript_mutator::TranscriptMutator>>,
+    ) -> Self {
+        self.transcript_mutator = m;
         self
     }
 

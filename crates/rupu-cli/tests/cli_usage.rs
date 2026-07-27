@@ -99,6 +99,7 @@ fn write_standalone_usage_metadata(
             trigger_source: "run_cli".into(),
             target: issue_ref.map(str::to_owned),
             workspace_strategy: Some("direct_checkout".into()),
+            pid: None,
         },
     )
     .unwrap();

@@ -148,9 +148,12 @@ export default function WorkflowRuns() {
   }
 
   // Row-level archive / restore / delete — each refetches after success.
-  async function handleRowArchive(id: string) {
+  // `host` is the row's own `host_id` (undefined/`"local"` → local store,
+  // any other id → proxied through that host's connector) so a fanned-out
+  // remote-host row's action lands on the host that actually owns the run.
+  async function handleRowArchive(id: string, host?: string) {
     try {
-      await api.archiveRun(id);
+      await api.archiveRun(id, host);
       setActionError(null);
       refresh();
     } catch (e) {
@@ -158,9 +161,9 @@ export default function WorkflowRuns() {
     }
   }
 
-  async function handleRowRestore(id: string) {
+  async function handleRowRestore(id: string, host?: string) {
     try {
-      await api.restoreRun(id);
+      await api.restoreRun(id, host);
       setActionError(null);
       refresh();
     } catch (e) {
@@ -168,10 +171,10 @@ export default function WorkflowRuns() {
     }
   }
 
-  async function handleRowDelete(id: string) {
+  async function handleRowDelete(id: string, host?: string) {
     if (!window.confirm('Permanently delete this run and its transcripts? This cannot be undone.')) return;
     try {
-      await api.deleteRun(id);
+      await api.deleteRun(id, host);
       setActionError(null);
       refresh();
     } catch (e) {
@@ -203,7 +206,7 @@ export default function WorkflowRuns() {
         {archived ? (
           <Button
             variant="ring"
-            onClick={() => void handleRowRestore(r.id)}
+            onClick={() => void handleRowRestore(r.id, r.host_id)}
             aria-label={`Restore run ${r.id}`}
           >
             Restore
@@ -211,7 +214,7 @@ export default function WorkflowRuns() {
         ) : (
           <Button
             variant="ring"
-            onClick={() => void handleRowArchive(r.id)}
+            onClick={() => void handleRowArchive(r.id, r.host_id)}
             aria-label={`Archive run ${r.id}`}
           >
             Archive
@@ -219,7 +222,7 @@ export default function WorkflowRuns() {
         )}
         <Button
           variant="ring-danger"
-          onClick={() => void handleRowDelete(r.id)}
+          onClick={() => void handleRowDelete(r.id, r.host_id)}
           aria-label={`Delete run ${r.id}`}
         >
           Delete
@@ -229,7 +232,10 @@ export default function WorkflowRuns() {
   };
 
   const columns: Column<RunListRow>[] = [...WORKFLOW_RUN_COLUMNS, actionColumn];
-  const bannerError = error ?? actionError;
+  // A fresh action error (e.g. this click's Archive/Delete refusal) must win
+  // over a stale fetch error from an earlier load — never the other way
+  // around, or the operator sees the wrong banner for what just happened.
+  const bannerError = actionError ?? error;
 
   return (
     <div className="p-8">

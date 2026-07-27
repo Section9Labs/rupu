@@ -91,9 +91,13 @@ export default function Sessions() {
     : rows;
 
   // Row-level archive / restore / delete — each refetches after success.
-  async function handleRowArchive(id: string) {
+  // `host` is the row's own `host_id` (undefined/`"local"` → local
+  // mutator, any other id → proxied through that host's connector) so a
+  // fanned-out remote-host row's action lands on the host that actually
+  // owns the session.
+  async function handleRowArchive(id: string, host?: string) {
     try {
-      await api.archiveSession(id);
+      await api.archiveSession(id, host);
       setActionError(null);
       refresh();
     } catch (e) {
@@ -101,9 +105,9 @@ export default function Sessions() {
     }
   }
 
-  async function handleRowRestore(id: string) {
+  async function handleRowRestore(id: string, host?: string) {
     try {
-      await api.restoreSession(id);
+      await api.restoreSession(id, host);
       setActionError(null);
       refresh();
     } catch (e) {
@@ -111,10 +115,10 @@ export default function Sessions() {
     }
   }
 
-  async function handleRowDelete(id: string) {
+  async function handleRowDelete(id: string, host?: string) {
     if (!window.confirm('Permanently delete this session and its transcripts? This cannot be undone.')) return;
     try {
-      await api.deleteSession(id);
+      await api.deleteSession(id, host);
       setActionError(null);
       refresh();
     } catch (e) {
@@ -361,9 +365,9 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
 function buildActionColumn(
   tab: Tab,
   navigate: ReturnType<typeof useNavigate>,
-  onArchive: (id: string) => void,
-  onRestore: (id: string) => void,
-  onDelete: (id: string) => void,
+  onArchive: (id: string, host?: string) => void,
+  onRestore: (id: string, host?: string) => void,
+  onDelete: (id: string, host?: string) => void,
 ): Column<SessionSummary> {
   return {
     key: 'action',
@@ -401,7 +405,7 @@ function buildActionColumn(
         {tab === 'active' ? (
           <Button
             variant="ring"
-            onClick={() => onArchive(s.session_id)}
+            onClick={() => onArchive(s.session_id, s.host_id)}
             aria-label={`Archive session ${s.session_id}`}
           >
             Archive
@@ -409,7 +413,7 @@ function buildActionColumn(
         ) : (
           <Button
             variant="ring"
-            onClick={() => onRestore(s.session_id)}
+            onClick={() => onRestore(s.session_id, s.host_id)}
             aria-label={`Restore session ${s.session_id}`}
           >
             Restore
@@ -417,7 +421,7 @@ function buildActionColumn(
         )}
         <Button
           variant="ring-danger"
-          onClick={() => onDelete(s.session_id)}
+          onClick={() => onDelete(s.session_id, s.host_id)}
           aria-label={`Delete session ${s.session_id}`}
         >
           Delete

@@ -1,28 +1,29 @@
 // @vitest-environment jsdom
-// AutoflowsDefs — the Enable/Disable toggle must only be offered for GLOBAL
-// rows; a project-scoped row shows the (read-only) Enabled state chip with
-// no toggle at all.
+// AutoflowsDefs — the Enable/Disable toggle now renders for EVERY row
+// regardless of scope.
 //
-// Root cause this guards against: `POST /api/autoflows/:name/enable|disable`
-// resolves `:name` via `resolve_workflow_path` (global-first, then EVERY
-// registered workspace), which is NOT the same resolution the list uses
-// (`distinct_repo_workspaces` — one REPRESENTATIVE worktree per repo). For a
-// project-scoped row, the toggle could therefore flip the global copy or a
-// non-representative worktree's copy instead of the file the row actually
-// shows — `load()` then re-renders unchanged state, reading as "the toggle
-// did nothing," and a second click compounds the wrong-file write. Gating
-// the toggle to `scope_kind === 'global'` closes that gap.
+// History: `POST /api/autoflows/:name/enable|disable` resolves `:name` via
+// `resolve_workflow_path` (global-first, then every registered workspace),
+// which used to NOT be the same resolution the list used
+// (`distinct_repo_workspaces` — one representative worktree per repo). For a
+// project-scoped row that mismatch meant the toggle could silently flip the
+// global copy or a non-representative worktree's copy instead of the file
+// the row actually showed, so the toggle was hidden on non-global rows
+// entirely (`scope_kind === 'global'` gate). The real fix:
+// `resolve_workflow_path` now uses `distinct_repo_workspaces` too (see
+// `resolve_workflow_scoped` in rupu-cp/src/api/workflows.rs), so it always
+// targets the SAME representative worktree the list itself shows — the
+// toggle is safe (and offered) for every row.
 //
-// The gate keys off `scope_kind`, NEVER the display `scope` string: `scope`
-// is a workspace path's basename and can legally collide with the literal
-// string `"global"` (a project registered at a path ending in `/global`) —
-// see `ScopeKind`'s doc comment in `lib/api.ts`. A row with that collision
-// (display `scope: 'global'`, structured `scope_kind: 'project'`) must still
-// render with no toggle.
+// `scope_kind` remains the correct field for DISPLAY (the scope chip) — it
+// just no longer gates the toggle. A row whose display `scope` collides
+// with the literal string `"global"` (a project registered at a path ending
+// in `/global`) still correctly shows a PROJECT scope chip, proving the
+// chip keys off `scope_kind`, not the display string.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, cleanup, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api, type AutoflowDefRow } from '../lib/api';
 
@@ -33,8 +34,8 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('AutoflowsDefs — scope-gated toggle', () => {
-  it('shows the Enabled state chip but no toggle button for a project-scoped row', async () => {
+describe('AutoflowsDefs — scope-aware toggle', () => {
+  it('shows a working Disable button for a project-scoped row', async () => {
     const ROW: AutoflowDefRow = {
       name: 'issue-triage',
       slug: 'issue-triage',
@@ -44,6 +45,9 @@ describe('AutoflowsDefs — scope-gated toggle', () => {
       enabled: true,
     };
     vi.spyOn(api, 'getAutoflowDefs').mockResolvedValue([ROW]);
+    const toggleSpy = vi
+      .spyOn(api, 'setAutoflowEnabled')
+      .mockResolvedValue({ name: 'issue-triage', enabled: false });
 
     render(
       <MemoryRouter initialEntries={['/build/autoflows']}>
@@ -52,19 +56,21 @@ describe('AutoflowsDefs — scope-gated toggle', () => {
     );
     await waitFor(() => expect(screen.getByText('issue-triage')).toBeInTheDocument());
 
-    // The Enabled column's chip is a plain-text badge ("Enabled" — matching
-    // both the column header cell and the chip itself, so assert there are
-    // at least two matches rather than a single unambiguous one).
-    expect(screen.getAllByText('Enabled').length).toBeGreaterThanOrEqual(2);
-    expect(screen.queryByRole('button', { name: 'Disable issue-triage' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Enable issue-triage' })).not.toBeInTheDocument();
+    const disableBtn = screen.getByRole('button', { name: 'Disable issue-triage' });
+    expect(disableBtn).toBeInTheDocument();
+
+    fireEvent.click(disableBtn);
+    await waitFor(() =>
+      expect(toggleSpy).toHaveBeenCalledWith('issue-triage', false, { scope_kind: 'project' }),
+    );
   });
 
-  it('shows the Enabled chip but no toggle for a project row whose display scope collides with the literal "global"', async () => {
+  it('shows the toggle for a project row whose display scope collides with the literal "global"', async () => {
     // A workspace registered at a path ending in `/global` produces exactly
     // this: display `scope === 'global'` but structured `scope_kind ===
-    // 'project'`. Gating on the display string alone would wrongly offer
-    // the toggle here.
+    // 'project'`. The toggle must render regardless (it no longer gates on
+    // scope at all), and the scope CHIP must still read "project" behavior
+    // off `scope_kind`, not the colliding display string.
     const ROW: AutoflowDefRow = {
       name: 'issue-triage',
       slug: 'issue-triage',
@@ -82,9 +88,7 @@ describe('AutoflowsDefs — scope-gated toggle', () => {
     );
     await waitFor(() => expect(screen.getByText('issue-triage')).toBeInTheDocument());
 
-    expect(screen.getAllByText('Enabled').length).toBeGreaterThanOrEqual(2);
-    expect(screen.queryByRole('button', { name: 'Disable issue-triage' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Enable issue-triage' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Disable issue-triage' })).toBeInTheDocument();
   });
 
   it('shows the toggle button for a genuinely global row', async () => {

@@ -86,6 +86,7 @@ describe('AutoflowRuns — canonical column order + Turns/Duration (I4)', () => 
       'Turns',
       'Duration',
       'Started',
+      '', // trailing row-actions column (unlabeled) — Task 3
     ]);
   });
 

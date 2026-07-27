@@ -250,13 +250,11 @@ fn collect_complete_lines(bytes: &[u8], starts_at_line_boundary: bool) -> Vec<Co
             break;
         }
         let line = &chunk[..chunk.len() - 1];
-        if !(line.is_empty() && cursor == 0 && !starts_at_line_boundary) {
-            if !line.is_empty() {
-                lines.push(CompleteLine {
-                    offset: cursor,
-                    bytes: line,
-                });
-            }
+        if !(line.is_empty() || line.is_empty() && cursor == 0 && !starts_at_line_boundary) {
+            lines.push(CompleteLine {
+                offset: cursor,
+                bytes: line,
+            });
         }
         cursor += chunk.len();
     }

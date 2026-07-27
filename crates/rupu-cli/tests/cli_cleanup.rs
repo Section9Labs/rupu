@@ -180,6 +180,7 @@ fn write_archived_standalone_transcript(
             trigger_source: "run_cli".into(),
             target: None,
             workspace_strategy: None,
+            pid: None,
         },
     )
     .unwrap();

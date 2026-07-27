@@ -5,7 +5,7 @@
 import { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, Pencil, Trash2 } from 'lucide-react';
-import { api, type AgentDetail } from '../lib/api';
+import { api, scopeSelectorFor, type AgentDetail } from '../lib/api';
 import { cn } from '../lib/cn';
 import CodeHighlight from '../components/CodeHighlight';
 import CodeEditor from '../components/CodeEditor';
@@ -70,7 +70,11 @@ export default function AgentDetailPage() {
     setSaving(true);
     setSaveError(null);
     try {
-      const updated = await api.saveAgent(name, raw);
+      // `scopeSelectorFor(agent)` threads the resolved `scope_kind`/
+      // `scope_id` so Save targets THIS exact file — mirrors `remove()`'s
+      // Delete call below. Without it a project-scoped Save would silently
+      // create a hidden global shadow instead of editing the file shown.
+      const updated = await api.saveAgent(name, raw, scopeSelectorFor(agent));
       setAgent(updated);
       setDraft(updated.raw);
       setEditing(false);
@@ -87,10 +91,33 @@ export default function AgentDetailPage() {
 
   async function remove() {
     if (!agent) return;
-    if (!window.confirm('Delete this agent?')) return;
+    const scopeLabel = agent.scope_kind === 'project' ? `project: ${agent.scope}` : 'global';
+    if (
+      !window.confirm(
+        `Delete agent "${agent.name}" (${scopeLabel})? This removes the definition file. This cannot be undone.`,
+      )
+    ) {
+      return;
+    }
     setDeleteError(null);
     try {
-      await api.deleteAgent(name);
+      // By `slug` (file stem), never the route's `name` param (frontmatter
+      // display name) — `DELETE /api/agents/:name` resolves by file stem
+      // (see `AgentSummary.slug`'s doc comment), and the two can differ for
+      // hand- or CLI-authored files. `scopeSelectorFor(agent)` threads the
+      // resolved `scope_kind`/`scope_id` so the request targets THIS exact
+      // file even when another repo defines the same slug. Mirrors
+      // `Agents.tsx`'s row Delete.
+      const result = await api.deleteAgent(agent.slug ?? name, scopeSelectorFor(agent));
+      if (
+        agent.scope_kind &&
+        (result.scope_kind !== agent.scope_kind || result.scope !== agent.scope)
+      ) {
+        setDeleteError(
+          `Deleted the ${result.scope_kind === 'project' ? `project (${result.scope})` : 'global'} definition — not the one shown here.`,
+        );
+        return;
+      }
       navigate('/agents');
     } catch (e: unknown) {
       setDeleteError(e instanceof Error ? e.message : 'Failed to delete agent');
@@ -126,30 +153,22 @@ export default function AgentDetailPage() {
           <h1 className="text-2xl font-semibold text-ink break-all">{agent.name}</h1>
           {agent.scope && <ScopeChip scope={agent.scope} />}
           <div className="ml-auto flex items-center gap-2">
-            {/* Gated to `scope_kind === 'global'` — the structured
-             *  discriminator, never the display `scope` string (a project's
-             *  path basename, which can legally equal the literal
-             *  "global"). This page resolves global-first then falls back to
-             *  every registered project's `.rupu/agents/`, so a
-             *  project-scoped `reviewer` can silently shadow a global
-             *  `reviewer` here — but `DELETE /api/agents/:name` only ever
-             *  resolves against the global agents dir. Without this gate,
-             *  Delete on a project-scoped row would destroy the hidden
-             *  GLOBAL file with no signal this page ever switched layers.
-             *  Deleting a project-scoped definition is NOT currently
-             *  supported anywhere in the CP — the filesystem or `rupu` CLI
-             *  is the current workaround. */}
-            {agent.scope_kind === 'global' && (
-              <Button
-                variant="danger-outline"
-                onClick={remove}
-                aria-label={`Delete ${agent.name}`}
-                className="gap-1.5"
-              >
-                <Trash2 size={14} />
-                Delete
-              </Button>
-            )}
+            {/* `DELETE /api/agents/:name` resolves project-aware (global-
+             *  then-registered-projects, by file stem — see
+             *  `resolve_agent_scoped` in `rupu-cp/src/api/agents.rs`), the
+             *  SAME layer walk this page's `getAgent` load uses, so it
+             *  always removes the exact file being shown here — safe for
+             *  every scope. `remove()`'s confirm dialog names the resolved
+             *  scope before the operator confirms. */}
+            <Button
+              variant="danger-outline"
+              onClick={remove}
+              aria-label={`Delete ${agent.name}`}
+              className="gap-1.5"
+            >
+              <Trash2 size={14} />
+              Delete
+            </Button>
             <Button onClick={() => setRunOpen(true)} aria-label={`Run ${agent.name}`}>
               Run
             </Button>

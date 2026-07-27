@@ -738,6 +738,68 @@ describe('RunDetail — remote host (?host=)', () => {
     await waitFor(() => expect(resumeSpy).toHaveBeenCalledWith('run-1', 'h-abc'));
   });
 
+  // Operator-reported gap this task fixes: RunDetail's Archive/Delete omitted
+  // `host`, hitting the local run store even when viewing a remote-host run —
+  // and for a CP-launched SSH run, the local store holds a MIRROR sharing the
+  // same run id, so the local delete silently "succeeds" while destroying the
+  // CP's only local copy and leaving the actual remote run untouched.
+  it('passes host to archiveRun when archiving a remote terminal run', async () => {
+    const remoteCompleted: RunGraphResponse = {
+      run: {
+        id: 'run-1',
+        workflow_name: 'remote-scan',
+        status: 'completed',
+        started_at: '2026-06-01T00:00:00Z',
+        finished_at: '2026-06-01T00:05:00Z',
+      } as RunGraphResponse['run'],
+      workflow: { steps: [{ id: 'step_a', kind: 'step', agent: 'reviewer' }] },
+      step_results: [],
+      units: [],
+      usage: EMPTY_USAGE,
+    };
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(remoteCompleted);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    const archiveSpy = vi.spyOn(api, 'archiveRun').mockResolvedValue(undefined);
+
+    renderRemotePage();
+
+    const archiveBtn = await screen.findByRole('button', { name: /Archive/ });
+    fireEvent.click(archiveBtn);
+
+    await waitFor(() => expect(archiveSpy).toHaveBeenCalledWith('run-1', 'h-abc'));
+  });
+
+  it('passes host to deleteRun when deleting a remote terminal run', async () => {
+    const remoteCompleted: RunGraphResponse = {
+      run: {
+        id: 'run-1',
+        workflow_name: 'remote-scan',
+        status: 'completed',
+        started_at: '2026-06-01T00:00:00Z',
+        finished_at: '2026-06-01T00:05:00Z',
+      } as RunGraphResponse['run'],
+      workflow: { steps: [{ id: 'step_a', kind: 'step', agent: 'reviewer' }] },
+      step_results: [],
+      units: [],
+      usage: EMPTY_USAGE,
+    };
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(remoteCompleted);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const deleteSpy = vi.spyOn(api, 'deleteRun').mockResolvedValue(undefined);
+
+    renderRemotePage();
+
+    const deleteBtn = await screen.findByRole('button', { name: /Delete/ });
+    fireEvent.click(deleteBtn);
+
+    await waitFor(() => expect(deleteSpy).toHaveBeenCalledWith('run-1', 'h-abc'));
+  });
+
   it('shows the host badge in the header for remote runs', async () => {
     const REMOTE_GRAPH: RunGraphResponse = {
       run: {

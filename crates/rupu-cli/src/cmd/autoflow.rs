@@ -2308,6 +2308,10 @@ fn build_retained_serve_rows(
     ))
 }
 
+// Row-builder args are independent rendering inputs (data + viewport dims);
+// bundling them into a params struct is a real refactor with behavior risk
+// across many call sites, out of scope for a toolchain-pin sweep (I-5).
+#[allow(clippy::too_many_arguments)]
 fn build_retained_serve_rows_for_size(
     monitor: &AutoflowMonitorReport,
     run_store: &RunStore,
@@ -2392,7 +2396,7 @@ fn build_retained_serve_rows_for_size(
         build_retained_serve_two_pane_rows(
             &entries,
             selected_index,
-            &monitor,
+            monitor,
             run_store,
             pricing,
             view_mode,
@@ -2404,7 +2408,7 @@ fn build_retained_serve_rows_for_size(
         build_retained_serve_stacked_rows(
             &entries,
             selected_index,
-            &monitor,
+            monitor,
             run_store,
             pricing,
             view_mode,
@@ -2425,6 +2429,10 @@ fn build_retained_serve_rows_for_size(
     rows
 }
 
+// Row-builder args are independent rendering inputs (data + viewport dims);
+// bundling them into a params struct is a real refactor with behavior risk
+// across many call sites, out of scope for a toolchain-pin sweep (I-5).
+#[allow(clippy::too_many_arguments)]
 fn build_retained_monitor_rows_for_size(
     monitor: &AutoflowMonitorReport,
     run_store: &RunStore,
@@ -2536,6 +2544,10 @@ fn build_retained_monitor_rows_for_size(
     rows
 }
 
+// Row-builder args are independent rendering inputs (data + viewport dims);
+// bundling them into a params struct is a real refactor with behavior risk
+// across many call sites, out of scope for a toolchain-pin sweep (I-5).
+#[allow(clippy::too_many_arguments)]
 fn build_retained_history_rows_for_size(
     report: &AutoflowHistoryReport,
     monitor: &AutoflowMonitorReport,
@@ -2667,6 +2679,10 @@ fn build_history_issue_entries(
     entries
 }
 
+// Row-builder args are independent rendering inputs (data + viewport dims);
+// bundling them into a params struct is a real refactor with behavior risk
+// across many call sites, out of scope for a toolchain-pin sweep (I-5).
+#[allow(clippy::too_many_arguments)]
 fn build_retained_history_two_pane_rows(
     entries: &[HistoryIssueEntry],
     selected_index: Option<usize>,
@@ -2714,6 +2730,10 @@ fn build_retained_history_two_pane_rows(
     )
 }
 
+// Row-builder args are independent rendering inputs (data + viewport dims);
+// bundling them into a params struct is a real refactor with behavior risk
+// across many call sites, out of scope for a toolchain-pin sweep (I-5).
+#[allow(clippy::too_many_arguments)]
 fn build_retained_history_stacked_rows(
     entries: &[HistoryIssueEntry],
     selected_index: Option<usize>,
@@ -2760,6 +2780,10 @@ fn build_retained_history_stacked_rows(
     rows
 }
 
+// Row-builder args are independent rendering inputs (data + viewport dims);
+// bundling them into a params struct is a real refactor with behavior risk
+// across many call sites, out of scope for a toolchain-pin sweep (I-5).
+#[allow(clippy::too_many_arguments)]
 fn build_history_issue_list_rows(
     entries: &[HistoryIssueEntry],
     selected_index: Option<usize>,
@@ -2815,6 +2839,10 @@ fn build_history_issue_list_rows(
     rows
 }
 
+// Row-builder args are independent rendering inputs (data + viewport dims);
+// bundling them into a params struct is a real refactor with behavior risk
+// across many call sites, out of scope for a toolchain-pin sweep (I-5).
+#[allow(clippy::too_many_arguments)]
 fn build_selected_history_rows(
     entries: &[HistoryIssueEntry],
     selected_index: Option<usize>,
@@ -3357,6 +3385,10 @@ fn retained_serve_activity_line(
     truncate_retained_ansi_line(&buf, width)
 }
 
+// Row-builder args are independent rendering inputs (data + viewport dims);
+// bundling them into a params struct is a real refactor with behavior risk
+// across many call sites, out of scope for a toolchain-pin sweep (I-5).
+#[allow(clippy::too_many_arguments)]
 fn build_retained_serve_two_pane_rows(
     entries: &[ServeIssueEntry<'_>],
     selected_index: Option<usize>,
@@ -3401,6 +3433,10 @@ fn build_retained_serve_two_pane_rows(
     )
 }
 
+// Row-builder args are independent rendering inputs (data + viewport dims);
+// bundling them into a params struct is a real refactor with behavior risk
+// across many call sites, out of scope for a toolchain-pin sweep (I-5).
+#[allow(clippy::too_many_arguments)]
 fn build_retained_serve_stacked_rows(
     entries: &[ServeIssueEntry<'_>],
     selected_index: Option<usize>,
@@ -3545,6 +3581,10 @@ fn render_issue_list_row(
     truncate_retained_ansi_line(&buf, width)
 }
 
+// Row-builder args are independent rendering inputs (data + viewport dims);
+// bundling them into a params struct is a real refactor with behavior risk
+// across many call sites, out of scope for a toolchain-pin sweep (I-5).
+#[allow(clippy::too_many_arguments)]
 fn build_selected_issue_rows(
     entries: &[ServeIssueEntry<'_>],
     selected_index: Option<usize>,
@@ -6349,7 +6389,7 @@ fn render_issue_frame(
         route.push(("tracker", human_tracker_name(tracker).to_string()));
     }
     if let Some(source) = claim.source.as_deref() {
-        if source != &claim.repo {
+        if source != claim.repo {
             route.push(("source", short_locator(source, 30)));
         }
     }
@@ -6969,10 +7009,8 @@ fn summarize_transcript_path(
                 out.providers.insert(provider);
                 out.models.insert(model);
             }
-            TranscriptEvent::AssistantMessage { content, .. } => {
-                if !content.trim().is_empty() {
-                    out.assistant_messages += 1;
-                }
+            TranscriptEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
+                out.assistant_messages += 1;
             }
             TranscriptEvent::ToolCall { .. } => out.tool_calls += 1,
             TranscriptEvent::CommandRun { .. } => out.command_runs += 1,

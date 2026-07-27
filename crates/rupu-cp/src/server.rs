@@ -58,6 +58,7 @@ pub fn router(state: AppState, token: Option<String>) -> Router {
         .merge(crate::api::source::routes())
         .merge(crate::api::code::routes())
         .merge(crate::api::transcript::routes())
+        .merge(crate::api::transcripts::routes())
         .merge(crate::api::usage::routes())
         .merge(crate::api::usage_outliers::routes())
         .merge(crate::api::workers::routes())

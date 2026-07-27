@@ -303,7 +303,7 @@ mod tests {
             .to_path_buf();
         assert!(base.exists(), "scratch base must exist after staging");
 
-        discard_workspace(
+        let _ = discard_workspace(
             State(state),
             Query(DeltaQuery {
                 dir: working_dir.clone(),

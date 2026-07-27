@@ -232,7 +232,11 @@ describe('AgentRuns — agent subject cell', () => {
     // destination is an explicit inner control (a button that navigates
     // programmatically), never a nested <a> — see the "row navigation"
     // describe block below for the navigation assertion.
-    const sessionControl = screen.getByRole('button', { name: /sess-01h/i });
+    // Exact match on the truncated shortId — a plain /sess-01h/i regex would
+    // now also match the row-actions buttons' aria-labels (Task 3: "Archive
+    // session sess-01H…", "Restore session sess-01H…", "Delete session
+    // sess-01H…"), which all contain that same substring.
+    const sessionControl = screen.getByRole('button', { name: 'sess-01H…' });
     expect(sessionControl).toBeInTheDocument();
   });
 
@@ -575,7 +579,9 @@ describe('AgentRuns — whole-row navigation (rowHref) goes to the transcript vi
     fireEvent.click(await screen.findByRole('button', { name: 'All' }));
     await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole('button', { name: /sess-01h/i }));
+    // Exact match — see the sibling "agent subject cell" test's comment for
+    // why a loose /sess-01h/i regex is now ambiguous (Task 3 row actions).
+    fireEvent.click(screen.getByRole('button', { name: 'sess-01H…' }));
 
     expect(screen.getByTestId('loc')).toHaveTextContent(
       `/sessions/${encodeURIComponent(sessionRowWithTranscript.session_id!)}`,

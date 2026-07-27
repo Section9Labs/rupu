@@ -72,7 +72,7 @@ describe('Workflows — row Delete action', () => {
 
   it('does not call the API when the confirm dialog is dismissed', async () => {
     vi.spyOn(api, 'getWorkflows').mockResolvedValue(ROWS);
-    const deleteSpy = vi.spyOn(api, 'deleteWorkflow').mockResolvedValue();
+    const deleteSpy = vi.spyOn(api, 'deleteWorkflow').mockResolvedValue({ deleted: true, scope: 'global', scope_kind: 'global' });
     vi.spyOn(window, 'confirm').mockReturnValue(false);
 
     render(
@@ -90,7 +90,7 @@ describe('Workflows — row Delete action', () => {
 
   it('deletes the workflow definition and refreshes the list on confirm, without navigating the row', async () => {
     const getWorkflowsSpy = vi.spyOn(api, 'getWorkflows').mockResolvedValue(ROWS);
-    const deleteSpy = vi.spyOn(api, 'deleteWorkflow').mockResolvedValue();
+    const deleteSpy = vi.spyOn(api, 'deleteWorkflow').mockResolvedValue({ deleted: true, scope: 'global', scope_kind: 'global' });
     vi.spyOn(window, 'confirm').mockReturnValue(true);
 
     render(
@@ -104,7 +104,9 @@ describe('Workflows — row Delete action', () => {
     const notCanceled = fireEvent.click(screen.getByRole('button', { name: 'Delete nightly-sweep' }));
     expect(notCanceled).toBe(false);
 
-    await waitFor(() => expect(deleteSpy).toHaveBeenCalledWith('nightly-sweep'));
+    await waitFor(() =>
+      expect(deleteSpy).toHaveBeenCalledWith('nightly-sweep', { scope_kind: 'global' }),
+    );
     await waitFor(() => expect(getWorkflowsSpy).toHaveBeenCalledTimes(2));
     expect(screen.getByTestId('loc')).toHaveTextContent('/workflows');
   });
