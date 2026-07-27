@@ -59,11 +59,12 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-22 | P1 | rupu-tools | `grep` and `ast_grep` escape the workspace — no `path_scope` containment | fixed |
 | I-23 | P0 | docs/autoflow | The autoflow author allowlist is undocumented and defaults to no restriction | fixed |
 | I-24 | P1 | rupu-cli | `on_reject` cleanup runs at `ask` mode regardless of the run's original mode | fixed |
-| I-25 | P1 | rupu-cli | `rupu workflow runs` — a list command — executes `on_reject` chains as a side effect | open |
+| I-25 | P1 | rupu-cli | `rupu workflow runs` — a list command — executes `on_reject` chains as a side effect | fixed |
 | I-26 | P1 | rupu-cli | Action steps get allowlist `["*"]`; the code comment claims parity with agent `tools:` | fixed |
 | I-27 | P2 | rupu-orchestrator | `action_protocol::validate_actions` is dead code; three docs describe a check that never runs | fixed |
 | I-78 | P1 | rupu-orchestrator | A workflow step at `--mode ask` still gets `BypassDecider` — `ask` grants full tool access | open |
 | I-79 | P2 | rupu-cli | The action dispatcher's `["*"]` allowlist is sound only by invariant, not by construction | open |
+| I-80 | P2 | rupu-cli/docs | Reject-timeout gates now resolve only via `cp serve`'s sweep; CLI-only operators lose auto-resolution | open |
 
 ### Arc 3 — single UI path
 
@@ -134,6 +135,35 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 ## Open
 
+### I-80 — reject-timeout gates now resolve only via `cp serve`'s sweep
+
+**Symptom.** After I-25, a gate with `on_timeout: reject` whose deadline has passed
+stays parked at `AwaitingApproval` indefinitely unless `rupu cp serve` is running.
+Before I-25, the next `rupu workflow runs` would resolve it.
+
+**Root cause.** Deliberate, and the correct trade for I-25: a listing command must
+not execute cleanup chains, and because `sweep_decision` only acts on runs still
+`AwaitingApproval`, the listing cannot finalize the run either without silently
+losing the chain. Resolution therefore moved entirely to the `cp serve` gate sweep
+(`[cp].gate_sweep_enabled`, default on at 60s).
+
+**Impact.** Affects a real class of user: anyone driving rupu purely from the CLI who
+never starts `rupu cp serve`, plus anyone who has set `[cp].gate_sweep_enabled = false`.
+Their reject-timeout gates no longer auto-resolve. This is a behavior change rather
+than a safety regression — the gate stays parked (fail-safe) rather than firing
+unexpectedly — and `rupu workflow reject <id>` still resolves it manually at any time.
+It is filed because the dependency is currently invisible: nothing tells such an
+operator that timeout routing needs a daemon.
+
+**Fix.** Options, in rough order of preference: document the dependency plainly in the
+gate/timeout docs and in `rupu workflow runs` output when it sees an overdue reject
+gate it is deliberately not resolving; or add an explicit opt-in
+`rupu workflow runs --resolve-expired` so the side effect is requested rather than
+implicit; or have the CLI resolve overdue reject gates on the `reject`/`approve`
+paths only, which is already true. Related: [[I-25]].
+
+---
+
 ### I-78 — a workflow step at `--mode ask` still gets `BypassDecider`
 
 **Symptom.** `rupu workflow run --mode ask` grants every agent step unrestricted
@@ -189,27 +219,6 @@ less constrained caller turns it into a real hole with no local signal.
 threading the registry rather than `&ToolDispatcher` through three call sites —
 mechanical but not free, hence P2. Defense in depth, not a live defect. Related:
 [[I-26]].
-
----
-
-### I-25 — a list command executes `on_reject` chains as a side effect
-
-**Symptom.** `rupu workflow runs` — a read-only-looking listing — can post
-GitHub comments and run agent steps.
-
-**Root cause.** The listing path performs lazy approval-timeout expiry, and the
-timeout-reject branch invokes the full `run_reject_cleanup` chain inline.
-
-**Impact.** A command whose name and output imply pure observation has
-side effects on external systems. Previously compounded by I-24 (now fixed):
-those side effects used to run at `ask` mode regardless of how the original run
-was launched; they now correctly inherit the run's own launch mode, but the
-listing path still shouldn't be the one running them at all.
-
-**Fix.** Either move timeout-driven cleanup exclusively to the `cp serve` gate
-sweep (which exists and is default-on), or keep the lazy expiry but have the
-listing path only *finalize state* and leave chain execution to the sweep. The
-choice is a behavior decision — decided in the Arc 2 plan.
 
 ---
 
@@ -274,6 +283,49 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-25 — a list command executes `on_reject` chains as a side effect
+
+**Symptom.** `rupu workflow runs` — a read-only-looking listing — can post
+GitHub comments and run agent steps.
+
+**Root cause.** The listing path performs lazy approval-timeout expiry, and the
+timeout-reject branch invokes the full `run_reject_cleanup` chain inline.
+
+**Impact.** A command whose name and output imply pure observation has
+side effects on external systems. Previously compounded by I-24 (now fixed):
+those side effects used to run at `ask` mode regardless of how the original run
+was launched; they now correctly inherit the run's own launch mode, but the
+listing path still shouldn't be the one running them at all.
+
+**Fix.** Either move timeout-driven cleanup exclusively to the `cp serve` gate
+sweep (which exists and is default-on), or keep the lazy expiry but have the
+listing path only *finalize state* and leave chain execution to the sweep. The
+choice is a behavior decision — decided in the Arc 2 plan.
+
+**Validation.** `crates/rupu-cli/tests/workflow_runs_no_side_effects.rs`, three tests
+driving `rupu_cli::run(...)` end to end:
+`listing_runs_does_not_execute_a_reject_cleanup_chain` (the chain's marker file must
+not exist after a listing), `listing_runs_leaves_a_reject_timeout_gate_awaiting_approval`,
+and `listing_runs_still_finalizes_a_fail_timeout_gate` (the lazy expiry that remains
+is not broken). RED was observed, not claimed: against unfixed code test 1 failed with
+the marker file present and test 2 failed `left: Rejected, right: AwaitingApproval`.
+
+**The fix is "skip", not "stop cleaning up".** For `on_timeout: reject` the loop now
+`continue`s *before* `expire_if_overdue`, rather than merely dropping the inline
+cleanup call. This matters: `sweep_decision` (`crates/rupu-cli/src/cmd/cp.rs:337`)
+only produces `ExpireThenCleanupReject` for a run still `AwaitingApproval` and falls
+through to `Skip` (`:366`) for every other status. Had the listing finalized the run
+to `Rejected` without running the chain, the sweep would have skipped it forever and
+the cleanup would have been silently lost — a worse bug than the one being fixed.
+Test 2 is the assertion that pins this. `approve` and `fail`/unset are unchanged:
+`expire_if_overdue` deliberately leaves the record `AwaitingApproval` on the approve
+arm, and finalizes the fail case internally with no chain to run.
+
+**Consequence tracked as I-80.** Reject-timeout gates are now resolved only by the
+`cp serve` sweep.
+
+---
 
 ### I-26 — action steps get a `["*"]` tool allowlist while the comment claims otherwise
 
