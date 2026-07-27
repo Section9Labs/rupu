@@ -34,8 +34,18 @@ steps:
       # a review-and-comment autoflow.
 
   - id: post_review
+    # NOTE: this step runs as `scm-pr-review`, whose
+    # `.rupu/agents/scm-pr-review.md` frontmatter `tools:` list declares
+    # `scm.prs.get` / `scm.prs.diff` / `scm.prs.comment`. The `actions:`
+    # list below is a REAL enforcement point
+    # (crates/rupu-orchestrator/src/step_factory.rs `narrow_agent_tools`,
+    # spec: docs/superpowers/specs/
+    # 2026-07-26-rupu-step-actions-enforcement-design.md): it narrows this
+    # step to exactly the connector tools listed here. Listed in full to
+    # match the agent's grant so this step keeps its existing behavior
+    # rather than silently losing a tool.
     agent: scm-pr-review
-    actions: ["scm.prs.comment"]
+    actions: ["scm.prs.get", "scm.prs.diff", "scm.prs.comment"]
     prompt: |
       Post exactly one summary review comment on PR
       #{{ event.pull_request.number }} ({{ event.pull_request.url }},

@@ -809,6 +809,14 @@ export interface AgentSummary {
   effort?: string | null;
   max_tokens?: number | null;
   /**
+   * The agent's frontmatter `tools:` allowlist — the runtime grant a step's
+   * `actions:` narrows (never extends; step-actions-enforcement design §2/§3d).
+   * Always present on the wire (an empty array, not omitted, for an agent
+   * whose frontmatter omits `tools:`), but kept optional here so literal test
+   * fixtures that predate this field don't need updating.
+   */
+  tools?: string[];
+  /**
    * `"global"` or a registered project's path basename. Always present on
    * the wire — the global `/api/agents` list tags every row `"global"`; the
    * per-project endpoint (`/api/projects/:wsId/agents`) tags project-local

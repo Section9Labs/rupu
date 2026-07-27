@@ -176,6 +176,12 @@ pub enum WorkflowParseError {
         tool: String,
         detail: String,
     },
+    #[error("step `{step}`: `actions:` entry `{tool}` is not a known MCP tool (see `rupu mcp` / GET /api/tools for the catalog)")]
+    ActionsUnknownTool { step: String, tool: String },
+    #[error("step `{step}`: an `action:` step must not carry a non-empty `actions:` allowlist — its tool is already explicit")]
+    ActionsOnActionStep { step: String },
+    #[error("step `{step}`: a non-empty `actions:` is not supported on a remote step (`host:`/`distribute:`) — the roster never reaches the remote dispatch payload, so it would be silently ignored; remove `actions:` or clear it to `[]`")]
+    ActionsUnsupportedOnRemoteStep { step: String },
     #[error("step `{step}`: edge target `{target}` is not a known step")]
     EdgeTargetUnknown { step: String, target: String },
     #[error("step `{step}`: an edge cannot target its own step")]
@@ -1180,6 +1186,7 @@ impl Workflow {
                 }
             }
             validate_step_shape(step)?;
+            validate_step_actions(step)?;
         }
         for (name, def) in &wf.inputs {
             validate_input_def(name, def)?;
@@ -1365,6 +1372,46 @@ fn validate_action_step(
     Ok(())
 }
 
+/// Each `actions:` entry must name a tool in the MCP catalog. Mirrors
+/// `validate_action_step`'s catalog lookup — same catalog, same crate dep.
+/// `actions:` is a NARROWING allowlist for an AGENT step; an `action:`
+/// step's tool is explicit, so a non-empty list there is a shape error
+/// (an EMPTY list stays legal — it is already present repo-wide).
+///
+/// A `host:`/`distribute:` (remote/placed) step never reaches
+/// `build_opts_for_step` — its roster travels in `UnitDispatch`/
+/// `AgentLaunchRequest`, which carry no tool list — so a narrowed
+/// `actions:` there would be a silent no-op (fail-OPEN: the remote agent
+/// runs its full grant while the CP shows it as narrowed). Until the
+/// roster is threaded through the remote dispatch payload (spec §3b-bis,
+/// deferred), reject a NON-EMPTY `actions:` on such a step outright; an
+/// empty `actions:` stays legal.
+fn validate_step_actions(step: &Step) -> Result<(), WorkflowParseError> {
+    if step.actions.is_empty() {
+        return Ok(());
+    }
+    if step.action.is_some() {
+        return Err(WorkflowParseError::ActionsOnActionStep {
+            step: step.id.clone(),
+        });
+    }
+    if step.host.is_some() || step.distribute.is_some() {
+        return Err(WorkflowParseError::ActionsUnsupportedOnRemoteStep {
+            step: step.id.clone(),
+        });
+    }
+    let catalog = rupu_mcp::tools::tool_catalog();
+    for tool in &step.actions {
+        if !catalog.iter().any(|s| s.name == tool.as_str()) {
+            return Err(WorkflowParseError::ActionsUnknownTool {
+                step: step.id.clone(),
+                tool: tool.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a step's effective workspace mode: the step's own `workspace`,
 /// else the workflow `defaults.workspace`, else `WorkspaceMode::None`.
 pub fn effective_workspace_mode(step: &Step, defaults: &WorkflowDefaults) -> WorkspaceMode {
@@ -1518,6 +1565,7 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
                 });
             }
             validate_step_shape(sub)?; // linear (or Plan-2 action) rules apply
+            validate_step_actions(sub)?;
         }
     } else if let Some(action) = &step.action {
         if step.agent.is_some()
@@ -2789,6 +2837,133 @@ distribute:
         )
         .unwrap();
         assert!(validate_step_shape(&step).is_err());
+    }
+}
+
+#[cfg(test)]
+mod actions_validation_tests {
+    use super::*;
+
+    #[test]
+    fn actions_entry_not_in_catalog_is_rejected() {
+        let raw = r#"
+name: w
+steps:
+  - id: s1
+    agent: a
+    prompt: p
+    actions: ["issues.list", "open_pr"]
+"#;
+        match Workflow::parse(raw).unwrap_err() {
+            WorkflowParseError::ActionsUnknownTool { step, tool } => {
+                assert_eq!(step, "s1");
+                assert_eq!(tool, "open_pr");
+            }
+            other => panic!("expected ActionsUnknownTool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_string_action_entry_is_rejected() {
+        let raw = "name: w\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n    actions: [\"\", \"\"]\n";
+        assert!(matches!(
+            Workflow::parse(raw).unwrap_err(),
+            WorkflowParseError::ActionsUnknownTool { .. }
+        ));
+    }
+
+    #[test]
+    fn valid_catalog_actions_are_accepted() {
+        let raw = "name: w\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n    actions: [\"issues.list\", \"issues.get\"]\n";
+        Workflow::parse(raw).expect("catalog names must be accepted");
+    }
+
+    #[test]
+    fn non_empty_actions_on_an_action_step_is_rejected() {
+        let raw = r#"
+name: w
+steps:
+  - id: s1
+    action: issues.list
+    with: { project: "o/r" }
+    actions: ["issues.list"]
+"#;
+        assert!(matches!(
+            Workflow::parse(raw).unwrap_err(),
+            WorkflowParseError::ActionsOnActionStep { .. }
+        ));
+    }
+
+    #[test]
+    fn empty_actions_on_an_action_step_is_still_accepted() {
+        let raw = "name: w\nsteps:\n  - id: s1\n    action: issues.list\n    with: { project: \"o/r\" }\n    actions: []\n";
+        Workflow::parse(raw).expect("empty actions on an action step must stay legal (compat)");
+    }
+
+    // ── §3b-bis: remote (host:/distribute:) steps fail closed ────────────────
+
+    #[test]
+    fn non_empty_actions_on_a_host_step_is_rejected() {
+        // A `host:` unit never reaches `build_opts_for_step` — its roster
+        // travels in `AgentLaunchRequest`, which carries no tool list — so a
+        // narrowed `actions:` there would silently be a no-op (fail-open).
+        let raw = r#"
+name: w
+steps:
+  - id: s1
+    agent: a
+    prompt: p
+    host: some-host
+    actions: ["issues.list"]
+"#;
+        match Workflow::parse(raw).unwrap_err() {
+            WorkflowParseError::ActionsUnsupportedOnRemoteStep { step } => {
+                assert_eq!(step, "s1");
+            }
+            other => panic!("expected ActionsUnsupportedOnRemoteStep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_empty_actions_on_a_distribute_step_is_rejected() {
+        let raw = r#"
+name: w
+steps:
+  - id: s1
+    for_each: "x"
+    agent: a
+    prompt: p
+    distribute:
+      hosts: [h1]
+    actions: ["issues.list"]
+"#;
+        assert!(matches!(
+            Workflow::parse(raw).unwrap_err(),
+            WorkflowParseError::ActionsUnsupportedOnRemoteStep { .. }
+        ));
+    }
+
+    #[test]
+    fn empty_actions_on_a_host_step_is_still_accepted() {
+        let raw = "name: w\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n    host: some-host\n    actions: []\n";
+        Workflow::parse(raw).expect("empty actions on a remote step must stay legal (compat)");
+    }
+
+    #[test]
+    fn every_sample_workflow_still_parses_after_actions_validation() {
+        for entry in std::fs::read_dir(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../.rupu/workflows"
+        ))
+        .unwrap()
+        {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path).unwrap();
+            Workflow::parse(&raw).unwrap_or_else(|e| panic!("{path:?} must still parse: {e:?}"));
+        }
     }
 }
 

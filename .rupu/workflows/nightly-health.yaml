@@ -44,15 +44,17 @@ steps:
 
   - id: report_health
     # NOTE: this step runs as `issue-reporter`, whose frontmatter `tools:`
-    # list declares `issues.list` / `issues.comment` / `issues.create` /
-    # `issues.update_state` — the runtime tool roster comes solely from the
-    # agent's own frontmatter (crates/rupu-orchestrator/src/step_factory.rs
-    # `agent_tools: spec.tools`), so this step can call these native tools
-    # directly. The `actions:` allowlist below is a separate audit-log
-    # allowlist for the action-protocol
-    # (crates/rupu-orchestrator/src/action_protocol.rs), not the tool grant.
+    # list declares `issues.list` / `issues.get` / `issues.comment` /
+    # `issues.create` / `issues.update_state`. The `actions:` list below is
+    # a REAL enforcement point (crates/rupu-orchestrator/src/step_factory.rs
+    # `narrow_agent_tools`, spec: docs/superpowers/specs/
+    # 2026-07-26-rupu-step-actions-enforcement-design.md): it narrows this
+    # step to exactly the connector tools listed here (builtin tools, if any
+    # were granted, would pass through untouched — this agent has none).
+    # Listed in full to match the agent's grant so this step keeps its
+    # existing behavior rather than silently losing a tool.
     agent: issue-reporter
-    actions: ["issues.list", "issues.comment", "issues.create", "issues.update_state"]
+    actions: ["issues.list", "issues.get", "issues.comment", "issues.create", "issues.update_state"]
     prompt: |
       Use the native `issues.list`, `issues.comment`, `issues.create`, and
       `issues.update_state` tools — do not use `gh` or any shell command for

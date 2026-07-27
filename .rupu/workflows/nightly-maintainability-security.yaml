@@ -38,15 +38,16 @@ steps:
   - id: report_maintainability
     # NOTE: this step runs as `issue-reporter`, whose
     # `.rupu/agents/issue-reporter.md` frontmatter `tools:` list declares
-    # `issues.list` / `issues.comment` / `issues.create` — the runtime tool
-    # roster comes solely from the agent's own frontmatter
-    # (crates/rupu-orchestrator/src/step_factory.rs `agent_tools: spec.tools`),
-    # so this step can call these native tools directly. The `actions:`
-    # allowlist below is a separate audit-log allowlist for the
-    # action-protocol (crates/rupu-orchestrator/src/action_protocol.rs), not
-    # the tool grant.
+    # `issues.list` / `issues.get` / `issues.comment` / `issues.create` /
+    # `issues.update_state`. The `actions:` list below is a REAL enforcement
+    # point (crates/rupu-orchestrator/src/step_factory.rs
+    # `narrow_agent_tools`, spec: docs/superpowers/specs/
+    # 2026-07-26-rupu-step-actions-enforcement-design.md): it narrows this
+    # step to exactly the connector tools listed here. Listed in full to
+    # match the agent's grant so this step keeps its existing behavior
+    # rather than silently losing a tool.
     agent: issue-reporter
-    actions: ["issues.list", "issues.comment", "issues.create"]
+    actions: ["issues.list", "issues.get", "issues.comment", "issues.create", "issues.update_state"]
     prompt: |
       File today's maintainability report using the native `issues.list`,
       `issues.comment`, and `issues.create` tools — do not use `gh` or any
@@ -81,7 +82,7 @@ steps:
     # `issue-reporter`, which has native `issues.*` tools via its own
     # frontmatter; see that step's comment.
     agent: issue-reporter
-    actions: ["issues.list", "issues.comment", "issues.create"]
+    actions: ["issues.list", "issues.get", "issues.comment", "issues.create", "issues.update_state"]
     prompt: |
       File today's security report using the native `issues.list`,
       `issues.comment`, and `issues.create` tools — do not use `gh` or any
