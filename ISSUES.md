@@ -132,6 +132,145 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 ## Open
 
+### I-22 — `grep` and `ast_grep` escape the workspace
+
+**Symptom.** An agent-supplied `path` argument reads outside the workspace:
+`path: "/etc"` (absolute) or `path: "../.."` both leave the sandbox. The write
+tools refuse the same input.
+
+**Root cause.** Both tools build their search root with a bare join and no
+containment check — `crates/rupu-tools/src/grep.rs:74` and
+`crates/rupu-tools/src/ast_grep.rs:150`, each
+`.map(|p| ctx.workspace_path.join(p))`. `Path::join` *replaces* the base when
+the argument is absolute, and does not normalize `..`. The crate already has
+the guard: `path_scope::is_inside` (`crates/rupu-tools/src/path_scope.rs:9`)
+canonicalizes both ends and is used by `read_file.rs:60`, `write_file.rs`, and
+`edit_file.rs`. The two search tools were simply never wired to it.
+
+**Impact.** The workspace boundary is a containment guarantee the write tools
+enforce and the read tools don't, so an agent can read `/etc`, `~/.ssh`, or a
+sibling repo through `grep`. Bounded by being read-only and still
+permission-gated, but it is a real escape from a documented boundary.
+
+**Fix.** Apply the same `is_inside` check both tools' siblings use, returning
+the same "escapes workspace" error shape. Note `glob` is **not** affected — it
+takes no user-supplied path and walks only `ctx.workspace_path`
+(`glob.rs:54`); the original TODO naming it was wrong.
+
+---
+
+### I-23 — the autoflow author allowlist is undocumented and defaults to open
+
+**Symptom.** Nothing in the user-facing docs describes `selector.authors` or
+`selector.authors_from`. A user writing an autoflow gets no restriction by
+default — any author who opens a matching issue or PR can trigger it.
+
+**Root cause.** `AutoflowSelector.authors` (`crates/rupu-orchestrator/src/workflow.rs:412`)
+and `.authors_from` (`:416`, with `AuthorScope::Collaborators | OrgMembers` at
+`:429`) are implemented and enforced by `author_allowed` (`:453`), but
+`docs/workflow-format.md`'s selector table documents only `states`,
+`labels_all`, `labels_any`, `labels_none`, and `limit`. The default — both
+fields unset — is *no* author restriction.
+
+**Impact.** This is the control that stops an arbitrary GitHub user from
+triggering an autonomous agent run by opening a PR — and autoflows commonly run
+at `permission_mode: bypass`. An operator who never learns the field exists has
+no reason to set it. Also undocumented on the same selector: `draft`, `base`,
+`on_skip`, and `Autoflow.source`.
+
+**Fix.** Document all of them in the selector table, with the default stated
+explicitly and a recommendation to set `authors_from: collaborators` for any
+autoflow that runs unattended. Consider whether the *default* should change —
+that is a behavior decision, so it is called out in the Arc 2 plan rather than
+assumed here.
+
+---
+
+### I-24 — `on_reject` cleanup runs at `ask` mode regardless of the run's mode
+
+**Symptom.** A workflow deliberately launched with `--mode readonly` has its
+gate rejected; the `on_reject` cleanup chain then executes with **write** tools
+enabled.
+
+**Root cause.** The run's original `--mode` is never persisted on `RunRecord`
+(only `resume_mode`, set by the web-resume path). `rupu workflow reject` has no
+`--mode` flag and passes `None`; `rebuild_opts_from_disk` then does
+`mode.unwrap_or("ask")`, and `parse_mode_for_runtime` maps anything that isn't
+`bypass`/`readonly` to `Ask`, which permits Write tools.
+
+**Impact.** A readonly guarantee silently stops applying at exactly the moment a
+human rejected the work — the cleanup chain can post comments, push branches, or
+call any Write connector the agent's grant allows.
+
+**Fix.** Persist the run's effective permission mode on `RunRecord` at start and
+have every cleanup-opts rebuild inherit it, defaulting to the *run's* mode
+rather than `ask`.
+
+---
+
+### I-25 — a list command executes `on_reject` chains as a side effect
+
+**Symptom.** `rupu workflow runs` — a read-only-looking listing — can post
+GitHub comments and run agent steps.
+
+**Root cause.** The listing path performs lazy approval-timeout expiry, and the
+timeout-reject branch invokes the full `run_reject_cleanup` chain inline.
+
+**Impact.** A command whose name and output imply pure observation has
+side effects on external systems. Compounded by I-24: those side effects run at
+`ask` mode regardless of how the original run was launched.
+
+**Fix.** Either move timeout-driven cleanup exclusively to the `cp serve` gate
+sweep (which exists and is default-on), or keep the lazy expiry but have the
+listing path only *finalize state* and leave chain execution to the sweep. The
+choice is a behavior decision — decided in the Arc 2 plan.
+
+---
+
+### I-26 — action steps get a `["*"]` tool allowlist while the comment claims otherwise
+
+**Symptom.** An action step can call any MCP catalog tool, even in a workflow
+whose agents are narrowed to a small `tools:` roster.
+
+**Root cause.** `action_dispatcher_for` builds
+`McpPermission::new(parse_mode_for_runtime(mode_str), vec!["*".into()])`. An
+agent step's MCP allowlist is its frontmatter `tools:` (`["*"]` only when the
+agent declares none). The doc comment on the builder asserts the opposite — that
+an `action:` step "sees exactly the same allow/deny surface a `tools:`-using
+agent step would" — which is false precisely in the case it names.
+
+**Impact.** Defensible by author intent (the tool name is written in the
+workflow), but the code comment is actively misleading and there is no per-step
+narrowing knob. Note `Step.actions` *is* enforced for agent steps since
+#533/#537 (`narrow_agent_tools`), so the asymmetry is now sharper.
+
+**Fix.** At minimum correct the comment. Preferably let a step's `actions:`
+narrow its own `action:` invocation the way it narrows an agent's grant.
+
+---
+
+### I-27 — `action_protocol::validate_actions` is dead code, and three docs describe it
+
+**Symptom.** README, `docs/agent-format.md`, and `docs/triggers.md` describe a
+runtime check on emitted actions that no shipped code path performs.
+
+**Root cause.** `crates/rupu-orchestrator/src/action_protocol.rs:18`
+`validate_actions` is exported but called from nowhere in the runner — its only
+callers are its own tests. `crates/rupu-agent/src/action.rs:21` likewise ships a
+field-less, method-less `pub struct ActionValidator;` whose comment says "Real
+impl lands in Task 11", and `ActionEnvelope` has no producer in `rupu-agent`.
+
+**Impact.** Documentation-only: readers are told a safety check exists that does
+not. Now more confusing because `actions:` *does* narrow tools via a different
+mechanism (`step_factory::narrow_agent_tools`), so the docs describe the wrong
+enforcement for a field that really is enforced.
+
+**Fix.** Delete `validate_actions` and the `ActionValidator` stub, and correct
+the three docs to describe the real mechanism. (The doc corrections overlap
+I-51 in Arc 6; do the code deletion here and let Arc 6 own the prose.)
+
+---
+
 ### I-6 — `rupu config set` corrupts `config.toml`, then silently wipes it
 
 **Symptom.** Two commands destroy a user's configuration:
