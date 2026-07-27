@@ -810,6 +810,24 @@ impl SshHostConnector {
         Ok(())
     }
 
+    /// Issue a one-shot `rupu transcript <tail...>` command on the remote
+    /// host. The `rupu session`-prefixed sibling of [`remote_session`]; used
+    /// by the transcript archive/delete overrides.
+    async fn remote_transcript(&self, tail: &[&str]) -> Result<(), HostConnectorError> {
+        let mut argv: Vec<String> = vec!["rupu".into(), "transcript".into()];
+        argv.extend(tail.iter().map(|s| s.to_string()));
+        let cmd = build_remote_command(&argv);
+        let out = self
+            .exec
+            .run(&cmd)
+            .await
+            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+        if !out.success {
+            return Err(HostConnectorError::Unreachable(out.stderr));
+        }
+        Ok(())
+    }
+
     /// Run a one-shot `rupu <argv...>` over ssh and return the parsed JSON
     /// value of the CLI's `--format json` report. Shared command-building +
     /// error-mapping for [`remote_json_rows`](Self::remote_json_rows)
@@ -1307,6 +1325,17 @@ impl HostConnector for SshHostConnector {
     /// `rupu session delete <id> --force`.
     async fn delete_session(&self, id: &str) -> Result<(), HostConnectorError> {
         self.remote_session(&["delete", id, "--force"]).await
+    }
+
+    /// Archive a standalone remote transcript via `rupu transcript archive <id>`.
+    async fn archive_transcript(&self, id: &str) -> Result<(), HostConnectorError> {
+        self.remote_transcript(&["archive", id]).await
+    }
+
+    /// Permanently delete a remote transcript via
+    /// `rupu transcript delete <id> --force`.
+    async fn delete_transcript(&self, id: &str) -> Result<(), HostConnectorError> {
+        self.remote_transcript(&["delete", id, "--force"]).await
     }
 
     /// Standalone agent runs via `rupu transcript list --format json`, reshaped
@@ -2849,6 +2878,46 @@ mod tests {
 
         let err = conn
             .archive_session("ses_01TESTARCHIVEOFFLINE")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Unreachable(_)),
+            "expected Unreachable, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_archive_delete_transcript_issue_remote_commands() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let id = "run_01TESTTRANSCRIPTOK";
+
+        conn.archive_transcript(id).await.unwrap();
+        conn.delete_transcript(id).await.unwrap();
+
+        let cmds = fake.commands.lock().unwrap();
+        assert!(
+            cmds.iter().any(|c| c.contains("'transcript'")
+                && c.contains("'archive'")
+                && c.contains(&format!("'{id}'"))),
+            "transcript archive command not found in: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("'transcript'")
+                && c.contains("'delete'")
+                && c.contains(&format!("'{id}'"))
+                && c.contains("'--force'")),
+            "transcript delete command not found in: {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_archive_transcript_offline_surfaces_unreachable() {
+        let fake = std::sync::Arc::new(FakeExec::offline("connection refused"));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let err = conn
+            .archive_transcript("run_01TESTTRANSCRIPTOFFLINE")
             .await
             .unwrap_err();
         assert!(

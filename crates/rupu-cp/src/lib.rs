@@ -19,6 +19,7 @@ pub mod session_sender;
 pub mod session_starter;
 pub mod sse;
 pub mod state;
+pub mod transcript_mutator;
 pub mod transcript_tail;
 pub mod usage;
 
@@ -60,6 +61,11 @@ pub struct ServeOpts {
     /// subprocess impl; `None` → the session archive/restore/delete endpoints
     /// return 501.
     pub session_mutator: Option<std::sync::Arc<dyn crate::session_mutator::SessionMutator>>,
+    /// Optional transcript-mutator adapter (standalone agent-run
+    /// transcripts). rupu-cli's `cp serve` provides the subprocess impl;
+    /// `None` → the transcript archive/delete endpoints return 501.
+    pub transcript_mutator:
+        Option<std::sync::Arc<dyn crate::transcript_mutator::TranscriptMutator>>,
 }
 
 /// The browser-clickable URL for a bound address. An unspecified bind host
@@ -123,6 +129,7 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         .with_session_starter(opts.session_starter.clone())
         .with_generator(opts.generator)
         .with_session_mutator(opts.session_mutator.clone())
+        .with_transcript_mutator(opts.transcript_mutator.clone())
         .with_bind(opts.bind.to_string())
         .with_token_set(opts.token.is_some());
 

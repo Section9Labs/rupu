@@ -451,6 +451,27 @@ impl HostConnector for HttpHostConnector {
             .map(|_| ())
     }
 
+    /// POST to the remote CP's `POST /api/transcripts/:id/archive`.
+    async fn archive_transcript(&self, id: &str) -> Result<(), HostConnectorError> {
+        self.send(
+            self.client
+                .post(self.url(&format!("/api/transcripts/{id}/archive")))
+                .json(&serde_json::json!({})),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// DELETE to the remote CP's `DELETE /api/transcripts/:id`.
+    async fn delete_transcript(&self, id: &str) -> Result<(), HostConnectorError> {
+        self.send(
+            self.client
+                .delete(self.url(&format!("/api/transcripts/{id}"))),
+        )
+        .await
+        .map(|_| ())
+    }
+
     async fn list_agent_runs(&self) -> Result<Vec<serde_json::Value>, HostConnectorError> {
         let v = self
             .proxy_get_json("/api/runs/agents?host=local&limit=10000")

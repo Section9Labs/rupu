@@ -198,6 +198,24 @@ async fn http_archive_restore_delete_session_round_trip() {
 }
 
 #[tokio::test]
+async fn http_archive_delete_transcript_round_trip() {
+    let server = httpmock::MockServer::start_async().await;
+    let archive_mock = server.mock(|when, then| {
+        when.method("POST").path("/api/transcripts/run_a/archive");
+        then.status(200).json_body(serde_json::json!({"ok": true, "id": "run_a"}));
+    });
+    let delete_mock = server.mock(|when, then| {
+        when.method("DELETE").path("/api/transcripts/run_a");
+        then.status(200).json_body(serde_json::json!({"ok": true, "id": "run_a"}));
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    c.archive_transcript("run_a").await.unwrap();
+    c.delete_transcript("run_a").await.unwrap();
+    archive_mock.assert();
+    delete_mock.assert();
+}
+
+#[tokio::test]
 async fn http_pause_resume_round_trip() {
     let server = httpmock::MockServer::start_async().await;
     let pause_mock = server.mock(|when, then| {

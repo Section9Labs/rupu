@@ -244,6 +244,22 @@ pub trait HostConnector: Send + Sync {
         Err(HostConnectorError::Unsupported("session delete".into()))
     }
 
+    /// Archive a standalone agent-run transcript on this host. The default
+    /// impl returns [`HostConnectorError::Unsupported`] so transports without
+    /// transcript mutation (Local — routed through the `TranscriptMutator`
+    /// port instead, see `api/transcripts.rs`; Bucket/Tunnel — no transcript
+    /// mirror) compile unchanged. SSH / HTTP override it. No `restore_transcript`
+    /// exists: `rupu transcript restore` is not a real CLI verb.
+    async fn archive_transcript(&self, _id: &str) -> Result<(), HostConnectorError> {
+        Err(HostConnectorError::Unsupported("transcript archive".into()))
+    }
+
+    /// Permanently delete a standalone agent-run transcript on this host.
+    /// Default: see [`archive_transcript`](Self::archive_transcript).
+    async fn delete_transcript(&self, _id: &str) -> Result<(), HostConnectorError> {
+        Err(HostConnectorError::Unsupported("transcript delete".into()))
+    }
+
     /// List standalone/agent runs on this host (`GET /api/runs/agents`).
     /// The SSH connector shells `rupu transcript list --format json`. Default
     /// errors so transports without agent-run enumeration compile unchanged.
