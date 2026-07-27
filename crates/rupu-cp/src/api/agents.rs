@@ -156,6 +156,17 @@ pub(crate) struct AgentDto {
     pub(crate) usage: crate::usage::UsageSummary,
     /// Distinct runs attributed to this agent. Defaults to `0`.
     pub(crate) run_count: u64,
+    /// Most-recent run timestamp (ISO-8601) attributed to this agent, or
+    /// `None` if it has never run. Mirrors `WorkflowDto::last_run`'s
+    /// semantics/name exactly — the shared "last activity" signal the list
+    /// tables use in place of a non-existent intrinsic status for
+    /// definitions (agents/workflows have no status of their own; only their
+    /// runs do). Populated by the same canonical-row rule as `usage` /
+    /// `run_count` above: only ONE row per agent name carries it. No
+    /// `skip_serializing_if` — matches `WorkflowDto::last_run`, which always
+    /// serializes (as `null` when absent) rather than omitting the key.
+    #[serde(default)]
+    pub(crate) last_run: Option<String>,
 }
 
 impl AgentDto {
@@ -172,6 +183,7 @@ impl AgentDto {
             scope: scope.into(),
             usage: crate::usage::UsageSummary::default(),
             run_count: 0,
+            last_run: None,
         }
     }
 }
@@ -246,6 +258,11 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
     }
     let rows = rupu_transcript::aggregate(&all_paths, rupu_transcript::TimeWindow::default());
     let breakdown = crate::usage::breakdown(&rows, &s.pricing, crate::usage::GroupBy::Agent);
+    // `last_run` can't be read off `breakdown` (it's built from
+    // cross-run-aggregated `UsageRow`s, which discard per-run timestamps) —
+    // see `last_run_by_agent`'s doc comment for why it re-walks per-run
+    // transcripts instead.
+    let last_runs = crate::usage::last_run_by_agent(&s.run_store, &runs);
 
     let mut canonical_dto_for_name: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
@@ -272,6 +289,7 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
                 runs: b.runs,
             };
             dto.run_count = b.runs;
+            dto.last_run = last_runs.get(&name).cloned();
         }
     }
 
@@ -1091,6 +1109,58 @@ mod tests {
             run_counts.iter().filter(|&&c| c == 0).count(),
             1,
             "the other same-named row stays zeroed rather than duplicating usage"
+        );
+
+        // The canonical-row rule must hold for `last_run` too: exactly one of
+        // the two same-named rows carries a timestamp, the other stays `None`
+        // rather than both showing the same (duplicated) last-run signal.
+        let last_runs: Vec<Option<String>> = rows.iter().map(|r| r.last_run.clone()).collect();
+        assert_eq!(
+            last_runs.iter().filter(|r| r.is_some()).count(),
+            1,
+            "exactly one row carries last_run"
+        );
+        assert_eq!(
+            last_runs.iter().filter(|r| r.is_none()).count(),
+            1,
+            "the other same-named row stays None rather than duplicating last_run"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_agents_last_run_reflects_run_and_none_when_never_run() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        save_agent_file(&s.global_dir, "code-reviewer", VALID_MD).expect("seed");
+        const GHOST_MD: &str = "---\nname: ghost\nmodel: opus\n---\nNever runs.\n";
+        save_agent_file(&s.global_dir, "ghost", GHOST_MD).expect("seed");
+
+        seed_run_with_agent_usage(
+            &s,
+            "run_1",
+            "ws_x",
+            "code-reviewer",
+            &tmp.path().join("t1.jsonl"),
+        );
+
+        let Json(rows) = list_agents(State(s)).await.expect("ok");
+
+        let reviewer = rows
+            .iter()
+            .find(|r| r.name == "code-reviewer")
+            .expect("code-reviewer present");
+        assert!(
+            reviewer.last_run.is_some(),
+            "an agent that ran must carry a last_run timestamp"
+        );
+
+        let ghost = rows
+            .iter()
+            .find(|r| r.name == "ghost")
+            .expect("ghost present");
+        assert_eq!(
+            ghost.last_run, None,
+            "an agent that never ran must have last_run == None"
         );
     }
 }

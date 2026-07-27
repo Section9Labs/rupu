@@ -204,6 +204,54 @@ pub fn rollup_by(
     out
 }
 
+/// Most-recent-run timestamp per agent NAME (ISO-8601 / RFC 3339), for the
+/// agents list's `last_run` column.
+///
+/// This can't reuse [`rollup_by`] as-is: `rollup_by`'s `key_of` reads a
+/// single key straight off the `RunRecord` (e.g. `workflow_name`), but a
+/// `RunRecord` carries no equivalent "the agent(s) this run used" field —
+/// `active_step_agent` is transient (cleared once the active step finishes,
+/// see its doc comment) and a single run's steps/fan-out units can span more
+/// than one named agent. So instead, for each run, this re-aggregates ONLY
+/// that run's own transcripts (same [`rupu_transcript::aggregate`] used
+/// elsewhere) to discover which agent name(s) it actually attributes usage
+/// to, then folds `run.started_at` into each such name's most-recent
+/// timestamp — the same "keep the latest" fold [`EntityRollup::add`] does.
+///
+/// A run with no readable transcripts contributes to no name. An agent name
+/// that never appears in any run's transcripts is simply absent from the
+/// returned map (the caller treats that as `None`, i.e. "never ran").
+pub fn last_run_by_agent(
+    store: &RunStore,
+    runs: &[rupu_orchestrator::RunRecord],
+) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for run in runs {
+        let paths = run_transcript_paths(store, &run.id);
+        if paths.is_empty() {
+            continue;
+        }
+        let rows = rupu_transcript::aggregate(&paths, TimeWindow::default());
+        let at = run.started_at.to_rfc3339();
+        let mut names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for row in &rows {
+            if !row.agent.is_empty() {
+                names.insert(row.agent.as_str());
+            }
+        }
+        for name in names {
+            out.entry(name.to_string())
+                .and_modify(|cur| {
+                    if *cur < at {
+                        *cur = at.clone();
+                    }
+                })
+                .or_insert_with(|| at.clone());
+        }
+    }
+    out
+}
+
 /// Dimension for the overview breakdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupBy {
