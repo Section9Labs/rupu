@@ -6383,6 +6383,8 @@ dependencies = [
  "rupu-auth",
  "rupu-config",
  "rupu-orchestrator",
+ "rupu-providers",
+ "rupu-runtime",
  "rupu-scm",
  "serde",
  "serde_json",

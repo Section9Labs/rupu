@@ -34,9 +34,9 @@ against the code before being recorded.
 | I-14 | P1 | rupu-cli | `log_level` has no consumer; logging reads only `RUPU_LOG` | fixed |
 | I-16 | P1 | rupu-scm | `[scm.*].clone_protocol` is inert — clones always use HTTPS despite the UI dropdown | fixed |
 | I-17 | P2 | rupu-scm | `[scm.*].timeout_ms` has no consumer | fixed |
-| I-19 | P1 | rupu-app | The desktop app passes `Config::default()` — all user config is inert there | open |
+| I-19 | P1 | rupu-app | The desktop app passes `Config::default()` — all user config is inert there | fixed |
 | I-20 | P2 | rupu-config | `resolve()`'s env-override tier is never populated; `KeySource::Env` is unreachable | fixed |
-| I-21 | P2 | rupu-cli | A malformed `config.toml` is silently swallowed on the pricing paths, printing wrong costs | open |
+| I-21 | P2 | rupu-cli | A malformed `config.toml` is silently swallowed on the pricing paths, printing wrong costs | fixed |
 
 ### Found during Arc 1 (unscheduled)
 
@@ -132,53 +132,6 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 ## Open
 
-### I-19 — the desktop app passes `Config::default()`; all user config is inert there
-
-**Symptom.** Every `config.toml` value a user sets is ignored inside rupu.app.
-A workflow run started from the GUI resolves a different provider, model, bash
-timeout, and provider tuning than the identical run started from `rupu
-workflow run`.
-
-**Root cause.** `crates/rupu-app/src/executor/mod.rs:210` builds its executor
-with `rupu_config::Config::default()` rather than the layered global+project
-config. The file admits it at `:109-115`. Consequently
-`DefaultStepFactory`'s `openai_compatible`, `provider_tuning`,
-`default_provider`, `default_model`, and `[bash]` fields are all empty/None at
-that site.
-
-**Impact.** A custom `openai-compatible` provider like `oracle` fails loudly
-with "unknown provider" in the GUI while working in the CLI. Everything else
-fails *silently* by resolving a default. This is the I-2/I-8 divergence shape
-at whole-config scale.
-
-**Note.** Split out of the combined "dead configuration" write-up (now under
-`## Fixed`) when the other eight keys were resolved; the historical row is
-preserved in that section's table. Fixing this means loading the layered
-config in `build_executor` and threading it into the executor config — the
-receiving fields all exist now.
-
----
-
-### I-21 — a malformed `config.toml` silently yields wrong cost figures
-
-**Symptom.** A typo in `[pricing]` makes `rupu run list` / `rupu run show` print
-costs computed from default rates, with no warning.
-
-**Root cause.** `crates/rupu-cli/src/cmd/run.rs:339,404` —
-`layer_files(...).unwrap_or_default()` discards a real `LayerError::Parse`
-(`crates/rupu-config/src/layer.rs:23-28`) and feeds `cfg.pricing` into
-`query_run_detail`. The fallback is deliberate per the comment at `run.rs:335`,
-but it was reasoned about for UI preferences, not for numbers the user reads.
-
-**Impact.** Wrong dollar figures presented as authoritative. The same pattern at
-`cmd/workflow.rs:993` and `cmd/cron.rs:281` affects only UI preferences and is
-harmless.
-
-**Fix.** On the pricing paths, surface the parse error (or at minimum warn that
-default rates are in use). Leave the UI-preference sites as they are.
-
----
-
 ### I-5 — `rust-toolchain.toml` is not honored on this box; clippy is red under 1.95
 
 **Symptom.** `cargo clippy` fails on a clean `main` in crates unrelated to any
@@ -268,8 +221,9 @@ whether global `default_model` is meant to be provider-agnostic.
 
 ### I-9 … I-14, I-17, I-20 — dead configuration
 
-*(I-19 shared this write-up and is **still open** — see its own entry under
-`## Open`. Its row is kept in the table below so no row is lost.)*
+*(I-19 shared this write-up and was split out because it needed its own
+diagnosis; it is now **fixed** — see its own entry under `## Fixed` below. Its
+row is kept in the table here so no row is lost.)*
 
 Nine keys parsed, were documented, and in several cases were editable in the CP
 Settings UI, yet had **no runtime consumer**. Proof for each was a
@@ -286,7 +240,7 @@ hits.
 | I-13 | `[retry]` (whole section) | `config.rs:113-116` | — | inert top-level section | **deleted as a live key, with a one-release deprecation shim.** `RetryConfig`, the typed `Config.retry` field and the `lib.rs` re-export are gone; `[retry]` is still *accepted* as an opaque `Option<toml::Value>` that nothing reads, and `Config::warn_deprecated_keys` (called from `validate`, i.e. every load path) warns naming the key. Superseded by per-provider `max_retries`. Rationale below | Absence greps: `grep -rn 'RetryConfig\|max_attempts\|initial_delay_ms' crates/rupu-config/src/` → 0; `grep -rn '\[retry\]' docs/ --include='*.md'` (excluding historical plan docs) → 0; not present in `ConfigEditor.tsx` or `Settings.test.tsx`. `parse::a_config_still_carrying_retry_loads_and_keeps_every_other_key` and `parse::retry_survives_layer_files_and_the_lock_aware_loader` prove the migration is non-destructive; `cargo build --workspace` + web `npm run test` clean |
 | I-14 | `log_level` | `config.rs:27` | `ConfigEditor.tsx:199-207`, with a lock toggle | logging read only `RUPU_LOG` (`logging.rs:25`) | **wired** → `logging::filter_directive(cfg_level, env)`: `RUPU_LOG` > `log_level` > `warn`. Config is loaded *before* logging init at all four init sites (`lib.rs:247`, `session.rs` worker + run-turn) | `logging::tests::config_log_level_is_the_fallback_when_env_is_unset`, `env_wins_over_config`, `neither_source_yields_warn`, `blank_values_are_treated_as_unset`, `an_unparseable_directive_falls_back_to_warn` |
 | I-17 | `[scm.*].timeout_ms` | `scm_config.rs:46` | `docs/scm.md:109-119` | no consumer (sibling `base_url`/`max_concurrency` *were* consumed) | **wired** → `ScmClientOptions::timeout` reaches octocrab (`set_connect_timeout`/`set_read_timeout`) plus the two ad-hoc reqwest clients in `github/client.rs`, and replaces GitLab's hardcoded 30 s | `github::client::tests::platform_config_reaches_the_client` asserts `GithubClient::timeout()` == the configured 4000 ms and 30 000 ms when unset; `client_options::tests::scm_timeout_defaults_to_30s` |
-| I-19 | all of it, in rupu-app | — | — | `executor/mod.rs:210` passes `Config::default()`; self-admitted at `:109-115` | **STILL OPEN** — tracked separately under `## Open`. The new `provider_tuning` map is empty there for the same reason, with the existing TODO extended to say so | n/a |
+| I-19 | all of it, in rupu-app | — | — | `executor/mod.rs:210` passes `Config::default()`; self-admitted at `:109-115` | **fixed** — see its own write-up under `## Fixed` for the detail; `build_executor` now loads the layered global+project config and threads `openai_compatible`/`provider_tuning`/`default_provider`/`default_model`/`[bash]` into every workflow it starts | see I-19's write-up |
 | I-20 | `resolve()` env tier | `resolve.rs:144-171` | — | both callers passed an empty map; `KeySource::Env` was unreachable | **deleted** — the `env` parameter and the `KeySource::Env` variant. Precedence is now `locked-global > project > global > default`. Six call sites (`layer_files_locked`, `rupu-cp` state + api/config) simplified; the CP UI's unreachable `env` provenance badge removed from `api.ts`'s `KeySource` union and `ConfigField.tsx`'s `SOURCE_CLASS` | Absence greps: `grep -rn 'KeySource::Env' crates/` → only the doc comment explaining the removal; `grep -rn "'env'" crates/rupu-cp/web/src` → 0. `resolve::tests::project_wins_when_unlocked_and_no_env_tier_exists` replaces the old env-precedence test; `no_policy_block_matches_layer_files` still passes |
 
 **Impact (before).** Exactly the I-1 shape, ~9×. A user read the docs, set a
@@ -613,11 +567,13 @@ from the callers, mirroring the I-2/I-8 approach.
   additionally pass `cfg.bash.timeout_secs.unwrap_or(120)` /
   `cfg.bash.env_allowlist.clone().unwrap_or_default()` — the same fallback
   `cmd/run.rs`/`cmd/session.rs` apply.
-- `crates/rupu-app/src/executor/mod.rs:100` (the GUI executor) has no real
-  `Config` yet — that gap is tracked separately as I-19, still open — so it
-  keeps the same `120`/empty values it already produced; the existing TODO
-  comment was extended to note `[bash]` alongside `default_provider`/
-  `default_model` as inert there. No behavior change at that site.
+- `crates/rupu-app/src/executor/mod.rs:100` (the GUI executor) had no real
+  `Config` yet — that gap was tracked separately as I-19 (now fixed, see its
+  own write-up) — so at the time of this fix it kept the same `120`/empty
+  values it already produced; the TODO comment was extended to note `[bash]`
+  alongside `default_provider`/`default_model` as inert there. No behavior
+  change at that site *until I-19 landed*, which threads real `[bash]` values
+  through the same fields this fix added.
 
 **Validation.** `cargo test -p rupu-orchestrator --lib` — 365 tests, all
 passing (1 new). `bash_config_reaches_the_step_opts`
@@ -921,3 +877,117 @@ model regardless of invocation" guarantee did not hold for a dispatched
 sub-agent. Closed as **I-8** (see above), which threads the same three
 config-derived values into `CliAgentDispatcher` that `DefaultStepFactory`
 carries.
+
+### I-19 — the desktop app passes `Config::default()`; all user config is inert there
+
+**Symptom.** Every `config.toml` value a user sets was ignored inside rupu.app.
+A workflow run started from the GUI resolved a different provider, model, bash
+timeout, and provider tuning than the identical run started from `rupu
+workflow run`.
+
+**Root cause.** `crates/rupu-app/src/executor/mod.rs:210` built its executor
+with `rupu_config::Config::default()` rather than the layered global+project
+config the CLI uses. The file admitted it at `:109-115`. Consequently
+`DefaultStepFactory`'s `openai_compatible`, `provider_tuning`,
+`default_provider`, `default_model`, and `[bash]` fields were all empty/None at
+that site — the I-2/I-8 divergence shape at whole-config scale. A custom
+`openai-compatible` provider like `oracle` failed loudly with "unknown
+provider" in the GUI while working in the CLI; everything else failed
+*silently* by resolving a default.
+
+**Fix.** PR (branch `arc1/config-integrity`).
+
+1. Extracted a pure `load_workflow_config(global: &Path, workspace_path:
+   &Path) -> Config` helper (`crates/rupu-app/src/executor/mod.rs`) that calls
+   `rupu_config::layer_files_locked` — global `<global>/config.toml` merged
+   with the opened workspace's own `.rupu/config.toml`. Policy-bearing
+   (`[scm]`, `default_provider`/`default_model`, `[bash]`, `[providers.*]`
+   tuning) so it goes through the lock-aware loader, not plain `layer_files`
+   (I-7). Unlike `rupu run`'s `paths::project_root_for`, there is no upward
+   walk from a cwd: the desktop app already knows its project root — it's the
+   workspace directory the user opened. A malformed `config.toml` is logged
+   (`tracing::warn!` naming the file and the parse error) and treated as
+   absent rather than blocking workspace-open outright; `build_executor`'s
+   signature is infallible and all three call sites (`main.rs` ×2,
+   `menu/app_menu.rs`) already treat "workspace opened" as the point of no
+   return, so a broken desktop config shouldn't make the app unusable — a
+   deliberately different call from I-21's, where the same kind of parse
+   error must fail the command because it feeds a cost figure the user reads.
+2. `build_executor` now calls this helper instead of passing
+   `Config::default()` to `Registry::discover`, and additionally computes
+   `rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers)` /
+   `provider_tuning_map(&cfg.providers)` — the identical calls `rupu run` and
+   `rupu workflow run` make. `WorkflowConfig` gained the five receiving
+   fields (`openai_compatible`, `provider_tuning`, `default_provider`,
+   `default_model`, `bash_timeout_secs`, `bash_env_allowlist`);
+   `start_workflow_with_opts` now threads them into `DefaultStepFactory`
+   instead of the hardcoded `HashMap::new()` / `None` / `120` / `Vec::new()`
+   the TODO comment (I-18) had documented.
+3. `rupu-app`'s `Cargo.toml` gained `rupu-runtime` and `rupu-providers` as
+   direct dependencies (needed to name `ProviderTuning` and call
+   `provider_factory`; previously reached only transitively through
+   `rupu-orchestrator`).
+
+**Validation.** `build_executor` itself isn't directly unit-testable (it needs
+a `Workspace` + ambient Tokio runtime + GPUI closure context), so per the
+task's fallback instruction the extracted `load_workflow_config` helper is
+tested directly, in `crates/rupu-app/src/executor/mod.rs`:
+
+- `load_workflow_config_reads_the_layered_config` — the binding assertion. A
+  global `config.toml` sets `default_provider`/`default_model`; a workspace
+  `.rupu/config.toml` overrides only `default_model`. Asserts both resolve as
+  `Some`, not the `None`/`None` `Config::default()` produced.
+- `load_workflow_config_treats_missing_project_file_as_absent` — a workspace
+  with no `.rupu/config.toml` at all still resolves the global value (no
+  regression to the common "workspace has no config" case).
+- `load_workflow_config_falls_back_to_defaults_on_malformed_toml` — a
+  present-but-invalid global `config.toml` does not panic and resolves to
+  `Config::default()` rather than propagating (matching point 1 above).
+
+`cargo test -p rupu-app --lib` — 27 tests, all passing (3 new). `cargo build
+-p rupu-app` — full binary build succeeds in this environment (Metal
+toolchain present); `cargo build --workspace` and `cargo clippy -p rupu-app
+--lib` are both clean.
+
+### I-21 — a malformed `config.toml` silently yields wrong cost figures
+
+**Symptom.** A typo in `[pricing]` made `rupu run list` / `rupu run show`
+print costs computed from default rates, with no warning.
+
+**Root cause.** `crates/rupu-cli/src/cmd/run.rs:339,404` —
+`layer_files_locked(...).unwrap_or_default()` discarded a real
+`LayerError::Parse` (`crates/rupu-config/src/layer.rs:23-28`) and fed
+`cfg.pricing` into `query_run_detail`. The fallback was deliberate per the
+comment at `run.rs:335`, but it was reasoned about for UI preferences, not for
+numbers the user reads and trusts.
+
+**Fix.** PR (branch `arc1/config-integrity`). Chose to **fail the command**
+rather than warn-and-continue: `list()` and `show()` already return
+`anyhow::Result<()>`, the dispatcher already renders an `Err` via
+`crate::output::diag::fail(e)`, and `run_inner`'s main launch path
+(`cmd/run.rs:473`) already propagates the identical `layer_files_locked` error
+with `?` — failing here is the path of least surprise, not a new failure mode
+for the binary. Both sites now `.map_err(...)` the `LayerError` into an
+`anyhow::Error` whose message names the config path and the underlying parse
+error (so it's legible even though `diag::fail` prints via `Display`, not the
+source chain), and additionally emit a `tracing::warn!` naming the same
+file/error before returning it. A **missing** `config.toml` is unaffected —
+`layer_files_locked` already treats that as an empty layer with no `Err`, so
+the common fresh-install case still resolves `PricingConfig::default()`
+without complaint. The identical pattern at `cmd/workflow.rs:993` and
+`cmd/cron.rs:281` affects only UI preferences and was deliberately left alone,
+per the task brief.
+
+**Validation.** `cargo test -p rupu-cli --lib cmd::run::` — 14 tests, all
+passing (2 new):
+
+- `malformed_config_surfaces_on_the_pricing_path` — the binding assertion.
+  With `RUPU_HOME` pointed at a temp dir whose `config.toml` is invalid TOML,
+  both `list(10, None, None)` and `show("run_missing", None)` return `Err`
+  rather than a default-priced report.
+- `missing_config_file_still_falls_back_without_erroring` — the regression
+  guard: no `config.toml` at all under `RUPU_HOME` still returns `Ok` from
+  `list()`, proving only a *present-but-broken* file fails the command.
+
+Both tests hold `crate::test_support::ENV_LOCK` for the `RUPU_HOME`
+mutation, mirroring the existing pattern in `cmd/cron.rs`/`cmd/webhook.rs`.
