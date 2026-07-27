@@ -1,9 +1,11 @@
 // @vitest-environment jsdom
-// AgentDetail edit/delete — the operator edits an agent's `.md` definition in
-// the browser, saves it (validated server-side), or deletes the agent.
+// AgentDetail edit/delete — the operator edits an agent's `.md` definition via
+// the Agent Builder card composer, saves it (validated server-side), or
+// deletes the agent.
 //
-// `CodeEditor` is mocked to a plain <textarea> so the test never pulls in the
-// real (lazy) CodeMirror chunk; `useNavigate` is mocked to assert navigation.
+// `CodeEditor` (used internally by the Agent Builder's Raw mode) is mocked to
+// a plain <textarea> so the test never pulls in the real (lazy) CodeMirror
+// chunk; `useNavigate` is mocked to assert navigation.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
@@ -31,23 +33,6 @@ vi.mock('../components/CodeEditor', () => ({
 }));
 
 import AgentDetailPage from './AgentDetail';
-
-// jsdom's localStorage is unreliable under this Node version — install a
-// simple in-memory implementation we fully control (mirrors
-// NewAgentModal.test.tsx's `installLocalStorage`).
-function installLocalStorage() {
-  const store = new Map<string, string>();
-  vi.stubGlobal('localStorage', {
-    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
-    setItem: (k: string, v: string) => store.set(k, String(v)),
-    removeItem: (k: string) => store.delete(k),
-    clear: () => store.clear(),
-    key: (i: number) => Array.from(store.keys())[i] ?? null,
-    get length() {
-      return store.size;
-    },
-  });
-}
 
 const RAW = `---\nname: reviewer\ndescription: Reviews code.\nprovider: anthropic\nmodel: claude-sonnet-4-6\n---\n\nYou review code.\n`;
 
@@ -82,42 +67,41 @@ function renderPage() {
 }
 
 describe('AgentDetail edit/delete', () => {
-  it('Edit reveals the editor seeded with the raw definition', async () => {
+  it('Edit reveals the Agent Builder seeded with the raw definition', async () => {
     vi.spyOn(api, 'getAgent').mockResolvedValue(AGENT);
     renderPage();
 
     fireEvent.click(await screen.findByRole('button', { name: 'Edit definition' }));
 
-    const editor = (await screen.findByTestId('code-editor')) as HTMLTextAreaElement;
-    expect(editor.value).toBe(RAW);
+    const nameInput = (await screen.findByLabelText(/agent name/i)) as HTMLInputElement;
+    expect(nameInput.value).toBe('reviewer');
   });
 
-  it('editing + Save calls saveAgent(name, draft) and exits edit mode', async () => {
+  it('editing + Save calls saveAgent(name, raw) and exits edit mode', async () => {
     vi.spyOn(api, 'getAgent').mockResolvedValue(AGENT);
-    const next = `${RAW}\nMore guidance.\n`;
-    const saveSpy = vi.spyOn(api, 'saveAgent').mockResolvedValue({ ...AGENT, raw: next });
+    const saveSpy = vi
+      .spyOn(api, 'saveAgent')
+      .mockResolvedValue({ ...AGENT, raw: `${RAW}\nMore guidance.\n` });
     renderPage();
 
     fireEvent.click(await screen.findByRole('button', { name: 'Edit definition' }));
-    const editor = (await screen.findByTestId('code-editor')) as HTMLTextAreaElement;
-
-    // Save disabled until the draft diverges from the saved raw.
-    const saveBtn = screen.getByRole('button', { name: 'Save' });
-    expect(saveBtn).toBeDisabled();
-
-    fireEvent.change(editor, { target: { value: next } });
-    expect(saveBtn).not.toBeDisabled();
-    fireEvent.click(saveBtn);
+    const nameInput = (await screen.findByLabelText(/agent name/i)) as HTMLInputElement;
+    fireEvent.change(nameInput, { target: { value: 'reviewer-2' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
 
     // `scopeSelectorFor(AGENT)` — AGENT is `scope_kind: 'global'` — is
     // threaded through so Save targets the exact resolved file, the same
     // way Delete does (see the scope-threading test below for the
     // project-scoped case).
     await waitFor(() =>
-      expect(saveSpy).toHaveBeenCalledWith('reviewer', next, { scope_kind: 'global' }),
+      expect(saveSpy).toHaveBeenCalledWith(
+        'reviewer',
+        expect.stringContaining('name: reviewer-2'),
+        { scope_kind: 'global' },
+      ),
     );
     // On success the editor closes (read-only highlight returns).
-    await waitFor(() => expect(screen.queryByTestId('code-editor')).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByLabelText(/agent name/i)).not.toBeInTheDocument());
   });
 
   it('surfaces a rejected Save as an inline alert', async () => {
@@ -128,14 +112,14 @@ describe('AgentDetail edit/delete', () => {
     renderPage();
 
     fireEvent.click(await screen.findByRole('button', { name: 'Edit definition' }));
-    const editor = (await screen.findByTestId('code-editor')) as HTMLTextAreaElement;
-    fireEvent.change(editor, { target: { value: `${RAW}x` } });
+    const nameInput = (await screen.findByLabelText(/agent name/i)) as HTMLInputElement;
+    fireEvent.change(nameInput, { target: { value: 'reviewer-2' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('invalid frontmatter: missing model');
     // Stays in edit mode so the operator can fix it.
-    expect(screen.getByTestId('code-editor')).toBeInTheDocument();
+    expect(screen.getByLabelText(/agent name/i)).toBeInTheDocument();
   });
 
   it('Delete (confirmed) calls deleteAgent and navigates to /agents', async () => {
@@ -220,10 +204,9 @@ describe('AgentDetail edit/delete', () => {
       scope_kind: 'project',
       scope_id: 'ws_a',
     });
-    const next = `${RAW}\nMore guidance.\n`;
     const saveSpy = vi.spyOn(api, 'saveAgent').mockResolvedValue({
       ...AGENT,
-      raw: next,
+      raw: `${RAW}\nMore guidance.\n`,
       scope: 'my-project',
       scope_kind: 'project',
       scope_id: 'ws_a',
@@ -231,36 +214,23 @@ describe('AgentDetail edit/delete', () => {
     renderPage();
 
     fireEvent.click(await screen.findByRole('button', { name: 'Edit definition' }));
-    const editor = (await screen.findByTestId('code-editor')) as HTMLTextAreaElement;
-    fireEvent.change(editor, { target: { value: next } });
+    const nameInput = (await screen.findByLabelText(/agent name/i)) as HTMLInputElement;
+    fireEvent.change(nameInput, { target: { value: 'reviewer-2' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
 
     await waitFor(() =>
-      expect(saveSpy).toHaveBeenCalledWith('reviewer', next, {
-        scope_kind: 'project',
-        scope_id: 'ws_a',
-      }),
+      expect(saveSpy).toHaveBeenCalledWith(
+        'reviewer',
+        expect.stringContaining('name: reviewer-2'),
+        { scope_kind: 'project', scope_id: 'ws_a' },
+      ),
     );
-  });
-
-  it('flag unset (default): Edit still shows the classic code editor, not the Agent Builder', async () => {
-    vi.spyOn(api, 'getAgent').mockResolvedValue(AGENT);
-    vi.spyOn(api, 'getConfig').mockResolvedValue({ cp: {} } as never);
-    renderPage();
-
-    fireEvent.click(await screen.findByRole('button', { name: 'Edit definition' }));
-
-    expect(await screen.findByTestId('code-editor')).toBeInTheDocument();
-    expect(screen.queryByLabelText(/agent name/i)).not.toBeInTheDocument();
   });
 });
 
-describe('AgentDetail — Agent Builder edit (next flag)', () => {
+describe('AgentDetail — Agent Builder edit', () => {
   it('renders the Agent Builder seeded from agent.raw and saves via saveFrom', async () => {
-    installLocalStorage();
-    window.localStorage.setItem('rupu.cp.agentUi', 'next');
     vi.spyOn(api, 'getAgent').mockResolvedValue(AGENT);
-    vi.spyOn(api, 'getConfig').mockResolvedValue({ cp: { agent_authoring_ui: 'next' } } as never);
     const next = `${RAW}\nMore guidance.\n`;
     const saveSpy = vi.spyOn(api, 'saveAgent').mockResolvedValue({ ...AGENT, raw: next });
 
