@@ -8,7 +8,8 @@
 import { AlertCircle, type LucideIcon } from 'lucide-react';
 import type { RunStatusStr } from '../lib/api';
 import { cn } from '../lib/cn';
-import { STATUS, type StatusDescriptor } from '../lib/status';
+import { SESSION_STATUS_DESCRIPTOR, type SessionStatusValue } from '../lib/sessionStatus';
+import { STATUS, statusMotionClass, type StatusDescriptor } from '../lib/status';
 
 // Live step state derived from the static record + SSE overrides. Kept in one
 // place so RunGraph and the timeline agree on the vocabulary.
@@ -55,6 +56,40 @@ export const STEP_STATE_STYLES: Record<StepState, StatusStyle> = {
   skipped: toPillStyle(STATUS.skipped),
 };
 
+// Shared rendering for every pill flavor (run-status and session-status
+// alike) — one markup path so `StatusPill` and `SessionStatusPill` are
+// byte-identical apart from which descriptor + motion class they're given.
+// `motion` is a CSS class name (`rg-pulse-run` / `rg-pulse-await`, both
+// reduced-motion guarded in `styles.css`) or `undefined` for a static pill;
+// it doubles as the `data-motion` marker tests assert on.
+function PillShell({
+  style,
+  size,
+  motion,
+}: {
+  style: StatusStyle;
+  size: 'xs' | 'sm';
+  motion?: 'rg-pulse-run' | 'rg-pulse-await';
+}) {
+  const Icon = style.icon;
+  return (
+    <span
+      data-motion={motion}
+      className={cn(
+        'inline-flex items-center gap-1 rounded ring-1 font-medium tabular-nums whitespace-nowrap',
+        style.cls,
+        motion,
+        size === 'xs'
+          ? 'text-meta uppercase tracking-wide px-1.5 py-0.5'
+          : 'text-note px-2 py-0.5',
+      )}
+    >
+      <Icon size={size === 'xs' ? 9 : 11} />
+      {style.label}
+    </span>
+  );
+}
+
 export function StatusPill({
   status,
   size = 'sm',
@@ -68,22 +103,22 @@ export function StatusPill({
     dot: 'bg-ink-mute',
     icon: AlertCircle,
   };
-  const Icon = s.icon;
-  const spin = status === 'running';
-  return (
-    <span
-      className={cn(
-        'inline-flex items-center gap-1 rounded ring-1 font-medium tabular-nums whitespace-nowrap',
-        s.cls,
-        size === 'xs'
-          ? 'text-meta uppercase tracking-wide px-1.5 py-0.5'
-          : 'text-note px-2 py-0.5',
-      )}
-    >
-      <Icon size={size === 'xs' ? 9 : 11} className={spin ? 'animate-spin' : undefined} />
-      {s.label}
-    </span>
-  );
+  return <PillShell style={s} size={size} motion={statusMotionClass(status)} />;
+}
+
+// Sessions speak a distinct 4-value vocabulary (idle/running/failed/stopped —
+// see `lib/sessionStatus.ts`), never renamed into run-status words. Routing
+// through the SAME `PillShell` as `StatusPill` is what makes a session
+// `running` render the identical motion marker as a run `running` (Task 2).
+export function SessionStatusPill({
+  status,
+  size = 'sm',
+}: {
+  status: SessionStatusValue;
+  size?: 'xs' | 'sm';
+}) {
+  const s = toPillStyle(SESSION_STATUS_DESCRIPTOR[status]);
+  return <PillShell style={s} size={size} motion={status === 'running' ? 'rg-pulse-run' : undefined} />;
 }
 
 export function StatusDot({

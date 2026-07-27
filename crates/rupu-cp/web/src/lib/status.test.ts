@@ -3,6 +3,7 @@ import {
   STATUS,
   normalizeStatusKey,
   runStatusStyle,
+  statusMotionClass,
   stepStateStyle,
 } from './status';
 
@@ -39,6 +40,18 @@ describe('status descriptors', () => {
     expect(stepStateStyle('awaiting_approval').hex).toBe('#f59e0b');
     expect(stepStateStyle('skipped').hex).toBe('#cbd5e1');
     expect(stepStateStyle('pending').hex).toBe('#94a3b8');
+  });
+
+  it('shared motion language: running and awaiting_approval get their pulse class, every other state is static', () => {
+    expect(statusMotionClass('running')).toBe('rg-pulse-run');
+    expect(statusMotionClass('awaiting_approval')).toBe('rg-pulse-await');
+    expect(statusMotionClass('completed')).toBeUndefined();
+    expect(statusMotionClass('failed')).toBeUndefined();
+    expect(statusMotionClass('pending')).toBeUndefined();
+    expect(statusMotionClass('paused')).toBeUndefined();
+    expect(statusMotionClass('rejected')).toBeUndefined();
+    expect(statusMotionClass('cancelled')).toBeUndefined();
+    expect(statusMotionClass('skipped')).toBeUndefined();
   });
 
   it('every descriptor carries a label, hex, tint, icon, dotClass, pillClass', () => {
