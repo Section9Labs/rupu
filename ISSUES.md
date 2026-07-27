@@ -32,7 +32,6 @@ against the code before being recorded.
 | I-12 | P1 | rupu-providers | `[providers.*].org_id` and `.region` have no consumers | open |
 | I-13 | P1 | rupu-config | The entire `[retry]` section is inert | open |
 | I-14 | P1 | rupu-cli | `log_level` has no consumer; logging reads only `RUPU_LOG` | open |
-| I-15 | P1 | rupu-scm | `[scm.default]` / `[issues.default]` are inert; platform choice is hardcoded GitHub-then-GitLab | open |
 | I-16 | P1 | rupu-scm | `[scm.*].clone_protocol` is inert — clones always use HTTPS despite the UI dropdown | open |
 | I-17 | P2 | rupu-scm | `[scm.*].timeout_ms` has no consumer | open |
 | I-19 | P1 | rupu-app | The desktop app passes `Config::default()` — all user config is inert there | open |
@@ -145,32 +144,6 @@ behavior than documented — with no error.
 documentation and UI field. Deleting is a legitimate outcome — an honestly absent
 knob beats a knob that lies. Validation must observe the value *at the consumer*;
 a parse test cannot see this class of defect.
-
----
-
-### I-15 — `[scm.default]` / `[issues.default]` are inert
-
-**Symptom.** A user with both GitHub and GitLab credentials sets
-`[scm.default] platform = "gitlab"`. Every tool call that omits `platform` still
-goes to GitHub.
-
-**Root cause.** `Registry::default_platform` / `default_tracker`
-(`crates/rupu-scm/src/registry.rs:206-230`) implement a hardcoded
-GitHub-then-GitLab preference over registered connectors and never read
-`ScmDefault` / `IssuesDefault` (`crates/rupu-config/src/scm_config.rs:24-38`),
-which have no consumer anywhere. The code says so: *"Wiring to `[scm.default]`
-config lands in Task 19; this is the v0 'first registered' fallback"*
-(`registry.rs:207-208`).
-
-**Impact.** The key is written into every `rupu init` config
-(`crates/rupu-cli/src/templates.rs:155`), documented as functional
-(`docs/scm.md:100-107`), and *named in the error message users see when it is
-missing* (`crates/rupu-mcp/src/tools/scm_repos.rs:73`: "no platform arg and no
-`[scm.default]` configured"). A GitLab-primary shop silently operates against
-GitHub. `default_tracker` additionally ignores Linear even when registered.
-
-**Fix.** Read the config values, falling back to the current preference only when
-unset. Include `IssueTracker::Linear` in the fallback.
 
 ---
 
@@ -299,6 +272,67 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-15 — `[scm.default]` / `[issues.default]` were inert
+
+**Symptom.** A user with both GitHub and GitLab credentials set
+`[scm.default] platform = "gitlab"`. Every tool call that omitted `platform`
+still went to GitHub.
+
+**Root cause.** `Registry::default_platform` / `default_tracker`
+(`crates/rupu-scm/src/registry.rs:206-230`) implemented a hardcoded
+GitHub-then-GitLab preference over registered connectors and never read
+`ScmDefault` / `IssuesDefault` (`crates/rupu-config/src/scm_config.rs:24-38`),
+which had no consumer anywhere. The code admitted it: *"Wiring to
+`[scm.default]` config lands in Task 19; this is the v0 'first registered'
+fallback"* (`registry.rs:207-208`).
+
+**Impact.** The key is written into every `rupu init` config
+(`crates/rupu-cli/src/templates.rs:155`), documented as functional
+(`docs/scm.md:100-107`), and *named in the error message users see when it is
+missing* (`crates/rupu-mcp/src/tools/scm_repos.rs:73`: "no platform arg and no
+`[scm.default]` configured"). A GitLab-primary shop silently operated against
+GitHub. `default_tracker` additionally ignored Linear (and Jira) even when
+registered.
+
+**Fix.** PR (branch `arc1/config-integrity`). `Registry::discover` already took
+`cfg: &Config`, so no signature change was needed anywhere — its call sites
+were unaffected. At `discover` time, `Registry` now parses
+`cfg.scm.default.platform` / `cfg.issues.default.tracker` into
+`Platform`/`IssueTracker` and stores them on two new private fields
+(`configured_default_platform`, `configured_default_tracker`); an unset or
+unparsable value just leaves the field `None`. `default_platform()` /
+`default_tracker()` consult the configured value first — but only return it if
+a connector for it is actually registered (a stale `[scm.default]` naming a
+platform with no live connector doesn't black-hole the default) — and fall
+back to the previous registration-order preference otherwise.
+`default_tracker()`'s fallback now walks `[Github, Gitlab, Linear, Jira]`
+instead of only the first two; `Registry::discover` already registers both
+Linear and Jira issue connectors (`registry.rs` Linear/Jira blocks), so both
+were reachable and both are now included in the default-tracker fallback. The
+stale "Wiring... lands in Task 19" comment at `registry.rs:207-208` is
+rewritten to describe current behavior.
+
+**Validation.** `cargo test -p rupu-scm --lib` — 47 tests, all passing (6 new,
+in `registry::tests`). Binding assertions, built via the existing
+`Registry::empty()` + `insert_repo_connector` test seam plus a new
+`insert_issue_connector` equivalent (fake `RepoConnector`/`IssueConnector`
+impls, no real credentials/network):
+`default_platform_prefers_the_configured_value` registers both GitHub and
+GitLab connectors, sets `configured_default_platform = Some(Gitlab)`, and
+asserts `default_platform() == Some(Gitlab)`;
+`default_platform_falls_back_when_config_is_unset` proves the old
+registration-order behavior (GitHub) is preserved with no config set;
+`default_platform_ignores_configured_value_with_no_matching_connector` proves
+a stale configured value doesn't return a platform with no connector;
+`default_tracker_includes_linear` registers only a Linear issue connector (no
+config) and asserts `default_tracker() == Some(Linear)`;
+`default_tracker_prefers_the_configured_value` and
+`default_tracker_falls_back_when_config_is_unset` mirror the platform cases
+for trackers. `cargo build --workspace` and `cargo clippy -p rupu-scm --lib
+--tests` are both clean.
+
+---
 
 ### I-18 — `[bash]` config was dropped on the workflow path
 

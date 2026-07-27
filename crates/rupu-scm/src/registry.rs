@@ -28,6 +28,10 @@ pub struct Registry {
     tracker_event_connectors: HashMap<IssueTracker, Arc<dyn EventConnector>>,
     github_extras: Option<Arc<GithubExtras>>,
     gitlab_extras: Option<Arc<GitlabExtras>>,
+    /// Parsed `[scm.default].platform`, captured at `discover` time.
+    configured_default_platform: Option<Platform>,
+    /// Parsed `[issues.default].tracker`, captured at `discover` time.
+    configured_default_tracker: Option<IssueTracker>,
 }
 
 impl Registry {
@@ -36,7 +40,29 @@ impl Registry {
     /// level and skipped. Errors during build are logged at WARN level
     /// and also skipped — the registry continues with whatever succeeded.
     pub async fn discover(resolver: &dyn CredentialResolver, cfg: &Config) -> Self {
-        let mut reg = Self::default();
+        // Capture `[scm.default]` / `[issues.default]` up front so
+        // `default_platform`/`default_tracker` can consult them later
+        // without needing the `Config` back in scope. An unset or
+        // unparsable value just leaves the field `None`, which falls
+        // back to the registration-order preference below.
+        let configured_default_platform = cfg
+            .scm
+            .default
+            .as_ref()
+            .and_then(|d| d.platform.as_deref())
+            .and_then(|s| s.parse::<Platform>().ok());
+        let configured_default_tracker = cfg
+            .issues
+            .default
+            .as_ref()
+            .and_then(|d| d.tracker.as_deref())
+            .and_then(|s| s.parse::<IssueTracker>().ok());
+
+        let mut reg = Self {
+            configured_default_platform,
+            configured_default_tracker,
+            ..Self::default()
+        };
 
         // GitHub
         match crate::connectors::github::try_build(resolver, cfg).await {
@@ -191,6 +217,12 @@ impl Registry {
         self.repo_connectors.insert(p, c);
     }
 
+    /// Test/internal: register an `IssueConnector` directly without going
+    /// through `discover`. Used by tests that need a fake connector.
+    pub fn insert_issue_connector(&mut self, t: IssueTracker, c: Arc<dyn IssueConnector>) {
+        self.issue_connectors.insert(t, c);
+    }
+
     /// Returns the per-platform extras handle for GitHub actions, if
     /// GitHub credentials were present during discovery.
     pub fn github_extras(&self) -> Option<Arc<GithubExtras>> {
@@ -204,9 +236,17 @@ impl Registry {
     }
 
     /// Return the default platform for tools that omit the `platform`
-    /// argument. Prefers GitHub, then GitLab. Wiring to `[scm.default]`
-    /// config lands in Task 19; this is the v0 "first registered" fallback.
+    /// argument. Honors `[scm.default].platform` when it names a
+    /// platform that actually has a registered connector; otherwise
+    /// falls back to the registration-order preference (GitHub, then
+    /// GitLab) — the same fallback used when no `[scm.default]` is
+    /// configured at all.
     pub fn default_platform(&self) -> Option<Platform> {
+        if let Some(p) = self.configured_default_platform {
+            if self.repo_connectors.contains_key(&p) {
+                return Some(p);
+            }
+        }
         if self.repo_connectors.contains_key(&Platform::Github) {
             Some(Platform::Github)
         } else if self.repo_connectors.contains_key(&Platform::Gitlab) {
@@ -217,15 +257,25 @@ impl Registry {
     }
 
     /// Return the default issue tracker for tools that omit the `tracker`
-    /// argument. Prefers GitHub, then GitLab.
+    /// argument. Honors `[issues.default].tracker` when it names a
+    /// tracker that actually has a registered connector; otherwise falls
+    /// back to the registration-order preference (GitHub, GitLab,
+    /// Linear, Jira) — the same fallback used when no `[issues.default]`
+    /// is configured at all.
     pub fn default_tracker(&self) -> Option<IssueTracker> {
-        if self.issue_connectors.contains_key(&IssueTracker::Github) {
-            Some(IssueTracker::Github)
-        } else if self.issue_connectors.contains_key(&IssueTracker::Gitlab) {
-            Some(IssueTracker::Gitlab)
-        } else {
-            None
+        if let Some(t) = self.configured_default_tracker {
+            if self.issue_connectors.contains_key(&t) {
+                return Some(t);
+            }
         }
+        [
+            IssueTracker::Github,
+            IssueTracker::Gitlab,
+            IssueTracker::Linear,
+            IssueTracker::Jira,
+        ]
+        .into_iter()
+        .find(|t| self.issue_connectors.contains_key(t))
     }
 
     /// Test-only: build a Registry with no connectors. Tools that
@@ -235,5 +285,209 @@ impl Registry {
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn empty() -> Self {
         Self::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! ISSUES.md I-15: `default_platform`/`default_tracker` used to
+    //! hardcode a GitHub-then-GitLab preference and never read
+    //! `[scm.default]`/`[issues.default]`. These tests build a Registry
+    //! via the `empty()` + `insert_*_connector` test seam (no real
+    //! credentials/network needed) and assert the config-first, then
+    //! registration-order-fallback behavior at the `default_platform()`/
+    //! `default_tracker()` consumer surface.
+    use std::path::Path;
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::error::ScmError;
+    use crate::types::{
+        Branch, Comment, CreateIssue, CreatePr, Diff, FileContent, Issue, IssueFilter, IssueRef,
+        IssueState, Pr, PrFilter, PrRef, Repo, RepoRef,
+    };
+
+    struct FakeRepoConnector(Platform);
+
+    #[async_trait]
+    impl RepoConnector for FakeRepoConnector {
+        fn platform(&self) -> Platform {
+            self.0
+        }
+        async fn list_repos(&self) -> Result<Vec<Repo>, ScmError> {
+            unimplemented!()
+        }
+        async fn get_repo(&self, _r: &RepoRef) -> Result<Repo, ScmError> {
+            unimplemented!()
+        }
+        async fn list_branches(&self, _r: &RepoRef) -> Result<Vec<Branch>, ScmError> {
+            unimplemented!()
+        }
+        async fn create_branch(
+            &self,
+            _r: &RepoRef,
+            _name: &str,
+            _from_sha: &str,
+        ) -> Result<Branch, ScmError> {
+            unimplemented!()
+        }
+        async fn read_file(
+            &self,
+            _r: &RepoRef,
+            _path: &str,
+            _ref_: Option<&str>,
+        ) -> Result<FileContent, ScmError> {
+            unimplemented!()
+        }
+        async fn list_prs(&self, _r: &RepoRef, _filter: PrFilter) -> Result<Vec<Pr>, ScmError> {
+            unimplemented!()
+        }
+        async fn get_pr(&self, _p: &PrRef) -> Result<Pr, ScmError> {
+            unimplemented!()
+        }
+        async fn diff_pr(&self, _p: &PrRef) -> Result<Diff, ScmError> {
+            unimplemented!()
+        }
+        async fn comment_pr(&self, _p: &PrRef, _body: &str) -> Result<Comment, ScmError> {
+            unimplemented!()
+        }
+        async fn create_pr(&self, _r: &RepoRef, _opts: CreatePr) -> Result<Pr, ScmError> {
+            unimplemented!()
+        }
+        async fn clone_to(&self, _r: &RepoRef, _dir: &Path) -> Result<(), ScmError> {
+            unimplemented!()
+        }
+    }
+
+    struct FakeIssueConnector(IssueTracker);
+
+    #[async_trait]
+    impl IssueConnector for FakeIssueConnector {
+        fn tracker(&self) -> IssueTracker {
+            self.0
+        }
+        async fn list_issues(
+            &self,
+            _project: &str,
+            _filter: IssueFilter,
+        ) -> Result<Vec<Issue>, ScmError> {
+            unimplemented!()
+        }
+        async fn get_issue(&self, _i: &IssueRef) -> Result<Issue, ScmError> {
+            unimplemented!()
+        }
+        async fn comment_issue(&self, _i: &IssueRef, _body: &str) -> Result<Comment, ScmError> {
+            unimplemented!()
+        }
+        async fn create_issue(
+            &self,
+            _project: &str,
+            _opts: CreateIssue,
+        ) -> Result<Issue, ScmError> {
+            unimplemented!()
+        }
+        async fn update_issue_state(
+            &self,
+            _i: &IssueRef,
+            _state: IssueState,
+        ) -> Result<(), ScmError> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn default_platform_prefers_the_configured_value() {
+        // A GitLab-primary shop that sets [scm.default] platform = "gitlab"
+        // must get GitLab back even though GitHub is also registered and
+        // would otherwise win under the registration-order fallback.
+        let mut reg = Registry::empty();
+        reg.insert_repo_connector(
+            Platform::Github,
+            Arc::new(FakeRepoConnector(Platform::Github)),
+        );
+        reg.insert_repo_connector(
+            Platform::Gitlab,
+            Arc::new(FakeRepoConnector(Platform::Gitlab)),
+        );
+        reg.configured_default_platform = Some(Platform::Gitlab);
+
+        assert_eq!(reg.default_platform(), Some(Platform::Gitlab));
+    }
+
+    #[test]
+    fn default_platform_falls_back_when_config_is_unset() {
+        // With no [scm.default], preserve today's registration-order
+        // preference (GitHub before GitLab).
+        let mut reg = Registry::empty();
+        reg.insert_repo_connector(
+            Platform::Github,
+            Arc::new(FakeRepoConnector(Platform::Github)),
+        );
+        reg.insert_repo_connector(
+            Platform::Gitlab,
+            Arc::new(FakeRepoConnector(Platform::Gitlab)),
+        );
+
+        assert_eq!(reg.default_platform(), Some(Platform::Github));
+    }
+
+    #[test]
+    fn default_platform_ignores_configured_value_with_no_matching_connector() {
+        // A stale/misconfigured [scm.default] naming a platform that
+        // has no registered connector must not black-hole the default;
+        // fall back to whatever is actually registered.
+        let mut reg = Registry::empty();
+        reg.insert_repo_connector(
+            Platform::Github,
+            Arc::new(FakeRepoConnector(Platform::Github)),
+        );
+        reg.configured_default_platform = Some(Platform::Gitlab);
+
+        assert_eq!(reg.default_platform(), Some(Platform::Github));
+    }
+
+    #[test]
+    fn default_tracker_includes_linear() {
+        // default_tracker() used to only consider Github/Gitlab, so a
+        // Linear-only setup got None even with Linear wired.
+        let mut reg = Registry::empty();
+        reg.insert_issue_connector(
+            IssueTracker::Linear,
+            Arc::new(FakeIssueConnector(IssueTracker::Linear)),
+        );
+
+        assert_eq!(reg.default_tracker(), Some(IssueTracker::Linear));
+    }
+
+    #[test]
+    fn default_tracker_prefers_the_configured_value() {
+        let mut reg = Registry::empty();
+        reg.insert_issue_connector(
+            IssueTracker::Github,
+            Arc::new(FakeIssueConnector(IssueTracker::Github)),
+        );
+        reg.insert_issue_connector(
+            IssueTracker::Gitlab,
+            Arc::new(FakeIssueConnector(IssueTracker::Gitlab)),
+        );
+        reg.configured_default_tracker = Some(IssueTracker::Gitlab);
+
+        assert_eq!(reg.default_tracker(), Some(IssueTracker::Gitlab));
+    }
+
+    #[test]
+    fn default_tracker_falls_back_when_config_is_unset() {
+        let mut reg = Registry::empty();
+        reg.insert_issue_connector(
+            IssueTracker::Github,
+            Arc::new(FakeIssueConnector(IssueTracker::Github)),
+        );
+        reg.insert_issue_connector(
+            IssueTracker::Gitlab,
+            Arc::new(FakeIssueConnector(IssueTracker::Gitlab)),
+        );
+
+        assert_eq!(reg.default_tracker(), Some(IssueTracker::Github));
     }
 }
