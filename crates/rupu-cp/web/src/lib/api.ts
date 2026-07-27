@@ -825,7 +825,14 @@ export interface AgentSummary {
   usage: UsageSummary;
   run_count: number;
   /** ISO-8601 timestamp of the agent's most recent run; `null`/absent when
-   *  the agent has never run. Mirrors `WorkflowSummary.last_run` exactly. */
+   *  the agent has never run. Same name/shape as `WorkflowSummary.last_run`
+   *  but NOT the same derivation: `WorkflowSummary.last_run` counts every
+   *  run structurally (keyed by `workflow_name`, transcripts irrelevant),
+   *  while this counts only runs whose transcripts are readable AND contain
+   *  a Usage event naming this agent. A run that died before its first LLM
+   *  call, or whose transcripts were pruned or live on an unreachable
+   *  remote host, shows `null` here ("never ran") even though the
+   *  equivalent workflow row would show a timestamp. */
   last_run?: string | null;
 }
 

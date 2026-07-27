@@ -157,14 +157,29 @@ pub(crate) struct AgentDto {
     /// Distinct runs attributed to this agent. Defaults to `0`.
     pub(crate) run_count: u64,
     /// Most-recent run timestamp (ISO-8601) attributed to this agent, or
-    /// `None` if it has never run. Mirrors `WorkflowDto::last_run`'s
-    /// semantics/name exactly — the shared "last activity" signal the list
+    /// `None` if it has never run. Same NAME, same wire shape, and same role
+    /// as `WorkflowDto::last_run` — the "last activity" signal the list
     /// tables use in place of a non-existent intrinsic status for
     /// definitions (agents/workflows have no status of their own; only their
-    /// runs do). Populated by the same canonical-row rule as `usage` /
-    /// `run_count` above: only ONE row per agent name carries it. No
-    /// `skip_serializing_if` — matches `WorkflowDto::last_run`, which always
-    /// serializes (as `null` when absent) rather than omitting the key.
+    /// runs do) — but the two are derived differently, and that difference
+    /// is user-visible:
+    ///
+    /// - `WorkflowDto::last_run` is STRUCTURAL: `rollup_by` keys every
+    ///   `RunRecord` by its `workflow_name` field directly, so every run
+    ///   counts regardless of whether its transcripts are readable.
+    /// - This field is TRANSCRIPT-DERIVED: a `RunRecord` carries no "agent(s)
+    ///   this run used" field, so a run only counts here if at least one of
+    ///   its transcripts is readable AND contains a `Usage` event naming this
+    ///   agent (see `last_run_by_agent` / the per-run loop in `list_agents`).
+    ///
+    /// Consequence: an agent whose run died before the first LLM call, or
+    /// whose transcripts were pruned or live on an unreachable remote host,
+    /// shows `None` here (reading as "never ran") even though an equivalent
+    /// workflow with the same run would show a timestamp. Populated by the
+    /// same canonical-row rule as `usage` / `run_count` above: only ONE row
+    /// per agent name carries it. No `skip_serializing_if` — matches
+    /// `WorkflowDto::last_run`, which always serializes (as `null` when
+    /// absent) rather than omitting the key.
     #[serde(default)]
     pub(crate) last_run: Option<String>,
 }
@@ -251,18 +266,47 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
     // `scope == "global"`, else the first row for that name in the
     // already-sorted order) rather than duplicating it onto every same-named
     // row. See the doc comment on `AgentDto::usage`.
+    //
+    // Single pass over the run store: each run's own transcripts are
+    // aggregated exactly once. The resulting `UsageRow`s feed straight into
+    // `all_rows` for `breakdown` (which re-groups by agent name and sums —
+    // whether the rows arrive pre-merged from one combined `aggregate` call
+    // over every path, or concatenated from one `aggregate` call per run, the
+    // per-key sums `breakdown` produces are identical, since token/run counts
+    // are strictly additive and every transcript still lands in exactly one
+    // run's batch). `last_run` is folded from the SAME per-run rows (their
+    // `agent` field names who the run's usage attributes to; `run.started_at`
+    // is the candidate timestamp) instead of a second re-aggregation pass —
+    // this used to be `last_run_by_agent`, which re-walked every run's
+    // transcripts a second time over the exact same files `all_rows` had just
+    // read.
     let runs = s.run_store.list().unwrap_or_default();
-    let mut all_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut all_rows: Vec<rupu_transcript::UsageRow> = Vec::new();
+    let mut last_runs: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     for r in &runs {
-        all_paths.extend(crate::usage::run_transcript_paths(&s.run_store, &r.id));
+        let paths = crate::usage::run_transcript_paths(&s.run_store, &r.id);
+        if paths.is_empty() {
+            continue;
+        }
+        let rows = rupu_transcript::aggregate(&paths, rupu_transcript::TimeWindow::default());
+        let at = r.started_at.to_rfc3339();
+        for row in &rows {
+            if row.agent.is_empty() {
+                continue;
+            }
+            last_runs
+                .entry(row.agent.clone())
+                .and_modify(|cur| {
+                    if *cur < at {
+                        *cur = at.clone();
+                    }
+                })
+                .or_insert_with(|| at.clone());
+        }
+        all_rows.extend(rows);
     }
-    let rows = rupu_transcript::aggregate(&all_paths, rupu_transcript::TimeWindow::default());
-    let breakdown = crate::usage::breakdown(&rows, &s.pricing, crate::usage::GroupBy::Agent);
-    // `last_run` can't be read off `breakdown` (it's built from
-    // cross-run-aggregated `UsageRow`s, which discard per-run timestamps) —
-    // see `last_run_by_agent`'s doc comment for why it re-walks per-run
-    // transcripts instead.
-    let last_runs = crate::usage::last_run_by_agent(&s.run_store, &runs);
+    let breakdown = crate::usage::breakdown(&all_rows, &s.pricing, crate::usage::GroupBy::Agent);
 
     let mut canonical_dto_for_name: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
