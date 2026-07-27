@@ -266,10 +266,10 @@ hits.
 |---|---|---|---|---|---|---|
 | I-9 | `[providers.*].timeout_ms` | `provider_config.rs:23` | `docs/providers.md:111` ("Default: `120000`") + `ConfigEditor.tsx:220` | vendor default always used | **wired** → every provider client's HTTP builder as connect + read (inactivity) timeouts, via `ProviderTuning::http_client_builder` (`rupu-providers/src/tuning.rs`) | `tuning::tests::configured_timeout_aborts_a_stalled_request` — a 60 ms deadline against a 2 s-stalled httpmock server surfaces `is_timeout()`; plus `client_timeout_defaults_to_documented_120s` and `default_timeout_lets_a_prompt_response_through` |
 | I-10 | `[providers.*].max_retries` | `provider_config.rs:25` | `docs/providers.md:112` ("Default: `5`") | real budget was a hardcoded 1 (`anthropic.rs:213`) | **wired** → `AnthropicClient::max_rate_limit_retries` (its native 429 loop) and `RetryingProvider` for every other provider. Default corrected to **1** (the code's real budget) and `docs/providers.md` fixed — raising it to the documented 5 would have slowed every cross-provider fallback by ~30 s | `anthropic::tests::max_retries_zero_issues_exactly_one_request` / `max_retries_one_issues_two_requests` count httpmock hits against a permanent 429; `tuned::tests::retry_budget_bounds_the_number_of_attempts`, `permanent_errors_are_not_retried`, `a_stream_that_already_emitted_output_is_not_re_issued` |
-| I-11 | `[providers.*].max_concurrency` | `provider_config.rs:27` | `docs/providers.md:113` + `concurrency.rs:6` | `semaphore_for` was called only by SCM clients; **no LLM call ever acquired a permit** | **wired** → `ThrottledProvider` wraps every factory-built provider and holds a permit for the whole call | `tuned::tests::llm_call_holds_a_permit_from_the_configured_semaphore` observes `available_permits()` *inside* the call (2 → 1); `max_concurrency_one_serializes_two_llm_calls` proves a second call blocks while the only permit is held |
+| I-11 | `[providers.*].max_concurrency` | `provider_config.rs:27` | `docs/providers.md:113` + `concurrency.rs:6` | `semaphore_for` was called only by SCM clients; **no LLM call ever acquired a permit** | **wired** → `ThrottledProvider` wraps every factory-built provider and holds a permit for the whole call | `tuned::tests::llm_call_holds_a_permit_from_the_configured_semaphore` observes `available_permits()` *inside* the call (2 → 1); `max_concurrency_one_serializes_two_llm_calls` proves a second call blocks while the only permit is held; `a_backoff_sleep_does_not_hold_a_concurrency_permit` samples `available_permits()` from inside the retry loop's backoff hook (must be 1, i.e. free) and `the_inverted_order_holds_the_permit_across_the_backoff` shows the same probe reading 0 under the old nesting |
 | I-12 | `[providers.*].org_id` | `provider_config.rs:19` | `docs/providers/openai.md:20` | org-scoped keys unreachable | **wired** → `OpenAI-Organization` header, platform API only (the ChatGPT-subscription endpoint is account-scoped) | `openai_codex::tuning_tests::configured_org_id_lands_on_the_outgoing_request_headers` asserts the header on the real `build_headers()`; `organization_header_only_applies_to_the_platform_api` covers the pure decision |
 | I-12 | `[providers.*].region` | `provider_config.rs:21` | `docs/providers/gemini.md:23,54` | non-default Vertex regions unreachable | **carried, still unused — deliberately.** No shipped Gemini client targets a regional Vertex endpoint (the three variants are AI Studio, Gemini CLI, Antigravity; none is region-scoped), so there is nothing honest to wire it to. Instead the *documentation stopped lying*: `docs/providers.md` and `docs/providers/gemini.md` now say it is accepted but has no effect, the CP Settings field carries the same help text, and the example configs no longer instruct setting it | `provider_factory::tests::provider_tuning_reads_every_configured_knob` asserts it is carried into `ProviderTuning`; the doc/UI change is the substantive fix |
-| I-13 | `[retry]` (whole section) | `config.rs:113-116` | — | inert top-level section | **deleted** — struct, `Config.retry` field, `lib.rs` re-export, and the parse-test fixture. Superseded by per-provider `max_retries` | Absence greps: `grep -rn 'RetryConfig\|max_attempts\|initial_delay_ms' crates/rupu-config/src/` → 0; `grep -rn '\[retry\]' docs/ --include='*.md'` (excluding historical plan docs) → 0; not present in `ConfigEditor.tsx`; `cargo build --workspace` + web `npm run test` clean |
+| I-13 | `[retry]` (whole section) | `config.rs:113-116` | — | inert top-level section | **deleted as a live key, with a one-release deprecation shim.** `RetryConfig`, the typed `Config.retry` field and the `lib.rs` re-export are gone; `[retry]` is still *accepted* as an opaque `Option<toml::Value>` that nothing reads, and `Config::warn_deprecated_keys` (called from `validate`, i.e. every load path) warns naming the key. Superseded by per-provider `max_retries`. Rationale below | Absence greps: `grep -rn 'RetryConfig\|max_attempts\|initial_delay_ms' crates/rupu-config/src/` → 0; `grep -rn '\[retry\]' docs/ --include='*.md'` (excluding historical plan docs) → 0; not present in `ConfigEditor.tsx` or `Settings.test.tsx`. `parse::a_config_still_carrying_retry_loads_and_keeps_every_other_key` and `parse::retry_survives_layer_files_and_the_lock_aware_loader` prove the migration is non-destructive; `cargo build --workspace` + web `npm run test` clean |
 | I-14 | `log_level` | `config.rs:27` | `ConfigEditor.tsx:199-207`, with a lock toggle | logging read only `RUPU_LOG` (`logging.rs:25`) | **wired** → `logging::filter_directive(cfg_level, env)`: `RUPU_LOG` > `log_level` > `warn`. Config is loaded *before* logging init at all four init sites (`lib.rs:247`, `session.rs` worker + run-turn) | `logging::tests::config_log_level_is_the_fallback_when_env_is_unset`, `env_wins_over_config`, `neither_source_yields_warn`, `blank_values_are_treated_as_unset`, `an_unparseable_directive_falls_back_to_warn` |
 | I-17 | `[scm.*].timeout_ms` | `scm_config.rs:46` | `docs/scm.md:109-119` | no consumer (sibling `base_url`/`max_concurrency` *were* consumed) | **wired** → `ScmClientOptions::timeout` reaches octocrab (`set_connect_timeout`/`set_read_timeout`) plus the two ad-hoc reqwest clients in `github/client.rs`, and replaces GitLab's hardcoded 30 s | `github::client::tests::platform_config_reaches_the_client` asserts `GithubClient::timeout()` == the configured 4000 ms and 30 000 ms when unset; `client_options::tests::scm_timeout_defaults_to_30s` |
 | I-19 | all of it, in rupu-app | — | — | `executor/mod.rs:210` passes `Config::default()`; self-admitted at `:109-115` | **STILL OPEN** — tracked separately under `## Open`. The new `provider_tuning` map is empty there for the same reason, with the existing TODO extended to say so | n/a |
@@ -288,7 +288,17 @@ carry the consumer-side logic, each built so the decision a key drives is a
   `client_timeout` / `retry_budget` / `concurrency_permits` / `retry_backoff`.
 - `crates/rupu-providers/src/tuned.rs` — `ThrottledProvider` and
   `RetryingProvider`, the two `LlmProvider` decorators the factory applies.
-  Throttle wraps retry, so a backoff sleep never holds a concurrency permit.
+  **Retry wraps throttle** — `RetryingProvider(ThrottledProvider(client))` — so
+  each attempt takes and drops its own permit and the exponential backoff sleeps
+  *outside* the semaphore. The first cut of `decorate()` had the nesting
+  inverted while both doc comments asserted this order; under rate limiting that
+  parked all of a provider's permits in `tokio::time::sleep` for the whole
+  2s/4s/8s ladder and starved every unrelated call. Fixed, with
+  `a_backoff_sleep_does_not_hold_a_concurrency_permit` pinning the property and
+  `the_inverted_order_holds_the_permit_across_the_backoff` kept as an executable
+  counter-example so the assertion is visibly non-vacuous. Caveat: anthropic is
+  not wrapped in `RetryingProvider` at all, so its *native* 429 loop still sleeps
+  inside the permit — the decorators cannot reach inside a client.
 - `crates/rupu-scm/src/client_options.rs` — `ScmClientOptions`,
   `CloneProtocol`, `clone_url`, `scm_timeout`, `run_clone`.
 
@@ -328,35 +338,40 @@ Every declared field with its non-test consumer. Verified with
 per key, plus targeted greps for the names that are common English words
 (`kind`, `stream`, `repo`, `owner`, `project`, `enabled`, `lock`, `theme`,
 `color`, `channel`) where the raw count is dominated by unrelated hits.
-**No key in this table lacks a consumer.**
+Three keys **do** lack a consumer — `[scm.default].owner`, `[scm.default].repo`,
+`[issues.default].project`. The first pass of this ledger asserted otherwise on
+the strength of an attribution that does not survive a grep; the rows are
+corrected below and the gap is filed as a new I-9-class issue rather than
+papered over. Every `file:line` in the table was re-verified against the tip of
+`arc1/config-integrity`.
 
 | Key | Consumer |
 |---|---|
-| `default_provider` | `rupu-runtime/src/provider_factory.rs:109` (`resolve_provider_name`) — I-1 |
-| `default_model` | `rupu-runtime/src/provider_factory.rs:128` (`resolve_model`) — I-2 |
+| `default_provider` | `rupu-runtime/src/provider_factory.rs:148` (`resolve_provider_name`) — I-1 |
+| `default_model` | `rupu-runtime/src/provider_factory.rs:167` (`resolve_model`) — I-2 |
 | `permission_mode` | `rupu-cli/src/cmd/session.rs:1261`, `cmd/run.rs` (mode resolution) |
-| `log_level` | `rupu-cli/src/logging.rs` (`filter_directive`), called from `lib.rs:247` — **I-14, wired here** |
+| `log_level` | `rupu-cli/src/logging.rs` (`filter_directive`), called from `lib.rs:250` — **I-14, wired here** |
 | `[bash].timeout_secs` | `rupu-cli/src/resume.rs:249`, `cmd/session.rs:6787`, `orchestrator/src/step_factory.rs` — I-18 |
 | `[bash].env_allowlist` | `rupu-cli/src/resume.rs:250`, `cmd/session.rs:6786` — I-18 |
-| `[retry].max_attempts` | **deleted** — I-13 |
-| `[retry].initial_delay_ms` | **deleted** — I-13 |
-| `[providers.*].base_url` | `rupu-runtime/src/provider_factory.rs:60` (`openai_compatible_params`) |
-| `[providers.*].kind` | `rupu-runtime/src/provider_factory.rs:57`; validated in `config.rs:138` |
-| `[providers.*].stream` | `rupu-runtime/src/provider_factory.rs:74` |
-| `[providers.*].default_model` | `rupu-runtime/src/provider_factory.rs:61` + `resolve_model`'s third tier |
+| `[retry].max_attempts` | **deleted** — I-13. Still *parses* as an inert no-op (`config.rs`'s `Config::retry`) so an existing config.toml carrying it does not lose its other keys; `Config::warn_deprecated_keys` warns; never re-serialized |
+| `[retry].initial_delay_ms` | as above — **deleted**, I-13 |
+| `[providers.*].base_url` | `rupu-runtime/src/provider_factory.rs:66` (`openai_compatible_params`) |
+| `[providers.*].kind` | `rupu-runtime/src/provider_factory.rs:63`; validated in `config.rs:169` |
+| `[providers.*].stream` | `rupu-runtime/src/provider_factory.rs:80` |
+| `[providers.*].default_model` | `rupu-runtime/src/provider_factory.rs:67` + `resolve_model`'s third tier |
 | `[providers.*].org_id` | `rupu-providers/src/openai_codex.rs` (`organization_header` → `build_headers`) — **I-12, wired here** |
 | `[providers.*].region` | carried into `ProviderTuning` (`rupu-runtime/src/provider_factory.rs`, `provider_tuning`); **no endpoint consumes it** — documented as accepted-but-unused in `docs/providers.md` and CP Settings — I-12 |
 | `[providers.*].timeout_ms` | `rupu-providers/src/tuning.rs` (`client_timeout` → `http_client_builder`) → each client's `with_tuning` — **I-9, wired here** |
 | `[providers.*].max_retries` | `rupu-providers/src/tuning.rs` (`retry_budget`) → `AnthropicClient::max_rate_limit_retries` + `tuned::RetryingProvider` — **I-10, wired here** |
 | `[providers.*].max_concurrency` | `rupu-providers/src/tuning.rs` (`concurrency_permits`) → `tuned::ThrottledProvider` — **I-11, wired here** |
-| `[[providers.*.models]].id` | `rupu-runtime/src/provider_factory.rs:66` |
-| `[[providers.*.models]].context_window` | `rupu-runtime/src/provider_factory.rs:67` |
-| `[[providers.*.models]].max_output` | `rupu-runtime/src/provider_factory.rs:68` |
-| `[scm.default].platform` | `rupu-scm/src/registry.rs:32` (`configured_default_platform`) — I-15 |
-| `[scm.default].owner` | `rupu-mcp` / `rupu-cli` repo-ref defaulting via `ScmDefault` |
-| `[scm.default].repo` | as above |
-| `[issues.default].tracker` | `rupu-scm/src/registry.rs:34` (`configured_default_tracker`) — I-15 |
-| `[issues.default].project` | `rupu-cli/src/cmd/issues.rs` issue-ref defaulting |
+| `[[providers.*.models]].id` | `rupu-runtime/src/provider_factory.rs:72` |
+| `[[providers.*.models]].context_window` | `rupu-runtime/src/provider_factory.rs:73` |
+| `[[providers.*.models]].max_output` | `rupu-runtime/src/provider_factory.rs:74` |
+| `[scm.default].platform` | `rupu-scm/src/registry.rs:80` (captured at `discover`), enforced at `:281` (`default_platform`) — I-15 |
+| `[scm.default].owner` | **NO CONSUMER** — the earlier "repo-ref defaulting via `ScmDefault`" claim was wrong; `grep -rn 'ScmDefault' crates --include='*.rs'` outside `rupu-config/` returns 0. Filed as a new I-9-class issue |
+| `[scm.default].repo` | **NO CONSUMER** — as above |
+| `[issues.default].tracker` | `rupu-scm/src/registry.rs:86` (captured at `discover`), enforced at `:312` (`default_tracker`) — I-15 |
+| `[issues.default].project` | **NO CONSUMER** — `IssuesDefault::project` is read nowhere outside `rupu-config/`; the `cmd/issues.rs` attribution was wrong. Filed as a new I-9-class issue |
 | `[scm.*].base_url` | `rupu-scm/src/client_options.rs` → `GithubClient::with_options` / `GitlabClient::with_options` |
 | `[scm.*].timeout_ms` | `rupu-scm/src/client_options.rs` (`scm_timeout`) → octocrab + reqwest builders — **I-17, wired here** |
 | `[scm.*].max_concurrency` | `rupu-scm/src/client_options.rs` → `concurrency::semaphore_for` |
@@ -365,7 +380,7 @@ per key, plus targeted greps for the names that are common English words
 | `[ui].theme` | `rupu-cli/src/cmd/ui.rs:661` |
 | `[ui].syntax.theme` | `rupu-cli/src/cmd/ui.rs` (`UiPrefs::resolve`) |
 | `[ui].palette.theme` | `rupu-cli/src/cmd/ui.rs` (`UiPrefs::resolve`) |
-| `[ui].live_view` | `rupu-cli/src/cmd/ui.rs:71` |
+| `[ui].live_view` | `rupu-cli/src/cmd/ui.rs:188` (`UiPrefs::resolve`) |
 | `[ui].pager` | `rupu-cli/src/cmd/ui.rs` |
 | `[ui].editor` | `rupu-cli/src/cmd/agent.rs` / `cmd/workflow.rs` editor resolution |
 | `[triggers].poll_sources` | `rupu-cli/src/cmd/cron.rs:598` |
@@ -373,22 +388,22 @@ per key, plus targeted greps for the names that are common English words
 | `[triggers].max_events_per_tick` | `rupu-cli/src/cmd/cron.rs:399` via `effective_max_events_per_tick` |
 | `[autoflow].enabled` | `rupu-cli/src/cmd/autoflow.rs:9322` |
 | `[autoflow].repo` | `rupu-cli/src/cmd/autoflow.rs:9200` |
-| `[autoflow].checkout` | `rupu-workspace/src/autoflow_worktree.rs` |
-| `[autoflow].worktree_root` | `rupu-workspace/src/autoflow_worktree.rs:35` |
+| `[autoflow].checkout` | `rupu-cli/src/cmd/autoflow.rs:12027` (`AutoflowCheckout` → `AutoflowWorkspaceStrategy`) |
+| `[autoflow].worktree_root` | `rupu-cli/src/cmd/autoflow.rs:12037` (`resolve_worktree_root`), consumed by `rupu-workspace/src/autoflow_worktree.rs:35` |
 | `[autoflow].permission_mode` | `rupu-cli/src/cmd/autoflow.rs:1701` |
-| `[autoflow].strict_templates` | `rupu-cli/src/resume.rs:267` |
+| `[autoflow].strict_templates` | `rupu-cli/src/cmd/autoflow.rs:10652` and `:11473` (`resume.rs:267` is a hardcoded `false`, not a consumer) |
 | `[autoflow].max_active` | `rupu-cli/src/cmd/autoflow_runtime.rs:495` |
-| `[autoflow].cleanup_after` | `rupu-cli/src/cmd/autoflow.rs:11672` |
+| `[autoflow].cleanup_after` | `rupu-cli/src/cmd/autoflow.rs:11711` (`cleanup_after_for_claim`), called at `:11672` |
 | `[pricing.<provider>.<model>].input_per_mtok` | `rupu-config/src/pricing_config.rs:74` (`cost_usd`), called from `rupu-cli/src/cmd/session.rs:5810` and the run/workflow cost columns |
 | `[pricing.<provider>.<model>].output_per_mtok` | as above |
 | `[pricing.<provider>.<model>].cached_input_per_mtok` | as above |
 | `[storage].archived_session_retention` | `rupu-cli/src/cmd/session.rs:7395` |
 | `[storage].archived_transcript_retention` | `rupu-cli/src/cmd/transcript.rs:1838` |
 | `[policy].lock` | `rupu-config/src/resolve.rs` (enforcement) + `rupu-cp/src/api/config.rs:325` — I-7 |
-| `[cp].max_workspace_bytes` | `rupu-cp/src/config_write.rs:301` |
-| `[cp].autoflow_reconcile_enabled` / `_interval_secs` | `rupu-cli/src/cmd/cp.rs:86-87` |
-| `[cp].cron_tick_enabled` / `_interval_secs` | `rupu-cli/src/cmd/cp.rs:113-114` |
-| `[cp].gate_sweep_enabled` / `_interval_secs` | `rupu-cli/src/cmd/cp.rs:145-146` |
+| `[cp].max_workspace_bytes` | `rupu-cp/src/config_write.rs:303` (`effective_max_workspace_bytes`) |
+| `[cp].autoflow_reconcile_enabled` / `_interval_secs` | `rupu-cli/src/cmd/cp.rs:93-94` |
+| `[cp].cron_tick_enabled` / `_interval_secs` | `rupu-cli/src/cmd/cp.rs:117-118` |
+| `[cp].gate_sweep_enabled` / `_interval_secs` | `rupu-cli/src/cmd/cp.rs:152-153` |
 | `[cp].agent_authoring_ui` | `rupu-cp/web/src/hooks/useAgentAuthoringUi.ts:9` (served through `/api/config`) |
 | `[cp].workflow_editor_ui` | `rupu-cp/web/src/hooks/useWorkflowEditorUi.ts:9` (served through `/api/config`) |
 | `[update].channel` | `rupu-cli/src/cmd/update.rs:74` |
@@ -398,11 +413,26 @@ Two keys' consumers are **not** Rust — `[cp].agent_authoring_ui` and
 `[cp].workflow_editor_ui` are read by the CP web app after `/api/config`
 serializes them. A Rust-only grep reports them as inert; they are not.
 
-**Behavioral note.** Because `Config` is `deny_unknown_fields`, a `config.toml`
-that still carries a `[retry]` section will now fail to parse. The section was
-never documented, never written by `rupu init`, and never read, so no
-functioning setup can depend on it — but it is a hard error rather than a
-warning, and worth a line in release notes.
+**Behavioral note — why `[retry]` deprecates instead of erroring.** The first
+cut simply deleted the field. Because `Config` is `deny_unknown_fields`, that
+made an existing `config.toml` carrying `[retry]` fail to deserialize — and the
+failure is not the clean startup error it looks like. Eight load paths swallow
+it with `.unwrap_or_default()` (`rupu-cli/src/cmd/update.rs:61-62`,
+`cmd/run.rs:339` and `:404`, `cmd/cp.rs:206`, `cmd/cron.rs:282`,
+`cmd/workflow.rs:994`, `cmd/transcript.rs:1465`, plus `rupu-cp/src/state.rs`
+which warns and falls back to defaults). On those commands the user would not
+see an error; they would silently run with **every** config key reset to its
+default — a harmless dead key converted into whole-config data loss, the exact
+class Arc 1 exists to eliminate.
+
+So the key stays deleted everywhere it was ever surfaced (docs, `rupu init`
+templates, the CP Settings UI, `ConfigEditor.tsx`) but survives at *parse* time
+for one release as `Config::retry: Option<toml::Value>` — `#[serde(default,
+skip_serializing)]`, read by nothing, never written back out, and announced by a
+`tracing::warn!` from `Config::warn_deprecated_keys` telling the user to delete
+the section. Release notes should say "`[retry]` is deprecated and ignored;
+remove it" rather than "`[retry]` is now rejected". Drop the field one release
+after v0.68.
 
 ---
 

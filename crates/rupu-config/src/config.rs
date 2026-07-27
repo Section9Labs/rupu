@@ -26,6 +26,23 @@ pub struct Config {
     pub permission_mode: Option<String>,
     pub log_level: Option<String>,
     pub bash: BashConfig,
+    /// **Deprecated, inert, and never read.** `[retry]` (`max_attempts` /
+    /// `initial_delay_ms`) parsed since Slice A and drove nothing; per-provider
+    /// `[providers.<name>].max_retries` supersedes it (ISSUES.md I-13).
+    ///
+    /// The field survives the deletion ONLY as a migration shim. `Config` is
+    /// `deny_unknown_fields`, so an existing `config.toml` carrying the section
+    /// would otherwise fail to deserialize — and seven CLI paths plus `rupu-cp`
+    /// load config with `.unwrap_or_default()`, which converts that parse error
+    /// into the *silent loss of every other key the user set*. Accepting the
+    /// key as an opaque no-op keeps the rest of the config intact; the warning
+    /// in [`Config::warn_deprecated_keys`] tells the user to delete it.
+    ///
+    /// `skip_serializing` keeps it out of `/api/config` and out of anything
+    /// that round-trips `Config` back to TOML, so the key disappears the first
+    /// time a config is rewritten. Remove the field one release after v0.68.
+    #[serde(default, skip_serializing)]
+    pub retry: Option<toml::Value>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
@@ -123,8 +140,31 @@ const RESERVED_PROVIDER_NAMES: &[&str] = &[
 ];
 
 impl Config {
+    /// Warn about keys that still parse but no longer do anything.
+    ///
+    /// Called from every load path (`layer_files`, `layer_files_locked` /
+    /// `resolve`) via [`Config::validate`], so a deprecated key is surfaced
+    /// wherever config is read rather than only on one command.
+    pub fn warn_deprecated_keys(&self) {
+        if self.retry.is_some() {
+            tracing::warn!(
+                key = "retry",
+                "config.toml still declares a `[retry]` section (max_attempts / \
+                 initial_delay_ms). It has never been read by anything and is now \
+                 formally deprecated: it is accepted as a no-op so the rest of your \
+                 config still loads. Delete the `[retry]` section; set \
+                 `[providers.<name>].max_retries` instead. A future release will \
+                 reject it."
+            );
+        }
+    }
+
     /// Validate cross-field invariants not expressible in serde.
+    ///
+    /// Also emits [`Config::warn_deprecated_keys`] — this is the one function
+    /// every load path already calls.
     pub fn validate(&self) -> Result<(), crate::layer::LayerError> {
+        self.warn_deprecated_keys();
         for (name, p) in &self.providers {
             if p.kind.as_deref() == Some("openai-compatible") {
                 if RESERVED_PROVIDER_NAMES.contains(&name.as_str()) {

@@ -10,8 +10,16 @@
 //! * [`RetryingProvider`] — re-issues a call that failed with a retryable
 //!   error, up to the configured budget (ISSUES.md I-10).
 //!
-//! The decorators are deliberately separate: throttling wraps retrying, so a
-//! retry does NOT hold a permit while it sleeps out its backoff.
+//! The decorators are deliberately separate, and the nesting order is load
+//! bearing: **retrying wraps throttling** —
+//! `RetryingProvider(ThrottledProvider(client))`. Each attempt then acquires
+//! its own permit and drops it as that attempt returns, so the exponential
+//! backoff sleeps *outside* the semaphore. Nested the other way round, one
+//! rate-limited call parks a permit in `tokio::time::sleep` for the entire
+//! 2s/4s/8s ladder and starves every other caller of the same provider.
+//! [`tests::a_backoff_sleep_does_not_hold_a_concurrency_permit`] pins the
+//! property; `the_inverted_order_holds_the_permit_across_the_backoff` pins why
+//! the order is not arbitrary.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -365,6 +373,94 @@ mod tests {
         );
         drop(held);
         call.await.unwrap();
+    }
+
+    // ── decorator ORDER: a backoff sleep must not hold a permit ──────────────
+
+    /// `available_permits()` on `backoff-permit-test`'s semaphore, sampled from
+    /// inside the retry loop's backoff hook — i.e. between two attempts, at the
+    /// exact moment the stack would be sleeping. `backoff` is a plain `fn`
+    /// pointer (no captures), so the sample lands in a static and the semaphore
+    /// is re-fetched from the process-wide registry by name.
+    static PERMITS_DURING_BACKOFF: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static PERMITS_DURING_INVERTED_BACKOFF: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    fn sample_permits_then_no_sleep(_attempt: u32) -> Duration {
+        let sem = crate::concurrency::semaphore_for("backoff-permit-test", Some(1));
+        PERMITS_DURING_BACKOFF.store(sem.available_permits(), Ordering::SeqCst);
+        Duration::from_millis(0)
+    }
+
+    fn sample_inverted_permits_then_no_sleep(_attempt: u32) -> Duration {
+        let sem = crate::concurrency::semaphore_for("backoff-permit-test-inverted", Some(1));
+        PERMITS_DURING_INVERTED_BACKOFF.store(sem.available_permits(), Ordering::SeqCst);
+        Duration::from_millis(0)
+    }
+
+    /// The production stack built by `provider_factory::decorate`: retry
+    /// OUTSIDE throttle. With `max_concurrency = 1` and a provider that 429s
+    /// once, the single permit must be free again while the retry sleeps —
+    /// otherwise a rate-limited call blocks every other call to that provider
+    /// for the whole backoff ladder.
+    #[tokio::test]
+    async fn a_backoff_sleep_does_not_hold_a_concurrency_permit() {
+        const NAME: &str = "backoff-permit-test";
+        let tuning = ProviderTuning {
+            max_concurrency: 1,
+            ..ProviderTuning::for_provider(NAME)
+        };
+        let sem = tuning.semaphore(NAME);
+        assert_eq!(sem.available_permits(), 1);
+
+        let mut probe = Probe::new(1); // 429 once, then succeed
+        probe.semaphore = Some(sem.clone());
+        let seen_in_call = probe.permits_seen.clone();
+        let calls = probe.calls.clone();
+
+        let throttled = ThrottledProvider::wrap(Box::new(probe), NAME, &tuning);
+        let mut p = RetryingProvider::new(Box::new(throttled), 3)
+            .with_backoff(sample_permits_then_no_sleep);
+
+        PERMITS_DURING_BACKOFF.store(usize::MAX, Ordering::SeqCst);
+        p.send(&req()).await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "expected one retry");
+        // Inside an attempt the permit IS held: 1 configured − 1 = 0 available.
+        assert_eq!(seen_in_call.load(Ordering::SeqCst), 0);
+        // But it is released before the backoff sleeps.
+        assert_eq!(
+            PERMITS_DURING_BACKOFF.load(Ordering::SeqCst),
+            1,
+            "the backoff slept while holding a concurrency permit"
+        );
+        assert_eq!(sem.available_permits(), 1, "permit leaked after the call");
+    }
+
+    /// The inverse nesting — throttle outermost — is what the factory used to
+    /// build. Kept as an executable counter-example so the assertion above is
+    /// visibly non-vacuous: here the permit is pinned at 0 across the backoff.
+    #[tokio::test]
+    async fn the_inverted_order_holds_the_permit_across_the_backoff() {
+        const NAME: &str = "backoff-permit-test-inverted";
+        let tuning = ProviderTuning {
+            max_concurrency: 1,
+            ..ProviderTuning::for_provider(NAME)
+        };
+        let sem = tuning.semaphore(NAME);
+
+        let retried = RetryingProvider::new(Box::new(Probe::new(1)), 3)
+            .with_backoff(sample_inverted_permits_then_no_sleep);
+        let mut p = ThrottledProvider::wrap(Box::new(retried), NAME, &tuning);
+
+        PERMITS_DURING_INVERTED_BACKOFF.store(usize::MAX, Ordering::SeqCst);
+        p.send(&req()).await.unwrap();
+
+        assert_eq!(
+            PERMITS_DURING_INVERTED_BACKOFF.load(Ordering::SeqCst),
+            0,
+            "expected the outer throttle to pin the permit across the backoff"
+        );
+        assert_eq!(sem.available_permits(), 1);
     }
 
     // ── I-10: max_retries is the real budget ─────────────────────────────────

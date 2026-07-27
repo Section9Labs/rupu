@@ -293,27 +293,37 @@ pub async fn build_for_provider_with_config(
 /// Apply the tuning decorators that make `max_retries` and `max_concurrency`
 /// observable on every call (ISSUES.md I-10 / I-11).
 ///
-/// Retry wraps the raw client, throttle wraps retry — so a backoff sleep does
-/// not hold a concurrency permit. Anthropic is the one provider NOT given a
-/// `RetryingProvider`: it has its own in-client 429 loop, already driven by
-/// `tuning.max_retries` via `AnthropicClient::with_tuning`, and stacking the
-/// two would silently square the budget.
+/// **Ordering matters.** Throttle wraps the raw client, retry wraps throttle —
+/// `RetryingProvider(ThrottledProvider(client))`. Each retry attempt therefore
+/// acquires its own permit and drops it the moment that attempt returns, so the
+/// exponential backoff sleeps *outside* the semaphore. The inverse nesting
+/// (throttle outermost) parks a permit in `tokio::time::sleep` for the whole
+/// 2s/4s/8s ladder, which under rate limiting starves every other caller of the
+/// same provider — `tuned::tests::a_backoff_sleep_does_not_hold_a_concurrency_permit`
+/// and its `..._inverted_order_...` counterpart pin both halves of that claim.
+///
+/// Anthropic is the one provider NOT given a `RetryingProvider`: it has its own
+/// in-client 429 loop, already driven by `tuning.max_retries` via
+/// `AnthropicClient::with_tuning`, and stacking the two would silently square
+/// the budget. That native loop *does* sleep inside the permit — the wrappers
+/// cannot reach inside a client — so anthropic keeps the starvation shape this
+/// ordering removes for everyone else. Fixing it means teaching
+/// `AnthropicClient` to release/reacquire around its own backoff; tracked as a
+/// follow-up rather than papered over here.
 fn decorate(
     client: Box<dyn LlmProvider>,
     name: &str,
     tuning: &rupu_providers::ProviderTuning,
 ) -> Box<dyn LlmProvider> {
-    let retried: Box<dyn LlmProvider> = if provider_has_native_retry(name) {
-        client
+    let throttled = rupu_providers::ThrottledProvider::wrap(client, name, tuning);
+    if provider_has_native_retry(name) {
+        Box::new(throttled)
     } else {
         Box::new(rupu_providers::RetryingProvider::new(
-            client,
+            Box::new(throttled),
             tuning.max_retries,
         ))
-    };
-    Box::new(rupu_providers::ThrottledProvider::wrap(
-        retried, name, tuning,
-    ))
+    }
 }
 
 /// True for providers whose client already spends `tuning.max_retries` itself.
