@@ -130,3 +130,44 @@ fn cp_config_overrides_gate_sweep_flags_from_toml() {
     assert!(!cfg.gate_sweep_enabled);
     assert_eq!(cfg.gate_sweep_interval_secs, 15);
 }
+
+#[test]
+fn locked_global_key_survives_a_project_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    let project = dir.path().join("project.toml");
+    std::fs::write(
+        &global,
+        "permission_mode = \"readonly\"\n[policy]\nlock = [\"permission_mode\"]\n",
+    )
+    .unwrap();
+    std::fs::write(&project, "permission_mode = \"bypass\"\n").unwrap();
+
+    // Unlocked loader: project wins (today's behavior, unchanged).
+    let plain = rupu_config::layer_files(Some(&global), Some(&project)).unwrap();
+    assert_eq!(plain.permission_mode.as_deref(), Some("bypass"));
+
+    // Lock-aware loader: the global lock holds.
+    let locked = rupu_config::layer_files_locked(Some(&global), Some(&project)).unwrap();
+    assert_eq!(
+        locked.permission_mode.as_deref(),
+        Some("readonly"),
+        "a locked global key must not be overridable by a project config"
+    );
+}
+
+#[test]
+fn unlocked_keys_still_layer_project_over_global() {
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    let project = dir.path().join("project.toml");
+    std::fs::write(
+        &global,
+        "default_model = \"g\"\n[policy]\nlock = [\"permission_mode\"]\n",
+    )
+    .unwrap();
+    std::fs::write(&project, "default_model = \"p\"\n").unwrap();
+
+    let locked = rupu_config::layer_files_locked(Some(&global), Some(&project)).unwrap();
+    assert_eq!(locked.default_model.as_deref(), Some("p"));
+}
