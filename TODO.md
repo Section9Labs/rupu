@@ -329,3 +329,41 @@ and are not repeated here.
 - [ ] Best-effort worktree teardown when releasing an autoflow claim from the web (leaks a worktree).
 - [ ] Reap detached `cp serve` children (zombie accumulation; the stdio + process-group half already shipped).
 - [ ] `rupu ui theme preview|use`; non-Base16 theme importers; `rupu init --interactive`; TUI mouse support; `File > Open Recent`.
+
+## Final art for the fan-out / fan-in node silhouettes ← moved from ISSUES.md (**I-32**)
+
+Moved out of `ISSUES.md` on 2026-07-27 during Arc 3. This is a deferred *feature*
+(polish that was never claimed complete), not a defect — nothing here claims to
+work and doesn't — so per the two-file split it belongs in this file.
+
+**Scope correction: `branch` is NOT part of this.** I-32's original title lumped
+`branch` in with `split`/`join`, but the code contradicts it. `branch`'s `vhex`
+silhouette is a deliberate "decision" shape — a hexagon rotated 90° with points
+on top and bottom, distinct from `for_each`'s left/right hexagon
+(`crates/rupu-cp/web/src/components/workflow-editor/nodeShapes.ts:194-224`) — and
+its height was **measured in headless Chrome** against the real rendered body
+(`lib/workflowLayout.ts:32-49`, which records that at 112px the safe rect was only
+68px tall, "a 5px clip, caught by rendering, not by the unit tests"). That is
+refinement work already done, not placeholder work.
+
+**What actually remains:** `fanout` and `fanin` only. Both are explicitly declared
+provisional *art* by their own authors:
+
+- `workflow-editor/kindVisuals.ts:48-51` — "deliberate placeholders (recognizable
+  and geometrically correct, not final art); the operator may refine them with
+  dedicated shape options later"
+- `nodeShapes.ts:353-358` (`fanout`) and `:381-384` (`fanin`) — "Placeholder
+  geometry (Task 6 brief) standing in for a real fan-out symbol; a later pass may
+  refine the exact silhouette."
+
+**They are not broken.** Both render real 5-vertex geometry
+(`nodeShapes.ts:359-377`, `:386-398`) with a safe content rect and tested handle
+anchors, and pass `nodeShapes.test.ts:96` (safe rect inside silhouette), `:231`
+and `:236` (simple polygon at 220×130 and 34×20), `:269-290` (vertex counts) and
+`:348` (anchors land on the outline). Nothing renders as a blank box or a fallback
+rect. Miniature palette previews reuse the same geometry
+(`NodePalette.tsx:235`), and `lib/workflowLayout.ts:107-125` reserves matching
+sizes, so the render and the dagre reservation agree.
+
+So this is purely "commission better art for two node kinds" — worth doing, safe
+to defer indefinitely, and it needs a design call rather than an engineering one.

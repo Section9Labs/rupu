@@ -74,7 +74,7 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-29 | P1 | rupu-cp web | Delete the classic workflow-editor UI; drop `[cp].workflow_editor_ui` | open |
 | I-30 | P1 | rupu-cp web | Collapse the run-graph classic/next dual paths to one | open |
 | I-31 | P2 | rupu-cp web | Remove both UI hooks and their localStorage overrides | open |
-| I-32 | P2 | rupu-cp web | Fan-out / fan-in / branch node silhouettes are placeholders | open |
+| I-32 | P2 | rupu-cp web | Fan-out / fan-in node silhouettes are provisional art (`branch` is not — mis-scoped) | moved → TODO.md |
 
 ### Arc 4 — gate/action correctness
 
