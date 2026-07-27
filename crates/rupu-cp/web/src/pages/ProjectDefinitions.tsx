@@ -15,6 +15,7 @@ import {
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { TriggerChip } from '../components/TriggerChip';
 import { TabBar, TabButton } from '../components/TabBar';
+import { EnabledChip } from './AutoflowsDefs';
 import { cn } from '../lib/cn';
 
 type Tab = 'agents' | 'workflows' | 'autoflows';
@@ -47,20 +48,19 @@ const AGENT_COLUMNS: Column<AgentSummary>[] = [
   {
     key: 'name',
     header: 'Name',
+    subject: true,
     sortable: true,
     sortValue: (a) => a.name,
-    render: (a) => (
-      <Link
-        to={`/agents/${encodeURIComponent(a.name)}`}
-        className="text-sm font-medium text-ink truncate hover:underline"
-      >
-        {a.name}
-      </Link>
-    ),
+    titleValue: (a) => a.name,
+    // Plain content — row-level navigation is `rowHref` (SortableTable
+    // link-wraps the whole row); an inline <Link> here would nest an <a>
+    // inside SortableTable's own <a>.
+    render: (a) => <span className="text-sm font-medium text-ink truncate">{a.name}</span>,
   },
   {
     key: 'scope',
     header: 'Scope',
+    fit: true,
     width: 'w-24',
     sortable: true,
     sortValue: (a) => a.scope ?? 'global',
@@ -69,6 +69,7 @@ const AGENT_COLUMNS: Column<AgentSummary>[] = [
   {
     key: 'provider',
     header: 'Provider',
+    fit: true,
     width: 'w-32',
     sortable: true,
     sortValue: (a) => a.provider ?? null,
@@ -82,6 +83,7 @@ const AGENT_COLUMNS: Column<AgentSummary>[] = [
   {
     key: 'model',
     header: 'Model',
+    fit: true,
     width: 'w-40',
     sortable: true,
     sortValue: (a) => a.model ?? null,
@@ -95,6 +97,7 @@ const AGENT_COLUMNS: Column<AgentSummary>[] = [
   {
     key: 'description',
     header: 'Description',
+    fit: true,
     render: (a) => (
       <span className="text-ui text-ink-dim truncate block max-w-md">{a.description ?? ''}</span>
     ),
@@ -105,20 +108,19 @@ const WORKFLOW_COLUMNS: Column<WorkflowSummary>[] = [
   {
     key: 'name',
     header: 'Name',
+    subject: true,
     sortable: true,
     sortValue: (w) => w.name,
-    render: (w) => (
-      <Link
-        to={`/workflows/${encodeURIComponent(w.name)}`}
-        className="text-sm font-medium text-ink truncate hover:underline"
-      >
-        {w.name}
-      </Link>
-    ),
+    titleValue: (w) => w.name,
+    // Plain content — row-level navigation is `rowHref` (SortableTable
+    // link-wraps the whole row); an inline <Link> here would nest an <a>
+    // inside SortableTable's own <a>.
+    render: (w) => <span className="text-sm font-medium text-ink truncate">{w.name}</span>,
   },
   {
     key: 'scope',
     header: 'Scope',
+    fit: true,
     width: 'w-24',
     sortable: true,
     sortValue: (w) => w.scope,
@@ -130,20 +132,19 @@ const AUTOFLOW_COLUMNS: Column<AutoflowDefRow>[] = [
   {
     key: 'name',
     header: 'Name',
+    subject: true,
     sortable: true,
     sortValue: (d) => d.name,
-    render: (d) => (
-      <Link
-        to={`/workflows/${encodeURIComponent(d.slug)}`}
-        className="text-sm font-medium text-ink truncate hover:underline"
-      >
-        {d.name}
-      </Link>
-    ),
+    titleValue: (d) => d.name,
+    // Plain content — row-level navigation is `rowHref` (SortableTable
+    // link-wraps the whole row); an inline <Link> here would nest an <a>
+    // inside SortableTable's own <a>.
+    render: (d) => <span className="text-sm font-medium text-ink truncate">{d.name}</span>,
   },
   {
     key: 'trigger',
     header: 'Trigger',
+    fit: true,
     width: 'w-28',
     sortable: true,
     sortValue: (d) => d.trigger,
@@ -152,10 +153,24 @@ const AUTOFLOW_COLUMNS: Column<AutoflowDefRow>[] = [
   {
     key: 'scope',
     header: 'Scope',
+    fit: true,
     width: 'w-24',
     sortable: true,
     sortValue: (d) => d.scope,
     render: (d) => <ScopeChip scope={d.scope} />,
+  },
+  {
+    key: 'enabled',
+    header: 'Enabled',
+    fit: true,
+    sortable: true,
+    sortValue: (d) => (d.enabled ? 1 : 0),
+    // Read-only — no toggle here. These rows are project-scoped by
+    // construction (this page IS the project's own definitions view), so
+    // there's no cross-scope ambiguity for a toggle to get wrong the way
+    // AutoflowsDefs.tsx's fleet-wide table has; a toggle is simply not
+    // offered from this sub-table at all (use the workflow detail page).
+    render: (d) => <EnabledChip enabled={d.enabled} />,
   },
 ];
 
@@ -270,6 +285,7 @@ function AgentsTab({ agents }: { agents: AgentSummary[] | null }) {
       columns={AGENT_COLUMNS}
       rows={agents}
       rowKey={(a) => a.name}
+      rowHref={(a) => `/agents/${encodeURIComponent(a.name)}`}
       initialSort={{ key: 'name', dir: 'asc' }}
     />
   );
@@ -283,6 +299,7 @@ function WorkflowsTab({ workflows }: { workflows: WorkflowSummary[] | null }) {
       columns={WORKFLOW_COLUMNS}
       rows={workflows}
       rowKey={(w) => w.name}
+      rowHref={(w) => `/workflows/${encodeURIComponent(w.name)}`}
       initialSort={{ key: 'name', dir: 'asc' }}
     />
   );
@@ -296,6 +313,7 @@ function AutoflowsTab({ autoflows }: { autoflows: AutoflowDefRow[] | null }) {
       columns={AUTOFLOW_COLUMNS}
       rows={autoflows}
       rowKey={(d) => d.name}
+      rowHref={(d) => `/workflows/${encodeURIComponent(d.slug)}`}
       initialSort={{ key: 'name', dir: 'asc' }}
     />
   );

@@ -57,6 +57,7 @@ const AGENT: AgentDetail = {
   provider: 'anthropic',
   model: 'claude-sonnet-4-6',
   scope: 'global',
+  scope_kind: 'global',
   usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: true, runs: 0 },
   run_count: 0,
   system_prompt: 'You review code.',
@@ -152,6 +153,35 @@ describe('AgentDetail edit/delete', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Delete reviewer' }));
     expect(delSpy).not.toHaveBeenCalled();
     expect(navigateMock).not.toHaveBeenCalled();
+  });
+
+  // ── Scope: gated Delete + visible scope indicator ────────────────────────
+  // Root cause: the detail loader resolves the global layer FIRST, falling
+  // back to a registered project's `.rupu/agents/` — so a project-scoped
+  // `reviewer` can shadow a global `reviewer` and this page silently renders
+  // the wrong layer's file with no signal it switched. `DELETE
+  // /api/agents/:name` only ever resolves against the global agents dir, so
+  // Delete here must be gated the same way the list already is (by
+  // `scope_kind`, never the display `scope` string).
+
+  it('a project-scoped agent shows a scope chip and no Delete button', async () => {
+    vi.spyOn(api, 'getAgent').mockResolvedValue({
+      ...AGENT,
+      scope: 'my-project',
+      scope_kind: 'project',
+    });
+    renderPage();
+
+    expect(await screen.findByText('my-project')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Delete reviewer' })).not.toBeInTheDocument();
+  });
+
+  it('a global agent shows a scope chip and a Delete button', async () => {
+    vi.spyOn(api, 'getAgent').mockResolvedValue(AGENT);
+    renderPage();
+
+    expect(await screen.findByText('global')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Delete reviewer' })).toBeInTheDocument();
   });
 
   it('flag unset (default): Edit still shows the classic code editor, not the Agent Builder', async () => {

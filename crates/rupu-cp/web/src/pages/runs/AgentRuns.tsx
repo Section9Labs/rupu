@@ -18,7 +18,7 @@
 // itself.
 
 import { useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { RefreshCw } from 'lucide-react';
 import { api, type AgentRunRow, type RunStatusStr } from '../../lib/api';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
@@ -161,25 +161,19 @@ export default function AgentRuns() {
         ) : (
           <section>
             <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
-              <UsageBarChart bars={visible.map((r) => {
-                const hostSuffix = r.host_id && r.host_id !== 'local'
-                  ? `&host=${encodeURIComponent(r.host_id)}`
-                  : '';
-                return {
-                  id: r.run_id,
-                  label: r.agent ?? r.run_id,
-                  to: r.transcript_path
-                    ? `/transcript?path=${encodeURIComponent(r.transcript_path)}&live=${isRunning(r.status) ? 1 : 0}${hostSuffix}`
-                    : undefined,
-                  input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens,
-                  cached_tokens: r.usage.cached_tokens, cost_usd: r.usage.cost_usd,
-                };
-              })} />
+              <UsageBarChart bars={visible.map((r) => ({
+                id: r.run_id,
+                label: r.agent ?? r.run_id,
+                to: agentRunHref(r),
+                input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens,
+                cached_tokens: r.usage.cached_tokens, cost_usd: r.usage.cost_usd,
+              }))} />
             </div>
             <SortableTable<AgentRunRow>
               columns={AGENT_RUN_COLUMNS}
               rows={visible}
               rowKey={(r) => r.run_id}
+              rowHref={agentRunHref}
               initialSort={{ key: 'started', dir: 'desc' }}
             />
             <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
@@ -203,6 +197,21 @@ function isRunning(status: string | null | undefined): boolean {
   return status === 'running' || status === 'awaiting_approval';
 }
 
+/** Build the row's detail-view link: agent runs are NOT in the workflow
+ *  run-store (`/api/runs/:id` would 404), so both the row (operator
+ *  decision, table-standardization Task 4) and the usage chart point at the
+ *  transcript view instead. `undefined` when there's no transcript to show
+ *  (older rows) — SortableTable leaves those rows unlinked, matching the
+ *  pre-existing chart behavior. Appends `&host=` for remote runs so the
+ *  transcript view can proxy-fetch. */
+function agentRunHref(r: AgentRunRow): string | undefined {
+  if (!r.transcript_path) return undefined;
+  const hostSuffix = r.host_id && r.host_id !== 'local'
+    ? `&host=${encodeURIComponent(r.host_id)}`
+    : '';
+  return `/transcript?path=${encodeURIComponent(r.transcript_path)}&live=${isRunning(r.status) ? 1 : 0}${hostSuffix}`;
+}
+
 // Session-branch agent-run rows carry the CLI's own wire vocabulary
 // (`"ok" | "error" | "aborted"` — see rupu-cp's api/run_streams.rs /
 // api/sessions.rs), NOT the run-status lexicon `StatusPill` speaks
@@ -224,7 +233,47 @@ function normalizeAgentRunStatus(s: string): RunStatusStr {
   }
 }
 
+/** The agent subject cell's competing "session xyz" reference. The row
+ *  itself navigates to the transcript view (operator decision,
+ *  table-standardization Task 4), so this needs to be an EXPLICIT inner
+ *  control, not a nested `<Link>` (SortableTable already wraps every cell of
+ *  a `rowHref` row in its own `<a>` — nesting a second `<a>` inside that is
+ *  invalid and breaks). A button that navigates programmatically avoids the
+ *  nested-anchor problem entirely. */
+function SessionRefButton({ sessionId }: { sessionId: string }) {
+  const navigate = useNavigate();
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        // preventDefault (not just stopPropagation) — stopPropagation alone
+        // does not block the enclosing rowHref <a>'s native default
+        // navigation action for a click landing on a nested control.
+        e.preventDefault();
+        e.stopPropagation();
+        navigate(`/sessions/${encodeURIComponent(sessionId)}`);
+      }}
+      className="text-brand-600 hover:underline font-mono"
+    >
+      {shortId(sessionId)}
+    </button>
+  );
+}
+
 const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
+  {
+    key: 'status',
+    header: 'Status',
+    fit: true,
+    sortable: true,
+    sortValue: (r) => r.status ?? null,
+    render: (r) =>
+      r.status ? (
+        <StatusPill status={normalizeAgentRunStatus(r.status)} />
+      ) : (
+        <span className="text-ink-mute">—</span>
+      ),
+  },
   {
     key: 'agent',
     header: 'Agent',
@@ -247,12 +296,7 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
             {r.session_id && (
               <span className="text-note text-ink-dim">
                 session{' '}
-                <Link
-                  to={`/sessions/${encodeURIComponent(r.session_id)}`}
-                  className="text-brand-600 hover:underline font-mono"
-                >
-                  {shortId(r.session_id)}
-                </Link>
+                <SessionRefButton sessionId={r.session_id} />
               </span>
             )}
           </div>
@@ -264,34 +308,12 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
     key: 'run',
     header: 'Run',
     fit: true,
-    // Agent runs are NOT in the workflow run-store (/api/runs/:id would 404), so
-    // the Run id links to the transcript view — matching the page's pre-table
-    // behavior. No transcript_path → render the id as plain text.
-    // Append &host= for remote runs so the transcript view can proxy-fetch.
-    render: (r) => {
-      const hostSuffix = r.host_id && r.host_id !== 'local'
-        ? `&host=${encodeURIComponent(r.host_id)}`
-        : '';
-      const href = r.transcript_path
-        ? `/transcript?path=${encodeURIComponent(r.transcript_path)}&live=${isRunning(r.status) ? 1 : 0}${hostSuffix}`
-        : null;
-      return href ? (
-        <Link to={href} className="text-note text-ink-mute font-mono hover:underline">
-          {shortId(r.run_id)}
-        </Link>
-      ) : (
-        <span className="text-note text-ink-mute font-mono">{shortId(r.run_id)}</span>
-      );
-    },
-  },
-  {
-    key: 'host',
-    header: 'Host',
-    fit: true,
-    sortable: true,
-    sortValue: (r) => r.host_id ?? 'local',
+    // Plain content, always — this is the SAME destination as the row's own
+    // `rowHref` (the transcript view) when one exists, so a dedicated inner
+    // link here would be a redundant nested <a>. Matches WorkflowRuns.tsx's
+    // 'run' column (plain shortId text) now that the whole row navigates.
     render: (r) => (
-      <span className="text-note text-ink-mute font-mono">{r.host_id ?? 'local'}</span>
+      <span className="text-note text-ink-mute font-mono">{shortId(r.run_id)}</span>
     ),
   },
   {
@@ -307,17 +329,14 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
     ),
   },
   {
-    key: 'status',
-    header: 'Status',
+    key: 'host',
+    header: 'Host',
     fit: true,
     sortable: true,
-    sortValue: (r) => r.status ?? null,
-    render: (r) =>
-      r.status ? (
-        <StatusPill status={normalizeAgentRunStatus(r.status)} />
-      ) : (
-        <span className="text-ink-mute">—</span>
-      ),
+    sortValue: (r) => r.host_id ?? 'local',
+    render: (r) => (
+      <span className="text-note text-ink-mute font-mono">{r.host_id ?? 'local'}</span>
+    ),
   },
   {
     key: 'in',
@@ -361,15 +380,6 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
     render: (r) => <span className="text-ink font-medium">{formatCost(r.usage.cost_usd)}</span>,
   },
   {
-    key: 'duration',
-    header: 'Duration',
-    fit: true,
-    align: 'right',
-    sortable: true,
-    sortValue: (r) => r.duration_ms ?? null,
-    render: (r) => <span className="text-ink-dim">{formatDuration(r.duration_ms)}</span>,
-  },
-  {
     key: 'turns',
     header: 'Turns',
     fit: true,
@@ -377,6 +387,15 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
     sortable: true,
     sortValue: (r) => r.turns,
     render: (r) => <span className="text-ink">{r.turns ? String(r.turns) : '—'}</span>,
+  },
+  {
+    key: 'duration',
+    header: 'Duration',
+    fit: true,
+    align: 'right',
+    sortable: true,
+    sortValue: (r) => r.duration_ms ?? null,
+    render: (r) => <span className="text-ink-dim">{formatDuration(r.duration_ms)}</span>,
   },
   {
     key: 'started',

@@ -14,6 +14,7 @@ import AgentLauncherSheet from '../components/AgentLauncherSheet';
 import AgentUsageTimeline from '../components/agent/AgentUsageTimeline';
 import { Button } from '../components/ui/Button';
 import { Spinner } from '../components/ui/Spinner';
+import { ScopeChip } from '../components/ScopeChip';
 import { useAgentAuthoringUi } from '../hooks/useAgentAuthoringUi';
 
 export default function AgentDetailPage() {
@@ -123,16 +124,32 @@ export default function AgentDetailPage() {
       <header className="mt-3">
         <div className="flex flex-wrap items-start gap-2">
           <h1 className="text-2xl font-semibold text-ink break-all">{agent.name}</h1>
+          {agent.scope && <ScopeChip scope={agent.scope} />}
           <div className="ml-auto flex items-center gap-2">
-            <Button
-              variant="danger-outline"
-              onClick={remove}
-              aria-label={`Delete ${agent.name}`}
-              className="gap-1.5"
-            >
-              <Trash2 size={14} />
-              Delete
-            </Button>
+            {/* Gated to `scope_kind === 'global'` — the structured
+             *  discriminator, never the display `scope` string (a project's
+             *  path basename, which can legally equal the literal
+             *  "global"). This page resolves global-first then falls back to
+             *  every registered project's `.rupu/agents/`, so a
+             *  project-scoped `reviewer` can silently shadow a global
+             *  `reviewer` here — but `DELETE /api/agents/:name` only ever
+             *  resolves against the global agents dir. Without this gate,
+             *  Delete on a project-scoped row would destroy the hidden
+             *  GLOBAL file with no signal this page ever switched layers.
+             *  Deleting a project-scoped definition is NOT currently
+             *  supported anywhere in the CP — the filesystem or `rupu` CLI
+             *  is the current workaround. */}
+            {agent.scope_kind === 'global' && (
+              <Button
+                variant="danger-outline"
+                onClick={remove}
+                aria-label={`Delete ${agent.name}`}
+                className="gap-1.5"
+              >
+                <Trash2 size={14} />
+                Delete
+              </Button>
+            )}
             <Button onClick={() => setRunOpen(true)} aria-label={`Run ${agent.name}`}>
               Run
             </Button>

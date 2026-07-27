@@ -99,32 +99,104 @@ pub struct RunMetrics {
     pub duration_ms: Option<u64>,
 }
 
-/// Count turns (one per `Usage` event) and capture `RunComplete.duration_ms`
-/// across the given transcripts. Tolerates unreadable/partial files.
-fn turns_and_duration(paths: &[PathBuf]) -> (u64, Option<u64>) {
+/// Single-pass replacement for what used to be two independent full scans
+/// over the same transcripts: `summarize_paths` (via
+/// `rupu_transcript::aggregate`) to get token/cost usage, and a second
+/// `JsonlReader::iter` pass (the old `turns_and_duration`) to count turns and
+/// capture duration. Every path is now opened and parsed exactly once.
+///
+/// Reimplements `rupu_transcript::aggregate`'s private `aggregate_one`
+/// grouping rules (keyed by `(provider, model, agent)`, anchored on
+/// `RunStart`, with a `Usage` event's own `provider`/`model` overriding the
+/// run-start values for a mid-run model swap; a zero-token row is still
+/// emitted for a run with `RunStart` but no `Usage` events; a transcript with
+/// no `RunStart` contributes no row) at the same `TimeWindow::default()`
+/// (unfiltered) that every caller of `run_metrics_paths` already used, so
+/// `aggregate`'s time-window filtering isn't needed here. Alongside that
+/// grouping, every `Usage` event (including one seen before any `RunStart`,
+/// same as the old `turns_and_duration`) bumps the turn counter, and every
+/// `RunComplete` records its `duration_ms` — the last one seen across all
+/// paths wins, matching the old function's path-order behavior.
+fn aggregate_rows_and_metrics(paths: &[PathBuf]) -> (Vec<UsageRow>, u64, Option<u64>) {
+    let mut by_key: BTreeMap<(String, String, String), UsageRow> = BTreeMap::new();
     let mut turns = 0u64;
     let mut duration_ms = None;
     for path in paths {
         let Ok(iter) = JsonlReader::iter(path) else {
             continue;
         };
+        let mut start: Option<(String, String, String)> = None; // (provider, model, agent)
+        let mut file_rows: BTreeMap<(String, String, String), UsageRow> = BTreeMap::new();
         for ev in iter.flatten() {
             match ev {
-                Event::Usage { .. } => turns += 1,
+                Event::RunStart {
+                    provider,
+                    model,
+                    agent,
+                    ..
+                } => start = Some((provider, model, agent)),
+                Event::Usage {
+                    provider,
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    cached_tokens,
+                    ..
+                } => {
+                    turns += 1;
+                    let Some((_, _, agent)) = &start else {
+                        continue; // no run-start yet; skip the orphan (matches aggregate_one)
+                    };
+                    let row = file_rows
+                        .entry((provider, model, agent.clone()))
+                        .or_default();
+                    row.input_tokens += u64::from(input_tokens);
+                    row.output_tokens += u64::from(output_tokens);
+                    row.cached_tokens += u64::from(cached_tokens);
+                }
                 Event::RunComplete { duration_ms: d, .. } => duration_ms = Some(d),
                 _ => {}
             }
         }
+        let Some((provider, model, agent)) = start else {
+            continue; // no RunStart; transcript skipped (matches aggregate_one)
+        };
+        if file_rows.is_empty() {
+            by_key
+                .entry((provider.clone(), model.clone(), agent.clone()))
+                .or_insert_with(|| UsageRow {
+                    provider,
+                    model,
+                    agent,
+                    ..UsageRow::default()
+                })
+                .runs += 1;
+        } else {
+            for ((p, m, a), r) in file_rows {
+                let entry = by_key
+                    .entry((p.clone(), m.clone(), a.clone()))
+                    .or_insert_with(|| UsageRow {
+                        provider: p,
+                        model: m,
+                        agent: a,
+                        ..UsageRow::default()
+                    });
+                entry.input_tokens += r.input_tokens;
+                entry.output_tokens += r.output_tokens;
+                entry.cached_tokens += r.cached_tokens;
+                entry.runs += 1;
+            }
+        }
     }
-    (turns, duration_ms)
+    (by_key.into_values().collect(), turns, duration_ms)
 }
 
 /// Full per-run metrics (usage + turns + duration) from transcript paths.
+/// Reads each path exactly once via [`aggregate_rows_and_metrics`].
 pub fn run_metrics_paths(paths: &[PathBuf], pricing: &PricingConfig) -> RunMetrics {
-    let usage = summarize_paths(paths, pricing);
-    let (turns, duration_ms) = turns_and_duration(paths);
+    let (rows, turns, duration_ms) = aggregate_rows_and_metrics(paths);
     RunMetrics {
-        usage,
+        usage: summarize(&rows, pricing),
         turns,
         duration_ms,
     }
@@ -567,6 +639,60 @@ mod tests {
         assert_eq!(m.duration_ms, Some(38000));
         assert_eq!(m.usage.input_tokens, 1800);
         assert_eq!(m.usage.output_tokens, 350);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pins the single-pass `run_metrics_paths` (via
+    /// `aggregate_rows_and_metrics`) against the old two-pass shape it
+    /// replaced: `summarize_paths` (`rupu_transcript::aggregate`, unchanged)
+    /// still computes usage the original way, so asserting the two agree —
+    /// across multiple transcripts with different agents/models, so the
+    /// `(provider, model, agent)` grouping actually exercises cross-file
+    /// merging — proves the single read produced byte-identical usage to the
+    /// old double read. Also checks turns (summed across both transcripts)
+    /// and duration (last `RunComplete` seen wins, same as the old
+    /// `turns_and_duration`).
+    #[test]
+    fn run_metrics_paths_usage_matches_old_two_pass_shape_across_transcripts() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("rupu-cp-metrics-multi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let p1 = dir.join("t1.jsonl");
+        let mut f1 = std::fs::File::create(&p1).unwrap();
+        writeln!(f1, r#"{{"type":"run_start","data":{{"run_id":"r1","workspace_id":"w","agent":"reviewer","provider":"anthropic","model":"claude-sonnet-4-6","started_at":"2026-01-01T00:00:00Z","mode":"ask"}}}}"#).unwrap();
+        writeln!(f1, r#"{{"type":"usage","data":{{"provider":"anthropic","model":"claude-sonnet-4-6","input_tokens":1000,"output_tokens":200,"cached_tokens":0}}}}"#).unwrap();
+        writeln!(f1, r#"{{"type":"run_complete","data":{{"run_id":"r1","status":"ok","total_tokens":1200,"duration_ms":10000}}}}"#).unwrap();
+        drop(f1);
+
+        let p2 = dir.join("t2.jsonl");
+        let mut f2 = std::fs::File::create(&p2).unwrap();
+        writeln!(f2, r#"{{"type":"run_start","data":{{"run_id":"r2","workspace_id":"w","agent":"fixer","provider":"anthropic","model":"claude-opus-4-8","started_at":"2026-01-01T00:00:00Z","mode":"ask"}}}}"#).unwrap();
+        writeln!(f2, r#"{{"type":"usage","data":{{"provider":"anthropic","model":"claude-opus-4-8","input_tokens":50,"output_tokens":10,"cached_tokens":0}}}}"#).unwrap();
+        writeln!(f2, r#"{{"type":"usage","data":{{"provider":"anthropic","model":"claude-opus-4-8","input_tokens":25,"output_tokens":5,"cached_tokens":0}}}}"#).unwrap();
+        writeln!(f2, r#"{{"type":"run_complete","data":{{"run_id":"r2","status":"ok","total_tokens":90,"duration_ms":20000}}}}"#).unwrap();
+        drop(f2);
+
+        let paths = vec![p1, p2];
+        let pricing = PricingConfig::default();
+
+        // The old shape: usage computed independently via
+        // `rupu_transcript::aggregate` (through `summarize_paths`, which is
+        // untouched by this change).
+        let expected_usage = summarize_paths(&paths, &pricing);
+
+        let metrics = run_metrics_paths(&paths, &pricing);
+        assert_eq!(
+            metrics.usage, expected_usage,
+            "single-pass usage must be identical to the old two-pass (aggregate-based) usage"
+        );
+        assert_eq!(metrics.turns, 3, "3 Usage events across both transcripts");
+        assert_eq!(
+            metrics.duration_ms,
+            Some(20000),
+            "last RunComplete seen across paths wins"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

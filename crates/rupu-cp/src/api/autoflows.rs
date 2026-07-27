@@ -1,5 +1,8 @@
 use crate::{
-    api::{fs_safety, repo_scope::distinct_repo_workspaces},
+    api::{
+        fs_safety,
+        repo_scope::{distinct_repo_workspaces, ScopeKind},
+    },
     config_write::write_atomic_raw,
     error::{ApiError, ApiResult},
     state::AppState,
@@ -20,7 +23,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/autoflows/:name/disable", post(disable_autoflow))
 }
 
-/// Slim DTO for a single autoflow-enabled workflow definition.
+/// Slim DTO for a single workflow definition carrying an `autoflow:` block
+/// (enabled or disabled — see `enabled` below).
 #[derive(Serialize)]
 pub(crate) struct AutoflowDefRow {
     pub(crate) name: String,
@@ -31,8 +35,20 @@ pub(crate) struct AutoflowDefRow {
     /// `TriggerKind` as a lowercase string: `"manual"`, `"cron"`, or `"event"`.
     pub(crate) trigger: String,
     /// `"global"` or the registered project's name, depending on the layer
-    /// the file came from.
+    /// the file came from. DISPLAY ONLY — it's a workspace path's basename
+    /// and can legally collide with the literal string `"global"`. Gates
+    /// (e.g. the Enable/Disable toggle) must key off `scope_kind`, never
+    /// this field — see [`ScopeKind`]'s doc comment.
     pub(crate) scope: String,
+    /// Structured scope discriminator backing the Enable/Disable toggle
+    /// gate. See [`ScopeKind`].
+    pub(crate) scope_kind: ScopeKind,
+    /// Whether `autoflow.enabled` is currently `true` in the on-disk YAML.
+    /// A workflow with no `autoflow:` block at all is excluded from the scan
+    /// entirely (see [`scan_autoflow_defs`]) — this field only distinguishes
+    /// enabled vs. disabled among workflows that DO have the block, so the CP
+    /// UI can offer both an Enable and a Disable action per row.
+    pub(crate) enabled: bool,
 }
 
 fn store(s: &AppState) -> WorkspaceStore {
@@ -47,13 +63,19 @@ fn repo_store(s: &AppState) -> RepoRegistryStore {
     }
 }
 
-/// Scan `<dir>/*.{yaml,yml}`, parse each, and keep only those whose
-/// `autoflow.enabled == true` (matching the CLI's `autoflow list` predicate).
+/// Scan `<dir>/*.{yaml,yml}`, parse each, and keep every workflow that has a
+/// top-level `autoflow:` block — regardless of whether `autoflow.enabled` is
+/// `true` or `false`. A plain workflow with no `autoflow:` block at all is
+/// not an autoflow definition and is excluded outright; each KEPT row's
+/// `enabled` field mirrors its on-disk `autoflow.enabled` value, so a caller
+/// can offer Enable on a disabled row and Disable on an enabled one instead
+/// of only ever seeing (and being able to disable) already-enabled defs.
 /// Each kept row is tagged with `scope`. A missing/unreadable dir → empty vec
 /// (tolerated). Unparseable files are skipped with a `tracing::warn!`.
 pub(crate) fn scan_autoflow_defs(
     dir: &std::path::Path,
     scope: impl Into<String>,
+    scope_kind: ScopeKind,
 ) -> Vec<AutoflowDefRow> {
     let scope = scope.into();
     if !dir.is_dir() {
@@ -96,16 +118,14 @@ pub(crate) fn scan_autoflow_defs(
                     return None;
                 }
             };
-            // Mirror the CLI's `autoflow list` predicate exactly:
-            // `workflow.autoflow.as_ref().map(|a| a.enabled).unwrap_or(false)`
-            if !workflow
-                .autoflow
-                .as_ref()
-                .map(|a| a.enabled)
-                .unwrap_or(false)
-            {
-                return None;
-            }
+            // Only a workflow that HAS an `autoflow:` block at all is an
+            // autoflow definition; its `enabled` value (true or false) is
+            // carried through on the row rather than used to filter it out
+            // (see this function's doc comment for why).
+            let enabled = match workflow.autoflow.as_ref() {
+                Some(a) => a.enabled,
+                None => return None,
+            };
             let trigger = match workflow.trigger.on {
                 rupu_orchestrator::TriggerKind::Manual => "manual",
                 rupu_orchestrator::TriggerKind::Cron => "cron",
@@ -117,6 +137,8 @@ pub(crate) fn scan_autoflow_defs(
                 slug,
                 trigger,
                 scope: scope.clone(),
+                scope_kind,
+                enabled,
             })
         })
         .collect();
@@ -132,9 +154,11 @@ pub(crate) fn scan_autoflow_defs(
 /// (see [`distinct_repo_workspaces`]) — many registered workspaces are
 /// autoflow run-worktrees of the same repo, so scanning every registered
 /// workspace would emit one duplicate row per worktree. Each kept file is
-/// parsed with [`Workflow::parse`]; only those where `autoflow.enabled ==
-/// true` (matching the CLI's `autoflow list` predicate) are returned, sorted
-/// by name then scope.
+/// parsed with [`Workflow::parse`]; every workflow carrying a top-level
+/// `autoflow:` block is returned — enabled AND disabled alike, each tagged
+/// with its current `enabled` state (see [`scan_autoflow_defs`]) — sorted by
+/// name then scope. A workflow with no `autoflow:` block at all is not
+/// returned.
 ///
 /// Each row is tagged `scope: "global"` or the representative workspace's
 /// path basename. A project def shadows a same-named GLOBAL row; two
@@ -145,7 +169,7 @@ pub(crate) fn scan_autoflow_defs(
 /// A missing workflows directory → `[]` (not an error).
 /// An unparseable YAML file is skipped with a `tracing::warn!`.
 async fn list_autoflow_defs(State(s): State<AppState>) -> ApiResult<Json<Vec<AutoflowDefRow>>> {
-    let mut rows = scan_autoflow_defs(&s.global_dir.join("workflows"), "global");
+    let mut rows = scan_autoflow_defs(&s.global_dir.join("workflows"), "global", ScopeKind::Global);
 
     let workspaces = store(&s).list().unwrap_or_default();
     let repos = distinct_repo_workspaces(workspaces, &repo_store(&s));
@@ -154,7 +178,7 @@ async fn list_autoflow_defs(State(s): State<AppState>) -> ApiResult<Json<Vec<Aut
         let dir = std::path::Path::new(&r.workspace.path)
             .join(".rupu")
             .join("workflows");
-        project_rows.extend(scan_autoflow_defs(&dir, r.scope));
+        project_rows.extend(scan_autoflow_defs(&dir, r.scope, ScopeKind::Project));
     }
 
     let project_names: std::collections::BTreeSet<&str> =
@@ -363,10 +387,80 @@ mod tests {
         )
         .expect("write");
 
-        let rows = scan_autoflow_defs(dir.path(), "global");
-        assert_eq!(rows.len(), 1, "the enabled autoflow should be returned");
+        let rows = scan_autoflow_defs(dir.path(), "global", ScopeKind::Global);
+        assert_eq!(rows.len(), 1, "the autoflow should be returned");
         assert_eq!(rows[0].name, "parsed-name");
         assert_eq!(rows[0].slug, "my-file-stem");
+        assert!(rows[0].enabled, "autoflow.enabled: true in the source YAML");
+    }
+
+    /// The structured `scope_kind` is caller-supplied, never inferred from
+    /// the display `scope` string — a project row can legally carry a
+    /// display `scope` of literally `"global"` (a workspace registered at a
+    /// path ending in `/global`), and it must still come back tagged
+    /// `ScopeKind::Project`. A true global row must come back
+    /// `ScopeKind::Global`. See [`ScopeKind`]'s doc comment for why this
+    /// distinction exists.
+    #[test]
+    fn scope_kind_is_independent_of_the_display_scope_string() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nightly.yaml");
+        std::fs::write(
+            &path,
+            "name: nightly\nautoflow:\n  enabled: true\nsteps:\n  - id: s1\n    agent: ag\n    actions: []\n    prompt: p\n",
+        )
+        .expect("write");
+
+        // A project registered at a path whose basename happens to be
+        // "global" still gets ScopeKind::Project.
+        let project_rows = scan_autoflow_defs(dir.path(), "global", ScopeKind::Project);
+        assert_eq!(project_rows.len(), 1);
+        assert_eq!(project_rows[0].scope, "global");
+        assert_eq!(project_rows[0].scope_kind, ScopeKind::Project);
+
+        // A genuinely global row gets ScopeKind::Global.
+        let global_rows = scan_autoflow_defs(dir.path(), "global", ScopeKind::Global);
+        assert_eq!(global_rows.len(), 1);
+        assert_eq!(global_rows[0].scope, "global");
+        assert_eq!(global_rows[0].scope_kind, ScopeKind::Global);
+    }
+
+    #[test]
+    fn disabled_autoflow_def_is_included_with_enabled_false() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nightly.yaml");
+        std::fs::write(
+            &path,
+            "name: nightly\nautoflow:\n  enabled: false\nsteps:\n  - id: s1\n    agent: ag\n    actions: []\n    prompt: p\n",
+        )
+        .expect("write");
+
+        let rows = scan_autoflow_defs(dir.path(), "global", ScopeKind::Global);
+        assert_eq!(
+            rows.len(),
+            1,
+            "a disabled autoflow def must still be listed, not skipped"
+        );
+        assert_eq!(rows[0].name, "nightly");
+        assert!(!rows[0].enabled);
+    }
+
+    #[test]
+    fn workflow_with_no_autoflow_block_is_excluded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plain.yaml");
+        std::fs::write(
+            &path,
+            "name: plain\nsteps:\n  - id: s1\n    agent: ag\n    actions: []\n    prompt: p\n",
+        )
+        .expect("write");
+
+        let rows = scan_autoflow_defs(dir.path(), "global", ScopeKind::Global);
+        assert_eq!(
+            rows.len(),
+            0,
+            "a plain workflow with no autoflow: block at all is not an autoflow def"
+        );
     }
 
     const ENABLED_AUTOFLOW: &str =

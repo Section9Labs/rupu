@@ -1,7 +1,7 @@
 use crate::{
     agent_launcher::{AgentLaunchError, AgentLaunchRequest, AgentLauncher},
     api::fs_safety::{validate_name, write_atomic},
-    api::repo_scope::distinct_repo_workspaces,
+    api::repo_scope::{distinct_repo_workspaces, ScopeKind},
     error::{ApiError, ApiResult},
     host::connector::HostConnectorError,
     session_starter::{SessionStartError, SessionStartRequest, SessionStarter},
@@ -96,14 +96,55 @@ fn create_agent_file(global_dir: &FsPath, raw: &str) -> Result<PathBuf, ApiError
     Ok(target)
 }
 
-/// Build the detail DTO from a loaded spec, tagged with `scope`.
-fn detail_from_spec(spec: rupu_agent::spec::AgentSpec, scope: impl Into<String>) -> AgentDetailDto {
+/// Map each agent's parsed frontmatter `name` to the FILE STEM it was loaded
+/// from, by scanning `<dir>/agents/*.md` directly. `delete_agent` removes
+/// `<slug>.md` by file stem, not by frontmatter `name` — when the two differ
+/// (hand- or CLI-authored files), a row keyed only by `name` would 404 or
+/// delete an unrelated file that happens to share that stem. Mirrors
+/// `AutoflowDefRow.slug`'s identical fix in
+/// `api::autoflows::scan_autoflow_defs`.
+///
+/// A file that fails to parse, or a missing/unreadable directory, is simply
+/// absent from the map rather than erroring — this is a supplementary
+/// name→slug lookup alongside the authoritative `AgentSpec` list
+/// `load_agents`/`load_agent` already produced; a scan hiccup here should
+/// not break the DTO the caller already has in hand (the caller falls back
+/// to `name` when a lookup misses).
+pub(crate) fn agent_slug_map(dir: &FsPath) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let agents_dir = dir.join("agents");
+    let Ok(entries) = std::fs::read_dir(&agents_dir) else {
+        return out;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(slug) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if let Ok(spec) = rupu_agent::AgentSpec::parse_file(&path) {
+            out.insert(spec.name, slug.to_string());
+        }
+    }
+    out
+}
+
+/// Build the detail DTO from a loaded spec, tagged with `scope`/`scope_kind`
+/// and `slug`.
+fn detail_from_spec(
+    spec: rupu_agent::spec::AgentSpec,
+    scope: impl Into<String>,
+    scope_kind: ScopeKind,
+    slug: impl Into<String>,
+) -> AgentDetailDto {
     let system_prompt = spec.system_prompt.clone();
     let raw = spec.raw.clone();
     AgentDetailDto {
         system_prompt,
         raw,
-        summary: AgentDto::from_spec(spec, scope),
+        summary: AgentDto::from_spec(spec, scope, scope_kind, slug),
     }
 }
 
@@ -111,15 +152,31 @@ fn detail_from_spec(spec: rupu_agent::spec::AgentSpec, scope: impl Into<String>)
 ///
 /// Project-aware: resolves `name` in the global layer first, falling back to
 /// every registered project's `.rupu/agents/` (first match) so a
-/// project-only agent's detail route doesn't 404.
+/// project-only agent's detail route doesn't 404. The resolved layer is
+/// carried on the returned DTO's `scope_kind` — callers (the CP detail page)
+/// use it to gate Delete, since `DELETE /api/agents/:name` only ever resolves
+/// against the global layer regardless of which layer this GET resolved.
 fn load_detail(s: &AppState, name: &str) -> ApiResult<AgentDetailDto> {
     match load_agent(&s.global_dir, None, name) {
-        Ok(spec) => Ok(detail_from_spec(spec, "global")),
+        Ok(spec) => {
+            let slug = agent_slug_map(&s.global_dir)
+                .remove(name)
+                .unwrap_or_else(|| name.to_string());
+            Ok(detail_from_spec(spec, "global", ScopeKind::Global, slug))
+        }
         Err(AgentLoadError::NotFound(_)) => {
             for w in store(s).list().unwrap_or_default() {
                 let rupu_dir = std::path::Path::new(&w.path).join(".rupu");
                 if let Ok(spec) = load_agent(&rupu_dir, None, name) {
-                    return Ok(detail_from_spec(spec, project_scope_name(&w)));
+                    let slug = agent_slug_map(&rupu_dir)
+                        .remove(name)
+                        .unwrap_or_else(|| name.to_string());
+                    return Ok(detail_from_spec(
+                        spec,
+                        project_scope_name(&w),
+                        ScopeKind::Project,
+                        slug,
+                    ));
                 }
             }
             Err(ApiError::not_found(format!("agent {name} not found")))
@@ -131,6 +188,11 @@ fn load_detail(s: &AppState, name: &str) -> ApiResult<AgentDetailDto> {
 #[derive(Serialize)]
 pub(crate) struct AgentDto {
     pub(crate) name: String,
+    /// File stem — the identifier `delete_agent` operates on (see
+    /// [`agent_slug_map`]'s doc comment for why this can differ from `name`).
+    /// Always present on the wire; the row's Delete action must pass THIS,
+    /// never `name`.
+    pub(crate) slug: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -152,7 +214,14 @@ pub(crate) struct AgentDto {
     pub(crate) tools: Vec<String>,
     /// `"project"` when the spec was loaded from `<project>/.rupu/agents`,
     /// else `"global"`. Defaults to `"global"` for the global-only endpoints.
+    /// DISPLAY ONLY for a project row — it's a workspace path's basename and
+    /// can legally collide with the literal string `"global"`. Destructive
+    /// gates must key off `scope_kind`, never this field — see
+    /// [`ScopeKind`]'s doc comment.
     pub(crate) scope: String,
+    /// Structured scope discriminator backing every Delete gate. See
+    /// [`ScopeKind`].
+    pub(crate) scope_kind: ScopeKind,
     /// Aggregate token + cost usage across every run attributed to this agent.
     /// Defaults to empty; populated only by the list handler. Usage is
     /// grouped by agent NAME alone (the transcript rows the breakdown is
@@ -165,14 +234,46 @@ pub(crate) struct AgentDto {
     pub(crate) usage: crate::usage::UsageSummary,
     /// Distinct runs attributed to this agent. Defaults to `0`.
     pub(crate) run_count: u64,
+    /// Most-recent run timestamp (ISO-8601) attributed to this agent, or
+    /// `None` if it has never run. Same NAME, same wire shape, and same role
+    /// as `WorkflowDto::last_run` — the "last activity" signal the list
+    /// tables use in place of a non-existent intrinsic status for
+    /// definitions (agents/workflows have no status of their own; only their
+    /// runs do) — but the two are derived differently, and that difference
+    /// is user-visible:
+    ///
+    /// - `WorkflowDto::last_run` is STRUCTURAL: `rollup_by` keys every
+    ///   `RunRecord` by its `workflow_name` field directly, so every run
+    ///   counts regardless of whether its transcripts are readable.
+    /// - This field is TRANSCRIPT-DERIVED: a `RunRecord` carries no "agent(s)
+    ///   this run used" field, so a run only counts here if at least one of
+    ///   its transcripts is readable AND contains a `Usage` event naming this
+    ///   agent (see the per-run loop in `list_agents`).
+    ///
+    /// Consequence: an agent whose run died before the first LLM call, or
+    /// whose transcripts were pruned or live on an unreachable remote host,
+    /// shows `None` here (reading as "never ran") even though an equivalent
+    /// workflow with the same run would show a timestamp. Populated by the
+    /// same canonical-row rule as `usage` / `run_count` above: only ONE row
+    /// per agent name carries it. No `skip_serializing_if` — matches
+    /// `WorkflowDto::last_run`, which always serializes (as `null` when
+    /// absent) rather than omitting the key.
+    #[serde(default)]
+    pub(crate) last_run: Option<String>,
 }
 
 impl AgentDto {
     /// Map a loaded [`rupu_agent::spec::AgentSpec`] to the wire DTO, tagging
-    /// it with the given scope.
-    pub(crate) fn from_spec(spec: rupu_agent::spec::AgentSpec, scope: impl Into<String>) -> Self {
+    /// it with the given scope and file-stem slug.
+    pub(crate) fn from_spec(
+        spec: rupu_agent::spec::AgentSpec,
+        scope: impl Into<String>,
+        scope_kind: ScopeKind,
+        slug: impl Into<String>,
+    ) -> Self {
         AgentDto {
             name: spec.name,
+            slug: slug.into(),
             description: spec.description,
             provider: spec.provider,
             model: spec.model,
@@ -180,8 +281,10 @@ impl AgentDto {
             max_tokens: spec.max_tokens,
             tools: spec.tools.unwrap_or_default(),
             scope: scope.into(),
+            scope_kind,
             usage: crate::usage::UsageSummary::default(),
             run_count: 0,
+            last_run: None,
         }
     }
 }
@@ -214,9 +317,16 @@ struct AgentDetailDto {
 /// error behavior is unchanged.
 async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>> {
     let specs = load_agents(&s.global_dir, None).map_err(|e| ApiError::internal(e.to_string()))?;
+    let global_slugs = agent_slug_map(&s.global_dir);
     let mut dtos: Vec<AgentDto> = specs
         .into_iter()
-        .map(|spec| AgentDto::from_spec(spec, "global"))
+        .map(|spec| {
+            let slug = global_slugs
+                .get(&spec.name)
+                .cloned()
+                .unwrap_or_else(|| spec.name.clone());
+            AgentDto::from_spec(spec, "global", ScopeKind::Global, slug)
+        })
         .collect();
 
     let workspaces = store(&s).list().unwrap_or_default();
@@ -226,11 +336,16 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
         let scope = r.scope;
         let rupu_dir = std::path::Path::new(&r.workspace.path).join(".rupu");
         match load_agents(&rupu_dir, None) {
-            Ok(specs) => project_dtos.extend(
-                specs
-                    .into_iter()
-                    .map(|spec| AgentDto::from_spec(spec, scope.clone())),
-            ),
+            Ok(specs) => {
+                let slugs = agent_slug_map(&rupu_dir);
+                project_dtos.extend(specs.into_iter().map(|spec| {
+                    let slug = slugs
+                        .get(&spec.name)
+                        .cloned()
+                        .unwrap_or_else(|| spec.name.clone());
+                    AgentDto::from_spec(spec, scope.clone(), ScopeKind::Project, slug)
+                }));
+            }
             Err(err) => {
                 tracing::warn!("agents: skipping project {scope}: {err}");
             }
@@ -249,13 +364,46 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
     // `scope == "global"`, else the first row for that name in the
     // already-sorted order) rather than duplicating it onto every same-named
     // row. See the doc comment on `AgentDto::usage`.
+    //
+    // Single pass over the run store: each run's own transcripts are
+    // aggregated exactly once. The resulting `UsageRow`s feed straight into
+    // `all_rows` for `breakdown` (which re-groups by agent name and sums —
+    // whether the rows arrive pre-merged from one combined `aggregate` call
+    // over every path, or concatenated from one `aggregate` call per run, the
+    // per-key sums `breakdown` produces are identical, since token/run counts
+    // are strictly additive and every transcript still lands in exactly one
+    // run's batch). `last_run` is folded from the SAME per-run rows (their
+    // `agent` field names who the run's usage attributes to; `run.started_at`
+    // is the candidate timestamp) instead of a second re-aggregation pass
+    // that re-walks every run's transcripts a second time over the exact
+    // same files `all_rows` had just read.
     let runs = s.run_store.list().unwrap_or_default();
-    let mut all_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut all_rows: Vec<rupu_transcript::UsageRow> = Vec::new();
+    let mut last_runs: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     for r in &runs {
-        all_paths.extend(crate::usage::run_transcript_paths(&s.run_store, &r.id));
+        let paths = crate::usage::run_transcript_paths(&s.run_store, &r.id);
+        if paths.is_empty() {
+            continue;
+        }
+        let rows = rupu_transcript::aggregate(&paths, rupu_transcript::TimeWindow::default());
+        let at = r.started_at.to_rfc3339();
+        for row in &rows {
+            if row.agent.is_empty() {
+                continue;
+            }
+            last_runs
+                .entry(row.agent.clone())
+                .and_modify(|cur| {
+                    if *cur < at {
+                        *cur = at.clone();
+                    }
+                })
+                .or_insert_with(|| at.clone());
+        }
+        all_rows.extend(rows);
     }
-    let rows = rupu_transcript::aggregate(&all_paths, rupu_transcript::TimeWindow::default());
-    let breakdown = crate::usage::breakdown(&rows, &s.pricing, crate::usage::GroupBy::Agent);
+    let breakdown = crate::usage::breakdown(&all_rows, &s.pricing, crate::usage::GroupBy::Agent);
 
     let mut canonical_dto_for_name: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
@@ -282,6 +430,7 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
                 runs: b.runs,
             };
             dto.run_count = b.runs;
+            dto.last_run = last_runs.get(&name).cloned();
         }
     }
 
@@ -847,6 +996,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "code-reviewer");
         assert_eq!(rows[0].scope, "global");
+        assert_eq!(rows[0].scope_kind, crate::api::repo_scope::ScopeKind::Global);
     }
 
     #[tokio::test]
@@ -870,6 +1020,10 @@ mod tests {
             .into_owned();
         assert_eq!(rows[0].name, "code-reviewer");
         assert_eq!(rows[0].scope, expected_scope);
+        assert_eq!(
+            rows[0].scope_kind,
+            crate::api::repo_scope::ScopeKind::Project
+        );
     }
 
     #[tokio::test]
@@ -895,6 +1049,31 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(resp.0.summary.scope, expected_scope);
+        // Project-only detail must be tagged `scope_kind: Project` — the CP
+        // detail page's Delete gate keys off this, never the display `scope`.
+        assert_eq!(
+            resp.0.summary.scope_kind,
+            crate::api::repo_scope::ScopeKind::Project
+        );
+    }
+
+    /// A GLOBAL agent's detail DTO is tagged `scope_kind: Global` — the
+    /// counterpart to `agent_detail_resolves_project_def`'s Project case.
+    /// The CP detail page's Delete gate keys off this field.
+    #[tokio::test]
+    async fn agent_detail_global_is_scope_kind_global() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        save_agent_file(&s.global_dir, "code-reviewer", VALID_MD).expect("seed");
+
+        let resp = get_agent(State(s), Path("code-reviewer".into()))
+            .await
+            .expect("global agent should resolve");
+        assert_eq!(resp.0.summary.scope, "global");
+        assert_eq!(
+            resp.0.summary.scope_kind,
+            crate::api::repo_scope::ScopeKind::Global
+        );
     }
 
     #[tokio::test]
@@ -1135,5 +1314,79 @@ mod tests {
             1,
             "the other same-named row stays zeroed rather than duplicating usage"
         );
+
+        // The canonical-row rule must hold for `last_run` too: exactly one of
+        // the two same-named rows carries a timestamp, the other stays `None`
+        // rather than both showing the same (duplicated) last-run signal.
+        let last_runs: Vec<Option<String>> = rows.iter().map(|r| r.last_run.clone()).collect();
+        assert_eq!(
+            last_runs.iter().filter(|r| r.is_some()).count(),
+            1,
+            "exactly one row carries last_run"
+        );
+        assert_eq!(
+            last_runs.iter().filter(|r| r.is_none()).count(),
+            1,
+            "the other same-named row stays None rather than duplicating last_run"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_agents_last_run_reflects_run_and_none_when_never_run() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        save_agent_file(&s.global_dir, "code-reviewer", VALID_MD).expect("seed");
+        const GHOST_MD: &str = "---\nname: ghost\nmodel: opus\n---\nNever runs.\n";
+        save_agent_file(&s.global_dir, "ghost", GHOST_MD).expect("seed");
+
+        seed_run_with_agent_usage(
+            &s,
+            "run_1",
+            "ws_x",
+            "code-reviewer",
+            &tmp.path().join("t1.jsonl"),
+        );
+
+        let Json(rows) = list_agents(State(s)).await.expect("ok");
+
+        let reviewer = rows
+            .iter()
+            .find(|r| r.name == "code-reviewer")
+            .expect("code-reviewer present");
+        assert!(
+            reviewer.last_run.is_some(),
+            "an agent that ran must carry a last_run timestamp"
+        );
+
+        let ghost = rows
+            .iter()
+            .find(|r| r.name == "ghost")
+            .expect("ghost present");
+        assert_eq!(
+            ghost.last_run, None,
+            "an agent that never ran must have last_run == None"
+        );
+    }
+
+    /// The Delete row-action must key off the file STEM, not the
+    /// frontmatter `name` — `delete_agent` removes `<slug>.md` by file
+    /// stem. When a `.md` file's stem differs from its frontmatter `name`
+    /// (hand- or CLI-authored files), the DTO must still report the
+    /// correct `slug` rather than falling back to `name`. Mirrors
+    /// `api::autoflows`'s `slug_is_file_stem_distinct_from_parsed_name`.
+    #[tokio::test]
+    async fn list_agents_slug_reflects_file_stem_when_it_differs_from_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let dir = agents_dir(&s);
+        std::fs::create_dir_all(&dir).unwrap();
+        // File stem ("my-file-stem") deliberately differs from the parsed
+        // frontmatter `name` ("code-reviewer") in VALID_MD.
+        std::fs::write(dir.join("my-file-stem.md"), VALID_MD).unwrap();
+
+        let Json(rows) = list_agents(State(s)).await.expect("ok");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "code-reviewer");
+        assert_eq!(rows[0].slug, "my-file-stem");
     }
 }

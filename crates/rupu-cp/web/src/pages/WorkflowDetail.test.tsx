@@ -40,11 +40,15 @@ const YAML = `name: nightly\ndescription: Nightly sweep.\nsteps:\n  - id: scan\n
 const DETAIL: WorkflowDetail = {
   workflow: {
     name: 'nightly',
-    scope: 'global',
     description: 'Nightly sweep.',
     steps: [{ id: 'scan', agent: 'scanner', prompt: 'Scan the repo' }],
   },
   yaml: YAML,
+  // `scope`/`scope_kind` are resolved server-side by the detail loader and
+  // served as sibling top-level fields — NOT nested inside `workflow` (a
+  // plain `Workflow::parse` of the YAML has no `scope` concept of its own).
+  scope: 'global',
+  scope_kind: 'global',
 };
 
 beforeEach(() => {
@@ -171,6 +175,37 @@ describe('WorkflowDetail', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Delete nightly' }));
     expect(delSpy).not.toHaveBeenCalled();
     expect(navigateMock).not.toHaveBeenCalled();
+  });
+
+  // ── Scope: gated Delete + visible scope indicator ────────────────────────
+  // Root cause: the detail loader resolves the global layer FIRST, falling
+  // back to a registered project's `.rupu/workflows/` — so a project-scoped
+  // `nightly` can shadow a global `nightly` and this page silently renders
+  // the wrong layer's file with no signal it switched. `DELETE
+  // /api/workflows/:name` only ever resolves against the global workflows
+  // dir, so Delete here must be gated the same way the list already is (by
+  // `scope_kind`, never the display `scope` string, which is read from the
+  // WRONG place entirely before this fix — `workflow.scope`, a field
+  // `Workflow::parse` never produces).
+
+  it('a project-scoped workflow shows a scope chip and no Delete button', async () => {
+    vi.spyOn(api, 'getWorkflow').mockResolvedValue({
+      ...DETAIL,
+      scope: 'my-project',
+      scope_kind: 'project',
+    });
+    renderPage();
+
+    expect(await screen.findByText('my-project')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Delete nightly' })).not.toBeInTheDocument();
+  });
+
+  it('a global workflow shows a scope chip and a Delete button', async () => {
+    vi.spyOn(api, 'getWorkflow').mockResolvedValue(DETAIL);
+    renderPage();
+
+    expect(await screen.findByText('global')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Delete nightly' })).toBeInTheDocument();
   });
 
   // ── Autoflow enable/disable ──────────────────────────────────────────────

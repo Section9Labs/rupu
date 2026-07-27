@@ -12,6 +12,7 @@
 //! once.
 
 use rupu_workspace::{RepoRegistryStore, Workspace};
+use serde::Serialize;
 use std::collections::BTreeMap;
 
 /// A single workspace chosen to represent a repo, tagged with the display
@@ -19,6 +20,24 @@ use std::collections::BTreeMap;
 pub(crate) struct RepoScope {
     pub(crate) workspace: Workspace,
     pub(crate) scope: String,
+}
+
+/// Structured scope discriminator — independent of the display `scope`
+/// string used throughout `api::agents` / `api::workflows` / `api::projects`.
+///
+/// `scope` (here and on `AgentDto`/`WorkflowDto`/detail DTOs) is a workspace
+/// path's BASENAME (see [`scope_name`]), chosen purely for display. It can
+/// therefore legally equal the literal string `"global"` for a project
+/// registered at a path whose last segment happens to be named `global` — a
+/// destructive-action gate keyed on `scope == "global"` would then wrongly
+/// treat that project's rows as the real global layer, defeating the gate.
+/// Every such gate (the Agents/Workflows list and detail Delete buttons) must
+/// key off `scope_kind` instead; `scope` stays display-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ScopeKind {
+    Global,
+    Project,
 }
 
 /// Collapse `workspaces` to one representative per distinct repo.
