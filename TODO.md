@@ -2,6 +2,21 @@
 
 Items deferred from completed slices. Each entry should name **why deferred**, **prereqs**, and **what unblocks it**.
 
+> **This file tracks deferred *features*.** Things that are *wrong* — defects,
+> drift, inert config — belong in [`ISSUES.md`](ISSUES.md). An item that turns
+> out to be shipped-but-inert moves here → there, because inert is a defect, not
+> a deferral.
+>
+> **Anti-orphan rule:** every "Deferred" / "Out of scope" item in a plan or spec
+> must be mirrored into this file (feature) or `ISSUES.md` (defect) **in the same
+> PR that writes the plan**. A 2026-07-24 audit found 31 items that existed only
+> inside a plan file and were referenced nowhere else. See
+> [`docs/superpowers/specs/2026-07-24-rupu-integrity-remediation-charter.md`](docs/superpowers/specs/2026-07-24-rupu-integrity-remediation-charter.md).
+>
+> **Truth pass, 2026-07-24.** The same audit verified every claim here against
+> the code. Entries proven shipped are marked ✅ inline below rather than
+> deleted, so the history stays readable.
+
 ## Sub-agent dispatch — agent-as-tool
 
 Has its own design spec: [`docs/superpowers/specs/2026-05-08-rupu-sub-agent-dispatch-design.md`](docs/superpowers/specs/2026-05-08-rupu-sub-agent-dispatch-design.md). That doc is the source of truth for the new tool family (`dispatch_agent` + `dispatch_agents_parallel`), the per-parent allowlist (`dispatchable_agents:` frontmatter), recursion / depth limits, the parent↔child run linkage in `RunRecord`, and how the line-stream printer renders dispatched children at indent+1.
@@ -184,9 +199,11 @@ Added `GeminiVariant::AiStudio` to the existing `GoogleGeminiClient` (rather tha
 
 All sites in `crates/rupu-providers/src/github_copilot.rs` agree on `"claude-sonnet-4-6"` as of the polish-pass review (2026-05-07). No action needed.
 
-## ProviderError truncate-helper test gap (deferred from Plan 1 Task 11)
+## ProviderError truncate-helper test gap ✅ resolved
 
-`crates/rupu-providers/src/classify.rs::truncate` uses `s.is_char_boundary` walk-back, but the regression test in `crates/rupu-providers/tests/classify.rs::classify_handles_multibyte_utf8_body_without_panic` uses a 4-byte-aligned input (`"🦀".repeat(N)` with `N % 4 == 0`), so the walk-back loop is never actually exercised. A truly adversarial test should use a 3-byte char (e.g. `"€".repeat(N)`) where `(max % 3 != 0)` to exercise the walk-back path. Plan 2/3 polish.
+Closed by the 2026-07-24 truth pass: `crates/rupu-providers/tests/classify.rs:90-107`
+now uses `"€".repeat(250)` (a 3-byte char), which exercises the `is_char_boundary`
+walk-back the original test missed.
 
 ## Control Plane — Phase 2 (Control) + Phase 3 (Authoring)
 
@@ -210,7 +227,7 @@ Roadmap from `docs/superpowers/specs/2026-06-18-rupu-control-plane-design.md` (P
 - Run **delete / archive / prune** — `RunStore` has no delete; `cleanup.rs` prunes only sessions/transcripts.
 - **Cron / trigger enable-disable toggle** — no `enabled` flag; toggling means rewriting workflow YAML `trigger:` or `[triggers].poll_sources` in config.toml.
 - **Nested/array config writes** — `rupu config set` handles top-level scalars only; no library `save` for nested config.
-- **Agent / workflow definition delete** — no subcommand, no engine fn.
+- **Agent / workflow definition delete** — ✅ the CP side shipped (`api/agents.rs:25`, `api/workflows.rs:24`, plus the scope-blind-delete fix in `2694ec7d`). Still open: the **CLI** subcommands (`rupu agent delete` / `rupu workflow delete`) — `cmd/agent.rs` exposes only `List | Show | Edit | Create`. (2026-07-24 truth pass)
 
 **Phase 3 (Authoring) — in progress:** in-browser edit of agent `.md` and workflow `.yaml`, gated by `AgentSpec::parse` / `Workflow::parse` validation. Pure-state file writes (rupu-cp can validate+write directly; no subprocess). Slices:
 - ✅ **3a — agent `.md` editor** (#377): edit/create/delete global agents (`global_dir/agents/<name>.md`), validated by `AgentSpec::parse`; lazy CodeMirror editor. Path-safety (`validate_name`) + validate-before-write + atomic tmp+rename. v1 = global agents only (project-agent editing is a follow-up).
@@ -221,11 +238,17 @@ Roadmap from `docs/superpowers/specs/2026-06-18-rupu-control-plane-design.md` (P
 
 ## Multi-host (fleet)
 
-- [ ] multi-host: make /api/runs/agents + /api/runs/autoflows host-aware (needs HostConnector::list_agent_runs/list_autoflow_runs)
+- ✅ multi-host: /api/runs/agents + /api/runs/autoflows are host-aware (2026-07-24 truth pass — `crates/rupu-cp/src/api/run_streams.rs:692,828`; connectors at `host/ssh.rs:1258,1266`, `host/http.rs:396,403`)
 
-## Workspace-scope hardening for search tools (`grep` / `ast_grep` / `glob`)
+## Workspace-scope hardening for search tools → moved to ISSUES.md as **I-22**
 
-An agent-supplied `path` can escape the workspace: `ctx.workspace_path.join(p)` replaces the base when `p` is absolute (`"/etc"`) and walks upward on `"../.."`. **Why deferred:** it is a pre-existing property of `grep` (`crates/rupu-tools/src/grep.rs:71-75`), not introduced by `ast_grep` (which mirrors it at `crates/rupu-tools/src/ast_grep.rs`); impact is bounded (read-only tools, still permission-gated). **Prereqs:** none — the crate already has a `path_scope` module (`crates/rupu-tools/src/path_scope.rs`) used by read/write/edit for exactly this containment check. **What unblocks it:** apply a `path_scope`-style resolve-and-verify-under-`workspace_path` guard to all three search tools in one change, with a test that a `../..`/absolute `path` is rejected. Surfaced by the `ast_grep` final review (spec `docs/superpowers/specs/2026-07-15-rupu-ast-grep-tool-design.md`).
+This is a defect, not a deferred feature, so it now lives in
+[`ISSUES.md`](ISSUES.md) (**I-22**, Arc 2) per the file split above.
+
+Two corrections from the 2026-07-24 truth pass: it affects **`grep` and
+`ast_grep` only** — `glob` takes no user-supplied `path` argument and walks only
+`ctx.workspace_path` (`crates/rupu-tools/src/glob.rs:54`), so it was never
+affected.
 
 ## CP rich tool-call rendering (initiative)
 
@@ -252,3 +275,57 @@ Today's baseline (`crates/rupu-cp/web/src/components/transcript/ToolCard.tsx`): 
 
 ### Sub-project 4 — AST visualization *(the "C" payoff)*
 - [ ] Playground-style syntax-tree + pattern↔match view. Depends on sub-project 1 (metavariable data) and sub-project 3 (a real parser for full-file trees — ast-grep `run --json` gives the matched node + metavars, NOT a whole-file tree; `--debug-query=ast|cst` gives only the *pattern* tree). Explore `ast-grep outline --json` for a cheap file-structure sidebar as a stepping stone.
+
+---
+
+## Recovered orphans (2026-07-24 audit)
+
+A four-sweep audit found **31 items that existed only inside a plan file's
+"Deferred" section** — referenced by no backlog and no tracker. They are
+recorded here so they survive the next plan. Each was verified still-open
+against the code; defects among them went to [`ISSUES.md`](ISSUES.md) instead
+and are not repeated here.
+
+### rupu-scm / rupu-mcp
+- [ ] **PR review threads** — line-level comments, suggestions, resolution. `scm.prs.comment` is repo-level only; a code-review agent cannot leave an inline comment, which is the primary review affordance. No `review_thread`/`line_comment` symbols exist.
+- [ ] **`merge_pr` / `enable_auto_merge`** — an autoflow can open a PR but never land it.
+- [ ] **`rupu mcp serve --transport http`** — the flag exists in `--help` and always errors (`cmd/mcp.rs:41`); rupu's MCP server is stdio-only, so it cannot be consumed over the network.
+- [ ] **Self-hosted GitLab / GitHub Enterprise clone + deep-links** — API `base_url` is configurable, but clone URLs hardcode `gitlab.com` / `github.com` (`connectors/gitlab/repo.rs:477`, `github/repo.rs:442`) and `weburl.rs:14-18` returns `None` for any other host. Related to ISSUES.md **I-16**.
+- [ ] `rupu repos search` / cross-platform repo search.
+- [ ] Bitbucket / Codeberg / Forgejo adapters.
+
+### rupu-cp — multi-host transports
+- [ ] **Interactive sessions over SSH and tunnel** — `tunnel.rs:190` and `ssh.rs:955` both `bail!("sessions not supported…")`; only local and HTTP-CP hosts can run a live session.
+- [ ] **Workspace sync over bucket and tunnel** — both inherit the `Unsupported` defaults (`host/connector.rs:245,256`), so `workspace: sync` only works over SSH/HttpCp.
+- [ ] **Pause / resume over the tunnel transport** — `tunnel.rs` implements approve/reject/cancel but not pause/resume, so those CP buttons silently fail against tunnel nodes while working for SSH ones.
+- [ ] **`HostConnector::read_source`** — source preview and the AST view are local-only; clicking a `path:line` on a remote run yields a "not available" message.
+- [ ] **SSH `ControlMaster` reuse** — every dashboard tile and status poll pays a fresh TCP+SSH handshake.
+- [ ] **mTLS / cert rotation for node tunnels** — `node/protocol.rs:50` declares an `Mtls {}` variant that is never constructed; node auth is enrollment-token-only.
+- [ ] Capability/label host selector and load-aware placement; bucket retention/GC.
+
+### rupu-cp — web
+- [ ] **Re-run a finished run from the web** — no `rerun` route; re-running means retyping every input.
+- [ ] **Launch concurrency caps** — the launch path spawns unbounded.
+- [ ] **Persist node layout** in the workflow editor; **preserve YAML comments** through a graph-tab save (today it rewrites canonically and strips them).
+- [ ] Findings mutation (ack / dismiss / resolve) — triaged findings resurface every review.
+- [ ] Project-scope create/edit for CP agents & workflows — reads are project-aware, writes always go global, so the UI shows project definitions it cannot edit.
+- [ ] Host selector on the create/generate modals (its stated blocker — multi-host — has landed).
+- [ ] Full `ModelRegistry` in the generate model dropdown (one model per provider today).
+- [ ] Tool/thinking deltas over the live-session SSE (text-only today).
+
+### rupu-orchestrator / rupu-tools
+- [ ] **Pause/resume a workflow containing `workspace: sync`** — refused outright (`runner.rs:162,171`); the workflows that most need a long pause are the ones that cannot pause.
+- [ ] **`actions:` roster through remote dispatch** — `UnitDispatch`/`AgentLaunchRequest` carry no tool list, so narrowing on a `host:`/`distribute:` step is a hard parse error and remote steps always run the agent's full grant.
+- [ ] Error edges / guarded edges / sub-workflows; single-node and nested loops; `distribute:` on `parallel:`/`panel:`.
+- [ ] ast-grep rewrite mode, YAML rulesets, and a human `rupu ast-grep` subcommand.
+- [ ] Live interleaved streaming in the non-TTY dispatch printer (CI/piped output prints nothing until every child finishes).
+
+### rupu-providers / rupu-coverage / misc
+- [ ] Structured OpenRouter `reasoning_details` replay; Copilot `reasoning_text` capture.
+- [ ] Configurable compaction summarizer model (`compactModel`) — compaction burns tokens on the primary model.
+- [ ] Coverage: `rerun` for session/workflow/autoflow surfaces (agent-only today); `run_shaping` capture; sampling-parameter control; stable finding identity across runs.
+- [ ] **Multi-platform release assets** — `make gh-beta` builds only the host binary, so `rupu update` finds no asset on Linux or Intel macOS.
+- [ ] Adaptive backoff for multi-source trigger polling (~100 repos on a 1-minute tick exhausts the GitHub hourly budget); GitHub Projects polling.
+- [ ] Best-effort worktree teardown when releasing an autoflow claim from the web (leaks a worktree).
+- [ ] Reap detached `cp serve` children (zombie accumulation; the stdio + process-group half already shipped).
+- [ ] `rupu ui theme preview|use`; non-Base16 theme importers; `rupu init --interactive`; TUI mouse support; `File > Open Recent`.
