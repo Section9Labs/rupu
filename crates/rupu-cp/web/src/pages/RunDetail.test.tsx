@@ -893,8 +893,11 @@ describe('RunDetail — Cycles tab', () => {
     expect(table).toHaveTextContent('issue-supervisor-dispatch');
 
     // The prior cycle's row (which carries a run_id via its event log) links
-    // to that run — the Run column shows the (truncated) run id.
-    const priorRunLink = screen.getByRole('link', { name: /run-old-/ });
+    // to that run. CyclesTab declares no `subject` column, so SortableTable's
+    // one-accessible-link-per-row rule (I7) falls back to the first column
+    // (Cycle) as the row's sole focusable/announced link; the Run cell's own
+    // link is present for mouse clicks only (aria-hidden + tabIndex=-1).
+    const priorRunLink = screen.getByRole('link', { name: /afc_ctx_old/ });
     expect(priorRunLink).toHaveAttribute('href', '/runs/run-old-1');
   });
 

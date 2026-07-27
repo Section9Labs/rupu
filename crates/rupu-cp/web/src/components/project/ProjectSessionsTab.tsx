@@ -10,13 +10,20 @@
 // Ported from pages/ProjectSessions.tsx, reshaped into a self-contained
 // component keyed off the `wsId` prop. Rows render via the shared SortableTable.
 //
+// Column order + status glyph match the canonical run-table standard
+// (`docs/superpowers/plans/2026-07-24-rupu-cp-table-standardization.md`
+// Task 3) — see `pages/Sessions.tsx`'s header comment for the full rationale.
+// `SessionStatusPill` is handed the raw wire value directly and does its own
+// exact-match-or-neutral-fallback (never coerces an unrecognized status onto
+// a real state).
+//
 // Find (parity with Sessions' 2026-07-23 amendment): a `SearchInput` in the
 // FilterBar's search slot narrows the loaded rows client-side, live per
 // keystroke, over agent name / session id — composing with (not replacing)
 // the Scope pill above it.
 
 import { useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { MessageSquare } from 'lucide-react';
 import { api, type SessionSummary } from '../../lib/api';
 import SortableTable, { type Column } from '../lists/SortableTable';
@@ -27,12 +34,12 @@ import { SearchInput } from '../ui/SearchInput';
 import { EmptyState } from '../ui/EmptyState';
 import { ErrorBanner } from '../ui/ErrorBanner';
 import { Spinner } from '../ui/Spinner';
+import { SessionStatusPill } from '../StatusPill';
 import { usePagedList } from '../../lib/usePagedList';
-import { durationBetween } from '../../lib/time';
+import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
-import { sessionStatusDot, sessionStatusLabel, sessionStatusTone } from '../../lib/sessionStatus';
+import { sessionStatusDisplayLabel, sessionStatusTone } from '../../lib/sessionStatus';
 import { shortId } from '../../lib/shortId';
-import { cn } from '../../lib/cn';
 
 // --- Scope filter -----------------------------------------------------------
 
@@ -64,19 +71,18 @@ function sessionDurationMs(s: SessionSummary): number | null {
   return Math.max(0, end - start);
 }
 
-const SESSION_COLUMNS: Column<SessionSummary>[] = [
+/** Build the session columns. Recreated whenever `navigate` changes (it's a
+ *  stable react-router identity, so effectively once). */
+function buildSessionColumns(navigate: ReturnType<typeof useNavigate>): Column<SessionSummary>[] {
+  return [
   {
     key: 'status',
     header: 'Status',
     fit: true,
     sortable: true,
-    sortValue: (s) => sessionStatusLabel(s.status),
-    render: (s) => (
-      <span className="flex items-center gap-1.5">
-        <span className={cn('inline-block w-2 h-2 rounded-full', sessionStatusDot(s.status))} />
-        <span className="text-note text-ink-dim">{sessionStatusLabel(s.status)}</span>
-      </span>
-    ),
+    // Sort on the label actually displayed (M3) — not the raw wire string.
+    sortValue: (s) => sessionStatusDisplayLabel(s.status),
+    render: (s) => <SessionStatusPill status={s.status} />,
   },
   {
     key: 'agent',
@@ -91,13 +97,11 @@ const SESSION_COLUMNS: Column<SessionSummary>[] = [
     key: 'session',
     header: 'Session',
     fit: true,
+    // Plain content — row-level navigation is `rowHref` (SortableTable
+    // link-wraps the whole row); an inline <Link> here would nest an <a>
+    // inside SortableTable's own <a>.
     render: (s) => (
-      <Link
-        to={`/sessions/${encodeURIComponent(s.session_id)}`}
-        className="text-note text-ink-mute font-mono hover:underline"
-      >
-        {shortId(s.session_id, 10)}
-      </Link>
+      <span className="text-note text-ink-mute font-mono">{shortId(s.session_id, 10)}</span>
     ),
   },
   {
@@ -176,24 +180,47 @@ const SESSION_COLUMNS: Column<SessionSummary>[] = [
     ),
   },
   {
+    key: 'started',
+    header: 'Started',
+    align: 'right',
+    fit: true,
+    sortable: true,
+    sortValue: (s) => (s.created_at ? Date.parse(s.created_at) : null),
+    render: (s) => <span className="text-ink-mute">{relativeTime(s.created_at)}</span>,
+  },
+  {
     key: 'action',
     header: '',
     fit: true,
     align: 'right',
+    // Its own real button (Open live) when present — keep it independently
+    // focusable/announced (I7) rather than swallowed by the row link.
+    interactive: true,
     render: (s) =>
       s.active_run_id ? (
-        <Link
-          to={`/runs/${encodeURIComponent(s.active_run_id)}`}
+        <button
+          type="button"
+          onClick={(e) => {
+            // The row is now link-wrapped (rowHref) — without both of
+            // these, this click either soft- or hard-navigates to the
+            // session instead of the run (stopPropagation alone does not
+            // block the enclosing <a>'s native default navigation action).
+            e.preventDefault();
+            e.stopPropagation();
+            navigate(`/runs/${encodeURIComponent(s.active_run_id!)}`);
+          }}
           className="inline-flex items-center rounded px-2 py-0.5 text-note font-medium ring-1 bg-info-bg text-info ring-info/30 hover:bg-info-bg"
-          onClick={(e) => e.stopPropagation()}
         >
           active run
-        </Link>
+        </button>
       ) : null,
   },
-];
+  ];
+}
 
 export default function ProjectSessionsTab({ wsId }: { wsId: string }) {
+  const navigate = useNavigate();
+  const sessionColumns = buildSessionColumns(navigate);
   const [scope, setScope] = useState<ScopeFilter>('all');
   const [query, setQuery] = useState('');
 
@@ -276,9 +303,10 @@ export default function ProjectSessionsTab({ wsId }: { wsId: string }) {
               source order already satisfies the default. Headers re-sort
               client-side. */}
           <SortableTable<SessionSummary>
-            columns={SESSION_COLUMNS}
+            columns={sessionColumns}
             rows={visible}
             rowKey={(s) => s.session_id}
+            rowHref={(s) => `/sessions/${encodeURIComponent(s.session_id)}`}
           />
         </div>
       )}

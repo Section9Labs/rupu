@@ -7,10 +7,15 @@
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { api } from '../../lib/api';
 import type { AgentRunRow, HostView } from '../../lib/api';
 import AgentRuns from './AgentRuns';
+
+function LocationProbe() {
+  const loc = useLocation();
+  return <div data-testid="loc">{loc.pathname + loc.search}</div>;
+}
 
 afterEach(() => {
   cleanup();
@@ -222,8 +227,13 @@ describe('AgentRuns — agent subject cell', () => {
 
     await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
     expect(screen.getByText('session_turn')).toBeInTheDocument();
-    const sessionLink = screen.getByRole('link', { name: /sess-01h/i });
-    expect(sessionLink).toHaveAttribute('href', `/sessions/${encodeURIComponent(SESSION_ROW.session_id!)}`);
+    // Operator decision (table-standardization Task 4): the row itself
+    // navigates to the transcript/workflow view, so this competing
+    // destination is an explicit inner control (a button that navigates
+    // programmatically), never a nested <a> — see the "row navigation"
+    // describe block below for the navigation assertion.
+    const sessionControl = screen.getByRole('button', { name: /sess-01h/i });
+    expect(sessionControl).toBeInTheDocument();
   });
 
   it('truncates the agent name cell with a title tooltip', async () => {
@@ -466,5 +476,129 @@ describe('AgentRuns — Find', () => {
 
     await waitFor(() => expect(screen.queryByText('fix-bug')).not.toBeInTheDocument());
     expect(screen.queryByText('review-pr')).not.toBeInTheDocument();
+  });
+});
+
+// ── Task 4 (table-standardization plan) — operator decision: row click goes
+// to the transcript/workflow view; the session link is an explicit inner
+// control that must not trigger row navigation ─────────────────────────────
+
+describe('AgentRuns — whole-row navigation (rowHref) goes to the transcript view', () => {
+  const ROW_WITH_TRANSCRIPT: AgentRunRow = {
+    ...REMOTE_ROW,
+    run_id: 'run-transcript-1',
+    transcript_path: '/rupu/agents/fix-bug/transcripts/run-transcript-1.jsonl',
+    status: 'completed',
+  };
+
+  it('renders the row as a link to the transcript view when transcript_path is present', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([ROW_WITH_TRANSCRIPT]);
+
+    render(
+      <MemoryRouter>
+        <AgentRuns />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    const link = screen.getByText('fix-bug').closest('a');
+    // REMOTE_ROW's host_id ('host_prod') isn't local, so &host= is appended
+    // (parity with the pre-existing usage-chart `to` computation).
+    expect(link).toHaveAttribute(
+      'href',
+      `/transcript?path=${encodeURIComponent(ROW_WITH_TRANSCRIPT.transcript_path!)}&live=0&host=host_prod`,
+    );
+  });
+
+  it('a row WITH transcript_path keeps the row-hover affordance', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([ROW_WITH_TRANSCRIPT]);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    const tr = screen.getByText('fix-bug').closest('tr')!;
+    expect(tr.className).toMatch(/hover:bg-bg/);
+  });
+
+  it('the Run id cell no longer carries its own duplicate link to the same destination', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([ROW_WITH_TRANSCRIPT]);
+
+    renderPage();
+
+    const idCell = await screen.findByText(/run-tran/);
+    expect(idCell.tagName).not.toBe('A');
+  });
+
+  it('a row with no transcript_path renders no row link at all', async () => {
+    stubDeps();
+    const noTranscript: AgentRunRow = { ...REMOTE_ROW, transcript_path: null };
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([noTranscript]);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    expect(screen.getByText('fix-bug').closest('a')).toBeNull();
+  });
+
+  // M5 (whole-branch-review): a dead (unlinked) row must not still show the
+  // hover highlight that implies it's clickable — see SortableTable.tsx's
+  // `isDeadLinkRow`.
+  it("a row with no transcript_path does not carry the row-hover affordance", async () => {
+    stubDeps();
+    const noTranscript: AgentRunRow = { ...REMOTE_ROW, transcript_path: null };
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([noTranscript]);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    const tr = screen.getByText('fix-bug').closest('tr')!;
+    expect(tr.className).not.toMatch(/hover:bg-bg/);
+  });
+
+  it('clicking the inner session control navigates to the session, not the row transcript destination', async () => {
+    stubDeps();
+    const sessionRowWithTranscript: AgentRunRow = {
+      ...SESSION_ROW,
+      transcript_path: '/rupu/agents/review-pr/transcripts/run-def456.jsonl',
+    };
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([sessionRowWithTranscript]);
+
+    render(
+      <MemoryRouter>
+        <AgentRuns />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
+    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: /sess-01h/i }));
+
+    expect(screen.getByTestId('loc')).toHaveTextContent(
+      `/sessions/${encodeURIComponent(sessionRowWithTranscript.session_id!)}`,
+    );
+  });
+});
+
+// ── Table standardization Task 3: Turns before Duration, matching Sessions ──
+
+describe('AgentRuns — Turns/Duration column order (table-standardization Task 3)', () => {
+  it('Turns precedes Duration in the header row (matches the canonical Sessions order)', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW]);
+
+    const { container } = renderPage();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    const headers = Array.from(container.querySelectorAll('thead th')).map(
+      (th) => th.textContent?.trim() ?? '',
+    );
+    const turnsIdx = headers.indexOf('Turns');
+    const durationIdx = headers.indexOf('Duration');
+    expect(turnsIdx).toBeGreaterThanOrEqual(0);
+    expect(durationIdx).toBeGreaterThan(turnsIdx);
   });
 });

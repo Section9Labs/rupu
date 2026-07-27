@@ -7,6 +7,9 @@ import { api, type AutoflowDefRow } from '../lib/api';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { Button } from '../components/ui/Button';
+import { EmptyState } from '../components/ui/EmptyState';
+import { ErrorBanner } from '../components/ui/ErrorBanner';
+import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
 import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
@@ -29,27 +32,38 @@ function TriggerChip({ trigger }: { trigger: string }) {
 
 // Autoflows are workflows with `autoflow.enabled`, so they reuse the workflow
 // detail page — keyed by file stem (`slug`), not the parsed display name.
+//
+// Column order follows the definition-table canonical standard
+// (`docs/superpowers/plans/2026-07-24-rupu-cp-table-standardization.md`
+// Task 5) applied to the fields `AutoflowDefRow` actually carries: Name
+// (the one flexible/truncating `subject` column) → Scope → Trigger. There is
+// no Runs/Tokens/Cost/Last-run data on this row type — those columns are not
+// fabricated (see the plan's "Out of scope" note).
 const DEF_COLUMNS: Column<AutoflowDefRow>[] = [
   {
     key: 'name',
     header: 'Name',
+    subject: true,
     sortable: true,
     sortValue: (d) => d.name,
-    render: (d) => <span className="text-sm font-medium text-ink truncate">{d.name}</span>,
-  },
-  {
-    key: 'trigger',
-    header: 'Trigger',
-    sortable: true,
-    sortValue: (d) => d.trigger,
-    render: (d) => <TriggerChip trigger={d.trigger} />,
+    titleValue: (d) => d.name,
+    render: (d) => <span className="text-sm font-medium text-ink">{d.name}</span>,
   },
   {
     key: 'scope',
     header: 'Scope',
+    fit: true,
     sortable: true,
     sortValue: (d) => d.scope,
     render: (d) => <ScopeChip scope={d.scope} />,
+  },
+  {
+    key: 'trigger',
+    header: 'Trigger',
+    fit: true,
+    sortable: true,
+    sortValue: (d) => d.trigger,
+    render: (d) => <TriggerChip trigger={d.trigger} />,
   },
 ];
 
@@ -96,16 +110,18 @@ export default function AutoflowsDefs() {
         </Button>
       </header>
 
-      {error && (
-        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {error}
-        </div>
-      )}
+      {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
       {defs === null ? (
-        <div className="text-sm text-ink-dim">Loading autoflow definitions…</div>
+        <div className="py-16 flex items-center justify-center">
+          <Spinner label="Loading autoflow definitions…" />
+        </div>
       ) : defs.length === 0 ? (
-        <AutoflowsEmpty />
+        <EmptyState
+          icon={<Inbox size={20} />}
+          title="No autoflow-enabled workflows"
+          hint="Workflows with autoflow triggers configured will appear here."
+        />
       ) : (
         <section>
           <SectionHeader tone="muted" label="Autoflow Workflows" count={defs.length} />
@@ -123,20 +139,6 @@ export default function AutoflowsDefs() {
           )}
         </section>
       )}
-    </div>
-  );
-}
-
-function AutoflowsEmpty() {
-  return (
-    <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
-        <Inbox size={20} className="text-ink-mute" />
-      </div>
-      <h2 className="text-sm font-medium text-ink">No autoflow-enabled workflows</h2>
-      <p className="mt-1 text-xs text-ink-dim max-w-xs">
-        Workflows with autoflow triggers configured will appear here.
-      </p>
     </div>
   );
 }

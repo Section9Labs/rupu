@@ -171,6 +171,18 @@ struct AutoflowEventRow {
     status: Option<String>,
     worker_name: Option<String>,
     usage: crate::usage::UsageSummary,
+    /// LLM turn count for the row's linked run (see
+    /// `crate::usage::run_metrics`), when `run_id` is present and its
+    /// transcripts are readable. `None` — NOT a fabricated `0` — when there
+    /// is no linked run to measure (e.g. `awaiting_human` / `cycle_failed`
+    /// events carry no `run_id`). Additive/optional, same as `detail` below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turns: Option<u64>,
+    /// Wall-clock duration in ms from the linked run's `RunComplete` event.
+    /// `None` when there's no linked run, or the run hasn't reached
+    /// `RunComplete` yet (still in flight). Additive/optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
     /// The on-disk event's `detail` field (the failure/error text for
     /// `cycle_failed` events). Additive/optional — omitted from the wire
     /// payload when absent so older clients see no shape change.
@@ -955,6 +967,8 @@ async fn list_autoflow_events(
             status: rec.event.status,
             worker_name: rec.worker_name,
             usage: crate::usage::UsageSummary::default(),
+            turns: None,
+            duration_ms: None,
             detail: rec.event.detail,
             host_id: None,
         })
@@ -966,7 +980,10 @@ async fn list_autoflow_events(
         for row in &mut page_rows {
             row.host_id = Some("local".to_string());
             if let Some(id) = &row.run_id {
-                row.usage = crate::usage::summarize_run(&s.run_store, id, &s.pricing);
+                let metrics = crate::usage::run_metrics(&s.run_store, id, &s.pricing);
+                row.usage = metrics.usage;
+                row.turns = Some(metrics.turns);
+                row.duration_ms = metrics.duration_ms;
             }
         }
         return Ok(Json(
@@ -996,16 +1013,16 @@ async fn list_autoflow_events(
 
     let mut page_values = crate::pagination::paginate(all_values, &q.page());
 
-    // Fill usage for local rows on this page (remote rows already have it)
+    // Fill usage/turns/duration for local rows on this page (remote rows
+    // already have them, filled by the remote host's own local branch above).
     for row in &mut page_values {
         if row["host_id"].as_str() == Some("local") {
-            if let Some(run_id) = row["run_id"].as_str() {
-                row["usage"] = serde_json::to_value(crate::usage::summarize_run(
-                    &s.run_store,
-                    run_id,
-                    &s.pricing,
-                ))
-                .unwrap();
+            let run_id = row["run_id"].as_str().map(|s| s.to_string());
+            if let Some(run_id) = run_id {
+                let metrics = crate::usage::run_metrics(&s.run_store, &run_id, &s.pricing);
+                row["usage"] = serde_json::to_value(&metrics.usage).unwrap();
+                row["turns"] = serde_json::to_value(metrics.turns).unwrap();
+                row["duration_ms"] = serde_json::to_value(metrics.duration_ms).unwrap();
             }
         }
     }
@@ -1461,6 +1478,8 @@ mod tests {
             status: rec.event.status.clone(),
             worker_name: rec.worker_name.clone(),
             usage: crate::usage::UsageSummary::default(),
+            turns: None,
+            duration_ms: None,
             detail: rec.event.detail.clone(),
             host_id: None,
         };
@@ -1499,11 +1518,201 @@ mod tests {
             status: rec.event.status.clone(),
             worker_name: rec.worker_name.clone(),
             usage: crate::usage::UsageSummary::default(),
+            turns: None,
+            duration_ms: None,
             detail: rec.event.detail.clone(),
             host_id: None,
         };
         let s = serde_json::to_string(&row).unwrap();
         assert!(!s.contains("\"detail\""));
         assert_eq!(row.run_id.as_deref(), Some("run_x"));
+    }
+
+    // ── turns / duration_ms: real source, not fabricated ───────────────────
+
+    /// Seed a completed `RunRecord` whose single step's transcript carries
+    /// two `Usage` events (→ `turns == 2`) and a `RunComplete` event with
+    /// `duration_ms`. Mirrors `api::agents::tests::seed_run_with_agent_usage`
+    /// (same run-store + step-result-record wiring), extended with the extra
+    /// transcript events `run_metrics` needs.
+    fn seed_completed_run_with_metrics(s: &AppState, run_id: &str, transcript_path: &std::path::Path) {
+        let record = rupu_orchestrator::RunRecord {
+            id: run_id.into(),
+            workflow_name: "wf".into(),
+            status: rupu_orchestrator::RunStatus::Completed,
+            inputs: std::collections::BTreeMap::new(),
+            event: None,
+            workspace_id: "ws1".into(),
+            workspace_path: std::path::PathBuf::from("/tmp/proj"),
+            transcript_dir: std::path::PathBuf::from("/tmp/proj/.rupu/transcripts"),
+            started_at: Utc::now(),
+            finished_at: None,
+            error_message: None,
+            awaiting: Vec::new(),
+            awaiting_step_id: None,
+            approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            resume_gate_id: None,
+            final_output: None,
+            loop_progress: Default::default(),
+        };
+        s.run_store.create(record, "name: wf\n").unwrap();
+
+        std::fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+        let events = [
+            rupu_transcript::Event::RunStart {
+                run_id: run_id.into(),
+                workspace_id: "ws1".into(),
+                agent: "triage".into(),
+                provider: "anthropic".into(),
+                model: "claude-opus-4-8".into(),
+                started_at: Utc::now(),
+                mode: rupu_transcript::RunMode::Ask,
+            },
+            rupu_transcript::Event::Usage {
+                provider: "anthropic".into(),
+                model: "claude-opus-4-8".into(),
+                served_model: None,
+                input_tokens: 100,
+                output_tokens: 50,
+                cached_tokens: 0,
+            },
+            rupu_transcript::Event::Usage {
+                provider: "anthropic".into(),
+                model: "claude-opus-4-8".into(),
+                served_model: None,
+                input_tokens: 20,
+                output_tokens: 10,
+                cached_tokens: 0,
+            },
+            rupu_transcript::Event::RunComplete {
+                run_id: run_id.into(),
+                status: rupu_transcript::RunStatus::Ok,
+                total_tokens: 180,
+                duration_ms: 4200,
+                error: None,
+            },
+        ];
+        let mut buf = Vec::new();
+        for ev in &events {
+            buf.extend(serde_json::to_vec(ev).unwrap());
+            buf.push(b'\n');
+        }
+        std::fs::write(transcript_path, &buf).unwrap();
+
+        s.run_store
+            .append_step_result(
+                run_id,
+                &rupu_orchestrator::runs::StepResultRecord {
+                    step_id: "s1".into(),
+                    run_id: run_id.into(),
+                    transcript_path: transcript_path.to_path_buf(),
+                    output: String::new(),
+                    success: true,
+                    skipped: false,
+                    rendered_prompt: String::new(),
+                    kind: rupu_orchestrator::runs::StepKind::Linear,
+                    items: vec![],
+                    findings: vec![],
+                    iterations: 0,
+                    resolved: true,
+                    finished_at: Utc::now(),
+                    loop_iteration: None,
+                },
+            )
+            .unwrap();
+    }
+
+    /// `list_autoflow_events` must surface `turns`/`duration_ms` for an event
+    /// that links to a real run (computed from that run's own transcripts —
+    /// never fabricated), and leave both `None` for an event with no
+    /// `run_id` to measure at all.
+    #[tokio::test]
+    async fn list_autoflow_events_surfaces_real_turns_and_duration_for_linked_run() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = crate::state::AppState::new(tmp.path().to_path_buf(), rupu_config::PricingConfig::default());
+
+        seed_completed_run_with_metrics(&s, "run_1", &tmp.path().join("t1.jsonl"));
+
+        let history = AutoflowHistoryStore::new(s.global_dir.join("autoflows").join("history"));
+        let cycle = AutoflowCycleRecord::new(AutoflowCycleMode::Tick, Utc::now());
+
+        // A launched run — has a run_id, so turns/duration_ms must be real.
+        history
+            .append_cycle_event(
+                &cycle,
+                AutoflowCycleEvent {
+                    kind: AutoflowCycleEventKind::RunLaunched,
+                    run_id: Some("run_1".into()),
+                    ..Default::default()
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        // An awaiting-human event — no run_id, so nothing to measure.
+        history
+            .append_cycle_event(
+                &cycle,
+                AutoflowCycleEvent {
+                    kind: AutoflowCycleEventKind::AwaitingHuman,
+                    ..Default::default()
+                },
+                Utc::now(),
+            )
+            .unwrap();
+
+        let Json(rows) = list_autoflow_events(
+            State(s),
+            Query(AutoflowEventsQuery {
+                offset: None,
+                limit: None,
+                host: Some("local".into()),
+            }),
+        )
+        .await
+        .expect("ok");
+
+        let launched = rows
+            .iter()
+            .find(|r| r["kind"] == serde_json::json!("run_launched"))
+            .expect("run_launched row present");
+        assert_eq!(
+            launched["turns"],
+            serde_json::json!(2),
+            "2 Usage events in the linked run's transcript"
+        );
+        assert_eq!(
+            launched["duration_ms"],
+            serde_json::json!(4200),
+            "duration_ms comes straight from the run's RunComplete event"
+        );
+
+        let awaiting = rows
+            .iter()
+            .find(|r| r["kind"] == serde_json::json!("awaiting_human"))
+            .expect("awaiting_human row present");
+        assert_eq!(
+            awaiting["turns"],
+            serde_json::Value::Null,
+            "no run_id to measure — must stay None, not a fabricated 0"
+        );
+        assert_eq!(awaiting["duration_ms"], serde_json::Value::Null);
     }
 }

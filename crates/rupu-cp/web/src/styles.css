@@ -245,6 +245,16 @@
 }
 .rg-loop-spin { animation: rg-loop-spin 2.4s linear infinite; display: inline-block; }
 
+/* Bug fix (Task 2): `.rg-pulse-run`/`.rg-pulse-await`/`.rg-loop-spin` had no
+ * `prefers-reduced-motion` guard — unlike `.react-flow__edge-path` below
+ * (~line 574), which already turns its own `rg-march` animation off. These
+ * three now also drive the shared StatusPill/SessionStatusPill motion (see
+ * `lib/status.ts#statusMotionClass`), so the gap covered every run-graph node
+ * card AND every status pill on Sessions/WorkflowRuns/AgentRuns/AutoflowRuns. */
+@media (prefers-reduced-motion: reduce) {
+  .rg-pulse-run, .rg-pulse-await, .rg-loop-spin { animation: none !important; }
+}
+
 /* ------------------------------------------------------------------ */
 /* xyflow chrome on dark — the vendored `@xyflow/react/dist/style.css` */
 /* paints controls / minimap / edges / attribution with its own LIGHT  */

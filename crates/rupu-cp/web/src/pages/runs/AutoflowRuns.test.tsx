@@ -217,7 +217,10 @@ describe('AutoflowRuns host filter — server-driven (runs + cycles tabs)', () =
 
     renderPage();
 
-    const link = await screen.findByRole('link', { name: /run-9/ });
+    // Only the subject cell (Workflow) is the accessible/focusable link now
+    // (I7 a11y fix — one Tab stop per row); the Run id cell's link is
+    // present for mouse clicks only.
+    const link = await screen.findByRole('link', { name: 'fix-issue' });
     expect(link).toHaveAttribute('href', '/runs/run-9');
   });
 
@@ -238,11 +241,13 @@ describe('AutoflowRuns host filter — server-driven (runs + cycles tabs)', () =
 
     renderPage();
 
-    const link = await screen.findByRole('link', { name: /run-10/ });
+    // Only the subject cell (Workflow) is the accessible/focusable link now
+    // (I7 a11y fix).
+    const link = await screen.findByRole('link', { name: 'fix-issue' });
     expect(link).toHaveAttribute('href', '/runs/run-10?host=host_prod');
   });
 
-  it('the whole row is clickable, not just the Run/Workflow cells — a plain cell (Host) is also link-wrapped to the same /runs/:id', async () => {
+  it('the whole row is clickable, not just the subject cell — a plain cell (Host) is also link-wrapped to the same /runs/:id (mouse-only, per I7)', async () => {
     const eventWithRun: AutoflowEventRow = {
       event_id: 'evt-4',
       cycle_id: 'cyc-4',
@@ -261,9 +266,14 @@ describe('AutoflowRuns host filter — server-driven (runs + cycles tabs)', () =
     // The Host cell has no special link handling of its own (it's a plain
     // `<span>local</span>`) — SortableTable's rowHref wraps EVERY cell of a
     // non-expandable row, so this proves the whole row is link-wrapped, not
-    // just cells that happen to render their own navigation.
-    const link = await screen.findByRole('link', { name: 'local' });
-    expect(link).toHaveAttribute('href', '/runs/run-11');
+    // just cells that happen to render their own navigation. It's mouse-only
+    // (I7 a11y fix: aria-hidden + tabIndex=-1) since it isn't the subject
+    // cell, so it's queried directly rather than via accessible role.
+    const hostCell = await screen.findByText('local');
+    const hostLink = hostCell.closest('a');
+    expect(hostLink).toHaveAttribute('href', '/runs/run-11');
+    expect(hostLink).toHaveAttribute('aria-hidden', 'true');
+    expect(hostLink).toHaveAttribute('tabindex', '-1');
   });
 
   it('Runs is the default/primary tab (rendered without clicking a tab)', async () => {
@@ -479,9 +489,11 @@ describe('AutoflowRuns — Event column (cycle_failed detail + issue ref fallbac
     expect(screen.getByText('120')).toBeInTheDocument();
 
     // No `detail` on this event → the row is NOT expandable (no chevron);
-    // it falls through to rowHref's per-row link-wrapping instead.
+    // it falls through to rowHref's per-row link-wrapping instead. Only the
+    // subject cell (Workflow) is the accessible/focusable link now (I7 a11y
+    // fix) — every other cell's link is present for mouse clicks only.
     expect(screen.queryByLabelText('Expand row')).not.toBeInTheDocument();
-    const link = await screen.findByRole('link', { name: 'Running' });
+    const link = await screen.findByRole('link', { name: 'fix-issue' });
     expect(link).toHaveAttribute('href', '/runs/run-77');
   });
 

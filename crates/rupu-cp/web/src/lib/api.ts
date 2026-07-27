@@ -446,6 +446,13 @@ export interface AutoflowEventRow {
   status?: string | null;
   worker_name?: string | null;
   usage: UsageSummary;
+  /** Turn count for the launched run. `null`/absent for non-run events
+   *  (awaiting/failed signals have no turns) and on older server versions —
+   *  never fabricate a `0`. */
+  turns?: number | null;
+  /** Run duration in milliseconds. `null`/absent for non-run events and on
+   *  older server versions — never fabricate a `0`. */
+  duration_ms?: number | null;
   /** Failure/error text for `cycle_failed` events. Absent for every other
    *  kind (and on older server versions). */
   detail?: string | null;
@@ -825,6 +832,16 @@ export interface AgentSummary {
   scope: string;
   usage: UsageSummary;
   run_count: number;
+  /** ISO-8601 timestamp of the agent's most recent run; `null`/absent when
+   *  the agent has never run. Same name/shape as `WorkflowSummary.last_run`
+   *  but NOT the same derivation: `WorkflowSummary.last_run` counts every
+   *  run structurally (keyed by `workflow_name`, transcripts irrelevant),
+   *  while this counts only runs whose transcripts are readable AND contain
+   *  a Usage event naming this agent. A run that died before its first LLM
+   *  call, or whose transcripts were pruned or live on an unreachable
+   *  remote host, shows `null` here ("never ran") even though the
+   *  equivalent workflow row would show a timestamp. */
+  last_run?: string | null;
 }
 
 export interface AgentDetail extends AgentSummary {

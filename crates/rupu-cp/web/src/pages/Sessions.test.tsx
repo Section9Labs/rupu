@@ -7,10 +7,15 @@
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { api } from '../lib/api';
 import type { SessionSummary, HostView } from '../lib/api';
 import Sessions from './Sessions';
+
+function LocationProbe() {
+  const loc = useLocation();
+  return <div data-testid="loc">{loc.pathname + loc.search}</div>;
+}
 
 afterEach(() => {
   cleanup();
@@ -258,6 +263,138 @@ describe('Sessions — kit loading/empty/error states', () => {
     renderPage();
 
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('network down'));
+  });
+});
+
+// ── Task 3 (2026-07-24 table-standardization plan): canonical column order,
+// the shared SessionStatusPill, and the new Started column ────────────────
+
+describe('Sessions — canonical run-table column order', () => {
+  it('renders headers in the canonical order: Status, Agent, Session, Host, Model, In, Out, Cached, Cost, Turns, Duration, Started, (actions)', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION]);
+
+    const { container } = renderPage();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    const headers = Array.from(container.querySelectorAll('thead th')).map(
+      (th) => th.textContent?.trim() ?? '',
+    );
+    expect(headers).toEqual([
+      'Status',
+      'Agent',
+      'Session',
+      'Host',
+      'Model',
+      'In',
+      'Out',
+      'Cached',
+      'Cost',
+      'Turns',
+      'Duration',
+      'Started',
+      '',
+    ]);
+  });
+
+  it('renders a Started cell with relativeTime(created_at)', async () => {
+    // Real timers throughout — usePagedList's polling + testing-library's
+    // waitFor both rely on real timers, so fake system time would hang them.
+    // Instead pin `created_at` a known 3 minutes before the real "now".
+    const threeMinAgo = new Date(Date.now() - 3 * 60_000).toISOString();
+    stubDeps();
+    vi.spyOn(api, 'getSessions').mockResolvedValue([
+      { ...REMOTE_SESSION, created_at: threeMinAgo },
+    ]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    expect(screen.getByText('3m ago')).toBeInTheDocument();
+  });
+});
+
+describe('Sessions — status cell uses the shared SessionStatusPill', () => {
+  it('a "running"-like status renders the shared pill with the motion marker', async () => {
+    stubDeps();
+    // rupu-cli's raw session status ("active") is not one of the four
+    // canonical values (idle|running|failed|stopped) — this also exercises
+    // the coercion path (sessionStatusTone maps "active" -> "running").
+    vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    const pill = screen.getByText('Running');
+    expect(pill).toHaveAttribute('data-motion', 'rg-pulse-run');
+  });
+
+  it('an unknown/garbage status value renders the RAW label, not a fabricated real state', async () => {
+    stubDeps();
+    const garbageSession: SessionSummary = { ...REMOTE_SESSION, status: 'zzz-not-a-real-status' };
+    vi.spyOn(api, 'getSessions').mockResolvedValue([garbageSession]);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    // Never coerced onto "Stopped" (or any of the four real states) — the raw
+    // wire value renders as-is, honestly reporting that the status is unknown.
+    const pill = screen.getByText('zzz-not-a-real-status');
+    expect(pill).toBeInTheDocument();
+    expect(pill).not.toHaveAttribute('data-motion', 'rg-pulse-run');
+    expect(screen.queryByText('Stopped')).toBeNull();
+  });
+});
+
+// ── Task 4 (table-standardization plan): whole-row navigation ──────────────
+
+describe('Sessions — whole-row navigation (rowHref)', () => {
+  it('renders each row as a link to /sessions/:id (with ?host= for a remote session)', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    const link = screen.getByText('fix-bug').closest('a');
+    expect(link).toHaveAttribute('href', `/sessions/${REMOTE_SESSION.session_id}?host=host_prod`);
+  });
+
+  it('clicking Archive does not navigate the row', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION]);
+    vi.spyOn(api, 'archiveSession').mockResolvedValue(undefined);
+
+    render(
+      <MemoryRouter>
+        <Sessions />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText(`Archive session ${REMOTE_SESSION.session_id}`));
+
+    expect(vi.mocked(api.archiveSession)).toHaveBeenCalledWith(REMOTE_SESSION.session_id);
+    expect(screen.getByTestId('loc')).toHaveTextContent('/');
+  });
+
+  it('clicking "active run" navigates to the run, not the session row', async () => {
+    stubDeps();
+    const withActiveRun: SessionSummary = { ...REMOTE_SESSION, active_run_id: 'run-xyz' };
+    vi.spyOn(api, 'getSessions').mockResolvedValue([withActiveRun]);
+
+    render(
+      <MemoryRouter>
+        <Sessions />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText('active run'));
+
+    expect(screen.getByTestId('loc')).toHaveTextContent('/runs/run-xyz');
   });
 });
 

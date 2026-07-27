@@ -85,6 +85,14 @@ function runDurationMs(run: RunListRow): number | null {
 
 const RUN_COLUMNS: Column<RunListRow>[] = [
   {
+    key: 'status',
+    header: 'Status',
+    fit: true,
+    sortable: true,
+    sortValue: (r) => r.status,
+    render: (r) => <StatusPill status={r.status} />,
+  },
+  {
     key: 'workflow',
     header: 'Workflow',
     subject: true,
@@ -106,14 +114,6 @@ const RUN_COLUMNS: Column<RunListRow>[] = [
     sortable: true,
     sortValue: (r) => r.trigger,
     render: (r) => <TriggerChip trigger={r.trigger} />,
-  },
-  {
-    key: 'status',
-    header: 'Status',
-    fit: true,
-    sortable: true,
-    sortValue: (r) => r.status,
-    render: (r) => <StatusPill status={r.status} />,
   },
   {
     key: 'in',
@@ -157,6 +157,15 @@ const RUN_COLUMNS: Column<RunListRow>[] = [
     render: (r) => <span className="text-ink font-medium">{formatCost(r.usage.cost_usd)}</span>,
   },
   {
+    key: 'turns',
+    header: 'Turns',
+    align: 'right',
+    fit: true,
+    sortable: true,
+    sortValue: (r) => r.turns,
+    render: (r) => <span className="text-ink">{r.turns ? String(r.turns) : '—'}</span>,
+  },
+  {
     key: 'duration',
     header: 'Duration',
     align: 'right',
@@ -170,15 +179,6 @@ const RUN_COLUMNS: Column<RunListRow>[] = [
           : durationBetween(r.started_at, r.finished_at)}
       </span>
     ),
-  },
-  {
-    key: 'turns',
-    header: 'Turns',
-    align: 'right',
-    fit: true,
-    sortable: true,
-    sortValue: (r) => r.turns,
-    render: (r) => <span className="text-ink">{r.turns ? String(r.turns) : '—'}</span>,
   },
   {
     key: 'started',

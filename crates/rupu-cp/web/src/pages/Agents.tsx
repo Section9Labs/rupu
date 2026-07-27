@@ -15,6 +15,7 @@ import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
 import { formatTokens, formatCost } from '../lib/usage';
+import { relativeTime } from '../lib/time';
 import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 import { useAgentAuthoringUi } from '../hooks/useAgentAuthoringUi';
@@ -373,6 +374,17 @@ const AGENT_COLUMNS: Column<AgentSummary>[] = [
     sortValue: (a) => a.usage?.cost_usd ?? null,
     render: (a) => (
       <span className="text-ink font-medium">{a.usage ? formatCost(a.usage.cost_usd) : '—'}</span>
+    ),
+  },
+  {
+    key: 'last_run',
+    header: 'Last run',
+    align: 'right',
+    fit: true,
+    sortable: true,
+    sortValue: (a) => (a.last_run ? Date.parse(a.last_run) : null),
+    render: (a) => (
+      <span className="text-ink-mute">{a.last_run ? relativeTime(a.last_run) : '—'}</span>
     ),
   },
 ];

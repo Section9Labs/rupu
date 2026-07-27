@@ -28,36 +28,50 @@ const TRANSPORT_LABEL: Record<HostTransportKind, string> = {
 // Run columns (minimal — matches WorkflowRuns column shape)
 // ---------------------------------------------------------------------------
 
+/** Build the detail link for a run on this host, including ?host= when the
+ *  run's own host_id isn't local (mirrors WorkflowRuns.tsx's `runHref`). */
+function runHref(r: RunListRow): string {
+  const hid = r.host_id;
+  if (hid && hid !== 'local') {
+    return `/runs/${encodeURIComponent(r.id)}?host=${encodeURIComponent(hid)}`;
+  }
+  return `/runs/${encodeURIComponent(r.id)}`;
+}
+
 const RUN_COLUMNS: Column<RunListRow>[] = [
-  {
-    key: 'id',
-    header: 'Run',
-    render: (r) => (
-      <Link
-        to={`/runs/${encodeURIComponent(r.id)}`}
-        className="text-sm font-mono text-brand-600 hover:text-brand-700 hover:underline"
-      >
-        {r.id.slice(0, 10)}…
-      </Link>
-    ),
-  },
-  {
-    key: 'workflow',
-    header: 'Workflow',
-    sortable: true,
-    sortValue: (r) => r.workflow_name,
-    render: (r) => <span className="text-sm text-ink">{r.workflow_name}</span>,
-  },
   {
     key: 'status',
     header: 'Status',
+    fit: true,
     sortable: true,
     sortValue: (r) => r.status,
     render: (r) => <StatusPill status={r.status} size="xs" />,
   },
   {
+    key: 'workflow',
+    header: 'Workflow',
+    subject: true,
+    sortable: true,
+    sortValue: (r) => r.workflow_name,
+    titleValue: (r) => r.workflow_name,
+    render: (r) => <span className="text-sm text-ink">{r.workflow_name}</span>,
+  },
+  {
+    key: 'id',
+    header: 'Run',
+    fit: true,
+    // Plain content — row-level navigation is `rowHref` (SortableTable
+    // link-wraps the whole row); an inline <Link> here would nest an <a>
+    // inside SortableTable's own <a>.
+    render: (r) => (
+      <span className="text-sm font-mono text-ink-dim">{r.id.slice(0, 10)}…</span>
+    ),
+  },
+  {
     key: 'started',
     header: 'Started',
+    align: 'right',
+    fit: true,
     sortable: true,
     sortValue: (r) => {
       const t = Date.parse(r.started_at);
@@ -199,6 +213,7 @@ export default function HostDetail() {
             columns={RUN_COLUMNS}
             rows={runs}
             rowKey={(r) => r.id}
+            rowHref={runHref}
             initialSort={{ key: 'started', dir: 'desc' }}
           />
         )}

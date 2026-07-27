@@ -2,7 +2,7 @@
 // control plane. Each row links to /workflows/:name for the steps + raw YAML.
 
 import { useEffect, useId, useMemo, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { Plus, Sparkles, Workflow as WorkflowIcon } from 'lucide-react';
 import { api, type ProviderModels, type WorkflowSummary } from '../lib/api';
 import { SectionHeader } from '../components/lists/SectionHeader';
@@ -119,6 +119,7 @@ export default function Workflows() {
             columns={columns}
             rows={shown}
             rowKey={(w) => `${w.scope}:${w.name}`}
+            rowHref={(w) => `/workflows/${encodeURIComponent(w.name)}`}
             initialSort={{ key: 'last_run', dir: 'desc' }}
           />
           {sorted.length > visible && (
@@ -330,14 +331,10 @@ function workflowColumns(onRun: (name: string) => void): Column<WorkflowSummary>
       sortable: true,
       sortValue: (w) => w.name,
       titleValue: (w) => w.name,
-      render: (w) => (
-        <Link
-          to={`/workflows/${encodeURIComponent(w.name)}`}
-          className="text-sm font-medium text-ink hover:underline"
-        >
-          {w.name}
-        </Link>
-      ),
+      // Plain content — row-level navigation is `rowHref` (SortableTable
+      // link-wraps the whole row); an inline <Link> here would nest an <a>
+      // inside SortableTable's own <a>.
+      render: (w) => <span className="text-sm font-medium text-ink">{w.name}</span>,
     },
     {
       key: 'scope',
@@ -396,10 +393,22 @@ function workflowColumns(onRun: (name: string) => void): Column<WorkflowSummary>
       header: '',
       align: 'right',
       fit: true,
+      // Its own real button (Run) — keep it independently
+      // focusable/announced (I7) rather than swallowed by the row link.
+      interactive: true,
       render: (w) => (
         <button
           type="button"
-          onClick={() => onRun(w.name)}
+          onClick={(e) => {
+            // The row is now link-wrapped (rowHref) — without both of
+            // these, this click either soft- or hard-navigates to the
+            // workflow instead of opening the launcher (stopPropagation
+            // alone does not block the enclosing <a>'s native default
+            // navigation action).
+            e.preventDefault();
+            e.stopPropagation();
+            onRun(w.name);
+          }}
           aria-label={`Run ${w.name}`}
           className="inline-flex items-center rounded-md border border-brand-600 bg-panel px-2.5 py-1 text-ui font-medium text-brand-700 hover:bg-brand-50"
         >

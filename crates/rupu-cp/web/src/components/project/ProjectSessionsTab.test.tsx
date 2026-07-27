@@ -9,9 +9,14 @@
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { api, type SessionSummary } from '../../lib/api';
 import ProjectSessionsTab from './ProjectSessionsTab';
+
+function LocationProbe() {
+  const loc = useLocation();
+  return <div data-testid="loc">{loc.pathname + loc.search}</div>;
+}
 
 afterEach(() => {
   cleanup();
@@ -181,6 +186,69 @@ describe('ProjectSessionsTab — table rules (fit/subject columns)', () => {
   });
 });
 
+describe('ProjectSessionsTab — Task 3: canonical column order + shared pill', () => {
+  it('renders headers in the canonical order (no Host slot — project tabs are already scoped): Status, Agent, Session, Model, In, Out, Cached, Cost, Turns, Duration, Started, (actions)', async () => {
+    mockSessions();
+    const { container } = renderTab();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    const headers = Array.from(container.querySelectorAll('thead th')).map(
+      (th) => th.textContent?.trim() ?? '',
+    );
+    expect(headers).toEqual([
+      'Status',
+      'Agent',
+      'Session',
+      'Model',
+      'In',
+      'Out',
+      'Cached',
+      'Cost',
+      'Turns',
+      'Duration',
+      'Started',
+      '',
+    ]);
+  });
+
+  it('renders a Started cell with relativeTime(created_at)', async () => {
+    // Real timers throughout — usePagedList's polling + testing-library's
+    // waitFor both rely on real timers, so fake system time would hang them.
+    // Instead pin `created_at` a known 3 minutes before the real "now".
+    const threeMinAgo = new Date(Date.now() - 3 * 60_000).toISOString();
+    mockSessions([{ ...ROWS[0], created_at: threeMinAgo }]);
+
+    renderTab();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    expect(screen.getAllByText('3m ago').length).toBeGreaterThan(0);
+  });
+
+  it('the status cell uses the shared SessionStatusPill (motion marker for a running-like status)', async () => {
+    mockSessions();
+    renderTab();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    // ROWS[0]'s raw status is "active" (rupu-cli vocabulary quirk, not one of
+    // the four canonical values) — exercises the coercion path.
+    const pill = screen.getByText('Running');
+    expect(pill).toHaveAttribute('data-motion', 'rg-pulse-run');
+  });
+
+  it('an unknown/garbage status value renders the RAW label, not a fabricated real state', async () => {
+    mockSessions([{ ...ROWS[0], status: 'totally-unrecognized' }]);
+    renderTab();
+
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    // Never coerced onto "Stopped" (or any of the four real states) — the raw
+    // wire value renders as-is, honestly reporting that the status is unknown.
+    const pill = screen.getByText('totally-unrecognized');
+    expect(pill).toBeInTheDocument();
+    expect(pill).not.toHaveAttribute('data-motion', 'rg-pulse-run');
+    expect(screen.queryByText('Stopped')).toBeNull();
+  });
+});
+
 describe('ProjectSessionsTab — usage bar chart strip', () => {
   it('renders a usage bar for each priced session', async () => {
     mockSessions();
@@ -190,6 +258,33 @@ describe('ProjectSessionsTab — usage bar chart strip', () => {
     // UsageBarChart renders each bar's label — both sessions have usage.
     const labels = screen.getAllByText('fix-bug');
     expect(labels.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe('ProjectSessionsTab — whole-row navigation (rowHref, Task 4)', () => {
+  it('renders each row as a link to /sessions/:id', async () => {
+    mockSessions();
+    renderTab();
+
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    const link = screen.getByText('fix-bug').closest('a');
+    expect(link).toHaveAttribute('href', '/sessions/sess-active-1');
+  });
+
+  it('clicking "active run" navigates to the run, not the session row', async () => {
+    mockSessions([{ ...ROWS[0], active_run_id: 'run-xyz' }]);
+
+    render(
+      <MemoryRouter>
+        <ProjectSessionsTab wsId="x" />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText('active run'));
+
+    expect(screen.getByTestId('loc')).toHaveTextContent('/runs/run-xyz');
   });
 });
 

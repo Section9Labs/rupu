@@ -41,6 +41,18 @@ export interface Column<T> {
    *  string. Falls back to `render(row)` itself when it happens to already
    *  be a string. */
   titleValue?: (row: T) => string;
+  /** This column renders its OWN interactive controls (buttons, links to a
+   *  different destination than the row) — typically a row-actions column.
+   *  On a `rowHref` table, SortableTable normally wraps every cell's content
+   *  in the row's own link so the whole row is clickable; for a column whose
+   *  content is sometimes `null` (e.g. an action button that only appears
+   *  conditionally), that wrapping link would render with no content and no
+   *  accessible name, and any button the column DOES render would nest
+   *  inside it (`<button>` inside `<a>`). Set `interactive: true` to render
+   *  this column as a plain, unwrapped cell instead — its own controls stay
+   *  independently focusable/announced and there is no nested/empty anchor.
+   *  Row click-through for other columns is unaffected. */
+  interactive?: boolean;
   render: (row: T) => React.ReactNode;
 }
 
@@ -114,6 +126,15 @@ export default function SortableTable<T>({
   // alignment) — distinct from whether any GIVEN row is expandable.
   const hasDetailFeature = Boolean(renderDetail);
   const totalCols = columns.length + (hasDetailFeature ? 1 : 0);
+  // rowHref link-wraps every cell so the whole row is clickable, but that
+  // used to mean a 13-column row was 13 identical tab stops and screen
+  // readers announced the same link 13 times per row. Only the subject
+  // column's link (the table's ONE flexible, describing column — §5.1) stays
+  // a real, focusable, announced link; every other cell's link is present
+  // for mouse click purposes only (`tabIndex={-1}` + `aria-hidden`), so a row
+  // is exactly one Tab stop. Falls back to the first column when a table has
+  // no `subject` column at all.
+  const subjectKey = columns.find((c) => c.subject)?.key ?? columns[0]?.key;
 
   /** Non-null/non-false detail content means this row is expandable. */
   function isDetailContent(node: React.ReactNode): boolean {
@@ -215,9 +236,18 @@ export default function SortableTable<T>({
             const isRowExpandable = hasDetailFeature && isDetailContent(detailContent);
             const href = isRowExpandable ? undefined : rowHref?.(row);
             const isOpen = isRowExpandable && open.has(key);
+            // M5 (whole-branch-review): a table that declares `rowHref` can
+            // still have individual rows with nothing to link to (e.g.
+            // AgentRuns rows with no `transcript_path`) — those must not
+            // show the same hover highlight as a genuinely clickable row,
+            // or the affordance lies about what a click will do. Tables
+            // that never declare `rowHref` at all (plain/action-only lists)
+            // are unaffected — this only suppresses hover for a row that
+            // fell through where the table's OWN rowHref came up empty.
+            const isDeadLinkRow = Boolean(rowHref) && !href && !isRowExpandable;
             return (
               <Fragment key={key}>
-                <tr className="hover:bg-bg/60 transition-colors">
+                <tr className={cn('transition-colors', !isDeadLinkRow && 'hover:bg-bg/60')}>
                   {hasDetailFeature && (
                     <td className="w-8 pl-3 align-middle">
                       {isRowExpandable && (
@@ -237,12 +267,30 @@ export default function SortableTable<T>({
                     const alignCls = cellClass(col);
                     // When the whole row is a link, each cell wraps its content in
                     // a block <Link> so the entire row is clickable (and every cell
-                    // is a navigation target) without nesting anchors. Pages that
-                    // use rowHref render plain content (no inner links); pages with
-                    // per-column links / interactive cells omit rowHref.
-                    return href ? (
+                    // is a navigation target) without nesting anchors — EXCEPT a
+                    // column marked `interactive`, which carries its own real
+                    // controls (and sometimes renders nothing at all): wrapping
+                    // it in the row link would nest a <button> inside an <a>, or
+                    // render an empty anchor with no accessible name when the
+                    // column's content is conditionally `null`. Those columns
+                    // always get the plain, unwrapped `<td>` branch below. Pages
+                    // that use rowHref render plain content (no inner links) for
+                    // their non-interactive cells; pages with per-column links
+                    // omit rowHref entirely.
+                    const isSubjectCell = col.key === subjectKey;
+                    // I7: mouse-only for every non-subject cell reached in the
+                    // link-wrapped branch (interactive columns never reach it —
+                    // see the `href && !col.interactive` gate below).
+                    const isMouseOnlyCell = !isSubjectCell;
+                    return href && !col.interactive ? (
                       <td key={col.key} className={alignCls}>
-                        <Link to={href} className="block px-4 py-2.5 align-middle">
+                        <Link
+                          to={href}
+                          className="block px-4 py-2.5 align-middle"
+                          {...(isMouseOnlyCell
+                            ? { tabIndex: -1, 'aria-hidden': true }
+                            : null)}
+                        >
                           {renderCellContent(col, row)}
                         </Link>
                       </td>
