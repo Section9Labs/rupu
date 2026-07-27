@@ -26,7 +26,6 @@ against the code before being recorded.
 
 | ID | Sev | Area | Title | Status |
 |---|---|---|---|---|
-| I-6 | P0 | rupu-cli | `rupu config set` writes dotted keys literally, then wipes the whole config on the next write | open |
 | I-7 | P0 | rupu-config | `[policy].lock` is enforced only inside rupu-cp; all 43 CLI config loads ignore it | open |
 | I-8 | P0 | rupu-cli | `dispatch_agent` hardcodes provider/model — the 4th I-1/I-2 site, never fixed | open |
 | I-9 | P1 | rupu-providers | `[providers.*].timeout_ms` has no consumer | open |
@@ -122,40 +121,6 @@ against the code before being recorded.
 ---
 
 ## Open
-
-### I-6 — `rupu config set` corrupts `config.toml`, then silently wipes it
-
-**Symptom.** Two commands destroy a user's configuration:
-
-```
-$ rupu config set ui.theme dracula     # writes a literal "ui.theme" top-level key
-$ rupu config set log_level debug      # config.toml is now an empty file
-```
-
-**Root cause.** Two independent defects in `crates/rupu-cli/src/cmd/config.rs`:
-
-1. `set` operates on the top-level table only — `t.insert(key.to_string(), parsed)`
-   (`config.rs:66`) inserts the dotted string `"ui.theme"` as a key rather than
-   descending into `[ui]`. `Config` is `#[serde(default, deny_unknown_fields)]`
-   (`crates/rupu-config/src/config.rs:22`), so the file no longer loads.
-2. The *next* `set` reads that now-invalid file with
-   `toml::from_str(&text).unwrap_or_else(|_| Value::Table(Default::default()))`
-   (`config.rs:54`) — on a parse failure it starts from an **empty table** and
-   writes it back, discarding every remaining setting.
-
-`get` has the same top-level-only limitation (`config.rs:42`) but is read-only.
-
-**Impact.** Data loss on the most natural input. `README.md:283` advertises the
-command as "Read / write rupu configuration"; only the clap help mentions the
-top-level restriction. Downstream, the corrupted file either hard-errors
-(`cmd/run.rs:473`) or is silently swallowed (`cmd/run.rs:339`), so the user may
-just see all their settings quietly stop applying.
-
-**Fix.** Descend dotted paths on both `get` and `set` (the CP web already does
-this — `crates/rupu-cp/src/api/config.rs` handles dotted keys). Never fall back
-to an empty table on a parse error: fail loudly and leave the file untouched.
-
----
 
 ### I-7 — `[policy].lock` is not enforced anywhere outside the web UI
 
@@ -407,6 +372,50 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-6 — `rupu config set` corrupts `config.toml`, then silently wipes it
+
+**Symptom.** Two commands destroy a user's configuration:
+
+```
+$ rupu config set ui.theme dracula     # writes a literal "ui.theme" top-level key
+$ rupu config set log_level debug      # config.toml is now an empty file
+```
+
+**Root cause.** Two independent defects in `crates/rupu-cli/src/cmd/config.rs`:
+
+1. `set` operates on the top-level table only — `t.insert(key.to_string(), parsed)`
+   (`config.rs:66`) inserts the dotted string `"ui.theme"` as a key rather than
+   descending into `[ui]`. `Config` is `#[serde(default, deny_unknown_fields)]`
+   (`crates/rupu-config/src/config.rs:22`), so the file no longer loads.
+2. The *next* `set` reads that now-invalid file with
+   `toml::from_str(&text).unwrap_or_else(|_| Value::Table(Default::default()))`
+   (`config.rs:54`) — on a parse failure it starts from an **empty table** and
+   writes it back, discarding every remaining setting.
+
+`get` has the same top-level-only limitation (`config.rs:42`) but is read-only.
+
+**Impact.** Data loss on the most natural input. `README.md:283` advertises the
+command as "Read / write rupu configuration"; only the clap help mentions the
+top-level restriction. Downstream, the corrupted file either hard-errors
+(`cmd/run.rs:473`) or is silently swallowed (`cmd/run.rs:339`), so the user may
+just see all their settings quietly stop applying.
+
+**Fix.** PR (branch `arc1/config-integrity`) — added `get_path`/`set_path`
+helpers in `crates/rupu-cli/src/cmd/config.rs` that split a dotted key on `.`
+and descend/create intermediate tables, replacing the top-level-only
+`t.insert(key.to_string(), parsed)`. `set_path` refuses to overwrite an
+existing non-table with a table rather than silently discarding it. `set`'s
+read path no longer falls back to an empty table on a parse error — a
+malformed `config.toml` now aborts the write with `anyhow::bail!` instead of
+being replaced.
+
+**Validation.** `cargo test -p rupu-cli --lib cmd::config` —
+`cmd::config::tests`, 5 tests, all observing real `Value` mutation/traversal
+(not just parsing): `set_path_descends_into_a_nested_table`,
+`set_path_creates_missing_intermediate_tables`,
+`set_path_refuses_to_overwrite_a_scalar_with_a_table`,
+`get_path_reads_a_nested_key`, `a_top_level_key_still_works`.
 
 ### I-1 — `default_provider` in `config.toml` was dead config
 
