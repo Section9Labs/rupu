@@ -92,7 +92,7 @@ org_id = "org-abc123"
 default_model = "gpt-5"
 
 [providers.gemini]
-region = "us-central1"   # for Vertex AI users
+default_model = "gemini-2.5-pro"
 
 [providers.copilot]
 # typically nothing needed
@@ -106,11 +106,11 @@ max_output = 16000
 ### Field reference
 
 - **`base_url`** (`Option<String>`): override the vendor's default API endpoint. Useful for proxies and Azure-OpenAI-style deployments. Default: vendor's documented URL.
-- **`org_id`** (`Option<String>`, OpenAI): organization scope for billed usage.
-- **`region`** (`Option<String>`, Gemini): Vertex AI region (e.g., `us-central1`, `europe-west4`). Ignored on AI Studio.
-- **`timeout_ms`** (`Option<u64>`): per-request timeout. Default: `120000` (2 min).
-- **`max_retries`** (`Option<u32>`): max attempts on `Transient` / `RateLimited` errors before giving up. Default: `5`.
-- **`max_concurrency`** (`Option<usize>`): per-provider semaphore size. Defaults: anthropic 4, openai 8, gemini 4, copilot 4.
+- **`org_id`** (`Option<String>`, OpenAI): organization scope for billed usage. Sent as the `OpenAI-Organization` header on the platform API (`api.openai.com`). Not sent on the ChatGPT-subscription endpoint, which is scoped by account rather than organization. Ignored by every other provider.
+- **`region`** (`Option<String>`): **accepted but not currently used.** It is reserved for a Vertex AI regional endpoint (e.g. `us-central1`), and no shipped Gemini client targets one — rupu's Gemini paths are AI Studio, Gemini CLI, and Antigravity, none of which is region-scoped. Setting it changes nothing today.
+- **`timeout_ms`** (`Option<u64>`): per-request *inactivity* deadline, applied as the HTTP client's connect + read timeout. A long generation that keeps streaming is never cut off; a connection that goes silent for this long is aborted. Default: `120000` (2 min). `0` is treated as unset.
+- **`max_retries`** (`Option<u32>`): retries *after* the first attempt on a retryable error (`RateLimited`, `Transient`, 5xx, 429/529, transport failures). Permanent errors — 4xx, auth failures, malformed requests — are never retried, and a stream that already emitted output is never re-issued. Backoff is 2s, doubling, capped at 60s. Default: `1`. (This doc previously claimed `5`; the implementation's real budget was `1`, chosen so `ProviderRouter` can fail over to another vendor quickly instead of spending ~30s of backoff on one. The doc was corrected to match the code — set the key explicitly if you want a larger budget.)
+- **`max_concurrency`** (`Option<usize>`): per-provider semaphore size — the maximum number of in-flight LLM calls to this provider in one rupu process. Defaults: anthropic 4, openai 8, gemini 4, copilot 4. The semaphore is created once per process on first use, so changing this mid-process has no effect. `0` is treated as unset.
 - **`default_model`** (`Option<String>`): model used when an agent file omits `model:`. No global default — the agent must either set `model:` or have one resolvable here.
 - **`[[providers.<name>.models]]`** (`Vec<CustomModel>`): register private/internal/fine-tuned models that aren't returned by `/v1/models`. Each entry takes `id` (required) plus optional `context_window` and `max_output`.
 

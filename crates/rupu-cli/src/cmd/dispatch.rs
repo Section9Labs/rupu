@@ -57,6 +57,11 @@ pub struct CliAgentDispatcher {
     /// `[providers.<name>] kind = "openai-compatible"` endpoint the same way
     /// `rupu run` and workflow steps do. Empty when none are declared.
     openai_compatible: std::collections::HashMap<String, provider_factory::OpenAiCompatibleParams>,
+    /// Resolved `[providers.<name>]` runtime knobs, keyed by provider name.
+    /// Lets a dispatched sub-agent honor `timeout_ms` / `max_retries` /
+    /// `max_concurrency` / `org_id` exactly as `rupu run` does
+    /// (ISSUES.md I-9…I-12). Empty ⇒ documented defaults.
+    provider_tuning: std::collections::HashMap<String, rupu_providers::ProviderTuning>,
 }
 
 impl std::fmt::Debug for CliAgentDispatcher {
@@ -89,6 +94,7 @@ impl CliAgentDispatcher {
             String,
             provider_factory::OpenAiCompatibleParams,
         >,
+        provider_tuning: std::collections::HashMap<String, rupu_providers::ProviderTuning>,
     ) -> Arc<Self> {
         let arc = Arc::new(Self {
             global,
@@ -104,6 +110,7 @@ impl CliAgentDispatcher {
             default_provider,
             default_model,
             openai_compatible,
+            provider_tuning,
         });
         let dyn_arc: Arc<dyn AgentDispatcher> = arc.clone();
         let _ = arc.self_dyn.set(dyn_arc);
@@ -229,6 +236,7 @@ impl AgentDispatcher for CliAgentDispatcher {
         let provider_config = provider_factory::ProviderConfig {
             anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
             openai_compatible: oai_params,
+            tuning: self.provider_tuning.get(&provider_name).cloned(),
         };
         let provider = match provider_factory::build_for_provider_with_config(
             &provider_name,
@@ -544,6 +552,7 @@ mod tests {
             None,
             None,
             std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
         );
 
         std::env::set_var(
@@ -639,6 +648,7 @@ mod tests {
             None,
             None,
             std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
         );
 
         std::env::set_var(
@@ -702,6 +712,7 @@ mod tests {
             None,
             Some("cfg-provider".to_string()),
             Some("cfg-model".to_string()),
+            std::collections::HashMap::new(),
             std::collections::HashMap::new(),
         );
 
@@ -776,6 +787,7 @@ mod tests {
             None,
             Some("cfg-provider".to_string()),
             Some("cfg-model".to_string()),
+            std::collections::HashMap::new(),
             std::collections::HashMap::new(),
         );
 
@@ -858,6 +870,7 @@ mod tests {
             None,
             None,
             oai,
+            std::collections::HashMap::new(),
         );
 
         std::env::set_var(
@@ -928,6 +941,7 @@ mod tests {
             None,
             None,
             None,
+            std::collections::HashMap::new(),
             std::collections::HashMap::new(),
         );
 

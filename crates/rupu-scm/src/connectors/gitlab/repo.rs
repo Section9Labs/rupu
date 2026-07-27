@@ -25,6 +25,10 @@ use crate::types::{
 
 use super::client::GitlabClient;
 
+/// Clone host for gitlab.com. Self-hosted clone URLs are a separate gap
+/// (clone paths ignore `[scm.gitlab].base_url`) tracked in `TODO.md`.
+const GITLAB_CLONE_HOST: &str = "gitlab.com";
+
 pub struct GitlabRepoConnector {
     client: GitlabClient,
 }
@@ -473,19 +477,17 @@ impl RepoConnector for GitlabRepoConnector {
         translate_mr_to_pr(r.clone(), &resp)
     }
     async fn clone_to(&self, r: &RepoRef, dir: &Path) -> Result<(), ScmError> {
-        // GitLab PAT-as-password convention with username "oauth2".
-        let url = format!(
-            "https://oauth2:{}@gitlab.com/{}/{}.git",
-            self.client.token, r.owner, r.repo
+        let protocol = self.client.clone_protocol();
+        // GitLab PAT-as-password convention with username "oauth2" (HTTPS only;
+        // the ssh form drops the token entirely).
+        let url = crate::client_options::clone_url(
+            GITLAB_CLONE_HOST,
+            &r.owner,
+            &r.repo,
+            protocol,
+            &format!("oauth2:{}", self.client.token),
         );
         let dir = dir.to_path_buf();
-        tokio::task::spawn_blocking(move || -> Result<(), ScmError> {
-            git2::Repository::clone(&url, &dir)
-                .map_err(|e| ScmError::Network(anyhow::anyhow!("git clone failed: {e}")))?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| ScmError::Transient(anyhow::anyhow!("join: {e}")))??;
-        Ok(())
+        crate::client_options::run_clone(url, dir, protocol).await
     }
 }

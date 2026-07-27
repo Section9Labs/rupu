@@ -117,6 +117,10 @@ impl AppExecutor {
             // existed. Fixing this means loading the layered config in
             // `build_executor`.
             openai_compatible: std::collections::HashMap::new(),
+            // Same TODO applies (ISSUES.md I-19): empty ⇒ every step falls
+            // back to `ProviderTuning::for_provider(name)`, i.e. the
+            // documented defaults.
+            provider_tuning: std::collections::HashMap::new(),
             default_provider: None,
             default_model: None,
             bash_timeout_secs: 120,

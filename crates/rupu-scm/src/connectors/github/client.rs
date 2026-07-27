@@ -18,6 +18,7 @@ use rupu_providers::concurrency;
 use tokio::sync::Semaphore;
 use url::Url;
 
+use crate::client_options::{CloneProtocol, ScmClientOptions};
 use crate::error::{classify_scm_error, ScmError};
 use crate::platform::Platform;
 
@@ -32,6 +33,11 @@ pub struct GithubClient {
     graphql_url: String,
     semaphore: Arc<Semaphore>,
     cache: Arc<Mutex<LruCache<String, CacheEntry>>>,
+    /// `[scm.github].timeout_ms` (ISSUES.md I-17). Applied to octocrab AND to
+    /// the two ad-hoc reqwest clients below, which previously had none.
+    timeout: Duration,
+    /// `[scm.github].clone_protocol` (ISSUES.md I-16).
+    clone_protocol: CloneProtocol,
 }
 
 struct CacheEntry {
@@ -41,14 +47,32 @@ struct CacheEntry {
 }
 
 impl GithubClient {
+    /// Convenience constructor with default `[scm.github]` options.
     pub fn new(token: String, base_url: Option<String>, max_concurrency: Option<usize>) -> Self {
-        let graphql_url = graphql_url_for(base_url.as_deref()).expect("valid github graphql url");
-        let mut builder = Octocrab::builder().personal_token(token.clone());
-        if let Some(url) = base_url {
+        Self::with_options(
+            token,
+            &ScmClientOptions {
+                base_url,
+                max_concurrency,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Build from resolved `[scm.github]` options — `base_url`,
+    /// `max_concurrency`, `timeout_ms` (I-17), `clone_protocol` (I-16).
+    pub fn with_options(token: String, opts: &ScmClientOptions) -> Self {
+        let graphql_url =
+            graphql_url_for(opts.base_url.as_deref()).expect("valid github graphql url");
+        let mut builder = Octocrab::builder()
+            .personal_token(token.clone())
+            .set_connect_timeout(Some(opts.timeout))
+            .set_read_timeout(Some(opts.timeout));
+        if let Some(url) = opts.base_url.clone() {
             builder = builder.base_uri(url).expect("valid base_url");
         }
         let inner = builder.build().expect("octocrab builder");
-        let semaphore = concurrency::semaphore_for("github", max_concurrency);
+        let semaphore = concurrency::semaphore_for("github", opts.max_concurrency);
         let cache = Arc::new(Mutex::new(LruCache::new(
             NonZeroUsize::new(CACHE_CAP).unwrap(),
         )));
@@ -58,7 +82,19 @@ impl GithubClient {
             graphql_url,
             semaphore,
             cache,
+            timeout: opts.timeout,
+            clone_protocol: opts.clone_protocol,
         }
+    }
+
+    /// The configured clone protocol, read by `GithubRepoConnector::clone_to`.
+    pub fn clone_protocol(&self) -> CloneProtocol {
+        self.clone_protocol
+    }
+
+    /// The configured HTTP deadline.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// Acquire a permit from the per-platform semaphore.
@@ -106,7 +142,7 @@ impl GithubClient {
     /// typed builder API doesn't expose response headers cleanly, so
     /// this goes through reqwest directly.
     pub async fn fetch_token_scopes(&self) -> Option<Vec<String>> {
-        let http = reqwest::Client::builder().build().ok()?;
+        let http = reqwest::Client::builder().timeout(self.timeout).build().ok()?;
         let resp = http
             .get("https://api.github.com/user")
             .header(reqwest::header::USER_AGENT, "rupu/0")
@@ -149,7 +185,7 @@ impl GithubClient {
             let token = token.clone();
             async move {
                 let _permit = self.permit().await;
-                let http = reqwest::Client::builder().build().map_err(|e| {
+                let http = reqwest::Client::builder().timeout(self.timeout).build().map_err(|e| {
                     ScmError::Network(anyhow::anyhow!("github graphql client: {e}"))
                 })?;
                 let resp = http
@@ -351,6 +387,50 @@ mod tests {
             graphql_url_for(Some("https://ghe.example.com/api/v3")).unwrap(),
             "https://ghe.example.com/api/graphql"
         );
+    }
+
+    /// I-16 / I-17: `[scm.github]` reaches the client that acts on it.
+    #[tokio::test]
+    async fn platform_config_reaches_the_client() {
+        let cfg = rupu_config::ScmPlatformConfig {
+            timeout_ms: Some(4_000),
+            clone_protocol: Some("ssh".into()),
+            ..Default::default()
+        };
+        let opts = ScmClientOptions::from_platform_config(Some(&cfg));
+        let c = GithubClient::with_options("ghp".into(), &opts);
+        assert_eq!(c.clone_protocol(), CloneProtocol::Ssh);
+        assert_eq!(c.timeout(), Duration::from_millis(4_000));
+
+        // No [scm.github] table ⇒ documented defaults.
+        let d = GithubClient::with_options(
+            "ghp".into(),
+            &ScmClientOptions::from_platform_config(None),
+        );
+        assert_eq!(d.clone_protocol(), CloneProtocol::Https);
+        assert_eq!(d.timeout(), Duration::from_millis(30_000));
+    }
+
+    /// The clone path asks the client for the protocol and builds the URL from
+    /// it — `ssh` yields the ssh form, nothing else changed.
+    #[tokio::test]
+    async fn configured_ssh_protocol_produces_an_ssh_clone_url() {
+        let cfg = rupu_config::ScmPlatformConfig {
+            clone_protocol: Some("ssh".into()),
+            ..Default::default()
+        };
+        let c = GithubClient::with_options(
+            "ghp_secret".into(),
+            &ScmClientOptions::from_platform_config(Some(&cfg)),
+        );
+        let url = crate::client_options::clone_url(
+            "github.com",
+            "section9labs",
+            "rupu",
+            c.clone_protocol(),
+            &c.token,
+        );
+        assert_eq!(url, "git@github.com:section9labs/rupu.git");
     }
 
     #[tokio::test]

@@ -2636,6 +2636,7 @@ pub(crate) async fn resume_run(
     // provider/model through the same config-derived defaults the step
     // factory below uses (ISSUES.md I-8).
     let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
+    let provider_tuning = rupu_runtime::provider_factory::provider_tuning_map(&cfg.providers);
     let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
         global.clone(),
         project_root.clone(),
@@ -2649,6 +2650,7 @@ pub(crate) async fn resume_run(
         cfg.default_provider.clone(),
         cfg.default_model.clone(),
         openai_compatible.clone(),
+        provider_tuning.clone(),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let action_dispatcher = crate::resume::action_dispatcher_for(&mcp_registry, &mode_str);
@@ -2662,6 +2664,7 @@ pub(crate) async fn resume_run(
         system_prompt_suffix: None,
         dispatcher: Some(dispatcher_dyn),
         openai_compatible,
+        provider_tuning,
         default_provider: cfg.default_provider.clone(),
         default_model: cfg.default_model.clone(),
         bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
@@ -4021,6 +4024,7 @@ async fn execute_workflow_invocation(
     // provider/model through the same config-derived defaults the step
     // factory below uses (ISSUES.md I-8).
     let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
+    let provider_tuning = rupu_runtime::provider_factory::provider_tuning_map(&cfg.providers);
     let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
         global.clone(),
         ctx.project_root.clone(),
@@ -4034,6 +4038,7 @@ async fn execute_workflow_invocation(
         cfg.default_provider.clone(),
         cfg.default_model.clone(),
         openai_compatible.clone(),
+        provider_tuning.clone(),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     // Shared across this run's initial `opts` AND the inline
@@ -4053,6 +4058,7 @@ async fn execute_workflow_invocation(
         system_prompt_suffix: ctx.system_prompt_suffix.clone(),
         dispatcher: Some(dispatcher_dyn),
         openai_compatible,
+        provider_tuning,
         default_provider: cfg.default_provider.clone(),
         default_model: cfg.default_model.clone(),
         bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),

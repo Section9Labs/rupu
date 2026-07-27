@@ -42,10 +42,10 @@ pub async fn try_build(
         rupu_providers::auth::AuthCredentials::ApiKey { key } => key,
         rupu_providers::auth::AuthCredentials::OAuth { access, .. } => access,
     };
-    let platform_cfg = cfg.scm.platforms.get("gitlab");
-    let base_url = platform_cfg.and_then(|p| p.base_url.clone());
-    let max_conc = platform_cfg.and_then(|p| p.max_concurrency);
-    let client = GitlabClient::new(token, base_url, max_conc);
+    let opts = crate::client_options::ScmClientOptions::from_platform_config(
+        cfg.scm.platforms.get("gitlab"),
+    );
+    let client = GitlabClient::with_options(token, &opts);
     let repo: Arc<dyn RepoConnector> = Arc::new(GitlabRepoConnector::new(client.clone()));
     let issues: Arc<dyn IssueConnector> = Arc::new(GitlabIssueConnector::new(client.clone()));
     let extras = Arc::new(GitlabExtras::new(client));

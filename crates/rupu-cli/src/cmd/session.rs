@@ -6136,13 +6136,17 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
         .project_root
         .as_ref()
         .map(|p| p.join(".rupu/config.toml"));
-    let _cfg =
+    let cfg =
         rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
     let resolver = rupu_auth::KeychainResolver::new();
 
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
         openai_compatible: None,
+        tuning: Some(provider_factory::provider_tuning(
+            &session.provider_name,
+            &cfg.providers,
+        )),
     };
     let (_resolved_auth, mut provider) = provider_factory::build_for_provider_with_config(
         &session.provider_name,
@@ -6308,7 +6312,11 @@ fn cancel_active_turn_in_place(global: &Path, session_id: &str) -> anyhow::Resul
 }
 
 async fn run_worker(args: RunWorkerArgs) -> anyhow::Result<()> {
-    crate::logging::init_to_file();
+    // `log_level` from config is the `RUPU_LOG` fallback here too — a session
+    // worker is a long-lived daemon whose log file is the only place its
+    // internals surface (ISSUES.md I-14).
+    let worker_cfg = crate::cmd::update::load_cli_config();
+    crate::logging::init_to_file(worker_cfg.log_level.as_deref());
 
     let global = paths::global_dir()?;
     let worker_pid = std::process::id();
@@ -6432,10 +6440,26 @@ async fn run_compact_request(
 ) -> anyhow::Result<()> {
     let (mut session, _scope) = read_session(global, session_id)?;
 
+    // Load config for the same reason the turn path does: a compaction call is
+    // a real provider call and must honor `[providers.<name>]` tuning
+    // (ISSUES.md I-9…I-12).
+    let cfg = rupu_config::layer_files_locked(
+        Some(&global.join("config.toml")),
+        session
+            .project_root
+            .as_ref()
+            .map(|p| p.join(".rupu/config.toml"))
+            .as_deref(),
+    )
+    .unwrap_or_default();
     let resolver = rupu_auth::KeychainResolver::new();
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
         openai_compatible: None,
+        tuning: Some(provider_factory::provider_tuning(
+            &session.provider_name,
+            &cfg.providers,
+        )),
     };
     let (_resolved_auth, mut provider) = provider_factory::build_for_provider_with_config(
         &session.provider_name,
@@ -6690,7 +6714,9 @@ fn finalize_compact_run(
 }
 
 async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
-    crate::logging::init_to_file();
+    // See `run_worker`: `log_level` is the `RUPU_LOG` fallback (I-14).
+    let turn_cfg = crate::cmd::update::load_cli_config();
+    crate::logging::init_to_file(turn_cfg.log_level.as_deref());
 
     let global = paths::global_dir()?;
     let (mut session, scope) = read_session(&global, &args.session_id)?;
@@ -6707,6 +6733,10 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
         openai_compatible: None,
+        tuning: Some(provider_factory::provider_tuning(
+            &session.provider_name,
+            &cfg.providers,
+        )),
     };
     let (_resolved_auth, provider) = provider_factory::build_for_provider_with_config(
         &session.provider_name,

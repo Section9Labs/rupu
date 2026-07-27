@@ -62,6 +62,12 @@ pub struct DefaultStepFactory {
     /// `[providers.<name>] kind = "openai-compatible"` is declared.
     pub openai_compatible:
         std::collections::HashMap<String, provider_factory::OpenAiCompatibleParams>,
+    /// Resolved `[providers.<name>]` runtime knobs, keyed by provider name
+    /// (`provider_factory::provider_tuning_map`). Lets a workflow step honor
+    /// `timeout_ms` / `max_retries` / `max_concurrency` / `org_id` exactly as
+    /// `rupu run` does (ISSUES.md I-9…I-12). Empty ⇒ documented defaults.
+    pub provider_tuning:
+        std::collections::HashMap<String, rupu_providers::ProviderTuning>,
     /// `default_provider` from `config.toml`. Used when a step's agent pins no
     /// `provider:`. `None` falls back to `provider_factory::FALLBACK_PROVIDER`.
     pub default_provider: Option<String>,
@@ -205,6 +211,7 @@ impl StepFactory for DefaultStepFactory {
                 let provider_config = provider_factory::ProviderConfig {
                     anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
                     openai_compatible: oai_params,
+                    tuning: self.provider_tuning.get(&provider_name).cloned(),
                 };
                 match provider_factory::build_for_provider_with_config(
                     &provider_name,
@@ -945,6 +952,7 @@ steps:
             system_prompt_suffix: None,
             dispatcher: None,
             openai_compatible: std::collections::HashMap::new(),
+            provider_tuning: std::collections::HashMap::new(),
             default_provider: None,
             default_model: None,
             bash_timeout_secs: 120,
@@ -1170,6 +1178,7 @@ steps:
             system_prompt_suffix: None,
             dispatcher: None,
             openai_compatible: std::collections::HashMap::new(),
+            provider_tuning: std::collections::HashMap::new(),
             default_provider: None,
             default_model: None,
             bash_timeout_secs: 120,
@@ -1222,6 +1231,7 @@ steps:
             system_prompt_suffix: None,
             dispatcher: None,
             openai_compatible: std::collections::HashMap::new(),
+            provider_tuning: std::collections::HashMap::new(),
             default_provider: None,
             default_model: None,
             bash_timeout_secs: 120,
@@ -1295,6 +1305,7 @@ steps:
             system_prompt_suffix: None,
             dispatcher: None,
             openai_compatible: std::collections::HashMap::new(),
+            provider_tuning: std::collections::HashMap::new(),
             default_provider: None,
             default_model: None,
             bash_timeout_secs: 120,

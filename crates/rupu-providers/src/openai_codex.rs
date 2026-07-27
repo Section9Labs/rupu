@@ -140,6 +140,24 @@ pub struct OpenAiCodexClient {
     api_url: String,
     auth_json_path: Option<PathBuf>,
     credential_store: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
+    /// `[providers.openai].org_id` — sent as `OpenAI-Organization` on the
+    /// platform API (ISSUES.md I-12).
+    org_id: Option<String>,
+}
+
+/// The `OpenAI-Organization` header value for a request to `api_url`, if any.
+///
+/// Only the platform API (`api.openai.com/v1/responses`) is organization-scoped.
+/// ChatGPT-subscription traffic goes to `/backend-api/codex/responses` and is
+/// scoped by `chatgpt-account-id`; an org header there is meaningless, so a
+/// user who set `org_id` for their API-key account does not accidentally send
+/// it on their SSO account. Blank/whitespace values are treated as unset.
+pub fn organization_header(api_url: &str, org_id: Option<&str>) -> Option<String> {
+    let org = org_id?.trim();
+    if org.is_empty() || api_url.contains("/backend-api/codex/") {
+        return None;
+    }
+    Some(org.to_string())
 }
 
 impl OpenAiCodexClient {
@@ -193,6 +211,7 @@ impl OpenAiCodexClient {
                     api_url,
                     auth_json_path,
                     credential_store: None,
+                    org_id: None,
                 })
             }
             AuthCredentials::ApiKey { key } => Ok(Self {
@@ -204,8 +223,19 @@ impl OpenAiCodexClient {
                 api_url: DEFAULT_API_URL.to_string(),
                 auth_json_path,
                 credential_store: None,
+                org_id: None,
             }),
         }
+    }
+
+    /// Apply `[providers.openai]` tuning: an HTTP client honoring
+    /// `timeout_ms` (I-9) and the `org_id` organization scope (I-12).
+    pub fn with_tuning(mut self, tuning: &crate::tuning::ProviderTuning) -> Self {
+        if let Ok(client) = tuning.http_client_builder().build() {
+            self.client = client;
+        }
+        self.org_id = tuning.org_id.clone();
+        self
     }
 
     /// Non-streaming send. Uses streaming internally because the OpenAI
@@ -286,6 +316,14 @@ impl OpenAiCodexClient {
                 headers.insert("chatgpt-account-id", val);
             } else {
                 warn!(account_id = %self.account_id, "invalid account_id, omitting header");
+            }
+        }
+        if let Some(org) = organization_header(&self.api_url, self.org_id.as_deref()) {
+            match org.parse() {
+                Ok(val) => {
+                    headers.insert("OpenAI-Organization", val);
+                }
+                Err(_) => warn!(org_id = %org, "invalid org_id, omitting OpenAI-Organization"),
             }
         }
         headers.insert("OpenAI-Beta", "responses=experimental".parse().unwrap());
@@ -2888,5 +2926,71 @@ mod reasoning_capture_tests {
             1,
             "function_call must not be duplicated: {input:#?}",
         );
+    }
+}
+
+#[cfg(test)]
+mod tuning_tests {
+    use super::*;
+
+    // ── [providers.openai] tuning (ISSUES.md I-9 / I-12) ─────────────────
+
+    #[test]
+    fn organization_header_only_applies_to_the_platform_api() {
+        assert_eq!(
+            organization_header("https://api.openai.com/v1/responses", Some("org-abc123")),
+            Some("org-abc123".to_string())
+        );
+        // ChatGPT-subscription endpoint is account-scoped, not org-scoped.
+        assert_eq!(
+            organization_header(
+                "https://chatgpt.com/backend-api/codex/responses",
+                Some("org-abc123")
+            ),
+            None
+        );
+        assert_eq!(
+            organization_header("https://api.openai.com/v1/responses", None),
+            None
+        );
+        assert_eq!(
+            organization_header("https://api.openai.com/v1/responses", Some("   ")),
+            None
+        );
+    }
+
+    #[test]
+    fn configured_org_id_lands_on_the_outgoing_request_headers() {
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey {
+                key: "sk-test".into(),
+            },
+            None,
+        )
+        .unwrap()
+        .with_tuning(&crate::tuning::ProviderTuning {
+            org_id: Some("org-abc123".into()),
+            ..crate::tuning::ProviderTuning::for_provider("openai")
+        });
+        client.api_url = "https://api.openai.com/v1/responses".into();
+        let headers = client.build_headers().expect("headers");
+        assert_eq!(
+            headers.get("OpenAI-Organization").map(|v| v.to_str().unwrap()),
+            Some("org-abc123")
+        );
+
+        // Without the config key the header is absent — no empty header shipped.
+        let client = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey {
+                key: "sk-test".into(),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(client
+            .build_headers()
+            .unwrap()
+            .get("OpenAI-Organization")
+            .is_none());
     }
 }

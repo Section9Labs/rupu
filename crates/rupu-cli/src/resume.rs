@@ -215,6 +215,7 @@ async fn rebuild_opts_from_disk(
     // provider/model through the same config-derived defaults the step
     // factory below uses (ISSUES.md I-8).
     let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
+    let provider_tuning = rupu_runtime::provider_factory::provider_tuning_map(&cfg.providers);
     let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
         global.clone(),
         project_root.clone(),
@@ -228,6 +229,7 @@ async fn rebuild_opts_from_disk(
         cfg.default_provider.clone(),
         cfg.default_model.clone(),
         openai_compatible.clone(),
+        provider_tuning.clone(),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let action_dispatcher = action_dispatcher_for(&mcp_registry, &mode_str);
@@ -241,6 +243,7 @@ async fn rebuild_opts_from_disk(
         system_prompt_suffix: None,
         dispatcher: Some(dispatcher_dyn),
         openai_compatible,
+        provider_tuning,
         default_provider: cfg.default_provider.clone(),
         default_model: cfg.default_model.clone(),
         bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),

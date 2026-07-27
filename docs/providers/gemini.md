@@ -20,9 +20,12 @@ Set the `project_id` if your token doesn't carry one in its `extra` claims:
 
 ```toml
 [providers.gemini]
-region = "us-central1"
 default_model = "gemini-2.5-pro"
 ```
+
+`region` is accepted by the config parser but has no effect: it is reserved
+for a Vertex AI regional endpoint, and none of rupu's Gemini paths (AI Studio,
+Gemini CLI, Antigravity) is region-scoped. See `docs/providers.md`.
 
 The `project_id` is read from the OAuth token's `extra` field (populated during the SSO flow). For headless setups where you can't run the SSO flow, this is the deferred AI-Studio API-key path that's not yet supported.
 
@@ -51,6 +54,6 @@ Once the AI-Studio listing endpoint is wired, `rupu models refresh --provider ge
 
 ## Known quirks
 
-- **Vertex AI region** — set via `region` in config. Default is the value baked into the lifted client; setting `us-central1` explicitly avoids surprises.
+- **Vertex AI region** — `region` in config is parsed but unused; no shipped Gemini client targets a regional Vertex endpoint. Setting it changes nothing.
 - **AI Studio API-key endpoint** — different shape from Vertex; Plan 1 doesn't ship a separate `GoogleGeminiAiStudioClient`. Track via `TODO.md`.
 - **Project ID required** — Google's API rejects requests without a billing-enabled project; the SSO flow captures this in token claims, but ensure your Google Cloud project has Vertex AI enabled before first run.

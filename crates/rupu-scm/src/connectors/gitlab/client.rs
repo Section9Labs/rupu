@@ -20,6 +20,7 @@ use reqwest::{Client, Method};
 use rupu_providers::concurrency;
 use tokio::sync::Semaphore;
 
+use crate::client_options::{CloneProtocol, ScmClientOptions};
 use crate::error::{classify_scm_error, ScmError};
 use crate::platform::Platform;
 
@@ -35,6 +36,8 @@ pub struct GitlabClient {
     pub(crate) token: String,
     semaphore: Arc<Semaphore>,
     cache: Arc<Mutex<LruCache<String, CacheEntry>>>,
+    /// `[scm.gitlab].clone_protocol` (ISSUES.md I-16).
+    clone_protocol: CloneProtocol,
 }
 
 struct CacheEntry {
@@ -44,13 +47,31 @@ struct CacheEntry {
 }
 
 impl GitlabClient {
+    /// Convenience constructor with default `[scm.gitlab]` options.
     pub fn new(token: String, base_url: Option<String>, max_concurrency: Option<usize>) -> Self {
-        let base = base_url.unwrap_or_else(|| "https://gitlab.com/api/v4".to_string());
-        let http = Client::builder()
-            .timeout(Duration::from_secs(30))
+        Self::with_options(
+            token,
+            &ScmClientOptions {
+                base_url,
+                max_concurrency,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Build from resolved `[scm.gitlab]` options — `base_url`,
+    /// `max_concurrency`, `timeout_ms` (I-17, previously hardcoded 30s),
+    /// `clone_protocol` (I-16).
+    pub fn with_options(token: String, opts: &ScmClientOptions) -> Self {
+        let base = opts
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "https://gitlab.com/api/v4".to_string());
+        let http = opts
+            .http_client_builder()
             .build()
             .expect("reqwest builder");
-        let semaphore = concurrency::semaphore_for("gitlab", max_concurrency);
+        let semaphore = concurrency::semaphore_for("gitlab", opts.max_concurrency);
         let cache = Arc::new(Mutex::new(LruCache::new(
             NonZeroUsize::new(CACHE_CAP).unwrap(),
         )));
@@ -60,7 +81,13 @@ impl GitlabClient {
             token,
             semaphore,
             cache,
+            clone_protocol: opts.clone_protocol,
         }
+    }
+
+    /// The configured clone protocol, read by `GitlabRepoConnector::clone_to`.
+    pub fn clone_protocol(&self) -> CloneProtocol {
+        self.clone_protocol
     }
 
     /// Acquire a permit from the per-platform semaphore.

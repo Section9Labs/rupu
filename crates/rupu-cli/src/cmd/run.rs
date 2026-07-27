@@ -531,6 +531,10 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
         openai_compatible: oai_params,
+        tuning: Some(provider_factory::provider_tuning(
+            &provider_name,
+            &cfg.providers,
+        )),
     };
     let (_resolved_auth, provider) = provider_factory::build_for_provider_with_config(
         &provider_name,
@@ -696,6 +700,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         cfg.default_provider.clone(),
         cfg.default_model.clone(),
         provider_factory::openai_compatible_map(&cfg.providers),
+        provider_factory::provider_tuning_map(&cfg.providers),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
 

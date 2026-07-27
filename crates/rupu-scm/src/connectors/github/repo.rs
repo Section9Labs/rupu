@@ -434,20 +434,22 @@ impl RepoConnector for GithubRepoConnector {
     }
 
     async fn clone_to(&self, r: &RepoRef, dir: &std::path::Path) -> Result<(), ScmError> {
-        let token = self.client.token.clone();
-        let owner = r.owner.clone();
-        let repo = r.repo.clone();
+        let protocol = self.client.clone_protocol();
+        let url = crate::client_options::clone_url(
+            GITHUB_CLONE_HOST,
+            &r.owner,
+            &r.repo,
+            protocol,
+            &self.client.token,
+        );
         let dir = dir.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            let url = format!("https://{token}@github.com/{owner}/{repo}.git");
-            git2::Repository::clone(&url, &dir)
-                .map(|_| ())
-                .map_err(|e| ScmError::Network(anyhow::anyhow!("git clone failed: {e}")))
-        })
-        .await
-        .map_err(|e| ScmError::Network(anyhow::anyhow!("clone_to task panicked: {e}")))?
+        crate::client_options::run_clone(url, dir, protocol).await
     }
 }
+
+/// Clone host for github.com. Self-hosted GHES clone URLs are a separate gap
+/// (clone paths ignore `[scm.github].base_url`) tracked in `TODO.md`.
+const GITHUB_CLONE_HOST: &str = "github.com";
 
 fn repo_from_octocrab(r: octocrab::models::Repository) -> Option<Repo> {
     let full = r.full_name?;
