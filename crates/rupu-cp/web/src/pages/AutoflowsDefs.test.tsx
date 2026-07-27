@@ -21,7 +21,7 @@ afterEach(() => {
 });
 
 const ROWS: AutoflowDefRow[] = [
-  { name: 'nightly-sweep', slug: 'nightly-sweep', trigger: 'cron', scope: 'global' },
+  { name: 'nightly-sweep', slug: 'nightly-sweep', trigger: 'cron', scope: 'global', enabled: true },
 ];
 
 describe('AutoflowsDefs — kit adoption', () => {
@@ -68,18 +68,20 @@ describe('AutoflowsDefs — kit adoption', () => {
     );
 
     await waitFor(() =>
-      expect(screen.getByText('No autoflow-enabled workflows')).toBeInTheDocument(),
+      expect(screen.getByText('No autoflow workflows')).toBeInTheDocument(),
     );
     // The kit EmptyState wraps its title/hint in a dashed-border rounded box —
     // distinguishing it from the old hand-rolled AutoflowsEmpty markup would
     // require snapshotting exact classes, so instead assert the copy the kit
     // component actually renders (hint text) is present alongside the title.
     expect(
-      screen.getByText('Workflows with autoflow triggers configured will appear here.'),
+      screen.getByText(
+        'Workflows with autoflow triggers configured (enabled or disabled) will appear here.',
+      ),
     ).toBeInTheDocument();
   });
 
-  it('orders columns Name, Scope, Trigger — the canonical fields AutoflowDefRow actually has', async () => {
+  it('orders columns Name, Scope, Trigger, Enabled — the canonical fields AutoflowDefRow actually has, plus the trailing action column', async () => {
     vi.spyOn(api, 'getAutoflowDefs').mockResolvedValue(ROWS);
 
     const { container } = render(
@@ -93,7 +95,10 @@ describe('AutoflowsDefs — kit adoption', () => {
     const headers = Array.from(container.querySelectorAll('thead th')).map(
       (th) => th.textContent?.trim() ?? '',
     );
-    expect(headers).toEqual(['Name', 'Scope', 'Trigger']);
+    // The action column's header is '' (it carries the Enable/Disable button,
+    // not a header label) — same convention as Workflows'/Agents' trailing
+    // action column.
+    expect(headers).toEqual(['Name', 'Scope', 'Trigger', 'Enabled', '']);
   });
 
   it('the Name column is the flexible/truncating subject column (title carries the untruncated value)', async () => {

@@ -579,7 +579,20 @@ export interface AutoflowDefRow {
    *  is keyed by. May differ from `name` (the parsed display name). */
   slug: string;
   trigger: string;
+  /** DISPLAY ONLY — see `ScopeKind`'s doc comment; gate the Enable/Disable
+   *  toggle on `scope_kind`, never this field. */
   scope: string;
+  /** Structured scope discriminator — gate the Enable/Disable toggle on
+   *  THIS, never `scope`. See `ScopeKind`'s doc comment. Optional so literal
+   *  test fixtures that predate this field don't need updating; a gate
+   *  reading `undefined` fails closed (no toggle offered). */
+  scope_kind?: ScopeKind;
+  /** Whether `autoflow.enabled` is currently `true` in the on-disk YAML. A
+   *  workflow with no `autoflow:` block at all never appears in this list at
+   *  all — this only distinguishes enabled vs. disabled among rows that DO
+   *  have the block. Mirrors `AutoflowDefRow.enabled` in
+   *  `rupu-cp/src/api/autoflows.rs`. */
+  enabled: boolean;
 }
 
 /** Response from `POST /api/autoflows/:name/enable` and `.../disable` —
@@ -805,11 +818,41 @@ export function windowFromDayRange(startDay: string, endDay: string): UsageWindo
 }
 
 // ---------------------------------------------------------------------------
+// Scope discriminator
+// ---------------------------------------------------------------------------
+
+/**
+ * Structured scope discriminator — mirrors `rupu_cp::api::repo_scope::ScopeKind`.
+ * Independent of the display `scope` string on the same row/detail DTO: that
+ * string is a workspace path's BASENAME (for a project row) and can legally
+ * equal the literal `"global"` for a project registered at a path whose last
+ * segment happens to be named `global`. Any destructive-action gate (the
+ * Agents/Workflows list and detail Delete buttons) must key off
+ * `scope_kind`, never `scope === 'global'` — see the Rust type's doc comment.
+ *
+ * Optional on every DTO below (mirroring `AgentSummary.slug`'s pattern) so
+ * literal test fixtures that predate this field don't need updating; a gate
+ * reading `undefined` fails closed (no Delete offered) rather than assuming
+ * global.
+ */
+export type ScopeKind = 'global' | 'project';
+
+// ---------------------------------------------------------------------------
 // Agents
 // ---------------------------------------------------------------------------
 
 export interface AgentSummary {
   name: string;
+  /**
+   * File stem — the identifier `DELETE /api/agents/:name` actually operates
+   * on (it removes `<slug>.md` by file stem, never by parsed frontmatter
+   * `name`). Can differ from `name` for hand- or CLI-authored files; a
+   * Delete action MUST pass this, never `name`, or it can 404 or remove an
+   * unrelated file that happens to share that stem. Mirrors
+   * `AutoflowDefRow.slug`. Optional here (falls back to `name`) so literal
+   * test fixtures that predate this field don't need updating.
+   */
+  slug?: string;
   description?: string | null;
   provider?: string | null;
   model?: string | null;
@@ -830,6 +873,9 @@ export interface AgentSummary {
    * defs with the project name.
    */
   scope: string;
+  /** Structured scope discriminator — gate Delete on THIS, never `scope`.
+   *  See `ScopeKind`'s doc comment. */
+  scope_kind?: ScopeKind;
   usage: UsageSummary;
   run_count: number;
   /** ISO-8601 timestamp of the agent's most recent run; `null`/absent when
@@ -867,17 +913,29 @@ export interface ToolSpec {
 
 export interface WorkflowSummary {
   name: string;
+  /** DISPLAY ONLY — see `ScopeKind`'s doc comment; gate Delete on
+   *  `scope_kind`, never this field. */
   scope: string;
+  scope_kind?: ScopeKind;
   usage: UsageSummary;
   run_count: number;
   last_run?: string | null;
 }
 
 export interface WorkflowDetail {
-  /** Parsed Workflow object — typed loosely; the UI inspects what it needs. */
+  /** Parsed Workflow object — typed loosely; the UI inspects what it needs.
+   *  Does NOT carry `scope`/`scope_kind` — those are resolved by the detail
+   *  loader (which layer `GET /api/workflows/:name` found the file in), not
+   *  parsed from the YAML itself, and are surfaced as sibling top-level
+   *  fields below instead. */
   workflow: Record<string, unknown>;
   yaml: string;
   usage?: UsageSummary;
+  /** Resolved layer's display scope (`"global"` or a project's path
+   *  basename) — DISPLAY ONLY, see `ScopeKind`'s doc comment. */
+  scope?: string;
+  /** Structured scope discriminator — gate Delete on THIS, never `scope`. */
+  scope_kind?: ScopeKind;
 }
 
 /** Permission mode a launched run starts in. */

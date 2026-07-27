@@ -289,7 +289,13 @@ export default function WorkflowDetailPage() {
   }
 
   const wfName = asString(detail.workflow.name) ?? name;
-  const scope = asString(detail.workflow.scope);
+  // `scope`/`scope_kind` are resolved by the SERVER's detail loader (which
+  // layer `GET /api/workflows/:name` found the file in) and served as
+  // sibling top-level fields — NOT read from the parsed `workflow` object,
+  // which has no `scope` concept of its own (a plain `Workflow::parse` of the
+  // YAML never produces one).
+  const scope = detail.scope;
+  const scopeKind = detail.scope_kind;
   const description = asString(detail.workflow.description);
   const autoflow = readAutoflow(detail.workflow);
   const inputNames = readInputNames(detail.workflow);
@@ -340,16 +346,31 @@ export default function WorkflowDetailPage() {
                   {autoflowPending ? 'Working…' : 'Resume'}
                 </Button>
               ))}
-            <Button
-              variant="danger-outline"
-              onClick={remove}
-              disabled={deleting}
-              aria-label={`Delete ${wfName}`}
-              className="gap-1.5"
-            >
-              <Trash2 size={14} />
-              Delete
-            </Button>
+            {/* Gated to `scope_kind === 'global'` — the structured
+             *  discriminator, never the display `scope` string (a project's
+             *  path basename, which can legally equal the literal
+             *  "global"). This page resolves global-first then falls back to
+             *  every registered project's `.rupu/workflows/`, so a
+             *  project-scoped workflow can silently shadow a same-named
+             *  global one here — but `DELETE /api/workflows/:name` only ever
+             *  resolves against the global workflows dir. Without this gate,
+             *  Delete on a project-scoped def would destroy the hidden
+             *  GLOBAL file with no signal this page ever switched layers.
+             *  Deleting a project-scoped definition is NOT currently
+             *  supported anywhere in the CP — the filesystem or `rupu` CLI
+             *  is the current workaround. */}
+            {scopeKind === 'global' && (
+              <Button
+                variant="danger-outline"
+                onClick={remove}
+                disabled={deleting}
+                aria-label={`Delete ${wfName}`}
+                className="gap-1.5"
+              >
+                <Trash2 size={14} />
+                Delete
+              </Button>
+            )}
             <Button onClick={() => setLauncherOpen(true)} aria-label={`Run ${wfName}`}>
               Run
             </Button>

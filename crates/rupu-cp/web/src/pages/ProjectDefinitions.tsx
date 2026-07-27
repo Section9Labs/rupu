@@ -15,6 +15,7 @@ import {
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { TriggerChip } from '../components/TriggerChip';
 import { TabBar, TabButton } from '../components/TabBar';
+import { EnabledChip } from './AutoflowsDefs';
 import { cn } from '../lib/cn';
 
 type Tab = 'agents' | 'workflows' | 'autoflows';
@@ -157,6 +158,19 @@ const AUTOFLOW_COLUMNS: Column<AutoflowDefRow>[] = [
     sortable: true,
     sortValue: (d) => d.scope,
     render: (d) => <ScopeChip scope={d.scope} />,
+  },
+  {
+    key: 'enabled',
+    header: 'Enabled',
+    fit: true,
+    sortable: true,
+    sortValue: (d) => (d.enabled ? 1 : 0),
+    // Read-only — no toggle here. These rows are project-scoped by
+    // construction (this page IS the project's own definitions view), so
+    // there's no cross-scope ambiguity for a toggle to get wrong the way
+    // AutoflowsDefs.tsx's fleet-wide table has; a toggle is simply not
+    // offered from this sub-table at all (use the workflow detail page).
+    render: (d) => <EnabledChip enabled={d.enabled} />,
   },
 ];
 

@@ -1,7 +1,7 @@
 // Workflows library — read-only list of workflow definitions discovered by the
 // control plane. Each row links to /workflows/:name for the steps + raw YAML.
 
-import { useEffect, useId, useMemo, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Plus, Sparkles, Workflow as WorkflowIcon } from 'lucide-react';
 import { api, type ProviderModels, type WorkflowSummary } from '../lib/api';
@@ -37,27 +37,47 @@ export default function Workflows() {
   // The workflow whose launcher sheet is open (null = none).
   const [launching, setLaunching] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  // Delete failures — kept separate from the list-fetch error above, but
+  // shown in the same banner (mirrors Sessions.tsx / WorkflowRuns.tsx's
+  // `actionError`).
+  const [actionError, setActionError] = useState<string | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .getWorkflows()
-      .then((data) => {
-        if (cancelled) return;
-        setWorkflows(data);
-        setVisible(STEP);
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setError(e instanceof Error ? e.message : 'Failed to load workflows');
-      });
-    return () => {
-      cancelled = true;
-    };
+  const load = useCallback(async () => {
+    try {
+      const data = await api.getWorkflows();
+      setWorkflows(data);
+      setVisible(STEP);
+      setError(null);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Failed to load workflows');
+    }
   }, []);
 
-  // `setLaunching` is a stable useState setter → build the columns once.
-  const columns = useMemo(() => workflowColumns(setLaunching), []);
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  // Row action: delete the workflow's YAML definition file — same
+  // confirm-then-call-then-refresh shape as Sessions.tsx's row Delete.
+  async function handleDelete(name: string) {
+    if (
+      !window.confirm(
+        `Permanently delete the YAML definition file for workflow "${name}"? This cannot be undone.`,
+      )
+    ) {
+      return;
+    }
+    try {
+      await api.deleteWorkflow(name);
+      setActionError(null);
+      await load();
+    } catch (e: unknown) {
+      setActionError(e instanceof Error ? e.message : 'Delete failed');
+    }
+  }
+
+  const columns = useMemo(() => workflowColumns(setLaunching, handleDelete), []);
+  const bannerError = error ?? actionError;
 
   const sorted = (workflows ?? []).slice().sort((a, b) => a.name.localeCompare(b.name));
   const shown = sorted.slice(0, visible);
@@ -82,7 +102,7 @@ export default function Workflows() {
         </Button>
       </header>
 
-      {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
+      {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
       {workflows === null ? (
         <div className="py-16 flex items-center justify-center">
@@ -322,7 +342,10 @@ function NewWorkflowModal({ onClose }: { onClose: () => void }) {
   );
 }
 
-function workflowColumns(onRun: (name: string) => void): Column<WorkflowSummary>[] {
+function workflowColumns(
+  onRun: (name: string) => void,
+  onDelete: (name: string) => void,
+): Column<WorkflowSummary>[] {
   return [
     {
       key: 'name',
@@ -393,27 +416,51 @@ function workflowColumns(onRun: (name: string) => void): Column<WorkflowSummary>
       header: '',
       align: 'right',
       fit: true,
-      // Its own real button (Run) — keep it independently
+      // Its own real buttons (Run/Delete) — keep them independently
       // focusable/announced (I7) rather than swallowed by the row link.
       interactive: true,
+      // Delete only renders for `scope_kind === 'global'` rows (the
+      // structured discriminator — NEVER the display `scope` string, which is
+      // a project's path basename and can legally equal the literal
+      // `"global"`; see `ScopeKind`'s doc comment): `DELETE
+      // /api/workflows/:name` resolves ONLY against the global workflows
+      // dir — a project row shadowing a same-named global definition would
+      // silently delete the WRONG (global) file instead. Run stays
+      // available for every row (project-aware resolution, non-destructive).
+      // Deleting a project-scoped definition is NOT currently supported
+      // anywhere in the CP (the detail page's Delete is gated the same way,
+      // for the same reason) — the filesystem or `rupu` CLI is the current
+      // workaround.
       render: (w) => (
-        <button
-          type="button"
+        <div
+          className="flex items-center justify-end gap-1"
           onClick={(e) => {
             // The row is now link-wrapped (rowHref) — without both of
             // these, this click either soft- or hard-navigates to the
-            // workflow instead of opening the launcher (stopPropagation
-            // alone does not block the enclosing <a>'s native default
-            // navigation action).
+            // workflow instead of acting (stopPropagation alone does not
+            // block the enclosing <a>'s native default navigation action).
             e.preventDefault();
             e.stopPropagation();
-            onRun(w.name);
           }}
-          aria-label={`Run ${w.name}`}
-          className="inline-flex items-center rounded-md border border-brand-600 bg-panel px-2.5 py-1 text-ui font-medium text-brand-700 hover:bg-brand-50"
         >
-          Run
-        </button>
+          <button
+            type="button"
+            onClick={() => onRun(w.name)}
+            aria-label={`Run ${w.name}`}
+            className="inline-flex items-center rounded-md border border-brand-600 bg-panel px-2.5 py-1 text-ui font-medium text-brand-700 hover:bg-brand-50"
+          >
+            Run
+          </button>
+          {w.scope_kind === 'global' && (
+            <Button
+              variant="ring-danger"
+              onClick={() => void onDelete(w.name)}
+              aria-label={`Delete ${w.name}`}
+            >
+              Delete
+            </Button>
+          )}
+        </div>
       ),
     },
   ];
