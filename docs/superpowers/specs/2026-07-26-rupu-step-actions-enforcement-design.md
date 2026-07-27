@@ -33,17 +33,29 @@ Three surfaces reference that namespace. Two are real; one is orphaned:
 
 There is also **no UI**: no `actions:` field exists in either editor. `workflowGraph.ts` parses + re-emits it when non-empty and `StepForm.tsx:143` carries it across a kind-switch (so existing values survive an edit), but there is no way to author it from the CP.
 
-## 2. Semantics (operator-locked)
+## 2. Semantics (operator-locked; **revised 2026-07-26 after the T1 review**)
 
-**`actions:` is a narrowing filter over the agent's grant:**
+**`actions:` narrows only the CONNECTOR (MCP catalog) portion of the agent's grant. Builtin tools are never touched.**
+
+> **Why the first formulation was wrong.** The original spec said `effective = agent.tools ∩ step.actions`. That is unimplementable: agent frontmatter `tools:` mixes **builtins** (`bash`, `read_file`, `write_file`, `edit_file`, `grep`, `glob`, `ast_grep`, `dispatch_agent` — see `rupu-agent`'s `tool_registry.rs`) with **catalog** names, while `actions:` entries are catalog-only (§3a). A raw intersection therefore *deleted every builtin* (an agent narrowed to `[scm.prs.get]` could no longer read a file), and `actions: [read_file]` could not express otherwise because validation rejects non-catalog names. Wildcard grants (`tools: [scm.*]`, documented in `docs/scm.md`) exact-matched nothing and collapsed to `Some([])` — a silently tool-less run. Both were CONFIRMED in review.
+
+Let `CATALOG` = the MCP tool catalog (§1) and `BUILTINS` = the agent runtime's builtin tool names. Let `expand(grant)` resolve every grant entry into concrete names over `BUILTINS ∪ CATALOG` (exact names pass through; `*` expands to everything; a prefix wildcard such as `scm.*` or `issues.*` expands to the catalog names it covers).
 
 ```
-effective_tools = agent.tools ∩ step.actions      when step.actions is NON-empty
-effective_tools = agent.tools                     when step.actions is empty or absent
+when step.actions is EMPTY or absent:
+    effective = agent.tools                                   (unchanged — pass through verbatim)
+
+when step.actions is NON-empty:
+    let g = expand(agent.tools)
+    effective = (g ∖ CATALOG)              # builtins and anything non-catalog: UNTOUCHED
+              ∪ (g ∩ CATALOG ∩ step.actions)   # connector subset: narrowed
 ```
 
-- A step can only ever **narrow**, never grant — it cannot give a step a tool the agent's frontmatter doesn't declare. Fail-closed by construction.
-- **Empty means unrestricted** (the agent's grant stands). This is non-negotiable for compatibility: every existing workflow carries `actions: []` while relying on the agent's `tools:`; a deny-all reading would break all of them.
+- **A step may only narrow, never grant.** The connector term is intersected with `g`, so a step can never obtain a catalog tool the agent lacks. Verified no-escalation in review.
+- **Builtins are out of scope for `actions:`.** File/shell access is governed by the agent's own `tools:` and the run mode (`ask`/`bypass`/`readonly`) — not by this field. `actions:` answers "which **connector** actions may this step take", which is what the field has always meant (its Okesu ancestry is connector verbs) and what the catalog validation in §3a already assumes.
+- **Wildcards are expanded before intersecting**, so `tools: [scm.*]` + `actions: [scm.prs.get]` ⇒ `[scm.prs.get]` (plus all builtins), never `[]`.
+- **Empty means unrestricted** (the agent's grant stands, verbatim). Non-negotiable for compatibility: every existing workflow carries `actions: []` while relying on the agent's `tools:`.
+- **An empty connector intersection is legal** (a step may legitimately be allowed zero connector calls) — but it must never strip builtins, and it is worth a `tool_audit`/warning (§3c) because it is usually an authoring mistake.
 
 ```yaml
 # agent issue-reporter frontmatter: tools: [issues.list, issues.comment, issues.create, issues.update_state]
@@ -63,6 +75,9 @@ In `workflow.rs`, each `actions:` entry must name a catalog tool → new `Workfl
 
 ### 3b. Shape rule vs `action:` steps
 A **non-empty** `actions:` on an `action:` step is a validation error (`ActionsOnActionStep { step }`) — an action node's tool is already explicit and permission-checked, so an allowlist there is redundant and confusing. An **empty** `actions:` on an action step stays legal (it is already present across the repo's workflows) — compat-safe.
+
+### 3b-bis. Remote / placed steps must fail closed (added after review)
+A `host:` / `distribute:` unit never reaches `build_opts_for_step` — its roster travels in `UnitDispatch`/`AgentLaunchRequest`, which carry no tool list. So a narrowed `actions:` on such a step would be a **silent no-op**: the CP would show the step as narrowed while the remote ran the agent's full grant (fail-open). Until the roster is threaded through the dispatch payload (deferred follow-up), a **non-empty `actions:` on a step carrying `host:` or `distribute:` is a validation error** (`ActionsUnsupportedOnRemoteStep { step }`). Empty stays legal. Fail closed, never silently.
 
 ### 3c. Enforce at exactly one point
 `crates/rupu-orchestrator/src/step_factory.rs` computes `agent_tools: spec.tools`. That becomes the intersection per §2. This is the single wiring point; no other call site changes.
@@ -109,6 +124,8 @@ The web's dead-shape handling for `action_emitted` (`transcriptView.ts`) stays a
 - **Parse-time rejection risk:** §3a will reject a workflow whose `actions:` holds a non-catalog verb. The in-repo samples are clean (`[]`, plus nightly-health's real MCP names), but live workflows under `~/.rupu` may carry legacy verbs and will start erroring with a message naming the offending verb. This is the honest outcome (those entries never did anything) and the fix is to remove or correct them.
 - **`actions: []` in the samples is left in place** (decision): it is harmless, it now documents "unrestricted" explicitly, and stripping ~10 files is pure churn.
 - The MCP catalog is unchanged; no new connector work.
+- **Docs must be corrected (added after review).** `docs/workflow-format.md` and `docs/workflow-authoring.md` currently state that `actions:` is *"not a tool allowlist"* and *"does not control tool access"* — the exact inverse of these semantics. They, plus the explanatory comments in `.rupu/workflows/nightly-health.yaml` and `nightly-maintainability-security.yaml`, must be updated in the same change that lands enforcement.
+- **Shipped samples with non-empty `actions:` change behavior (added after review).** Under §2, a sample listing only some connector verbs now loses the rest: `nightly-health` drops `issues.get`; `nightly-maintainability-security` drops `issues.get` + `issues.update_state`; `pr-code-review` drops `scm.prs.get` + `scm.prs.diff`. Each such list must be completed to preserve current behavior (add the missing verbs the step actually uses), so enabling enforcement is not a silent functional change to shipped workflows.
 
 ## 6. Testing
 
