@@ -4,7 +4,7 @@
 import { useCallback, useEffect, useId, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Plus, Sparkles, Workflow as WorkflowIcon } from 'lucide-react';
-import { api, type ProviderModels, type WorkflowSummary } from '../lib/api';
+import { api, scopeSelectorFor, type ProviderModels, type WorkflowSummary } from '../lib/api';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import LauncherSheet from '../components/LauncherSheet';
@@ -61,10 +61,10 @@ export default function Workflows() {
   // Row action: delete the workflow's YAML definition file — same
   // confirm-then-call-then-refresh shape as Sessions.tsx's row Delete.
   //
-  // `DELETE /api/workflows/:name` resolves project-aware (global-then-
-  // registered-projects, same layer walk `getWorkflow` uses), so this is
-  // safe for every row regardless of scope — the confirm dialog names the
-  // resolved layer before the operator confirms.
+  // `scopeSelectorFor(w)` threads the row's exact `scope_kind`/`scope_id` so
+  // `DELETE /api/workflows/:name` targets THIS row's file even when another
+  // repo defines the same name — the confirm dialog names the resolved
+  // layer before the operator confirms.
   async function handleDelete(w: WorkflowSummary) {
     const scopeLabel = w.scope_kind === 'project' ? `project: ${w.scope}` : 'global';
     if (
@@ -75,8 +75,16 @@ export default function Workflows() {
       return;
     }
     try {
-      await api.deleteWorkflow(w.name);
-      setActionError(null);
+      const result = await api.deleteWorkflow(w.name, scopeSelectorFor(w));
+      // Confirm the server actually removed the layer the operator was
+      // shown — never silently trust a bare "ok" as "removed what I saw."
+      if (w.scope_kind && (result.scope_kind !== w.scope_kind || result.scope !== w.scope)) {
+        setActionError(
+          `Deleted the ${result.scope_kind === 'project' ? `project (${result.scope})` : 'global'} definition — not the ${scopeLabel} one shown here.`,
+        );
+      } else {
+        setActionError(null);
+      }
       await load();
     } catch (e: unknown) {
       setActionError(e instanceof Error ? e.message : 'Delete failed');
@@ -85,10 +93,11 @@ export default function Workflows() {
 
   // Row action: flip `autoflow.enabled` for a row that IS an autoflow
   // (`autoflow_enabled !== null`) — reuses `api.setAutoflowEnabled`, the
-  // same call `AutoflowsDefs.tsx`'s toggle uses.
+  // same call `AutoflowsDefs.tsx`'s toggle uses, threading `scopeSelectorFor`
+  // the same way `handleDelete` above does.
   async function handleToggleAutoflow(w: WorkflowSummary) {
     try {
-      await api.setAutoflowEnabled(w.name, !w.autoflow_enabled);
+      await api.setAutoflowEnabled(w.name, !w.autoflow_enabled, scopeSelectorFor(w));
       setActionError(null);
       await load();
     } catch (e: unknown) {

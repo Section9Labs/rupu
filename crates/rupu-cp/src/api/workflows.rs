@@ -1,13 +1,13 @@
 use crate::{
     api::fs_safety,
-    api::repo_scope::{distinct_repo_workspaces, ScopeKind},
+    api::repo_scope::{distinct_repo_workspaces, ScopeKind, ScopeQuery},
     error::{ApiError, ApiResult},
     host::connector::HostConnectorError,
     launcher::LaunchError,
     state::AppState,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::{get, post},
     Json, Router,
 };
@@ -50,14 +50,29 @@ fn repo_store(s: &AppState) -> RepoRegistryStore {
 }
 
 /// Resolve `name` to a workflow YAML path, the directory that contains it,
-/// and the scope layer it resolved from: the global layer first
-/// (`"global"`, [`ScopeKind::Global`]), then one representative workspace
-/// per distinct repo among the registered projects (see
+/// and the scope layer it resolved from: one representative workspace per
+/// distinct repo among the registered projects FIRST (see
 /// [`distinct_repo_workspaces`] — many registered workspaces are autoflow
 /// run-worktrees of the very same repo, each carrying an identical copy of
 /// `.rupu/workflows/`, so this avoids resolving against a stale
-/// non-representative worktree). First match wins; `None` when `name`
-/// resolves in neither layer.
+/// non-representative worktree), falling back to the global layer
+/// (`"global"`, [`ScopeKind::Global`]) only when no registered project
+/// defines `name`. First match wins; `None` when `name` resolves in neither
+/// layer.
+///
+/// PROJECT-FIRST is deliberate, not incidental: every list this resolver
+/// backs ([`list_workflows`], `api::autoflows::list_autoflow_defs`) shadows
+/// a same-named GLOBAL row WITH the project row (`rows.retain(|r|
+/// !project_names.contains(...))`), and the CLI runtime resolves the same
+/// way (`rupu-cli/src/cmd/workflow.rs`: "we prefer the project shadow if
+/// present and fall back to global"). A global-first resolver here — the
+/// prior implementation — silently disagreed with what the operator's own
+/// list showed them: for a name defined in BOTH layers, the list displayed
+/// only the project row, but Delete/Enable/Disable resolved and removed the
+/// HIDDEN global file, leaving the visible project row untouched (reading
+/// as "delete did nothing" while quietly destroying a definition the
+/// operator never saw). Project-first here closes that data-loss bug and
+/// makes every consumer of this resolver agree with the list/runtime.
 ///
 /// Using the SAME representative-selection [`list_workflows`] (and
 /// `api::autoflows::list_autoflow_defs`) uses to build its rows closes the
@@ -72,9 +87,11 @@ fn repo_store(s: &AppState) -> RepoRegistryStore {
 /// in the list (see `different_repos_same_def_name_both_appear`), but
 /// `:name` alone can't disambiguate which one a click meant — this resolver
 /// (like `GET`/`PUT /api/workflows/:name` before it) can only ever return
-/// the first such repo it finds. That's an inherent limitation of the
-/// bare-name-keyed route, not something this change introduces or could fix
-/// without also threading a scope qualifier through the URL.
+/// the first such repo it finds (deterministic — `distinct_repo_workspaces`
+/// sorts by `scope`). A caller that needs to pin down one specific repo's
+/// row unambiguously should use [`resolve_workflow_scoped_explicit`]
+/// instead, which every mutating web-UI caller now does (see
+/// [`delete_workflow`]) by threading the row's `scope_id`.
 ///
 /// No `host`/remote concept here, unlike `launch_run` below: `s.global_dir`
 /// and every registered workspace's `path` are local filesystem paths on
@@ -85,12 +102,13 @@ fn repo_store(s: &AppState) -> RepoRegistryStore {
 pub(crate) fn resolve_workflow_scoped(
     s: &AppState,
     name: &str,
-) -> Option<(std::path::PathBuf, std::path::PathBuf, String, ScopeKind)> {
-    let dir = workflows_dir(s);
-    let global = dir.join(format!("{name}.yaml"));
-    if global.exists() {
-        return Some((global, dir, "global".to_string(), ScopeKind::Global));
-    }
+) -> Option<(
+    std::path::PathBuf,
+    std::path::PathBuf,
+    String,
+    ScopeKind,
+    Option<String>,
+)> {
     let workspaces = store(s).list().unwrap_or_default();
     for r in distinct_repo_workspaces(workspaces, &repo_store(s)) {
         let proj_dir = std::path::Path::new(&r.workspace.path)
@@ -98,8 +116,19 @@ pub(crate) fn resolve_workflow_scoped(
             .join("workflows");
         let candidate = proj_dir.join(format!("{name}.yaml"));
         if candidate.exists() {
-            return Some((candidate, proj_dir, r.scope, ScopeKind::Project));
+            return Some((
+                candidate,
+                proj_dir,
+                r.scope,
+                ScopeKind::Project,
+                Some(r.workspace.id),
+            ));
         }
+    }
+    let dir = workflows_dir(s);
+    let global = dir.join(format!("{name}.yaml"));
+    if global.exists() {
+        return Some((global, dir, "global".to_string(), ScopeKind::Global, None));
     }
     None
 }
@@ -110,7 +139,73 @@ pub(crate) fn resolve_workflow_scoped(
 /// `pub(crate)` so `api::autoflows`'s enable/disable endpoint can reuse the
 /// same project-aware resolution rather than re-deriving it.
 pub(crate) fn resolve_workflow_path(s: &AppState, name: &str) -> Option<std::path::PathBuf> {
-    resolve_workflow_scoped(s, name).map(|(path, _, _, _)| path)
+    resolve_workflow_scoped(s, name).map(|(path, _, _, _, _)| path)
+}
+
+/// Resolve `name` restricted to an EXPLICIT scope — the disambiguating
+/// counterpart to [`resolve_workflow_scoped`]'s implicit (project-first,
+/// then global) walk.
+///
+/// - `ScopeKind::Global` looks ONLY in the global workflows dir.
+/// - `ScopeKind::Project` requires `scope_id` (the target row's registered
+///   workspace `id` — NOT the display `scope` string, which can collide
+///   between two different repos whose representative workspace paths share
+///   a basename) and looks ONLY at that ONE workspace, found by matching
+///   `scope_id` against [`distinct_repo_workspaces`]'s output. A `None`
+///   `scope_id` (or one that matches no representative workspace) resolves
+///   to `None` outright.
+///
+/// Returns `None` on ANY mismatch — file absent in the requested scope,
+/// `scope_id` not found, etc. — rather than falling back to another layer.
+/// Callers must treat `None` as 404, never silently retry with
+/// [`resolve_workflow_scoped`] — that would defeat the whole point of an
+/// operator picking a specific row to delete/toggle.
+pub(crate) fn resolve_workflow_scoped_explicit(
+    s: &AppState,
+    name: &str,
+    scope_kind: ScopeKind,
+    scope_id: Option<&str>,
+) -> Option<(std::path::PathBuf, std::path::PathBuf, String, ScopeKind)> {
+    match scope_kind {
+        ScopeKind::Global => {
+            let dir = workflows_dir(s);
+            let global = dir.join(format!("{name}.yaml"));
+            if global.exists() {
+                Some((global, dir, "global".to_string(), ScopeKind::Global))
+            } else {
+                None
+            }
+        }
+        ScopeKind::Project => {
+            let scope_id = scope_id?;
+            let workspaces = store(s).list().unwrap_or_default();
+            let r = distinct_repo_workspaces(workspaces, &repo_store(s))
+                .into_iter()
+                .find(|r| r.workspace.id == scope_id)?;
+            let proj_dir = std::path::Path::new(&r.workspace.path)
+                .join(".rupu")
+                .join("workflows");
+            let candidate = proj_dir.join(format!("{name}.yaml"));
+            if candidate.exists() {
+                Some((candidate, proj_dir, r.scope, ScopeKind::Project))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Path-only convenience wrapper over [`resolve_workflow_scoped_explicit`],
+/// mirroring [`resolve_workflow_path`]. Used by
+/// `api::autoflows::set_autoflow_enabled` when the request carries explicit
+/// scope query params.
+pub(crate) fn resolve_workflow_path_explicit(
+    s: &AppState,
+    name: &str,
+    scope_kind: ScopeKind,
+    scope_id: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    resolve_workflow_scoped_explicit(s, name, scope_kind, scope_id).map(|(path, _, _, _)| path)
 }
 
 #[derive(Serialize)]
@@ -123,6 +218,14 @@ pub(crate) struct WorkflowDto {
     pub(crate) scope: String,
     /// Structured scope discriminator backing every Delete gate.
     pub(crate) scope_kind: ScopeKind,
+    /// The underlying registered workspace's unique `id` for a Project row
+    /// (`None` for a Global row). Unlike `scope` (a path basename, which can
+    /// collide between two different repos), this is the genuinely unique
+    /// identifier for "which repo" — pass it back as the `scope_id` query
+    /// param on `DELETE`/enable-disable to pin the action to THIS row's file
+    /// when another repo defines the same `name`. See
+    /// `repo_scope::ScopeQuery`'s doc comment.
+    pub(crate) scope_id: Option<String>,
     /// Aggregate token + cost usage across every run attributed to this
     /// workflow name. `RunRecord` records `workflow_name` alone (not which
     /// scope's definition produced the run), so `usage`/`run_count`/
@@ -163,6 +266,7 @@ pub(crate) fn scan_workflow_names(
     dir: &std::path::Path,
     scope: impl Into<String>,
     scope_kind: ScopeKind,
+    scope_id: Option<String>,
 ) -> Vec<WorkflowDto> {
     let scope = scope.into();
     if !dir.is_dir() {
@@ -189,6 +293,7 @@ pub(crate) fn scan_workflow_names(
                 name,
                 scope: scope.clone(),
                 scope_kind,
+                scope_id: scope_id.clone(),
                 usage: crate::usage::UsageSummary::default(),
                 run_count: 0,
                 last_run: None,
@@ -217,6 +322,7 @@ async fn list_workflows(State(s): State<AppState>) -> ApiResult<Json<Vec<Workflo
         &s.global_dir.join("workflows"),
         "global",
         ScopeKind::Global,
+        None,
     );
 
     let workspaces = store(&s).list().unwrap_or_default();
@@ -226,7 +332,8 @@ async fn list_workflows(State(s): State<AppState>) -> ApiResult<Json<Vec<Workflo
         let dir = std::path::Path::new(&r.workspace.path)
             .join(".rupu")
             .join("workflows");
-        project_rows.extend(scan_workflow_names(&dir, r.scope, ScopeKind::Project));
+        let scope_id = Some(r.workspace.id.clone());
+        project_rows.extend(scan_workflow_names(&dir, r.scope, ScopeKind::Project, scope_id));
     }
 
     let project_names: std::collections::BTreeSet<&str> =
@@ -268,18 +375,20 @@ async fn list_workflows(State(s): State<AppState>) -> ApiResult<Json<Vec<Workflo
 }
 
 /// Load workflow `name` and build the full detail DTO (`workflow` + raw `yaml` +
-/// aggregate `usage` + resolved `scope`/`scope_kind`). Shared by GET / PUT / POST.
+/// aggregate `usage` + resolved `scope`/`scope_kind`/`scope_id`). Shared by
+/// GET / PUT / POST.
 ///
-/// Project-aware: resolves `name` in the global layer first, falling back to
-/// every registered project's `.rupu/workflows/` (first match) so a
+/// Project-aware: resolves `name` project-first, falling back to the global
+/// layer (see [`resolve_workflow_scoped`]'s doc comment for why) so a
 /// project-only workflow's detail route doesn't 404. The resolved layer is
-/// carried on the response's `scope`/`scope_kind`, which the CP detail page
-/// shows (scope chip + naming the layer in the delete confirmation) —
+/// carried on the response's `scope`/`scope_kind`/`scope_id`, which the CP
+/// detail page shows (scope chip + naming the layer in the delete
+/// confirmation) and threads back on its own Delete/toggle calls —
 /// `DELETE /api/workflows/:name` independently resolves the SAME way (see
 /// [`resolve_workflow_scoped`]), so Delete always removes the file this page
-/// is actually showing.
+/// is actually showing when no explicit scope is passed.
 fn load_detail(s: &AppState, name: &str) -> ApiResult<Json<serde_json::Value>> {
-    let (path, _dir, scope, scope_kind) = resolve_workflow_scoped(s, name)
+    let (path, _dir, scope, scope_kind, scope_id) = resolve_workflow_scoped(s, name)
         .ok_or_else(|| ApiError::not_found(format!("workflow {name} not found")))?;
     let yaml = std::fs::read_to_string(&path).map_err(|e| ApiError::internal(e.to_string()))?;
     let workflow = Workflow::parse(&yaml).map_err(|e| ApiError::internal(e.to_string()))?;
@@ -297,6 +406,7 @@ fn load_detail(s: &AppState, name: &str) -> ApiResult<Json<serde_json::Value>> {
         "usage": usage,
         "scope": scope,
         "scope_kind": scope_kind,
+        "scope_id": scope_id,
     })))
 }
 
@@ -369,23 +479,43 @@ async fn validate_workflow(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-/// `DELETE /api/workflows/:name` — remove the workflow definition `:name`,
-/// resolved the same global-then-registered-projects way
-/// [`resolve_workflow_scoped`] does (the same resolver `GET`/`PUT
-/// /api/workflows/:name` use). A project-scoped workflow's Delete
-/// row-action therefore removes the actual project file the row/detail page
-/// displays, not a same-named global file it shadows — the data-loss bug PR
-/// #536 worked around by hiding Delete on non-global rows entirely. Returns
-/// the resolved `scope`/`scope_kind` alongside `deleted: true` so the caller
-/// can report which layer's file was removed. Local-only, no `?host=` —
-/// see [`resolve_workflow_scoped`]'s doc comment.
+/// `DELETE /api/workflows/:name` — remove the workflow definition `:name`.
+///
+/// Accepts optional `?scope_kind=global|project&scope_id=<workspace id>`
+/// query params (see [`ScopeQuery`]'s doc comment). When present, resolution
+/// is EXPLICIT via [`resolve_workflow_scoped_explicit`] — restricted to
+/// exactly that layer/workspace, 404 on any mismatch (wrong layer, absent
+/// file, unknown `scope_id`) rather than falling back to another layer. When
+/// absent (older clients), falls back to the implicit project-first resolver
+/// [`resolve_workflow_scoped`] — the SAME resolver `GET`/`PUT
+/// /api/workflows/:name` use — so a project-scoped workflow's Delete
+/// row-action still removes the actual project file the row/detail page
+/// displays, not a same-named global file it shadows (the data-loss bug PR
+/// #536 worked around by hiding Delete on non-global rows entirely, and a
+/// LATER bug this fixes: the implicit resolver briefly resolved
+/// global-first, backwards from what the list/CLI runtime prefer — see
+/// [`resolve_workflow_scoped`]'s doc comment).
+///
+/// Returns the resolved `scope`/`scope_kind` alongside `deleted: true` so the
+/// caller can confirm which layer's file was actually removed. Local-only,
+/// no `?host=` — see [`resolve_workflow_scoped`]'s doc comment.
 async fn delete_workflow(
     State(s): State<AppState>,
     Path(name): Path<String>,
+    Query(q): Query<ScopeQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     fs_safety::validate_name(&name)?;
-    let (target, dir, scope, scope_kind) = resolve_workflow_scoped(&s, &name)
-        .ok_or_else(|| ApiError::not_found(format!("workflow {name} not found")))?;
+    let (target, dir, scope, scope_kind) = match q.scope_kind {
+        Some(kind) => resolve_workflow_scoped_explicit(&s, &name, kind, q.scope_id.as_deref())
+            .ok_or_else(|| {
+                ApiError::not_found(format!("workflow {name} not found in the requested scope"))
+            })?,
+        None => {
+            let (target, dir, scope, scope_kind, _scope_id) = resolve_workflow_scoped(&s, &name)
+                .ok_or_else(|| ApiError::not_found(format!("workflow {name} not found")))?;
+            (target, dir, scope, scope_kind)
+        }
+    };
     // Defense in depth — see `fs_safety::validate_within`'s doc comment.
     fs_safety::validate_within(&target, &dir)?;
     std::fs::remove_file(&target).map_err(|e| ApiError::internal(e.to_string()))?;
@@ -756,17 +886,25 @@ mod tests {
         std::fs::create_dir_all(workflows_dir(&s)).unwrap();
         std::fs::write(wf_path(&s, "demo"), VALID_YAML).unwrap();
 
-        let resp = delete_workflow(State(s.clone()), Path("demo".into()))
-            .await
-            .expect("delete ok");
+        let resp = delete_workflow(
+            State(s.clone()),
+            Path("demo".into()),
+            Query(ScopeQuery::default()),
+        )
+        .await
+        .expect("delete ok");
         assert_eq!(resp.0["deleted"], serde_json::json!(true));
         assert_eq!(resp.0["scope"], serde_json::json!("global"));
         assert_eq!(resp.0["scope_kind"], serde_json::json!("global"));
         assert!(!wf_path(&s, "demo").exists());
 
-        let err = delete_workflow(State(s.clone()), Path("demo".into()))
-            .await
-            .expect_err("absent");
+        let err = delete_workflow(
+            State(s.clone()),
+            Path("demo".into()),
+            Query(ScopeQuery::default()),
+        )
+        .await
+        .expect_err("absent");
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
     }
 
@@ -790,9 +928,13 @@ mod tests {
         .unwrap();
         register_workspace(&tmp, "ws_a", proj.path());
 
-        let resp = delete_workflow(State(s.clone()), Path("nightly-sweep".into()))
-            .await
-            .expect("project-scoped delete should succeed");
+        let resp = delete_workflow(
+            State(s.clone()),
+            Path("nightly-sweep".into()),
+            Query(ScopeQuery::default()),
+        )
+        .await
+        .expect("project-scoped delete should succeed");
         assert_eq!(resp.0["scope_kind"], serde_json::json!("project"));
         assert!(
             !proj_workflows.join("nightly-sweep.yaml").exists(),
@@ -824,9 +966,13 @@ mod tests {
         .unwrap();
         register_workspace(&tmp, "ws_a", proj.path());
 
-        let resp = delete_workflow(State(s.clone()), Path("nightly-sweep".into()))
-            .await
-            .expect("global delete should succeed");
+        let resp = delete_workflow(
+            State(s.clone()),
+            Path("nightly-sweep".into()),
+            Query(ScopeQuery::default()),
+        )
+        .await
+        .expect("global delete should succeed");
         assert_eq!(resp.0["scope_kind"], serde_json::json!("global"));
         assert!(!wf_path(&s, "nightly-sweep").exists());
         assert!(
@@ -845,13 +991,167 @@ mod tests {
         std::fs::write(&outside_target, VALID_YAML).unwrap();
         std::fs::create_dir_all(workflows_dir(&s)).unwrap();
 
-        let err = delete_workflow(State(s), Path("../evil".into()))
-            .await
-            .expect_err("traversal name must be rejected");
+        let err = delete_workflow(
+            State(s),
+            Path("../evil".into()),
+            Query(ScopeQuery::default()),
+        )
+        .await
+        .expect_err("traversal name must be rejected");
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
         assert!(
             outside_target.exists(),
             "the out-of-tree file must be byte-for-byte untouched"
+        );
+    }
+
+    // ── Critical 1: project-first precedence for a name shared by BOTH
+    //    layers ─────────────────────────────────────────────────────────
+    //
+    // The list always shadows a same-named GLOBAL row WITH the project row
+    // (`rows.retain(|r| !project_names.contains(...))` in `list_workflows`),
+    // so Delete on the row the operator sees must remove the PROJECT file,
+    // never the hidden global one. Regression for the inverted-precedence
+    // data-loss bug: a global-first resolver would delete the global file
+    // here while the project row (the one actually shown) survived —
+    // silently destroying a definition the operator never saw, while
+    // reading as "delete did nothing."
+
+    #[tokio::test]
+    async fn delete_with_name_in_both_layers_removes_project_leaves_global_intact() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        std::fs::create_dir_all(workflows_dir(&s)).unwrap();
+        std::fs::write(wf_path(&s, "shared-name"), VALID_YAML.replace("demo", "shared-name"))
+            .unwrap();
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_workflows = proj.path().join(".rupu").join("workflows");
+        std::fs::create_dir_all(&proj_workflows).unwrap();
+        std::fs::write(
+            proj_workflows.join("shared-name.yaml"),
+            VALID_YAML.replace("demo", "shared-name"),
+        )
+        .unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        // The list shadows the global row with the project row — confirm
+        // that's really what's shown before deleting it.
+        let Json(rows) = list_workflows(State(s.clone())).await.expect("ok");
+        assert_eq!(rows.len(), 1, "the project row shadows the global one");
+        assert_eq!(rows[0].scope_kind, ScopeKind::Project);
+
+        // No explicit scope query — the implicit (project-first) resolver
+        // must match what the list showed.
+        let resp = delete_workflow(
+            State(s.clone()),
+            Path("shared-name".into()),
+            Query(ScopeQuery::default()),
+        )
+        .await
+        .expect("delete should succeed");
+        assert_eq!(resp.0["scope_kind"], serde_json::json!("project"));
+        assert!(
+            !proj_workflows.join("shared-name.yaml").exists(),
+            "the PROJECT file (the one the list/operator saw) must be removed"
+        );
+        assert!(
+            wf_path(&s, "shared-name").exists(),
+            "the shadowed GLOBAL file must survive untouched"
+        );
+    }
+
+    // ── Critical 2: `scope_id` disambiguates a name shared by TWO repos ──
+
+    #[tokio::test]
+    async fn delete_with_explicit_scope_id_targets_one_repo_of_two_with_the_same_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        std::fs::create_dir_all(workflows_dir(&s)).unwrap(); // empty global
+
+        let proj_x = tmp.path().join("proj-x");
+        let workflows_x = proj_x.join(".rupu").join("workflows");
+        std::fs::create_dir_all(&workflows_x).unwrap();
+        std::fs::write(
+            workflows_x.join("foo.yaml"),
+            VALID_YAML.replace("demo", "foo"),
+        )
+        .unwrap();
+        register_workspace_with_remote(&tmp, "ws_x", &proj_x, Some("git@github.com:acme/x.git"));
+
+        let proj_y = tmp.path().join("proj-y");
+        let workflows_y = proj_y.join(".rupu").join("workflows");
+        std::fs::create_dir_all(&workflows_y).unwrap();
+        std::fs::write(
+            workflows_y.join("foo.yaml"),
+            VALID_YAML.replace("demo", "foo"),
+        )
+        .unwrap();
+        register_workspace_with_remote(&tmp, "ws_y", &proj_y, Some("git@github.com:acme/y.git"));
+
+        // Both rows appear in the list — confirm the ambiguity is real
+        // before resolving it with an explicit scope_id.
+        let Json(rows) = list_workflows(State(s.clone())).await.expect("ok");
+        assert_eq!(rows.len(), 2);
+
+        // Delete repo Y's row specifically, by its workspace id.
+        let resp = delete_workflow(
+            State(s.clone()),
+            Path("foo".into()),
+            Query(ScopeQuery {
+                scope_kind: Some(ScopeKind::Project),
+                scope_id: Some("ws_y".to_string()),
+            }),
+        )
+        .await
+        .expect("explicit-scope delete should succeed");
+        assert_eq!(resp.0["scope"], serde_json::json!("proj-y"));
+        assert!(
+            !workflows_y.join("foo.yaml").exists(),
+            "repo Y's file must be removed"
+        );
+        assert!(
+            workflows_x.join("foo.yaml").exists(),
+            "repo X's same-named file must survive untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_explicit_scope_mismatch_404s_and_leaves_every_file_untouched() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        std::fs::create_dir_all(workflows_dir(&s)).unwrap();
+        std::fs::write(wf_path(&s, "shared-name"), VALID_YAML.replace("demo", "shared-name"))
+            .unwrap();
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_workflows = proj.path().join(".rupu").join("workflows");
+        std::fs::create_dir_all(&proj_workflows).unwrap();
+        std::fs::write(
+            proj_workflows.join("shared-name.yaml"),
+            VALID_YAML.replace("demo", "shared-name"),
+        )
+        .unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        // Ask explicitly for the GLOBAL layer's row's Delete to instead
+        // target Project scope with an unknown workspace id — must 404,
+        // NOT silently fall back to deleting the global (or project) file.
+        let err = delete_workflow(
+            State(s.clone()),
+            Path("shared-name".into()),
+            Query(ScopeQuery {
+                scope_kind: Some(ScopeKind::Project),
+                scope_id: Some("no-such-workspace".to_string()),
+            }),
+        )
+        .await
+        .expect_err("mismatched explicit scope must 404, never fall back");
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+        assert!(wf_path(&s, "shared-name").exists(), "global file untouched");
+        assert!(
+            proj_workflows.join("shared-name.yaml").exists(),
+            "project file untouched"
         );
     }
 
@@ -1283,7 +1583,7 @@ mod tests {
 
         // ...and the resolver used by both delete and the autoflow toggle
         // must resolve to that SAME worktree's file.
-        let (path, _dir, scope, _kind) = resolve_workflow_scoped(&s, "issue-triage")
+        let (path, _dir, scope, _kind, _scope_id) = resolve_workflow_scoped(&s, "issue-triage")
             .expect("should resolve against the representative worktree");
         assert_eq!(scope, "worktree-a");
         assert_eq!(

@@ -5,7 +5,7 @@
 import { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, Pencil, Trash2 } from 'lucide-react';
-import { api, type AgentDetail } from '../lib/api';
+import { api, scopeSelectorFor, type AgentDetail } from '../lib/api';
 import { cn } from '../lib/cn';
 import CodeHighlight from '../components/CodeHighlight';
 import CodeEditor from '../components/CodeEditor';
@@ -100,8 +100,20 @@ export default function AgentDetailPage() {
       // By `slug` (file stem), never the route's `name` param (frontmatter
       // display name) — `DELETE /api/agents/:name` resolves by file stem
       // (see `AgentSummary.slug`'s doc comment), and the two can differ for
-      // hand- or CLI-authored files. Mirrors `Agents.tsx`'s row Delete.
-      await api.deleteAgent(agent.slug ?? name);
+      // hand- or CLI-authored files. `scopeSelectorFor(agent)` threads the
+      // resolved `scope_kind`/`scope_id` so the request targets THIS exact
+      // file even when another repo defines the same slug. Mirrors
+      // `Agents.tsx`'s row Delete.
+      const result = await api.deleteAgent(agent.slug ?? name, scopeSelectorFor(agent));
+      if (
+        agent.scope_kind &&
+        (result.scope_kind !== agent.scope_kind || result.scope !== agent.scope)
+      ) {
+        setDeleteError(
+          `Deleted the ${result.scope_kind === 'project' ? `project (${result.scope})` : 'global'} definition — not the one shown here.`,
+        );
+        return;
+      }
       navigate('/agents');
     } catch (e: unknown) {
       setDeleteError(e instanceof Error ? e.message : 'Failed to delete agent');

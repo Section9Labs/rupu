@@ -82,7 +82,9 @@ describe('AutoflowsDefs — Enabled column + toggle', () => {
     );
     expect(notCanceled).toBe(false);
 
-    await waitFor(() => expect(toggleSpy).toHaveBeenCalledWith('nightly-sweep', false));
+    await waitFor(() =>
+      expect(toggleSpy).toHaveBeenCalledWith('nightly-sweep', false, { scope_kind: 'global' }),
+    );
     await waitFor(() => expect(getDefsSpy).toHaveBeenCalledTimes(2));
     expect(screen.getByTestId('loc')).toHaveTextContent('/build/autoflows');
   });
@@ -102,7 +104,9 @@ describe('AutoflowsDefs — Enabled column + toggle', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Enable stale-cleanup' }));
 
-    await waitFor(() => expect(toggleSpy).toHaveBeenCalledWith('stale-cleanup', true));
+    await waitFor(() =>
+      expect(toggleSpy).toHaveBeenCalledWith('stale-cleanup', true, { scope_kind: 'global' }),
+    );
   });
 
   it('surfaces a toggle failure via the page error mechanism', async () => {

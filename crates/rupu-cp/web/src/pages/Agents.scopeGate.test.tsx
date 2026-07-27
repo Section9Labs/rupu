@@ -94,7 +94,9 @@ describe('Agents — scope-aware Delete + slug-based delete', () => {
       },
     ];
     vi.spyOn(api, 'getAgents').mockResolvedValue(ROWS);
-    const deleteSpy = vi.spyOn(api, 'deleteAgent').mockResolvedValue();
+    const deleteSpy = vi
+      .spyOn(api, 'deleteAgent')
+      .mockResolvedValue({ deleted: true, scope: 'my-project', scope_kind: 'project' });
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
 
     render(
@@ -107,7 +109,9 @@ describe('Agents — scope-aware Delete + slug-based delete', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Delete reviewer' }));
 
     expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('project: my-project'));
-    await waitFor(() => expect(deleteSpy).toHaveBeenCalledWith('reviewer'));
+    await waitFor(() =>
+      expect(deleteSpy).toHaveBeenCalledWith('reviewer', { scope_kind: 'project' }),
+    );
   });
 
   it('the confirm dialog names "global" for a global row\'s Delete', async () => {
@@ -177,7 +181,7 @@ describe('Agents — scope-aware Delete + slug-based delete', () => {
       },
     ];
     vi.spyOn(api, 'getAgents').mockResolvedValue(ROWS);
-    const deleteSpy = vi.spyOn(api, 'deleteAgent').mockResolvedValue();
+    const deleteSpy = vi.spyOn(api, 'deleteAgent').mockResolvedValue({ deleted: true, scope: 'global', scope_kind: 'global' });
     vi.spyOn(window, 'confirm').mockReturnValue(true);
 
     render(
@@ -189,7 +193,9 @@ describe('Agents — scope-aware Delete + slug-based delete', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Delete code-reviewer' }));
 
-    await waitFor(() => expect(deleteSpy).toHaveBeenCalledWith('my-file-stem'));
+    await waitFor(() =>
+      expect(deleteSpy).toHaveBeenCalledWith('my-file-stem', { scope_kind: 'global' }),
+    );
     expect(deleteSpy).not.toHaveBeenCalledWith('code-reviewer');
   });
 });

@@ -156,19 +156,21 @@ describe('WorkflowDetail', () => {
 
   it('Delete (confirmed) calls deleteWorkflow and navigates to /workflows', async () => {
     vi.spyOn(api, 'getWorkflow').mockResolvedValue(DETAIL);
-    const delSpy = vi.spyOn(api, 'deleteWorkflow').mockResolvedValue();
+    const delSpy = vi.spyOn(api, 'deleteWorkflow').mockResolvedValue({ deleted: true, scope: 'global', scope_kind: 'global' });
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     renderPage();
 
     fireEvent.click(await screen.findByRole('button', { name: 'Delete nightly' }));
 
-    await waitFor(() => expect(delSpy).toHaveBeenCalledWith('nightly'));
+    await waitFor(() =>
+      expect(delSpy).toHaveBeenCalledWith('nightly', { scope_kind: 'global' }),
+    );
     expect(navigateMock).toHaveBeenCalledWith('/workflows');
   });
 
   it('Delete (cancelled at confirm) does nothing', async () => {
     vi.spyOn(api, 'getWorkflow').mockResolvedValue(DETAIL);
-    const delSpy = vi.spyOn(api, 'deleteWorkflow').mockResolvedValue();
+    const delSpy = vi.spyOn(api, 'deleteWorkflow').mockResolvedValue({ deleted: true, scope: 'global', scope_kind: 'global' });
     vi.spyOn(window, 'confirm').mockReturnValue(false);
     renderPage();
 
@@ -191,7 +193,9 @@ describe('WorkflowDetail', () => {
       scope: 'my-project',
       scope_kind: 'project',
     });
-    const delSpy = vi.spyOn(api, 'deleteWorkflow').mockResolvedValue();
+    const delSpy = vi
+      .spyOn(api, 'deleteWorkflow')
+      .mockResolvedValue({ deleted: true, scope: 'my-project', scope_kind: 'project' });
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
     renderPage();
 
@@ -201,7 +205,9 @@ describe('WorkflowDetail', () => {
     expect(confirmSpy).toHaveBeenCalledWith(
       expect.stringContaining('project: my-project'),
     );
-    await waitFor(() => expect(delSpy).toHaveBeenCalledWith('nightly'));
+    await waitFor(() =>
+      expect(delSpy).toHaveBeenCalledWith('nightly', { scope_kind: 'project' }),
+    );
   });
 
   it('a global workflow shows a scope chip and a Delete button whose confirm names "global"', async () => {
@@ -239,7 +245,9 @@ describe('WorkflowDetail', () => {
 
     fireEvent.click(disableBtn);
 
-    await waitFor(() => expect(setSpy).toHaveBeenCalledWith('nightly', false));
+    await waitFor(() =>
+      expect(setSpy).toHaveBeenCalledWith('nightly', false, { scope_kind: 'global' }),
+    );
     expect(await screen.findByRole('button', { name: 'Resume nightly' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Disable nightly' })).not.toBeInTheDocument();
   });
@@ -256,7 +264,9 @@ describe('WorkflowDetail', () => {
 
     fireEvent.click(resumeBtn);
 
-    await waitFor(() => expect(setSpy).toHaveBeenCalledWith('nightly', true));
+    await waitFor(() =>
+      expect(setSpy).toHaveBeenCalledWith('nightly', true, { scope_kind: 'global' }),
+    );
     expect(await screen.findByRole('button', { name: 'Disable nightly' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Resume nightly' })).not.toBeInTheDocument();
   });

@@ -134,19 +134,21 @@ describe('AgentDetail edit/delete', () => {
 
   it('Delete (confirmed) calls deleteAgent and navigates to /agents', async () => {
     vi.spyOn(api, 'getAgent').mockResolvedValue(AGENT);
-    const delSpy = vi.spyOn(api, 'deleteAgent').mockResolvedValue();
+    const delSpy = vi.spyOn(api, 'deleteAgent').mockResolvedValue({ deleted: true, scope: 'global', scope_kind: 'global' });
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     renderPage();
 
     fireEvent.click(await screen.findByRole('button', { name: 'Delete reviewer' }));
 
-    await waitFor(() => expect(delSpy).toHaveBeenCalledWith('reviewer'));
+    await waitFor(() =>
+      expect(delSpy).toHaveBeenCalledWith('reviewer', { scope_kind: 'global' }),
+    );
     expect(navigateMock).toHaveBeenCalledWith('/agents');
   });
 
   it('Delete (cancelled at confirm) does nothing', async () => {
     vi.spyOn(api, 'getAgent').mockResolvedValue(AGENT);
-    const delSpy = vi.spyOn(api, 'deleteAgent').mockResolvedValue();
+    const delSpy = vi.spyOn(api, 'deleteAgent').mockResolvedValue({ deleted: true, scope: 'global', scope_kind: 'global' });
     vi.spyOn(window, 'confirm').mockReturnValue(false);
     renderPage();
 
@@ -169,7 +171,9 @@ describe('AgentDetail edit/delete', () => {
       scope: 'my-project',
       scope_kind: 'project',
     });
-    const delSpy = vi.spyOn(api, 'deleteAgent').mockResolvedValue();
+    const delSpy = vi
+      .spyOn(api, 'deleteAgent')
+      .mockResolvedValue({ deleted: true, scope: 'my-project', scope_kind: 'project' });
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
     renderPage();
 
@@ -179,7 +183,9 @@ describe('AgentDetail edit/delete', () => {
     expect(confirmSpy).toHaveBeenCalledWith(
       expect.stringContaining('project: my-project'),
     );
-    await waitFor(() => expect(delSpy).toHaveBeenCalledWith('reviewer'));
+    await waitFor(() =>
+      expect(delSpy).toHaveBeenCalledWith('reviewer', { scope_kind: 'project' }),
+    );
   });
 
   it('a global agent shows a scope chip and a Delete button whose confirm names "global"', async () => {

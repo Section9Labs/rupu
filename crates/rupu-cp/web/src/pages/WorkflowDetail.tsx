@@ -8,7 +8,7 @@ import { lazy, Suspense, useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, Trash2 } from 'lucide-react';
 import yaml from 'js-yaml';
-import { api, ApiError, type AgentSummary, type WorkflowDetail } from '../lib/api';
+import { api, ApiError, scopeSelectorFor, type AgentSummary, type WorkflowDetail } from '../lib/api';
 import { ScopeChip } from '../components/ScopeChip';
 import LauncherSheet from '../components/LauncherSheet';
 import { Button } from '../components/ui/Button';
@@ -242,7 +242,20 @@ export default function WorkflowDetailPage() {
     setDeleting(true);
     setDeleteError(null);
     try {
-      await api.deleteWorkflow(name);
+      // `scopeSelectorFor(detail)` threads the resolved `scope_kind`/
+      // `scope_id` so the request targets THIS exact file even when
+      // another repo defines the same name.
+      const result = await api.deleteWorkflow(name, scopeSelectorFor(detail));
+      if (
+        detail.scope_kind &&
+        (result.scope_kind !== detail.scope_kind || result.scope !== detail.scope)
+      ) {
+        setDeleteError(
+          `Deleted the ${result.scope_kind === 'project' ? `project (${result.scope})` : 'global'} definition — not the one shown here.`,
+        );
+        setDeleting(false);
+        return;
+      }
       navigate('/workflows');
     } catch (e: unknown) {
       setDeleteError(e instanceof Error ? e.message : 'Failed to delete workflow');
@@ -262,7 +275,11 @@ export default function WorkflowDetailPage() {
     setAutoflowReadOnly(false);
     setAutoflowError(null);
     try {
-      const resp = await api.setAutoflowEnabled(name, !currentlyEnabled);
+      const resp = await api.setAutoflowEnabled(
+        name,
+        !currentlyEnabled,
+        detail ? scopeSelectorFor(detail) : undefined,
+      );
       setAutoflowEnabledOverride(resp.enabled);
     } catch (e: unknown) {
       if (e instanceof ApiError && e.status === 501) {

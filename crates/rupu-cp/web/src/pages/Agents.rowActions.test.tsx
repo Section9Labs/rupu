@@ -125,7 +125,7 @@ describe('Agents — row actions', () => {
 
   it('clicking Delete without confirming does not call the API', async () => {
     vi.spyOn(api, 'getAgents').mockResolvedValue(ROWS);
-    const deleteSpy = vi.spyOn(api, 'deleteAgent').mockResolvedValue();
+    const deleteSpy = vi.spyOn(api, 'deleteAgent').mockResolvedValue({ deleted: true, scope: 'global', scope_kind: 'global' });
     vi.spyOn(window, 'confirm').mockReturnValue(false);
 
     render(
@@ -143,7 +143,7 @@ describe('Agents — row actions', () => {
 
   it('clicking Delete and confirming deletes the agent definition and refreshes the list, without navigating the row', async () => {
     const getAgentsSpy = vi.spyOn(api, 'getAgents').mockResolvedValue(ROWS);
-    const deleteSpy = vi.spyOn(api, 'deleteAgent').mockResolvedValue();
+    const deleteSpy = vi.spyOn(api, 'deleteAgent').mockResolvedValue({ deleted: true, scope: 'global', scope_kind: 'global' });
     vi.spyOn(window, 'confirm').mockReturnValue(true);
 
     render(
@@ -157,7 +157,9 @@ describe('Agents — row actions', () => {
     const notCanceled = fireEvent.click(screen.getByRole('button', { name: 'Delete reviewer' }));
     expect(notCanceled).toBe(false);
 
-    await waitFor(() => expect(deleteSpy).toHaveBeenCalledWith('reviewer'));
+    await waitFor(() =>
+      expect(deleteSpy).toHaveBeenCalledWith('reviewer', { scope_kind: 'global' }),
+    );
     await waitFor(() => expect(getAgentsSpy).toHaveBeenCalledTimes(2));
     expect(screen.getByTestId('loc')).toHaveTextContent('/agents');
   });

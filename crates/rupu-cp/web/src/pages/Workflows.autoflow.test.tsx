@@ -168,7 +168,9 @@ describe('Workflows — autoflow badge + toggle', () => {
     );
     expect(notCanceled).toBe(false);
 
-    await waitFor(() => expect(toggleSpy).toHaveBeenCalledWith('nightly-sweep', false));
+    await waitFor(() =>
+      expect(toggleSpy).toHaveBeenCalledWith('nightly-sweep', false, { scope_kind: 'global' }),
+    );
     await waitFor(() => expect(getWorkflowsSpy).toHaveBeenCalledTimes(2));
     expect(screen.getByTestId('loc')).toHaveTextContent('/workflows');
   });

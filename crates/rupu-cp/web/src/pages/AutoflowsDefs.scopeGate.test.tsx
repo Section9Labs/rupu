@@ -60,7 +60,9 @@ describe('AutoflowsDefs — scope-aware toggle', () => {
     expect(disableBtn).toBeInTheDocument();
 
     fireEvent.click(disableBtn);
-    await waitFor(() => expect(toggleSpy).toHaveBeenCalledWith('issue-triage', false));
+    await waitFor(() =>
+      expect(toggleSpy).toHaveBeenCalledWith('issue-triage', false, { scope_kind: 'project' }),
+    );
   });
 
   it('shows the toggle for a project row whose display scope collides with the literal "global"', async () => {

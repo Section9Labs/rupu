@@ -89,7 +89,9 @@ describe('Workflows — scope-aware Delete', () => {
       },
     ];
     vi.spyOn(api, 'getWorkflows').mockResolvedValue(ROWS);
-    const deleteSpy = vi.spyOn(api, 'deleteWorkflow').mockResolvedValue();
+    const deleteSpy = vi
+      .spyOn(api, 'deleteWorkflow')
+      .mockResolvedValue({ deleted: true, scope: 'my-project', scope_kind: 'project' });
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
 
     render(
@@ -102,7 +104,9 @@ describe('Workflows — scope-aware Delete', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Delete nightly-sweep' }));
 
     expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('project: my-project'));
-    await waitFor(() => expect(deleteSpy).toHaveBeenCalledWith('nightly-sweep'));
+    await waitFor(() =>
+      expect(deleteSpy).toHaveBeenCalledWith('nightly-sweep', { scope_kind: 'project' }),
+    );
   });
 
   it('the confirm dialog names "global" for a global row\'s Delete', async () => {

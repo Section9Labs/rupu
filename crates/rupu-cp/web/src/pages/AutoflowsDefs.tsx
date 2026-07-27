@@ -3,7 +3,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { Inbox, RefreshCw } from 'lucide-react';
-import { api, type AutoflowDefRow } from '../lib/api';
+import { api, scopeSelectorFor, type AutoflowDefRow } from '../lib/api';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { Button } from '../components/ui/Button';
@@ -177,9 +177,12 @@ export default function AutoflowsDefs() {
   // Row action: flip `autoflow.enabled` — keyed by `slug` (file stem), the
   // same identifier `resolve_workflow_path` resolves `POST
   // /api/autoflows/:name/enable|disable` against server-side.
+  // `scopeSelectorFor(d)` threads the row's exact `scope_kind`/`scope_id` so
+  // the toggle targets THIS row's file even when another repo defines the
+  // same name.
   async function handleToggle(d: AutoflowDefRow) {
     try {
-      await api.setAutoflowEnabled(d.slug, !d.enabled);
+      await api.setAutoflowEnabled(d.slug, !d.enabled, scopeSelectorFor(d));
       setActionError(null);
       await load();
     } catch (e) {

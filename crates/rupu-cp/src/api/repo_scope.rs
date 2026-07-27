@@ -12,7 +12,7 @@
 //! once.
 
 use rupu_workspace::{RepoRegistryStore, Workspace};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// A single workspace chosen to represent a repo, tagged with the display
@@ -29,15 +29,46 @@ pub(crate) struct RepoScope {
 /// path's BASENAME (see [`scope_name`]), chosen purely for display. It can
 /// therefore legally equal the literal string `"global"` for a project
 /// registered at a path whose last segment happens to be named `global` — a
-/// destructive-action gate keyed on `scope == "global"` would then wrongly
-/// treat that project's rows as the real global layer, defeating the gate.
-/// Every such gate (the Agents/Workflows list and detail Delete buttons) must
-/// key off `scope_kind` instead; `scope` stays display-only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// naive check keyed on `scope == "global"` would then wrongly treat that
+/// project's rows as the real global layer. `scope_kind` is the correct
+/// field to read for DISPLAY purposes (the scope chip, and naming the layer
+/// in a delete confirmation dialog) instead of the collidable `scope`
+/// string.
+///
+/// It is NOT, on its own, a sufficient key for a destructive action: two
+/// DIFFERENT repos can each define a same-named agent/workflow, and both
+/// their rows carry `scope_kind: Project` — see
+/// `different_repos_same_def_name_both_appear`. Disambiguating a specific
+/// row's target for `DELETE`/enable-disable requires the row's `scope_id`
+/// (the underlying registered workspace's unique id) alongside this, passed
+/// as the `?scope_kind=&scope_id=` query params those endpoints accept — see
+/// `resolve_agent_scoped_explicit` / `resolve_workflow_scoped_explicit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ScopeKind {
     Global,
     Project,
+}
+
+/// Query params accepted by `DELETE /api/agents/:name`, `DELETE
+/// /api/workflows/:name`, and `POST /api/autoflows/:name/enable|disable` to
+/// pin down EXACTLY which layer's file to act on, rather than trusting
+/// `:name` alone to resolve unambiguously.
+///
+/// Both fields are optional for backward compatibility: when `scope_kind` is
+/// absent, the endpoint falls back to the implicit project-first resolver
+/// (`resolve_agent_scoped` / `resolve_workflow_scoped`) — never a
+/// global-first one. When `scope_kind` is `Project`, `scope_id` must name the
+/// exact registered workspace (its unique `id`, NOT the display `scope`
+/// string, which can collide across two different repos) whose `.rupu/`
+/// definition to target; a missing/unmatched `scope_id` in that case resolves
+/// to nothing (404), never a guess.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct ScopeQuery {
+    #[serde(default)]
+    pub(crate) scope_kind: Option<ScopeKind>,
+    #[serde(default)]
+    pub(crate) scope_id: Option<String>,
 }
 
 /// Collapse `workspaces` to one representative per distinct repo.

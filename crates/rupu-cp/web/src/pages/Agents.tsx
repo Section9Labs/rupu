@@ -4,7 +4,7 @@
 import { useCallback, useEffect, useId, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Plus, Sparkles } from 'lucide-react';
-import { api, type AgentSummary, type ProviderModels } from '../lib/api';
+import { api, scopeSelectorFor, type AgentSummary, type ProviderModels } from '../lib/api';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import UsageBarChart from '../components/charts/UsageBarChart';
@@ -72,9 +72,9 @@ export default function Agents() {
   // Deletes by `slug` (file stem), never `name` (frontmatter display name) —
   // `DELETE /api/agents/:name` removes `<slug>.md` by file stem, and the two
   // can differ for hand- or CLI-authored files (see `AgentSummary.slug`'s
-  // doc comment). The endpoint resolves project-aware (global-then-
-  // registered-projects, same layer walk `getAgent` uses), so this is safe
-  // for every row regardless of scope — the confirm dialog names the
+  // doc comment). `scopeSelectorFor(agent)` threads the row's exact
+  // `scope_kind`/`scope_id` so the server targets THIS row's file even when
+  // another repo defines the same slug — the confirm dialog names the
   // resolved layer so the operator knows exactly what's about to be removed.
   async function handleDelete(agent: AgentSummary) {
     const scopeLabel = agent.scope_kind === 'project' ? `project: ${agent.scope}` : 'global';
@@ -86,8 +86,19 @@ export default function Agents() {
       return;
     }
     try {
-      await api.deleteAgent(agent.slug ?? agent.name);
-      setActionError(null);
+      const result = await api.deleteAgent(agent.slug ?? agent.name, scopeSelectorFor(agent));
+      // Confirm the server actually removed the layer the operator was
+      // shown — never silently trust a bare "ok" as "removed what I saw."
+      if (
+        agent.scope_kind &&
+        (result.scope_kind !== agent.scope_kind || result.scope !== agent.scope)
+      ) {
+        setActionError(
+          `Deleted the ${result.scope_kind === 'project' ? `project (${result.scope})` : 'global'} definition — not the ${scopeLabel} one shown here.`,
+        );
+      } else {
+        setActionError(null);
+      }
       await load();
     } catch (e: unknown) {
       setActionError(e instanceof Error ? e.message : 'Delete failed');
