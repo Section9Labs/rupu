@@ -135,7 +135,7 @@ impl StepFactory for DefaultStepFactory {
         // unknown step ids surface clearly, but we drive the agent
         // load off `agent_name` (which differs from the parent's
         // `agent:` for `parallel:` sub-steps).
-        let _step = self
+        let step = self
             .workflow
             .steps
             .iter()
@@ -230,7 +230,7 @@ impl StepFactory for DefaultStepFactory {
         AgentRunOpts {
             agent_name: spec.name,
             agent_system_prompt,
-            agent_tools: spec.tools,
+            agent_tools: narrow_agent_tools(spec.tools, &step.actions),
             provider,
             provider_name,
             model,
@@ -306,6 +306,30 @@ impl StepFactory for DefaultStepFactory {
             compact_at_percent: spec.compact_at_percent,
             pause: None,
         }
+    }
+}
+
+/// `actions:` is a NARROWING filter (spec §2): a step can only ever
+/// reduce the agent's grant, never extend it. An EMPTY `actions:` means
+/// "no extra restriction" — compat-critical, since every existing
+/// workflow carries `actions: []` while relying on the agent's `tools:`.
+/// `agent_tools == None` means "unrestricted"; a non-empty allowlist
+/// still narrows that to exactly the listed tools.
+pub(crate) fn narrow_agent_tools(
+    agent_tools: Option<Vec<String>>,
+    step_actions: &[String],
+) -> Option<Vec<String>> {
+    if step_actions.is_empty() {
+        return agent_tools;
+    }
+    match agent_tools {
+        None => Some(step_actions.to_vec()),
+        Some(granted) => Some(
+            granted
+                .into_iter()
+                .filter(|t| step_actions.iter().any(|a| a == t))
+                .collect(),
+        ),
     }
 }
 
@@ -521,6 +545,139 @@ mod concerns_resolution_tests {
             scope_name.as_deref(),
             Some("my-workflow"),
             "scope_name must equal the workflow's name"
+        );
+    }
+}
+
+#[cfg(test)]
+mod narrow_agent_tools_tests {
+    use super::narrow_agent_tools;
+
+    #[test]
+    fn empty_actions_leaves_the_agent_grant_untouched() {
+        let tools = Some(vec!["issues.list".to_string(), "issues.create".to_string()]);
+        assert_eq!(narrow_agent_tools(tools.clone(), &[]), tools);
+        assert_eq!(narrow_agent_tools(None, &[]), None);
+    }
+
+    #[test]
+    fn non_empty_actions_intersects_the_agent_grant() {
+        let tools = Some(vec!["issues.list".into(), "issues.create".into()]);
+        let got = narrow_agent_tools(tools, &["issues.list".to_string(), "issues.get".to_string()]);
+        // `issues.get` is NOT granted by the agent -> dropped (narrow only, never grant)
+        assert_eq!(got, Some(vec!["issues.list".to_string()]));
+    }
+
+    #[test]
+    fn actions_narrow_an_unrestricted_agent() {
+        // agent_tools None == unrestricted; a step allowlist still narrows it
+        let got = narrow_agent_tools(None, &["issues.list".to_string()]);
+        assert_eq!(got, Some(vec!["issues.list".to_string()]));
+    }
+}
+
+/// End-to-end proof that `build_opts_for_step` actually narrows
+/// `agent_tools` per the step's `actions:` (not just the isolated
+/// helper). Drives the real `DefaultStepFactory` against an on-disk
+/// agent spec granting `[issues.list, issues.create]`; no live
+/// provider credentials are needed because a build failure resolves
+/// to `ProviderBuildErrorStub` rather than panicking — we only assert
+/// on the `agent_tools` field of the returned `AgentRunOpts`.
+#[cfg(test)]
+mod narrowing_end_to_end_tests {
+    use super::DefaultStepFactory;
+    use crate::runner::StepFactory;
+    use crate::workflow::Workflow;
+    use std::sync::Arc;
+
+    const WF: &str = r#"
+name: w
+steps:
+  - id: narrowed
+    agent: ag
+    prompt: p
+    actions: ["issues.list"]
+  - id: unrestricted
+    agent: ag
+    prompt: p
+    actions: []
+"#;
+
+    fn factory(global: std::path::PathBuf) -> DefaultStepFactory {
+        DefaultStepFactory {
+            workflow: Workflow::parse(WF).expect("workflow must parse"),
+            global,
+            project_root: None,
+            resolver: Arc::new(rupu_auth::KeychainResolver::new()),
+            mode_str: "bypass".to_string(),
+            mcp_registry: Arc::new(rupu_scm::Registry::empty()),
+            system_prompt_suffix: None,
+            dispatcher: None,
+            openai_compatible: std::collections::HashMap::new(),
+            default_provider: None,
+            default_model: None,
+        }
+    }
+
+    fn write_agent(global: &std::path::Path) {
+        let agents_dir = global.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("ag.md"),
+            "---\nname: ag\ntools: [issues.list, issues.create]\n---\nDo the thing.\n",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn step_actions_narrows_the_agent_grant() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_agent(tmp.path());
+        let f = factory(tmp.path().to_path_buf());
+
+        let opts = f
+            .build_opts_for_step(
+                "narrowed",
+                "ag",
+                "prompt".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                tmp.path().join("transcript.jsonl"),
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            opts.agent_tools,
+            Some(vec!["issues.list".to_string()]),
+            "actions: [issues.list] must narrow the agent's [issues.list, issues.create] grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_step_actions_leave_the_agent_grant_unrestricted() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_agent(tmp.path());
+        let f = factory(tmp.path().to_path_buf());
+
+        let opts = f
+            .build_opts_for_step(
+                "unrestricted",
+                "ag",
+                "prompt".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                tmp.path().join("transcript.jsonl"),
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            opts.agent_tools,
+            Some(vec!["issues.list".to_string(), "issues.create".to_string()]),
+            "actions: [] must leave the agent's full grant untouched"
         );
     }
 }
