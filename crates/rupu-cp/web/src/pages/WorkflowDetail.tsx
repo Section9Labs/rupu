@@ -231,7 +231,14 @@ export default function WorkflowDetailPage() {
 
   async function remove() {
     if (!detail || deleting) return;
-    if (!window.confirm('Delete this workflow?')) return;
+    const scopeLabel = detail.scope_kind === 'project' ? `project: ${detail.scope}` : 'global';
+    if (
+      !window.confirm(
+        `Delete workflow "${wfName}" (${scopeLabel})? This removes the definition file. This cannot be undone.`,
+      )
+    ) {
+      return;
+    }
     setDeleting(true);
     setDeleteError(null);
     try {
@@ -295,7 +302,6 @@ export default function WorkflowDetailPage() {
   // which has no `scope` concept of its own (a plain `Workflow::parse` of the
   // YAML never produces one).
   const scope = detail.scope;
-  const scopeKind = detail.scope_kind;
   const description = asString(detail.workflow.description);
   const autoflow = readAutoflow(detail.workflow);
   const inputNames = readInputNames(detail.workflow);
@@ -346,31 +352,23 @@ export default function WorkflowDetailPage() {
                   {autoflowPending ? 'Working…' : 'Resume'}
                 </Button>
               ))}
-            {/* Gated to `scope_kind === 'global'` — the structured
-             *  discriminator, never the display `scope` string (a project's
-             *  path basename, which can legally equal the literal
-             *  "global"). This page resolves global-first then falls back to
-             *  every registered project's `.rupu/workflows/`, so a
-             *  project-scoped workflow can silently shadow a same-named
-             *  global one here — but `DELETE /api/workflows/:name` only ever
-             *  resolves against the global workflows dir. Without this gate,
-             *  Delete on a project-scoped def would destroy the hidden
-             *  GLOBAL file with no signal this page ever switched layers.
-             *  Deleting a project-scoped definition is NOT currently
-             *  supported anywhere in the CP — the filesystem or `rupu` CLI
-             *  is the current workaround. */}
-            {scopeKind === 'global' && (
-              <Button
-                variant="danger-outline"
-                onClick={remove}
-                disabled={deleting}
-                aria-label={`Delete ${wfName}`}
-                className="gap-1.5"
-              >
-                <Trash2 size={14} />
-                Delete
-              </Button>
-            )}
+            {/* `DELETE /api/workflows/:name` resolves project-aware
+             *  (global-then-registered-projects — see
+             *  `resolve_workflow_scoped` in `rupu-cp/src/api/workflows.rs`),
+             *  the SAME layer walk this page's `getWorkflow` load uses, so
+             *  it always removes the exact file being shown here — safe for
+             *  every scope. `remove()`'s confirm dialog names the resolved
+             *  scope before the operator confirms. */}
+            <Button
+              variant="danger-outline"
+              onClick={remove}
+              disabled={deleting}
+              aria-label={`Delete ${wfName}`}
+              className="gap-1.5"
+            >
+              <Trash2 size={14} />
+              Delete
+            </Button>
             <Button onClick={() => setLauncherOpen(true)} aria-label={`Run ${wfName}`}>
               Run
             </Button>

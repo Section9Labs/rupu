@@ -231,7 +231,14 @@ async fn disable_autoflow(
 ///   [`super::workflows::resolve_workflow_path`] — the same global-then-
 ///   registered-projects resolution `GET /api/workflows/:name` uses — so an
 ///   autoflow defined only inside a registered project's `.rupu/workflows/`
-///   is reachable, not just global ones. 404 if no file resolves.
+///   is reachable, not just global ones. 404 if no file resolves. That
+///   resolver now also picks the SAME representative worktree
+///   `list_autoflow_defs`/`list_workflows` show for a repo with multiple
+///   registered worktrees (`distinct_repo_workspaces`), so a project-scoped
+///   toggle always flips the file the row actually displays rather than a
+///   different, non-representative worktree's copy — the toggle no longer
+///   needs to be hidden on non-global rows for that reason (see the CP
+///   Workflows/AutoflowsDefs list columns).
 /// - **Targeted edit, not a round-trip**: [`set_autoflow_enabled_in_yaml`]
 ///   rewrites only the `enabled:` scalar line inside the `autoflow:` block
 ///   (or inserts one, if the block omits it — `enabled` is `#[serde(default)]`
@@ -248,6 +255,11 @@ async fn disable_autoflow(
 /// - **Backup + atomic**: persisted via [`write_atomic_raw`] (backup to
 ///   `<path>.bak`, write-then-rename), not `config_write::write_atomic` —
 ///   that helper's `validate_toml` gate would reject YAML outright.
+/// - **Local-only, no `?host=`**: unlike the run-launch endpoints, this
+///   never proxies to a remote host — see
+///   `workflows::resolve_workflow_scoped`'s doc comment for why that's
+///   correct (workflow definitions live only on this CP process's own
+///   filesystem).
 async fn set_autoflow_enabled(
     s: &AppState,
     name: &str,
@@ -743,6 +755,58 @@ mod tests {
         let on_disk = std::fs::read_to_string(&path).unwrap();
         let parsed = Workflow::parse(&on_disk).expect("still Workflow::parse's");
         assert!(parsed.autoflow.expect("still an autoflow").enabled);
+    }
+
+    /// Proves the toggle-scope-caveat fix end-to-end: for a repo with
+    /// several registered worktrees, disabling a project-scoped autoflow
+    /// must edit the SAME worktree's copy `list_autoflow_defs` shows as the
+    /// row's `scope` (the deterministic representative — see
+    /// `repo_scope::distinct_repo_workspaces`), leaving every other
+    /// worktree's copy untouched. Before `resolve_workflow_path` was
+    /// switched to `distinct_repo_workspaces`, this could silently flip a
+    /// non-representative worktree's copy instead.
+    #[tokio::test]
+    async fn disable_project_scoped_targets_the_same_representative_worktree_the_list_uses() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("workflows")).unwrap(); // empty global
+
+        let remote = "git@github.com:acme/widgets.git";
+        let mut worktree_paths = std::collections::BTreeMap::new();
+        for name in ["worktree-a", "worktree-b", "worktree-c"] {
+            let root = tmp.path().join(name);
+            let workflows = root.join(".rupu").join("workflows");
+            std::fs::create_dir_all(&workflows).unwrap();
+            let path = workflows.join("issue-triage.yaml");
+            std::fs::write(&path, AUTOFLOW_ENABLED_TRUE.replace("nightly", "issue-triage")).unwrap();
+            worktree_paths.insert(name.to_string(), path);
+            register_workspace_with_remote(&tmp, &format!("ws_{name}"), &root, Some(remote));
+        }
+
+        let s = with_dummy_launcher(test_state(&tmp));
+
+        // The list names "worktree-a" as the representative (deterministic
+        // path-sort tie-break, no tracked-repo record).
+        let Json(rows) = list_autoflow_defs(State(s.clone())).await.expect("ok");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].scope, "worktree-a");
+
+        let resp = disable_autoflow(State(s), Path("issue-triage".into()))
+            .await
+            .expect("disable should succeed");
+        assert!(!resp.0.enabled);
+
+        let a_disk = std::fs::read_to_string(&worktree_paths["worktree-a"]).unwrap();
+        assert!(
+            a_disk.contains("enabled: false"),
+            "the REPRESENTATIVE worktree's file must be the one edited"
+        );
+        for other in ["worktree-b", "worktree-c"] {
+            let on_disk = std::fs::read_to_string(&worktree_paths[other]).unwrap();
+            assert!(
+                on_disk.contains("enabled: true"),
+                "a non-representative worktree's copy must be left untouched"
+            );
+        }
     }
 
     #[tokio::test]

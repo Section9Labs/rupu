@@ -177,35 +177,42 @@ describe('WorkflowDetail', () => {
     expect(navigateMock).not.toHaveBeenCalled();
   });
 
-  // ── Scope: gated Delete + visible scope indicator ────────────────────────
-  // Root cause: the detail loader resolves the global layer FIRST, falling
-  // back to a registered project's `.rupu/workflows/` — so a project-scoped
-  // `nightly` can shadow a global `nightly` and this page silently renders
-  // the wrong layer's file with no signal it switched. `DELETE
-  // /api/workflows/:name` only ever resolves against the global workflows
-  // dir, so Delete here must be gated the same way the list already is (by
-  // `scope_kind`, never the display `scope` string, which is read from the
-  // WRONG place entirely before this fix — `workflow.scope`, a field
-  // `Workflow::parse` never produces).
+  // ── Scope: scope-aware Delete + visible scope indicator + named confirm ──
+  // `DELETE /api/workflows/:name` resolves project-aware (global-then-
+  // registered-projects — `resolve_workflow_scoped` in
+  // `rupu-cp/src/api/workflows.rs`), the SAME layer walk this page's
+  // `getWorkflow` load uses — so Delete is offered (and safe) for every
+  // scope, and the confirm dialog names the resolved layer before the
+  // operator confirms.
 
-  it('a project-scoped workflow shows a scope chip and no Delete button', async () => {
+  it('a project-scoped workflow shows a scope chip and a Delete button whose confirm names the project scope', async () => {
     vi.spyOn(api, 'getWorkflow').mockResolvedValue({
       ...DETAIL,
       scope: 'my-project',
       scope_kind: 'project',
     });
+    const delSpy = vi.spyOn(api, 'deleteWorkflow').mockResolvedValue();
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
     renderPage();
 
     expect(await screen.findByText('my-project')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Delete nightly' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Delete nightly' }));
+
+    expect(confirmSpy).toHaveBeenCalledWith(
+      expect.stringContaining('project: my-project'),
+    );
+    await waitFor(() => expect(delSpy).toHaveBeenCalledWith('nightly'));
   });
 
-  it('a global workflow shows a scope chip and a Delete button', async () => {
+  it('a global workflow shows a scope chip and a Delete button whose confirm names "global"', async () => {
     vi.spyOn(api, 'getWorkflow').mockResolvedValue(DETAIL);
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
     renderPage();
 
     expect(await screen.findByText('global')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Delete nightly' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Delete nightly' }));
+
+    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('global'));
   });
 
   // ── Autoflow enable/disable ──────────────────────────────────────────────

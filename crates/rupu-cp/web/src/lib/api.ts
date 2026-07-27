@@ -579,13 +579,14 @@ export interface AutoflowDefRow {
    *  is keyed by. May differ from `name` (the parsed display name). */
   slug: string;
   trigger: string;
-  /** DISPLAY ONLY — see `ScopeKind`'s doc comment; gate the Enable/Disable
-   *  toggle on `scope_kind`, never this field. */
+  /** DISPLAY ONLY — see `ScopeKind`'s doc comment. */
   scope: string;
-  /** Structured scope discriminator — gate the Enable/Disable toggle on
-   *  THIS, never `scope`. See `ScopeKind`'s doc comment. Optional so literal
-   *  test fixtures that predate this field don't need updating; a gate
-   *  reading `undefined` fails closed (no toggle offered). */
+  /** Structured scope discriminator — the correct field to read scope off
+   *  of for display (the scope chip). See `ScopeKind`'s doc comment: the
+   *  Enable/Disable toggle is no longer gated on this — the backend
+   *  resolver it calls through
+   *  (`resolve_workflow_path`/`distinct_repo_workspaces`) now always
+   *  targets the same file this row displays, for every scope. */
   scope_kind?: ScopeKind;
   /** Whether `autoflow.enabled` is currently `true` in the on-disk YAML. A
    *  workflow with no `autoflow:` block at all never appears in this list at
@@ -826,14 +827,19 @@ export function windowFromDayRange(startDay: string, endDay: string): UsageWindo
  * Independent of the display `scope` string on the same row/detail DTO: that
  * string is a workspace path's BASENAME (for a project row) and can legally
  * equal the literal `"global"` for a project registered at a path whose last
- * segment happens to be named `global`. Any destructive-action gate (the
- * Agents/Workflows list and detail Delete buttons) must key off
- * `scope_kind`, never `scope === 'global'` — see the Rust type's doc comment.
+ * segment happens to be named `global`.
+ *
+ * `DELETE /api/agents/:name` and `DELETE /api/workflows/:name` (and the
+ * autoflow enable/disable endpoints) resolve project-aware — the SAME
+ * global-then-registered-projects layer walk the GET/list endpoints use —
+ * so these actions are safe for every row regardless of scope; `scope_kind`
+ * is no longer a gate on whether Delete/Enable/Disable renders. It's still
+ * the correct field to read scope OFF of for display purposes (the scope
+ * chip, and naming the layer in a delete confirmation dialog), since
+ * `scope` alone can't be trusted to mean "global."
  *
  * Optional on every DTO below (mirroring `AgentSummary.slug`'s pattern) so
- * literal test fixtures that predate this field don't need updating; a gate
- * reading `undefined` fails closed (no Delete offered) rather than assuming
- * global.
+ * literal test fixtures that predate this field don't need updating.
  */
 export type ScopeKind = 'global' | 'project';
 
@@ -873,8 +879,7 @@ export interface AgentSummary {
    * defs with the project name.
    */
   scope: string;
-  /** Structured scope discriminator — gate Delete on THIS, never `scope`.
-   *  See `ScopeKind`'s doc comment. */
+  /** Structured scope discriminator — see `ScopeKind`'s doc comment. */
   scope_kind?: ScopeKind;
   usage: UsageSummary;
   run_count: number;
@@ -913,13 +918,23 @@ export interface ToolSpec {
 
 export interface WorkflowSummary {
   name: string;
-  /** DISPLAY ONLY — see `ScopeKind`'s doc comment; gate Delete on
-   *  `scope_kind`, never this field. */
+  /** DISPLAY ONLY — see `ScopeKind`'s doc comment. */
   scope: string;
   scope_kind?: ScopeKind;
   usage: UsageSummary;
   run_count: number;
   last_run?: string | null;
+  /** `null`/absent when the workflow has no top-level `autoflow:` block at
+   *  all (a plain, manually-launched workflow); `true`/`false` mirroring
+   *  the on-disk `autoflow.enabled` when it does — both enabled AND
+   *  disabled autoflows carry a boolean here, so the row can offer an
+   *  Enable/Disable toggle in either direction (reuses
+   *  `api.setAutoflowEnabled`, the same call `AutoflowsDefs.tsx` uses).
+   *  Drives the "Autoflow" badge: render it whenever this is not
+   *  null/undefined. Optional/nullable so literal test fixtures that
+   *  predate this field don't need updating (treated as "not an
+   *  autoflow"). Mirrors `AutoflowDefRow.enabled`. */
+  autoflow_enabled?: boolean | null;
 }
 
 export interface WorkflowDetail {
@@ -934,7 +949,7 @@ export interface WorkflowDetail {
   /** Resolved layer's display scope (`"global"` or a project's path
    *  basename) — DISPLAY ONLY, see `ScopeKind`'s doc comment. */
   scope?: string;
-  /** Structured scope discriminator — gate Delete on THIS, never `scope`. */
+  /** Structured scope discriminator — see `ScopeKind`'s doc comment. */
   scope_kind?: ScopeKind;
 }
 
@@ -1907,11 +1922,17 @@ export const api = {
       body: JSON.stringify({ raw }),
     });
   },
-  /** Delete an agent definition. 404 if absent. */
+  /** Delete an agent definition — by `slug` (file stem), not frontmatter
+   *  `name`; see `AgentSummary.slug`'s doc comment. Resolves project-aware
+   *  (global-then-registered-projects, same as `getAgent`), so this is safe
+   *  to call for any row regardless of scope. 404 if absent. The response
+   *  also carries the resolved `scope`/`scope_kind` (which layer's file was
+   *  removed); callers that don't need it can ignore the resolved value. */
   async deleteAgent(name: string): Promise<void> {
-    await request<{ deleted: boolean }>(`/api/agents/${encodeURIComponent(name)}`, {
-      method: 'DELETE',
-    });
+    await request<{ deleted: boolean; scope: string; scope_kind: ScopeKind }>(
+      `/api/agents/${encodeURIComponent(name)}`,
+      { method: 'DELETE' },
+    );
   },
 
   // --- Workflows ---
@@ -1962,11 +1983,17 @@ export const api = {
   generateModels(): Promise<ProviderModels[]> {
     return request<ProviderModels[]>('/api/generate/models');
   },
-  /** Delete a workflow definition. 404 if absent. */
+  /** Delete a workflow definition. Resolves project-aware
+   *  (global-then-registered-projects, same as `getWorkflow`), so this is
+   *  safe to call for any row regardless of scope. 404 if absent. The
+   *  response also carries the resolved `scope`/`scope_kind` (which layer's
+   *  file was removed); callers that don't need it can ignore the resolved
+   *  value. */
   async deleteWorkflow(name: string): Promise<void> {
-    await request<{ deleted: boolean }>(`/api/workflows/${encodeURIComponent(name)}`, {
-      method: 'DELETE',
-    });
+    await request<{ deleted: boolean; scope: string; scope_kind: ScopeKind }>(
+      `/api/workflows/${encodeURIComponent(name)}`,
+      { method: 'DELETE' },
+    );
   },
   /** Parse-check a workflow YAML server-side (writes nothing). Resolves
    *  {ok:true} on 200, or {ok:false, error} when the server returns 400. */

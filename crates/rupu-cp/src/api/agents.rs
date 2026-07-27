@@ -1,6 +1,6 @@
 use crate::{
     agent_launcher::{AgentLaunchError, AgentLaunchRequest, AgentLauncher},
-    api::fs_safety::{validate_name, write_atomic},
+    api::fs_safety::{validate_name, validate_within, write_atomic},
     api::repo_scope::{distinct_repo_workspaces, ScopeKind},
     error::{ApiError, ApiResult},
     host::connector::HostConnectorError,
@@ -57,6 +57,51 @@ fn project_scope_name(w: &rupu_workspace::Workspace) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| w.id.clone())
+}
+
+/// Resolve agent file-STEM `slug` to its on-disk path, the directory that
+/// contains it, and the scope layer it resolved from: the global agents dir
+/// first, then one representative workspace per distinct repo among the
+/// registered projects (see [`distinct_repo_workspaces`] — many registered
+/// workspaces are autoflow run-worktrees of the very same repo, each
+/// carrying an identical copy of `.rupu/agents/`, so this avoids resolving
+/// against a stale non-representative worktree). First match wins; `None`
+/// when `slug` resolves in neither layer.
+///
+/// Backs `DELETE /api/agents/:name` ([`delete_agent`]). Deliberately walks
+/// the SAME global-then-projects layer order [`load_detail`] does, but keyed
+/// by file STEM rather than frontmatter `name` (unlike `load_detail`, which
+/// matches by `name` via `load_agent`) — the Delete row-action's identifier
+/// is the slug (see [`AgentDto::slug`]'s doc comment: a hand- or
+/// CLI-authored `.md` file's stem can differ from its own frontmatter
+/// `name`, and resolving "by name" in that case would 404 or remove an
+/// unrelated file that happens to share a name).
+///
+/// No `host`/remote concept here, unlike `run_agent`/`start_session` below:
+/// `s.global_dir` and every registered workspace's `path` are local
+/// filesystem paths on THIS `rupu cp` process's own host — agent
+/// definitions are never fetched from or proxied to a remote host, so this
+/// resolver (and therefore [`delete_agent`]) is correctly host-unaware.
+pub(crate) fn resolve_agent_scoped(
+    s: &AppState,
+    slug: &str,
+) -> Option<(PathBuf, PathBuf, String, ScopeKind)> {
+    let dir = agents_dir(s);
+    let global = dir.join(format!("{slug}.md"));
+    if global.exists() {
+        return Some((global, dir, "global".to_string(), ScopeKind::Global));
+    }
+    let workspaces = store(s).list().unwrap_or_default();
+    for r in distinct_repo_workspaces(workspaces, &repo_store(s)) {
+        let proj_dir = std::path::Path::new(&r.workspace.path)
+            .join(".rupu")
+            .join("agents");
+        let candidate = proj_dir.join(format!("{slug}.md"));
+        if candidate.exists() {
+            return Some((candidate, proj_dir, r.scope, ScopeKind::Project));
+        }
+    }
+    None
 }
 
 /// Pure core of `PUT /api/agents/:name`: validate the url name, parse + validate
@@ -153,9 +198,11 @@ fn detail_from_spec(
 /// Project-aware: resolves `name` in the global layer first, falling back to
 /// every registered project's `.rupu/agents/` (first match) so a
 /// project-only agent's detail route doesn't 404. The resolved layer is
-/// carried on the returned DTO's `scope_kind` — callers (the CP detail page)
-/// use it to gate Delete, since `DELETE /api/agents/:name` only ever resolves
-/// against the global layer regardless of which layer this GET resolved.
+/// carried on the returned DTO's `scope_kind`, which the CP detail page
+/// shows (scope chip + naming the layer in the delete confirmation) —
+/// `DELETE /api/agents/:name` independently resolves the SAME way (by file
+/// stem rather than frontmatter name; see [`resolve_agent_scoped`]), so
+/// Delete always removes the file this page is actually showing.
 fn load_detail(s: &AppState, name: &str) -> ApiResult<AgentDetailDto> {
     match load_agent(&s.global_dir, None, name) {
         Ok(spec) => {
@@ -477,18 +524,30 @@ async fn create_agent(
     Ok(Json(load_detail(&s, &spec.name)?))
 }
 
-/// `DELETE /api/agents/:name` — remove the global agent definition `:name`.
+/// `DELETE /api/agents/:name` — remove the agent definition whose file STEM
+/// is `:name` (see [`AgentDto::slug`]), resolved the same global-then-
+/// registered-projects way [`resolve_agent_scoped`] does. A project-scoped
+/// agent's Delete row-action therefore removes the actual project file the
+/// row/detail page displays, not a same-named global file it shadows — the
+/// data-loss bug PR #536 worked around by hiding Delete on non-global rows
+/// entirely. Returns the resolved `scope`/`scope_kind` alongside
+/// `deleted: true` so the caller can report which layer's file was removed.
+/// Local-only, no `?host=` — see [`resolve_agent_scoped`]'s doc comment.
 async fn delete_agent(
     State(s): State<AppState>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_name(&name)?;
-    let target = agents_dir(&s).join(format!("{name}.md"));
-    if !target.exists() {
-        return Err(ApiError::not_found(format!("agent {name} not found")));
-    }
+    let (target, dir, scope, scope_kind) = resolve_agent_scoped(&s, &name)
+        .ok_or_else(|| ApiError::not_found(format!("agent {name} not found")))?;
+    // Defense in depth — see `validate_within`'s doc comment.
+    validate_within(&target, &dir)?;
     std::fs::remove_file(&target).map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(serde_json::json!({ "deleted": true })))
+    Ok(Json(serde_json::json!({
+        "deleted": true,
+        "scope": scope,
+        "scope_kind": scope_kind,
+    })))
 }
 
 /// Request body for `POST /api/agents/:name/run`. All fields optional; a
@@ -812,6 +871,8 @@ mod tests {
             .block_on(delete_agent(State(s.clone()), Path("code-reviewer".into())))
             .expect("delete ok");
         assert_eq!(body.0["deleted"], serde_json::json!(true));
+        assert_eq!(body.0["scope"], serde_json::json!("global"));
+        assert_eq!(body.0["scope_kind"], serde_json::json!("global"));
         assert!(!agents_dir(&s).join("code-reviewer.md").exists());
 
         // Second delete → not found.
@@ -820,6 +881,89 @@ mod tests {
             .block_on(delete_agent(State(s.clone()), Path("code-reviewer".into())))
             .expect_err("absent");
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// Regression for the operator complaint this PR fixes: a project-scoped
+    /// agent's Delete row-action must remove the actual PROJECT file, not a
+    /// same-named global one (or, if there is no name collision, an
+    /// unrelated global definition must be left byte-for-byte untouched).
+    #[tokio::test]
+    async fn delete_removes_project_file_leaves_unrelated_global_untouched() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        // An unrelated global agent — must survive the project-scoped delete.
+        const KEEPER_MD: &str = "---\nname: keeper\nmodel: opus\n---\nStays put.\n";
+        save_agent_file(&s.global_dir, "keeper", KEEPER_MD).expect("seed global");
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_agents = proj.path().join(".rupu").join("agents");
+        std::fs::create_dir_all(&proj_agents).unwrap();
+        const REVIEWER_MD: &str = "---\nname: reviewer\nmodel: opus\n---\nProject reviewer.\n";
+        std::fs::write(proj_agents.join("reviewer.md"), REVIEWER_MD).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let resp = delete_agent(State(s.clone()), Path("reviewer".into()))
+            .await
+            .expect("project-scoped delete should succeed");
+        assert_eq!(resp.0["deleted"], serde_json::json!(true));
+        assert_eq!(resp.0["scope_kind"], serde_json::json!("project"));
+        assert!(
+            !proj_agents.join("reviewer.md").exists(),
+            "the PROJECT file must be removed"
+        );
+        assert!(
+            agents_dir(&s).join("keeper.md").exists(),
+            "an unrelated GLOBAL agent must be left untouched"
+        );
+    }
+
+    /// Vice-versa of the above: deleting a global agent must leave a
+    /// differently-named project agent untouched.
+    #[tokio::test]
+    async fn delete_removes_global_file_leaves_unrelated_project_untouched() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        const REVIEWER_MD: &str = "---\nname: reviewer\nmodel: opus\n---\nGlobal reviewer.\n";
+        save_agent_file(&s.global_dir, "reviewer", REVIEWER_MD).expect("seed global");
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_agents = proj.path().join(".rupu").join("agents");
+        std::fs::create_dir_all(&proj_agents).unwrap();
+        const OTHER_MD: &str = "---\nname: other\nmodel: opus\n---\nProject-only agent.\n";
+        std::fs::write(proj_agents.join("other.md"), OTHER_MD).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let resp = delete_agent(State(s.clone()), Path("reviewer".into()))
+            .await
+            .expect("global delete should succeed");
+        assert_eq!(resp.0["scope_kind"], serde_json::json!("global"));
+        assert!(!agents_dir(&s).join("reviewer.md").exists());
+        assert!(
+            proj_agents.join("other.md").exists(),
+            "an unrelated PROJECT agent must be left untouched"
+        );
+    }
+
+    /// A traversal-y `:name` must be rejected by `validate_name` before any
+    /// disk access — mirrors `api::autoflows`'s identical guard.
+    #[tokio::test]
+    async fn delete_rejects_traversal_name_before_any_disk_access() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        // A file a successful traversal *would* reach: sibling of the global
+        // agents dir, i.e. `<global_dir>/evil.md` via `../evil` from inside
+        // `<global_dir>/agents/`.
+        let outside_target = tmp.path().join("evil.md");
+        std::fs::write(&outside_target, VALID_MD).unwrap();
+
+        let err = delete_agent(State(s), Path("../evil".into()))
+            .await
+            .expect_err("traversal name must be rejected");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            outside_target.exists(),
+            "the out-of-tree file must be byte-for-byte untouched"
+        );
     }
 
     struct MockStarter {

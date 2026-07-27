@@ -155,33 +155,42 @@ describe('AgentDetail edit/delete', () => {
     expect(navigateMock).not.toHaveBeenCalled();
   });
 
-  // ── Scope: gated Delete + visible scope indicator ────────────────────────
-  // Root cause: the detail loader resolves the global layer FIRST, falling
-  // back to a registered project's `.rupu/agents/` — so a project-scoped
-  // `reviewer` can shadow a global `reviewer` and this page silently renders
-  // the wrong layer's file with no signal it switched. `DELETE
-  // /api/agents/:name` only ever resolves against the global agents dir, so
-  // Delete here must be gated the same way the list already is (by
-  // `scope_kind`, never the display `scope` string).
+  // ── Scope: scope-aware Delete + visible scope indicator + named confirm ──
+  // `DELETE /api/agents/:name` resolves project-aware (global-then-
+  // registered-projects, by file stem — `resolve_agent_scoped` in
+  // `rupu-cp/src/api/agents.rs`), the SAME layer walk this page's
+  // `getAgent` load uses — so Delete is offered (and safe) for every scope,
+  // and the confirm dialog names the resolved layer before the operator
+  // confirms.
 
-  it('a project-scoped agent shows a scope chip and no Delete button', async () => {
+  it('a project-scoped agent shows a scope chip and a Delete button whose confirm names the project scope', async () => {
     vi.spyOn(api, 'getAgent').mockResolvedValue({
       ...AGENT,
       scope: 'my-project',
       scope_kind: 'project',
     });
+    const delSpy = vi.spyOn(api, 'deleteAgent').mockResolvedValue();
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
     renderPage();
 
     expect(await screen.findByText('my-project')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Delete reviewer' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Delete reviewer' }));
+
+    expect(confirmSpy).toHaveBeenCalledWith(
+      expect.stringContaining('project: my-project'),
+    );
+    await waitFor(() => expect(delSpy).toHaveBeenCalledWith('reviewer'));
   });
 
-  it('a global agent shows a scope chip and a Delete button', async () => {
+  it('a global agent shows a scope chip and a Delete button whose confirm names "global"', async () => {
     vi.spyOn(api, 'getAgent').mockResolvedValue(AGENT);
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
     renderPage();
 
     expect(await screen.findByText('global')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Delete reviewer' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Delete reviewer' }));
+
+    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('global'));
   });
 
   it('flag unset (default): Edit still shows the classic code editor, not the Agent Builder', async () => {
