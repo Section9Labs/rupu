@@ -17,7 +17,10 @@ import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 const ENABLED_CLS = 'bg-ok-bg text-ok ring-ok/30';
 const DISABLED_CLS = 'bg-surface text-ink-mute ring-border';
 
-function EnabledChip({ enabled }: { enabled: boolean }) {
+/** Exported so `ProjectDefinitions.tsx`'s autoflow sub-table can render the
+ *  same read-only enabled/disabled chip without a toggle (its rows are
+ *  project-scoped by construction — see that file's `AUTOFLOW_COLUMNS`). */
+export function EnabledChip({ enabled }: { enabled: boolean }) {
   return (
     <span
       className={cn(
@@ -102,34 +105,47 @@ function defColumns(onToggle: (d: AutoflowDefRow) => void): Column<AutoflowDefRo
       fit: true,
       // Its own real button (Enable/Disable) — keep it independently
       // focusable/announced (I7) rather than swallowed by the row link.
+      //
+      // Gated to `scope === 'global'`: `POST /api/autoflows/:name/enable|
+      // disable` resolves `:name` via `resolve_workflow_path` (global-first,
+      // then EVERY registered workspace), which is NOT the same resolution
+      // the list uses (`distinct_repo_workspaces` — one representative
+      // worktree per repo). For a project-scoped row that mismatch means
+      // the toggle can silently flip the global copy or a non-representative
+      // worktree's copy instead of the file the row actually shows — the
+      // list then re-renders unchanged (or a different row changes), which
+      // reads as "the toggle did nothing" and a second click compounds the
+      // wrong-file write. A project-scoped row instead shows the (already
+      // present, read-only) Enabled column state with no toggle at all.
       interactive: true,
-      render: (d) => (
-        <div
-          className="flex items-center justify-end"
-          onClick={(e) => {
-            // The row is link-wrapped (rowHref) — without both of these,
-            // this click either soft- or hard-navigates to the workflow
-            // instead of toggling it (stopPropagation alone does not block
-            // the enclosing <a>'s native default navigation action).
-            e.preventDefault();
-            e.stopPropagation();
-          }}
-        >
-          {d.enabled ? (
-            <Button
-              variant="ring-danger"
-              onClick={() => onToggle(d)}
-              aria-label={`Disable ${d.name}`}
-            >
-              Disable
-            </Button>
-          ) : (
-            <Button variant="ring" onClick={() => onToggle(d)} aria-label={`Enable ${d.name}`}>
-              Enable
-            </Button>
-          )}
-        </div>
-      ),
+      render: (d) =>
+        d.scope === 'global' ? (
+          <div
+            className="flex items-center justify-end"
+            onClick={(e) => {
+              // The row is link-wrapped (rowHref) — without both of these,
+              // this click either soft- or hard-navigates to the workflow
+              // instead of toggling it (stopPropagation alone does not block
+              // the enclosing <a>'s native default navigation action).
+              e.preventDefault();
+              e.stopPropagation();
+            }}
+          >
+            {d.enabled ? (
+              <Button
+                variant="ring-danger"
+                onClick={() => onToggle(d)}
+                aria-label={`Disable ${d.name}`}
+              >
+                Disable
+              </Button>
+            ) : (
+              <Button variant="ring" onClick={() => onToggle(d)} aria-label={`Enable ${d.name}`}>
+                Enable
+              </Button>
+            )}
+          </div>
+        ) : null,
     },
   ];
 }
@@ -206,8 +222,8 @@ export default function AutoflowsDefs() {
       ) : defs.length === 0 ? (
         <EmptyState
           icon={<Inbox size={20} />}
-          title="No autoflow-enabled workflows"
-          hint="Workflows with autoflow triggers configured will appear here."
+          title="No autoflow workflows"
+          hint="Workflows with autoflow triggers configured (enabled or disabled) will appear here."
         />
       ) : (
         <section>

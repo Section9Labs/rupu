@@ -353,13 +353,24 @@ async fn project_agents(
     let specs = rupu_agent::loader::load_agents(&s.global_dir, Some(&rupu_dir))
         .map_err(|e| ApiError::internal(e.to_string()))?;
     let project_agents_dir = rupu_dir.join("agents");
+    let global_slugs = crate::api::agents::agent_slug_map(&s.global_dir);
+    let project_slugs = crate::api::agents::agent_slug_map(&rupu_dir);
     let dtos = specs
         .into_iter()
         .map(|spec| {
             // Project iff the same-named file exists under the project layer.
             let local = project_agents_dir.join(format!("{}.md", spec.name));
             let scope = if local.is_file() { "project" } else { "global" };
-            AgentDto::from_spec(spec, scope)
+            let slugs = if scope == "project" {
+                &project_slugs
+            } else {
+                &global_slugs
+            };
+            let slug = slugs
+                .get(&spec.name)
+                .cloned()
+                .unwrap_or_else(|| spec.name.clone());
+            AgentDto::from_spec(spec, scope, slug)
         })
         .collect();
     Ok(Json(dtos))
@@ -408,7 +419,8 @@ fn merge_autoflow_defs(
     global
 }
 
-/// `GET /api/projects/:ws_id/autoflows` — autoflow-enabled workflows from the
+/// `GET /api/projects/:ws_id/autoflows` — workflows carrying an `autoflow:`
+/// block (enabled AND disabled alike — see [`scan_autoflow_defs`]) from the
 /// global layer merged with the project's `<path>/.rupu/workflows`; project
 /// shadows global by name.
 async fn project_autoflows(

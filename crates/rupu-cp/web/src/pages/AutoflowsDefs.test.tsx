@@ -68,14 +68,16 @@ describe('AutoflowsDefs — kit adoption', () => {
     );
 
     await waitFor(() =>
-      expect(screen.getByText('No autoflow-enabled workflows')).toBeInTheDocument(),
+      expect(screen.getByText('No autoflow workflows')).toBeInTheDocument(),
     );
     // The kit EmptyState wraps its title/hint in a dashed-border rounded box —
     // distinguishing it from the old hand-rolled AutoflowsEmpty markup would
     // require snapshotting exact classes, so instead assert the copy the kit
     // component actually renders (hint text) is present alongside the title.
     expect(
-      screen.getByText('Workflows with autoflow triggers configured will appear here.'),
+      screen.getByText(
+        'Workflows with autoflow triggers configured (enabled or disabled) will appear here.',
+      ),
     ).toBeInTheDocument();
   });
 

@@ -96,14 +96,53 @@ fn create_agent_file(global_dir: &FsPath, raw: &str) -> Result<PathBuf, ApiError
     Ok(target)
 }
 
-/// Build the detail DTO from a loaded spec, tagged with `scope`.
-fn detail_from_spec(spec: rupu_agent::spec::AgentSpec, scope: impl Into<String>) -> AgentDetailDto {
+/// Map each agent's parsed frontmatter `name` to the FILE STEM it was loaded
+/// from, by scanning `<dir>/agents/*.md` directly. `delete_agent` removes
+/// `<slug>.md` by file stem, not by frontmatter `name` — when the two differ
+/// (hand- or CLI-authored files), a row keyed only by `name` would 404 or
+/// delete an unrelated file that happens to share that stem. Mirrors
+/// `AutoflowDefRow.slug`'s identical fix in
+/// `api::autoflows::scan_autoflow_defs`.
+///
+/// A file that fails to parse, or a missing/unreadable directory, is simply
+/// absent from the map rather than erroring — this is a supplementary
+/// name→slug lookup alongside the authoritative `AgentSpec` list
+/// `load_agents`/`load_agent` already produced; a scan hiccup here should
+/// not break the DTO the caller already has in hand (the caller falls back
+/// to `name` when a lookup misses).
+pub(crate) fn agent_slug_map(dir: &FsPath) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let agents_dir = dir.join("agents");
+    let Ok(entries) = std::fs::read_dir(&agents_dir) else {
+        return out;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(slug) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if let Ok(spec) = rupu_agent::AgentSpec::parse_file(&path) {
+            out.insert(spec.name, slug.to_string());
+        }
+    }
+    out
+}
+
+/// Build the detail DTO from a loaded spec, tagged with `scope` and `slug`.
+fn detail_from_spec(
+    spec: rupu_agent::spec::AgentSpec,
+    scope: impl Into<String>,
+    slug: impl Into<String>,
+) -> AgentDetailDto {
     let system_prompt = spec.system_prompt.clone();
     let raw = spec.raw.clone();
     AgentDetailDto {
         system_prompt,
         raw,
-        summary: AgentDto::from_spec(spec, scope),
+        summary: AgentDto::from_spec(spec, scope, slug),
     }
 }
 
@@ -114,12 +153,20 @@ fn detail_from_spec(spec: rupu_agent::spec::AgentSpec, scope: impl Into<String>)
 /// project-only agent's detail route doesn't 404.
 fn load_detail(s: &AppState, name: &str) -> ApiResult<AgentDetailDto> {
     match load_agent(&s.global_dir, None, name) {
-        Ok(spec) => Ok(detail_from_spec(spec, "global")),
+        Ok(spec) => {
+            let slug = agent_slug_map(&s.global_dir)
+                .remove(name)
+                .unwrap_or_else(|| name.to_string());
+            Ok(detail_from_spec(spec, "global", slug))
+        }
         Err(AgentLoadError::NotFound(_)) => {
             for w in store(s).list().unwrap_or_default() {
                 let rupu_dir = std::path::Path::new(&w.path).join(".rupu");
                 if let Ok(spec) = load_agent(&rupu_dir, None, name) {
-                    return Ok(detail_from_spec(spec, project_scope_name(&w)));
+                    let slug = agent_slug_map(&rupu_dir)
+                        .remove(name)
+                        .unwrap_or_else(|| name.to_string());
+                    return Ok(detail_from_spec(spec, project_scope_name(&w), slug));
                 }
             }
             Err(ApiError::not_found(format!("agent {name} not found")))
@@ -131,6 +178,11 @@ fn load_detail(s: &AppState, name: &str) -> ApiResult<AgentDetailDto> {
 #[derive(Serialize)]
 pub(crate) struct AgentDto {
     pub(crate) name: String,
+    /// File stem — the identifier `delete_agent` operates on (see
+    /// [`agent_slug_map`]'s doc comment for why this can differ from `name`).
+    /// Always present on the wire; the row's Delete action must pass THIS,
+    /// never `name`.
+    pub(crate) slug: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -195,10 +247,15 @@ pub(crate) struct AgentDto {
 
 impl AgentDto {
     /// Map a loaded [`rupu_agent::spec::AgentSpec`] to the wire DTO, tagging
-    /// it with the given scope.
-    pub(crate) fn from_spec(spec: rupu_agent::spec::AgentSpec, scope: impl Into<String>) -> Self {
+    /// it with the given scope and file-stem slug.
+    pub(crate) fn from_spec(
+        spec: rupu_agent::spec::AgentSpec,
+        scope: impl Into<String>,
+        slug: impl Into<String>,
+    ) -> Self {
         AgentDto {
             name: spec.name,
+            slug: slug.into(),
             description: spec.description,
             provider: spec.provider,
             model: spec.model,
@@ -241,9 +298,16 @@ struct AgentDetailDto {
 /// error behavior is unchanged.
 async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>> {
     let specs = load_agents(&s.global_dir, None).map_err(|e| ApiError::internal(e.to_string()))?;
+    let global_slugs = agent_slug_map(&s.global_dir);
     let mut dtos: Vec<AgentDto> = specs
         .into_iter()
-        .map(|spec| AgentDto::from_spec(spec, "global"))
+        .map(|spec| {
+            let slug = global_slugs
+                .get(&spec.name)
+                .cloned()
+                .unwrap_or_else(|| spec.name.clone());
+            AgentDto::from_spec(spec, "global", slug)
+        })
         .collect();
 
     let workspaces = store(&s).list().unwrap_or_default();
@@ -253,11 +317,16 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
         let scope = r.scope;
         let rupu_dir = std::path::Path::new(&r.workspace.path).join(".rupu");
         match load_agents(&rupu_dir, None) {
-            Ok(specs) => project_dtos.extend(
-                specs
-                    .into_iter()
-                    .map(|spec| AgentDto::from_spec(spec, scope.clone())),
-            ),
+            Ok(specs) => {
+                let slugs = agent_slug_map(&rupu_dir);
+                project_dtos.extend(specs.into_iter().map(|spec| {
+                    let slug = slugs
+                        .get(&spec.name)
+                        .cloned()
+                        .unwrap_or_else(|| spec.name.clone());
+                    AgentDto::from_spec(spec, scope.clone(), slug)
+                }));
+            }
             Err(err) => {
                 tracing::warn!("agents: skipping project {scope}: {err}");
             }
@@ -1248,5 +1317,27 @@ mod tests {
             ghost.last_run, None,
             "an agent that never ran must have last_run == None"
         );
+    }
+
+    /// The Delete row-action must key off the file STEM, not the
+    /// frontmatter `name` — `delete_agent` removes `<slug>.md` by file
+    /// stem. When a `.md` file's stem differs from its frontmatter `name`
+    /// (hand- or CLI-authored files), the DTO must still report the
+    /// correct `slug` rather than falling back to `name`. Mirrors
+    /// `api::autoflows`'s `slug_is_file_stem_distinct_from_parsed_name`.
+    #[tokio::test]
+    async fn list_agents_slug_reflects_file_stem_when_it_differs_from_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let dir = agents_dir(&s);
+        std::fs::create_dir_all(&dir).unwrap();
+        // File stem ("my-file-stem") deliberately differs from the parsed
+        // frontmatter `name` ("code-reviewer") in VALID_MD.
+        std::fs::write(dir.join("my-file-stem.md"), VALID_MD).unwrap();
+
+        let Json(rows) = list_agents(State(s)).await.expect("ok");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "code-reviewer");
+        assert_eq!(rows[0].slug, "my-file-stem");
     }
 }

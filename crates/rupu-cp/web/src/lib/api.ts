@@ -816,6 +816,16 @@ export function windowFromDayRange(startDay: string, endDay: string): UsageWindo
 
 export interface AgentSummary {
   name: string;
+  /**
+   * File stem — the identifier `DELETE /api/agents/:name` actually operates
+   * on (it removes `<slug>.md` by file stem, never by parsed frontmatter
+   * `name`). Can differ from `name` for hand- or CLI-authored files; a
+   * Delete action MUST pass this, never `name`, or it can 404 or remove an
+   * unrelated file that happens to share that stem. Mirrors
+   * `AutoflowDefRow.slug`. Optional here (falls back to `name`) so literal
+   * test fixtures that predate this field don't need updating.
+   */
+  slug?: string;
   description?: string | null;
   provider?: string | null;
   model?: string | null;

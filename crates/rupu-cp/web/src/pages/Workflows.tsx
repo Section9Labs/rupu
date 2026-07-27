@@ -419,6 +419,13 @@ function workflowColumns(
       // Its own real buttons (Run/Delete) — keep them independently
       // focusable/announced (I7) rather than swallowed by the row link.
       interactive: true,
+      // Delete only renders for `scope === 'global'` rows: `DELETE
+      // /api/workflows/:name` resolves ONLY against the global workflows
+      // dir — a project row shadowing a same-named global definition would
+      // silently delete the WRONG (global) file instead. Run stays
+      // available for every row (project-aware resolution, non-destructive).
+      // Deletion for project-scoped defs remains available on the workflow
+      // detail page.
       render: (w) => (
         <div
           className="flex items-center justify-end gap-1"
@@ -439,13 +446,15 @@ function workflowColumns(
           >
             Run
           </button>
-          <Button
-            variant="ring-danger"
-            onClick={() => void onDelete(w.name)}
-            aria-label={`Delete ${w.name}`}
-          >
-            Delete
-          </Button>
+          {w.scope === 'global' && (
+            <Button
+              variant="ring-danger"
+              onClick={() => void onDelete(w.name)}
+              aria-label={`Delete ${w.name}`}
+            >
+              Delete
+            </Button>
+          )}
         </div>
       ),
     },

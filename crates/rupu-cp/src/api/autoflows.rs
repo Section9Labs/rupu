@@ -20,7 +20,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/autoflows/:name/disable", post(disable_autoflow))
 }
 
-/// Slim DTO for a single autoflow-enabled workflow definition.
+/// Slim DTO for a single workflow definition carrying an `autoflow:` block
+/// (enabled or disabled — see `enabled` below).
 #[derive(Serialize)]
 pub(crate) struct AutoflowDefRow {
     pub(crate) name: String,

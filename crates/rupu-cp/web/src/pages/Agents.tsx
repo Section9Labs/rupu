@@ -68,16 +68,23 @@ export default function Agents() {
 
   // Row action: delete the agent's .md definition file — same
   // confirm-then-call-then-refresh shape as Sessions.tsx's row Delete.
-  async function handleDelete(name: string) {
+  //
+  // Deletes by `slug` (file stem), never `name` (frontmatter display name) —
+  // `DELETE /api/agents/:name` removes `<slug>.md` by file stem, and the two
+  // can differ for hand- or CLI-authored files (see `AgentSummary.slug`'s
+  // doc comment). Only called for `scope === 'global'` rows: the endpoint
+  // only ever resolves against the GLOBAL agents dir, so it cannot safely
+  // target a project-scoped row (see `agentActionColumn`'s scope gate).
+  async function handleDelete(agent: AgentSummary) {
     if (
       !window.confirm(
-        `Permanently delete the definition file for agent "${name}"? This cannot be undone.`,
+        `Permanently delete the definition file for agent "${agent.name}"? This cannot be undone.`,
       )
     ) {
       return;
     }
     try {
-      await api.deleteAgent(name);
+      await api.deleteAgent(agent.slug ?? agent.name);
       setActionError(null);
       await load();
     } catch (e: unknown) {
@@ -353,7 +360,7 @@ function NewAgentModal({ onClose }: { onClose: () => void }) {
 function agentColumns(
   onRun: (name: string) => void,
   onSession: (name: string) => void,
-  onDelete: (name: string) => void,
+  onDelete: (agent: AgentSummary) => void,
 ): Column<AgentSummary>[] {
   return [...AGENT_BASE_COLUMNS, agentActionColumn(onRun, onSession, onDelete)];
 }
@@ -367,11 +374,20 @@ function agentColumns(
  *  (bubbling up from whichever button was clicked) so a click here never
  *  soft- or hard-navigates the link-wrapped row — stopPropagation alone does
  *  not block the enclosing `<a>`'s native default navigation.
+ *
+ *  Delete only renders for `scope === 'global'` rows: `DELETE
+ *  /api/agents/:name` resolves ONLY against the global agents dir, so it
+ *  cannot safely target a project-scoped row — a project row shadowing a
+ *  same-named global definition would silently delete the WRONG (global)
+ *  file instead. Run/Session stay available for every row: both resolve the
+ *  agent project-aware (global-then-every-registered-project) and are
+ *  non-destructive. Deletion for project-scoped defs remains available on
+ *  the agent detail page.
  */
 function agentActionColumn(
   onRun: (name: string) => void,
   onSession: (name: string) => void,
-  onDelete: (name: string) => void,
+  onDelete: (agent: AgentSummary) => void,
 ): Column<AgentSummary> {
   return {
     key: 'action',
@@ -402,13 +418,15 @@ function agentActionColumn(
         >
           Session
         </Button>
-        <Button
-          variant="ring-danger"
-          onClick={() => void onDelete(a.name)}
-          aria-label={`Delete ${a.name}`}
-        >
-          Delete
-        </Button>
+        {a.scope === 'global' && (
+          <Button
+            variant="ring-danger"
+            onClick={() => void onDelete(a)}
+            aria-label={`Delete ${a.name}`}
+          >
+            Delete
+          </Button>
+        )}
       </div>
     ),
   };
