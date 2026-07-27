@@ -253,6 +253,7 @@ fn sample_run_record(id: &str, issue_ref: &str) -> rupu_orchestrator::RunRecord 
         started_at: chrono::Utc::now(),
         finished_at: None,
         error_message: None,
+        awaiting: Vec::new(),
         awaiting_step_id: None,
         approval_prompt: None,
         awaiting_since: None,
@@ -272,6 +273,7 @@ fn sample_run_record(id: &str, issue_ref: &str) -> rupu_orchestrator::RunRecord 
         resume_claimed_at: None,
         resume_claimed_by: None,
         resume_mode: None,
+        resume_gate_id: None,
         active_step_transcript_path: None,
         final_output: None,
     }

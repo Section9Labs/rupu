@@ -23,8 +23,8 @@ use crate::templates::{
     StepOutput,
 };
 use crate::workflow::{
-    effective_workspace_mode, is_nonlinear, yaml_scalar_to_string, InputType, Step, Workflow,
-    WorkflowParseError, WorkspaceMode,
+    effective_workspace_mode, is_nonlinear, workflow_edges, yaml_scalar_to_string, InputType,
+    Step, Workflow, WorkflowParseError, WorkspaceMode,
 };
 use async_trait::async_trait;
 use rupu_agent::{run_agent, AgentRunOpts, RunError, RunResult};
@@ -173,10 +173,12 @@ pub enum RunWorkflowError {
         "action step `{step}` requires runtime wiring — this entry point does not provide an SCM dispatcher"
     )]
     ActionDispatcherMissing { step: String },
+    #[error("scheduler: a dispatched node task panicked or was cancelled: {0}")]
+    SchedulerTaskJoin(#[from] tokio::task::JoinError),
     #[error(
-        "workflow `{name}` uses non-linear orchestration (split/join/fork), which requires the DAG scheduler — not yet available (Phase 2)"
+        "run cancelled: {aborted} in-flight node(s) aborted; restart to resume from checkpoint"
     )]
-    NonlinearNotYetSupported { name: String },
+    RunCancelled { aborted: usize },
 }
 
 /// Trait the orchestrator uses to construct per-unit [`AgentRunOpts`].
@@ -207,6 +209,15 @@ pub trait StepFactory: Send + Sync {
     ) -> AgentRunOpts;
 }
 
+/// `Clone` exists solely so [`run_scheduler`] can wrap one `Arc`-shared copy
+/// (`Arc::new(opts.clone())`, cloned once per run) and hand a cheap
+/// `Arc::clone` of it into every `tokio::spawn`ed node dispatch — the same
+/// reason `run_parallel_step` clones individual `Arc` fields today, just
+/// promoted to the whole struct now that dispatch happens at workflow scope,
+/// not only inside one fan-out step. Every field is itself `Clone` (plain
+/// data or an `Arc<dyn Trait + Send + Sync>`), so this is a cheap,
+/// non-semantic addition — no behavior depends on it outside the scheduler.
+#[derive(Clone)]
 pub struct OrchestratorRunOpts {
     pub workflow: Workflow,
     pub inputs: BTreeMap<String, String>,
@@ -440,6 +451,16 @@ pub struct AwaitingInfo {
     /// units. Empty for every pause shape except a manual pause that landed
     /// mid-fan-out.
     pub fanout_completed_units: std::collections::BTreeMap<usize, ItemResult>,
+    /// Every gate parked in this pause (Phase 2, Task 5b-1, spec §7).
+    /// `step_id`/`prompt`/`expires_at` above mirror this set's FIRST
+    /// element — the "single-gate convenience" existing callers (the CLI's
+    /// `result.awaiting.step_id`/`.prompt`) keep reading unchanged. Empty
+    /// for a `PauseReason::Manual` pause (the gate-awaiting-set model is
+    /// specific to approval gates); one element for every approval pause
+    /// through the legacy single-cursor loop or a DAG run whose batch-park
+    /// wave reached exactly one gate; more than one for a DAG run whose
+    /// wave reached several concurrent gates at once.
+    pub gates: Vec<crate::runs::AwaitingGate>,
 }
 
 /// Caller-supplied resume context. When `OrchestratorRunOpts.resume_from`
@@ -541,20 +562,18 @@ impl ResumeState {
 pub async fn run_workflow(
     opts: OrchestratorRunOpts,
 ) -> Result<OrchestratorRunResult, RunWorkflowError> {
-    // Phase 2 gate: the linear runner below can only execute a workflow
-    // whose control flow is a single line (with today's skip-set branches).
-    // A workflow using split/join, a fork, or a reconverge needs the DAG
-    // scheduler, which doesn't exist yet. Reject it here — before the
-    // transcript dir is created, before inputs are resolved, and before any
-    // run-record is persisted — so no partial state or on-disk bookkeeping
-    // is left behind for a run that never truly started. Legacy/linear
-    // workflows (including branches and an explicit-but-linear `next`
-    // chain) are unaffected and fall through to run exactly as before.
-    if is_nonlinear(&opts.workflow) {
-        return Err(RunWorkflowError::NonlinearNotYetSupported {
-            name: opts.workflow.name.clone(),
-        });
-    }
+    // Phase 2 (Task 5): `is_nonlinear` used to be an honesty GATE here —
+    // reject before any work started. It is now a ROUTER instead (spec §9):
+    // a workflow whose control flow is more than a single line (split/join,
+    // a fork, or a reconverge) executes through the concurrent ready-set
+    // scheduler (`run_scheduler`); a legacy/linear workflow (including
+    // today's branches and an explicit-but-linear `next` chain) continues
+    // through the untouched declaration-order loop (`run_steps_inner`).
+    // The actual routing decision is made once, at the `run_steps_inner`/
+    // `run_scheduler` call site below — see the comment there. Both return
+    // the same `InnerOutcome`, so every consumer below that point (events,
+    // awaiting-parking, persistence) is unchanged and shared between the
+    // two paths.
 
     std::fs::create_dir_all(&opts.transcript_dir)?;
     let resolved_inputs = resolve_inputs(&opts.workflow, &opts.inputs)?;
@@ -620,6 +639,7 @@ pub async fn run_workflow(
                 started_at: chrono::Utc::now(),
                 finished_at: None,
                 error_message: None,
+                awaiting: Vec::new(),
                 awaiting_step_id: None,
                 approval_prompt: None,
                 awaiting_since: None,
@@ -640,6 +660,7 @@ pub async fn run_workflow(
                 resume_claimed_at: None,
                 resume_claimed_by: None,
                 resume_mode: None,
+                resume_gate_id: None,
                 final_output: None,
             };
             Some(store.create(record, yaml).map_err(map_run_store_err)?)
@@ -694,15 +715,53 @@ pub async fn run_workflow(
         }
     }
 
-    let outcome = run_steps_inner(
-        &opts,
-        &run_id,
-        &resolved_inputs,
-        workflow_default_continue,
-        approved_step_id.as_deref(),
-        &mut step_results,
-    )
-    .await;
+    // The router (spec §2, §9): a non-linear workflow (split/join/fork/
+    // reconverge — `is_nonlinear`) runs through the concurrent ready-set
+    // scheduler; every other (legacy/linear) workflow continues through
+    // the untouched declaration-order loop — byte-identical by
+    // construction, since it's the exact same function call this crate
+    // has always made here. This `if`/`else` is the ONLY place the two
+    // paths diverge; everything below (event emission, awaiting-parking,
+    // run-record persistence) consumes the shared `InnerOutcome` and does
+    // not know or care which path produced it.
+    //
+    // `cancel: None` — a whole-run cancel signal (spec §8) is not yet
+    // threaded through `run_workflow`'s public surface; that wiring, and
+    // the CP/CLI-facing plumbing to trigger it, is out of this task's
+    // scope.
+    //
+    // Concurrent-gate boundary (T5b): a non-linear workflow whose
+    // concurrent paths each reach an approval gate does NOT park all of
+    // them independently yet — `run_scheduler`'s ready-drain loop returns
+    // `InnerOutcome::Paused` on the FIRST gate it reaches (same as today),
+    // so multiple gates are handled sequentially across resumes rather
+    // than concurrently. This is correct (every gate is eventually
+    // handled, nothing silently skipped) but not the full "awaiting set"
+    // model spec §7 describes — that migration (`RunRecord.awaiting_
+    // step_id` -> `awaiting: Vec<AwaitingGate>`, approve/reject-by-gate-id,
+    // the CP UI, and the gate sweep) is Task 5b's job, not this one's.
+    let outcome = if is_nonlinear(&opts.workflow) {
+        run_scheduler(
+            &opts,
+            &run_id,
+            &resolved_inputs,
+            workflow_default_continue,
+            approved_step_id.as_deref(),
+            &mut step_results,
+            None,
+        )
+        .await
+    } else {
+        run_steps_inner(
+            &opts,
+            &run_id,
+            &resolved_inputs,
+            workflow_default_continue,
+            approved_step_id.as_deref(),
+            &mut step_results,
+        )
+        .await
+    };
 
     // Map the inner outcome onto the persisted terminal status.
     // Paused = `AwaitingApproval` and the record carries the
@@ -734,10 +793,13 @@ pub async fn run_workflow(
             Ok(InnerOutcome::Paused {
                 step_id,
                 prompt,
-                timeout_seconds,
                 reason,
                 seed,
                 fanout_completed_units,
+                gates,
+                // `timeout_seconds` is superseded by `gates` (each gate
+                // carries its own) for computing `expires_at` below.
+                ..
             }) => {
                 let now = chrono::Utc::now();
                 // Approval → non-terminal `AwaitingApproval` (existing shape).
@@ -746,14 +808,64 @@ pub async fn run_workflow(
                     PauseReason::Approval => crate::runs::RunStatus::AwaitingApproval,
                     PauseReason::Manual => crate::runs::RunStatus::Paused,
                 };
-                record.awaiting_step_id = Some(step_id.clone());
-                record.approval_prompt = match reason {
-                    PauseReason::Approval => Some(prompt.clone()),
-                    PauseReason::Manual => None,
+                // Batch-parking (Task 5b-1, spec §7): for an Approval pause,
+                // `gates` carries EVERY gate the scheduler reached in this
+                // drain wave (one element for the legacy single-cursor loop
+                // and for a DAG run whose wave reached exactly one gate;
+                // several for a DAG run whose wave reached concurrent gates
+                // on independent paths). All gates in one wave share the
+                // same `since` (this `now`) — the run paused once. A Manual
+                // pause is a single-step concept orthogonal to the gate
+                // model (`gates` is always empty for it, by construction —
+                // see `GateParked`'s doc) — `record.awaiting` stays EMPTY
+                // and only the legacy compat fields carry the paused-mid-
+                // step id, exactly as before this task.
+                // Task 5b-2a (5b-1 Minor #3): a gate that was ALREADY parked
+                // before this resume cycle must keep its ORIGINAL `since`/
+                // `expires_at` rather than restarting its timeout clock. On
+                // resume, `record` (loaded from disk above, before the
+                // scheduler ran) still carries the PRE-resume awaiting set —
+                // e.g. after approving gate A, `record.awaiting` here is
+                // exactly `[gate B]` with gate B's original park instant.
+                // The scheduler recomputes the ready-set from scratch and
+                // re-reports every still-parked gate (including B) in
+                // `gates` for THIS pass, so without this lookup B would get
+                // a fresh `since: now` / `expires_at: now + timeout` every
+                // single resume — silently extending its deadline forever.
+                // Only a genuinely NEW gate (not in `prior_gates`) gets a
+                // fresh clock.
+                let prior_gates = record.awaiting.clone();
+                let gate_set: Vec<crate::runs::AwaitingGate> = match reason {
+                    PauseReason::Approval => gates
+                        .iter()
+                        .map(|g| match prior_gates.iter().find(|p| p.step_id == g.step_id) {
+                            Some(prior) => crate::runs::AwaitingGate {
+                                step_id: g.step_id.clone(),
+                                prompt: Some(g.prompt.clone()),
+                                since: prior.since,
+                                expires_at: prior.expires_at,
+                            },
+                            None => crate::runs::AwaitingGate {
+                                step_id: g.step_id.clone(),
+                                prompt: Some(g.prompt.clone()),
+                                since: now,
+                                expires_at: g
+                                    .timeout_seconds
+                                    .map(|secs| now + chrono::Duration::seconds(secs as i64)),
+                            },
+                        })
+                        .collect(),
+                    PauseReason::Manual => Vec::new(),
                 };
-                record.awaiting_since = Some(now);
-                record.expires_at =
-                    timeout_seconds.map(|secs| now + chrono::Duration::seconds(secs as i64));
+                record.awaiting = gate_set;
+                if *reason == PauseReason::Approval {
+                    record.sync_awaiting_compat();
+                } else {
+                    record.awaiting_step_id = Some(step_id.clone());
+                    record.approval_prompt = None;
+                    record.awaiting_since = Some(now);
+                    record.expires_at = None;
+                }
                 record.runner_pid = None;
                 record.active_step_id = None;
                 record.active_step_kind = None;
@@ -777,6 +889,7 @@ pub async fn run_workflow(
                     reason: *reason,
                     resume_seed: seed.clone(),
                     fanout_completed_units: fanout_completed_units.clone(),
+                    gates: record.awaiting.clone(),
                 });
             }
             Err(e) => {
@@ -803,12 +916,28 @@ pub async fn run_workflow(
         reason,
         seed,
         fanout_completed_units,
+        gates,
     }) = &outcome
     {
         // No store but the run paused (approval gate or manual pause) — surface
         // the paused state to the caller anyway.
+        let now = chrono::Utc::now();
         let expires_at =
-            timeout_seconds.map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
+            timeout_seconds.map(|secs| now + chrono::Duration::seconds(secs as i64));
+        let gate_set: Vec<crate::runs::AwaitingGate> = match reason {
+            PauseReason::Approval => gates
+                .iter()
+                .map(|g| crate::runs::AwaitingGate {
+                    step_id: g.step_id.clone(),
+                    prompt: Some(g.prompt.clone()),
+                    since: now,
+                    expires_at: g
+                        .timeout_seconds
+                        .map(|secs| now + chrono::Duration::seconds(secs as i64)),
+                })
+                .collect(),
+            PauseReason::Manual => Vec::new(),
+        };
         awaiting = Some(AwaitingInfo {
             step_id: step_id.clone(),
             prompt: prompt.clone(),
@@ -816,6 +945,7 @@ pub async fn run_workflow(
             reason: *reason,
             resume_seed: seed.clone(),
             fanout_completed_units: fanout_completed_units.clone(),
+            gates: gate_set,
         });
     }
 
@@ -875,6 +1005,17 @@ pub async fn run_workflow(
 /// pause check is a cheap no-op there.
 fn pause_triggered(pause: &Option<CancellationToken>) -> bool {
     pause.as_ref().is_some_and(|t| t.is_cancelled())
+}
+
+/// True when a whole-run cancel has been requested (Task 4, spec §8) — the
+/// harder sibling of [`pause_triggered`]: pause lets in-flight work reach
+/// its own safe boundary and is left completely unaffected by this
+/// function; cancel aborts in-flight work immediately (see
+/// [`cancel_finalize`]). `false` for the no-cancel path (`None`), so this
+/// is a cheap no-op for every call site until [`run_scheduler`] is handed
+/// a real token.
+fn cancel_requested(cancel: Option<&CancellationToken>) -> bool {
+    cancel.is_some_and(|t| t.is_cancelled())
 }
 
 /// True when any step in the workflow resolves to `workspace: sync`. Used to
@@ -946,6 +1087,7 @@ fn split_seed_for_resume(seed: Vec<Message>) -> (Vec<Message>, String) {
 /// Inner loop's terminal state. Distinguishes "ran to completion"
 /// from "paused at an approval gate" without forcing the caller to
 /// inspect persisted state.
+#[derive(Debug)]
 enum InnerOutcome {
     Done,
     Paused {
@@ -966,7 +1108,30 @@ enum InnerOutcome {
         /// [`AwaitingInfo::fanout_completed_units`]). Empty except for a
         /// manual pause that landed mid-fan-out.
         fanout_completed_units: std::collections::BTreeMap<usize, ItemResult>,
+        /// Every gate parked in this pause (Task 5b-1, spec §7). For
+        /// every return site except `run_scheduler`'s batch-park path
+        /// this mirrors `step_id`/`prompt`/`timeout_seconds` as a single
+        /// element (the "single-gate convenience"); `run_scheduler`'s
+        /// batch-park path is the only producer of >1. Empty for a
+        /// `PauseReason::Manual` pause — see [`GateParked`]'s doc.
+        gates: Vec<GateParked>,
     },
+}
+
+/// One gate reached in a batch-park wave, carried on
+/// [`InnerOutcome::Paused`] until `run_workflow` turns it into a
+/// [`crate::runs::AwaitingGate`] (which needs a `since`/`expires_at`
+/// timestamp `run_workflow`, not the scheduler, computes — see that
+/// function's Paused-handling arm). Deliberately NOT reused for a
+/// `PauseReason::Manual` pause: the awaiting-SET model (spec §7) is
+/// specific to approval gates, a manual/cooperative pause is a single-step
+/// concept, so every Manual return site leaves this empty rather than
+/// synthesizing a manual "gate."
+#[derive(Debug, Clone)]
+struct GateParked {
+    step_id: String,
+    prompt: String,
+    timeout_seconds: Option<u64>,
 }
 
 /// The actual per-step loop, factored out so the surrounding
@@ -982,6 +1147,1725 @@ enum InnerOutcome {
 ///   loop skips any step whose id already appears (replaying their
 ///   outputs into the context for `{{ steps.<id>.output }}`).
 async fn run_steps_inner(
+    opts: &OrchestratorRunOpts,
+    run_id: &str,
+    resolved_inputs: &BTreeMap<String, String>,
+    workflow_default_continue: bool,
+    approved_step_id: Option<&str>,
+    step_results: &mut Vec<StepResult>,
+) -> Result<InnerOutcome, RunWorkflowError> {
+    let order: Vec<&Step> = opts.workflow.steps.iter().collect();
+    run_steps_over(
+        &order,
+        opts,
+        run_id,
+        resolved_inputs,
+        workflow_default_continue,
+        approved_step_id,
+        step_results,
+    )
+    .await
+}
+
+/// Effectively-unbounded concurrency cap used when a workflow declares no
+/// `max_concurrency:` (§4/§11 of the Phase-2 scheduler design doc: default
+/// is unbounded — every ready node runs, including a `split:`'s full
+/// fan-out, never artificially serialized). Comfortably under
+/// `tokio::sync::Semaphore`'s internal permit ceiling; no real workflow's
+/// graph width will ever approach it.
+const UNBOUNDED_MAX_CONCURRENCY: usize = 1 << 20;
+
+/// Concurrent ready-set scheduler (Phase-2 design doc §2 "the scheduler",
+/// §4 "concurrency"). Unlike [`run_steps_inner`]/[`run_steps_over`] (which
+/// dispatch `opts.workflow.steps` one at a time in declaration order), this
+/// dispatches EVERY currently-ready node at once and launches each
+/// newly-ready node the instant its dependencies clear — not a
+/// per-declaration-order walk and not a rigid wave barrier.
+///
+/// **Readiness / implicit all-join (§2, D2).** A node is ready when every
+/// inbound edge from [`workflow_edges`] (control edges — `next`/`split`/
+/// branch arms — UNION inferred `steps.X.*` data edges, the same graph
+/// [`is_nonlinear`]'s topological check and Task 1's `ready_set_order` used)
+/// is `done`. Tracked as a plain Kahn's-algorithm indegree array: a node
+/// with N inbound edges simply needs N decrements before it's ready. This
+/// covers Task 2's "implicit all-join" requirement with NO separate join
+/// code path — a regular node with two predecessors just has indegree 2.
+///
+/// **`split` (§2, §4).** A `split:` node fans into N targets. It carries no
+/// agent (enforced at parse time by `validate_graph`'s
+/// `OrchestrationNodeHasWork` check), so it resolves synchronously as an
+/// orchestration no-op — an instant `StepResult`, no `tokio::spawn` — the
+/// same way `branch` already resolves inline below. Its kind is
+/// [`crate::runs::StepKind::Split`] (Task 5b-2b-ii: previously reused
+/// [`crate::runs::StepKind::Branch`] to avoid rippling `rupu-cli`/`rupu-cp`'s
+/// exhaustive `StepKind` matches while split was still test-only; now that
+/// split is live via [`is_nonlinear`] workflows through this same
+/// `run_workflow` router, every consumer has its own `Split` arm and the
+/// dedicated variant is no longer deferred). Marking the split `done` unlocks every one of its
+/// targets in the SAME indegree decrement pass, so they all go ready
+/// together and get dispatched concurrently on the very next drain below.
+///
+/// **Concurrency (§4).** Real dispatch (linear / panel / parallel /
+/// for_each / action, via [`run_node`]) is the only work that
+/// `tokio::spawn`s, bounded by a workflow-scope [`Semaphore`] sized from
+/// `opts.workflow.max_concurrency` (default [`UNBOUNDED_MAX_CONCURRENCY`])
+/// — exactly the `Semaphore` + `tokio::spawn` + join pattern
+/// [`run_parallel_step`] already uses for one step's internal fan-out,
+/// promoted here to the whole graph. A `tokio::task::JoinSet` (keyed by
+/// declaration index) holds every in-flight dispatch; the main loop
+/// alternates between draining every ready-but-undispatched node
+/// (resolving control-flow synchronously, spawning real work) and awaiting
+/// exactly the next task to finish (`JoinSet::join_next`, not a
+/// wait-for-everyone barrier) — so a node with one predecessor still
+/// running launches the moment THAT ONE predecessor completes, without
+/// waiting on unrelated siblings. `opts` is cloned once into an `Arc`
+/// (`OrchestratorRunOpts` derives `Clone` for exactly this) so every
+/// spawned task gets a cheap `Arc::clone` instead of needing `opts` to
+/// outlive the function as a bare reference.
+///
+/// For a legacy linear chain (graph width 1, every sample under
+/// `.rupu/workflows/*.yaml`) exactly one node is ever ready at a time, so
+/// this degenerates to the original one-at-a-time dispatch — proven
+/// byte-for-byte against [`run_steps_inner`] by `dag_scheduler_golden`
+/// below, now exercising the concurrent implementation directly (there is
+/// no separate sequential-only code path anymore).
+///
+/// **Persist order.** `step_results` is appended to in the order each
+/// node's outcome is drained from the `JoinSet` (completion order) — same
+/// as `run_parallel_step`'s own join loop. For a linear chain, completion
+/// order IS dispatch order IS declaration order (only one node in flight
+/// ever), so this is byte-for-byte unaffected. For a genuine fork,
+/// completion order between unrelated siblings is a real race; this is a
+/// deliberate choice, not forced into a declaration-order re-sort, because
+/// nothing in this crate treats `step_results`' order as positionally
+/// meaningful — downstream templates key `steps.<id>` by NAME
+/// (`base_context_for_step` builds a `BTreeMap`), so no template-visible
+/// behavior depends on inter-sibling order.
+///
+/// **Error / pause unwinding.** A hard failure (`run_node` returning `Err`
+/// — i.e. NOT `continue_on_error`) or any pause (approval-gate parking, the
+/// legacy inline gate, the step-boundary check, or a mid-dispatch pause
+/// bubbling out as `NodeOutcome::Paused`) stops launching new nodes and
+/// returns immediately — "like the loop does" per this task's brief. Any
+/// sibling tasks still in the `JoinSet` are ABORTED when it drops (tokio's
+/// documented `JoinSet` drop behavior), not gracefully drained to a safe
+/// boundary; full in-flight cancellation (a token threaded through
+/// `dispatch_one`, §8 of the design doc) is later in this arc. Every
+/// sample this task's golden test covers has graph width 1, so there is
+/// never another task in flight when this fires — unobservable there.
+async fn run_scheduler(
+    opts: &OrchestratorRunOpts,
+    run_id: &str,
+    resolved_inputs: &BTreeMap<String, String>,
+    workflow_default_continue: bool,
+    approved_step_id: Option<&str>,
+    step_results: &mut Vec<StepResult>,
+    // Task 4, spec §8: a whole-run cancel signal, DISTINCT from
+    // `opts.pause` (the pre-existing cooperative "stop at the next safe
+    // boundary" signal — unchanged, still respected below). When `Some`
+    // and cancelled, the scheduler stops launching new ready nodes AND
+    // aborts every currently in-flight dispatched node immediately (via
+    // `cancel_finalize`, reusing Task 3's `AbortHandle` map — no parallel
+    // cancellation mechanism), persisting a `"cancelled"` marker for each
+    // one so a resume replays it as not-live instead of re-dispatching it.
+    // `None` (every call site before this task, and every legacy/golden
+    // test) preserves prior behavior exactly — this parameter is
+    // additive. See this task's report for exactly what "cancel" reaches
+    // (the `tokio::spawn`ed task boundary) vs. what stays detached.
+    cancel: Option<&CancellationToken>,
+) -> Result<InnerOutcome, RunWorkflowError> {
+    let wf = &opts.workflow;
+    let n = wf.steps.len();
+    let index_of: BTreeMap<&str, usize> = wf
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.id.as_str(), i))
+        .collect();
+
+    // Captured once — both the graph-construction choice just below and
+    // the branch-pruning arm further down (which needs REAL reachability
+    // over the graph, not the author-declared `branch_skipped` set — Task
+    // 3, spec §6) must agree on which mode this run is in.
+    let graph_mode = is_nonlinear(wf);
+    let mut indegree: Vec<usize> = vec![0; n];
+    let mut successors: Vec<Vec<usize>> = vec![Vec::new(); n];
+    // Reverse of `successors` — every node's direct predecessors. Used by
+    // an explicit `join`'s inbound-set (Task 3, spec §5) and by
+    // loser-cancellation's ancestor-exclusivity check (Task 3, spec §8).
+    // Only meaningful in graph mode (chain mode's `successors` is a
+    // synthesized linear chain that doesn't encode a join's real inbound
+    // edges at all — see the `else` arm below).
+    let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); n];
+    if graph_mode {
+        // Genuinely non-linear (split/join/fork, or explicit edges whose
+        // declaration order isn't already topological): use the real
+        // dependency graph — control edges union inferred data edges —
+        // exactly as authored. Independent nodes are MEANT to run
+        // concurrently here; that's the whole point of Phase 2.
+        for (a, b) in &workflow_edges(wf) {
+            if let (Some(&ai), Some(&bi)) = (index_of.get(a.as_str()), index_of.get(b.as_str())) {
+                successors[ai].push(bi);
+                predecessors[bi].push(ai);
+                indegree[bi] += 1;
+            }
+        }
+    } else {
+        // Every workflow the LIVE boundary (`run_workflow`'s `is_nonlinear`
+        // honesty gate, ~line 564) treats as linear — edge-free, OR
+        // carrying explicit edges that still happen to be declaration-
+        // order-topological (e.g. `a (next:[b]); b; c`, an independent
+        // trailing step alongside a partial explicit chain) — MUST get the
+        // exact declaration-order chain here, not `workflow_edges`' graph.
+        // Gating on `workflow_has_explicit_edges` instead of `is_nonlinear`
+        // is wrong: it would route that `a;b;c` example into the
+        // explicit-edges branch below, where Kahn's algorithm sees `a` and
+        // `c` as simultaneously ready (no edge relates them) and dispatches
+        // them concurrently — reordering `step_results` vs
+        // `run_steps_inner`'s deterministic `a, b, c` the moment a later
+        // task lifts the `is_nonlinear` gate and this becomes the live
+        // path. `workflow_edges`' inferred data edges are ALSO not a
+        // complete substitute for declaration order even in the plain
+        // edge-free case: two declaration-adjacent steps that don't
+        // reference each other's `steps.*` output and aren't joined by any
+        // `next:` have NO edge between them in that graph, yet the legacy
+        // contract still requires the earlier one to fully finish before
+        // the later one starts (e.g. `gate-demo.yaml`'s `assess` step and
+        // its unrelated `ship_gate` approval gate — this exact gap broke
+        // the golden test before this fix, since both would otherwise read
+        // as simultaneously "ready"). Synthesizing the full chain
+        // `steps[i] -> steps[i+1]` is strictly sufficient (a superset of
+        // any real data or partial-explicit edge: by the time node `i+1`
+        // is ready every one of `0..=i` is already done) and keeps graph
+        // width at 1 throughout, so `run_scheduler` degenerates to the
+        // exact one-at-a-time order `run_steps_inner` walks.
+        for i in 0..n.saturating_sub(1) {
+            successors[i].push(i + 1);
+            predecessors[i + 1].push(i);
+            indegree[i + 1] += 1;
+        }
+    }
+
+    // Explicit `join` nodes (Task 3, spec §5) — the ONE rule: a join's
+    // inbound set is exactly its `predecessors` row (edges that point at
+    // it), and its wait POLICY determines the threshold of inbound paths
+    // that must land before it fires. A `join:` anywhere makes
+    // `is_nonlinear` true (see that function), so `join_threshold` is
+    // always empty when `!graph_mode` — chain-mode workflows never
+    // exercise any of this task's join/prune/cancel machinery, which is
+    // exactly how the golden test's byte-for-byte equality stays intact
+    // without a single line of it needing to special-case "am I in chain
+    // mode".
+    let mut join_threshold: BTreeMap<usize, usize> = BTreeMap::new();
+    // Total inbound-edge count per join, independent of `threshold` —
+    // needed so a join can still fire once every inbound path is
+    // ACCOUNTED FOR (live or pruned/skipped/cancelled), even when too many
+    // of them turned out non-live to ever reach `threshold` via live
+    // arrivals alone (post-review fix: see `JoinScheduling`'s doc).
+    let mut join_inbound_total: BTreeMap<usize, usize> = BTreeMap::new();
+    for (i, step) in wf.steps.iter().enumerate() {
+        let Some(j) = &step.join else { continue };
+        let inbound = predecessors[i].len();
+        let threshold = match &j.wait {
+            crate::workflow::JoinWait::Keyword(crate::workflow::JoinWaitKeyword::All) => inbound,
+            crate::workflow::JoinWait::Keyword(crate::workflow::JoinWaitKeyword::Any) => 1,
+            // `validate_graph`'s `JoinCountExceedsInbound` check already
+            // rejects `count > inbound` at parse time; nothing to clamp.
+            crate::workflow::JoinWait::Count { count } => *count as usize,
+        };
+        join_threshold.insert(i, threshold);
+        join_inbound_total.insert(i, inbound);
+    }
+
+    // Resume seeding: steps already in a caller-pre-seeded `step_results`
+    // are `done` up front (mirrors `run_steps_over`'s `already_done`), and
+    // an already-done `branch:` step's persisted taken-arm output
+    // reconstructs `branch_skipped` the same way `run_steps_over` does —
+    // see that function's comment for why (an untaken arm not yet reached
+    // at the original pause is neither `done` nor `branch_skipped`
+    // otherwise, and would wrongly go ready on resume).
+    let mut done: Vec<bool> = vec![false; n];
+    let mut branch_skipped: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Real-reachability branch pruning (Task 3, spec §6, graph mode
+    // only — see the branch-handling arm below) and join
+    // loser-cancellation markers for a node that hasn't been dispatched
+    // yet (Task 3, spec §5/§8). Task 4, spec §3: rebuilt from the
+    // persisted `"pruned"`/`"cancelled"` `StepResult.output` markers below
+    // — a resumed run must REPLAY these decisions, not just rely on
+    // `done[i]` already being `true` for that one node (which alone
+    // would still stop IT from re-dispatching, but leaves these sets
+    // inconsistent with reality for anything else that inspects them).
+    let mut pruned: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut cancel_state = Cancellation {
+        cancelled: std::collections::BTreeSet::new(),
+        in_flight_abort: BTreeMap::new(),
+        task_id_to_index: BTreeMap::new(),
+        cancelled_by_us: std::collections::BTreeSet::new(),
+    };
+    for sr in step_results.iter() {
+        if let Some(&i) = index_of.get(sr.step_id.as_str()) {
+            done[i] = true;
+            if let Some(branch) = &wf.steps[i].branch {
+                match sr.output.as_str() {
+                    "then" => branch_skipped.extend(branch.r#else.iter().cloned()),
+                    "else" => branch_skipped.extend(branch.then.iter().cloned()),
+                    _ => {}
+                }
+            }
+            // Guarded on `sr.skipped` (always `true` for these two
+            // markers, always `false` for a real dispatch/branch/split/
+            // join/gate result) so a real agent turn that happens to
+            // output the literal text "pruned" or "cancelled" can never
+            // be misread as one of these markers.
+            if sr.skipped {
+                match sr.output.as_str() {
+                    "pruned" => {
+                        pruned.insert(sr.step_id.clone());
+                    }
+                    "cancelled" => {
+                        cancel_state.cancelled.insert(sr.step_id.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    for (i, &is_done) in done.iter().enumerate() {
+        if is_done {
+            for &s in &successors[i] {
+                indegree[s] = indegree[s].saturating_sub(1);
+            }
+        }
+    }
+
+    let mut ready: std::collections::BTreeSet<usize> = (0..n)
+        .filter(|&i| !done[i] && indegree[i] == 0 && !join_threshold.contains_key(&i))
+        .collect();
+
+    // Join arrival tracking (Task 3, spec §5) + loser-cancellation
+    // bookkeeping (Task 3, spec §8, first use in this arc):
+    // `in_flight_abort` lets a join resolution reach into an in-flight
+    // sibling's `JoinSet` slot and abort it directly; `task_id_to_index`
+    // recovers which of OUR node indices a `JoinError` belongs to (the
+    // error itself only carries tokio's own `task::Id`); `cancelled_by_us`
+    // distinguishes an EXPECTED abort (swallow it, keep scheduling) from a
+    // genuine panic/cancellation (propagate as `SchedulerTaskJoin`, same
+    // as before this task). See this task's report for exactly what
+    // "cancel" reaches today (the scheduler/`JoinSet` boundary — the
+    // dispatched task is aborted, so a MockProvider-backed test agent
+    // stops at its next await point) vs. Task 4's deeper agent-run
+    // interruption.
+    //
+    // Task 4, spec §3 (the resume gap Task 3's own report flagged): a join
+    // that already fired pre-pause has its own MERGED `StepResult` on disk
+    // (`done[j]` is already `true`) — seed `resolved` with every such join
+    // up front so it's never re-drained, THEN replay every already-done
+    // node's arrival into whatever join(s) it directly feeds (exactly what
+    // `mark_done_and_track_joins` would have recorded live). Without this,
+    // a `wait: all` join with SOME (not all) inbound paths already done
+    // pre-pause resumes with `arrived`/`resolved_count` both at zero and
+    // can wait forever for arrivals that already happened.
+    let resolved_joins_from_disk: std::collections::BTreeSet<usize> = join_threshold
+        .keys()
+        .copied()
+        .filter(|&j| done[j])
+        .collect();
+    let mut join_state = JoinScheduling {
+        threshold: join_threshold,
+        inbound_total: join_inbound_total,
+        arrived: BTreeMap::new(),
+        resolved_count: BTreeMap::new(),
+        resolved: resolved_joins_from_disk,
+    };
+    let mut resume_join_worklist: Vec<usize> = Vec::new();
+    for sr in step_results.iter() {
+        if let Some(&i) = index_of.get(sr.step_id.as_str()) {
+            resume_join_worklist.extend(track_join_arrivals(
+                i,
+                !sr.skipped,
+                &successors,
+                &mut join_state,
+            ));
+        }
+    }
+    if !resume_join_worklist.is_empty() {
+        drain_joins(
+            resume_join_worklist,
+            wf,
+            opts,
+            run_id,
+            step_results,
+            &mut done,
+            &successors,
+            &predecessors,
+            &mut indegree,
+            &mut ready,
+            &mut join_state,
+            &mut cancel_state,
+        );
+    }
+
+    let resume_paused_step_id: Option<&str> = opts
+        .resume_from
+        .as_ref()
+        .and_then(|r| r.paused_step.as_ref())
+        .map(|ps| ps.step_id.as_str());
+
+    let max_concurrency = wf
+        .max_concurrency
+        .map(|m| m as usize)
+        .unwrap_or(UNBOUNDED_MAX_CONCURRENCY)
+        .max(1);
+    let semaphore = Arc::new(Semaphore::new(max_concurrency));
+    let opts_arc = Arc::new(opts.clone());
+
+    let mut in_flight: tokio::task::JoinSet<(usize, Result<NodeOutcome, RunWorkflowError>)> =
+        tokio::task::JoinSet::new();
+
+    // Batch-parking (Task 5b-1, spec §7): every approval gate this wave
+    // reaches is recorded here instead of returning immediately. This lets
+    // the loop keep dispatching every OTHER ready node and keep draining
+    // `in_flight` to completion — a sibling on an unrelated concurrent path
+    // that's about to finish is never aborted just because some other path
+    // hit a gate. Deliberate non-goal: this is NOT full async parking
+    // ("keep computing indefinitely while a gate waits for a human") — the
+    // whole run still pauses once no further non-gate progress is
+    // possible (both `ready` and `in_flight` empty); it just pauses with
+    // EVERY gate reached in the wave in the set, not only the first.
+    let mut parked: Vec<GateParked> = Vec::new();
+
+    loop {
+        // Drain every currently-ready, not-yet-dispatched node. Resolving
+        // one synchronously (skip / branch / split / gate-approved) can
+        // unlock a LATER-indexed node in the same `ready` set — the
+        // `while let` keeps draining until nothing more is ready, so a
+        // chain of instant no-ops (e.g. several `when:`-skips in a row)
+        // still resolves in one pass, exactly like the sequential loop.
+        while let Some(&i) = ready.iter().next() {
+            // Task 4, spec §8: a whole-run cancel stops launching NEW
+            // ready nodes immediately (harder than `pause_triggered`
+            // below, which only applies at THIS same boundary for the
+            // soft form) — leave `i` in `ready` (about to be abandoned
+            // anyway) and fall through to `cancel_finalize` below.
+            if cancel_requested(cancel) {
+                break;
+            }
+            ready.remove(&i);
+            let step = &wf.steps[i];
+
+            let is_pruned = pruned.contains(&step.id);
+            let is_cancelled = !is_pruned && cancel_state.cancelled.contains(&step.id);
+            if branch_skipped.contains(&step.id) || is_pruned || is_cancelled {
+                // Task 3: a node can now be skipped for three distinct
+                // reasons — the pre-existing author-declared branch-arm
+                // skip-set (chain mode only), real-reachability branch
+                // pruning (spec §6, graph mode — see the branch-handling
+                // arm below), or join loser-cancellation (spec §5/§8 —
+                // see `drain_joins`). Each persists a distinguishing
+                // `output` marker so a later resume (Task 4) can tell
+                // them apart on disk.
+                let (marker, reason): (&str, &str) = if is_pruned {
+                    ("pruned", "pruned (unreachable via the taken branch arm)")
+                } else if is_cancelled {
+                    (
+                        "cancelled",
+                        "cancelled (a join resolved without waiting for this path)",
+                    )
+                } else {
+                    ("", "not taken by branch")
+                };
+                info!(step = %step.id, reason, "skipping");
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepSkipped {
+                            run_id: run_id.to_string(),
+                            step_id: step.id.clone(),
+                            reason: reason.to_string(),
+                        },
+                    );
+                }
+                let result = StepResult {
+                    step_id: step.id.clone(),
+                    rendered_prompt: String::new(),
+                    run_id: String::new(),
+                    transcript_path: PathBuf::new(),
+                    output: marker.to_string(),
+                    success: false,
+                    skipped: true,
+                    kind: step_kind_for_run_record(step),
+                    items: Vec::new(),
+                    ..Default::default()
+                };
+                complete_and_drain_joins(
+                    i,
+                    false, // skip / prune / cancel no-op — never a live join arrival
+                    result,
+                    wf,
+                    opts,
+                    run_id,
+                    step_results,
+                    &mut done,
+                    &successors,
+                    &predecessors,
+                    &mut indegree,
+                    &mut ready,
+                    &mut join_state,
+                    &mut cancel_state,
+                );
+                continue;
+            }
+
+            if pause_triggered(&opts.pause) {
+                if workflow_has_sync_step(opts) {
+                    return Err(RunWorkflowError::PauseWithWorkspaceSync);
+                }
+                info!(step = %step.id, "cooperative pause at step boundary");
+                // Manual pause is a hard, immediate return (unlike the
+                // approval-gate batch-park above) — the awaiting-set model
+                // is specific to approval gates (spec §7), so any gate
+                // ALREADY collected into `parked` this wave is dropped
+                // here rather than folded into this Manual-reason pause
+                // (which the `gates` field below leaves empty). Nothing is
+                // corrupted: a dropped-but-parked gate was never persisted
+                // (no `StepResult`), so it simply re-parks on the next
+                // resume exactly as if this wave had reached it first.
+                return Ok(InnerOutcome::Paused {
+                    step_id: step.id.clone(),
+                    prompt: String::new(),
+                    timeout_seconds: None,
+                    reason: PauseReason::Manual,
+                    seed: Vec::new(),
+                    fanout_completed_units: std::collections::BTreeMap::new(),
+                    gates: Vec::new(),
+                });
+            }
+
+            let ctx = base_context_for_step(
+                resolved_inputs,
+                opts.event.as_ref(),
+                opts.issue.as_ref(),
+                step_results,
+            );
+
+            if let Some(when_expr) = &step.when {
+                let take =
+                    render_when_expression(when_expr, &ctx, render_mode(opts.strict_templates))
+                        .map_err(|e| RunWorkflowError::Render {
+                            step: step.id.clone(),
+                            source: e,
+                        })?;
+                if !take {
+                    info!(step = %step.id, "skipping (when: expression is falsy)");
+                    if let Some(sink) = opts.event_sink.as_ref() {
+                        sink.emit(
+                            run_id,
+                            &crate::executor::Event::StepSkipped {
+                                run_id: run_id.to_string(),
+                                step_id: step.id.clone(),
+                                reason: "when: expression evaluated to false".into(),
+                            },
+                        );
+                    }
+                    let result = StepResult {
+                        step_id: step.id.clone(),
+                        rendered_prompt: String::new(),
+                        run_id: String::new(),
+                        transcript_path: PathBuf::new(),
+                        output: String::new(),
+                        success: false,
+                        skipped: true,
+                        items: Vec::new(),
+                        ..Default::default()
+                    };
+                    complete_and_drain_joins(
+                        i,
+                        false, // skip / prune / cancel no-op — never a live join arrival
+                        result,
+                        wf,
+                        opts,
+                        run_id,
+                        step_results,
+                        &mut done,
+                        &successors,
+                        &predecessors,
+                        &mut indegree,
+                        &mut ready,
+                        &mut join_state,
+                        &mut cancel_state,
+                    );
+                    continue;
+                }
+            }
+
+            if crate::workflow::is_approval_gate(step) {
+                let ap = step.approval.as_ref().expect("gate has approval");
+                let gate_suppressed = approved_step_id == Some(step.id.as_str());
+                let prompt = match &ap.prompt {
+                    Some(t) => render_step_prompt(t, &ctx, render_mode(opts.strict_templates))
+                        .map_err(|e| RunWorkflowError::Render {
+                            step: step.id.clone(),
+                            source: e,
+                        })?,
+                    None => format!(
+                        "Approve gate `{}` of workflow `{}`?",
+                        step.id, opts.workflow.name
+                    ),
+                };
+
+                if gate_suppressed {
+                    info!(step = %step.id, "gate: resuming with human approval");
+                    emit_gate_result(opts, run_id, step, "approved", "human", None, step_results);
+                    let worklist = mark_done_and_track_joins(
+                        i,
+                        true, // gate resolved with a real decision — a live arrival
+                        &successors,
+                        &mut indegree,
+                        &mut ready,
+                        &mut done,
+                        &mut join_state,
+                    );
+                    drain_joins(
+                        worklist,
+                        wf,
+                        opts,
+                        run_id,
+                        step_results,
+                        &mut done,
+                        &successors,
+                        &predecessors,
+                        &mut indegree,
+                        &mut ready,
+                        &mut join_state,
+                        &mut cancel_state,
+                    );
+                    continue;
+                }
+                if let Some(expr) = &ap.auto_approve {
+                    let truthy =
+                        render_when_expression(expr, &ctx, render_mode(opts.strict_templates))
+                            .map_err(|e| RunWorkflowError::Render {
+                                step: step.id.clone(),
+                                source: e,
+                            })?;
+                    if truthy {
+                        info!(step = %step.id, "gate auto-approved");
+                        emit_gate_result(
+                            opts,
+                            run_id,
+                            step,
+                            "approved",
+                            "auto",
+                            None,
+                            step_results,
+                        );
+                        let worklist = mark_done_and_track_joins(
+                            i,
+                            true, // gate resolved with a real decision — a live arrival
+                            &successors,
+                            &mut indegree,
+                            &mut ready,
+                            &mut done,
+                            &mut join_state,
+                        );
+                        drain_joins(
+                            worklist,
+                            wf,
+                            opts,
+                            run_id,
+                            step_results,
+                            &mut done,
+                            &successors,
+                            &predecessors,
+                            &mut indegree,
+                            &mut ready,
+                            &mut join_state,
+                            &mut cancel_state,
+                        );
+                        continue;
+                    }
+                }
+                info!(step = %step.id, "gate: pausing for approval");
+                fire_notify_hooks(
+                    opts,
+                    &step.id,
+                    &ap.notify,
+                    &ctx,
+                    render_mode(opts.strict_templates),
+                )
+                .await;
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepAwaitingApproval {
+                            run_id: run_id.to_string(),
+                            step_id: step.id.clone(),
+                            reason: prompt.clone(),
+                        },
+                    );
+                }
+                // Batch-park (spec §7): record this gate and keep draining
+                // the rest of `ready` — do NOT return yet. A sibling on an
+                // independent path that also hits a gate in this same wave
+                // joins the same `parked` set instead of only ever seeing
+                // the first one; a sibling that's genuinely dispatchable
+                // still gets dispatched below in this same pass.
+                parked.push(GateParked {
+                    step_id: step.id.clone(),
+                    prompt,
+                    timeout_seconds: ap.timeout_seconds,
+                });
+                continue;
+            }
+
+            if let Some(approval) = &step.approval {
+                let gate_suppressed = approved_step_id == Some(step.id.as_str())
+                    || resume_paused_step_id == Some(step.id.as_str());
+                if approval.required && !gate_suppressed {
+                    let prompt = match &approval.prompt {
+                        Some(template) => render_step_prompt(
+                            template,
+                            &ctx,
+                            render_mode(opts.strict_templates),
+                        )
+                        .map_err(|e| RunWorkflowError::Render {
+                            step: step.id.clone(),
+                            source: e,
+                        })?,
+                        None => format!(
+                            "Approve step `{}` of workflow `{}`?",
+                            step.id, opts.workflow.name
+                        ),
+                    };
+                    info!(step = %step.id, "pausing for approval");
+                    if let Some(sink) = opts.event_sink.as_ref() {
+                        sink.emit(
+                            run_id,
+                            &crate::executor::Event::StepAwaitingApproval {
+                                run_id: run_id.to_string(),
+                                step_id: step.id.clone(),
+                                reason: prompt.clone(),
+                            },
+                        );
+                    }
+                    // Batch-park (spec §7) — see the gate-node arm above.
+                    parked.push(GateParked {
+                        step_id: step.id.clone(),
+                        prompt,
+                        timeout_seconds: approval.timeout_seconds,
+                    });
+                    continue;
+                }
+            }
+
+            if let Some(branch) = &step.branch {
+                let branch_timer = std::time::Instant::now();
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepStarted {
+                            run_id: run_id.to_string(),
+                            step_id: step.id.clone(),
+                            kind: crate::runs::StepKind::Branch,
+                            agent: None,
+                            host: None,
+                        },
+                    );
+                }
+                let take = render_when_expression(
+                    &branch.condition,
+                    &ctx,
+                    render_mode(opts.strict_templates),
+                )
+                .map_err(|e| RunWorkflowError::Render {
+                    step: step.id.clone(),
+                    source: e,
+                })?;
+                let taken = if take { "then" } else { "else" };
+                if graph_mode {
+                    // Task 3, spec §6 (post-review fix): real reachability
+                    // over the graph (`successors`, control edges union
+                    // inferred data edges), NOT the author-declared
+                    // `branch_skipped` set the chain-mode `else` arm below
+                    // still relies on, and NOT a naive "reachable from the
+                    // untaken arm minus reachable from the taken arm" diff
+                    // either — see `branch_prune_set`'s doc for why that
+                    // naive version silently over-prunes a node fed by an
+                    // UNRELATED live predecessor (not either branch arm).
+                    let untaken_ids: &[String] = if take { &branch.r#else } else { &branch.then };
+                    let untaken_idxs: Vec<usize> = untaken_ids
+                        .iter()
+                        .filter_map(|id| index_of.get(id.as_str()).copied())
+                        .collect();
+                    for idx in branch_prune_set(i, &untaken_idxs, &successors, &predecessors) {
+                        pruned.insert(wf.steps[idx].id.clone());
+                    }
+                } else if take {
+                    branch_skipped.extend(branch.r#else.iter().cloned());
+                } else {
+                    branch_skipped.extend(branch.then.iter().cloned());
+                }
+                info!(step = %step.id, arm = taken, "branch: took arm");
+                let result = StepResult {
+                    step_id: step.id.clone(),
+                    output: taken.to_string(),
+                    success: true,
+                    skipped: false,
+                    kind: crate::runs::StepKind::Branch,
+                    ..Default::default()
+                };
+                let duration_ms = branch_timer.elapsed().as_millis() as u64;
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepCompleted {
+                            run_id: run_id.to_string(),
+                            step_id: step.id.clone(),
+                            success: true,
+                            duration_ms,
+                            host: None,
+                        },
+                    );
+                }
+                complete_and_drain_joins(
+                    i,
+                    true, // branch resolution is a real completion — a live arrival
+                    result,
+                    wf,
+                    opts,
+                    run_id,
+                    step_results,
+                    &mut done,
+                    &successors,
+                    &predecessors,
+                    &mut indegree,
+                    &mut ready,
+                    &mut join_state,
+                    &mut cancel_state,
+                );
+                continue;
+            }
+
+            // `split:` orchestration no-op — see this function's doc.
+            if step.split.is_some() {
+                let split_timer = std::time::Instant::now();
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepStarted {
+                            run_id: run_id.to_string(),
+                            step_id: step.id.clone(),
+                            kind: crate::runs::StepKind::Split,
+                            agent: None,
+                            host: None,
+                        },
+                    );
+                }
+                let result = StepResult {
+                    step_id: step.id.clone(),
+                    output: String::new(),
+                    success: true,
+                    skipped: false,
+                    kind: crate::runs::StepKind::Split,
+                    ..Default::default()
+                };
+                let duration_ms = split_timer.elapsed().as_millis() as u64;
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepCompleted {
+                            run_id: run_id.to_string(),
+                            step_id: step.id.clone(),
+                            success: true,
+                            duration_ms,
+                            host: None,
+                        },
+                    );
+                }
+                complete_and_drain_joins(
+                    i,
+                    true, // split resolution is a real completion — a live arrival
+                    result,
+                    wf,
+                    opts,
+                    run_id,
+                    step_results,
+                    &mut done,
+                    &successors,
+                    &predecessors,
+                    &mut indegree,
+                    &mut ready,
+                    &mut join_state,
+                    &mut cancel_state,
+                );
+                continue;
+            }
+
+            // Real dispatch: linear / panel / parallel / for_each / action —
+            // spawned concurrently, bounded by `semaphore`. Everything up to
+            // and including the `StepStarted` emit mirrors `run_steps_over`
+            // exactly; only WHERE the dispatch itself runs changed.
+            let effective_continue_on_error =
+                step.continue_on_error.unwrap_or(workflow_default_continue);
+            persist_active_step(opts, run_id, step, None);
+            let step_kind = step_kind_for_run_record(step);
+            if let Some(sink) = opts.event_sink.as_ref() {
+                sink.emit(
+                    run_id,
+                    &crate::executor::Event::StepStarted {
+                        run_id: run_id.to_string(),
+                        step_id: step.id.clone(),
+                        kind: step_kind,
+                        agent: step.agent.clone(),
+                        host: step.host.clone(),
+                    },
+                );
+            }
+            if resume_paused_step_id == Some(step.id.as_str()) {
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepResumed {
+                            run_id: run_id.to_string(),
+                            step_id: step.id.clone(),
+                        },
+                    );
+                }
+            }
+
+            let permit_sem = Arc::clone(&semaphore);
+            let opts_task = Arc::clone(&opts_arc);
+            let run_id_owned = run_id.to_string();
+            let step_owned = step.clone();
+            let ctx_owned = ctx;
+            let abort_handle = in_flight.spawn(async move {
+                let _permit = permit_sem
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore not closed");
+                let outcome = run_node(
+                    &run_id_owned,
+                    &step_owned,
+                    &ctx_owned,
+                    &opts_task,
+                    effective_continue_on_error,
+                )
+                .await;
+                (i, outcome)
+            });
+            // Task 3, spec §8: recorded so a join resolving via `first`/
+            // `count` can reach into this exact in-flight slot and abort
+            // it (`cancel_state.in_flight_abort`), and so the `JoinError`
+            // that abort produces can be traced back to node `i` when it
+            // surfaces below (`cancel_state.task_id_to_index` — the
+            // `JoinError` itself only carries tokio's own `task::Id`).
+            cancel_state.task_id_to_index.insert(abort_handle.id(), i);
+            cancel_state.in_flight_abort.insert(i, abort_handle);
+        }
+
+        // Task 4, spec §8: the ready-drain loop above only catches the
+        // cancel signal at ITS OWN boundary (between draining one
+        // ready-but-undispatched node and the next). A node with no
+        // predecessor ready to unblock it might sit here for a while with
+        // `in_flight` non-empty and `ready` empty — check again so a
+        // cancel fired while every currently-ready node had already been
+        // drained still gets caught before we settle in to await the next
+        // completion.
+        if cancel_requested(cancel) {
+            return cancel_finalize(opts, run_id, step_results, &mut in_flight, &mut cancel_state)
+                .await;
+        }
+
+        if in_flight.is_empty() {
+            break;
+        }
+
+        // Task 4, spec §8: race the next dispatch completion against the
+        // cancel signal itself, so a cancel fired WHILE we're awaiting a
+        // long-running in-flight node is caught immediately rather than
+        // only after that node happens to finish on its own.
+        let join_next_result = if let Some(token) = cancel {
+            tokio::select! {
+                res = in_flight.join_next() => res,
+                () = token.cancelled() => {
+                    return cancel_finalize(
+                        opts, run_id, step_results, &mut in_flight, &mut cancel_state,
+                    )
+                    .await;
+                }
+            }
+        } else {
+            in_flight.join_next().await
+        };
+
+        let (i, node_result) = match join_next_result.expect("in_flight is non-empty") {
+            Ok(pair) => {
+                cancel_state.in_flight_abort.remove(&pair.0);
+                pair
+            }
+            Err(join_err) => {
+                let idx = cancel_state.task_id_to_index.remove(&join_err.id());
+                if join_err.is_cancelled() {
+                    if let Some(ix) = idx {
+                        if cancel_state.cancelled_by_us.remove(&ix) {
+                            // Expected: this is a join loser we
+                            // deliberately aborted (spec §5/§8) —
+                            // `in_flight_abort` was already removed at
+                            // the moment we called `.abort()`. This node
+                            // itself deliberately gets NO `StepResult` of
+                            // its own (unchanged from Task 3 — it never
+                            // ran, so there's nothing to record, and
+                            // `join_and_prune`'s tests assert exactly
+                            // this for a single-hop loser).
+                            //
+                            // **Post-review fix (Task 4 follow-up):** but
+                            // its own bookkeeping MUST still run —
+                            // `unlock_successors` (decrement its
+                            // successors' indegree) and
+                            // `track_join_arrivals` (non-live: resolve
+                            // any join it directly feeds without counting
+                            // as an arrival). Without this, a MULTI-HOP
+                            // losing closure (e.g. a losing arm
+                            // `A -> B -> C` behind a `wait: any` join,
+                            // where `A` is the one actually in-flight and
+                            // aborted here) silently strands `B`/`C`:
+                            // `drain_joins` already marked them
+                            // `cancel_state.cancelled`, but with `A` never
+                            // decrementing `B`'s indegree, `B` never
+                            // reaches `ready` at all — it never hits the
+                            // skip-persist check, never gets a terminal
+                            // `StepResult`, and the run still reports
+                            // `Ok(Done)` having silently dropped a
+                            // reachable node. Running this now lets `B`
+                            // (and, cascading, `C`) flow into `ready` and
+                            // resolve through the EXISTING
+                            // `cancel_state.cancelled` skip-persist path
+                            // exactly like a loser that was never
+                            // dispatched at all.
+                            let worklist = mark_done_and_track_joins(
+                                ix,
+                                false, // aborted, not a live arrival
+                                &successors,
+                                &mut indegree,
+                                &mut ready,
+                                &mut done,
+                                &mut join_state,
+                            );
+                            if !worklist.is_empty() {
+                                drain_joins(
+                                    worklist,
+                                    wf,
+                                    opts,
+                                    run_id,
+                                    step_results,
+                                    &mut done,
+                                    &successors,
+                                    &predecessors,
+                                    &mut indegree,
+                                    &mut ready,
+                                    &mut join_state,
+                                    &mut cancel_state,
+                                );
+                            }
+                            continue;
+                        }
+                    }
+                }
+                // A genuine panic, or a cancellation we did NOT
+                // initiate (e.g. the whole `JoinSet` being dropped) —
+                // propagate exactly as before this task.
+                return Err(RunWorkflowError::SchedulerTaskJoin(join_err));
+            }
+        };
+        match node_result? {
+            NodeOutcome::Paused {
+                step_id,
+                seed,
+                fanout_completed_units,
+            } => {
+                // Manual/mid-dispatch pause — same hard-return, `parked`-
+                // dropping contract as the step-boundary Manual pause
+                // above.
+                return Ok(InnerOutcome::Paused {
+                    step_id,
+                    prompt: String::new(),
+                    timeout_seconds: None,
+                    reason: PauseReason::Manual,
+                    seed,
+                    fanout_completed_units,
+                    gates: Vec::new(),
+                });
+            }
+            NodeOutcome::Completed(result) => {
+                let done_step_id = wf.steps[i].id.clone();
+                clear_active_step(opts, run_id, &done_step_id);
+                if cancel_state.cancelled_by_us.remove(&i) {
+                    // Lost the abort race — tokio's own docs note a task
+                    // that had already finished when `.abort()` was
+                    // called still yields `Ok`. This node was already
+                    // written off as a join loser (the join resolved
+                    // without it); discard the straggler result rather
+                    // than double-counting it or re-triggering a join
+                    // that already fired.
+                    continue;
+                }
+                complete_and_drain_joins(
+                    i,
+                    true, // real dispatch completed — a live arrival
+                    result,
+                    wf,
+                    opts,
+                    run_id,
+                    step_results,
+                    &mut done,
+                    &successors,
+                    &predecessors,
+                    &mut indegree,
+                    &mut ready,
+                    &mut join_state,
+                    &mut cancel_state,
+                );
+            }
+        }
+    }
+
+    // The loop above only `break`s once BOTH `ready` and `in_flight` are
+    // empty — i.e. no further non-gate progress is possible (the batch-
+    // parking non-goal stated on `parked`'s declaration: this is NOT
+    // "keep computing while a gate waits", it's "pause once nothing else
+    // CAN run"). If any gate was reached along the way, the run pauses now
+    // with the FULL set; `step_id`/`prompt`/`timeout_seconds` mirror the
+    // first-reached gate for the single-gate callers (`AwaitingInfo`, the
+    // legacy CLI printer) that only ever look at those three fields.
+    if let Some(first) = parked.first() {
+        return Ok(InnerOutcome::Paused {
+            step_id: first.step_id.clone(),
+            prompt: first.prompt.clone(),
+            timeout_seconds: first.timeout_seconds,
+            reason: PauseReason::Approval,
+            seed: Vec::new(),
+            fanout_completed_units: std::collections::BTreeMap::new(),
+            gates: parked,
+        });
+    }
+
+    Ok(InnerOutcome::Done)
+}
+
+/// Task 4, spec §8: a whole-run cancel signal fired mid-schedule. Aborts
+/// every currently in-flight dispatched node (reuses Task 3's own
+/// `AbortHandle` map — no parallel cancellation mechanism is introduced)
+/// and drains the `JoinSet` to completion. A node that raced ahead and
+/// actually finished before its abort landed is still recorded with its
+/// REAL result — tokio's own documented behavior is that `.abort()` on an
+/// already-finished task is a no-op, so it surfaces as `Ok`, not `Err`,
+/// and there is no reason to discard a good result just because a cancel
+/// was in flight at the same moment.
+///
+/// **Deliberately does NOT persist anything for a node that was actually
+/// aborted mid-flight.** Spec §8 is explicit that restart-from-checkpoint
+/// means: a node that checkpointed (a fan-out's `completed_units`) picks
+/// up from its checkpoint; **a node with no checkpoint restarts CLEAN**.
+/// A plain aborted node has no checkpoint (a hard `.abort()` drops its
+/// future instantly — no graceful mid-turn checkpoint extraction is
+/// possible, unlike the cooperative `opts.pause` path `run_linear_step`/
+/// `run_fanout_step` already support), so the only spec-correct
+/// resume behavior is "not in `step_results` → re-runs on resume",
+/// EXACTLY the existing pause-time-in-flight contract (spec §3: "none of
+/// those are `done`, so they simply re-run"). This is why cancel here is
+/// NOT symmetric with a join's loser-cancellation (§5, `drain_joins`),
+/// which DOES persist a `"cancelled"` marker: a join loser is
+/// permanently moot (the join already resolved without it — re-running
+/// it later would be pointless), whereas a whole-run-cancelled node has
+/// no such permanent reason to stay dead.
+///
+/// **What this reaches, precisely (see this task's report for the full
+/// writeup):** the `tokio::spawn`ed task is aborted at its very next
+/// `.await` point — for a real agent dispatch that's wherever
+/// `rupu_agent::run_agent`'s own internal awaits are (a provider call, a
+/// tool run). The in-flight work is DROPPED, not gracefully interrupted
+/// mid-turn. A `for_each`/`distribute:` fan-out node's OWN
+/// `completed_units` checkpoint is unaffected by any of this: that
+/// mechanism is keyed off `opts.resume_from` (a cooperative-pause
+/// checkpoint built by [`run_fanout_step`] itself via `opts.pause`,
+/// independent of the scheduler-level hard-cancel signal here) and is
+/// exercised unchanged — see this task's report for how a fan-out node
+/// restarts from checkpoint under the scheduler.
+async fn cancel_finalize(
+    opts: &OrchestratorRunOpts,
+    run_id: &str,
+    step_results: &mut Vec<StepResult>,
+    in_flight: &mut tokio::task::JoinSet<(usize, Result<NodeOutcome, RunWorkflowError>)>,
+    cancel_state: &mut Cancellation,
+) -> Result<InnerOutcome, RunWorkflowError> {
+    let to_abort: Vec<usize> = cancel_state.in_flight_abort.keys().copied().collect();
+    for i in &to_abort {
+        if let Some(handle) = cancel_state.in_flight_abort.remove(i) {
+            handle.abort();
+            cancel_state.cancelled_by_us.insert(*i);
+        }
+    }
+    let aborted = to_abort.len();
+    while let Some(joined) = in_flight.join_next().await {
+        match joined {
+            Ok((_, Ok(NodeOutcome::Completed(result)))) => {
+                persist_step_result(opts, run_id, &result);
+                step_results.push(result);
+            }
+            Ok((_, Ok(NodeOutcome::Paused { .. }))) => {
+                // A node independently noticed its OWN cooperative-pause
+                // check (`opts.pause`, unrelated to this cancel signal)
+                // while we were tearing down. There's no clean partial
+                // state to record for it here — the whole run is ending
+                // as `RunCancelled` regardless of which signal a given
+                // node happened to notice first.
+            }
+            Ok((_, Err(e))) => return Err(e),
+            Err(join_err) => {
+                let idx = cancel_state.task_id_to_index.remove(&join_err.id());
+                if join_err.is_cancelled() {
+                    if let Some(ix) = idx {
+                        if cancel_state.cancelled_by_us.remove(&ix) {
+                            // Genuinely aborted by this cancel — no
+                            // checkpoint to extract, no marker to
+                            // persist (see the doc comment above): the
+                            // node simply stays absent from
+                            // `step_results` so a resume re-runs it
+                            // clean.
+                            continue;
+                        }
+                    }
+                }
+                // A genuine panic, or a cancellation this function did
+                // NOT initiate — propagate rather than mask it behind
+                // `RunCancelled`.
+                return Err(RunWorkflowError::SchedulerTaskJoin(join_err));
+            }
+        }
+    }
+    Err(RunWorkflowError::RunCancelled { aborted })
+}
+
+/// Decrement node `i`'s successors' indegree (it just completed — sync
+/// resolution or an awaited async dispatch) and insert any that reach 0
+/// into `ready`. Shared by every completion path in [`run_scheduler`].
+///
+/// A successor that's an explicit `join` node (present as a key in
+/// `join_threshold`) is deliberately never inserted into `ready` here,
+/// even at indegree 0 — Task 3, spec §5: a join's readiness is governed
+/// by its wait POLICY (tracked separately in [`JoinScheduling`] and
+/// resolved by [`drain_joins`]), not by "every inbound edge resolved".
+/// For the default `wait: all` policy the two conditions coincide
+/// (`threshold == predecessors.len()`), so a join still fires at exactly
+/// the same moment it would have under plain indegree tracking — it's
+/// only `first`/`count` that need to fire EARLIER, before indegree
+/// reaches 0, which is why joins are excluded from `ready` uniformly
+/// rather than only for those two policies.
+fn unlock_successors(
+    i: usize,
+    successors: &[Vec<usize>],
+    indegree: &mut [usize],
+    ready: &mut std::collections::BTreeSet<usize>,
+    join_threshold: &BTreeMap<usize, usize>,
+) {
+    for &s in &successors[i] {
+        indegree[s] = indegree[s].saturating_sub(1);
+        if indegree[s] == 0 && !join_threshold.contains_key(&s) {
+            ready.insert(s);
+        }
+    }
+}
+
+/// Per-run join-scheduling state (Task 3, spec §5): `threshold[j]` is how
+/// many LIVE inbound paths must land before join `j` fires
+/// (`predecessors.len()` for `all`, `1` for `any`/`first`, `count` for the
+/// count form — see [`run_scheduler`]'s setup). `arrived[j]` is the list of
+/// predecessor node indices that completed LIVE (actually ran — NOT
+/// pruned/`when:`-skipped/cancelled) so far, in COMPLETION order
+/// (meaningful for `first`: it's the single fastest LIVE path; harmless for
+/// `all`/`count`, which don't care about order).
+///
+/// **Post-review fix:** a pruned/skipped/cancelled predecessor must still
+/// resolve the join's indegree (so the join can fire on its live arms —
+/// [`unlock_successors`] is unconditional) but must NEVER be counted in
+/// `arrived` or merged into the join's `results`/`sub_results` — see
+/// [`mark_done_and_track_joins`]'s `live` parameter. Because a pruned
+/// predecessor is invisible to `arrived`, `threshold` alone can no longer
+/// be the only fire condition for `all` (or for `count`/`any` when enough
+/// of a join's inbound get pruned that live arrivals can never reach
+/// `threshold`): `resolved_count[j]` tracks EVERY inbound resolution
+/// (live or not) against `inbound_total[j]` (`predecessors[j].len()`,
+/// fixed at setup), and a join fires when EITHER `arrived.len() >=
+/// threshold` (the live-count reaches policy) OR `resolved_count[j] >=
+/// inbound_total[j]` (everything inbound is accounted for, whether or not
+/// enough was live) — the second clause is what prevents a join from
+/// hanging forever when too many of its paths get pruned to ever satisfy
+/// the first. `resolved` guards against processing the same join twice —
+/// necessary because both fire conditions can become true on the same
+/// call, and because [`drain_joins`] can cascade (a join feeding another
+/// join).
+struct JoinScheduling {
+    threshold: BTreeMap<usize, usize>,
+    inbound_total: BTreeMap<usize, usize>,
+    arrived: BTreeMap<usize, Vec<usize>>,
+    resolved_count: BTreeMap<usize, usize>,
+    resolved: std::collections::BTreeSet<usize>,
+}
+
+/// Loser-cancellation bookkeeping (Task 3, spec §8, first use in this arc).
+/// `cancelled` is the string (step-id) set the ready-drain loop's skip
+/// check consults for a node that was never dispatched at all — the same
+/// shape as `branch_skipped`/`pruned`. `in_flight_abort` holds every
+/// currently-spawned node's `AbortHandle`, keyed by OUR node index, so a
+/// join resolution can reach in and cancel one directly.
+/// `task_id_to_index` is the reverse lookup a `JoinError` needs (it only
+/// carries tokio's own `task::Id`, not our index). `cancelled_by_us`
+/// distinguishes an abort WE initiated (swallow the resulting `JoinError`,
+/// or discard a straggler `Ok` that won the race against the abort) from
+/// a genuine panic or an externally-initiated cancellation (still a hard
+/// error, exactly as before this task).
+///
+/// **What "cancel" reaches today, vs. Task 4:** aborting the
+/// `tokio::spawn`ed task stops the dispatch at its next `.await` point —
+/// for a real agent run that's wherever `rupu_agent::run_agent`'s own
+/// internal awaits are (a provider call, a tool run), so the in-flight
+/// HTTP/tool work is dropped, not gracefully interrupted mid-turn. Task
+/// 4's "cancel is restart-aware" (spec §8) — checkpointing partial
+/// progress so a restart resumes rather than reruns from scratch — is
+/// NOT implemented here; a cancelled node simply never gets a
+/// `StepResult` and is never retried within the same run.
+struct Cancellation {
+    cancelled: std::collections::BTreeSet<String>,
+    in_flight_abort: BTreeMap<usize, tokio::task::AbortHandle>,
+    task_id_to_index: BTreeMap<tokio::task::Id, usize>,
+    cancelled_by_us: std::collections::BTreeSet<usize>,
+}
+
+/// Transitive closure (including every start node) reachable by following
+/// `adj` from every node in `starts`. Shared by two Task-3 reachability
+/// questions that are mirror images of each other:
+/// - Branch pruning (spec §6): forward, over `successors` — "everything
+///   downstream of the untaken arm".
+/// - Join loser-cancellation's ancestor-exclusivity check (spec §5/§8):
+///   backward, over `predecessors` — "everything upstream of a losing
+///   inbound path".
+///
+/// In both cases, a node belongs EXCLUSIVELY to one side of a fork iff
+///   it's reachable from that side and NOT reachable from the other — see
+///   [`branch_prune_set`] and [`drain_joins`], which both compute a set
+///   difference of two `reachable_via` calls.
+fn reachable_via(
+    starts: &[usize],
+    adj: &[Vec<usize>],
+) -> std::collections::BTreeSet<usize> {
+    let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut stack: Vec<usize> = starts.to_vec();
+    while let Some(n) = stack.pop() {
+        if seen.insert(n) {
+            stack.extend(adj[n].iter().copied());
+        }
+    }
+    seen
+}
+
+/// Like [`reachable_via`], but any edge FROM `cut_from` INTO a node in
+/// `cut_to` is skipped during traversal — the one specific edge (or set of
+/// edges) this computation is entitled to treat as severed. Lets
+/// [`branch_prune_set`] ask "if the branch's untaken-arm edge(s) didn't
+/// exist, would this node still be reachable from somewhere?" without
+/// actually mutating the graph.
+fn reachable_via_excluding(
+    starts: &[usize],
+    adj: &[Vec<usize>],
+    cut_from: usize,
+    cut_to: &std::collections::BTreeSet<usize>,
+) -> std::collections::BTreeSet<usize> {
+    let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut stack: Vec<usize> = starts.to_vec();
+    while let Some(n) = stack.pop() {
+        if seen.insert(n) {
+            for &m in &adj[n] {
+                if n == cut_from && cut_to.contains(&m) {
+                    continue;
+                }
+                stack.push(m);
+            }
+        }
+    }
+    seen
+}
+
+/// Task 3, spec §6. **Post-review fix — replaces the original naive
+/// "reachable from untaken minus reachable from taken" diff, which had a
+/// real silent-drop bug:** that version correctly excluded a reconverge
+/// (reachable via BOTH arms) but WRONGLY pruned a node that's reachable
+/// via the untaken arm AND via some entirely UNRELATED live predecessor
+/// that has nothing to do with either branch arm (e.g. an independent
+/// entry step feeding the same downstream node) — that node has a
+/// perfectly good way to become ready regardless of this branch's
+/// decision, so pruning it silently starved whatever's downstream of it.
+///
+/// **The fix:** instead of comparing against "reachable from the taken
+/// arm specifically", compare `reach_untaken` against "reachable from ANY
+/// graph entry point (a node with no inbound edges at all) once ONLY
+/// `branch_idx`'s edge(s) to `untaken_targets` are cut" — via
+/// [`reachable_via_excluding`]. This is a strict superset of the old
+/// taken-arm-only reachability (an entry point can always still reach the
+/// taken arm, since that edge is untouched) that ALSO covers any
+/// unrelated live path into the same node. A node is pruned only if
+/// EVERY structural path into it required the specific edge being cut —
+/// which both correctly excludes a reconverge (still reachable via the
+/// taken arm) AND correctly excludes a node fed by an unrelated live
+/// predecessor (still reachable via that predecessor).
+///
+/// Only meaningful in graph mode (`successors`/`predecessors` built from
+/// [`workflow_edges`], which includes branch-arm edges); chain mode never
+/// calls this — see [`run_scheduler`]'s branch-handling arm.
+fn branch_prune_set(
+    branch_idx: usize,
+    untaken_targets: &[usize],
+    successors: &[Vec<usize>],
+    predecessors: &[Vec<usize>],
+) -> std::collections::BTreeSet<usize> {
+    let reach_untaken = reachable_via(untaken_targets, successors);
+    let untaken_set: std::collections::BTreeSet<usize> = untaken_targets.iter().copied().collect();
+    let entries: Vec<usize> = (0..predecessors.len())
+        .filter(|&i| predecessors[i].is_empty())
+        .collect();
+    let reach_from_entries_reduced =
+        reachable_via_excluding(&entries, successors, branch_idx, &untaken_set);
+    reach_untaken
+        .difference(&reach_from_entries_reduced)
+        .copied()
+        .collect()
+}
+
+/// The non-persisting half of "a node just resolved": mark it `done`,
+/// unlock its successors' indegree (a pruned/skipped/cancelled node's
+/// resolution counts exactly like a real completion for this purpose —
+/// Task 3, spec §6's requirement that a pruned predecessor not block a
+/// downstream reconverge), and record this node's arrival against every
+/// join it directly feeds (Task 3, spec §5) — but ONLY as a live arrival
+/// when `live` is `true`. Returns the indices of joins newly satisfied —
+/// the caller ([`drain_joins`]) resolves those. Split out from
+/// [`finish_node`] so the two call sites that persist via
+/// [`emit_gate_result`] (which already pushes a `StepResult` itself)
+/// don't push a second one.
+///
+/// **`live` — post-review fix, CRITICAL.** `live` must be `false` for a
+/// node resolved via the skip/prune/cancel no-op path (branch pruning,
+/// `when:`-skip, join loser-cancellation) and `true` for everything that
+/// actually ran (real dispatch, `branch`/`split`'s own synchronous
+/// resolution, an approval gate's decision, a join's own merge). A
+/// NON-live resolution still counts toward `resolved_count` (so a join
+/// waiting on it doesn't hang) but is NEVER pushed into `arrived` — i.e.
+/// never merged into a join's `results`/`sub_results`, and never poisons
+/// its `success`. Before this fix, every completing node — pruned or not
+/// — was recorded as a join arrival unconditionally, so a `wait: all`
+/// join downstream of a branch merged the DEAD arm's `"pruned"` output
+/// and forced `success = false` even though the live arm succeeded.
+#[allow(clippy::too_many_arguments)]
+fn mark_done_and_track_joins(
+    i: usize,
+    live: bool,
+    successors: &[Vec<usize>],
+    indegree: &mut [usize],
+    ready: &mut std::collections::BTreeSet<usize>,
+    done: &mut [bool],
+    joins: &mut JoinScheduling,
+) -> Vec<usize> {
+    done[i] = true;
+    unlock_successors(i, successors, indegree, ready, &joins.threshold);
+    track_join_arrivals(i, live, successors, joins)
+}
+
+/// The join-bookkeeping half of [`mark_done_and_track_joins`], split out
+/// (Task 4) so [`run_scheduler`]'s resume-seeding can REPLAY it for every
+/// node that's already `done` from a prior process's persisted
+/// `step_results` — exactly the accounting a join with some (not all)
+/// inbound paths already resolved pre-pause needs, or it resumes with
+/// `arrived`/`resolved_count` both at zero and can wait forever for
+/// arrivals that already happened. See [`mark_done_and_track_joins`] for
+/// what `live` must be at each live call site; the resume replay passes
+/// `!step_result.skipped` (every skip/prune/cancel marker sets `skipped:
+/// true`, matching exactly the `live: false` those call sites already
+/// pass).
+fn track_join_arrivals(
+    i: usize,
+    live: bool,
+    successors: &[Vec<usize>],
+    joins: &mut JoinScheduling,
+) -> Vec<usize> {
+    let mut newly_satisfied = Vec::new();
+    for &s in &successors[i] {
+        if joins.resolved.contains(&s) {
+            continue;
+        }
+        let Some(&threshold) = joins.threshold.get(&s) else {
+            continue;
+        };
+        let resolved_count = joins.resolved_count.entry(s).or_insert(0);
+        *resolved_count += 1;
+        if live {
+            let arrived = joins.arrived.entry(s).or_default();
+            if !arrived.contains(&i) {
+                arrived.push(i);
+            }
+        }
+        let arrived_len = joins.arrived.get(&s).map(Vec::len).unwrap_or(0);
+        let inbound_total = joins.inbound_total.get(&s).copied().unwrap_or(0);
+        // Fire on whichever condition comes first: enough LIVE arrivals to
+        // satisfy the wait policy, OR every inbound path accounted for
+        // (live or not) — the second clause is what stops a join from
+        // hanging forever when too many of its paths were pruned/skipped
+        // to ever reach `threshold` via live arrivals alone.
+        if arrived_len >= threshold || *resolved_count >= inbound_total {
+            newly_satisfied.push(s);
+        }
+    }
+    newly_satisfied
+}
+
+/// Persist + push a completed/skipped/pruned/cancelled node's
+/// `StepResult`, then run [`mark_done_and_track_joins`]. The shared tail
+/// every completion path in [`run_scheduler`] calls (mirroring what the
+/// pre-Task-3 code did inline at each site — skip / when-skip / branch /
+/// split / the async `Completed` arm — now also join-aware). See
+/// [`mark_done_and_track_joins`] for what `live` must be at each call site.
+#[allow(clippy::too_many_arguments)]
+fn finish_node(
+    i: usize,
+    live: bool,
+    result: StepResult,
+    opts: &OrchestratorRunOpts,
+    run_id: &str,
+    step_results: &mut Vec<StepResult>,
+    done: &mut [bool],
+    successors: &[Vec<usize>],
+    indegree: &mut [usize],
+    ready: &mut std::collections::BTreeSet<usize>,
+    joins: &mut JoinScheduling,
+) -> Vec<usize> {
+    persist_step_result(opts, run_id, &result);
+    step_results.push(result);
+    mark_done_and_track_joins(i, live, successors, indegree, ready, done, joins)
+}
+
+/// Resolve every join in `worklist` (Task 3, spec §5), cascading if
+/// resolving one join newly satisfies another (a join feeding a join).
+/// For each join `j`:
+/// 1. **Winners** are `joins.arrived[j]` (already exactly `threshold`
+///    entries, in arrival order — the scheduler processes one node
+///    completion at a time, so there's no race within this single-
+///    threaded bookkeeping). **Losers** are `j`'s other direct
+///    predecessors.
+/// 2. **Cancellation** (spec §8): start from the ancestor-exclusive
+///    closure of the losers (reachable backward from `losers`, minus
+///    reachable backward from `winners` — the same `reachable_via`
+///    set-difference [`branch_prune_set`] uses forward). **Post-review
+///    fix:** a candidate is then PROTECTED (removed from the closure,
+///    left to run normally) if cancelling it would silently strand a
+///    live consumer outside this join's losing path — i.e. it has a
+///    successor that's neither another still-cancellable candidate nor
+///    the join `j` itself (the one edge this resolution is entitled to
+///    cut). Protecting a candidate also protects its own candidate
+///    ancestors transitively (they must still run to feed it), so this
+///    runs to a fixed point. Only what survives that fixed point is
+///    actually cancelled: aborted if currently in-flight
+///    (`cancel.in_flight_abort`), or marked `cancelled` (if not yet
+///    dispatched) so the ready-drain loop's skip check resolves it as a
+///    no-op instead of ever running it.
+/// 3. **Merge** (spec §5's ONE rule): the join's own `StepResult.items`
+///    is one [`ItemResult`] per winner, `sub_id` = that winner's step id
+///    (source-keyed) — `base_context_for_step` turns this into BOTH
+///    `steps.<join>.results` (ordered list of output strings, winner
+///    arrival order) and `steps.<join>.sub_results.<source_id>.output`
+///    (keyed lookup) for free, with no new `StepOutput` field. See this
+///    task's report for the exact shape + a template example.
+#[allow(clippy::too_many_arguments)]
+fn drain_joins(
+    mut worklist: Vec<usize>,
+    wf: &Workflow,
+    opts: &OrchestratorRunOpts,
+    run_id: &str,
+    step_results: &mut Vec<StepResult>,
+    done: &mut [bool],
+    successors: &[Vec<usize>],
+    predecessors: &[Vec<usize>],
+    indegree: &mut [usize],
+    ready: &mut std::collections::BTreeSet<usize>,
+    joins: &mut JoinScheduling,
+    cancel: &mut Cancellation,
+) {
+    while let Some(j) = worklist.pop() {
+        if !joins.resolved.insert(j) {
+            continue;
+        }
+        let winners = joins.arrived.get(&j).cloned().unwrap_or_default();
+        let losers: Vec<usize> = predecessors[j]
+            .iter()
+            .copied()
+            .filter(|p| !winners.contains(p))
+            .collect();
+
+        if !losers.is_empty() {
+            let reach_losers = reachable_via(&losers, predecessors);
+            let reach_winners = reachable_via(&winners, predecessors);
+            let mut cancel_candidates: std::collections::BTreeSet<usize> =
+                reach_losers.difference(&reach_winners).copied().collect();
+            // Post-review fix: protect (un-cancel) any candidate that
+            // feeds a live consumer outside this closure — a successor
+            // that's neither another candidate nor the join `j` itself
+            // (the one edge we're entitled to cut). Protecting a node
+            // also protects its own candidate ancestors transitively
+            // (they must still run to feed it), so iterate to a fixed
+            // point rather than a single pass.
+            loop {
+                let protect: Vec<usize> = cancel_candidates
+                    .iter()
+                    .copied()
+                    .filter(|&x| {
+                        successors[x]
+                            .iter()
+                            .any(|&s| s != j && !cancel_candidates.contains(&s))
+                    })
+                    .collect();
+                if protect.is_empty() {
+                    break;
+                }
+                for x in protect {
+                    cancel_candidates.remove(&x);
+                }
+            }
+            for idx in cancel_candidates {
+                if done[idx] {
+                    continue;
+                }
+                if let Some(handle) = cancel.in_flight_abort.remove(&idx) {
+                    handle.abort();
+                    cancel.cancelled_by_us.insert(idx);
+                } else {
+                    cancel.cancelled.insert(wf.steps[idx].id.clone());
+                    ready.remove(&idx);
+                }
+            }
+        }
+
+        let join_timer = std::time::Instant::now();
+        let mut items = Vec::with_capacity(winners.len());
+        let mut outputs = Vec::with_capacity(winners.len());
+        let mut all_success = true;
+        for (idx0, &w) in winners.iter().enumerate() {
+            let source_id = wf.steps[w].id.clone();
+            let src = step_results
+                .iter()
+                .rev()
+                .find(|sr| sr.step_id == source_id)
+                .expect("a join's winner must already have a StepResult");
+            all_success = all_success && src.success;
+            outputs.push(src.output.clone());
+            items.push(ItemResult {
+                index: idx0,
+                item: serde_json::Value::Null,
+                sub_id: source_id,
+                rendered_prompt: String::new(),
+                run_id: src.run_id.clone(),
+                transcript_path: src.transcript_path.clone(),
+                output: src.output.clone(),
+                success: src.success,
+            });
+        }
+        let join_step = &wf.steps[j];
+        if let Some(sink) = opts.event_sink.as_ref() {
+            sink.emit(
+                run_id,
+                &crate::executor::Event::StepStarted {
+                    run_id: run_id.to_string(),
+                    step_id: join_step.id.clone(),
+                    kind: crate::runs::StepKind::Join,
+                    agent: None,
+                    host: None,
+                },
+            );
+        }
+        let output = serde_json::to_string(&outputs).unwrap_or_else(|_| "[]".into());
+        let join_result = StepResult {
+            step_id: join_step.id.clone(),
+            output,
+            success: all_success,
+            skipped: false,
+            kind: crate::runs::StepKind::Join,
+            items,
+            ..Default::default()
+        };
+        let duration_ms = join_timer.elapsed().as_millis() as u64;
+        if let Some(sink) = opts.event_sink.as_ref() {
+            sink.emit(
+                run_id,
+                &crate::executor::Event::StepCompleted {
+                    run_id: run_id.to_string(),
+                    step_id: join_step.id.clone(),
+                    success: all_success,
+                    duration_ms,
+                    host: None,
+                },
+            );
+        }
+        let more = finish_node(
+            j, true, join_result, opts, run_id, step_results, done, successors, indegree, ready,
+            joins,
+        );
+        worklist.extend(more);
+    }
+}
+
+/// [`finish_node`] followed by [`drain_joins`] — the common case (every
+/// completion path except the two `emit_gate_result`-backed gate-approval
+/// sites, which push their own `StepResult` and call
+/// [`mark_done_and_track_joins`] + [`drain_joins`] directly).
+#[allow(clippy::too_many_arguments)]
+fn complete_and_drain_joins(
+    i: usize,
+    live: bool,
+    result: StepResult,
+    wf: &Workflow,
+    opts: &OrchestratorRunOpts,
+    run_id: &str,
+    step_results: &mut Vec<StepResult>,
+    done: &mut [bool],
+    successors: &[Vec<usize>],
+    predecessors: &[Vec<usize>],
+    indegree: &mut [usize],
+    ready: &mut std::collections::BTreeSet<usize>,
+    joins: &mut JoinScheduling,
+    cancel: &mut Cancellation,
+) {
+    let worklist = finish_node(
+        i, live, result, opts, run_id, step_results, done, successors, indegree, ready, joins,
+    );
+    drain_joins(
+        worklist,
+        wf,
+        opts,
+        run_id,
+        step_results,
+        done,
+        successors,
+        predecessors,
+        indegree,
+        ready,
+        joins,
+        cancel,
+    );
+}
+
+/// The actual per-step loop body — [`run_steps_inner`]'s (and only
+/// [`run_steps_inner`]'s, since Task 2) shared implementation, iterating
+/// `order` (declaration order) directly. Behavior is IDENTICAL to what was,
+/// before the Task-1 extraction, `run_steps_inner`'s own body iterating
+/// `&opts.workflow.steps` directly.
+async fn run_steps_over(
+    order: &[&Step],
     opts: &OrchestratorRunOpts,
     run_id: &str,
     resolved_inputs: &BTreeMap<String, String>,
@@ -1007,7 +2891,7 @@ async fn run_steps_inner(
     // `when:`-skip shape.
     let mut branch_skipped: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
-    for step in &opts.workflow.steps {
+    for step in order.iter().copied() {
         // Resume: skip steps that already ran in the prior process.
         if already_done.contains(&step.id) {
             // If the already-done step is a `branch:` step, reconstruct the
@@ -1087,6 +2971,7 @@ async fn run_steps_inner(
                 reason: PauseReason::Manual,
                 seed: Vec::new(),
                 fanout_completed_units: std::collections::BTreeMap::new(),
+                gates: Vec::new(),
             });
         }
 
@@ -1199,11 +3084,16 @@ async fn run_steps_inner(
             }
             return Ok(InnerOutcome::Paused {
                 step_id: step.id.clone(),
-                prompt,
+                prompt: prompt.clone(),
                 timeout_seconds: ap.timeout_seconds,
                 reason: PauseReason::Approval,
                 seed: Vec::new(),
                 fanout_completed_units: std::collections::BTreeMap::new(),
+                gates: vec![GateParked {
+                    step_id: step.id.clone(),
+                    prompt,
+                    timeout_seconds: ap.timeout_seconds,
+                }],
             });
         }
 
@@ -1245,11 +3135,16 @@ async fn run_steps_inner(
                 }
                 return Ok(InnerOutcome::Paused {
                     step_id: step.id.clone(),
-                    prompt,
+                    prompt: prompt.clone(),
                     timeout_seconds: approval.timeout_seconds,
                     reason: PauseReason::Approval,
                     seed: Vec::new(),
                     fanout_completed_units: std::collections::BTreeMap::new(),
+                    gates: vec![GateParked {
+                        step_id: step.id.clone(),
+                        prompt,
+                        timeout_seconds: approval.timeout_seconds,
+                    }],
                 });
             }
         }
@@ -1347,143 +3242,202 @@ async fn run_steps_inner(
                 );
             }
         }
-        let step_timer = std::time::Instant::now();
-
-        let dispatch_result: Result<StepResult, RunWorkflowError> = if step.panel.is_some() {
-            run_panel_step(run_id, step, &ctx, opts, effective_continue_on_error).await
-        } else if step.parallel.is_some() {
-            run_parallel_step(step, &ctx, opts, effective_continue_on_error).await
-        } else if step.for_each.is_some() {
-            // A distributed fan-out honors the cooperative pause token
-            // MID-UNIT (not just at the step boundary): a paused-incomplete
-            // fan-out unwinds here carrying the units that already succeeded,
-            // so the resumed run re-dispatches only the paused / not-yet-
-            // started ones.
-            match run_fanout_step(run_id, step, &ctx, opts, effective_continue_on_error).await {
-                Ok(FanoutStepOutcome::Paused {
+        match run_node(run_id, step, &ctx, opts, effective_continue_on_error).await? {
+            NodeOutcome::Paused {
+                step_id,
+                seed,
+                fanout_completed_units,
+            } => {
+                return Ok(InnerOutcome::Paused {
                     step_id,
-                    completed_units,
-                }) => {
-                    info!(step = %step_id, "cooperative pause mid-fan-out");
-                    if let Some(sink) = opts.event_sink.as_ref() {
-                        sink.emit(
-                            run_id,
-                            &crate::executor::Event::StepPaused {
-                                run_id: run_id.to_string(),
-                                step_id: step_id.clone(),
-                            },
-                        );
-                    }
-                    clear_active_step(opts, run_id, &step.id);
-                    return Ok(InnerOutcome::Paused {
-                        step_id,
-                        prompt: String::new(),
-                        timeout_seconds: None,
-                        reason: PauseReason::Manual,
-                        seed: Vec::new(),
-                        fanout_completed_units: completed_units,
-                    });
-                }
-                Ok(FanoutStepOutcome::Completed(sr)) => Ok(sr),
-                Err(e) => Err(e),
+                    prompt: String::new(),
+                    timeout_seconds: None,
+                    reason: PauseReason::Manual,
+                    seed,
+                    fanout_completed_units,
+                    gates: Vec::new(),
+                });
             }
-        } else if step.action.is_some() {
-            // Action steps never pause mid-run — a single dispatcher call is
-            // either fast enough to run to completion or fails outright; no
-            // cooperative-pause checkpoint shape exists for it.
-            match opts.action_dispatcher.as_ref() {
-                Some(dispatcher) => {
-                    execute_action_step(
-                        dispatcher,
-                        step,
-                        &ctx,
-                        render_mode(opts.strict_templates),
-                        effective_continue_on_error,
-                        &opts.transcript_dir,
-                    )
-                    .await
-                }
-                None => Err(RunWorkflowError::ActionDispatcherMissing {
-                    step: step.id.clone(),
-                }),
-            }
-        } else {
-            // The linear path is the only other shape that pauses mid-step
-            // (its agent run carries the cooperative pause token). A
-            // paused-incomplete step unwinds here into a manual-pause
-            // checkpoint carrying the seed.
-            match run_linear_step(run_id, step, &ctx, opts, effective_continue_on_error).await {
-                Ok(LinearStepOutcome::Paused { step_id, seed }) => {
-                    // A `workspace: sync` workflow is refused loudly here too
-                    // — checkpointing mid-step would drop in-flight deltas
-                    // the same way a step-boundary/fan-out pause would.
-                    // Mirrors the step-boundary guard above and the fan-out
-                    // guard in `run_fanout_step`.
-                    if workflow_has_sync_step(opts) {
-                        return Err(RunWorkflowError::PauseWithWorkspaceSync);
-                    }
-                    info!(step = %step_id, "cooperative pause mid-step");
-                    if let Some(sink) = opts.event_sink.as_ref() {
-                        sink.emit(
-                            run_id,
-                            &crate::executor::Event::StepPaused {
-                                run_id: run_id.to_string(),
-                                step_id: step_id.clone(),
-                            },
-                        );
-                    }
-                    clear_active_step(opts, run_id, &step.id);
-                    return Ok(InnerOutcome::Paused {
-                        step_id,
-                        prompt: String::new(),
-                        timeout_seconds: None,
-                        reason: PauseReason::Manual,
-                        seed,
-                        fanout_completed_units: std::collections::BTreeMap::new(),
-                    });
-                }
-                Ok(LinearStepOutcome::Completed(sr)) => Ok(sr),
-                Err(e) => Err(e),
-            }
-        };
-
-        let duration_ms = step_timer.elapsed().as_millis() as u64;
-
-        match &dispatch_result {
-            Ok(result) => {
-                if let Some(sink) = opts.event_sink.as_ref() {
-                    sink.emit(
-                        run_id,
-                        &crate::executor::Event::StepCompleted {
-                            run_id: run_id.to_string(),
-                            step_id: step.id.clone(),
-                            success: result.success,
-                            duration_ms,
-                            host: step.host.clone(),
-                        },
-                    );
-                }
-            }
-            Err(e) => {
-                if let Some(sink) = opts.event_sink.as_ref() {
-                    sink.emit(
-                        run_id,
-                        &crate::executor::Event::StepFailed {
-                            run_id: run_id.to_string(),
-                            step_id: step.id.clone(),
-                            error: e.to_string(),
-                        },
-                    );
-                }
+            NodeOutcome::Completed(result) => {
+                persist_step_result(opts, run_id, &result);
+                clear_active_step(opts, run_id, &step.id);
+                step_results.push(result);
             }
         }
-
-        let result = dispatch_result?;
-        persist_step_result(opts, run_id, &result);
-        clear_active_step(opts, run_id, &step.id);
-        step_results.push(result);
     }
     Ok(InnerOutcome::Done)
+}
+
+/// Outcome of dispatching one workflow node — panel / parallel / for_each /
+/// action / linear — via [`run_node`]. Distinct from [`InnerOutcome`]'s
+/// `Paused` variant, which ALSO covers the step-boundary and approval-gate
+/// pauses that happen in [`run_steps_over`] BEFORE `run_node` is ever
+/// called; those never produce a `NodeOutcome`.
+enum NodeOutcome {
+    /// The node ran to completion — success or a tolerated
+    /// (`continue_on_error`) failure.
+    Completed(StepResult),
+    /// A cooperative pause landed mid-dispatch (mid-fan-out or
+    /// mid-linear-step). Carries exactly the fields that vary for THIS
+    /// pause shape — `prompt` is always empty, `timeout_seconds` always
+    /// `None`, and `reason` is always [`PauseReason::Manual`] whenever a
+    /// pause reaches this point (see [`InnerOutcome::Paused`]'s doc), so
+    /// the caller fills those in when it re-wraps this into an
+    /// `InnerOutcome::Paused`.
+    Paused {
+        step_id: String,
+        seed: Vec<Message>,
+        fanout_completed_units: std::collections::BTreeMap<usize, ItemResult>,
+    },
+}
+
+/// Dispatch exactly one step (panel / parallel / for_each / action /
+/// linear) and return its outcome. Lifted verbatim out of
+/// [`run_steps_over`]'s per-step dispatch — a pure extraction, not a
+/// behavior change (see this crate's Phase-2 DAG-scheduler foundation
+/// work, `run_scheduler`).
+///
+/// The `StepCompleted`/`StepFailed` emission that used to sit immediately
+/// after this block inline in the loop now lives at the end of THIS
+/// function instead of in the caller, so it stays colocated with the point
+/// where `dispatch_result` is actually finalized — that matters because
+/// the two early `return`s below (the fan-out/linear "paused" arms,
+/// including the `workflow_has_sync_step` guard) bypass it entirely,
+/// exactly as they bypassed the equivalent code when it lived inline in
+/// the loop.
+async fn run_node(
+    run_id: &str,
+    step: &Step,
+    ctx: &StepContext,
+    opts: &OrchestratorRunOpts,
+    effective_continue_on_error: bool,
+) -> Result<NodeOutcome, RunWorkflowError> {
+    let step_timer = std::time::Instant::now();
+
+    let dispatch_result: Result<StepResult, RunWorkflowError> = if step.panel.is_some() {
+        run_panel_step(run_id, step, ctx, opts, effective_continue_on_error).await
+    } else if step.parallel.is_some() {
+        run_parallel_step(step, ctx, opts, effective_continue_on_error).await
+    } else if step.for_each.is_some() {
+        // A distributed fan-out honors the cooperative pause token
+        // MID-UNIT (not just at the step boundary): a paused-incomplete
+        // fan-out unwinds here carrying the units that already succeeded,
+        // so the resumed run re-dispatches only the paused / not-yet-
+        // started ones.
+        match run_fanout_step(run_id, step, ctx, opts, effective_continue_on_error).await {
+            Ok(FanoutStepOutcome::Paused {
+                step_id,
+                completed_units,
+            }) => {
+                info!(step = %step_id, "cooperative pause mid-fan-out");
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepPaused {
+                            run_id: run_id.to_string(),
+                            step_id: step_id.clone(),
+                        },
+                    );
+                }
+                clear_active_step(opts, run_id, &step.id);
+                return Ok(NodeOutcome::Paused {
+                    step_id,
+                    seed: Vec::new(),
+                    fanout_completed_units: completed_units,
+                });
+            }
+            Ok(FanoutStepOutcome::Completed(sr)) => Ok(sr),
+            Err(e) => Err(e),
+        }
+    } else if step.action.is_some() {
+        // Action steps never pause mid-run — a single dispatcher call is
+        // either fast enough to run to completion or fails outright; no
+        // cooperative-pause checkpoint shape exists for it.
+        match opts.action_dispatcher.as_ref() {
+            Some(dispatcher) => {
+                execute_action_step(
+                    dispatcher,
+                    step,
+                    ctx,
+                    render_mode(opts.strict_templates),
+                    effective_continue_on_error,
+                    &opts.transcript_dir,
+                )
+                .await
+            }
+            None => Err(RunWorkflowError::ActionDispatcherMissing {
+                step: step.id.clone(),
+            }),
+        }
+    } else {
+        // The linear path is the only other shape that pauses mid-step
+        // (its agent run carries the cooperative pause token). A
+        // paused-incomplete step unwinds here into a manual-pause
+        // checkpoint carrying the seed.
+        match run_linear_step(run_id, step, ctx, opts, effective_continue_on_error).await {
+            Ok(LinearStepOutcome::Paused { step_id, seed }) => {
+                // A `workspace: sync` workflow is refused loudly here too
+                // — checkpointing mid-step would drop in-flight deltas
+                // the same way a step-boundary/fan-out pause would.
+                // Mirrors the step-boundary guard above and the fan-out
+                // guard in `run_fanout_step`.
+                if workflow_has_sync_step(opts) {
+                    return Err(RunWorkflowError::PauseWithWorkspaceSync);
+                }
+                info!(step = %step_id, "cooperative pause mid-step");
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepPaused {
+                            run_id: run_id.to_string(),
+                            step_id: step_id.clone(),
+                        },
+                    );
+                }
+                clear_active_step(opts, run_id, &step.id);
+                return Ok(NodeOutcome::Paused {
+                    step_id,
+                    seed,
+                    fanout_completed_units: std::collections::BTreeMap::new(),
+                });
+            }
+            Ok(LinearStepOutcome::Completed(sr)) => Ok(sr),
+            Err(e) => Err(e),
+        }
+    };
+
+    let duration_ms = step_timer.elapsed().as_millis() as u64;
+
+    match &dispatch_result {
+        Ok(result) => {
+            if let Some(sink) = opts.event_sink.as_ref() {
+                sink.emit(
+                    run_id,
+                    &crate::executor::Event::StepCompleted {
+                        run_id: run_id.to_string(),
+                        step_id: step.id.clone(),
+                        success: result.success,
+                        duration_ms,
+                        host: step.host.clone(),
+                    },
+                );
+            }
+        }
+        Err(e) => {
+            if let Some(sink) = opts.event_sink.as_ref() {
+                sink.emit(
+                    run_id,
+                    &crate::executor::Event::StepFailed {
+                        run_id: run_id.to_string(),
+                        step_id: step.id.clone(),
+                        error: e.to_string(),
+                    },
+                );
+            }
+        }
+    }
+
+    Ok(NodeOutcome::Completed(dispatch_result?))
 }
 
 /// Append one step's record to the run's `step_results.jsonl`. A
@@ -1591,6 +3545,10 @@ fn step_kind_for_run_record(step: &Step) -> crate::runs::StepKind {
         crate::runs::StepKind::ApprovalGate
     } else if step.branch.is_some() {
         crate::runs::StepKind::Branch
+    } else if step.split.is_some() {
+        crate::runs::StepKind::Split
+    } else if step.join.is_some() {
+        crate::runs::StepKind::Join
     } else if step.panel.is_some() {
         crate::runs::StepKind::Panel
     } else if step.parallel.is_some() {
@@ -2180,11 +4138,19 @@ pub async fn run_reject_cleanup(
         step_results.push(result);
     }
 
-    // 4. Cleanup never changes the terminal status — `RunStore::reject`
-    //    already finalized it before this function was called.
+    // 4. Cleanup never changes the terminal status itself — that was
+    //    already decided by whichever `reject_gate`/`expire_gate_if_overdue`
+    //    call preceded this cleanup. Pre-5b-2a that was ALWAYS `Rejected`
+    //    (the sole gate, emptying the set). Task 5b-2a (spec §7): several
+    //    concurrent gates can each carry their own `on_reject` chain —
+    //    rejecting one gate of a still-parked set only removes it, and
+    //    the run stays `AwaitingApproval` until every gate resolves. This
+    //    cleanup call is scoped to ONE gate's chain regardless of which
+    //    case applies; step 5 below is what has to tell the difference.
 
-    // 5. `RunStore::reject` already appended a terminal `RunCompleted`
-    //    event before this function ran (step 1 doc comment above), but
+    // 5. `RunStore::reject_gate`/`expire_gate_if_overdue` already appended
+    //    a terminal `RunCompleted` event IF rejecting this gate emptied
+    //    the awaiting set (step 1 doc comment above), but
     //    `emit_gate_result` (step 2 above) unconditionally emits the
     //    gate's own `StepStarted`/`StepCompleted` events after that, and
     //    every cleanup step dispatched in the loop above appends its own
@@ -2198,18 +4164,31 @@ pub async fn run_reject_cleanup(
     //    `RunCompleted(Rejected)` event here — after the chain — so the
     //    log ends closed. This is a deliberate duplicate: it is NOT
     //    deduped downstream, it is simply an accepted trailing marker
-    //    that keeps the log's last line authoritative. Skipped silently
-    //    only when `opts.run_store` is `None` (in-memory runs have no
-    //    `events.jsonl` to close).
+    //    that keeps the log's last line authoritative.
+    //
+    //    Task 5b-2a: this must NOT fire while the run is still
+    //    `AwaitingApproval` — a sibling gate rejected earlier in the same
+    //    set must not falsely close the event log for a run that's still
+    //    genuinely active on another path. Reload the persisted record
+    //    and gate the re-append on it actually being terminal. Skipped
+    //    entirely when `opts.run_store` is `None` (in-memory runs have no
+    //    `events.jsonl` to close) or the record can't be reloaded (same
+    //    best-effort contract `append_terminal_event` itself already has).
     if let Some(store) = &opts.run_store {
-        store.append_terminal_event(
-            &run_id,
-            &crate::executor::Event::RunCompleted {
-                run_id: run_id.clone(),
-                status: crate::runs::RunStatus::Rejected,
-                finished_at: chrono::Utc::now(),
-            },
-        );
+        let still_awaiting = store
+            .load(&run_id)
+            .map(|r| r.status == crate::runs::RunStatus::AwaitingApproval)
+            .unwrap_or(false);
+        if !still_awaiting {
+            store.append_terminal_event(
+                &run_id,
+                &crate::executor::Event::RunCompleted {
+                    run_id: run_id.clone(),
+                    status: crate::runs::RunStatus::Rejected,
+                    finished_at: chrono::Utc::now(),
+                },
+            );
+        }
     }
 
     Ok(())
@@ -5872,7 +7851,12 @@ steps:
     }
 
     // -----------------------------------------------------------------------
-    // Phase 2 gate — non-linear workflows are rejected before any execution
+    // Phase 2 router (Task 5) — non-linear workflows now run for real
+    // through the live scheduler instead of being rejected. This fixture
+    // and test used to prove the honesty gate fired
+    // (`run_workflow_rejects_a_split_workflow_before_any_execution`,
+    // asserting `RunWorkflowError::NonlinearNotYetSupported`); flipped
+    // here to prove the opposite — a real end-to-end execution.
     // -----------------------------------------------------------------------
 
     const WF_SPLIT: &str = r#"
@@ -5883,33 +7867,78 @@ steps:
   - id: a
     agent: x
     prompt: p
+    next: [d]
   - id: b
     agent: x
     prompt: p
+    next: [d]
+  - id: d
+    agent: x
+    prompt: "merged a={{ steps.a.output }} b={{ steps.b.output }}"
 "#;
 
     #[tokio::test]
-    async fn run_workflow_rejects_a_split_workflow_before_any_execution() {
+    async fn run_workflow_runs_a_split_join_workflow_live_through_the_scheduler() {
         let dir = tempfile::tempdir().unwrap();
         let dispatcher = Arc::new(FakeUnitDispatcher::new());
         let wf = Workflow::parse(WF_SPLIT).unwrap();
-        let opts = make_opts(wf, dir.path().to_path_buf(), dispatcher.clone());
-
-        let err = run_workflow(opts)
-            .await
-            .expect_err("split workflow must be rejected, not mis-run as a line");
         assert!(
-            matches!(err, RunWorkflowError::NonlinearNotYetSupported { ref name } if name == "nonlinear-split"),
-            "expected NonlinearNotYetSupported, got: {err:?}"
+            is_nonlinear(&wf),
+            "fixture must be non-linear to exercise the live scheduler router"
+        );
+        let mut opts = make_opts(wf, dir.path().to_path_buf(), dispatcher);
+        opts.factory = Arc::new(PerCallMockFactory);
+
+        let res = run_workflow(opts).await.expect(
+            "a split/join workflow must now run to completion through run_workflow, not be rejected",
+        );
+        assert!(
+            res.awaiting.is_none(),
+            "no gate in this workflow — must reach Completed, not park"
         );
 
-        // PanicFactory (wired into `make_opts`) never fires and the fake
-        // dispatcher was never called — proof the gate fired before the
-        // linear loop dispatched anything.
-        assert!(dispatcher.calls.lock().unwrap().is_empty());
-        // No transcript dir side effect either — the gate is the very
-        // first statement in `run_workflow`, ahead of `create_dir_all`.
-        assert!(!dir.path().join("run.json").exists());
+        // The split node itself never dispatches (an orchestration
+        // no-op); `a` and `b` both ran (concurrently — dispatch order
+        // between them isn't asserted, only that both completed), and
+        // `d` (the implicit all-join reconverge) sees BOTH of their real
+        // outputs.
+        //
+        // Task 5b-2b-ii: the split node's own persisted `StepResult` must
+        // carry `StepKind::Split`, not the reused `StepKind::Branch` — this
+        // is the exact render-correctness defect this task fixes.
+        let s = res
+            .step_results
+            .iter()
+            .find(|sr| sr.step_id == "s")
+            .expect("the split node itself has a persisted StepResult");
+        assert_eq!(
+            s.kind,
+            crate::runs::StepKind::Split,
+            "a live split node must persist kind: Split, not the reused Branch"
+        );
+        let a = res
+            .step_results
+            .iter()
+            .find(|sr| sr.step_id == "a")
+            .expect("a ran");
+        let b = res
+            .step_results
+            .iter()
+            .find(|sr| sr.step_id == "b")
+            .expect("b ran");
+        let d = res
+            .step_results
+            .iter()
+            .find(|sr| sr.step_id == "d")
+            .expect("d ran");
+        assert!(!a.skipped && a.success);
+        assert!(!b.skipped && b.success);
+        assert!(!d.skipped && d.success);
+        assert!(
+            d.output.contains("a=done:p") && d.output.contains("b=done:p"),
+            "d must see both a's and b's real output: {}",
+            d.output
+        );
     }
 
     /// Hands out a fresh `MockProvider` per call (unlike `OneShotFactory`,
@@ -5981,6 +8010,3050 @@ steps:
         assert_eq!(
             result.step_results[1].output, "done:then done:p",
             "step b ran with step a's real output, proving genuine sequential execution"
+        );
+    }
+}
+
+/// Phase-2 DAG-scheduler foundation (task 1 of the arc — see
+/// `.superpowers/sdd/task-1-brief.md`): `run_scheduler` must reproduce
+/// `run_steps_inner` byte-for-byte over every real `.rupu/workflows/*.yaml`
+/// sample before anything downstream (concurrency, later tasks) builds on
+/// it. A `#[cfg(test)]` module in THIS file, not `tests/`, specifically so
+/// it can call `run_steps_inner` / `run_scheduler` / `InnerOutcome`
+/// directly without making any of them part of the crate's public API —
+/// both are private helpers `run_workflow`'s router (`is_nonlinear`)
+/// chooses between (Task 5); this module keeps proving their equality at
+/// that white-box level rather than only through `run_workflow`.
+#[cfg(test)]
+mod dag_scheduler_golden {
+    use super::*;
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_mcp::{McpPermission, ToolDispatcher};
+    use rupu_providers::types::StopReason;
+    use rupu_scm::{
+        Branch, Comment, CreatePr, Diff, FileContent, Platform, Pr, PrFilter, PrRef, Registry,
+        RepoConnector, RepoRef, ScmError,
+    };
+    use rupu_tools::{PermissionMode, ToolContext};
+
+    /// Echoes `step {id} agent {agent} echo: {prompt}` for every agent
+    /// dispatch, across every sample workflow — deterministic and
+    /// content-agnostic (mirrors `FakeFactory` in `tests/linear_runner.rs`).
+    /// A panel step's panelist output under this factory is plain prose,
+    /// not `{"findings": [...]}` JSON — but `parse_findings` treats
+    /// unparseable text as zero findings rather than an error (see that
+    /// function above), so panel steps still complete (with an empty
+    /// findings list, clearing any `gate:` threshold immediately) under
+    /// this factory. No panel-specific scripting is needed for this
+    /// golden set.
+    struct EchoFactory;
+
+    #[async_trait]
+    impl StepFactory for EchoFactory {
+        async fn build_opts_for_step(
+            &self,
+            step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: PathBuf,
+            transcript_path: PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> AgentRunOpts {
+            let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+                text: format!("step {step_id} agent {agent_name} echo: {rendered_prompt}"),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            }]);
+            AgentRunOpts {
+                agent_name: format!("ag-{agent_name}"),
+                agent_system_prompt: "echo".into(),
+                agent_tools: None,
+                provider: Box::new(provider),
+                provider_name: "mock".into(),
+                model: "mock-1".into(),
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                max_turns: 5,
+                decider: Arc::new(BypassDecider),
+                tool_context: ToolContext::default(),
+                user_message: rendered_prompt,
+                initial_messages: Vec::new(),
+                turn_index_offset: 0,
+                mode_str: "bypass".into(),
+                no_stream: true,
+                suppress_stream_stdout: true,
+                mcp_registry: None,
+                effort: None,
+                context_window: None,
+                output_format: None,
+                output_schema: None,
+                anthropic_task_budget: None,
+                anthropic_context_management: None,
+                anthropic_speed: None,
+                parent_run_id: None,
+                depth: 0,
+                dispatchable_agents: None,
+                step_id: step_id.to_string(),
+                on_tool_call,
+                on_stream_event: None,
+                concerns: None,
+                max_tokens: DEFAULT_MAX_TOKENS,
+                scope_name: None,
+                surface_tag: None,
+                context_window_tokens: None,
+                compact_at_percent: None,
+                pause: None,
+            }
+        }
+    }
+
+    /// Backs the one `action:` kind our sample workflows use
+    /// (`scm.prs.list` — a real top-level step in `action-demo.yaml`, and
+    /// `gate-demo.yaml`'s best-effort `notify:` hook). Every other
+    /// `RepoConnector` method is unreachable from these samples.
+    struct FakeConnector;
+
+    #[async_trait]
+    impl RepoConnector for FakeConnector {
+        fn platform(&self) -> Platform {
+            Platform::Github
+        }
+        async fn list_repos(&self) -> Result<Vec<rupu_scm::Repo>, ScmError> {
+            unimplemented!()
+        }
+        async fn get_repo(&self, _r: &RepoRef) -> Result<rupu_scm::Repo, ScmError> {
+            unimplemented!()
+        }
+        async fn list_branches(&self, _r: &RepoRef) -> Result<Vec<Branch>, ScmError> {
+            unimplemented!()
+        }
+        async fn create_branch(
+            &self,
+            _r: &RepoRef,
+            _name: &str,
+            _from_sha: &str,
+        ) -> Result<Branch, ScmError> {
+            unimplemented!()
+        }
+        async fn read_file(
+            &self,
+            _r: &RepoRef,
+            _path: &str,
+            _ref_: Option<&str>,
+        ) -> Result<FileContent, ScmError> {
+            unimplemented!()
+        }
+        async fn list_prs(&self, _r: &RepoRef, _f: PrFilter) -> Result<Vec<Pr>, ScmError> {
+            Ok(Vec::new())
+        }
+        async fn get_pr(&self, _p: &PrRef) -> Result<Pr, ScmError> {
+            unimplemented!()
+        }
+        async fn diff_pr(&self, _p: &PrRef) -> Result<Diff, ScmError> {
+            unimplemented!()
+        }
+        async fn comment_pr(&self, _p: &PrRef, _body: &str) -> Result<Comment, ScmError> {
+            unimplemented!()
+        }
+        async fn create_pr(&self, _r: &RepoRef, _opts: CreatePr) -> Result<Pr, ScmError> {
+            unimplemented!()
+        }
+        async fn clone_to(&self, _r: &RepoRef, _dir: &Path) -> Result<(), ScmError> {
+            unimplemented!()
+        }
+    }
+
+    fn build_dispatcher() -> Arc<ToolDispatcher> {
+        let mut reg = Registry::empty();
+        reg.insert_repo_connector(Platform::Github, Arc::new(FakeConnector));
+        Arc::new(ToolDispatcher::new(
+            Arc::new(reg),
+            McpPermission::new(PermissionMode::Bypass, vec!["*".into()]),
+        ))
+    }
+
+    /// Minimal `(inputs, issue, event)` fixture each sample workflow needs
+    /// to render without a `RenderError`/`UndeclaredInput` — derived by
+    /// reading each file's `inputs:` schema and `issue.*`/`event.*`
+    /// template references. Any file not listed needs none of the three.
+    fn fixture_for(
+        name: &str,
+    ) -> (
+        BTreeMap<String, String>,
+        Option<serde_json::Value>,
+        Option<serde_json::Value>,
+    ) {
+        match name {
+            "code-review-panel.yaml" => (
+                BTreeMap::from([("diff".to_string(), "+ x".to_string())]),
+                None,
+                None,
+            ),
+            "dispatch-demo.yaml" => (
+                BTreeMap::from([("subject".to_string(), "src/main.rs".to_string())]),
+                None,
+                None,
+            ),
+            "investigate-then-fix.yaml" => (
+                BTreeMap::from([("prompt".to_string(), "bug".to_string())]),
+                None,
+                None,
+            ),
+            "issue-supervisor-dispatch.yaml" => (
+                BTreeMap::new(),
+                Some(serde_json::json!({"number": 1, "ref": "github:acme/widget#1"})),
+                None,
+            ),
+            "issue-to-spec-and-plan.yaml" => (
+                BTreeMap::new(),
+                Some(serde_json::json!({
+                    "number": 1,
+                    "r": {"project": "acme/widget"},
+                    "title": "t",
+                    "labels": ["bug"],
+                    "body": "b",
+                })),
+                None,
+            ),
+            "issue-triage.yaml" => (
+                BTreeMap::new(),
+                Some(serde_json::json!({
+                    "number": 1,
+                    "ref": "github:acme/widget#1",
+                    "title": "t",
+                    "author": "alice",
+                    "labels": ["bug"],
+                    "body": "b",
+                })),
+                None,
+            ),
+            "phase-delivery-cycle.yaml" => (
+                BTreeMap::from([("phase".to_string(), "phase-1".to_string())]),
+                Some(serde_json::json!({"number": 1})),
+                None,
+            ),
+            "pr-code-review.yaml" => (
+                BTreeMap::new(),
+                None,
+                Some(serde_json::json!({
+                    "pull_request": {"diff": "+x", "number": 1, "url": "u", "head_sha": "abc"},
+                })),
+            ),
+            "quick-bugfix.yaml" => (
+                BTreeMap::from([("prompt".to_string(), "bug".to_string())]),
+                None,
+                None,
+            ),
+            "review-changed-files.yaml" => (
+                BTreeMap::from([("files".to_string(), "a.rs\nb.rs".to_string())]),
+                None,
+                None,
+            ),
+            _ => (BTreeMap::new(), None, None),
+        }
+    }
+
+    /// One comparable row of a step's golden result: exactly the fields
+    /// the task-1 brief calls for (id, output, success, skipped, kind), in
+    /// declaration/dispatch order.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct GoldenStep {
+        id: String,
+        output: String,
+        success: bool,
+        skipped: bool,
+        kind: crate::runs::StepKind,
+    }
+
+    impl From<&StepResult> for GoldenStep {
+        fn from(sr: &StepResult) -> Self {
+            GoldenStep {
+                id: sr.step_id.clone(),
+                output: sr.output.clone(),
+                success: sr.success,
+                skipped: sr.skipped,
+                kind: sr.kind,
+            }
+        }
+    }
+
+    /// `InnerOutcome`'s discriminant plus the paused step id (when any) —
+    /// enough to compare two runs' terminal state alongside their
+    /// `step_results` snapshot, without needing the full pause payload
+    /// (prompt / timeout / seed / fanout units) to be comparable.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum GoldenTerminal {
+        Done,
+        Paused(String),
+    }
+
+    /// Which of the two step-dispatch drivers `run_one` exercises.
+    #[derive(Debug, Clone, Copy)]
+    enum Driver {
+        /// `run_steps_inner` — today's live path (plain declaration order).
+        Loop,
+        /// `run_scheduler` — the ready-set walk this task adds, proven
+        /// (not yet wired as the live path).
+        Scheduler,
+    }
+
+    /// Every sample workflow's yaml file, read once per call (files are
+    /// tiny; simplicity over caching).
+    fn sample_workflow_files() -> Vec<(String, String)> {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.rupu/workflows");
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let name = p.file_name().unwrap().to_str().unwrap().to_string();
+            let raw = std::fs::read_to_string(&p).unwrap();
+            out.push((name, raw));
+        }
+        out.sort();
+        assert!(!out.is_empty(), "expected sample workflows under {dir}");
+        out
+    }
+
+    /// Run one sample workflow through `driver`, returning its terminal
+    /// state + `step_results` snapshot. In-memory only (`run_store: None`,
+    /// `run_id: ""`) — persistence is irrelevant to this comparison and
+    /// both helpers already no-op cleanly without a store.
+    async fn run_one(driver: Driver, name: &str, raw: &str) -> (GoldenTerminal, Vec<GoldenStep>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(raw).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
+        let (inputs, issue, event) = fixture_for(name);
+        let opts = OrchestratorRunOpts {
+            workflow: wf,
+            inputs,
+            workspace_id: format!("ws_{name}"),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(EchoFactory),
+            event,
+            issue,
+            issue_ref: None,
+            run_store: None,
+            workflow_yaml: None,
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: Some(build_dispatcher()),
+            pause: None,
+        };
+        let resolved_inputs = resolve_inputs(&opts.workflow, &opts.inputs)
+            .unwrap_or_else(|e| panic!("{name}: resolve_inputs failed: {e}"));
+        let workflow_default_continue = opts.workflow.defaults.continue_on_error.unwrap_or(false);
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = match driver {
+            Driver::Loop => {
+                run_steps_inner(
+                    &opts,
+                    "",
+                    &resolved_inputs,
+                    workflow_default_continue,
+                    None,
+                    &mut step_results,
+                )
+                .await
+            }
+            Driver::Scheduler => {
+                run_scheduler(
+                    &opts,
+                    "",
+                    &resolved_inputs,
+                    workflow_default_continue,
+                    None,
+                    &mut step_results,
+                    None,
+                )
+                .await
+            }
+        };
+
+        let terminal = match outcome {
+            Ok(InnerOutcome::Done) => GoldenTerminal::Done,
+            Ok(InnerOutcome::Paused { step_id, .. }) => GoldenTerminal::Paused(step_id),
+            Err(e) => panic!("{name}: run failed under {driver:?}: {e}"),
+        };
+        let snapshot = step_results.iter().map(GoldenStep::from).collect();
+        (terminal, snapshot)
+    }
+
+    /// Task-1 brief, steps 1-2: capture `run_steps_inner`'s `step_results`
+    /// (+ terminal state) for every sample workflow and prove the
+    /// MockProvider harness is deterministic — the golden baseline the
+    /// scheduler is proven against below stays meaningful only if running
+    /// the SAME workflow twice yields the SAME snapshot.
+    #[tokio::test]
+    async fn loop_snapshot_is_deterministic_for_every_sample_workflow() {
+        for (name, raw) in sample_workflow_files() {
+            let a = run_one(Driver::Loop, &name, &raw).await;
+            let b = run_one(Driver::Loop, &name, &raw).await;
+            assert_eq!(a, b, "{name}: run_steps_inner must be deterministic");
+        }
+    }
+
+    /// Task-1 brief, step 4: `run_scheduler`'s ready-set walk must
+    /// reproduce `run_steps_inner`'s declaration-order walk byte-for-byte
+    /// — same `step_results` (ids, outputs, success, skipped, kind, order)
+    /// AND the same terminal state (`Done`, or `Paused` at the same step)
+    /// — for every real `.rupu/workflows/*.yaml` sample.
+    #[tokio::test]
+    async fn scheduler_matches_loop_byte_for_byte_for_every_sample_workflow() {
+        for (name, raw) in sample_workflow_files() {
+            let golden = run_one(Driver::Loop, &name, &raw).await;
+            let scheduled = run_one(Driver::Scheduler, &name, &raw).await;
+            assert_eq!(
+                golden, scheduled,
+                "{name}: run_scheduler must reproduce run_steps_inner exactly"
+            );
+        }
+    }
+
+    /// Regression test (found in review): the synthesized declaration-order
+    /// chain in `run_scheduler` must be gated on `is_nonlinear`, NOT
+    /// `workflow_has_explicit_edges`. Every sample above is edge-free, so
+    /// none of them exercise the explicit-edges branch at all — this
+    /// fixture is `is_nonlinear == false` (the exact boundary
+    /// `run_workflow`'s honesty gate uses) yet DOES carry a partial
+    /// explicit edge (`a: next: [b]`) alongside an independent trailing
+    /// step `c` with no edge to/from `a`/`b` whatsoever. Gating on
+    /// `workflow_has_explicit_edges` (true here) would route this into the
+    /// real-dependency-graph branch, where Kahn's algorithm sees `a` and
+    /// `c` as simultaneously ready (`workflow_edges` only contains `a ->
+    /// b`) and dispatches them concurrently — silently reordering
+    /// `step_results` vs `run_steps_inner`'s deterministic `a, b, c` the
+    /// moment a later task lifts the `is_nonlinear` gate and this becomes
+    /// the live path. Confirmed to FAIL against the pre-fix
+    /// `workflow_has_explicit_edges` gate (see this task's report) and
+    /// PASS against the `is_nonlinear` gate below.
+    #[tokio::test]
+    async fn scheduler_matches_loop_for_partial_explicit_edges_with_independent_step() {
+        const RAW: &str = r#"
+name: partial-edges-plus-independent-step
+steps:
+  - id: a
+    agent: ag
+    prompt: "do a"
+    next: [b]
+  - id: b
+    agent: ag
+    prompt: "do b"
+  - id: c
+    agent: ag
+    prompt: "do c"
+"#;
+        let wf = Workflow::parse(RAW).unwrap();
+        assert!(
+            !crate::workflow::is_nonlinear(&wf),
+            "fixture must be is_nonlinear == false to exercise the gap this test guards"
+        );
+        assert!(
+            crate::workflow::workflow_has_explicit_edges(&wf),
+            "fixture must carry an explicit edge — the whole point is is_nonlinear and \
+             workflow_has_explicit_edges disagree here"
+        );
+
+        let name = "partial-edges-plus-independent-step";
+        let golden = run_one(Driver::Loop, name, RAW).await;
+        let scheduled = run_one(Driver::Scheduler, name, RAW).await;
+        assert_eq!(
+            golden, scheduled,
+            "run_scheduler must reproduce run_steps_inner exactly for a partial-explicit-edges \
+             workflow that is_nonlinear still treats as linear"
+        );
+    }
+}
+
+/// Task 2: concurrent dispatch + `split` fan-out + implicit all-join +
+/// `max_concurrency`. These exercise [`run_scheduler`] directly (same
+/// reason `dag_scheduler_golden` does — it isn't `pub`). As of Task 5,
+/// [`run_workflow`] also reaches it for any [`is_nonlinear`] workflow (see
+/// `join_and_prune`'s trailing `..._live_through_run_workflow` tests for
+/// coverage through that full public surface); these tests target the
+/// scheduler's internals directly instead.
+#[cfg(test)]
+mod scheduler_concurrency {
+    use super::*;
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_providers::types::StopReason;
+    use rupu_tools::ToolContext;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    const SPLIT_FANOUT_WF: &str = r#"
+name: split-fanout
+steps:
+  - id: fanout
+    split: [a, b]
+  - id: a
+    agent: worker
+    prompt: "do a"
+  - id: b
+    agent: worker
+    prompt: "do b"
+  - id: d
+    agent: worker
+    prompt: "reconverge a={{ steps.a.output }} b={{ steps.b.output }}"
+"#;
+
+    /// One `StepFactory` covering every Task-2 test below:
+    /// - `concurrency_tracked` steps increment/decrement `current` around an
+    ///   `sleep_ms`-long `tokio::time::sleep`, with `max_seen` recording the
+    ///   high-water mark — the concurrency-overlap proof (§ this task's
+    ///   brief: "assert overlap ... via ... a shared timestamp"). A step
+    ///   NOT in this list dispatches instantly.
+    /// - `slow_step` independently makes ONE named step artificially slow
+    ///   (used to keep a sibling reliably still in-flight while another
+    ///   step fails, for the mid-graph-failure test).
+    /// - `calls` records every step id actually dispatched through this
+    ///   factory, in call order — proves a `split:` node (never dispatched
+    ///   here) is a true orchestration no-op, and gives a coarse ordering
+    ///   check (a reconverge step is always the LAST id appended).
+    ///
+    /// Deliberately has NO "make the agent turn itself fail" knob: `rupu-
+    /// agent`'s `run_agent` retries a `ScriptedTurn::ProviderError` up to
+    /// `MAX_HTTP_RETRIES` times with capped exponential backoff (it maps to
+    /// `ProviderError::Http`, which `is_retryable_provider_error` always
+    /// retries) — a real ~48s wall-clock cascade before giving up, the same
+    /// cost `tests/linear_runner.rs`'s `FailingFactory`-based tests already
+    /// pay. The mid-graph-failure test below instead fails via a template
+    /// render error (`RunWorkflowError::Render`), which propagates
+    /// immediately with no retry — same "hard failure, no
+    /// `continue_on_error`" contract, without the unrelated retry-timing
+    /// cost.
+    struct SchedulerTestFactory {
+        concurrency_tracked: &'static [&'static str],
+        sleep_ms: u64,
+        slow_step: Option<(&'static str, u64)>,
+        current: Arc<AtomicUsize>,
+        max_seen: Arc<AtomicUsize>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SchedulerTestFactory {
+        fn new() -> Self {
+            Self {
+                concurrency_tracked: &[],
+                sleep_ms: 0,
+                slow_step: None,
+                current: Arc::new(AtomicUsize::new(0)),
+                max_seen: Arc::new(AtomicUsize::new(0)),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn tracking(mut self, steps: &'static [&'static str], sleep_ms: u64) -> Self {
+            self.concurrency_tracked = steps;
+            self.sleep_ms = sleep_ms;
+            self
+        }
+
+        fn slow(mut self, step: &'static str, ms: u64) -> Self {
+            self.slow_step = Some((step, ms));
+            self
+        }
+    }
+
+    #[async_trait]
+    impl StepFactory for SchedulerTestFactory {
+        async fn build_opts_for_step(
+            &self,
+            step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: PathBuf,
+            transcript_path: PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> AgentRunOpts {
+            self.calls.lock().unwrap().push(step_id.to_string());
+
+            if self.concurrency_tracked.contains(&step_id) {
+                let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_seen.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(self.sleep_ms)).await;
+                self.current.fetch_sub(1, Ordering::SeqCst);
+            } else if let Some((slow_id, ms)) = self.slow_step {
+                if slow_id == step_id {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
+            }
+
+            let turn = ScriptedTurn::AssistantText {
+                text: format!("step {step_id} agent {agent_name} echo: {rendered_prompt}"),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            };
+            let provider = MockProvider::new(vec![turn]);
+            AgentRunOpts {
+                agent_name: format!("ag-{agent_name}"),
+                agent_system_prompt: "echo".into(),
+                agent_tools: None,
+                provider: Box::new(provider),
+                provider_name: "mock".into(),
+                model: "mock-1".into(),
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                max_turns: 5,
+                decider: Arc::new(BypassDecider),
+                tool_context: ToolContext::default(),
+                user_message: rendered_prompt,
+                initial_messages: Vec::new(),
+                turn_index_offset: 0,
+                mode_str: "bypass".into(),
+                no_stream: true,
+                suppress_stream_stdout: true,
+                mcp_registry: None,
+                effort: None,
+                context_window: None,
+                output_format: None,
+                output_schema: None,
+                anthropic_task_budget: None,
+                anthropic_context_management: None,
+                anthropic_speed: None,
+                parent_run_id: None,
+                depth: 0,
+                dispatchable_agents: None,
+                step_id: step_id.to_string(),
+                on_tool_call,
+                on_stream_event: None,
+                concerns: None,
+                max_tokens: DEFAULT_MAX_TOKENS,
+                scope_name: None,
+                surface_tag: None,
+                context_window_tokens: None,
+                compact_at_percent: None,
+                pause: None,
+            }
+        }
+    }
+
+    fn opts_for(wf: Workflow, factory: SchedulerTestFactory, tmp: &tempfile::TempDir) -> OrchestratorRunOpts {
+        OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_sched".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: None,
+            workflow_yaml: None,
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        }
+    }
+
+    /// (1) A `split:` node fans into two targets that dispatch and run
+    /// CONCURRENTLY (both in flight at once — `max_seen` hits 2, which is
+    /// only possible if `a`'s and `b`'s `sleep(50ms)` windows overlapped in
+    /// real time), and the reconverge step (`d`, which reads BOTH
+    /// `steps.a.output` and `steps.b.output`) runs exactly once, strictly
+    /// after both are done — the implicit all-join. Wrapped in a
+    /// `tokio::time::timeout` as a belt-and-suspenders: if the scheduler
+    /// somehow serialized `a`/`b` there'd be no deadlock risk here (unlike
+    /// a barrier-based proof), but a regression that stalls the scheduler
+    /// entirely still fails loudly instead of hanging the test suite.
+    #[tokio::test]
+    async fn split_fans_into_concurrent_jobs_and_reconverge_runs_once_after_both() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(SPLIT_FANOUT_WF).unwrap();
+        let factory = SchedulerTestFactory::new().tracking(&["a", "b"], 50);
+        let max_seen = Arc::clone(&factory.max_seen);
+        let calls = Arc::clone(&factory.calls);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+
+        assert!(matches!(outcome, InnerOutcome::Done));
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            2,
+            "a and b must have been in flight at the same time at least once"
+        );
+
+        let ids: std::collections::BTreeSet<&str> =
+            step_results.iter().map(|sr| sr.step_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            std::collections::BTreeSet::from(["fanout", "a", "b", "d"]),
+            "every node should have a StepResult"
+        );
+        for sr in &step_results {
+            assert!(sr.success, "{}: expected success, got {sr:?}", sr.step_id);
+        }
+
+        // `d` (the reconverge) is dispatched strictly after both `a` and
+        // `b` have fully completed — never merely after their `sleep`
+        // resolves, but after `run_node` returns and the scheduler marks
+        // them `done`.
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            3,
+            "fanout must never be dispatched (orchestration no-op): {calls:?}"
+        );
+        assert_eq!(calls[2], "d", "reconverge must be the last dispatch: {calls:?}");
+        let first_two: std::collections::BTreeSet<&str> =
+            [calls[0].as_str(), calls[1].as_str()].into_iter().collect();
+        assert_eq!(first_two, std::collections::BTreeSet::from(["a", "b"]));
+    }
+
+    /// (2) Split's `StepResult` itself: no agent dispatched, instant
+    /// success, empty output — the orchestration-no-op contract.
+    #[tokio::test]
+    async fn split_node_is_orchestration_only_no_agent_dispatched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(SPLIT_FANOUT_WF).unwrap();
+        let factory = SchedulerTestFactory::new();
+        let calls = Arc::clone(&factory.calls);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None)
+            .await
+            .expect("scheduler must not error");
+
+        let fanout = step_results
+            .iter()
+            .find(|sr| sr.step_id == "fanout")
+            .expect("split node should still have a StepResult");
+        assert!(fanout.success);
+        assert!(fanout.output.is_empty());
+        assert!(
+            !calls.lock().unwrap().contains(&"fanout".to_string()),
+            "split must never reach the StepFactory (no agent to dispatch)"
+        );
+    }
+
+    /// (3) `max_concurrency: 1` bounds the semaphore to one permit: `a` and
+    /// `b` still both run (the run still completes, correctly), but never
+    /// concurrently — `max_seen` never exceeds 1, even though both are
+    /// simultaneously READY the instant the split completes.
+    #[tokio::test]
+    async fn max_concurrency_one_serializes_the_split_fanout_but_still_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut wf = Workflow::parse(SPLIT_FANOUT_WF).unwrap();
+        wf.max_concurrency = Some(1);
+        let factory = SchedulerTestFactory::new().tracking(&["a", "b"], 30);
+        let max_seen = Arc::clone(&factory.max_seen);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+
+        assert!(matches!(outcome, InnerOutcome::Done));
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "max_concurrency: 1 must never let two nodes run at once"
+        );
+        let ids: std::collections::BTreeSet<&str> =
+            step_results.iter().map(|sr| sr.step_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            std::collections::BTreeSet::from(["fanout", "a", "b", "d"]),
+            "the run must still complete every node despite the cap"
+        );
+        for sr in &step_results {
+            assert!(sr.success, "{}: expected success, got {sr:?}", sr.step_id);
+        }
+    }
+
+    /// (4) `max_concurrency: 0` is rejected at parse time (mirrors
+    /// `max_parallel`'s own >=1 validation) rather than silently meaning
+    /// "unbounded" or "never run anything".
+    #[test]
+    fn max_concurrency_zero_is_rejected_at_parse_time() {
+        let raw = SPLIT_FANOUT_WF.replacen(
+            "name: split-fanout\n",
+            "name: split-fanout\nmax_concurrency: 0\n",
+            1,
+        );
+        let err = Workflow::parse(&raw).expect_err("max_concurrency: 0 must fail to parse");
+        assert!(
+            matches!(
+                err,
+                WorkflowParseError::InvalidMaxConcurrency { value: 0 }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Same shape as [`SPLIT_FANOUT_WF`], except `a`'s prompt references an
+    /// input nobody ever provides (`inputs.missing`). Under
+    /// `strict_templates: true` this is a `RunWorkflowError::Render` —
+    /// synchronous, inside `run_node`, with no retry — the cleanest way to
+    /// fail a node instantly without touching `rupu-agent`'s provider-
+    /// error retry cascade (see [`SchedulerTestFactory`]'s doc comment).
+    const SPLIT_FANOUT_WF_BAD_TEMPLATE: &str = r#"
+name: split-fanout-bad-template
+steps:
+  - id: fanout
+    split: [a, b]
+  - id: a
+    agent: worker
+    prompt: "{{ inputs.missing }}"
+  - id: b
+    agent: worker
+    prompt: "do b"
+  - id: d
+    agent: worker
+    prompt: "reconverge a={{ steps.a.output }} b={{ steps.b.output }}"
+"#;
+
+    /// (5) A mid-graph failure (no `continue_on_error`) stops the run: the
+    /// failing node's sibling (`b`, deliberately kept in flight via
+    /// `slow(...)` well past `a`'s near-instant render failure) never
+    /// reaches `step_results`, and the reconverge (`d`, which needs BOTH
+    /// `a` and `b` done) never launches at all. Matches `run_steps_over`'s
+    /// own contract: a hard failure propagates as `Err` before its own
+    /// `StepResult` is ever pushed, so only the already-synchronously-
+    /// resolved `split` node's result survives.
+    #[tokio::test]
+    async fn mid_graph_failure_without_continue_on_error_stops_the_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(SPLIT_FANOUT_WF_BAD_TEMPLATE).unwrap();
+        let factory = SchedulerTestFactory::new().slow("b", 300);
+        let mut opts = opts_for(wf, factory, &tmp);
+        opts.strict_templates = true;
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect_err("a's render failure must abort the run");
+
+        assert!(
+            matches!(err, RunWorkflowError::Render { ref step, .. } if step == "a"),
+            "unexpected error: {err}"
+        );
+        let ids: Vec<&str> = step_results.iter().map(|sr| sr.step_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["fanout"],
+            "only the already-resolved split node should be persisted; got {ids:?}"
+        );
+    }
+}
+
+/// Task 3: branch pruning (spec §6) + explicit `join` (spec §5,
+/// `all`/`first`/`count`) + loser-cancellation (spec §8, first use).
+/// Exercises [`run_scheduler`] directly — same reason `scheduler_concurrency`
+/// does (not `pub`). This module's trailing `..._live_through_run_workflow`
+/// tests (added by Task 5) re-run a couple of these same fixtures through
+/// the live [`run_workflow`] entry point instead, now that its
+/// [`is_nonlinear`] router reaches the scheduler for real.
+#[cfg(test)]
+mod join_and_prune {
+    use super::*;
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_providers::types::StopReason;
+    use rupu_tools::ToolContext;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Dispatches every step to an echoing `MockProvider` turn. Any step
+    /// named in `slow` sleeps that many ms BEFORE the (near-instant)
+    /// scripted turn — the delay stands in for "this path is still doing
+    /// real work" so a `first`/`count` join's threshold is reliably met by
+    /// the OTHER (fast) inbound path first, giving deterministic winners.
+    ///
+    /// `finished` is the key proof for cancellation: it's appended to only
+    /// AFTER the sleep completes, right before the scripted turn would run.
+    /// A step that appears in `calls` (dispatch started) but NOT in
+    /// `finished` (never got past its sleep) was genuinely cancelled by an
+    /// abort — not merely "the join proceeded without waiting for it" —
+    /// since aborting a `tokio::spawn`ed task drops it at its very next
+    /// `.await` point (here, the `tokio::time::sleep`).
+    struct JoinTestFactory {
+        slow: &'static [(&'static str, u64)],
+        calls: Arc<Mutex<Vec<String>>>,
+        finished: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl JoinTestFactory {
+        fn new(slow: &'static [(&'static str, u64)]) -> Self {
+            Self {
+                slow,
+                calls: Arc::new(Mutex::new(Vec::new())),
+                finished: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StepFactory for JoinTestFactory {
+        async fn build_opts_for_step(
+            &self,
+            step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: PathBuf,
+            transcript_path: PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> AgentRunOpts {
+            self.calls.lock().unwrap().push(step_id.to_string());
+            if let Some(&(_, ms)) = self.slow.iter().find(|&&(id, _)| id == step_id) {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
+            self.finished.lock().unwrap().push(step_id.to_string());
+
+            let turn = ScriptedTurn::AssistantText {
+                text: format!("step {step_id} agent {agent_name} echo: {rendered_prompt}"),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            };
+            let provider = MockProvider::new(vec![turn]);
+            AgentRunOpts {
+                agent_name: format!("ag-{agent_name}"),
+                agent_system_prompt: "echo".into(),
+                agent_tools: None,
+                provider: Box::new(provider),
+                provider_name: "mock".into(),
+                model: "mock-1".into(),
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                max_turns: 5,
+                decider: Arc::new(BypassDecider),
+                tool_context: ToolContext::default(),
+                user_message: rendered_prompt,
+                initial_messages: Vec::new(),
+                turn_index_offset: 0,
+                mode_str: "bypass".into(),
+                no_stream: true,
+                suppress_stream_stdout: true,
+                mcp_registry: None,
+                effort: None,
+                context_window: None,
+                output_format: None,
+                output_schema: None,
+                anthropic_task_budget: None,
+                anthropic_context_management: None,
+                anthropic_speed: None,
+                parent_run_id: None,
+                depth: 0,
+                dispatchable_agents: None,
+                step_id: step_id.to_string(),
+                on_tool_call,
+                on_stream_event: None,
+                concerns: None,
+                max_tokens: DEFAULT_MAX_TOKENS,
+                scope_name: None,
+                surface_tag: None,
+                context_window_tokens: None,
+                compact_at_percent: None,
+                pause: None,
+            }
+        }
+    }
+
+    fn opts_for(
+        wf: Workflow,
+        factory: JoinTestFactory,
+        tmp: &tempfile::TempDir,
+    ) -> OrchestratorRunOpts {
+        OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_join".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: None,
+            workflow_yaml: None,
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        }
+    }
+
+    fn result_for<'a>(step_results: &'a [StepResult], id: &str) -> &'a StepResult {
+        step_results
+            .iter()
+            .find(|sr| sr.step_id == id)
+            .unwrap_or_else(|| panic!("missing StepResult for `{id}`; got {step_results:?}"))
+    }
+
+    const JOIN_ALL_WF: &str = r#"
+name: join-all
+steps:
+  - id: fanout
+    split: [a, b]
+  - id: a
+    agent: worker
+    prompt: "do a"
+    next: [gathered]
+  - id: b
+    agent: worker
+    prompt: "do b"
+    next: [gathered]
+  - id: gathered
+    join: { wait: all }
+  - id: after
+    agent: worker
+    prompt: "n={{ steps.gathered.results | length }} a={{ steps.gathered.sub_results.a.output }} b={{ steps.gathered.sub_results.b.output }}"
+"#;
+
+    /// `join: { wait: all }` over 2 inbound paths merges BOTH outputs into
+    /// `steps.<join>.results` (an ordered list) AND
+    /// `steps.<join>.sub_results.<source_id>` (keyed by source step id) —
+    /// the exact shape documented in this task's report. A downstream step
+    /// reads both forms.
+    #[tokio::test]
+    async fn join_wait_all_merges_both_inbound_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(JOIN_ALL_WF).unwrap();
+        let factory = JoinTestFactory::new(&[]);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        let gathered = result_for(&step_results, "gathered");
+        assert!(gathered.success);
+        assert_eq!(gathered.items.len(), 2, "both inbound paths waited for");
+        let sub_ids: std::collections::BTreeSet<&str> =
+            gathered.items.iter().map(|it| it.sub_id.as_str()).collect();
+        assert_eq!(sub_ids, std::collections::BTreeSet::from(["a", "b"]));
+
+        let after = result_for(&step_results, "after");
+        assert!(
+            after.output.contains("n=2"),
+            "downstream step should see steps.gathered.results | length == 2: {}",
+            after.output
+        );
+        assert!(
+            after.output.contains("a=step a agent worker echo: do a")
+                && after.output.contains("b=step b agent worker echo: do b"),
+            "downstream step should see both sub_results outputs: {}",
+            after.output
+        );
+    }
+
+    const JOIN_ANY_WF: &str = r#"
+name: join-any
+steps:
+  - id: fanout
+    split: [a, b]
+  - id: a
+    agent: worker
+    prompt: "do a"
+    next: [gathered]
+  - id: b
+    agent: worker
+    prompt: "do b"
+    next: [gathered]
+  - id: gathered
+    join: { wait: any }
+  - id: after
+    agent: worker
+    prompt: "n={{ steps.gathered.results | length }}"
+"#;
+
+    /// `wait: any` (`first`): the join proceeds on the FIRST inbound path
+    /// (`a`, dispatched with no delay) and CANCELS the other (`b`, made
+    /// artificially slow so it's still in-flight when `a` wins). The
+    /// assertion is that `b` was genuinely cancelled — dispatched (in
+    /// `calls`) but never reached past its sleep (`finished` lacks it),
+    /// and never got a `StepResult` — not merely that the join proceeded
+    /// without it.
+    #[tokio::test]
+    async fn join_wait_any_proceeds_on_first_and_cancels_the_loser() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(JOIN_ANY_WF).unwrap();
+        let factory = JoinTestFactory::new(&[("b", 300)]);
+        let calls = Arc::clone(&factory.calls);
+        let finished = Arc::clone(&factory.finished);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        let gathered = result_for(&step_results, "gathered");
+        assert!(gathered.success);
+        assert_eq!(gathered.items.len(), 1, "any: exactly one winner");
+        assert_eq!(gathered.items[0].sub_id, "a");
+
+        let after = result_for(&step_results, "after");
+        assert!(after.output.contains("n=1"));
+
+        assert!(
+            !step_results.iter().any(|sr| sr.step_id == "b"),
+            "the cancelled loser must never get a StepResult"
+        );
+        assert!(
+            calls.lock().unwrap().contains(&"b".to_string()),
+            "b must have actually been dispatched (started) before losing"
+        );
+        assert!(
+            !finished.lock().unwrap().contains(&"b".to_string()),
+            "b must have been cancelled mid-flight, not run to completion"
+        );
+    }
+
+    const JOIN_COUNT_WF: &str = r#"
+name: join-count
+steps:
+  - id: fanout
+    split: [a, b, c]
+  - id: a
+    agent: worker
+    prompt: "do a"
+    next: [gathered]
+  - id: b
+    agent: worker
+    prompt: "do b"
+    next: [gathered]
+  - id: c
+    agent: worker
+    prompt: "do c"
+    next: [gathered]
+  - id: gathered
+    join: { wait: { count: 2 } }
+  - id: after
+    agent: worker
+    prompt: "n={{ steps.gathered.results | length }}"
+"#;
+
+    /// `wait: { count: 2 }` over 3 inbound paths: proceeds once 2 land
+    /// (`a`, `b` — both dispatched with no delay), merges those 2, and
+    /// cancels the 3rd (`c`, made artificially slow).
+    #[tokio::test]
+    async fn join_wait_count_proceeds_on_two_of_three_and_cancels_the_third() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(JOIN_COUNT_WF).unwrap();
+        let factory = JoinTestFactory::new(&[("c", 300)]);
+        let calls = Arc::clone(&factory.calls);
+        let finished = Arc::clone(&factory.finished);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        let gathered = result_for(&step_results, "gathered");
+        assert!(gathered.success);
+        assert_eq!(gathered.items.len(), 2, "count:2 waits for exactly 2");
+        let sub_ids: std::collections::BTreeSet<&str> =
+            gathered.items.iter().map(|it| it.sub_id.as_str()).collect();
+        assert_eq!(sub_ids, std::collections::BTreeSet::from(["a", "b"]));
+
+        assert!(
+            !step_results.iter().any(|sr| sr.step_id == "c"),
+            "the cancelled 3rd path must never get a StepResult"
+        );
+        assert!(calls.lock().unwrap().contains(&"c".to_string()));
+        assert!(
+            !finished.lock().unwrap().contains(&"c".to_string()),
+            "c must have been cancelled mid-flight, not run to completion"
+        );
+    }
+
+    const BRANCH_PRUNE_WF: &str = r#"
+name: branch-prune
+steps:
+  - id: br
+    branch:
+      condition: "true"
+      then: [x]
+      else: [y]
+  - id: x
+    agent: worker
+    prompt: "x"
+    next: [reconverge]
+  - id: y
+    agent: worker
+    prompt: "y"
+    next: [reconverge, only_via_y]
+  - id: only_via_y
+    agent: worker
+    prompt: "only reachable via y"
+  - id: reconverge
+    agent: worker
+    prompt: "reconverge"
+"#;
+
+    /// Branch pruning (spec §6): the branch takes `then` (`x`). Real
+    /// reachability over the graph must prune `y` (the untaken arm) AND
+    /// `only_via_y` (reachable ONLY through `y`) — neither is ever
+    /// dispatched — while `reconverge` (reachable through BOTH `x` and
+    /// `y`) still runs exactly once, on the live `x` arm, once `y`'s
+    /// pruned-resolution has unblocked its half of `reconverge`'s
+    /// indegree.
+    #[tokio::test]
+    async fn branch_prunes_the_untaken_arm_but_not_a_shared_reconverge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(BRANCH_PRUNE_WF).unwrap();
+        assert!(
+            crate::workflow::is_nonlinear(&wf),
+            "fixture must be graph mode to exercise real-reachability pruning"
+        );
+        let factory = JoinTestFactory::new(&[]);
+        let calls = Arc::clone(&factory.calls);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        let x = result_for(&step_results, "x");
+        assert!(!x.skipped && x.success, "taken arm must run: {x:?}");
+        let reconverge = result_for(&step_results, "reconverge");
+        assert!(
+            !reconverge.skipped && reconverge.success,
+            "shared reconverge must still run: {reconverge:?}"
+        );
+
+        let y = result_for(&step_results, "y");
+        assert!(y.skipped, "untaken arm must be pruned: {y:?}");
+        assert_eq!(y.output, "pruned");
+        let only_via_y = result_for(&step_results, "only_via_y");
+        assert!(
+            only_via_y.skipped,
+            "node reachable only through the untaken arm must be pruned: {only_via_y:?}"
+        );
+        assert_eq!(only_via_y.output, "pruned");
+
+        let calls = calls.lock().unwrap();
+        assert!(
+            !calls.contains(&"y".to_string()) && !calls.contains(&"only_via_y".to_string()),
+            "pruned nodes must never reach the StepFactory: {calls:?}"
+        );
+        assert!(calls.contains(&"x".to_string()) && calls.contains(&"reconverge".to_string()));
+    }
+
+    const BRANCH_TO_JOIN_WF: &str = r#"
+name: branch-to-join
+steps:
+  - id: br
+    branch:
+      condition: "true"
+      then: [a]
+      else: [b]
+  - id: a
+    agent: worker
+    prompt: "do a"
+    next: [gathered]
+  - id: b
+    agent: worker
+    prompt: "do b"
+    next: [gathered]
+  - id: gathered
+    join: { wait: all }
+  - id: after
+    agent: worker
+    prompt: "n={{ steps.gathered.results | length }}"
+"#;
+
+    /// **Post-review CRITICAL-fix regression.** A branch's PRUNED arm must
+    /// never be merged into a downstream `join`'s results, nor poison its
+    /// `success`. Before the fix, `mark_done_and_track_joins` counted
+    /// EVERY completing node — pruned or not — as a join arrival, so
+    /// `gathered` fired with BOTH `a` (live, taken) and `b` (pruned,
+    /// `output: "pruned"`, `success: false`) merged in:
+    /// `results.len() == 2` and `gathered.success == false` even though
+    /// the live arm succeeded cleanly. Confirmed to FAIL against the
+    /// pre-fix code (`items.len() == 2`, `sub_results.b.output ==
+    /// "pruned"`, `gathered.success == false`) and PASS after the `live`
+    /// parameter was threaded through — see this task's report.
+    #[tokio::test]
+    async fn branch_pruned_arm_is_never_merged_into_a_downstream_join() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(BRANCH_TO_JOIN_WF).unwrap();
+        let factory = JoinTestFactory::new(&[]);
+        let calls = Arc::clone(&factory.calls);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        let b = result_for(&step_results, "b");
+        assert!(
+            b.skipped && b.output == "pruned",
+            "b (untaken arm) must be pruned: {b:?}"
+        );
+
+        let gathered = result_for(&step_results, "gathered");
+        assert!(
+            gathered.success,
+            "join must not be poisoned by the pruned arm: {gathered:?}"
+        );
+        assert_eq!(
+            gathered.items.len(),
+            1,
+            "join must merge ONLY the taken arm, not the pruned one: {:?}",
+            gathered.items
+        );
+        assert_eq!(gathered.items[0].sub_id, "a");
+        assert!(
+            !gathered.items.iter().any(|it| it.output == "pruned"),
+            "the pruned arm's marker output must never appear in the merge: {:?}",
+            gathered.items
+        );
+
+        let after = result_for(&step_results, "after");
+        assert!(
+            after.output.contains("n=1"),
+            "downstream should see exactly 1 merged result: {}",
+            after.output
+        );
+
+        assert!(
+            !calls.lock().unwrap().contains(&"b".to_string()),
+            "pruned arm must never reach the StepFactory"
+        );
+    }
+
+    const WHEN_SKIP_TO_JOIN_WF: &str = r#"
+name: when-skip-to-join
+steps:
+  - id: a
+    agent: worker
+    prompt: "do a"
+    when: "false"
+    next: [gathered]
+  - id: b
+    agent: worker
+    prompt: "do b"
+    next: [gathered]
+  - id: gathered
+    join: { wait: all }
+  - id: after
+    agent: worker
+    prompt: "n={{ steps.gathered.results | length }}"
+"#;
+
+    /// **Post-review CRITICAL-fix regression, the `when:`-skip flavor.** A
+    /// `when: false` predecessor must never be merged into a downstream
+    /// `join`'s results either — same bug class as the branch case above,
+    /// same fix (the `live` flag on `mark_done_and_track_joins`).
+    /// Confirmed to FAIL against the pre-fix code and PASS after.
+    #[tokio::test]
+    async fn when_skipped_predecessor_is_never_merged_into_a_downstream_join() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(WHEN_SKIP_TO_JOIN_WF).unwrap();
+        let factory = JoinTestFactory::new(&[]);
+        let calls = Arc::clone(&factory.calls);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        let a = result_for(&step_results, "a");
+        assert!(a.skipped, "a (when: false) must be skipped: {a:?}");
+
+        let gathered = result_for(&step_results, "gathered");
+        assert!(
+            gathered.success,
+            "join must not be poisoned by the skipped predecessor: {gathered:?}"
+        );
+        assert_eq!(
+            gathered.items.len(),
+            1,
+            "join must merge ONLY the live predecessor: {:?}",
+            gathered.items
+        );
+        assert_eq!(gathered.items[0].sub_id, "b");
+
+        let after = result_for(&step_results, "after");
+        assert!(
+            after.output.contains("n=1"),
+            "downstream should see exactly 1 merged result: {}",
+            after.output
+        );
+
+        assert!(
+            !calls.lock().unwrap().contains(&"a".to_string()),
+            "when-skipped predecessor must never reach the StepFactory"
+        );
+    }
+
+    const BRANCH_PRUNE_UNRELATED_LIVE_PREDECESSOR_WF: &str = r#"
+name: branch-prune-unrelated-live-predecessor
+steps:
+  - id: br
+    branch:
+      condition: "true"
+      then: [a]
+      else: [b]
+  - id: a
+    agent: worker
+    prompt: "a"
+  - id: b
+    agent: worker
+    prompt: "b"
+    next: [shared]
+  - id: z
+    agent: worker
+    prompt: "z"
+    next: [shared]
+  - id: shared
+    agent: worker
+    prompt: "shared sees z={{ steps.z.output }}"
+"#;
+
+    /// **Post-review IMPORTANT-fix regression.** `shared` is reachable
+    /// from the untaken arm (`b`) AND from `z` — an entirely independent,
+    /// always-live entry step that has nothing to do with either branch
+    /// arm. The naive "reachable-from-untaken minus reachable-from-taken"
+    /// diff would prune `shared` anyway (it's not reachable via the TAKEN
+    /// arm `a`), silently stranding `z`'s real output. The fix compares
+    /// against reachability from every graph entry point with only the
+    /// untaken edge cut, which correctly finds `shared` still reachable
+    /// via `z` and leaves it un-pruned. `b` itself (which has NO
+    /// alternate live path) must still be pruned. Confirmed to FAIL
+    /// against the pre-fix `branch_prune_set` (see this task's report)
+    /// and PASS after.
+    #[tokio::test]
+    async fn branch_prune_does_not_strand_a_node_fed_by_an_unrelated_live_predecessor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(BRANCH_PRUNE_UNRELATED_LIVE_PREDECESSOR_WF).unwrap();
+        assert!(crate::workflow::is_nonlinear(&wf), "fixture must be graph mode");
+        let factory = JoinTestFactory::new(&[]);
+        let calls = Arc::clone(&factory.calls);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        let b = result_for(&step_results, "b");
+        assert!(b.skipped && b.output == "pruned", "b must still be pruned: {b:?}");
+
+        let shared = result_for(&step_results, "shared");
+        assert!(
+            !shared.skipped && shared.success,
+            "shared must NOT be pruned — z gives it a live path: {shared:?}"
+        );
+        assert!(
+            shared.output.contains("step z agent worker echo: z"),
+            "shared must have actually run and seen z's real output: {}",
+            shared.output
+        );
+
+        assert!(calls.lock().unwrap().contains(&"shared".to_string()));
+        assert!(!calls.lock().unwrap().contains(&"b".to_string()));
+    }
+
+    const JOIN_CANCEL_UNRELATED_CONSUMER_WF: &str = r#"
+name: join-cancel-unrelated-consumer
+steps:
+  - id: fanout
+    split: [w, fast]
+  - id: w
+    agent: worker
+    prompt: "w"
+    next: [loser, y]
+  - id: loser
+    agent: worker
+    prompt: "loser"
+    next: [gathered]
+  - id: fast
+    agent: worker
+    prompt: "fast"
+    next: [gathered]
+  - id: gathered
+    join: { wait: any }
+  - id: y
+    agent: worker
+    prompt: "y sees w={{ steps.w.output }}"
+"#;
+
+    /// **Post-review IMPORTANT-fix regression, the symmetric loser-
+    /// cancellation case.** `w` feeds BOTH `loser` (the join's losing
+    /// inbound path) AND `y` — a live consumer that has nothing to do
+    /// with the join at all. The naive ancestor-exclusive closure
+    /// (ancestors of `loser` minus ancestors of `fast`) would include `w`
+    /// and cancel/abort it, silently stranding `y`. The fix protects `w`
+    /// (it has a successor — `y` — outside the cancellation closure and
+    /// isn't the join itself), so `w` runs to completion normally; only
+    /// `loser` itself (whose ONLY successor is the join) is actually
+    /// cancelled. Confirmed to FAIL against the pre-fix cancellation
+    /// closure (see this task's report) and PASS after.
+    #[tokio::test]
+    async fn join_loser_cancellation_does_not_strand_an_ancestors_unrelated_consumer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(JOIN_CANCEL_UNRELATED_CONSUMER_WF).unwrap();
+        let factory = JoinTestFactory::new(&[("w", 80)]);
+        let calls = Arc::clone(&factory.calls);
+        let finished = Arc::clone(&factory.finished);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        let gathered = result_for(&step_results, "gathered");
+        assert_eq!(gathered.items.len(), 1);
+        assert_eq!(gathered.items[0].sub_id, "fast", "fast must win the race");
+
+        // `w` must survive (not aborted) — it's needed by `y`.
+        assert!(
+            finished.lock().unwrap().contains(&"w".to_string()),
+            "w must have been allowed to run to completion, not cancelled"
+        );
+        let w = result_for(&step_results, "w");
+        assert!(w.success, "w must have a real StepResult: {w:?}");
+
+        // `y` must actually run and see `w`'s real output.
+        let y = result_for(&step_results, "y");
+        assert!(
+            y.output.contains("step w agent worker echo: w"),
+            "y must have run with w's real output: {}",
+            y.output
+        );
+
+        // `loser` itself (no consumer besides the join) must still be
+        // cancelled — it gets a `StepResult` (the same "resolved as a
+        // no-op" marker a pruned/skipped node gets, per the ready-drain
+        // loop's unified skip check), but it must be `skipped` with the
+        // `"cancelled"` marker, and must NEVER actually reach the
+        // `StepFactory`.
+        let loser = result_for(&step_results, "loser");
+        assert!(
+            loser.skipped && loser.output == "cancelled",
+            "loser must be resolved as cancelled, not dispatched: {loser:?}"
+        );
+        assert!(
+            !calls.lock().unwrap().contains(&"loser".to_string()),
+            "loser must never reach the StepFactory"
+        );
+    }
+
+    const MULTI_HOP_LOSER_CHAIN_WF: &str = r#"
+name: multi-hop-loser-chain
+steps:
+  - id: fanout
+    split: [fast, a]
+  - id: fast
+    agent: worker
+    prompt: "fast"
+    next: [gathered]
+  - id: a
+    agent: worker
+    prompt: "a"
+    next: [b]
+  - id: b
+    agent: worker
+    prompt: "b"
+    next: [c]
+  - id: c
+    agent: worker
+    prompt: "c"
+    next: [gathered]
+  - id: gathered
+    join: { wait: any }
+"#;
+
+    /// **Post-review regression: the multi-hop losing-closure silent-vanish
+    /// bug.** `fast` wins `gathered`'s `wait: any` immediately; the losing
+    /// closure is `{a, b, c}` (none protected — none has a consumer outside
+    /// the closure or the join itself). `a` is the ONLY one actually
+    /// in-flight at that moment (`b`/`c` are still blocked behind it,
+    /// indegree > 0) — it gets hard-aborted via `cancel.in_flight_abort`.
+    ///
+    /// Before the fix: the abort-swallow path (`Err(join_err)` +
+    /// `cancelled_by_us.remove` in the main loop) only `continue`d — it
+    /// never ran `unlock_successors`/`track_join_arrivals` for `a`, so
+    /// `b`'s indegree never reached 0. `b`/`c` were marked
+    /// `cancel_state.cancelled` (by `drain_joins`, when the closure was
+    /// computed) but NEVER entered `ready`, so they never reached the
+    /// skip-persist check — no `StepResult`, ever. The run still returned
+    /// `Ok(InnerOutcome::Done)`, silently dropping two reachable nodes with
+    /// zero terminal record. Confirmed to FAIL against the pre-fix code
+    /// (this exact assertion block) and PASS after: `a`'s abort now runs
+    /// that bookkeeping non-live, which unblocks `b` into `ready`, which
+    /// resolves through the EXISTING skip-persist path and unblocks `c`
+    /// the same way — the SAME terminal `"cancelled"` marker a
+    /// never-dispatched loser already gets.
+    #[tokio::test]
+    async fn multi_hop_losing_closure_does_not_silently_drop_descendants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(MULTI_HOP_LOSER_CHAIN_WF).unwrap();
+        let factory = JoinTestFactory::new(&[("a", 300)]);
+        let calls = Arc::clone(&factory.calls);
+        let finished = Arc::clone(&factory.finished);
+        let opts = opts_for(wf, factory, &tmp);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+        )
+        .await
+        .expect("scheduler must not hang")
+        .expect("scheduler must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        let gathered = result_for(&step_results, "gathered");
+        assert!(gathered.success);
+        assert_eq!(gathered.items.len(), 1, "any: exactly one winner");
+        assert_eq!(gathered.items[0].sub_id, "fast");
+
+        // `a` — the one genuinely in-flight, hard-aborted node — gets NO
+        // `StepResult` of its own, unchanged from the single-hop contract
+        // above: it never ran, so there's nothing of ITS OWN to record.
+        assert!(
+            !step_results.iter().any(|sr| sr.step_id == "a"),
+            "the directly-aborted node itself still gets no StepResult"
+        );
+        assert!(calls.lock().unwrap().contains(&"a".to_string()));
+        assert!(
+            !finished.lock().unwrap().contains(&"a".to_string()),
+            "a must have been genuinely aborted mid-flight, not run to completion"
+        );
+
+        // `b` and `c` — blocked behind `a`, never dispatched — MUST each
+        // still resolve to a terminal `"cancelled"` marker. This is the
+        // core regression assertion: before the fix, both of these
+        // `result_for` calls panic (no StepResult exists for either).
+        let b = result_for(&step_results, "b");
+        assert!(
+            b.skipped && b.output == "cancelled",
+            "b must resolve as cancelled, not silently vanish: {b:?}"
+        );
+        let c = result_for(&step_results, "c");
+        assert!(
+            c.skipped && c.output == "cancelled",
+            "c must resolve as cancelled, not silently vanish: {c:?}"
+        );
+        assert!(
+            !calls.lock().unwrap().contains(&"b".to_string())
+                && !calls.lock().unwrap().contains(&"c".to_string()),
+            "b and c must never reach the StepFactory"
+        );
+
+        // Every node in the workflow must be accounted for: either it has
+        // a StepResult, or (only `a`, the one genuinely in-flight
+        // ancestor) it drove its successors' bookkeeping without one of
+        // its own. No step silently disappears from both.
+        let recorded: std::collections::BTreeSet<&str> =
+            step_results.iter().map(|sr| sr.step_id.as_str()).collect();
+        assert_eq!(
+            recorded,
+            std::collections::BTreeSet::from(["fanout", "fast", "gathered", "b", "c"]),
+            "exactly every reachable node except the one genuinely in-flight ancestor must have a terminal StepResult"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 5: the SAME fixtures above, now driven through the LIVE
+    // `run_workflow` entry point rather than calling `run_scheduler`
+    // directly. Every test above this point proves the scheduler's
+    // internals; these prove `run_workflow`'s router actually reaches it
+    // for a non-linear workflow (spec §9) instead of rejecting it.
+    // -----------------------------------------------------------------------
+
+    /// `split → [a, b] → join(wait: all) gathered → after`, run through
+    /// `run_workflow` (not `run_scheduler`). Before this task this fixture
+    /// was rejected outright with `NonlinearNotYetSupported`; now it must
+    /// run to a real `Done` terminal, with `a`/`b` both dispatched and
+    /// `gathered` merging both of their results — the flipped shape of the
+    /// old honesty-gate regression test.
+    #[tokio::test]
+    async fn join_wait_all_completes_live_through_run_workflow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(JOIN_ALL_WF).unwrap();
+        assert!(
+            is_nonlinear(&wf),
+            "fixture must be non-linear to exercise the live scheduler router"
+        );
+        let factory = JoinTestFactory::new(&[]);
+        let opts = opts_for(wf, factory, &tmp);
+
+        let res = run_workflow(opts)
+            .await
+            .expect("a split/join workflow must now run to completion through run_workflow");
+        assert!(
+            res.awaiting.is_none(),
+            "no gate in this workflow — must reach Done, not park"
+        );
+
+        let gathered = result_for(&res.step_results, "gathered");
+        assert!(gathered.success);
+        assert_eq!(gathered.items.len(), 2, "both inbound paths waited for");
+        let sub_ids: std::collections::BTreeSet<&str> =
+            gathered.items.iter().map(|it| it.sub_id.as_str()).collect();
+        assert_eq!(sub_ids, std::collections::BTreeSet::from(["a", "b"]));
+
+        // The join node's own persisted `StepResult` must carry
+        // `StepKind::Join`, not the reused `StepKind::Branch` — the exact
+        // render-correctness defect this task fixes (mirrors the split
+        // assertion in `run_workflow_runs_a_split_join_workflow_live_through_the_scheduler`).
+        assert_eq!(
+            gathered.kind,
+            crate::runs::StepKind::Join,
+            "a live join node must persist kind: Join, not the reused Branch"
+        );
+
+        let after = result_for(&res.step_results, "after");
+        assert!(
+            after.output.contains("n=2"),
+            "downstream step must see steps.gathered.results | length == 2: {}",
+            after.output
+        );
+    }
+
+    /// The branch-pruning fixture, run through `run_workflow`: the taken
+    /// arm (`x`) and the shared reconverge run; the untaken arm (`y`) and
+    /// the node reachable only through it (`only_via_y`) are pruned and
+    /// never dispatched — same assertions as
+    /// `branch_prunes_the_untaken_arm_but_not_a_shared_reconverge` above,
+    /// now proving the LIVE router reaches the same real-reachability
+    /// pruning logic, not just `run_scheduler` called directly.
+    #[tokio::test]
+    async fn branch_pruning_completes_live_through_run_workflow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(BRANCH_PRUNE_WF).unwrap();
+        assert!(is_nonlinear(&wf), "fixture must be graph mode");
+        let factory = JoinTestFactory::new(&[]);
+        let calls = Arc::clone(&factory.calls);
+        let opts = opts_for(wf, factory, &tmp);
+
+        let res = run_workflow(opts)
+            .await
+            .expect("branch pruning must run to completion through run_workflow");
+        assert!(res.awaiting.is_none());
+
+        let x = result_for(&res.step_results, "x");
+        assert!(!x.skipped && x.success, "taken arm must run: {x:?}");
+        let reconverge = result_for(&res.step_results, "reconverge");
+        assert!(
+            !reconverge.skipped && reconverge.success,
+            "shared reconverge must still run: {reconverge:?}"
+        );
+        let y = result_for(&res.step_results, "y");
+        assert!(y.skipped, "untaken arm must be pruned: {y:?}");
+        let only_via_y = result_for(&res.step_results, "only_via_y");
+        assert!(
+            only_via_y.skipped,
+            "node reachable only through the untaken arm must be pruned: {only_via_y:?}"
+        );
+        let calls = calls.lock().unwrap();
+        assert!(
+            !calls.contains(&"y".to_string()) && !calls.contains(&"only_via_y".to_string()),
+            "pruned nodes must never reach the StepFactory: {calls:?}"
+        );
+    }
+
+    /// A non-linear workflow (a fork out of the gate step itself — a
+    /// non-branch step with 2 `next:` targets, `is_nonlinear`'s fork rule)
+    /// whose SOLE approval gate is also its entry node: the gate is the
+    /// only ready node at the start, so it parks before anything else is
+    /// ever dispatched — a clean, deterministic instance of "ONE approval
+    /// gate parks" (spec §7's simplest case; T5b's full concurrent
+    /// awaiting-set is NOT exercised here — see this task's report for the
+    /// boundary). Approve-resume (mirroring `tests/gate_node.rs`'s
+    /// pattern) then completes the run, dispatching both fork targets.
+    const NONLINEAR_GATE_WF: &str = r#"
+name: nonlinear-gate
+steps:
+  - id: gate
+    approval:
+      prompt: "Approve the fan-out?"
+    next: [a, b]
+  - id: a
+    agent: worker
+    prompt: "do a"
+  - id: b
+    agent: worker
+    prompt: "do b"
+"#;
+
+    #[tokio::test]
+    async fn single_gate_in_nonlinear_workflow_parks_then_resume_completes_live_through_run_workflow(
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(NONLINEAR_GATE_WF).unwrap();
+        assert!(
+            is_nonlinear(&wf),
+            "fixture must be non-linear (fork out of the gate) to exercise the live router"
+        );
+
+        // --- Phase 1: the gate is the only ready node — it must park
+        // before `a`/`b` are ever reachable. ---
+        let factory1 = JoinTestFactory::new(&[]);
+        let calls1 = Arc::clone(&factory1.calls);
+        let opts1 = opts_for(wf.clone(), factory1, &tmp);
+        let res1 = run_workflow(opts1)
+            .await
+            .expect("a pause is Ok, not Err");
+        let awaiting = res1.awaiting.clone().expect("the gate must pause the run");
+        assert_eq!(awaiting.step_id, "gate");
+        assert!(
+            res1.step_results.is_empty(),
+            "a paused gate has no completed result yet"
+        );
+        assert!(
+            calls1.lock().unwrap().is_empty(),
+            "a/b must never reach the StepFactory before the gate is approved: {:?}",
+            calls1.lock().unwrap()
+        );
+
+        // --- Phase 2: approve + resume — mirrors `tests/gate_node.rs`'s
+        // approve-resume pattern, adapted for the in-memory (no run_store)
+        // shape this module's `opts_for` uses. ---
+        let factory2 = JoinTestFactory::new(&[]);
+        let calls2 = Arc::clone(&factory2.calls);
+        let mut opts2 = opts_for(wf, factory2, &tmp);
+        opts2.resume_from = Some(ResumeState::from_approval(
+            res1.run_id.clone(),
+            res1.step_results.clone(),
+            "gate".to_string(),
+        ));
+
+        let res2 = run_workflow(opts2)
+            .await
+            .expect("resume after approval must complete the run");
+        assert!(res2.awaiting.is_none(), "resumed run must reach Done");
+
+        let gate = result_for(&res2.step_results, "gate");
+        assert!(gate.success);
+        let a = result_for(&res2.step_results, "a");
+        let b = result_for(&res2.step_results, "b");
+        assert!(!a.skipped && a.success, "a must run after the gate resolves: {a:?}");
+        assert!(!b.skipped && b.success, "b must run after the gate resolves: {b:?}");
+        let dispatched = calls2.lock().unwrap();
+        assert!(
+            dispatched.contains(&"a".to_string()) && dispatched.contains(&"b".to_string()),
+            "both fork targets must have been dispatched post-approval: {dispatched:?}"
+        );
+    }
+
+    /// Task 5b-1 (spec §7): TWO independent concurrent paths each hitting
+    /// their own gate — the scenario T5a's report named as the explicit
+    /// boundary it did NOT cover. `fanout` forks into three: `gate_a` and
+    /// `gate_b` (each gating its own downstream `a`/`b`), and `indep` — a
+    /// REAL dispatch with no gate on its path at all, artificially slowed
+    /// so it's still in-flight at the exact moment both gates park.
+    ///
+    /// This exercises the batch-parking contract end to end: both gates
+    /// land in ONE `Paused` with `awaiting.len() == 2` (not two separate
+    /// pause/resume round-trips), AND `indep` — the independent in-flight
+    /// sibling — is drained to completion rather than aborted when the
+    /// scheduler stops for the gates (the T5a sibling-stranding fix).
+    /// Uses a real disk-backed `RunStore` (unlike this module's other
+    /// tests) specifically to assert on the PERSISTED `RunRecord.awaiting`
+    /// set and `RunStatus`, not just the in-memory `AwaitingInfo`.
+    const NONLINEAR_TWO_GATE_WF: &str = r#"
+name: nonlinear-two-gate
+steps:
+  - id: fanout
+    split: [gate_a, gate_b, indep]
+  - id: gate_a
+    approval:
+      prompt: "Approve A?"
+    next: [a]
+  - id: gate_b
+    approval:
+      prompt: "Approve B?"
+    next: [b]
+  - id: indep
+    agent: worker
+    prompt: "independent work, no gate on this path"
+  - id: a
+    agent: worker
+    prompt: "do a"
+  - id: b
+    agent: worker
+    prompt: "do b"
+"#;
+
+    #[tokio::test]
+    async fn two_concurrent_gates_batch_park_in_one_pause_while_indep_sibling_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::runs::RunStore::new(tmp.path().join("runs")));
+        let wf = Workflow::parse(NONLINEAR_TWO_GATE_WF).unwrap();
+        assert!(is_nonlinear(&wf), "fixture must fork to exercise the DAG scheduler");
+
+        // --- Phase 1: fanout unlocks gate_a + gate_b + indep together.
+        // `indep` is slowed so it's still in-flight when both gates park in
+        // the same drain wave. ---
+        let factory1 = JoinTestFactory::new(&[("indep", 60)]);
+        let calls1 = Arc::clone(&factory1.calls);
+        let opts1 = OrchestratorRunOpts {
+            workflow: wf.clone(),
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_two_gate".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory1),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(NONLINEAR_TWO_GATE_WF.to_string()),
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+        let res1 = run_workflow(opts1).await.expect("a batch-park is Ok, not Err");
+        let run_id = res1.run_id.clone();
+
+        let awaiting = res1.awaiting.clone().expect("both gates must pause the run");
+        assert_eq!(awaiting.gates.len(), 2, "both gates must land in ONE pause");
+        let parked_ids: std::collections::BTreeSet<&str> =
+            awaiting.gates.iter().map(|g| g.step_id.as_str()).collect();
+        assert_eq!(
+            parked_ids,
+            std::collections::BTreeSet::from(["gate_a", "gate_b"])
+        );
+
+        // The independent sibling ran to completion — NOT aborted just
+        // because the two gates parked in the same wave.
+        let indep = result_for(&res1.step_results, "indep");
+        assert!(indep.success && !indep.skipped, "indep: {indep:?}");
+        assert!(
+            calls1.lock().unwrap().contains(&"indep".to_string()),
+            "indep must have reached the StepFactory"
+        );
+        // Neither gated path was ever reachable yet.
+        assert!(res1.step_results.iter().all(|sr| sr.step_id != "a" && sr.step_id != "b"));
+
+        // Persisted state: the RunRecord itself carries the full set.
+        let rec1 = store.load(&run_id).unwrap();
+        assert_eq!(rec1.status, crate::runs::RunStatus::AwaitingApproval);
+        assert_eq!(rec1.awaiting.len(), 2);
+        let rec1_ids: std::collections::BTreeSet<&str> =
+            rec1.awaiting.iter().map(|g| g.step_id.as_str()).collect();
+        assert_eq!(
+            rec1_ids,
+            std::collections::BTreeSet::from(["gate_a", "gate_b"])
+        );
+        // Derived-compat mirrors the FIRST gate in the set.
+        assert_eq!(rec1.awaiting_step_id.as_deref(), Some(rec1.awaiting[0].step_id.as_str()));
+
+        // --- Phase 2: approve gate_a only (by id, via the store) —
+        // gate_b must stay parked; the run must stay AwaitingApproval, NOT
+        // flip to Running. ---
+        store
+            .approve_gate(&run_id, "matt", chrono::Utc::now(), Some("gate_a"))
+            .expect("approve gate_a");
+        let rec2 = store.load(&run_id).unwrap();
+        assert_eq!(rec2.status, crate::runs::RunStatus::AwaitingApproval);
+        assert_eq!(rec2.awaiting.len(), 1);
+        assert_eq!(rec2.awaiting[0].step_id, "gate_b");
+
+        let factory2 = JoinTestFactory::new(&[]);
+        let calls2 = Arc::clone(&factory2.calls);
+        let opts2 = OrchestratorRunOpts {
+            workflow: wf.clone(),
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_two_gate".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory2),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(NONLINEAR_TWO_GATE_WF.to_string()),
+            resume_from: Some(ResumeState::from_approval(
+                run_id.clone(),
+                res1.step_results.clone(),
+                "gate_a".to_string(),
+            )),
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+        let res2 = run_workflow(opts2).await.expect("resume of gate_a's path is Ok");
+        // gate_b is still parked — the resumed run pauses AGAIN, it does
+        // not run to completion.
+        let awaiting2 = res2.awaiting.clone().expect("gate_b must still be parked");
+        assert_eq!(awaiting2.gates.len(), 1);
+        assert_eq!(awaiting2.gates[0].step_id, "gate_b");
+        let a = result_for(&res2.step_results, "a");
+        assert!(a.success && !a.skipped, "a must run once gate_a is approved: {a:?}");
+        assert!(
+            calls2.lock().unwrap().contains(&"a".to_string())
+                && !calls2.lock().unwrap().contains(&"b".to_string()),
+            "only a's path may run while gate_b is still parked: {:?}",
+            calls2.lock().unwrap()
+        );
+        let rec3 = store.load(&run_id).unwrap();
+        assert_eq!(rec3.status, crate::runs::RunStatus::AwaitingApproval);
+        assert_eq!(rec3.awaiting.len(), 1);
+        assert_eq!(rec3.awaiting[0].step_id, "gate_b");
+
+        // --- Phase 3: approve gate_b — the set empties, the run completes. ---
+        store
+            .approve_gate(&run_id, "matt", chrono::Utc::now(), Some("gate_b"))
+            .expect("approve gate_b");
+        let rec4 = store.load(&run_id).unwrap();
+        assert_eq!(rec4.status, crate::runs::RunStatus::Running);
+        assert!(rec4.awaiting.is_empty());
+
+        let factory3 = JoinTestFactory::new(&[]);
+        let calls3 = Arc::clone(&factory3.calls);
+        let opts3 = OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_two_gate".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory3),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(NONLINEAR_TWO_GATE_WF.to_string()),
+            resume_from: Some(ResumeState::from_approval(
+                run_id.clone(),
+                res2.step_results.clone(),
+                "gate_b".to_string(),
+            )),
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+        let res3 = run_workflow(opts3).await.expect("resume of gate_b's path completes");
+        assert!(res3.awaiting.is_none(), "the run must reach Done once both gates are resolved");
+        let b = result_for(&res3.step_results, "b");
+        assert!(b.success && !b.skipped, "b must run once gate_b is approved: {b:?}");
+        assert!(calls3.lock().unwrap().contains(&"b".to_string()));
+
+        let rec5 = store.load(&run_id).unwrap();
+        assert_eq!(rec5.status, crate::runs::RunStatus::Completed);
+        assert!(rec5.awaiting.is_empty());
+        assert!(rec5.awaiting_step_id.is_none());
+    }
+
+    const NONLINEAR_TWO_GATE_TIMEOUT_WF: &str = r#"
+name: nonlinear-two-gate-timeout
+steps:
+  - id: fanout
+    split: [gate_a, gate_b]
+  - id: gate_a
+    approval:
+      prompt: "Approve A?"
+    next: [a]
+  - id: gate_b
+    approval:
+      prompt: "Approve B?"
+      timeout_seconds: 3600
+    next: [b]
+  - id: a
+    agent: worker
+    prompt: "do a"
+  - id: b
+    agent: worker
+    prompt: "do b"
+"#;
+
+    /// Task 5b-2a (5b-1 Minor #3, deferred): a still-parked gate must keep
+    /// its ORIGINAL `since`/`expires_at` across a resume cycle, not get a
+    /// fresh clock every time `run_workflow` re-enters. Before the fix,
+    /// `run_workflow`'s Approval-pause handling unconditionally recomputed
+    /// `since: now()` / `expires_at: now() + timeout` for EVERY gate the
+    /// scheduler re-parks on a resume pass — including a gate that was
+    /// already parked before this resume and never touched by the
+    /// operator. Approving gate_a resumes gate_a's path while gate_b (with
+    /// a real `timeout_seconds`) is re-evaluated fresh by the scheduler and
+    /// re-parks in THIS resume's `Paused` outcome; its clock must be
+    /// carried forward from the FIRST pause, not restarted.
+    #[tokio::test]
+    async fn resume_preserves_still_parked_gates_original_clock_not_a_fresh_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::runs::RunStore::new(tmp.path().join("runs")));
+        let wf = Workflow::parse(NONLINEAR_TWO_GATE_TIMEOUT_WF).unwrap();
+        assert!(is_nonlinear(&wf), "fixture must fork to exercise the DAG scheduler");
+
+        // --- Phase 1: fanout parks both gates in one batch. ---
+        let factory1 = JoinTestFactory::new(&[]);
+        let opts1 = OrchestratorRunOpts {
+            workflow: wf.clone(),
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_gate_clock".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory1),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(NONLINEAR_TWO_GATE_TIMEOUT_WF.to_string()),
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+        let res1 = run_workflow(opts1).await.expect("both gates batch-park");
+        let run_id = res1.run_id.clone();
+
+        let rec1 = store.load(&run_id).unwrap();
+        assert_eq!(rec1.awaiting.len(), 2);
+        let gate_b_before = rec1
+            .awaiting
+            .iter()
+            .find(|g| g.step_id == "gate_b")
+            .cloned()
+            .expect("gate_b must be parked after phase 1");
+        assert!(
+            gate_b_before.expires_at.is_some(),
+            "gate_b carries a real timeout_seconds — its clock must be checkable"
+        );
+
+        // A newly-parked gate always gets `since` from THIS pause instant —
+        // sanity check the fixture actually exercises a non-trivial clock
+        // before asserting it survives a resume unchanged.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // --- Phase 2: approve gate_a only; resume. gate_b re-parks in the
+        // SAME resume call — its since/expires_at must be UNCHANGED from
+        // phase 1, not recomputed against phase 2's `now()`. ---
+        store
+            .approve_gate(&run_id, "matt", chrono::Utc::now(), Some("gate_a"))
+            .expect("approve gate_a");
+
+        let factory2 = JoinTestFactory::new(&[]);
+        let opts2 = OrchestratorRunOpts {
+            workflow: wf.clone(),
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_gate_clock".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory2),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(NONLINEAR_TWO_GATE_TIMEOUT_WF.to_string()),
+            resume_from: Some(ResumeState::from_approval(
+                run_id.clone(),
+                res1.step_results.clone(),
+                "gate_a".to_string(),
+            )),
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+        let res2 = run_workflow(opts2).await.expect("resume of gate_a's path re-parks on gate_b");
+        let awaiting2 = res2.awaiting.clone().expect("gate_b must still be parked");
+        assert_eq!(awaiting2.gates.len(), 1);
+        assert_eq!(awaiting2.gates[0].step_id, "gate_b");
+
+        let rec2 = store.load(&run_id).unwrap();
+        assert_eq!(rec2.status, crate::runs::RunStatus::AwaitingApproval);
+        assert_eq!(rec2.awaiting.len(), 1);
+        let gate_b_after = &rec2.awaiting[0];
+        assert_eq!(gate_b_after.step_id, "gate_b");
+
+        // The bug: `since`/`expires_at` reset to a fresh `now()` on every
+        // resume. The fix: both are carried forward byte-for-byte from
+        // phase 1's pause instant.
+        assert_eq!(
+            gate_b_after.since, gate_b_before.since,
+            "gate_b's park instant must survive the resume unchanged"
+        );
+        assert_eq!(
+            gate_b_after.expires_at, gate_b_before.expires_at,
+            "gate_b's timeout deadline must survive the resume unchanged"
+        );
+    }
+
+    /// Counterpart to the clock-preservation test above: a gate that is
+    /// NEWLY parked in this resume pass (not present in the prior
+    /// `awaiting` set at all) must still get a FRESH `since`/`expires_at`
+    /// computed at ITS OWN pause instant — the preservation logic must not
+    /// leak into gates that have no prior record to preserve.
+    #[tokio::test]
+    async fn resume_gives_a_genuinely_new_gate_a_fresh_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::runs::RunStore::new(tmp.path().join("runs")));
+        // Linear-with-two-sequential-gates: gate_a first, gate_b only
+        // becomes reachable once gate_a is approved — so gate_b is a
+        // GENUINELY new gate on the resume that approves gate_a, not one
+        // that was already parked before it.
+        const WF: &str = r#"
+name: sequential-two-gate
+steps:
+  - id: gate_a
+    approval:
+      prompt: "Approve A?"
+  - id: gate_b
+    approval:
+      prompt: "Approve B?"
+      timeout_seconds: 3600
+"#;
+        let wf = Workflow::parse(WF).unwrap();
+
+        let opts1 = OrchestratorRunOpts {
+            workflow: wf.clone(),
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_new_gate_clock".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(JoinTestFactory::new(&[])),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(WF.to_string()),
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+        let res1 = run_workflow(opts1).await.expect("pauses at gate_a");
+        let run_id = res1.run_id.clone();
+        let rec1 = store.load(&run_id).unwrap();
+        assert_eq!(rec1.awaiting.len(), 1);
+        assert_eq!(rec1.awaiting[0].step_id, "gate_a");
+
+        let before_resume = chrono::Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        store
+            .approve_gate(&run_id, "matt", chrono::Utc::now(), Some("gate_a"))
+            .expect("approve gate_a");
+
+        let opts2 = OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_new_gate_clock".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(JoinTestFactory::new(&[])),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(WF.to_string()),
+            resume_from: Some(ResumeState::from_approval(
+                run_id.clone(),
+                res1.step_results.clone(),
+                "gate_a".to_string(),
+            )),
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause: None,
+        };
+        let res2 = run_workflow(opts2).await.expect("resume reaches the newly-unlocked gate_b");
+        let awaiting2 = res2.awaiting.expect("gate_b must park");
+        assert_eq!(awaiting2.gates.len(), 1);
+        assert_eq!(awaiting2.gates[0].step_id, "gate_b");
+
+        let rec2 = store.load(&run_id).unwrap();
+        let gate_b = &rec2.awaiting[0];
+        assert_eq!(gate_b.step_id, "gate_b");
+        assert!(
+            gate_b.since > before_resume,
+            "a genuinely new gate must get a FRESH since from THIS pause instant, not \
+             something predating the resume that unlocked it"
+        );
+        assert!(gate_b.expires_at.is_some_and(|exp| exp > gate_b.since));
+    }
+}
+
+/// Task 4: per-node resume (rebuilding done/pruned/cancelled + join
+/// arrival bookkeeping from disk) and whole-run cancel/restart-from-
+/// checkpoint. See this task's report for the full design writeup.
+#[cfg(test)]
+mod resume_and_cancel {
+    use super::*;
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS};
+    use rupu_providers::types::StopReason;
+    use rupu_tools::ToolContext;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// One `StepFactory` covering every test below: records every
+    /// dispatched step id (`calls`, in call order) and, separately, every
+    /// id that ran to completion PAST any configured `slow` delay
+    /// (`finished`) — the same "started but never finished" cancellation
+    /// proof `join_and_prune`'s `JoinTestFactory` uses.
+    struct RecordingFactory {
+        calls: Arc<Mutex<Vec<String>>>,
+        finished: Arc<Mutex<Vec<String>>>,
+        slow: &'static [(&'static str, u64)],
+    }
+
+    impl RecordingFactory {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                finished: Arc::new(Mutex::new(Vec::new())),
+                slow: &[],
+            }
+        }
+
+        fn slow(mut self, steps: &'static [(&'static str, u64)]) -> Self {
+            self.slow = steps;
+            self
+        }
+    }
+
+    #[async_trait]
+    impl StepFactory for RecordingFactory {
+        async fn build_opts_for_step(
+            &self,
+            step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: PathBuf,
+            transcript_path: PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> AgentRunOpts {
+            self.calls.lock().unwrap().push(step_id.to_string());
+            if let Some(&(_, ms)) = self.slow.iter().find(|&&(id, _)| id == step_id) {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
+            self.finished.lock().unwrap().push(step_id.to_string());
+
+            let turn = ScriptedTurn::AssistantText {
+                text: format!("step {step_id} agent {agent_name} echo: {rendered_prompt}"),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            };
+            let provider = MockProvider::new(vec![turn]);
+            AgentRunOpts {
+                agent_name: format!("ag-{agent_name}"),
+                agent_system_prompt: "echo".into(),
+                agent_tools: None,
+                provider: Box::new(provider),
+                provider_name: "mock".into(),
+                model: "mock-1".into(),
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                max_turns: 5,
+                decider: Arc::new(BypassDecider),
+                tool_context: ToolContext::default(),
+                user_message: rendered_prompt,
+                initial_messages: Vec::new(),
+                turn_index_offset: 0,
+                mode_str: "bypass".into(),
+                no_stream: true,
+                suppress_stream_stdout: true,
+                mcp_registry: None,
+                effort: None,
+                context_window: None,
+                output_format: None,
+                output_schema: None,
+                anthropic_task_budget: None,
+                anthropic_context_management: None,
+                anthropic_speed: None,
+                parent_run_id: None,
+                depth: 0,
+                dispatchable_agents: None,
+                step_id: step_id.to_string(),
+                on_tool_call,
+                on_stream_event: None,
+                concerns: None,
+                max_tokens: DEFAULT_MAX_TOKENS,
+                scope_name: None,
+                surface_tag: None,
+                context_window_tokens: None,
+                compact_at_percent: None,
+                pause: None,
+            }
+        }
+    }
+
+    fn opts_for(
+        wf: Workflow,
+        factory: RecordingFactory,
+        tmp: &tempfile::TempDir,
+        pause: Option<CancellationToken>,
+        resume_from: Option<ResumeState>,
+    ) -> OrchestratorRunOpts {
+        OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_resume_cancel".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(factory),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: None,
+            workflow_yaml: None,
+            resume_from,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+            action_dispatcher: None,
+            pause,
+        }
+    }
+
+    const SPLIT_JOIN_ALL_WF: &str = r#"
+name: split-join-resume
+steps:
+  - id: fanout
+    split: [a, b, c]
+  - id: a
+    agent: worker
+    prompt: "do a"
+    next: [gathered]
+  - id: b
+    agent: worker
+    prompt: "do b"
+    next: [gathered]
+  - id: c
+    agent: worker
+    prompt: "do c"
+    next: [gathered]
+  - id: gathered
+    join: { wait: all }
+"#;
+
+    /// **Mid-DAG resume (spec §3, the Task-3-report gap).** Simulates a
+    /// pause after `fanout`/`a`/`b` completed but `c` was still in-flight:
+    /// hand-construct the on-disk shape (`step_results` pre-seeded with
+    /// exactly those 3 entries) and drive a FRESH `run_scheduler` call over
+    /// it. Resume must re-dispatch ONLY `c` (never `a`/`b` again), and
+    /// `gathered` (`wait: all` over 3 inbound) must fire EXACTLY ONCE,
+    /// merging all 3 — including the two seeded from resume, which never
+    /// went through a live `mark_done_and_track_joins` call in this
+    /// process. Without the resume-seeding fix, `gathered.threshold` (3)
+    /// is never reached (only `c`'s live arrival is ever recorded) and the
+    /// join never fires at all — the run would silently finish `Done`
+    /// with no `gathered` `StepResult`, not merely hang.
+    #[tokio::test]
+    async fn mid_dag_resume_reruns_only_the_in_flight_node_and_the_join_fires_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(SPLIT_JOIN_ALL_WF).unwrap();
+        let factory = RecordingFactory::new();
+        let calls = Arc::clone(&factory.calls);
+        let opts = opts_for(wf, factory, &tmp, None, None);
+        let resolved_inputs = BTreeMap::new();
+
+        let mut step_results = vec![
+            StepResult {
+                step_id: "fanout".into(),
+                success: true,
+                kind: crate::runs::StepKind::Split,
+                ..Default::default()
+            },
+            StepResult {
+                step_id: "a".into(),
+                output: "out-a".into(),
+                success: true,
+                kind: crate::runs::StepKind::Linear,
+                ..Default::default()
+            },
+            StepResult {
+                step_id: "b".into(),
+                output: "out-b".into(),
+                success: true,
+                kind: crate::runs::StepKind::Linear,
+                ..Default::default()
+            },
+        ];
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+        )
+        .await
+        .expect("resume must not hang")
+        .expect("resume must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        assert_eq!(
+            calls.lock().unwrap().clone(),
+            vec!["c".to_string()],
+            "resume must re-dispatch ONLY the in-flight node, never a/b"
+        );
+
+        let gathered = step_results
+            .iter()
+            .find(|sr| sr.step_id == "gathered")
+            .expect("join must fire after the resumed node completes");
+        assert!(gathered.success);
+        assert_eq!(
+            gathered.items.len(),
+            3,
+            "wait:all must merge all 3 inbound paths, including the two seeded from resume"
+        );
+        let sub_ids: std::collections::BTreeSet<&str> =
+            gathered.items.iter().map(|it| it.sub_id.as_str()).collect();
+        assert_eq!(sub_ids, std::collections::BTreeSet::from(["a", "b", "c"]));
+    }
+
+    const BRANCH_PRUNE_RESUME_WF: &str = r#"
+name: branch-prune-resume
+steps:
+  - id: br
+    branch:
+      condition: "true"
+      then: [x]
+      else: [y]
+  - id: x
+    agent: worker
+    prompt: "x"
+    next: [reconverge]
+  - id: y
+    agent: worker
+    prompt: "y"
+    next: [reconverge, only_via_y]
+  - id: only_via_y
+    agent: worker
+    prompt: "only reachable via y"
+  - id: reconverge
+    agent: worker
+    prompt: "reconverge"
+"#;
+
+    /// **Pruned-node persistence across resume (spec §3).** On-disk shape
+    /// after the branch resolved and its entire pruned closure (`y`,
+    /// `only_via_y`) resolved — Task 3's own resolution is synchronous and
+    /// always persists the whole closure in one pass, so this is the only
+    /// shape a real pause can ever leave behind — but before the live
+    /// remainder (`reconverge`) was reached. Resume must dispatch ONLY
+    /// `reconverge`; the pruned nodes must never reach the `StepFactory`.
+    #[tokio::test]
+    async fn pruned_node_stays_pruned_across_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(BRANCH_PRUNE_RESUME_WF).unwrap();
+        let factory = RecordingFactory::new();
+        let calls = Arc::clone(&factory.calls);
+        let opts = opts_for(wf, factory, &tmp, None, None);
+        let resolved_inputs = BTreeMap::new();
+
+        let mut step_results = vec![
+            StepResult {
+                step_id: "br".into(),
+                output: "then".into(),
+                success: true,
+                kind: crate::runs::StepKind::Branch,
+                ..Default::default()
+            },
+            StepResult {
+                step_id: "x".into(),
+                output: "out-x".into(),
+                success: true,
+                kind: crate::runs::StepKind::Linear,
+                ..Default::default()
+            },
+            StepResult {
+                step_id: "y".into(),
+                output: "pruned".into(),
+                success: false,
+                skipped: true,
+                kind: crate::runs::StepKind::Linear,
+                ..Default::default()
+            },
+            StepResult {
+                step_id: "only_via_y".into(),
+                output: "pruned".into(),
+                success: false,
+                skipped: true,
+                kind: crate::runs::StepKind::Linear,
+                ..Default::default()
+            },
+        ];
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+        )
+        .await
+        .expect("resume must not hang")
+        .expect("resume must not error");
+        assert!(matches!(outcome, InnerOutcome::Done));
+
+        assert_eq!(
+            calls.lock().unwrap().clone(),
+            vec!["reconverge".to_string()],
+            "resume must dispatch ONLY the still-live remainder, never a pruned node"
+        );
+        let reconverge = step_results
+            .iter()
+            .find(|sr| sr.step_id == "reconverge")
+            .expect("reconverge must run on resume");
+        assert!(reconverge.success);
+    }
+
+    const JOIN_CANCEL_RESUME_WF: &str = r#"
+name: join-cancel-resume
+steps:
+  - id: fanout
+    split: [w, fast]
+  - id: w
+    agent: worker
+    prompt: "w"
+    next: [loser, y]
+  - id: loser
+    agent: worker
+    prompt: "loser"
+    next: [gathered]
+  - id: fast
+    agent: worker
+    prompt: "fast"
+    next: [gathered]
+  - id: gathered
+    join: { wait: any }
+  - id: y
+    agent: worker
+    prompt: "y"
+"#;
+
+    /// **Cancelled join-loser persistence across resume (spec §3+§5) —
+    /// "same for a loser-cancelled node" as the pruned test above.** `w` is
+    /// slow so `fast` wins `gathered`'s `wait: any`; `loser` (whose only
+    /// successor is the join) is cancelled, `w` survives (it also feeds
+    /// `y`, an unrelated live consumer) — the exact shape
+    /// `join_loser_cancellation_does_not_strand_an_ancestors_unrelated_consumer`
+    /// proves already persists a `"cancelled"` `StepResult` for `loser`
+    /// within a single run. This test's OWN job is the resume half: hand
+    /// that persisted run's full `step_results` to a fresh scheduler call
+    /// and confirm NOTHING gets re-dispatched — `loser` stays cancelled,
+    /// permanently, exactly like a pruned node (a join loser is
+    /// permanently moot; see `cancel_finalize`'s doc for why this is NOT
+    /// the same contract as a whole-run cancel's restart-clean node).
+    #[tokio::test]
+    async fn cancelled_join_loser_persists_across_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(JOIN_CANCEL_RESUME_WF).unwrap();
+        let resolved_inputs = BTreeMap::new();
+
+        let factory1 = RecordingFactory::new().slow(&[("w", 80)]);
+        let opts1 = opts_for(wf.clone(), factory1, &tmp, None, None);
+        let mut step_results: Vec<StepResult> = Vec::new();
+        let outcome1 = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts1, "", &resolved_inputs, false, None, &mut step_results, None),
+        )
+        .await
+        .expect("run 1 must not hang")
+        .expect("run 1 must not error");
+        assert!(matches!(outcome1, InnerOutcome::Done));
+        let loser = step_results
+            .iter()
+            .find(|sr| sr.step_id == "loser")
+            .expect("loser must resolve as cancelled within run 1");
+        assert!(loser.skipped && loser.output == "cancelled");
+
+        // Resume: a FRESH scheduler call + a FRESH factory (its own empty
+        // `calls`), seeded with run 1's full persisted `step_results`.
+        let factory2 = RecordingFactory::new();
+        let calls2 = Arc::clone(&factory2.calls);
+        let opts2 = opts_for(wf, factory2, &tmp, None, None);
+        let mut step_results2 = step_results.clone();
+        let outcome2 = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts2, "", &resolved_inputs, false, None, &mut step_results2, None),
+        )
+        .await
+        .expect("resume must not hang")
+        .expect("resume must not error");
+        assert!(matches!(outcome2, InnerOutcome::Done));
+        assert!(
+            calls2.lock().unwrap().is_empty(),
+            "resume must not re-dispatch anything, including the already-cancelled loser: {:?}",
+            calls2.lock().unwrap()
+        );
+        assert_eq!(
+            step_results2.len(),
+            step_results.len(),
+            "no new StepResults on resume — everything was already resolved"
+        );
+    }
+
+    const CANCEL_FANOUT_WF: &str = r#"
+name: cancel-mid-flight
+steps:
+  - id: fanout
+    split: [a, b]
+  - id: a
+    agent: worker
+    prompt: "a"
+  - id: b
+    agent: worker
+    prompt: "b"
+"#;
+
+    /// **Whole-run cancel stops every in-flight job (spec §8).** `a`/`b`
+    /// both dispatch concurrently (`split`'s fan-out) and sleep 300ms
+    /// before finishing; an external task fires the cancel token at 50ms —
+    /// reliably well before either finishes. Proof of a GENUINE mid-flight
+    /// abort (not merely "the run ended before they were scheduled"):
+    /// both appear in `calls` (dispatch started) but neither in `finished`
+    /// (never got past its sleep). Per `cancel_finalize`'s doc, neither
+    /// gets a `StepResult` — spec §8's "a node with no checkpoint restarts
+    /// clean" — so a resume would simply re-dispatch them, not skip them.
+    #[tokio::test]
+    async fn whole_run_cancel_aborts_in_flight_nodes_and_does_not_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(CANCEL_FANOUT_WF).unwrap();
+        let factory = RecordingFactory::new().slow(&[("a", 300), ("b", 300)]);
+        let calls = Arc::clone(&factory.calls);
+        let finished = Arc::clone(&factory.finished);
+        let opts = opts_for(wf, factory, &tmp, None, None);
+        let resolved_inputs = BTreeMap::new();
+        let mut step_results: Vec<StepResult> = Vec::new();
+
+        let cancel_token = CancellationToken::new();
+        let trigger = cancel_token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(
+                &opts,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                Some(&cancel_token),
+            ),
+        )
+        .await
+        .expect("cancel must not hang");
+
+        match outcome {
+            Err(RunWorkflowError::RunCancelled { aborted }) => {
+                assert_eq!(aborted, 2, "both a and b must have been in-flight and aborted");
+            }
+            other => panic!("expected Err(RunCancelled), got {other:?}"),
+        }
+
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(
+            std::collections::BTreeSet::from_iter(calls.iter().cloned()),
+            std::collections::BTreeSet::from(["a".to_string(), "b".to_string()]),
+            "both must have been dispatched (started) before cancellation: {calls:?}"
+        );
+        let finished = finished.lock().unwrap().clone();
+        assert!(
+            finished.is_empty(),
+            "neither must have run to completion — genuinely aborted mid-flight: {finished:?}"
+        );
+        assert!(
+            !step_results.iter().any(|sr| sr.step_id == "a" || sr.step_id == "b"),
+            "a genuinely cancelled node must NOT be recorded — spec §8: restart clean, not permanently done: {step_results:?}"
+        );
+    }
+
+    const FANOUT_CHECKPOINT_WF: &str = r#"
+name: fanout-checkpoint
+steps:
+  - id: process
+    for_each: "a\nb\nc"
+    agent: worker
+    prompt: "Process {{ item }}"
+    max_parallel: 1
+    distribute:
+      hosts: [h1]
+"#;
+
+    /// Cancels the pause token right AFTER its FIRST dispatch returns a
+    /// real result — i.e. once unit 0's work is genuinely done, not from
+    /// inside its own dispatch (which would race `dispatch_one`'s
+    /// `agent_opts.pause` wiring for a LOCAL unit and risk flagging unit 0
+    /// itself as paused-mid-turn instead of completed). Lifted from
+    /// `tests/pause_resume_e2e.rs`'s `CancelFirstUnitDispatcher` — the
+    /// proven-correct way to land a mid-fan-out pause deterministically.
+    struct CancelFirstUnitDispatcher {
+        token: CancellationToken,
+        calls: Mutex<Vec<usize>>,
+    }
+    #[async_trait]
+    impl UnitDispatcher for CancelFirstUnitDispatcher {
+        async fn dispatch_unit(
+            &self,
+            unit: UnitDispatch,
+            _host: &str,
+        ) -> Result<UnitOutcome, RunError> {
+            let is_first = self.calls.lock().unwrap().is_empty();
+            self.calls.lock().unwrap().push(unit.index);
+            let outcome = UnitOutcome {
+                output: format!("out-{}", unit.index),
+                success: true,
+                error: None,
+                workspace_delta: None,
+            };
+            if is_first {
+                self.token.cancel();
+            }
+            Ok(outcome)
+        }
+    }
+
+    /// Records every dispatched `(index, host)` pair. No cancellation —
+    /// used for the resume pass.
+    #[derive(Default)]
+    struct RecordingUnitDispatcher {
+        calls: Mutex<Vec<usize>>,
+    }
+    #[async_trait]
+    impl UnitDispatcher for RecordingUnitDispatcher {
+        async fn dispatch_unit(
+            &self,
+            unit: UnitDispatch,
+            _host: &str,
+        ) -> Result<UnitOutcome, RunError> {
+            self.calls.lock().unwrap().push(unit.index);
+            Ok(UnitOutcome {
+                output: format!("out-{}", unit.index),
+                success: true,
+                error: None,
+                workspace_delta: None,
+            })
+        }
+    }
+
+    /// **Restart-from-checkpoint reuses `completed_units` unchanged under
+    /// the scheduler (spec §8).** Uses the EXISTING cooperative
+    /// `opts.pause` mechanism (not the new hard-cancel token above) to
+    /// land a pause after exactly the first unit — the only mechanism
+    /// that can extract a graceful mid-fan-out checkpoint at all (a hard
+    /// `.abort()` drops the future instantly with nothing to extract; see
+    /// `cancel_finalize`'s doc). Confirms `run_fanout_step`'s
+    /// `completed_units` replay — built for `run_steps_over` — works
+    /// unchanged when the SAME node is dispatched via `run_scheduler`
+    /// (`run_node` is shared by both drivers): resume replays unit 0 from
+    /// its checkpoint and dispatches ONLY units 1 and 2 fresh.
+    #[tokio::test]
+    async fn fanout_restarts_from_completed_units_checkpoint_under_scheduler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(FANOUT_CHECKPOINT_WF).unwrap();
+        let resolved_inputs = BTreeMap::new();
+
+        let token = CancellationToken::new();
+        let dispatcher1 = Arc::new(CancelFirstUnitDispatcher {
+            token: token.clone(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut opts1 = opts_for(
+            wf.clone(),
+            RecordingFactory::new(),
+            &tmp,
+            Some(token),
+            None,
+        );
+        opts1.unit_dispatcher = Some(dispatcher1.clone());
+        let mut step_results1: Vec<StepResult> = Vec::new();
+
+        let outcome1 = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts1, "", &resolved_inputs, false, None, &mut step_results1, None),
+        )
+        .await
+        .expect("phase 1 must not hang")
+        .expect("phase 1 must not error");
+
+        let fanout_completed_units = match outcome1 {
+            InnerOutcome::Paused {
+                step_id,
+                fanout_completed_units,
+                ..
+            } => {
+                assert_eq!(step_id, "process");
+                fanout_completed_units
+            }
+            other => panic!("expected a mid-fan-out pause, got {other:?}"),
+        };
+        assert_eq!(
+            fanout_completed_units.len(),
+            1,
+            "only the first unit should have completed before the cooperative pause landed"
+        );
+        assert!(fanout_completed_units.contains_key(&0));
+        assert_eq!(
+            dispatcher1.calls.lock().unwrap().clone(),
+            vec![0],
+            "only unit 0 should have reached the dispatcher"
+        );
+
+        let mut completed_units = std::collections::BTreeMap::new();
+        completed_units.insert("process".to_string(), fanout_completed_units);
+        let dispatcher2 = Arc::new(RecordingUnitDispatcher::default());
+        let mut opts2 = opts_for(
+            wf,
+            RecordingFactory::new(),
+            &tmp,
+            None,
+            Some(ResumeState {
+                run_id: String::new(),
+                prior_step_results: Vec::new(),
+                approved_step_id: String::new(),
+                completed_units,
+                reason: PauseReason::Manual,
+                paused_step: None,
+                rejected_reason: None,
+            }),
+        );
+        opts2.unit_dispatcher = Some(dispatcher2.clone());
+        let mut step_results2: Vec<StepResult> = Vec::new();
+        let outcome2 = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_scheduler(&opts2, "", &resolved_inputs, false, None, &mut step_results2, None),
+        )
+        .await
+        .expect("resume must not hang")
+        .expect("resume must not error");
+        assert!(matches!(outcome2, InnerOutcome::Done));
+
+        let process = step_results2
+            .iter()
+            .find(|sr| sr.step_id == "process")
+            .expect("process must complete on resume");
+        assert!(process.success);
+        assert_eq!(
+            process.items.len(),
+            3,
+            "all 3 units accounted for: 1 replayed from checkpoint + 2 freshly dispatched"
+        );
+
+        let mut calls2 = dispatcher2.calls.lock().unwrap().clone();
+        calls2.sort_unstable();
+        assert_eq!(
+            calls2,
+            vec![1, 2],
+            "only the 2 not-yet-completed units should be dispatched on resume: {calls2:?}"
         );
     }
 }

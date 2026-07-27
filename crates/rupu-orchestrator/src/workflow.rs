@@ -50,6 +50,8 @@ pub enum WorkflowParseError {
     },
     #[error("step `{step}`: `max_parallel` must be at least 1, got {value}")]
     InvalidMaxParallel { step: String, value: i64 },
+    #[error("workflow: `max_concurrency` must be at least 1, got {value}")]
+    InvalidMaxConcurrency { value: i64 },
     #[error(
         "step `{step}`: `parallel:` is mutually exclusive with `for_each:` and with the top-level `agent`/`prompt`"
     )]
@@ -186,6 +188,18 @@ pub enum WorkflowParseError {
     OrchestrationNodeHasWork { step: String, kind: String },
     #[error("step `{step}`: `join.wait.count` must be at least 1")]
     JoinCountInvalid { step: String },
+    #[error(
+        "step `{step}`: `join.wait.count` ({count}) exceeds the number of inbound paths that can feed it ({inbound})"
+    )]
+    JoinCountExceedsInbound {
+        step: String,
+        count: u32,
+        inbound: usize,
+    },
+    #[error(
+        "step `{step}`: `join` has no inbound edges — it would never fire, silently stranding it and everything downstream of it"
+    )]
+    JoinNoInboundEdges { step: String },
 }
 
 /// How a workflow gets kicked off. Manual is the existing behavior
@@ -1027,6 +1041,17 @@ pub struct Workflow {
     /// from the workflow name) so their ledger entries accumulate together.
     #[serde(default)]
     pub concerns: Option<ConcernsBlock>,
+    /// Phase-2 DAG scheduler: caps the total number of nodes the scheduler
+    /// runs concurrently across the WHOLE graph (workflow scope — distinct
+    /// from a `parallel:`/`for_each:` step's own `max_parallel:`, which
+    /// caps only that one step's internal fan-out). `None` (the default)
+    /// is unbounded: the scheduler runs every node the graph's dependency
+    /// structure makes ready, including a `split:`'s full fan-out, with no
+    /// artificial cap. Must be at least 1 when set — see
+    /// `WorkflowParseError::InvalidMaxConcurrency`. Not consulted by the
+    /// legacy linear runner (`run_steps_inner`), only by `run_scheduler`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
     pub steps: Vec<Step>,
 }
 
@@ -1042,6 +1067,11 @@ impl Workflow {
         let wf: Workflow = serde_yaml::from_str(s)?;
         if wf.steps.is_empty() {
             return Err(WorkflowParseError::Empty);
+        }
+        if let Some(mc) = wf.max_concurrency {
+            if mc < 1 {
+                return Err(WorkflowParseError::InvalidMaxConcurrency { value: mc as i64 });
+            }
         }
         let mut seen = BTreeSet::new();
         for step in &wf.steps {
@@ -1898,18 +1928,21 @@ pub fn is_nonlinear(wf: &Workflow) -> bool {
     if indeg.values().any(|&d| d > 1) {
         return true;
     }
-    // Honesty check: the linear runner walks `wf.steps` in LIST order and
-    // ignores `next` for dispatch — it only consults the dependency graph
-    // here, to gate. A graph-mode workflow (one with explicit `next`/
-    // `split`/`join`) is only faithfully runnable by that linear walk if
-    // its list order already IS a valid topological order of the full
-    // dependency graph (control edges union inferred `steps.X.*` data
-    // edges — see `workflow_edges`). If some edge `a -> b` (a must run
-    // before b) has `b` declared at or before `a`, the linear runner will
-    // reach `b` before `a` ran and render/execute it against stale or
-    // empty state. This is exactly the class of silent mis-run this gate
-    // exists to prevent, so a violation here routes to the same
-    // `NonlinearNotYetSupported` error as a fork/reconverge/split/join.
+    // Honesty check: the linear runner (`run_steps_inner`) walks
+    // `wf.steps` in LIST order and ignores `next` for dispatch — it only
+    // consults the dependency graph here, to route. A graph-mode workflow
+    // (one with explicit `next`/`split`/`join`) is only faithfully
+    // runnable by that linear walk if its list order already IS a valid
+    // topological order of the full dependency graph (control edges union
+    // inferred `steps.X.*` data edges — see `workflow_edges`). If some
+    // edge `a -> b` (a must run before b) has `b` declared at or before
+    // `a`, the linear runner would reach `b` before `a` ran and
+    // render/execute it against stale or empty state. This is exactly the
+    // class of silent mis-run `is_nonlinear` exists to catch, so a
+    // violation here is treated the same as a fork/reconverge/split/join:
+    // `run_workflow`'s router (`crates/rupu-orchestrator/src/runner.rs`)
+    // sends it to the real dependency-graph scheduler (`run_scheduler`)
+    // instead of the declaration-order loop.
     if workflow_has_explicit_edges(wf) && !declaration_order_is_topological(wf) {
         return true;
     }
@@ -1976,7 +2009,7 @@ fn declaration_order_is_topological(wf: &Workflow) -> bool {
 /// `join:`. Legacy edge-free workflows keep running only the pre-existing
 /// forward-only `validate_branch_targets` / `validate_template_refs`
 /// checks — `validate_graph` never runs for them.
-fn workflow_has_explicit_edges(wf: &Workflow) -> bool {
+pub(crate) fn workflow_has_explicit_edges(wf: &Workflow) -> bool {
     wf.steps
         .iter()
         .any(|s| !s.next.is_empty() || s.split.is_some() || s.join.is_some())
@@ -1992,6 +2025,17 @@ fn workflow_has_explicit_edges(wf: &Workflow) -> bool {
 ///   is acyclic, via Kahn's algorithm.
 fn validate_graph(wf: &Workflow) -> Result<(), WorkflowParseError> {
     let ids: BTreeSet<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
+
+    // Computed once up front (control edges union inferred data edges) so
+    // both the `join.wait.count` inbound-degree check below and cycle
+    // detection at the bottom of this function reuse the same edge set
+    // instead of recomputing it.
+    let edges = workflow_edges(wf);
+    let mut inbound_degree: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, b) in &edges {
+        *inbound_degree.entry(b.as_str()).or_insert(0) += 1;
+    }
+
     for step in &wf.steps {
         let is_orch = step.split.is_some() || step.join.is_some();
         let has_work = step.agent.is_some()
@@ -2011,14 +2055,36 @@ fn validate_graph(wf: &Workflow) -> Result<(), WorkflowParseError> {
                 },
             });
         }
-        if let Some(Join {
-            wait: JoinWait::Count { count },
-        }) = &step.join
-        {
-            if *count < 1 {
-                return Err(WorkflowParseError::JoinCountInvalid {
+        if let Some(join) = &step.join {
+            // A join with zero inbound edges can never fire under ANY wait
+            // policy (`all`/`any`/`count`) — its arrival tracking never
+            // gets a single completion to react to, so it (and everything
+            // downstream of it) would silently never run while the rest of
+            // the workflow reports `Done`. Reject unconditionally, not just
+            // for the `count` form.
+            let inbound = inbound_degree.get(step.id.as_str()).copied().unwrap_or(0);
+            if inbound == 0 {
+                return Err(WorkflowParseError::JoinNoInboundEdges {
                     step: step.id.clone(),
                 });
+            }
+            if let JoinWait::Count { count } = &join.wait {
+                if *count < 1 {
+                    return Err(WorkflowParseError::JoinCountInvalid {
+                        step: step.id.clone(),
+                    });
+                }
+                // A join can never actually reach a count higher than the
+                // number of paths that feed it — reject at parse time
+                // rather than let the scheduler wait forever on inbound
+                // paths that don't exist (spec §5).
+                if (*count as usize) > inbound {
+                    return Err(WorkflowParseError::JoinCountExceedsInbound {
+                        step: step.id.clone(),
+                        count: *count,
+                        inbound,
+                    });
+                }
             }
         }
         for t in step.next.iter().chain(step.split.iter().flatten()) {
@@ -2037,7 +2103,6 @@ fn validate_graph(wf: &Workflow) -> Result<(), WorkflowParseError> {
     }
 
     // Cycle detection over the full dependency graph (Kahn's algorithm).
-    let edges = workflow_edges(wf);
     let mut indeg: BTreeMap<&str, usize> = wf.steps.iter().map(|s| (s.id.as_str(), 0)).collect();
     let mut adj: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (a, b) in &edges {
@@ -2673,14 +2738,14 @@ steps:
 
     #[test]
     fn join_wait_count_and_any_parse() {
-        let any = Workflow::parse("name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: j\n    join: { wait: any }\n").unwrap();
+        let any = Workflow::parse("name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [j]\n  - id: j\n    join: { wait: any }\n").unwrap();
         assert!(matches!(
             any.steps[1].join.as_ref().unwrap().wait,
             JoinWait::Keyword(JoinWaitKeyword::Any)
         ));
-        let cnt = Workflow::parse("name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: j\n    join: { wait: { count: 2 } }\n").unwrap();
+        let cnt = Workflow::parse("name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [j]\n  - id: b\n    agent: x\n    prompt: p\n    next: [j]\n  - id: j\n    join: { wait: { count: 2 } }\n").unwrap();
         assert!(matches!(
-            cnt.steps[1].join.as_ref().unwrap().wait,
+            cnt.steps[2].join.as_ref().unwrap().wait,
             JoinWait::Count { count: 2 }
         ));
     }
@@ -2691,7 +2756,7 @@ steps:
             ("all", JoinWait::Keyword(JoinWaitKeyword::All)),
             ("any", JoinWait::Keyword(JoinWaitKeyword::Any)),
         ] {
-            let raw = format!("name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: j\n    join: {{ wait: {yaml_wait} }}\n");
+            let raw = format!("name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [j]\n  - id: j\n    join: {{ wait: {yaml_wait} }}\n");
             let wf = Workflow::parse(&raw).unwrap();
             assert_eq!(wf.steps[1].join.as_ref().unwrap().wait, expected);
             let out = serde_yaml::to_string(&wf).unwrap();
@@ -2699,16 +2764,16 @@ steps:
             assert_eq!(wf2.steps[1].join.as_ref().unwrap().wait, expected);
         }
 
-        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: j\n    join: { wait: { count: 2 } }\n";
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [j]\n  - id: b\n    agent: x\n    prompt: p\n    next: [j]\n  - id: j\n    join: { wait: { count: 2 } }\n";
         let wf = Workflow::parse(raw).unwrap();
         assert_eq!(
-            wf.steps[1].join.as_ref().unwrap().wait,
+            wf.steps[2].join.as_ref().unwrap().wait,
             JoinWait::Count { count: 2 }
         );
         let out = serde_yaml::to_string(&wf).unwrap();
         let wf2 = Workflow::parse(&out).unwrap();
         assert_eq!(
-            wf2.steps[1].join.as_ref().unwrap().wait,
+            wf2.steps[2].join.as_ref().unwrap().wait,
             JoinWait::Count { count: 2 }
         );
     }
@@ -2775,6 +2840,49 @@ steps:
             Workflow::parse(raw).unwrap_err(),
             WorkflowParseError::JoinCountInvalid { .. }
         ));
+    }
+
+    #[test]
+    fn join_count_exceeding_inbound_degree_is_invalid() {
+        // Only 2 inbound edges (a, b) feed `j`, but `count: 3` demands more
+        // paths than can ever arrive — must be rejected at parse time
+        // rather than let the scheduler wait forever.
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [j]\n  - id: b\n    agent: x\n    prompt: p\n    next: [j]\n  - id: j\n    join: { wait: { count: 3 } }\n";
+        let err = Workflow::parse(raw).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WorkflowParseError::JoinCountExceedsInbound {
+                    count: 3,
+                    inbound: 2,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn join_with_zero_inbound_edges_is_rejected_regardless_of_wait_policy() {
+        // A join nobody feeds would never fire under ANY policy (`all`,
+        // `any`, or `count`), silently stranding it and everything
+        // downstream while the run reports `Done` — reject at parse time.
+        for wait in ["all", "any", "{ count: 1 }"] {
+            let raw = format!(
+                "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: j\n    join: {{ wait: {wait} }}\n"
+            );
+            let err = Workflow::parse(&raw).unwrap_err();
+            assert!(
+                matches!(err, WorkflowParseError::JoinNoInboundEdges { .. }),
+                "wait: {wait}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn join_count_equal_to_inbound_degree_is_valid() {
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [j]\n  - id: b\n    agent: x\n    prompt: p\n    next: [j]\n  - id: j\n    join: { wait: { count: 2 } }\n";
+        Workflow::parse(raw).expect("count equal to inbound degree must be accepted");
     }
 
     #[test]

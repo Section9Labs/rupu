@@ -51,6 +51,7 @@ fn seed_scoped_run(id: &str, ws_id: &str, proj_path: &Path, status: RunStatus) -
             Some(Utc::now())
         },
         error_message: None,
+        awaiting: Vec::new(),
         awaiting_step_id: None,
         approval_prompt: None,
         awaiting_since: None,
@@ -59,6 +60,7 @@ fn seed_scoped_run(id: &str, ws_id: &str, proj_path: &Path, status: RunStatus) -
         resume_claimed_at: None,
         resume_claimed_by: None,
         resume_mode: None,
+        resume_gate_id: None,
         issue_ref: None,
         issue: None,
         parent_run_id: None,

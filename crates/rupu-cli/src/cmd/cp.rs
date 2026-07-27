@@ -564,55 +564,108 @@ async fn run_resume_worker(
             };
             let store = Arc::clone(&store);
             let run_id = run.id.clone();
-            tokio::spawn(async move {
-                let now2 = chrono::Utc::now();
-                // Capture the requested resume mode while the marker is still
-                // present, then hand the run off to a detached
-                // `rupu workflow <subcommand> <run_id> [--mode <m>]` child.
-                // The child does `store.approve`/the checkpoint-resume flip +
-                // the in-process resume in ITS OWN process, so the resumed
-                // run is independently killable (Cancel) and a resume crash
-                // can't take down `cp serve`. The web marker leaves the run
-                // AwaitingApproval/Paused, so the child's precondition holds.
-                let mode = store.load(&run_id).ok().and_then(|r| r.resume_mode.clone());
+            tokio::spawn(resume_one_run(store, run_id, subcommand, None));
+        }
+    }
+}
 
-                let exe = match std::env::current_exe() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!(run_id = %run_id, error = %e, "resume worker: cannot resolve current exe; clearing marker");
-                        if let Err(ce) = store.clear_resume(&run_id, now2) {
-                            tracing::warn!(run_id = %run_id, error = %ce, "resume worker: clear_resume failed");
-                        }
-                        return;
-                    }
-                };
+/// Build the `rupu workflow <subcommand> <run_id> [--gate <g>] [--mode <m>]`
+/// argv the resume worker spawns for a claimed run. Pure + independently
+/// testable (T5b-2b-i correctness fix, spec §7): `gate` MUST come from the
+/// run's `resume_gate_id` MARKER field, not live `awaiting_step_id` — a
+/// second concurrent approve request can reorder the latter before this
+/// runs, but the marker is immutable once written (see `resume_gate_id`'s
+/// doc on `RunRecord`) — and is only ever appended for the `approve`
+/// subcommand: a `Paused` resume (`workflow resume`) has no gate concept.
+///
+/// Without `--gate` on a genuinely >1-gate run, `workflow approve` hits
+/// `AmbiguousGate` and the detached child exits non-zero — but the caller
+/// already cleared the marker on a successful SPAWN (not on the child's
+/// eventual exit status, which it can't observe — the child is detached),
+/// so a missing `--gate` here permanently strands the run
+/// `AwaitingApproval` with every gate still parked. This was a real,
+/// shipped bug (fixed as part of T5b-2b-i) — see
+/// `resume_one_run_passes_the_markers_gate_id_to_the_spawned_approve_child`
+/// for the regression test.
+fn build_resume_argv<'a>(
+    subcommand: &'a str,
+    run_id: &'a str,
+    gate: Option<&'a str>,
+    mode: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut argv: Vec<&str> = vec!["workflow", subcommand, run_id];
+    if subcommand == "approve" {
+        if let Some(g) = gate {
+            argv.push("--gate");
+            argv.push(g);
+        }
+    }
+    if let Some(m) = mode {
+        argv.push("--mode");
+        argv.push(m);
+    }
+    argv
+}
 
-                let mut argv: Vec<&str> = vec!["workflow", subcommand, &run_id];
-                if let Some(m) = mode.as_deref() {
-                    argv.push("--mode");
-                    argv.push(m);
+/// Resolve + spawn the detached `rupu workflow <subcommand> <run_id> [...]`
+/// child for ONE already-claimed run (the resume worker's per-run body,
+/// extracted so tests can drive it directly instead of waiting out the
+/// worker's 4s poll interval), then clear its resume marker on either a
+/// successful spawn (the child now owns the run) or a failed one (so a
+/// poisoned run isn't retried forever).
+///
+/// Captures the requested resume mode AND the targeted gate (T5b-2b-i) from
+/// the run's marker fields (`resume_mode`/`resume_gate_id`) while the
+/// marker is still present, then hands off to
+/// [`build_resume_argv`]. `exe_override` lets tests point at a fake
+/// executable instead of `std::env::current_exe()` (the production
+/// default, used when `None`) — e.g. a capture script that records its
+/// argv, so a test can assert on the EXACT argv the real `rupu` binary
+/// would have received, rather than just on marker-field plumbing.
+async fn resume_one_run(
+    store: Arc<RunStore>,
+    run_id: String,
+    subcommand: &'static str,
+    exe_override: Option<std::path::PathBuf>,
+) {
+    let now2 = chrono::Utc::now();
+    let loaded = store.load(&run_id).ok();
+    let mode = loaded.as_ref().and_then(|r| r.resume_mode.clone());
+    let gate = loaded.as_ref().and_then(|r| r.resume_gate_id.clone());
+
+    let exe = match exe_override {
+        Some(p) => p,
+        None => match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(run_id = %run_id, error = %e, "resume worker: cannot resolve current exe; clearing marker");
+                if let Err(ce) = store.clear_resume(&run_id, now2) {
+                    tracing::warn!(run_id = %run_id, error = %ce, "resume worker: clear_resume failed");
                 }
+                return;
+            }
+        },
+    };
 
-                match std::process::Command::new(&exe).args(&argv).spawn() {
-                    Ok(_child) => {
-                        // Detached: do NOT wait. The child now owns the run;
-                        // clear the marker so we don't re-claim it.
-                        tracing::info!(run_id = %run_id, subcommand, "spawned workflow subprocess to resume");
-                        if let Err(ce) = store.clear_resume(&run_id, now2) {
-                            tracing::warn!(run_id = %run_id, error = %ce, "resume worker: clear_resume failed");
-                        } else {
-                            tracing::info!(run_id = %run_id, "resume worker: cleared resume marker");
-                        }
-                    }
-                    Err(e) => {
-                        // Don't retry a poisoned spawn forever; clear marker.
-                        tracing::error!(run_id = %run_id, subcommand, error = %e, "resume worker: spawn workflow subprocess failed; clearing marker");
-                        if let Err(ce) = store.clear_resume(&run_id, now2) {
-                            tracing::warn!(run_id = %run_id, error = %ce, "resume worker: clear_resume failed");
-                        }
-                    }
-                }
-            });
+    let argv = build_resume_argv(subcommand, &run_id, gate.as_deref(), mode.as_deref());
+
+    match std::process::Command::new(&exe).args(&argv).spawn() {
+        Ok(_child) => {
+            // Detached: do NOT wait. The child now owns the run;
+            // clear the marker so we don't re-claim it.
+            tracing::info!(run_id = %run_id, subcommand, "spawned workflow subprocess to resume");
+            if let Err(ce) = store.clear_resume(&run_id, now2) {
+                tracing::warn!(run_id = %run_id, error = %ce, "resume worker: clear_resume failed");
+            } else {
+                tracing::info!(run_id = %run_id, "resume worker: cleared resume marker");
+            }
+        }
+        Err(e) => {
+            // Don't retry a poisoned spawn forever; clear marker.
+            tracing::error!(run_id = %run_id, subcommand, error = %e, "resume worker: spawn workflow subprocess failed; clearing marker");
+            if let Err(ce) = store.clear_resume(&run_id, now2) {
+                tracing::warn!(run_id = %run_id, error = %ce, "resume worker: clear_resume failed");
+            }
         }
     }
 }
@@ -682,127 +735,184 @@ async fn run_gate_sweep(
                     tracing::debug!(run_id = %run_id, "gate sweep: skipping remote-host awaiting run");
                     continue;
                 }
-                let expired = rec.expires_at.is_some_and(|exp| now > exp);
-                // Cheap short-circuit: a gate that isn't overdue yet needs no
-                // snapshot read / expire call (the decision would be `Skip`).
-                if !expired {
-                    continue;
-                }
-                let on_timeout = store.resolve_gate_timeout(&rec);
-                let decision = sweep_decision(rec.status, on_timeout, expired, None, is_remote);
-                // Capture the gate step id BEFORE expire_if_overdue clears it
-                // (the reject branch nulls awaiting_step_id).
-                let gate_step_id = rec.awaiting_step_id.clone();
-                let expire_res = store.expire_if_overdue(&mut rec, now, on_timeout);
-                let outcome = match expire_res {
-                    Ok(o) => o,
-                    Err(e) => {
-                        tracing::warn!(run_id = %run_id, error = %e, "gate sweep: expire_if_overdue failed");
+                // Task 5b-2a (spec §7/§8): iterate the FULL awaiting set —
+                // one element for a legacy/single-gate run (see
+                // `awaiting_gates`'s normalization), several for a genuine
+                // multi-gate DAG run — so each gate's OWN `on_timeout`
+                // policy resolves independently rather than assuming "the
+                // sole/first gate". Snapshotted before the loop: a `Fail`
+                // action on one gate finalizes the WHOLE run
+                // (`expire_gate_if_overdue`'s doc), which must stop this
+                // loop from touching sibling gates that no longer exist on
+                // a terminal record.
+                let gates_snapshot = rec.awaiting_gates();
+                for gate in gates_snapshot {
+                    if rec.status != rupu_orchestrator::RunStatus::AwaitingApproval {
+                        break;
+                    }
+                    let expired = gate.expires_at.is_some_and(|exp| now > exp);
+                    // Cheap short-circuit: a gate that isn't overdue yet
+                    // needs no snapshot read / expire call (the decision
+                    // would be `Skip`).
+                    if !expired {
                         continue;
                     }
-                };
-                match decision {
-                    SweepAction::Skip => {
-                        // Not overdue, or Fail/default already finalized inside
-                        // the expire call.
-                        if matches!(outcome, Some(rupu_orchestrator::TimeoutAction::Fail)) {
-                            tracing::info!(run_id = %run_id, "gate sweep: gate timed out → run failed");
+                    let gate_step_id = gate.step_id.clone();
+                    let on_timeout = store.resolve_gate_timeout_for(&rec, &gate_step_id);
+                    let decision = sweep_decision(rec.status, on_timeout, expired, None, is_remote);
+                    let expire_res =
+                        store.expire_gate_if_overdue(&mut rec, &gate_step_id, now, on_timeout);
+                    let outcome = match expire_res {
+                        Ok(o) => o,
+                        Err(e) => {
+                            tracing::warn!(run_id = %run_id, gate = %gate_step_id, error = %e, "gate sweep: expire_gate_if_overdue failed");
+                            continue;
                         }
-                    }
-                    SweepAction::ExpireApprove => {
-                        // Claim the resume lease before spawning: the web
-                        // approve path's `run_resume_worker` also spawns
-                        // `workflow approve` for AwaitingApproval runs it
-                        // finds via `list_pending_resume`, and both paths
-                        // race on the SAME `resume_claimed_at` field
-                        // regardless of which one requested the resume — so
-                        // claiming here stops the sweep from re-spawning a
-                        // second approve for a run the resume worker (or a
-                        // prior sweep tick) already handed off.
-                        let claimed = match store.claim_resume(&run_id, &worker_id, now) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                tracing::warn!(run_id = %run_id, error = %e, "gate sweep: claim_resume failed");
+                    };
+                    match decision {
+                        SweepAction::Skip => {
+                            // Not overdue, or Fail/default already finalized
+                            // inside the expire call.
+                            if matches!(outcome, Some(rupu_orchestrator::TimeoutAction::Fail)) {
+                                tracing::info!(run_id = %run_id, gate = %gate_step_id, "gate sweep: gate timed out → run failed");
+                            }
+                        }
+                        SweepAction::ExpireApprove => {
+                            // Claim the resume lease before spawning: the web
+                            // approve path's `run_resume_worker` also spawns
+                            // `workflow approve` for AwaitingApproval runs it
+                            // finds via `list_pending_resume`, and both paths
+                            // race on the SAME `resume_claimed_at` field
+                            // regardless of which one requested the resume — so
+                            // claiming here stops the sweep from re-spawning a
+                            // second approve for a run the resume worker (or a
+                            // prior sweep tick) already handed off.
+                            let claimed = match store.claim_resume(&run_id, &worker_id, now) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    tracing::warn!(run_id = %run_id, error = %e, "gate sweep: claim_resume failed");
+                                    continue;
+                                }
+                            };
+                            if !claimed {
+                                tracing::info!(run_id = %run_id, "gate-sweep: approve already claimed for run_id, skipping");
                                 continue;
                             }
-                        };
-                        if !claimed {
-                            tracing::info!(run_id = %run_id, "gate-sweep: approve already claimed for run_id, skipping");
-                            continue;
-                        }
-                        // expire left the record AwaitingApproval; hand off to a
-                        // detached `rupu workflow approve <id>`, which re-resolves
-                        // the on_timeout: approve policy and does the approve +
-                        // in-process resume in its own killable process (mirrors
-                        // the resume worker's detached spawn).
-                        let mut argv: Vec<&str> = vec!["workflow", "approve", &run_id];
-                        if let Some(m) = rec.resume_mode.as_deref() {
-                            argv.push("--mode");
-                            argv.push(m);
-                        }
-                        match std::process::Command::new(&exe).args(&argv).spawn() {
-                            Ok(_child) => {
-                                tracing::info!(run_id = %run_id, "gate sweep: on_timeout=approve → spawned detached workflow approve");
+                            // expire left the record AwaitingApproval; hand off
+                            // to a detached `rupu workflow approve <id> --gate
+                            // <gate_step_id>`, which re-resolves the
+                            // on_timeout: approve policy and does the approve +
+                            // in-process resume in its own killable process
+                            // (mirrors the resume worker's detached spawn).
+                            // `--gate` targets exactly the timed-out gate —
+                            // required once >1 gate can be parked (a bare
+                            // `approve` would hit `AmbiguousGate` if a sibling
+                            // is still parked), harmless for the sole-gate
+                            // case.
+                            let mut argv: Vec<&str> =
+                                vec!["workflow", "approve", &run_id, "--gate", &gate_step_id];
+                            if let Some(m) = rec.resume_mode.as_deref() {
+                                argv.push("--mode");
+                                argv.push(m);
                             }
-                            Err(e) => {
-                                tracing::error!(run_id = %run_id, error = %e, "gate sweep: failed to spawn workflow approve for on_timeout=approve");
-                            }
-                        }
-                        // The spawned child now owns the run (or the spawn
-                        // failed and we don't want to strand the lease
-                        // either way) — clear the marker/claim exactly like
-                        // the resume worker does after its own spawn.
-                        if let Err(ce) = store.clear_resume(&run_id, now) {
-                            tracing::warn!(run_id = %run_id, error = %ce, "gate sweep: clear_resume failed");
-                        }
-                    }
-                    SweepAction::ExpireThenCleanupReject => {
-                        // expire finalized the run Rejected. Run the same
-                        // on_reject cleanup chain the CLI reject path runs.
-                        if !matches!(outcome, Some(rupu_orchestrator::TimeoutAction::Reject)) {
-                            tracing::warn!(run_id = %run_id, "gate sweep: expected reject outcome for on_timeout=reject but got {outcome:?}; skipping cleanup");
-                            continue;
-                        }
-                        let step_id = gate_step_id.unwrap_or_default();
-                        let reason = rec
-                            .error_message
-                            .clone()
-                            .unwrap_or_else(|| "gate timed out (on_timeout: reject)".to_string());
-                        tracing::info!(run_id = %run_id, step_id = %step_id, "gate sweep: on_timeout=reject → run auto-rejected; running on_reject cleanup");
-                        if crate::cmd::workflow::cheap_on_reject_chain_len(&store, &run_id, &step_id)
-                            != Some(0)
-                        {
-                            match crate::resume::build_reject_cleanup_opts(
-                                &store,
-                                &run_id,
-                                &step_id,
-                                &reason,
-                                rec.resume_mode.as_deref(),
-                            )
-                            .await
-                            {
-                                Ok((opts, chain_len)) => {
-                                    match rupu_orchestrator::runner::run_reject_cleanup(
-                                        opts, &step_id, &reason, "timeout",
-                                    )
-                                    .await
-                                    {
-                                        Ok(()) => {
-                                            tracing::info!(run_id = %run_id, chain_len, "gate sweep: on_reject cleanup chain executed");
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(run_id = %run_id, error = %e, "gate sweep: on_reject cleanup chain errored (run is already rejected)");
-                                        }
-                                    }
+                            match std::process::Command::new(&exe).args(&argv).spawn() {
+                                Ok(_child) => {
+                                    tracing::info!(run_id = %run_id, gate = %gate_step_id, "gate sweep: on_timeout=approve → spawned detached workflow approve");
+                                    // Minor (5b-2a handoff): the detached child
+                                    // now independently owns approving THIS
+                                    // gate — it will call `store.approve_gate`
+                                    // itself, which persists removing
+                                    // `gate_step_id` from `awaiting`. Mirror
+                                    // that removal in THIS in-memory `rec` too
+                                    // so a sibling gate processed later in the
+                                    // SAME sweep pass (e.g. an
+                                    // `ExpireThenCleanupReject` arm below, via
+                                    // `expire_gate_if_overdue`'s
+                                    // `self.update(record)`) doesn't clobber
+                                    // the child's concurrent write by
+                                    // re-persisting a full record that still
+                                    // shows this gate parked — a race that
+                                    // otherwise transiently flips the run back
+                                    // to `AwaitingApproval[gate_step_id]`
+                                    // (self-heals once the child's own write
+                                    // lands, but must not be reintroduced by a
+                                    // sibling's write in this same pass). Only
+                                    // done on a successful spawn: on a failed
+                                    // spawn no child exists to race against,
+                                    // and the gate is still genuinely parked
+                                    // on disk for the next sweep tick to retry.
+                                    rec.awaiting = rec
+                                        .awaiting_gates()
+                                        .into_iter()
+                                        .filter(|g| g.step_id != gate_step_id)
+                                        .collect();
+                                    rec.sync_awaiting_compat();
                                 }
                                 Err(e) => {
-                                    tracing::warn!(run_id = %run_id, error = %e, "gate sweep: could not build on_reject cleanup opts (run is already rejected)");
+                                    tracing::error!(run_id = %run_id, gate = %gate_step_id, error = %e, "gate sweep: failed to spawn workflow approve for on_timeout=approve");
+                                }
+                            }
+                            // The spawned child now owns the run (or the spawn
+                            // failed and we don't want to strand the lease
+                            // either way) — clear the marker/claim exactly like
+                            // the resume worker does after its own spawn.
+                            if let Err(ce) = store.clear_resume(&run_id, now) {
+                                tracing::warn!(run_id = %run_id, error = %ce, "gate sweep: clear_resume failed");
+                            }
+                        }
+                        SweepAction::ExpireThenCleanupReject => {
+                            // expire_gate_if_overdue removed THIS gate from
+                            // the set (and finalized the run Rejected only if
+                            // that emptied it — other parked gates may still
+                            // remain). Run the same on_reject cleanup chain
+                            // the CLI reject path runs, scoped to this gate.
+                            if !matches!(outcome, Some(rupu_orchestrator::TimeoutAction::Reject)) {
+                                tracing::warn!(run_id = %run_id, gate = %gate_step_id, "gate sweep: expected reject outcome for on_timeout=reject but got {outcome:?}; skipping cleanup");
+                                continue;
+                            }
+                            let reason = rec
+                                .error_message
+                                .clone()
+                                .unwrap_or_else(|| "gate timed out (on_timeout: reject)".to_string());
+                            tracing::info!(run_id = %run_id, step_id = %gate_step_id, "gate sweep: on_timeout=reject → gate auto-rejected; running on_reject cleanup");
+                            if crate::cmd::workflow::cheap_on_reject_chain_len(
+                                &store,
+                                &run_id,
+                                &gate_step_id,
+                            ) != Some(0)
+                            {
+                                match crate::resume::build_reject_cleanup_opts(
+                                    &store,
+                                    &run_id,
+                                    &gate_step_id,
+                                    &reason,
+                                    rec.resume_mode.as_deref(),
+                                )
+                                .await
+                                {
+                                    Ok((opts, chain_len)) => {
+                                        match rupu_orchestrator::runner::run_reject_cleanup(
+                                            opts, &gate_step_id, &reason, "timeout",
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => {
+                                                tracing::info!(run_id = %run_id, gate = %gate_step_id, chain_len, "gate sweep: on_reject cleanup chain executed");
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(run_id = %run_id, gate = %gate_step_id, error = %e, "gate sweep: on_reject cleanup chain errored (gate already rejected)");
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(run_id = %run_id, gate = %gate_step_id, error = %e, "gate sweep: could not build on_reject cleanup opts (gate already rejected)");
+                                    }
                                 }
                             }
                         }
-                    }
-                    SweepAction::Reap => {
-                        tracing::warn!(run_id = %run_id, "gate sweep: unexpected Reap decision for AwaitingApproval run; skipping");
+                        SweepAction::Reap => {
+                            tracing::warn!(run_id = %run_id, gate = %gate_step_id, "gate sweep: unexpected Reap decision for AwaitingApproval run; skipping");
+                        }
                     }
                 }
             }
@@ -833,11 +943,519 @@ async fn run_gate_sweep(
 
 #[cfg(test)]
 mod tests {
-    use super::{run_periodic_tick, sweep_decision, SweepAction};
+    use super::{
+        build_resume_argv, resume_one_run, run_gate_sweep, run_periodic_tick, sweep_decision,
+        SweepAction,
+    };
     use rupu_orchestrator::{RunStatus, TimeoutAction};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    // ── T5b-2b-i correctness fix: the resume worker's gate-id round-trip ──
+
+    #[test]
+    fn build_resume_argv_includes_gate_only_for_approve_when_present() {
+        // The bug: on a >1-gate run, the worker used to omit `--gate`
+        // entirely, so the spawned `workflow approve` hit `AmbiguousGate`
+        // and exited non-zero while the marker had already been cleared —
+        // permanently stranding the run `AwaitingApproval` with every gate
+        // still parked. `--gate` must be present whenever a gate id was
+        // resolved AND the subcommand is `approve`.
+        assert_eq!(
+            build_resume_argv("approve", "run_x", Some("gate_b"), None),
+            vec!["workflow", "approve", "run_x", "--gate", "gate_b"],
+        );
+        // Legacy/sole-gate marker (no gate id resolved) — back-compat,
+        // `--gate` omitted exactly like before this field existed.
+        assert_eq!(
+            build_resume_argv("approve", "run_x", None, None),
+            vec!["workflow", "approve", "run_x"],
+        );
+        // `--mode` composes with `--gate`.
+        assert_eq!(
+            build_resume_argv("approve", "run_x", Some("gate_b"), Some("bypass")),
+            vec!["workflow", "approve", "run_x", "--gate", "gate_b", "--mode", "bypass"],
+        );
+        // `workflow resume` (a cooperative-pause resume) has no gate
+        // concept — `--gate` must never appear even if `gate` is `Some`
+        // (e.g. a stale marker field left over from a different flow).
+        assert_eq!(
+            build_resume_argv("resume", "run_x", Some("gate_b"), None),
+            vec!["workflow", "resume", "run_x"],
+        );
+    }
+
+    /// A 2-gate `AwaitingApproval` run for the resume-worker round-trip
+    /// tests — both `gate_a` and `gate_b` genuinely parked.
+    fn multi_gate_resume_record(id: &str) -> rupu_orchestrator::RunRecord {
+        use rupu_orchestrator::runs::AwaitingGate;
+        let now = chrono::Utc::now();
+        let mut rec = rupu_orchestrator::RunRecord {
+            id: id.into(),
+            workflow_name: "g".into(),
+            status: RunStatus::AwaitingApproval,
+            inputs: std::collections::BTreeMap::new(),
+            event: None,
+            workspace_id: "ws_1".into(),
+            workspace_path: std::path::PathBuf::from("/tmp/proj"),
+            transcript_dir: std::path::PathBuf::from("/tmp/proj/.rupu/transcripts"),
+            started_at: now,
+            finished_at: None,
+            final_output: None,
+            error_message: None,
+            awaiting: vec![
+                AwaitingGate {
+                    step_id: "gate_a".into(),
+                    prompt: Some("approve a?".into()),
+                    since: now,
+                    expires_at: None,
+                },
+                AwaitingGate {
+                    step_id: "gate_b".into(),
+                    prompt: Some("approve b?".into()),
+                    since: now,
+                    expires_at: None,
+                },
+            ],
+            awaiting_step_id: None,
+            approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            resume_gate_id: None,
+        };
+        rec.sync_awaiting_compat();
+        rec
+    }
+
+    /// The full round-trip this bug slipped through on: a web operator
+    /// approves gate_b of a 2-gate run (`request_resume_approval` — the
+    /// EXACT call `api/runs.rs`'s `approve_run` makes), which sets the
+    /// `resume_gate_id` marker; `resume_one_run` (the resume worker's
+    /// per-run body) then reads that marker and spawns the child with
+    /// `--gate gate_b` in its REAL argv — verified by pointing the spawn at
+    /// a capture script instead of a real `rupu` binary, so this asserts on
+    /// the literal argv a production spawn would receive, not just on
+    /// marker-field plumbing. Must FAIL on the pre-fix code (which had no
+    /// `resume_gate_id` field/argv wiring at all — verified via a temporary
+    /// revert, see the T5b-2b-i report) and PASS with the fix.
+    #[tokio::test]
+    async fn resume_one_run_passes_the_markers_gate_id_to_the_spawned_approve_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
+        let rec = multi_gate_resume_record("run_resume_worker_gate_b");
+        store
+            .create(
+                rec.clone(),
+                "name: g\nsteps:\n  - id: gate_a\n    approval: {}\n  - id: gate_b\n    approval: {}\n",
+            )
+            .unwrap();
+
+        // Simulate the web operator approving gate_b specifically — the
+        // exact `RunStore` call `POST /api/runs/:id/approve?gate=gate_b`
+        // makes (api/runs.rs's `approve_run`).
+        let now = chrono::Utc::now();
+        store
+            .request_resume_approval(&rec.id, "web", None, now, Some("gate_b"))
+            .expect("approving gate_b of a 2-gate run should succeed");
+        // Sanity: the marker really does carry the target gate.
+        assert_eq!(
+            store.load(&rec.id).unwrap().resume_gate_id.as_deref(),
+            Some("gate_b")
+        );
+
+        // A capture script standing in for the real `rupu` binary: appends
+        // its argv to a file instead of actually running anything.
+        let capture_path = tmp.path().join("captured_argv.txt");
+        let script_path = tmp.path().join("capture.sh");
+        std::fs::write(
+            &script_path,
+            format!("#!/bin/sh\necho \"$@\" >> {}\n", capture_path.display()),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        resume_one_run(
+            Arc::clone(&store),
+            rec.id.clone(),
+            "approve",
+            Some(script_path),
+        )
+        .await;
+
+        // The script runs asynchronously (detached, not awaited by
+        // `resume_one_run` itself) — poll briefly for its output.
+        let mut captured = None;
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&capture_path) {
+                captured = Some(s);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let captured = captured.expect("capture script should have run and recorded its argv");
+        assert!(
+            captured.contains("--gate gate_b"),
+            "spawned child's argv was: {captured:?} — missing --gate gate_b"
+        );
+        // gate_a must not appear as the target.
+        assert!(!captured.contains("--gate gate_a"));
+
+        // The marker was cleared (spawn succeeded) — the child now owns
+        // resolving gate_b for real.
+        let reloaded = store.load(&rec.id).unwrap();
+        assert!(reloaded.resume_requested_at.is_none());
+        assert!(reloaded.resume_gate_id.is_none());
+    }
+
+    /// Single-gate parity: a legacy/sole-gate marker (`resume_gate_id:
+    /// None`) must still spawn a working `workflow approve` — `--gate`
+    /// omitted, exactly like before this field existed.
+    #[tokio::test]
+    async fn resume_one_run_omits_gate_for_a_sole_gate_marker() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
+        let mut rec = multi_gate_resume_record("run_resume_worker_sole");
+        // Collapse to a single parked gate.
+        rec.awaiting.truncate(1);
+        rec.sync_awaiting_compat();
+        store
+            .create(rec.clone(), "name: g\nsteps:\n  - id: gate_a\n    approval: {}\n")
+            .unwrap();
+
+        let now = chrono::Utc::now();
+        store
+            .request_resume_approval(&rec.id, "web", None, now, None)
+            .expect("approving the sole gate with no explicit id should work as today");
+        assert_eq!(store.load(&rec.id).unwrap().resume_gate_id, None);
+
+        let capture_path = tmp.path().join("captured_argv.txt");
+        let script_path = tmp.path().join("capture.sh");
+        std::fs::write(
+            &script_path,
+            format!("#!/bin/sh\necho \"$@\" >> {}\n", capture_path.display()),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        resume_one_run(
+            Arc::clone(&store),
+            rec.id.clone(),
+            "approve",
+            Some(script_path),
+        )
+        .await;
+
+        let mut captured = None;
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&capture_path) {
+                captured = Some(s);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let captured = captured.expect("capture script should have run and recorded its argv");
+        assert!(
+            !captured.contains("--gate"),
+            "sole-gate resume must not pass --gate: {captured:?}"
+        );
+    }
+
+    /// gate_a: `timeout_seconds: 10`, `on_timeout: reject`, no `on_reject:`
+    /// (an empty chain — `cheap_on_reject_chain_len` short-circuits before
+    /// the heavy `build_reject_cleanup_opts`/`run_reject_cleanup` path,
+    /// which needs real config/resolver/MCP-registry wiring this unit test
+    /// deliberately avoids). gate_b: a plain gate with NO timeout — must
+    /// never be touched by timing out gate_a.
+    const GATE_A_REJECT_GATE_B_NONE_YAML: &str =
+        "name: g\nsteps:\n  - id: gate_a\n    approval:\n      timeout_seconds: 10\n      on_timeout: reject\n  - id: gate_b\n    approval: {}\n";
+
+    /// Task 5b-2a: the sweep must time out ONLY the overdue gate in a
+    /// multi-gate `awaiting` set, leaving every other parked gate — and the
+    /// run's `AwaitingApproval` status — untouched.
+    #[tokio::test]
+    async fn run_gate_sweep_times_out_only_the_overdue_gate_leaves_sibling_parked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
+        let hosts = rupu_workspace::HostStore {
+            root: tmp.path().join("hosts"),
+        };
+        // Never actually spawned in this scenario: the only overdue gate
+        // routes to `on_timeout: reject` with a 0-length `on_reject` chain,
+        // which never reaches the `ExpireApprove` spawn branch.
+        let exe = std::env::current_exe().unwrap();
+
+        let now = chrono::Utc::now();
+        let since = now - chrono::Duration::seconds(120);
+        let mut rec = rupu_orchestrator::RunRecord {
+            id: "run_sweep_multi_gate".into(),
+            workflow_name: "g".into(),
+            status: RunStatus::AwaitingApproval,
+            inputs: std::collections::BTreeMap::new(),
+            event: None,
+            workspace_id: "ws_1".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            started_at: since,
+            finished_at: None,
+            final_output: None,
+            error_message: None,
+            awaiting: vec![
+                rupu_orchestrator::runs::AwaitingGate {
+                    step_id: "gate_a".into(),
+                    prompt: Some("approve a?".into()),
+                    since,
+                    expires_at: Some(now - chrono::Duration::seconds(30)), // overdue
+                },
+                rupu_orchestrator::runs::AwaitingGate {
+                    step_id: "gate_b".into(),
+                    prompt: Some("approve b?".into()),
+                    since,
+                    expires_at: None, // no timeout — must never expire
+                },
+            ],
+            awaiting_step_id: None,
+            approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            resume_gate_id: None,
+        };
+        rec.sync_awaiting_compat();
+        store.create(rec.clone(), GATE_A_REJECT_GATE_B_NONE_YAML).unwrap();
+
+        run_gate_sweep(
+            Arc::clone(&store),
+            hosts,
+            exe,
+            "sweep-test".to_string(),
+        )
+        .await;
+
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(
+            reloaded.status,
+            RunStatus::AwaitingApproval,
+            "gate_b is still parked — the run must not finalize"
+        );
+        assert_eq!(reloaded.awaiting.len(), 1);
+        assert_eq!(reloaded.awaiting[0].step_id, "gate_b");
+        assert_eq!(reloaded.awaiting_step_id.as_deref(), Some("gate_b"));
+    }
+
+    /// gate_a: `on_timeout: approve`. gate_b: `on_timeout: reject` with no
+    /// `on_reject:` (empty chain, same short-circuit as
+    /// `GATE_A_REJECT_GATE_B_NONE_YAML`).
+    const GATE_A_APPROVE_GATE_B_REJECT_YAML: &str = "name: g\nsteps:\n  - id: gate_a\n    approval:\n      timeout_seconds: 10\n      on_timeout: approve\n  - id: gate_b\n    approval:\n      timeout_seconds: 10\n      on_timeout: reject\n";
+
+    /// Task 5b-2b-i sweep-race fix: when a SINGLE sweep pass processes two
+    /// concurrently-overdue gates with mixed `on_timeout` policies — gate_a:
+    /// `approve` (processed first, per `awaiting`'s order), gate_b: `reject`
+    /// (processed second) — the approve branch's detached spawn hands gate_a
+    /// off to a child process that will independently call
+    /// `store.approve_gate`. Before this fix, the in-memory `rec` was never
+    /// updated to reflect that hand-off, so gate_b's own
+    /// `expire_gate_if_overdue` → `self.update(record)` a moment later
+    /// persisted a STALE 2-gate copy (minus only gate_b) — resurrecting
+    /// gate_a in `run.json` even though a detached process now owns
+    /// resolving it, and leaving the run `AwaitingApproval` instead of
+    /// reaching the `Rejected` state gate_b's own timeout earned on its own
+    /// path.
+    #[tokio::test]
+    async fn run_gate_sweep_two_overdue_mixed_policy_gates_does_not_resurrect_the_approved_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
+        let hosts = rupu_workspace::HostStore {
+            root: tmp.path().join("hosts"),
+        };
+        // A trivial, instantly-exiting binary — the sweep's `ExpireApprove`
+        // branch really does spawn it (so the fix's "on a *successful*
+        // spawn" in-memory removal actually exercises), but it ignores
+        // every arg and never touches `run.json`, so it can't itself
+        // resolve the race this test is isolating.
+        let exe = std::path::PathBuf::from("true");
+
+        let now = chrono::Utc::now();
+        let since = now - chrono::Duration::seconds(120);
+        let mut rec = rupu_orchestrator::RunRecord {
+            id: "run_sweep_mixed_policy".into(),
+            workflow_name: "g".into(),
+            status: RunStatus::AwaitingApproval,
+            inputs: std::collections::BTreeMap::new(),
+            event: None,
+            workspace_id: "ws_1".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            started_at: since,
+            finished_at: None,
+            final_output: None,
+            error_message: None,
+            awaiting: vec![
+                rupu_orchestrator::runs::AwaitingGate {
+                    step_id: "gate_a".into(),
+                    prompt: Some("approve a?".into()),
+                    since,
+                    expires_at: Some(now - chrono::Duration::seconds(30)), // overdue
+                },
+                rupu_orchestrator::runs::AwaitingGate {
+                    step_id: "gate_b".into(),
+                    prompt: Some("approve b?".into()),
+                    since,
+                    expires_at: Some(now - chrono::Duration::seconds(30)), // overdue
+                },
+            ],
+            awaiting_step_id: None,
+            approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            resume_gate_id: None,
+        };
+        rec.sync_awaiting_compat();
+        store
+            .create(rec.clone(), GATE_A_APPROVE_GATE_B_REJECT_YAML)
+            .unwrap();
+
+        run_gate_sweep(Arc::clone(&store), hosts, exe, "sweep-test".to_string()).await;
+
+        let reloaded = store.load(&rec.id).unwrap();
+        assert!(
+            !reloaded.awaiting.iter().any(|g| g.step_id == "gate_a"),
+            "gate_a was handed off to a detached approve — it must not be \
+             resurrected by gate_b's own reject persisting a stale \
+             in-memory copy of the awaiting set: {:?}",
+            reloaded.awaiting
+        );
+        // gate_b's own reject empties what's left of the (correctly fixed)
+        // in-memory set, so the run reaches the same terminal `Rejected`
+        // state its own timeout earned.
+        assert_eq!(reloaded.status, RunStatus::Rejected);
+        assert!(reloaded.awaiting.is_empty());
+    }
+
+    /// Single-gate parity: a legacy-shaped record (empty `awaiting`, only
+    /// the derived-compat fields populated) with exactly ONE overdue gate
+    /// must reach the SAME terminal routing the sweep reached before Task
+    /// 5b-2a's per-gate loop existed.
+    #[tokio::test]
+    async fn run_gate_sweep_sole_overdue_gate_reaches_same_terminal_routing_as_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
+        let hosts = rupu_workspace::HostStore {
+            root: tmp.path().join("hosts"),
+        };
+        let exe = std::env::current_exe().unwrap();
+
+        let now = chrono::Utc::now();
+        let rec = rupu_orchestrator::RunRecord {
+            id: "run_sweep_sole_gate".into(),
+            workflow_name: "g".into(),
+            status: RunStatus::AwaitingApproval,
+            inputs: std::collections::BTreeMap::new(),
+            event: None,
+            workspace_id: "ws_1".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            started_at: now - chrono::Duration::seconds(120),
+            finished_at: None,
+            final_output: None,
+            error_message: None,
+            awaiting: Vec::new(),
+            awaiting_step_id: Some("gate_a".into()),
+            approval_prompt: Some("approve a?".into()),
+            awaiting_since: Some(now - chrono::Duration::seconds(120)),
+            expires_at: Some(now - chrono::Duration::seconds(30)), // overdue
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            resume_gate_id: None,
+        };
+        store.create(rec.clone(), GATE_A_REJECT_GATE_B_NONE_YAML).unwrap();
+
+        run_gate_sweep(
+            Arc::clone(&store),
+            hosts,
+            exe,
+            "sweep-test".to_string(),
+        )
+        .await;
+
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(
+            reloaded.status,
+            RunStatus::Rejected,
+            "a sole overdue gate must still finalize the whole run, same as before 5b-2a"
+        );
+        assert!(reloaded.awaiting.is_empty());
+        assert!(reloaded.awaiting_step_id.is_none());
+    }
 
     /// Plan 4 gate sweep: the pure classifier's full truth table. `expired`
     /// only matters for `AwaitingApproval`; `pid_alive` only for

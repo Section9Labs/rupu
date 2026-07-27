@@ -103,6 +103,7 @@ fn seed_transcript_with_model(dir: &std::path::Path, run_id: &str, model: &str) 
         started_at: chrono::Utc::now(),
         finished_at: None,
         error_message: None,
+        awaiting: Vec::new(),
         awaiting_step_id: None,
         approval_prompt: None,
         awaiting_since: None,
@@ -123,6 +124,7 @@ fn seed_transcript_with_model(dir: &std::path::Path, run_id: &str, model: &str) 
         resume_claimed_at: None,
         resume_claimed_by: None,
         resume_mode: None,
+        resume_gate_id: None,
         final_output: None,
     };
     let transcript_path = dir.join(format!("{run_id}.jsonl"));
@@ -194,6 +196,7 @@ async fn usage_priced_only_reports_empty_unpriced_gap() {
         started_at: chrono::Utc::now(),
         finished_at: None,
         error_message: None,
+        awaiting: Vec::new(),
         awaiting_step_id: None,
         approval_prompt: None,
         awaiting_since: None,
@@ -214,6 +217,7 @@ async fn usage_priced_only_reports_empty_unpriced_gap() {
         resume_claimed_at: None,
         resume_claimed_by: None,
         resume_mode: None,
+        resume_gate_id: None,
         final_output: None,
     };
     let transcript_path = dir.path().join("run_priced.jsonl");
@@ -550,6 +554,7 @@ fn seed_run_with_usage(
         started_at,
         finished_at: None,
         error_message: None,
+        awaiting: Vec::new(),
         awaiting_step_id: None,
         approval_prompt: None,
         awaiting_since: None,
@@ -570,6 +575,7 @@ fn seed_run_with_usage(
         resume_claimed_at: None,
         resume_claimed_by: None,
         resume_mode: None,
+        resume_gate_id: None,
         final_output: None,
     };
     let transcript_path = dir.join(format!("{run_id}.jsonl"));

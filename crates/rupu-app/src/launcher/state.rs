@@ -163,6 +163,7 @@ mod tests {
             notify_issue: false,
             steps: vec![],
             concerns: None,
+            max_concurrency: None,
         }
     }
 

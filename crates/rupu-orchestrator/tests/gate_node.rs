@@ -1381,3 +1381,202 @@ async fn notify_skips_gracefully_with_no_action_dispatcher() {
     let awaiting = res.awaiting.clone().expect("gate must still pause");
     assert_eq!(awaiting.step_id, "gate");
 }
+
+// ---------------------------------------------------------------------------
+// Test 13 (Task 5b-2a, spec §7) — MULTI-GATE reject with cleanup: rejecting
+// ONE gate of a two-gate parked set runs THAT gate's own `on_reject` chain,
+// leaves the sibling gate untouched/still parked, and does NOT falsely close
+// `events.jsonl` with a terminal `RunCompleted` while the run is still
+// genuinely `AwaitingApproval` on the other gate.
+// ---------------------------------------------------------------------------
+
+const WF_MULTI_GATE_REJECT: &str = r#"
+name: multi-gate-reject
+steps:
+  - id: fanout
+    split: [gate_a, gate_b]
+  - id: gate_a
+    approval:
+      prompt: "Approve A?"
+      on_reject:
+        - id: notify_fail_a
+          agent: worker
+          prompt: "cleanup after gate_a reject: {{ steps.gate_a.decision }}"
+    next: [a]
+  - id: gate_b
+    approval:
+      prompt: "Approve B?"
+    next: [b]
+  - id: a
+    agent: worker
+    prompt: "do a"
+  - id: b
+    agent: worker
+    prompt: "do b"
+"#;
+
+#[tokio::test]
+async fn reject_one_gate_of_a_multi_gate_set_runs_its_own_cleanup_leaves_sibling_parked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let wf = Workflow::parse(WF_MULTI_GATE_REJECT).unwrap();
+
+    // --- Phase 1: fanout batch-parks both gates. `event_sink: None` here —
+    // `run_workflow`'s own `RunStore`-backed persistence still writes
+    // `events.jsonl` via `append_terminal_event`/the executor plumbing
+    // regardless of whether an external sink is wired; the run id isn't
+    // known until after this call allocates it, so a caller-supplied sink
+    // can't be built ahead of time anyway (every other test in this file
+    // takes the same `event_sink: None` shape for phase 1). ---
+    let opts1 = OrchestratorRunOpts {
+        workflow: wf.clone(),
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_multi_gate_reject".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_MULTI_GATE_REJECT.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+    };
+    let res1 = run_workflow(opts1).await.expect("both gates batch-park");
+    let run_id = res1.run_id.clone();
+    let awaiting = res1.awaiting.clone().expect("both gates must pause the run");
+    assert_eq!(awaiting.gates.len(), 2);
+
+    // --- Operator rejects gate_a ONLY (mirrors `rupu workflow reject
+    // <run_id> --gate gate_a`): gate_b must stay parked. ---
+    let decision = store
+        .reject_gate(&run_id, "operator", "not today", chrono::Utc::now(), Some("gate_a"))
+        .expect("reject_gate(gate_a) succeeds");
+    let (rejected_step_id, reason) = match decision {
+        ApprovalDecision::Rejected {
+            step_id, reason, ..
+        } => (step_id, reason),
+        other => panic!("expected Rejected, got {other:?}"),
+    };
+    assert_eq!(rejected_step_id, "gate_a");
+
+    let record_after_reject = store.load(&run_id).unwrap();
+    assert_eq!(
+        record_after_reject.status,
+        RunStatus::AwaitingApproval,
+        "gate_b is still parked — rejecting gate_a alone must not finalize the run"
+    );
+    assert_eq!(record_after_reject.awaiting.len(), 1);
+    assert_eq!(record_after_reject.awaiting[0].step_id, "gate_b");
+
+    // --- Cleanup: dispatch gate_a's on_reject chain. ---
+    // Unlike the single-gate `WF_GATE_REJECT` fixture, this workflow has a
+    // preceding `fanout` (split) step that DID complete before either gate
+    // parked — so `prior_step_results` carries that one entry, not none.
+    let prior_records = store.read_step_results(&run_id).unwrap();
+    let prior_step_results: Vec<StepResult> =
+        prior_records.iter().map(StepResult::from).collect();
+    assert_eq!(
+        prior_step_results.iter().map(|r| r.step_id.as_str()).collect::<Vec<_>>(),
+        vec!["fanout"],
+        "only the split node itself has completed; neither gate has"
+    );
+
+    let factory = Arc::new(EchoFactory::default());
+    let opts2 = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: record_after_reject.workspace_id.clone(),
+        workspace_path: record_after_reject.workspace_path.clone(),
+        transcript_dir: record_after_reject.transcript_dir.clone(),
+        factory: factory.clone(),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_MULTI_GATE_REJECT.to_string()),
+        resume_from: Some(ResumeState::from_rejection(
+            run_id.clone(),
+            prior_step_results,
+            rejected_step_id.clone(),
+            reason.clone(),
+        )),
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+    };
+
+    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human")
+        .await
+        .expect("cleanup never errors");
+
+    // gate_a's on_reject step actually dispatched.
+    assert_eq!(
+        factory.seen.lock().unwrap().clone(),
+        vec!["notify_fail_a".to_string()]
+    );
+
+    let records = store.read_step_results(&run_id).unwrap();
+    let gate_a_record = records
+        .iter()
+        .find(|r| r.step_id == "gate_a")
+        .expect("gate_a result persisted");
+    assert!(gate_a_record.success);
+    let gate_a_output: serde_json::Value =
+        serde_json::from_str(&gate_a_record.output).expect("gate_a output is JSON");
+    assert_eq!(gate_a_output["decision"], "rejected");
+    let cleanup_record = records
+        .iter()
+        .find(|r| r.step_id == "notify_fail_a")
+        .expect("on_reject step result persisted");
+    assert!(cleanup_record.success);
+    assert!(
+        cleanup_record.output.contains("cleanup after gate_a reject: rejected"),
+        "on_reject step should see steps.gate_a.decision == rejected; got {:?}",
+        cleanup_record.output
+    );
+
+    // The run is STILL AwaitingApproval on gate_b — cleanup for gate_a
+    // must not have touched the run's overall status or gate_b's entry.
+    let record_final = store.load(&run_id).unwrap();
+    assert_eq!(record_final.status, RunStatus::AwaitingApproval);
+    assert_eq!(record_final.awaiting.len(), 1);
+    assert_eq!(record_final.awaiting[0].step_id, "gate_b");
+
+    // events.jsonl must NOT get a false terminal `RunCompleted` appended
+    // while the run is still genuinely active on gate_b's path — this is
+    // the bug Task 5b-2a's fix to `run_reject_cleanup` step 5 closes.
+    // `opts1`/`opts2` above both pass `event_sink: None`, and nothing else
+    // in this scenario writes to `events.jsonl` (`reject_gate` only calls
+    // `append_terminal_event` when it flips the run terminal, which it
+    // does NOT for gate_a here since gate_b keeps the set non-empty) —
+    // so this file must not exist at all. Before the fix, `run_reject_
+    // cleanup` unconditionally called `store.append_terminal_event(..)`
+    // regardless of `opts.event_sink`, which WOULD have created it with a
+    // `RunCompleted` line even though the run was still `AwaitingApproval`.
+    let events_path = store.events_path(&run_id);
+    assert!(
+        !events_path.is_file(),
+        "events.jsonl must not be created/appended while gate_b is still parked \
+         (found: {})",
+        events_path.display()
+    );
+
+    // --- Now reject gate_b too: the set empties, the run finalizes. ---
+    let decision2 = store
+        .reject_gate(&run_id, "operator", "not today either", chrono::Utc::now(), Some("gate_b"))
+        .expect("reject_gate(gate_b) succeeds");
+    assert!(matches!(decision2, ApprovalDecision::Rejected { .. }));
+    let record_terminal = store.load(&run_id).unwrap();
+    assert_eq!(record_terminal.status, RunStatus::Rejected);
+    assert!(record_terminal.awaiting.is_empty());
+}

@@ -1291,6 +1291,7 @@ fn mirrored_awaiting_run_is_not_pending_resume() {
         started_at: chrono::Utc::now(),
         finished_at: None,
         error_message: None,
+        awaiting: Vec::new(),
         awaiting_step_id: Some("gate-step".to_string()),
         approval_prompt: Some("approve?".to_string()),
         awaiting_since: Some(chrono::Utc::now()),
@@ -1311,6 +1312,7 @@ fn mirrored_awaiting_run_is_not_pending_resume() {
         resume_claimed_at: None,
         resume_claimed_by: None,
         resume_mode: None,
+        resume_gate_id: None,
         final_output: None,
     };
     store.create(rec, "").unwrap();
@@ -1350,6 +1352,7 @@ fn mirrored_awaiting_run_is_not_pending_resume_ssh_host() {
         started_at: chrono::Utc::now(),
         finished_at: None,
         error_message: None,
+        awaiting: Vec::new(),
         awaiting_step_id: Some("gate-step".to_string()),
         approval_prompt: Some("approve?".to_string()),
         awaiting_since: Some(chrono::Utc::now()),
@@ -1370,6 +1373,7 @@ fn mirrored_awaiting_run_is_not_pending_resume_ssh_host() {
         resume_claimed_at: None,
         resume_claimed_by: None,
         resume_mode: None,
+        resume_gate_id: None,
         final_output: None,
     };
     store.create(rec, "").unwrap();
@@ -1404,6 +1408,7 @@ fn mirrored_awaiting_run_is_not_pending_resume_bucket_host() {
         started_at: chrono::Utc::now(),
         finished_at: None,
         error_message: None,
+        awaiting: Vec::new(),
         awaiting_step_id: Some("gate-step".to_string()),
         approval_prompt: Some("approve?".to_string()),
         awaiting_since: Some(chrono::Utc::now()),
@@ -1424,6 +1429,7 @@ fn mirrored_awaiting_run_is_not_pending_resume_bucket_host() {
         resume_claimed_at: None,
         resume_claimed_by: None,
         resume_mode: None,
+        resume_gate_id: None,
         final_output: None,
     };
     store.create(rec, "").unwrap();

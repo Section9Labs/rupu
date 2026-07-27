@@ -129,21 +129,49 @@ pub struct RunRecord {
     /// Set in `Failed` status; the runner's error message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
-    /// id of the step the run is paused at, if any.
+    /// Every approval gate currently parked on this run (Phase 2, spec §7).
+    /// A DAG can reach several gates on independent concurrent paths in a
+    /// single batch-park wave (see `run_scheduler`'s doc); this is the
+    /// CANONICAL set. Empty for a fresh/legacy record (including every
+    /// `run.json` written before this field existed — `#[serde(default)]`
+    /// gives `[]` on load) and for a run that isn't currently awaiting
+    /// approval at all.
+    ///
+    /// `awaiting_step_id` / `approval_prompt` / `awaiting_since` /
+    /// `expires_at` below are kept as DERIVED COMPAT fields, mirroring
+    /// this set's FIRST element (`None`s when the set is empty) —
+    /// [`RunRecord::sync_awaiting_compat`] is the single place that does
+    /// this mirroring; every writer of `awaiting` must call it
+    /// immediately after mutating the set. They are never deleted: 40+
+    /// read sites across `rupu-cli`/`rupu-cp` depend on them and are
+    /// Task 5b-2's to migrate to the set, not this task's. A legacy
+    /// on-disk record — `awaiting: []` but `awaiting_step_id: Some(_)` —
+    /// is normalized into a one-element set on demand by
+    /// [`RunRecord::awaiting_gates`] rather than by a load-time rewrite,
+    /// so an old `run.json` a caller merely READS (never mutates) round-
+    /// trips byte-for-byte with its legacy shape intact.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub awaiting: Vec<AwaitingGate>,
+    /// id of the step the run is paused at, if any. DERIVED COMPAT — see
+    /// `awaiting` above; authoritative only for a legacy record where
+    /// `awaiting` is empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub awaiting_step_id: Option<String>,
-    /// Rendered approval prompt the operator sees.
+    /// Rendered approval prompt the operator sees. DERIVED COMPAT — see
+    /// `awaiting` above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_prompt: Option<String>,
     /// When the run paused for approval. Set alongside
     /// `awaiting_step_id`. Used as the anchor for `expires_at`.
+    /// DERIVED COMPAT — see `awaiting` above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub awaiting_since: Option<DateTime<Utc>>,
     /// When the pending approval expires. `None` when the awaited
     /// step has no `timeout_seconds:` set. After this instant, an
     /// approve/reject attempt will fail and `rupu workflow runs`
     /// surfaces the run as expired (status flipped to `Failed`
-    /// with `error_message` set on first observation).
+    /// with `error_message` set on first observation). DERIVED COMPAT —
+    /// see `awaiting` above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
     /// Stable text reference to the issue this run targets, when
@@ -227,6 +255,23 @@ pub struct RunRecord {
     /// [`RunStore::clear_resume`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_mode: Option<String>,
+    /// The SPECIFIC gate this marker targets, on a multi-gate
+    /// `AwaitingApproval` run (Task 5b-2b-i correctness fix, spec §7). Set
+    /// alongside `resume_requested_at`/`resume_mode` by
+    /// [`RunStore::request_resume_approval`] whenever the caller named a
+    /// gate explicitly (`gate_id: Some(_)`); `None` for a legacy/sole-gate
+    /// marker. This is the ONLY channel the marker itself carries the
+    /// target gate through to the background resume worker — reordering
+    /// `awaiting` so `awaiting_step_id` names the target (which
+    /// `request_resume_approval` also does) is NOT sufficient on its own:
+    /// `awaiting_step_id` is mutable state that a second concurrent
+    /// approve request can reorder again before this marker is consumed,
+    /// so the worker must read the target gate off the MARKER, not off
+    /// live record state. The worker passes `--gate <id>` to `workflow
+    /// approve` when this is `Some`, and omits it (sole-gate back-compat)
+    /// when `None`. Cleared by [`RunStore::clear_resume`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_gate_id: Option<String>,
     /// Final assistant text for an agent run (set by `rupu run`); `None` for
     /// workflow runs and older records. Carried by the mirror so a remotely
     /// dispatched unit's output is retrievable centrally.
@@ -234,7 +279,78 @@ pub struct RunRecord {
     pub final_output: Option<String>,
 }
 
+/// One parked approval gate (Phase 2, spec §7). An element of
+/// `RunRecord.awaiting` — see that field's doc for the additive-model
+/// contract (canonical set + derived-compat legacy fields).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AwaitingGate {
+    pub step_id: String,
+    /// Rendered approval prompt for this specific gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// When this gate parked. All gates parked in the same batch-park
+    /// wave (`run_scheduler`) share the same instant — the run paused
+    /// once, even though several independent paths hit a gate.
+    pub since: DateTime<Utc>,
+    /// When this gate's approval expires. `None` when its step has no
+    /// `timeout_seconds:` set. Independent per gate — two concurrent
+    /// gates may have different timeouts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
 impl RunRecord {
+    /// The canonical awaiting-set, normalizing a legacy on-disk shape
+    /// (empty `awaiting`, but `awaiting_step_id: Some(_)` — every
+    /// `run.json` written before this field existed, and any record a
+    /// single-gate code path still populates only the derived-compat
+    /// fields on) into a one-element set built from those compat
+    /// fields. For a modern record (`awaiting` non-empty) returns it
+    /// verbatim — the compat fields are NEVER authoritative once the
+    /// set itself is populated.
+    ///
+    /// This is a read-only accessor — it does not mutate or persist
+    /// anything. A caller that's about to MUTATE the set should start
+    /// from this (so a legacy record gets upgraded in memory before the
+    /// mutation), then call [`Self::sync_awaiting_compat`] afterwards.
+    pub fn awaiting_gates(&self) -> Vec<AwaitingGate> {
+        if !self.awaiting.is_empty() {
+            return self.awaiting.clone();
+        }
+        let Some(step_id) = self.awaiting_step_id.clone() else {
+            return Vec::new();
+        };
+        vec![AwaitingGate {
+            step_id,
+            prompt: self.approval_prompt.clone(),
+            since: self.awaiting_since.unwrap_or(self.started_at),
+            expires_at: self.expires_at,
+        }]
+    }
+
+    /// Re-derive `awaiting_step_id` / `approval_prompt` / `awaiting_since`
+    /// / `expires_at` from `self.awaiting`'s FIRST element (`None`s when
+    /// the set is empty). Every writer of `self.awaiting` MUST call this
+    /// immediately after mutating it — it is the single place that keeps
+    /// the derived-compat fields in sync with the canonical set, per
+    /// `awaiting`'s own field doc.
+    pub fn sync_awaiting_compat(&mut self) {
+        match self.awaiting.first() {
+            Some(g) => {
+                self.awaiting_step_id = Some(g.step_id.clone());
+                self.approval_prompt = g.prompt.clone();
+                self.awaiting_since = Some(g.since);
+                self.expires_at = g.expires_at;
+            }
+            None => {
+                self.awaiting_step_id = None;
+                self.approval_prompt = None;
+                self.awaiting_since = None;
+                self.expires_at = None;
+            }
+        }
+    }
+
     /// How this run came to exist: `"manual"` | `"cron"` | `"event"`.
     ///
     /// Lives here, beside the fields it reads, because both `rupu-cp` (run
@@ -275,6 +391,28 @@ pub enum StepKind {
     Parallel,
     Panel,
     Branch,
+    /// `split:` orchestration node — fans control flow into N named
+    /// targets (no `wait:`/merge semantics of its own; each target is a
+    /// normal node with its own inbound edge). Distinct from [`Self::Branch`]
+    /// (a conditional then/else fork): a split always takes every arm.
+    /// Added in Task 5b-2b-ii; before this, a live split node persisted
+    /// `kind: Branch` (see `runner.rs`'s split-resolution sites) purely to
+    /// avoid rippling this enum's exhaustive matches while split was
+    /// test-only. A legacy on-disk `StepResult` with `kind: "branch"` for
+    /// what was actually a split node still deserializes fine — it just
+    /// renders with the branch glyph, exactly as it always has.
+    Split,
+    /// `join:` orchestration node (a barrier/merge reconverge). Persists
+    /// the join's own `StepResult` (winners' outputs gathered into
+    /// `items`/`output`) under its own kind rather than reusing
+    /// [`Self::Branch`]. Mirrors [`Self::Split`]'s history exactly: before
+    /// this variant existed, a live join node persisted `kind: Branch`
+    /// (see `runner.rs`'s join-resolution sites in `drain_joins`) to avoid
+    /// rippling this enum's exhaustive matches while join was still
+    /// test-only. A legacy on-disk `StepResult` with `kind: "branch"` for
+    /// what was actually a join node still deserializes fine — it just
+    /// renders with the branch glyph, exactly as it always has.
+    Join,
     Action,
     ApprovalGate,
 }
@@ -901,6 +1039,19 @@ impl RunStore {
     /// record wasn't overdue. Used by the CLI's `approve` / `reject` /
     /// `runs` paths (and Plan 4's cp-serve sweep) to enforce the
     /// timeout lazily — no daemon needed.
+    ///
+    /// **Sole-gate only (Phase 2, Task 5b-1 boundary):** this whole-run
+    /// expiry check operates on `record.expires_at` (the derived-compat
+    /// mirror of the awaiting-set's FIRST gate — see `RunRecord::awaiting`'s
+    /// doc). It intentionally no-ops (`Ok(None)`) for a record whose
+    /// awaiting-set has more than one gate: expiring ONE gate out of a
+    /// still-parked set must NOT fail/reject the whole run out from under
+    /// the other gates, and a real per-gate timeout sweep (which gate,
+    /// which policy, does the run stay open) is Task 5b-2's job alongside
+    /// the rest of the CP/CLI gate-sweep ripple. For the legacy/single-gate
+    /// case (every record producible today, and every DAG run until Task
+    /// 5b-2 lands) this is unchanged — the set always has exactly one
+    /// element there, so this guard never fires.
     pub fn expire_if_overdue(
         &self,
         record: &mut RunRecord,
@@ -908,6 +1059,9 @@ impl RunStore {
         on_timeout: Option<TimeoutAction>,
     ) -> Result<Option<TimeoutAction>, RunStoreError> {
         if record.status != RunStatus::AwaitingApproval {
+            return Ok(None);
+        }
+        if record.awaiting_gates().len() > 1 {
             return Ok(None);
         }
         let Some(expires_at) = record.expires_at else {
@@ -934,10 +1088,21 @@ impl RunStore {
         match action {
             TimeoutAction::Fail => {
                 record.status = RunStatus::Failed;
-                // Keep awaiting_step_id / approval_prompt around so
-                // post-mortem inspection can see what was missed; clear
-                // expires_at so subsequent reads don't re-expire.
-                record.expires_at = None;
+                // Task 5b-1 follow-up: clear the timed-out gate from
+                // `awaiting` and re-sync the compat fields so a terminal
+                // (Failed) record has NO parked gate in EITHER
+                // representation. Leaving `awaiting` populated here while
+                // clearing only `expires_at` (this arm's pre-5b-1 shape)
+                // left `awaiting=[gate]` disagreeing with
+                // `awaiting_step_id: None` on a Failed run — invisible
+                // while every reader still used the compat fields, but a
+                // phantom parked gate the moment a reader (Task 5b-2)
+                // switches to `awaiting`. The step id this arm used to
+                // keep the compat fields around for (post-mortem
+                // inspection) is preserved anyway: `error_message`,
+                // built above, embeds it.
+                record.awaiting.clear();
+                record.sync_awaiting_compat();
                 self.update(record)?;
                 self.append_terminal_event(
                     &record.id,
@@ -954,10 +1119,13 @@ impl RunStore {
             }
             TimeoutAction::Reject => {
                 record.status = RunStatus::Rejected;
-                record.awaiting_step_id = None;
-                record.approval_prompt = None;
-                record.awaiting_since = None;
-                record.expires_at = None;
+                // Task 5b-1 follow-up: clear via the set + sync (not the
+                // four manual field-assignments this arm used before) so
+                // `awaiting` and the compat fields agree on this
+                // terminal record — see the Fail arm's comment above for
+                // the full rationale (same fix, same reasoning).
+                record.awaiting.clear();
+                record.sync_awaiting_compat();
                 self.update(record)?;
                 self.append_terminal_event(
                     &record.id,
@@ -978,8 +1146,31 @@ impl RunStore {
     /// resolve a paused run's gate `on_timeout` routing before calling
     /// [`expire_if_overdue`](Self::expire_if_overdue) themselves. Same
     /// best-effort `None`-on-any-failure contract as the private resolver.
+    ///
+    /// **Sole-gate-shaped** — resolves the policy for `record.awaiting_step_id`
+    /// (the compat mirror of the awaiting-set's FIRST gate). Task 5b-2a's
+    /// per-gate callers (the gate sweep, once a run genuinely batch-parks
+    /// more than one gate) want
+    /// [`resolve_gate_timeout_for`](Self::resolve_gate_timeout_for) instead,
+    /// which takes the target gate's own step id explicitly.
     pub fn resolve_gate_timeout(&self, record: &RunRecord) -> Option<TimeoutAction> {
         self.gate_on_timeout(record)
+    }
+
+    /// Per-gate counterpart to [`resolve_gate_timeout`](Self::resolve_gate_timeout)
+    /// (Task 5b-2a, spec §7/§8): resolve the `on_timeout` routing configured
+    /// on the gate NODE named `step_id`, independent of which gate (if any)
+    /// the compat fields mirror. Every concurrently-parked gate can carry a
+    /// different `on_timeout` policy, so the gate sweep must resolve each
+    /// one by its own id rather than assuming "the sole/first gate" like
+    /// [`resolve_gate_timeout`](Self::resolve_gate_timeout) does. Same
+    /// best-effort `None`-on-any-failure contract.
+    pub fn resolve_gate_timeout_for(
+        &self,
+        record: &RunRecord,
+        step_id: &str,
+    ) -> Option<TimeoutAction> {
+        self.gate_on_timeout_for_step(record, step_id)
     }
 
     /// Resolve the `on_timeout` routing configured on the gate NODE
@@ -994,6 +1185,14 @@ impl RunStore {
     /// corrupted on-disk state, not an absent policy.
     fn gate_on_timeout(&self, record: &RunRecord) -> Option<TimeoutAction> {
         let step_id = record.awaiting_step_id.as_deref()?;
+        self.gate_on_timeout_for_step(record, step_id)
+    }
+
+    /// Shared body of [`gate_on_timeout`](Self::gate_on_timeout) and
+    /// [`resolve_gate_timeout_for`](Self::resolve_gate_timeout_for) — same
+    /// snapshot-load-and-resolve logic, parametrized by an explicit
+    /// `step_id` instead of always reading it off `record.awaiting_step_id`.
+    fn gate_on_timeout_for_step(&self, record: &RunRecord, step_id: &str) -> Option<TimeoutAction> {
         let body = match self.read_workflow_snapshot(&record.id) {
             Ok(body) => body,
             Err(e) => {
@@ -1019,6 +1218,127 @@ impl RunStore {
             }
         };
         crate::workflow::gate_timeout_action(&workflow, step_id)
+    }
+
+    /// Per-gate counterpart to [`expire_if_overdue`](Self::expire_if_overdue)
+    /// (Task 5b-2a, spec §7/§8's sweep half). `expire_if_overdue` stays
+    /// sole-gate-only and byte-for-byte unchanged (the primary safety
+    /// invariant); this method is what a caller that has already resolved
+    /// a run's FULL awaiting set (`awaiting_gates()`) uses to time out ONE
+    /// named gate while every OTHER parked gate on `record.awaiting` is
+    /// left untouched.
+    ///
+    /// Action semantics, deliberately chosen so the sole-gate case is
+    /// byte-identical to `expire_if_overdue`'s (this is what makes single-
+    /// gate parity hold: with exactly one gate parked, calling this method
+    /// with that gate's id reaches the SAME terminal state
+    /// `expire_if_overdue` would):
+    /// - `Fail` (default) — an abort-the-run policy: timing out THIS gate
+    ///   fails the WHOLE run immediately, regardless of any sibling gates
+    ///   still parked (a gate authored `on_timeout: fail` is an operator
+    ///   directive that this gate's timeout is fatal to the run, not just
+    ///   to its own path — unlike `reject`, which is inherently path-scoped).
+    ///   `record.awaiting` is cleared in FULL (mirroring
+    ///   `expire_if_overdue`'s Fail arm), not just the timed-out gate's
+    ///   entry — a terminal `Failed` record carries no parked gate in
+    ///   either representation.
+    /// - `Reject` — a path-scoped decision: only THIS gate is removed from
+    ///   the set. The run transitions to `Rejected` only once removing it
+    ///   EMPTIES the set (mirroring [`reject_gate`](Self::reject_gate)'s
+    ///   empties-the-set-transitions-out rule); otherwise the record stays
+    ///   `AwaitingApproval` with the remaining gates untouched. The CALLER
+    ///   is responsible for then running this gate's own `on_reject`
+    ///   cleanup chain — same contract as `expire_if_overdue`'s Reject arm.
+    /// - `Approve` — mutate NOTHING; the record stays `AwaitingApproval`
+    ///   exactly as it was. The CALLER resumes THIS gate exactly like an
+    ///   operator approve (`approve_gate(.., Some(step_id))`).
+    ///
+    /// Returns `Ok(Some(action))` when this gate's expiry fired (telling
+    /// the caller which action was taken/is needed), `Ok(None)` when it
+    /// wasn't overdue — covering: the run isn't `AwaitingApproval`,
+    /// `step_id` isn't currently one of the parked gates, or that gate has
+    /// no `timeout_seconds` set.
+    pub fn expire_gate_if_overdue(
+        &self,
+        record: &mut RunRecord,
+        step_id: &str,
+        now: DateTime<Utc>,
+        on_timeout: Option<TimeoutAction>,
+    ) -> Result<Option<TimeoutAction>, RunStoreError> {
+        if record.status != RunStatus::AwaitingApproval {
+            return Ok(None);
+        }
+        let gates = record.awaiting_gates();
+        let Some(gate) = gates.iter().find(|g| g.step_id == step_id).cloned() else {
+            return Ok(None);
+        };
+        let Some(expires_at) = gate.expires_at else {
+            return Ok(None);
+        };
+        if now <= expires_at {
+            return Ok(None);
+        }
+        let action = on_timeout.unwrap_or(TimeoutAction::Fail);
+        if action == TimeoutAction::Approve {
+            // Gate policy resolves the timed-out wait to an auto-approve:
+            // leave the record untouched (still `AwaitingApproval`) and
+            // tell the caller to proceed exactly as if an operator had
+            // approved THIS gate.
+            return Ok(Some(TimeoutAction::Approve));
+        }
+        let waited = expires_at - gate.since;
+        let message = format!(
+            "approval expired: paused at step `{step_id}` waited longer than {}s without approval",
+            waited.num_seconds()
+        );
+        match action {
+            TimeoutAction::Fail => {
+                record.finished_at = Some(now);
+                record.error_message = Some(message);
+                record.status = RunStatus::Failed;
+                // Fail is an abort-the-run policy — clear the WHOLE set,
+                // not just the timed-out gate (see this method's doc).
+                record.awaiting.clear();
+                record.sync_awaiting_compat();
+                self.update(record)?;
+                self.append_terminal_event(
+                    &record.id,
+                    &crate::executor::Event::RunFailed {
+                        run_id: record.id.clone(),
+                        error: record
+                            .error_message
+                            .clone()
+                            .unwrap_or_else(|| "approval expired".into()),
+                        finished_at: now,
+                    },
+                );
+                Ok(Some(TimeoutAction::Fail))
+            }
+            TimeoutAction::Reject => {
+                let mut remaining = gates;
+                remaining.retain(|g| g.step_id != step_id);
+                record.awaiting = remaining;
+                if record.awaiting.is_empty() {
+                    record.status = RunStatus::Rejected;
+                    record.error_message = Some(message);
+                    record.finished_at = Some(now);
+                }
+                record.sync_awaiting_compat();
+                self.update(record)?;
+                if record.status == RunStatus::Rejected {
+                    self.append_terminal_event(
+                        &record.id,
+                        &crate::executor::Event::RunCompleted {
+                            run_id: record.id.clone(),
+                            status: RunStatus::Rejected,
+                            finished_at: now,
+                        },
+                    );
+                }
+                Ok(Some(TimeoutAction::Reject))
+            }
+            TimeoutAction::Approve => unreachable!("handled above"),
+        }
     }
 }
 
@@ -1061,6 +1381,27 @@ pub enum ApprovalError {
     ExpiredRejected { step_id: String, reason: String },
     #[error("missing awaiting_step_id in record")]
     NoAwaitingStep,
+    /// (Phase 2, Task 5b-1, spec §7.) The run has more than one gate
+    /// parked and the caller didn't say which one — approving/rejecting
+    /// with no gate id would be an ambiguous guess. Every caller of the
+    /// gate-id-less [`RunStore::approve`]/[`RunStore::reject`] hits this
+    /// the moment a DAG run genuinely batch-parks >1 gate; callers that
+    /// need to target a specific gate must move to
+    /// [`RunStore::approve_gate`]/[`RunStore::reject_gate`] with
+    /// `Some(id)` (Task 5b-2's job for the CLI/CP surface).
+    #[error(
+        "run `{run_id}` has {} pending gates ({}) — specify which one",
+        .candidates.len(),
+        .candidates.join(", ")
+    )]
+    AmbiguousGate {
+        run_id: String,
+        candidates: Vec<String>,
+    },
+    /// A caller passed `gate_id: Some(id)` but `id` isn't one of the
+    /// run's currently-parked gates.
+    #[error("gate `{step_id}` is not awaiting approval on run `{run_id}`")]
+    GateNotFound { run_id: String, step_id: String },
     #[error("store: {0}")]
     Store(#[from] RunStoreError),
 }
@@ -1093,11 +1434,37 @@ impl RunStore {
     /// Library-level approve flow: load → expire-check → mutate
     /// status → persist. Caller is responsible for re-entering
     /// `run_workflow` (CLI does this via the existing path).
+    ///
+    /// Back-compat wrapper over [`approve_gate`](Self::approve_gate) with
+    /// `gate_id: None` — the sole-gate resolution (Task 5b-1, spec §7):
+    /// identical behavior to before this task for every record that has
+    /// exactly one parked gate (every record producible today), and a
+    /// clear [`ApprovalError::AmbiguousGate`] rather than a silent
+    /// wrong-gate approve for a genuine multi-gate DAG run. Existing
+    /// callers (the CLI, the cp-serve sweep) keep compiling and behaving
+    /// exactly as before unchanged; Task 5b-2 migrates them to
+    /// `approve_gate` so an operator can target one gate of several.
     pub fn approve(
         &self,
         run_id: &str,
         approver: &str,
         now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        self.approve_gate(run_id, approver, now, None)
+    }
+
+    /// Gate-targeted approve (Task 5b-1, spec §7). `gate_id: None` behaves
+    /// exactly like the legacy sole-gate [`approve`](Self::approve) —
+    /// see that method's doc for the compat contract. `gate_id: Some(id)`
+    /// approves exactly that gate: it's removed from the awaiting set;
+    /// the run stays `AwaitingApproval` while other gates remain parked,
+    /// and only flips to `Running` once the set is empty.
+    pub fn approve_gate(
+        &self,
+        run_id: &str,
+        approver: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        gate_id: Option<&str>,
     ) -> Result<ApprovalDecision, ApprovalError> {
         let mut record = self.load(run_id).map_err(|e| match e {
             RunStoreError::NotFound(s) => ApprovalError::NotFound(s),
@@ -1136,16 +1503,42 @@ impl RunStore {
                 record.status.as_str().to_string(),
             ));
         }
-        let step_id = record
-            .awaiting_step_id
-            .clone()
-            .ok_or(ApprovalError::NoAwaitingStep)?;
+        // Normalize a legacy (or still-sole-gate) record into the
+        // canonical set, resolve WHICH gate this call targets, then
+        // remove it. `gates` is the set with the target already removed
+        // — the run stays `AwaitingApproval` while it's non-empty and
+        // only flips to `Running` once it's empty.
+        let mut gates = record.awaiting_gates();
+        let step_id = match gate_id {
+            Some(id) => {
+                if !gates.iter().any(|g| g.step_id == id) {
+                    return Err(ApprovalError::GateNotFound {
+                        run_id: run_id.to_string(),
+                        step_id: id.to_string(),
+                    });
+                }
+                id.to_string()
+            }
+            None => match gates.len() {
+                0 => return Err(ApprovalError::NoAwaitingStep),
+                1 => gates[0].step_id.clone(),
+                _ => {
+                    return Err(ApprovalError::AmbiguousGate {
+                        run_id: run_id.to_string(),
+                        candidates: gates.iter().map(|g| g.step_id.clone()).collect(),
+                    });
+                }
+            },
+        };
         let _ = approver; // identity recorded in transcript via runner re-entry
-        record.status = RunStatus::Running;
-        record.awaiting_step_id = None;
-        record.approval_prompt = None;
-        record.awaiting_since = None;
-        record.expires_at = None;
+        gates.retain(|g| g.step_id != step_id);
+        record.awaiting = gates;
+        record.status = if record.awaiting.is_empty() {
+            RunStatus::Running
+        } else {
+            RunStatus::AwaitingApproval
+        };
+        record.sync_awaiting_compat();
         record.error_message = None;
         self.update(&record)?;
         Ok(ApprovalDecision::Approved {
@@ -1154,12 +1547,41 @@ impl RunStore {
         })
     }
 
+    /// Back-compat wrapper over [`reject_gate`](Self::reject_gate) with
+    /// `gate_id: None` — see [`approve`](Self::approve)'s doc for the
+    /// identical sole-gate-resolution / ambiguity-guard contract.
     pub fn reject(
         &self,
         run_id: &str,
         approver: &str,
         reason: &str,
         now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        self.reject_gate(run_id, approver, reason, now, None)
+    }
+
+    /// Gate-targeted reject (Task 5b-1, spec §7). `gate_id: None` behaves
+    /// exactly like the legacy sole-gate [`reject`](Self::reject).
+    /// `gate_id: Some(id)` rejects exactly that gate: it's removed from
+    /// the awaiting set; the run stays `AwaitingApproval` while other
+    /// gates remain parked, and only flips to `Rejected` once the set is
+    /// empty (mirroring [`approve_gate`](Self::approve_gate)'s
+    /// empties-the-set-transitions-out rule, using THIS call's own
+    /// Rejected outcome for the final transition).
+    ///
+    /// **5b-2 handoff note:** rejecting one gate out of a still-parked
+    /// multi-gate set does not run that gate's own `on_reject` cleanup
+    /// chain or cancel its downstream path — this method only tracks
+    /// set membership + the whole-run terminal transition. Driving a
+    /// single rejected path's cleanup while sibling gates stay parked is
+    /// part of the CP/CLI gate-sweep ripple Task 5b-2 owns.
+    pub fn reject_gate(
+        &self,
+        run_id: &str,
+        approver: &str,
+        reason: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        gate_id: Option<&str>,
     ) -> Result<ApprovalDecision, ApprovalError> {
         let mut record = self.load(run_id).map_err(|e| match e {
             RunStoreError::NotFound(s) => ApprovalError::NotFound(s),
@@ -1203,27 +1625,48 @@ impl RunStore {
                 record.status.as_str().to_string(),
             ));
         }
-        let step_id = record
-            .awaiting_step_id
-            .clone()
-            .ok_or(ApprovalError::NoAwaitingStep)?;
-        let _ = approver;
-        record.status = RunStatus::Rejected;
-        record.error_message = Some(format!("rejected: {reason}"));
-        record.finished_at = Some(now);
-        record.awaiting_step_id = None;
-        record.approval_prompt = None;
-        record.awaiting_since = None;
-        record.expires_at = None;
-        self.update(&record)?;
-        self.append_terminal_event(
-            run_id,
-            &crate::executor::Event::RunCompleted {
-                run_id: run_id.to_string(),
-                status: RunStatus::Rejected,
-                finished_at: now,
+        let mut gates = record.awaiting_gates();
+        let step_id = match gate_id {
+            Some(id) => {
+                if !gates.iter().any(|g| g.step_id == id) {
+                    return Err(ApprovalError::GateNotFound {
+                        run_id: run_id.to_string(),
+                        step_id: id.to_string(),
+                    });
+                }
+                id.to_string()
+            }
+            None => match gates.len() {
+                0 => return Err(ApprovalError::NoAwaitingStep),
+                1 => gates[0].step_id.clone(),
+                _ => {
+                    return Err(ApprovalError::AmbiguousGate {
+                        run_id: run_id.to_string(),
+                        candidates: gates.iter().map(|g| g.step_id.clone()).collect(),
+                    });
+                }
             },
-        );
+        };
+        let _ = approver;
+        gates.retain(|g| g.step_id != step_id);
+        record.awaiting = gates;
+        if record.awaiting.is_empty() {
+            record.status = RunStatus::Rejected;
+            record.error_message = Some(format!("rejected: {reason}"));
+            record.finished_at = Some(now);
+        }
+        record.sync_awaiting_compat();
+        self.update(&record)?;
+        if record.status == RunStatus::Rejected {
+            self.append_terminal_event(
+                run_id,
+                &crate::executor::Event::RunCompleted {
+                    run_id: run_id.to_string(),
+                    status: RunStatus::Rejected,
+                    finished_at: now,
+                },
+            );
+        }
         Ok(ApprovalDecision::Rejected {
             run_id: run_id.to_string(),
             step_id,
@@ -1264,12 +1707,29 @@ impl RunStore {
     /// run (`ask` / `bypass` / `readonly`). It is validated and stored on
     /// `resume_mode`; anything outside the three known modes (or `None`)
     /// stores `None`, leaving the worker to fall back to its default.
+    ///
+    /// `gate_id` (Task 5b-2b, spec §7) targets a specific parked gate on a
+    /// genuinely multi-gate `AwaitingApproval` run — this marker-only path
+    /// has no way to hand the target gate id directly to the background
+    /// worker that eventually spawns `rupu workflow approve`, so instead it
+    /// REORDERS `record.awaiting` so the targeted gate becomes the first
+    /// element, then re-derives the compat fields
+    /// ([`RunRecord::sync_awaiting_compat`]) — `awaiting_step_id` (which the
+    /// worker already reads to build its `--gate` argv) now names exactly
+    /// this gate. `None` behaves exactly like before this task for a record
+    /// with at most one parked gate (the sole-gate back-compat contract);
+    /// for a genuine multi-gate record it returns
+    /// [`ApprovalError::AmbiguousGate`] rather than silently marking the
+    /// first gate. `Some(id)` that doesn't name a currently-parked gate
+    /// returns [`ApprovalError::GateNotFound`]. Only applies to the
+    /// `AwaitingApproval` case — a `Paused` run has no gate to target.
     pub fn request_resume_approval(
         &self,
         run_id: &str,
         approver: &str,
         mode: Option<&str>,
         now: chrono::DateTime<chrono::Utc>,
+        gate_id: Option<&str>,
     ) -> Result<ApprovalDecision, ApprovalError> {
         let mut record = self.load(run_id).map_err(|e| match e {
             RunStoreError::NotFound(s) => ApprovalError::NotFound(s),
@@ -1323,6 +1783,65 @@ impl RunStore {
                 record.status.as_str().to_string(),
             ));
         }
+        // Gate targeting (spec §7) — only meaningful while genuinely
+        // `AwaitingApproval`. A record with at most one parked gate takes
+        // the untouched byte-for-byte-identical path (whether `gate_id` is
+        // `None`, or `Some` naming that sole gate); only a record with >1
+        // parked gates needs the reorder-and-resync below.
+        //
+        // `resolved_gate_id` is separate from the `awaiting`
+        // reorder/`sync_awaiting_compat()` below: it's what actually gets
+        // persisted onto the MARKER itself (`record.resume_gate_id`,
+        // written further down). The reorder alone is not sufficient to
+        // get the target gate to the background resume worker — a second
+        // concurrent approve request could reorder `awaiting_step_id`
+        // again before this marker is consumed (T5b-2b-i correctness fix:
+        // the marker must carry its own immutable target, not rely on
+        // mutable live record state at resume time).
+        let mut resolved_gate_id: Option<String> = None;
+        if record.status == RunStatus::AwaitingApproval {
+            let gates = record.awaiting_gates();
+            if gates.len() > 1 {
+                match gate_id {
+                    None => {
+                        return Err(ApprovalError::AmbiguousGate {
+                            run_id: run_id.to_string(),
+                            candidates: gates.iter().map(|g| g.step_id.clone()).collect(),
+                        });
+                    }
+                    Some(id) => {
+                        let mut reordered = gates;
+                        let pos = reordered
+                            .iter()
+                            .position(|g| g.step_id == id)
+                            .ok_or_else(|| ApprovalError::GateNotFound {
+                                run_id: run_id.to_string(),
+                                step_id: id.to_string(),
+                            })?;
+                        let target = reordered.remove(pos);
+                        reordered.insert(0, target);
+                        record.awaiting = reordered;
+                        record.sync_awaiting_compat();
+                        resolved_gate_id = Some(id.to_string());
+                    }
+                }
+            } else if let Some(id) = gate_id {
+                // Sole-gate (or legacy compat-only) record: an explicit
+                // gate id must still name the one gate that's actually
+                // parked, but no reorder/resync is needed — the compat
+                // fields already mirror it. Still recorded on the marker
+                // (harmless — `approve_gate(Some(sole)) ==
+                // approve_gate(None)` — but robust against the same
+                // race the multi-gate branch above guards against).
+                if !gates.iter().any(|g| g.step_id == id) {
+                    return Err(ApprovalError::GateNotFound {
+                        run_id: run_id.to_string(),
+                        step_id: id.to_string(),
+                    });
+                }
+                resolved_gate_id = Some(id.to_string());
+            }
+        }
         // The approval-gate case always has `awaiting_step_id` set (the
         // runner persists it alongside the gate); keep that a hard error so
         // a corrupt AwaitingApproval record still surfaces loudly. A
@@ -1345,6 +1864,7 @@ impl RunStore {
         record.resume_mode = mode
             .filter(|m| matches!(*m, "ask" | "bypass" | "readonly"))
             .map(str::to_string);
+        record.resume_gate_id = resolved_gate_id;
         self.update(&record)?;
         Ok(ApprovalDecision::Approved {
             run_id: run_id.to_string(),
@@ -1417,6 +1937,7 @@ impl RunStore {
         record.resume_claimed_at = None;
         record.resume_claimed_by = None;
         record.resume_mode = None;
+        record.resume_gate_id = None;
         self.update(&record)?;
         Ok(())
     }
@@ -1818,6 +2339,7 @@ mod tests {
             started_at: Utc::now(),
             finished_at: None,
             error_message: None,
+            awaiting: Vec::new(),
             awaiting_step_id: None,
             approval_prompt: None,
             awaiting_since: None,
@@ -1838,6 +2360,7 @@ mod tests {
             resume_claimed_at: None,
             resume_claimed_by: None,
             resume_mode: None,
+            resume_gate_id: None,
             final_output: None,
         }
     }
@@ -2302,6 +2825,91 @@ mod tests {
         }
     }
 
+    /// Confirmed-latent bug from 5b-1 review: on the timeout Fail/Reject
+    /// terminal paths, `record.awaiting` must end up empty IN SYNC with
+    /// the compat fields — before this fix, those two arms cleared only
+    /// the compat fields, leaving a populated `awaiting` set (the real
+    /// shape `run_workflow`'s Approval-pause handling persists post-5b-1)
+    /// disagreeing with `awaiting_step_id: None` on a terminal record: a
+    /// phantom parked gate, invisible only because every reader still
+    /// used the compat fields. The pre-existing timeout tests never
+    /// caught this because they build a legacy record (`awaiting: []`,
+    /// only the compat fields set) directly rather than the populated-set
+    /// shape a real batch-park produces — this helper simulates THAT
+    /// shape.
+    fn awaiting_set_record_for_timeout(id: &str, now: DateTime<Utc>) -> RunRecord {
+        let mut rec = sample_record(id);
+        rec.status = RunStatus::AwaitingApproval;
+        rec.awaiting = vec![AwaitingGate {
+            step_id: "deploy".into(),
+            prompt: Some("ok?".into()),
+            since: now - chrono::Duration::seconds(120),
+            expires_at: Some(now - chrono::Duration::seconds(30)),
+        }];
+        rec.sync_awaiting_compat();
+        rec
+    }
+
+    #[test]
+    fn expire_if_overdue_on_timeout_fail_clears_awaiting_set_in_sync_with_compat_fields() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let rec = awaiting_set_record_for_timeout("run_timeout_fail_sync", now);
+        let run_id = rec.id.clone();
+        store.create(rec.clone(), "x").unwrap();
+
+        let mut loaded = rec;
+        let outcome = store
+            .expire_if_overdue(&mut loaded, now, Some(TimeoutAction::Fail))
+            .unwrap();
+        assert_eq!(outcome, Some(TimeoutAction::Fail));
+        assert_eq!(loaded.status, RunStatus::Failed);
+        // `awaiting` and the compat fields must AGREE — both empty.
+        assert!(
+            loaded.awaiting.is_empty(),
+            "phantom parked gate on a Failed record: {:?}",
+            loaded.awaiting
+        );
+        assert!(loaded.awaiting_step_id.is_none());
+        assert!(loaded.approval_prompt.is_none());
+        assert!(loaded.awaiting_since.is_none());
+        assert!(loaded.expires_at.is_none());
+        // Persisted to disk too — not just the in-memory `loaded`.
+        let reloaded = store.load(&run_id).unwrap();
+        assert!(reloaded.awaiting.is_empty());
+        assert!(reloaded.awaiting_step_id.is_none());
+    }
+
+    #[test]
+    fn expire_if_overdue_on_timeout_reject_clears_awaiting_set_in_sync_with_compat_fields() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let rec = awaiting_set_record_for_timeout("run_timeout_reject_sync", now);
+        let run_id = rec.id.clone();
+        store.create(rec.clone(), "x").unwrap();
+
+        let mut loaded = rec;
+        let outcome = store
+            .expire_if_overdue(&mut loaded, now, Some(TimeoutAction::Reject))
+            .unwrap();
+        assert_eq!(outcome, Some(TimeoutAction::Reject));
+        assert_eq!(loaded.status, RunStatus::Rejected);
+        assert!(
+            loaded.awaiting.is_empty(),
+            "phantom parked gate on a Rejected record: {:?}",
+            loaded.awaiting
+        );
+        assert!(loaded.awaiting_step_id.is_none());
+        assert!(loaded.approval_prompt.is_none());
+        assert!(loaded.awaiting_since.is_none());
+        assert!(loaded.expires_at.is_none());
+        let reloaded = store.load(&run_id).unwrap();
+        assert!(reloaded.awaiting.is_empty());
+        assert!(reloaded.awaiting_step_id.is_none());
+    }
+
     #[test]
     fn expire_if_overdue_is_idempotent() {
         let tmp = TempDir::new().unwrap();
@@ -2450,6 +3058,455 @@ mod tests {
         assert_eq!(reloaded.status, RunStatus::Failed);
     }
 
+    // ── Task 5b-1: the multi-gate awaiting-set (spec §7) ────────────────
+
+    fn two_gate_record(id: &str) -> RunRecord {
+        let mut rec = sample_record(id);
+        rec.status = RunStatus::AwaitingApproval;
+        let since = Utc::now();
+        rec.awaiting = vec![
+            AwaitingGate {
+                step_id: "gate_a".into(),
+                prompt: Some("approve a?".into()),
+                since,
+                expires_at: None,
+            },
+            AwaitingGate {
+                step_id: "gate_b".into(),
+                prompt: Some("approve b?".into()),
+                since,
+                expires_at: None,
+            },
+        ];
+        rec.sync_awaiting_compat();
+        rec
+    }
+
+    #[test]
+    fn multi_gate_record_round_trips_through_disk_intact() {
+        // A modern record with a real multi-gate `awaiting` set persists
+        // and loads back byte-for-byte, and the derived-compat fields
+        // mirror gate_a (the FIRST element) — not dropped, not stale.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = two_gate_record("run_multi_gate");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let loaded = store.load(&rec.id).unwrap();
+        assert_eq!(loaded.awaiting, rec.awaiting);
+        assert_eq!(loaded.awaiting.len(), 2);
+        assert_eq!(loaded.awaiting_step_id.as_deref(), Some("gate_a"));
+        assert_eq!(loaded.approval_prompt.as_deref(), Some("approve a?"));
+        assert_eq!(loaded.awaiting_since, Some(rec.awaiting[0].since));
+    }
+
+    #[test]
+    fn legacy_record_with_only_awaiting_step_id_normalizes_to_one_element_set() {
+        // The on-disk shape of EVERY `run.json` written before this task
+        // (and everything a single-gate code path still writes): empty
+        // `awaiting`, only the legacy compat fields populated.
+        // `awaiting_gates()` must synthesize a one-element set from them
+        // WITHOUT mutating the record — the legacy shape re-persists
+        // unchanged (the round-trip below never calls a mutator).
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = awaiting_record("run_legacy_single_gate");
+        assert!(
+            rec.awaiting.is_empty(),
+            "precondition: legacy fixture must not populate the new field"
+        );
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let loaded = store.load(&rec.id).unwrap();
+        // On-disk shape preserved exactly — reading never upgrades it.
+        assert!(loaded.awaiting.is_empty());
+        assert_eq!(loaded.awaiting_step_id.as_deref(), Some("deploy"));
+        assert_eq!(loaded.approval_prompt.as_deref(), Some("ok?"));
+
+        // The normalized view synthesizes a one-element set from the
+        // legacy fields.
+        let gates = loaded.awaiting_gates();
+        assert_eq!(gates.len(), 1);
+        assert_eq!(gates[0].step_id, "deploy");
+        assert_eq!(gates[0].prompt.as_deref(), Some("ok?"));
+        assert_eq!(gates[0].since, loaded.awaiting_since.unwrap());
+
+        // Re-persisting the record UNCHANGED keeps the legacy shape byte-
+        // for-byte (nothing here calls `sync_awaiting_compat` or mutates
+        // `awaiting`) — proof `awaiting_gates()` is read-only.
+        store.update(&loaded).unwrap();
+        let reloaded = store.load(&rec.id).unwrap();
+        assert!(reloaded.awaiting.is_empty());
+        assert_eq!(reloaded.awaiting_step_id.as_deref(), Some("deploy"));
+    }
+
+    #[test]
+    fn record_json_with_no_awaiting_key_at_all_deserializes_and_normalizes() {
+        // The REAL migration case: a `run.json` written before `awaiting`
+        // existed has no such key in the file at all — not even `[]`.
+        // `#[serde(default)]` must produce an empty `Vec` from a wholly
+        // ABSENT key (the earlier round-trip tests only ever exercise a
+        // record built from the `RunRecord` struct itself, which always
+        // serializes SOME value for every field pre-5b-1-serde-attribute
+        // or none at all now that `skip_serializing_if` is set — neither
+        // proves the absent-key case a genuinely pre-existing on-disk
+        // file has). Hand-written JSON, not constructed via the struct.
+        let json = r#"{
+            "id": "run_hand_written_legacy",
+            "workflow_name": "investigate-then-fix",
+            "status": "awaiting_approval",
+            "inputs": {},
+            "workspace_id": "ws_1",
+            "workspace_path": "/tmp/proj",
+            "transcript_dir": "/tmp/proj/.rupu/transcripts",
+            "started_at": "2026-01-01T00:00:00Z",
+            "awaiting_step_id": "deploy",
+            "approval_prompt": "ok?",
+            "awaiting_since": "2026-01-01T00:05:00Z"
+        }"#;
+        let rec: RunRecord = serde_json::from_str(json).expect("no `awaiting` key must still parse");
+        assert!(
+            rec.awaiting.is_empty(),
+            "absent key must default to empty, not error or synthesize eagerly"
+        );
+        assert_eq!(rec.awaiting_step_id.as_deref(), Some("deploy"));
+
+        let gates = rec.awaiting_gates();
+        assert_eq!(gates.len(), 1, "normalizes to a one-element set on demand");
+        assert_eq!(gates[0].step_id, "deploy");
+        assert_eq!(gates[0].prompt.as_deref(), Some("ok?"));
+    }
+
+    #[test]
+    fn empty_awaiting_set_does_not_grow_an_awaiting_key_on_serialize() {
+        // Mirrors how `next` is skipped on `Step` when empty — an empty
+        // `awaiting` must not add a `"awaiting": []` key when a legacy or
+        // terminal record re-persists, so a pre-5b-1 `run.json` (or a
+        // just-expired/approved/rejected one, post the sync fix above)
+        // stays byte-identical on rewrite instead of silently growing a
+        // new key every future task would then have to tolerate too.
+        let rec = sample_record("run_no_awaiting_key_on_write");
+        assert!(rec.awaiting.is_empty());
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(
+            !json.contains("\"awaiting\""),
+            "empty `awaiting` must be omitted from the serialized record, got: {json}"
+        );
+    }
+
+    #[test]
+    fn approve_gate_by_id_shrinks_the_set_and_stays_awaiting_until_empty() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = two_gate_record("run_two_gate_approve");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        // Approve gate_a by id: it's removed, gate_b stays parked, the run
+        // stays AwaitingApproval (NOT Running — the set is non-empty).
+        let decision = store
+            .approve_gate(&rec.id, "matt", Utc::now(), Some("gate_a"))
+            .unwrap();
+        assert!(matches!(
+            decision,
+            ApprovalDecision::Approved { ref step_id, .. } if step_id == "gate_a"
+        ));
+        let mid = store.load(&rec.id).unwrap();
+        assert_eq!(mid.status, RunStatus::AwaitingApproval);
+        assert_eq!(mid.awaiting.len(), 1);
+        assert_eq!(mid.awaiting[0].step_id, "gate_b");
+        // Derived-compat now mirrors the ONE remaining gate.
+        assert_eq!(mid.awaiting_step_id.as_deref(), Some("gate_b"));
+
+        // Approve gate_b by id: the set empties, the run flips to Running.
+        let decision2 = store
+            .approve_gate(&rec.id, "matt", Utc::now(), Some("gate_b"))
+            .unwrap();
+        assert!(matches!(
+            decision2,
+            ApprovalDecision::Approved { ref step_id, .. } if step_id == "gate_b"
+        ));
+        let done = store.load(&rec.id).unwrap();
+        assert_eq!(done.status, RunStatus::Running);
+        assert!(done.awaiting.is_empty());
+        assert!(done.awaiting_step_id.is_none());
+    }
+
+    #[test]
+    fn approve_with_no_gate_id_on_a_multi_gate_run_is_ambiguous() {
+        // The legacy sole-gate `approve()` — and `approve_gate(None)` —
+        // must refuse rather than silently approve whichever gate
+        // happens to be first, once a run genuinely has more than one
+        // parked gate.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = two_gate_record("run_two_gate_ambiguous");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let err = store.approve(&rec.id, "matt", Utc::now()).unwrap_err();
+        match err {
+            ApprovalError::AmbiguousGate { run_id, candidates } => {
+                assert_eq!(run_id, rec.id);
+                assert_eq!(candidates, vec!["gate_a".to_string(), "gate_b".to_string()]);
+            }
+            other => panic!("expected AmbiguousGate, got {other:?}"),
+        }
+        // Nothing mutated — still AwaitingApproval with both gates intact.
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::AwaitingApproval);
+        assert_eq!(reloaded.awaiting.len(), 2);
+    }
+
+    #[test]
+    fn approve_gate_with_unknown_id_errors_gate_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = two_gate_record("run_two_gate_unknown_id");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let err = store
+            .approve_gate(&rec.id, "matt", Utc::now(), Some("no_such_gate"))
+            .unwrap_err();
+        assert!(matches!(err, ApprovalError::GateNotFound { .. }));
+    }
+
+    #[test]
+    fn reject_gate_by_id_shrinks_the_set_before_flipping_to_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = two_gate_record("run_two_gate_reject");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        store
+            .reject_gate(&rec.id, "matt", "no", Utc::now(), Some("gate_a"))
+            .unwrap();
+        let mid = store.load(&rec.id).unwrap();
+        assert_eq!(mid.status, RunStatus::AwaitingApproval);
+        assert_eq!(mid.awaiting.len(), 1);
+        assert_eq!(mid.awaiting[0].step_id, "gate_b");
+
+        store
+            .reject_gate(&rec.id, "matt", "no", Utc::now(), Some("gate_b"))
+            .unwrap();
+        let done = store.load(&rec.id).unwrap();
+        assert_eq!(done.status, RunStatus::Rejected);
+        assert!(done.awaiting.is_empty());
+    }
+
+    // ── Task 5b-2a: per-gate expiry (`expire_gate_if_overdue`) ──────────
+
+    fn two_gate_record_with_expiry(
+        id: &str,
+        gate_a_expires_at: Option<DateTime<Utc>>,
+        gate_b_expires_at: Option<DateTime<Utc>>,
+    ) -> RunRecord {
+        let mut rec = sample_record(id);
+        rec.status = RunStatus::AwaitingApproval;
+        let since = Utc::now() - chrono::Duration::seconds(120);
+        rec.awaiting = vec![
+            AwaitingGate {
+                step_id: "gate_a".into(),
+                prompt: Some("approve a?".into()),
+                since,
+                expires_at: gate_a_expires_at,
+            },
+            AwaitingGate {
+                step_id: "gate_b".into(),
+                prompt: Some("approve b?".into()),
+                since,
+                expires_at: gate_b_expires_at,
+            },
+        ];
+        rec.sync_awaiting_compat();
+        rec
+    }
+
+    #[test]
+    fn expire_gate_if_overdue_reject_removes_only_the_overdue_gate_leaves_sibling_parked() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        // gate_a is overdue (timeout: reject); gate_b has NO timeout set —
+        // it must never be touched by timing out gate_a.
+        let rec = two_gate_record_with_expiry(
+            "run_gate_a_overdue_reject",
+            Some(now - chrono::Duration::seconds(30)),
+            None,
+        );
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let mut loaded = rec;
+        let outcome = store
+            .expire_gate_if_overdue(&mut loaded, "gate_a", now, Some(TimeoutAction::Reject))
+            .unwrap();
+        assert_eq!(outcome, Some(TimeoutAction::Reject));
+        // Only gate_a is gone; the run stays AwaitingApproval because
+        // gate_b is still parked (Reject terminates only if it EMPTIES
+        // the set).
+        assert_eq!(loaded.status, RunStatus::AwaitingApproval);
+        assert_eq!(loaded.awaiting.len(), 1);
+        assert_eq!(loaded.awaiting[0].step_id, "gate_b");
+        assert_eq!(loaded.awaiting_step_id.as_deref(), Some("gate_b"));
+
+        let reloaded = store.load(&loaded.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::AwaitingApproval);
+        assert_eq!(reloaded.awaiting.len(), 1);
+        assert_eq!(reloaded.awaiting[0].step_id, "gate_b");
+    }
+
+    #[test]
+    fn expire_gate_if_overdue_reject_flips_rejected_once_the_sole_gate_empties_the_set() {
+        // Single-gate parity: a run with exactly ONE overdue gate must
+        // reach the SAME terminal state `expire_if_overdue` reaches.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_sole_gate_overdue_reject");
+        rec.status = RunStatus::AwaitingApproval;
+        rec.awaiting = vec![AwaitingGate {
+            step_id: "deploy".into(),
+            prompt: Some("ok?".into()),
+            since: now - chrono::Duration::seconds(120),
+            expires_at: Some(now - chrono::Duration::seconds(30)),
+        }];
+        rec.sync_awaiting_compat();
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let mut loaded = rec;
+        let outcome = store
+            .expire_gate_if_overdue(&mut loaded, "deploy", now, Some(TimeoutAction::Reject))
+            .unwrap();
+        assert_eq!(outcome, Some(TimeoutAction::Reject));
+        assert_eq!(loaded.status, RunStatus::Rejected);
+        assert!(loaded.awaiting.is_empty());
+        assert!(loaded.awaiting_step_id.is_none());
+        assert!(loaded.finished_at.is_some());
+
+        match last_event(&store, "run_sole_gate_overdue_reject") {
+            crate::executor::Event::RunCompleted { status, .. } => {
+                assert_eq!(status, RunStatus::Rejected);
+            }
+            other => panic!("expected RunCompleted(rejected), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expire_gate_if_overdue_fail_forces_whole_run_failed_even_with_sibling_parked() {
+        // `on_timeout: fail` is an abort-the-run policy: timing out gate_a
+        // fails the WHOLE run immediately, clearing gate_b too — unlike
+        // Reject, Fail does not wait for the set to empty on its own.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let rec = two_gate_record_with_expiry(
+            "run_gate_a_overdue_fail",
+            Some(now - chrono::Duration::seconds(30)),
+            None,
+        );
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let mut loaded = rec;
+        let outcome = store
+            .expire_gate_if_overdue(&mut loaded, "gate_a", now, Some(TimeoutAction::Fail))
+            .unwrap();
+        assert_eq!(outcome, Some(TimeoutAction::Fail));
+        assert_eq!(loaded.status, RunStatus::Failed);
+        assert!(
+            loaded.awaiting.is_empty(),
+            "Fail clears the WHOLE set, including sibling gate_b"
+        );
+        assert!(loaded.awaiting_step_id.is_none());
+
+        let reloaded = store.load(&loaded.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Failed);
+        assert!(reloaded.awaiting.is_empty());
+    }
+
+    #[test]
+    fn expire_gate_if_overdue_approve_leaves_record_untouched_for_that_gate() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let rec = two_gate_record_with_expiry(
+            "run_gate_a_overdue_approve",
+            Some(now - chrono::Duration::seconds(30)),
+            None,
+        );
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let mut loaded = rec.clone();
+        let outcome = store
+            .expire_gate_if_overdue(&mut loaded, "gate_a", now, Some(TimeoutAction::Approve))
+            .unwrap();
+        assert_eq!(outcome, Some(TimeoutAction::Approve));
+        // Nothing mutated — both gates untouched, not persisted.
+        assert_eq!(loaded.awaiting, rec.awaiting);
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.awaiting.len(), 2);
+    }
+
+    #[test]
+    fn expire_gate_if_overdue_is_noop_for_a_gate_not_currently_parked() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let rec = two_gate_record_with_expiry(
+            "run_gate_unknown_id",
+            Some(now - chrono::Duration::seconds(30)),
+            None,
+        );
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let mut loaded = rec;
+        let outcome = store
+            .expire_gate_if_overdue(&mut loaded, "no_such_gate", now, Some(TimeoutAction::Reject))
+            .unwrap();
+        assert!(outcome.is_none());
+        assert_eq!(loaded.awaiting.len(), 2, "unrelated gate id must not touch the set");
+    }
+
+    #[test]
+    fn expire_gate_if_overdue_is_noop_when_gate_has_no_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        // gate_b has no timeout_seconds — never expires no matter `now`.
+        let rec = two_gate_record_with_expiry("run_gate_b_no_timeout", None, None);
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let mut loaded = rec;
+        let outcome = store
+            .expire_gate_if_overdue(&mut loaded, "gate_b", now, Some(TimeoutAction::Reject))
+            .unwrap();
+        assert!(outcome.is_none());
+        assert_eq!(loaded.awaiting.len(), 2);
+    }
+
+    #[test]
+    fn single_gate_approve_via_legacy_entrypoint_is_unaffected_by_the_set_model() {
+        // Primary safety invariant: a one-gate run behaves EXACTLY as
+        // before this task through the unchanged `approve()` signature —
+        // `awaiting.len() == 1`, `awaiting_step_id` set, `approve(None)`
+        // (i.e. plain `approve()`) resolves the sole gate with no
+        // ambiguity error.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = awaiting_record("run_single_gate_parity");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        assert_eq!(rec.awaiting_gates().len(), 1);
+
+        let decision = store.approve(&rec.id, "matt", Utc::now()).unwrap();
+        assert!(matches!(
+            decision,
+            ApprovalDecision::Approved { ref step_id, .. } if step_id == "deploy"
+        ));
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Running);
+        assert!(reloaded.awaiting.is_empty());
+        assert!(reloaded.awaiting_step_id.is_none());
+        assert!(reloaded.approval_prompt.is_none());
+        assert!(reloaded.awaiting_since.is_none());
+    }
+
     #[test]
     fn step_kind_round_trips_through_jsonl() {
         // Each variant must round-trip cleanly through serde so the
@@ -2460,6 +3517,8 @@ mod tests {
             StepKind::Parallel,
             StepKind::Panel,
             StepKind::Branch,
+            StepKind::Split,
+            StepKind::Join,
             StepKind::Action,
             StepKind::ApprovalGate,
         ] {
@@ -2469,6 +3528,31 @@ mod tests {
             let parsed: StepResultRecord = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed.kind, kind);
         }
+    }
+
+    /// Task 5b-2b-ii: `Split`'s wire repr is exactly `"split"` (the same
+    /// `snake_case` convention every other variant uses), and it round-trips
+    /// through the same JSONL shape a live split-node `StepResult` is
+    /// persisted as.
+    #[test]
+    fn step_kind_split_serializes_to_snake_case_split() {
+        assert_eq!(
+            serde_json::to_string(&StepKind::Split).unwrap(),
+            "\"split\""
+        );
+        let parsed: StepKind = serde_json::from_str("\"split\"").unwrap();
+        assert_eq!(parsed, StepKind::Split);
+    }
+
+    /// Join's wire repr is exactly `"join"` (the same `snake_case`
+    /// convention every other variant uses), and it round-trips through
+    /// the same JSONL shape a live join-node `StepResult` is persisted as.
+    /// Mirrors [`step_kind_split_serializes_to_snake_case_split`].
+    #[test]
+    fn step_kind_join_serializes_to_snake_case_join() {
+        assert_eq!(serde_json::to_string(&StepKind::Join).unwrap(), "\"join\"");
+        let parsed: StepKind = serde_json::from_str("\"join\"").unwrap();
+        assert_eq!(parsed, StepKind::Join);
     }
 
     #[test]
@@ -2488,6 +3572,28 @@ mod tests {
         });
         let parsed: StepResultRecord = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.kind, StepKind::Linear);
+    }
+
+    /// Task 5b-2b-ii, PRIMARY SAFETY INVARIANT: a legacy on-disk record with
+    /// `kind: "branch"` — either a real branch, or (pre-this-task) a split
+    /// node that was persisted under the reused `Branch` variant — still
+    /// deserializes cleanly as `StepKind::Branch`. Adding `Split` is
+    /// additive; it must never break reading an old record.
+    #[test]
+    fn legacy_branch_kind_record_still_deserializes_as_branch() {
+        let json = serde_json::json!({
+            "step_id": "old_split_or_branch",
+            "run_id": "run_old",
+            "transcript_path": "",
+            "output": "",
+            "success": true,
+            "skipped": false,
+            "rendered_prompt": "",
+            "kind": "branch",
+            "finished_at": Utc::now().to_rfc3339(),
+        });
+        let parsed: StepResultRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.kind, StepKind::Branch);
     }
 
     #[test]
@@ -2526,7 +3632,7 @@ mod tests {
 
         let now = Utc::now();
         let decision = store
-            .request_resume_approval(&rec.id, "matt", None, now)
+            .request_resume_approval(&rec.id, "matt", None, now, None)
             .unwrap();
         // The decision reports the still-present awaited step id.
         assert_eq!(
@@ -2545,6 +3651,167 @@ mod tests {
         assert!(reloaded.approval_prompt.is_some());
         assert!(reloaded.awaiting_since.is_some());
         assert_eq!(reloaded.resume_requested_at, Some(now));
+        // `gate_id: None` and only one gate parked — the marker carries no
+        // gate id at all (the resume worker omits `--gate`, byte-for-byte
+        // the pre-T5b-2b-i behavior).
+        assert_eq!(reloaded.resume_gate_id, None);
+    }
+
+    /// A 2-gate `AwaitingApproval` record — both `gate_a` and `gate_b`
+    /// genuinely parked (not the legacy compat-only shape).
+    fn multi_gate_awaiting_record(id: &str) -> RunRecord {
+        let mut rec = sample_record(id);
+        rec.status = RunStatus::AwaitingApproval;
+        let since = Utc::now();
+        rec.awaiting = vec![
+            AwaitingGate {
+                step_id: "gate_a".into(),
+                prompt: Some("approve a?".into()),
+                since,
+                expires_at: None,
+            },
+            AwaitingGate {
+                step_id: "gate_b".into(),
+                prompt: Some("approve b?".into()),
+                since,
+                expires_at: None,
+            },
+        ];
+        rec.sync_awaiting_compat();
+        rec
+    }
+
+    #[test]
+    fn request_resume_approval_with_gate_targets_that_gate_on_a_multi_gate_run() {
+        // Task 5b-2b (spec §7): the web marker path has no way to hand the
+        // target gate id directly to the resume worker, so it BOTH reorders
+        // `awaiting` (so the targeted gate is first and the derived-compat
+        // `awaiting_step_id` names it — useful for display / a first
+        // approximation) AND persists it on `resume_gate_id`, the field the
+        // marker itself carries the target through on (T5b-2b-i
+        // correctness fix: `awaiting_step_id` is live, mutable record
+        // state a second concurrent approve request could reorder again
+        // before the async resume worker gets to it — the worker reads
+        // `resume_gate_id`, not `awaiting_step_id`, for exactly that
+        // reason; see that field's doc).
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = multi_gate_awaiting_record("run_resume_multi_b");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let now = Utc::now();
+        let decision = store
+            .request_resume_approval(&rec.id, "web", None, now, Some("gate_b"))
+            .unwrap();
+        assert_eq!(
+            decision,
+            ApprovalDecision::Approved {
+                run_id: rec.id.clone(),
+                step_id: "gate_b".into(),
+            }
+        );
+
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::AwaitingApproval);
+        // Both gates remain parked — targeting one for resume does not drop
+        // its sibling.
+        assert_eq!(reloaded.awaiting.len(), 2);
+        assert!(reloaded.awaiting.iter().any(|g| g.step_id == "gate_a"));
+        assert!(reloaded.awaiting.iter().any(|g| g.step_id == "gate_b"));
+        // gate_b is now first, so the derived-compat field names it too.
+        assert_eq!(reloaded.awaiting_step_id.as_deref(), Some("gate_b"));
+        assert_eq!(reloaded.resume_requested_at, Some(now));
+        // The marker itself carries the target gate — this is what the
+        // resume worker actually reads to build its `--gate` argv.
+        assert_eq!(reloaded.resume_gate_id.as_deref(), Some("gate_b"));
+    }
+
+    #[test]
+    fn request_resume_approval_with_no_gate_on_a_multi_gate_run_is_ambiguous() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = multi_gate_awaiting_record("run_resume_multi_ambig");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let err = store
+            .request_resume_approval(&rec.id, "web", None, Utc::now(), None)
+            .unwrap_err();
+        match err {
+            ApprovalError::AmbiguousGate { run_id, candidates } => {
+                assert_eq!(run_id, rec.id);
+                assert_eq!(candidates, vec!["gate_a".to_string(), "gate_b".to_string()]);
+            }
+            other => panic!("expected AmbiguousGate, got {other:?}"),
+        }
+        // No marker was set — the run is untouched by the failed attempt.
+        let reloaded = store.load(&rec.id).unwrap();
+        assert!(reloaded.resume_requested_at.is_none());
+        assert_eq!(reloaded.awaiting.len(), 2);
+    }
+
+    #[test]
+    fn request_resume_approval_with_unknown_gate_id_on_multi_gate_run_errors() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = multi_gate_awaiting_record("run_resume_multi_unknown");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let err = store
+            .request_resume_approval(&rec.id, "web", None, Utc::now(), Some("nope"))
+            .unwrap_err();
+        assert!(matches!(err, ApprovalError::GateNotFound { .. }));
+        let reloaded = store.load(&rec.id).unwrap();
+        assert!(reloaded.resume_requested_at.is_none());
+    }
+
+    #[test]
+    fn request_resume_approval_with_gate_id_matching_sole_gate_is_unchanged() {
+        // Sole-gate parity: an explicit `gate_id` that happens to name the
+        // one parked gate on a 1-gate run resolves/resumes identically to
+        // `None` — primary safety invariant (`approve_gate(Some(sole)) ==
+        // approve_gate(None)`). The marker DOES still record
+        // `resume_gate_id: Some("deploy")` here (harmless — the worker's
+        // `--gate deploy` on a sole gate is a no-op-equivalent to omitting
+        // it), which is a deliberate robustness choice, not a behavior
+        // change: contrast with `request_resume_approval_is_marker_only_and_stays_awaiting`
+        // below, which omits `gate_id` entirely and asserts
+        // `resume_gate_id` stays `None`.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = awaiting_record("run_resume_sole_gate_named");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let now = Utc::now();
+        let decision = store
+            .request_resume_approval(&rec.id, "web", None, now, Some("deploy"))
+            .unwrap();
+        assert_eq!(
+            decision,
+            ApprovalDecision::Approved {
+                run_id: rec.id.clone(),
+                step_id: "deploy".into(),
+            }
+        );
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::AwaitingApproval);
+        assert_eq!(reloaded.awaiting_step_id.as_deref(), Some("deploy"));
+        assert_eq!(reloaded.resume_requested_at, Some(now));
+        assert_eq!(reloaded.resume_gate_id.as_deref(), Some("deploy"));
+    }
+
+    #[test]
+    fn request_resume_approval_with_wrong_gate_id_on_sole_gate_run_errors() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = awaiting_record("run_resume_sole_gate_wrong");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let err = store
+            .request_resume_approval(&rec.id, "web", None, Utc::now(), Some("not-deploy"))
+            .unwrap_err();
+        assert!(matches!(err, ApprovalError::GateNotFound { .. }));
+        let reloaded = store.load(&rec.id).unwrap();
+        assert!(reloaded.resume_requested_at.is_none());
     }
 
     #[test]
@@ -2556,7 +3823,7 @@ mod tests {
         store.create(rec.clone(), SAMPLE_YAML).unwrap();
 
         let err = store
-            .request_resume_approval(&rec.id, "matt", None, Utc::now())
+            .request_resume_approval(&rec.id, "matt", None, Utc::now(), None)
             .unwrap_err();
         assert!(matches!(err, ApprovalError::NotAwaiting(_)));
     }
@@ -2575,7 +3842,7 @@ mod tests {
 
         let now = Utc::now();
         let decision = store
-            .request_resume_approval(&rec.id, "web", None, now)
+            .request_resume_approval(&rec.id, "web", None, now, None)
             .unwrap();
         assert_eq!(
             decision,
@@ -2605,7 +3872,7 @@ mod tests {
         store.create(rec.clone(), SAMPLE_YAML).unwrap();
 
         let decision = store
-            .request_resume_approval(&rec.id, "web", None, Utc::now())
+            .request_resume_approval(&rec.id, "web", None, Utc::now(), None)
             .unwrap();
         assert_eq!(
             decision,
@@ -2873,7 +4140,7 @@ mod tests {
         store.create(rec.clone(), SAMPLE_YAML).unwrap();
 
         store
-            .request_resume_approval(&rec.id, "matt", Some("bypass"), Utc::now())
+            .request_resume_approval(&rec.id, "matt", Some("bypass"), Utc::now(), None)
             .unwrap();
 
         let reloaded = store.load(&rec.id).unwrap();
@@ -2891,7 +4158,7 @@ mod tests {
         store.create(rec.clone(), SAMPLE_YAML).unwrap();
 
         store
-            .request_resume_approval(&rec.id, "matt", Some("turbo"), Utc::now())
+            .request_resume_approval(&rec.id, "matt", Some("turbo"), Utc::now(), None)
             .unwrap();
 
         let reloaded = store.load(&rec.id).unwrap();

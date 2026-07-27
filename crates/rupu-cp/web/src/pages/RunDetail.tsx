@@ -55,6 +55,31 @@ type Tab = 'transcript' | 'events' | 'findings' | 'cycles';
  */
 type Selection = { stepId: string; unitIndex?: number } | null;
 
+/**
+ * Per-gate approve/reject UI state for the MULTI-gate banner (Task 5b-2b,
+ * spec §7) — one of these per parked gate, keyed by step id. Mirrors the
+ * single-gate `gatePending`/`gateError`/`gateDecision`/`rejectOpen`/
+ * `rejectReason`/`approveMode` state atoms above, just multiplied out so two
+ * concurrently-parked gates don't share one pending/error flag.
+ */
+interface GateUiState {
+  pending: boolean;
+  error: string | null;
+  decision: 'approved' | 'rejected' | null;
+  rejectOpen: boolean;
+  rejectReason: string;
+  approveMode: 'ask' | 'bypass' | 'readonly';
+}
+
+const DEFAULT_GATE_UI_STATE: GateUiState = {
+  pending: false,
+  error: null,
+  decision: null,
+  rejectOpen: false,
+  rejectReason: '',
+  approveMode: 'ask',
+};
+
 /** A for_each node with a populated fan-out (units list). */
 function fanoutOf(node: GraphNode | undefined): GraphNode['fanout'] | null {
   if (!node) return null;
@@ -154,6 +179,13 @@ export default function RunDetail() {
   const [rejectReason, setRejectReason] = useState('');
   // Permission mode the run resumes in once approved (worker honours it).
   const [approveMode, setApproveMode] = useState<'ask' | 'bypass' | 'readonly'>('ask');
+
+  // Per-gate UI state for a MULTI-gate run (>1 parked gate, Task 5b-2b, spec
+  // §7) — keyed by step id. The single-gate banner below keeps using the
+  // (unchanged) state above; this map only comes into play once
+  // `awaitingGates.length > 1`, so the 1-gate UX/behavior stays byte-for-byte
+  // identical to before this task.
+  const [multiGateState, setMultiGateState] = useState<Record<string, GateUiState>>({});
 
   // Cancel local state — `cancelPending` disables the controls mid-request;
   // `cancelError` surfaces a failed cancel.
@@ -392,6 +424,64 @@ export default function RunDetail() {
       ? { stepId: run.awaiting_step_id, reason: run.approval_prompt ?? 'Awaiting approval' }
       : undefined;
   }, [model, run]);
+
+  // The FULL parked-gate set (Task 5b-2b, spec §7), straight from the
+  // persisted record's `awaiting` array. Empty/absent for a legacy or
+  // single-gate record — the single-gate banner below relies on `awaiting`
+  // above instead (which already mirrors that one gate via the derived
+  // compat fields, unchanged by this task). Only read here to decide WHICH
+  // banner to render — `awaitingGates.length > 1` is the sole switch.
+  const awaitingGates = run?.awaiting ?? [];
+
+  function gateUiState(stepId: string): GateUiState {
+    return multiGateState[stepId] ?? DEFAULT_GATE_UI_STATE;
+  }
+  function patchGateUiState(stepId: string, patch: Partial<GateUiState>) {
+    setMultiGateState((prev) => ({
+      ...prev,
+      [stepId]: { ...(prev[stepId] ?? DEFAULT_GATE_UI_STATE), ...patch },
+    }));
+  }
+
+  async function onApproveGate(stepId: string) {
+    if (!run || gateUiState(stepId).pending) return;
+    const mode = gateUiState(stepId).approveMode;
+    patchGateUiState(stepId, { pending: true, error: null });
+    try {
+      if (host) {
+        await api.approveRun(run.id, mode, host, stepId);
+      } else {
+        await api.approveRun(run.id, mode, undefined, stepId);
+      }
+      patchGateUiState(stepId, { decision: 'approved' });
+    } catch (e: unknown) {
+      patchGateUiState(stepId, {
+        error: e instanceof Error ? e.message : 'Failed to approve gate',
+      });
+    } finally {
+      patchGateUiState(stepId, { pending: false });
+    }
+  }
+
+  async function onRejectGate(stepId: string) {
+    if (!run || gateUiState(stepId).pending) return;
+    const reason = gateUiState(stepId).rejectReason;
+    patchGateUiState(stepId, { pending: true, error: null });
+    try {
+      if (host) {
+        await api.rejectRun(run.id, reason, host, stepId);
+      } else {
+        await api.rejectRun(run.id, reason, undefined, stepId);
+      }
+      patchGateUiState(stepId, { decision: 'rejected', rejectOpen: false });
+    } catch (e: unknown) {
+      patchGateUiState(stepId, {
+        error: e instanceof Error ? e.message : 'Failed to reject gate',
+      });
+    } finally {
+      patchGateUiState(stepId, { pending: false });
+    }
+  }
 
   const effectiveStatus = liveRunStatus ?? run?.status ?? 'pending';
   const isRunning = effectiveStatus === 'running' || effectiveStatus === 'pending';
@@ -713,115 +803,249 @@ export default function RunDetail() {
           </div>
         )}
 
-        {awaiting && (
-          <div className="mt-3 flex items-start gap-3 rounded-lg border border-warn/30 bg-warn-bg px-4 py-3">
-            <Pause size={16} className="mt-0.5 shrink-0 text-warn" />
-            <div className="min-w-0">
-              <div className="text-sm font-medium text-warn">
-                Awaiting approval · <span className="font-mono">{awaiting.stepId}</span>
+        {awaitingGates.length > 1 ? (
+          <div className="mt-3 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-sm font-medium text-warn">
+                <Pause size={16} className="shrink-0" />
+                Awaiting approval · {awaitingGates.length} gates parked
               </div>
-              <p className="mt-0.5 break-words text-ui text-warn">{awaiting.reason}</p>
-
-              {cancelled ? (
-                <div className="mt-2 text-ui font-medium text-ink">Cancelled.</div>
-              ) : resumeRequested ? (
-                <div className="mt-2 flex items-center gap-2 text-ui font-medium text-ok">
-                  <span
-                    className="inline-block h-2 w-2 animate-pulse rounded-full bg-ok"
-                    aria-hidden="true"
-                  />
-                  Approved — resuming…
-                </div>
-              ) : rejected ? (
-                <div className="mt-2 text-ui font-medium text-err">Rejected.</div>
-              ) : (
-                <div className="mt-2 space-y-2">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <label htmlFor="approve-mode" className="text-ui font-medium text-warn">
-                      Resume mode
-                    </label>
-                    <select
-                      id="approve-mode"
-                      value={approveMode}
-                      onChange={(e) =>
-                        setApproveMode(e.target.value as 'ask' | 'bypass' | 'readonly')
-                      }
-                      disabled={gatePending}
-                      aria-label="Resume mode"
-                      className="rounded-md border border-warn/30 bg-panel px-2 py-1.5 text-ui font-medium text-ink focus:border-warn/30 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      <option value="ask">Ask</option>
-                      <option value="bypass">Bypass</option>
-                      <option value="readonly">Read-only</option>
-                    </select>
-                    <button
-                      type="button"
-                      onClick={onApprove}
-                      disabled={gatePending}
-                      aria-label="Approve run"
-                      className="inline-flex items-center rounded-md bg-ok px-3 py-1.5 text-ui font-medium text-white hover:bg-ok disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {gatePending ? 'Working…' : 'Approve'}
-                    </button>
-                    <Button
-                      variant="danger-outline"
-                      onClick={() => {
-                        setRejectOpen((v) => !v);
-                        setGateError(null);
-                      }}
-                      disabled={gatePending}
-                      aria-label="Reject run"
-                    >
-                      Reject
-                    </Button>
-                    {cancellable && (
-                      <Button
-                        variant="secondary"
-                        onClick={onCancel}
-                        disabled={cancelPending}
-                        aria-label="Cancel run"
-                      >
-                        {cancelPending ? 'Cancelling…' : 'Cancel'}
-                      </Button>
-                    )}
-                  </div>
-
-                  {cancelError && (
-                    <p className="text-note font-medium text-err" role="alert">
-                      {cancelError}
-                    </p>
-                  )}
-
-                  {rejectOpen && (
-                    <div className="flex flex-wrap items-center gap-2">
-                      <input
-                        type="text"
-                        value={rejectReason}
-                        onChange={(e) => setRejectReason(e.target.value)}
-                        placeholder="Reason (optional)"
-                        aria-label="Rejection reason"
-                        className="min-w-0 flex-1 rounded-md border border-err/30 bg-panel px-2 py-1 text-ui text-ink placeholder:text-ink-mute focus:border-err/30 focus:outline-none"
-                      />
-                      <Button
-                        variant="danger"
-                        onClick={onReject}
-                        disabled={gatePending}
-                        aria-label="Confirm rejection"
-                      >
-                        {gatePending ? 'Working…' : 'Confirm reject'}
-                      </Button>
-                    </div>
-                  )}
-
-                  {gateError && (
-                    <p className="text-note font-medium text-err" role="alert">
-                      {gateError}
-                    </p>
-                  )}
-                </div>
+              {cancellable && (
+                <Button
+                  variant="secondary"
+                  onClick={onCancel}
+                  disabled={cancelPending}
+                  aria-label="Cancel run"
+                >
+                  {cancelPending ? 'Cancelling…' : 'Cancel'}
+                </Button>
               )}
             </div>
+            {cancelError && (
+              <p className="text-note font-medium text-err" role="alert">
+                {cancelError}
+              </p>
+            )}
+            {awaitingGates.map((g) => {
+              const gs = gateUiState(g.step_id);
+              return (
+                <div
+                  key={g.step_id}
+                  className="flex items-start gap-3 rounded-lg border border-warn/30 bg-warn-bg px-4 py-3"
+                >
+                  <Pause size={16} className="mt-0.5 shrink-0 text-warn" />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-medium text-warn">
+                      <span className="font-mono">{g.step_id}</span>
+                    </div>
+                    <p className="mt-0.5 break-words text-ui text-warn">
+                      {g.prompt ?? 'Awaiting approval'}
+                    </p>
+
+                    {cancelled ? (
+                      <div className="mt-2 text-ui font-medium text-ink">Cancelled.</div>
+                    ) : gs.decision === 'approved' ? (
+                      <div className="mt-2 flex items-center gap-2 text-ui font-medium text-ok">
+                        <span
+                          className="inline-block h-2 w-2 animate-pulse rounded-full bg-ok"
+                          aria-hidden="true"
+                        />
+                        Approved — resuming…
+                      </div>
+                    ) : gs.decision === 'rejected' ? (
+                      <div className="mt-2 text-ui font-medium text-err">Rejected.</div>
+                    ) : (
+                      <div className="mt-2 space-y-2">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <label
+                            htmlFor={`approve-mode-${g.step_id}`}
+                            className="text-ui font-medium text-warn"
+                          >
+                            Resume mode
+                          </label>
+                          <select
+                            id={`approve-mode-${g.step_id}`}
+                            value={gs.approveMode}
+                            onChange={(e) =>
+                              patchGateUiState(g.step_id, {
+                                approveMode: e.target.value as 'ask' | 'bypass' | 'readonly',
+                              })
+                            }
+                            disabled={gs.pending}
+                            aria-label={`Resume mode for ${g.step_id}`}
+                            className="rounded-md border border-warn/30 bg-panel px-2 py-1.5 text-ui font-medium text-ink focus:border-warn/30 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            <option value="ask">Ask</option>
+                            <option value="bypass">Bypass</option>
+                            <option value="readonly">Read-only</option>
+                          </select>
+                          <button
+                            type="button"
+                            onClick={() => onApproveGate(g.step_id)}
+                            disabled={gs.pending}
+                            aria-label={`Approve ${g.step_id}`}
+                            className="inline-flex items-center rounded-md bg-ok px-3 py-1.5 text-ui font-medium text-white hover:bg-ok disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            {gs.pending ? 'Working…' : 'Approve'}
+                          </button>
+                          <Button
+                            variant="danger-outline"
+                            onClick={() =>
+                              patchGateUiState(g.step_id, { rejectOpen: !gs.rejectOpen, error: null })
+                            }
+                            disabled={gs.pending}
+                            aria-label={`Reject ${g.step_id}`}
+                          >
+                            Reject
+                          </Button>
+                        </div>
+
+                        {gs.rejectOpen && (
+                          <div className="flex flex-wrap items-center gap-2">
+                            <input
+                              type="text"
+                              value={gs.rejectReason}
+                              onChange={(e) =>
+                                patchGateUiState(g.step_id, { rejectReason: e.target.value })
+                              }
+                              placeholder="Reason (optional)"
+                              aria-label={`Rejection reason for ${g.step_id}`}
+                              className="min-w-0 flex-1 rounded-md border border-err/30 bg-panel px-2 py-1 text-ui text-ink placeholder:text-ink-mute focus:border-err/30 focus:outline-none"
+                            />
+                            <Button
+                              variant="danger"
+                              onClick={() => onRejectGate(g.step_id)}
+                              disabled={gs.pending}
+                              aria-label={`Confirm rejection for ${g.step_id}`}
+                            >
+                              {gs.pending ? 'Working…' : 'Confirm reject'}
+                            </Button>
+                          </div>
+                        )}
+
+                        {gs.error && (
+                          <p className="text-note font-medium text-err" role="alert">
+                            {gs.error}
+                          </p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
           </div>
+        ) : (
+          awaiting && (
+            <div className="mt-3 flex items-start gap-3 rounded-lg border border-warn/30 bg-warn-bg px-4 py-3">
+              <Pause size={16} className="mt-0.5 shrink-0 text-warn" />
+              <div className="min-w-0">
+                <div className="text-sm font-medium text-warn">
+                  Awaiting approval · <span className="font-mono">{awaiting.stepId}</span>
+                </div>
+                <p className="mt-0.5 break-words text-ui text-warn">{awaiting.reason}</p>
+
+                {cancelled ? (
+                  <div className="mt-2 text-ui font-medium text-ink">Cancelled.</div>
+                ) : resumeRequested ? (
+                  <div className="mt-2 flex items-center gap-2 text-ui font-medium text-ok">
+                    <span
+                      className="inline-block h-2 w-2 animate-pulse rounded-full bg-ok"
+                      aria-hidden="true"
+                    />
+                    Approved — resuming…
+                  </div>
+                ) : rejected ? (
+                  <div className="mt-2 text-ui font-medium text-err">Rejected.</div>
+                ) : (
+                  <div className="mt-2 space-y-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <label htmlFor="approve-mode" className="text-ui font-medium text-warn">
+                        Resume mode
+                      </label>
+                      <select
+                        id="approve-mode"
+                        value={approveMode}
+                        onChange={(e) =>
+                          setApproveMode(e.target.value as 'ask' | 'bypass' | 'readonly')
+                        }
+                        disabled={gatePending}
+                        aria-label="Resume mode"
+                        className="rounded-md border border-warn/30 bg-panel px-2 py-1.5 text-ui font-medium text-ink focus:border-warn/30 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        <option value="ask">Ask</option>
+                        <option value="bypass">Bypass</option>
+                        <option value="readonly">Read-only</option>
+                      </select>
+                      <button
+                        type="button"
+                        onClick={onApprove}
+                        disabled={gatePending}
+                        aria-label="Approve run"
+                        className="inline-flex items-center rounded-md bg-ok px-3 py-1.5 text-ui font-medium text-white hover:bg-ok disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {gatePending ? 'Working…' : 'Approve'}
+                      </button>
+                      <Button
+                        variant="danger-outline"
+                        onClick={() => {
+                          setRejectOpen((v) => !v);
+                          setGateError(null);
+                        }}
+                        disabled={gatePending}
+                        aria-label="Reject run"
+                      >
+                        Reject
+                      </Button>
+                      {cancellable && (
+                        <Button
+                          variant="secondary"
+                          onClick={onCancel}
+                          disabled={cancelPending}
+                          aria-label="Cancel run"
+                        >
+                          {cancelPending ? 'Cancelling…' : 'Cancel'}
+                        </Button>
+                      )}
+                    </div>
+
+                    {cancelError && (
+                      <p className="text-note font-medium text-err" role="alert">
+                        {cancelError}
+                      </p>
+                    )}
+
+                    {rejectOpen && (
+                      <div className="flex flex-wrap items-center gap-2">
+                        <input
+                          type="text"
+                          value={rejectReason}
+                          onChange={(e) => setRejectReason(e.target.value)}
+                          placeholder="Reason (optional)"
+                          aria-label="Rejection reason"
+                          className="min-w-0 flex-1 rounded-md border border-err/30 bg-panel px-2 py-1 text-ui text-ink placeholder:text-ink-mute focus:border-err/30 focus:outline-none"
+                        />
+                        <Button
+                          variant="danger"
+                          onClick={onReject}
+                          disabled={gatePending}
+                          aria-label="Confirm rejection"
+                        >
+                          {gatePending ? 'Working…' : 'Confirm reject'}
+                        </Button>
+                      </div>
+                    )}
+
+                    {gateError && (
+                      <p className="text-note font-medium text-err" role="alert">
+                        {gateError}
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          )
         )}
 
         {isPaused && (

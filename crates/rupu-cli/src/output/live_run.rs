@@ -780,6 +780,8 @@ fn overall_progress_fraction(state: &LiveRunState) -> f64 {
             },
             StepKind::Linear => 0.0,
             StepKind::Branch => 0.0,
+            StepKind::Split => 0.0,
+            StepKind::Join => 0.0,
             StepKind::Action => 0.0,
             StepKind::ApprovalGate => 0.0,
         })
@@ -1069,7 +1071,12 @@ pub fn render_graph(state: &LiveRunState, _workflow: &Workflow, width: usize) ->
                     ));
                 }
             }
-            StepKind::Linear | StepKind::Branch | StepKind::Action | StepKind::ApprovalGate => {
+            StepKind::Linear
+            | StepKind::Branch
+            | StepKind::Split
+            | StepKind::Join
+            | StepKind::Action
+            | StepKind::ApprovalGate => {
                 let right = if matches!(step.status, NodeStatus::Complete) {
                     format!(
                         "{} {} ⇡{}",
@@ -2734,6 +2741,7 @@ mod tests {
             started_at: Utc::now(),
             finished_at: None,
             error_message: None,
+            awaiting: Vec::new(),
             awaiting_step_id: None,
             approval_prompt: None,
             awaiting_since: None,
@@ -2742,6 +2750,7 @@ mod tests {
             resume_claimed_at: None,
             resume_claimed_by: None,
             resume_mode: None,
+            resume_gate_id: None,
             issue_ref: None,
             issue: None,
             parent_run_id: None,
