@@ -24,10 +24,6 @@ fn parses_full_config() {
         timeout_secs = 60
         env_allowlist = ["MY_VAR", "AWS_PROFILE"]
 
-        [retry]
-        max_attempts = 3
-        initial_delay_ms = 200
-
         [ui]
         color = "always"
         theme = "Solarized (light)"
@@ -62,7 +58,6 @@ fn parses_full_config() {
         cfg.bash.env_allowlist,
         Some(vec!["MY_VAR".into(), "AWS_PROFILE".into()])
     );
-    assert_eq!(cfg.retry.max_attempts, Some(3));
     assert_eq!(cfg.ui.color.as_deref(), Some("always"));
     assert_eq!(cfg.ui.theme.as_deref(), Some("Solarized (light)"));
     assert_eq!(cfg.ui.live_view.as_deref(), Some("full"));

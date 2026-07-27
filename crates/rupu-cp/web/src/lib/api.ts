@@ -1356,7 +1356,7 @@ export interface RunDiff {
 // ---------------------------------------------------------------------------
 
 /** Provenance source for one resolved config key — mirrors `rupu_config::KeySource`. */
-export type KeySource = 'global' | 'project' | 'env' | 'default';
+export type KeySource = 'global' | 'project' | 'default';
 
 /** Mirrors `rupu_config::KeyProvenance` — where a resolved key's value came
  *  from, and whether it is enforced by the global `[policy].lock` list. */

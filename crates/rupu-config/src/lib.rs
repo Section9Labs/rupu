@@ -31,7 +31,7 @@ pub mod triggers_config;
 pub mod update_config;
 
 pub use autoflow_config::{AutoflowCheckout, AutoflowConfig};
-pub use config::{BashConfig, Config, RetryConfig, UiConfig, UiPaletteConfig, UiSyntaxConfig};
+pub use config::{BashConfig, Config, UiConfig, UiPaletteConfig, UiSyntaxConfig};
 pub use layer::{layer_files, layer_files_locked, LayerError};
 pub use policy_config::{CpConfig, PolicyConfig};
 pub use pricing_config::{ModelPricing, PricingConfig};

@@ -224,7 +224,7 @@ impl AppState {
     /// until fixed.
     fn resolve_global_config(global_dir: &std::path::Path) -> rupu_config::Config {
         let path = global_dir.join("config.toml");
-        match rupu_config::resolve(Some(&path), None, &std::collections::BTreeMap::new()) {
+        match rupu_config::resolve(Some(&path), None) {
             Ok(r) => r.config,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "failed to resolve global config; using defaults");

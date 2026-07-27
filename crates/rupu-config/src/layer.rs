@@ -85,7 +85,7 @@ pub fn layer_files_locked(
     global: Option<&Path>,
     project: Option<&Path>,
 ) -> Result<Config, LayerError> {
-    let resolved = crate::resolve::resolve(global, project, &std::collections::BTreeMap::new())?;
+    let resolved = crate::resolve::resolve(global, project)?;
     Ok(resolved.config)
 }
 

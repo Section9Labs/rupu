@@ -26,7 +26,6 @@ pub struct Config {
     pub permission_mode: Option<String>,
     pub log_level: Option<String>,
     pub bash: BashConfig,
-    pub retry: RetryConfig,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
@@ -105,14 +104,6 @@ pub struct BashConfig {
     /// Environment variables (beyond the always-allowed PATH/HOME/USER/
     /// TERM/LANG) that are forwarded into the bash subprocess.
     pub env_allowlist: Option<Vec<String>>,
-}
-
-/// Provider-call retry configuration.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RetryConfig {
-    pub max_attempts: Option<u32>,
-    pub initial_delay_ms: Option<u64>,
 }
 
 /// Provider names reserved for built-in providers. A `[providers.<name>]`
