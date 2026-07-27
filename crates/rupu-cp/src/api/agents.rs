@@ -1010,6 +1010,7 @@ mod tests {
             resume_mode: None,
             resume_gate_id: None,
             final_output: None,
+            loop_progress: Default::default(),
         };
         s.run_store.create(record, "name: wf\n").unwrap();
         write_agent_transcript(transcript_path, agent);
@@ -1030,6 +1031,7 @@ mod tests {
                     iterations: 0,
                     resolved: true,
                     finished_at: chrono::Utc::now(),
+                    loop_iteration: None,
                 },
             )
             .unwrap();

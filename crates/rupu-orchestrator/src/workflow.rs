@@ -200,6 +200,31 @@ pub enum WorkflowParseError {
         "step `{step}`: `join` has no inbound edges — it would never fire, silently stranding it and everything downstream of it"
     )]
     JoinNoInboundEdges { step: String },
+    #[error("loop `{loop_name}`: node `{node}` does not match any step id")]
+    LoopNodeUnknown { loop_name: String, node: String },
+    #[error("loop `{loop_name}`: node `{node}` is listed twice")]
+    LoopDuplicateNode { loop_name: String, node: String },
+    #[error("step `{node}` belongs to two loops: `{}` and `{}`", loops.0, loops.1)]
+    LoopNodeOverlap {
+        node: String,
+        loops: (String, String),
+    },
+    #[error("loop `{loop_name}` must contain at least 2 nodes (v1: loops don't nest, single-node retry is out of scope)")]
+    LoopTooSmall { loop_name: String },
+    #[error("loop `{loop_name}`: `max_iterations` must be at least 1")]
+    LoopMaxIterationsInvalid { loop_name: String },
+    #[error("loop `{loop_name}`: `until` must not be empty")]
+    LoopUntilEmpty { loop_name: String },
+    #[error("loop `{loop_name}` has a cycle through its internal control edges: {path}")]
+    LoopSubgraphCyclic { loop_name: String, path: String },
+    #[error(
+        "loop `{loop_name}`: member `{node}`'s own `split`/`join` targets `{target}`, which is outside the loop (a member's split/join fan-out must stay inside the loop; a plain `next`/branch-arm to an outside node is a valid loop EXIT, per spec §2b/§2f)"
+    )]
+    LoopMemberEscapes {
+        loop_name: String,
+        node: String,
+        target: String,
+    },
 }
 
 /// How a workflow gets kicked off. Manual is the existing behavior
@@ -866,6 +891,51 @@ pub struct Join {
     pub wait: JoinWait,
 }
 
+/// What a bounded loop does when `max_iterations` is exhausted without
+/// `until` ever holding. `Fail` (the default) matches the no-silent-no-op
+/// ethos: an unconverged loop fails the run loudly rather than letting a
+/// caller believe the last iteration's output is "the" answer. `Proceed`
+/// is the explicit escape hatch — the run continues to the loop's
+/// successors with the last iteration's outputs and
+/// `loop.<name>.converged == false` (Task 3 wires the runtime meaning;
+/// this crate only carries the enum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OnMax {
+    #[default]
+    Fail,
+    Proceed,
+}
+
+/// A named bounded subgraph loop (spec §2a): a sub-DAG of existing step
+/// ids that re-run together, sequentially, until `until` holds or
+/// `max_iterations` is reached. v1 is flat — loops don't nest and a step
+/// belongs to at most one loop (see [`WorkflowParseError::LoopNodeOverlap`]).
+/// This crate defines the language + validation; the iteration driver (the
+/// loop as a super-node in `run_scheduler`, `run_loop_node`) lives in
+/// `crates/rupu-orchestrator/src/runner.rs` (Phase 3 Task 3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LoopDef {
+    /// The loop's member step ids. Must name real steps (see
+    /// [`WorkflowParseError::LoopNodeUnknown`]), be disjoint from every
+    /// other loop's members, and number at least 2 (see
+    /// [`WorkflowParseError::LoopTooSmall`]).
+    pub nodes: Vec<String>,
+    /// minijinja template evaluated (same engine as `when:`/branch
+    /// condition) after each iteration completes. Truthy ⇒ the loop
+    /// converges. Must be non-empty (see
+    /// [`WorkflowParseError::LoopUntilEmpty`]).
+    pub until: String,
+    /// Hard iteration cap. Must be at least 1 (see
+    /// [`WorkflowParseError::LoopMaxIterationsInvalid`]).
+    pub max_iterations: u32,
+    /// What happens when the cap is reached without `until` holding.
+    /// Defaults to [`OnMax::Fail`].
+    #[serde(default)]
+    pub on_max: OnMax,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Step {
@@ -971,6 +1041,14 @@ pub struct Step {
     /// where flow follows list order. Non-empty makes this an explicit graph.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub next: Vec<String>,
+    /// Explicit predecessor edge(s) — the symmetric inverse of `next:`. Each
+    /// id `p` here contributes a control edge `p -> this step` (folded into
+    /// [`workflow_edges`] alongside `next`/`split`/branch edges; deduped with
+    /// an equivalent `next` describing the same edge). Empty in a legacy
+    /// (edge-free) workflow. Non-empty makes this an explicit graph, same as
+    /// a non-empty `next` (see [`workflow_has_explicit_edges`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
     /// `split` orchestration node — fans the flow into N independent concurrent
     /// tracks. Carries no agent/action/etc. (validated). Executed in Phase 2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1052,6 +1130,14 @@ pub struct Workflow {
     /// legacy linear runner (`run_steps_inner`), only by `run_scheduler`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrency: Option<u32>,
+    /// Named bounded subgraph loops (Phase 3 §2a). `BTreeMap`, matching
+    /// `inputs`/`outputs` — loop order is semantically irrelevant since
+    /// each loop is independent and keyed by name; no new dep. Empty
+    /// (the default) in every legacy workflow, so it never appears in a
+    /// legacy workflow's serialized form. See [`LoopDef`], [`loop_of_step`],
+    /// [`loop_internal_edges`], [`collapsed_graph_edges`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub loops: BTreeMap<String, LoopDef>,
     pub steps: Vec<Step>,
 }
 
@@ -1867,6 +1953,17 @@ pub fn workflow_edges(wf: &Workflow) -> Vec<(String, String)> {
                 edges.insert((step.id.clone(), t.clone()));
             }
         }
+        // `depends_on` is the symmetric inverse of `next`: each id `p` here
+        // contributes the control edge `p -> step.id`. Self-ref filtered
+        // (an explicit self-dependency is rejected by `validate_graph`'s
+        // EdgeSelfLoop check, not represented here); dedups with an
+        // equivalent `next`/`split`/branch edge describing the same pair
+        // via the shared BTreeSet.
+        for p in &step.depends_on {
+            if p != &step.id {
+                edges.insert((p.clone(), step.id.clone()));
+            }
+        }
         // Inferred data edges: X -> step for every steps.X reference in this step.
         for (_, tmpl) in collect_templates_for_step(step) {
             for (referenced, _field) in scan_step_refs(&tmpl) {
@@ -1877,6 +1974,111 @@ pub fn workflow_edges(wf: &Workflow) -> Vec<(String, String)> {
         }
     }
     edges.into_iter().collect()
+}
+
+/// The name of the loop `step_id` belongs to, or `None` if it isn't a
+/// member of any loop. `pub` so Tasks 3-4 (the iteration driver + resume)
+/// can ask "is this node inside a loop?" without re-deriving membership.
+pub fn loop_of_step<'a>(wf: &'a Workflow, step_id: &str) -> Option<&'a str> {
+    wf.loops.iter().find_map(|(name, def)| {
+        if def.nodes.iter().any(|n| n == step_id) {
+            Some(name.as_str())
+        } else {
+            None
+        }
+    })
+}
+
+/// A loop's members' internal CONTROL edges only (next/split/branch-arm/
+/// depends_on, both endpoints members) — exactly the acyclic-by-
+/// construction subgraph [`validate_loop_subgraph_acyclic`] already proves
+/// at parse time (this is the same computation, exposed `pub`). Task 3's
+/// iteration driver uses this to tell a genuine intra-iteration dependency
+/// (a control edge, or a [`loop_internal_edges`] DATA edge that is a
+/// control-DAG descendant of its source) apart from the loop's controlled
+/// feedback back-reference (spec §2d), which is neither. Returns an empty
+/// vec for an unknown loop name.
+pub fn loop_control_edges(wf: &Workflow, loop_name: &str) -> Vec<(String, String)> {
+    let Some(def) = wf.loops.get(loop_name) else {
+        return Vec::new();
+    };
+    let members: BTreeSet<&str> = def.nodes.iter().map(|s| s.as_str()).collect();
+    let mut edges: BTreeSet<(String, String)> = BTreeSet::new();
+    for step in wf.steps.iter().filter(|s| members.contains(s.id.as_str())) {
+        let outs = step.next.iter().chain(step.split.iter().flatten()).chain(
+            step.branch
+                .iter()
+                .flat_map(|b| b.then.iter().chain(b.r#else.iter())),
+        );
+        for t in outs {
+            if members.contains(t.as_str()) {
+                edges.insert((step.id.clone(), t.clone()));
+            }
+        }
+        for p in &step.depends_on {
+            if members.contains(p.as_str()) && p != &step.id {
+                edges.insert((p.clone(), step.id.clone()));
+            }
+        }
+    }
+    edges.into_iter().collect()
+}
+
+/// The subset of [`workflow_edges`] whose BOTH endpoints are members of
+/// `loop_name`. Includes both control edges (next/split/branch-arm/
+/// depends_on between members) and inferred data edges — including the
+/// controlled feedback edge (spec §2d), which IS a real `workflow_edges`
+/// entry even though it's excluded from the internal-acyclicity check
+/// (`validate_loop_subgraph_acyclic`, control-edges-only — see its doc
+/// comment). `pub` for Task 3's recursive per-iteration `run_scheduler`
+/// call, which needs the loop's own edge set restricted to its member
+/// subset. Returns an empty vec for an unknown loop name.
+pub fn loop_internal_edges(wf: &Workflow, loop_name: &str) -> Vec<(String, String)> {
+    let Some(def) = wf.loops.get(loop_name) else {
+        return Vec::new();
+    };
+    let members: BTreeSet<&str> = def.nodes.iter().map(|s| s.as_str()).collect();
+    workflow_edges(wf)
+        .into_iter()
+        .filter(|(a, b)| members.contains(a.as_str()) && members.contains(b.as_str()))
+        .collect()
+}
+
+/// [`workflow_edges`] with every loop collapsed to a single super-node id
+/// `"loop:<name>"` (spec §2b): an edge with one endpoint inside a loop and
+/// one outside is rewired to/from the super-node; an edge fully inside one
+/// loop (both endpoints members of the SAME loop) is dropped (internal —
+/// handled by the loop's own recursive scheduler, not the outer graph); an
+/// edge between two DIFFERENT loops connects the two super-nodes. This is
+/// the outer graph both the collapsed-acyclicity validation
+/// (`validate_collapsed_graph_acyclic`) and Task 3's outer `run_scheduler`
+/// loop-super-node dispatch consume.
+pub fn collapsed_graph_edges(wf: &Workflow) -> Vec<(String, String)> {
+    let membership: BTreeMap<&str, &str> = wf
+        .loops
+        .iter()
+        .flat_map(|(name, def)| def.nodes.iter().map(move |n| (n.as_str(), name.as_str())))
+        .collect();
+    let resolve = |id: &str| -> String {
+        match membership.get(id) {
+            Some(loop_name) => format!("loop:{loop_name}"),
+            None => id.to_string(),
+        }
+    };
+    let mut out: BTreeSet<(String, String)> = BTreeSet::new();
+    for (a, b) in workflow_edges(wf) {
+        let ra = resolve(&a);
+        let rb = resolve(&b);
+        if ra == rb {
+            // Either both endpoints collapse to the same loop super-node
+            // (an internal edge — dropped) or a same-node edge that
+            // shouldn't happen post-collapse; either way, not an outer
+            // edge.
+            continue;
+        }
+        out.insert((ra, rb));
+    }
+    out.into_iter().collect()
 }
 
 /// True iff this workflow needs the Phase 2 DAG scheduler, i.e. the
@@ -1903,27 +2105,66 @@ pub fn workflow_edges(wf: &Workflow) -> Vec<(String, String)> {
 /// restates list order — and today's branches are `false`: the existing
 /// linear runner executes both faithfully.
 pub fn is_nonlinear(wf: &Workflow) -> bool {
+    // A loop is a super-node collapsed from its members (spec §2b) —
+    // inherently non-linear regardless of whether the outer graph forks
+    // or reconverges. Checked first/unconditionally so a trivial single-
+    // chain-through-a-loop workflow still routes to the scheduler, which
+    // (Phase 3 Task 3) drives the loop for real via `run_loop_node`
+    // rather than silently mis-running it through `run_steps_inner`.
+    if !wf.loops.is_empty() {
+        return true;
+    }
     if wf.steps.iter().any(|s| s.split.is_some() || s.join.is_some()) {
         return true;
     }
-    // Fork: a non-branch step whose `next` has more than one target.
-    if wf
-        .steps
-        .iter()
-        .any(|s| s.branch.is_none() && s.next.len() > 1)
-    {
-        return true;
-    }
-    // Reconverge: any node with >1 inbound control edge.
-    let mut indeg: BTreeMap<&str, usize> = BTreeMap::new();
+    // The deduped control-edge set (next/split/branch-arm/depends_on) shared
+    // by BOTH the fork (outdegree) and reconverge (indegree) checks below,
+    // so they agree on what counts as a "successor". `depends_on` is
+    // `next`'s symmetric inverse (spec §1a): `a next: [b, c]` and
+    // `b depends_on: [a]; c depends_on: [a]` describe the IDENTICAL fork and
+    // must produce the same `is_nonlinear` verdict — a fork check that only
+    // read `s.next.len()` would miss the latter authoring entirely. Also
+    // dedups a `next` and a `depends_on` describing the SAME edge (the exact
+    // case `workflow_edges` also handles), so that pair doesn't
+    // double-count into a false-positive fork/reconverge.
+    //
+    // Deliberately excludes inferred `steps.X` data edges (unlike
+    // `workflow_edges`): a linear workflow whose step feeds two LATER steps
+    // purely via `{{ steps.X.output }}` (no `next`/`depends_on` at all) must
+    // stay `is_nonlinear == false` — see
+    // `is_nonlinear_false_for_a_step_referencing_two_prior_steps`.
+    let mut control_edges: BTreeSet<(&str, &str)> = BTreeSet::new();
     for s in &wf.steps {
         for t in s.next.iter().chain(s.split.iter().flatten()).chain(
             s.branch
                 .iter()
                 .flat_map(|b| b.then.iter().chain(b.r#else.iter())),
         ) {
-            *indeg.entry(t.as_str()).or_insert(0) += 1;
+            control_edges.insert((s.id.as_str(), t.as_str()));
         }
+        for p in &s.depends_on {
+            control_edges.insert((p.as_str(), s.id.as_str()));
+        }
+    }
+
+    // Fork: a non-branch step whose control successors (via the shared set
+    // above) number more than one.
+    let mut outdeg: BTreeMap<&str, usize> = BTreeMap::new();
+    for (a, _) in &control_edges {
+        *outdeg.entry(a).or_insert(0) += 1;
+    }
+    if wf
+        .steps
+        .iter()
+        .any(|s| s.branch.is_none() && outdeg.get(s.id.as_str()).copied().unwrap_or(0) > 1)
+    {
+        return true;
+    }
+
+    // Reconverge: any node with >1 inbound control edge.
+    let mut indeg: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, b) in &control_edges {
+        *indeg.entry(b).or_insert(0) += 1;
     }
     if indeg.values().any(|&d| d > 1) {
         return true;
@@ -2005,14 +2246,18 @@ fn declaration_order_is_topological(wf: &Workflow) -> bool {
 }
 
 /// A workflow "has explicit edges" (is a graph workflow rather than a
-/// legacy linear one) when any step declares `next:`, `split:`, or
-/// `join:`. Legacy edge-free workflows keep running only the pre-existing
-/// forward-only `validate_branch_targets` / `validate_template_refs`
-/// checks — `validate_graph` never runs for them.
+/// legacy linear one) when any step declares `next:`, `split:`, `join:`, or
+/// `depends_on:`. Legacy edge-free workflows keep running only the
+/// pre-existing forward-only `validate_branch_targets` /
+/// `validate_template_refs` checks — `validate_graph` never runs for them.
 pub(crate) fn workflow_has_explicit_edges(wf: &Workflow) -> bool {
-    wf.steps
-        .iter()
-        .any(|s| !s.next.is_empty() || s.split.is_some() || s.join.is_some())
+    !wf.loops.is_empty()
+        || wf.steps.iter().any(|s| {
+            !s.next.is_empty()
+                || s.split.is_some()
+                || s.join.is_some()
+                || !s.depends_on.is_empty()
+        })
 }
 
 /// Validate the dependency graph of a workflow that has explicit edges:
@@ -2087,7 +2332,17 @@ fn validate_graph(wf: &Workflow) -> Result<(), WorkflowParseError> {
                 }
             }
         }
-        for t in step.next.iter().chain(step.split.iter().flatten()) {
+        // `depends_on` entries are checked by the same self-loop /
+        // unknown-id logic as `next`/`split`: the check is symmetric in
+        // edge direction (self-loop is `t == step.id` either way; existence
+        // is `ids.contains(t)` either way), so chaining it in here covers
+        // depends_on with no separate error variants.
+        for t in step
+            .next
+            .iter()
+            .chain(step.split.iter().flatten())
+            .chain(step.depends_on.iter())
+        {
             if t == &step.id {
                 return Err(WorkflowParseError::EdgeSelfLoop {
                     step: step.id.clone(),
@@ -2100,6 +2355,22 @@ fn validate_graph(wf: &Workflow) -> Result<(), WorkflowParseError> {
                 });
             }
         }
+    }
+
+    // Loop language + validation (spec §2f). Runs BEFORE the cycle check
+    // below because a loop's controlled feedback (§2d: a member->member
+    // DATA edge that would create an internal cycle) is a legitimate
+    // `workflow_edges` entry — the *raw* full-graph Kahn check below would
+    // wrongly flag it as `WorkflowCycle`. So: no loops -> the raw
+    // full-graph check runs unchanged (byte-for-byte with every workflow
+    // that predates this task); loops present -> skip the raw check
+    // entirely and instead cycle-check the COLLAPSED graph (each loop is
+    // one super-node; internal edges, feedback included, are dropped by
+    // construction — see `collapsed_graph_edges`), plus each loop's own
+    // internal-control-edges-only acyclicity.
+    validate_loops(wf)?;
+    if !wf.loops.is_empty() {
+        return validate_collapsed_graph_acyclic(wf);
     }
 
     // Cycle detection over the full dependency graph (Kahn's algorithm).
@@ -2128,6 +2399,269 @@ fn validate_graph(wf: &Workflow) -> Result<(), WorkflowParseError> {
         }
     }
     if seen != wf.steps.len() {
+        let stuck: Vec<&str> = indeg
+            .iter()
+            .filter(|(_, &d)| d > 0)
+            .map(|(&k, _)| k)
+            .collect();
+        return Err(WorkflowParseError::WorkflowCycle {
+            path: stuck.join(" -> "),
+        });
+    }
+    Ok(())
+}
+
+/// Loop-specific validation (spec §2f), called by [`validate_graph`] once
+/// the per-step next/split/depends_on/join checks above have already run.
+/// No-op when `wf.loops` is empty.
+///
+/// Checks (each its own error, in this order):
+/// 1. every `loops.<name>.nodes` id names a real step
+///    ([`WorkflowParseError::LoopNodeUnknown`]);
+/// 2. a node is not repeated within the SAME loop's `nodes:` list
+///    ([`WorkflowParseError::LoopDuplicateNode`]);
+/// 3. loops are disjoint — a step belongs to at most one loop
+///    ([`WorkflowParseError::LoopNodeOverlap`]; v1: loops don't nest);
+/// 4. a loop has at least 2 DISTINCT nodes ([`WorkflowParseError::LoopTooSmall`]);
+/// 5. `max_iterations >= 1` ([`WorkflowParseError::LoopMaxIterationsInvalid`]);
+/// 6. `until` is non-empty ([`WorkflowParseError::LoopUntilEmpty`]);
+/// 7. no loop member's own `split` fan-out escapes the loop — a plain
+///    `next`/branch-arm exit is VALID, see
+///    [`validate_loop_member_escapes`]'s doc comment
+///    ([`WorkflowParseError::LoopMemberEscapes`]);
+/// 8. each loop's internal CONTROL edges (next/split/branch-arm/
+///    depends_on between members — NOT inferred data edges; see
+///    `validate_loop_subgraph_acyclic`'s doc comment for why) are acyclic
+///    ([`WorkflowParseError::LoopSubgraphCyclic`]).
+///
+/// The 9th spec §2f check — the collapsed outer graph is acyclic — is
+/// `validate_collapsed_graph_acyclic`, called separately by
+/// `validate_graph` (not here) since it needs to run in place of, not
+/// alongside, the raw full-graph Kahn check.
+fn validate_loops(wf: &Workflow) -> Result<(), WorkflowParseError> {
+    if wf.loops.is_empty() {
+        return Ok(());
+    }
+    let ids: BTreeSet<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
+
+    let mut node_loop: BTreeMap<&str, &str> = BTreeMap::new();
+    for (name, def) in &wf.loops {
+        let mut seen_in_loop: BTreeSet<&str> = BTreeSet::new();
+        for node in &def.nodes {
+            if !ids.contains(node.as_str()) {
+                return Err(WorkflowParseError::LoopNodeUnknown {
+                    loop_name: name.clone(),
+                    node: node.clone(),
+                });
+            }
+            // A node repeated within the SAME loop's `nodes:` list is a
+            // mis-authoring, not a legitimate 1-member loop — reject it
+            // explicitly rather than letting it silently dedup down to
+            // fewer distinct members than `LoopTooSmall`'s raw
+            // `Vec::len()` check saw (`[gen, gen]` has len 2, but only
+            // ONE distinct member).
+            if !seen_in_loop.insert(node.as_str()) {
+                return Err(WorkflowParseError::LoopDuplicateNode {
+                    loop_name: name.clone(),
+                    node: node.clone(),
+                });
+            }
+            if let Some(&other) = node_loop.get(node.as_str()) {
+                if other != name.as_str() {
+                    return Err(WorkflowParseError::LoopNodeOverlap {
+                        node: node.clone(),
+                        loops: (other.to_string(), name.clone()),
+                    });
+                }
+            } else {
+                node_loop.insert(node.as_str(), name.as_str());
+            }
+        }
+        if def.nodes.len() < 2 {
+            return Err(WorkflowParseError::LoopTooSmall {
+                loop_name: name.clone(),
+            });
+        }
+        if def.max_iterations == 0 {
+            return Err(WorkflowParseError::LoopMaxIterationsInvalid {
+                loop_name: name.clone(),
+            });
+        }
+        if def.until.trim().is_empty() {
+            return Err(WorkflowParseError::LoopUntilEmpty {
+                loop_name: name.clone(),
+            });
+        }
+    }
+
+    for (name, def) in &wf.loops {
+        let members: BTreeSet<&str> = def.nodes.iter().map(|s| s.as_str()).collect();
+        validate_loop_member_escapes(wf, name, &members)?;
+        validate_loop_subgraph_acyclic(wf, name, &members)?;
+    }
+    Ok(())
+}
+
+/// Only a loop member's own `split` fan-out may not reach outside the loop
+/// (spec §2f: "A loop member may not carry split/join that reaches OUTSIDE
+/// the loop"). A plain `next:`/branch-arm from a member to a non-member is
+/// a VALID loop EXIT (spec §2b defines the loop's successors as exactly
+/// "edges from a loop member to a non-member"), and the Phase-3 editor's
+/// draw-action writes `next` on exit — rejecting it here would reject
+/// workflows the editor itself authors. Task 3's per-iteration inner
+/// scheduler is restricted to [`loop_internal_edges`] (which already
+/// excludes any member->outside edge), so a `next`-authored exit is never
+/// followed mid-iteration; [`collapsed_graph_edges`] rewires it to
+/// `loop:<name> -> <target>` so the OUTER scheduler makes the target ready
+/// only once the loop converges — exactly the entry/exit split described
+/// there. `join` has no outgoing target field of its own (its inbound set
+/// is inferred from edges pointing AT it), so there is nothing for a
+/// member's own `join` to "escape" via — only `split`'s explicit target
+/// list is checked. `depends_on` is excluded for the same reason as
+/// before: it's a predecessor declaration (an INCOMING edge onto whoever
+/// declares it), so a member's own `depends_on` can never "escape" the
+/// loop outward.
+fn validate_loop_member_escapes(
+    wf: &Workflow,
+    loop_name: &str,
+    members: &BTreeSet<&str>,
+) -> Result<(), WorkflowParseError> {
+    for step in wf.steps.iter().filter(|s| members.contains(s.id.as_str())) {
+        for t in step.split.iter().flatten() {
+            if !members.contains(t.as_str()) {
+                return Err(WorkflowParseError::LoopMemberEscapes {
+                    loop_name: loop_name.to_string(),
+                    node: step.id.clone(),
+                    target: t.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A loop's members + their INTERNAL CONTROL edges (next/split/branch-arm/
+/// depends_on where BOTH endpoints are members) must be acyclic — Kahn's
+/// algorithm over that control-edges-only subgraph.
+///
+/// Deliberately does NOT include inferred `steps.X` DATA edges (unlike
+/// [`loop_internal_edges`], which is control-union-data for Task 3's
+/// scheduling use). This is the feedback-edge exclusion rule (spec §2d):
+/// a member->member data ref that would create an internal cycle (e.g.
+/// `gen` reading `{{ steps.critique.output }}` when `critique` runs after
+/// `gen` within the same iteration) is the loop's *intentional*
+/// cross-iteration feedback, not a same-iteration dependency — it must
+/// read the PRIOR iteration's value (Task 3), never be treated as "this
+/// iteration hasn't run yet, so it's a cycle." Simplest correct rule
+/// (documented in the spec): control edges alone must be acyclic; a data
+/// edge is never part of this specific check, so it can never be the
+/// cause of a rejection here, regardless of whether it happens to also
+/// close a cycle when unioned with the control edges.
+fn validate_loop_subgraph_acyclic(
+    wf: &Workflow,
+    loop_name: &str,
+    members: &BTreeSet<&str>,
+) -> Result<(), WorkflowParseError> {
+    let mut indeg: BTreeMap<&str, usize> = members.iter().map(|&m| (m, 0)).collect();
+    let mut adj: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for step in wf.steps.iter().filter(|s| members.contains(s.id.as_str())) {
+        let outs = step.next.iter().chain(step.split.iter().flatten()).chain(
+            step.branch
+                .iter()
+                .flat_map(|b| b.then.iter().chain(b.r#else.iter())),
+        );
+        for t in outs {
+            if members.contains(t.as_str()) {
+                *indeg.entry(t.as_str()).or_insert(0) += 1;
+                adj.entry(step.id.as_str()).or_default().push(t.as_str());
+            }
+        }
+        for p in &step.depends_on {
+            if members.contains(p.as_str()) {
+                *indeg.entry(step.id.as_str()).or_insert(0) += 1;
+                adj.entry(p.as_str()).or_default().push(step.id.as_str());
+            }
+        }
+    }
+    let mut ready: Vec<&str> = indeg
+        .iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(&k, _)| k)
+        .collect();
+    let mut seen = 0usize;
+    while let Some(n) = ready.pop() {
+        seen += 1;
+        for &m in adj.get(n).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let e = indeg
+                .get_mut(m)
+                .expect("adj target always present in members/indeg");
+            *e -= 1;
+            if *e == 0 {
+                ready.push(m);
+            }
+        }
+    }
+    if seen != members.len() {
+        let stuck: Vec<&str> = indeg
+            .iter()
+            .filter(|(_, &d)| d > 0)
+            .map(|(&k, _)| k)
+            .collect();
+        return Err(WorkflowParseError::LoopSubgraphCyclic {
+            loop_name: loop_name.to_string(),
+            path: stuck.join(" -> "),
+        });
+    }
+    Ok(())
+}
+
+/// The 8th spec §2f check: the collapsed outer graph (each loop replaced
+/// by its super-node `"loop:<name>"`, per [`collapsed_graph_edges`]) must
+/// be acyclic — no cycle between loops, or between a loop and an outer
+/// node. Reuses the exact Kahn shape as `validate_graph`'s raw
+/// full-graph check, just over the collapsed node/edge sets, and reports
+/// the same [`WorkflowParseError::WorkflowCycle`] variant.
+fn validate_collapsed_graph_acyclic(wf: &Workflow) -> Result<(), WorkflowParseError> {
+    let member_ids: BTreeSet<&str> = wf
+        .loops
+        .values()
+        .flat_map(|d| d.nodes.iter().map(|s| s.as_str()))
+        .collect();
+    let mut node_ids: BTreeSet<String> = wf
+        .steps
+        .iter()
+        .filter(|s| !member_ids.contains(s.id.as_str()))
+        .map(|s| s.id.clone())
+        .collect();
+    for name in wf.loops.keys() {
+        node_ids.insert(format!("loop:{name}"));
+    }
+    let edges = collapsed_graph_edges(wf);
+    let mut indeg: BTreeMap<&str, usize> = node_ids.iter().map(|s| (s.as_str(), 0)).collect();
+    let mut adj: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (a, b) in &edges {
+        *indeg.entry(b.as_str()).or_insert(0) += 1;
+        adj.entry(a.as_str()).or_default().push(b.as_str());
+    }
+    let mut ready: Vec<&str> = indeg
+        .iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(&k, _)| k)
+        .collect();
+    let mut seen = 0usize;
+    while let Some(n) = ready.pop() {
+        seen += 1;
+        for &m in adj.get(n).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let e = indeg
+                .get_mut(m)
+                .expect("adj target always present in indeg");
+            *e -= 1;
+            if *e == 0 {
+                ready.push(m);
+            }
+        }
+    }
+    if seen != node_ids.len() {
         let stuck: Vec<&str> = indeg
             .iter()
             .filter(|(_, &d)| d > 0)
@@ -2786,6 +3320,82 @@ steps:
         assert!(!out.contains("next"), "legacy step must not emit next:");
         assert!(!out.contains("split"));
         assert!(!out.contains("join"));
+        assert!(!out.contains("depends_on"));
+    }
+
+    #[test]
+    fn parses_depends_on() {
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: p\n    depends_on: [a]\n";
+        let wf = Workflow::parse(raw).unwrap();
+        assert_eq!(wf.steps[1].depends_on, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn legacy_step_serializes_without_depends_on_key() {
+        // A step with no depends_on must round-trip with NO depends_on key
+        // at all (skip_serializing_if, mirrors `next` exactly).
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n";
+        let wf = Workflow::parse(raw).unwrap();
+        let out = serde_yaml::to_string(&wf).unwrap();
+        assert!(
+            !out.contains("depends_on"),
+            "legacy step must not emit depends_on:, got: {out}"
+        );
+        let wf2 = Workflow::parse(&out).unwrap();
+        assert!(wf2.steps[0].depends_on.is_empty());
+    }
+
+    #[test]
+    fn workflow_edges_includes_depends_on_edge() {
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: p\n    depends_on: [a]\n";
+        let wf = Workflow::parse(raw).unwrap();
+        let edges = workflow_edges(&wf);
+        assert!(edges.contains(&("a".to_string(), "b".to_string())));
+    }
+
+    #[test]
+    fn workflow_edges_dedups_next_and_depends_on_describing_the_same_edge() {
+        // a.next = [b] AND b.depends_on = [a] both describe a -> b: must
+        // collapse to exactly ONE edge in the returned set, not two.
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [b]\n  - id: b\n    agent: x\n    prompt: p\n    depends_on: [a]\n";
+        let wf = Workflow::parse(raw).unwrap();
+        let edges = workflow_edges(&wf);
+        let count = edges
+            .iter()
+            .filter(|e| e == &&("a".to_string(), "b".to_string()))
+            .count();
+        assert_eq!(count, 1, "expected exactly one a->b edge, got {edges:?}");
+    }
+
+    #[test]
+    fn depends_on_naming_unknown_step_is_rejected() {
+        let raw =
+            "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    depends_on: [ghost]\n";
+        assert!(matches!(
+            Workflow::parse(raw).unwrap_err(),
+            WorkflowParseError::EdgeTargetUnknown { .. }
+        ));
+    }
+
+    #[test]
+    fn depends_on_self_reference_is_rejected() {
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    depends_on: [a]\n";
+        assert!(matches!(
+            Workflow::parse(raw).unwrap_err(),
+            WorkflowParseError::EdgeSelfLoop { .. }
+        ));
+    }
+
+    #[test]
+    fn depends_on_cycle_is_rejected_with_path() {
+        // a depends_on [b], b depends_on [a]: a real cycle authored purely
+        // via depends_on (a <- b, b <- a is the same two-node cycle).
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    depends_on: [b]\n  - id: b\n    agent: x\n    prompt: p\n    depends_on: [a]\n";
+        let err = Workflow::parse(raw).unwrap_err();
+        assert!(
+            matches!(err, WorkflowParseError::WorkflowCycle { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -3063,5 +3673,675 @@ mod is_nonlinear_tests {
         let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [g]\n  - id: g\n    branch:\n      condition: \"{{ steps.a.output }}\"\n      then: [x]\n      else: [y]\n  - id: x\n    agent: a\n    prompt: p\n  - id: y\n    agent: a\n    prompt: p\n";
         let wf = Workflow::parse(raw).unwrap();
         assert!(!is_nonlinear(&wf));
+    }
+
+    #[test]
+    fn is_nonlinear_false_for_a_depends_on_only_linear_chain_in_declaration_order() {
+        // a; b depends_on:[a]; c depends_on:[b] — declaration order IS a
+        // valid topological order (a before b before c), no fork/reconverge
+        // — must stay linear-runnable, exactly mirroring
+        // `is_nonlinear_false_for_a_linear_chain_with_explicit_next`.
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: p\n    depends_on: [a]\n  - id: c\n    agent: x\n    prompt: p\n    depends_on: [b]\n";
+        let wf = Workflow::parse(raw).unwrap();
+        assert!(!is_nonlinear(&wf));
+    }
+
+    #[test]
+    fn is_nonlinear_true_for_a_depends_on_reconverge() {
+        // c depends_on: [a, b] — two distinct predecessors converging on c,
+        // the depends_on-authored mirror of `is_nonlinear_true_for_a_diamond_reconverge`.
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: p\n  - id: c\n    agent: x\n    prompt: p\n    depends_on: [a, b]\n";
+        let wf = Workflow::parse(raw).unwrap();
+        assert!(is_nonlinear(&wf));
+    }
+
+    #[test]
+    fn is_nonlinear_true_for_a_depends_on_authored_fork_matching_a_next_authored_fork() {
+        // `a next: [b, c]` and `b depends_on: [a]; c depends_on: [a]`
+        // describe the IDENTICAL fork (spec §1a: depends_on is next's
+        // symmetric inverse) — both must be is_nonlinear == true. Before
+        // this fix, the fork check read only `s.next.len()` and missed the
+        // depends_on-authored version entirely (it would stay false and
+        // route to `run_steps_inner`, which runs b/c sequentially instead
+        // of concurrently — a silent divergence from the next-authored
+        // fork's behavior).
+        let next_fork = Workflow::parse(
+            "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n    next: [b, c]\n  - id: b\n    agent: x\n    prompt: p\n  - id: c\n    agent: x\n    prompt: p\n",
+        )
+        .unwrap();
+        let depends_on_fork = Workflow::parse(
+            "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: p\n    depends_on: [a]\n  - id: c\n    agent: x\n    prompt: p\n    depends_on: [a]\n",
+        )
+        .unwrap();
+        assert!(
+            is_nonlinear(&next_fork),
+            "next-authored fork must be nonlinear"
+        );
+        assert!(
+            is_nonlinear(&depends_on_fork),
+            "the symmetric-inverse depends_on authoring must produce the same verdict"
+        );
+    }
+
+    #[test]
+    fn is_nonlinear_false_for_a_data_fan_out_with_no_control_edges() {
+        // `a` feeds TWO later steps purely via `{{ steps.a.output }}` — no
+        // `next`/`depends_on` anywhere. Proves the depends_on-aware fork
+        // check (which now folds depends_on-derived successors into a
+        // node's out-degree) still excludes INFERRED DATA edges from that
+        // out-degree count — must stay is_nonlinear == false
+        // (byte-equality: a linear workflow with a data fan-out must keep
+        // running through `run_steps_inner`, unchanged).
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: \"use {{ steps.a.output }}\"\n  - id: c\n    agent: x\n    prompt: \"use {{ steps.a.output }}\"\n";
+        let wf = Workflow::parse(raw).unwrap();
+        assert!(!is_nonlinear(&wf));
+    }
+
+    #[test]
+    fn is_nonlinear_true_for_depends_on_out_of_topological_order() {
+        // b declares depends_on:[c] but c is declared AFTER b — the linear
+        // runner would dispatch b before c ever ran. Must route to the
+        // scheduler, the depends_on-authored mirror of
+        // `is_nonlinear_true_for_a_forward_data_ref_out_of_declaration_order`.
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n  - id: b\n    agent: x\n    prompt: p\n    depends_on: [c]\n  - id: c\n    agent: x\n    prompt: p\n";
+        let wf = Workflow::parse(raw).unwrap();
+        assert!(is_nonlinear(&wf));
+    }
+
+    #[test]
+    fn is_nonlinear_still_false_for_every_sample_workflow_after_depends_on_support() {
+        // Re-confirms the existing golden-safety property holds with the
+        // depends_on-aware code paths in place: no sample workflow uses
+        // depends_on, so nothing here should change is_nonlinear's verdict.
+        for entry in std::fs::read_dir(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../.rupu/workflows"
+        ))
+        .unwrap()
+        {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&p).unwrap();
+            let wf = Workflow::parse(&raw).unwrap();
+            assert!(
+                !is_nonlinear(&wf),
+                "{:?} should be linear-runnable",
+                p.file_name().unwrap()
+            );
+            // Round-trip: reparse the serialized form and confirm the
+            // output is byte-identical (depends_on never introduced).
+            let out = serde_yaml::to_string(&wf).unwrap();
+            assert!(
+                !out.contains("depends_on"),
+                "{:?} must not gain a depends_on key",
+                p.file_name().unwrap()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod loop_schema_tests {
+    use super::*;
+
+    #[test]
+    fn parses_loops_block() {
+        let raw = r#"
+name: w
+steps:
+  - id: gen
+    agent: x
+    prompt: p
+  - id: test
+    agent: x
+    prompt: p
+    depends_on: [gen]
+  - id: critique
+    agent: x
+    prompt: p
+    depends_on: [test]
+loops:
+  refine:
+    nodes: [gen, test, critique]
+    until: "{{ steps.critique.approved }}"
+    max_iterations: 5
+"#;
+        let wf = Workflow::parse(raw).unwrap();
+        let def = wf.loops.get("refine").expect("loop `refine` must parse");
+        assert_eq!(
+            def.nodes,
+            vec!["gen".to_string(), "test".to_string(), "critique".to_string()]
+        );
+        assert_eq!(def.until, "{{ steps.critique.approved }}");
+        assert_eq!(def.max_iterations, 5);
+        assert_eq!(
+            def.on_max,
+            OnMax::Fail,
+            "on_max defaults to Fail when omitted"
+        );
+    }
+
+    #[test]
+    fn parses_on_max_proceed() {
+        let raw = r#"
+name: w
+steps:
+  - id: gen
+    agent: x
+    prompt: p
+  - id: test
+    agent: x
+    prompt: p
+    depends_on: [gen]
+loops:
+  refine:
+    nodes: [gen, test]
+    until: "{{ steps.test.output }}"
+    max_iterations: 3
+    on_max: proceed
+"#;
+        let wf = Workflow::parse(raw).unwrap();
+        assert_eq!(wf.loops["refine"].on_max, OnMax::Proceed);
+    }
+
+    #[test]
+    fn legacy_workflow_serializes_without_loops_key() {
+        let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: p\n";
+        let wf = Workflow::parse(raw).unwrap();
+        let out = serde_yaml::to_string(&wf).unwrap();
+        assert!(
+            !out.contains("loops"),
+            "legacy workflow must not emit loops:, got: {out}"
+        );
+        let wf2 = Workflow::parse(&out).unwrap();
+        assert!(wf2.loops.is_empty());
+    }
+
+    #[test]
+    fn loop_node_unknown_is_rejected() {
+        let raw = r#"
+name: w
+steps:
+  - id: gen
+    agent: x
+    prompt: p
+  - id: test
+    agent: x
+    prompt: p
+    depends_on: [gen]
+loops:
+  refine:
+    nodes: [gen, ghost]
+    until: "{{ steps.test.output }}"
+    max_iterations: 3
+"#;
+        let err = Workflow::parse(raw).unwrap_err();
+        assert!(
+            matches!(err, WorkflowParseError::LoopNodeUnknown { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn loop_node_overlap_is_rejected() {
+        let raw = r#"
+name: w
+steps:
+  - id: a
+    agent: x
+    prompt: p
+  - id: b
+    agent: x
+    prompt: p
+    depends_on: [a]
+  - id: c
+    agent: x
+    prompt: p
+    depends_on: [b]
+loops:
+  loop1:
+    nodes: [a, b]
+    until: "{{ steps.b.output }}"
+    max_iterations: 3
+  loop2:
+    nodes: [b, c]
+    until: "{{ steps.c.output }}"
+    max_iterations: 3
+"#;
+        let err = Workflow::parse(raw).unwrap_err();
+        assert!(
+            matches!(err, WorkflowParseError::LoopNodeOverlap { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn loop_too_small_is_rejected() {
+        let raw = r#"
+name: w
+steps:
+  - id: a
+    agent: x
+    prompt: p
+  - id: b
+    agent: x
+    prompt: p
+    depends_on: [a]
+loops:
+  refine:
+    nodes: [a]
+    until: "{{ steps.a.output }}"
+    max_iterations: 3
+"#;
+        let err = Workflow::parse(raw).unwrap_err();
+        assert!(
+            matches!(err, WorkflowParseError::LoopTooSmall { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn loop_max_iterations_zero_is_rejected() {
+        let raw = r#"
+name: w
+steps:
+  - id: a
+    agent: x
+    prompt: p
+  - id: b
+    agent: x
+    prompt: p
+    depends_on: [a]
+loops:
+  refine:
+    nodes: [a, b]
+    until: "{{ steps.b.output }}"
+    max_iterations: 0
+"#;
+        let err = Workflow::parse(raw).unwrap_err();
+        assert!(
+            matches!(err, WorkflowParseError::LoopMaxIterationsInvalid { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn loop_until_empty_is_rejected() {
+        let raw = r#"
+name: w
+steps:
+  - id: a
+    agent: x
+    prompt: p
+  - id: b
+    agent: x
+    prompt: p
+    depends_on: [a]
+loops:
+  refine:
+    nodes: [a, b]
+    until: ""
+    max_iterations: 3
+"#;
+        let err = Workflow::parse(raw).unwrap_err();
+        assert!(
+            matches!(err, WorkflowParseError::LoopUntilEmpty { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn loop_subgraph_cyclic_is_rejected_with_path() {
+        // A real CONTROL-edge cycle authored purely via depends_on among
+        // three members: critique -> gen -> test -> critique. Must be
+        // rejected as LoopSubgraphCyclic (not silently accepted, and not
+        // conflated with the collapsed-graph WorkflowCycle check).
+        let raw = r#"
+name: w
+steps:
+  - id: gen
+    agent: x
+    prompt: p
+    depends_on: [critique]
+  - id: test
+    agent: x
+    prompt: p
+    depends_on: [gen]
+  - id: critique
+    agent: x
+    prompt: p
+    depends_on: [test]
+loops:
+  refine:
+    nodes: [gen, test, critique]
+    until: "{{ steps.critique.output }}"
+    max_iterations: 3
+"#;
+        let err = Workflow::parse(raw).unwrap_err();
+        match err {
+            WorkflowParseError::LoopSubgraphCyclic { loop_name, path } => {
+                assert_eq!(loop_name, "refine");
+                assert!(!path.is_empty(), "path must name the stuck nodes");
+            }
+            other => panic!("expected LoopSubgraphCyclic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_member_escapes_is_rejected() {
+        // `fanout` is a loop member whose OWN `split:` targets `outside`,
+        // a non-member — rejected. (A plain `next`/branch-arm exit is
+        // valid per spec §2b/§2f — see
+        // `loop_member_next_authored_exit_is_valid_and_collapses_correctly`
+        // below; only `split`/`join` fan-out reaching outside is
+        // rejected.)
+        let raw = r#"
+name: w
+steps:
+  - id: fanout
+    split: [outside, test]
+  - id: test
+    agent: x
+    prompt: p
+    depends_on: [fanout]
+  - id: outside
+    agent: x
+    prompt: p
+loops:
+  refine:
+    nodes: [fanout, test]
+    until: "{{ steps.test.output }}"
+    max_iterations: 3
+"#;
+        let err = Workflow::parse(raw).unwrap_err();
+        match err {
+            WorkflowParseError::LoopMemberEscapes {
+                loop_name,
+                node,
+                target,
+            } => {
+                assert_eq!(loop_name, "refine");
+                assert_eq!(node, "fanout");
+                assert_eq!(target, "outside");
+            }
+            other => panic!("expected LoopMemberEscapes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_member_next_authored_exit_is_valid_and_collapses_correctly() {
+        // `critique` (member) exits the loop via a plain `next: [ship]` —
+        // spec §2b defines the loop's successors as exactly "edges from a
+        // loop member to a non-member," and §2f rejects ONLY split/join
+        // reaching outside, not `next`. This is also how the Phase-3
+        // editor's draw-action authors an exit (it always writes `next`),
+        // so rejecting this shape would reject workflows the editor
+        // itself produces.
+        let raw = r#"
+name: w
+steps:
+  - id: seed
+    agent: seeder
+    prompt: p
+    next: [gen]
+  - id: gen
+    agent: generator
+    prompt: p
+  - id: test
+    agent: tester
+    prompt: p
+    depends_on: [gen]
+  - id: critique
+    agent: critic
+    prompt: p
+    depends_on: [test]
+    next: [ship]
+  - id: ship
+    agent: shipper
+    prompt: p
+loops:
+  refine:
+    nodes: [gen, test, critique]
+    until: "{{ steps.critique.output }}"
+    max_iterations: 5
+"#;
+        let wf = Workflow::parse(raw)
+            .expect("a member's plain `next:` exit must be a valid loop successor edge");
+        let edges = collapsed_graph_edges(&wf);
+        assert!(edges.contains(&("seed".to_string(), "loop:refine".to_string())));
+        assert!(edges.contains(&("loop:refine".to_string(), "ship".to_string())));
+        assert_eq!(
+            edges.len(),
+            2,
+            "internal loop edges must still be dropped: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn loop_duplicate_node_is_rejected() {
+        // `nodes: [gen, gen]` has `Vec::len() == 2` (would pass
+        // `LoopTooSmall`'s raw length check) but only ONE distinct
+        // member — a degenerate single-member loop must not silently
+        // reach Task 3's execution; reject explicitly.
+        let raw = r#"
+name: w
+steps:
+  - id: gen
+    agent: x
+    prompt: p
+loops:
+  refine:
+    nodes: [gen, gen]
+    until: "{{ steps.gen.output }}"
+    max_iterations: 3
+"#;
+        let err = Workflow::parse(raw).unwrap_err();
+        match err {
+            WorkflowParseError::LoopDuplicateNode { loop_name, node } => {
+                assert_eq!(loop_name, "refine");
+                assert_eq!(node, "gen");
+            }
+            other => panic!("expected LoopDuplicateNode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collapsed_graph_cycle_between_loop_and_outside_node_is_rejected() {
+        // `gen` (member) depends_on `outside` (entry, fine); `outside`
+        // (non-member) depends_on `test` (exit authored on the outside
+        // node, fine) — but together they form a genuine 2-cycle at the
+        // COLLAPSED level: outside -> loop:refine -> outside. Neither
+        // endpoint's own escape check nor the internal-subgraph-acyclic
+        // check catches this (both are satisfied); only the collapsed
+        // outer-graph check does.
+        let raw = r#"
+name: w
+steps:
+  - id: gen
+    agent: x
+    prompt: p
+    depends_on: [outside]
+  - id: test
+    agent: x
+    prompt: p
+    depends_on: [gen]
+  - id: outside
+    agent: x
+    prompt: p
+    depends_on: [test]
+loops:
+  refine:
+    nodes: [gen, test]
+    until: "{{ steps.test.output }}"
+    max_iterations: 3
+"#;
+        let err = Workflow::parse(raw).unwrap_err();
+        assert!(
+            matches!(err, WorkflowParseError::WorkflowCycle { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// `seed -> (loop refine: gen -> test -> critique) -> ship` — the
+    /// spec §2a example shape. Must parse cleanly: this is the positive
+    /// case proving the validation matrix doesn't over-reject a
+    /// legitimately-authored loop.
+    const VALID_REFINE_LOOP: &str = r#"
+name: w
+steps:
+  - id: seed
+    agent: seeder
+    prompt: p
+    next: [gen]
+  - id: gen
+    agent: generator
+    prompt: p
+  - id: test
+    agent: tester
+    prompt: p
+    depends_on: [gen]
+  - id: critique
+    agent: critic
+    prompt: p
+    depends_on: [test]
+  - id: ship
+    agent: shipper
+    prompt: p
+    depends_on: [critique]
+loops:
+  refine:
+    nodes: [gen, test, critique]
+    until: "{{ steps.critique.output }}"
+    max_iterations: 5
+"#;
+
+    #[test]
+    fn valid_refine_loop_passes_validation() {
+        Workflow::parse(VALID_REFINE_LOOP)
+            .expect("a well-formed seed -> (loop) -> ship workflow must parse");
+    }
+
+    #[test]
+    fn is_nonlinear_true_for_a_loop_workflow() {
+        let wf = Workflow::parse(VALID_REFINE_LOOP).unwrap();
+        assert!(is_nonlinear(&wf), "a loop is a super-node — always nonlinear");
+    }
+
+    #[test]
+    fn loop_of_step_reports_membership() {
+        let wf = Workflow::parse(VALID_REFINE_LOOP).unwrap();
+        assert_eq!(loop_of_step(&wf, "gen"), Some("refine"));
+        assert_eq!(loop_of_step(&wf, "test"), Some("refine"));
+        assert_eq!(loop_of_step(&wf, "critique"), Some("refine"));
+        assert_eq!(loop_of_step(&wf, "seed"), None);
+        assert_eq!(loop_of_step(&wf, "ship"), None);
+    }
+
+    #[test]
+    fn loop_internal_edges_excludes_external_endpoints() {
+        let wf = Workflow::parse(VALID_REFINE_LOOP).unwrap();
+        let internal = loop_internal_edges(&wf, "refine");
+        assert!(internal.contains(&("gen".to_string(), "test".to_string())));
+        assert!(internal.contains(&("test".to_string(), "critique".to_string())));
+        assert!(
+            !internal
+                .iter()
+                .any(|(a, b)| a == "seed" || b == "seed" || a == "ship" || b == "ship"),
+            "external endpoints must not appear: {internal:?}"
+        );
+    }
+
+    #[test]
+    fn collapsed_graph_edges_rewires_loop_boundary_and_drops_internal_edges() {
+        let wf = Workflow::parse(VALID_REFINE_LOOP).unwrap();
+        let edges = collapsed_graph_edges(&wf);
+        assert!(edges.contains(&("seed".to_string(), "loop:refine".to_string())));
+        assert!(edges.contains(&("loop:refine".to_string(), "ship".to_string())));
+        assert_eq!(
+            edges.len(),
+            2,
+            "internal loop edges must be dropped, not surfaced: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn loop_feedback_data_edge_is_excluded_from_the_cyclic_check() {
+        // `gen` reads `{{ steps.critique.output }}` — a member->member
+        // data ref to a NON-ancestor (critique runs after gen within an
+        // iteration). Naively unioned with the control edges
+        // (gen->test->critique), this closes a cycle
+        // (critique->gen->test->critique) — but it's the loop's
+        // *intentional* cross-iteration feedback (spec §2d), not a
+        // same-iteration dependency, and must NOT be rejected as
+        // LoopSubgraphCyclic.
+        let raw = r#"
+name: w
+steps:
+  - id: seed
+    agent: seeder
+    prompt: p
+    next: [gen]
+  - id: gen
+    agent: generator
+    prompt: "improve on {{ steps.critique.output }}"
+  - id: test
+    agent: tester
+    prompt: p
+    depends_on: [gen]
+  - id: critique
+    agent: critic
+    prompt: p
+    depends_on: [test]
+  - id: ship
+    agent: shipper
+    prompt: p
+    depends_on: [critique]
+loops:
+  refine:
+    nodes: [gen, test, critique]
+    until: "{{ steps.critique.output }}"
+    max_iterations: 5
+"#;
+        let wf = Workflow::parse(raw)
+            .expect("the feedback ref must not be rejected as LoopSubgraphCyclic");
+        // Confirm the data edge really is present in workflow_edges (i.e.
+        // this test would have caught a naive "union control+data, then
+        // Kahn" implementation) — the exclusion is doing real work, not
+        // accidentally never encountering the edge at all.
+        let edges = workflow_edges(&wf);
+        assert!(
+            edges.contains(&("critique".to_string(), "gen".to_string())),
+            "the feedback data edge must be a real workflow_edges entry: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn is_nonlinear_still_false_for_every_sample_workflow_after_loop_support() {
+        for entry in std::fs::read_dir(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../.rupu/workflows"
+        ))
+        .unwrap()
+        {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&p).unwrap();
+            let wf = Workflow::parse(&raw).unwrap();
+            assert!(
+                !is_nonlinear(&wf),
+                "{:?} should be linear-runnable",
+                p.file_name().unwrap()
+            );
+            let out = serde_yaml::to_string(&wf).unwrap();
+            assert!(
+                !out.contains("loops"),
+                "{:?} must not gain a loops key",
+                p.file_name().unwrap()
+            );
+        }
     }
 }

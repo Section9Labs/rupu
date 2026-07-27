@@ -911,6 +911,7 @@ mod tests {
             resume_mode: None,
             resume_gate_id: None,
             final_output: None,
+            loop_progress: Default::default(),
         }
     }
 

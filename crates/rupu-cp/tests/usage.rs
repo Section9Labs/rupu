@@ -126,6 +126,7 @@ fn seed_transcript_with_model(dir: &std::path::Path, run_id: &str, model: &str) 
         resume_mode: None,
         resume_gate_id: None,
         final_output: None,
+        loop_progress: Default::default(),
     };
     let transcript_path = dir.join(format!("{run_id}.jsonl"));
     run_store.create(record, "name: wf\n").unwrap();
@@ -147,6 +148,7 @@ fn seed_transcript_with_model(dir: &std::path::Path, run_id: &str, model: &str) 
                 iterations: 0,
                 resolved: true,
                 finished_at: chrono::Utc::now(),
+                loop_iteration: None,
             },
         )
         .unwrap();
@@ -219,6 +221,7 @@ async fn usage_priced_only_reports_empty_unpriced_gap() {
         resume_mode: None,
         resume_gate_id: None,
         final_output: None,
+        loop_progress: Default::default(),
     };
     let transcript_path = dir.path().join("run_priced.jsonl");
     run_store.create(record, "name: wf\n").unwrap();
@@ -265,6 +268,7 @@ async fn usage_priced_only_reports_empty_unpriced_gap() {
                 iterations: 0,
                 resolved: true,
                 finished_at: chrono::Utc::now(),
+                loop_iteration: None,
             },
         )
         .unwrap();
@@ -577,6 +581,7 @@ fn seed_run_with_usage(
         resume_mode: None,
         resume_gate_id: None,
         final_output: None,
+        loop_progress: Default::default(),
     };
     let transcript_path = dir.join(format!("{run_id}.jsonl"));
     run_store.create(record, "name: wf\n").unwrap();
@@ -605,6 +610,7 @@ fn seed_run_with_usage(
                 iterations: 0,
                 resolved: true,
                 finished_at: chrono::Utc::now(),
+                loop_iteration: None,
             },
         )
         .unwrap();

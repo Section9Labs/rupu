@@ -831,6 +831,7 @@ fn replay_step_result_history(
         | StepKind::Branch
         | StepKind::Split
         | StepKind::Join
+        | StepKind::Loop
         | StepKind::Action
         | StepKind::ApprovalGate => replay_linear_step_history(state, rec, view_mode, prefs),
         StepKind::ForEach | StepKind::Parallel | StepKind::Panel => {
@@ -1024,6 +1025,7 @@ fn append_step_result_lines(
         | StepKind::Branch
         | StepKind::Split
         | StepKind::Join
+        | StepKind::Loop
         | StepKind::Action
         | StepKind::ApprovalGate => {
             let status = if rec.success {
@@ -1097,6 +1099,7 @@ fn append_step_result_lines(
                 StepKind::Branch => unreachable!(),
                 StepKind::Split => unreachable!(),
                 StepKind::Join => unreachable!(),
+                StepKind::Loop => unreachable!(),
                 StepKind::Action => unreachable!(),
                 StepKind::ApprovalGate => unreachable!(),
             };
@@ -1152,6 +1155,7 @@ fn append_fanout_item_lines(
             StepKind::Branch => unreachable!(),
             StepKind::Split => unreachable!(),
             StepKind::Join => unreachable!(),
+            StepKind::Loop => unreachable!(),
             StepKind::Action => unreachable!(),
             StepKind::ApprovalGate => unreachable!(),
         };
@@ -2703,6 +2707,7 @@ fn drain_step_results(
             | StepKind::Branch
             | StepKind::Split
             | StepKind::Join
+            | StepKind::Loop
             | StepKind::Action
             | StepKind::ApprovalGate => {
                 // Linear step — open a tailer if we have a transcript.
@@ -2762,6 +2767,7 @@ fn render_fanout_step(
         StepKind::Branch => unreachable!("render_fanout_step called for branch step"),
         StepKind::Split => unreachable!("render_fanout_step called for split step"),
         StepKind::Join => unreachable!("render_fanout_step called for join step"),
+        StepKind::Loop => unreachable!("render_fanout_step called for loop step"),
         StepKind::Action => unreachable!("render_fanout_step called for action step"),
         StepKind::ApprovalGate => unreachable!("render_fanout_step called for gate step"),
     };
@@ -2799,6 +2805,7 @@ fn render_fanout_step(
         StepKind::Branch => unreachable!(),
         StepKind::Split => unreachable!(),
         StepKind::Join => unreachable!(),
+        StepKind::Loop => unreachable!(),
         StepKind::Action => unreachable!(),
         StepKind::ApprovalGate => unreachable!(),
     }
@@ -2859,6 +2866,7 @@ fn render_child_item(
         StepKind::Branch => unreachable!(),
         StepKind::Split => unreachable!(),
         StepKind::Join => unreachable!(),
+        StepKind::Loop => unreachable!(),
         StepKind::Action => unreachable!(),
         StepKind::ApprovalGate => unreachable!(),
     };
@@ -3730,6 +3738,7 @@ mod tests {
             active_step_agent: None,
             active_step_transcript_path: None,
             final_output: None,
+            loop_progress: Default::default(),
         }
     }
 
@@ -4084,6 +4093,7 @@ mod tests {
             iterations: 0,
             resolved: true,
             finished_at: Utc::now(),
+            loop_iteration: None,
         };
         std::fs::write(
             &step_results,
@@ -4364,6 +4374,7 @@ mod tests {
             iterations: 0,
             resolved: true,
             finished_at: Utc::now(),
+            loop_iteration: None,
         };
         let prefs = UiPrefs::resolve(
             &rupu_config::UiConfig::default(),

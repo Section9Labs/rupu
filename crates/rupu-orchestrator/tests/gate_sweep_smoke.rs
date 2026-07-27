@@ -87,6 +87,7 @@ fn base_record(id: &str) -> RunRecord {
         resume_mode: None,
         resume_gate_id: None,
         final_output: None,
+        loop_progress: BTreeMap::new(),
     }
 }
 

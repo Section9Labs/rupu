@@ -130,6 +130,7 @@ impl NodeMirror {
             resume_mode: None,
             resume_gate_id: None,
             final_output: None,
+            loop_progress: Default::default(),
         };
 
         // Empty workflow YAML: node runs don't carry a local workflow snapshot.
