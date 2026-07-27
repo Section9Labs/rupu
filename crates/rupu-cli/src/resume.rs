@@ -18,12 +18,36 @@ use std::sync::Arc;
 
 /// Build the `action_dispatcher` every `OrchestratorRunOpts` construction
 /// site wires: an in-process MCP `ToolDispatcher` over the same SCM
-/// `Registry` and permission mode the run's `DefaultStepFactory` already
-/// carries for agent-step tool calls, so an `action:` step sees exactly
-/// the same allow/deny surface a `tools:`-using agent step would.
-/// `parse_mode_for_runtime` (rupu-agent) is reused rather than
-/// duplicated — it is the same mode string → `PermissionMode` mapping
-/// `run_agent` applies to its own tool registry.
+/// `Registry` and the run's permission mode.
+///
+/// **Mode** genuinely matches the agent path — `parse_mode_for_runtime`
+/// (rupu-agent) is reused rather than duplicated, so it is the same mode
+/// string → `PermissionMode` mapping `run_agent` applies to its own tool
+/// registry, and a `readonly` run refuses Write-classified tools here too.
+///
+/// The **tool allowlist** deliberately does NOT match the agent path, and
+/// this is not an oversight (ISSUES.md I-26). An agent step's surface is
+/// its `tools:` list narrowed by `actions:` (`step_factory.rs`'s
+/// `narrow_agent_tools`); this dispatcher passes `["*"]` instead, because
+/// it is built once per run while the tool it may call is per-step. That
+/// is sound rather than permissive, resting on three invariants:
+///
+/// 1. Every consumer of `opts.action_dispatcher` funnels into
+///    `execute_action_step`, whose only dispatch is `dispatcher.call(tool,
+///    …)` with `tool = step.action`. Agent-step tool calls never reach
+///    this dispatcher.
+/// 2. That tool is validated against the live MCP catalog at parse time by
+///    `validate_action_step` (`rupu-orchestrator`'s `workflow.rs`).
+/// 3. A step may not carry a non-empty `actions:` alongside `action:` —
+///    `WorkflowParseError::ActionsOnActionStep` rejects it, since an
+///    action step's tool is already explicit. So there is no per-step
+///    allowlist here to honor in the first place.
+///
+/// In short: the only tool this dispatcher can ever be asked for is one
+/// named explicitly in the workflow source and already catalog-checked.
+/// Narrowing the allowlist to that single tool anyway — so the guarantee
+/// is structural rather than an invariant enforced three modules away —
+/// is tracked as **I-79**.
 pub fn action_dispatcher_for(
     registry: &Arc<rupu_scm::Registry>,
     mode_str: &str,

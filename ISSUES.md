@@ -60,7 +60,7 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-23 | P0 | docs/autoflow | The autoflow author allowlist is undocumented and defaults to no restriction | fixed |
 | I-24 | P1 | rupu-cli | `on_reject` cleanup runs at `ask` mode regardless of the run's original mode | fixed |
 | I-25 | P1 | rupu-cli | `rupu workflow runs` — a list command — executes `on_reject` chains as a side effect | open |
-| I-26 | P1 | rupu-cli | Action steps get allowlist `["*"]`; the code comment claims parity with agent `tools:` | open |
+| I-26 | P1 | rupu-cli | Action steps get allowlist `["*"]`; the code comment claims parity with agent `tools:` | fixed |
 | I-27 | P2 | rupu-orchestrator | `action_protocol::validate_actions` is dead code; three docs describe a check that never runs | fixed |
 | I-78 | P1 | rupu-orchestrator | A workflow step at `--mode ask` still gets `BypassDecider` — `ask` grants full tool access | open |
 | I-79 | P2 | rupu-cli | The action dispatcher's `["*"]` allowlist is sound only by invariant, not by construction | open |
@@ -213,28 +213,6 @@ choice is a behavior decision — decided in the Arc 2 plan.
 
 ---
 
-### I-26 — action steps get a `["*"]` tool allowlist while the comment claims otherwise
-
-**Symptom.** An action step can call any MCP catalog tool, even in a workflow
-whose agents are narrowed to a small `tools:` roster.
-
-**Root cause.** `action_dispatcher_for` builds
-`McpPermission::new(parse_mode_for_runtime(mode_str), vec!["*".into()])`. An
-agent step's MCP allowlist is its frontmatter `tools:` (`["*"]` only when the
-agent declares none). The doc comment on the builder asserts the opposite — that
-an `action:` step "sees exactly the same allow/deny surface a `tools:`-using
-agent step would" — which is false precisely in the case it names.
-
-**Impact.** Defensible by author intent (the tool name is written in the
-workflow), but the code comment is actively misleading and there is no per-step
-narrowing knob. Note `Step.actions` *is* enforced for agent steps since
-#533/#537 (`narrow_agent_tools`), so the asymmetry is now sharper.
-
-**Fix.** At minimum correct the comment. Preferably let a step's `actions:`
-narrow its own `action:` invocation the way it narrows an agent's grant.
-
----
-
 ### I-4 — Four `linear_runner` tests fail on a clean `main`
 
 **Symptom.** `cargo test -p rupu-orchestrator --test linear_runner` reports
@@ -296,6 +274,62 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-26 — action steps get a `["*"]` tool allowlist while the comment claims otherwise
+
+**Symptom.** An action step can call any MCP catalog tool, even in a workflow
+whose agents are narrowed to a small `tools:` roster.
+
+**Root cause.** `action_dispatcher_for` builds
+`McpPermission::new(parse_mode_for_runtime(mode_str), vec!["*".into()])`. An
+agent step's MCP allowlist is its frontmatter `tools:` (`["*"]` only when the
+agent declares none). The doc comment on the builder asserts the opposite — that
+an `action:` step "sees exactly the same allow/deny surface a `tools:`-using
+agent step would" — which is false precisely in the case it names.
+
+**Impact.** Defensible by author intent (the tool name is written in the
+workflow), but the code comment is actively misleading and there is no per-step
+narrowing knob. Note `Step.actions` *is* enforced for agent steps since
+#533/#537 (`narrow_agent_tools`), so the asymmetry is now sharper.
+
+**Fix.** At minimum correct the comment. Preferably let a step's `actions:`
+narrow its own `action:` invocation the way it narrows an agent's grant.
+
+**Scope corrected — half of this issue was based on a false premise.** The original
+fix had two halves: (a) narrow an action step by its own `actions:` list, and
+(b) correct the doc comment. Half (a) is **withdrawn as impossible and meaningless**:
+`validate_step_actions` (`crates/rupu-orchestrator/src/workflow.rs:1389`) rejects a
+step carrying both `action:` and a non-empty `actions:` at parse time with
+`WorkflowParseError::ActionsOnActionStep` — *"an `action:` step must not carry a
+non-empty `actions:` allowlist — its tool is already explicit"* — and a parse test at
+`workflow.rs:2887` already asserts it. A workflow of the shape this issue proposed to
+narrow cannot be authored at all.
+
+**The wildcard is not exploitable, and that was verified rather than assumed.**
+`opts.action_dispatcher` has exactly three production consumers (`runner.rs:4293`,
+`:4700` for notify hooks, `:4923`), all funnelling into `execute_action_step`, whose
+only dispatch is `dispatcher.call(tool, …)` with `tool = step.action`. Agent-step tool
+calls go through the `rupu-tools` registry and `DefaultStepFactory`'s own narrowing,
+never this dispatcher. Every `action:` tool is catalog-validated at parse time by
+`validate_action_step`. So the only tool reachable through `["*"]` is one named
+explicitly in the workflow source and already checked.
+
+**Validation.** The doc comment on `action_dispatcher_for`
+(`crates/rupu-cli/src/resume.rs:19`) no longer claims an `action:` step "sees exactly
+the same allow/deny surface a `tools:`-using agent step would". It now separates the
+two halves — the **mode** half genuinely does match the agent path
+(`parse_mode_for_runtime` is shared, and a `readonly` run refuses Write tools here
+too), while the **allowlist** half deliberately differs — and enumerates the three
+invariants that make the wildcard sound, naming `ActionsOnActionStep` so the next
+reader can find the enforcement. `cargo build -p rupu-cli` clean. No behavior change,
+so no new test; the invariant's existing coverage is `workflow.rs:2887`.
+
+**Follow-up filed.** Making the guarantee structural rather than invariant-dependent
+— narrowing the allowlist to the single tool being invoked — is tracked as **I-79**
+(P2). It needs `execute_action_step` to build or be handed a per-step dispatcher,
+threading the registry through three call sites.
+
+---
 
 ### I-23 — the autoflow author allowlist is undocumented and defaults to open
 
