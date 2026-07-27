@@ -68,6 +68,20 @@ export function sessionStatusLabel(status: unknown): string {
   }
 }
 
+/** The label actually shown on-screen for a session status by
+ *  `SessionStatusPill`: the descriptor's human word (`Idle` / `Running` /
+ *  `Failed` / `Stopped`) whenever `sessionStatusTone` resolves to one of the
+ *  four real states (exact vocabulary match or a substring heuristic like
+ *  `"active"` → running), otherwise the raw wire label unchanged (the
+ *  `neutral` catch-all is never coerced onto a real state). Sort columns
+ *  should key off THIS, not the raw wire string, so sorting groups rows by
+ *  what the operator actually sees in the pill. */
+export function sessionStatusDisplayLabel(status: unknown): string {
+  const tone = sessionStatusTone(status);
+  if (tone === 'neutral') return sessionStatusLabel(status);
+  return SESSION_STATUS_DESCRIPTOR[tone].label;
+}
+
 /** Map a coerced label to one of the five dot tones. */
 export function sessionStatusTone(status: unknown): SessionTone {
   const label = sessionStatusLabel(status).toLowerCase();

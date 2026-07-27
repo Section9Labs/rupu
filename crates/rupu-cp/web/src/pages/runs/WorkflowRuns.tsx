@@ -184,6 +184,10 @@ export default function WorkflowRuns() {
     key: 'actions',
     header: '',
     fit: true,
+    // Its own real buttons (Archive/Restore/Delete) — keep them
+    // independently focusable/announced rather than swallowed by the
+    // row-link's mouse-only treatment (I7).
+    interactive: true,
     render: (r) => (
       <div
         className="flex items-center justify-end gap-1"
@@ -340,6 +344,14 @@ function runDurationMs(run: RunListRow): number | null {
 
 const WORKFLOW_RUN_COLUMNS: Column<RunListRow>[] = [
   {
+    key: 'status',
+    header: 'Status',
+    fit: true,
+    sortable: true,
+    sortValue: (r) => r.status,
+    render: (r) => <StatusPill status={r.status} />,
+  },
+  {
     key: 'workflow',
     header: 'Workflow',
     subject: true,
@@ -355,16 +367,6 @@ const WORKFLOW_RUN_COLUMNS: Column<RunListRow>[] = [
     render: (r) => <span className="text-note text-ink-mute font-mono">{shortId(r.id)}</span>,
   },
   {
-    key: 'host',
-    header: 'Host',
-    fit: true,
-    sortable: true,
-    sortValue: (r) => r.host_id ?? 'local',
-    render: (r) => (
-      <span className="text-note text-ink-mute font-mono">{r.host_id ?? 'local'}</span>
-    ),
-  },
-  {
     key: 'trigger',
     header: 'Trigger',
     fit: true,
@@ -373,12 +375,14 @@ const WORKFLOW_RUN_COLUMNS: Column<RunListRow>[] = [
     render: (r) => <TriggerChip trigger={r.trigger} />,
   },
   {
-    key: 'status',
-    header: 'Status',
+    key: 'host',
+    header: 'Host',
     fit: true,
     sortable: true,
-    sortValue: (r) => r.status,
-    render: (r) => <StatusPill status={r.status} />,
+    sortValue: (r) => r.host_id ?? 'local',
+    render: (r) => (
+      <span className="text-note text-ink-mute font-mono">{r.host_id ?? 'local'}</span>
+    ),
   },
   {
     key: 'in',

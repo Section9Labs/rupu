@@ -329,7 +329,7 @@ describe('Sessions — status cell uses the shared SessionStatusPill', () => {
     expect(pill).toHaveAttribute('data-motion', 'rg-pulse-run');
   });
 
-  it('an unknown/garbage status value renders without crashing (falls back to a static pill)', async () => {
+  it('an unknown/garbage status value renders the RAW label, not a fabricated real state', async () => {
     stubDeps();
     const garbageSession: SessionSummary = { ...REMOTE_SESSION, status: 'zzz-not-a-real-status' };
     vi.spyOn(api, 'getSessions').mockResolvedValue([garbageSession]);
@@ -337,9 +337,12 @@ describe('Sessions — status cell uses the shared SessionStatusPill', () => {
     renderPage();
 
     await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
-    const pill = screen.getByText('Stopped');
+    // Never coerced onto "Stopped" (or any of the four real states) — the raw
+    // wire value renders as-is, honestly reporting that the status is unknown.
+    const pill = screen.getByText('zzz-not-a-real-status');
     expect(pill).toBeInTheDocument();
     expect(pill).not.toHaveAttribute('data-motion', 'rg-pulse-run');
+    expect(screen.queryByText('Stopped')).toBeNull();
   });
 });
 

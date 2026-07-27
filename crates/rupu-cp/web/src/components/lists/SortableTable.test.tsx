@@ -192,4 +192,32 @@ describe('SortableTable', () => {
     const wrapper = nameCell.firstElementChild as HTMLElement;
     expect(wrapper).toHaveAttribute('title', 'Beta');
   });
+
+  // I7 (whole-branch-review, a11y): rowHref used to wrap EVERY cell's
+  // content in its own <Link>, so a multi-column row was one tab stop per
+  // column and screen readers announced the same destination once per cell.
+  // Only the subject column's link stays a real, focusable, announced link;
+  // the rest are mouse-only (tabIndex=-1 + aria-hidden), so a row is exactly
+  // one Tab stop, while the whole row stays clickable.
+  it('link-wraps only the subject cell for keyboard/AT — other cells are mouse-only', () => {
+    const columns: Column<Row>[] = [
+      { key: 'name', header: 'Name', subject: true, render: (r) => <span>{r.name}</span> },
+      { key: 'cost', header: 'Cost', align: 'right', render: (r) => <span>{r.cost}</span> },
+    ];
+    renderTable({ columns, rowHref: (r) => `/things/${r.id}` });
+
+    const betaRow = screen.getAllByRole('row')[1];
+    // Exactly one accessible (non-hidden) link per row.
+    expect(within(betaRow).getAllByRole('link')).toHaveLength(1);
+
+    const cells = within(betaRow).getAllByRole('cell');
+    const nameLink = cells[0].querySelector('a')!;
+    const costLink = cells[1].querySelector('a')!;
+    expect(nameLink).not.toHaveAttribute('aria-hidden');
+    expect(nameLink).not.toHaveAttribute('tabindex');
+    expect(costLink).toHaveAttribute('aria-hidden', 'true');
+    expect(costLink).toHaveAttribute('tabindex', '-1');
+    // Still present (and pointing at the row href) for mouse clicks.
+    expect(costLink).toHaveAttribute('href', '/things/b');
+  });
 });

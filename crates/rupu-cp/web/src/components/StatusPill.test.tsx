@@ -60,6 +60,15 @@ describe('StatusPill vs SessionStatusPill — one shared visual language', () =>
     },
   );
 
+  it('a genuinely unrecognized session status renders the RAW label, never a fabricated real state', () => {
+    const { getByText, queryByText, container } = render(
+      <SessionStatusPill status="zzz-not-a-real-status" />,
+    );
+    expect(getByText('zzz-not-a-real-status')).toBeInTheDocument();
+    expect(queryByText('Stopped')).toBeNull();
+    expect(container.querySelector('[data-motion]')).toBeNull();
+  });
+
   it('preserves the session-native words — idle/failed/stopped never render as run words', () => {
     expect(render(<SessionStatusPill status="idle" />).getByText('Idle')).toBeInTheDocument();
     expect(render(<SessionStatusPill status="failed" />).getByText('Failed')).toBeInTheDocument();

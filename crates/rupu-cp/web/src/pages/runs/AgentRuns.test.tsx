@@ -511,6 +511,17 @@ describe('AgentRuns — whole-row navigation (rowHref) goes to the transcript vi
     );
   });
 
+  it('a row WITH transcript_path keeps the row-hover affordance', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([ROW_WITH_TRANSCRIPT]);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    const tr = screen.getByText('fix-bug').closest('tr')!;
+    expect(tr.className).toMatch(/hover:bg-bg/);
+  });
+
   it('the Run id cell no longer carries its own duplicate link to the same destination', async () => {
     stubDeps();
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([ROW_WITH_TRANSCRIPT]);
@@ -530,6 +541,21 @@ describe('AgentRuns — whole-row navigation (rowHref) goes to the transcript vi
 
     await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
     expect(screen.getByText('fix-bug').closest('a')).toBeNull();
+  });
+
+  // M5 (whole-branch-review): a dead (unlinked) row must not still show the
+  // hover highlight that implies it's clickable — see SortableTable.tsx's
+  // `isDeadLinkRow`.
+  it("a row with no transcript_path does not carry the row-hover affordance", async () => {
+    stubDeps();
+    const noTranscript: AgentRunRow = { ...REMOTE_ROW, transcript_path: null };
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([noTranscript]);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+    const tr = screen.getByText('fix-bug').closest('tr')!;
+    expect(tr.className).not.toMatch(/hover:bg-bg/);
   });
 
   it('clicking the inner session control navigates to the session, not the row transcript destination', async () => {

@@ -446,6 +446,13 @@ export interface AutoflowEventRow {
   status?: string | null;
   worker_name?: string | null;
   usage: UsageSummary;
+  /** Turn count for the launched run. `null`/absent for non-run events
+   *  (awaiting/failed signals have no turns) and on older server versions —
+   *  never fabricate a `0`. */
+  turns?: number | null;
+  /** Run duration in milliseconds. `null`/absent for non-run events and on
+   *  older server versions — never fabricate a `0`. */
+  duration_ms?: number | null;
   /** Failure/error text for `cycle_failed` events. Absent for every other
    *  kind (and on older server versions). */
   detail?: string | null;

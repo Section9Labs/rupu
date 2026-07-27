@@ -8,7 +8,7 @@
 import { AlertCircle, type LucideIcon } from 'lucide-react';
 import type { RunStatusStr } from '../lib/api';
 import { cn } from '../lib/cn';
-import { SESSION_STATUS_DESCRIPTOR, type SessionStatusValue } from '../lib/sessionStatus';
+import { sessionStatusLabel, sessionStatusTone, SESSION_STATUS_DESCRIPTOR } from '../lib/sessionStatus';
 import { STATUS, statusMotionClass, type StatusDescriptor } from '../lib/status';
 
 // Live step state derived from the static record + SSE overrides. Kept in one
@@ -110,15 +110,36 @@ export function StatusPill({
 // see `lib/sessionStatus.ts`), never renamed into run-status words. Routing
 // through the SAME `PillShell` as `StatusPill` is what makes a session
 // `running` render the identical motion marker as a run `running` (Task 2).
+//
+// `status` is `unknown` (the wire type the session summary carries — see
+// `lib/sessionStatus.ts`'s doc comment). `sessionStatusTone` does the same
+// forgiving normalization every other session-status consumer already relies
+// on (exact vocabulary match, then substring heuristics for looser wire
+// values like `"active"`) — that part is a deliberate, tested mapping, not
+// the bug. The bug was its `neutral` catch-all (truly unrecognized input:
+// null, absent, garbage) being folded onto `stopped`, presenting a confident
+// but fabricated state. For `neutral` this renders the RAW label with a
+// neutral tone and an AlertCircle icon instead, mirroring `StatusPill`'s own
+// unrecognized-status fallback below — never inventing a real state.
 export function SessionStatusPill({
   status,
   size = 'sm',
 }: {
-  status: SessionStatusValue;
+  status: unknown;
   size?: 'xs' | 'sm';
 }) {
-  const s = toPillStyle(SESSION_STATUS_DESCRIPTOR[status]);
-  return <PillShell style={s} size={size} motion={status === 'running' ? 'rg-pulse-run' : undefined} />;
+  const tone = sessionStatusTone(status);
+  if (tone !== 'neutral') {
+    const s = toPillStyle(SESSION_STATUS_DESCRIPTOR[tone]);
+    return <PillShell style={s} size={size} motion={tone === 'running' ? 'rg-pulse-run' : undefined} />;
+  }
+  const s: StatusStyle = {
+    label: sessionStatusLabel(status),
+    cls: 'bg-surface text-ink ring-border',
+    dot: 'bg-ink-mute',
+    icon: AlertCircle,
+  };
+  return <PillShell style={s} size={size} />;
 }
 
 export function StatusDot({

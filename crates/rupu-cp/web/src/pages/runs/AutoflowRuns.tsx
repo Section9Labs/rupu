@@ -44,6 +44,7 @@ import { usePagedList } from '../../lib/usePagedList';
 import { cn } from '../../lib/cn';
 import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
+import { formatDuration } from '../../lib/duration';
 import { shortId } from '../../lib/shortId';
 
 const MODE_CLS: Record<string, string> = {
@@ -177,6 +178,23 @@ function matchesAutoflowQuery(query: string, fields: (string | null | undefined)
 
 const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
   {
+    key: 'status',
+    header: 'Status',
+    fit: true,
+    sortable: true,
+    sortValue: (e) => e.status ?? null,
+    render: (e) => {
+      if (!isRunEvent(e)) return null;
+      // `e.status` is a serialized `RunStatus` (see rupu-cp's
+      // api/run_resolve.rs) — the same lexicon `StatusPill` speaks.
+      return e.status ? (
+        <StatusPill status={e.status as RunStatusStr} />
+      ) : (
+        <span className="text-ink-mute">—</span>
+      );
+    },
+  },
+  {
     key: 'workflow',
     header: 'Workflow',
     subject: true,
@@ -225,16 +243,6 @@ const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
       ),
   },
   {
-    key: 'host',
-    header: 'Host',
-    fit: true,
-    sortable: true,
-    sortValue: (e) => e.host_id ?? 'local',
-    render: (e) => (
-      <span className="text-note text-ink-mute font-mono">{e.host_id ?? 'local'}</span>
-    ),
-  },
-  {
     key: 'worker',
     header: 'Worker',
     fit: true,
@@ -250,21 +258,14 @@ const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
     },
   },
   {
-    key: 'status',
-    header: 'Status',
+    key: 'host',
+    header: 'Host',
     fit: true,
     sortable: true,
-    sortValue: (e) => e.status ?? null,
-    render: (e) => {
-      if (!isRunEvent(e)) return null;
-      // `e.status` is a serialized `RunStatus` (see rupu-cp's
-      // api/run_resolve.rs) — the same lexicon `StatusPill` speaks.
-      return e.status ? (
-        <StatusPill status={e.status as RunStatusStr} />
-      ) : (
-        <span className="text-ink-mute">—</span>
-      );
-    },
+    sortValue: (e) => e.host_id ?? 'local',
+    render: (e) => (
+      <span className="text-note text-ink-mute font-mono">{e.host_id ?? 'local'}</span>
+    ),
   },
   {
     key: 'in',
@@ -317,6 +318,26 @@ const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
       isRunEvent(e) ? (
         <span className="text-ink font-medium">{formatCost(e.usage.cost_usd)}</span>
       ) : null,
+  },
+  {
+    key: 'turns',
+    header: 'Turns',
+    align: 'right',
+    fit: true,
+    sortable: true,
+    sortValue: (e) => e.turns ?? null,
+    render: (e) =>
+      isRunEvent(e) ? <span className="text-ink">{e.turns ? String(e.turns) : '—'}</span> : null,
+  },
+  {
+    key: 'duration',
+    header: 'Duration',
+    align: 'right',
+    fit: true,
+    sortable: true,
+    sortValue: (e) => e.duration_ms ?? null,
+    render: (e) =>
+      isRunEvent(e) ? <span className="text-ink-dim">{formatDuration(e.duration_ms)}</span> : null,
   },
   {
     key: 'started',

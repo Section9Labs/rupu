@@ -165,6 +165,9 @@ function buildColumns(onRemove: (id: string) => void): Column<HostView>[] {
       key: 'actions',
       header: '',
       fit: true,
+      // Its own real button (Remove) when present — keep it independently
+      // focusable/announced (I7) rather than swallowed by the row link.
+      interactive: true,
       render: (h) =>
         h.transport_kind === 'local' ? null : (
           <button

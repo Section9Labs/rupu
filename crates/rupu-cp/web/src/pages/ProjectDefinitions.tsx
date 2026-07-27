@@ -47,8 +47,10 @@ const AGENT_COLUMNS: Column<AgentSummary>[] = [
   {
     key: 'name',
     header: 'Name',
+    subject: true,
     sortable: true,
     sortValue: (a) => a.name,
+    titleValue: (a) => a.name,
     // Plain content — row-level navigation is `rowHref` (SortableTable
     // link-wraps the whole row); an inline <Link> here would nest an <a>
     // inside SortableTable's own <a>.
@@ -57,6 +59,7 @@ const AGENT_COLUMNS: Column<AgentSummary>[] = [
   {
     key: 'scope',
     header: 'Scope',
+    fit: true,
     width: 'w-24',
     sortable: true,
     sortValue: (a) => a.scope ?? 'global',
@@ -65,6 +68,7 @@ const AGENT_COLUMNS: Column<AgentSummary>[] = [
   {
     key: 'provider',
     header: 'Provider',
+    fit: true,
     width: 'w-32',
     sortable: true,
     sortValue: (a) => a.provider ?? null,
@@ -78,6 +82,7 @@ const AGENT_COLUMNS: Column<AgentSummary>[] = [
   {
     key: 'model',
     header: 'Model',
+    fit: true,
     width: 'w-40',
     sortable: true,
     sortValue: (a) => a.model ?? null,
@@ -91,6 +96,7 @@ const AGENT_COLUMNS: Column<AgentSummary>[] = [
   {
     key: 'description',
     header: 'Description',
+    fit: true,
     render: (a) => (
       <span className="text-ui text-ink-dim truncate block max-w-md">{a.description ?? ''}</span>
     ),
@@ -101,8 +107,10 @@ const WORKFLOW_COLUMNS: Column<WorkflowSummary>[] = [
   {
     key: 'name',
     header: 'Name',
+    subject: true,
     sortable: true,
     sortValue: (w) => w.name,
+    titleValue: (w) => w.name,
     // Plain content — row-level navigation is `rowHref` (SortableTable
     // link-wraps the whole row); an inline <Link> here would nest an <a>
     // inside SortableTable's own <a>.
@@ -111,6 +119,7 @@ const WORKFLOW_COLUMNS: Column<WorkflowSummary>[] = [
   {
     key: 'scope',
     header: 'Scope',
+    fit: true,
     width: 'w-24',
     sortable: true,
     sortValue: (w) => w.scope,
@@ -122,8 +131,10 @@ const AUTOFLOW_COLUMNS: Column<AutoflowDefRow>[] = [
   {
     key: 'name',
     header: 'Name',
+    subject: true,
     sortable: true,
     sortValue: (d) => d.name,
+    titleValue: (d) => d.name,
     // Plain content — row-level navigation is `rowHref` (SortableTable
     // link-wraps the whole row); an inline <Link> here would nest an <a>
     // inside SortableTable's own <a>.
@@ -132,6 +143,7 @@ const AUTOFLOW_COLUMNS: Column<AutoflowDefRow>[] = [
   {
     key: 'trigger',
     header: 'Trigger',
+    fit: true,
     width: 'w-28',
     sortable: true,
     sortValue: (d) => d.trigger,
@@ -140,6 +152,7 @@ const AUTOFLOW_COLUMNS: Column<AutoflowDefRow>[] = [
   {
     key: 'scope',
     header: 'Scope',
+    fit: true,
     width: 'w-24',
     sortable: true,
     sortValue: (d) => d.scope,

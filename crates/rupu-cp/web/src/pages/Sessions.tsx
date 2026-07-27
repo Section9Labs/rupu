@@ -11,10 +11,9 @@
 // Task 3): Status leads via the shared `SessionStatusPill` (Task 2), then
 // Agent (subject) → Session id → Host → Model → In/Out/Cached/Cost →
 // Turns → Duration → Started → actions. Status is `unknown` on the wire —
-// `toPillStatus` below coerces it to `SessionStatusPill`'s narrow 4-value
-// union via `lib/sessionStatus`'s existing label/tone helpers, folding the
-// `neutral` fallback tone (garbage/unrecognized input) onto `stopped` (the
-// same quiet slate visual `sessionStatusTone` already gives `neutral`).
+// `SessionStatusPill` is handed the raw value directly and does its OWN
+// exact-match-or-neutral-fallback (never coerces an unrecognized status onto
+// a real state; see `components/StatusPill.tsx`).
 //
 // Find (2026-07-23 operator feedback amendment #1): a `SearchInput` in the
 // FilterBar's search slot narrows the loaded rows client-side, live per
@@ -40,25 +39,8 @@ import { usePagedList } from '../lib/usePagedList';
 import { cn } from '../lib/cn';
 import { durationBetween, relativeTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
-import {
-  isSessionStatusValue,
-  sessionStatusLabel,
-  sessionStatusTone,
-  type SessionStatusValue,
-} from '../lib/sessionStatus';
+import { sessionStatusDisplayLabel } from '../lib/sessionStatus';
 import { shortId } from '../lib/shortId';
-
-/** Coerce the wire's `unknown` session status into `SessionStatusPill`'s
- *  narrow 4-value union. Exact vocabulary matches pass through; anything
- *  else falls back to the same tone `sessionStatusTone` already resolves it
- *  to, with `neutral` (its catch-all for unrecognized input) folded onto
- *  `stopped` — never crashes, never invents a 5th status. */
-function toPillStatus(status: unknown): SessionStatusValue {
-  const label = sessionStatusLabel(status).toLowerCase();
-  if (isSessionStatusValue(label)) return label;
-  const tone = sessionStatusTone(status);
-  return tone === 'neutral' ? 'stopped' : tone;
-}
 
 type Tab = 'active' | 'archived';
 
@@ -254,8 +236,10 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
     header: 'Status',
     fit: true,
     sortable: true,
-    sortValue: (s) => sessionStatusLabel(s.status),
-    render: (s) => <SessionStatusPill status={toPillStatus(s.status)} />,
+    // Sort on the label actually displayed (M3) — not the raw wire string —
+    // so sorting groups rows by what the operator sees in the pill.
+    sortValue: (s) => sessionStatusDisplayLabel(s.status),
+    render: (s) => <SessionStatusPill status={s.status} />,
   },
   {
     key: 'agent',
@@ -386,6 +370,9 @@ function buildActionColumn(
     header: '',
     fit: true,
     align: 'right',
+    // Its own real buttons (Archive/Restore/Delete) — keep them
+    // independently focusable/announced (I7).
+    interactive: true,
     render: (s) => (
       <div
         className="flex items-center justify-end gap-1"

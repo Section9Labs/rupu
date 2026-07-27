@@ -262,6 +262,19 @@ function SessionRefButton({ sessionId }: { sessionId: string }) {
 
 const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
   {
+    key: 'status',
+    header: 'Status',
+    fit: true,
+    sortable: true,
+    sortValue: (r) => r.status ?? null,
+    render: (r) =>
+      r.status ? (
+        <StatusPill status={normalizeAgentRunStatus(r.status)} />
+      ) : (
+        <span className="text-ink-mute">—</span>
+      ),
+  },
+  {
     key: 'agent',
     header: 'Agent',
     subject: true,
@@ -304,16 +317,6 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
     ),
   },
   {
-    key: 'host',
-    header: 'Host',
-    fit: true,
-    sortable: true,
-    sortValue: (r) => r.host_id ?? 'local',
-    render: (r) => (
-      <span className="text-note text-ink-mute font-mono">{r.host_id ?? 'local'}</span>
-    ),
-  },
-  {
     key: 'source',
     header: 'Source',
     fit: true,
@@ -326,17 +329,14 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
     ),
   },
   {
-    key: 'status',
-    header: 'Status',
+    key: 'host',
+    header: 'Host',
     fit: true,
     sortable: true,
-    sortValue: (r) => r.status ?? null,
-    render: (r) =>
-      r.status ? (
-        <StatusPill status={normalizeAgentRunStatus(r.status)} />
-      ) : (
-        <span className="text-ink-mute">—</span>
-      ),
+    sortValue: (r) => r.host_id ?? 'local',
+    render: (r) => (
+      <span className="text-note text-ink-mute font-mono">{r.host_id ?? 'local'}</span>
+    ),
   },
   {
     key: 'in',

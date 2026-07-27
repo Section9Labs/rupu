@@ -42,6 +42,7 @@ const RUN_COLUMNS: Column<RunListRow>[] = [
   {
     key: 'id',
     header: 'Run',
+    fit: true,
     // Plain content — row-level navigation is `rowHref` (SortableTable
     // link-wraps the whole row); an inline <Link> here would nest an <a>
     // inside SortableTable's own <a>.
@@ -52,13 +53,16 @@ const RUN_COLUMNS: Column<RunListRow>[] = [
   {
     key: 'workflow',
     header: 'Workflow',
+    subject: true,
     sortable: true,
     sortValue: (r) => r.workflow_name,
+    titleValue: (r) => r.workflow_name,
     render: (r) => <span className="text-sm text-ink">{r.workflow_name}</span>,
   },
   {
     key: 'status',
     header: 'Status',
+    fit: true,
     sortable: true,
     sortValue: (r) => r.status,
     render: (r) => <StatusPill status={r.status} size="xs" />,
@@ -66,6 +70,8 @@ const RUN_COLUMNS: Column<RunListRow>[] = [
   {
     key: 'started',
     header: 'Started',
+    align: 'right',
+    fit: true,
     sortable: true,
     sortValue: (r) => {
       const t = Date.parse(r.started_at);

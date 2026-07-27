@@ -393,6 +393,9 @@ function workflowColumns(onRun: (name: string) => void): Column<WorkflowSummary>
       header: '',
       align: 'right',
       fit: true,
+      // Its own real button (Run) — keep it independently
+      // focusable/announced (I7) rather than swallowed by the row link.
+      interactive: true,
       render: (w) => (
         <button
           type="button"

@@ -41,6 +41,17 @@ export interface Column<T> {
    *  string. Falls back to `render(row)` itself when it happens to already
    *  be a string. */
   titleValue?: (row: T) => string;
+  /** This column renders its OWN interactive controls (buttons, links to a
+   *  different destination than the row) — typically a row-actions column.
+   *  On a `rowHref` table, SortableTable normally makes every non-subject
+   *  cell's wrapping link mouse-only (`tabIndex=-1` + `aria-hidden`, I7) so
+   *  a row is one accessible tab stop; that would also swallow this
+   *  column's own controls from the accessibility tree, which is worse than
+   *  the duplicate-link problem it fixes. Set `interactive: true` to skip
+   *  that treatment for this column so its controls stay independently
+   *  focusable/announced (mouse behavior is unaffected either way — the
+   *  wrapping link and the row click handler are unchanged). */
+  interactive?: boolean;
   render: (row: T) => React.ReactNode;
 }
 
@@ -114,6 +125,15 @@ export default function SortableTable<T>({
   // alignment) — distinct from whether any GIVEN row is expandable.
   const hasDetailFeature = Boolean(renderDetail);
   const totalCols = columns.length + (hasDetailFeature ? 1 : 0);
+  // rowHref link-wraps every cell so the whole row is clickable, but that
+  // used to mean a 13-column row was 13 identical tab stops and screen
+  // readers announced the same link 13 times per row. Only the subject
+  // column's link (the table's ONE flexible, describing column — §5.1) stays
+  // a real, focusable, announced link; every other cell's link is present
+  // for mouse click purposes only (`tabIndex={-1}` + `aria-hidden`), so a row
+  // is exactly one Tab stop. Falls back to the first column when a table has
+  // no `subject` column at all.
+  const subjectKey = columns.find((c) => c.subject)?.key ?? columns[0]?.key;
 
   /** Non-null/non-false detail content means this row is expandable. */
   function isDetailContent(node: React.ReactNode): boolean {
@@ -215,9 +235,18 @@ export default function SortableTable<T>({
             const isRowExpandable = hasDetailFeature && isDetailContent(detailContent);
             const href = isRowExpandable ? undefined : rowHref?.(row);
             const isOpen = isRowExpandable && open.has(key);
+            // M5 (whole-branch-review): a table that declares `rowHref` can
+            // still have individual rows with nothing to link to (e.g.
+            // AgentRuns rows with no `transcript_path`) — those must not
+            // show the same hover highlight as a genuinely clickable row,
+            // or the affordance lies about what a click will do. Tables
+            // that never declare `rowHref` at all (plain/action-only lists)
+            // are unaffected — this only suppresses hover for a row that
+            // fell through where the table's OWN rowHref came up empty.
+            const isDeadLinkRow = Boolean(rowHref) && !href && !isRowExpandable;
             return (
               <Fragment key={key}>
-                <tr className="hover:bg-bg/60 transition-colors">
+                <tr className={cn('transition-colors', !isDeadLinkRow && 'hover:bg-bg/60')}>
                   {hasDetailFeature && (
                     <td className="w-8 pl-3 align-middle">
                       {isRowExpandable && (
@@ -240,9 +269,20 @@ export default function SortableTable<T>({
                     // is a navigation target) without nesting anchors. Pages that
                     // use rowHref render plain content (no inner links); pages with
                     // per-column links / interactive cells omit rowHref.
+                    const isSubjectCell = col.key === subjectKey;
+                    // I7: mouse-only for every non-subject cell EXCEPT ones
+                    // marked `interactive` — those carry their own real
+                    // controls, which must stay in the accessibility tree.
+                    const isMouseOnlyCell = !isSubjectCell && !col.interactive;
                     return href ? (
                       <td key={col.key} className={alignCls}>
-                        <Link to={href} className="block px-4 py-2.5 align-middle">
+                        <Link
+                          to={href}
+                          className="block px-4 py-2.5 align-middle"
+                          {...(isMouseOnlyCell
+                            ? { tabIndex: -1, 'aria-hidden': true }
+                            : null)}
+                        >
                           {renderCellContent(col, row)}
                         </Link>
                       </td>

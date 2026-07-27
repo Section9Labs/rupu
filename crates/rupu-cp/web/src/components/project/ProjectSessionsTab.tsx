@@ -12,9 +12,10 @@
 //
 // Column order + status glyph match the canonical run-table standard
 // (`docs/superpowers/plans/2026-07-24-rupu-cp-table-standardization.md`
-// Task 3) — see `pages/Sessions.tsx`'s header comment for the full rationale;
-// `toPillStatus` here is the same coercion, duplicated locally rather than
-// shared since Task 3 is scoped to these two files only.
+// Task 3) — see `pages/Sessions.tsx`'s header comment for the full rationale.
+// `SessionStatusPill` is handed the raw wire value directly and does its own
+// exact-match-or-neutral-fallback (never coerces an unrecognized status onto
+// a real state).
 //
 // Find (parity with Sessions' 2026-07-23 amendment): a `SearchInput` in the
 // FilterBar's search slot narrows the loaded rows client-side, live per
@@ -37,23 +38,8 @@ import { SessionStatusPill } from '../StatusPill';
 import { usePagedList } from '../../lib/usePagedList';
 import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
-import {
-  isSessionStatusValue,
-  sessionStatusLabel,
-  sessionStatusTone,
-  type SessionStatusValue,
-} from '../../lib/sessionStatus';
+import { sessionStatusDisplayLabel, sessionStatusTone } from '../../lib/sessionStatus';
 import { shortId } from '../../lib/shortId';
-
-/** Coerce the wire's `unknown` session status into `SessionStatusPill`'s
- *  narrow 4-value union — see `pages/Sessions.tsx`'s `toPillStatus` for the
- *  full rationale (identical logic, duplicated per this task's file scope). */
-function toPillStatus(status: unknown): SessionStatusValue {
-  const label = sessionStatusLabel(status).toLowerCase();
-  if (isSessionStatusValue(label)) return label;
-  const tone = sessionStatusTone(status);
-  return tone === 'neutral' ? 'stopped' : tone;
-}
 
 // --- Scope filter -----------------------------------------------------------
 
@@ -94,8 +80,9 @@ function buildSessionColumns(navigate: ReturnType<typeof useNavigate>): Column<S
     header: 'Status',
     fit: true,
     sortable: true,
-    sortValue: (s) => sessionStatusLabel(s.status),
-    render: (s) => <SessionStatusPill status={toPillStatus(s.status)} />,
+    // Sort on the label actually displayed (M3) — not the raw wire string.
+    sortValue: (s) => sessionStatusDisplayLabel(s.status),
+    render: (s) => <SessionStatusPill status={s.status} />,
   },
   {
     key: 'agent',
@@ -206,6 +193,9 @@ function buildSessionColumns(navigate: ReturnType<typeof useNavigate>): Column<S
     header: '',
     fit: true,
     align: 'right',
+    // Its own real button (Open live) when present — keep it independently
+    // focusable/announced (I7) rather than swallowed by the row link.
+    interactive: true,
     render: (s) =>
       s.active_run_id ? (
         <button

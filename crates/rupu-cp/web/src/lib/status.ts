@@ -16,9 +16,9 @@ import {
   Ban,
   CheckCircle2,
   Clock,
-  Loader2,
   Pause,
   PauseCircle,
+  Play,
   SkipForward,
   XCircle,
   XOctagon,
@@ -67,7 +67,11 @@ export const STATUS: Record<StatusKey, StatusDescriptor> = {
     label: 'Running',
     hex: '#3b82f6',
     tint: '#eff6ff',
-    icon: Loader2,
+    // M1: was `Loader2` — motion for `running` is now carried by the pill's
+    // ring pulse (`statusMotionClass`/`rg-pulse-run`), not icon rotation, so
+    // a static `Loader2` glyph read as a STALLED spinner. `Play` reads
+    // correctly whether or not the pill's own motion is active/reduced.
+    icon: Play,
     dotClass: 'bg-status-running',
     pillClass: 'bg-status-running/10 text-status-running ring-status-running/30',
   },
