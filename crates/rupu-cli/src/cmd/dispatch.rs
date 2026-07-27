@@ -437,6 +437,7 @@ fn read_final_assistant_text(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ENV_LOCK;
     use rupu_transcript::{Event, JsonlWriter, RunMode, RunStatus};
     use tempfile::TempDir;
 
@@ -519,6 +520,7 @@ mod tests {
     /// through to `DispatchCompleted`.
     #[tokio::test]
     async fn dispatch_emits_started_then_completed_with_matching_sub_run_id() {
+        let _guard = ENV_LOCK.lock().await;
         let dir = TempDir::new().unwrap();
         let global = dir.path().join("global");
         std::fs::create_dir_all(global.join("agents")).unwrap();
@@ -616,6 +618,7 @@ mod tests {
     /// must not change `dispatch()`'s behavior — it's a pure no-op path.
     #[tokio::test]
     async fn dispatch_with_no_sink_still_succeeds() {
+        let _guard = ENV_LOCK.lock().await;
         let dir = TempDir::new().unwrap();
         let global = dir.path().join("global");
         std::fs::create_dir_all(global.join("agents")).unwrap();
@@ -680,6 +683,7 @@ mod tests {
     /// persisted output rather than any mock internals.
     #[tokio::test]
     async fn dispatch_honors_config_default_provider_and_model() {
+        let _guard = ENV_LOCK.lock().await;
         let dir = TempDir::new().unwrap();
         let global = dir.path().join("global");
         std::fs::create_dir_all(global.join("agents")).unwrap();
@@ -756,6 +760,7 @@ mod tests {
     /// precedence `resolve_provider_name`/`resolve_model` encode.
     #[tokio::test]
     async fn dispatch_agent_frontmatter_overrides_config_defaults() {
+        let _guard = ENV_LOCK.lock().await;
         let dir = TempDir::new().unwrap();
         let global = dir.path().join("global");
         std::fs::create_dir_all(global.join("agents")).unwrap();
@@ -827,6 +832,7 @@ mod tests {
     /// `FALLBACK_MODEL` when neither the agent nor `default_model` pins one.
     #[tokio::test]
     async fn dispatch_resolves_openai_compatible_provider_default_model() {
+        let _guard = ENV_LOCK.lock().await;
         let dir = TempDir::new().unwrap();
         let global = dir.path().join("global");
         std::fs::create_dir_all(global.join("agents")).unwrap();
@@ -910,6 +916,7 @@ mod tests {
     /// visible notice recording the limitation.
     #[tokio::test]
     async fn dispatch_leaves_a_visible_delegation_narrowing_notice_on_the_child_transcript() {
+        let _guard = ENV_LOCK.lock().await;
         let dir = TempDir::new().unwrap();
         let global = dir.path().join("global");
         std::fs::create_dir_all(global.join("agents")).unwrap();
