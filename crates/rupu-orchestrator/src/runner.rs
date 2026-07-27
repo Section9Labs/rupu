@@ -4604,6 +4604,14 @@ async fn execute_action_step(
         }
         Err(e) => (true, false, Some(e.to_string())),
     };
+    // `blocked` reuses `ToolDispatcher::is_blocked` (rupu-mcp) rather than
+    // re-deriving it from `allowed` — the SAME classifier the agent-tool-call
+    // audit path would use if action nodes had an agent grant to check.
+    // An action node's tool is always explicit (it IS `step.action`), so
+    // `declared`/`granted`/`restricted` are always `true` here — there is
+    // no separate allowlist to narrow against (T1's `ActionsOnActionStep`
+    // validation already forbids a non-empty `actions:` on an action step).
+    let tool_audit_blocked = rupu_mcp::ToolDispatcher::is_blocked(&call_result);
     match JsonlWriter::create(&transcript_path) {
         Ok(mut writer) => {
             if let Err(e) = writer.write(&Event::ActionEmitted {
@@ -4614,6 +4622,14 @@ async fn execute_action_step(
                 reason,
             }) {
                 warn!(step = %step.id, error = %e, "failed to write action audit transcript line");
+            } else if let Err(e) = writer.write(&Event::ToolAudit {
+                tool: tool.to_string(),
+                declared: true,
+                granted: true,
+                blocked: tool_audit_blocked,
+                restricted: true,
+            }) {
+                warn!(step = %step.id, error = %e, "failed to write tool_audit transcript line");
             } else if let Err(e) = writer.flush() {
                 warn!(step = %step.id, error = %e, "failed to flush action audit transcript");
             }
@@ -5358,13 +5374,18 @@ async fn run_linear_step(
                     let sink = sink.clone();
                     let wf_run_id = workflow_run_id.to_string();
                     let step_id = step.id.clone();
-                    std::sync::Arc::new(move |_caller_step_id: &str, tool_name: &str| {
+                    std::sync::Arc::new(move |_caller_step_id: &str, tool_name: &str, blocked: bool| {
+                        let note = if blocked {
+                            format!("{tool_name} — blocked")
+                        } else {
+                            tool_name.to_string()
+                        };
                         sink.emit(
                             &wf_run_id,
                             &crate::executor::Event::StepWorking {
                                 run_id: wf_run_id.clone(),
                                 step_id: step_id.clone(),
-                                note: Some(tool_name.to_string()),
+                                note: Some(note),
                                 transcript_path: None,
                             },
                         );

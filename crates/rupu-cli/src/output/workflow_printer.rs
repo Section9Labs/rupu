@@ -1558,6 +1558,23 @@ fn workflow_transcript_event_lines(
                 kind: WorkflowViewLineKind::Event,
             }]
         }
+        TxEvent::ToolAudit {
+            tool,
+            declared,
+            granted,
+            blocked,
+            ..
+        } => {
+            let status = if *blocked { UiStatus::Failed } else { UiStatus::Complete };
+            let detail = format!("{tool}  ·  declared={declared} granted={granted} blocked={blocked}");
+            vec![WorkflowViewLine {
+                status,
+                text: retained_workflow_event_line_raw(status, "tool audit", &detail),
+                continuation: false,
+                indent: 0,
+                kind: WorkflowViewLineKind::Event,
+            }]
+        }
         TxEvent::GateRequested {
             gate_id,
             prompt,

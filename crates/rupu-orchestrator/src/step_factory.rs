@@ -227,6 +227,19 @@ impl StepFactory for DefaultStepFactory {
         // constructed).
         let parent_run_id_for_tool_ctx = Some(run_id.clone());
 
+        // `spec.tools` is MOVED into `narrow_agent_tools` just below, so
+        // clone the PRE-narrowing grant here — it's exactly the
+        // information `tool_audit`'s `granted` field needs, and
+        // narrowing discards it by construction (that's the whole
+        // point of narrowing).
+        let pre_narrow_tools = spec.tools.clone();
+        let audited_on_tool_call = wrap_on_tool_call_with_audit(
+            on_tool_call,
+            transcript_path.clone(),
+            step.actions.clone(),
+            pre_narrow_tools,
+        );
+
         AgentRunOpts {
             agent_name: spec.name,
             agent_system_prompt,
@@ -285,7 +298,7 @@ impl StepFactory for DefaultStepFactory {
             depth: 0,
             dispatchable_agents: spec.dispatchable_agents,
             step_id: step_id.to_string(),
-            on_tool_call,
+            on_tool_call: Some(audited_on_tool_call),
             on_stream_event: None,
             // Workflow-level concerns take precedence over agent-level concerns.
             // When the workflow declares `concerns:`, every step uses it —
@@ -425,6 +438,123 @@ pub(crate) fn narrow_agent_tools(
     }
 
     Some(effective)
+}
+
+// ---------------------------------------------------------------------------
+// `tool_audit` transcript trail (step `actions:` enforcement, T2)
+// ---------------------------------------------------------------------------
+
+/// Whether `tool_name` is covered by an agent's PRE-narrowing grant,
+/// using the SAME wildcard-aware expand/covers logic
+/// [`narrow_agent_tools`] uses (spec §2's `expand(grant)`). A naive
+/// exact-string-match would wrongly report `granted: false` for a
+/// `tools: [scm.*]` agent asked about `scm.prs.get` — this is the
+/// regression `narrow_agent_tools`'s own tests already guard for the
+/// enforcement path; `tool_audit`'s `granted` field must not
+/// reintroduce it on the audit path.
+///
+/// `pre_narrow_tools == None` means unrestricted (the agent's `tools:`
+/// frontmatter is absent) — everything is granted.
+fn tool_is_granted(pre_narrow_tools: &Option<Vec<String>>, tool_name: &str) -> bool {
+    match pre_narrow_tools {
+        None => true,
+        Some(grant) => {
+            let catalog = catalog_tool_names();
+            let mut universe = builtin_tool_names();
+            for name in &catalog {
+                push_unique(&mut universe, name);
+            }
+            expand_grant(grant, &universe).iter().any(|t| t == tool_name)
+        }
+    }
+}
+
+/// Append one `tool_audit` transcript line to `transcript_path` (spec
+/// §4a/§4b). Best-effort: a write failure is logged and swallowed —
+/// this is an observability side-channel, never allowed to fail the
+/// run it's auditing.
+///
+/// Uses `JsonlWriter::append` (O_APPEND), which is safe to interleave
+/// with `run_agent`'s own transcript writer ONLY because `run_agent`
+/// was changed (2026-07-26) to also hold an append-mode writer for
+/// exactly this reason — see the doc on `rupu_agent::OnToolCallCallback`
+/// and the comment above `run_agent`'s writer construction.
+///
+/// `declared`/`granted`/`blocked` distinguish three independent axes
+/// (spec §4a): `declared` is "was this tool named in the step's
+/// `actions:` list" (false both when `actions:` is empty/absent — NOT
+/// a violation — and when it's non-empty but doesn't name this tool;
+/// `restricted` disambiguates those two). `granted` is "does the
+/// agent's `tools:` frontmatter cover this tool" (pre-narrowing).
+/// `blocked` is "was the call actually denied", supplied by the
+/// caller from the `OnToolCallCallback` outcome.
+///
+/// When a step declares a tool the agent does not grant
+/// (`declared && !granted`), this is spec §3c's "visible, not
+/// fatal" case: narrowing already made it safe (no escalation — the
+/// call is blocked by construction), but it's very likely an
+/// authoring mistake, so it ALSO gets a `tracing::warn!` in addition
+/// to the transcript line.
+fn emit_tool_audit(
+    transcript_path: &std::path::Path,
+    tool_name: &str,
+    step_actions: &[String],
+    pre_narrow_tools: &Option<Vec<String>>,
+    blocked: bool,
+) {
+    let restricted = !step_actions.is_empty();
+    let declared = restricted && step_actions.iter().any(|a| a == tool_name);
+    let granted = tool_is_granted(pre_narrow_tools, tool_name);
+
+    if declared && !granted {
+        tracing::warn!(
+            tool = tool_name,
+            "step `actions:` declares `{tool_name}` but the agent's `tools:` grant \
+             does not cover it; the call is narrowed away (no escalation — this is \
+             safe, not a security issue) but is very likely an authoring mistake"
+        );
+    }
+
+    match rupu_transcript::JsonlWriter::append(transcript_path) {
+        Ok(mut w) => {
+            if let Err(e) = w.write(&rupu_transcript::Event::ToolAudit {
+                tool: tool_name.to_string(),
+                declared,
+                granted,
+                blocked,
+                restricted,
+            }) {
+                tracing::warn!(error = %e, "failed to write tool_audit transcript line");
+            } else if let Err(e) = w.flush() {
+                tracing::warn!(error = %e, "failed to flush tool_audit transcript line");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to open transcript for tool_audit append");
+        }
+    }
+}
+
+/// Wrap the caller-supplied `on_tool_call` (the live-executor
+/// `StepWorking`-note hook `run_linear_step` builds) with `tool_audit`
+/// emission, so every catalog tool call an agent step attempts gets an
+/// audit-trail line — regardless of whether a live-executor hook is
+/// even wired (e.g. CLI/cron/MCP-triggered runs with no `event_sink`).
+/// The original hook, when present, still fires first and unchanged
+/// (same `blocked` value it always would have received under the new
+/// 3-arg signature).
+fn wrap_on_tool_call_with_audit(
+    inner: Option<OnToolCallCallback>,
+    transcript_path: PathBuf,
+    step_actions: Vec<String>,
+    pre_narrow_tools: Option<Vec<String>>,
+) -> OnToolCallCallback {
+    Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
+        if let Some(cb) = inner.as_ref() {
+            cb(step_id, tool_name, blocked);
+        }
+        emit_tool_audit(&transcript_path, tool_name, &step_actions, &pre_narrow_tools, blocked);
+    })
 }
 
 /// Construct a stub `LlmProvider` that errors on first call. Used when
@@ -855,6 +985,227 @@ steps:
             Some(vec!["issues.list".to_string(), "issues.create".to_string()]),
             "actions: [] must leave the agent's full grant untouched"
         );
+    }
+
+    /// Read a transcript JSONL's `tool_audit` lines back as raw
+    /// `serde_json::Value`s (adjacently-tagged `{"type":...,"data":{...}}`
+    /// shape) so tests can assert on fields without depending on
+    /// `rupu_transcript::Event`'s full derive.
+    fn read_tool_audit_lines(path: &std::path::Path) -> Vec<serde_json::Value> {
+        let body = std::fs::read_to_string(path).unwrap_or_default();
+        body.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|v| v["type"] == "tool_audit")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn on_tool_call_is_always_wired_even_when_the_caller_passes_none() {
+        // `build_opts_for_step` must ALWAYS return `Some(...)` for
+        // `on_tool_call` — the tool_audit trail must exist even for
+        // CLI/cron/MCP-triggered runs with no live-executor event_sink
+        // (which pass `on_tool_call: None` in).
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_agent(tmp.path());
+        let f = factory(tmp.path().to_path_buf());
+        let transcript_path = tmp.path().join("transcript_wired.jsonl");
+
+        let opts = f
+            .build_opts_for_step(
+                "unrestricted",
+                "ag",
+                "prompt".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                transcript_path.clone(),
+                None,
+            )
+            .await;
+
+        let cb = opts.on_tool_call.expect("on_tool_call must always be Some");
+        cb("unrestricted", "issues.list", false);
+
+        let lines = read_tool_audit_lines(&transcript_path);
+        assert_eq!(lines.len(), 1, "expected exactly one tool_audit line; got {lines:?}");
+        assert_eq!(lines[0]["data"]["tool"], "issues.list");
+        assert_eq!(lines[0]["data"]["declared"], false, "actions: [] -> not declared");
+        assert_eq!(lines[0]["data"]["restricted"], false, "actions: [] -> unrestricted");
+        assert_eq!(lines[0]["data"]["granted"], true, "issues.list IS in the agent's grant");
+        assert_eq!(lines[0]["data"]["blocked"], false);
+    }
+
+    const WF_UNGRANTED: &str = r#"
+name: w
+steps:
+  - id: narrowed
+    agent: ag
+    prompt: p
+    actions: ["issues.get", "issues.list"]
+"#;
+
+    #[tokio::test]
+    async fn declared_and_blocked_call_writes_the_correct_tool_audit_fields() {
+        // `issues.list` IS declared (in `actions:`) and IS granted (agent's
+        // `tools:`) — a normal, allowed call.
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_agent(tmp.path());
+        let f = DefaultStepFactory {
+            workflow: crate::workflow::Workflow::parse(WF_UNGRANTED).expect("parses"),
+            global: tmp.path().to_path_buf(),
+            project_root: None,
+            resolver: Arc::new(rupu_auth::KeychainResolver::new()),
+            mode_str: "bypass".to_string(),
+            mcp_registry: Arc::new(rupu_scm::Registry::empty()),
+            system_prompt_suffix: None,
+            dispatcher: None,
+            openai_compatible: std::collections::HashMap::new(),
+            default_provider: None,
+            default_model: None,
+        };
+        let transcript_path = tmp.path().join("transcript_declared.jsonl");
+
+        let opts = f
+            .build_opts_for_step(
+                "narrowed",
+                "ag",
+                "prompt".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                transcript_path.clone(),
+                None,
+            )
+            .await;
+        let cb = opts.on_tool_call.expect("always wired");
+        cb("narrowed", "issues.list", false);
+
+        let lines = read_tool_audit_lines(&transcript_path);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["data"]["tool"], "issues.list");
+        assert_eq!(lines[0]["data"]["declared"], true);
+        assert_eq!(lines[0]["data"]["restricted"], true);
+        assert_eq!(lines[0]["data"]["granted"], true);
+        assert_eq!(lines[0]["data"]["blocked"], false);
+    }
+
+    #[tokio::test]
+    async fn a_step_declaring_an_ungranted_tool_emits_granted_false() {
+        // `issues.get` IS declared (in `actions:`) but the agent's `tools:`
+        // grant (`[issues.list, issues.create]`) does NOT cover it — spec
+        // §3c: visible (granted: false in the transcript + a
+        // tracing::warn!), not fatal. Narrowing already made the call
+        // safe (no escalation), so `blocked` mirrors what the runtime
+        // would actually do (the tool never makes it into the narrowed
+        // roster) — the caller passes that outcome through unchanged.
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_agent(tmp.path());
+        let f = DefaultStepFactory {
+            workflow: crate::workflow::Workflow::parse(WF_UNGRANTED).expect("parses"),
+            global: tmp.path().to_path_buf(),
+            project_root: None,
+            resolver: Arc::new(rupu_auth::KeychainResolver::new()),
+            mode_str: "bypass".to_string(),
+            mcp_registry: Arc::new(rupu_scm::Registry::empty()),
+            system_prompt_suffix: None,
+            dispatcher: None,
+            openai_compatible: std::collections::HashMap::new(),
+            default_provider: None,
+            default_model: None,
+        };
+        let transcript_path = tmp.path().join("transcript_ungranted.jsonl");
+
+        let opts = f
+            .build_opts_for_step(
+                "narrowed",
+                "ag",
+                "prompt".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                transcript_path.clone(),
+                None,
+            )
+            .await;
+
+        // Sanity: `issues.get` really was narrowed away (no escalation).
+        assert_eq!(
+            opts.agent_tools,
+            Some(vec!["issues.list".to_string()]),
+            "issues.get must be narrowed away — the agent never granted it"
+        );
+
+        let cb = opts.on_tool_call.expect("always wired");
+        cb("narrowed", "issues.get", true);
+
+        let lines = read_tool_audit_lines(&transcript_path);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["data"]["tool"], "issues.get");
+        assert_eq!(lines[0]["data"]["declared"], true);
+        assert_eq!(lines[0]["data"]["restricted"], true);
+        assert_eq!(lines[0]["data"]["granted"], false, "agent never granted issues.get");
+        assert_eq!(lines[0]["data"]["blocked"], true);
+    }
+
+    const WF_WILDCARD: &str = r#"
+name: w
+steps:
+  - id: narrowed
+    agent: wildcard-ag
+    prompt: p
+    actions: ["scm.prs.get"]
+"#;
+
+    #[tokio::test]
+    async fn wildcard_granted_agent_reports_granted_true_not_a_naive_match_false() {
+        // Regression for the naive-exact-match bug narrow_agent_tools
+        // itself guards on the enforcement side (spec §2's rewrite): an
+        // agent granting `tools: [scm.*]` must report `granted: true`
+        // for `scm.prs.get`, not `false` from a bare `list.contains(tool)`
+        // check.
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let agents_dir = tmp.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("wildcard-ag.md"),
+            "---\nname: wildcard-ag\ntools: [scm.*]\n---\nDo the thing.\n",
+        )
+        .unwrap();
+        let f = DefaultStepFactory {
+            workflow: crate::workflow::Workflow::parse(WF_WILDCARD).expect("parses"),
+            global: tmp.path().to_path_buf(),
+            project_root: None,
+            resolver: Arc::new(rupu_auth::KeychainResolver::new()),
+            mode_str: "bypass".to_string(),
+            mcp_registry: Arc::new(rupu_scm::Registry::empty()),
+            system_prompt_suffix: None,
+            dispatcher: None,
+            openai_compatible: std::collections::HashMap::new(),
+            default_provider: None,
+            default_model: None,
+        };
+        let transcript_path = tmp.path().join("transcript_wildcard.jsonl");
+
+        let opts = f
+            .build_opts_for_step(
+                "narrowed",
+                "wildcard-ag",
+                "prompt".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                transcript_path.clone(),
+                None,
+            )
+            .await;
+        let cb = opts.on_tool_call.expect("always wired");
+        cb("narrowed", "scm.prs.get", false);
+
+        let lines = read_tool_audit_lines(&transcript_path);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["data"]["granted"], true, "scm.* must cover scm.prs.get: {lines:?}");
+        assert_eq!(lines[0]["data"]["declared"], true);
+        assert_eq!(lines[0]["data"]["blocked"], false);
     }
 }
 

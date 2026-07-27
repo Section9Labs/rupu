@@ -63,4 +63,47 @@ impl ToolDispatcher {
         }
         Err(McpError::UnknownTool(name.to_string()))
     }
+
+    /// Whether a `call` result represents a DENIAL (blocked by the
+    /// permission layer) rather than an execution failure. Shared by
+    /// every caller that needs to distinguish "denied" from "errored"
+    /// for audit purposes (`rupu-orchestrator`'s `execute_action_step`,
+    /// which builds the `action:`-node `tool_audit` transcript line)
+    /// without duplicating the match against
+    /// `McpError::PermissionDenied`. Does not change `call`'s own
+    /// error/permission behavior — purely a read-only classifier over
+    /// its result.
+    pub fn is_blocked(result: &Result<String, McpError>) -> bool {
+        matches!(result, Err(McpError::PermissionDenied { .. }))
+    }
+}
+
+#[cfg(test)]
+mod is_blocked_tests {
+    use super::*;
+
+    #[test]
+    fn permission_denied_is_blocked() {
+        let result: Result<String, McpError> = Err(McpError::PermissionDenied {
+            tool: "issues.create".into(),
+            reason: "readonly mode".into(),
+        });
+        assert!(ToolDispatcher::is_blocked(&result));
+    }
+
+    #[test]
+    fn success_is_not_blocked() {
+        let result: Result<String, McpError> = Ok("{}".to_string());
+        assert!(!ToolDispatcher::is_blocked(&result));
+    }
+
+    #[test]
+    fn a_non_permission_error_is_not_blocked() {
+        // A connector failure (bad request, network error, etc.) is a
+        // real failure, but NOT a denial — `blocked` must stay false so
+        // the audit trail doesn't conflate "the call was refused" with
+        // "the call reached the connector and errored".
+        let result: Result<String, McpError> = Err(McpError::UnknownTool("bogus".into()));
+        assert!(!ToolDispatcher::is_blocked(&result));
+    }
 }
