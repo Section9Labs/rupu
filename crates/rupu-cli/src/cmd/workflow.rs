@@ -989,6 +989,7 @@ async fn show(
     let project_root = paths::project_root_for(&pwd)?;
     let global_cfg = global.join("config.toml");
     let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
+    // UI prefs only — lock does not apply (I-7)
     let cfg =
         rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default();
 
@@ -2107,7 +2108,7 @@ fn layered_config_workflow(
 ) -> rupu_config::Config {
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.map(|p| p.join(".rupu/config.toml"));
-    rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())
+    rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())
         .unwrap_or_default()
 }
 
@@ -2611,7 +2612,7 @@ pub(crate) async fn resume_run(
     let resolver = Arc::new(rupu_auth::KeychainResolver::new());
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
     let mcp_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
 
     let mode_str = mode.unwrap_or("ask").to_string();
@@ -3369,7 +3370,7 @@ async fn run_with_outcome(
     // [scm] platform settings.
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
     let live_view = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, view).live_view;
 
     // Build the SCM/issue registry once for the entire workflow run.
@@ -3970,7 +3971,7 @@ async fn execute_workflow_invocation(
         .project_root
         .as_ref()
         .map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
     let mcp_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
 
     let transcripts = paths::transcripts_dir(&global, ctx.project_root.as_deref());

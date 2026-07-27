@@ -82,6 +82,7 @@ fn config_editor() -> Option<String> {
     let pwd = std::env::current_dir().ok()?;
     let project_root = crate::paths::project_root_for(&pwd).ok().flatten();
     let project_cfg = project_root.map(|p| p.join(".rupu/config.toml"));
+    // UI prefs only — lock does not apply (I-7)
     let cfg = rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).ok()?;
     cfg.ui.editor
 }

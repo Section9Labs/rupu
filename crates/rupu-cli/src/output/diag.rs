@@ -187,6 +187,7 @@ pub fn prefs_for_diag(no_color: bool) -> UiPrefs {
             let pwd = std::env::current_dir().ok()?;
             let project_root = paths::project_root_for(&pwd).ok().flatten();
             let project_cfg = project_root.map(|p| p.join(".rupu/config.toml"));
+            // UI prefs only — lock does not apply (I-7)
             rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).ok()
         })
         .unwrap_or_default();

@@ -4036,6 +4036,7 @@ fn retained_serve_ui_prefs() -> UiPrefs {
         .as_ref()
         .and_then(|dir| paths::project_root_for(dir).ok().flatten());
     let cfg = match global.as_ref() {
+        // UI prefs only — lock does not apply (I-7)
         Some(global_dir) => rupu_config::layer_files(
             Some(&global_dir.join("config.toml")),
             project_root
@@ -11647,7 +11648,7 @@ fn issue_payload(cfg: &Config, issue: &Issue) -> anyhow::Result<serde_json::Valu
 fn resolve_config(global: &Path, project_root: Option<&Path>) -> anyhow::Result<Config> {
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.map(|root| root.join(".rupu/config.toml"));
-    Ok(rupu_config::layer_files(
+    Ok(rupu_config::layer_files_locked(
         Some(&global_cfg_path),
         project_cfg_path.as_deref(),
     )?)

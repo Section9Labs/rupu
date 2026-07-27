@@ -498,7 +498,7 @@ fn layered_config(
 ) -> rupu_config::Config {
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.map(|p| p.join(".rupu/config.toml"));
-    rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())
+    rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())
         .unwrap_or_default()
 }
 

@@ -1174,6 +1174,7 @@ async fn show(
     }
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
+    // UI prefs only — lock does not apply (I-7)
     let cfg = rupu_config::layer_files(
         Some(&global.join("config.toml")),
         project_root
@@ -1253,7 +1254,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
 
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
 
     let cli_mode = args.mode.as_deref().and_then(parse_mode);
     let agent_mode = spec.permission_mode.as_deref().and_then(parse_mode);
@@ -1690,7 +1691,7 @@ fn attach_blocking(
     }
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let cfg = rupu_config::layer_files(
+    let cfg = rupu_config::layer_files_locked(
         Some(&global.join("config.toml")),
         project_root
             .as_deref()
@@ -6135,7 +6136,8 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
         .project_root
         .as_ref()
         .map(|p| p.join(".rupu/config.toml"));
-    let _cfg = rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let _cfg =
+        rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
     let resolver = rupu_auth::KeychainResolver::new();
 
     let provider_config = provider_factory::ProviderConfig {
@@ -6698,7 +6700,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         .project_root
         .as_ref()
         .map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
     let resolver = rupu_auth::KeychainResolver::new();
     let scm_registry = Arc::new(rupu_scm::Registry::discover(&resolver, &cfg).await);
 
@@ -7358,7 +7360,7 @@ fn session_prune_cutoff(
         value.to_string()
     } else {
         let path = global.join("config.toml");
-        let cfg = rupu_config::layer_files(Some(&path), None)?;
+        let cfg = rupu_config::layer_files_locked(Some(&path), None)?;
         cfg.storage
             .archived_session_retention
             .unwrap_or_else(|| "30d".to_string())

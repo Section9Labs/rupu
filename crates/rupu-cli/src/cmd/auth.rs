@@ -147,7 +147,7 @@ fn is_openai_compatible_name(name: &str) -> bool {
         return false;
     };
     let global_cfg = global.join("config.toml");
-    let cfg = match rupu_config::layer_files(Some(&global_cfg), None) {
+    let cfg = match rupu_config::layer_files_locked(Some(&global_cfg), None) {
         Ok(c) => c,
         Err(_) => return false,
     };
@@ -520,6 +520,7 @@ fn auth_ui_prefs(
     let project_cfg = project_root
         .as_ref()
         .map(|path| path.join(".rupu/config.toml"));
+    // UI prefs only — lock does not apply (I-7)
     let cfg = rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref())?;
     Ok(UiPrefs::resolve(
         &cfg.ui,
@@ -850,7 +851,7 @@ async fn status(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
     }
     if let Ok(global) = crate::paths::global_dir() {
         let global_cfg = global.join("config.toml");
-        if let Ok(cfg) = rupu_config::layer_files(Some(&global_cfg), None) {
+        if let Ok(cfg) = rupu_config::layer_files_locked(Some(&global_cfg), None) {
             for (name, p) in &cfg.providers {
                 if p.kind.as_deref() != Some("openai-compatible") {
                     continue;

@@ -336,7 +336,7 @@ async fn list(
     // falling back to defaults on a missing/malformed config.toml rather
     // than failing the command.
     let global_cfg_path = global.join("config.toml");
-    let cfg = rupu_config::layer_files(Some(&global_cfg_path), None).unwrap_or_default();
+    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), None).unwrap_or_default();
 
     let mut all: Vec<_> = store
         .list()?
@@ -401,7 +401,7 @@ async fn show(
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
     let global_cfg_path = global.join("config.toml");
-    let cfg = rupu_config::layer_files(Some(&global_cfg_path), None).unwrap_or_default();
+    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), None).unwrap_or_default();
 
     // Emit rupu-cp's own detail payload verbatim — do NOT re-shape it here.
     // See `query_run_detail`'s doc comment (crates/rupu-cp/src/api/runs.rs)
@@ -470,7 +470,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // Resolve config (global + project).
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
     let prefs = UiPrefs::resolve(&cfg.ui, false, None, None, args.view);
 
     // Resolve permission mode.

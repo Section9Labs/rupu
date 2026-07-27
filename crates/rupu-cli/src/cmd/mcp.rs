@@ -46,7 +46,7 @@ async fn serve_inner(args: ServeArgs) -> anyhow::Result<()> {
     let project_root = paths::project_root_for(&pwd)?;
     let global_cfg = global.join("config.toml");
     let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref())?;
+    let cfg = rupu_config::layer_files_locked(Some(&global_cfg), project_cfg.as_deref())?;
 
     let resolver = rupu_auth::KeychainResolver::new();
     let registry = Arc::new(Registry::discover(&resolver, &cfg).await);

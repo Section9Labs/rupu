@@ -26,7 +26,6 @@ against the code before being recorded.
 
 | ID | Sev | Area | Title | Status |
 |---|---|---|---|---|
-| I-7 | P0 | rupu-config | `[policy].lock` is enforced only inside rupu-cp; all 43 CLI config loads ignore it | open |
 | I-8 | P0 | rupu-cli | `dispatch_agent` hardcodes provider/model — the 4th I-1/I-2 site, never fixed | open |
 | I-9 | P1 | rupu-providers | `[providers.*].timeout_ms` has no consumer | open |
 | I-10 | P1 | rupu-providers | `[providers.*].max_retries` has no consumer; real retry budget is a hardcoded 1 | open |
@@ -121,33 +120,6 @@ against the code before being recorded.
 ---
 
 ## Open
-
-### I-7 — `[policy].lock` is not enforced anywhere outside the web UI
-
-**Symptom.** An administrator locks `permission_mode` globally. The CP Settings
-UI shows the field locked and refuses to edit it. A project-level
-`.rupu/config.toml` still overrides it for every `rupu run`, `rupu session` and
-`rupu workflow run`.
-
-**Root cause.** Lock enforcement lives entirely inside `rupu_config::resolve`
-(`crates/rupu-config/src/resolve.rs:180-197`, `is_locked` → global-wins
-precedence). `resolve()` has **6 call sites, all in rupu-cp**
-(`crates/rupu-cp/src/state.rs`, `crates/rupu-cp/src/api/config.rs`). Every CLI
-path loads configuration through `rupu_config::layer_files` instead — **43 call
-sites** — which performs ordinary project-over-global layering and never
-consults `[policy].lock`.
-
-**Impact.** The one mechanism presented as a governance control is a UI-only
-affordance. `ConfigEditor.tsx:7-14` tells the operator "a field whose resolved
-value is enforced by the global policy lock cannot be edited", which is true of
-the web form and false of the tool.
-
-**Fix.** Route CLI config loading through a single lock-aware resolver so
-`layer_files` is no longer used directly for policy-bearing keys. Validate with a
-test that a locked global key survives a conflicting project config on a CLI
-code path — not only through `resolve()`.
-
----
 
 ### I-8 — `dispatch_agent` hardcodes provider and model (the unfixed 4th I-1/I-2 site)
 
@@ -372,6 +344,71 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-7 — `[policy].lock` is not enforced anywhere outside the web UI
+
+**Symptom.** An administrator locks `permission_mode` globally. The CP Settings
+UI shows the field locked and refuses to edit it. A project-level
+`.rupu/config.toml` still overrides it for every `rupu run`, `rupu session` and
+`rupu workflow run`.
+
+**Root cause.** Lock enforcement lives entirely inside `rupu_config::resolve`
+(`crates/rupu-config/src/resolve.rs:180-197`, `is_locked` → global-wins
+precedence). `resolve()` has **6 call sites, all in rupu-cp**
+(`crates/rupu-cp/src/state.rs`, `crates/rupu-cp/src/api/config.rs`). Every CLI
+path loads configuration through `rupu_config::layer_files` instead — **43 call
+sites** — which performs ordinary project-over-global layering and never
+consults `[policy].lock`.
+
+**Impact.** The one mechanism presented as a governance control is a UI-only
+affordance. `ConfigEditor.tsx:7-14` tells the operator "a field whose resolved
+value is enforced by the global policy lock cannot be edited", which is true of
+the web form and false of the tool.
+
+**Fix.** PR (branch `arc1/config-integrity`), in two commits:
+
+1. `crates/rupu-config/src/layer.rs` gained `layer_files_locked(global,
+   project)` — same signature as `layer_files`, but it delegates to
+   `resolve()` (empty env map) and returns `resolved.config`, so the
+   global-wins-when-locked precedence and the dotted-key encoding are the
+   single implementation in `resolve.rs`, not a second copy.
+2. Every **policy-bearing** `layer_files` call site in `rupu-cli` moved to
+   `layer_files_locked` — 29 of the 42 non-test sites: `resume.rs`, `cmd/run.rs`
+   (×3), `cmd/session.rs` (×5), `cmd/workflow.rs` (×4), `cmd/cp.rs` (×2),
+   `cmd/cron.rs` (×2), `cmd/issues.rs` (×2), `cmd/auth.rs` (×2),
+   `cmd/repos.rs`, `cmd/mcp.rs`, `cmd/update.rs`, `cmd/webhook.rs`,
+   `cmd/agent.rs`, `cmd/usage.rs`, `cmd/autoflow.rs`, `cmd/transcript.rs`.
+   The rule applied: **migrate** whenever the loaded `Config` escapes the
+   function or feeds a non-`[ui]` key (permission mode, provider/model,
+   `[scm]`/`[issues]`, `[triggers]`, `[cp]`, `[storage]` retention,
+   `[pricing]`, `[update]`); **leave** only where the `Config` is local to the
+   function and nothing but `cfg.ui` is read.
+
+   The 13 deliberate leaves are UI-preference-only loads (theme / color /
+   pager / live-view / `[ui].editor`) and each now carries the marker comment
+   `// UI prefs only — lock does not apply (I-7)`: `cmd/ui.rs`,
+   `cmd/session.rs:show`, `cmd/cron.rs:ui_prefs`, `cmd/editor.rs`,
+   `cmd/workflow.rs:show`, `cmd/transcript.rs` (×2), `cmd/autoflow.rs`,
+   `cmd/auth.rs:auth_ui_prefs`, `output/diag.rs`, `cmd/watch.rs`,
+   `output/workflow_printer.rs`, `cmd/repos.rs:tracked`.
+
+**Validation.** `cargo test -p rupu-cli --test policy_lock` — 3 tests. The two
+that prove the migration drive a **real CLI command** rather than the config
+crate, so they would still fail if any `rupu run` call site had been left on
+`layer_files`: `cli_run_honors_a_locked_global_permission_mode` writes a global
+`permission_mode = "readonly"` + `lock = ["permission_mode"]` against a project
+`permission_mode = "bypass"`, invokes `rupu_cli::run(["rupu","run","writer","go"])`
+(no `--mode` flag) under the mock provider, and asserts the agent's `write_file`
+call was **denied** — i.e. the effective mode stayed `readonly`. It fails on the
+pre-fix code with the file present on disk. `cli_run_lets_an_unlocked_project_permission_mode_win`
+is the control: with no `[policy].lock`, ordinary project-over-global layering
+still applies and the write goes through.
+`layer_files_locked_keeps_the_locked_global_value` pins the library contract.
+
+Completeness is enforced by grep: `grep -rn "layer_files(" --include="*.rs"
+crates/rupu-cli | grep -v test` returns only the 13 UI-preference sites, every
+one of them carrying the `// UI prefs only — lock does not apply (I-7)`
+comment.
 
 ### I-6 — `rupu config set` corrupts `config.toml`, then silently wipes it
 

@@ -51,7 +51,7 @@ pub async fn handle(action: Action) -> ExitCode {
             // loops enabled, 60s cadence — same as an absent `[cp]` section.
             let cp_runtime_cfg = {
                 let global_cfg_path = global_dir.join("config.toml");
-                rupu_config::layer_files(Some(&global_cfg_path), None)
+                rupu_config::layer_files_locked(Some(&global_cfg_path), None)
                     .unwrap_or_default()
                     .cp
             };
@@ -202,7 +202,8 @@ pub async fn handle(action: Action) -> ExitCode {
             let repos: Option<Arc<dyn rupu_cp::repos::RepoLister>> = {
                 let resolver = rupu_auth::KeychainResolver::new();
                 let global_cfg = global_dir.join("config.toml");
-                let cfg = rupu_config::layer_files(Some(&global_cfg), None).unwrap_or_default();
+                let cfg = rupu_config::layer_files_locked(Some(&global_cfg), None)
+                    .unwrap_or_default();
                 let registry = Arc::new(rupu_scm::Registry::discover(&resolver, &cfg).await);
                 Some(Arc::new(crate::cp_repos::CpRepoLister { registry }))
             };
