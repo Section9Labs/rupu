@@ -57,11 +57,13 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | ID | Sev | Area | Title | Status |
 |---|---|---|---|---|
 | I-22 | P1 | rupu-tools | `grep` and `ast_grep` escape the workspace — no `path_scope` containment | fixed |
-| I-23 | P0 | docs/autoflow | The autoflow author allowlist is undocumented and defaults to no restriction | open |
+| I-23 | P0 | docs/autoflow | The autoflow author allowlist is undocumented and defaults to no restriction | fixed |
 | I-24 | P1 | rupu-cli | `on_reject` cleanup runs at `ask` mode regardless of the run's original mode | fixed |
 | I-25 | P1 | rupu-cli | `rupu workflow runs` — a list command — executes `on_reject` chains as a side effect | open |
 | I-26 | P1 | rupu-cli | Action steps get allowlist `["*"]`; the code comment claims parity with agent `tools:` | open |
-| I-27 | P2 | rupu-orchestrator | `action_protocol::validate_actions` is dead code; three docs describe a check that never runs | open |
+| I-27 | P2 | rupu-orchestrator | `action_protocol::validate_actions` is dead code; three docs describe a check that never runs | fixed |
+| I-78 | P1 | rupu-orchestrator | A workflow step at `--mode ask` still gets `BypassDecider` — `ask` grants full tool access | open |
+| I-79 | P2 | rupu-cli | The action dispatcher's `["*"]` allowlist is sound only by invariant, not by construction | open |
 
 ### Arc 3 — single UI path
 
@@ -132,30 +134,61 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 ## Open
 
-### I-23 — the autoflow author allowlist is undocumented and defaults to open
+### I-78 — a workflow step at `--mode ask` still gets `BypassDecider`
 
-**Symptom.** Nothing in the user-facing docs describes `selector.authors` or
-`selector.authors_from`. A user writing an autoflow gets no restriction by
-default — any author who opens a matching issue or PR can trigger it.
+**Symptom.** `rupu workflow run --mode ask` grants every agent step unrestricted
+tool access. `bash`, `write_file` and `edit_file` all execute without a prompt and
+without a denial, which is precisely `bypass` behavior under a different name.
 
-**Root cause.** `AutoflowSelector.authors` (`crates/rupu-orchestrator/src/workflow.rs:412`)
-and `.authors_from` (`:416`, with `AuthorScope::Collaborators | OrgMembers` at
-`:429`) are implemented and enforced by `author_allowed` (`:453`), but
-`docs/workflow-format.md`'s selector table documents only `states`,
-`labels_all`, `labels_any`, `labels_none`, and `limit`. The default — both
-fields unset — is *no* author restriction.
+**Root cause.** `DefaultStepFactory::build` (`crates/rupu-orchestrator/src/step_factory.rs`)
+hardcoded `decider: Arc::new(BypassDecider)` for every workflow step regardless of
+the run's mode. `BypassDecider`'s own doc comment describes it as a "Test/CI
+decider… always Allow". I-24's fix introduced `ReadonlyDecider` and wired it in for
+`readonly`, but deliberately left `ask` on `BypassDecider`, because the agent
+runtime's interactive `ask` decider blocks on stdin and a workflow step has no
+operator present to answer it.
 
-**Impact.** This is the control that stops an arbitrary GitHub user from
-triggering an autonomous agent run by opening a PR — and autoflows commonly run
-at `permission_mode: bypass`. An operator who never learns the field exists has
-no reason to set it. Also undocumented on the same selector: `draft`, `base`,
-`on_skip`, and `Autoflow.source`.
+**Impact.** Discovered while building I-24's validation test — without it, that fix
+would have had no observable effect at the tool layer. Two live gaps remain. First,
+an operator choosing `ask` over `bypass` reasonably expects *more* restriction and
+silently gets none; this is the "silent no-op config" class the whole program
+exists to eliminate. Second, `ask` is the **default** when `--mode` is omitted, so
+every workflow run that doesn't pass a mode is effectively running at bypass.
 
-**Fix.** Document all of them in the selector table, with the default stated
-explicitly and a recommendation to set `authors_from: collaborators` for any
-autoflow that runs unattended. Consider whether the *default* should change —
-that is a behavior decision, so it is called out in the Arc 2 plan rather than
-assumed here.
+**Fix.** Decide what `ask` means in an unattended context — there is no operator to
+prompt, so it must resolve to something non-interactive. The plausible options are
+to treat it as `readonly` (deny writers), to gate it behind the existing approval
+machinery so the *workflow* asks rather than the tool layer, or to reject
+`--mode ask` on a workflow run and force an explicit choice. Whichever is chosen,
+the current state — `ask` silently meaning `bypass` — is not defensible, and the
+default-mode case makes it P1 rather than P2. Related: [[I-24]].
+
+---
+
+### I-79 — the action dispatcher's `["*"]` allowlist is sound only by invariant
+
+**Symptom.** `action_dispatcher_for` (`crates/rupu-cli/src/resume.rs:27`) builds its
+`McpPermission` with a wildcard tool allowlist, `vec!["*".into()]`.
+
+**Root cause.** The dispatcher is constructed once per run, while the tool it may
+call is per-step, so the construction site has no single tool name to narrow to.
+
+**Impact.** No exploitable hole **today**, and this was verified rather than
+assumed: `opts.action_dispatcher` has exactly three production consumers
+(`runner.rs:4293`, `:4700`, `:4923`), all of which funnel into `execute_action_step`,
+whose only dispatch is `dispatcher.call(tool, …)` with `tool = step.action`. That
+tool is validated against the live MCP catalog at parse time by
+`validate_action_step`, and a step may not carry a non-empty `actions:` alongside
+`action:` (`ActionsOnActionStep`). Agent-step tool calls never touch this dispatcher.
+So the wildcard is currently unreachable — but its safety rests on an invariant
+enforced three modules away, and any future code that hands this dispatcher to a
+less constrained caller turns it into a real hole with no local signal.
+
+**Fix.** Narrow the allowlist to the single tool being invoked. This needs
+`execute_action_step` to build (or be handed) a per-step dispatcher, which means
+threading the registry rather than `&ToolDispatcher` through three call sites —
+mechanical but not free, hence P2. Defense in depth, not a live defect. Related:
+[[I-26]].
 
 ---
 
@@ -199,28 +232,6 @@ narrowing knob. Note `Step.actions` *is* enforced for agent steps since
 
 **Fix.** At minimum correct the comment. Preferably let a step's `actions:`
 narrow its own `action:` invocation the way it narrows an agent's grant.
-
----
-
-### I-27 — `action_protocol::validate_actions` is dead code, and three docs describe it
-
-**Symptom.** README, `docs/agent-format.md`, and `docs/triggers.md` describe a
-runtime check on emitted actions that no shipped code path performs.
-
-**Root cause.** `crates/rupu-orchestrator/src/action_protocol.rs:18`
-`validate_actions` is exported but called from nowhere in the runner — its only
-callers are its own tests. `crates/rupu-agent/src/action.rs:21` likewise ships a
-field-less, method-less `pub struct ActionValidator;` whose comment says "Real
-impl lands in Task 11", and `ActionEnvelope` has no producer in `rupu-agent`.
-
-**Impact.** Documentation-only: readers are told a safety check exists that does
-not. Now more confusing because `actions:` *does* narrow tools via a different
-mechanism (`step_factory::narrow_agent_tools`), so the docs describe the wrong
-enforcement for a field that really is enforced.
-
-**Fix.** Delete `validate_actions` and the `ActionValidator` stub, and correct
-the three docs to describe the real mechanism. (The doc corrections overlap
-I-51 in Arc 6; do the code deletion here and let Arc 6 own the prose.)
 
 ---
 
@@ -285,6 +296,91 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-23 — the autoflow author allowlist is undocumented and defaults to open
+
+**Symptom.** Nothing in the user-facing docs describes `selector.authors` or
+`selector.authors_from`. A user writing an autoflow gets no restriction by
+default — any author who opens a matching issue or PR can trigger it.
+
+**Root cause.** `AutoflowSelector.authors` (`crates/rupu-orchestrator/src/workflow.rs:412`)
+and `.authors_from` (`:416`, with `AuthorScope::Collaborators | OrgMembers` at
+`:429`) are implemented and enforced by `author_allowed` (`:453`), but
+`docs/workflow-format.md`'s selector table documents only `states`,
+`labels_all`, `labels_any`, `labels_none`, and `limit`. The default — both
+fields unset — is *no* author restriction.
+
+**Impact.** This is the control that stops an arbitrary GitHub user from
+triggering an autonomous agent run by opening a PR — and autoflows commonly run
+at `permission_mode: bypass`. An operator who never learns the field exists has
+no reason to set it. Also undocumented on the same selector: `draft`, `base`,
+`on_skip`, and `Autoflow.source`.
+
+**Fix.** Document all of them in the selector table, with the default stated
+explicitly and a recommendation to set `authors_from: collaborators` for any
+autoflow that runs unattended. Consider whether the *default* should change —
+that is a behavior decision, so it is called out in the Arc 2 plan rather than
+assumed here.
+
+**Validation.** Documented in `docs/workflow-format.md`: the selector table gained
+`source`, `draft`, `base`, `authors`, `authors_from` and `on_skip` rows, plus a new
+"Author restriction" prose subsection. Every serialized value was verified against
+its `#[serde(rename_all = "snake_case")]` enum rather than assumed —
+`AuthorScope` → `collaborators` / `org_members` (`workflow.rs:427`), `DraftFilter`
+→ `include` / `exclude` / `only` (`:479`), `SkipAction` → `skip` /
+`label_needs_human` (`:438`). The documented precedence was read off
+`author_allowed` (`:464-476`) and is non-obvious: a match in `authors`
+short-circuits to **allow** and overrides a failing `authors_from` scope check;
+only a non-empty `authors` with no match *and* no `authors_from` denies. The prose
+states plainly that with neither field set any author can trigger the autoflow, and
+that autoflows commonly run at `permission_mode: bypass`.
+
+**Default unchanged, deliberately.** Operator decision: tightening it would silently
+stop existing autoflows from firing on outside contributors. Documented, not changed.
+
+---
+
+### I-27 — `action_protocol::validate_actions` is dead code, and three docs describe it
+
+**Symptom.** README, `docs/agent-format.md`, and `docs/triggers.md` describe a
+runtime check on emitted actions that no shipped code path performs.
+
+**Root cause.** `crates/rupu-orchestrator/src/action_protocol.rs:18`
+`validate_actions` is exported but called from nowhere in the runner — its only
+callers are its own tests. `crates/rupu-agent/src/action.rs:21` likewise ships a
+field-less, method-less `pub struct ActionValidator;` whose comment says "Real
+impl lands in Task 11", and `ActionEnvelope` has no producer in `rupu-agent`.
+
+**Impact.** Documentation-only: readers are told a safety check exists that does
+not. Now more confusing because `actions:` *does* narrow tools via a different
+mechanism (`step_factory::narrow_agent_tools`), so the docs describe the wrong
+enforcement for a field that really is enforced.
+
+**Fix.** Delete `validate_actions` and the `ActionValidator` stub, and correct
+the three docs to describe the real mechanism. (The doc corrections overlap
+I-51 in Arc 6; do the code deletion here and let Arc 6 own the prose.)
+
+**Validation.** Already fixed by commit `28ec5cc3` ("chore: delete the dead legacy
+action protocol"), which landed during Arc 1 and is an ancestor of this branch. It
+removed all five files this issue named: `rupu-agent/src/action.rs` (the
+`ActionValidator` stub), `rupu-orchestrator/src/action_protocol.rs`
+(`validate_actions`), both crates' re-exports, and
+`rupu-orchestrator/tests/action_allowlist.rs`. Validation is the deletion itself:
+`grep -rn "validate_actions\|ActionValidator" --include="*.rs" crates` now returns
+zero hits, and `cargo build --workspace` is clean. The issue was fixed without being
+closed in the tracker; this closure is the bookkeeping.
+
+**Not to be confused with live code.** `validate_action_step`
+(`crates/rupu-orchestrator/src/workflow.rs:1324`) survives and is the **live**
+catalog validator for `action:` steps and notify hooks. It is unrelated to the
+deleted `validate_actions` and must not be removed.
+
+**Prose corrections deferred.** README (×2), `docs/agent-format.md` and
+`docs/triggers.md` still describe the deleted check. Those are owned by **I-51 in
+Arc 6**, which holds the whole `actions:` documentation contradiction, so the two
+do not collide.
+
+---
 
 ### I-22 — `grep` and `ast_grep` escape the workspace
 
