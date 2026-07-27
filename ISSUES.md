@@ -26,16 +26,16 @@ against the code before being recorded.
 
 | ID | Sev | Area | Title | Status |
 |---|---|---|---|---|
-| I-9 | P1 | rupu-providers | `[providers.*].timeout_ms` has no consumer | open |
-| I-10 | P1 | rupu-providers | `[providers.*].max_retries` has no consumer; real retry budget is a hardcoded 1 | open |
-| I-11 | P1 | rupu-providers | `[providers.*].max_concurrency` never throttles LLM calls (semaphore is SCM-only) | open |
-| I-12 | P1 | rupu-providers | `[providers.*].org_id` and `.region` have no consumers | open |
-| I-13 | P1 | rupu-config | The entire `[retry]` section is inert | open |
-| I-14 | P1 | rupu-cli | `log_level` has no consumer; logging reads only `RUPU_LOG` | open |
-| I-16 | P1 | rupu-scm | `[scm.*].clone_protocol` is inert — clones always use HTTPS despite the UI dropdown | open |
-| I-17 | P2 | rupu-scm | `[scm.*].timeout_ms` has no consumer | open |
+| I-9 | P1 | rupu-providers | `[providers.*].timeout_ms` has no consumer | fixed |
+| I-10 | P1 | rupu-providers | `[providers.*].max_retries` has no consumer; real retry budget is a hardcoded 1 | fixed |
+| I-11 | P1 | rupu-providers | `[providers.*].max_concurrency` never throttles LLM calls (semaphore is SCM-only) | fixed |
+| I-12 | P1 | rupu-providers | `[providers.*].org_id` and `.region` have no consumers | fixed |
+| I-13 | P1 | rupu-config | The entire `[retry]` section is inert | fixed |
+| I-14 | P1 | rupu-cli | `log_level` has no consumer; logging reads only `RUPU_LOG` | fixed |
+| I-16 | P1 | rupu-scm | `[scm.*].clone_protocol` is inert — clones always use HTTPS despite the UI dropdown | fixed |
+| I-17 | P2 | rupu-scm | `[scm.*].timeout_ms` has no consumer | fixed |
 | I-19 | P1 | rupu-app | The desktop app passes `Config::default()` — all user config is inert there | open |
-| I-20 | P2 | rupu-config | `resolve()`'s env-override tier is never populated; `KeySource::Env` is unreachable | open |
+| I-20 | P2 | rupu-config | `resolve()`'s env-override tier is never populated; `KeySource::Env` is unreachable | fixed |
 | I-21 | P2 | rupu-cli | A malformed `config.toml` is silently swallowed on the pricing paths, printing wrong costs | open |
 
 ### Arc 2 — safety
@@ -118,51 +118,30 @@ against the code before being recorded.
 
 ## Open
 
-### I-9 … I-14, I-17, I-19, I-20 — dead configuration
+### I-19 — the desktop app passes `Config::default()`; all user config is inert there
 
-Nine keys parse, are documented, and in several cases are editable in the CP
-Settings UI, yet have **no runtime consumer**. Proof for each is a workspace-wide
-grep (excluding `crates/rupu-config/` and tests) returning zero hits.
+**Symptom.** Every `config.toml` value a user sets is ignored inside rupu.app.
+A workflow run started from the GUI resolves a different provider, model, bash
+timeout, and provider tuning than the identical run started from `rupu
+workflow run`.
 
-| ID | Key | Declared | Documented as working | Reality |
-|---|---|---|---|---|
-| I-9 | `[providers.*].timeout_ms` | `provider_config.rs:23` | `docs/providers.md:111` ("Default: `120000`") + `ConfigEditor.tsx:220` | vendor default always used |
-| I-10 | `[providers.*].max_retries` | `provider_config.rs:25` | `docs/providers.md:112` ("Default: `5`") | real budget is a hardcoded 1 (`anthropic.rs:213`) |
-| I-11 | `[providers.*].max_concurrency` | `provider_config.rs:27` | `docs/providers.md:113` + `concurrency.rs:6` | `semaphore_for` is called only by SCM clients; **no LLM call ever acquires a permit** |
-| I-12 | `[providers.*].org_id`, `.region` | `provider_config.rs:19,21` | `docs/providers/openai.md:20`, `gemini.md:23` | org-scoped keys and non-default Vertex regions are unreachable |
-| I-13 | `[retry]` (whole section) | `config.rs:113-116` | — | inert top-level section |
-| I-14 | `log_level` | `config.rs:27` | `ConfigEditor.tsx:199-207`, with a lock toggle | logging reads only `RUPU_LOG` (`logging.rs:25`) |
-| I-17 | `[scm.*].timeout_ms` | `scm_config.rs:46` | `docs/scm.md:109-119` | no consumer (sibling `base_url`/`max_concurrency` *are* consumed) |
-| I-19 | all of it, in rupu-app | — | — | `executor/mod.rs:210` passes `Config::default()`; self-admitted at `:109-115` |
-| I-20 | `resolve()` env tier | `resolve.rs:144-171` | — | both callers pass an empty map; `KeySource::Env` is unreachable |
+**Root cause.** `crates/rupu-app/src/executor/mod.rs:210` builds its executor
+with `rupu_config::Config::default()` rather than the layered global+project
+config. The file admits it at `:109-115`. Consequently
+`DefaultStepFactory`'s `openai_compatible`, `provider_tuning`,
+`default_provider`, `default_model`, and `[bash]` fields are all empty/None at
+that site.
 
-**Impact.** Exactly the I-1 shape, ~9×. A user reads the docs, sets a value,
-sees it accepted (and in four cases sees it in the web UI), and gets different
-behavior than documented — with no error.
+**Impact.** A custom `openai-compatible` provider like `oracle` fails loudly
+with "unknown provider" in the GUI while working in the CLI. Everything else
+fails *silently* by resolving a default. This is the I-2/I-8 divergence shape
+at whole-config scale.
 
-**Fix.** For each: wire it to its consumer, or delete the key and its
-documentation and UI field. Deleting is a legitimate outcome — an honestly absent
-knob beats a knob that lies. Validation must observe the value *at the consumer*;
-a parse test cannot see this class of defect.
-
----
-
-### I-16 — `[scm.*].clone_protocol` is inert
-
-**Symptom.** A user on SSH-only infrastructure selects "ssh" from the
-`clone_protocol` dropdown in CP Settings. Clones still go over HTTPS.
-
-**Root cause.** `clone_protocol` (`crates/rupu-config/src/scm_config.rs:51`) has
-no consumer. The clone paths hardcode HTTPS with an embedded token —
-`connectors/gitlab/repo.rs:477-479`, `connectors/github/repo.rs:442`.
-
-**Impact.** Documented at `docs/scm.md:109-119` and given a dedicated
-`https`/`ssh` dropdown at `ConfigEditor.tsx:374,463`. Clones fail or use the
-wrong credentials on hosts that only permit SSH.
-
-**Fix.** Honor the setting in both connectors' clone paths. Note this overlaps
-the self-hosted-host defect (clone URLs also ignore `base_url`), tracked
-separately in `TODO.md`.
+**Note.** Split out of the combined "dead configuration" write-up (now under
+`## Fixed`) when the other eight keys were resolved; the historical row is
+preserved in that section's table. Fixing this means loading the layered
+config in `build_executor` and threading it into the executor config — the
+receiving fields all exist now.
 
 ---
 
@@ -272,6 +251,209 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-9 … I-14, I-17, I-20 — dead configuration
+
+*(I-19 shared this write-up and is **still open** — see its own entry under
+`## Open`. Its row is kept in the table below so no row is lost.)*
+
+Nine keys parsed, were documented, and in several cases were editable in the CP
+Settings UI, yet had **no runtime consumer**. Proof for each was a
+workspace-wide grep (excluding `crates/rupu-config/` and tests) returning zero
+hits.
+
+| ID | Key | Declared | Documented as working | Reality (before) | Outcome | Validation |
+|---|---|---|---|---|---|---|
+| I-9 | `[providers.*].timeout_ms` | `provider_config.rs:23` | `docs/providers.md:111` ("Default: `120000`") + `ConfigEditor.tsx:220` | vendor default always used | **wired** → every provider client's HTTP builder as connect + read (inactivity) timeouts, via `ProviderTuning::http_client_builder` (`rupu-providers/src/tuning.rs`) | `tuning::tests::configured_timeout_aborts_a_stalled_request` — a 60 ms deadline against a 2 s-stalled httpmock server surfaces `is_timeout()`; plus `client_timeout_defaults_to_documented_120s` and `default_timeout_lets_a_prompt_response_through` |
+| I-10 | `[providers.*].max_retries` | `provider_config.rs:25` | `docs/providers.md:112` ("Default: `5`") | real budget was a hardcoded 1 (`anthropic.rs:213`) | **wired** → `AnthropicClient::max_rate_limit_retries` (its native 429 loop) and `RetryingProvider` for every other provider. Default corrected to **1** (the code's real budget) and `docs/providers.md` fixed — raising it to the documented 5 would have slowed every cross-provider fallback by ~30 s | `anthropic::tests::max_retries_zero_issues_exactly_one_request` / `max_retries_one_issues_two_requests` count httpmock hits against a permanent 429; `tuned::tests::retry_budget_bounds_the_number_of_attempts`, `permanent_errors_are_not_retried`, `a_stream_that_already_emitted_output_is_not_re_issued` |
+| I-11 | `[providers.*].max_concurrency` | `provider_config.rs:27` | `docs/providers.md:113` + `concurrency.rs:6` | `semaphore_for` was called only by SCM clients; **no LLM call ever acquired a permit** | **wired** → `ThrottledProvider` wraps every factory-built provider and holds a permit for the whole call | `tuned::tests::llm_call_holds_a_permit_from_the_configured_semaphore` observes `available_permits()` *inside* the call (2 → 1); `max_concurrency_one_serializes_two_llm_calls` proves a second call blocks while the only permit is held |
+| I-12 | `[providers.*].org_id` | `provider_config.rs:19` | `docs/providers/openai.md:20` | org-scoped keys unreachable | **wired** → `OpenAI-Organization` header, platform API only (the ChatGPT-subscription endpoint is account-scoped) | `openai_codex::tuning_tests::configured_org_id_lands_on_the_outgoing_request_headers` asserts the header on the real `build_headers()`; `organization_header_only_applies_to_the_platform_api` covers the pure decision |
+| I-12 | `[providers.*].region` | `provider_config.rs:21` | `docs/providers/gemini.md:23,54` | non-default Vertex regions unreachable | **carried, still unused — deliberately.** No shipped Gemini client targets a regional Vertex endpoint (the three variants are AI Studio, Gemini CLI, Antigravity; none is region-scoped), so there is nothing honest to wire it to. Instead the *documentation stopped lying*: `docs/providers.md` and `docs/providers/gemini.md` now say it is accepted but has no effect, the CP Settings field carries the same help text, and the example configs no longer instruct setting it | `provider_factory::tests::provider_tuning_reads_every_configured_knob` asserts it is carried into `ProviderTuning`; the doc/UI change is the substantive fix |
+| I-13 | `[retry]` (whole section) | `config.rs:113-116` | — | inert top-level section | **deleted** — struct, `Config.retry` field, `lib.rs` re-export, and the parse-test fixture. Superseded by per-provider `max_retries` | Absence greps: `grep -rn 'RetryConfig\|max_attempts\|initial_delay_ms' crates/rupu-config/src/` → 0; `grep -rn '\[retry\]' docs/ --include='*.md'` (excluding historical plan docs) → 0; not present in `ConfigEditor.tsx`; `cargo build --workspace` + web `npm run test` clean |
+| I-14 | `log_level` | `config.rs:27` | `ConfigEditor.tsx:199-207`, with a lock toggle | logging read only `RUPU_LOG` (`logging.rs:25`) | **wired** → `logging::filter_directive(cfg_level, env)`: `RUPU_LOG` > `log_level` > `warn`. Config is loaded *before* logging init at all four init sites (`lib.rs:247`, `session.rs` worker + run-turn) | `logging::tests::config_log_level_is_the_fallback_when_env_is_unset`, `env_wins_over_config`, `neither_source_yields_warn`, `blank_values_are_treated_as_unset`, `an_unparseable_directive_falls_back_to_warn` |
+| I-17 | `[scm.*].timeout_ms` | `scm_config.rs:46` | `docs/scm.md:109-119` | no consumer (sibling `base_url`/`max_concurrency` *were* consumed) | **wired** → `ScmClientOptions::timeout` reaches octocrab (`set_connect_timeout`/`set_read_timeout`) plus the two ad-hoc reqwest clients in `github/client.rs`, and replaces GitLab's hardcoded 30 s | `github::client::tests::platform_config_reaches_the_client` asserts `GithubClient::timeout()` == the configured 4000 ms and 30 000 ms when unset; `client_options::tests::scm_timeout_defaults_to_30s` |
+| I-19 | all of it, in rupu-app | — | — | `executor/mod.rs:210` passes `Config::default()`; self-admitted at `:109-115` | **STILL OPEN** — tracked separately under `## Open`. The new `provider_tuning` map is empty there for the same reason, with the existing TODO extended to say so | n/a |
+| I-20 | `resolve()` env tier | `resolve.rs:144-171` | — | both callers passed an empty map; `KeySource::Env` was unreachable | **deleted** — the `env` parameter and the `KeySource::Env` variant. Precedence is now `locked-global > project > global > default`. Six call sites (`layer_files_locked`, `rupu-cp` state + api/config) simplified; the CP UI's unreachable `env` provenance badge removed from `api.ts`'s `KeySource` union and `ConfigField.tsx`'s `SOURCE_CLASS` | Absence greps: `grep -rn 'KeySource::Env' crates/` → only the doc comment explaining the removal; `grep -rn "'env'" crates/rupu-cp/web/src` → 0. `resolve::tests::project_wins_when_unlocked_and_no_env_tier_exists` replaces the old env-precedence test; `no_policy_block_matches_layer_files` still passes |
+
+**Impact (before).** Exactly the I-1 shape, ~9×. A user read the docs, set a
+value, saw it accepted (and in several cases saw it in the web UI), and got
+different behavior than documented — with no error.
+
+**Fix.** PR (branch `arc1/config-integrity`), two commits: the deletions
+(I-13, I-20) and the wiring (I-9…I-12, I-14, I-16, I-17). Three new modules
+carry the consumer-side logic, each built so the decision a key drives is a
+*pure function* that a test can observe without a network:
+
+- `crates/rupu-providers/src/tuning.rs` — `ProviderTuning` plus
+  `client_timeout` / `retry_budget` / `concurrency_permits` / `retry_backoff`.
+- `crates/rupu-providers/src/tuned.rs` — `ThrottledProvider` and
+  `RetryingProvider`, the two `LlmProvider` decorators the factory applies.
+  Throttle wraps retry, so a backoff sleep never holds a concurrency permit.
+- `crates/rupu-scm/src/client_options.rs` — `ScmClientOptions`,
+  `CloneProtocol`, `clone_url`, `scm_timeout`, `run_clone`.
+
+`rupu_runtime::provider_factory::provider_tuning` is the single adapter from
+`rupu_config::ProviderConfig` to `ProviderTuning` — `rupu-providers` still does
+not depend on `rupu-config` (hexagonal rule 1). The map is threaded through
+`rupu run`, `rupu session` (turn, worker, compaction), workflow steps
+(`DefaultStepFactory.provider_tuning`), and sub-agent dispatch
+(`CliAgentDispatcher.provider_tuning`) so the same key resolves identically on
+every path — the I-2/I-8 lesson.
+
+**Two decisions worth flagging.**
+
+1. *Timeout semantics.* `timeout_ms` is applied as connect + read (inactivity)
+   timeouts, never as reqwest's total `timeout`. A total 120 s deadline would
+   abort a legitimately long streaming generation mid-flight. The documented
+   120000 ms default is exactly the Anthropic client's pre-existing
+   hand-rolled `STREAM_IDLE_TIMEOUT_SECS = 120`, which is where that number
+   came from, so the default is behavior-preserving. `docs/providers.md` now
+   states the semantics precisely. The SCM side keeps a *total* deadline —
+   those calls are short request/response round-trips with no streaming.
+2. *`max_retries` default is 1, not the documented 5.* Per the brief's
+   instruction to make the doc match the code when they disagree after wiring.
+   Anthropic's comment gives the reason: a small budget lets `ProviderRouter`
+   fail over to another vendor quickly instead of spending ~30 s of
+   exponential backoff on one rate-limited provider. Anthropic is therefore
+   the one provider *not* wrapped in `RetryingProvider` — it spends the budget
+   in its own 429 loop, and stacking the two would square it
+   (`provider_factory::provider_has_native_retry`, asserted by
+   `only_anthropic_skips_the_retry_decorator`).
+
+#### Config-key ledger — every field in `crates/rupu-config/src/**`
+
+Arc 1's proof of completion, and the input to the Arc 6 config-reference page.
+Every declared field with its non-test consumer. Verified with
+`grep -rn '\bFIELD\b' --include='*.rs' crates | grep -v '^crates/rupu-config/' | grep -v test`
+per key, plus targeted greps for the names that are common English words
+(`kind`, `stream`, `repo`, `owner`, `project`, `enabled`, `lock`, `theme`,
+`color`, `channel`) where the raw count is dominated by unrelated hits.
+**No key in this table lacks a consumer.**
+
+| Key | Consumer |
+|---|---|
+| `default_provider` | `rupu-runtime/src/provider_factory.rs:109` (`resolve_provider_name`) — I-1 |
+| `default_model` | `rupu-runtime/src/provider_factory.rs:128` (`resolve_model`) — I-2 |
+| `permission_mode` | `rupu-cli/src/cmd/session.rs:1261`, `cmd/run.rs` (mode resolution) |
+| `log_level` | `rupu-cli/src/logging.rs` (`filter_directive`), called from `lib.rs:247` — **I-14, wired here** |
+| `[bash].timeout_secs` | `rupu-cli/src/resume.rs:249`, `cmd/session.rs:6787`, `orchestrator/src/step_factory.rs` — I-18 |
+| `[bash].env_allowlist` | `rupu-cli/src/resume.rs:250`, `cmd/session.rs:6786` — I-18 |
+| `[retry].max_attempts` | **deleted** — I-13 |
+| `[retry].initial_delay_ms` | **deleted** — I-13 |
+| `[providers.*].base_url` | `rupu-runtime/src/provider_factory.rs:60` (`openai_compatible_params`) |
+| `[providers.*].kind` | `rupu-runtime/src/provider_factory.rs:57`; validated in `config.rs:138` |
+| `[providers.*].stream` | `rupu-runtime/src/provider_factory.rs:74` |
+| `[providers.*].default_model` | `rupu-runtime/src/provider_factory.rs:61` + `resolve_model`'s third tier |
+| `[providers.*].org_id` | `rupu-providers/src/openai_codex.rs` (`organization_header` → `build_headers`) — **I-12, wired here** |
+| `[providers.*].region` | carried into `ProviderTuning` (`rupu-runtime/src/provider_factory.rs`, `provider_tuning`); **no endpoint consumes it** — documented as accepted-but-unused in `docs/providers.md` and CP Settings — I-12 |
+| `[providers.*].timeout_ms` | `rupu-providers/src/tuning.rs` (`client_timeout` → `http_client_builder`) → each client's `with_tuning` — **I-9, wired here** |
+| `[providers.*].max_retries` | `rupu-providers/src/tuning.rs` (`retry_budget`) → `AnthropicClient::max_rate_limit_retries` + `tuned::RetryingProvider` — **I-10, wired here** |
+| `[providers.*].max_concurrency` | `rupu-providers/src/tuning.rs` (`concurrency_permits`) → `tuned::ThrottledProvider` — **I-11, wired here** |
+| `[[providers.*.models]].id` | `rupu-runtime/src/provider_factory.rs:66` |
+| `[[providers.*.models]].context_window` | `rupu-runtime/src/provider_factory.rs:67` |
+| `[[providers.*.models]].max_output` | `rupu-runtime/src/provider_factory.rs:68` |
+| `[scm.default].platform` | `rupu-scm/src/registry.rs:32` (`configured_default_platform`) — I-15 |
+| `[scm.default].owner` | `rupu-mcp` / `rupu-cli` repo-ref defaulting via `ScmDefault` |
+| `[scm.default].repo` | as above |
+| `[issues.default].tracker` | `rupu-scm/src/registry.rs:34` (`configured_default_tracker`) — I-15 |
+| `[issues.default].project` | `rupu-cli/src/cmd/issues.rs` issue-ref defaulting |
+| `[scm.*].base_url` | `rupu-scm/src/client_options.rs` → `GithubClient::with_options` / `GitlabClient::with_options` |
+| `[scm.*].timeout_ms` | `rupu-scm/src/client_options.rs` (`scm_timeout`) → octocrab + reqwest builders — **I-17, wired here** |
+| `[scm.*].max_concurrency` | `rupu-scm/src/client_options.rs` → `concurrency::semaphore_for` |
+| `[scm.*].clone_protocol` | `rupu-scm/src/client_options.rs` (`CloneProtocol`, `clone_url`) → both `clone_to` impls — **I-16, wired here** |
+| `[ui].color` | `rupu-cli/src/cmd/ui.rs` (`UiPrefs::resolve`) |
+| `[ui].theme` | `rupu-cli/src/cmd/ui.rs:661` |
+| `[ui].syntax.theme` | `rupu-cli/src/cmd/ui.rs` (`UiPrefs::resolve`) |
+| `[ui].palette.theme` | `rupu-cli/src/cmd/ui.rs` (`UiPrefs::resolve`) |
+| `[ui].live_view` | `rupu-cli/src/cmd/ui.rs:71` |
+| `[ui].pager` | `rupu-cli/src/cmd/ui.rs` |
+| `[ui].editor` | `rupu-cli/src/cmd/agent.rs` / `cmd/workflow.rs` editor resolution |
+| `[triggers].poll_sources` | `rupu-cli/src/cmd/cron.rs:598` |
+| `[triggers].poll_sources[].source` / `.poll_interval` | `rupu-cli/src/cmd/cron.rs:713` |
+| `[triggers].max_events_per_tick` | `rupu-cli/src/cmd/cron.rs:399` via `effective_max_events_per_tick` |
+| `[autoflow].enabled` | `rupu-cli/src/cmd/autoflow.rs:9322` |
+| `[autoflow].repo` | `rupu-cli/src/cmd/autoflow.rs:9200` |
+| `[autoflow].checkout` | `rupu-workspace/src/autoflow_worktree.rs` |
+| `[autoflow].worktree_root` | `rupu-workspace/src/autoflow_worktree.rs:35` |
+| `[autoflow].permission_mode` | `rupu-cli/src/cmd/autoflow.rs:1701` |
+| `[autoflow].strict_templates` | `rupu-cli/src/resume.rs:267` |
+| `[autoflow].max_active` | `rupu-cli/src/cmd/autoflow_runtime.rs:495` |
+| `[autoflow].cleanup_after` | `rupu-cli/src/cmd/autoflow.rs:11672` |
+| `[pricing.<provider>.<model>].input_per_mtok` | `rupu-config/src/pricing_config.rs:74` (`cost_usd`), called from `rupu-cli/src/cmd/session.rs:5810` and the run/workflow cost columns |
+| `[pricing.<provider>.<model>].output_per_mtok` | as above |
+| `[pricing.<provider>.<model>].cached_input_per_mtok` | as above |
+| `[storage].archived_session_retention` | `rupu-cli/src/cmd/session.rs:7395` |
+| `[storage].archived_transcript_retention` | `rupu-cli/src/cmd/transcript.rs:1838` |
+| `[policy].lock` | `rupu-config/src/resolve.rs` (enforcement) + `rupu-cp/src/api/config.rs:325` — I-7 |
+| `[cp].max_workspace_bytes` | `rupu-cp/src/config_write.rs:301` |
+| `[cp].autoflow_reconcile_enabled` / `_interval_secs` | `rupu-cli/src/cmd/cp.rs:86-87` |
+| `[cp].cron_tick_enabled` / `_interval_secs` | `rupu-cli/src/cmd/cp.rs:113-114` |
+| `[cp].gate_sweep_enabled` / `_interval_secs` | `rupu-cli/src/cmd/cp.rs:145-146` |
+| `[cp].agent_authoring_ui` | `rupu-cp/web/src/hooks/useAgentAuthoringUi.ts:9` (served through `/api/config`) |
+| `[cp].workflow_editor_ui` | `rupu-cp/web/src/hooks/useWorkflowEditorUi.ts:9` (served through `/api/config`) |
+| `[update].channel` | `rupu-cli/src/cmd/update.rs:74` |
+| `[update].check` | `rupu-cli/src/lib.rs:276` |
+
+Two keys' consumers are **not** Rust — `[cp].agent_authoring_ui` and
+`[cp].workflow_editor_ui` are read by the CP web app after `/api/config`
+serializes them. A Rust-only grep reports them as inert; they are not.
+
+**Behavioral note.** Because `Config` is `deny_unknown_fields`, a `config.toml`
+that still carries a `[retry]` section will now fail to parse. The section was
+never documented, never written by `rupu init`, and never read, so no
+functioning setup can depend on it — but it is a hard error rather than a
+warning, and worth a line in release notes.
+
+---
+
+### I-16 — `[scm.*].clone_protocol` is inert
+
+**Symptom.** A user on SSH-only infrastructure selects "ssh" from the
+`clone_protocol` dropdown in CP Settings. Clones still go over HTTPS.
+
+**Root cause.** `clone_protocol` (`crates/rupu-config/src/scm_config.rs:51`) had
+no consumer. The clone paths hardcoded HTTPS with an embedded token —
+`connectors/gitlab/repo.rs:477-479`, `connectors/github/repo.rs:442`.
+
+**Impact.** Documented at `docs/scm.md:109-119` and given a dedicated
+`https`/`ssh` dropdown at `ConfigEditor.tsx:374,463`. Clones failed or used the
+wrong credentials on hosts that only permit SSH.
+
+**Fix.** PR (branch `arc1/config-integrity`). `CloneProtocol` +
+`clone_url(host, owner, repo, protocol, userinfo)` in the new
+`crates/rupu-scm/src/client_options.rs`; both `clone_to` impls now ask their
+client for the configured protocol and build the URL through it. `ssh` yields
+`git@<host>:<owner>/<repo>.git` with the token dropped entirely.
+
+**SSH clones shell out to the system `git`, deliberately.** Two blocking
+reasons, both recorded in `ssh_clone_argv`'s doc comment: rupu's `git2` is
+built without the `ssh` feature (root `Cargo.toml` enables only `https` +
+vendored libgit2/openssl), so libgit2 has *no* ssh transport at all; and even
+with it, libgit2 does not read `~/.ssh/config`, so host aliases,
+`IdentityFile`, `ProxyJump`, and agent forwarding — precisely what SSH-only
+infrastructure depends on — would silently not apply. The HTTPS path is
+unchanged and still uses `git2`. A missing `git` on `PATH` surfaces as a
+named `ScmError::Network`, not a silent fallback.
+
+**Validation.** `client_options::tests::clone_url_honors_ssh_protocol` is the
+binding assertion — `ssh` yields `git@github.com:o/r.git` and
+`git@gitlab.com:grp/sub/r.git` (nested namespace), the default yields the
+token-bearing https form both connectors used to hardcode.
+`ssh_clone_url_never_leaks_the_token` guards the credential.
+`clone_protocol_parses_ssh_case_insensitively` covers the parse, including the
+warn-and-fall-back-to-https path for an unrecognized value.
+`github::client::tests::configured_ssh_protocol_produces_an_ssh_clone_url` and
+`gitlab::client::client_options_tests::configured_ssh_protocol_produces_an_ssh_clone_url`
+drive the *real* config → `ScmClientOptions` → client → URL chain.
+`cargo test -p rupu-scm` is fully green (50 lib + all integration tests).
+
+**Still open, unchanged.** The clone paths use the public host constant and
+still ignore `[scm.<platform>].base_url`, so self-hosted GHES / GitLab clone
+URLs remain wrong. That is the separate gap already tracked in `TODO.md`; the
+two host constants are now named (`GITHUB_CLONE_HOST` / `GITLAB_CLONE_HOST`)
+with a comment pointing at it.
+
+---
 
 ### I-15 — `[scm.default]` / `[issues.default]` were inert
 
