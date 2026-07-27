@@ -50,6 +50,7 @@ const AUTOFLOW: AutoflowDefRow = {
   slug: 'auto-deploy',
   trigger: 'cron',
   scope: 'project',
+  enabled: true,
 };
 
 function stub() {

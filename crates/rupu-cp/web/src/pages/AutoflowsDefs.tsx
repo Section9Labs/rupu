@@ -14,6 +14,22 @@ import { ScopeChip } from '../components/ScopeChip';
 import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 
+const ENABLED_CLS = 'bg-ok-bg text-ok ring-ok/30';
+const DISABLED_CLS = 'bg-surface text-ink-mute ring-border';
+
+function EnabledChip({ enabled }: { enabled: boolean }) {
+  return (
+    <span
+      className={cn(
+        'inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5',
+        enabled ? ENABLED_CLS : DISABLED_CLS,
+      )}
+    >
+      {enabled ? 'Enabled' : 'Disabled'}
+    </span>
+  );
+}
+
 const STEP = 20;
 
 const TRIGGER_CLS: Record<string, string> = {
@@ -30,48 +46,103 @@ function TriggerChip({ trigger }: { trigger: string }) {
   );
 }
 
-// Autoflows are workflows with `autoflow.enabled`, so they reuse the workflow
-// detail page — keyed by file stem (`slug`), not the parsed display name.
+// Autoflows are workflows with an `autoflow:` block, so they reuse the
+// workflow detail page — keyed by file stem (`slug`), not the parsed display
+// name. `scan_autoflow_defs` (rupu-cp) now lists BOTH enabled and disabled
+// defs (previously disabled ones were silently dropped, which made a
+// Enable/Disable toggle incoherent), so the Enabled column + toggle button
+// below are meaningful in both directions.
 //
 // Column order follows the definition-table canonical standard
 // (`docs/superpowers/plans/2026-07-24-rupu-cp-table-standardization.md`
 // Task 5) applied to the fields `AutoflowDefRow` actually carries: Name
-// (the one flexible/truncating `subject` column) → Scope → Trigger. There is
-// no Runs/Tokens/Cost/Last-run data on this row type — those columns are not
+// (the one flexible/truncating `subject` column) → Scope → Trigger → Enabled,
+// then the trailing action column (the Enable/Disable toggle). There is no
+// Runs/Tokens/Cost/Last-run data on this row type — those columns are not
 // fabricated (see the plan's "Out of scope" note).
-const DEF_COLUMNS: Column<AutoflowDefRow>[] = [
-  {
-    key: 'name',
-    header: 'Name',
-    subject: true,
-    sortable: true,
-    sortValue: (d) => d.name,
-    titleValue: (d) => d.name,
-    render: (d) => <span className="text-sm font-medium text-ink">{d.name}</span>,
-  },
-  {
-    key: 'scope',
-    header: 'Scope',
-    fit: true,
-    sortable: true,
-    sortValue: (d) => d.scope,
-    render: (d) => <ScopeChip scope={d.scope} />,
-  },
-  {
-    key: 'trigger',
-    header: 'Trigger',
-    fit: true,
-    sortable: true,
-    sortValue: (d) => d.trigger,
-    render: (d) => <TriggerChip trigger={d.trigger} />,
-  },
-];
+function defColumns(onToggle: (d: AutoflowDefRow) => void): Column<AutoflowDefRow>[] {
+  return [
+    {
+      key: 'name',
+      header: 'Name',
+      subject: true,
+      sortable: true,
+      sortValue: (d) => d.name,
+      titleValue: (d) => d.name,
+      render: (d) => <span className="text-sm font-medium text-ink">{d.name}</span>,
+    },
+    {
+      key: 'scope',
+      header: 'Scope',
+      fit: true,
+      sortable: true,
+      sortValue: (d) => d.scope,
+      render: (d) => <ScopeChip scope={d.scope} />,
+    },
+    {
+      key: 'trigger',
+      header: 'Trigger',
+      fit: true,
+      sortable: true,
+      sortValue: (d) => d.trigger,
+      render: (d) => <TriggerChip trigger={d.trigger} />,
+    },
+    {
+      key: 'enabled',
+      header: 'Enabled',
+      fit: true,
+      sortable: true,
+      sortValue: (d) => (d.enabled ? 1 : 0),
+      render: (d) => <EnabledChip enabled={d.enabled} />,
+    },
+    {
+      key: 'action',
+      header: '',
+      align: 'right',
+      fit: true,
+      // Its own real button (Enable/Disable) — keep it independently
+      // focusable/announced (I7) rather than swallowed by the row link.
+      interactive: true,
+      render: (d) => (
+        <div
+          className="flex items-center justify-end"
+          onClick={(e) => {
+            // The row is link-wrapped (rowHref) — without both of these,
+            // this click either soft- or hard-navigates to the workflow
+            // instead of toggling it (stopPropagation alone does not block
+            // the enclosing <a>'s native default navigation action).
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+        >
+          {d.enabled ? (
+            <Button
+              variant="ring-danger"
+              onClick={() => onToggle(d)}
+              aria-label={`Disable ${d.name}`}
+            >
+              Disable
+            </Button>
+          ) : (
+            <Button variant="ring" onClick={() => onToggle(d)} aria-label={`Enable ${d.name}`}>
+              Enable
+            </Button>
+          )}
+        </div>
+      ),
+    },
+  ];
+}
 
 export default function AutoflowsDefs() {
   const [defs, setDefs] = useState<AutoflowDefRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [visible, setVisible] = useState(STEP);
+  // Toggle failures — kept separate from the list-fetch error above, but
+  // shown in the same banner (mirrors Sessions.tsx / WorkflowRuns.tsx's
+  // `actionError`).
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setRefreshing(true);
@@ -91,11 +162,27 @@ export default function AutoflowsDefs() {
     void load();
   }, [load]);
 
+  // Row action: flip `autoflow.enabled` — keyed by `slug` (file stem), the
+  // same identifier `resolve_workflow_path` resolves `POST
+  // /api/autoflows/:name/enable|disable` against server-side.
+  async function handleToggle(d: AutoflowDefRow) {
+    try {
+      await api.setAutoflowEnabled(d.slug, !d.enabled);
+      setActionError(null);
+      await load();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Failed to update autoflow');
+    }
+  }
+
+  const columns = defColumns(handleToggle);
+
   const shown = (defs ?? []).slice(0, visible);
   const { sentinelRef } = useInfiniteScroll({
     hasMore: visible < (defs?.length ?? 0),
     loadMore: () => setVisible((v) => v + STEP),
   });
+  const bannerError = error ?? actionError;
 
   return (
     <div className="p-8">
@@ -110,7 +197,7 @@ export default function AutoflowsDefs() {
         </Button>
       </header>
 
-      {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
+      {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
       {defs === null ? (
         <div className="py-16 flex items-center justify-center">
@@ -126,7 +213,7 @@ export default function AutoflowsDefs() {
         <section>
           <SectionHeader tone="muted" label="Autoflow Workflows" count={defs.length} />
           <SortableTable<AutoflowDefRow>
-            columns={DEF_COLUMNS}
+            columns={columns}
             rows={shown}
             rowKey={(d) => d.slug}
             rowHref={(d) => `/workflows/${encodeURIComponent(d.slug)}`}

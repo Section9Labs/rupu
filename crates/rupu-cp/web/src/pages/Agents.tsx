@@ -1,7 +1,7 @@
 // Agents library — read-only list of agent files discovered by the control
 // plane. Each row links to /agents/:name for the full system prompt.
 
-import { useEffect, useId, useState } from 'react';
+import { useCallback, useEffect, useId, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Plus, Sparkles } from 'lucide-react';
 import { api, type AgentSummary, type ProviderModels } from '../lib/api';
@@ -9,6 +9,7 @@ import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import UsageBarChart from '../components/charts/UsageBarChart';
 import CodeEditor from '../components/CodeEditor';
+import AgentLauncherSheet from '../components/AgentLauncherSheet';
 import { Button } from '../components/ui/Button';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
@@ -30,24 +31,61 @@ export default function Agents() {
   const [error, setError] = useState<string | null>(null);
   const [visible, setVisible] = useState(STEP);
   const [createOpen, setCreateOpen] = useState(false);
+  // The agent whose launcher sheet (Run) is open (null = none).
+  const [launchingAgent, setLaunchingAgent] = useState<string | null>(null);
+  // Session-start / delete failures — kept separate from the list-fetch
+  // error above, but shown in the same banner (mirrors Sessions.tsx /
+  // pages/runs/WorkflowRuns.tsx's `actionError`).
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const data = await api.getAgents();
+      setAgents(data);
+      setVisible(STEP);
+      setError(null);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Failed to load agents');
+    }
+  }, []);
 
   useEffect(() => {
-    let cancelled = false;
-    api
-      .getAgents()
-      .then((data) => {
-        if (cancelled) return;
-        setAgents(data);
-        setVisible(STEP);
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setError(e instanceof Error ? e.message : 'Failed to load agents');
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    void load();
+  }, [load]);
+
+  // Row action: start a session directly (no form) and jump straight to it —
+  // mirrors AgentLauncherSheet's own `onLaunch` session branch (`startSession`
+  // then navigate to `/sessions/:id`), just without a prompt/target/host form.
+  async function handleStartSession(name: string) {
+    try {
+      const res = await api.startSession(name);
+      setActionError(null);
+      navigate(`/sessions/${res.session_id}`);
+    } catch (e: unknown) {
+      setActionError(e instanceof Error ? e.message : 'Failed to start session');
+    }
+  }
+
+  // Row action: delete the agent's .md definition file — same
+  // confirm-then-call-then-refresh shape as Sessions.tsx's row Delete.
+  async function handleDelete(name: string) {
+    if (
+      !window.confirm(
+        `Permanently delete the definition file for agent "${name}"? This cannot be undone.`,
+      )
+    ) {
+      return;
+    }
+    try {
+      await api.deleteAgent(name);
+      setActionError(null);
+      await load();
+    } catch (e: unknown) {
+      setActionError(e instanceof Error ? e.message : 'Delete failed');
+    }
+  }
+
+  const columns = agentColumns(setLaunchingAgent, handleStartSession, handleDelete);
 
   const sorted = (agents ?? []).slice().sort((a, b) => a.name.localeCompare(b.name));
   const shown = sorted.slice(0, visible);
@@ -55,6 +93,7 @@ export default function Agents() {
     hasMore: visible < sorted.length,
     loadMore: () => setVisible((v) => v + STEP),
   });
+  const bannerError = error ?? actionError;
 
   return (
     <div className="p-8">
@@ -75,7 +114,7 @@ export default function Agents() {
         </Button>
       </header>
 
-      {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
+      {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
       {agents === null ? (
         <div className="py-16 flex items-center justify-center">
@@ -109,7 +148,7 @@ export default function Agents() {
           </div>
           <SectionHeader tone="muted" label="Agents" count={sorted.length} />
           <SortableTable<AgentSummary>
-            columns={AGENT_COLUMNS}
+            columns={columns}
             rows={shown}
             rowKey={(a) => a.name}
             rowHref={(a) => `/agents/${encodeURIComponent(a.name)}`}
@@ -124,6 +163,10 @@ export default function Agents() {
       )}
 
       {createOpen && <NewAgentModal onClose={() => setCreateOpen(false)} />}
+
+      {launchingAgent && (
+        <AgentLauncherSheet agent={launchingAgent} onClose={() => setLaunchingAgent(null)} />
+      )}
     </div>
   );
 }
@@ -307,7 +350,71 @@ function NewAgentModal({ onClose }: { onClose: () => void }) {
   );
 }
 
-const AGENT_COLUMNS: Column<AgentSummary>[] = [
+function agentColumns(
+  onRun: (name: string) => void,
+  onSession: (name: string) => void,
+  onDelete: (name: string) => void,
+): Column<AgentSummary>[] {
+  return [...AGENT_BASE_COLUMNS, agentActionColumn(onRun, onSession, onDelete)];
+}
+
+/** Trailing action column: Run / Session / Delete. `interactive: true` so
+ *  SortableTable renders it as a plain, unwrapped cell rather than
+ *  link-wrapping it inside the row's own `rowHref` anchor (which would nest
+ *  these buttons inside an `<a>`) — same treatment as Workflows.tsx's Run
+ *  column and Sessions.tsx's Archive/Restore/Delete column. The wrapping div
+ *  calls preventDefault()+stopPropagation() on every click that reaches it
+ *  (bubbling up from whichever button was clicked) so a click here never
+ *  soft- or hard-navigates the link-wrapped row — stopPropagation alone does
+ *  not block the enclosing `<a>`'s native default navigation.
+ */
+function agentActionColumn(
+  onRun: (name: string) => void,
+  onSession: (name: string) => void,
+  onDelete: (name: string) => void,
+): Column<AgentSummary> {
+  return {
+    key: 'action',
+    header: '',
+    align: 'right',
+    fit: true,
+    interactive: true,
+    render: (a) => (
+      <div
+        className="flex items-center justify-end gap-1"
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+        }}
+      >
+        <button
+          type="button"
+          onClick={() => onRun(a.name)}
+          aria-label={`Run ${a.name}`}
+          className="inline-flex items-center rounded-md border border-brand-600 bg-panel px-2.5 py-1 text-ui font-medium text-brand-700 hover:bg-brand-50"
+        >
+          Run
+        </button>
+        <Button
+          variant="ring"
+          onClick={() => void onSession(a.name)}
+          aria-label={`Start session with ${a.name}`}
+        >
+          Session
+        </Button>
+        <Button
+          variant="ring-danger"
+          onClick={() => void onDelete(a.name)}
+          aria-label={`Delete ${a.name}`}
+        >
+          Delete
+        </Button>
+      </div>
+    ),
+  };
+}
+
+const AGENT_BASE_COLUMNS: Column<AgentSummary>[] = [
   {
     key: 'name',
     header: 'Name',

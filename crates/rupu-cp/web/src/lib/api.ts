@@ -580,6 +580,12 @@ export interface AutoflowDefRow {
   slug: string;
   trigger: string;
   scope: string;
+  /** Whether `autoflow.enabled` is currently `true` in the on-disk YAML. A
+   *  workflow with no `autoflow:` block at all never appears in this list at
+   *  all — this only distinguishes enabled vs. disabled among rows that DO
+   *  have the block. Mirrors `AutoflowDefRow.enabled` in
+   *  `rupu-cp/src/api/autoflows.rs`. */
+  enabled: boolean;
 }
 
 /** Response from `POST /api/autoflows/:name/enable` and `.../disable` —

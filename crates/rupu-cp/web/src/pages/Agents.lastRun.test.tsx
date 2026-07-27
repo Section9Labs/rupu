@@ -85,14 +85,15 @@ describe('Agents — Last run column', () => {
     const row = screen.getByText('never-run-agent').closest('tr');
     expect(row).not.toBeNull();
     const cells = Array.from(row!.querySelectorAll('td')).map((td) => td.textContent?.trim());
-    // Runs cell is also '—' (run_count: 0), so assert the LAST cell (Last run,
-    // there's no action column on Agents) is the em-dash.
-    expect(cells[cells.length - 1]).toBe('—');
+    // Runs cell is also '—' (run_count: 0). The Last run column is now
+    // second-to-last (the trailing action column carries the Run/Session/
+    // Delete buttons, not em-dash text).
+    expect(cells[cells.length - 2]).toBe('—');
   });
 });
 
 describe('Agents — definition-table canonical column order', () => {
-  it('orders columns Name, Scope, Description, Runs, Tokens, Cost, Last run', async () => {
+  it('orders columns Name, Scope, Description, Runs, Tokens, Cost, Last run, plus the trailing action column', async () => {
     vi.spyOn(api, 'getAgents').mockResolvedValue(ROWS);
 
     const { container } = render(
@@ -106,6 +107,18 @@ describe('Agents — definition-table canonical column order', () => {
     const headers = Array.from(container.querySelectorAll('thead th')).map(
       (th) => th.textContent?.trim() ?? '',
     );
-    expect(headers).toEqual(['Name', 'Scope', 'Description', 'Runs', 'Tokens', 'Cost', 'Last run']);
+    // The action column's header is '' (it carries the Run/Session/Delete
+    // buttons, not a header label) — same convention as Workflows' existing
+    // trailing action column.
+    expect(headers).toEqual([
+      'Name',
+      'Scope',
+      'Description',
+      'Runs',
+      'Tokens',
+      'Cost',
+      'Last run',
+      '',
+    ]);
   });
 });
