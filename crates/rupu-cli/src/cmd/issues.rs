@@ -247,8 +247,11 @@ impl DetailOutput for IssueShowOutput {
 }
 
 async fn list(args: ListArgs, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
-    let (registry, global, project_root) = build_registry().await?;
-    let repo = resolve_repo_or_autodetect(args.repo.as_deref())?;
+    let (registry, _global, _project_root, cfg) = build_registry().await?;
+    let repo = resolve_repo_or_autodetect(
+        args.repo.as_deref(),
+        configured_default_repo(cfg.issues.default.as_ref()),
+    )?;
     let tracker = repo_to_issue_tracker(repo.platform);
     let conn = registry.issues(tracker).ok_or_else(|| {
         anyhow::anyhow!("no {tracker} credential — run `rupu auth login --provider {tracker}`")
@@ -292,7 +295,6 @@ async fn list(args: ListArgs, global_format: Option<OutputFormat>) -> anyhow::Re
         return Ok(());
     }
 
-    let cfg = layered_config(&global, project_root.as_deref());
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, args.no_color, None, None, None);
     let rows: Vec<IssueListRow> = issues
         .iter()
@@ -336,18 +338,8 @@ async fn list(args: ListArgs, global_format: Option<OutputFormat>) -> anyhow::Re
     report::emit_collection(global_format, &output)
 }
 
-fn layered_config(
-    global: &std::path::Path,
-    project_root: Option<&std::path::Path>,
-) -> rupu_config::Config {
-    let global_cfg_path = global.join("config.toml");
-    let project_cfg_path = project_root.map(|p| p.join(".rupu/config.toml"));
-    rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())
-        .unwrap_or_default()
-}
-
 async fn show(args: ShowArgs, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
-    let (registry, global, project_root) = build_registry().await?;
+    let (registry, _global, _project_root, cfg) = build_registry().await?;
     let issue_ref = resolve_issue_ref(&args.r#ref)?;
     let conn = registry.issues(issue_ref.tracker).ok_or_else(|| {
         anyhow::anyhow!(
@@ -357,7 +349,6 @@ async fn show(args: ShowArgs, global_format: Option<OutputFormat>) -> anyhow::Re
         )
     })?;
     let issue = conn.get_issue(&issue_ref).await?;
-    let cfg = layered_config(&global, project_root.as_deref());
     let pager_flag = if args.pager {
         Some(true)
     } else if args.no_pager {
@@ -489,6 +480,7 @@ async fn build_registry() -> anyhow::Result<(
     Arc<Registry>,
     std::path::PathBuf,
     Option<std::path::PathBuf>,
+    rupu_config::Config,
 )> {
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
@@ -502,7 +494,7 @@ async fn build_registry() -> anyhow::Result<(
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg), project_cfg.as_deref())?;
     let resolver = rupu_auth::KeychainResolver::new();
     let registry = Arc::new(Registry::discover(&resolver, &cfg).await);
-    Ok((registry, global, project_root))
+    Ok((registry, global, project_root, cfg))
 }
 
 fn parse_state_filter(s: &str) -> anyhow::Result<Option<IssueState>> {
@@ -521,9 +513,42 @@ fn repo_to_issue_tracker(p: Platform) -> IssueTracker {
     }
 }
 
-/// Parse `--repo` (run-target syntax) or auto-detect from cwd's
-/// git remote when `--repo` is `None`. Returns a typed `RepoRef`.
-pub(crate) fn resolve_repo_or_autodetect(repo_arg: Option<&str>) -> anyhow::Result<RepoRef> {
+/// Resolve `[issues.default]` into a concrete `RepoRef` (ISSUES.md I-73):
+/// `[scm.default].owner`/`.repo` were found to have zero safe consumers
+/// (deprecated instead — see `ScmDefault`'s doc), but `[issues.default]`'s
+/// `tracker` + `project` pair has an unambiguous one here. Requires BOTH
+/// to be set, `tracker` to name a currently-supported platform (`github` /
+/// `gitlab`), and `project` to parse as `<owner>/<repo>` — any of those
+/// failing is treated as "unset" (falls through to cwd autodetect)
+/// rather than erroring, mirroring the same "unavailable configured
+/// default falls back silently" contract `Registry::default_platform`/
+/// `default_tracker` already established for `.platform`/`.tracker`
+/// (I-15).
+fn configured_default_repo(defaults: Option<&rupu_config::IssuesDefault>) -> Option<RepoRef> {
+    let defaults = defaults?;
+    let tracker: IssueTracker = defaults.tracker.as_deref()?.parse().ok()?;
+    let platform = match tracker {
+        IssueTracker::Github => Platform::Github,
+        IssueTracker::Gitlab => Platform::Gitlab,
+        _ => return None,
+    };
+    let project = defaults.project.as_deref()?;
+    let (owner, repo) = project.split_once('/')?;
+    Some(RepoRef {
+        platform,
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+    })
+}
+
+/// Parse `--repo` (run-target syntax); when omitted, fall back to
+/// `configured_default` (the caller's already-resolved
+/// `[issues.default]`, see [`configured_default_repo`]), then to
+/// auto-detecting from cwd's git remote. Returns a typed `RepoRef`.
+pub(crate) fn resolve_repo_or_autodetect(
+    repo_arg: Option<&str>,
+    configured_default: Option<RepoRef>,
+) -> anyhow::Result<RepoRef> {
     if let Some(s) = repo_arg {
         let parsed = crate::run_target::parse_run_target(s)?;
         match parsed {
@@ -563,6 +588,8 @@ pub(crate) fn resolve_repo_or_autodetect(repo_arg: Option<&str>) -> anyhow::Resu
                 })
             }
         }
+    } else if let Some(r) = configured_default {
+        Ok(r)
     } else {
         autodetect_repo_from_cwd()
     }
@@ -811,6 +838,119 @@ mod tests {
     #[test]
     fn parse_remote_url_unknown_host_returns_none() {
         assert!(parse_remote_url("https://example.com/owner/repo.git").is_none());
+    }
+
+    // ── ISSUES.md I-73: `[issues.default]` wiring ──────────────────────
+
+    #[test]
+    fn configured_default_repo_wires_up_owner_repo_from_project_and_tracker() {
+        let cfg: rupu_config::Config = toml::from_str(
+            r#"
+            [issues.default]
+            tracker = "gitlab"
+            project = "section9labs/rupu"
+        "#,
+        )
+        .unwrap();
+        let default = configured_default_repo(cfg.issues.default.as_ref());
+        assert_eq!(
+            default,
+            Some(RepoRef {
+                platform: Platform::Gitlab,
+                owner: "section9labs".into(),
+                repo: "rupu".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn configured_default_repo_none_when_issues_default_absent() {
+        let cfg: rupu_config::Config = toml::from_str("").unwrap();
+        assert_eq!(configured_default_repo(cfg.issues.default.as_ref()), None);
+    }
+
+    #[test]
+    fn configured_default_repo_none_when_tracker_missing() {
+        let cfg: rupu_config::Config = toml::from_str(
+            r#"
+            [issues.default]
+            project = "section9labs/rupu"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(configured_default_repo(cfg.issues.default.as_ref()), None);
+    }
+
+    #[test]
+    fn configured_default_repo_none_when_project_missing() {
+        let cfg: rupu_config::Config = toml::from_str(
+            r#"
+            [issues.default]
+            tracker = "github"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(configured_default_repo(cfg.issues.default.as_ref()), None);
+    }
+
+    #[test]
+    fn configured_default_repo_none_when_project_not_owner_slash_repo() {
+        let cfg: rupu_config::Config = toml::from_str(
+            r#"
+            [issues.default]
+            tracker = "github"
+            project = "not-a-slash-pair"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(configured_default_repo(cfg.issues.default.as_ref()), None);
+    }
+
+    #[test]
+    fn configured_default_repo_none_for_unsupported_tracker() {
+        // Linear/Jira projects aren't `<owner>/<repo>`-shaped GitHub/GitLab
+        // repos — same "unavailable configured default falls through"
+        // contract as I-15's `default_platform`/`default_tracker`.
+        let cfg: rupu_config::Config = toml::from_str(
+            r#"
+            [issues.default]
+            tracker = "linear"
+            project = "team-123"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(configured_default_repo(cfg.issues.default.as_ref()), None);
+    }
+
+    /// The binding test: a config that sets `[issues.default]` and a
+    /// command that omits `--repo` gets the configured repo, not an
+    /// autodetect-or-error.
+    #[test]
+    fn resolve_repo_or_autodetect_uses_configured_default_when_repo_arg_omitted() {
+        let configured = RepoRef {
+            platform: Platform::Gitlab,
+            owner: "acme".into(),
+            repo: "widgets".into(),
+        };
+        let r = resolve_repo_or_autodetect(None, Some(configured.clone())).unwrap();
+        assert_eq!(r, configured);
+    }
+
+    #[test]
+    fn resolve_repo_or_autodetect_prefers_explicit_repo_arg_over_configured_default() {
+        let configured = RepoRef {
+            platform: Platform::Gitlab,
+            owner: "acme".into(),
+            repo: "widgets".into(),
+        };
+        let r = resolve_repo_or_autodetect(
+            Some("github:Section9Labs/rupu"),
+            Some(configured),
+        )
+        .unwrap();
+        assert_eq!(r.platform, Platform::Github);
+        assert_eq!(r.owner, "Section9Labs");
+        assert_eq!(r.repo, "rupu");
     }
 
     #[test]

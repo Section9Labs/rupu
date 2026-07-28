@@ -403,3 +403,67 @@ fn cp_deprecated_ui_keys_emit_a_deprecation_warning_each() {
         "expected a deprecation warning naming cp.workflow_editor_ui, got: {joined}"
     );
 }
+
+/// ISSUES.md I-73: `[scm.default].owner`/`.repo` have zero consumers and
+/// are now formally deprecated (unlike `.platform`, which I-15 wired up).
+/// Deprecated keys round-trip out of any TOML rewrite, mirroring the
+/// `[cp]` UI flags' contract above.
+#[test]
+fn scm_default_owner_and_repo_never_round_trip_back_out() {
+    let toml = r#"
+        [scm.default]
+        platform = "github"
+        owner = "section9labs"
+        repo = "rupu"
+    "#;
+    let cfg: Config = toml::from_str(toml).expect("parse");
+    let round_tripped = toml::to_string(&cfg).expect("serialize");
+    assert!(
+        round_tripped.contains("platform = \"github\""),
+        "the live `.platform` key must still round-trip: {round_tripped}"
+    );
+    assert!(
+        !round_tripped.contains("owner"),
+        "deprecated key must not be re-serialized: {round_tripped}"
+    );
+    assert!(
+        !round_tripped.contains("section9labs"),
+        "deprecated key's value must not be re-serialized: {round_tripped}"
+    );
+    assert!(
+        !round_tripped.contains("repo = "),
+        "deprecated key must not be re-serialized: {round_tripped}"
+    );
+}
+
+/// The second half of the binding test: presence of either deprecated key
+/// must emit a one-line `tracing::warn!` naming it, mirroring `[retry]`'s
+/// `warn_deprecated_keys` contract.
+#[test]
+fn scm_default_owner_and_repo_emit_deprecation_warnings() {
+    let cfg: Config = toml::from_str(
+        r#"
+        [scm.default]
+        owner = "section9labs"
+        repo = "rupu"
+    "#,
+    )
+    .expect("parse");
+
+    let subscriber = capture::CapturingSubscriber::default();
+    let messages = subscriber.messages.clone();
+    tracing::subscriber::with_default(subscriber, || {
+        cfg.validate().expect("validate");
+    });
+
+    let logs = messages.lock().unwrap();
+    let joined = logs.join("\n");
+    assert!(
+        joined.contains("scm.default.owner"),
+        "expected a deprecation warning naming scm.default.owner, got: {joined}"
+    );
+    assert!(
+        joined.contains("scm.default.repo"),
+        "expected a deprecation warning naming scm.default.repo, got: {joined}"
+    );
+}

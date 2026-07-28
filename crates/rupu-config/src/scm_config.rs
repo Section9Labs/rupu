@@ -22,18 +22,57 @@ pub struct IssuesSection {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScmDefault {
+    /// Consumed by [`rupu_scm::Registry::default_platform`] (ISSUES.md
+    /// I-15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// **Deprecated, inert, and never read** (ISSUES.md I-73). Every real
+    /// consumer that would need a single default repo — `rupu repos
+    /// attach|prefer|forget` (which permanently associate a repo with a
+    /// workspace path) and every SCM MCP tool's `owner`/`repo` args —
+    /// requires them explicit for a reason: silently defaulting *which*
+    /// repo a command targets is the exact "ambiguous command silently
+    /// targets the wrong repo" failure mode a default must not create.
+    /// `[issues.default].project` (paired with `.tracker`) is the safe
+    /// analog: it feeds `rupu issues list --repo`'s existing
+    /// cwd-autodetect fallback tier, a command that already tolerates an
+    /// implicit target.
+    ///
+    /// `skip_serializing` keeps it out of `/api/config` and out of
+    /// anything that round-trips this struct back to TOML, so the key
+    /// disappears the first time a config is rewritten. The warning in
+    /// [`crate::Config::warn_deprecated_keys`] tells the user to delete
+    /// it. Kept as `Option<String>` rather than the `Option<toml::Value>`
+    /// shim used for `[retry]`/`[cp]`'s deprecated keys: `ScmDefault` is
+    /// not `#[serde(deny_unknown_fields)]` (unlike `Config`/`CpConfig`),
+    /// so there is no parse-failure risk this indirection exists to
+    /// avoid — an unknown-shaped value here already fails loudly with a
+    /// normal serde type error instead of silently swallowing the rest of
+    /// the user's config, which is strictly better for a field that's
+    /// still typed as a plain string.
+    #[serde(default, skip_serializing)]
     pub owner: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// **Deprecated, inert, and never read.** See `owner`'s doc — same
+    /// reasoning and shim shape.
+    #[serde(default, skip_serializing)]
     pub repo: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuesDefault {
+    /// Consumed by [`rupu_scm::Registry::default_tracker`] (ISSUES.md
+    /// I-15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracker: Option<String>,
+    /// `<owner>/<repo>` for the configured `tracker`. Consumed by
+    /// `rupu-cli`'s `configured_default_repo` (ISSUES.md I-73) as a
+    /// fallback tier for `rupu issues list --repo`, between an explicit
+    /// `--repo` and cwd git-remote autodetection — the same "unavailable
+    /// configured default falls through rather than erroring" contract
+    /// `tracker` above already established. Requires `tracker` to also be
+    /// set and to name a currently-supported platform (`github` /
+    /// `gitlab`); either condition failing, or `project` not parsing as
+    /// `<owner>/<repo>`, is treated as unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
 }
