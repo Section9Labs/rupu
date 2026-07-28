@@ -11,7 +11,6 @@
 //! kept alive, and has no clean equivalent off macOS, so it would
 //! silently do nothing for some users while appearing to work.
 
-use crate::account_key::{account_for, legacy_account_for};
 use crate::backend::ProviderId;
 use rupu_providers::AuthMode;
 
@@ -35,35 +34,52 @@ const LEGACY_PROVIDERS: &[ProviderId] = &[
 
 /// Provider names with credentials still sitting in the macOS keychain.
 ///
+/// `named` supplies user-defined (openai-compatible) provider names from
+/// config — `store_named` wrote those under the same `<name>/<mode>`
+/// accounts, so a detector that only knew the `ProviderId` built-ins
+/// would silently miss them. Callers that have no config loaded may pass
+/// an empty slice.
+///
 /// Empty on every other OS, and empty on macOS when nothing is found or
 /// the keychain cannot be read. Total by construction: this runs inside
 /// `rupu auth login`, where a panic or a hard error would be far worse
 /// than a missed notice.
-pub fn detect_stranded_keychain_credentials() -> Vec<String> {
+pub fn detect_stranded_keychain_credentials(named: &[String]) -> Vec<String> {
     if std::env::consts::OS != "macos" {
         return Vec::new();
     }
 
-    LEGACY_PROVIDERS
+    let builtins = LEGACY_PROVIDERS
         .iter()
-        .filter(|provider| {
-            // Both shapes the keychain ever held: the current
-            // `<provider>/<mode>` accounts and the Slice A bare
-            // `<provider>` account.
-            legacy_accounts_for(**provider)
+        .map(|p| p.as_str().to_string())
+        .collect::<Vec<_>>();
+
+    let mut seen = std::collections::BTreeSet::new();
+    builtins
+        .iter()
+        .chain(named.iter())
+        // A named provider may shadow a built-in name; probing it twice
+        // would report it twice in the notice.
+        .filter(|name| seen.insert((*name).clone()))
+        .filter(|name| {
+            accounts_for_name(name)
                 .iter()
                 .any(|account| keychain_entry_exists(account))
         })
-        .map(|p| p.as_str().to_string())
+        .cloned()
         .collect()
 }
 
-/// Every keychain account string a given provider could be stored under.
-fn legacy_accounts_for(provider: ProviderId) -> Vec<String> {
+/// Every keychain account string a provider could be stored under: the
+/// current `<name>/<mode>` shapes plus the Slice A bare `<name>`.
+///
+/// Built on the plain provider string rather than `ProviderId` so named
+/// providers, which have no enum variant, go through the identical path.
+fn accounts_for_name(name: &str) -> Vec<String> {
     vec![
-        account_for(provider, AuthMode::ApiKey),
-        account_for(provider, AuthMode::Sso),
-        legacy_account_for(provider),
+        format!("{name}/{}", AuthMode::ApiKey.as_str()),
+        format!("{name}/{}", AuthMode::Sso.as_str()),
+        name.to_string(),
     ]
 }
 
@@ -91,7 +107,7 @@ mod tests {
         // Everywhere else this must be a no-op returning no findings —
         // never an error, never a spurious warning.
         if std::env::consts::OS != "macos" {
-            assert!(detect_stranded_keychain_credentials().is_empty());
+            assert!(detect_stranded_keychain_credentials(&[]).is_empty());
         }
     }
 
@@ -100,18 +116,52 @@ mod tests {
         // Whatever the host, the probe must be total: a missing binary,
         // a locked keychain, and a denied prompt are all "no findings",
         // not a crash in the middle of `rupu auth login`.
-        let _ = detect_stranded_keychain_credentials();
+        let _ = detect_stranded_keychain_credentials(&[]);
+        let _ = detect_stranded_keychain_credentials(&["oracle".to_string()]);
     }
 
     #[test]
     fn probed_accounts_cover_both_historical_shapes() {
-        let accounts = legacy_accounts_for(ProviderId::Anthropic);
+        let accounts = accounts_for_name(ProviderId::Anthropic.as_str());
         assert!(accounts.contains(&"anthropic/api-key".to_string()));
         assert!(accounts.contains(&"anthropic/sso".to_string()));
         assert!(
             accounts.contains(&"anthropic".to_string()),
             "the Slice A bare-provider account must still be probed, or \
              credentials written before the mode suffix go unreported"
+        );
+    }
+
+    /// Named (openai-compatible) providers have no `ProviderId` variant,
+    /// but `store_named` wrote them under the same account shapes. They
+    /// must be probed identically or their credentials strand silently.
+    #[test]
+    fn named_providers_get_the_same_account_shapes_as_builtins() {
+        let named = accounts_for_name("oracle");
+        assert!(named.contains(&"oracle/api-key".to_string()));
+        assert!(named.contains(&"oracle/sso".to_string()));
+        assert!(named.contains(&"oracle".to_string()));
+
+        // Identical shape to a built-in, modulo the name.
+        let builtin = accounts_for_name(ProviderId::Anthropic.as_str());
+        assert_eq!(named.len(), builtin.len());
+    }
+
+    /// A named provider configured with the same name as a built-in
+    /// would otherwise be probed twice and reported twice. Hermetic:
+    /// trivially true when nothing is stranded, catches the duplicate
+    /// when something is.
+    #[test]
+    fn results_never_contain_duplicates() {
+        let out =
+            detect_stranded_keychain_credentials(&["anthropic".to_string(), "oracle".to_string()]);
+        let mut deduped = out.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(
+            out.len(),
+            deduped.len(),
+            "a named provider shadowing a built-in must not be reported twice: {out:?}"
         );
     }
 

@@ -139,6 +139,27 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
     crate::output::formats::ensure_supported(command_name, format, supported)
 }
 
+/// Names of user-defined openai-compatible providers from config.
+///
+/// Best-effort: an unreadable or absent config yields an empty list
+/// rather than an error, because the only caller is a courtesy notice.
+fn configured_named_providers() -> Vec<String> {
+    let Ok(global) = crate::paths::global_dir() else {
+        return Vec::new();
+    };
+    let global_cfg = global.join("config.toml");
+    let Ok(cfg) = rupu_config::layer_files_locked(Some(&global_cfg), None) else {
+        return Vec::new();
+    };
+    cfg.providers
+        .keys()
+        .filter(|name| {
+            rupu_runtime::provider_factory::openai_compatible_params(name, &cfg.providers).is_some()
+        })
+        .cloned()
+        .collect()
+}
+
 /// Load layered config and return true if `name` is a declared
 /// openai-compatible provider.
 fn is_openai_compatible_name(name: &str) -> bool {
@@ -423,7 +444,11 @@ impl DetailOutput for AuthBackendOutput {
 /// with no explanation. Read-only and best-effort: a `security` probe
 /// that fails for any reason yields no findings and no output.
 fn warn_about_stranded_keychain_credentials() {
-    let stranded = rupu_auth::detect_stranded_keychain_credentials();
+    // Named (openai-compatible) providers were stored under the same
+    // account shapes as built-ins, so they have to be probed too — the
+    // built-in list alone would miss them silently.
+    let named = configured_named_providers();
+    let stranded = rupu_auth::detect_stranded_keychain_credentials(&named);
     if stranded.is_empty() {
         return;
     }
