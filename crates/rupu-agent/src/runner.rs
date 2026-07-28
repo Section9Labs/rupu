@@ -2383,11 +2383,18 @@ impl LlmProvider for MockProvider {
             let mut q = self.script.lock().unwrap();
             q.pop_front()
         };
+        // `Other` (not `Http`) deliberately: `is_retryable_provider_error`
+        // retries `Http` up to `MAX_HTTP_RETRIES` with real `tokio::time::sleep`
+        // backoff (~48s total). A scripted failure represents a test's
+        // intentional, permanent "this step fails" fixture, not a transient
+        // network blip — mapping it to `Http` made the send loop retry it,
+        // draining the single scripted turn on attempt 2 and surfacing
+        // "mock script exhausted" instead of the test's own message (I-4).
         let turn = next.ok_or_else(|| {
-            rupu_providers::ProviderError::Http("mock script exhausted".to_string())
+            rupu_providers::ProviderError::Other(anyhow::anyhow!("mock script exhausted"))
         })?;
         match turn {
-            ScriptedTurn::ProviderError(e) => Err(rupu_providers::ProviderError::Http(e)),
+            ScriptedTurn::ProviderError(e) => Err(rupu_providers::ProviderError::Other(anyhow::anyhow!(e))),
             ScriptedTurn::AssistantText {
                 text,
                 stop,

@@ -9900,17 +9900,14 @@ steps:
     ///   here) is a true orchestration no-op, and gives a coarse ordering
     ///   check (a reconverge step is always the LAST id appended).
     ///
-    /// Deliberately has NO "make the agent turn itself fail" knob: `rupu-
-    /// agent`'s `run_agent` retries a `ScriptedTurn::ProviderError` up to
-    /// `MAX_HTTP_RETRIES` times with capped exponential backoff (it maps to
-    /// `ProviderError::Http`, which `is_retryable_provider_error` always
-    /// retries) — a real ~48s wall-clock cascade before giving up, the same
-    /// cost `tests/linear_runner.rs`'s `FailingFactory`-based tests already
-    /// pay. The mid-graph-failure test below instead fails via a template
-    /// render error (`RunWorkflowError::Render`), which propagates
-    /// immediately with no retry — same "hard failure, no
-    /// `continue_on_error`" contract, without the unrelated retry-timing
-    /// cost.
+    /// Deliberately has NO "make the agent turn itself fail" knob: the
+    /// mid-graph-failure test below instead fails via a template render
+    /// error (`RunWorkflowError::Render`), which propagates immediately —
+    /// same "hard failure, no `continue_on_error`" contract as a scripted
+    /// `ScriptedTurn::ProviderError`, without adding a fail-injection path
+    /// to this shared factory. (`ScriptedTurn::ProviderError` itself now
+    /// maps to a non-retryable `ProviderError::Other` — see I-4 — so it no
+    /// longer costs a ~48s retry cascade either way.)
     struct SchedulerTestFactory {
         concurrency_tracked: &'static [&'static str],
         sleep_ms: u64,
