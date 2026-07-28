@@ -141,6 +141,9 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 ## Open
 
+
+## Fixed
+
 ### I-86 — three stale claims in `docs/spec.md`
 
 Surfaced during the Arc 6 truth pass and filed rather than fixed, because `docs/spec.md`
@@ -162,24 +165,23 @@ banner approach taken for [[I-70]]).
 
 ---
 
-### I-83 — `RetryingProvider` ignores server-supplied `Retry-After`
+### I-85 — four hand-written reasoning-effort ladders, two duplicated verbatim
 
-**Symptom.** When a provider returns 429 with a `Retry-After` header telling us exactly how
-long to wait, rupu ignores it and uses its own exponential backoff instead.
+**Symptom.** `ThinkingLevel` is a single shared enum, but every provider hand-writes its own
+translation with no shared helper: Anthropic → `budget_tokens`
+(`anthropic.rs:1338-1349`), Gemini → level + budget (`google_gemini.rs:357-371`),
+openai_wire → `reasoning_effort` string (`:178-185`), Codex → `reasoning.effort` string
+behind a model gate (`openai_codex.rs:537-546`).
 
-**Root cause.** `RetryingProvider` (`tuned.rs:151-174`) calls `(self.backoff)(attempt)`
-unconditionally. Nothing in production ever parsed the header — see [[I-49]], which deleted
-the inert stub that was *supposed* to.
+**Root cause.** Incremental provider addition, each pass adding a `match` rather than
+extending a shared mapping.
 
-**Impact.** Low today: the default is one 2s retry, so we rarely retry long enough for the
-server's hint to matter. It becomes real for anyone raising `max_retries`, where ignoring an
-explicit `Retry-After: 30` means hammering a provider that told us to back off — which is
-how rate-limit bans escalate.
+**Impact.** The last two are **byte-identical duplicated `match` blocks in two files**, so
+any per-provider constraint (see [[I-47]]) has to be written twice or it silently diverges.
+Maintenance risk rather than a live defect.
 
-**Fix.** Parse `Retry-After` from the response headers at the client boundary (rupu-scm
-already does this correctly at `error.rs:144` and is the model to copy), surface it via the
-already-existing `ProviderError::RateLimited { retry_after }`, and have `RetryingProvider`
-prefer it over its computed backoff when present. Related: [[I-49]].
+**Fix.** Factor the translation into one place keyed by wire format. Do this **before**
+adding any per-provider allowlist, not after, or the allowlist becomes a third copy.
 
 ---
 
@@ -203,23 +205,24 @@ inner one after a 429-driven exhaustion. Needs a decision about intended total a
 
 ---
 
-### I-85 — four hand-written reasoning-effort ladders, two duplicated verbatim
+### I-83 — `RetryingProvider` ignores server-supplied `Retry-After`
 
-**Symptom.** `ThinkingLevel` is a single shared enum, but every provider hand-writes its own
-translation with no shared helper: Anthropic → `budget_tokens`
-(`anthropic.rs:1338-1349`), Gemini → level + budget (`google_gemini.rs:357-371`),
-openai_wire → `reasoning_effort` string (`:178-185`), Codex → `reasoning.effort` string
-behind a model gate (`openai_codex.rs:537-546`).
+**Symptom.** When a provider returns 429 with a `Retry-After` header telling us exactly how
+long to wait, rupu ignores it and uses its own exponential backoff instead.
 
-**Root cause.** Incremental provider addition, each pass adding a `match` rather than
-extending a shared mapping.
+**Root cause.** `RetryingProvider` (`tuned.rs:151-174`) calls `(self.backoff)(attempt)`
+unconditionally. Nothing in production ever parsed the header — see [[I-49]], which deleted
+the inert stub that was *supposed* to.
 
-**Impact.** The last two are **byte-identical duplicated `match` blocks in two files**, so
-any per-provider constraint (see [[I-47]]) has to be written twice or it silently diverges.
-Maintenance risk rather than a live defect.
+**Impact.** Low today: the default is one 2s retry, so we rarely retry long enough for the
+server's hint to matter. It becomes real for anyone raising `max_retries`, where ignoring an
+explicit `Retry-After: 30` means hammering a provider that told us to back off — which is
+how rate-limit bans escalate.
 
-**Fix.** Factor the translation into one place keyed by wire format. Do this **before**
-adding any per-provider allowlist, not after, or the allowlist becomes a third copy.
+**Fix.** Parse `Retry-After` from the response headers at the client boundary (rupu-scm
+already does this correctly at `error.rs:144` and is the model to copy), surface it via the
+already-existing `ProviderError::RateLimited { retry_after }`, and have `RetryingProvider`
+prefer it over its computed backoff when present. Related: [[I-49]].
 
 ---
 
@@ -309,6 +312,33 @@ paths only, which is already true. Related: [[I-25]].
 
 ---
 
+### I-79 — the action dispatcher's `["*"]` allowlist is sound only by invariant
+
+**Symptom.** `action_dispatcher_for` (`crates/rupu-cli/src/resume.rs:27`) builds its
+`McpPermission` with a wildcard tool allowlist, `vec!["*".into()]`.
+
+**Root cause.** The dispatcher is constructed once per run, while the tool it may
+call is per-step, so the construction site has no single tool name to narrow to.
+
+**Impact.** No exploitable hole **today**, and this was verified rather than
+assumed: `opts.action_dispatcher` has exactly three production consumers
+(`runner.rs:4293`, `:4700`, `:4923`), all of which funnel into `execute_action_step`,
+whose only dispatch is `dispatcher.call(tool, …)` with `tool = step.action`. That
+tool is validated against the live MCP catalog at parse time by
+`validate_action_step`, and a step may not carry a non-empty `actions:` alongside
+`action:` (`ActionsOnActionStep`). Agent-step tool calls never touch this dispatcher.
+So the wildcard is currently unreachable — but its safety rests on an invariant
+enforced three modules away, and any future code that hands this dispatcher to a
+less constrained caller turns it into a real hole with no local signal.
+
+**Fix.** Narrow the allowlist to the single tool being invoked. This needs
+`execute_action_step` to build (or be handed) a per-step dispatcher, which means
+threading the registry rather than `&ToolDispatcher` through three call sites —
+mechanical but not free, hence P2. Defense in depth, not a live defect. Related:
+[[I-26]].
+
+---
+
 ### I-78 — a workflow step at `--mode ask` still gets `BypassDecider`
 
 **Symptom.** `rupu workflow run --mode ask` grants every agent step unrestricted
@@ -339,37 +369,6 @@ the current state — `ask` silently meaning `bypass` — is not defensible, and
 default-mode case makes it P1 rather than P2. Related: [[I-24]].
 
 ---
-
-### I-79 — the action dispatcher's `["*"]` allowlist is sound only by invariant
-
-**Symptom.** `action_dispatcher_for` (`crates/rupu-cli/src/resume.rs:27`) builds its
-`McpPermission` with a wildcard tool allowlist, `vec!["*".into()]`.
-
-**Root cause.** The dispatcher is constructed once per run, while the tool it may
-call is per-step, so the construction site has no single tool name to narrow to.
-
-**Impact.** No exploitable hole **today**, and this was verified rather than
-assumed: `opts.action_dispatcher` has exactly three production consumers
-(`runner.rs:4293`, `:4700`, `:4923`), all of which funnel into `execute_action_step`,
-whose only dispatch is `dispatcher.call(tool, …)` with `tool = step.action`. That
-tool is validated against the live MCP catalog at parse time by
-`validate_action_step`, and a step may not carry a non-empty `actions:` alongside
-`action:` (`ActionsOnActionStep`). Agent-step tool calls never touch this dispatcher.
-So the wildcard is currently unreachable — but its safety rests on an invariant
-enforced three modules away, and any future code that hands this dispatcher to a
-less constrained caller turns it into a real hole with no local signal.
-
-**Fix.** Narrow the allowlist to the single tool being invoked. This needs
-`execute_action_step` to build (or be handed) a per-step dispatcher, which means
-threading the registry rather than `&ToolDispatcher` through three call sites —
-mechanical but not free, hence P2. Defense in depth, not a live defect. Related:
-[[I-26]].
-
----
-
-
-
-## Fixed
 
 ### I-3 — Global `default_model` shadows a provider-scoped `default_model`
 
