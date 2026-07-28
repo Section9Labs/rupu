@@ -12,13 +12,18 @@ PR, nested namespaces, rate-limit headers).
 |-------------------------------------|:------:|:------:|:------:|:----:|
 | Repos (list, get, branches)         |   ✅   |   ✅   |   —    |   —  |
 | PRs / MRs (read, comment, create)   |   ✅   |   ✅   |   —    |   —  |
-| Issues (read, comment, create, transition) | ✅ |   ✅   |   —    |   —  |
+| Issues (read, comment, create, transition) | ✅ |   ✅   |   ✅   |   ✅  |
 | Workflow / pipeline trigger         |   ✅   |   ✅   |   —    |   —  |
 | `clone_to` (local checkout)         |   ✅   |   ✅   |   —    |   —  |
 | File read by ref                    |   ✅   |   ✅   |   —    |   —  |
-| API surface                         |  REST  |  REST  |   —    |   —  |
+| API surface                         |  REST  |  REST  | GraphQL| REST |
 
-Linear and Jira currently participate through **native trigger sources** (webhook + polling), not through the MCP `issues.*` tool surface yet.
+Linear and Jira implement the full `IssueConnector` trait (`list_issues`,
+`get_issue`, `comment_issue`, `create_issue`, `update_issue_state`), so the
+`issues.*` MCP tools (`issues.list`, `issues.get`, `issues.comment`,
+`issues.create`, `issues.update_state`) work against them today, in addition
+to their native trigger sources (webhook + polling). They are not full repo /
+PR backends — no `scm.*` repo, branch, PR/MR, or clone support.
 
 ## Auth
 

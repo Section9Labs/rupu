@@ -26,15 +26,17 @@ transcript on every run. A single Rust binary that:
   found — that accumulates across runs and is diff-able and replayable
   (`rupu coverage`; see [docs/coverage.md](docs/coverage.md)).
 
-What's NOT in this binary yet: the SaaS dashboard, the remote sandbox runtime,
-and the native desktop app — those are slices D + E. See [TODO.md](TODO.md) for
-deferred items in already-shipped slices.
+What's NOT in this binary yet: the hosted multi-tenant `rupu.cloud` relay and
+the remote sandbox runtime (Slice E). The local control-plane web UI
+(`rupu cp serve`) and the native desktop app (`rupu.app`, a separate binary,
+Slice D) already ship. See [TODO.md](TODO.md) for deferred items in
+already-shipped slices.
 
 ---
 
 ## Install
 
-**From source (requires Rust 1.77+):**
+**From source (requires Rust 1.95+):**
 
 ```sh
 cargo install --git https://github.com/Section9Labs/rupu
@@ -79,7 +81,7 @@ versions.
 
 ### Authenticate
 
-rupu supports four providers; each works with API-key auth or SSO.
+rupu ships five LLM providers. Four support both API-key and SSO auth:
 
 | Provider  | API key                              | SSO                                |
 | --------- | ------------------------------------ | ---------------------------------- |
@@ -87,6 +89,11 @@ rupu supports four providers; each works with API-key auth or SSO.
 | openai    | `platform.openai.com` → API Keys     | ChatGPT login (browser callback)   |
 | gemini    | `aistudio.google.com` → Get API Key  | Google account (browser callback)  |
 | copilot   | (PAT via `gh` token)                 | GitHub login (device code)         |
+
+A fifth, `openai-compatible`, is a user-declared generic adapter for any
+`/v1/chat/completions` endpoint (vLLM, Oracle GenAI, Together, …) — API-key
+auth only, no SSO. See `docs/providers.md` and
+`docs/providers/openai-compatible.md`.
 
 ```sh
 # API key
@@ -254,6 +261,7 @@ coverage gaps.
 - `docs/agent-authoring.md` — how to write good agents
 - `docs/workflow-format.md` — complete workflow schema reference
 - `docs/workflow-authoring.md` — how to design good workflows
+- `docs/configuration.md` — complete `~/.rupu/config.toml` reference
 - `docs/development-flows.md` — recommended engineering flows
 - `docs/coverage.md` — agentic coverage harness (ledgers, catalogs, audit / diff / rerun)
 - `examples/README.md` — copyable agents and workflows
@@ -267,7 +275,7 @@ rupu agent {list, show, edit}         Manage agents (list / inspect / open in $E
 rupu workflow {list, show, edit}      Manage workflows
 rupu workflow run <name> [target]     Run a workflow (target: repo, PR, or issue ref)
 rupu workflow runs                    List recent persisted runs
-rupu workflow {approve, reject} <id>  Resume / cancel a paused-for-approval run
+rupu workflow {approve, reject} <id>  Resume / cancel a paused-for-approval run (--gate <step-id> when several gates are parked at once)
 rupu watch <run_id> [--replay]        Re-attach to any past or in-flight run
 rupu transcript {list, show}          Browse JSONL transcripts
 rupu coverage {list, show, audit, gap} Inspect agentic coverage ledgers (+ catalog, templates)
@@ -283,6 +291,16 @@ rupu ui {themes, theme ...}           List, inspect, validate, and import UI the
 rupu config {get, set}                Read / write rupu configuration
 rupu completions {print, install}     Shell-completion scripts (with dynamic agent names)
 rupu usage                            Usage reports across transcripts + workflow runs
+rupu session {start, list, show, send, attach, stop, archive, restore, delete, prune, compact}
+                                       Persistent agent sessions (multi-turn conversations)
+rupu autoflow {list, show, run, tick, serve, ...}
+                                       Autonomous workflows against persistent issue state
+rupu cleanup [--sessions|--transcripts] [--stats] [--dry-run]
+                                       Prune archived local sessions and transcripts
+rupu cp serve [--bind] [--token]      Local control-plane HTTP server for the rupu web UI
+rupu host {add, list, remove}         Manage named rupu-cp hosts
+rupu node [--cp-url] | {enroll, pull} Dial-home tunnel agent + node enrollment
+rupu update [--check] [--channel]     Download and install the latest release for the configured channel
 ```
 
 Run `rupu <subcommand> --help` for the full surface of any one. Tab completion
@@ -463,8 +481,13 @@ See [`docs/spec.md`](docs/spec.md) for the full architecture. Short version:
   long-lived agent conversations. Sessions can also be archived, restored, listed with
   `--all|--archived`, pruned by age, permanently deleted with `--force`, or cleaned in
   bulk with `rupu cleanup`.
-- **Tool policy** lives in each agent's `tools:` and `permissionMode`; workflow
-  `actions:` is a separate action-protocol allowlist, not a tool allowlist.
+- **Tool policy** lives in each agent's `tools:` and `permissionMode`. A workflow
+  step's `actions:` further narrows the connector/MCP subset of that grant for
+  the step — it never touches builtin tools (`bash`, `read_file`, `write_file`,
+  `edit_file`, `grep`, `glob`, `ast_grep`, `dispatch_agent`,
+  `dispatch_agents_parallel`) and can only narrow, never grant beyond what the
+  agent's `tools:` already allows. Every catalog call is recorded in the
+  transcript's `tool_audit` trail.
 
 ---
 
@@ -472,9 +495,11 @@ See [`docs/spec.md`](docs/spec.md) for the full architecture. Short version:
 
 Bypass mode runs arbitrary shell commands on your machine. Review every agent file
 before you run it, just as you would review a shell script. An agent's `tools:` list
-and `permissionMode` define its tool surface; workflow `actions:` is a separate
-mechanism and does not replace tool policy. Treat an agent you did not write with
-the same caution you would treat untrusted code.
+and `permissionMode` define its tool surface; a workflow step's `actions:` can only
+narrow that surface's connector/MCP tools further, never widen it or restrict
+builtins — it is not a substitute for reviewing the agent's own `tools:` and
+`permissionMode`. Treat an agent you did not write with the same caution you would
+treat untrusted code.
 
 ---
 
@@ -487,7 +512,7 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-MSRV: **1.77**. Set `RUPU_LOG=debug` for verbose tracing output.
+MSRV: **1.95**. Set `RUPU_LOG=debug` for verbose tracing output.
 
 ---
 

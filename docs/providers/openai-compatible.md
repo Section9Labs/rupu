@@ -85,7 +85,7 @@ You review code changes for correctness, style, and missing tests.
 ## Step 4: Run
 
 ```sh
-rupu run --agent oracle-codereview
+rupu run oracle-codereview
 ```
 
 To verify the model list:
@@ -115,9 +115,9 @@ Each `[[providers.<name>.models]]` entry:
 
 - Only API-key auth (`Authorization: Bearer`) is supported. SSO flows are
   not available for openai-compatible providers.
-- Workflow steps and subagents will gain openai-compatible support in Plan 2.
-  For now they use the built-in providers (anthropic, openai, gemini, copilot)
-  only.
+- Workflow steps and dispatched subagents support openai-compatible providers
+  the same way `rupu run` does — a step whose agent sets `provider: oracle`
+  resolves `[providers.oracle]` from config and builds the same client.
 - Model listing (`rupu models list`) returns only the models declared in
   `[[providers.<name>.models]]` — rupu does not call `/v1/models` on these
   endpoints.

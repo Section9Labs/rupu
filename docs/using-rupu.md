@@ -283,6 +283,28 @@ rupu workflow approve run_01J...
 rupu workflow reject run_01J... --reason "not ready"
 ```
 
+The run must be in `awaiting_approval` status. Both subcommands accept
+`--mode ask|bypass|readonly` (`approve` only, to override the permission mode for the
+resumed run) and `--gate <step-id>`.
+
+`--gate` targets one specific parked approval gate by step id. It is required once a
+run has more than one gate parked at once — a concurrent DAG run where several gate
+steps land in the same batch-park wave, so the run is `awaiting_approval` with multiple
+gates open simultaneously and there is no single "the" gate to resolve. Omit `--gate`
+for the ordinary single-gate case; the sole parked gate resolves exactly as before.
+
+Resolving one gate of several leaves the others parked:
+
+```sh
+rupu workflow approve run_01J... --gate review-gate
+rupu workflow reject run_01J... --gate security-gate --reason "missing tests"
+```
+
+Approving a gate lets that branch continue; rejecting one runs *that gate's* own
+`on_reject` cleanup chain and leaves the others parked. The run as a whole stays
+`awaiting_approval` until every parked gate has been resolved — it only flips to
+`rejected` once every gate is resolved.
+
 ### Browse issues
 
 ```sh
@@ -1045,6 +1067,89 @@ rupu mcp serve --transport stdio
 ```
 
 Use this when you want Claude Desktop, Cursor, or another MCP host to operate on the same unified repo / issue abstraction.
+
+---
+
+## Control plane, remote hosts, and updates
+
+### Local control-plane web UI
+
+```sh
+rupu cp serve
+rupu cp serve --bind 0.0.0.0:7878 --token secret123
+rupu cp serve --no-open
+```
+
+`rupu cp serve` starts a local HTTP server (default `127.0.0.1:7878`) that serves the
+rupu web UI: run history, Live Events, workflow/agent authoring, and approval gates. It
+is not just an HTTP server — while it runs, it also drives three in-process background
+loops on a timer: the autoflow reconciler, the cron/event-trigger tick, and the gate
+sweep (enforces gate `on_timeout` routing and reaps orphaned runs whose recorded
+`runner_pid` has died). Each loop is independently gated by a `[cp]` config key
+(`autoflow_reconcile_enabled`, `cron_tick_enabled`, `gate_sweep_enabled`; all default
+`true` at a 60s interval — see [configuration.md](configuration.md#cp)), so a `cp serve`
+process can stand in for a separate `rupu autoflow serve` / `rupu cron tick` cron
+entry / gate-timeout watcher.
+
+`--token` gates `/api/*` behind `Authorization: Bearer <token>`; the web UI itself and
+`/healthz` stay open on localhost regardless. Without `--no-open`, the served URL opens
+in a browser automatically when run from an interactive terminal; the URL is always
+printed either way.
+
+### Remote hosts (`rupu host`)
+
+```sh
+rupu host add prod --url https://cp.example.com --token-stdin
+rupu host add build-box --ssh build-box.local
+rupu host add archive --bucket s3://my-bucket --prefix rupu/host-1
+rupu host list
+rupu host remove host_01J...
+```
+
+`rupu host` registers additional `rupu-cp` instances the local CLI/UI can reach,
+alongside the always-present local instance. Three transports, mutually exclusive per
+host: `--url` (a remote `rupu cp serve` reached over HTTP, with an optional bearer
+token), `--ssh` (a `user@host` destination or `~/.ssh/config` alias, with optional
+`--port` / `--identity`), and `--bucket` (an object-store dead-drop — `s3://`, `gs://`,
+or `file://` — with an optional `--prefix`; credentials come from the environment /
+cloud credential chain and are never stored by rupu).
+
+### Dial-home tunnel nodes (`rupu node`)
+
+```sh
+rupu node enroll build-box-01 --cp-url wss://cp.example.com
+# prints a one-time token + a `rupu node --cp-url ... --token-stdin` command
+# to run ON the remote box
+
+rupu node pull --bucket s3://my-bucket --prefix rupu/host-1
+rupu node pull --bucket s3://my-bucket --once
+```
+
+`rupu node enroll` (run on the CP machine) registers a new tunnel node and prints a
+copy-paste command for the remote box — the enrollment token is shown once and is never
+persisted to disk. Running bare `rupu node --cp-url wss://... --token-stdin` on that box
+opens a WebSocket dial-home tunnel to the CP's `/api/node/connect` endpoint so the node
+can be dispatched work without inbound connectivity. `rupu node pull` is the
+bucket-transport counterpart: it polls an object-store dead-drop, atomically claims
+queued jobs, runs them locally, and writes results back — `--once` drains
+currently-available jobs and exits instead of looping forever (`--interval` controls the
+loop-mode poll cadence, default 15s).
+
+### Updating the binary (`rupu update`)
+
+```sh
+rupu update --check              # report only, install nothing
+rupu update                      # install the latest release for the configured channel
+rupu update --channel beta       # override the channel for this run
+rupu update --force              # reinstall even if already up to date, or downgrade
+rupu update --rollback           # restore the previously-installed binary from backup
+```
+
+`rupu update` downloads and installs the latest release for the channel configured at
+`[update].channel` (`stable` by default; see [configuration.md](configuration.md#update)),
+verifying a sha256 checksum before an atomic in-place binary swap with a backup for
+`--rollback`. `[update].check` (default `true`) controls whether ordinary commands print
+a passive "update available" notice.
 
 ---
 

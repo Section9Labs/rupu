@@ -180,14 +180,14 @@ You review code changes for correctness and style.
 Then run:
 
 ```sh
-rupu run --agent oracle-codereview
+rupu run oracle-codereview
 ```
 
 ### Workflow steps and subagents
 
-Workflow steps and subagents will gain openai-compatible support in Plan 2.
-For now they use the built-in providers (anthropic, openai, gemini, copilot)
-only.
+Workflow steps and dispatched subagents support `openai-compatible` providers
+the same way `rupu run` does: a step whose agent sets `provider: oracle`
+resolves the `[providers.oracle]` config entry and builds the same client.
 
 ### Per-provider walkthrough
 

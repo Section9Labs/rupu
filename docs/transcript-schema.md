@@ -122,10 +122,51 @@ Emitted at the beginning of each agent turn (before the LLM request is sent).
 
 ---
 
+### `usage`
+
+Emitted once per LLM response, right after the provider call returns and before any
+`assistant_delta`/`assistant_message` events for that response. `output_tokens` is already the
+billable output figure — Gemini's reasoning/"thinking" tokens (reported separately by the
+provider as `thoughtsTokenCount`) are folded in here upstream, so no separate reasoning-token
+field exists on this event.
+
+| Field           | Type             | Description                                                  |
+|-----------------|------------------|----------------------------------------------------------------|
+| `provider`      | string           | Provider name (e.g., `anthropic`)                             |
+| `model`         | string           | Requested model id (used for pricing attribution)              |
+| `served_model`  | string, optional | Actual model the provider served, if it differs from `model`   |
+| `input_tokens`  | u32              | Input tokens for this response                                 |
+| `output_tokens` | u32              | Billable output tokens (includes any reasoning tokens)         |
+| `cached_tokens` | u32              | Cached-input tokens included in `input_tokens` (default `0`)    |
+
+```json
+{"type":"usage","data":{"provider":"anthropic","model":"claude-sonnet-4-6","input_tokens":1024,"output_tokens":312,"cached_tokens":0}}
+```
+
+---
+
+### `assistant_delta`
+
+Emitted for each incremental text chunk while a streaming provider response is in flight —
+zero or more of these precede the `assistant_message` event for the same message. Consumers
+that only want the final text can ignore `assistant_delta` and read `assistant_message`
+instead; consumers rendering a live typing effect read both.
+
+| Field     | Type   | Description                        |
+|-----------|--------|-------------------------------------|
+| `content` | string | One incremental text chunk          |
+
+```json
+{"type":"assistant_delta","data":{"content":"I'll start by"}}
+```
+
+---
+
 ### `assistant_message`
 
-Emitted when the LLM produces a text response (may be emitted multiple times per turn if the
-provider streams partial results, but rupu emits one event per complete message block).
+Emitted when the LLM produces a text response (may be preceded by zero or more `assistant_delta`
+events if the provider streams partial results, but rupu emits one `assistant_message` per
+complete message block).
 
 | Field      | Type             | Description                                     |
 |------------|------------------|-------------------------------------------------|
@@ -209,19 +250,62 @@ index on `command_run` events without parsing `tool_call` inputs.
 
 ### `action_emitted`
 
-Emitted when the agent emits an action-protocol verb. In v0, no effect is executed; the event
-records the allowlist check result only.
+**Two different things have shared this event name across rupu's history — do not confuse them:**
 
-| Field     | Type             | Description                                          |
-|-----------|------------------|------------------------------------------------------|
-| `kind`    | string           | Action verb (e.g., `propose_edit`, `open_pr`)        |
-| `payload` | object           | Action data                                          |
-| `allowed` | bool             | Whether the action was on the step's `actions:` list |
-| `applied` | bool             | Whether the effect was executed (always `false` in v0) |
-| `reason`  | string, optional | Explanation when `allowed` or `applied` is `false`   |
+**1. Live action-node shape (current, real effects).** Written by
+`execute_action_step` (`rupu-orchestrator`) whenever a standalone `action:`
+workflow step dispatches through the in-process MCP `ToolDispatcher`. `kind`
+is the real MCP catalog tool name (e.g. `issues.create`, not a bespoke verb);
+`payload` is the rendered `with:` args sent to the connector; `applied` is
+`true` whenever the dispatcher call actually reached the connector
+(regardless of whether the connector call itself succeeded) and `false` only
+when the call was denied before reaching it. This event is always followed
+immediately by a `tool_audit` event covering the same call — `tool_audit`,
+not `action_emitted`, is what the CP transcript panel renders a badge from.
+
+| Field     | Type             | Description                                                          |
+|-----------|------------------|-----------------------------------------------------------------------|
+| `kind`    | string           | MCP catalog tool name (e.g. `issues.create`, `scm.prs.comment`)      |
+| `payload` | object           | Rendered `with:` args sent to the connector                          |
+| `allowed` | bool             | `false` only for `McpError::PermissionDenied` (the call never reached the connector) |
+| `applied` | bool             | Whether the dispatcher call reached the connector (`true`) or was denied before reaching it (`false`) |
+| `reason`  | string, optional | Explanation when `allowed` or `applied` is `false`                    |
 
 ```json
-{"type":"action_emitted","data":{"kind":"log_finding","payload":{"message":"null pointer in parser.rs:142"},"allowed":true,"applied":false,"reason":"not wired in v0"}}
+{"type":"action_emitted","data":{"kind":"issues.create","payload":{"title":"null pointer in parser.rs:142","body":"..."},"allowed":true,"applied":true}}
+```
+
+**2. Legacy finding/verb shape (dead, no longer producible).** Before the
+`actions:`/`action:` catalog validation landed, `kind` could be an
+Okesu-heritage free-form verb such as `log_finding` or `propose_edit` that
+did not correspond to any real MCP tool, and `applied` was always `false`
+(no effect was ever executed). `validate_step_actions` (`rupu-orchestrator`,
+`workflow.rs`) now rejects any `actions:`/`action:` entry that isn't a real
+MCP catalog tool name at workflow-parse time, so this shape can no longer be
+produced by any current code path. It is documented here only so a reader of
+an old transcript file understands what they're looking at.
+
+---
+
+### `tool_audit`
+
+Per-catalog-tool-call audit trail for a workflow step's `actions:` enforcement. Emitted from two
+choke points: the agent runtime's `on_tool_call` hook (wrapped by `rupu-orchestrator::step_factory`)
+for agent-driven MCP calls, and `execute_action_step` for `action:`-node calls — for an action-node
+call it is written immediately after that call's `action_emitted` line, covering the same call.
+Never confuse `tool_audit` with `action_emitted`: `tool_audit` is the general catalog-call audit
+line, and it is what the CP transcript panel renders a badge from.
+
+| Field        | Type   | Description                                                                                     |
+|--------------|--------|---------------------------------------------------------------------------------------------------|
+| `tool`       | string | The MCP catalog tool name (e.g. `issues.create`)                                                  |
+| `declared`   | bool   | Whether `tool` appears in the step's `actions:` allowlist. `false` both when `actions:` is empty/absent (unrestricted — not a violation) and when `actions:` is non-empty but doesn't name this tool — use `restricted` to tell those apart |
+| `granted`    | bool   | Whether `tool` is covered by the agent's `tools:` grant, evaluated before any `actions:` narrowing. Always `true` for an `action:` node (no agent-grant concept applies there) |
+| `blocked`    | bool   | Whether the call was actually denied — either narrowed out of the agent's roster before reaching the registry, or denied by the MCP mode/permission gate |
+| `restricted` | bool   | Whether the step declared a non-empty `actions:` allowlist at all (disambiguates `declared: false`) |
+
+```json
+{"type":"tool_audit","data":{"tool":"issues.create","declared":true,"granted":true,"blocked":false,"restricted":true}}
 ```
 
 ---
@@ -296,8 +380,10 @@ Within a single run file the event ordering is:
 ```
 run_start
   (turn_start
+    usage
+    assistant_delta*
     assistant_message*
-    (tool_call  tool_result  file_edit?  command_run?  action_emitted*)*
+    (tool_call  tool_result  file_edit?  command_run?  action_emitted?  tool_audit?)*
   turn_end)*
 run_complete
 ```

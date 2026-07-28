@@ -68,6 +68,12 @@ Everything after the closing `---` is the system prompt.
 | `anthropicTaskBudget` | integer | no | none | Anthropic-only soft output budget |
 | `anthropicContextManagement` | string | no | none | Anthropic-only context pruning |
 | `anthropicSpeed` | string | no | none | Anthropic-only fast mode |
+| `outputSchema` | object (inline YAML) | no | none | JSON Schema for Anthropic structured outputs; only takes effect with `outputFormat: json` |
+| `dispatchableAgents` | array\<string\> | no | none (no dispatch) | Allowlist of agent names this agent may dispatch via `dispatch_agent` / `dispatch_agents_parallel` |
+| `concerns` | object | no | none | Coverage-concerns block; injects the coverage tools + catalog into the system prompt |
+| `maxTokens` | integer | no | `8192` | Per-request output-token budget (`max_tokens` in the LLM request); extended thinking (`effort`) draws from this same budget |
+| `contextWindowTokens` | integer | no | none (compaction disabled) | Model context-window size in tokens; when set, enables proactive LLM context compaction |
+| `compactAtPercent` | integer | no | `80` when `contextWindowTokens` is set | Percentage of `contextWindowTokens` at which compaction triggers; clamped to `[10, 95]` |
 
 ---
 
@@ -115,6 +121,13 @@ Built-in tool names:
 - `edit_file`
 - `grep`
 - `glob`
+- `ast_grep`
+- `dispatch_agent`
+- `dispatch_agents_parallel`
+
+`dispatch_agent` and `dispatch_agents_parallel` dispatch to child agents named
+in this agent's `dispatchableAgents:` list (see below); they fail at
+invocation if the requested agent isn't on that allowlist.
 
 MCP-backed tool names are also valid, for example:
 
@@ -137,7 +150,7 @@ Notes:
 
 - if you omit `tools:`, the agent gets the full built-in surface and, when SCM / issue connectors are configured, discovered MCP tools as well
 - for reusable repo agents, explicit `tools:` is better than relying on the implicit wide-open default
-- `tools:` is not the same thing as workflow `actions:`; `tools:` gates tool calls, `actions:` gates the action protocol emitted from agent output inside workflows
+- `tools:` is not the same thing as a workflow step's `actions:`. `tools:` is this agent's full tool grant; `actions:` (on a workflow step) can only narrow the connector/MCP subset of that grant further for that one step — it never touches builtin tools (`bash`, `read_file`, `write_file`, `edit_file`, `grep`, `glob`, `ast_grep`, `dispatch_agent`, `dispatch_agents_parallel`) and can never grant a tool beyond what `tools:` already allows
 
 ### `permissionMode`
 
@@ -233,6 +246,26 @@ Accepted values:
 - `json`
 
 Use `json` only when the caller downstream needs machine-readable output. If you set `outputFormat: json`, the system prompt should still describe the exact JSON shape expected.
+
+### `outputSchema`
+
+Inline YAML mapping deserialized straight into a JSON Schema. Only takes effect when `outputFormat: json` is also set — Anthropic then guarantees a schema-conforming response via `output_config.format = {type: "json_schema", schema: <this value>}`. Without `outputSchema`, `outputFormat: json` is prompt-driven only (no server-side guarantee). Ignored by providers other than Anthropic.
+
+### `dispatchableAgents`
+
+Allowlist of agent names this agent may hand work to via the `dispatch_agent` / `dispatch_agents_parallel` builtin tools. Omit it (the default) to give the agent no dispatch capability at all — the dispatch tools still appear in the registry, but any call fails at invocation with "not in dispatchableAgents".
+
+### `concerns`
+
+Coverage-concerns block (see `docs/coverage.md`). When present, the runner flattens the concern catalog, writes a snapshot to `.rupu/coverage/<target>/catalog.yaml`, injects the four coverage tools, and prepends the catalog to the system prompt. A workflow step's own `concerns:` block takes precedence over the agent's when both are set.
+
+### `maxTokens`
+
+Per-request output-token budget (the LLM request's `max_tokens`). Defaults to `8192` when omitted. Extended thinking (`effort`) draws from this same budget, so raise it for agents that both reason heavily and produce long output.
+
+### `contextWindowTokens` and `compactAtPercent`
+
+`contextWindowTokens` sets the model's context-window size in tokens and enables proactive LLM context compaction: when the previous turn's input exceeded `compactAtPercent` of this value, the runner summarizes older turns before the next turn. `compactAtPercent` defaults to `80` when `contextWindowTokens` is set and is otherwise omitted; values are clamped to `[10, 95]`. Leaving `contextWindowTokens` unset disables compaction entirely.
 
 ### Anthropic-specific fields
 

@@ -70,6 +70,7 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-83 | P2 | rupu-providers | `RetryingProvider` ignores server-supplied `Retry-After` by design; nothing in production reads it | open |
 | I-84 | P1 | rupu-providers | Anthropic's nested idle-retry × 429-retry loops multiply attempts | open |
 | I-85 | P2 | rupu-providers | Four hand-written reasoning-effort ladders, two of them byte-identical duplicates | open |
+| I-86 | P2 | docs/spec.md | Three stale claims: `gate_requested` "not emitted in v0", an `actions:` allowlist check on `action_emitted` that never existed, and "v0 logs `action_emitted` only" | open |
 
 ### Arc 3 — single UI path
 
@@ -112,33 +113,54 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 | ID | Sev | Area | Title | Status |
 |---|---|---|---|---|
-| I-50 | P0 | README | MSRV is stated as 1.77; the workspace requires 1.88, so `cargo install` fails | open |
-| I-51 | P0 | docs | Three docs still say `actions:` is *not* a tool allowlist — since #533/#537 it narrows tools | open |
-| I-52 | P0 | docs/providers | `rupu run --agent <name>` is documented twice; the flag does not exist | open |
-| I-53 | P0 | docs/workflow-format | Approval **gate nodes** are entirely undocumented | open |
-| I-54 | P0 | docs/workflow-format | `action:` connector steps are entirely undocumented | open |
-| I-55 | P0 | docs/workflow-format | `branch:` is undocumented, including its silent-wrong-result transitive-arm rule | open |
-| I-56 | P0 | docs/workflow-format | The `wake_on:` example uses `github.pull_request.closed`, which never fires | open |
-| I-57 | P0 | docs/workflow-format | The `when:` event example uses a path that renders empty, silently skipping the step forever | open |
-| I-58 | P1 | docs | There is no config reference page; ~25 shipped keys are documented nowhere | open |
-| I-59 | P1 | docs/workflow-format | Non-linear constructs (`next`/`depends_on`/`split`/`join`/`loops`/`max_concurrency`) are undocumented | open |
-| I-60 | P1 | docs/workflow-format | Remote placement (`host:`/`distribute:`/`workspace:`) is referenced but never defined | open |
-| I-61 | P1 | docs/workflow-format | "Timeouts are enforced lazily" is stale — the gate sweep enforces them by default | open |
-| I-62 | P1 | docs/workflow-format | `autoflow.entity` is documented as issue-only; `pull_request` ships | open |
-| I-63 | P1 | docs/agent-format | Six accepted frontmatter keys and three built-in tools are missing from the reference | open |
-| I-64 | P1 | docs/transcript-schema | `action_emitted` semantics are wrong and two shipped event types are undocumented | open |
-| I-65 | P1 | docs/scm | The capability matrix says Linear/Jira have no `issues.*` support; both work today | open |
-| I-66 | P1 | docs/providers | "Workflow steps and subagents don't support openai-compatible" is stale | open |
-| I-67 | P1 | docs | `rupu cp`, `host`, `node`, `update`, `session`, `autoflow`, `cleanup` are undocumented | open |
-| I-68 | P1 | docs | `rupu workflow approve\|reject --gate <step-id>` is unmentioned but required for multi-gate runs | open |
-| I-69 | P1 | rupu-cli | `rupu cp serve --help` describes an HTTP server; it also runs autoflow, cron and gate-sweep daemons | open |
-| I-70 | P1 | docs/specs | The gate/action design spec's own YAML examples fail schema validation | open |
-| I-71 | P2 | README | The subcommand table omits 7 shipped commands; provider count and "not in this binary" are stale | open |
-| I-72 | P2 | docs/providers | `[pricing]` is recommended but its schema is documented nowhere | open |
+| I-50 | P0 | README | MSRV is stated as 1.77; the workspace requires 1.88, so `cargo install` fails | fixed |
+| I-51 | P0 | docs | Three docs still say `actions:` is *not* a tool allowlist — since #533/#537 it narrows tools | fixed |
+| I-52 | P0 | docs/providers | `rupu run --agent <name>` is documented twice; the flag does not exist | fixed |
+| I-53 | P0 | docs/workflow-format | Approval **gate nodes** are entirely undocumented | fixed (in Arc 4) |
+| I-54 | P0 | docs/workflow-format | `action:` connector steps are entirely undocumented | fixed |
+| I-55 | P0 | docs/workflow-format | `branch:` is undocumented, including its silent-wrong-result transitive-arm rule | fixed |
+| I-56 | P0 | docs/workflow-format | The `wake_on:` example uses `github.pull_request.closed`, which never fires | fixed |
+| I-57 | P0 | docs/workflow-format | The `when:` event example uses a path that renders empty, silently skipping the step forever | fixed |
+| I-58 | P1 | docs | There is no config reference page; ~25 shipped keys are documented nowhere | fixed |
+| I-59 | P1 | docs/workflow-format | Non-linear constructs (`next`/`depends_on`/`split`/`join`/`loops`/`max_concurrency`) are undocumented | fixed |
+| I-60 | P1 | docs/workflow-format | Remote placement (`host:`/`distribute:`/`workspace:`) is referenced but never defined | fixed |
+| I-61 | P1 | docs/workflow-format | "Timeouts are enforced lazily" is stale — the gate sweep enforces them by default | fixed (in Arc 4) |
+| I-62 | P1 | docs/workflow-format | `autoflow.entity` is documented as issue-only; `pull_request` ships | fixed |
+| I-63 | P1 | docs/agent-format | Six accepted frontmatter keys and three built-in tools are missing from the reference | fixed |
+| I-64 | P1 | docs/transcript-schema | `action_emitted` semantics are wrong and two shipped event types are undocumented | fixed |
+| I-65 | P1 | docs/scm | The capability matrix says Linear/Jira have no `issues.*` support; both work today | fixed |
+| I-66 | P1 | docs/providers | "Workflow steps and subagents don't support openai-compatible" is stale | fixed |
+| I-67 | P1 | docs | `rupu cp`, `host`, `node`, `update`, `session`, `autoflow`, `cleanup` are undocumented | fixed |
+| I-68 | P1 | docs | `rupu workflow approve\|reject --gate <step-id>` is unmentioned but required for multi-gate runs | fixed |
+| I-69 | P1 | rupu-cli | `rupu cp serve --help` describes an HTTP server; it also runs autoflow, cron and gate-sweep daemons | fixed |
+| I-70 | P1 | docs/specs | The gate/action design spec's own YAML examples fail schema validation | fixed |
+| I-71 | P2 | README | The subcommand table omits 7 shipped commands; provider count and "not in this binary" are stale | fixed |
+| I-72 | P2 | docs/providers | `[pricing]` is recommended but its schema is documented nowhere | fixed |
 
 ---
 
 ## Open
+
+### I-86 — three stale claims in `docs/spec.md`
+
+Surfaced during the Arc 6 truth pass and filed rather than fixed, because `docs/spec.md`
+was outside that sweep's assigned scope.
+
+- `:230` — lists `gate_requested` as *"reserved; not emitted in v0"*. Gate nodes ship and
+  the CP transcript viewer has an explicit arm for the event, so this needs checking against
+  the current emitters.
+- `:250` — *"For each `action_emitted` event, check the step's `actions:` allowlist"*
+  describes a check that **never existed in shipped code**. This is the same phantom
+  validator [[I-27]] deleted and [[I-51]] corrected elsewhere; `docs/spec.md` was missed
+  because it wasn't in either issue's file list.
+- `:65` — *"v0 logs `action_emitted` only"* predates action steps actually executing.
+
+**Fix.** Verify each against the current `Event` emitters and correct, or add a dated
+correction banner if `docs/spec.md` is meant to read as a historical record rather than live
+reference — decide which it is first, since that determines the treatment (compare the
+banner approach taken for [[I-70]]).
+
+---
 
 ### I-83 — `RetryingProvider` ignores server-supplied `Retry-After`
 
@@ -406,6 +428,151 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-54 … I-57, I-59, I-60, I-62 — `docs/workflow-format.md` truth pass
+
+Closed together as one sweep of the workflow authoring reference. **Every YAML example was
+verified by actually parsing it** — the implementer stood up a scratch crate with a path
+dependency on `rupu-orchestrator` and called `Workflow::parse` directly, rather than
+eyeballing the schema. That is what caught the errors below.
+
+- **I-54** — `action:` connector steps documented: the shape, parse-time catalog validation,
+  `with:`-key checking against the tool's JSON schema, the `ActionsOnActionStep` rule
+  (a step may not carry a non-empty `actions:` alongside `action:`), and Arc 4's
+  literal/whole-template/partial-template coercion rule.
+- **I-55** — `branch:` documented, including the transitive-arm rule taken **verbatim from
+  the `Branch` struct's doc comment** and `run_scheduler`'s `branch_skipped` logic, with a
+  worked "parses but is silently wrong" example. The implementer confirmed by parsing that
+  the wrong form **does** parse — proving it is a silent runtime bug, not a schema error,
+  which is precisely why it needed documenting.
+- **I-56** — the `wake_on:` example used `github.pull_request.closed`. GitHub PR canonical
+  ids are `github.pr.*`, never `github.pull_request.*` (confirmed in the connector's
+  `events.rs`), so that trigger could never fire. Fixed to `github.pr.opened`.
+- **I-57** — the `when:` example used `event.pull_request.merged`, which renders **empty**,
+  silently skipping the step forever. `build_event_payload` nests the vendor payload under
+  `event.payload.*`; corrected, and confirmed against that function's own unit test.
+- **I-59** — `next`, `depends_on`, `split`, `join`, `loops`, `max_concurrency` documented,
+  each **confirmed live-executed** via `run_scheduler`/`is_nonlinear` rather than parse-only.
+- **I-60** — `host:`/`distribute:`/`workspace:` remote placement documented, confirmed
+  executed through `UnitDispatcher` (not stubbed), plus the
+  `ActionsUnsupportedOnRemoteStep` rule.
+- **I-62** — `autoflow.entity` accepts `issue` **and** `pull_request`. Also fixed an
+  adjacent stale row the issue didn't mention: `claim.key` was documented as issue-only but
+  also accepts `pr_head_sha`.
+
+**A broken example of my own was found and fixed.** The gate-node `on_reject` example added
+in Arc 4 (commit `f0112477`) used `action: scm.prs.comment` with `with: { project: … }` —
+but that tool takes `owner`/`repo`, not `project`, so the example **did not parse**. Written
+while fixing documentation truth, and caught only because this pass parsed its examples
+instead of trusting them. It is now
+`with: { platform: github, owner: acme, repo: widget, number: 41, body: "rolled back" }`.
+
+**Not verified, recorded honestly:** whether `rupu webhook serve` produces an identical
+`event.*` envelope to the polled-on-cron-tick path that was traced. Only the polled-events
+plan has landed, so the polled path is what is documented; webhook-specific vocabulary is
+left to `docs/triggers.md`.
+
+---
+
+### I-50 … I-52, I-58, I-63 … I-69, I-71, I-72 — the docs truth pass (batch)
+
+Closed together as one sweep across every doc except `docs/workflow-format.md`. Each was
+verified against the code rather than against the filed text, and **two filed items were
+themselves wrong**.
+
+- **I-50** — README claimed "Rust 1.77+" in two places; the real pin is **1.95**
+  (`rust-toolchain.toml:2`, `Cargo.toml:32`). Note the *issue* said 1.88 — **the tracker
+  entry describing a doc-truth bug had itself gone stale**, which is a fair illustration of
+  why this arc exists.
+- **I-51** — README ×2, `docs/agent-format.md` and `docs/triggers.md` all still said
+  `actions:` is *not* a tool allowlist. It has been a real connector-subset narrowing since
+  #533/#537. The nuance now stated correctly: **builtins are never narrowed** — it
+  constrains connector/MCP tools only (confirmed in `step_factory.rs`'s
+  `narrow_agent_tools`).
+- **I-52** — `rupu run --agent <name>` was documented in two live pages and **that flag does
+  not exist**; `rupu run --help` offers only `--format`. The real form is positional:
+  `rupu run <agent> [target] [prompt]`. Files under `docs/superpowers/plans/` were left
+  alone as dated records.
+- **I-58 / I-72** — new `docs/configuration.md` documenting the real `~/.rupu/config.toml`
+  schema with **verified** defaults (e.g. `max_retries` = 1, sweep defaults on/60s,
+  `MAX_WORKSPACE_BYTES` = 256 MiB), including `[pricing]`. Deprecated-but-accepted keys
+  (`[retry]`, `[cp].agent_authoring_ui`, `[cp].workflow_editor_ui`) are marked as inert
+  shims, so nobody deletes them from a config expecting a behavior change or, worse, adds
+  them expecting one.
+- **I-63** — added exactly six frontmatter keys (`outputSchema`, `dispatchableAgents`,
+  `concerns`, `maxTokens`, `contextWindowTokens`, `compactAtPercent`) and three builtin
+  tools (`ast_grep`, `dispatch_agent`, `dispatch_agents_parallel`), verified against
+  `AgentSpec`/`Frontmatter` and `default_tool_registry()`.
+- **I-64** — documented **both** `action_emitted` shapes (the dead legacy finding shape and
+  the live action-node shape — see [[I-40]]). The filed issue said *two* event types were
+  undocumented; **there were three**: `assistant_delta`, `usage` and `tool_audit`, all
+  confirmed to have real production writers. All three documented.
+- **I-65** — the capability matrix claimed Linear and Jira have no `issues.*` support. Both
+  implement the full `IssueConnector` (`list/get/comment/create/update_state`) and are wired
+  into the registry. Matrix corrected.
+- **I-66** — "workflow steps and subagents don't support openai-compatible" was stale; they
+  resolve it today.
+- **I-67** — documented `rupu cp`, `host`, `node`, `update`. The filed issue **overstated
+  scope**: `session`, `autoflow` and `cleanup` were already thoroughly documented.
+- **I-68** — `--gate <step-id>` on `workflow approve|reject` confirmed to exist and now
+  documented, including why it is required when several gates are parked at once.
+- **I-69** (the only code change) — `rupu cp serve --help` described an HTTP server only.
+  It now names all three background loops (autoflow reconciler, cron/event tick, gate
+  sweep) and their gating `[cp]` keys. **Verified by running `--help`.**
+- **I-71** — subcommand table gained the seven missing commands; provider count corrected
+  4 → 5. `google-antigravity` was deliberately *excluded* as an internal Gemini SSO variant
+  rather than a separate user-facing provider.
+
+**Validation.** `cargo build --workspace` clean; README MSRV now reads 1.95 in both spots;
+`grep` for `run --agent` across live docs returns nothing; `rupu cp serve --help` verified
+by execution. Follow-up filed as [[I-86]].
+
+---
+
+### I-70 — the gate/action design spec is flagged as drifted
+
+**This is the drift that started the whole program.** The operator spotted that the spec's
+`with:` examples would fail schema validation and that it lists `scm.prs.add_labels`, which
+isn't in `tool_catalog()` — which prompted the audit that produced this tracker.
+
+**Verified.** `scm.prs.add_labels` appears in the spec's §3 v1 action set and **nowhere in
+the code** — a workflow copying it fails at parse time with `ActionsUnknownTool`. The real
+shipped catalog is 17 tools: `issues.create|comment|get|list|update_state`,
+`scm.prs.create|comment|get|list|diff`, `scm.branches.create|list`, `scm.repos.get|list`,
+`scm.files.read`, `github.workflows_dispatch`, `gitlab.pipeline_trigger`. The spec also
+predates two rules it therefore violates: `ActionsOnActionStep` and Arc 4's templated-value
+coercion.
+
+**Fix: a dated correction banner, not a rewrite.** Specs in this repo are records of what
+was approved on a date; editing the body would falsify the record. This is the same
+reasoning Arc 3 used to leave 18 historical plan/spec files untouched. The banner states
+plainly that the YAML must not be copied, lists the real catalog, and points at the
+authoritative references (`docs/workflow-format.md` and `rupu mcp` / `GET /api/tools`) — so
+the document stays honest as history without misleading anyone who reads it as guidance.
+
+---
+
+### I-53 + I-61 — closed by Arc 4, recorded here for the ledger
+
+Both were fixed while closing [[I-37]] in Arc 4 and are recorded rather than re-worked.
+
+**I-53 — gate nodes were entirely undocumented.** Found while writing I-37's `cp serve`
+dependency note: standalone `approval:` gate nodes had **no user-facing documentation at
+all** — `on_timeout`, `auto_approve`, `on_reject` and `notify` appeared nowhere in `docs/`.
+A shipped feature with no docs. `docs/workflow-format.md` now has a "Gate nodes (standalone
+`approval:` steps)" section with the field table, the `steps.<gate-id>.decision` note, and
+the unattended-routing subsection.
+
+**I-61 — "timeouts are enforced lazily on the next run-store interaction" was stale.** True
+when written; **false since Arc 2** made the runs listing side-effect-free ([[I-25]]).
+Removed in the same edit, and replaced with the accurate statement that timeout routing is
+performed by `cp serve`'s gate sweep — which is what [[I-80]] tracks the operator
+consequence of.
+
+**Validation.** `grep -c "Gate nodes (standalone" docs/workflow-format.md` → 1;
+`grep -c "enforced lazily" docs/workflow-format.md` → 0.
+
+---
 
 ### I-45 + I-46 — the Gemini thinking config is model-gated and lowercase
 
