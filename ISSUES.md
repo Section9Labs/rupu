@@ -82,13 +82,13 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 |---|---|---|---|---|
 | I-33 | P0 | rupu-orchestrator | Action steps cannot take a templated number — the headline use case is unexpressible | open |
 | I-34 | P0 | rupu-orchestrator | `{{ steps.<action>.output }}` is an unindexable JSON string; no `fromjson` filter exists | open |
-| I-35 | P0 | rupu-cp | CP web reject (and host-connector, TUI, cancel) skips the `on_reject` chain entirely | open |
+| I-35 | P0 | rupu-cp | Web, local/http connector, desktop-app and **both cancel** paths skip the `on_reject` chain (no TUI exists; SSH/tunnel are fine) | open |
 | I-36 | P1 | rupu-orchestrator | A reject with an empty `on_reject` chain records no gate decision at all | open |
 | I-37 | P1 | rupu-cli | `on_timeout: approve` never resumes without `cp serve` — the lazy path only prints a hint | open |
 | I-38 | P1 | rupu-orchestrator | A timeout-driven approval is recorded as `via: "human"` | open |
-| I-39 | P1 | rupu-orchestrator | `StepKind` has no `#[serde(other)]`; old binaries die on new `events.jsonl` | open |
-| I-40 | P1 | rupu-cp web | The CP transcript viewer discards `action_emitted` — action steps show an empty transcript | open |
-| I-41 | P2 | rupu-cli | `rupu workflow show` renders gate and action steps as `linear` with a blank primary column | open |
+| I-39 | P1 | rupu-orchestrator | `StepKind` has no `#[serde(other)]`; an unknown kind **silently drops the whole step result** on resume (readers skip, they do not die) | open |
+| I-40 | P2 | rupu-cp web | The CP transcript never shows an action step's rendered `with:` args (the node itself *does* render via `tool_audit`) | open |
+| I-41 | P2 | rupu-cli | `rupu workflow show`'s **steps table** lacks gate/action arms (the graph, the primary view, is correct) | open |
 | I-42 | P2 | rupu-orchestrator | A `when:`-skipped gate/action loses its kind and persists as `Linear` | open |
 | I-43 | P2 | rupu-cli | The gate sweep can re-spawn `workflow approve` every tick forever, with no backoff | open |
 | I-44 | P2 | rupu-orchestrator | `notify` hooks write orphan transcript files no `StepResult` references | open |
