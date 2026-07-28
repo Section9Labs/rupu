@@ -88,7 +88,7 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-37 | P1 | rupu-cli | `on_timeout: approve` never resumes without `cp serve` — the lazy path only prints a hint | open |
 | I-38 | P1 | rupu-orchestrator | A timeout-driven approval is recorded as `via: "human"` | open |
 | I-39 | P1 | rupu-orchestrator | `StepKind` has no `#[serde(other)]`; an unknown kind **silently drops the whole step result** on resume (readers skip, they do not die) | open |
-| I-40 | P2 | rupu-cp web | The CP transcript never shows an action step's rendered `with:` args (the node itself *does* render via `tool_audit`) | open |
+| I-40 | P2 | rupu-cp web | The CP transcript never shows an action step's rendered `with:` args (the node itself *does* render via `tool_audit`) | fixed |
 | I-41 | P2 | rupu-cli | `rupu workflow show`'s **steps table** lacks gate/action arms (the graph, the primary view, is correct) | open |
 | I-42 | P2 | rupu-orchestrator | A `when:`-skipped gate/action loses its kind and persists as `Linear` | open |
 | I-43 | P2 | rupu-cli | The gate sweep can re-spawn `workflow approve` every tick forever, with no backoff | open |
@@ -307,6 +307,45 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-40 — an action step's rendered `with:` args are now visible
+
+**The filed title was wrong**, and correcting it changed the work. It claimed action steps
+show an *empty transcript*. They do not: `execute_action_step` writes **two** lines
+(`ActionEmitted` and `ToolAudit`), and the viewer already had a dedicated standalone-action
+fallback for `tool_audit` (`transcriptView.ts:364`) with a passing test at
+`transcriptView.test.ts:369`. The node rendered fine.
+
+**The real gap** was the `action_emitted` payload — the **rendered `with:` args**, plus
+`allowed`/`applied`/`reason`. So an operator could see *that* an action ran but never
+*what it sent*, which for a tool that comments on issues or opens PRs is the part that
+matters.
+
+**Root cause.** `action_emitted` fell through to `default: break`, under a comment calling
+it a "dead/legacy shape". That was half true: **two distinct shapes share the event name.**
+The legacy finding shape (`{action: 'report_finding', severity, summary}`) genuinely is
+dead. The action-node shape (`{kind, payload, allowed, applied}`) is live and carries the
+args. Treating both as dead discarded the live one.
+
+**Fix.** The action-node shape's payload is stashed (queued by tool name, since a step may
+call the same tool twice) and picked up by the `tool_audit` that immediately follows,
+producing a **single merged entry** with `input` populated instead of `undefined`. The
+legacy shape stays ignored.
+
+**Why this respects the existing regression test rather than overriding it.** Two tests
+deliberately asserted `action_emitted` stays ignored; the plan flagged that they must be
+revised deliberately, not deleted. On inspection the real invariant that test protects is
+*"an action call is surfaced exactly once, never twice"* — and merging preserves it
+exactly. **The test passes unchanged.** Only its name and comment were corrected, because
+"action_emitted stays dead" no longer describes what it guards. The stale
+`transcriptView.ts` comment was corrected for the same reason — still true of
+`user_message`, no longer true of `action_emitted`.
+
+**Validation.** Two new tests: the args are visible on the merged entry, and a legacy
+`report_finding` payload is **not** mistaken for action args. Suite 1854 → 1856 across 179
+files, `npm run build` clean.
+
+---
 
 ### I-33 — a templated scalar now reaches a typed tool parameter
 
