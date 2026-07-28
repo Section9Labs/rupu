@@ -120,16 +120,40 @@ Confirmed by `cargo tree` against both target triples: the Windows graph does **
 
 ### 3. Credentials on Linux: file backend
 
-`keyring` moves from a flat `[workspace.dependencies]` entry to per-target dependency
-tables in its two consumers, `rupu-auth` and `rupu-workspace`. On Linux the crate is not a
-dependency at all.
+**Correction to an earlier assumption:** the file backend is already the default on every
+platform. `KeychainResolver::with_service` (`crates/rupu-auth/src/resolver.rs:97-135`)
+resolves `RUPU_AUTH_BACKEND` → probe cache → **file**, and the comment there explains why
+(cdhash-bound keychain requirements break bare CLI binaries on every rebuild). Only the
+module-level doc comment at `resolver.rs:44-51` still describes keyring-as-default; it is
+stale and should be corrected. So no default-flipping work is required.
 
-`KeychainResolver` (`crates/rupu-auth/src/resolver.rs`) and `host_store`
-(`crates/rupu-workspace/src/host_store.rs`) default to the existing JSON-file backend on
-Linux: `~/.rupu/auth.json`, permissions reset to 0600 on every write, a `tracing::warn!` if
-the file is found wider than 0600. That code path already exists and is tested
-(`crates/rupu-auth/src/json_file.rs`); this makes it the default rather than an
-`RUPU_AUTH_BACKEND=file` opt-in.
+What is actually required is removing the dependency, which is more invasive than flipping
+a default. `keyring` moves from a flat `[workspace.dependencies]` entry to per-target
+dependency tables in its two consumers, `rupu-auth` and `rupu-workspace`, so that on Linux
+the crate is absent entirely. Because `keyring::Error` is woven into public API surface,
+that requires `cfg`-gating across six files:
+
+| File | Keyring surface to gate |
+|---|---|
+| `crates/rupu-auth/src/backend.rs:60` | `AuthError::Keyring(#[from] keyring::Error)` variant |
+| `crates/rupu-auth/src/keyring.rs` | whole module (`KeyringBackend`) |
+| `crates/rupu-auth/src/lib.rs:41` | `pub use keyring::KeyringBackend` |
+| `crates/rupu-auth/src/probe.rs:11` | keychain-availability probe |
+| `crates/rupu-auth/src/resolver.rs` | `Storage::Keyring` variant + its match arms |
+| `crates/rupu-workspace/src/host_store.rs:39-40` | `HostStoreError::Keyring` variant |
+
+**No mock store.** `keyring` v3 compiles on Linux with no platform feature enabled by
+falling back to an in-memory mock credential store. That must not ship: it would accept
+writes and lose them silently, which is precisely the silent-noop failure mode this project
+rejects. Removing the dependency outright is what makes the failure honest.
+
+Consequently `rupu auth backend --use keychain` must return an explicit
+"not supported on this platform" error on Linux (`crates/rupu-cli/src/cmd/auth.rs:443`
+already has the unknown-backend error path to extend), never a silent fallback.
+
+The file backend itself is unchanged: `~/.rupu/auth.json`, permissions reset to 0600 on
+every write, a `tracing::warn!` if found wider than 0600
+(`crates/rupu-auth/src/json_file.rs`).
 
 **Stated plainly:** with the dependency removed there is no keyring option on Linux. Desktop
 Linux users get plaintext-with-0600, not gnome-keyring or KWallet. This is accepted
