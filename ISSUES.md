@@ -65,6 +65,7 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-78 | P1 | rupu-orchestrator | A workflow step at `--mode ask` still gets `BypassDecider` — `ask` grants full tool access | open |
 | I-79 | P2 | rupu-cli | The action dispatcher's `["*"]` allowlist is sound only by invariant, not by construction | open |
 | I-80 | P2 | rupu-cli/docs | Reject-timeout gates now resolve only via `cp serve`'s sweep; CLI-only operators lose auto-resolution | open |
+| I-81 | P2 | rupu-mcp | `tools_list_matches_snapshot` fails in this worktree — schemars field-order drift under Homebrew 1.95 vs pinned 1.88 | open |
 
 ### Arc 3 — single UI path
 
@@ -80,7 +81,7 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 | ID | Sev | Area | Title | Status |
 |---|---|---|---|---|
-| I-33 | P0 | rupu-orchestrator | Action steps cannot take a templated number — the headline use case is unexpressible | open |
+| I-33 | P0 | rupu-orchestrator | Action steps cannot take a templated number — the headline use case is unexpressible | fixed |
 | I-34 | P0 | rupu-orchestrator | `{{ steps.<action>.output }}` is an unindexable JSON string; no `fromjson` filter exists | fixed |
 | I-35 | P0 | rupu-cp | Web, local/http connector, desktop-app and **both cancel** paths skip the `on_reject` chain (no TUI exists; SSH/tunnel are fine) | open |
 | I-36 | P1 | rupu-orchestrator | A reject with an empty `on_reject` chain records no gate decision at all | open |
@@ -134,6 +135,29 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 ---
 
 ## Open
+
+### I-81 — `tools_list_matches_snapshot` fails in this worktree
+
+**Symptom.** `cargo test -p rupu-mcp` reports
+`tools_list_matches_snapshot ... FAILED — tools/list snapshot drift`
+(`crates/rupu-mcp/tests/schema_snapshot.rs:36`).
+
+**Not caused by this program.** Verified: `git diff origin/main..HEAD --name-only` shows
+**zero** `rupu-mcp` files changed across Arcs 1–4. The last commit to touch that snapshot
+was itself `8cea2495 test: bless tools_list snapshot (field order)`, i.e. it has drifted on
+field ordering before.
+
+**Root cause (probable).** Same class as [[I-4]] and [[I-5]]: this worktree runs Homebrew
+Rust 1.95 against a `rust-toolchain.toml` pinned at 1.88, and `schemars` emits schema
+properties in a different order under the newer compiler. Not confirmed by bisect — filed
+so the known-red baseline is written down rather than rediscovered each arc.
+
+**Fix.** Confirm it reproduces on a clean `main` under 1.95 and passes under 1.88. If so it
+is an environment artifact, and the durable fix is making the snapshot order-insensitive
+(compare parsed JSON with sorted keys) rather than blessing it again — a blessed snapshot
+will just re-drift for the next person on a different toolchain.
+
+---
 
 ### I-80 — reject-timeout gates now resolve only via `cp serve`'s sweep
 
@@ -283,6 +307,60 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-33 — a templated scalar now reaches a typed tool parameter
+
+**Symptom.** The `action:` feature's headline use case — *"comment on issue #N"*, where N
+comes from a workflow input or a trigger event — was **literally unexpressible**. Writing
+`number: "{{ inputs.number }}"` failed at dispatch with
+`invalid type: string "42", expected u64`.
+
+**Root cause.** Three layers each behaving reasonably, combining into a dead end:
+`validate_action_step` (`workflow.rs:1319`) deliberately checks **keys only** — its own
+doc comment says *"VALUES are not checked — they may be minijinja templates rendered at
+runtime (the dispatcher's typed serde parse re-validates then)"*. `render_action_args`
+(`runner.rs:4528`) rendered a string leaf to `serde_json::Value::String`
+**unconditionally**. The dispatcher then did a typed serde parse (e.g.
+`CommentIssueArgs { number: u64, .. }`) which rejects `"42"`. No coercion existed anywhere
+(`deserialize_with`/`as_u64` in `crates/rupu-mcp/src`: zero hits).
+
+Aggravating: a declared `type: int` input could not help, because `StepContext.inputs` is
+`BTreeMap<String, String>` and `render_step_prompt` returns `String` regardless of source.
+The same applied to `{{ event.issue.number }}`.
+
+**Scope.** Every integer parameter in the catalog — `issues.get/comment/update_state.number`
+(u64), `scm.prs.get/diff/comment.number` (u32), every `.limit`. The only workaround was a
+literal unquoted `number: 7`, which is exactly what the repo's own fixture used
+(`tests/action_step.rs:259`) — **every pre-existing test templated only string fields**,
+which is why this survived.
+
+**Fix.** `render_action_args` now coerces against the tool's declared JSON-schema type,
+resolved through a shared `schema_scalar_kind` helper so "which types are coercible" has
+exactly one definition, used by both the renderer and the parser. Two deliberate judgment
+calls:
+- **Coercion fires only when the schema declares `integer`/`number`/`boolean`** — never
+  inferred from the value's shape. Inferring would mangle `"007"` and version strings in
+  genuine string fields.
+- **A *partial* template into a typed field** (`"issue-{{ n }}"`) is an author error and is
+  rejected, not coerced.
+
+Failures raise `RenderError::ActionArgType` naming the parameter and expected type, rather
+than surfacing a bare downstream serde message. Parse-time checking was also added for
+*literal* wrong-type values, so authors fail fast at `Workflow::parse` instead of mid-run.
+
+**Validation.** RED observed as the exact predicted error. Tests:
+`templated_numeric_field_reaches_the_connector_as_a_json_number` (asserts the connector
+received a JSON **number**, not a string — the binding assertion),
+`non_numeric_template_into_a_numeric_field_fails_naming_step_and_param`,
+`numeric_looking_string_in_a_string_field_is_not_mangled` (the over-coercion guard), and
+`action_step_literal_string_for_numeric_param_fails_parse`. A new `RecordingIssueConnector`
+fixture was needed — the existing harness only had a `RepoConnector`, which is itself a
+sign of how little the issue-tool path was exercised.
+
+No tool's schema shape defeated the lookup. `workflows.dispatch.inputs` and
+`pipeline_trigger.variables` are correctly left uncoerced by design.
+
+---
 
 ### I-34 — an action step's output is now indexable
 
