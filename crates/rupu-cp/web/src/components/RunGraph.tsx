@@ -27,7 +27,6 @@ import type { GraphNode, RunGraphModel } from '../lib/runGraphModel';
 import type { StepNodeDto } from '../lib/api';
 import type { Pos } from '../lib/graphLayout';
 import { useThemeColors } from '../lib/useThemeColors';
-import { useWorkflowEditorUi, type WorkflowEditorUi } from '../hooks/useWorkflowEditorUi';
 import { runKindAccent } from './graph/kindBridge';
 import StepNode from './graph/StepNode';
 import ParallelNode from './graph/ParallelNode';
@@ -71,8 +70,6 @@ const NODE_TYPES: NodeTypes = {
 
 interface NodeData extends Record<string, unknown> {
   node: GraphNode;
-  /** Resolved visual language — 'next' turns on the kind-colored paint. */
-  ui: WorkflowEditorUi;
   onOpenUnit?: (stepId: string, index: number) => void;
   onExpandFanout?: (stepId: string) => void;
 }
@@ -103,7 +100,6 @@ export default function RunGraph(props: Props) {
 
 function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectNode }: Props) {
   const colors = useThemeColors();
-  const ui = useWorkflowEditorUi();
   // Clicking a fan-out unit square selects that unit's transcript AND keeps the
   // existing drill behavior. Wrap onOpenUnit so the unit click does both.
   const handleOpenUnit = useCallback(
@@ -150,12 +146,12 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
         id: node.id,
         type: flowKind(node.kind),
         position: pos ? { x: pos.x, y: pos.y } : { x: 0, y: 0 },
-        data: { node, ui, onOpenUnit: handleOpenUnit, onExpandFanout },
+        data: { node, onOpenUnit: handleOpenUnit, onExpandFanout },
         draggable: false,
         selectable: true,
       };
     });
-  }, [model, positions, ui, handleOpenUnit, onExpandFanout]);
+  }, [model, positions, handleOpenUnit, onExpandFanout]);
 
   const edges = useMemo<Edge[]>(() => {
     return model.edges.map((e) => {
@@ -164,32 +160,11 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
       const active = targetState === 'running';
       const awaiting = targetState === 'awaiting_approval';
 
-      if (ui !== 'next') {
-        // Classic — unchanged: flat inkMute, with the blue/amber marching-ants
-        // classes (rg-edge-active / rg-edge-await) owning both color and
-        // animation for the live frontier. `animated` stays off — it would
-        // double up on top of the CSS dash animation.
-        const stroke = active
-          ? colors.status.running
-          : awaiting
-            ? colors.status.awaiting
-            : colors.inkMute;
-        return {
-          id: `${e.from}->${e.to}`,
-          source: e.from,
-          target: e.to,
-          type: 'smoothstep',
-          className: active ? 'rg-edge-active' : awaiting ? 'rg-edge-await' : undefined,
-          markerEnd: { type: MarkerType.ArrowClosed, color: stroke },
-          style: active || awaiting ? undefined : { stroke, strokeWidth: 2 },
-        };
-      }
-
-      // Next — the connector takes its SOURCE step's kind color; the live
-      // frontier animates via the color-agnostic `rg-edge-flow` class (stroke
-      // supplied here in JS so the ants march in ANY kind color). An awaiting
-      // gate is the one place status wins over kind: amber reads as "needs
-      // you" regardless of what kind of step precedes it.
+      // The connector takes its SOURCE step's kind color; the live frontier
+      // animates via the color-agnostic `rg-edge-flow` class (stroke supplied
+      // here in JS so the ants march in ANY kind color). An awaiting gate is
+      // the one place status wins over kind: amber reads as "needs you"
+      // regardless of what kind of step precedes it.
       const source = model.nodeById(e.from);
       const accent = source ? runKindAccent(source.kind) : 'inkMute';
       const traversed = active || targetState === 'done';
@@ -208,7 +183,7 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
         style: { stroke, strokeWidth: 2 },
       };
     });
-  }, [model, colors, ui]);
+  }, [model, colors]);
 
   if (model.nodes.length === 0) {
     return (

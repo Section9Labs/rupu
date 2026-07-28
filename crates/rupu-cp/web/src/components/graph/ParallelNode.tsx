@@ -10,12 +10,9 @@ import { stateStyle } from './stepStyle';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { nodeSize } from '../../lib/nodeSize';
 import { runKindAccent } from './kindBridge';
-import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 
 export interface ParallelNodeData extends Record<string, unknown> {
   node: GraphNode;
-  /** 'next' turns on the kind-colored container tint; absent/'classic' keeps today's. */
-  ui?: WorkflowEditorUi;
 }
 
 type ParallelFlowNode = Node<ParallelNodeData, 'parallel'>;
@@ -23,10 +20,9 @@ type ParallelFlowNode = Node<ParallelNodeData, 'parallel'>;
 function ParallelNodeView({ data }: NodeProps<ParallelFlowNode>) {
   const { node } = data;
   const colors = useThemeColors();
-  const next = data.ui === 'next';
-  // Container identity: in next this is the SAME accent the editor paints
-  // 'parallel' with (sev.critical); classic keeps the legacy brand tint.
-  const accentKey = next ? runKindAccent(node.kind) : 'brand.500';
+  // Container identity: the SAME accent the editor paints 'parallel' with
+  // (sev.critical).
+  const accentKey = runKindAccent(node.kind);
   const handleStyle = {
     background: colors.alpha(accentKey, 0.5),
     width: 6,
@@ -53,11 +49,8 @@ function ParallelNodeView({ data }: NodeProps<ParallelFlowNode>) {
       <Handle type="target" position={Position.Left} style={handleStyle} />
 
       <div
-        className={[
-          'mb-1.5 flex items-center justify-between gap-3 text-meta font-bold uppercase tracking-wide',
-          next ? '' : 'text-brand-500',
-        ].join(' ')}
-        style={next ? { color: colors.get(accentKey) } : undefined}
+        className="mb-1.5 flex items-center justify-between gap-3 text-meta font-bold uppercase tracking-wide"
+        style={{ color: colors.get(accentKey) }}
       >
         <span className="truncate">parallel · {node.id}</span>
         <span className="tabular-nums">

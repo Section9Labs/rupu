@@ -6,8 +6,8 @@ import { ReactFlowProvider } from '@xyflow/react';
 import StepNode from './StepNode';
 import type { GraphNode } from '../../lib/runGraphModel';
 
-function renderNode(node: Partial<GraphNode>, ui?: 'classic' | 'next') {
-  const data = { node: { id: 'build', kind: 'step', state: 'running', ...node } as GraphNode, ui };
+function renderNode(node: Partial<GraphNode>) {
+  const data = { node: { id: 'build', kind: 'step', state: 'running', ...node } as GraphNode };
   return render(
     <ReactFlowProvider>
       {/* React Flow node components are called with (props); the harness in
@@ -22,14 +22,8 @@ function renderNode(node: Partial<GraphNode>, ui?: 'classic' | 'next') {
 afterEach(cleanup);
 
 describe('StepNode', () => {
-  it('classic: renders the step id and the neutral kind chip', () => {
-    renderNode({}, 'classic');
-    expect(screen.getByText('build')).toBeInTheDocument();
-    expect(screen.getByText('step')).toBeInTheDocument();
-  });
-
-  it('next: keeps the status overlay legible on a FAILED step', () => {
-    renderNode({ state: 'failed' }, 'next');
+  it('keeps the status overlay legible on a FAILED step', () => {
+    renderNode({ state: 'failed' });
     // the status glyph + label must survive the kind repaint
     expect(screen.getByText('✕')).toBeInTheDocument();
     expect(screen.getByText('failed')).toBeInTheDocument();
@@ -37,8 +31,8 @@ describe('StepNode', () => {
     expect(screen.getByText('step')).toBeInTheDocument();
   });
 
-  it('next: renders a kind pill for the step kind', () => {
-    renderNode({ kind: 'step' }, 'next');
+  it('renders a kind pill for the step kind', () => {
+    renderNode({ kind: 'step' });
     expect(screen.getByTestId('rg-kindpill')).toHaveTextContent('step');
   });
 });

@@ -213,26 +213,11 @@
 @keyframes rg-march {
   to { stroke-dashoffset: -28; }
 }
-/* xyflow renders the edge as `path.react-flow__edge-path`; mark the
- * active/awaiting edges via a wrapper class on the <g> and animate the
- * dashed stroke so the ants march along the rendered curve. */
-.react-flow__edge.rg-edge-active .react-flow__edge-path {
-  stroke: rgb(var(--c-status-running));
-  stroke-width: 2;
-  stroke-dasharray: 7 7;
-  animation: rg-march 0.7s linear infinite;
-}
-.react-flow__edge.rg-edge-await .react-flow__edge-path {
-  stroke: rgb(var(--c-status-awaiting));
-  stroke-width: 2;
-  stroke-dasharray: 6 6;
-  animation: rg-march 0.9s linear infinite;
-}
-
-/* `next` run-graph flow: animation only, no color. The stroke is supplied by
- * the edge's inline style (RunGraph's edge memo) so the marching-ants can
- * render in ANY per-kind accent. Classic keeps .rg-edge-active/.rg-edge-await
- * above, which bake their own blue/amber stroke. */
+/* xyflow renders the edge as `path.react-flow__edge-path`; mark the live
+ * frontier edge via a wrapper class on the <g> and animate the dashed
+ * stroke so the ants march along the rendered curve. Animation only, no
+ * color — the stroke is supplied by the edge's inline style (RunGraph's edge
+ * memo) so the marching-ants can render in ANY per-kind accent. */
 .react-flow__edge.rg-edge-flow .react-flow__edge-path {
   stroke-width: 2;
   stroke-dasharray: 7 7;

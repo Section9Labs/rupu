@@ -1,8 +1,7 @@
 // @vitest-environment jsdom
-// RunGraph edges — classic keeps the flat/blue/amber status styling; next
-// colors each edge by its SOURCE step's kind and animates only the live
-// frontier. We assert on the Edge objects React Flow is handed, by mocking
-// @xyflow/react's ReactFlow to capture its props.
+// RunGraph edges — every edge is colored by its SOURCE step's kind and
+// animates only the live frontier. We assert on the Edge objects React Flow
+// is handed, by mocking @xyflow/react's ReactFlow to capture its props.
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { render, cleanup } from '@testing-library/react';
@@ -19,11 +18,6 @@ vi.mock('@xyflow/react', async () => {
     },
   };
 });
-
-const uiMock = vi.fn(() => 'classic');
-vi.mock('../hooks/useWorkflowEditorUi', () => ({
-  useWorkflowEditorUi: () => uiMock(),
-}));
 
 import RunGraph from './RunGraph';
 import type { RunGraphModel, GraphNode } from '../lib/runGraphModel';
@@ -66,7 +60,6 @@ for (const [k, v] of Object.entries(CSS_VARS)) {
 afterEach(() => {
   cleanup();
   captured = [];
-  uiMock.mockReturnValue('classic');
 });
 
 const POS = new Map([
@@ -75,17 +68,7 @@ const POS = new Map([
 ]);
 
 describe('RunGraph edges', () => {
-  it('classic: the edge into a running step keeps the rg-edge-active class', () => {
-    const model = modelWith(
-      [node('a', 'action', 'done'), node('b', 'step', 'running')],
-      [{ from: 'a', to: 'b' }],
-    );
-    render(<RunGraph model={model} positions={POS} />);
-    expect(captured[0].className).toBe('rg-edge-active');
-  });
-
-  it('next: an edge is colored by its SOURCE kind and the live one flows', () => {
-    uiMock.mockReturnValue('next');
+  it('an edge is colored by its SOURCE kind and the live one flows', () => {
     const model = modelWith(
       [node('a', 'action', 'done'), node('b', 'step', 'running')],
       [{ from: 'a', to: 'b' }],
@@ -97,13 +80,12 @@ describe('RunGraph edges', () => {
     // ...and its stroke comes from JS: the SOURCE step is an `action` step,
     // whose kind accent is `sev.info` (see kindVisuals.KIND_ACCENT), so the
     // stroke must be the seeded --c-sev-info value, and NOT the running-blue
-    // the classic path would use.
+    // a status-only stroke would use.
     expect(edge.style?.stroke).toBe('rgb(100 116 139)');
     expect(edge.style?.stroke).not.toBe('rgb(59 130 246)');
   });
 
-  it('next: an edge into an awaiting gate flows in amber, not the source kind color', () => {
-    uiMock.mockReturnValue('next');
+  it('an edge into an awaiting gate flows in amber, not the source kind color', () => {
     const model = modelWith(
       [node('a', 'action', 'done'), node('b', 'gate', 'awaiting_approval')],
       [{ from: 'a', to: 'b' }],
@@ -124,8 +106,7 @@ describe('RunGraph edges', () => {
     expect(captured[0].style?.stroke).not.toBe(awaitEdge.style?.stroke);
   });
 
-  it('next: a not-yet-reached edge is muted relative to a traversed one', () => {
-    uiMock.mockReturnValue('next');
+  it('a not-yet-reached edge is muted relative to a traversed one', () => {
     const done = modelWith(
       [node('a', 'step', 'done'), node('b', 'step', 'done')],
       [{ from: 'a', to: 'b' }],
