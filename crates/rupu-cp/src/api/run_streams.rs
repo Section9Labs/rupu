@@ -106,6 +106,15 @@ struct StandaloneMetaDto {
     session_id: Option<String>,
     #[serde(default)]
     trigger_source: Option<String>,
+    /// The OS pid of the `rupu run`/`rupu session` process that owns this
+    /// transcript (`StandaloneRunMetadata::pid`,
+    /// `crates/rupu-cli/src/standalone_run_metadata.rs`), written BEFORE the
+    /// agent loop starts. `#[serde(default)]` so metadata predating this
+    /// field (no `pid` key at all) still deserializes to `None` instead of
+    /// erroring the row. `None` here means "no liveness signal" — treated
+    /// exactly like today (falls into the completed group), never guessed at.
+    #[serde(default)]
+    pid: Option<u32>,
 }
 
 /// Minimal CP-side projection of one entry in `session.json`'s `runs` array.
@@ -338,13 +347,38 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
             }
         }
 
+        // Standalone meta.json carries no `status` field by design (see the
+        // struct doc comment above) — `rupu run` writes it BEFORE the agent
+        // loop starts. The `pid` field (added alongside the CLI's
+        // duplicate-execution guard) is the one liveness signal we DO have:
+        // when it's present and the process is still alive, the run is
+        // running right now, no matter how stale the on-disk metadata looks.
+        // No pid at all (legacy metadata, or the process has already
+        // exited and nothing has updated the row) falls through to `None`
+        // exactly as before — never guessed at.
+        //
+        // Known caveat: pid reuse. If the owning process exited and the OS
+        // later hands the same pid to an unrelated process, this reports the
+        // long-finished run as `running`. That fails safe, not silent: the
+        // pill shows Running (a stale-but-recoverable false positive, not a
+        // false "safe to delete"), and the archive/delete guard this pid
+        // field was added for (`crates/rupu-cli/src/cmd/transcript.rs`)
+        // already refuses to touch a run with a live-looking pid — an
+        // operator who knows better can override it with `--ignore-liveness`
+        // on the CLI. We accept the rare false positive in exchange for never
+        // fabricating a status for a run that might genuinely still be going.
+        let status = match dto.pid {
+            Some(pid) if rupu_orchestrator::runs::pid_is_running(pid) => Some("running".to_string()),
+            _ => None,
+        };
+
         rows.push(AgentRunRow {
             run_id: dto.run_id,
             source: "standalone",
             agent,
             session_id: dto.session_id,
             trigger_source: dto.trigger_source,
-            status: None, // standalone meta does not carry run status
+            status,
             started_at,
             transcript_path,
             usage: crate::usage::UsageSummary::default(),
@@ -1048,6 +1082,61 @@ mod tests {
         assert!(agent_in_lifecycle(Some("running"), None)); // no filter → all
     }
 
+    // ── standalone-run liveness (pid) drives status ────────────────────────────
+    //
+    // A `rupu run` writes `<run_id>.meta.json` BEFORE the agent loop starts,
+    // and standalone metadata carries no `status` field — so a genuinely
+    // live run's row used to fall straight into the "completed" lifecycle
+    // group (`agent_in_lifecycle(None, Some("completed"))` == true). The
+    // `pid` field added for the CLI's duplicate-execution guard is the
+    // liveness signal that fixes this: when it's present and the process is
+    // still alive, report the row as `running` — the exact string the
+    // status pill's `RunStatusStr`/`STATUS.running` lexicon and
+    // `agent_in_lifecycle`'s `"active"` group already understand. A dead or
+    // absent pid must behave exactly as before.
+
+    #[test]
+    fn standalone_run_with_live_pid_reports_running_and_is_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The test process's own pid is guaranteed alive for the test's
+        // duration — no need to spawn a child process to get a live pid.
+        let live_pid = std::process::id();
+        write_standalone_meta_with_pid(tmp.path(), "run_live", live_pid);
+
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status.as_deref(), Some("running"));
+        assert!(agent_in_lifecycle(rows[0].status.as_deref(), Some("active")));
+        assert!(!agent_in_lifecycle(
+            rows[0].status.as_deref(),
+            Some("completed")
+        ));
+    }
+
+    #[test]
+    fn standalone_run_with_dead_pid_behaves_exactly_as_today() {
+        let tmp = tempfile::tempdir().unwrap();
+        // u32::MAX is not a valid live pid on any supported platform.
+        write_standalone_meta_with_pid(tmp.path(), "run_dead", u32::MAX);
+
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, None);
+        assert!(agent_in_lifecycle(rows[0].status.as_deref(), Some("completed")));
+    }
+
+    #[test]
+    fn standalone_run_with_no_pid_behaves_exactly_as_today() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Legacy metadata predating the `pid` field — no `pid` key at all.
+        write_standalone_meta(tmp.path(), "run_legacy", None, None);
+
+        let rows = collect_standalone_runs(tmp.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, None);
+        assert!(agent_in_lifecycle(rows[0].status.as_deref(), Some("completed")));
+    }
+
     // ── A1: collect_standalone_runs fills agent + started_at ──────────────────
 
     /// Write `<global>/transcripts/<run_id>.meta.json` + a matching
@@ -1065,6 +1154,24 @@ mod tests {
             "run_id": run_id,
             "session_id": session_id,
             "trigger_source": trigger_source,
+        });
+        fs::write(
+            dir.join(format!("{run_id}.meta.json")),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Like `write_standalone_meta`, but also stamps a `pid` field — the
+    /// liveness signal `StandaloneRunMetadata::pid` adds on the CLI side.
+    fn write_standalone_meta_with_pid(global: &std::path::Path, run_id: &str, pid: u32) {
+        let dir = global.join("transcripts");
+        fs::create_dir_all(&dir).unwrap();
+        let meta = serde_json::json!({
+            "run_id": run_id,
+            "session_id": null,
+            "trigger_source": null,
+            "pid": pid,
         });
         fs::write(
             dir.join(format!("{run_id}.meta.json")),
