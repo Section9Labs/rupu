@@ -67,6 +67,11 @@ pub enum Action {
     Archive {
         #[arg(add = ArgValueCompleter::new(standalone_transcript_run_ids))]
         run_id: String,
+        /// Skip the still-running check; only use when the recorded pid was
+        /// reused by an unrelated process — deleting a live run's transcript
+        /// loses it.
+        #[arg(long)]
+        ignore_liveness: bool,
     },
     /// Permanently delete a standalone transcript and its metadata.
     Delete(DeleteArgs),
@@ -80,6 +85,12 @@ pub struct DeleteArgs {
     pub run_id: String,
     #[arg(long)]
     pub force: bool,
+    /// Skip the still-running check; only use when the recorded pid was
+    /// reused by an unrelated process — deleting a live run's transcript
+    /// loses it. Independent of `--force`: both are required to delete a
+    /// transcript that still looks live.
+    #[arg(long)]
+    pub ignore_liveness: bool,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -115,7 +126,10 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
             };
             show(&run_id, view, no_color, pager_flag, global_format).await
         }
-        Action::Archive { run_id } => archive(&run_id).await,
+        Action::Archive {
+            run_id,
+            ignore_liveness,
+        } => archive(&run_id, ignore_liveness).await,
         Action::Delete(args) => delete(args).await,
         Action::Prune(args) => prune(args, global_format).await,
     };
@@ -1556,14 +1570,16 @@ struct TranscriptLocation {
     archived: bool,
 }
 
-async fn archive(run_id: &str) -> anyhow::Result<()> {
+async fn archive(run_id: &str, ignore_liveness: bool) -> anyhow::Result<()> {
     let location = locate_transcript(run_id)?;
     if location.archived {
         anyhow::bail!("transcript already archived: {run_id}");
     }
     let mut metadata = load_metadata_if_present(&location)?;
     ensure_standalone_transcript(run_id, metadata.as_ref())?;
-    ensure_standalone_not_running(run_id, "archive", metadata.as_ref())?;
+    if !ignore_liveness {
+        ensure_standalone_not_running(run_id, "archive", metadata.as_ref())?;
+    }
     let archived_dir = paths::archived_transcripts_dir(
         location
             .transcript_path
@@ -1592,7 +1608,9 @@ async fn delete(args: DeleteArgs) -> anyhow::Result<()> {
     let location = locate_transcript(&args.run_id)?;
     let metadata = load_metadata_if_present(&location)?;
     ensure_standalone_transcript(&args.run_id, metadata.as_ref())?;
-    ensure_standalone_not_running(&args.run_id, "delete", metadata.as_ref())?;
+    if !args.ignore_liveness {
+        ensure_standalone_not_running(&args.run_id, "delete", metadata.as_ref())?;
+    }
     remove_file_if_exists(&location.transcript_path)?;
     remove_file_if_exists(&location.metadata_path)?;
     println!("deleted transcript {}", args.run_id);

@@ -29,27 +29,33 @@ pub fn routes() -> Router<AppState> {
 }
 
 /// Optional `?host=<id>` query param, same shape as `sessions.rs`'s
-/// `SessionHostQuery`.
+/// `SessionHostQuery`, plus `?ignore_liveness=true` — the PID-reuse escape
+/// hatch. Defaults to `false`: unchanged behavior unless the caller opts in.
 #[derive(Deserialize, Default)]
 struct TranscriptHostQuery {
     #[serde(default)]
     host: Option<String>,
+    #[serde(default)]
+    ignore_liveness: bool,
 }
 
 async fn mutate_transcript(
     s: &AppState,
     id: &str,
     action: crate::transcript_mutator::TranscriptAction,
+    ignore_liveness: bool,
 ) -> ApiResult<Json<serde_json::Value>> {
     use crate::transcript_mutator::TranscriptMutateError as E;
     let m = s.transcript_mutator.clone().ok_or_else(|| {
         ApiError::not_available("transcript archive/delete requires `rupu cp serve`")
     })?;
-    m.mutate(id, action).await.map_err(|e| match e {
-        E::NotFound(_) => ApiError::not_found(format!("transcript {id} not found")),
-        E::Invalid(msg) => ApiError::conflict(msg),
-        E::Failed { message, .. } => ApiError::internal(message),
-    })?;
+    m.mutate(id, action, ignore_liveness)
+        .await
+        .map_err(|e| match e {
+            E::NotFound(_) => ApiError::not_found(format!("transcript {id} not found")),
+            E::Invalid(msg) => ApiError::conflict(msg),
+            E::Failed { message, .. } => ApiError::internal(message),
+        })?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
 
@@ -87,12 +93,18 @@ async fn archive_transcript(
     let host = q.host.as_deref().unwrap_or("local");
     if host != "local" {
         let conn = crate::api::runs::resolve_host(&s, host)?;
-        conn.archive_transcript(&id)
+        conn.archive_transcript(&id, q.ignore_liveness)
             .await
             .map_err(map_host_transcript_mutate_err)?;
         return Ok(Json(serde_json::json!({ "ok": true, "id": id, "host_id": host })));
     }
-    mutate_transcript(&s, &id, crate::transcript_mutator::TranscriptAction::Archive).await
+    mutate_transcript(
+        &s,
+        &id,
+        crate::transcript_mutator::TranscriptAction::Archive,
+        q.ignore_liveness,
+    )
+    .await
 }
 
 /// `DELETE /api/transcripts/:id[?host=<id>]`. See [`archive_transcript`]'s doc.
@@ -105,12 +117,18 @@ async fn delete_transcript(
     let host = q.host.as_deref().unwrap_or("local");
     if host != "local" {
         let conn = crate::api::runs::resolve_host(&s, host)?;
-        conn.delete_transcript(&id)
+        conn.delete_transcript(&id, q.ignore_liveness)
             .await
             .map_err(map_host_transcript_mutate_err)?;
         return Ok(Json(serde_json::json!({ "ok": true, "id": id, "host_id": host })));
     }
-    mutate_transcript(&s, &id, crate::transcript_mutator::TranscriptAction::Delete).await
+    mutate_transcript(
+        &s,
+        &id,
+        crate::transcript_mutator::TranscriptAction::Delete,
+        q.ignore_liveness,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -125,6 +143,7 @@ mod tests {
             &self,
             id: &str,
             action: TranscriptAction,
+            _ignore_liveness: bool,
         ) -> Result<(), TranscriptMutateError> {
             if id == "missing" {
                 return Err(TranscriptMutateError::NotFound(id.into()));
@@ -134,6 +153,24 @@ mod tests {
                     "transcript session-owned is managed by session ses_1".into(),
                 ));
             }
+            Ok(())
+        }
+    }
+
+    /// Captures the `ignore_liveness` flag passed through so a test can
+    /// assert it defaults to `false` and threads through when set.
+    struct CapturingMutator {
+        seen: std::sync::Mutex<Vec<bool>>,
+    }
+    #[async_trait::async_trait]
+    impl TranscriptMutator for CapturingMutator {
+        async fn mutate(
+            &self,
+            _id: &str,
+            _action: TranscriptAction,
+            ignore_liveness: bool,
+        ) -> Result<(), TranscriptMutateError> {
+            self.seen.lock().unwrap().push(ignore_liveness);
             Ok(())
         }
     }
@@ -280,6 +317,7 @@ mod tests {
             Path("run_1".to_string()),
             Query(TranscriptHostQuery {
                 host: Some("host_nonexistent".into()),
+                ignore_liveness: false,
             }),
         )
         .await
@@ -296,5 +334,39 @@ mod tests {
             "still running".into(),
         ));
         assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+    }
+
+    // PID-reuse escape hatch (TDD case e): `?ignore_liveness=` threads
+    // through to the mutator, and defaults to `false` when the query param
+    // is absent.
+    #[tokio::test]
+    async fn archive_transcript_ignore_liveness_defaults_false_and_threads_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mutator = std::sync::Arc::new(CapturingMutator {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let state = AppState::new(tmp.path().to_path_buf(), Default::default())
+            .with_transcript_mutator(Some(mutator.clone()));
+
+        let _ = archive_transcript(
+            State(state.clone()),
+            Path("run_1".to_string()),
+            Query(TranscriptHostQuery::default()),
+        )
+        .await
+        .expect("ok");
+
+        let _ = archive_transcript(
+            State(state),
+            Path("run_1".to_string()),
+            Query(TranscriptHostQuery {
+                host: None,
+                ignore_liveness: true,
+            }),
+        )
+        .await
+        .expect("ok");
+
+        assert_eq!(*mutator.seen.lock().unwrap(), vec![false, true]);
     }
 }

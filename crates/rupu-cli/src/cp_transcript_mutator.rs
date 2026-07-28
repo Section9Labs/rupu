@@ -21,8 +21,11 @@ pub struct SubprocessTranscriptMutator {
 /// Build the argv (after the executable) for a transcript mutation.
 ///
 /// For `Delete` we always pass `--force` because the CP UI presents its own
-/// confirmation step before invoking the endpoint.
-pub(crate) fn build_argv(id: &str, action: TranscriptAction) -> Vec<String> {
+/// confirmation step before invoking the endpoint. `ignore_liveness` maps
+/// straight to the CLI's own `--ignore-liveness` flag — the PID-reuse escape
+/// hatch — and defaults to `false` (unchanged behavior) unless the caller
+/// opted in.
+pub(crate) fn build_argv(id: &str, action: TranscriptAction, ignore_liveness: bool) -> Vec<String> {
     let mut argv = vec![
         "transcript".to_string(),
         action.as_str().to_string(),
@@ -30,6 +33,9 @@ pub(crate) fn build_argv(id: &str, action: TranscriptAction) -> Vec<String> {
     ];
     if action == TranscriptAction::Delete {
         argv.push("--force".to_string());
+    }
+    if ignore_liveness {
+        argv.push("--ignore-liveness".to_string());
     }
     argv
 }
@@ -77,8 +83,9 @@ impl TranscriptMutator for SubprocessTranscriptMutator {
         &self,
         id: &str,
         action: TranscriptAction,
+        ignore_liveness: bool,
     ) -> Result<(), TranscriptMutateError> {
-        let argv = build_argv(id, action);
+        let argv = build_argv(id, action, ignore_liveness);
         let out = tokio::process::Command::new(&self.exe)
             .args(&argv)
             .output()
@@ -104,12 +111,30 @@ mod tests {
     #[test]
     fn argv_includes_force_only_for_delete() {
         assert_eq!(
-            build_argv("run_abc", TranscriptAction::Archive),
+            build_argv("run_abc", TranscriptAction::Archive, false),
             vec!["transcript", "archive", "run_abc"]
         );
         assert_eq!(
-            build_argv("run_abc", TranscriptAction::Delete),
+            build_argv("run_abc", TranscriptAction::Delete, false),
             vec!["transcript", "delete", "run_abc", "--force"]
+        );
+    }
+
+    #[test]
+    fn argv_appends_ignore_liveness_when_set() {
+        assert_eq!(
+            build_argv("run_abc", TranscriptAction::Archive, true),
+            vec!["transcript", "archive", "run_abc", "--ignore-liveness"]
+        );
+        assert_eq!(
+            build_argv("run_abc", TranscriptAction::Delete, true),
+            vec![
+                "transcript",
+                "delete",
+                "run_abc",
+                "--force",
+                "--ignore-liveness"
+            ]
         );
     }
 

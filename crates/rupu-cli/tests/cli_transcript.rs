@@ -536,6 +536,143 @@ async fn archive_and_delete_refuse_a_live_standalone_run() {
     assert!(metadata_path_for_run(&transcripts_dir, "run_live01").is_file());
 }
 
+// PID-reuse escape hatch: `--ignore-liveness` explicitly opts out of the I4
+// guard above — the recovery path for a recorded pid that was reused by an
+// unrelated process after a reboot/wraparound. With the flag set, a "live"
+// pid no longer blocks archive/delete.
+#[tokio::test]
+async fn ignore_liveness_overrides_a_live_pid_refusal() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("transcripts").create_dir_all().unwrap();
+    let transcripts_dir = global.path().join("transcripts");
+
+    write_transcript(&transcripts_dir, "run_live_arch", "archive-agent", 61);
+    write_metadata_sidecar_with_pid(
+        &transcripts_dir,
+        "run_live_arch",
+        None,
+        Some(std::process::id()),
+    );
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["transcript", "archive", "run_live_arch", "--ignore-liveness"])
+        .assert()
+        .success();
+    assert!(!transcripts_dir.join("run_live_arch.jsonl").exists());
+    assert!(transcripts_dir
+        .join("archive/run_live_arch.jsonl")
+        .is_file());
+
+    write_transcript(&transcripts_dir, "run_live_del", "archive-agent", 61);
+    write_metadata_sidecar_with_pid(
+        &transcripts_dir,
+        "run_live_del",
+        None,
+        Some(std::process::id()),
+    );
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args([
+            "transcript",
+            "delete",
+            "run_live_del",
+            "--force",
+            "--ignore-liveness",
+        ])
+        .assert()
+        .success();
+    assert!(!transcripts_dir.join("run_live_del.jsonl").exists());
+    assert!(!metadata_path_for_run(&transcripts_dir, "run_live_del").exists());
+}
+
+// `--ignore-liveness` is a liveness-only override — it must NOT reach the
+// separate session-ownership guard (`ensure_standalone_transcript`), which
+// has no override at all: a transcript actually owned by a session must
+// still be refused even with a live pid AND `--ignore-liveness` set.
+#[tokio::test]
+async fn ignore_liveness_does_not_bypass_session_ownership_guard() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("transcripts").create_dir_all().unwrap();
+    let transcripts_dir = global.path().join("transcripts");
+
+    write_transcript(&transcripts_dir, "run_session_live", "archive-agent", 61);
+    write_metadata_sidecar_with_pid(
+        &transcripts_dir,
+        "run_session_live",
+        Some("ses_owned02"),
+        Some(std::process::id()),
+    );
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args([
+            "transcript",
+            "archive",
+            "run_session_live",
+            "--ignore-liveness",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("managed by session ses_owned02"));
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args([
+            "transcript",
+            "delete",
+            "run_session_live",
+            "--force",
+            "--ignore-liveness",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("managed by session ses_owned02"));
+
+    assert!(transcripts_dir.join("run_session_live.jsonl").is_file());
+    assert!(metadata_path_for_run(&transcripts_dir, "run_session_live").is_file());
+}
+
+// `--ignore-liveness` and `--force` are independent opt-outs for `delete`:
+// the former skips the liveness check, the latter is the "confirm you mean
+// it" gate. Neither substitutes for the other.
+#[tokio::test]
+async fn delete_ignore_liveness_without_force_still_refuses() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("transcripts").create_dir_all().unwrap();
+    let transcripts_dir = global.path().join("transcripts");
+
+    write_transcript(&transcripts_dir, "run_noforce", "archive-agent", 61);
+    write_metadata_sidecar_with_pid(&transcripts_dir, "run_noforce", None, Some(999_999));
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["transcript", "delete", "run_noforce", "--ignore-liveness"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("requires --force"));
+
+    assert!(transcripts_dir.join("run_noforce.jsonl").is_file());
+}
+
 #[tokio::test]
 async fn prune_deletes_old_archived_standalone_transcripts_and_uses_config_default() {
     let _guard = ENV_LOCK.lock().await;

@@ -21,7 +21,7 @@ import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { api } from '../../lib/api';
+import { api, ApiError } from '../../lib/api';
 import type { AgentRunRow, HostView } from '../../lib/api';
 import AgentRuns from './AgentRuns';
 
@@ -282,6 +282,119 @@ describe('AgentRuns — standalone-sourced row actions target the TRANSCRIPT end
 
     expect(screen.queryByLabelText(`Restore run ${STANDALONE_ROW.run_id}`)).not.toBeInTheDocument();
     expect(screen.queryByText('Restore')).not.toBeInTheDocument();
+  });
+});
+
+// PID-reuse escape hatch (Plan 2). The server refuses a standalone
+// archive/delete with a 409 while the recorded pid still looks alive
+// (`AgentRuns.tsx`'s `LIVENESS_REFUSAL_MARKER`, mirroring the CLI's
+// `ensure_standalone_not_running` message shape). The page must NOT offer a
+// one-click force — only a SECOND, explicit confirm naming the risk, and
+// only retry with `ignoreLiveness: true` when that second confirm is
+// accepted.
+describe('AgentRuns — standalone liveness-refusal override retry', () => {
+  const LIVENESS_ERROR = new ApiError(
+    409,
+    JSON.stringify({
+      error:
+        'cannot archive transcript run-standalone-1: it is still running (owning process 4242 is alive)',
+    }),
+  );
+
+  it('a liveness 409 triggers a second confirm naming the risk, and accepting retries Archive with ignoreLiveness=true', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([STANDALONE_ROW]);
+    const archiveSpy = vi
+      .spyOn(api, 'archiveTranscript')
+      .mockRejectedValueOnce(LIVENESS_ERROR)
+      .mockResolvedValueOnce(undefined);
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText(`Archive run ${STANDALONE_ROW.run_id}`));
+
+    await waitFor(() => expect(archiveSpy).toHaveBeenCalledTimes(2));
+    expect(archiveSpy).toHaveBeenNthCalledWith(1, STANDALONE_ROW.run_id, STANDALONE_ROW.host_id);
+    expect(archiveSpy).toHaveBeenNthCalledWith(
+      2,
+      STANDALONE_ROW.run_id,
+      STANDALONE_ROW.host_id,
+      true,
+    );
+
+    // confirm() call #2 (0-indexed 1) is the liveness-override prompt — it
+    // names the run, the recorded pid, and the real risk of overriding a
+    // still-live run.
+    expect(confirmSpy.mock.calls[1][0]).toContain(STANDALONE_ROW.run_id);
+    expect(confirmSpy.mock.calls[1][0]).toContain('4242');
+    expect(confirmSpy.mock.calls[1][0]).toMatch(/loses the transcript/i);
+  });
+
+  it('declining the second confirm makes no retry call', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([STANDALONE_ROW]);
+    const archiveSpy = vi.spyOn(api, 'archiveTranscript').mockRejectedValueOnce(LIVENESS_ERROR);
+    const confirmSpy = vi
+      .spyOn(window, 'confirm')
+      .mockReturnValueOnce(true) // initial "Archive run ...?" confirm
+      .mockReturnValueOnce(false); // declined liveness-override confirm
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText(`Archive run ${STANDALONE_ROW.run_id}`));
+
+    await waitFor(() => expect(archiveSpy).toHaveBeenCalledTimes(1));
+    expect(confirmSpy).toHaveBeenCalledTimes(2);
+    // Give an errant retry a moment to show up before asserting its absence.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(archiveSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('a non-liveness 409 (session-ownership refusal shape) does NOT trigger the second confirm', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([STANDALONE_ROW]);
+    const sessionOwnedError = new ApiError(
+      409,
+      JSON.stringify({ error: 'transcript run-standalone-1 is managed by session ses_1' }),
+    );
+    const archiveSpy = vi.spyOn(api, 'archiveTranscript').mockRejectedValueOnce(sessionOwnedError);
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValueOnce(true);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText(`Archive run ${STANDALONE_ROW.run_id}`));
+
+    await waitFor(() => expect(archiveSpy).toHaveBeenCalledTimes(1));
+    // Only the initial confirm fired — no second liveness-override prompt
+    // for a refusal that isn't about liveness.
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('Delete: a liveness 409 triggers the second confirm and retries with ignoreLiveness=true', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([STANDALONE_ROW]);
+    const deleteSpy = vi
+      .spyOn(api, 'deleteTranscript')
+      .mockRejectedValueOnce(LIVENESS_ERROR)
+      .mockResolvedValueOnce(undefined);
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText(`Delete run ${STANDALONE_ROW.run_id}`));
+
+    await waitFor(() => expect(deleteSpy).toHaveBeenCalledTimes(2));
+    expect(deleteSpy).toHaveBeenNthCalledWith(
+      2,
+      STANDALONE_ROW.run_id,
+      STANDALONE_ROW.host_id,
+      true,
+    );
   });
 });
 
