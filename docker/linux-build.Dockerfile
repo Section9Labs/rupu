@@ -23,6 +23,8 @@ FROM rust:1.95-alpine3.21
 #   as the process-level rustls provider (crates/rupu-cli/src/main.rs).
 # pkgconf: consulted by several -sys build scripts.
 # git: build scripts and several tests shell out to it.
+# file: used by CI to prove the built binary is statically linked. Alpine's
+#   base image does not ship it.
 # bash: test fixtures write `#!/bin/sh` scripts, but a real shell makes
 #   debugging a failing build far easier.
 # nodejs, npm: `make cp-web` builds the embedded CP UI before a release.
@@ -33,7 +35,7 @@ FROM rust:1.95-alpine3.21
 # `keyring` — fix that, do not add the package.
 RUN apk add --no-cache \
       musl-dev gcc g++ make perl cmake clang clang-dev \
-      pkgconf git bash nodejs npm
+      pkgconf git file bash nodejs npm
 
 ENV CARGO_TERM_COLOR=always
 WORKDIR /work

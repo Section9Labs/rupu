@@ -52,10 +52,15 @@ jobs:
         run: |
           docker run --rm -v "$PWD":/work -w /work rupu-linux-build sh -c '
             set -e
-            file target/linux-musl/release/rupu
-            ldd  target/linux-musl/release/rupu 2>&1 | head -3 || true
-            ./target/linux-musl/release/rupu --version
-            ./target/linux-musl/release/rupu update --print-platform
+            bin=target/linux-musl/release/rupu
+            file "$bin"
+            # Assert, do not merely print: a dynamically-linked binary here
+            # would defeat the whole reason for choosing musl.
+            file "$bin" | grep -q "statically linked" \
+              || { echo "::error::binary is not statically linked"; exit 1; }
+            ldd "$bin" 2>&1 | head -3 || true
+            ./"$bin" --version
+            ./"$bin" update --print-platform
           '
 
       # Static linking is the whole point of choosing musl: a glibc build
