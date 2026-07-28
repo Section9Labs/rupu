@@ -14909,11 +14909,15 @@ steps:
         init_git_repo(&project);
 
         let server = MockServer::start();
-        let body = std::fs::read_to_string(
-            "/Users/matt/Code/Oracle/rupu/.worktrees/feat-autoflow-phase-4/crates/rupu-scm/tests/fixtures/github/issues_list_happy.json",
-        )
-        .unwrap()
-        .replace("section9labs", "Section9Labs");
+        // Resolve the fixture relative to this crate. This was an absolute
+        // path into one developer's machine — and into a worktree that no
+        // longer exists — so the test only passed where that directory
+        // happened to be present. The first Linux CI run caught it.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rupu-scm/tests/fixtures/github/issues_list_happy.json");
+        let body = std::fs::read_to_string(&fixture)
+            .unwrap_or_else(|e| panic!("read fixture {}: {e}", fixture.display()))
+            .replace("section9labs", "Section9Labs");
         server.mock(|when, then| {
             when.method(GET).path("/repos/Section9Labs/rupu/issues");
             then.status(200)
