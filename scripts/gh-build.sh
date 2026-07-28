@@ -81,9 +81,20 @@ if ! gh auth status >/dev/null 2>&1; then
   exit 1
 fi
 
-OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
-ARCH="$(uname -m)"
-ASSET_NAME="rupu-${OS}-${ARCH}"
+# Ask the binary what it is, rather than deriving the name a second time.
+# An independent derivation is how publisher and updater drift: `uname -m`
+# says `x86_64` where `rupu_update::platform_name` says `x64`, so an
+# x86_64 release would publish `rupu-linux-x86_64` while `rupu update`
+# looked for `rupu-linux-x64`. They agree only by coincidence on Apple
+# Silicon (`arm64` both ways), which is why this went unnoticed while
+# macOS was the only published target.
+PLATFORM="$("$BIN" update --print-platform)"
+if [[ -z "$PLATFORM" ]]; then
+  echo "\`$BIN update --print-platform\` produced no output." >&2
+  echo "  That flag landed alongside this script's change; an older binary won't have it." >&2
+  exit 1
+fi
+ASSET_NAME="rupu-${PLATFORM}"
 
 SHA_FULL="$(git rev-parse HEAD)"
 SHA_SHORT="$(git rev-parse --short HEAD)"
