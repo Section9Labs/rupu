@@ -346,8 +346,19 @@ impl GoogleGeminiClient {
         // Thinking config. `Auto` uses Gemini's dynamic-budget sentinel
         // (`thinkingBudget: -1`); the level field is omitted in that
         // case because the server picks.
+        //
+        // For non-`Auto` levels, `thinkingLevel` and `thinkingBudget` are
+        // two different generations' controls, not two names for the same
+        // thing: `thinkingLevel` is a Gemini-3-only enum key, while
+        // `thinkingBudget` is the numeric knob Gemini 2.5 understands.
+        // Per Google's documented contract, exactly one is sent, gated on
+        // the model string (not the provider/variant — both model
+        // families share this provider). The level string is sent
+        // lowercase, matching the documented casing (tolerance for
+        // uppercase is unverified against the live API either way).
         if let Some(level) = &request.thinking {
             use crate::model_tier::ThinkingLevel;
+            let is_gemini_3 = request.model.starts_with("gemini-3");
             gen_config["thinkingConfig"] = match level {
                 ThinkingLevel::Auto => serde_json::json!({
                     "includeThoughts": true,
@@ -355,20 +366,26 @@ impl GoogleGeminiClient {
                 }),
                 _ => {
                     let (level_str, budget) = match level {
-                        ThinkingLevel::Minimal => ("MINIMAL", 128),
-                        ThinkingLevel::Low => ("LOW", 2048),
-                        ThinkingLevel::Medium => ("MEDIUM", 8192),
-                        ThinkingLevel::High => ("HIGH", 32768),
+                        ThinkingLevel::Minimal => ("minimal", 128),
+                        ThinkingLevel::Low => ("low", 2048),
+                        ThinkingLevel::Medium => ("medium", 8192),
+                        ThinkingLevel::High => ("high", 32768),
                         // Gemini's API caps thinkingBudget at 32768; Max
                         // is clamped to High for now.
-                        ThinkingLevel::Max => ("HIGH", 32768),
+                        ThinkingLevel::Max => ("high", 32768),
                         ThinkingLevel::Auto => unreachable!(),
                     };
-                    serde_json::json!({
-                        "includeThoughts": true,
-                        "thinkingLevel": level_str,
-                        "thinkingBudget": budget,
-                    })
+                    if is_gemini_3 {
+                        serde_json::json!({
+                            "includeThoughts": true,
+                            "thinkingLevel": level_str,
+                        })
+                    } else {
+                        serde_json::json!({
+                            "includeThoughts": true,
+                            "thinkingBudget": budget,
+                        })
+                    }
                 }
             };
         }
@@ -1130,8 +1147,13 @@ mod tests {
         let body = client.build_request_body(&request);
         let config = &body["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(config["includeThoughts"], true);
-        assert_eq!(config["thinkingLevel"], "MEDIUM");
         assert_eq!(config["thinkingBudget"], 8192);
+        // gemini-2.5-pro is not a Gemini-3 model: `thinkingLevel` is a
+        // Gemini-3-only key and must not be sent alongside `thinkingBudget`.
+        assert!(
+            config.get("thinkingLevel").is_none(),
+            "gemini-2.5-pro must not receive the Gemini-3-only thinkingLevel key"
+        );
     }
 
     #[test]
@@ -1160,6 +1182,88 @@ mod tests {
         let body = client.build_request_body(&request);
         let config = &body["request"]["generationConfig"]["thinkingConfig"];
         assert_eq!(config["thinkingBudget"], 32768); // clamped to High
+        assert!(
+            config.get("thinkingLevel").is_none(),
+            "gemini-2.5-pro must not receive the Gemini-3-only thinkingLevel key"
+        );
+    }
+
+    #[test]
+    fn test_build_request_body_thinking_gemini_3_uses_level_not_budget() {
+        let client =
+            GoogleGeminiClient::new(test_creds("proj"), GeminiVariant::GeminiCli, None).unwrap();
+
+        let request = LlmRequest {
+            model: "gemini-3-pro-preview".into(),
+            system: None,
+            messages: vec![Message::user("think hard")],
+            max_tokens: 16000,
+            tools: vec![],
+            cell_id: None,
+            trace_id: None,
+            thinking: Some(crate::model_tier::ThinkingLevel::Medium),
+            context_window: None,
+            task_type: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+        };
+
+        let body = client.build_request_body(&request);
+        let config = &body["request"]["generationConfig"]["thinkingConfig"];
+        assert_eq!(config["includeThoughts"], true);
+        // Lowercase per Google's documented contract (I-46).
+        assert_eq!(config["thinkingLevel"], "medium");
+        assert!(
+            config.get("thinkingBudget").is_none(),
+            "gemini-3-pro-preview must not receive the Gemini-2.5-only thinkingBudget key"
+        );
+    }
+
+    #[test]
+    fn test_thinking_config_never_sends_both_keys() {
+        // Mutual exclusion is the invariant worth pinning: whichever model
+        // family, thinkingLevel and thinkingBudget must never co-occur.
+        let client =
+            GoogleGeminiClient::new(test_creds("proj"), GeminiVariant::GeminiCli, None).unwrap();
+
+        for model in ["gemini-2.5-pro", "gemini-3-pro-preview"] {
+            for level in [
+                crate::model_tier::ThinkingLevel::Minimal,
+                crate::model_tier::ThinkingLevel::Low,
+                crate::model_tier::ThinkingLevel::Medium,
+                crate::model_tier::ThinkingLevel::High,
+                crate::model_tier::ThinkingLevel::Max,
+            ] {
+                let request = LlmRequest {
+                    model: model.into(),
+                    system: None,
+                    messages: vec![Message::user("test")],
+                    max_tokens: 4096,
+                    tools: vec![],
+                    cell_id: None,
+                    trace_id: None,
+                    thinking: Some(level),
+                    context_window: None,
+                    task_type: None,
+                    output_format: None,
+                    output_schema: None,
+                    anthropic_task_budget: None,
+                    anthropic_context_management: None,
+                    anthropic_speed: None,
+                };
+                let body = client.build_request_body(&request);
+                let config = &body["request"]["generationConfig"]["thinkingConfig"];
+                let has_level = config.get("thinkingLevel").is_some();
+                let has_budget = config.get("thinkingBudget").is_some();
+                assert!(
+                    has_level ^ has_budget,
+                    "model={model} level={level:?}: exactly one of thinkingLevel/thinkingBudget must be present (level={has_level}, budget={has_budget})"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1962,12 +2066,17 @@ mod tests {
                 anthropic_speed: None,
             };
             let body = client.build_request_body(&request);
-            let budget = body["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"]
-                .as_u64()
-                .unwrap();
+            let config = &body["request"]["generationConfig"]["thinkingConfig"];
+            let budget = config["thinkingBudget"].as_u64().unwrap();
             assert_eq!(
                 budget, expected_budget,
                 "ThinkingLevel::{level:?} budget mismatch"
+            );
+            // gemini-2.5-pro is not Gemini-3: thinkingLevel (a Gemini-3-only
+            // key) must never accompany thinkingBudget.
+            assert!(
+                config.get("thinkingLevel").is_none(),
+                "ThinkingLevel::{level:?}: thinkingLevel must not be sent for gemini-2.5-pro"
             );
         }
     }
