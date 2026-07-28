@@ -99,11 +99,11 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 | ID | Sev | Area | Title | Status |
 |---|---|---|---|---|
-| I-45 | P0 | rupu-providers | Gemini 3 gets a guaranteed 400 — `thinkingLevel` and `thinkingBudget` are sent together | open |
-| I-46 | P1 | rupu-providers | Gemini thinking levels are sent uppercase; the API expects lowercase | open |
-| I-47 | P1 | rupu-providers | `xhigh` / `minimal` are rejected outright by DeepSeek, Groq and xAI | open |
-| I-48 | P1 | rupu-providers | `usageMetadata.thoughtsTokenCount` is never read — Gemini reasoning tokens are missing from cost | open |
-| I-49 | P2 | rupu-providers | `parse_retry_after` is a stub returning `None`; every 429 backs off a flat 60s | open |
+| I-45 | P1 | rupu-providers | `thinkingLevel` + `thinkingBudget` are always co-sent, and there is **no model gate** — the Gemini-3-only key also goes to 2.5 (the "400" is doc-derived, never observed) | open |
+| I-46 | P2 | rupu-providers | Gemini thinking levels are sent uppercase; Google documents lowercase (our own spec says tolerance is **unverified**) | open |
+| I-47 | P2 | rupu-providers | `minimal`/`xhigh` are forwarded to any openai-compatible endpoint with no allowlist ("rejected outright" is **unproven**; none of the named vendors ship as providers) | open |
+| I-48 | **P0** | rupu-providers | `usageMetadata.thoughtsTokenCount` is never read — the **only default-reachable** defect here; Gemini spend is silently under-billed and run totals under-report | open |
+| I-49 | P2 | rupu-providers | `classify.rs` is dead code (zero production callers) — the filed "flat 60s" claim is **false at every constant**; real default is one 2s retry | open |
 
 ### Arc 6 — docs truth pass
 
