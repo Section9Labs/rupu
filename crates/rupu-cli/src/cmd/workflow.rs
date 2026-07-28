@@ -2027,6 +2027,23 @@ async fn runs(
         // `rupu workflow reject` by hand — there is no other path that
         // will resolve it.
         if on_timeout == Some(rupu_orchestrator::TimeoutAction::Reject) {
+            // ISSUES.md I-80: this listing deliberately leaves the gate
+            // parked (see the I-25 note above), which means an operator who
+            // never runs `rupu cp serve` would otherwise see an overdue gate
+            // sit here forever with no explanation. Say so once, with the
+            // manual remedy, rather than letting the dependency stay
+            // invisible. Only fires for a gate that is ACTUALLY overdue —
+            // a reject gate still within its timeout is just parked normally
+            // and needs no comment.
+            if r.expires_at.is_some_and(|exp| exp <= now) {
+                println!(
+                    "rupu: run {} has an overdue gate with on_timeout: reject — \
+                     resolution is performed by `rupu cp serve`'s gate sweep.\n      \
+                     If you don't run `cp serve`, resolve it with \
+                     `rupu workflow reject {} --reason \"...\"`.",
+                    r.id, r.id
+                );
+            }
             continue;
         }
 
