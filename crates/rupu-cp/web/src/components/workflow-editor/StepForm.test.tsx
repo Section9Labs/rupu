@@ -165,20 +165,7 @@ describe('StepForm', () => {
   });
 });
 
-describe('StepForm — branch (flag-gated)', () => {
-  it('the Kind select offers Branch (if) only when workflowEditorUi is next', () => {
-    render(
-      <StepForm
-        node={nodeWith({ kind: 'step', agent: 'planner' })}
-        agents={AGENTS}
-        problems={[]}
-        exprContext={EXPR}
-        onChange={() => {}}
-      />,
-    );
-    expect(screen.queryByRole('option', { name: 'Branch (if)' })).not.toBeInTheDocument();
-  });
-
+describe('StepForm — branch', () => {
   it('the Kind select offers Branch (if) when workflowEditorUi is next', () => {
     render(
       <StepForm
@@ -469,21 +456,8 @@ describe('StepForm — split/join orchestration nodes (Task 6)', () => {
   });
 });
 
-describe('StepForm — roomier long-text fields (Task 5, next only)', () => {
-  it('classic: the Prompt field stays default-sized (no size prop threaded)', () => {
-    render(
-      <StepForm
-        node={nodeWith({ kind: 'step', agent: 'planner' })}
-        agents={AGENTS}
-        problems={[]}
-        exprContext={EXPR}
-        onChange={() => {}}
-      />,
-    );
-    expect(screen.getByLabelText('Prompt')).toHaveAttribute('data-size', 'default');
-  });
-
-  it('next: the Prompt field is sized large', () => {
+describe('StepForm — roomier long-text fields', () => {
+  it('the Prompt field is sized large', () => {
     render(
       <StepForm
         node={nodeWith({ kind: 'step', agent: 'planner' })}
@@ -511,43 +485,20 @@ describe('StepForm — roomier long-text fields (Task 5, next only)', () => {
     expect(screen.getByLabelText('Sub-step 1 prompt')).toHaveAttribute('data-size', 'large');
   });
 
-  it('next: the panel Subject and Prompt fields are sized large; classic stays default', () => {
+  it('the panel Subject and Prompt fields are sized large', () => {
     const node = nodeWith({ kind: 'panel', panel: { panelists: [], subject: 'review' } });
-    const { rerender } = render(
-      <StepForm node={node} agents={AGENTS} problems={[]} exprContext={EXPR} onChange={() => {}} />,
-    );
-    expect(screen.getByLabelText('Panel subject')).toHaveAttribute('data-size', 'default');
-
-    rerender(
-      <StepForm
-        node={node}
-        agents={AGENTS}
-        problems={[]}
-        exprContext={EXPR}
-        onChange={() => {}}
-        workflowEditorUi="next"
-      />,
-    );
+    render(<StepForm node={node} agents={AGENTS} problems={[]} exprContext={EXPR} onChange={() => {}} />);
     expect(screen.getByLabelText('Panel subject')).toHaveAttribute('data-size', 'large');
     expect(screen.getByLabelText('Panel prompt')).toHaveAttribute('data-size', 'large');
   });
 });
 
-describe('StepForm — Approval prompt expression completions (Task 3, next only)', () => {
+describe('StepForm — Approval prompt expression completions', () => {
   function nodeWithApproval(): GraphNode {
     return nodeWith({ kind: 'step', agent: 'planner', approvalRequired: true, approvalPrompt: 'ok {{ inputs.x }}?' });
   }
 
-  it('classic: Approval prompt stays a plain input (byte-identical)', () => {
-    render(
-      <StepForm node={nodeWithApproval()} agents={AGENTS} problems={[]} exprContext={EXPR} onChange={() => {}} />,
-    );
-    const field = screen.getByLabelText('Approval prompt');
-    expect(field.tagName).toBe('INPUT');
-    expect(field).toHaveValue('ok {{ inputs.x }}?');
-  });
-
-  it('next: Approval prompt renders the ExpressionField shell (mocked as a textarea)', () => {
+  it('Approval prompt renders the ExpressionField shell (mocked as a textarea)', () => {
     render(
       <StepForm
         node={nodeWithApproval()}
@@ -1192,13 +1143,7 @@ describe('WorkflowSettingsForm', () => {
     );
   });
 
-  it('classic: the description field keeps rows=3 (byte-identical)', () => {
-    const meta: WorkflowMeta = { name: 'wf', description: '', rest: {} };
-    render(<WorkflowSettingsForm meta={meta} onChange={() => {}} />);
-    expect(screen.getByLabelText('Workflow description')).toHaveAttribute('rows', '3');
-  });
-
-  it('next: the description field is roomier (rows=4)', () => {
+  it('the description field is roomier (rows=4)', () => {
     const meta: WorkflowMeta = { name: 'wf', description: '', rest: {} };
     render(<WorkflowSettingsForm meta={meta} onChange={() => {}} workflowEditorUi="next" />);
     expect(screen.getByLabelText('Workflow description')).toHaveAttribute('rows', '4');

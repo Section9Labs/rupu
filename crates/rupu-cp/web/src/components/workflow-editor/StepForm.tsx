@@ -42,10 +42,6 @@ interface StepFormProps {
    *  target that would close a cycle back onto an upstream node is excluded).
    *  Defaults to empty (no cycle guard) for callers that don't thread it. */
   edges?: GraphEdge[];
-  /** Workflow-editor-UI flag — the "Branch (if)" kind option is only offered
-   *  in the Kind <select> when 'next', UNLESS the node being edited is
-   *  already a branch (an existing branch node must always be editable
-   *  regardless of the flag). Defaults to 'classic'. */
   workflowEditorUi?: WorkflowEditorUi;
   /** MCP tool catalog — populates the action body's tool <select> and drives its
    *  `with:` key/value editor (the selected tool's `input_schema.properties`).
@@ -104,11 +100,6 @@ const KIND_LABELS: Record<StepKind, string> = {
   join: 'Join (barrier)',
 };
 
-// Kinds offered in the Kind <select> only when the `next` flag is on — UNLESS
-// the node being edited is already that kind, in which case it must always be
-// selectable (an existing node stays fully editable regardless of the flag).
-const NEXT_ONLY_KINDS = new Set<StepKind>(['branch', 'approval_gate', 'action', 'split', 'join']);
-
 export default function StepForm({
   node,
   agents,
@@ -123,9 +114,7 @@ export default function StepForm({
 }: StepFormProps) {
   const d = node.data;
 
-  const kindOptions = (Object.keys(KIND_LABELS) as StepKind[]).filter(
-    (k) => !NEXT_ONLY_KINDS.has(k) || workflowEditorUi === 'next' || d.kind === k,
-  );
+  const kindOptions = Object.keys(KIND_LABELS) as StepKind[];
 
   // Generic field patch — spread the old data so raw_passthrough and every
   // unedited field survive.
@@ -487,7 +476,8 @@ function LinearFields({
   agents,
   patch,
   exprContext,
-  workflowEditorUi,
+  // Unread here (Task 5 removes the prop entirely) — kept for signature stability.
+  workflowEditorUi: _workflowEditorUi,
   tools,
 }: {
   d: StepNodeData;
@@ -514,7 +504,7 @@ function LinearFields({
           context={fieldCtx(exprContext, { isForEachPrompt: d.kind === 'for_each' })}
           multiline
           ariaLabel="Prompt"
-          size={workflowEditorUi === 'next' ? 'large' : undefined}
+          size="large"
         />
       </label>
 
@@ -553,7 +543,8 @@ function ParallelFields({
   agents,
   patch,
   exprContext,
-  workflowEditorUi,
+  // Unread here (Task 5 removes the prop entirely) — kept for signature stability.
+  workflowEditorUi: _workflowEditorUi,
 }: {
   d: StepNodeData;
   agents: AgentSummary[];
@@ -624,7 +615,7 @@ function ParallelFields({
               multiline
               ariaLabel={`Sub-step ${i + 1} prompt`}
               placeholder="prompt"
-              size={workflowEditorUi === 'next' ? 'large' : undefined}
+              size="large"
             />
           </div>
         ))}
@@ -648,7 +639,8 @@ function PanelFields({
   agents,
   patch,
   exprContext,
-  workflowEditorUi,
+  // Unread here (Task 5 removes the prop entirely) — kept for signature stability.
+  workflowEditorUi: _workflowEditorUi,
 }: {
   d: StepNodeData;
   agents: AgentSummary[];
@@ -705,7 +697,7 @@ function PanelFields({
           context={fieldCtx(exprContext, { isPanelField: true })}
           multiline
           ariaLabel="Panel subject"
-          size={workflowEditorUi === 'next' ? 'large' : undefined}
+          size="large"
         />
       </label>
 
@@ -717,7 +709,7 @@ function PanelFields({
           context={fieldCtx(exprContext, { isPanelField: true })}
           multiline
           ariaLabel="Panel prompt"
-          size={workflowEditorUi === 'next' ? 'large' : undefined}
+          size="large"
         />
       </label>
 
@@ -1053,7 +1045,8 @@ function GateFields({
   agents,
   patch,
   exprContext,
-  workflowEditorUi,
+  // Unread here (Task 5 removes the prop entirely) — kept for signature stability.
+  workflowEditorUi: _workflowEditorUi,
 }: {
   d: StepNodeData;
   agents: AgentSummary[];
@@ -1181,23 +1174,13 @@ function GateFields({
     <div className="space-y-3">
       <label className="block">
         <span className={labelCls}>Approval prompt</span>
-        {workflowEditorUi === 'next' ? (
-          <ExpressionField
-            value={d.approvalPrompt ?? ''}
-            onChange={(v) => patch({ approvalPrompt: v === '' ? undefined : v })}
-            context={fieldCtx(exprContext, {})}
-            multiline
-            ariaLabel="Approval prompt"
-          />
-        ) : (
-          <input
-            type="text"
-            value={d.approvalPrompt ?? ''}
-            onChange={(e) => patch({ approvalPrompt: e.target.value === '' ? undefined : e.target.value })}
-            aria-label="Approval prompt"
-            className={fieldCls}
-          />
-        )}
+        <ExpressionField
+          value={d.approvalPrompt ?? ''}
+          onChange={(v) => patch({ approvalPrompt: v === '' ? undefined : v })}
+          context={fieldCtx(exprContext, {})}
+          multiline
+          ariaLabel="Approval prompt"
+        />
       </label>
 
       <label className="block">
@@ -1313,7 +1296,7 @@ function GateFields({
                       multiline
                       ariaLabel={`On-reject step ${i + 1} prompt`}
                       placeholder="prompt"
-                      size={workflowEditorUi === 'next' ? 'large' : undefined}
+                      size="large"
                     />
                   </>
                 )}
@@ -1542,17 +1525,14 @@ function ApprovalFields({
   d,
   patch,
   exprContext,
-  workflowEditorUi,
+  // Unread here (Task 5 removes the prop entirely) — kept for signature stability.
+  workflowEditorUi: _workflowEditorUi,
   onConvertToGate,
 }: {
   d: StepNodeData;
   patch: (p: Partial<StepNodeData>) => void;
-  /** Vocabulary context for the Approval-prompt field (next-gated ExpressionField). */
+  /** Vocabulary context for the Approval-prompt field (ExpressionField). */
   exprContext: StepExprContext;
-  /** Approval prompt renders as an ExpressionField only when 'next' — it is a
-   *  minijinja-rendered template (same engine/context as `prompt:`, per the
-   *  orchestrator's `Approval.prompt` doc comment), so it's genuinely
-   *  expression-capable; classic keeps today's plain input byte-identical. */
   workflowEditorUi: WorkflowEditorUi;
   /** Threaded from StepForm — rewrites this legacy inline approval into a
    *  standalone gate step. Renders the "Convert to gate node" button only when
@@ -1582,22 +1562,12 @@ function ApprovalFields({
         <div className="space-y-3 rounded-md border border-border bg-surface p-2.5">
           <label className="block">
             <span className={labelCls}>Approval prompt</span>
-            {workflowEditorUi === 'next' ? (
-              <ExpressionField
-                value={d.approvalPrompt ?? ''}
-                onChange={(v) => patch({ approvalPrompt: v === '' ? undefined : v })}
-                context={fieldCtx(exprContext, {})}
-                ariaLabel="Approval prompt"
-              />
-            ) : (
-              <input
-                type="text"
-                value={d.approvalPrompt ?? ''}
-                onChange={(e) => patch({ approvalPrompt: e.target.value === '' ? undefined : e.target.value })}
-                aria-label="Approval prompt"
-                className={fieldCls}
-              />
-            )}
+            <ExpressionField
+              value={d.approvalPrompt ?? ''}
+              onChange={(v) => patch({ approvalPrompt: v === '' ? undefined : v })}
+              context={fieldCtx(exprContext, {})}
+              ariaLabel="Approval prompt"
+            />
           </label>
           <label className="block">
             <span className={labelCls}>Approval timeout (seconds)</span>

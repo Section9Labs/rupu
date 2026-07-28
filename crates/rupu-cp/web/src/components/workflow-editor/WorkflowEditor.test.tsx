@@ -167,17 +167,6 @@ describe('WorkflowEditor live reconcile', () => {
     expect(screen.getByRole('heading', { name: 'Inputs' })).toBeInTheDocument();
   });
 
-  it('classic: no rail palette slot, no Blocks tab, and WorkflowEditorGraph gets no paletteContainer', () => {
-    const { container } = render(
-      <WorkflowEditor draftYaml={VALID} onYamlChange={() => {}} agents={[]} validity={null} />,
-    );
-    expect(container.querySelector('.wfx-rail-palette-slot')).not.toBeInTheDocument();
-    expect(screen.queryByRole('tab', { name: 'Blocks' })).not.toBeInTheDocument();
-    expect(screen.getByTestId('graph')).toHaveAttribute('data-palette-container', 'none');
-    // classic default tab is still Settings.
-    expect(screen.getByRole('tab', { name: 'Settings' })).toHaveAttribute('aria-selected', 'true');
-  });
-
   it('next: renders 4 tabs (Blocks · Step · Settings · Reference) in that order, defaulting to Blocks', () => {
     render(
       <WorkflowEditor
@@ -265,14 +254,6 @@ describe('WorkflowEditor source pane toggle (Task 2)', () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
-  });
-
-  it('classic: no source toggle button, YAML editor always present', () => {
-    render(
-      <WorkflowEditor draftYaml={VALID} onYamlChange={() => {}} agents={[]} validity={{ ok: true }} />,
-    );
-    expect(screen.queryByRole('button', { name: /source/i })).not.toBeInTheDocument();
-    expect(screen.getByTestId('code')).toBeInTheDocument();
   });
 
   it('next: a "Hide source" toggle is present by default, editor mounted', () => {
@@ -376,15 +357,6 @@ describe('WorkflowEditor resizable inspector rail (Task 5, next only)', () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
-  });
-
-  it('classic: no resize-inspector separator; aside keeps the literal lg:w-80 sizing', () => {
-    const { container } = render(
-      <WorkflowEditor draftYaml={VALID} onYamlChange={() => {}} agents={[]} validity={null} />,
-    );
-    const aside = container.querySelector('aside')!;
-    expect(aside.className).toContain('lg:w-80');
-    expect(screen.queryByRole('separator', { name: 'Resize inspector' })).not.toBeInTheDocument();
   });
 
   it('next: aside exposes a vertical "Resize inspector" separator and drops lg:w-80', () => {

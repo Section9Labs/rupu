@@ -485,16 +485,13 @@ interface Props {
   /** When true the YAML is currently unparseable: keep the last good graph on
    *  screen but dim it, freeze interactions, and show a "graph paused" chip. */
   paused?: boolean;
-  /** Workflow-editor-UI flag — gates the branch palette card in NodePalette
-   *  ('next' only). Rendering an EXISTING branch node is always on regardless
-   *  of this flag; only the ability to ADD a new one from the palette is gated. */
+  /** Workflow-editor-UI flag, threaded down to NodePalette / EditableStepNode. */
   workflowEditorUi?: WorkflowEditorUi;
   /** Inspector-rail slot to portal the palette into (Task 1), owned by
-   *  WorkflowEditor. Only consulted when `workflowEditorUi === 'next'`:
+   *  WorkflowEditor:
    *  - set → the palette portals in as `variant="rail"`, no floating dock.
    *  - null/undefined (rail slot not mounted yet) → palette renders nothing
-   *    for that frame, rather than flashing the floating dock.
-   *  Classic ALWAYS renders today's floating dock and ignores this prop. */
+   *    for that frame, rather than flashing the floating dock. */
   paletteContainer?: HTMLElement | null;
   /** MCP tool catalog (from `api.getTools()`), owned by WorkflowEditor and
    *  threaded to NodePalette so the `next` look can offer connector ACTION
@@ -642,14 +639,12 @@ function WorkflowEditorGraphInner({
     // paints on that node's top-bar — the edge just carries it downstream).
     return graph.edges.map((e) => {
       const branchColor = branchEdgeColor(e.branch, colors);
-      const next = workflowEditorUi === 'next';
       const isSelected = selectedEdgeIds.has(e.id);
       const sourceKind = kindById.get(e.source);
       const accentKey = sourceKind ? KIND_ACCENT[sourceKind] : undefined;
-      // Plain (non-branch) edges get a kind-tinted arrowhead in `next`,
-      // matching the stroke below (classic leaves the marker color undefined
-      // → xyflow's default).
-      const markerColor = branchColor ?? (next ? colors.alpha(accentKey ?? 'inkMute', 0.55) : undefined);
+      // Plain (non-branch) edges get a kind-tinted arrowhead, matching the
+      // stroke below.
+      const markerColor = branchColor ?? colors.alpha(accentKey ?? 'inkMute', 0.55);
       const edge: Edge = {
         id: e.id,
         source: e.source,
@@ -659,52 +654,42 @@ function WorkflowEditorGraphInner({
       };
       // Anchor the edge at the branch node's matching arm handle.
       // `EditableStepNode` gives every `branch`-kind node TWO source handles,
-      // `id="then"` (green, top) / `id="else"` (red, below) — both the `next`
-      // and classic render paths use those exact ids. Without this, xyflow
-      // falls back to the FIRST source handle it finds for every edge from
-      // that node (always "then"/green), so a correctly-derived else-arm
-      // edge still visually draws from the green dot. `branch` and the
-      // handle id are the same two literal strings by construction, so this
-      // is a pure derivation, not a new field to keep in sync.
+      // `id="then"` (green, top) / `id="else"` (red, below). Without this,
+      // xyflow falls back to the FIRST source handle it finds for every edge
+      // from that node (always "then"/green), so a correctly-derived
+      // else-arm edge still visually draws from the green dot. `branch` and
+      // the handle id are the same two literal strings by construction, so
+      // this is a pure derivation, not a new field to keep in sync.
       if (e.branch) edge.sourceHandle = e.branch;
       // Only set `selected` when true, so an unselected edge's emitted shape
-      // stays byte-identical to before edge selection existed (classic tests
-      // assert exact edge shapes).
+      // stays as small as possible.
       if (isSelected) edge.selected = true;
-      // xyflow's built-in dashed flow animation — every `next` edge gets it
-      // (branch arm or plain); classic never sets the key at all, so its
-      // emission stays byte-identical to before this change.
-      if (next) edge.animated = true;
+      // xyflow's built-in dashed flow animation, on every edge (branch arm or
+      // plain).
+      edge.animated = true;
       if (e.label !== undefined) edge.label = e.label;
       if (branchColor !== undefined) {
-        // Branch (true/false) arm — colored stroke, a touch bolder for `next`
-        // (mirrors the mockup's `.edge.t-true`/`.edge.t-false`), bolder still
-        // when selected. An inline `style.stroke` always wins over xyflow's
-        // default `.selected` CSS treatment, so `next` earns its selected
-        // emphasis here rather than through the stylesheet; classic (no
-        // inline strokeWidth here) still falls back to xyflow's default
-        // selected-edge CSS.
-        edge.style = next ? { stroke: branchColor, strokeWidth: isSelected ? 3.5 : 2.5 } : { stroke: branchColor };
+        // Branch (true/false) arm — colored stroke, a touch bolder (mirrors
+        // the mockup's `.edge.t-true`/`.edge.t-false`), bolder still when
+        // selected. An inline `style.stroke` always wins over xyflow's
+        // default `.selected` CSS treatment, so the selected emphasis is
+        // earned here rather than through the stylesheet.
+        edge.style = { stroke: branchColor, strokeWidth: isSelected ? 3.5 : 2.5 };
         edge.labelStyle = { fill: branchColor, fontWeight: 600 };
-        if (next) {
-          // Semantic label chip: ✓ then / ✕ else, filled with a soft tint of
-          // the arm's own accent (status.done / status.failed).
-          const isThen = e.branch === 'then';
-          edge.label = isThen ? '✓ then' : '✕ else';
-          edge.labelBgStyle = {
-            fill: colors.alpha(isThen ? 'status.done' : 'status.failed', 0.12),
-          };
-          edge.labelBgPadding = [6, 3];
-          edge.labelBgBorderRadius = 6;
-        } else {
-          edge.labelBgStyle = { fillOpacity: 0 };
-        }
-      } else if (next) {
+        // Semantic label chip: ✓ then / ✕ else, filled with a soft tint of
+        // the arm's own accent (status.done / status.failed).
+        const isThen = e.branch === 'then';
+        edge.label = isThen ? '✓ then' : '✕ else';
+        edge.labelBgStyle = {
+          fill: colors.alpha(isThen ? 'status.done' : 'status.failed', 0.12),
+        };
+        edge.labelBgPadding = [6, 3];
+        edge.labelBgBorderRadius = 6;
+      } else {
         // Plain chain/data-ref edge — themed off the SOURCE node's kind
         // accent (mockup's `.edge`, upgraded from a flat muted stroke so
         // every edge — not just branch arms — reads as meaningful); bolder,
-        // full-strength when selected. Classic leaves this edge with
-        // xyflow's default styling (including its default selected look).
+        // full-strength when selected.
         edge.style = {
           stroke: colors.alpha(accentKey ?? 'inkMute', isSelected ? 0.9 : 0.55),
           strokeWidth: isSelected ? 3 : 2,
@@ -721,7 +706,7 @@ function WorkflowEditorGraphInner({
       }
       return edge;
     });
-  }, [graph.edges, kindById, colors, workflowEditorUi, selectedEdgeIds]);
+  }, [graph.edges, kindById, colors, selectedEdgeIds]);
 
   // Move (drag) + delete (Backspace/Delete) both arrive as node changes.
   const onNodesChange = useCallback(
@@ -974,14 +959,7 @@ function WorkflowEditorGraphInner({
   );
 
   return (
-    <div
-      className={[
-        'relative h-full min-h-[16rem] w-full overflow-hidden rounded-xl border border-border shadow-card',
-        workflowEditorUi === 'next' ? 'wfx-canvas' : '',
-      ]
-        .join(' ')
-        .trim()}
-    >
+    <div className="relative h-full min-h-[16rem] w-full overflow-hidden rounded-xl border border-border shadow-card wfx-canvas">
       {/* "graph paused" chip — top-center, shown while YAML is unparseable */}
       {paused && (
         <div
@@ -1071,27 +1049,17 @@ function WorkflowEditorGraphInner({
         />
       )}
 
-      {workflowEditorUi === 'next'
-        ? paletteContainer &&
-          createPortal(
-            <NodePalette
-              onAdd={addNode}
-              onDragStartKind={() => {}}
-              disabled={paused}
-              workflowEditorUi={workflowEditorUi}
-              variant="rail"
-              tools={tools}
-            />,
-            paletteContainer,
-          )
-        : (
+      {paletteContainer &&
+        createPortal(
           <NodePalette
             onAdd={addNode}
             onDragStartKind={() => {}}
             disabled={paused}
             workflowEditorUi={workflowEditorUi}
+            variant="rail"
             tools={tools}
-          />
+          />,
+          paletteContainer,
         )}
 
       <div
@@ -1115,20 +1083,11 @@ function WorkflowEditorGraphInner({
         fitView
         fitViewOptions={{ padding: 0.2, maxZoom: 1.0 }}
         proOptions={{ hideAttribution: true }}
-        // `next` leaves this transparent so the `.wfx-canvas` radial wash on the
-        // outer container (set above) shows through behind the grid pattern.
-        style={{ background: workflowEditorUi === 'next' ? 'transparent' : colors.bg }}
+        // Transparent so the `.wfx-canvas` radial wash on the outer container
+        // (set above) shows through behind the grid pattern.
+        style={{ background: 'transparent' }}
       >
-        {workflowEditorUi === 'next' ? (
-          <Background
-            variant={BackgroundVariant.Lines}
-            gap={28}
-            lineWidth={1}
-            color={colors.alpha('inkMute', 0.12)}
-          />
-        ) : (
-          <Background variant={BackgroundVariant.Dots} gap={16} size={1} color={colors.alpha('inkMute', 0.25)} />
-        )}
+        <Background variant={BackgroundVariant.Lines} gap={28} lineWidth={1} color={colors.alpha('inkMute', 0.12)} />
         <MiniMap
           pannable
           zoomable

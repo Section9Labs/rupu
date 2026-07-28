@@ -27,26 +27,6 @@ export const NODE_KIND_MIME = 'application/rupu-node-kind';
  *  name. Absent for the plain kind cards (whose drop yields a bare node). */
 export const NODE_SEED_MIME = 'application/rupu-node-seed';
 
-// Per-kind accent color — classic-only fixed hex, matching the real card's
-// classic top-bar. `next` uses the themed `KIND_ACCENT` imported from
-// kindVisuals above (shared with EditableStepNode).
-const KIND_COLOR: Record<StepKind, string> = {
-  step: '#1860f2',
-  for_each: '#8b5cf6',
-  parallel: '#9333ea',
-  panel: '#f59e0b',
-  branch: '#16a34a',
-  // gate/action are `next`-only cards — these classic hexes exist only to
-  // satisfy the exhaustive Record; the classic dock never renders them.
-  approval_gate: '#a855f7',
-  action: '#0ea5e9',
-  // split/join (Phase 1 non-linear orchestration) are `next`-only cards, like
-  // gate/action above — these hexes exist only to satisfy the exhaustive
-  // Record; the classic dock never renders them.
-  split: '#6366f1',
-  join: '#4338ca',
-};
-
 interface PaletteItem {
   kind: StepKind;
   /** card title — the kind keyword, matching the real node's chip. */
@@ -62,12 +42,9 @@ const ITEMS: readonly PaletteItem[] = [
   { kind: 'panel', label: 'panel', sub: 'review+gate' },
 ];
 
-// branch + gate are newer, still-behind-flag kinds — only offered from the
-// palette when `workflowEditorUi === 'next'` (see Props.workflowEditorUi below).
 const BRANCH_ITEM: PaletteItem = { kind: 'branch', label: 'branch', sub: 'if / then / else' };
 const GATE_ITEM: PaletteItem = { kind: 'approval_gate', label: 'gate', sub: 'human approval' };
-// split/join (Task 6) — Phase 1 non-linear orchestration nodes, `next`-only
-// like branch/gate above.
+// split/join (Task 6) — Phase 1 non-linear orchestration nodes.
 const SPLIT_ITEM: PaletteItem = { kind: 'split', label: 'split', sub: 'fan out' };
 const JOIN_ITEM: PaletteItem = { kind: 'join', label: 'join', sub: 'barrier' };
 
@@ -329,15 +306,12 @@ interface Props {
   onDragStartKind: (kind: StepKind) => void;
   /** When paused (YAML unparseable) the whole dock is inert. */
   disabled?: boolean;
-  /** Workflow-editor-UI flag — the branch/gate + connector cards render only
-   *  when 'next'. Defaults to 'classic' (kind cards only) for callers that
-   *  don't thread it. */
   workflowEditorUi?: WorkflowEditorUi;
-  /** 'float' (default): the classic/next floating dock, unchanged. 'rail': a
-   *  compact, non-absolute block for the inspector rail (Task 1) — same cards,
-   *  themed accent, no drag-hint copy, sub-text moved to a `title` tooltip. */
+  /** 'float' (default): the floating dock. 'rail': a compact, non-absolute
+   *  block for the inspector rail (Task 1) — same cards, themed accent, no
+   *  drag-hint copy, sub-text moved to a `title` tooltip. */
   variant?: 'float' | 'rail';
-  /** MCP tool catalog — grouped into connector ACTION cards (`next` only). */
+  /** MCP tool catalog — grouped into connector ACTION cards. */
   tools?: ToolSpec[];
 }
 
@@ -345,13 +319,13 @@ export default function NodePalette({
   onAdd,
   onDragStartKind,
   disabled = false,
-  workflowEditorUi = 'classic',
+  // Unread here (Task 5 removes the prop entirely) — kept for signature stability.
+  workflowEditorUi: _workflowEditorUi = 'classic',
   variant = 'float',
   tools,
 }: Props) {
-  const items = workflowEditorUi === 'next' ? [...ITEMS, BRANCH_ITEM, GATE_ITEM, SPLIT_ITEM, JOIN_ITEM] : ITEMS;
-  // Connector cards are `next`-only (classic dock stays byte-stable).
-  const connectorGroups = workflowEditorUi === 'next' && tools ? groupConnectors(tools) : [];
+  const items = [...ITEMS, BRANCH_ITEM, GATE_ITEM, SPLIT_ITEM, JOIN_ITEM];
+  const connectorGroups = tools ? groupConnectors(tools) : [];
   const colors = useThemeColors();
   // Rail-only state (declared unconditionally — Rules of Hooks — even though
   // only the `variant === 'rail'` branch below reads them). Selecting a chip
@@ -551,77 +525,38 @@ export default function NodePalette({
     );
   }
 
-  // "next" (instrument) look — a wholly separate render path so the classic
-  // markup below stays byte-identical. Ported from the mockup's `.palette`/
-  // `.pcard` (row-style card: accent-tinted kind icon + label/sub), styled via
-  // the `.wfx-*` CSS block; only the outer dock position (bottom-left float)
-  // stays Tailwind, matching the classic dock's placement.
-  if (workflowEditorUi === 'next') {
-    return (
-      <div
-        data-ui="next"
-        className="pointer-events-auto absolute bottom-3 left-3 z-10 max-w-[calc(100%-1.5rem)]"
-      >
-        <div className="wfx-palette">
-          <div className="wfx-palette-hint">Drag a card onto the canvas, or click to add at center.</div>
-          <div className="wfx-palette-list">
-            {items.map((item) => {
-              const color = colors.get(KIND_ACCENT[item.kind]);
-              const Icon = KIND_ICON[item.kind];
-              return (
-                <button
-                  key={item.kind}
-                  type="button"
-                  draggable={!disabled}
-                  disabled={disabled}
-                  onClick={() => onAdd(item.kind)}
-                  onDragStart={handleDragStart(item.kind)}
-                  aria-label={`Add ${item.label} node`}
-                  className="wfx-pcard"
-                >
-                  <Icon className="wfx-picon" size={14} strokeWidth={2} style={{ color }} aria-hidden />
-                  <div className="wfx-pcard-text">
-                    <div className="wfx-pl">{item.label}</div>
-                    <div className="wfx-pd">{item.sub}</div>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-          {connectorSection}
-        </div>
-      </div>
-    );
-  }
-
+  // The floating dock — row-style cards (accent-tinted kind icon +
+  // label/sub), styled via the `.wfx-*` CSS block; the outer dock position
+  // (bottom-left float) stays Tailwind.
   return (
-    <div className="pointer-events-auto absolute bottom-3 left-3 z-10 max-w-[calc(100%-1.5rem)] rounded-lg border border-border bg-panel/95 px-2 py-2 shadow-card">
-      <div className="px-0.5 pb-1.5 text-meta text-ink-mute">
-        Drag a card onto the canvas, or click to add at center.
-      </div>
-      <div className="flex flex-wrap gap-1.5">
-        {items.map((item) => {
-          const color = KIND_COLOR[item.kind];
-          return (
-            <button
-              key={item.kind}
-              type="button"
-              draggable={!disabled}
-              disabled={disabled}
-              onClick={() => onAdd(item.kind)}
-              onDragStart={handleDragStart(item.kind)}
-              aria-label={`Add ${item.label} node`}
-              className="group w-[104px] cursor-grab overflow-hidden rounded-[8px] border border-border bg-panel text-left shadow-sm transition hover:ring-1 hover:ring-brand-100 active:cursor-grabbing disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {/* colored top-bar — by KIND, mirrors the real card */}
-              <div className="h-[3px] w-full" style={{ background: color }} />
-              <div className="px-2 py-1.5">
-                <div className="truncate text-note font-semibold text-ink">{item.label}</div>
-                <div className="mt-0.5 truncate text-meta text-ink-mute">{item.sub}</div>
-              </div>
-            </button>
-          );
-        })}
+    <div data-ui="next" className="pointer-events-auto absolute bottom-3 left-3 z-10 max-w-[calc(100%-1.5rem)]">
+      <div className="wfx-palette">
+        <div className="wfx-palette-hint">Drag a card onto the canvas, or click to add at center.</div>
+        <div className="wfx-palette-list">
+          {items.map((item) => {
+            const color = colors.get(KIND_ACCENT[item.kind]);
+            const Icon = KIND_ICON[item.kind];
+            return (
+              <button
+                key={item.kind}
+                type="button"
+                draggable={!disabled}
+                disabled={disabled}
+                onClick={() => onAdd(item.kind)}
+                onDragStart={handleDragStart(item.kind)}
+                aria-label={`Add ${item.label} node`}
+                className="wfx-pcard"
+              >
+                <Icon className="wfx-picon" size={14} strokeWidth={2} style={{ color }} aria-hidden />
+                <div className="wfx-pcard-text">
+                  <div className="wfx-pl">{item.label}</div>
+                  <div className="wfx-pd">{item.sub}</div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+        {connectorSection}
       </div>
     </div>
   );

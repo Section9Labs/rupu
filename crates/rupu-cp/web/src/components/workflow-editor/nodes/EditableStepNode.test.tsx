@@ -45,12 +45,12 @@ describe('EditableStepNode', () => {
     renderNode({ id: 'build', kind: 'step', agent: 'coder' });
     expect(screen.getByText('build')).toBeInTheDocument();
     expect(screen.getByText('step')).toBeInTheDocument();
-    expect(screen.getByText('coder')).toBeInTheDocument();
+    expect(screen.getByText(/coder/)).toBeInTheDocument();
   });
 
   it('a step with no agent reads "(no agent)"', () => {
     renderNode({ id: 'x', kind: 'step' });
-    expect(screen.getByText('(no agent)')).toBeInTheDocument();
+    expect(screen.getByText(/\(no agent\)/)).toBeInTheDocument();
   });
 
   it('a parallel node renders a stacked row per sub-step', () => {
@@ -83,7 +83,7 @@ describe('EditableStepNode', () => {
       },
     });
     expect(screen.getByText('panel')).toBeInTheDocument();
-    expect(screen.getByText('· 2 panelists')).toBeInTheDocument();
+    expect(screen.getByText('2 panelists')).toBeInTheDocument();
     expect(screen.getByText(/gate ≥ high/)).toBeInTheDocument();
   });
 
@@ -128,28 +128,6 @@ describe('EditableStepNode', () => {
   it('carries data-ui="next" on the outer node when workflowEditorUi is "next"', () => {
     const { container } = renderNode({ id: 'x', kind: 'step' }, [], false, 'next');
     expect(container.querySelector('[data-ui="next"]')).toBeInTheDocument();
-  });
-
-  it('defaults to data-ui="classic" when workflowEditorUi is unset', () => {
-    const { container } = renderNode({ id: 'x', kind: 'step' });
-    expect(container.querySelector('[data-ui="classic"]')).toBeInTheDocument();
-  });
-
-  describe('classic look (workflowEditorUi unset)', () => {
-    it('renders the current id span and kind chip, and no .wfx-* markers', () => {
-      const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' });
-      expect(container.querySelector('.text-ui.font-semibold')).toHaveTextContent('build');
-      expect(screen.getByText('step')).toBeInTheDocument();
-      expect(container.querySelector('.wfx-node')).not.toBeInTheDocument();
-      expect(container.querySelector('.wfx-kindpill')).not.toBeInTheDocument();
-      expect(container.querySelector('.wfx-nid')).not.toBeInTheDocument();
-    });
-
-    it('renders no kind icon (Task 3: icons are next-only)', () => {
-      const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' });
-      expect(container.querySelector('.wfx-kindicon')).not.toBeInTheDocument();
-      expect(container.querySelector('svg')).not.toBeInTheDocument();
-    });
   });
 
   describe('next (instrument) look', () => {

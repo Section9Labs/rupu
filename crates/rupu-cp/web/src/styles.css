@@ -414,9 +414,7 @@
 }
 
 /* ================================================================== */
-/* Flow Designer (next) editor — namespaced .wfx-*, nothing leaks.    */
-/* Behind `data.workflowEditorUi === 'next'` (EditableStepNode); the  */
-/* `classic` render path is untouched Tailwind/inline-style markup.   */
+/* Flow Designer editor — namespaced .wfx-*, nothing leaks.           */
 /* Ported from the approved interactive mockup (flow-designer.html);  */
 /* colors come from the shared `--c-*` tokens (light + dark), same as */
 /* the Situation Room / Agent Builder blocks above/below.             */
@@ -863,14 +861,13 @@
   .wfx-palette-filter, .wfx-detail-addbtn { transition: none !important; }
 }
 
-/* ── Settings inspector authoring cards (Task 5): Trigger / Inputs ── */
+/* ── Settings inspector authoring cards: Trigger / Inputs ── */
 /* Ported from the mockup's `.card-sec`/`.sh`/`.sb` (card shell) and
- * `.seg`/`.chip` (segmented control / removable chip). Behind
- * `workflowEditorUi === 'next'` in WorkflowSettingsForm; the classic
- * rest-chips form is untouched. Field controls inside these cards reuse the
- * standard Tailwind field/label classes already used across StepForm /
- * WorkflowSettingsForm — only the card chrome + segmented control + chip list
- * are new, themed via the shared `--c-*` tokens (no new tokens added). */
+ * `.seg`/`.chip` (segmented control / removable chip). Field controls inside
+ * these cards reuse the standard Tailwind field/label classes already used
+ * across StepForm / WorkflowSettingsForm — only the card chrome + segmented
+ * control + chip list are new, themed via the shared `--c-*` tokens (no new
+ * tokens added). */
 .wfx-card {
   border: 1px solid rgb(var(--c-border));
   border-radius: 10px;

@@ -155,10 +155,9 @@ export default function WorkflowEditor({
   // cards (the palette degrades to kind cards only).
   const [tools, setTools] = useState<ToolSpec[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  // `next` defaults to the Blocks tab (the palette now lives there — Task
-  // "Flow Designer rail redesign"); classic keeps its old Settings default,
-  // since it has no Blocks tab to default to.
-  const [panelTab, setPanelTab] = useState<PanelTab>(workflowEditorUi === 'next' ? 'blocks' : 'settings');
+  // Defaults to the Blocks tab (the palette lives there — Task "Flow
+  // Designer rail redesign").
+  const [panelTab, setPanelTab] = useState<PanelTab>('blocks');
   const [connError, setConnError] = useState<string | null>(null);
   // Transient notice (e.g. selection lost on rename), auto-dismissed.
   const [notice, setNotice] = useState<string | null>(null);
@@ -489,7 +488,7 @@ export default function WorkflowEditor({
 
       {/* ── LEFT / MAIN: graph over YAML, resizable ───────────────────────── */}
       <div className="min-h-0 min-w-0 flex-1">
-        {workflowEditorUi === 'next' && !sourceOpen ? (
+        {!sourceOpen ? (
           <div className="flex h-full min-h-0 flex-col">
             <div className="min-h-0 flex-1 overflow-hidden p-3">
               <WorkflowEditorGraph
@@ -534,17 +533,14 @@ export default function WorkflowEditor({
                   onInvalidConnection={setConnError}
                   paused={paused}
                   workflowEditorUi={workflowEditorUi}
-                  paletteContainer={workflowEditorUi === 'next' ? paletteSlot : undefined}
+                  paletteContainer={paletteSlot}
                   tools={tools}
                 />
               </div>
             }
             bottom={
               <div className="flex h-full min-h-0 flex-col">
-                <div
-                  className="min-h-0 flex-1 overflow-auto p-3"
-                  {...(workflowEditorUi === 'next' ? { id: SOURCE_PANE_ID } : {})}
-                >
+                <div className="min-h-0 flex-1 overflow-auto p-3" id={SOURCE_PANE_ID}>
                   <CodeEditor
                     value={draftYaml}
                     onChange={onYamlChange}
@@ -554,17 +550,15 @@ export default function WorkflowEditor({
                 </div>
                 <div className="flex items-center gap-2 border-t border-border bg-panel px-3 py-1.5">
                   <span className="text-note text-ink-mute">⟳ synced from graph</span>
-                  {workflowEditorUi === 'next' && (
-                    <button
-                      type="button"
-                      onClick={toggleSourceOpen}
-                      aria-expanded={true}
-                      aria-controls={SOURCE_PANE_ID}
-                      className="rounded px-1.5 py-0.5 text-note font-medium text-ink-dim hover:bg-surface-hover hover:text-ink"
-                    >
-                      Hide source
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    onClick={toggleSourceOpen}
+                    aria-expanded={true}
+                    aria-controls={SOURCE_PANE_ID}
+                    className="rounded px-1.5 py-0.5 text-note font-medium text-ink-dim hover:bg-surface-hover hover:text-ink"
+                  >
+                    Hide source
+                  </button>
                   <span className="ml-auto">
                     <ValidityBadge validity={validity} />
                   </span>
@@ -577,81 +571,48 @@ export default function WorkflowEditor({
 
       {/* ── RIGHT: inspector rail ─────────────────────────────────────────── */}
       <aside
-        ref={workflowEditorUi === 'next' ? asideRef : undefined}
-        className={
-          workflowEditorUi === 'next'
-            ? 'relative flex w-full shrink-0 flex-col border-t border-border bg-panel wfx-rail-sized lg:border-l lg:border-t-0'
-            : 'flex w-full shrink-0 flex-col border-t border-border bg-panel lg:w-80 lg:border-l lg:border-t-0'
-        }
-        style={workflowEditorUi === 'next' ? ({ '--wfx-rail-w': `${railWidth}px` } as React.CSSProperties) : undefined}
+        ref={asideRef}
+        className="relative flex w-full shrink-0 flex-col border-t border-border bg-panel wfx-rail-sized lg:border-l lg:border-t-0"
+        style={{ '--wfx-rail-w': `${railWidth}px` } as React.CSSProperties}
       >
-        {workflowEditorUi === 'next' && (
-          <div
-            role="separator"
-            aria-orientation="vertical"
-            aria-label="Resize inspector"
-            aria-valuenow={railWidth}
-            aria-valuemin={RAIL_WIDTH_MIN}
-            aria-valuemax={RAIL_WIDTH_MAX}
-            tabIndex={0}
-            onPointerDown={onRailPointerDown}
-            onKeyDown={onRailKeyDown}
-            className="wfx-rail-handle hidden lg:block"
-          />
-        )}
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize inspector"
+          aria-valuenow={railWidth}
+          aria-valuemin={RAIL_WIDTH_MIN}
+          aria-valuemax={RAIL_WIDTH_MAX}
+          tabIndex={0}
+          onPointerDown={onRailPointerDown}
+          onKeyDown={onRailKeyDown}
+          className="wfx-rail-handle hidden lg:block"
+        />
         <div className="border-b border-border p-3">
           <div role="tablist" aria-label="Inspector" className="inline-flex rounded-lg border border-border bg-panel p-0.5">
-            {workflowEditorUi === 'next' && (
-              <PanelTabButton
-                active={panelTab === 'blocks'}
-                onClick={() => setPanelTab('blocks')}
-                tabId="inspector-tab-blocks"
-                controls="inspector-blocks"
-              >
-                Blocks
-              </PanelTabButton>
-            )}
-            {workflowEditorUi === 'next' ? (
-              // next order: Blocks · Step · Settings · Reference.
-              <>
-                <PanelTabButton
-                  active={panelTab === 'step'}
-                  onClick={() => setPanelTab('step')}
-                  tabId="inspector-tab-step"
-                  controls="inspector-step"
-                >
-                  Step
-                </PanelTabButton>
-                <PanelTabButton
-                  active={panelTab === 'settings'}
-                  onClick={() => setPanelTab('settings')}
-                  tabId="inspector-tab-settings"
-                  controls="inspector-settings"
-                >
-                  Settings
-                </PanelTabButton>
-              </>
-            ) : (
-              // classic order (unchanged): Settings · Step.
-              <>
-                <PanelTabButton
-                  active={panelTab === 'settings'}
-                  onClick={() => setPanelTab('settings')}
-                  tabId="inspector-tab-settings"
-                  controls="inspector-settings"
-                >
-                  Settings
-                </PanelTabButton>
-                <PanelTabButton
-                  active={panelTab === 'step'}
-                  onClick={() => setPanelTab('step')}
-                  tabId="inspector-tab-step"
-                  controls="inspector-step"
-                >
-                  Step
-                </PanelTabButton>
-              </>
-            )}
+            <PanelTabButton
+              active={panelTab === 'blocks'}
+              onClick={() => setPanelTab('blocks')}
+              tabId="inspector-tab-blocks"
+              controls="inspector-blocks"
+            >
+              Blocks
+            </PanelTabButton>
+            <PanelTabButton
+              active={panelTab === 'step'}
+              onClick={() => setPanelTab('step')}
+              tabId="inspector-tab-step"
+              controls="inspector-step"
+            >
+              Step
+            </PanelTabButton>
+            <PanelTabButton
+              active={panelTab === 'settings'}
+              onClick={() => setPanelTab('settings')}
+              tabId="inspector-tab-settings"
+              controls="inspector-settings"
+            >
+              Settings
+            </PanelTabButton>
             <PanelTabButton
               active={panelTab === 'reference'}
               onClick={() => setPanelTab('reference')}

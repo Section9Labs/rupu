@@ -45,21 +45,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('WorkflowSettingsForm — classic (unchanged)', () => {
-  it('renders the read-only rest-chips form and no Trigger/Inputs card', () => {
-    render(<WorkflowSettingsForm meta={metaWith({ trigger: { on: 'cron', cron: '* * * * *' } })} onChange={() => {}} />);
-    expect(screen.getByText('Preserved advanced keys — edit these in the YAML tab:')).toBeInTheDocument();
-    expect(screen.getByText('trigger')).toBeInTheDocument();
-    expect(screen.queryByTestId('trigger-card')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('inputs-card')).not.toBeInTheDocument();
-  });
-
-  it('defaults to classic when workflowEditorUi is omitted', () => {
-    render(<WorkflowSettingsForm meta={metaWith({ inputs: { x: { type: 'string', required: false } } })} onChange={() => {}} />);
-    expect(screen.queryByTestId('inputs-card')).not.toBeInTheDocument();
-    expect(screen.getByText('inputs')).toBeInTheDocument();
-  });
-
+describe('WorkflowSettingsForm — name/description', () => {
   it('editing the name emits a meta with rest preserved', () => {
     const spy = vi.fn();
     const meta = metaWith({ trigger: { cron: '* * * * *' } });
@@ -220,20 +206,6 @@ describe('WorkflowSettingsForm — next: Inputs card', () => {
     expect(screen.getByLabelText('Input 1 description')).toHaveValue('target repo');
     expect(screen.getByText('a')).toBeInTheDocument();
     expect(screen.getByText('b')).toBeInTheDocument();
-  });
-});
-
-describe('WorkflowSettingsForm — classic: autoflow stays a chip, not a card', () => {
-  it('renders autoflow as a read-only chip and no autoflow card', () => {
-    render(
-      <WorkflowSettingsForm
-        meta={metaWith({ autoflow: { enabled: true, entity: 'issue' } })}
-        onChange={() => {}}
-      />,
-    );
-    expect(screen.getByText('autoflow')).toBeInTheDocument();
-    expect(screen.queryByTestId('autoflow-card')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('lifecycle-ribbon')).not.toBeInTheDocument();
   });
 });
 
