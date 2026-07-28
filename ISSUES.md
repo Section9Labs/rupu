@@ -81,7 +81,7 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | ID | Sev | Area | Title | Status |
 |---|---|---|---|---|
 | I-33 | P0 | rupu-orchestrator | Action steps cannot take a templated number — the headline use case is unexpressible | open |
-| I-34 | P0 | rupu-orchestrator | `{{ steps.<action>.output }}` is an unindexable JSON string; no `fromjson` filter exists | open |
+| I-34 | P0 | rupu-orchestrator | `{{ steps.<action>.output }}` is an unindexable JSON string; no `fromjson` filter exists | fixed |
 | I-35 | P0 | rupu-cp | Web, local/http connector, desktop-app and **both cancel** paths skip the `on_reject` chain (no TUI exists; SSH/tunnel are fine) | open |
 | I-36 | P1 | rupu-orchestrator | A reject with an empty `on_reject` chain records no gate decision at all | open |
 | I-37 | P1 | rupu-cli | `on_timeout: approve` never resumes without `cp serve` — the lazy path only prints a hint | open |
@@ -283,6 +283,48 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-34 — an action step's output is now indexable
+
+**Symptom.** `{{ steps.<action-id>.output }}` interpolated a raw JSON string that could
+not be indexed. There was no way to get a field out of it, which made `action:` steps
+effectively **write-only**: you could call a tool but never consume its result.
+
+**Root cause.** The output is a JSON string end to end — the MCP dispatcher returns
+`Result<String, _>` (`crates/rupu-mcp/src/dispatcher.rs:26`), `StepResult.output` is a
+`String`, and it reaches minijinja verbatim as `StepOutput.output: String`
+(`templates.rs:141`). minijinja is pinned with `features = ["json"]`, which registers
+**only `tojson`** — there is no inverse filter in minijinja at all — and
+`grep -rn "add_filter" crates/` returned **zero hits repo-wide**, so the crate registered
+no filters of its own either. The only environment customization was
+`env.add_function("read_file", …)`.
+
+`tojson` goes the wrong way (it would double-encode an already-JSON string), and there is
+no `split`/regex escape hatch that yields a typed value, so the only survivable pattern
+was string surgery. Extracting a field was effectively impossible.
+
+**Fix.** Registers a `fromjson` filter alongside `read_file` in `templates.rs`. There is
+exactly one `Environment::new()` site in the crate, so one registration covers prompt
+rendering and `when:` evaluation both. Invalid JSON fails the render naming the filter,
+rather than yielding `undefined` — an undefined would render as `""` and silently ship an
+empty value downstream, which is the failure mode this program exists to eliminate.
+
+**Validation.** Five tests in `crates/rupu-orchestrator/tests/templates.rs`, 4 RED before
+the change: indexing a field, **typed** round-trip (`> 5` comparison, proving the value is
+a real number and not a string that merely renders the same), nested/array indexing,
+`tojson` round-trip, and the invalid-JSON error.
+
+That last test carries an explicit guard against **passing for the wrong reason** — before
+the filter existed, minijinja's "unknown filter" error *also* contained the word
+`fromjson`, so asserting only on that substring is satisfied by the filter being absent.
+It now additionally asserts the message is **not** the unknown-filter one.
+
+**Documented** in `docs/workflow-format.md` under a new "Template filters" section, with
+the worked action-step example, the typed-comparison case, and a note that gates need no
+equivalent because a gate decision is already pre-parsed as `steps.<id>.decision`. An
+undocumented filter is a silent feature.
+
+---
 
 ### I-31 — both UI hooks and their localStorage overrides are removed
 
