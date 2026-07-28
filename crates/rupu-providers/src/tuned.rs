@@ -93,12 +93,13 @@ impl LlmProvider for ThrottledProvider {
         self.inner.provider_id()
     }
 
-    // `list_models` is deliberately NOT forwarded: `async_trait` gives the
-    // `&self` default method a `Self: Sync` bound, and `Box<dyn LlmProvider>`
-    // is `Send` only. No caller reaches `list_models` through a boxed
-    // provider — `rupu models refresh` calls it on the concrete client for
-    // exactly this reason (`rupu-cli/src/cmd/models.rs:206-208`) — so the
-    // inherited empty-vec default is never observed.
+    // I-76: forwarded now that `LlmProvider: Send + Sync` (see provider.rs)
+    // makes it possible to call the inner boxed provider's real
+    // `list_models` through the trait object at all — see
+    // `tests::throttled_provider_forwards_list_models_through_a_boxed_decorator`.
+    async fn list_models(&self) -> Vec<crate::model_pool::ModelInfo> {
+        self.inner.list_models().await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -247,12 +248,10 @@ impl LlmProvider for RetryingProvider {
         self.inner.provider_id()
     }
 
-    // `list_models` is deliberately NOT forwarded: `async_trait` gives the
-    // `&self` default method a `Self: Sync` bound, and `Box<dyn LlmProvider>`
-    // is `Send` only. No caller reaches `list_models` through a boxed
-    // provider — `rupu models refresh` calls it on the concrete client for
-    // exactly this reason (`rupu-cli/src/cmd/models.rs:206-208`) — so the
-    // inherited empty-vec default is never observed.
+    // I-76: see the matching comment on ThrottledProvider above.
+    async fn list_models(&self) -> Vec<crate::model_pool::ModelInfo> {
+        self.inner.list_models().await
+    }
 }
 
 #[cfg(test)]
@@ -349,6 +348,23 @@ mod tests {
 
         fn provider_id(&self) -> ProviderId {
             ProviderId::Anthropic
+        }
+
+        async fn list_models(&self) -> Vec<crate::model_pool::ModelInfo> {
+            vec![probe_model_info("probe-model")]
+        }
+    }
+
+    /// Minimal fixture, mirroring `github_copilot::make_model_info`.
+    fn probe_model_info(id: &str) -> crate::model_pool::ModelInfo {
+        crate::model_pool::ModelInfo {
+            id: id.to_string(),
+            provider: ProviderId::Anthropic,
+            context_window: 0,
+            max_output_tokens: 0,
+            capabilities: Vec::new(),
+            cost: crate::model_pool::ModelCost::default(),
+            status: crate::model_pool::ModelStatus::default(),
         }
     }
 
@@ -725,5 +741,47 @@ mod tests {
         tokio::time::advance(Duration::from_millis(200)).await;
         handle.await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    // ── I-76: decorators forward list_models ─────────────────────────────
+
+    /// Through a `Box<dyn LlmProvider>` — not the concrete inner type — a
+    /// `ThrottledProvider` must return the wrapped provider's real models,
+    /// not the trait's empty-vec default.
+    #[tokio::test]
+    async fn throttled_provider_forwards_list_models_through_a_boxed_decorator() {
+        let tuning = ProviderTuning::for_provider("list-models-throttle-test");
+        let throttled: Box<dyn LlmProvider> = Box::new(ThrottledProvider::wrap(
+            Box::new(Probe::new(0)),
+            "list-models-throttle-test",
+            &tuning,
+        ));
+        let models = throttled.list_models().await;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "probe-model");
+    }
+
+    /// Same property for `RetryingProvider`.
+    #[tokio::test]
+    async fn retrying_provider_forwards_list_models_through_a_boxed_decorator() {
+        let retrying: Box<dyn LlmProvider> =
+            Box::new(RetryingProvider::new(Box::new(Probe::new(0)), 1));
+        let models = retrying.list_models().await;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "probe-model");
+    }
+
+    /// Both decorators stacked, as `provider_factory::decorate` actually
+    /// builds them (`RetryingProvider(ThrottledProvider(client))`) — the
+    /// realistic factory-built shape the bug report was about.
+    #[tokio::test]
+    async fn stacked_decorators_forward_list_models() {
+        let tuning = ProviderTuning::for_provider("list-models-stacked-test");
+        let throttled =
+            ThrottledProvider::wrap(Box::new(Probe::new(0)), "list-models-stacked-test", &tuning);
+        let stacked: Box<dyn LlmProvider> = Box::new(RetryingProvider::new(Box::new(throttled), 1));
+        let models = stacked.list_models().await;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "probe-model");
     }
 }
