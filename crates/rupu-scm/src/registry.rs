@@ -245,12 +245,14 @@ impl Registry {
 
     /// Test/internal: register a `RepoConnector` directly without going
     /// through `discover`. Used by tests that need a fake connector.
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn insert_repo_connector(&mut self, p: Platform, c: Arc<dyn RepoConnector>) {
         self.repo_connectors.insert(p, c);
     }
 
     /// Test/internal: register an `IssueConnector` directly without going
     /// through `discover`. Used by tests that need a fake connector.
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn insert_issue_connector(&mut self, t: IssueTracker, c: Arc<dyn IssueConnector>) {
         self.issue_connectors.insert(t, c);
     }

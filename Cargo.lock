@@ -6720,6 +6720,7 @@ dependencies = [
  "rupu-auth",
  "rupu-config",
  "rupu-providers",
+ "rupu-scm",
  "serde",
  "serde_json",
  "tempfile",
