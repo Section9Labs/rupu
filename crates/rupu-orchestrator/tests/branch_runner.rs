@@ -298,6 +298,7 @@ async fn resume_after_branch_keeps_not_taken_arm_skipped() {
         reason: PauseReason::Manual,
         paused_step: None,
         rejected_reason: None,
+        ..Default::default()
     });
 
     let res = run_workflow(opts).await.unwrap();

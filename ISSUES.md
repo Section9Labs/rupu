@@ -65,6 +65,8 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-78 | P1 | rupu-orchestrator | A workflow step at `--mode ask` still gets `BypassDecider` — `ask` grants full tool access | open |
 | I-79 | P2 | rupu-cli | The action dispatcher's `["*"]` allowlist is sound only by invariant, not by construction | open |
 | I-80 | P2 | rupu-cli/docs | Reject-timeout gates now resolve only via `cp serve`'s sweep; CLI-only operators lose auto-resolution | open |
+| I-81 | P2 | rupu-mcp | `tools_list_matches_snapshot` fails in this worktree — schemars field-order drift under Homebrew 1.95 vs pinned 1.88 | open |
+| I-82 | P2 | rupu-cp | The CP web approve path discards the resolved decision, so a web approve's true actor is lost before the resume worker spawns | open |
 
 ### Arc 3 — single UI path
 
@@ -80,18 +82,18 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 | ID | Sev | Area | Title | Status |
 |---|---|---|---|---|
-| I-33 | P0 | rupu-orchestrator | Action steps cannot take a templated number — the headline use case is unexpressible | open |
-| I-34 | P0 | rupu-orchestrator | `{{ steps.<action>.output }}` is an unindexable JSON string; no `fromjson` filter exists | open |
-| I-35 | P0 | rupu-cp | CP web reject (and host-connector, TUI, cancel) skips the `on_reject` chain entirely | open |
-| I-36 | P1 | rupu-orchestrator | A reject with an empty `on_reject` chain records no gate decision at all | open |
-| I-37 | P1 | rupu-cli | `on_timeout: approve` never resumes without `cp serve` — the lazy path only prints a hint | open |
-| I-38 | P1 | rupu-orchestrator | A timeout-driven approval is recorded as `via: "human"` | open |
-| I-39 | P1 | rupu-orchestrator | `StepKind` has no `#[serde(other)]`; old binaries die on new `events.jsonl` | open |
-| I-40 | P1 | rupu-cp web | The CP transcript viewer discards `action_emitted` — action steps show an empty transcript | open |
-| I-41 | P2 | rupu-cli | `rupu workflow show` renders gate and action steps as `linear` with a blank primary column | open |
-| I-42 | P2 | rupu-orchestrator | A `when:`-skipped gate/action loses its kind and persists as `Linear` | open |
-| I-43 | P2 | rupu-cli | The gate sweep can re-spawn `workflow approve` every tick forever, with no backoff | open |
-| I-44 | P2 | rupu-orchestrator | `notify` hooks write orphan transcript files no `StepResult` references | open |
+| I-33 | P0 | rupu-orchestrator | Action steps cannot take a templated number — the headline use case is unexpressible | fixed |
+| I-34 | P0 | rupu-orchestrator | `{{ steps.<action>.output }}` is an unindexable JSON string; no `fromjson` filter exists | fixed |
+| I-35 | P0 | rupu-cp | Web, local/http connector, desktop-app and **both cancel** paths skip the `on_reject` chain (no TUI exists; SSH/tunnel are fine) | fixed |
+| I-36 | P1 | rupu-orchestrator | A reject with an empty `on_reject` chain records no gate decision at all | fixed |
+| I-37 | P1 | rupu-cli | `on_timeout: approve` never resumes without `cp serve` — the lazy path only prints a hint | fixed (docs) |
+| I-38 | P1 | rupu-orchestrator | A timeout-driven approval is recorded as `via: "human"` | fixed |
+| I-39 | P1 | rupu-orchestrator | `StepKind` has no `#[serde(other)]`; an unknown kind **silently drops the whole step result** on resume (readers skip, they do not die) | fixed |
+| I-40 | P2 | rupu-cp web | The CP transcript never shows an action step's rendered `with:` args (the node itself *does* render via `tool_audit`) | fixed |
+| I-41 | P2 | rupu-cli | `rupu workflow show`'s **steps table** lacks gate/action arms (the graph, the primary view, is correct) | fixed |
+| I-42 | P2 | rupu-orchestrator | A `when:`-skipped gate/action loses its kind and persists as `Linear` | fixed |
+| I-43 | P2 | rupu-cli | The gate sweep can re-spawn `workflow approve` every tick forever, with no backoff | fixed |
+| I-44 | P2 | rupu-orchestrator | `notify` hooks write orphan transcript files no `StepResult` references | fixed |
 
 ### Arc 5 — provider wire correctness
 
@@ -135,6 +137,55 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 ## Open
 
+### I-82 — a web approve's true actor is lost before the resume worker spawns
+
+**Symptom.** Approving a gate from the CP web UI records the decision, but the *identity*
+of whoever approved does not reach the gate decision row that [[I-36]]/[[I-38]] added.
+
+**Root cause.** `request_resume_approval` resolves an approval decision, but the CP's
+`approve_run` handler discards the returned value, so the actor is gone before the
+cross-process resume worker spawns and re-enters the runner. The same false comment
+I-36 corrected on `approve_gate`/`reject_gate` — *"identity recorded in transcript via
+runner re-entry"* — also sat on `request_resume_approval`; the comment was fixed there,
+but unlike the other two the plumbing behind it was **not** built, because it crosses a
+process boundary rather than staying inside one call chain.
+
+**Impact.** Audit-quality, not correctness: the decision, reason, timestamp and `via` are
+all recorded correctly; only the *who* is missing, and only for web-initiated approvals.
+CLI and sweep-driven paths carry the actor properly after I-36/I-38. Filed rather than
+folded into I-36 because it needs the resume-worker handoff to carry the actor across the
+spawn, which is a different piece of work from the in-process threading.
+
+**Fix.** Have `approve_run` persist the resolved decision's actor (the marker the resume
+worker already reads is the natural carrier), and have the worker thread it into
+`resume_run`'s existing `approver` parameter — which now exists, so the receiving end is
+already in place.
+
+---
+
+### I-81 — `tools_list_matches_snapshot` fails in this worktree
+
+**Symptom.** `cargo test -p rupu-mcp` reports
+`tools_list_matches_snapshot ... FAILED — tools/list snapshot drift`
+(`crates/rupu-mcp/tests/schema_snapshot.rs:36`).
+
+**Not caused by this program.** Verified: `git diff origin/main..HEAD --name-only` shows
+**zero** `rupu-mcp` files changed across Arcs 1–4. The last commit to touch that snapshot
+was itself `8cea2495 test: bless tools_list snapshot (field order)`, i.e. it has drifted on
+field ordering before.
+
+**Root cause (probable).** Same class as [[I-4]] and [[I-5]]: this worktree runs Homebrew
+Rust 1.95 against a `rust-toolchain.toml` pinned at 1.88, and `schemars` emits schema
+properties in a different order under the newer compiler. Not confirmed by bisect — filed
+so the known-red baseline is written down rather than rediscovered each arc.
+
+**Fix.** Confirm it reproduces on a clean `main` under 1.95 and passes under 1.88. If so it
+is an environment artifact, and the durable fix is making the snapshot order-insensitive
+(compare parsed JSON with sorted keys) rather than blessing it again — a blessed snapshot
+will just re-drift for the next person on a different toolchain.
+
+---
+
 ### I-80 — reject-timeout gates now resolve only via `cp serve`'s sweep
 
 **Symptom.** After I-25, a gate with `on_timeout: reject` whose deadline has passed
@@ -149,7 +200,15 @@ losing the chain. Resolution therefore moved entirely to the `cp serve` gate swe
 
 **Impact.** Affects a real class of user: anyone driving rupu purely from the CLI who
 never starts `rupu cp serve`, plus anyone who has set `[cp].gate_sweep_enabled = false`.
-Their reject-timeout gates no longer auto-resolve. This is a behavior change rather
+Their reject-timeout gates no longer auto-resolve.
+
+**Scope widened by [[I-35]] (Arc 4).** The sweep is now also the executor of `on_reject`
+cleanup for **web, desktop-app and cancel** rejects, which previously ran no chain at all.
+So the same "needs `cp serve`" dependency now covers materially more behavior than
+timeout routing alone. This is still a strict improvement over the prior state for those
+paths (cleanup eventually runs, versus never), but it raises the stakes on documenting the
+dependency: an operator who never starts `cp serve` now has *both* unresolved
+reject-timeout gates *and* unexecuted cleanup chains, with nothing surfacing either. This is a behavior change rather
 than a safety regression — the gate stays parked (fail-safe) rather than firing
 unexpectedly — and `rupu workflow reject <id>` still resolves it manually at any time.
 It is filed because the dependency is currently invisible: nothing tells such an
@@ -283,6 +342,386 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-36 + I-38 — gate decision provenance is recorded on every path
+
+Closed together because they were one gap: **the gate audit record could not tell you who
+decided, or whether a human decided at all.**
+
+**I-36.** An **empty** `on_reject` chain short-circuited past `run_reject_cleanup` — which
+is the **only caller of `emit_gate_result`** — so no gate decision row was written at all.
+Separately, `RunStore::reject_gate` and `approve_gate` both explicitly discarded the actor
+(`let _ = approver;`), under a comment claiming *"identity recorded in transcript via runner
+re-entry"*. **That comment was false**: `emit_gate_result` had no approver field.
+
+**I-38.** When the `cp serve` sweep resolved an `on_timeout: approve` gate it spawned
+`rupu workflow approve`, which landed in the normal approve path and emitted
+`via: "human"` — a machine-initiated approval was indistinguishable from an operator's.
+Reject already threaded `"timeout"` correctly; the asymmetry was the bug.
+
+**Fix.** The decision JSON gains an `approver` field, and the plumbing the false comments
+*claimed* existed was actually built: approver → `ApprovalDecision` →
+`ResumeState::from_approval_with_actor` → `run_reject_cleanup`'s new `approver` param →
+`emit_gate_result`. Timeout provenance is threaded through the approve path so a
+sweep-driven approval records `via: "timeout"`. The I-36 unconditional-cleanup fix was
+applied to **all three** sites sharing that guard — CLI reject, CLI approve's
+`ExpiredRejected` arm, and the cp-serve sweep — not only the one named in the plan;
+`cheap_on_reject_chain_len` thereby became dead and was removed.
+
+**Validation.** Three tests, all RED pre-fix for the right reasons (no gate row /
+`via:"human"` / `approver:null`): empty-chain reject records a decision with reason **and**
+actor; a sweep timeout-approve records `via == "timeout"`; and a genuine operator approve
+still records `via == "human"` with the operator's identity — that third one is the guard
+that stops the timeout fix over-applying.
+
+**A third false comment** of the same wording was found on `request_resume_approval` and
+corrected, but its cross-process resume-worker plumbing was **not** wired — see [[I-82]].
+
+---
+
+### I-39 — an unknown `StepKind` no longer drops the whole step result
+
+**The filed title was wrong and the real defect is worse.** It said old binaries "die" on a
+new `events.jsonl`. Nothing dies: every reader is tolerant and **silently skips the line**
+(`api/events.rs`, `api/graph.rs`, `transcript_tail.rs`, `executor/file_tail.rs`,
+`agent/runner.rs` ×3, and `RunStore::read_step_results`, whose own comment says *"Skip
+malformed rows rather than failing the read"*).
+
+The severe case is **`step_results.jsonl`**: skipping a row means an older binary resuming a
+run **silently loses a prior step's output** — the template context loses values and steps
+re-run, with no error surfaced anywhere. `StepKind` had 10 variants and no `#[serde(other)]`;
+`#[serde(default)]` on `StepResultRecord.kind` covers only a *missing* field, not an unknown
+value. The `Split`/`Join`/`Loop` doc comments narrate **three separate rounds** of exactly
+this variant-addition, so this had already bitten repeatedly.
+
+**Fix.** `#[serde(other)] Unknown` as the final variant (serde requires it last), plus the
+11 resulting exhaustive-match arms across `cmd/autoflow.rs`, `output/live_run.rs` and
+`output/workflow_printer.rs` — falling back to the generic linear rendering, or
+`unreachable!()` only where an outer match had already narrowed the kind.
+
+**Validation.** RED verified by toggling `#[serde(other)]` off (the row was silently
+dropped — `rows.len() == 1` instead of 2) and back on. The binding assertion is that the
+**data survives**, not the label: `future.output == "future output survives"`.
+
+**`events.jsonl` deliberately not covered.** It is internally-tagged with struct-only
+variants, so the same treatment would require new no-op arms in GUI-adjacent `rupu-app` and
+CLI live-view matches — which this repo's rules say need runtime rendering validation a
+subagent cannot perform. Since resume reads `step_results.jsonl` exclusively, `events.jsonl`
+is diagnostic-only and did not clear the "cheap" bar. A defensible scope call, recorded
+rather than silently skipped.
+
+---
+
+### I-42 — a `when:`-skipped gate or action keeps its kind
+
+**Symptom.** A gate or action step skipped by a false `when:` guard persisted as
+`kind: "linear"` in `step_results.jsonl`, losing the fact that it was ever a gate or an
+action.
+
+**Root cause.** Of the four skip sites, **two set `kind` and two did not**. The `when:`-skip
+sites (scheduler and linear loop) built their `StepResult` with `..Default::default()`, and
+`StepKind::default()` is `Linear`. The `when:` check runs *before* the gate/action checks,
+so the kind was never derived. The two sites that do it correctly — prune/cancel and
+branch-not-taken — sit ~60 lines away in the same file, which is what makes this an
+omission rather than a decision.
+
+**Fix.** Both `when:`-skip sites now set `kind: step_kind_for_run_record(step)`, exactly as
+their neighbours do. Two lines.
+
+**Validation.** Three tests observed RED (`Linear` vs expected `ApprovalGate`/`Action`),
+covering both the scheduler and linear-loop paths for a gate, plus an action step.
+
+---
+
+### I-43 — the gate sweep no longer re-spawns `approve` forever
+
+**Symptom.** For an `on_timeout: approve` gate the sweep spawns a detached
+`rupu workflow approve`. If that spawn failed — or the run was still `AwaitingApproval` and
+overdue on the next tick — it spawned another. Every 60 seconds. Indefinitely.
+
+**Root cause.** The sweep claims a lease via `claim_resume`, then calls `clear_resume`
+**unconditionally** after spawning, including when the spawn itself failed. `clear_resume`
+nulls `resume_claimed_at`, so the next tick's `claim_resume` returns `true` again. The
+in-memory `rec.awaiting` mutation is explicitly in-memory only and the next tick reloads
+from disk. There was no marker, no backoff and no attempt counter; the only thing that
+stopped repetition was the child successfully flipping the status — which the sweep never
+verified.
+
+**Fix.** Do not clear the resume claim when the spawn failed, so the existing 5-minute
+`RESUME_LEASE` TTL acts as the backoff. No new marker, counter or config knob — the
+infrastructure was already there for the web-approve race, and reusing it keeps one
+concept rather than two.
+
+**Validation.** `run_gate_sweep_does_not_respawn_forever_after_spawn_failure`. The binding
+assertion is on the **second** tick — `resume_claimed_at` is unchanged between tick 1 and
+tick 2, proving no re-claim and therefore no re-spawn. Asserting only on the first tick
+would have proved nothing.
+
+---
+
+### I-44 — notify hook transcripts are no longer orphaned
+
+**Symptom.** Every `notify:` hook on a gate wrote a transcript `.jsonl` that **nothing
+referenced** — a ULID-named file, unrecoverable by path, invisible to `show-run` and the CP,
+never collected.
+
+**Root cause.** `fire_notify_hooks` built a synthetic step and called
+`execute_action_step`, then **discarded the returned `Ok(StepResult)`**. Meanwhile
+`execute_action_step` unconditionally writes its transcript. And because
+`continue_on_error: true` is passed, even a *failed* hook returns `Ok` — so the file was
+written and dropped on **every** path, not just the error path.
+
+**Fix.** Persist the notify hook's `StepResult` (id `<step>.notify`) like every other step,
+threading `run_id`/`step_results` into `fire_notify_hooks`. Suppressing the transcript was
+the alternative and was rejected: the audit trail is the entire point of a notify hook —
+these are the calls that tell an outside system a gate is waiting.
+
+**Validation.** `notify_hook_transcript_is_referenced_by_a_persisted_step_result`, observed
+RED.
+
+---
+
+### I-41 — the steps table now renders gate and action nodes
+
+**Re-scoped from the filed title.** It claimed `rupu workflow show` renders gates and
+actions as `linear`. Only the **steps table** does. The graph renderer
+(`rupu-app-canvas`'s `git_graph.rs:278,308`) already emits `gate` and `action · <tool>`
+correctly, and the graph is the primary view — so this was never "show is broken".
+
+**Root cause.** `workflow_step_table_summary` had arms for `parallel`, `panel` and
+`for_each`, then fell through to `linear`. A gate printed `KIND=linear` with a **blank**
+PRIMARY column (gates have no `agent:`), and an action printed the same while **never
+naming the tool it calls** — which is the entire identity of an action step.
+
+**Fix.** A gate arm (prompt in PRIMARY; `auto_approve`/`timeout`/`on_timeout`/`on_reject`/
+`notify` in DETAIL) and an action arm (tool in PRIMARY, sorted `with:` keys in DETAIL —
+sorted so the column is stable across runs).
+
+**Validation.** Three tests, two **observed RED** by disabling the new arms
+(`left: "linear"`, `right: "gate"` / `"action"`). The third is a guard against the new arms
+over-matching: an agent step that merely *carries* an inline `approval:` is **not** a gate
+node and must still render `linear` with its agent name — it stayed green throughout,
+proving the guard is real rather than incidental.
+
+---
+
+### I-37 — the `cp serve` dependency for timeout routing is documented
+
+**Fixed as documentation, deliberately — and the code was left alone.** Making the runs
+listing resume an `on_timeout: approve` gate would **directly re-break [[I-25]]** from
+Arc 2, whose entire point is that a read command has no external side effects. The
+hint-only behavior is correct; what was missing is that nothing told the operator there is
+no automatic non-`cp serve` resume path.
+
+**A larger gap was found while fixing it:** standalone `approval:` **gate nodes were
+entirely undocumented** — `on_timeout`, `auto_approve`, `on_reject` and `notify` appeared
+nowhere in `docs/`. A whole shipped feature had no user-facing documentation.
+
+**Fix.** `docs/workflow-format.md` gains a gate-node section: the field table, the
+`steps.<gate-id>.decision` note, and an explicit subsection stating that
+`timeout_seconds`/`on_timeout` are acted on **only** by a running `rupu cp serve`, with the
+concrete manual fallback for each case. It also folds in the widened [[I-35]]/[[I-80]]
+consequence: `on_reject` chains triggered from the web UI, the desktop app or
+`workflow cancel` are recorded as pending and executed by the same sweep, so they wait on
+`cp serve` too.
+
+Removed the stale line *"timeouts are enforced lazily on the next run-store interaction"* —
+true when written, false since Arc 2 made the listing side-effect-free.
+
+---
+
+### I-35 — every reject and cancel path now runs the `on_reject` chain
+
+**Symptom.** Rejecting a gate from the CP web UI, the desktop app, a local/http host
+connector, or **cancelling** an awaiting run silently skipped the gate's `on_reject`
+cleanup chain. The operator saw a rejected run and reasonably believed cleanup had run.
+It never had, and nothing would ever retry it.
+
+**Root cause.** `run_reject_cleanup` is not merely "cleanup" — it is **the only caller of
+`emit_gate_result`**, so a path that skips it also records *no gate decision at all*.
+Five paths skipped it: CP web `POST /api/runs/:id/reject`, `LocalHostConnector::reject_run`,
+`HttpHostConnector::reject_run`, the `rupu-app` desktop reject, and — the sneakiest —
+`RunStore::cancel`, whose `AwaitingApproval` arm calls `self.reject(...)`, driving **both**
+CLI `workflow cancel` and CP web `/cancel`.
+
+**Neither `cp serve` worker covered it**, verified rather than assumed: the resume worker
+filters on `resume_requested_at.is_some()`, which a reject never sets; and the gate sweep
+matched only `AwaitingApproval`/`Running`/`Pending`, so an already-terminal `Rejected` run
+fell to `_ => {}` forever. The library documented the gap against itself at
+`runs.rs:1627-1634`.
+
+**Corrections to the filed issue** (it would have misdirected the work): there is **no
+TUI** — the affected GUI is the GPUI desktop app. And SSH/tunnel connectors were wrongly
+blamed: they **do** run the chain, because they re-enter the CLI.
+
+**Fix — marker + sweep, respecting the read-only boundary.** `rupu-cp` is deliberately
+read-only ("record-in-CP, resume-in-cp-serve") and must not grow a workflow runtime, so
+the chain is *not* called from `rupu-cp`. Instead `RunStore::reject_gate` records a
+`reject_cleanup_pending` marker when it finalizes a run `Rejected`, and the `cp serve`
+gate sweep grew an arm that picks those up, runs `build_reject_cleanup_opts` +
+`run_reject_cleanup`, and clears the marker.
+
+Because the marker lives in `RunStore::reject_gate`, the desktop app
+(`InProcessExecutor::reject` → `run_store.reject`) and **both** cancel paths
+(`RunStore::cancel` → `self.reject`) are covered with no caller-specific wiring — confirmed,
+not assumed. The CLI's own `reject` clears the marker after its existing synchronous run,
+so the sweep never double-executes.
+
+**The sweep arm matches on the MARKER, never on `status == Rejected`.** That is deliberate:
+matching on status is exactly the failure class Arc 2 hit in [[I-25]], where finalizing a
+run before the chain ran caused the sweep to skip it forever.
+
+**Validation.** RED observed by commenting out the marker assignment — all three tests
+failed at the marker assertion, then passed when restored.
+`web_reject_leaves_marker_sweep_runs_cleanup_and_records_gate_decision` stands up a **real**
+`rupu_cp::server::router` + `axum::serve` and rejects over genuine HTTP rather than calling
+the handler directly; `cancel_on_awaiting_approval_run_leaves_marker_sweep_runs_cleanup`
+covers the cancel path; and
+`empty_on_reject_chain_clears_marker_and_does_not_reprocess_on_next_tick` proves a second
+tick is a silent no-op (asserted by the absence of a duplicate gate row in
+`step_results.jsonl`), so an empty chain cannot spin. Real chain execution goes through the
+`RUPU_MOCK_PROVIDER_SCRIPT` seam with an actual `write_file` call.
+
+**Operator consequence — tracked, not buried.** Cleanup for web/app/cancel rejects now
+depends on `cp serve` running, the same dependency [[I-80]] already tracks for
+reject-timeout gates. I-80's write-up is widened rather than a duplicate being filed.
+
+---
+
+### I-40 — an action step's rendered `with:` args are now visible
+
+**The filed title was wrong**, and correcting it changed the work. It claimed action steps
+show an *empty transcript*. They do not: `execute_action_step` writes **two** lines
+(`ActionEmitted` and `ToolAudit`), and the viewer already had a dedicated standalone-action
+fallback for `tool_audit` (`transcriptView.ts:364`) with a passing test at
+`transcriptView.test.ts:369`. The node rendered fine.
+
+**The real gap** was the `action_emitted` payload — the **rendered `with:` args**, plus
+`allowed`/`applied`/`reason`. So an operator could see *that* an action ran but never
+*what it sent*, which for a tool that comments on issues or opens PRs is the part that
+matters.
+
+**Root cause.** `action_emitted` fell through to `default: break`, under a comment calling
+it a "dead/legacy shape". That was half true: **two distinct shapes share the event name.**
+The legacy finding shape (`{action: 'report_finding', severity, summary}`) genuinely is
+dead. The action-node shape (`{kind, payload, allowed, applied}`) is live and carries the
+args. Treating both as dead discarded the live one.
+
+**Fix.** The action-node shape's payload is stashed (queued by tool name, since a step may
+call the same tool twice) and picked up by the `tool_audit` that immediately follows,
+producing a **single merged entry** with `input` populated instead of `undefined`. The
+legacy shape stays ignored.
+
+**Why this respects the existing regression test rather than overriding it.** Two tests
+deliberately asserted `action_emitted` stays ignored; the plan flagged that they must be
+revised deliberately, not deleted. On inspection the real invariant that test protects is
+*"an action call is surfaced exactly once, never twice"* — and merging preserves it
+exactly. **The test passes unchanged.** Only its name and comment were corrected, because
+"action_emitted stays dead" no longer describes what it guards. The stale
+`transcriptView.ts` comment was corrected for the same reason — still true of
+`user_message`, no longer true of `action_emitted`.
+
+**Validation.** Two new tests: the args are visible on the merged entry, and a legacy
+`report_finding` payload is **not** mistaken for action args. Suite 1854 → 1856 across 179
+files, `npm run build` clean.
+
+---
+
+### I-33 — a templated scalar now reaches a typed tool parameter
+
+**Symptom.** The `action:` feature's headline use case — *"comment on issue #N"*, where N
+comes from a workflow input or a trigger event — was **literally unexpressible**. Writing
+`number: "{{ inputs.number }}"` failed at dispatch with
+`invalid type: string "42", expected u64`.
+
+**Root cause.** Three layers each behaving reasonably, combining into a dead end:
+`validate_action_step` (`workflow.rs:1319`) deliberately checks **keys only** — its own
+doc comment says *"VALUES are not checked — they may be minijinja templates rendered at
+runtime (the dispatcher's typed serde parse re-validates then)"*. `render_action_args`
+(`runner.rs:4528`) rendered a string leaf to `serde_json::Value::String`
+**unconditionally**. The dispatcher then did a typed serde parse (e.g.
+`CommentIssueArgs { number: u64, .. }`) which rejects `"42"`. No coercion existed anywhere
+(`deserialize_with`/`as_u64` in `crates/rupu-mcp/src`: zero hits).
+
+Aggravating: a declared `type: int` input could not help, because `StepContext.inputs` is
+`BTreeMap<String, String>` and `render_step_prompt` returns `String` regardless of source.
+The same applied to `{{ event.issue.number }}`.
+
+**Scope.** Every integer parameter in the catalog — `issues.get/comment/update_state.number`
+(u64), `scm.prs.get/diff/comment.number` (u32), every `.limit`. The only workaround was a
+literal unquoted `number: 7`, which is exactly what the repo's own fixture used
+(`tests/action_step.rs:259`) — **every pre-existing test templated only string fields**,
+which is why this survived.
+
+**Fix.** `render_action_args` now coerces against the tool's declared JSON-schema type,
+resolved through a shared `schema_scalar_kind` helper so "which types are coercible" has
+exactly one definition, used by both the renderer and the parser. Two deliberate judgment
+calls:
+- **Coercion fires only when the schema declares `integer`/`number`/`boolean`** — never
+  inferred from the value's shape. Inferring would mangle `"007"` and version strings in
+  genuine string fields.
+- **A *partial* template into a typed field** (`"issue-{{ n }}"`) is an author error and is
+  rejected, not coerced.
+
+Failures raise `RenderError::ActionArgType` naming the parameter and expected type, rather
+than surfacing a bare downstream serde message. Parse-time checking was also added for
+*literal* wrong-type values, so authors fail fast at `Workflow::parse` instead of mid-run.
+
+**Validation.** RED observed as the exact predicted error. Tests:
+`templated_numeric_field_reaches_the_connector_as_a_json_number` (asserts the connector
+received a JSON **number**, not a string — the binding assertion),
+`non_numeric_template_into_a_numeric_field_fails_naming_step_and_param`,
+`numeric_looking_string_in_a_string_field_is_not_mangled` (the over-coercion guard), and
+`action_step_literal_string_for_numeric_param_fails_parse`. A new `RecordingIssueConnector`
+fixture was needed — the existing harness only had a `RepoConnector`, which is itself a
+sign of how little the issue-tool path was exercised.
+
+No tool's schema shape defeated the lookup. `workflows.dispatch.inputs` and
+`pipeline_trigger.variables` are correctly left uncoerced by design.
+
+---
+
+### I-34 — an action step's output is now indexable
+
+**Symptom.** `{{ steps.<action-id>.output }}` interpolated a raw JSON string that could
+not be indexed. There was no way to get a field out of it, which made `action:` steps
+effectively **write-only**: you could call a tool but never consume its result.
+
+**Root cause.** The output is a JSON string end to end — the MCP dispatcher returns
+`Result<String, _>` (`crates/rupu-mcp/src/dispatcher.rs:26`), `StepResult.output` is a
+`String`, and it reaches minijinja verbatim as `StepOutput.output: String`
+(`templates.rs:141`). minijinja is pinned with `features = ["json"]`, which registers
+**only `tojson`** — there is no inverse filter in minijinja at all — and
+`grep -rn "add_filter" crates/` returned **zero hits repo-wide**, so the crate registered
+no filters of its own either. The only environment customization was
+`env.add_function("read_file", …)`.
+
+`tojson` goes the wrong way (it would double-encode an already-JSON string), and there is
+no `split`/regex escape hatch that yields a typed value, so the only survivable pattern
+was string surgery. Extracting a field was effectively impossible.
+
+**Fix.** Registers a `fromjson` filter alongside `read_file` in `templates.rs`. There is
+exactly one `Environment::new()` site in the crate, so one registration covers prompt
+rendering and `when:` evaluation both. Invalid JSON fails the render naming the filter,
+rather than yielding `undefined` — an undefined would render as `""` and silently ship an
+empty value downstream, which is the failure mode this program exists to eliminate.
+
+**Validation.** Five tests in `crates/rupu-orchestrator/tests/templates.rs`, 4 RED before
+the change: indexing a field, **typed** round-trip (`> 5` comparison, proving the value is
+a real number and not a string that merely renders the same), nested/array indexing,
+`tojson` round-trip, and the invalid-JSON error.
+
+That last test carries an explicit guard against **passing for the wrong reason** — before
+the filter existed, minijinja's "unknown filter" error *also* contained the word
+`fromjson`, so asserting only on that substring is satisfied by the filter being absent.
+It now additionally asserts the message is **not** the unknown-filter one.
+
+**Documented** in `docs/workflow-format.md` under a new "Template filters" section, with
+the worked action-step example, the typed-comparison case, and a note that gates need no
+equivalent because a gate decision is already pre-parsed as `steps.<id>.decision`. An
+undocumented filter is a silent feature.
+
+---
 
 ### I-31 — both UI hooks and their localStorage overrides are removed
 

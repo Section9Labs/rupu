@@ -1496,6 +1496,94 @@ fn workflow_step_table_summary(step: &rupu_orchestrator::Step) -> (&'static str,
         return ("for_each", primary, parts.join("  ·  "));
     }
 
+    // ISSUES.md I-41: gate and action nodes are first-class step kinds and must
+    // not fall through to the `linear` arm below, which would print KIND=linear
+    // with a BLANK primary column — gates have no `agent:`, and an action step's
+    // whole identity is the tool it calls. The graph renderer
+    // (`rupu-app-canvas`'s `git_graph.rs`) already renders both correctly; this
+    // table was the only view that didn't.
+    if rupu_orchestrator::is_approval_gate(step) {
+        let mut parts = Vec::new();
+        if let Some(approval) = &step.approval {
+            if let Some(expr) = approval
+                .auto_approve
+                .as_deref()
+                .filter(|v| !v.trim().is_empty())
+            {
+                parts.push(format!(
+                    "auto_approve {}",
+                    crate::cmd::transcript::truncate_single_line(expr, 20)
+                ));
+            }
+            if let Some(secs) = approval.timeout_seconds {
+                parts.push(format!("timeout {secs}s"));
+            }
+            if let Some(on_timeout) = approval.on_timeout {
+                parts.push(format!(
+                    "on_timeout {}",
+                    match on_timeout {
+                        rupu_orchestrator::TimeoutAction::Approve => "approve",
+                        rupu_orchestrator::TimeoutAction::Reject => "reject",
+                        rupu_orchestrator::TimeoutAction::Fail => "fail",
+                    }
+                ));
+            }
+            if !approval.on_reject.is_empty() {
+                parts.push(format!("on_reject {} step(s)", approval.on_reject.len()));
+            }
+            if !approval.notify.is_empty() {
+                parts.push(format!("notify {}", approval.notify.len()));
+            }
+        }
+        let primary = step
+            .approval
+            .as_ref()
+            .and_then(|a| a.prompt.as_deref())
+            .map(|p| crate::cmd::transcript::truncate_single_line(p, 32))
+            .unwrap_or_else(|| "—".into());
+        return (
+            "gate",
+            primary,
+            if parts.is_empty() {
+                "—".into()
+            } else {
+                parts.join("  ·  ")
+            },
+        );
+    }
+
+    if let Some(action) = &step.action {
+        let mut parts = Vec::new();
+        if let Some(with) = &step.with {
+            if let Some(map) = with.as_object() {
+                let mut keys: Vec<String> = map.keys().cloned().collect();
+                keys.sort();
+                if !keys.is_empty() {
+                    parts.push(format!("with {}", keys.join(", ")));
+                }
+            }
+        }
+        if let Some(when) = step
+            .when
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            parts.push(format!(
+                "when {}",
+                crate::cmd::transcript::truncate_single_line(when, 28)
+            ));
+        }
+        return (
+            "action",
+            action.clone(),
+            if parts.is_empty() {
+                "—".into()
+            } else {
+                parts.join("  ·  ")
+            },
+        );
+    }
+
     let primary = step.agent.clone().unwrap_or_default();
     let mut parts = Vec::new();
     if !step.actions.is_empty() {
@@ -1807,7 +1895,7 @@ fn resolve_workflow_path(
 
 /// Read + parse a run's persisted workflow snapshot — no config/resolver/
 /// MCP-registry/dispatcher rebuild, just the YAML on disk. Shared by
-/// [`gate_on_timeout_for`] and [`cheap_on_reject_chain_len`] so callers on
+/// [`gate_on_timeout_for`] and [`gate_on_timeout_for_step`] so callers on
 /// the same run don't each pay for their own read + parse.
 fn read_and_parse_workflow_snapshot(
     store: &rupu_orchestrator::RunStore,
@@ -1863,37 +1951,15 @@ fn gate_on_timeout_for_step(
     rupu_orchestrator::gate_timeout_action(&workflow, step_id)
 }
 
-/// Cheap pre-check for the reject-cleanup path (`rupu workflow reject` and
-/// the timeout-reject branch of `approve`): parse the run's persisted
-/// workflow snapshot only (no config/resolver/MCP-registry/dispatcher
-/// rebuild) and return the rejected step's `on_reject` chain length.
-///
-/// **Not** called by the `runs` listing (ISSUES.md I-25): a listing command
-/// must not execute cleanup chains, so it skips `on_timeout: reject` gates
-/// entirely rather than pre-checking whether they have anything to clean
-/// up — see the comment at that call site.
-///
-/// `Some(0)` means "definitely nothing to run" — a legacy inline-approval
-/// step, or a gate node with an empty (or absent) `on_reject:` — so the
-/// caller should skip [`crate::resume::build_reject_cleanup_opts`]'s heavy
-/// rebuild entirely and print nothing. `None` means the cheap parse itself
-/// failed (unreadable/unparseable snapshot, or the step id wasn't found);
-/// callers fall through to the heavy path so its existing warning fires
-/// rather than silently assuming there's no cleanup to do.
-pub(crate) fn cheap_on_reject_chain_len(
-    store: &rupu_orchestrator::RunStore,
-    run_id: &str,
-    step_id: &str,
-) -> Option<usize> {
-    let workflow = read_and_parse_workflow_snapshot(store, run_id).ok()?;
-    let step = workflow.steps.iter().find(|s| s.id == step_id)?;
-    Some(
-        step.approval
-            .as_ref()
-            .map(|a| a.on_reject.len())
-            .unwrap_or(0),
-    )
-}
+// `cheap_on_reject_chain_len` (a pre-check that skipped
+// `build_reject_cleanup_opts` + `run_reject_cleanup` entirely for an empty
+// `on_reject:` chain) was removed as part of I-36: `run_reject_cleanup` is
+// the ONLY caller of `emit_gate_result`, so skipping it for an empty chain
+// meant no gate decision row was ever written for that reject. Every
+// caller now runs the (heavier, but still correct) full rebuild
+// unconditionally; `build_reject_cleanup_opts` still returns the chain
+// length so callers can decide whether to print "cleanup: N step(s)
+// executed".
 
 async fn runs(
     limit: usize,
@@ -2248,12 +2314,30 @@ fn ambiguous_gate_message(action: &str, run_id: &str, candidates: &[String]) -> 
 #[derive(Debug)]
 enum ApproveGateOutcome {
     /// The targeted gate was approved; resume from this step id.
-    Approved(String),
+    Approved {
+        step_id: String,
+        /// I-36: the operator's identity, threaded into
+        /// `resume::resume_run` -> `ResumeState::from_approval_with_actor`
+        /// so the gate's persisted decision names who approved.
+        approver: String,
+        /// I-38: `true` when this approve landed on an already-overdue
+        /// `on_timeout: approve` gate (this call merely observed/confirmed
+        /// a decision the gate's own policy already made) — flips the
+        /// persisted decision's `via` from `"human"` to `"timeout"`.
+        via_timeout: bool,
+    },
     /// The gate had already auto-rejected on `on_timeout: reject` before
     /// this operator approve landed — the store already finalized the run
     /// `Rejected`. The caller (phase 2, async) still needs to run the
     /// on_reject cleanup chain for `step_id`.
-    ExpiredRejected { step_id: String, reason: String },
+    ExpiredRejected {
+        step_id: String,
+        reason: String,
+        /// I-36: who observed/reported the already-expired gate (this
+        /// call's operator, even though the actual decision was
+        /// timeout-driven — see `run_reject_cleanup`'s `approver` doc).
+        approver: String,
+    },
 }
 
 /// Phase 1 of `approve` (Task 5b-2a): the overdue pre-check message +
@@ -2279,6 +2363,12 @@ fn resolve_approve_gate(
     // compat-mirrored first gate when `--gate` is omitted) rather than
     // always the first gate in the set — a multi-gate run's other gates
     // may have different policies entirely.
+    //
+    // I-38: `via_timeout` captures this same detection (previously used
+    // only for the `println!` below and then discarded) so the caller can
+    // thread it into the resumed run's gate decision — a sweep-driven
+    // `on_timeout: approve` must record `via: "timeout"`, not `"human"`.
+    let mut via_timeout = false;
     if let Ok(record) = store.load(run_id) {
         let target_step_id = gate
             .map(str::to_string)
@@ -2295,6 +2385,7 @@ fn resolve_approve_gate(
                 && gate_on_timeout_for_step(store, &record, &step_id)
                     == Some(rupu_orchestrator::TimeoutAction::Approve)
             {
+                via_timeout = true;
                 println!(
                     "rupu: gate `{step_id}` timed out with on_timeout: approve — \
                      auto-approving and resuming"
@@ -2308,7 +2399,11 @@ fn resolve_approve_gate(
     // the TUI uses a different resume model.
     match store.approve_gate(run_id, &approver, chrono::Utc::now(), gate) {
         Ok(rupu_orchestrator::ApprovalDecision::Approved { step_id, .. }) => {
-            Ok(ApproveGateOutcome::Approved(step_id))
+            Ok(ApproveGateOutcome::Approved {
+                step_id,
+                approver,
+                via_timeout,
+            })
         }
         Err(rupu_orchestrator::ApprovalError::Expired(msg)) => {
             anyhow::bail!("approval expired before it was acted on — {msg}");
@@ -2322,7 +2417,11 @@ fn resolve_approve_gate(
             println!(
                 "rupu: gate timed out (on_timeout: reject) — run {run_id} auto-rejected at step `{step_id}`"
             );
-            Ok(ApproveGateOutcome::ExpiredRejected { step_id, reason })
+            Ok(ApproveGateOutcome::ExpiredRejected {
+                step_id,
+                reason,
+                approver,
+            })
         }
         Err(rupu_orchestrator::ApprovalError::NotAwaiting(s)) => {
             anyhow::bail!(
@@ -2358,35 +2457,50 @@ async fn approve(run_id: &str, mode: Option<&str>, gate: Option<&str>) -> anyhow
     let runs_dir = global.join("runs");
     let store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir));
 
-    let awaited_step_id = match resolve_approve_gate(&store, run_id, gate)? {
-        ApproveGateOutcome::Approved(step_id) => step_id,
-        ApproveGateOutcome::ExpiredRejected { step_id, reason } => {
-            if cheap_on_reject_chain_len(&store, run_id, &step_id) != Some(0) {
-                match crate::resume::build_reject_cleanup_opts(
-                    &store, run_id, &step_id, &reason, mode,
-                )
+    let (awaited_step_id, approver, via_timeout) = match resolve_approve_gate(&store, run_id, gate)?
+    {
+        ApproveGateOutcome::Approved {
+            step_id,
+            approver,
+            via_timeout,
+        } => (step_id, approver, via_timeout),
+        ApproveGateOutcome::ExpiredRejected {
+            step_id,
+            reason,
+            approver,
+        } => {
+            // I-36: run the cleanup chain unconditionally, not only when
+            // `cheap_on_reject_chain_len` reports a non-empty chain — an
+            // empty chain must still record the gate's rejected decision
+            // (`run_reject_cleanup` itself already handles a zero-length
+            // chain fine; `chain_len` is only used below to decide whether
+            // to print "cleanup: N step(s) executed").
+            match crate::resume::build_reject_cleanup_opts(&store, run_id, &step_id, &reason, mode)
                 .await
-                {
-                    Ok((opts, chain_len)) => {
-                        match rupu_orchestrator::runner::run_reject_cleanup(
-                            opts, &step_id, &reason, "timeout",
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                if chain_len > 0 {
-                                    println!("cleanup: {chain_len} step(s) executed");
-                                }
+            {
+                Ok((opts, chain_len)) => {
+                    match rupu_orchestrator::runner::run_reject_cleanup(
+                        opts,
+                        &step_id,
+                        &reason,
+                        "timeout",
+                        Some(&approver),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            if chain_len > 0 {
+                                println!("cleanup: {chain_len} step(s) executed");
                             }
-                            Err(e) => eprintln!("warning: on_reject cleanup chain errored: {e}"),
                         }
+                        Err(e) => eprintln!("warning: on_reject cleanup chain errored: {e}"),
                     }
-                    Err(e) => {
-                        eprintln!(
-                            "warning: could not load workflow for on_reject cleanup: {e} \
-                             (run is already correctly rejected)"
-                        );
-                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warning: could not load workflow for on_reject cleanup: {e} \
+                         (run is already correctly rejected)"
+                    );
                 }
             }
             return Ok(());
@@ -2396,7 +2510,15 @@ async fn approve(run_id: &str, mode: Option<&str>, gate: Option<&str>) -> anyhow
     // background session worker can resume an approved gate identically.
     // `awaited_step_id` is threaded in because `approve` clears the
     // record's `awaiting_step_id`, so it can't be recovered post-flip.
-    let outcome = crate::resume::resume_run(&store, run_id, &awaited_step_id, mode).await?;
+    let outcome = crate::resume::resume_run(
+        &store,
+        run_id,
+        &awaited_step_id,
+        mode,
+        &approver,
+        via_timeout,
+    )
+    .await?;
     let awaited_step_id = outcome.awaited_step_id;
     let result = outcome.result;
     println!(
@@ -2724,6 +2846,7 @@ pub(crate) async fn resume_run(
         reason,
         paused_step,
         rejected_reason: None,
+        ..Default::default()
     };
 
     // Clone the workflow for the live view before `opts` consumes it.
@@ -2841,6 +2964,9 @@ struct RejectGateOutcome {
     /// `on_timeout: reject` policy had already fired before this operator
     /// reject landed, `"human"` for a genuine operator decision.
     via: &'static str,
+    /// I-36: the rejecting operator's identity, threaded into
+    /// `run_reject_cleanup`'s `approver` argument.
+    approver: String,
 }
 
 /// Phase 1 of `reject` (Task 5b-2a): the `via`-attribution pre-check +
@@ -2907,6 +3033,7 @@ fn resolve_reject_gate(
             step_id,
             reason,
             via,
+            approver,
         }),
         Err(rupu_orchestrator::ApprovalError::Expired(msg)) => {
             anyhow::bail!("approval expired before it was acted on — {msg}");
@@ -2944,6 +3071,7 @@ async fn reject(run_id: &str, reason: Option<&str>, gate: Option<&str>) -> anyho
         step_id: rejected_step_id,
         reason: rejected_reason,
         via,
+        approver,
     } = resolve_reject_gate(&store, run_id, reason, gate)?;
     // Task 5b-2a: rejecting one gate of a still-parked multi-gate set
     // leaves the run `AwaitingApproval` (the other gates stay parked) —
@@ -2962,41 +3090,55 @@ async fn reject(run_id: &str, reason: Option<&str>, gate: Option<&str>) -> anyho
 
     // The run is already correctly `Rejected` at this point (the library
     // call above is what finalized it) — a cleanup-load failure is warned,
-    // never turned into a command error. `on_reject` chains are optional;
-    // most rejected gates have none.
-    if cheap_on_reject_chain_len(&store, run_id, &rejected_step_id) != Some(0) {
-        match crate::resume::build_reject_cleanup_opts(
-            &store,
-            run_id,
-            &rejected_step_id,
-            &rejected_reason,
-            None,
-        )
-        .await
-        {
-            Ok((opts, chain_len)) => {
-                match rupu_orchestrator::runner::run_reject_cleanup(
-                    opts,
-                    &rejected_step_id,
-                    &rejected_reason,
-                    via,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        if chain_len > 0 {
-                            println!("cleanup: {chain_len} step(s) executed");
-                        }
+    // never turned into a command error.
+    //
+    // I-36: run this unconditionally, not only when
+    // `cheap_on_reject_chain_len` reports a non-empty `on_reject:` chain —
+    // `run_reject_cleanup` is the ONLY caller of `emit_gate_result`, so an
+    // empty chain must still reach it to record the gate's rejected
+    // decision (reason + actor). `on_reject` chains being optional is not
+    // a reason to skip recording that the gate WAS rejected.
+    match crate::resume::build_reject_cleanup_opts(
+        &store,
+        run_id,
+        &rejected_step_id,
+        &rejected_reason,
+        None,
+    )
+    .await
+    {
+        Ok((opts, chain_len)) => {
+            match rupu_orchestrator::runner::run_reject_cleanup(
+                opts,
+                &rejected_step_id,
+                &rejected_reason,
+                via,
+                Some(&approver),
+            )
+            .await
+            {
+                Ok(()) => {
+                    if chain_len > 0 {
+                        println!("cleanup: {chain_len} step(s) executed");
                     }
-                    Err(e) => eprintln!("warning: on_reject cleanup chain errored: {e}"),
+                    // I-35: the chain just ran synchronously — clear
+                    // the pending-cleanup marker `reject_gate` may
+                    // have set so the `cp serve` gate sweep doesn't
+                    // run it again on its next tick. Best-effort: a
+                    // clear failure is warned, not fatal (the run is
+                    // already correctly rejected either way).
+                    if let Err(e) = store.clear_reject_cleanup(run_id) {
+                        eprintln!("warning: could not clear on_reject cleanup marker: {e}");
+                    }
                 }
+                Err(e) => eprintln!("warning: on_reject cleanup chain errored: {e}"),
             }
-            Err(e) => {
-                eprintln!(
-                    "warning: could not load workflow for on_reject cleanup: {e} \
-                     (run is already correctly rejected)"
-                );
-            }
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: could not load workflow for on_reject cleanup: {e} \
+                 (run is already correctly rejected)"
+            );
         }
     }
     Ok(())
@@ -4527,6 +4669,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            reject_cleanup_pending: None,
             permission_mode: None,
             issue_ref: None,
             issue: None,
@@ -4790,7 +4933,7 @@ mod tests {
 
         let outcome = resolve_approve_gate(&store, &rec.id, Some("gate_b")).unwrap();
         match outcome {
-            ApproveGateOutcome::Approved(step_id) => assert_eq!(step_id, "gate_b"),
+            ApproveGateOutcome::Approved { step_id, .. } => assert_eq!(step_id, "gate_b"),
             ApproveGateOutcome::ExpiredRejected { .. } => panic!("must not have expired"),
         }
 
@@ -4830,7 +4973,7 @@ mod tests {
 
         let outcome = resolve_approve_gate(&store, &rec.id, None).unwrap();
         match outcome {
-            ApproveGateOutcome::Approved(step_id) => assert_eq!(step_id, "step_approve"),
+            ApproveGateOutcome::Approved { step_id, .. } => assert_eq!(step_id, "step_approve"),
             ApproveGateOutcome::ExpiredRejected { .. } => panic!("must not have expired"),
         }
         let reloaded = store.load(&rec.id).unwrap();
@@ -4895,5 +5038,250 @@ mod tests {
         assert_eq!(outcome.step_id, "step_approve");
         let reloaded = store.load(&rec.id).unwrap();
         assert_eq!(reloaded.status, RunStatus::Rejected);
+    }
+
+    // ── I-36 / I-38: gate decision provenance ─────────────────────────
+    //
+    // The gate audit record must always be written (even for an empty
+    // `on_reject` chain), and must say WHO decided and WHETHER a human
+    // decided at all. Full end-to-end tests, driving the real `reject`/
+    // `approve` command handlers in-process (same code a spawned `rupu
+    // workflow approve`/`reject` runs) against a real disk-backed
+    // `RunStore` under a temp `RUPU_HOME`.
+
+    /// Single-gate `AwaitingApproval` record with a real-on-disk workspace
+    /// (required: the resume/cleanup rebuild path canonicalizes
+    /// `workspace_path`). `expires_at` lets callers construct an overdue
+    /// gate for the timeout-provenance test.
+    fn single_gate_awaiting_record(
+        id: &str,
+        workspace: &std::path::Path,
+        since: chrono::DateTime<Utc>,
+        expires_at: Option<chrono::DateTime<Utc>>,
+    ) -> RunRecord {
+        let mut rec = sample_run_record(RunStatus::AwaitingApproval, None);
+        rec.id = id.to_string();
+        rec.workspace_path = workspace.to_path_buf();
+        rec.transcript_dir = workspace.join(".rupu/transcripts");
+        rec.awaiting = vec![rupu_orchestrator::runs::AwaitingGate {
+            step_id: "gate".into(),
+            prompt: Some("Approve?".into()),
+            since,
+            expires_at,
+        }];
+        rec.sync_awaiting_compat();
+        rec
+    }
+
+    /// I-36: pre-fix, `reject()` only ran `run_reject_cleanup` (the sole
+    /// `emit_gate_result` caller) when `cheap_on_reject_chain_len` reported
+    /// a non-empty `on_reject:` chain — an empty chain (this fixture) short-
+    /// circuited past it entirely, so NO gate decision row was ever written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reject_with_empty_on_reject_chain_still_records_gate_decision_with_actor() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        crate::test_support::ensure_crypto_provider();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let store = rupu_orchestrator::RunStore::new(home.join("runs"));
+        let now = Utc::now();
+        let rec = single_gate_awaiting_record("run_i36_empty_reject", &workspace, now, None);
+        store
+            .create(
+                rec.clone(),
+                "name: g\nsteps:\n  - id: gate\n    approval:\n      prompt: \"Approve?\"\n",
+            )
+            .unwrap();
+
+        std::env::set_var("RUPU_HOME", &home);
+        let result = reject(&rec.id, Some("not today"), None).await;
+        std::env::remove_var("RUPU_HOME");
+        result.expect("reject should succeed even with an empty on_reject chain");
+
+        let step_results = store.read_step_results(&rec.id).unwrap();
+        let gate_record = step_results.iter().find(|r| r.step_id == "gate").expect(
+            "I-36: an empty on_reject chain must still record the gate's rejected decision",
+        );
+        let output: serde_json::Value = serde_json::from_str(&gate_record.output).unwrap();
+        assert_eq!(output["decision"], "rejected");
+        assert_eq!(output["reason"], "not today");
+        assert_eq!(
+            output["approver"],
+            whoami::username(),
+            "the rejecting operator's identity must be recorded, not discarded"
+        );
+    }
+
+    /// I-38: the `cp serve` gate sweep resolves an overdue `on_timeout:
+    /// approve` gate by spawning `rupu workflow approve --gate <id>` — the
+    /// SAME code this test drives in-process. Pre-fix, `resolve_approve_gate`
+    /// detected the overdue-timeout condition only to `println!` it, then
+    /// still resumed via the plain approve-resume path, which hardcoded
+    /// `via: "human"` — indistinguishable from a genuine operator decision.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn approve_of_an_overdue_on_timeout_approve_gate_records_via_timeout() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        crate::test_support::ensure_crypto_provider();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let store = rupu_orchestrator::RunStore::new(home.join("runs"));
+        let now = Utc::now();
+        let since = now - chrono::Duration::seconds(120);
+        let overdue = now - chrono::Duration::seconds(30);
+        let rec = single_gate_awaiting_record("run_i38_overdue", &workspace, since, Some(overdue));
+        store
+            .create(
+                rec.clone(),
+                "name: g\nsteps:\n  - id: gate\n    approval:\n      prompt: \"Approve?\"\n      timeout_seconds: 10\n      on_timeout: approve\n",
+            )
+            .unwrap();
+
+        std::env::set_var("RUPU_HOME", &home);
+        let result = approve(&rec.id, None, None).await;
+        std::env::remove_var("RUPU_HOME");
+        result.expect("approve of an overdue on_timeout: approve gate should succeed");
+
+        let step_results = store.read_step_results(&rec.id).unwrap();
+        let gate_record = step_results
+            .iter()
+            .find(|r| r.step_id == "gate")
+            .expect("gate decision must be recorded");
+        let output: serde_json::Value = serde_json::from_str(&gate_record.output).unwrap();
+        assert_eq!(output["decision"], "approved");
+        assert_eq!(
+            output["via"], "timeout",
+            "a sweep/timeout-driven approve must not be indistinguishable from a human one"
+        );
+    }
+
+    /// I-38 guard: a genuine, NOT-overdue operator approve must still record
+    /// `via: "human"` and the operator's own identity — proves the timeout
+    /// detection above doesn't over-apply to the ordinary case.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn approve_of_a_fresh_gate_still_records_via_human_and_operator_identity() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        crate::test_support::ensure_crypto_provider();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let store = rupu_orchestrator::RunStore::new(home.join("runs"));
+        let now = Utc::now();
+        let rec = single_gate_awaiting_record("run_i38_fresh", &workspace, now, None);
+        store
+            .create(
+                rec.clone(),
+                "name: g\nsteps:\n  - id: gate\n    approval:\n      prompt: \"Approve?\"\n",
+            )
+            .unwrap();
+
+        std::env::set_var("RUPU_HOME", &home);
+        let result = approve(&rec.id, None, None).await;
+        std::env::remove_var("RUPU_HOME");
+        result.expect("approve of a fresh gate should succeed");
+
+        let step_results = store.read_step_results(&rec.id).unwrap();
+        let gate_record = step_results
+            .iter()
+            .find(|r| r.step_id == "gate")
+            .expect("gate decision must be recorded");
+        let output: serde_json::Value = serde_json::from_str(&gate_record.output).unwrap();
+        assert_eq!(output["decision"], "approved");
+        assert_eq!(output["via"], "human");
+        assert_eq!(output["approver"], whoami::username());
+    }
+
+    // ── I-41: gate/action arms in the steps table ────────────────────
+    //
+    // Before this, both fell through to the `linear` arm, printing
+    // KIND=linear with a BLANK primary column — a gate has no `agent:`,
+    // and an action step's whole identity is the tool it calls, which was
+    // never named anywhere in the table. The graph renderer already
+    // handled both; this table was the only view that didn't.
+
+    fn parse_one_step(yaml: &str) -> rupu_orchestrator::Step {
+        let wf = rupu_orchestrator::Workflow::parse(yaml).expect("fixture must parse");
+        wf.steps.into_iter().next().expect("one step")
+    }
+
+    #[test]
+    fn steps_table_renders_a_gate_node_as_kind_gate_not_linear() {
+        let step = parse_one_step(
+            r#"
+name: gated
+steps:
+  - id: sign-off
+    approval:
+      required: true
+      prompt: "Ship this to production?"
+      timeout_seconds: 3600
+      on_timeout: reject
+"#,
+        );
+        let (kind, primary, detail) = workflow_step_table_summary(&step);
+        assert_eq!(kind, "gate", "a gate must not render as `linear`");
+        assert!(
+            primary.contains("Ship this"),
+            "the gate prompt belongs in PRIMARY, which was blank before: {primary}"
+        );
+        assert!(detail.contains("timeout 3600s"), "detail was: {detail}");
+        assert!(detail.contains("on_timeout reject"), "detail was: {detail}");
+    }
+
+    #[test]
+    fn steps_table_renders_an_action_node_naming_the_tool() {
+        let step = parse_one_step(
+            r#"
+name: acts
+steps:
+  - id: comment
+    action: issues.comment
+    with:
+      project: "acme/widget"
+      number: 7
+      body: "triaged"
+"#,
+        );
+        let (kind, primary, detail) = workflow_step_table_summary(&step);
+        assert_eq!(kind, "action", "an action must not render as `linear`");
+        assert_eq!(
+            primary, "issues.comment",
+            "the tool name is the action's identity and was never shown before"
+        );
+        // `with:` keys are listed sorted so the column is stable across runs.
+        assert!(detail.contains("with body, number, project"), "detail was: {detail}");
+    }
+
+    #[test]
+    fn steps_table_still_renders_a_plain_agent_step_as_linear() {
+        // Guard against the new arms swallowing ordinary steps: an agent step
+        // that merely *carries* an inline `approval:` is NOT a gate node.
+        let step = parse_one_step(
+            r#"
+name: plain
+steps:
+  - id: build
+    agent: coder
+    prompt: "do the thing"
+    approval:
+      required: true
+"#,
+        );
+        let (kind, primary, _detail) = workflow_step_table_summary(&step);
+        assert_eq!(kind, "linear");
+        assert_eq!(primary, "coder");
     }
 }

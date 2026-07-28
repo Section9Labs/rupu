@@ -326,9 +326,10 @@ pub struct OrchestratorRunOpts {
 /// single resume path (`run_workflow` with `resume_from`) can distinguish an
 /// approval-gate pause (operator approves, then resumes) from a manual /
 /// operator-requested pause (cooperative interrupt, then resumes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PauseReason {
     /// Paused before a step whose `approval:` gate required sign-off.
+    #[default]
     Approval,
     /// Paused by the cooperative pause signal ([`OrchestratorRunOpts::pause`]).
     Manual,
@@ -502,7 +503,7 @@ pub struct AwaitingInfo {
 /// step in `prior_step_results` as already done (replays their
 /// outputs into the context), and dispatches the awaited step
 /// without re-asking for approval.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ResumeState {
     pub run_id: String,
     pub prior_step_results: Vec<StepResult>,
@@ -535,6 +536,22 @@ pub struct ResumeState {
     /// caller that only holds the `ResumeState` (e.g. a future cp-serve
     /// reject worker) doesn't need to thread the reason through separately.
     pub rejected_reason: Option<String>,
+    /// I-36/I-38: who approved (an operator's OS username, `"web"`, etc.),
+    /// consumed by `run_workflow`'s gate-suppression path so the gate's
+    /// persisted decision (`emit_gate_result`'s `approver` field) carries
+    /// the real actor instead of nothing. `None` (the `Default`, and what
+    /// [`Self::from_approval`] sets) for every non-approval `ResumeState`
+    /// and for a caller that hasn't opted into actor tracking — those keep
+    /// recording `via: "human"` with no approver, exactly like before this
+    /// field existed. Set via [`Self::from_approval_with_actor`].
+    pub approver: Option<String>,
+    /// I-36/I-38: `true` when this approve-resume was driven by a gate's
+    /// own `on_timeout: approve` policy (the `cp serve` sweep spawning
+    /// `rupu workflow approve`) rather than a genuine operator decision.
+    /// Flips `emit_gate_result`'s `via` from `"human"` to `"timeout"` on
+    /// the gate-suppression path. `false` (the default) for every ordinary
+    /// approve.
+    pub via_timeout: bool,
 }
 
 /// A linear step that paused mid-run, carried on [`ResumeState`] so the
@@ -565,6 +582,28 @@ impl ResumeState {
             reason: PauseReason::Approval,
             paused_step: None,
             rejected_reason: None,
+            approver: None,
+            via_timeout: false,
+        }
+    }
+
+    /// I-36/I-38: [`Self::from_approval`] plus the actor/timeout provenance
+    /// the CLI's `resolve_approve_gate` already detects but previously
+    /// discarded after a `println!`. Used by `resume_run` so a real
+    /// operator approve records `via: "human"` + their identity, and a
+    /// `cp serve` sweep-driven `on_timeout: approve` records `via:
+    /// "timeout"` instead of being indistinguishable from a human decision.
+    pub fn from_approval_with_actor(
+        run_id: String,
+        prior_step_results: Vec<StepResult>,
+        approved_step_id: String,
+        approver: String,
+        via_timeout: bool,
+    ) -> Self {
+        Self {
+            approver: Some(approver),
+            via_timeout,
+            ..Self::from_approval(run_id, prior_step_results, approved_step_id)
         }
     }
 
@@ -589,6 +628,8 @@ impl ResumeState {
             reason: PauseReason::Approval,
             paused_step: None,
             rejected_reason: Some(reason),
+            approver: None,
+            via_timeout: false,
         }
     }
 }
@@ -695,6 +736,7 @@ pub async fn run_workflow(
                 resume_claimed_by: None,
                 resume_mode: None,
                 resume_gate_id: None,
+                reject_cleanup_pending: None,
                 // ISSUES.md I-24: capture the launch mode straight off the
                 // factory so it's on disk from the very first write —
                 // `rebuild_opts_from_disk` reads this back as the
@@ -1953,6 +1995,7 @@ async fn run_scheduler_scoped(
                         output: String::new(),
                         success: false,
                         skipped: true,
+                        kind: step_kind_for_run_record(step),
                         items: Vec::new(),
                         loop_iteration: current_loop_iteration,
                         ..Default::default()
@@ -1993,13 +2036,25 @@ async fn run_scheduler_scoped(
                 };
 
                 if gate_suppressed {
-                    info!(step = %step.id, "gate: resuming with human approval");
+                    // I-36/I-38: the resume-approve provenance the caller
+                    // (CLI `resolve_approve_gate`/`resume_run`) attached to
+                    // `opts.resume_from` — `via_timeout` distinguishes a
+                    // sweep-driven `on_timeout: approve` from a genuine
+                    // operator decision; `approver` carries who (when known).
+                    let via_timeout = opts.resume_from.as_ref().is_some_and(|r| r.via_timeout);
+                    let via = if via_timeout { "timeout" } else { "human" };
+                    let approver = opts
+                        .resume_from
+                        .as_ref()
+                        .and_then(|r| r.approver.as_deref());
+                    info!(step = %step.id, via, "gate: resuming with approval");
                     emit_gate_result(
                         opts,
                         run_id,
                         step,
                         "approved",
-                        "human",
+                        via,
+                        approver,
                         None,
                         step_results,
                         current_loop_iteration,
@@ -2045,6 +2100,7 @@ async fn run_scheduler_scoped(
                             "approved",
                             "auto",
                             None,
+                            None,
                             step_results,
                             current_loop_iteration,
                         );
@@ -2077,10 +2133,12 @@ async fn run_scheduler_scoped(
                 info!(step = %step.id, "gate: pausing for approval");
                 fire_notify_hooks(
                     opts,
+                    run_id,
                     &step.id,
                     &ap.notify,
                     &ctx,
                     render_mode(opts.strict_templates),
+                    step_results,
                 )
                 .await;
                 if let Some(sink) = opts.event_sink.as_ref() {
@@ -3966,6 +4024,7 @@ async fn run_steps_over(
                     output: String::new(),
                     success: false,
                     skipped: true,
+                    kind: step_kind_for_run_record(step),
                     items: Vec::new(),
                     ..Default::default()
                 };
@@ -3999,9 +4058,25 @@ async fn run_steps_over(
             };
 
             if gate_suppressed {
-                info!(step = %step.id, "gate: resuming with human approval");
+                // I-36/I-38: see the identical comment on the scheduler's
+                // gate_suppressed branch above.
+                let via_timeout = opts.resume_from.as_ref().is_some_and(|r| r.via_timeout);
+                let via = if via_timeout { "timeout" } else { "human" };
+                let approver = opts
+                    .resume_from
+                    .as_ref()
+                    .and_then(|r| r.approver.as_deref());
+                info!(step = %step.id, via, "gate: resuming with approval");
                 emit_gate_result(
-                    opts, run_id, step, "approved", "human", None, step_results, None,
+                    opts,
+                    run_id,
+                    step,
+                    "approved",
+                    via,
+                    approver,
+                    None,
+                    step_results,
+                    None,
                 );
                 continue;
             }
@@ -4015,7 +4090,15 @@ async fn run_steps_over(
                 if truthy {
                     info!(step = %step.id, "gate auto-approved");
                     emit_gate_result(
-                        opts, run_id, step, "approved", "auto", None, step_results, None,
+                        opts,
+                        run_id,
+                        step,
+                        "approved",
+                        "auto",
+                        None,
+                        None,
+                        step_results,
+                        None,
                     );
                     continue;
                 }
@@ -4023,10 +4106,12 @@ async fn run_steps_over(
             info!(step = %step.id, "gate: pausing for approval");
             fire_notify_hooks(
                 opts,
+                run_id,
                 &step.id,
                 &ap.notify,
                 &ctx,
                 render_mode(opts.strict_templates),
+                step_results,
             )
             .await;
             if let Some(sink) = opts.event_sink.as_ref() {
@@ -4525,40 +4610,181 @@ fn step_kind_for_run_record(step: &Step) -> crate::runs::StepKind {
 /// and null pass through unchanged. `None` (no `with:` block at all) becomes
 /// an empty object, a valid call for any tool whose schema has no required
 /// parameters.
+///
+/// I-33: a rendered STRING leaf directly under a top-level `with:` key is
+/// additionally coerced against `tool`'s declared JSON-schema type — see
+/// [`render_action_leaf`]. This is the only place in the pipeline that knows
+/// both "was this leaf a template" and "what type does the tool want", so
+/// it's also the only place that can fix "comment on issue #{{ n }}"
+/// without either guessing from the rendered value's shape or teaching the
+/// dispatcher to coerce (which would blur a real author bug — sending the
+/// literal string "42" on purpose — into "helpful" magic).
 fn render_action_args(
     with: Option<&serde_json::Value>,
     ctx: &StepContext,
     mode: RenderMode,
+    tool: &str,
 ) -> Result<serde_json::Value, RenderError> {
-    fn walk(
-        value: &serde_json::Value,
-        ctx: &StepContext,
-        mode: RenderMode,
-    ) -> Result<serde_json::Value, RenderError> {
-        match value {
-            serde_json::Value::String(s) => {
-                Ok(serde_json::Value::String(render_step_prompt(s, ctx, mode)?))
-            }
-            serde_json::Value::Array(items) => Ok(serde_json::Value::Array(
-                items
-                    .iter()
-                    .map(|item| walk(item, ctx, mode))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )),
-            serde_json::Value::Object(map) => {
-                let mut out = serde_json::Map::with_capacity(map.len());
-                for (key, val) in map {
-                    out.insert(key.clone(), walk(val, ctx, mode)?);
-                }
-                Ok(serde_json::Value::Object(out))
-            }
-            // Numbers, bools, null: no template surface, pass through as-is.
-            other => Ok(other.clone()),
-        }
+    let with_map = match with {
+        None => return Ok(serde_json::json!({})),
+        Some(serde_json::Value::Object(m)) => m,
+        // `validate_action_step` (workflow.rs) already rejects a non-object
+        // `with:` at parse time; this is only reachable via direct calls
+        // (e.g. tests) that skip parsing. No property schema to key off of,
+        // so fall back to the plain (non-coercing) walk.
+        Some(other) => return walk(other, ctx, mode),
+    };
+
+    let props: Option<serde_json::Map<String, serde_json::Value>> = rupu_mcp::tools::tool_catalog()
+        .into_iter()
+        .find(|spec| spec.name == tool)
+        .and_then(|spec| spec.input_schema.get("properties").cloned())
+        .and_then(|p| p.as_object().cloned());
+
+    let mut out = serde_json::Map::with_capacity(with_map.len());
+    for (key, val) in with_map {
+        let target_kind = props
+            .as_ref()
+            .and_then(|p| p.get(key))
+            .and_then(|prop_schema| prop_schema.get("type"))
+            .and_then(crate::templates::schema_scalar_kind);
+        out.insert(
+            key.clone(),
+            render_action_leaf(val, ctx, mode, key, target_kind)?,
+        );
     }
-    match with {
-        None => Ok(serde_json::json!({})),
-        Some(v) => walk(v, ctx, mode),
+    Ok(serde_json::Value::Object(out))
+}
+
+/// Plain (non-coercing) recursive render — used for nested array/object
+/// values inside `with:` (coercion only applies at the top level; see
+/// `render_action_args`'s doc comment) and as the defensive fallback when
+/// `with:` isn't an object.
+fn walk(
+    value: &serde_json::Value,
+    ctx: &StepContext,
+    mode: RenderMode,
+) -> Result<serde_json::Value, RenderError> {
+    match value {
+        serde_json::Value::String(s) => {
+            Ok(serde_json::Value::String(render_step_prompt(s, ctx, mode)?))
+        }
+        serde_json::Value::Array(items) => Ok(serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| walk(item, ctx, mode))
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (key, val) in map {
+                out.insert(key.clone(), walk(val, ctx, mode)?);
+            }
+            Ok(serde_json::Value::Object(out))
+        }
+        // Numbers, bools, null: no template surface, pass through as-is.
+        other => Ok(other.clone()),
+    }
+}
+
+/// How a raw (pre-render) `with:` string leaf relates to minijinja's `{{ }}`
+/// delimiters — decides whether [`render_action_leaf`] may coerce it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TemplateShape {
+    /// No `{{` at all: a plain literal (e.g. `"hi"`, or `"007"` typed with
+    /// quotes on purpose). Never coerced here — see judgment call (a) in
+    /// the I-33 plan: coercion only fires when the ENTIRE leaf was a
+    /// template, never guessed from a literal's shape. A literal of the
+    /// wrong type is instead rejected at parse time (`validate_action_step`,
+    /// workflow.rs) when the mismatch is visible without rendering.
+    Literal,
+    /// The trimmed string is exactly one `{{ ... }}` expression and nothing
+    /// else — the whole leaf came from a template. Safe to coerce.
+    Whole,
+    /// `{{ }}` appears but mixed with other text (`"issue-{{ n }}"`) or
+    /// more than one expression. Judgment call (b): this is an author
+    /// error for a typed field, not something to coerce — there's no
+    /// sensible single number to extract from `"issue-42"`.
+    Partial,
+}
+
+fn template_shape(s: &str) -> TemplateShape {
+    if !s.contains("{{") {
+        return TemplateShape::Literal;
+    }
+    let t = s.trim();
+    if t.starts_with("{{")
+        && t.ends_with("}}")
+        && t.matches("{{").count() == 1
+        && t.matches("}}").count() == 1
+    {
+        TemplateShape::Whole
+    } else {
+        TemplateShape::Partial
+    }
+}
+
+/// Parse a rendered string into the JSON value `kind` names, or `None` if it
+/// doesn't fit. `kind` is always one of `schema_scalar_kind`'s outputs.
+fn coerce_scalar(rendered: &str, kind: &'static str) -> Option<serde_json::Value> {
+    let t = rendered.trim();
+    match kind {
+        "integer" => t.parse::<i64>().ok().map(serde_json::Value::from),
+        "number" => t.parse::<f64>().ok().map(serde_json::Value::from),
+        "boolean" => match t.to_ascii_lowercase().as_str() {
+            "true" => Some(serde_json::Value::Bool(true)),
+            "false" => Some(serde_json::Value::Bool(false)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Render one top-level `with:` leaf, coercing it to `target_kind` (from
+/// the tool's JSON schema) when the leaf is a string. `param` is the
+/// `with:` key, used only for error messages.
+///
+/// - Not a string (already a JSON number/bool/array/object/null): passed
+///   through the plain [`walk`] — a literal of the right shape needs no
+///   help, and arrays/objects recurse without coercion (see
+///   `render_action_args`'s doc comment; no tool in the catalog needs it).
+/// - String with `target_kind: None` (schema says `string`/`array`/
+///   `object`, or the tool/param is unknown to the catalog): rendered
+///   normally, never coerced.
+/// - String with a numeric/boolean `target_kind`:
+///   - [`TemplateShape::Literal`] — left as the rendered (== original)
+///     string; see judgment call (a).
+///   - [`TemplateShape::Whole`] — rendered, then parsed via
+///     [`coerce_scalar`]; a parse failure is reported against the
+///     RENDERED value (what the template actually produced).
+///   - [`TemplateShape::Partial`] — rejected before rendering; see
+///     judgment call (b).
+fn render_action_leaf(
+    raw: &serde_json::Value,
+    ctx: &StepContext,
+    mode: RenderMode,
+    param: &str,
+    target_kind: Option<&'static str>,
+) -> Result<serde_json::Value, RenderError> {
+    let (s, kind) = match (raw, target_kind) {
+        (serde_json::Value::String(s), Some(kind)) => (s, kind),
+        _ => return walk(raw, ctx, mode),
+    };
+    match template_shape(s) {
+        TemplateShape::Literal => Ok(serde_json::Value::String(render_step_prompt(s, ctx, mode)?)),
+        TemplateShape::Partial => Err(RenderError::ActionArgType {
+            param: param.to_string(),
+            message: format!(
+                "expected {kind}, but `{s}` mixes a template with other text — use a single `{{{{ ... }}}}` expression for a {kind} parameter, not a partial template"
+            ),
+        }),
+        TemplateShape::Whole => {
+            let rendered = render_step_prompt(s, ctx, mode)?;
+            coerce_scalar(&rendered, kind).ok_or_else(|| RenderError::ActionArgType {
+                param: param.to_string(),
+                message: format!("expected {kind}, got `{rendered}` (rendered from `{s}`)"),
+            })
+        }
     }
 }
 
@@ -4609,7 +4835,7 @@ async fn execute_action_step(
         .action
         .as_deref()
         .expect("execute_action_step called for a non-action step");
-    let args = render_action_args(step.with.as_ref(), ctx, mode).map_err(|e| {
+    let args = render_action_args(step.with.as_ref(), ctx, mode, tool).map_err(|e| {
         RunWorkflowError::Render {
             step: step.id.clone(),
             source: e,
@@ -4707,12 +4933,24 @@ async fn execute_action_step(
 /// dispatcher, render error, dispatch error) is logged and swallowed —
 /// notify never changes the park outcome, never blocks it, and never
 /// surfaces as a run error.
+///
+/// I-44: `execute_action_step` unconditionally writes an audit-trail
+/// transcript at a fresh ULID path. A hook that dispatched (`Ok(result)` —
+/// which, because `continue_on_error: true` is passed below, includes a
+/// *failed* dispatch too, just with `success: false`) has its `StepResult`
+/// persisted to `step_results.jsonl` and pushed into the live `step_results`
+/// template context under id `<step_id>.notify`, so the transcript stays
+/// reachable via `show-run` / the CP instead of being orphaned. Only a
+/// render failure (`Err`, no `StepResult` to persist — nothing was
+/// dispatched, no transcript was written) has nothing to persist.
 async fn fire_notify_hooks(
     opts: &OrchestratorRunOpts,
+    run_id: &str,
     step_id: &str,
     notify: &[crate::workflow::NotifyAction],
     ctx: &StepContext,
     mode: RenderMode,
+    step_results: &mut Vec<StepResult>,
 ) {
     if notify.is_empty() {
         return;
@@ -4746,10 +4984,15 @@ async fn fire_notify_hooks(
             action: Some(n.action.clone()),
             with: Some(n.with.clone()),
         };
-        if let Err(e) =
-            execute_action_step(dispatcher, &synth, ctx, mode, true, &opts.transcript_dir).await
+        match execute_action_step(dispatcher, &synth, ctx, mode, true, &opts.transcript_dir).await
         {
-            warn!(step = %step_id, action = %n.action, error = %e, "gate notify hook failed; continuing");
+            Ok(result) => {
+                persist_step_result(opts, run_id, &result);
+                step_results.push(result);
+            }
+            Err(e) => {
+                warn!(step = %step_id, action = %n.action, error = %e, "gate notify hook failed; continuing");
+            }
         }
     }
 }
@@ -4757,11 +5000,17 @@ async fn fire_notify_hooks(
 /// Record a resolved gate node's result: `StepStarted` + `StepCompleted`
 /// events, a `StepResult` whose `output` is the decision JSON (spec §3.1),
 /// persisted like any other step. `decision` is `"approved"` or
-/// `"rejected"`; `via` is `"human"` (approve-resume / operator reject) or
+/// `"rejected"`; `via` is `"human"` (approve-resume / operator reject),
 /// `"auto"` (auto_approve truthy — always paired with `decision:
-/// "approved"`); `reason` is the operator's rejection reason (`Some` only
-/// for a rejected decision, `None` otherwise, matching spec §3.1's
-/// `"reason": null` for approvals).
+/// "approved"`), or `"timeout"` (a gate's own `on_timeout:` policy, whether
+/// approve or reject); `approver` is who decided (I-36) — `Some` for a
+/// human-attributable decision (including one an operator merely observed
+/// after the fact, e.g. an already-overdue gate), `None` for `"auto"` (the
+/// workflow itself decided) and for a fully autonomous `"timeout"` (no
+/// operator involved at all, e.g. the sweep's own `ExpireThenCleanupReject`
+/// arm); `reason` is the operator's rejection reason (`Some` only for a
+/// rejected decision, `None` otherwise, matching spec §3.1's `"reason":
+/// null` for approvals).
 #[allow(clippy::too_many_arguments)]
 fn emit_gate_result(
     opts: &OrchestratorRunOpts,
@@ -4769,6 +5018,7 @@ fn emit_gate_result(
     step: &Step,
     decision: &str,
     via: &str,
+    approver: Option<&str>,
     reason: Option<&str>,
     step_results: &mut Vec<StepResult>,
     // Task 4 (spec §3): stamped onto this gate's persisted `StepResult`
@@ -4794,6 +5044,7 @@ fn emit_gate_result(
     let output = serde_json::json!({
         "decision": decision,
         "via": via,
+        "approver": approver,
         "reason": reason,
         "decided_at": chrono::Utc::now().to_rfc3339(),
     })
@@ -4843,11 +5094,19 @@ fn emit_gate_result(
 /// that lands on an already-overdue `on_timeout: reject` gate). Callers
 /// must pass the value that matches how this rejection actually came
 /// about — it is persisted verbatim into the gate's `StepResult` output.
+///
+/// `approver` (I-36) is who rejected — `Some(identity)` for an
+/// operator-observed decision (a CLI/web-issued reject, or an operator's
+/// `approve`/listing call that merely discovered an already-overdue
+/// `on_timeout: reject` gate), `None` for a fully autonomous sweep-driven
+/// expiry with no operator involved at all (the gate sweep's own
+/// `ExpireThenCleanupReject` arm).
 pub async fn run_reject_cleanup(
     opts: OrchestratorRunOpts,
     rejected_step_id: &str,
     reason: &str,
     via: &str,
+    approver: Option<&str>,
 ) -> Result<(), RunWorkflowError> {
     let Some(gate) = opts.workflow.steps.iter().find(|s| s.id == rejected_step_id) else {
         return Ok(()); // legacy inline approval or unknown id — nothing to run
@@ -4888,6 +5147,7 @@ pub async fn run_reject_cleanup(
         gate,
         "rejected",
         via,
+        approver,
         Some(reason),
         &mut step_results,
         None,
@@ -7286,7 +7546,7 @@ mod tests {
             "labels": ["{{ steps.seed.output }}", "static"],
         });
 
-        let rendered = render_action_args(Some(&with), &ctx, RenderMode::Permissive)
+        let rendered = render_action_args(Some(&with), &ctx, RenderMode::Permissive, "issues.create")
             .expect("array-valued with: renders");
 
         assert_eq!(rendered["labels"][0], "bug-report");
@@ -7871,6 +8131,7 @@ steps:
             reason: PauseReason::Approval,
             paused_step: None,
             rejected_reason: None,
+            ..Default::default()
         });
         let err = run_workflow(opts)
             .await
@@ -8148,6 +8409,7 @@ steps:
                 seed_messages: awaiting.resume_seed,
             }),
             rejected_reason: None,
+            ..Default::default()
         });
 
         let res2 = run_workflow(opts2).await.expect("resume completes");
@@ -8241,6 +8503,7 @@ steps:
             reason: PauseReason::Manual,
             paused_step: None,
             rejected_reason: None,
+            ..Default::default()
         });
 
         let res2 = run_workflow(opts2).await.expect("resume completes");
@@ -8369,6 +8632,7 @@ steps:
                 seed_messages: seed.clone(),
             }),
             rejected_reason: None,
+            ..Default::default()
         });
 
         run_workflow(opts).await.expect("resume completes");
@@ -8442,6 +8706,7 @@ steps:
                 seed_messages: seed.clone(),
             }),
             rejected_reason: None,
+            ..Default::default()
         });
 
         run_workflow(opts).await.expect("resume completes");
@@ -8657,6 +8922,7 @@ steps:
                 reason: PauseReason::Manual,
                 paused_step: None,
                 rejected_reason: None,
+                ..Default::default()
             }),
             run_id_override: None,
             strict_templates: false,
@@ -8823,6 +9089,7 @@ steps:
             reason: PauseReason::Manual,
             paused_step: None,
             rejected_reason: None,
+            ..Default::default()
         });
 
         let res2 = run_workflow(opts2).await.expect("resume completes");
@@ -11247,6 +11514,7 @@ loops:
                 reason: PauseReason::Manual,
                 paused_step: None,
                 rejected_reason: None,
+                ..Default::default()
             }),
         );
 
@@ -11421,6 +11689,7 @@ loops:
                 reason: PauseReason::Manual,
                 paused_step: None,
                 rejected_reason: None,
+                ..Default::default()
             }),
             run_id_override: None,
             strict_templates: false,
@@ -11668,6 +11937,7 @@ loops:
                     resume_claimed_by: None,
                     resume_mode: None,
                     resume_gate_id: None,
+                    reject_cleanup_pending: None,
                     permission_mode: None,
                     final_output: None,
                     loop_progress: BTreeMap::new(),
@@ -13963,6 +14233,7 @@ steps:
                 reason: PauseReason::Manual,
                 paused_step: None,
                 rejected_reason: None,
+                ..Default::default()
             }),
         );
         opts2.unit_dispatcher = Some(dispatcher2.clone());

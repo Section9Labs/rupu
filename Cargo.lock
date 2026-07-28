@@ -6462,6 +6462,7 @@ dependencies = [
  "assert_cmd",
  "assert_fs",
  "async-trait",
+ "axum",
  "chrono",
  "clap",
  "clap_complete",

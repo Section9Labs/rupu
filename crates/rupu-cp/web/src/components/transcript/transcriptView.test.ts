@@ -298,7 +298,7 @@ describe('buildTranscriptView — graceful ignores', () => {
     expect(view.turns[0].assistant?.content).toContain('keyring module');
   });
 
-  it('still ignores action_emitted even alongside a tool_audit line (regression: never conflate the two)', () => {
+  it('merges action_emitted into the tool_audit entry rather than adding a second item (regression: never conflate the two)', () => {
     const actionEmitted: TranscriptEvent = {
       type: 'action_emitted',
       data: { kind: 'scm.prs.comment', payload: {}, allowed: true, applied: true },
@@ -309,10 +309,52 @@ describe('buildTranscriptView — graceful ignores', () => {
     };
     const view = buildTranscriptView([actionEmitted, audit]);
     const tools = view.turns.flatMap((t) => t.tools);
-    // Only the tool_audit produces a visible item; action_emitted stays dead.
+    // The standing invariant: an action call is surfaced exactly ONCE. Since
+    // ISSUES.md I-40 the action_emitted payload enriches that single entry
+    // rather than being discarded, but it still never produces an item of its
+    // own.
     expect(tools).toHaveLength(1);
     expect(tools[0].tool).toBe('scm.prs.comment');
     expect(tools[0].audit).toBeDefined();
+  });
+
+  it('surfaces an action step\'s rendered with: args on the merged entry (I-40)', () => {
+    // The whole point: an operator must be able to see WHAT an action sent,
+    // not just that it ran. Before I-40 this was `input: undefined`.
+    const actionEmitted: TranscriptEvent = {
+      type: 'action_emitted',
+      data: {
+        kind: 'issues.comment',
+        payload: { project: 'acme/widget', number: 42, body: 'triaged' },
+        allowed: true,
+        applied: true,
+      },
+    };
+    const audit: TranscriptEvent = {
+      type: 'tool_audit',
+      data: { tool: 'issues.comment', declared: true, granted: true, blocked: false, restricted: false },
+    };
+    const view = buildTranscriptView([actionEmitted, audit]);
+    const tools = view.turns.flatMap((t) => t.tools);
+    expect(tools).toHaveLength(1);
+    expect(tools[0].input).toEqual({ project: 'acme/widget', number: 42, body: 'triaged' });
+  });
+
+  it('does not attach a legacy report_finding action_emitted as tool args (I-40)', () => {
+    // The legacy finding shape has no `kind`/`payload` and must stay fully
+    // ignored -- it must not be mistaken for action args.
+    const legacy: TranscriptEvent = {
+      type: 'action_emitted',
+      data: { action: 'report_finding', severity: 'high', summary: 'legacy' },
+    };
+    const audit: TranscriptEvent = {
+      type: 'tool_audit',
+      data: { tool: 'issues.comment', declared: true, granted: true, blocked: false, restricted: false },
+    };
+    const view = buildTranscriptView([legacy, audit]);
+    const tools = view.turns.flatMap((t) => t.tools);
+    expect(tools).toHaveLength(1);
+    expect(tools[0].input).toBeUndefined();
   });
 });
 

@@ -1515,6 +1515,32 @@ steps:
 }
 
 #[test]
+fn action_step_literal_string_for_numeric_param_fails_parse() {
+    // I-33 step 5: `number` is `u64`; a plain literal string (no `{{`)
+    // is an author typo (stray quotes) caught at parse time, before the
+    // run-time render/coerce path (`render_action_leaf`, runner.rs) is
+    // ever reached — a template in the same field parses fine, see
+    // `action_step_valid_with_templated_values_parses` below.
+    let yaml = r#"
+name: bad
+steps:
+  - id: x
+    action: issues.comment
+    with:
+      project: "acme/repo"
+      number: "7"
+      body: "hi"
+"#;
+    let err = Workflow::parse(yaml).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("x"), "error must name the step; got: {msg}");
+    assert!(
+        msg.contains("number"),
+        "error must name the parameter; got: {msg}"
+    );
+}
+
+#[test]
 fn action_step_valid_with_templated_values_parses() {
     // Values are templates rendered at runtime — parse validates KEYS only.
     let yaml = r#"

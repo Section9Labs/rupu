@@ -763,7 +763,7 @@ async fn reject_runs_on_reject_cleanup_chain() {
         pause: None,
     };
 
-    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human")
+    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human", None)
         .await
         .expect("cleanup never errors");
 
@@ -887,7 +887,7 @@ async fn reject_cleanup_step_failure_does_not_change_terminal_outcome() {
         pause: None,
     };
 
-    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human")
+    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human", None)
         .await
         .expect("a failing cleanup step is logged, not returned as an error");
 
@@ -1000,7 +1000,7 @@ async fn reject_cleanup_with_empty_on_reject_dispatches_nothing() {
         pause: None,
     };
 
-    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human")
+    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human", None)
         .await
         .expect("empty on_reject is Ok without dispatching anything");
 
@@ -1136,7 +1136,7 @@ async fn timeout_reject_records_via_timeout_not_human() {
         pause: None,
     };
 
-    run_reject_cleanup(opts2, &rejected_step_id, &reason, "timeout")
+    run_reject_cleanup(opts2, &rejected_step_id, &reason, "timeout", None)
         .await
         .expect("cleanup never errors");
 
@@ -1515,7 +1515,7 @@ async fn reject_one_gate_of_a_multi_gate_set_runs_its_own_cleanup_leaves_sibling
         pause: None,
     };
 
-    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human")
+    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human", None)
         .await
         .expect("cleanup never errors");
 
@@ -1579,4 +1579,180 @@ async fn reject_one_gate_of_a_multi_gate_set_runs_its_own_cleanup_leaves_sibling
     let record_terminal = store.load(&run_id).unwrap();
     assert_eq!(record_terminal.status, RunStatus::Rejected);
     assert!(record_terminal.awaiting.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// I-42 — a `when:`-skipped gate must keep its `kind`, not silently become
+// `Linear` (`StepKind::default()`). Two skip sites build the skipped
+// `StepResult`: the linear-loop path (single-cursor declaration-order loop,
+// no split/join/branch) and the scheduler path (`run_scheduler`, taken for
+// any nonlinear workflow — see `is_nonlinear`). Both must set
+// `kind: step_kind_for_run_record(step)`, matching the two adjacent skip
+// sites (prune/cancel, branch-not-taken) that already do.
+// ---------------------------------------------------------------------------
+
+// Test 14 — linear-loop path: a single gate step with `when: false`.
+#[tokio::test]
+async fn when_false_gate_preserves_kind_linear_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let yaml = r#"
+name: gate-when-skip-linear
+steps:
+  - id: gate
+    when: "false"
+    approval:
+      prompt: "never shown"
+"#;
+    let wf = Workflow::parse(yaml).unwrap();
+    assert!(
+        !rupu_orchestrator::workflow::is_nonlinear(&wf),
+        "fixture must be linear-loop mode to exercise the linear-loop skip site"
+    );
+
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_gate_when_skip_linear".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(yaml.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+    };
+
+    let res = run_workflow(opts).await.expect("run completes");
+    assert_eq!(res.step_results.len(), 1);
+    let gate = &res.step_results[0];
+    assert_eq!(gate.step_id, "gate");
+    assert!(gate.skipped, "when: false must skip the gate");
+    assert_eq!(
+        gate.kind,
+        StepKind::ApprovalGate,
+        "a when:-skipped gate must keep kind ApprovalGate, not fall back to Linear"
+    );
+}
+
+// Test 15 — scheduler path: same shape, but the workflow is nonlinear
+// (`split:`) so `run_workflow` routes through `run_scheduler` instead.
+#[tokio::test]
+async fn when_false_gate_preserves_kind_scheduler_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let yaml = r#"
+name: gate-when-skip-scheduler
+steps:
+  - id: fanout
+    split: [gate, other]
+  - id: gate
+    when: "false"
+    approval:
+      prompt: "never shown"
+  - id: other
+    agent: worker
+    prompt: "hi"
+"#;
+    let wf = Workflow::parse(yaml).unwrap();
+    assert!(
+        rupu_orchestrator::workflow::is_nonlinear(&wf),
+        "fixture must be nonlinear to exercise the scheduler skip site"
+    );
+
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_gate_when_skip_scheduler".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(EchoFactory::default()),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(yaml.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+    };
+
+    let res = run_workflow(opts).await.expect("run completes");
+    let gate = res
+        .step_results
+        .iter()
+        .find(|r| r.step_id == "gate")
+        .expect("gate result present");
+    assert!(gate.skipped, "when: false must skip the gate");
+    assert_eq!(
+        gate.kind,
+        StepKind::ApprovalGate,
+        "a when:-skipped gate must keep kind ApprovalGate, not fall back to Linear (scheduler path)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// I-44 — a gate's `notify:` hook transcript must be reachable from a
+// persisted `StepResult`, not orphaned. `fire_notify_hooks` used to discard
+// `execute_action_step`'s `Ok(StepResult)`, so the transcript it
+// unconditionally wrote at a fresh ULID path was referenced by nothing.
+// ---------------------------------------------------------------------------
+
+// Test 16 — after a gate with a `notify:` hook parks, the hook's own
+// `StepResult` (id `<gate>.notify`) is persisted to `step_results.jsonl`
+// and its `transcript_path` points at a real file on disk.
+#[tokio::test]
+async fn notify_hook_transcript_is_referenced_by_a_persisted_step_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let wf = Workflow::parse(WF_GATE_NOTIFY).unwrap();
+    let (dispatcher, _connector) = dispatcher_with_connector(false);
+
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_gate_notify_persisted".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_GATE_NOTIFY.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: Some(dispatcher),
+        pause: None,
+    };
+
+    let res = run_workflow(opts).await.expect("a pause is Ok, not Err");
+    let awaiting = res.awaiting.clone().expect("gate must pause the run");
+    assert_eq!(awaiting.step_id, "gate");
+
+    let records = store.read_step_results(&res.run_id).unwrap();
+    let notify_record = records
+        .iter()
+        .find(|r| r.step_id == "gate.notify")
+        .expect("notify hook's StepResult must be persisted to step_results.jsonl");
+    assert!(
+        notify_record.transcript_path.exists(),
+        "notify hook's transcript_path must exist on disk: {:?}",
+        notify_record.transcript_path
+    );
 }

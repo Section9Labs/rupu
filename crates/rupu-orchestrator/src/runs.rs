@@ -272,6 +272,28 @@ pub struct RunRecord {
     /// when `None`. Cleared by [`RunStore::clear_resume`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_gate_id: Option<String>,
+    /// Cleanup-pending marker (I-35): set by [`RunStore::reject_gate`]'s
+    /// explicit-reject branch whenever it finalizes the run `Rejected`,
+    /// naming the gate whose `on_reject` chain still needs to run. Mirrors
+    /// `resume_requested_at`'s marker-and-sweep shape for the reject side:
+    /// a caller that ran the chain synchronously itself (the CLI `reject`
+    /// command, and — by re-entering the CLI — the SSH/tunnel host
+    /// connectors) clears this marker immediately after; a caller with no
+    /// workflow runtime of its own (CP web, `LocalHostConnector` /
+    /// `HttpHostConnector`, the `rupu-app` desktop executor, and
+    /// `RunStore::cancel` on an `AwaitingApproval` run — all of which
+    /// bottom out in this same `reject_gate` call) leaves it set, and the
+    /// `cp serve` gate sweep picks it up via
+    /// [`RunStore::list_reject_cleanup_pending`], runs
+    /// `build_reject_cleanup_opts` + `run_reject_cleanup`, and clears it on
+    /// success via [`RunStore::clear_reject_cleanup`]. See
+    /// [`RejectCleanupMarker`] for the field contract. NOT set on the
+    /// `on_timeout: reject` auto-expiry branch inside `reject_gate` (that
+    /// path is already covered — the CLI's `via: "timeout"` handling and
+    /// the sweep's own proactive `expire_gate_if_overdue` arm both run the
+    /// chain synchronously without needing a marker).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reject_cleanup_pending: Option<RejectCleanupMarker>,
     /// The effective permission mode (`ask` / `bypass` / `readonly`) this
     /// run was launched with, persisted once at fresh-run creation
     /// (ISSUES.md I-24). Read by `rebuild_opts_from_disk`
@@ -327,6 +349,36 @@ pub struct AwaitingGate {
     /// gates may have different timeouts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// Field contract for [`RunRecord::reject_cleanup_pending`] (I-35). See
+/// that field's doc for the full set-by / cleared-by / matched-by story.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectCleanupMarker {
+    /// The gate step whose `on_reject` chain needs to run.
+    pub step_id: String,
+    /// The reject/cancel reason, threaded verbatim into
+    /// `run_reject_cleanup`'s `reason` argument (and from there into the
+    /// gate's persisted rejected `StepResult`).
+    pub reason: String,
+    /// Decision provenance (spec §3.1) — always `"human"` today, since
+    /// this marker is only ever set from `reject_gate`'s explicit-reject
+    /// branch (see the field doc on `RunRecord`). Kept as a field rather
+    /// than hardcoded so a future caller with a different provenance
+    /// doesn't have to widen the marker shape.
+    pub via: String,
+    /// I-36: the rejecting caller's identity (`reject_gate`'s `approver`
+    /// argument — an OS username for the CLI, `"web"` for the CP HTTP
+    /// handler). `#[serde(default)]` so a marker persisted before this
+    /// field existed still deserializes (as `None`) instead of failing the
+    /// whole record read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver: Option<String>,
+    /// When the marker was recorded — informational only today (no
+    /// lease/staleness semantics like `resume_claimed_at`'s, since
+    /// `run_reject_cleanup` is idempotent-on-retry: the chain always
+    /// operates on an already-terminal `Rejected` run).
+    pub requested_at: DateTime<Utc>,
 }
 
 impl RunRecord {
@@ -463,6 +515,24 @@ pub enum StepKind {
     Loop,
     Action,
     ApprovalGate,
+    /// I-39: catches any `kind` string this binary doesn't recognize —
+    /// forward-compat for an OLDER binary reading a `step_results.jsonl`
+    /// row a NEWER binary wrote with a `StepKind` variant that didn't exist
+    /// yet when this binary was built. Must stay LAST: serde's
+    /// `#[serde(other)]` is only valid on the final variant of an
+    /// externally-tagged enum. Before this variant existed, an unrecognized
+    /// `kind` string failed the WHOLE row's deserialization, and every
+    /// reader (`RunStore::read_step_results` chief among them, since it's
+    /// the one that feeds template context on resume) silently
+    /// `filter_map`s a failed row away — so a prior step's `output` was
+    /// lost wholesale on resume with an older binary, not just its kind
+    /// label. Every OTHER field on the row (`output`, `step_id`, `success`,
+    /// ...) still deserializes normally under this variant — only the kind
+    /// label is downgraded, not the data. Every `match` on `StepKind` must
+    /// handle this arm without panicking; printer/graph dispatch falls back
+    /// to the generic linear rendering.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One entry in `step_results.jsonl`. Mirrors [`StepResult`] but with
@@ -1406,11 +1476,20 @@ pub enum ApprovalDecision {
     Approved {
         run_id: String,
         step_id: String,
+        /// I-36: who approved (the operator's OS username for a CLI/`web`
+        /// call, `None` only for a caller that genuinely has no identity to
+        /// give). Previously computed by every approve path and then
+        /// silently discarded (`let _ = approver;`) — now returned so the
+        /// caller can thread it into the gate's persisted decision
+        /// (`emit_gate_result`'s `approver` field) on runner re-entry.
+        approver: Option<String>,
     },
     Rejected {
         run_id: String,
         step_id: String,
         reason: String,
+        /// I-36: who rejected — same contract as `Approved::approver`.
+        approver: Option<String>,
     },
     Expired {
         run_id: String,
@@ -1587,7 +1666,6 @@ impl RunStore {
                 }
             },
         };
-        let _ = approver; // identity recorded in transcript via runner re-entry
         gates.retain(|g| g.step_id != step_id);
         record.awaiting = gates;
         record.status = if record.awaiting.is_empty() {
@@ -1598,9 +1676,17 @@ impl RunStore {
         record.sync_awaiting_compat();
         record.error_message = None;
         self.update(&record)?;
+        // I-36: `approver` is returned on the decision rather than persisted
+        // here — this method has no cross-process handoff point analogous
+        // to `reject_gate`'s `RejectCleanupMarker` (an approve-resume always
+        // re-enters `run_workflow` synchronously in the SAME process that
+        // called this method), so the immediate caller (the CLI's
+        // `resolve_approve_gate`) threads it straight into
+        // `ResumeState::from_approval_with_actor` on re-entry.
         Ok(ApprovalDecision::Approved {
             run_id: run_id.to_string(),
             step_id,
+            approver: Some(approver.to_string()),
         })
     }
 
@@ -1669,6 +1755,13 @@ impl RunStore {
                         .error_message
                         .clone()
                         .unwrap_or_else(|| "approval expired".into()),
+                    // The gate's own timeout policy made this decision, not
+                    // this call's `approver` — but the operator DID observe
+                    // and report it (this early return only fires from an
+                    // explicit reject call), so record them as the observer
+                    // rather than `None`, mirroring `resolve_approve_gate`'s
+                    // `ExpiredRejected` handling on the approve side.
+                    approver: Some(approver.to_string()),
                 });
             }
             // `Approve` leaves the record untouched — the operator's
@@ -1704,13 +1797,34 @@ impl RunStore {
                 }
             },
         };
-        let _ = approver;
         gates.retain(|g| g.step_id != step_id);
         record.awaiting = gates;
         if record.awaiting.is_empty() {
             record.status = RunStatus::Rejected;
             record.error_message = Some(format!("rejected: {reason}"));
             record.finished_at = Some(now);
+            // I-35: record the on_reject cleanup-pending marker so a
+            // caller with no workflow runtime of its own (CP web,
+            // `LocalHostConnector`/`HttpHostConnector`, the rupu-app
+            // desktop executor, and `RunStore::cancel` — all of which
+            // bottom out here) still gets its gate's `on_reject` chain
+            // run, via the cp-serve gate sweep
+            // (`list_reject_cleanup_pending`). A caller that runs the
+            // chain synchronously itself (the CLI `reject` command) clears
+            // this marker right after — see `RunRecord::reject_cleanup_pending`'s
+            // doc for the full contract.
+            //
+            // I-36: `approver` (previously discarded via `let _ = approver;`)
+            // rides along on the marker too — the deferred cp-serve sweep
+            // consumer runs in a DIFFERENT process from this call, so it has
+            // no other way to recover who rejected.
+            record.reject_cleanup_pending = Some(RejectCleanupMarker {
+                step_id: step_id.clone(),
+                reason: reason.to_string(),
+                via: "human".to_string(),
+                approver: Some(approver.to_string()),
+                requested_at: now,
+            });
         }
         record.sync_awaiting_compat();
         self.update(&record)?;
@@ -1728,6 +1842,7 @@ impl RunStore {
             run_id: run_id.to_string(),
             step_id,
             reason: reason.to_string(),
+            approver: Some(approver.to_string()),
         })
     }
 
@@ -1913,19 +2028,31 @@ impl RunStore {
         } else {
             record.awaiting_step_id.clone().unwrap_or_default()
         };
-        let _ = approver; // identity recorded in transcript via runner re-entry
-                          // Marker-only: leave status AwaitingApproval/Paused and keep
-                          // awaiting_step_id / approval_prompt / awaiting_since /
-                          // expires_at intact for the worker to resume.
+        // Marker-only: leave status AwaitingApproval/Paused and keep
+        // awaiting_step_id / approval_prompt / awaiting_since /
+        // expires_at intact for the worker to resume.
         record.resume_requested_at = Some(now);
         record.resume_mode = mode
             .filter(|m| matches!(*m, "ask" | "bypass" | "readonly"))
             .map(str::to_string);
         record.resume_gate_id = resolved_gate_id;
         self.update(&record)?;
+        // I-36 (sibling gap, not fully closed here): `approver` is no
+        // longer silently discarded — it's returned on the decision like
+        // every other approve/reject path. But unlike `approve_gate`
+        // (whose caller re-enters `run_workflow` in the SAME process) this
+        // is marker-only: the actual resume happens later, in a DIFFERENT
+        // process (the cp-serve resume worker spawning `rupu workflow
+        // approve`), which today re-derives its own `approver` via
+        // `whoami::username()` rather than reading it back from here or
+        // from this record. So a web-initiated approve's true identity
+        // (e.g. `"web"`) is available on the returned decision but not yet
+        // threaded through to the eventual `emit_gate_result` call —
+        // tracked as a follow-up, not solved by this change.
         Ok(ApprovalDecision::Approved {
             run_id: run_id.to_string(),
             step_id,
+            approver: Some(approver.to_string()),
         })
     }
 
@@ -1995,6 +2122,38 @@ impl RunStore {
         record.resume_claimed_by = None;
         record.resume_mode = None;
         record.resume_gate_id = None;
+        self.update(&record)?;
+        Ok(())
+    }
+
+    /// Runs the `cp serve` gate sweep must still run an `on_reject`
+    /// cleanup chain for (I-35): still `Rejected` AND carrying an
+    /// unconsumed [`RejectCleanupMarker`]. Mirrors
+    /// [`list_pending_resume`](Self::list_pending_resume)'s marker-scan
+    /// shape for the reject side.
+    ///
+    /// Deliberately matches on the MARKER, not on `status == Rejected`
+    /// alone — a run whose chain already ran (synchronously, via the CLI
+    /// `reject` command, or on a prior sweep tick) stays `Rejected`
+    /// forever, but its marker is gone, so it is correctly excluded
+    /// rather than re-processed every tick.
+    pub fn list_reject_cleanup_pending(&self) -> Result<Vec<RunRecord>, RunStoreError> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|r| r.status == RunStatus::Rejected)
+            .filter(|r| r.reject_cleanup_pending.is_some())
+            .collect())
+    }
+
+    /// Clear the pending on_reject-cleanup marker after the chain has run.
+    /// Called by the cp-serve sweep once `run_reject_cleanup` succeeds, and
+    /// by any synchronous caller of `reject_gate` (the CLI `reject`
+    /// command) that already ran the chain itself, so the sweep does not
+    /// repeat the work on its next tick.
+    pub fn clear_reject_cleanup(&self, run_id: &str) -> Result<(), RunStoreError> {
+        let mut record = self.load(run_id)?;
+        record.reject_cleanup_pending = None;
         self.update(&record)?;
         Ok(())
     }
@@ -2426,6 +2585,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            reject_cleanup_pending: None,
             permission_mode: None,
             final_output: None,
             loop_progress: BTreeMap::new(),
@@ -2630,6 +2790,81 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].step_id, "a");
         assert_eq!(rows[1].step_id, "b");
+    }
+
+    /// I-39: an OLDER binary reading a `step_results.jsonl` row a NEWER
+    /// binary wrote with a `kind` this binary doesn't recognize must not
+    /// silently drop the whole row — `StepKind`'s `#[serde(other)]` catch-
+    /// all downgrades only the kind label to `Unknown`, while every other
+    /// field (crucially `output`, since losing it means a resumed run
+    /// silently loses a prior step's result and re-runs it) still
+    /// deserializes normally. Pre-fix (`StepKind` had no `#[serde(other)]`
+    /// variant), this row failed `StepResultRecord` deserialization
+    /// entirely and `read_step_results`'s `if let Ok(rec) = ...` silently
+    /// dropped it — this test would see only 1 row, not 2, and the
+    /// `future_step` output would be gone.
+    #[test]
+    fn unknown_kind_row_still_deserializes_and_preserves_output() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = sample_record("run_unknown_kind");
+        store
+            .create(
+                rec.clone(),
+                "name: x\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n",
+            )
+            .unwrap();
+
+        // A normal row, exactly like any other step result on disk today.
+        store
+            .append_step_result(&rec.id, &sample_step_result("a"))
+            .unwrap();
+
+        // A row shaped like a FUTURE binary's step_result — same fields as
+        // `sample_step_result`, but `kind` is a string this binary's
+        // `StepKind` enum has never heard of. Written directly to the
+        // JSONL file (not via `append_step_result`, which only ever
+        // constructs a real `StepKind`) to simulate exactly what
+        // `read_step_results` faces on disk.
+        let future_row = serde_json::json!({
+            "step_id": "future_step",
+            "run_id": "run_step_future_step",
+            "transcript_path": "/tmp/future_step.jsonl",
+            "output": "future output survives",
+            "success": true,
+            "skipped": false,
+            "rendered_prompt": "prompt for future_step",
+            "kind": "some_future_kind",
+            "items": [],
+            "findings": [],
+            "iterations": 0,
+            "resolved": true,
+            "finished_at": Utc::now().to_rfc3339(),
+        });
+        let path = store.step_results_log(&rec.id);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write;
+        writeln!(f, "{}", future_row).unwrap();
+
+        let rows = store.read_step_results(&rec.id).unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "the unknown-kind row must NOT be silently dropped: {rows:?}"
+        );
+        let future = rows
+            .iter()
+            .find(|r| r.step_id == "future_step")
+            .expect("future_step row must be present");
+        assert_eq!(future.kind, StepKind::Unknown);
+        assert_eq!(
+            future.output, "future output survives",
+            "the output is the actual harm if this row were dropped — it must survive"
+        );
+        assert!(future.success);
     }
 
     #[test]
@@ -3771,6 +4006,7 @@ mod tests {
             ApprovalDecision::Approved {
                 run_id: rec.id.clone(),
                 step_id: "deploy".into(),
+                approver: Some("matt".into()),
             }
         );
 
@@ -3839,6 +4075,7 @@ mod tests {
             ApprovalDecision::Approved {
                 run_id: rec.id.clone(),
                 step_id: "gate_b".into(),
+                approver: Some("web".into()),
             }
         );
 
@@ -3921,6 +4158,7 @@ mod tests {
             ApprovalDecision::Approved {
                 run_id: rec.id.clone(),
                 step_id: "deploy".into(),
+                approver: Some("web".into()),
             }
         );
         let reloaded = store.load(&rec.id).unwrap();
@@ -3980,6 +4218,7 @@ mod tests {
             ApprovalDecision::Approved {
                 run_id: rec.id.clone(),
                 step_id: "build".into(),
+                approver: Some("web".into()),
             }
         );
 
@@ -4010,6 +4249,7 @@ mod tests {
             ApprovalDecision::Approved {
                 run_id: rec.id.clone(),
                 step_id: String::new(),
+                approver: Some("web".into()),
             }
         );
     }

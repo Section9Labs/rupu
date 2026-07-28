@@ -793,6 +793,9 @@ fn overall_progress_fraction(state: &LiveRunState) -> f64 {
             StepKind::Loop => 0.0,
             StepKind::Action => 0.0,
             StepKind::ApprovalGate => 0.0,
+            // I-39: an unrecognized future kind — same "linear / unknown:
+            // 0.0" fallback the doc comment above already anticipates.
+            StepKind::Unknown => 0.0,
         })
         .unwrap_or(0.0);
 
@@ -1086,7 +1089,10 @@ pub fn render_graph(state: &LiveRunState, _workflow: &Workflow, width: usize) ->
             | StepKind::Join
             | StepKind::Loop
             | StepKind::Action
-            | StepKind::ApprovalGate => {
+            | StepKind::ApprovalGate
+            // I-39: an unrecognized future kind falls back to the same
+            // generic linear rendering as every other non-fanout kind.
+            | StepKind::Unknown => {
                 let right = if matches!(step.status, NodeStatus::Complete) {
                     format!(
                         "{} {} ⇡{}",
@@ -2804,6 +2810,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            reject_cleanup_pending: None,
             permission_mode: None,
             issue_ref: None,
             issue: None,

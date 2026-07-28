@@ -135,6 +135,7 @@ fn sample_run_record(
         resume_claimed_by: None,
         resume_mode: None,
         resume_gate_id: None,
+        reject_cleanup_pending: None,
         permission_mode: None,
         issue_ref: Some(issue_ref.into()),
         issue: None,

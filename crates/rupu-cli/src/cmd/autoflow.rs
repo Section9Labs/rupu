@@ -4045,6 +4045,9 @@ fn step_kind_label(kind: StepKind) -> &'static str {
         StepKind::Loop => "loop",
         StepKind::Action => "action",
         StepKind::ApprovalGate => "gate",
+        // I-39: an unrecognized future kind — render it like a linear step
+        // rather than panicking or fabricating a made-up label.
+        StepKind::Unknown => "linear",
     }
 }
 
@@ -13422,6 +13425,7 @@ steps:
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            reject_cleanup_pending: None,
             permission_mode: None,
             active_step_transcript_path: None,
             final_output: None,
@@ -13573,6 +13577,7 @@ steps:
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            reject_cleanup_pending: None,
             permission_mode: None,
             active_step_transcript_path: None,
             final_output: None,
@@ -13709,6 +13714,7 @@ steps:
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            reject_cleanup_pending: None,
             permission_mode: None,
             active_step_transcript_path: None,
             final_output: None,
@@ -13860,6 +13866,7 @@ steps:
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            reject_cleanup_pending: None,
             permission_mode: None,
             active_step_transcript_path: None,
             final_output: None,
@@ -14001,6 +14008,7 @@ steps:
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            reject_cleanup_pending: None,
             permission_mode: None,
             active_step_transcript_path: None,
             final_output: None,
@@ -14134,6 +14142,7 @@ steps:
                     resume_claimed_by: None,
                     resume_mode: None,
                     resume_gate_id: None,
+                    reject_cleanup_pending: None,
                     permission_mode: None,
                     active_step_transcript_path: None,
                     final_output: None,
@@ -14282,6 +14291,7 @@ steps:
                     resume_claimed_by: None,
                     resume_mode: None,
                     resume_gate_id: None,
+                    reject_cleanup_pending: None,
                     permission_mode: None,
                     active_step_transcript_path: None,
                     final_output: None,
@@ -14455,6 +14465,7 @@ steps:
                     resume_claimed_by: None,
                     resume_mode: None,
                     resume_gate_id: None,
+                    reject_cleanup_pending: None,
                     permission_mode: None,
                     active_step_transcript_path: None,
                     final_output: None,

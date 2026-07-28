@@ -830,7 +830,10 @@ fn replay_step_result_history(
         | StepKind::Join
         | StepKind::Loop
         | StepKind::Action
-        | StepKind::ApprovalGate => replay_linear_step_history(state, rec, view_mode, prefs),
+        | StepKind::ApprovalGate
+        // I-39: an unrecognized future kind falls back to the generic
+        // linear rendering, never a panic.
+        | StepKind::Unknown => replay_linear_step_history(state, rec, view_mode, prefs),
         StepKind::ForEach | StepKind::Parallel | StepKind::Panel => {
             append_step_result_lines(state, rec, view_mode, prefs)
         }
@@ -1024,7 +1027,10 @@ fn append_step_result_lines(
         | StepKind::Join
         | StepKind::Loop
         | StepKind::Action
-        | StepKind::ApprovalGate => {
+        | StepKind::ApprovalGate
+        // I-39: an unrecognized future kind falls back to the generic
+        // linear rendering, never a panic.
+        | StepKind::Unknown => {
             let status = if rec.success {
                 UiStatus::Complete
             } else {
@@ -1099,6 +1105,10 @@ fn append_step_result_lines(
                 StepKind::Loop => unreachable!(),
                 StepKind::Action => unreachable!(),
                 StepKind::ApprovalGate => unreachable!(),
+                // I-39: unreachable for the same reason as the arms above —
+                // the outer match already narrowed `rec.kind` to
+                // ForEach/Parallel/Panel.
+                StepKind::Unknown => unreachable!(),
             };
             state.push_tree_item(
                 status,
@@ -1155,6 +1165,9 @@ fn append_fanout_item_lines(
             StepKind::Loop => unreachable!(),
             StepKind::Action => unreachable!(),
             StepKind::ApprovalGate => unreachable!(),
+            // I-39: unreachable — this fn (`append_fanout_item_lines`) is
+            // only ever called from the ForEach/Parallel/Panel arm above.
+            StepKind::Unknown => unreachable!(),
         };
         let status = if item.success {
             UiStatus::Complete
@@ -2724,7 +2737,10 @@ fn drain_step_results(
             | StepKind::Join
             | StepKind::Loop
             | StepKind::Action
-            | StepKind::ApprovalGate => {
+            | StepKind::ApprovalGate
+            // I-39: an unrecognized future kind falls back to the generic
+            // linear rendering, never a panic.
+            | StepKind::Unknown => {
                 // Linear step — open a tailer if we have a transcript.
                 if rec.transcript_path.as_os_str().is_empty() || !rec.transcript_path.exists() {
                     // Header + immediate footer (nothing to stream).
@@ -2785,6 +2801,9 @@ fn render_fanout_step(
         StepKind::Loop => unreachable!("render_fanout_step called for loop step"),
         StepKind::Action => unreachable!("render_fanout_step called for action step"),
         StepKind::ApprovalGate => unreachable!("render_fanout_step called for gate step"),
+        // I-39: unreachable for the same reason as the arms above — every
+        // caller only dispatches here for ForEach/Parallel/Panel.
+        StepKind::Unknown => unreachable!("render_fanout_step called for an unknown-kind step"),
     };
 
     // Child frames at indent+1.
@@ -2823,6 +2842,7 @@ fn render_fanout_step(
         StepKind::Loop => unreachable!(),
         StepKind::Action => unreachable!(),
         StepKind::ApprovalGate => unreachable!(),
+        StepKind::Unknown => unreachable!(),
     }
 }
 
@@ -2884,6 +2904,7 @@ fn render_child_item(
         StepKind::Loop => unreachable!(),
         StepKind::Action => unreachable!(),
         StepKind::ApprovalGate => unreachable!(),
+        StepKind::Unknown => unreachable!(),
     };
 
     if view_mode == LiveViewMode::Focused {
@@ -3740,6 +3761,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            reject_cleanup_pending: None,
             permission_mode: None,
             issue_ref: None,
             issue: None,

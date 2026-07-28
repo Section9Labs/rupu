@@ -21,12 +21,48 @@ use thiserror::Error;
 pub enum RenderError {
     #[error("template: {0}")]
     Template(String),
+    /// I-33: an `action:` step's `with:` leaf was rendered against a tool
+    /// parameter the catalog declares as `integer`/`number`/`boolean`, but
+    /// either the rendered value didn't parse as that type, or the raw
+    /// leaf mixed a template with other text (a *partial* template into a
+    /// typed field is an author error, not something to coerce — see
+    /// `schema_scalar_kind`/`render_action_leaf` in `runner.rs`). Kept
+    /// distinct from `Template` so the message can name the parameter and
+    /// expected type instead of surfacing a bare downstream serde error.
+    #[error("action parameter `{param}`: {message}")]
+    ActionArgType { param: String, message: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderMode {
     Permissive,
     Strict,
+}
+
+/// I-33: reduce a JSON-schema `"type"` value (as produced by `schemars` for
+/// the MCP tool catalog — either a bare string like `"integer"`, or an
+/// array like `["integer", "null"]` for an `Option<T>` field) down to the
+/// one scalar kind `render_action_leaf` (runner.rs) and `validate_action_step`
+/// (workflow.rs) know how to coerce/reject. Returns `None` for `"string"`,
+/// `"array"`, `"object"`, or any type this arg-coercion pass doesn't touch —
+/// callers must leave those leaves alone.
+///
+/// Shared by both call sites so "which JSON-schema types are coercible" has
+/// exactly one definition.
+pub(crate) fn schema_scalar_kind(prop_type: &serde_json::Value) -> Option<&'static str> {
+    fn one(s: &str) -> Option<&'static str> {
+        match s {
+            "integer" => Some("integer"),
+            "number" => Some("number"),
+            "boolean" => Some("boolean"),
+            _ => None,
+        }
+    }
+    match prop_type {
+        serde_json::Value::String(s) => one(s),
+        serde_json::Value::Array(items) => items.iter().find_map(|v| v.as_str().and_then(one)),
+        _ => None,
+    }
 }
 
 /// Variable bag passed to the renderer.
@@ -445,6 +481,29 @@ pub fn render_step_prompt(
                     format!("read_file({path:?}) failed: {e}"),
                 )
             })
+        },
+    );
+    // `fromjson` — parse a JSON string into a structured value so it can be
+    // indexed (ISSUES.md I-34). An `action:` step's output is a JSON *string*
+    // end to end: the MCP dispatcher returns `Result<String, _>`,
+    // `StepResult.output` is a `String`, and it reaches minijinja verbatim.
+    // minijinja's `json` feature ships only `tojson` — there is no inverse —
+    // so without this an action step is write-only: you can call a tool but
+    // cannot consume its result. Errors loudly on invalid JSON rather than
+    // yielding undefined, which would render as "" and ship an empty value
+    // downstream. This mirrors the bespoke escape hatch gates already have
+    // (`steps.<id>.decision`, pre-parsed in the runner).
+    env.add_filter(
+        "fromjson",
+        |raw: String| -> Result<MjValue, minijinja::Error> {
+            serde_json::from_str::<serde_json::Value>(&raw)
+                .map(MjValue::from_serialize)
+                .map_err(|e| {
+                    minijinja::Error::new(
+                        minijinja::ErrorKind::InvalidOperation,
+                        format!("fromjson: input is not valid JSON: {e}"),
+                    )
+                })
         },
     );
     env.add_template("step", template)

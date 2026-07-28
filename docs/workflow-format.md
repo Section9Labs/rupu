@@ -378,7 +378,61 @@ Behavior:
 - if approval is required, the run pauses before the step dispatches
 - resume with `rupu workflow approve <run-id>`
 - reject with `rupu workflow reject <run-id> --reason "..."`
-- timeouts are enforced lazily on the next run-store interaction
+
+### Gate nodes (standalone `approval:` steps)
+
+A step that carries **only** an `approval:` block — no `agent:`, `action:`,
+`for_each:`, `parallel:`, `panel:` or `branch:` — is a **gate node**: a
+first-class pause in the graph rather than a pause attached to some other
+step's work.
+
+```yaml
+- id: sign-off
+  approval:
+    required: true
+    prompt: "Ship {{ inputs.tag }} to production?"
+    timeout_seconds: 3600
+    on_timeout: reject        # approve | reject | fail (default: fail)
+    auto_approve: "{{ inputs.trusted }}"
+    on_reject:                # steps run when the gate is rejected
+      - id: rollback
+        action: scm.prs.comment
+        with: { project: "acme/widget", number: 41, body: "rolled back" }
+    notify:                   # fired best-effort as the gate parks
+      - action: issues.comment
+        with: { project: "acme/widget", number: 41, body: "awaiting sign-off" }
+```
+
+| Field | Values | Notes |
+| --- | --- | --- |
+| `on_timeout` | `approve` \| `reject` \| `fail` | What to do when `timeout_seconds` elapses. Defaults to `fail`. |
+| `auto_approve` | expression | When truthy, the gate resolves without pausing. `notify:` hooks do **not** fire on auto-approve. |
+| `on_reject` | list of steps | A cleanup chain run when the gate is rejected — by an operator, or by an `on_timeout: reject`. |
+| `notify` | list of `action:` hooks | Fired best-effort just before the gate parks. A notify failure never blocks the pause. |
+
+A gate's decision is available downstream as `steps.<gate-id>.decision`
+(already parsed — no `fromjson` needed).
+
+#### Unattended timeout routing requires `rupu cp serve`
+
+**`timeout_seconds` and `on_timeout` are only acted on by a running
+`rupu cp serve`**, whose background gate sweep
+(`[cp].gate_sweep_enabled`, default on, `[cp].gate_sweep_interval_secs`,
+default 60) is what expires overdue gates and executes their routing.
+
+If you never start `cp serve`, or you set `[cp].gate_sweep_enabled = false`:
+
+- an `on_timeout: approve` gate **stays parked** rather than resuming — resolve
+  it with `rupu workflow approve <run-id>`;
+- an `on_timeout: reject` gate likewise stays parked — `rupu workflow reject
+  <run-id> --reason "..."` resolves it and runs the `on_reject` chain;
+- an `on_reject` chain triggered from the **CP web UI, the desktop app, or
+  `rupu workflow cancel`** is recorded as pending and executed by the sweep, so
+  it too waits until `cp serve` runs.
+
+Listing runs (`rupu workflow runs`) deliberately does **not** resolve gates or
+execute cleanup chains — a read command must have no external side effects. The
+CLI `approve`/`reject` commands and the sweep are the only things that do.
 
 ### `contract`
 
@@ -597,6 +651,40 @@ Workflow templates use minijinja. Missing variables render as empty strings.
 | Function | Returns | Notes |
 | --- | --- | --- |
 | `read_file('<path>')` | File contents as a string | Path is resolved against the run's working directory. Errors loudly (the run fails) if the file is missing. |
+
+### Template filters
+
+Beyond minijinja's builtins:
+
+| Filter | Returns | Notes |
+| --- | --- | --- |
+| `fromjson` | The parsed JSON value | The inverse of minijinja's builtin `tojson`. Fails the run if the input is not valid JSON — it never silently yields an empty value. |
+
+`fromjson` is what makes an **`action:` step's output usable**. An action step's
+`output` is a JSON *string*, so `{{ steps.<id>.output }}` interpolates the raw
+text and cannot be indexed. Pipe it through `fromjson` first:
+
+```yaml
+steps:
+  - id: fetch
+    action: issues.get
+    with: { project: "acme/widget", number: 41 }
+
+  - id: triage
+    agent: triager
+    prompt: |
+      Issue title: {{ (steps.fetch.output | fromjson).title }}
+      Labels: {{ (steps.fetch.output | fromjson)['labels'] | join(', ') }}
+```
+
+Values come back **typed**, so comparisons and arithmetic work:
+
+```yaml
+    when: "{{ (steps.fetch.output | fromjson).comments > 5 }}"
+```
+
+Approval-gate steps do not need this — a gate's decision is pre-parsed for you
+as `steps.<gate-id>.decision`.
 
 `read_file` lets control flow be driven by a **file a prior step wrote** instead of by an agent's chat output, which is far more deterministic. The canonical use is sourcing a `for_each:` list from a file:
 
