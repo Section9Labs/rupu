@@ -1,0 +1,91 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-musl:
+    name: linux musl (build + test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # The pinned Alpine/musl toolchain. Building the image here rather
+      # than pulling a published one keeps the Dockerfile the single source
+      # of truth; publishing it to ghcr is a later optimization.
+      - name: Build the pinned musl image
+        run: docker build -f docker/linux-build.Dockerfile -t rupu-linux-build .
+
+      # Guards the property that makes static linking possible. `keyring`
+      # was removed from the workspace (#554) precisely so the Linux graph
+      # has no D-Bus dependency; a future crate re-adding it would break the
+      # release build at the worst possible moment, silently.
+      - name: Assert keyring and dbus stay out of the Linux graph
+        run: |
+          leaked=$(docker run --rm -v "$PWD":/work -w /work rupu-linux-build \
+            cargo tree --workspace -e normal --prefix none \
+            | grep -E '^(keyring|libdbus-sys|dbus-secret-service) ' | sort -u || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::keyring/dbus leaked back into the Linux dependency graph:"
+            echo "$leaked"
+            exit 1
+          fi
+          echo "Linux graph is clean."
+
+      # The real spike: this is the first time this workspace has ever been
+      # compiled for Linux. aws-lc-rs (the rustls provider rupu installs at
+      # startup) and git2's vendored libgit2 + OpenSSL are the risky C
+      # dependencies under musl.
+      - name: Build the static CLI
+        run: |
+          docker run --rm -v "$PWD":/work -w /work rupu-linux-build \
+            cargo build --release -p rupu-cli --target-dir target/linux-musl
+
+      - name: Verify the binary is genuinely static and self-describing
+        run: |
+          docker run --rm -v "$PWD":/work -w /work rupu-linux-build sh -c '
+            set -e
+            file target/linux-musl/release/rupu
+            ldd  target/linux-musl/release/rupu 2>&1 | head -3 || true
+            ./target/linux-musl/release/rupu --version
+            ./target/linux-musl/release/rupu update --print-platform
+          '
+
+      # Static linking is the whole point of choosing musl: a glibc build
+      # made on this runner would not run on Debian 12 (glibc 2.36). Debian
+      # has no musl at all, so a successful run here proves it.
+      - name: Verify it runs on a distro it was not built on
+        run: |
+          docker run --rm -v "$PWD":/work -w /work debian:12 \
+            /work/target/linux-musl/release/rupu --version
+          docker run --rm -v "$PWD":/work -w /work alpine:3.21 \
+            /work/target/linux-musl/release/rupu update --print-platform
+
+      # rupu-app is macOS-only (GPUI + objc2). The workspace declares no
+      # default-members, so this must be scoped explicitly or it tries to
+      # compile GPUI.
+      - name: Test
+        run: |
+          docker run --rm -v "$PWD":/work -w /work rupu-linux-build \
+            cargo test --workspace --exclude rupu-app --locked
+
+      - name: Clippy
+        run: |
+          docker run --rm -v "$PWD":/work -w /work rupu-linux-build \
+            cargo clippy --workspace --exclude rupu-app --all-targets --locked -- -D warnings
+
+      # Informational only: `main` carries a large number of rustfmt diff
+      # sites predating this workflow. Promote to blocking once a dedicated
+      # formatting-cleanup PR has landed.
+      - name: Format (informational)
+        continue-on-error: true
+        run: |
+          docker run --rm -v "$PWD":/work -w /work rupu-linux-build \
+            cargo fmt --all --check
