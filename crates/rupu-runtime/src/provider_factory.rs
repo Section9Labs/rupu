@@ -152,26 +152,27 @@ pub fn resolve_provider_name(spec_provider: Option<&str>, cfg_default: Option<&s
         .to_string()
 }
 
-/// Resolve the model for a run: agent frontmatter `model:` wins, then
-/// `default_model` from `config.toml`, then the resolved provider's
-/// `[providers.<name>].default_model`, then [`FALLBACK_MODEL`].
+/// Resolve the model for a run: agent frontmatter `model:` wins, then the
+/// resolved provider's `[providers.<name>].default_model`, then the global
+/// `default_model` from `config.toml`, then [`FALLBACK_MODEL`].
 ///
 /// The single resolution point for `rupu run`, `rupu session`, and workflow
 /// steps — the workflow path previously skipped `cfg.default_model`, so the
 /// same agent could resolve to a different model depending on how it was
 /// invoked (ISSUES.md I-2).
 ///
-/// Note the global `default_model` is consulted *before* the provider-scoped
-/// one. That is the pre-existing `rupu run` order, preserved here deliberately;
-/// see ISSUES.md I-3 for why it is questionable.
+/// The provider-scoped default is consulted *before* the global one: it is
+/// the more specific value, and an agent pinned to a custom openai-compatible
+/// provider must get that provider's model rather than a global default the
+/// custom endpoint doesn't recognize (ISSUES.md I-3).
 pub fn resolve_model(
     spec_model: Option<&str>,
     cfg_default: Option<&str>,
     provider_default: Option<&str>,
 ) -> String {
     non_empty(spec_model)
-        .or(non_empty(cfg_default))
         .or(non_empty(provider_default))
+        .or(non_empty(cfg_default))
         .unwrap_or(FALLBACK_MODEL)
         .to_string()
 }
