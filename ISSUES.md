@@ -90,9 +90,9 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-39 | P1 | rupu-orchestrator | `StepKind` has no `#[serde(other)]`; an unknown kind **silently drops the whole step result** on resume (readers skip, they do not die) | open |
 | I-40 | P2 | rupu-cp web | The CP transcript never shows an action step's rendered `with:` args (the node itself *does* render via `tool_audit`) | fixed |
 | I-41 | P2 | rupu-cli | `rupu workflow show`'s **steps table** lacks gate/action arms (the graph, the primary view, is correct) | fixed |
-| I-42 | P2 | rupu-orchestrator | A `when:`-skipped gate/action loses its kind and persists as `Linear` | open |
-| I-43 | P2 | rupu-cli | The gate sweep can re-spawn `workflow approve` every tick forever, with no backoff | open |
-| I-44 | P2 | rupu-orchestrator | `notify` hooks write orphan transcript files no `StepResult` references | open |
+| I-42 | P2 | rupu-orchestrator | A `when:`-skipped gate/action loses its kind and persists as `Linear` | fixed |
+| I-43 | P2 | rupu-cli | The gate sweep can re-spawn `workflow approve` every tick forever, with no backoff | fixed |
+| I-44 | P2 | rupu-orchestrator | `notify` hooks write orphan transcript files no `StepResult` references | fixed |
 
 ### Arc 5 — provider wire correctness
 
@@ -315,6 +315,75 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-42 — a `when:`-skipped gate or action keeps its kind
+
+**Symptom.** A gate or action step skipped by a false `when:` guard persisted as
+`kind: "linear"` in `step_results.jsonl`, losing the fact that it was ever a gate or an
+action.
+
+**Root cause.** Of the four skip sites, **two set `kind` and two did not**. The `when:`-skip
+sites (scheduler and linear loop) built their `StepResult` with `..Default::default()`, and
+`StepKind::default()` is `Linear`. The `when:` check runs *before* the gate/action checks,
+so the kind was never derived. The two sites that do it correctly — prune/cancel and
+branch-not-taken — sit ~60 lines away in the same file, which is what makes this an
+omission rather than a decision.
+
+**Fix.** Both `when:`-skip sites now set `kind: step_kind_for_run_record(step)`, exactly as
+their neighbours do. Two lines.
+
+**Validation.** Three tests observed RED (`Linear` vs expected `ApprovalGate`/`Action`),
+covering both the scheduler and linear-loop paths for a gate, plus an action step.
+
+---
+
+### I-43 — the gate sweep no longer re-spawns `approve` forever
+
+**Symptom.** For an `on_timeout: approve` gate the sweep spawns a detached
+`rupu workflow approve`. If that spawn failed — or the run was still `AwaitingApproval` and
+overdue on the next tick — it spawned another. Every 60 seconds. Indefinitely.
+
+**Root cause.** The sweep claims a lease via `claim_resume`, then calls `clear_resume`
+**unconditionally** after spawning, including when the spawn itself failed. `clear_resume`
+nulls `resume_claimed_at`, so the next tick's `claim_resume` returns `true` again. The
+in-memory `rec.awaiting` mutation is explicitly in-memory only and the next tick reloads
+from disk. There was no marker, no backoff and no attempt counter; the only thing that
+stopped repetition was the child successfully flipping the status — which the sweep never
+verified.
+
+**Fix.** Do not clear the resume claim when the spawn failed, so the existing 5-minute
+`RESUME_LEASE` TTL acts as the backoff. No new marker, counter or config knob — the
+infrastructure was already there for the web-approve race, and reusing it keeps one
+concept rather than two.
+
+**Validation.** `run_gate_sweep_does_not_respawn_forever_after_spawn_failure`. The binding
+assertion is on the **second** tick — `resume_claimed_at` is unchanged between tick 1 and
+tick 2, proving no re-claim and therefore no re-spawn. Asserting only on the first tick
+would have proved nothing.
+
+---
+
+### I-44 — notify hook transcripts are no longer orphaned
+
+**Symptom.** Every `notify:` hook on a gate wrote a transcript `.jsonl` that **nothing
+referenced** — a ULID-named file, unrecoverable by path, invisible to `show-run` and the CP,
+never collected.
+
+**Root cause.** `fire_notify_hooks` built a synthetic step and called
+`execute_action_step`, then **discarded the returned `Ok(StepResult)`**. Meanwhile
+`execute_action_step` unconditionally writes its transcript. And because
+`continue_on_error: true` is passed, even a *failed* hook returns `Ok` — so the file was
+written and dropped on **every** path, not just the error path.
+
+**Fix.** Persist the notify hook's `StepResult` (id `<step>.notify`) like every other step,
+threading `run_id`/`step_results` into `fire_notify_hooks`. Suppressing the transcript was
+the alternative and was rejected: the audit trail is the entire point of a notify hook —
+these are the calls that tell an outside system a gate is waiting.
+
+**Validation.** `notify_hook_transcript_is_referenced_by_a_persisted_step_result`, observed
+RED.
+
+---
 
 ### I-41 — the steps table now renders gate and action nodes
 
