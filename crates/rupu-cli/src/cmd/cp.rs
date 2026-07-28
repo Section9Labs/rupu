@@ -857,17 +857,36 @@ async fn run_gate_sweep(
                                         .filter(|g| g.step_id != gate_step_id)
                                         .collect();
                                     rec.sync_awaiting_compat();
+                                    // The spawned child now owns the run —
+                                    // clear the marker/claim exactly like the
+                                    // resume worker does after its own spawn.
+                                    if let Err(ce) = store.clear_resume(&run_id, now) {
+                                        tracing::warn!(run_id = %run_id, error = %ce, "gate sweep: clear_resume failed");
+                                    }
                                 }
                                 Err(e) => {
-                                    tracing::error!(run_id = %run_id, gate = %gate_step_id, error = %e, "gate sweep: failed to spawn workflow approve for on_timeout=approve");
+                                    // I-43: deliberately do NOT clear_resume
+                                    // here. No child was spawned to own the
+                                    // run, so if we cleared the claim, the
+                                    // very next sweep tick would see a free
+                                    // lease and re-spawn immediately — for a
+                                    // permanently-failing spawn (bad exe
+                                    // path, exhausted process table, etc.)
+                                    // that re-spawns forever at the sweep's
+                                    // cadence (default 60s) with no backoff,
+                                    // since nothing else ever moves the run
+                                    // out of `AwaitingApproval`. Leaving the
+                                    // claim in place reuses the SAME
+                                    // `RESUME_LEASE` TTL `claim_resume`
+                                    // already enforces for the web-approve
+                                    // race (5 minutes) as a backoff: the next
+                                    // reclaim attempt (this sweep or the
+                                    // resume worker) waits for the lease to
+                                    // go stale rather than retrying every
+                                    // tick. The gate itself stays genuinely
+                                    // parked on disk either way.
+                                    tracing::error!(run_id = %run_id, gate = %gate_step_id, error = %e, "gate sweep: failed to spawn workflow approve for on_timeout=approve; leaving resume claim in place to back off retries");
                                 }
-                            }
-                            // The spawned child now owns the run (or the spawn
-                            // failed and we don't want to strand the lease
-                            // either way) — clear the marker/claim exactly like
-                            // the resume worker does after its own spawn.
-                            if let Err(ce) = store.clear_resume(&run_id, now) {
-                                tracing::warn!(run_id = %run_id, error = %ce, "gate sweep: clear_resume failed");
                             }
                         }
                         SweepAction::ExpireThenCleanupReject => {
@@ -1533,6 +1552,108 @@ mod tests {
         );
         assert!(reloaded.awaiting.is_empty());
         assert!(reloaded.awaiting_step_id.is_none());
+    }
+
+    /// I-43: a spawn failure in the `ExpireApprove` arm must not clear the
+    /// resume claim, or the very next sweep tick sees a free lease and
+    /// re-spawns immediately — forever, at the sweep's cadence (default
+    /// 60s), since nothing else ever flips the run out of
+    /// `AwaitingApproval`. `exe` here is a path guaranteed not to exist, so
+    /// `std::process::Command::spawn()` itself returns `Err` (the OS-level
+    /// launch failure this test targets — not a child that launches and
+    /// then exits nonzero).
+    ///
+    /// The binding assertion is about the SECOND tick: with the fix, the
+    /// first failed spawn leaves `resume_claimed_at` set (claim retained),
+    /// so the second tick's `claim_resume` sees a live lease and skips
+    /// entirely — `resume_claimed_at` is unchanged between the two ticks.
+    /// Pre-fix, the first tick clears the claim unconditionally, so the
+    /// second tick re-claims (a fresh, later `resume_claimed_at`) and
+    /// re-attempts the spawn.
+    #[tokio::test]
+    async fn run_gate_sweep_does_not_respawn_forever_after_spawn_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
+        let hosts = rupu_workspace::HostStore {
+            root: tmp.path().join("hosts"),
+        };
+        let exe = std::path::PathBuf::from("/nonexistent/rupu-gate-sweep-i43-test-binary");
+        assert!(!exe.exists(), "test exe path must not exist");
+
+        let now = chrono::Utc::now();
+        let rec = rupu_orchestrator::RunRecord {
+            id: "run_sweep_spawn_fail".into(),
+            workflow_name: "g".into(),
+            status: RunStatus::AwaitingApproval,
+            inputs: std::collections::BTreeMap::new(),
+            event: None,
+            workspace_id: "ws_1".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            started_at: now - chrono::Duration::seconds(120),
+            finished_at: None,
+            final_output: None,
+            error_message: None,
+            awaiting: Vec::new(),
+            awaiting_step_id: Some("gate_a".into()),
+            approval_prompt: Some("approve a?".into()),
+            awaiting_since: Some(now - chrono::Duration::seconds(120)),
+            expires_at: Some(now - chrono::Duration::seconds(30)), // overdue
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            resume_gate_id: None,
+            reject_cleanup_pending: None,
+            permission_mode: None,
+            loop_progress: Default::default(),
+        };
+        // Single gate, `on_timeout: approve` — must route to `ExpireApprove`.
+        store
+            .create(
+                rec.clone(),
+                "name: g\nsteps:\n  - id: gate_a\n    approval:\n      timeout_seconds: 10\n      on_timeout: approve\n",
+            )
+            .unwrap();
+
+        run_gate_sweep(Arc::clone(&store), hosts.clone(), exe.clone(), "sweep-test".to_string()).await;
+
+        let after_tick1 = store.load(&rec.id).unwrap();
+        assert_eq!(
+            after_tick1.status,
+            RunStatus::AwaitingApproval,
+            "the gate is still genuinely parked after a failed spawn — nothing resolved it"
+        );
+        let claimed_after_tick1 = after_tick1.resume_claimed_at;
+        assert!(
+            claimed_after_tick1.is_some(),
+            "a spawn failure must NOT clear the resume claim — it must leave the lease in \
+             place so the existing RESUME_LEASE TTL backs off the next reclaim, instead of \
+             clearing it and inviting an immediate re-spawn on the very next tick"
+        );
+
+        run_gate_sweep(Arc::clone(&store), hosts, exe, "sweep-test".to_string()).await;
+
+        let after_tick2 = store.load(&rec.id).unwrap();
+        assert_eq!(
+            after_tick2.resume_claimed_at, claimed_after_tick1,
+            "the second tick must see a still-live lease and skip re-claiming/re-spawning \
+             entirely — a changed resume_claimed_at means it re-claimed, which means it \
+             re-spawned, which is the unbounded-respawn bug"
+        );
+        assert_eq!(after_tick2.status, RunStatus::AwaitingApproval);
     }
 
     /// Plan 4 gate sweep: the pure classifier's full truth table. `expired`
