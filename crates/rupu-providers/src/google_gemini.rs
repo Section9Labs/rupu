@@ -208,11 +208,13 @@ impl GoogleGeminiClient {
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
+            let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Api {
+            return Err(crate::error::api_error_from_response(
                 status,
-                message: extract_google_error(&text),
-            });
+                &headers,
+                extract_google_error(&text),
+            ));
         }
 
         let resp_json: serde_json::Value = response.json().await?;
@@ -239,11 +241,13 @@ impl GoogleGeminiClient {
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
+            let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Api {
+            return Err(crate::error::api_error_from_response(
                 status,
-                message: extract_google_error(&text),
-            });
+                &headers,
+                extract_google_error(&text),
+            ));
         }
 
         let mut parser = SseParser::new();

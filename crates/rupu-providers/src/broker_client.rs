@@ -77,11 +77,13 @@ impl LlmProvider for BrokerClient {
 
         let status = response.status();
         if !status.is_success() {
+            let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                message: text,
-            });
+            return Err(crate::error::api_error_from_response(
+                status.as_u16(),
+                &headers,
+                text,
+            ));
         }
 
         let body: serde_json::Value = response.json().await?;
@@ -118,11 +120,13 @@ impl LlmProvider for BrokerClient {
 
         let status = response.status();
         if !status.is_success() {
+            let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                message: text,
-            });
+            return Err(crate::error::api_error_from_response(
+                status.as_u16(),
+                &headers,
+                text,
+            ));
         }
 
         let mut parser = SseParser::new();

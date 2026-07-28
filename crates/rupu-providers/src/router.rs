@@ -154,7 +154,8 @@ impl LlmProvider for ProviderRouter {
 
                 match provider.send(&req).await {
                     Ok(resp) => return Ok(resp),
-                    Err(ProviderError::Api { status: 429, .. }) => {
+                    Err(ProviderError::Api { status: 429, .. })
+                    | Err(ProviderError::RateLimited { .. }) => {
                         warn!(
                             provider = %provider.provider_id(),
                             "rate-limited (429), trying next provider"
@@ -236,7 +237,8 @@ impl LlmProvider for ProviderRouter {
 
                 match provider.stream(&req, on_event).await {
                     Ok(resp) => return Ok(resp),
-                    Err(ProviderError::Api { status: 429, .. }) => {
+                    Err(ProviderError::Api { status: 429, .. })
+                    | Err(ProviderError::RateLimited { .. }) => {
                         warn!(
                             provider = %provider.provider_id(),
                             "rate-limited (429), trying next provider"
