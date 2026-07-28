@@ -163,6 +163,11 @@ async fn auth_backend_snapshot_defaults_to_full() {
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", tmp.path())
+        // `supports-color` honors FORCE_COLOR ahead of the `--no-color`
+        // flag, so a developer shell exporting it makes these plain-text
+        // assertions fail. Clear it for the child.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .arg("auth")
         .arg("backend")
         .arg("--no-color")
@@ -185,6 +190,11 @@ async fn auth_backend_focused_hides_detail_sections() {
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", tmp.path())
+        // `supports-color` honors FORCE_COLOR ahead of the `--no-color`
+        // flag, so a developer shell exporting it makes these plain-text
+        // assertions fail. Clear it for the child.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .arg("auth")
         .arg("backend")
         .arg("--view")
@@ -208,6 +218,11 @@ async fn auth_backend_use_file_renders_requested_backend_snapshot() {
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", tmp.path())
+        // `supports-color` honors FORCE_COLOR ahead of the `--no-color`
+        // flag, so a developer shell exporting it makes these plain-text
+        // assertions fail. Clear it for the child.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .arg("auth")
         .arg("backend")
         .arg("--use")

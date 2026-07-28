@@ -2723,8 +2723,13 @@ mod tests {
 
         // A colored string: ANSI must not be counted and the visible
         // width must respect the bound.
-        let mut colored = String::new();
-        let _ = palette::write_colored(&mut colored, "abcdefghij", palette::BRAND);
+        //
+        // The escape sequence is written literally rather than produced by
+        // `palette::write_colored`. The subject here is `truncate_to_width`'s
+        // ANSI-awareness, not the color *decision* — and routing through
+        // `write_colored` made this test depend on process-global color state
+        // that a concurrently-running test can flip.
+        let colored = "\x1b[38;2;124;58;237mabcdefghij\x1b[39m".to_string();
         let t = truncate_to_width(&colored, 5);
         assert_eq!(visible_len(&t), 5, "colored truncation: {t:?}");
         assert!(t.contains('\x1b'), "color codes preserved");

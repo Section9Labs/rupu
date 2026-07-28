@@ -1616,7 +1616,13 @@ fn ensure_session_worker(
     session: &mut SessionRecord,
     scope: SessionScope,
 ) -> anyhow::Result<u32> {
-    if let Some(pid) = session.worker_pid.filter(|pid| pid_is_running(*pid)) {
+    // A recorded worker pid equal to our own is never a real worker — see
+    // `terminate_pid`. Reject it here too, so we neither reuse ourselves as
+    // the worker nor fall through into trying to terminate ourselves.
+    if let Some(pid) = session
+        .worker_pid
+        .filter(|pid| *pid != std::process::id() && pid_is_running(*pid))
+    {
         if !worker_is_stale(current_binary_mtime(), session.worker_binary_mtime) {
             return Ok(pid);
         }
@@ -3843,9 +3849,19 @@ fn render_session_entry_rows(
                 width,
             )
         }
-        SessionEntry::ToolAudit { tool, declared, granted, blocked } => {
-            let status = if *blocked { Status::Failed } else { Status::Complete };
-            let detail = format!("{tool}  ·  declared={declared} granted={granted} blocked={blocked}");
+        SessionEntry::ToolAudit {
+            tool,
+            declared,
+            granted,
+            blocked,
+        } => {
+            let status = if *blocked {
+                Status::Failed
+            } else {
+                Status::Complete
+            };
+            let detail =
+                format!("{tool}  ·  declared={declared} granted={granted} blocked={blocked}");
             render_nested_event_rows(
                 next_is_nested,
                 status,
@@ -4587,11 +4603,20 @@ fn transcript_event_lines(
             blocked,
             ..
         } => {
-            let detail = format!("{tool}  ·  declared={declared} granted={granted} blocked={blocked}");
+            let detail =
+                format!("{tool}  ·  declared={declared} granted={granted} blocked={blocked}");
             vec![SessionViewLine {
-                status: if *blocked { Status::Failed } else { Status::Complete },
+                status: if *blocked {
+                    Status::Failed
+                } else {
+                    Status::Complete
+                },
                 text: retained_session_event_line_raw(
-                    if *blocked { Status::Failed } else { Status::Complete },
+                    if *blocked {
+                        Status::Failed
+                    } else {
+                        Status::Complete
+                    },
                     "tool audit",
                     &detail,
                 ),
@@ -6132,8 +6157,7 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
         .project_root
         .as_ref()
         .map(|p| p.join(".rupu/config.toml"));
-    let cfg =
-        rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
     let resolver = rupu_auth::KeychainResolver::new();
 
     let provider_config = provider_factory::ProviderConfig {
@@ -7411,6 +7435,18 @@ fn pid_is_running(pid: u32) -> bool {
 }
 
 fn terminate_pid(pid: u32) -> bool {
+    // Never signal ourselves. A recorded `worker_pid` equal to this
+    // process is always a corrupt state — a bug that wrote the wrong pid,
+    // or an OS pid recycled onto us — and honoring it makes rupu SIGTERM
+    // itself mid-command. Refusing is strictly better than obeying: the
+    // caller treats `false` as "could not terminate" and moves on.
+    if pid == std::process::id() {
+        tracing::warn!(
+            pid,
+            "refusing to terminate this process: a recorded worker pid matched our own"
+        );
+        return false;
+    }
     Command::new("/bin/kill")
         .arg("-TERM")
         .arg(pid.to_string())
@@ -7776,10 +7812,27 @@ mod tests {
     #[test]
     fn handle_session_live_input_queues_prompt_while_running() {
         let global = tempfile::tempdir().expect("tmpdir");
+
+        // A live worker that is NOT this process. Using `std::process::id()`
+        // here used to make `ensure_session_worker` judge the worker stale
+        // and `terminate_pid` it — SIGTERMing the test harness and killing
+        // the whole `--lib` target before the rest of the suite could run.
+        let mut worker = Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn stand-in worker");
+        let worker_pid = worker.id();
+
         let session = SessionRecord {
             status: SessionStatus::Running,
-            active_pid: Some(std::process::id()),
-            worker_pid: Some(std::process::id()),
+            active_pid: Some(worker_pid),
+            worker_pid: Some(worker_pid),
+            // Match the current binary so the worker is not judged stale;
+            // otherwise the reuse path restarts it.
+            worker_binary_mtime: current_binary_mtime(),
             ..test_session_record()
         };
         write_session(global.path(), SessionScope::Active, &session).expect("write session");
@@ -7817,6 +7870,21 @@ mod tests {
             state.entries.first(),
             Some(SessionEntry::UserPrompt { content, queued: true, .. }) if content == "summarize the repo"
         ));
+
+        let _ = worker.kill();
+        let _ = worker.wait();
+    }
+
+    /// Regression guard for the harness-killing bug above: signalling our own
+    /// pid is never correct, and honoring it made `rupu` SIGTERM itself.
+    #[test]
+    fn terminate_pid_refuses_to_signal_this_process() {
+        // If this returns true, the process is already dead and the rest of
+        // the suite never runs — which is precisely the failure it guards.
+        assert!(
+            !terminate_pid(std::process::id()),
+            "terminate_pid must refuse its own pid"
+        );
     }
 
     #[test]
@@ -8155,22 +8223,26 @@ mod tests {
         state.pricing = PricingConfig::default();
         state.activity = SessionActivity::Thinking;
 
-        let header = render_session_header_line(&session, &state, 160);
+        // Strip ANSI before asserting. Each token glyph is colored while its
+        // value is not, so `⇡` and `120` are not contiguous in the raw string
+        // — and the raw form varies with ambient color state, which another
+        // test running in parallel can flip.
+        let header = strip_ansi(&render_session_header_line(&session, &state, 160));
+
         // Header shows the workspace label (repo_ref stripped of platform prefix),
         // not the agent name — the agent appears on the prompt row instead.
-        assert!(header.contains("Section9Labs/rupu"));
-        assert!(!header.contains("issue-reader"));
-        assert!(header.contains("gpt-5"));
-        assert!(header.contains("effort high"));
-        assert!(header.contains("⇡"));
-        assert!(header.contains(" 120"));
-        assert!(header.contains("⇣"));
-        assert!(header.contains(" 45"));
-        assert!(header.contains("⟳"));
-        assert!(header.contains(" 18"));
-        // grand total = 120 + 45 + 18 = 183
-        assert!(header.contains("total 183"));
-        assert!(header.contains("~$"));
+        assert!(header.contains("Section9Labs/rupu"), "header: {header}");
+        assert!(!header.contains("issue-reader"), "header: {header}");
+        assert!(header.contains("gpt-5"), "header: {header}");
+        // `effort high` became the `⚡<level>` glyph in #303, when the context
+        // gauge was added and header width got tight. The same PR dropped the
+        // `total <sum>` part and changed `~$` to a plain `$` — this test kept
+        // asserting the pre-#303 shape and has been failing ever since.
+        assert!(header.contains("⚡high"), "header: {header}");
+        assert!(header.contains("⇡120"), "header: {header}");
+        assert!(header.contains("⇣45"), "header: {header}");
+        assert!(header.contains("⟳18"), "header: {header}");
+        assert!(header.contains('$'), "header: {header}");
     }
 
     #[test]
@@ -8183,13 +8255,17 @@ mod tests {
         );
 
         // No cached summary → the header omits the coverage part entirely.
-        assert!(!render_session_header_line(&session, &state, 160).contains("coverage"));
+        // Asserted against the label actually rendered; checking for the word
+        // "coverage" passed vacuously once the label was shortened, so it
+        // proved nothing.
+        assert!(!render_session_header_line(&session, &state, 160).contains("Cov "));
 
         // Once `maybe_refresh_coverage` has populated the cache, the header
-        // renders `coverage <complete>/<total> concerns`.
+        // renders `Cov <complete>/<total>` — shortened from
+        // `coverage <n>/<m> concerns` in #303 when the context gauge was added.
         state.coverage_summary = Some((3, 7));
         let header = render_session_header_line(&session, &state, 160);
-        assert!(header.contains("coverage 3/7 concerns"));
+        assert!(header.contains("Cov 3/7"), "header was: {header}");
     }
 
     #[test]

@@ -762,6 +762,11 @@ steps:
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", home.path())
+        // This asserts on plain text, so neutralize a developer shell that
+        // exports FORCE_COLOR — the binary honors it (correctly) even through
+        // a pipe, which would embed ANSI in every assertion below.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(project.path())
         .args(["autoflow", "show", "controller"])
         .assert()
@@ -928,6 +933,11 @@ steps:
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", home.path())
+        // This asserts on plain text, so neutralize a developer shell that
+        // exports FORCE_COLOR — the binary honors it (correctly) even through
+        // a pipe, which would embed ANSI in every assertion below.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(outside.path())
         .args([
             "autoflow",

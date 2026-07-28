@@ -10,6 +10,7 @@ use comfy_table::Color as TableColor;
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, RwLock};
 
 /// Default running / active token (blue-500 #3b82f6).
@@ -161,6 +162,36 @@ impl Default for UiPaletteTheme {
 static ACTIVE_PALETTE: LazyLock<RwLock<UiPaletteTheme>> =
     LazyLock::new(|| RwLock::new(UiPaletteTheme::default()));
 
+/// Hard override that beats `owo-colors`' auto-detection.
+///
+/// Needed because auto-detection consults `FORCE_COLOR` *before* `NO_COLOR`
+/// and caches the answer on first use (`supports_color::on_cached`). Two
+/// consequences this fixes:
+///
+/// - `--no-color` was silently ignored on any machine exporting
+///   `FORCE_COLOR` (Ghostty and several modern shells do). The flag computed
+///   a `ColorMode::Never` that the color writers never consulted.
+/// - Tests asserting on plain text were order-dependent: whichever test
+///   queried color first locked the cached answer for the whole process.
+static COLOR_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Turn color off for this process, overriding auto-detection and
+/// `FORCE_COLOR`. Called when `--no-color` / `NO_COLOR` / `[ui].color =
+/// "never"` resolve to "never", and by tests that assert on plain text.
+pub fn disable_color() {
+    COLOR_DISABLED.store(true, Ordering::Relaxed);
+}
+
+/// Re-enable auto-detection. Exists so a test that disabled color does not
+/// leak that decision into the rest of the process.
+pub fn enable_color() {
+    COLOR_DISABLED.store(false, Ordering::Relaxed);
+}
+
+fn color_disabled() -> bool {
+    COLOR_DISABLED.load(Ordering::Relaxed)
+}
+
 pub fn set_active_palette(theme: UiPaletteTheme) {
     if let Ok(mut slot) = ACTIVE_PALETTE.write() {
         *slot = theme;
@@ -244,6 +275,9 @@ impl Status {
 /// Write `text` using a semantic color token that remaps through the
 /// active palette.
 pub fn write_colored(f: &mut dyn fmt::Write, text: &str, color: owo_colors::Rgb) -> fmt::Result {
+    if color_disabled() {
+        return f.write_str(text);
+    }
     let color = themed(color);
     let colored = text
         .if_supports_color(owo_colors::Stream::Stdout, |s| s.color(color))
@@ -257,6 +291,9 @@ pub fn write_bold_colored(
     text: &str,
     color: owo_colors::Rgb,
 ) -> fmt::Result {
+    if color_disabled() {
+        return f.write_str(text);
+    }
     let color = themed(color);
     let probe = text
         .if_supports_color(owo_colors::Stream::Stdout, |s| s.color(color))
