@@ -259,6 +259,13 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
   // (not a single slot — see the module doc for why adjacency/last-call-wins
   // misattributes when a turn has >1 tool_use of possibly-mixed names).
   const pendingAuditsByTool = new Map<string, ToolView[]>();
+  // ISSUES.md I-40: an action node emits `action_emitted` (carrying the
+  // RENDERED `with:` args) immediately before its `tool_audit`, and has no
+  // `tool_call`/`tool_result` pair at all. Stash the args here so the
+  // standalone entry the `tool_audit` arm creates can show what the action
+  // actually sent, instead of `input: undefined`. Keyed by tool name, queued
+  // because a step may invoke the same tool more than once.
+  const pendingActionArgsByTool = new Map<string, unknown[]>();
 
   function ensureTurn(): TurnView {
     if (current === null) {
@@ -367,7 +374,14 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
           // accompanying tool_call/tool_result shape at all). Surface
           // it as a standalone entry so the audit line is never
           // silently dropped.
-          ensureTurn().tools.push({ tool, input: undefined, kind: classify(tool), audit });
+          //
+          // I-40: attach the rendered `with:` args stashed by the matching
+          // `action_emitted` that precedes it, so the entry shows what the
+          // action actually sent. Still exactly ONE entry per action call —
+          // the two events are merged, never surfaced separately.
+          const argQueue = pendingActionArgsByTool.get(tool);
+          const input = argQueue && argQueue.length > 0 ? argQueue.shift() : undefined;
+          ensureTurn().tools.push({ tool, input, kind: classify(tool), audit });
         }
         break;
       }
@@ -420,10 +434,32 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
         break;
       }
 
-      // user_message and action_emitted are dead/legacy shapes — findings come
-      // from `report_finding` tool_calls now, and there is no user_message in
-      // the live stream. turn_start / turn_end / assistant_delta /
-      // gate_requested carry no render payload. All ignored gracefully.
+      case 'action_emitted': {
+        // Two distinct shapes share this event name.
+        //
+        // 1. The LEGACY finding shape (`{ action: 'report_finding', severity,
+        //    summary }`) really is dead — findings come from `report_finding`
+        //    tool_calls now. Ignored, as before.
+        // 2. The ACTION-NODE shape (`{ kind, payload, allowed, applied }`),
+        //    written by `execute_action_step` just before its `tool_audit`.
+        //    `payload` is the rendered `with:` args (ISSUES.md I-40).
+        //
+        // Only shape 2 is stashed, and it deliberately produces NO item of its
+        // own — the following `tool_audit` picks the args up and renders a
+        // single merged entry. That preserves the standing invariant that an
+        // action call is never surfaced twice.
+        const kind = asString(data.kind);
+        if (kind && data.payload !== undefined) {
+          const queue = pendingActionArgsByTool.get(kind);
+          if (queue) queue.push(data.payload);
+          else pendingActionArgsByTool.set(kind, [data.payload]);
+        }
+        break;
+      }
+
+      // user_message is a dead/legacy shape — there is no user_message in the
+      // live stream. turn_start / turn_end / assistant_delta / gate_requested
+      // carry no render payload. All ignored gracefully.
       default:
         break;
     }
