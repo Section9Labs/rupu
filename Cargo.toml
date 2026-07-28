@@ -99,9 +99,6 @@ walkdir = "2"
 which = "6"
 whoami = "1"
 
-# Auth
-keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }
-
 # OAuth / PKCE
 tiny_http = "0.12"
 webbrowser = "1"
