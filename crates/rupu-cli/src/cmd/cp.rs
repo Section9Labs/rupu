@@ -946,6 +946,62 @@ async fn run_gate_sweep(
                     }
                 }
             }
+            // I-35: a `Rejected` run whose reject/cancel had no workflow
+            // runtime of its own to run the chain synchronously (CP web,
+            // `LocalHostConnector`/`HttpHostConnector`, the rupu-app
+            // desktop executor, and `RunStore::cancel` — see
+            // `RunRecord::reject_cleanup_pending`'s doc) leaves the marker
+            // set; this arm is the deferred worker for it, mirroring the
+            // resume worker's marker-and-sweep shape for the approve side.
+            // Matches on the MARKER (via `list_reject_cleanup_pending`'s
+            // same filter, re-checked here per-run since this loop already
+            // iterates every run), never on `status == Rejected` alone —
+            // a run whose chain already ran keeps that status forever but
+            // has no marker, so it's a cheap no-op below rather than a
+            // repeat of the chain.
+            rupu_orchestrator::RunStatus::Rejected => {
+                if is_remote {
+                    tracing::debug!(run_id = %run_id, "gate sweep: skipping remote-host rejected run");
+                    continue;
+                }
+                let Some(marker) = rec.reject_cleanup_pending.clone() else {
+                    continue;
+                };
+                tracing::info!(run_id = %run_id, step_id = %marker.step_id, "gate sweep: running deferred on_reject cleanup (I-35)");
+                match crate::resume::build_reject_cleanup_opts(
+                    &store,
+                    &run_id,
+                    &marker.step_id,
+                    &marker.reason,
+                    rec.resume_mode.as_deref(),
+                )
+                .await
+                {
+                    Ok((opts, chain_len)) => {
+                        match rupu_orchestrator::runner::run_reject_cleanup(
+                            opts,
+                            &marker.step_id,
+                            &marker.reason,
+                            &marker.via,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                tracing::info!(run_id = %run_id, step_id = %marker.step_id, chain_len, "gate sweep: deferred on_reject cleanup executed");
+                                if let Err(e) = store.clear_reject_cleanup(&run_id) {
+                                    tracing::warn!(run_id = %run_id, error = %e, "gate sweep: clear_reject_cleanup failed");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(run_id = %run_id, error = %e, "gate sweep: deferred on_reject cleanup chain errored; marker left set, will retry next tick");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(run_id = %run_id, error = %e, "gate sweep: could not build deferred on_reject cleanup opts; marker left set, will retry next tick");
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1049,6 +1105,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
         };
@@ -1271,6 +1328,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
         };
@@ -1378,6 +1436,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
         };
@@ -1452,6 +1511,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
         };
@@ -1638,5 +1698,339 @@ mod tests {
         .await;
 
         assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    // ── I-35: every reject/cancel path must run the on_reject chain ──
+    //
+    // Pre-fix, `RunStore::reject_gate`'s explicit-reject branch (the one
+    // CP web, `LocalHostConnector`/`HttpHostConnector`, the rupu-app
+    // executor, and `RunStore::cancel` all bottom out in) recorded NO
+    // marker at all, and this sweep had no arm looking for one — so a
+    // web/app/cancel reject's `on_reject` chain (and the gate decision
+    // `run_reject_cleanup` is the only caller of `emit_gate_result` for)
+    // never ran, no matter how many sweep ticks fired. These tests drive
+    // the REAL `build_reject_cleanup_opts`/`run_reject_cleanup` path (not
+    // a test-double factory) via the `RUPU_MOCK_PROVIDER_SCRIPT` seam
+    // (`crates/rupu-runtime/src/provider_factory.rs`), mirroring
+    // `crates/rupu-cli/tests/workflow_runs_no_side_effects.rs`'s fixture
+    // shape: a real `write_file` tool call is the only reliable proof the
+    // chain genuinely executed, as opposed to merely flipping a flag.
+
+    /// The on_reject chain's only step: write a marker file via the real
+    /// `write_file` tool. Its existence on disk is the proof the chain
+    /// really ran (not just that some in-memory flag flipped).
+    const I35_WRITE_SCRIPT: &str = r#"
+[
+  { "AssistantToolUse": { "text": null, "tool_id": "call_1", "tool_name": "write_file", "tool_input": {"path": "reject_cleanup_marker.txt", "content": "cleanup ran"}, "stop": "tool_use" } },
+  { "AssistantText": { "text": "done", "stop": "end_turn" } }
+]
+"#;
+
+    const I35_WRITER_AGENT: &str = "---\nname: writer\nprovider: anthropic\nmodel: claude-sonnet-4-6\nmaxTurns: 2\ntools: [write_file]\n---\nyou write files.";
+
+    /// A single gate whose `on_reject` chain runs the `writer` agent above.
+    const I35_WORKFLOW_NONEMPTY_CHAIN: &str = "name: g\nsteps:\n  - id: gate\n    approval:\n      prompt: \"Approve?\"\n      on_reject:\n        - id: cleanup\n          agent: writer\n          prompt: \"cleanup after reject\"\n";
+
+    /// Same shape, but no `on_reject:` at all — Test 3's empty-chain,
+    /// must-not-spin case.
+    const I35_WORKFLOW_EMPTY_CHAIN: &str =
+        "name: g\nsteps:\n  - id: gate\n    approval:\n      prompt: \"Approve?\"\n";
+
+    /// `<tmp>/home` (a `RUPU_HOME` with the `writer` agent) + `<tmp>/workspace`
+    /// (the run's workspace — must exist on disk for `project_root_for`'s
+    /// `canonicalize`, but needs no `.rupu/` of its own: `rebuild_opts_from_disk`
+    /// re-parses the workflow from the PERSISTED SNAPSHOT `store.create` was
+    /// given, never from a project directory).
+    fn i35_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join("agents")).unwrap();
+        std::fs::write(home.join("agents/writer.md"), I35_WRITER_AGENT).unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        (tmp, home, workspace)
+    }
+
+    /// An `AwaitingApproval` run parked at `gate`, workspace-bound to
+    /// `workspace`, ready for an explicit reject/cancel. Caller still needs
+    /// to `store.create(rec, <yaml>)` with whichever chain (non-empty or
+    /// empty) the test needs.
+    fn i35_awaiting_record(id: &str, workspace: &std::path::Path) -> rupu_orchestrator::RunRecord {
+        use rupu_orchestrator::runs::AwaitingGate;
+        let now = chrono::Utc::now();
+        let mut rec = rupu_orchestrator::RunRecord {
+            id: id.into(),
+            workflow_name: "g".into(),
+            status: RunStatus::AwaitingApproval,
+            inputs: std::collections::BTreeMap::new(),
+            event: None,
+            workspace_id: "ws_1".into(),
+            workspace_path: workspace.to_path_buf(),
+            transcript_dir: workspace.join(".rupu/transcripts"),
+            started_at: now,
+            finished_at: None,
+            final_output: None,
+            error_message: None,
+            awaiting: vec![AwaitingGate {
+                step_id: "gate".into(),
+                prompt: Some("Approve?".into()),
+                since: now,
+                expires_at: None,
+            }],
+            awaiting_step_id: None,
+            approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            resume_gate_id: None,
+            reject_cleanup_pending: None,
+            permission_mode: None,
+            loop_progress: Default::default(),
+        };
+        rec.sync_awaiting_compat();
+        rec
+    }
+
+    /// Test 1: reject via the WEB API handler (`POST /api/runs/:id/reject`
+    /// against a real spawned `rupu-cp` server), not the CLI. The web
+    /// handler must leave the chain to the sweep; the sweep must then
+    /// actually run it (real filesystem side effect) AND record the gate's
+    /// rejected decision. Pre-fix, the marker file never appears no matter
+    /// how many sweep ticks run, because `reject_gate` recorded no marker
+    /// for the sweep to find.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn web_reject_leaves_marker_sweep_runs_cleanup_and_records_gate_decision() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        crate::test_support::ensure_crypto_provider();
+
+        let (_tmp, home, workspace) = i35_fixture();
+        let rec = i35_awaiting_record("run_i35_web_reject", &workspace);
+
+        let app_state =
+            rupu_cp::state::AppState::new(home.clone(), rupu_config::PricingConfig::default());
+        app_state
+            .run_store
+            .create(rec.clone(), I35_WORKFLOW_NONEMPTY_CHAIN)
+            .unwrap();
+
+        let app = rupu_cp::server::router(app_state.clone(), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/api/runs/{}/reject", rec.id))
+            .json(&serde_json::json!({ "reason": "not today" }))
+            .send()
+            .await
+            .expect("reject request should succeed");
+        assert!(
+            resp.status().is_success(),
+            "POST /api/runs/:id/reject returned {}",
+            resp.status()
+        );
+
+        // Immediately after the web reject: the run is terminally
+        // Rejected, the cleanup-pending marker IS set, but the chain has
+        // NOT run yet (no marker file, no gate StepResult) — the web
+        // handler itself must not run a workflow runtime.
+        let after_reject = app_state.run_store.load(&rec.id).unwrap();
+        assert_eq!(after_reject.status, RunStatus::Rejected);
+        assert!(
+            after_reject.reject_cleanup_pending.is_some(),
+            "web reject must leave the on_reject cleanup-pending marker for the sweep"
+        );
+        assert!(
+            !workspace.join("reject_cleanup_marker.txt").exists(),
+            "the web reject handler itself must not run the on_reject chain synchronously"
+        );
+
+        // Run the deferred worker for the marker above.
+        let hosts = rupu_workspace::HostStore {
+            root: home.join("hosts"),
+        };
+        let exe = std::env::current_exe().unwrap();
+        std::env::set_var("RUPU_HOME", &home);
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", I35_WRITE_SCRIPT);
+        run_gate_sweep(
+            Arc::clone(&app_state.run_store),
+            hosts,
+            exe,
+            "test-worker".into(),
+        )
+        .await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        std::env::remove_var("RUPU_HOME");
+
+        assert!(
+            workspace.join("reject_cleanup_marker.txt").exists(),
+            "the sweep must have run the on_reject chain for real"
+        );
+        let after_sweep = app_state.run_store.load(&rec.id).unwrap();
+        assert!(
+            after_sweep.reject_cleanup_pending.is_none(),
+            "the sweep must clear the marker once cleanup succeeds"
+        );
+        let step_results = app_state.run_store.read_step_results(&rec.id).unwrap();
+        let gate_record = step_results
+            .iter()
+            .find(|r| r.step_id == "gate")
+            .expect("the gate's rejected decision must be recorded");
+        let gate_output: serde_json::Value = serde_json::from_str(&gate_record.output).unwrap();
+        assert_eq!(gate_output["decision"], "rejected");
+    }
+
+    /// Test 2: `RunStore::cancel` on an `AwaitingApproval` run — the path
+    /// behind BOTH `rupu workflow cancel` and the CP web `/cancel` control
+    /// — must reach the same deferred-cleanup fate as an explicit reject:
+    /// `cancel` rejects internally (`RunStore::reject`), which is the same
+    /// `reject_gate` explicit-reject branch the web reject handler above
+    /// goes through, so the marker + sweep mechanism covers it "for free".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_on_awaiting_approval_run_leaves_marker_sweep_runs_cleanup() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        crate::test_support::ensure_crypto_provider();
+
+        let (_tmp, home, workspace) = i35_fixture();
+        let store = Arc::new(rupu_orchestrator::RunStore::new(home.join("runs")));
+        let rec = i35_awaiting_record("run_i35_cancel", &workspace);
+        store
+            .create(rec.clone(), I35_WORKFLOW_NONEMPTY_CHAIN)
+            .unwrap();
+
+        let outcome = store
+            .cancel(
+                &rec.id,
+                "operator",
+                "cancelled by operator",
+                chrono::Utc::now(),
+            )
+            .expect("cancel of an AwaitingApproval run should succeed");
+        assert!(matches!(
+            outcome,
+            rupu_orchestrator::runs::CancelOutcome::RejectedAwaitingApproval
+        ));
+
+        let after_cancel = store.load(&rec.id).unwrap();
+        assert_eq!(after_cancel.status, RunStatus::Rejected);
+        assert!(
+            after_cancel.reject_cleanup_pending.is_some(),
+            "cancelling a paused run must leave the on_reject cleanup-pending marker for the sweep"
+        );
+        assert!(!workspace.join("reject_cleanup_marker.txt").exists());
+
+        let hosts = rupu_workspace::HostStore {
+            root: home.join("hosts"),
+        };
+        let exe = std::env::current_exe().unwrap();
+        std::env::set_var("RUPU_HOME", &home);
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", I35_WRITE_SCRIPT);
+        run_gate_sweep(Arc::clone(&store), hosts, exe, "test-worker".into()).await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        std::env::remove_var("RUPU_HOME");
+
+        assert!(
+            workspace.join("reject_cleanup_marker.txt").exists(),
+            "the sweep must have run the cancelled run's on_reject chain for real"
+        );
+        assert!(store
+            .load(&rec.id)
+            .unwrap()
+            .reject_cleanup_pending
+            .is_none());
+        let step_results = store.read_step_results(&rec.id).unwrap();
+        assert!(step_results.iter().any(|r| r.step_id == "gate"));
+    }
+
+    /// Test 3: a rejected run with an EMPTY `on_reject` chain must not
+    /// spin — `run_reject_cleanup` unconditionally records the gate's
+    /// decision even with zero chain steps, so the sweep clears the marker
+    /// on its very first tick. A second tick must be a silent no-op: no
+    /// error, and — the concrete, checkable proof nothing re-ran — the
+    /// gate's `StepResult` is not duplicated in `step_results.jsonl`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_on_reject_chain_clears_marker_and_does_not_reprocess_on_next_tick() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        crate::test_support::ensure_crypto_provider();
+
+        let (_tmp, home, workspace) = i35_fixture();
+        let store = Arc::new(rupu_orchestrator::RunStore::new(home.join("runs")));
+        let rec = i35_awaiting_record("run_i35_empty_chain", &workspace);
+        store.create(rec.clone(), I35_WORKFLOW_EMPTY_CHAIN).unwrap();
+
+        store
+            .reject_gate(&rec.id, "web", "not needed", chrono::Utc::now(), None)
+            .expect("reject should succeed");
+        assert!(store
+            .load(&rec.id)
+            .unwrap()
+            .reject_cleanup_pending
+            .is_some());
+
+        let hosts = rupu_workspace::HostStore {
+            root: home.join("hosts"),
+        };
+        let exe = std::env::current_exe().unwrap();
+        std::env::set_var("RUPU_HOME", &home);
+
+        // Tick 1: clears the marker and records the gate's decision even
+        // though the chain has zero steps.
+        run_gate_sweep(
+            Arc::clone(&store),
+            hosts.clone(),
+            exe.clone(),
+            "test-worker".into(),
+        )
+        .await;
+        let after_first = store.load(&rec.id).unwrap();
+        assert!(
+            after_first.reject_cleanup_pending.is_none(),
+            "an empty on_reject chain must still clear the marker on the first tick"
+        );
+        let after_first_results = store.read_step_results(&rec.id).unwrap();
+        let gate_rows = after_first_results
+            .iter()
+            .filter(|r| r.step_id == "gate")
+            .count();
+        assert_eq!(
+            gate_rows, 1,
+            "the gate's decision must be recorded exactly once"
+        );
+
+        // Tick 2: the marker is gone, so this must be a silent no-op — no
+        // second "gate" row appended (the pre-fix-shaped failure mode this
+        // guards against: a marker that keeps matching and re-running the
+        // chain every tick because the sweep matched on `status ==
+        // Rejected` instead of the marker).
+        run_gate_sweep(Arc::clone(&store), hosts, exe, "test-worker".into()).await;
+        std::env::remove_var("RUPU_HOME");
+
+        let after_second_results = store.read_step_results(&rec.id).unwrap();
+        let gate_rows_after_second = after_second_results
+            .iter()
+            .filter(|r| r.step_id == "gate")
+            .count();
+        assert_eq!(
+            gate_rows_after_second, 1,
+            "a second sweep tick must not reprocess an already-cleared marker"
+        );
     }
 }

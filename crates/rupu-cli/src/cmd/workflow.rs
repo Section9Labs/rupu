@@ -2987,6 +2987,15 @@ async fn reject(run_id: &str, reason: Option<&str>, gate: Option<&str>) -> anyho
                         if chain_len > 0 {
                             println!("cleanup: {chain_len} step(s) executed");
                         }
+                        // I-35: the chain just ran synchronously — clear
+                        // the pending-cleanup marker `reject_gate` may
+                        // have set so the `cp serve` gate sweep doesn't
+                        // run it again on its next tick. Best-effort: a
+                        // clear failure is warned, not fatal (the run is
+                        // already correctly rejected either way).
+                        if let Err(e) = store.clear_reject_cleanup(run_id) {
+                            eprintln!("warning: could not clear on_reject cleanup marker: {e}");
+                        }
                     }
                     Err(e) => eprintln!("warning: on_reject cleanup chain errored: {e}"),
                 }
@@ -4527,6 +4536,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            reject_cleanup_pending: None,
             permission_mode: None,
             issue_ref: None,
             issue: None,

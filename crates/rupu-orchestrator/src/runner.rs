@@ -695,6 +695,7 @@ pub async fn run_workflow(
                 resume_claimed_by: None,
                 resume_mode: None,
                 resume_gate_id: None,
+                reject_cleanup_pending: None,
                 // ISSUES.md I-24: capture the launch mode straight off the
                 // factory so it's on disk from the very first write —
                 // `rebuild_opts_from_disk` reads this back as the
@@ -11809,6 +11810,7 @@ loops:
                     resume_claimed_by: None,
                     resume_mode: None,
                     resume_gate_id: None,
+                    reject_cleanup_pending: None,
                     permission_mode: None,
                     final_output: None,
                     loop_progress: BTreeMap::new(),

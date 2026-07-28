@@ -72,6 +72,12 @@ assert_cmd = { workspace = true }
 predicates.workspace = true
 httpmock.workspace = true
 tar.workspace = true
+# I-35: unit tests in `cmd/cp.rs` spin up a real `rupu-cp` HTTP server
+# in-process (via `rupu_cp::server::router` + `axum::serve`) to exercise
+# the web reject handler end to end, then run the gate sweep against the
+# same on-disk `RunStore`. Test-only — no production code in this crate
+# touches axum directly (`rupu_cp::serve` owns that for `rupu cp serve`).
+axum = { workspace = true, features = ["ws"] }
 # test-util only (paused virtual clock) — layered on the same workspace
 # `tokio` dependency already pulled in normally; only affects test builds.
 tokio = { workspace = true, features = ["test-util"] }

@@ -272,6 +272,28 @@ pub struct RunRecord {
     /// when `None`. Cleared by [`RunStore::clear_resume`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_gate_id: Option<String>,
+    /// Cleanup-pending marker (I-35): set by [`RunStore::reject_gate`]'s
+    /// explicit-reject branch whenever it finalizes the run `Rejected`,
+    /// naming the gate whose `on_reject` chain still needs to run. Mirrors
+    /// `resume_requested_at`'s marker-and-sweep shape for the reject side:
+    /// a caller that ran the chain synchronously itself (the CLI `reject`
+    /// command, and — by re-entering the CLI — the SSH/tunnel host
+    /// connectors) clears this marker immediately after; a caller with no
+    /// workflow runtime of its own (CP web, `LocalHostConnector` /
+    /// `HttpHostConnector`, the `rupu-app` desktop executor, and
+    /// `RunStore::cancel` on an `AwaitingApproval` run — all of which
+    /// bottom out in this same `reject_gate` call) leaves it set, and the
+    /// `cp serve` gate sweep picks it up via
+    /// [`RunStore::list_reject_cleanup_pending`], runs
+    /// `build_reject_cleanup_opts` + `run_reject_cleanup`, and clears it on
+    /// success via [`RunStore::clear_reject_cleanup`]. See
+    /// [`RejectCleanupMarker`] for the field contract. NOT set on the
+    /// `on_timeout: reject` auto-expiry branch inside `reject_gate` (that
+    /// path is already covered — the CLI's `via: "timeout"` handling and
+    /// the sweep's own proactive `expire_gate_if_overdue` arm both run the
+    /// chain synchronously without needing a marker).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reject_cleanup_pending: Option<RejectCleanupMarker>,
     /// The effective permission mode (`ask` / `bypass` / `readonly`) this
     /// run was launched with, persisted once at fresh-run creation
     /// (ISSUES.md I-24). Read by `rebuild_opts_from_disk`
@@ -327,6 +349,29 @@ pub struct AwaitingGate {
     /// gates may have different timeouts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// Field contract for [`RunRecord::reject_cleanup_pending`] (I-35). See
+/// that field's doc for the full set-by / cleared-by / matched-by story.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectCleanupMarker {
+    /// The gate step whose `on_reject` chain needs to run.
+    pub step_id: String,
+    /// The reject/cancel reason, threaded verbatim into
+    /// `run_reject_cleanup`'s `reason` argument (and from there into the
+    /// gate's persisted rejected `StepResult`).
+    pub reason: String,
+    /// Decision provenance (spec §3.1) — always `"human"` today, since
+    /// this marker is only ever set from `reject_gate`'s explicit-reject
+    /// branch (see the field doc on `RunRecord`). Kept as a field rather
+    /// than hardcoded so a future caller with a different provenance
+    /// doesn't have to widen the marker shape.
+    pub via: String,
+    /// When the marker was recorded — informational only today (no
+    /// lease/staleness semantics like `resume_claimed_at`'s, since
+    /// `run_reject_cleanup` is idempotent-on-retry: the chain always
+    /// operates on an already-terminal `Rejected` run).
+    pub requested_at: DateTime<Utc>,
 }
 
 impl RunRecord {
@@ -1711,6 +1756,22 @@ impl RunStore {
             record.status = RunStatus::Rejected;
             record.error_message = Some(format!("rejected: {reason}"));
             record.finished_at = Some(now);
+            // I-35: record the on_reject cleanup-pending marker so a
+            // caller with no workflow runtime of its own (CP web,
+            // `LocalHostConnector`/`HttpHostConnector`, the rupu-app
+            // desktop executor, and `RunStore::cancel` — all of which
+            // bottom out here) still gets its gate's `on_reject` chain
+            // run, via the cp-serve gate sweep
+            // (`list_reject_cleanup_pending`). A caller that runs the
+            // chain synchronously itself (the CLI `reject` command) clears
+            // this marker right after — see `RunRecord::reject_cleanup_pending`'s
+            // doc for the full contract.
+            record.reject_cleanup_pending = Some(RejectCleanupMarker {
+                step_id: step_id.clone(),
+                reason: reason.to_string(),
+                via: "human".to_string(),
+                requested_at: now,
+            });
         }
         record.sync_awaiting_compat();
         self.update(&record)?;
@@ -1995,6 +2056,38 @@ impl RunStore {
         record.resume_claimed_by = None;
         record.resume_mode = None;
         record.resume_gate_id = None;
+        self.update(&record)?;
+        Ok(())
+    }
+
+    /// Runs the `cp serve` gate sweep must still run an `on_reject`
+    /// cleanup chain for (I-35): still `Rejected` AND carrying an
+    /// unconsumed [`RejectCleanupMarker`]. Mirrors
+    /// [`list_pending_resume`](Self::list_pending_resume)'s marker-scan
+    /// shape for the reject side.
+    ///
+    /// Deliberately matches on the MARKER, not on `status == Rejected`
+    /// alone — a run whose chain already ran (synchronously, via the CLI
+    /// `reject` command, or on a prior sweep tick) stays `Rejected`
+    /// forever, but its marker is gone, so it is correctly excluded
+    /// rather than re-processed every tick.
+    pub fn list_reject_cleanup_pending(&self) -> Result<Vec<RunRecord>, RunStoreError> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|r| r.status == RunStatus::Rejected)
+            .filter(|r| r.reject_cleanup_pending.is_some())
+            .collect())
+    }
+
+    /// Clear the pending on_reject-cleanup marker after the chain has run.
+    /// Called by the cp-serve sweep once `run_reject_cleanup` succeeds, and
+    /// by any synchronous caller of `reject_gate` (the CLI `reject`
+    /// command) that already ran the chain itself, so the sweep does not
+    /// repeat the work on its next tick.
+    pub fn clear_reject_cleanup(&self, run_id: &str) -> Result<(), RunStoreError> {
+        let mut record = self.load(run_id)?;
+        record.reject_cleanup_pending = None;
         self.update(&record)?;
         Ok(())
     }
@@ -2418,6 +2511,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            reject_cleanup_pending: None,
             permission_mode: None,
             final_output: None,
             loop_progress: BTreeMap::new(),
