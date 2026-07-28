@@ -1,16 +1,20 @@
 //! `rupu node` — dial-home agent + local enroll helper.
 //!
-//! **Agent mode** (`rupu node --cp-url <wss://...> --token <tok>`):
-//! Connects this machine to a remote rupu-cp as a tunnel node.  Sends
-//! `Hello`, awaits `Welcome`, then processes inbound frames: `Run` →
-//! spawn `rupu workflow run` / `rupu run`, tail artifact files, stream
-//! `Artifact` frames back; `Cancel` → kill child; `Ping` → `Pong`.
-//! Reconnects with exponential backoff (1 s … 60 s cap) on disconnect.
+//! **Agent mode** (`rupu node --cp-url ws://<host>:7878/api/node/connect --token <tok>`):
+//! Connects this machine to a remote rupu-cp as a tunnel node.  The
+//! `/api/node/connect` path is appended automatically when the URL has
+//! no path; `wss://` is rejected up front (this build has no TLS —
+//! front the CP with a TLS-terminating proxy and rebuild with TLS
+//! support to use it).  Sends `Hello`, awaits `Welcome`, then processes
+//! inbound frames: `Run` → spawn `rupu workflow run` / `rupu run`, tail
+//! artifact files, stream `Artifact` frames back; `Cancel` → kill
+//! child; `Ping` → `Pong`.  Reconnects with exponential backoff
+//! (1 s … 60 s cap) on disconnect.
 //!
 //! **Enroll mode** (`rupu node enroll <name>`):
 //! Mints a tunnel host + one-time token in the local host store and
-//! prints the `rupu node --cp-url ... --token ...` command to run on
-//! the box.
+//! prints the ready-to-run `rupu node --cp-url ... --token ...`
+//! command (this machine's routable IP, port 7878, full endpoint path).
 //!
 //! ## Node identity
 //!
@@ -44,8 +48,10 @@ use ulid::Ulid;
 #[derive(clap::Args, Debug)]
 pub struct NodeArgs {
     /// WebSocket URL of the control-plane node endpoint
-    /// (e.g. `wss://cp.example.com`).  Required in agent mode
-    /// (when no subcommand is given).
+    /// (e.g. `ws://cp.example.com:7878/api/node/connect`; the
+    /// `/api/node/connect` path is appended automatically when omitted).
+    /// `wss://` requires a TLS-terminating proxy and a TLS-enabled build.
+    /// Required in agent mode (when no subcommand is given).
     #[arg(long)]
     pub cp_url: Option<String>,
 
@@ -77,9 +83,10 @@ pub enum NodeAction {
         /// Display name for the node (e.g. `build-box-01`).
         name: String,
 
-        /// CP URL hint to include in the printed command
-        /// (e.g. `wss://cp.example.com`).  Informational only — the
-        /// printed command is a copy-paste template for the operator.
+        /// CP URL to include in the printed command
+        /// (e.g. `ws://cp.example.com:7878`; the `/api/node/connect`
+        /// path is appended automatically when omitted).  Default: this
+        /// machine's detected routable IP on port 7878.
         #[arg(long)]
         cp_url: Option<String>,
     },
@@ -150,18 +157,17 @@ struct BucketRunState {
 
 pub async fn handle(args: NodeArgs) -> ExitCode {
     let result = match args.action {
-        Some(NodeAction::Enroll { name, cp_url }) => {
-            enroll_inner(&name, cp_url.as_deref())
-        }
+        Some(NodeAction::Enroll { name, cp_url }) => enroll_inner(&name, cp_url.as_deref()),
         Some(NodeAction::Pull(pull_args)) => pull(pull_args).await,
         None => {
             let Some(cp_url) = args.cp_url else {
                 eprintln!(
                     "error: --cp-url is required in node agent mode\n\
-                     hint: rupu node --cp-url wss://<cp-host> --token <token>"
+                     hint: rupu node --cp-url ws://<cp-host>:7878 --token <token>"
                 );
                 return ExitCode::FAILURE;
             };
+            let cp_url = normalize_cp_url(&cp_url);
             let token = match resolve_token(args.token, args.token_stdin) {
                 Ok(Some(t)) => t,
                 Ok(None) => {
@@ -195,28 +201,27 @@ pub async fn handle(args: NodeArgs) -> ExitCode {
 
 fn enroll_inner(name: &str, cp_url: Option<&str>) -> anyhow::Result<()> {
     let global = crate::paths::global_dir()?;
-    let store = HostStore { root: global.join("hosts") };
+    let store = HostStore {
+        root: global.join("hosts"),
+    };
     let (host, token) = enroll_node(&store, name).context("enroll node in host store")?;
-    let cp_placeholder = cp_url.unwrap_or("wss://<cp-host>");
+    // Enroll runs on the CP machine (it writes the local host store), so this
+    // machine's routable IP is the right default host for the printed command.
+    let detected_ip = rupu_cp::net::detect_routable_ip();
+    let (cmd, stdin_cmd) = enroll_commands(cp_url, detected_ip, &token, &host.id);
     println!("enrolled: {} ({})", host.name, host.id);
     println!();
     println!("⚠  token shown ONCE — copy it to the node now:");
     println!();
-    println!(
-        "  rupu node --cp-url {cp} --token {tok} --node-id {nid}",
-        cp = cp_placeholder,
-        tok = token,
-        nid = host.id,
-    );
+    println!("  {cmd}");
     println!();
     println!("Or to keep the token out of shell history:");
     println!();
-    println!(
-        "  printf '%s' '{tok}' | rupu node --cp-url {cp} --token-stdin --node-id {nid}",
-        tok = token,
-        cp = cp_placeholder,
-        nid = host.id,
-    );
+    println!("  {stdin_cmd}");
+    if cp_url.is_none() && detected_ip.is_none() {
+        println!();
+        println!("(could not detect this machine's IP — replace <cp-host> with the CP's address)");
+    }
     Ok(())
 }
 
@@ -275,6 +280,9 @@ fn resolve_node_id(override_id: Option<String>) -> anyhow::Result<String> {
 // ---------------------------------------------------------------------------
 
 async fn run_agent_loop(cp_url: &str, token: &str, node_id: &str) -> anyhow::Result<()> {
+    // wss:// cannot work in this build — fail fast with an actionable error
+    // instead of looping on TlsFeatureNotEnabled.
+    reject_wss(cp_url)?;
     if cp_url.starts_with("ws://") {
         warn!(
             url = %cp_url,
@@ -286,14 +294,20 @@ async fn run_agent_loop(cp_url: &str, token: &str, node_id: &str) -> anyhow::Res
     let mut backoff_secs: u64 = 1;
 
     loop {
+        // Plain user-facing lines alongside tracing: this is a foreground
+        // agent the operator watches, and the CLI only surfaces warn+ from
+        // tracing — without these a successful connect is silent.
+        eprintln!("connecting to {cp_url} as {node_id} …");
         info!(url = %cp_url, node_id = %node_id, "node: connecting");
         match connect_and_run(cp_url, token, node_id, &exe).await {
             Ok(()) => {
                 // Clean close: reset backoff so the next attempt is prompt.
                 backoff_secs = 1;
+                eprintln!("connection closed — reconnecting in {backoff_secs}s");
                 warn!("node: connection closed; reconnecting in {backoff_secs}s");
             }
             Err(e) => {
+                eprintln!("connection failed: {e:#} — retrying in {backoff_secs}s");
                 warn!(error = %e, "node: connection error; reconnecting in {backoff_secs}s");
             }
         }
@@ -306,6 +320,79 @@ async fn run_agent_loop(cp_url: &str, token: &str, node_id: &str) -> anyhow::Res
 const BACKOFF_CAP: u64 = 60;
 fn next_backoff(current: u64) -> u64 {
     (current * 2).min(BACKOFF_CAP)
+}
+
+// ---------------------------------------------------------------------------
+// CP URL handling (normalization, scheme guard, enroll command builder)
+// ---------------------------------------------------------------------------
+
+/// The CP's node WebSocket endpoint path (see `rupu-cp`'s `node::server`).
+const NODE_CONNECT_PATH: &str = "/api/node/connect";
+
+/// Normalize a CP URL for the node agent: when the URL carries no path (or
+/// just `/`), append [`NODE_CONNECT_PATH`]. A URL that already has a path is
+/// used verbatim, so operators can point at a reverse proxy with a custom
+/// prefix.
+fn normalize_cp_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        // No scheme — leave it alone; the connect call will surface the error.
+        return url.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let rest = &url[authority_start..];
+    match rest.find('/') {
+        // No path at all: `ws://h:7878` → append.
+        None => format!("{url}{NODE_CONNECT_PATH}"),
+        // Bare trailing slash: `ws://h:7878/` → replace with the endpoint.
+        Some(idx) if rest[idx..].len() == 1 => {
+            format!("{}{NODE_CONNECT_PATH}", &url[..authority_start + idx])
+        }
+        // Real path present: use verbatim.
+        Some(_) => url.to_string(),
+    }
+}
+
+/// Fail fast on `wss://`: this build compiles `tokio-tungstenite` without a
+/// TLS feature, so a `wss://` dial fails instantly with
+/// `TlsFeatureNotEnabled`. Surface an actionable error instead.
+fn reject_wss(url: &str) -> anyhow::Result<()> {
+    if url.starts_with("wss://") {
+        anyhow::bail!(
+            "wss:// is not supported by this build (no TLS support compiled in) — \
+             use ws:// (plaintext; keep it on a trusted network), or front the CP \
+             with a TLS-terminating proxy and rebuild with TLS support"
+        );
+    }
+    Ok(())
+}
+
+/// Build the two copy-paste commands `rupu node enroll` prints:
+/// `(--token variant, --token-stdin variant)`.
+///
+/// When `--cp-url` was given it is normalized (path appended if missing);
+/// otherwise the detected routable IP of this machine (enroll runs on the CP
+/// box) with the default CP port 7878 is used, falling back to a
+/// `<cp-host>` placeholder when detection fails.
+fn enroll_commands(
+    cp_url_flag: Option<&str>,
+    detected_ip: Option<std::net::IpAddr>,
+    token: &str,
+    node_id: &str,
+) -> (String, String) {
+    let cp = match cp_url_flag {
+        Some(u) => normalize_cp_url(u),
+        None => match detected_ip {
+            Some(std::net::IpAddr::V6(v6)) => format!("ws://[{v6}]:7878{NODE_CONNECT_PATH}"),
+            Some(ip) => format!("ws://{ip}:7878{NODE_CONNECT_PATH}"),
+            None => format!("ws://<cp-host>{NODE_CONNECT_PATH}"),
+        },
+    };
+    (
+        format!("rupu node --cp-url {cp} --token {token} --node-id {node_id}"),
+        format!(
+            "printf '%s' '{token}' | rupu node --cp-url {cp} --token-stdin --node-id {node_id}"
+        ),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +437,7 @@ async fn connect_and_run(
             serde_json::to_string(&welcome_frame).unwrap_or_else(|_| "?".into())
         );
     }
+    eprintln!("connected ✓ (authenticated as {node_id})");
     info!(node_id = %node_id, "node: authenticated (Welcome received)");
 
     // Runs root: <global>/runs/<run_id>/
@@ -480,7 +568,9 @@ async fn connect_and_run(
                 if let Some(state) = active.get_mut(&run_id) {
                     let argv = build_control_argv(ControlKind::Approve, &run_id, &mode, None);
                     match spawn_control(exe, &argv) {
-                        Ok(child) => { state.child = child; }
+                        Ok(child) => {
+                            state.child = child;
+                        }
                         Err(e) => warn!(run_id = %run_id, error = %e, "node: approve spawn failed"),
                     }
                 } else {
@@ -490,9 +580,12 @@ async fn connect_and_run(
             Frame::Reject { run_id, reason } => {
                 info!(run_id = %run_id, "node: Reject received");
                 if let Some(state) = active.get_mut(&run_id) {
-                    let argv = build_control_argv(ControlKind::Reject, &run_id, "", reason.as_deref());
+                    let argv =
+                        build_control_argv(ControlKind::Reject, &run_id, "", reason.as_deref());
                     match spawn_control(exe, &argv) {
-                        Ok(child) => { state.child = child; }
+                        Ok(child) => {
+                            state.child = child;
+                        }
                         Err(e) => warn!(run_id = %run_id, error = %e, "node: reject spawn failed"),
                     }
                 } else {
@@ -763,11 +856,7 @@ pub(crate) fn result_key(kind: &str, seq: u64) -> String {
 // Called only in unit tests; suppress the dead_code lint for non-test builds.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn next_control_seq(existing: &[(u64, Vec<u8>)]) -> u64 {
-    existing
-        .iter()
-        .map(|(s, _)| *s + 1)
-        .max()
-        .unwrap_or(0)
+    existing.iter().map(|(s, _)| *s + 1).max().unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -849,8 +938,7 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
             let run_dir = runs_root.join(rid);
 
             // Drain events.jsonl
-            let lines =
-                drain_new_lines(&run_dir.join("events.jsonl"), &mut state.offsets.events);
+            let lines = drain_new_lines(&run_dir.join("events.jsonl"), &mut state.offsets.events);
             if !lines.is_empty() {
                 let body = lines.join("\n") + "\n";
                 let key = result_key("events", state.events_seq);
@@ -1062,17 +1150,27 @@ mod tests {
 
         // Second drain with advanced offset → nothing new.
         let more = drain_new_lines(&path, &mut offset);
-        assert!(more.is_empty(), "second drain should be empty, got: {more:?}");
+        assert!(
+            more.is_empty(),
+            "second drain should be empty, got: {more:?}"
+        );
 
         // Append 2 more lines → only those come back.
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(f, r#"{{"type":"ev","n":3}}"#).unwrap();
         writeln!(f, r#"{{"type":"ev","n":4}}"#).unwrap();
         f.flush().unwrap();
         drop(f);
 
         let new_lines = drain_new_lines(&path, &mut offset);
-        assert_eq!(new_lines.len(), 2, "expected 2 new lines, got: {new_lines:?}");
+        assert_eq!(
+            new_lines.len(),
+            2,
+            "expected 2 new lines, got: {new_lines:?}"
+        );
         assert!(new_lines[0].contains("\"n\":3"), "new[0]: {}", new_lines[0]);
         assert!(new_lines[1].contains("\"n\":4"), "new[1]: {}", new_lines[1]);
     }
@@ -1105,7 +1203,10 @@ mod tests {
         assert_eq!(offset, 0, "offset must not advance for partial line");
 
         // Append the newline → now the line is returned.
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(f).unwrap();
         drop(f);
 
@@ -1254,6 +1355,131 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // normalize_cp_url
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn normalize_appends_path_to_bare_host() {
+        assert_eq!(
+            normalize_cp_url("ws://cp.example.com"),
+            "ws://cp.example.com/api/node/connect"
+        );
+    }
+
+    #[test]
+    fn normalize_appends_path_to_host_with_port() {
+        assert_eq!(
+            normalize_cp_url("ws://10.0.0.5:7878"),
+            "ws://10.0.0.5:7878/api/node/connect"
+        );
+    }
+
+    #[test]
+    fn normalize_handles_trailing_slash() {
+        assert_eq!(
+            normalize_cp_url("ws://h:7878/"),
+            "ws://h:7878/api/node/connect"
+        );
+    }
+
+    #[test]
+    fn normalize_leaves_explicit_path_alone() {
+        assert_eq!(
+            normalize_cp_url("ws://h:7878/api/node/connect"),
+            "ws://h:7878/api/node/connect"
+        );
+        assert_eq!(
+            normalize_cp_url("ws://h:7878/custom/prefix"),
+            "ws://h:7878/custom/prefix"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_wss_scheme() {
+        assert_eq!(
+            normalize_cp_url("wss://h:7878"),
+            "wss://h:7878/api/node/connect"
+        );
+    }
+
+    #[test]
+    fn normalize_passes_through_schemeless_input() {
+        // Garbage in, garbage out — the connect call will produce the error.
+        assert_eq!(normalize_cp_url("not-a-url"), "not-a-url");
+    }
+
+    // ------------------------------------------------------------------
+    // reject_wss
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn reject_wss_fails_fast_with_friendly_message() {
+        let err = reject_wss("wss://cp.example.com/api/node/connect")
+            .expect_err("wss:// must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("wss:// is not supported by this build"),
+            "unexpected message: {msg}"
+        );
+        assert!(msg.contains("use ws://"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn reject_wss_allows_plain_ws() {
+        reject_wss("ws://cp.example.com/api/node/connect").expect("ws:// must pass");
+    }
+
+    // ------------------------------------------------------------------
+    // enroll_commands
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn enroll_commands_default_uses_detected_ip_and_full_url() {
+        let ip: std::net::IpAddr = "192.168.1.23".parse().unwrap();
+        let (cmd, stdin_cmd) = enroll_commands(None, Some(ip), "tok123", "node_01AAA");
+        assert_eq!(
+            cmd,
+            "rupu node --cp-url ws://192.168.1.23:7878/api/node/connect --token tok123 --node-id node_01AAA"
+        );
+        assert!(stdin_cmd.contains("ws://192.168.1.23:7878/api/node/connect"));
+        assert!(stdin_cmd.contains("--token-stdin"));
+        assert!(stdin_cmd.contains("--node-id node_01AAA"));
+    }
+
+    #[test]
+    fn enroll_commands_normalizes_given_cp_url() {
+        let (cmd, _) = enroll_commands(Some("ws://h:7878"), None, "tok", "node_1");
+        assert!(
+            cmd.contains("--cp-url ws://h:7878/api/node/connect"),
+            "path must be appended: {cmd}"
+        );
+        assert!(cmd.contains("--node-id node_1"), "cmd: {cmd}");
+    }
+
+    #[test]
+    fn enroll_commands_placeholder_when_no_ip_detected() {
+        let (cmd, _) = enroll_commands(None, None, "tok", "node_1");
+        assert!(
+            cmd.contains("ws://<cp-host>/api/node/connect"),
+            "cmd: {cmd}"
+        );
+        assert!(!cmd.contains("wss://"), "must not suggest wss: {cmd}");
+    }
+
+    // ------------------------------------------------------------------
+    // detect_routable_ip (shared helper in rupu-cp)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn detect_routable_ip_not_loopback_when_some() {
+        // CI sandboxes may yield None — that is acceptable; but when an IP
+        // is detected it must be a real interface address, never loopback.
+        if let Some(ip) = rupu_cp::net::detect_routable_ip() {
+            assert!(!ip.is_loopback(), "detected loopback: {ip}");
+        }
+    }
+
+    // ------------------------------------------------------------------
     // result_key: bucket result object key helper
     // ------------------------------------------------------------------
 
@@ -1263,7 +1489,10 @@ mod tests {
         assert_eq!(result_key("events", 1), "events.0001.jsonl");
         assert_eq!(result_key("events", 42), "events.0042.jsonl");
         assert_eq!(result_key("step_results", 9999), "step_results.9999.jsonl");
-        assert_eq!(result_key("unit_checkpoints", 100), "unit_checkpoints.0100.jsonl");
+        assert_eq!(
+            result_key("unit_checkpoints", 100),
+            "unit_checkpoints.0100.jsonl"
+        );
     }
 
     #[test]

@@ -285,6 +285,94 @@ struct EnrollNodeBody {
     name: String,
 }
 
+/// Split an HTTP `Host` header value into `(host, port)`.
+///
+/// Handles bracketed IPv6 (`[::1]:7878` → `("[::1]", Some(7878))`), plain
+/// `host:port`, and bare hosts (port `None`). An unparseable port is treated
+/// as absent.
+fn split_host_port(header: &str) -> (String, Option<u16>) {
+    // Bracketed IPv6: `[::1]` or `[::1]:7878`.
+    if let Some(rest) = header.strip_prefix('[') {
+        if let Some(close) = rest.find(']') {
+            let host = format!("[{}]", &rest[..close]);
+            let port = rest[close + 1..]
+                .strip_prefix(':')
+                .and_then(|p| p.parse::<u16>().ok());
+            return (host, port);
+        }
+    }
+    // `host:port` — only when the suffix parses as a port (guards against
+    // unbracketed IPv6, which has multiple colons and is left intact).
+    if let Some((host, port)) = header.rsplit_once(':') {
+        if !host.contains(':') {
+            if let Ok(p) = port.parse::<u16>() {
+                return (host.to_string(), Some(p));
+            }
+            return (host.to_string(), None);
+        }
+    }
+    (header.to_string(), None)
+}
+
+/// True when `host` (as produced by [`split_host_port`]) is a loopback
+/// address a *remote* node could never reach: `localhost`, `127.x.x.x`,
+/// `::1` / `[::1]`.
+fn is_loopback_host(host: &str) -> bool {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if bare.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    bare.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Build the copy-paste `rupu node …` command for a freshly-enrolled tunnel
+/// node.
+///
+/// Host derivation, in order:
+/// 1. the request's `Host` header — the operator reached the CP at that
+///    address, so it is a good default for the node too — unless it is a
+///    loopback address a remote node cannot use;
+/// 2. for loopback (or absent) Host headers: the machine's detected routable
+///    IP, keeping the Host header's port (default 7878);
+/// 3. when detection also fails: a `<your-cp-host>` placeholder the operator
+///    must substitute by hand.
+///
+/// Scheme is always `ws://` — this build has no TLS support in the node
+/// agent, and the CP itself serves plain HTTP.
+fn build_node_command(
+    host_header: Option<&str>,
+    detected_ip: Option<std::net::IpAddr>,
+    token: &str,
+    node_id: &str,
+) -> String {
+    let (header_host, header_port) = match host_header {
+        Some(h) => {
+            let (host, port) = split_host_port(h);
+            (Some(host), port)
+        }
+        None => (None, None),
+    };
+    let port = header_port.unwrap_or(7878);
+    let host = match header_host {
+        Some(h) if !is_loopback_host(&h) => h,
+        // Loopback or absent: a remote node cannot dial it — use this
+        // machine's routable IP, or a placeholder if detection failed.
+        _ => match detected_ip {
+            Some(std::net::IpAddr::V6(v6)) => format!("[{v6}]"),
+            Some(ip) => ip.to_string(),
+            None => "<your-cp-host>".to_string(),
+        },
+    };
+    format!(
+        "rupu node --cp-url ws://{host}:{port}/api/node/connect --token {token} --node-id {node_id}"
+    )
+}
+
 /// Response from `POST /api/hosts/node`.
 ///
 /// `token` is the plaintext enrollment token — shown **once** here and never
@@ -302,12 +390,14 @@ pub struct EnrollNodeResponse {
 /// `POST /api/hosts/node` — enroll a new tunnel node.
 ///
 /// Mints a one-time enrollment token and a `Tunnel` host record.  Returns the
-/// host view, the runnable command (with a placeholder for the CP's public WSS
-/// URL — substitute the real address before running), and the plaintext token.
+/// host view, the runnable command (host derived from the request's `Host`
+/// header, falling back to this machine's routable IP when the operator is on
+/// localhost — see [`build_node_command`]), and the plaintext token.
 ///
 /// Requires the `cp serve` launcher adapter; returns 501 on a read-only deploy.
 async fn enroll_node_handler(
     State(s): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<EnrollNodeBody>,
 ) -> ApiResult<Json<EnrollNodeResponse>> {
     // Read-only guard — same pattern as add_host.
@@ -327,9 +417,18 @@ async fn enroll_node_handler(
 
     let (transport_kind, base_url) = transport_fields(&host.transport);
 
-    // AppState does not carry the CP's public URL; emit a clear placeholder so
-    // the operator knows they must substitute the real hostname/port.
-    let command = format!("rupu node --cp-url wss://<your-cp-host>:7878 --token {token}");
+    // Derive the node's dial address from the request: the Host header the
+    // operator used to reach the CP, falling back to this machine's routable
+    // IP when that address is loopback (unreachable for a remote node).
+    let host_header = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok());
+    let command = build_node_command(
+        host_header,
+        crate::net::detect_routable_ip(),
+        &token,
+        &host.id,
+    );
 
     Ok(Json(EnrollNodeResponse {
         host: HostView {
@@ -456,4 +555,132 @@ async fn remove_host(State(s): State<AppState>, Path(id): Path<String>) -> ApiRe
         .remove_host(&id)
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    // ------------------------------------------------------------------
+    // split_host_port
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn split_host_port_variants() {
+        assert_eq!(
+            split_host_port("cp.example.com"),
+            ("cp.example.com".to_string(), None)
+        );
+        assert_eq!(
+            split_host_port("cp.example.com:7878"),
+            ("cp.example.com".to_string(), Some(7878))
+        );
+        assert_eq!(
+            split_host_port("[::1]:7878"),
+            ("[::1]".to_string(), Some(7878))
+        );
+        assert_eq!(split_host_port("[::1]"), ("[::1]".to_string(), None));
+        // Unparseable port → treated as absent.
+        assert_eq!(split_host_port("h:notaport"), ("h".to_string(), None));
+    }
+
+    // ------------------------------------------------------------------
+    // is_loopback_host
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn loopback_hosts_detected() {
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("LOCALHOST"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("[::1]"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("cp.example.com"));
+        assert!(!is_loopback_host("192.168.1.10"));
+    }
+
+    // ------------------------------------------------------------------
+    // build_node_command
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn command_uses_host_header_verbatim() {
+        let cmd = build_node_command(Some("cp.example.com:9999"), None, "tok", "node_1");
+        assert_eq!(
+            cmd,
+            "rupu node --cp-url ws://cp.example.com:9999/api/node/connect --token tok --node-id node_1"
+        );
+    }
+
+    #[test]
+    fn command_defaults_port_7878_when_header_has_none() {
+        let cmd = build_node_command(Some("cp.example.com"), None, "tok", "node_1");
+        assert!(
+            cmd.contains("ws://cp.example.com:7878/api/node/connect"),
+            "cmd: {cmd}"
+        );
+    }
+
+    #[test]
+    fn localhost_header_falls_back_to_detected_ip_keeping_port() {
+        let ip: IpAddr = "10.1.2.3".parse().unwrap();
+        let cmd = build_node_command(Some("localhost:9999"), Some(ip), "tok", "node_1");
+        assert!(
+            cmd.contains("ws://10.1.2.3:9999/api/node/connect"),
+            "cmd: {cmd}"
+        );
+    }
+
+    #[test]
+    fn localhost_header_no_detected_ip_uses_placeholder() {
+        let cmd = build_node_command(Some("127.0.0.1:7878"), None, "tok", "node_1");
+        assert!(
+            cmd.contains("ws://<your-cp-host>:7878/api/node/connect"),
+            "cmd: {cmd}"
+        );
+    }
+
+    #[test]
+    fn absent_header_uses_detected_ip_and_default_port() {
+        let ip: IpAddr = "192.168.7.7".parse().unwrap();
+        let cmd = build_node_command(None, Some(ip), "tok", "node_1");
+        assert!(
+            cmd.contains("ws://192.168.7.7:7878/api/node/connect"),
+            "cmd: {cmd}"
+        );
+    }
+
+    #[test]
+    fn detected_ipv6_is_bracketed() {
+        let ip: IpAddr = "fd00::1".parse().unwrap();
+        let cmd = build_node_command(Some("localhost"), Some(ip), "tok", "node_1");
+        assert!(
+            cmd.contains("ws://[fd00::1]:7878/api/node/connect"),
+            "cmd: {cmd}"
+        );
+    }
+
+    #[test]
+    fn command_always_includes_node_id_and_ws_scheme() {
+        let cmd = build_node_command(None, None, "tok", "node_01XYZ");
+        assert!(cmd.contains("--node-id node_01XYZ"), "cmd: {cmd}");
+        assert!(cmd.contains("--cp-url ws://"), "cmd: {cmd}");
+        assert!(!cmd.contains("wss://"), "cmd: {cmd}");
+    }
+
+    // ------------------------------------------------------------------
+    // detect_routable_ip
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn detect_routable_ip_not_loopback_when_some() {
+        // CI sandboxes may yield None — acceptable; but a detected IP must
+        // be a real interface address, never loopback.
+        if let Some(ip) = crate::net::detect_routable_ip() {
+            assert!(!ip.is_loopback(), "detected loopback: {ip}");
+        }
+    }
 }
