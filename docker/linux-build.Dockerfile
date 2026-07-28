@@ -25,6 +25,11 @@ FROM rust:1.95-alpine3.21
 # git: build scripts and several tests shell out to it.
 # file: used by CI to prove the built binary is statically linked. Alpine's
 #   base image does not ship it.
+# ripgrep: rupu's `grep` tool shells out to `rg` and hard-errors without it
+#   (crates/rupu-tools/src/grep.rs) — it is a genuine runtime dependency of
+#   the product, not just of the tests. `ast-grep` is the other external
+#   binary rupu can use, but that one is gracefully optional (its tests skip
+#   when absent), so it is deliberately not installed here.
 # bash: test fixtures write `#!/bin/sh` scripts, but a real shell makes
 #   debugging a failing build far easier.
 # nodejs, npm: `make cp-web` builds the embedded CP UI before a release.
@@ -35,7 +40,7 @@ FROM rust:1.95-alpine3.21
 # `keyring` — fix that, do not add the package.
 RUN apk add --no-cache \
       musl-dev gcc g++ make perl cmake clang clang-dev \
-      pkgconf git file bash nodejs npm
+      pkgconf git file ripgrep bash nodejs npm
 
 ENV CARGO_TERM_COLOR=always
 WORKDIR /work
