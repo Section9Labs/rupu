@@ -1043,7 +1043,7 @@ async fn on_reject_cleanup_dispatches_action_step_for_real() {
         pause: None,
     };
 
-    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human")
+    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human", None)
         .await
         .expect("cleanup never errors");
 

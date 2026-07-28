@@ -326,9 +326,10 @@ pub struct OrchestratorRunOpts {
 /// single resume path (`run_workflow` with `resume_from`) can distinguish an
 /// approval-gate pause (operator approves, then resumes) from a manual /
 /// operator-requested pause (cooperative interrupt, then resumes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PauseReason {
     /// Paused before a step whose `approval:` gate required sign-off.
+    #[default]
     Approval,
     /// Paused by the cooperative pause signal ([`OrchestratorRunOpts::pause`]).
     Manual,
@@ -502,7 +503,7 @@ pub struct AwaitingInfo {
 /// step in `prior_step_results` as already done (replays their
 /// outputs into the context), and dispatches the awaited step
 /// without re-asking for approval.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ResumeState {
     pub run_id: String,
     pub prior_step_results: Vec<StepResult>,
@@ -535,6 +536,22 @@ pub struct ResumeState {
     /// caller that only holds the `ResumeState` (e.g. a future cp-serve
     /// reject worker) doesn't need to thread the reason through separately.
     pub rejected_reason: Option<String>,
+    /// I-36/I-38: who approved (an operator's OS username, `"web"`, etc.),
+    /// consumed by `run_workflow`'s gate-suppression path so the gate's
+    /// persisted decision (`emit_gate_result`'s `approver` field) carries
+    /// the real actor instead of nothing. `None` (the `Default`, and what
+    /// [`Self::from_approval`] sets) for every non-approval `ResumeState`
+    /// and for a caller that hasn't opted into actor tracking — those keep
+    /// recording `via: "human"` with no approver, exactly like before this
+    /// field existed. Set via [`Self::from_approval_with_actor`].
+    pub approver: Option<String>,
+    /// I-36/I-38: `true` when this approve-resume was driven by a gate's
+    /// own `on_timeout: approve` policy (the `cp serve` sweep spawning
+    /// `rupu workflow approve`) rather than a genuine operator decision.
+    /// Flips `emit_gate_result`'s `via` from `"human"` to `"timeout"` on
+    /// the gate-suppression path. `false` (the default) for every ordinary
+    /// approve.
+    pub via_timeout: bool,
 }
 
 /// A linear step that paused mid-run, carried on [`ResumeState`] so the
@@ -565,6 +582,28 @@ impl ResumeState {
             reason: PauseReason::Approval,
             paused_step: None,
             rejected_reason: None,
+            approver: None,
+            via_timeout: false,
+        }
+    }
+
+    /// I-36/I-38: [`Self::from_approval`] plus the actor/timeout provenance
+    /// the CLI's `resolve_approve_gate` already detects but previously
+    /// discarded after a `println!`. Used by `resume_run` so a real
+    /// operator approve records `via: "human"` + their identity, and a
+    /// `cp serve` sweep-driven `on_timeout: approve` records `via:
+    /// "timeout"` instead of being indistinguishable from a human decision.
+    pub fn from_approval_with_actor(
+        run_id: String,
+        prior_step_results: Vec<StepResult>,
+        approved_step_id: String,
+        approver: String,
+        via_timeout: bool,
+    ) -> Self {
+        Self {
+            approver: Some(approver),
+            via_timeout,
+            ..Self::from_approval(run_id, prior_step_results, approved_step_id)
         }
     }
 
@@ -589,6 +628,8 @@ impl ResumeState {
             reason: PauseReason::Approval,
             paused_step: None,
             rejected_reason: Some(reason),
+            approver: None,
+            via_timeout: false,
         }
     }
 }
@@ -1995,13 +2036,25 @@ async fn run_scheduler_scoped(
                 };
 
                 if gate_suppressed {
-                    info!(step = %step.id, "gate: resuming with human approval");
+                    // I-36/I-38: the resume-approve provenance the caller
+                    // (CLI `resolve_approve_gate`/`resume_run`) attached to
+                    // `opts.resume_from` — `via_timeout` distinguishes a
+                    // sweep-driven `on_timeout: approve` from a genuine
+                    // operator decision; `approver` carries who (when known).
+                    let via_timeout = opts.resume_from.as_ref().is_some_and(|r| r.via_timeout);
+                    let via = if via_timeout { "timeout" } else { "human" };
+                    let approver = opts
+                        .resume_from
+                        .as_ref()
+                        .and_then(|r| r.approver.as_deref());
+                    info!(step = %step.id, via, "gate: resuming with approval");
                     emit_gate_result(
                         opts,
                         run_id,
                         step,
                         "approved",
-                        "human",
+                        via,
+                        approver,
                         None,
                         step_results,
                         current_loop_iteration,
@@ -2046,6 +2099,7 @@ async fn run_scheduler_scoped(
                             step,
                             "approved",
                             "auto",
+                            None,
                             None,
                             step_results,
                             current_loop_iteration,
@@ -4004,9 +4058,25 @@ async fn run_steps_over(
             };
 
             if gate_suppressed {
-                info!(step = %step.id, "gate: resuming with human approval");
+                // I-36/I-38: see the identical comment on the scheduler's
+                // gate_suppressed branch above.
+                let via_timeout = opts.resume_from.as_ref().is_some_and(|r| r.via_timeout);
+                let via = if via_timeout { "timeout" } else { "human" };
+                let approver = opts
+                    .resume_from
+                    .as_ref()
+                    .and_then(|r| r.approver.as_deref());
+                info!(step = %step.id, via, "gate: resuming with approval");
                 emit_gate_result(
-                    opts, run_id, step, "approved", "human", None, step_results, None,
+                    opts,
+                    run_id,
+                    step,
+                    "approved",
+                    via,
+                    approver,
+                    None,
+                    step_results,
+                    None,
                 );
                 continue;
             }
@@ -4020,7 +4090,15 @@ async fn run_steps_over(
                 if truthy {
                     info!(step = %step.id, "gate auto-approved");
                     emit_gate_result(
-                        opts, run_id, step, "approved", "auto", None, step_results, None,
+                        opts,
+                        run_id,
+                        step,
+                        "approved",
+                        "auto",
+                        None,
+                        None,
+                        step_results,
+                        None,
                     );
                     continue;
                 }
@@ -4922,11 +5000,17 @@ async fn fire_notify_hooks(
 /// Record a resolved gate node's result: `StepStarted` + `StepCompleted`
 /// events, a `StepResult` whose `output` is the decision JSON (spec §3.1),
 /// persisted like any other step. `decision` is `"approved"` or
-/// `"rejected"`; `via` is `"human"` (approve-resume / operator reject) or
+/// `"rejected"`; `via` is `"human"` (approve-resume / operator reject),
 /// `"auto"` (auto_approve truthy — always paired with `decision:
-/// "approved"`); `reason` is the operator's rejection reason (`Some` only
-/// for a rejected decision, `None` otherwise, matching spec §3.1's
-/// `"reason": null` for approvals).
+/// "approved"`), or `"timeout"` (a gate's own `on_timeout:` policy, whether
+/// approve or reject); `approver` is who decided (I-36) — `Some` for a
+/// human-attributable decision (including one an operator merely observed
+/// after the fact, e.g. an already-overdue gate), `None` for `"auto"` (the
+/// workflow itself decided) and for a fully autonomous `"timeout"` (no
+/// operator involved at all, e.g. the sweep's own `ExpireThenCleanupReject`
+/// arm); `reason` is the operator's rejection reason (`Some` only for a
+/// rejected decision, `None` otherwise, matching spec §3.1's `"reason":
+/// null` for approvals).
 #[allow(clippy::too_many_arguments)]
 fn emit_gate_result(
     opts: &OrchestratorRunOpts,
@@ -4934,6 +5018,7 @@ fn emit_gate_result(
     step: &Step,
     decision: &str,
     via: &str,
+    approver: Option<&str>,
     reason: Option<&str>,
     step_results: &mut Vec<StepResult>,
     // Task 4 (spec §3): stamped onto this gate's persisted `StepResult`
@@ -4959,6 +5044,7 @@ fn emit_gate_result(
     let output = serde_json::json!({
         "decision": decision,
         "via": via,
+        "approver": approver,
         "reason": reason,
         "decided_at": chrono::Utc::now().to_rfc3339(),
     })
@@ -5008,11 +5094,19 @@ fn emit_gate_result(
 /// that lands on an already-overdue `on_timeout: reject` gate). Callers
 /// must pass the value that matches how this rejection actually came
 /// about — it is persisted verbatim into the gate's `StepResult` output.
+///
+/// `approver` (I-36) is who rejected — `Some(identity)` for an
+/// operator-observed decision (a CLI/web-issued reject, or an operator's
+/// `approve`/listing call that merely discovered an already-overdue
+/// `on_timeout: reject` gate), `None` for a fully autonomous sweep-driven
+/// expiry with no operator involved at all (the gate sweep's own
+/// `ExpireThenCleanupReject` arm).
 pub async fn run_reject_cleanup(
     opts: OrchestratorRunOpts,
     rejected_step_id: &str,
     reason: &str,
     via: &str,
+    approver: Option<&str>,
 ) -> Result<(), RunWorkflowError> {
     let Some(gate) = opts.workflow.steps.iter().find(|s| s.id == rejected_step_id) else {
         return Ok(()); // legacy inline approval or unknown id — nothing to run
@@ -5053,6 +5147,7 @@ pub async fn run_reject_cleanup(
         gate,
         "rejected",
         via,
+        approver,
         Some(reason),
         &mut step_results,
         None,
@@ -8036,6 +8131,7 @@ steps:
             reason: PauseReason::Approval,
             paused_step: None,
             rejected_reason: None,
+            ..Default::default()
         });
         let err = run_workflow(opts)
             .await
@@ -8313,6 +8409,7 @@ steps:
                 seed_messages: awaiting.resume_seed,
             }),
             rejected_reason: None,
+            ..Default::default()
         });
 
         let res2 = run_workflow(opts2).await.expect("resume completes");
@@ -8406,6 +8503,7 @@ steps:
             reason: PauseReason::Manual,
             paused_step: None,
             rejected_reason: None,
+            ..Default::default()
         });
 
         let res2 = run_workflow(opts2).await.expect("resume completes");
@@ -8534,6 +8632,7 @@ steps:
                 seed_messages: seed.clone(),
             }),
             rejected_reason: None,
+            ..Default::default()
         });
 
         run_workflow(opts).await.expect("resume completes");
@@ -8607,6 +8706,7 @@ steps:
                 seed_messages: seed.clone(),
             }),
             rejected_reason: None,
+            ..Default::default()
         });
 
         run_workflow(opts).await.expect("resume completes");
@@ -8822,6 +8922,7 @@ steps:
                 reason: PauseReason::Manual,
                 paused_step: None,
                 rejected_reason: None,
+                ..Default::default()
             }),
             run_id_override: None,
             strict_templates: false,
@@ -8988,6 +9089,7 @@ steps:
             reason: PauseReason::Manual,
             paused_step: None,
             rejected_reason: None,
+            ..Default::default()
         });
 
         let res2 = run_workflow(opts2).await.expect("resume completes");
@@ -11412,6 +11514,7 @@ loops:
                 reason: PauseReason::Manual,
                 paused_step: None,
                 rejected_reason: None,
+                ..Default::default()
             }),
         );
 
@@ -11586,6 +11689,7 @@ loops:
                 reason: PauseReason::Manual,
                 paused_step: None,
                 rejected_reason: None,
+                ..Default::default()
             }),
             run_id_override: None,
             strict_templates: false,
@@ -14129,6 +14233,7 @@ steps:
                 reason: PauseReason::Manual,
                 paused_step: None,
                 rejected_reason: None,
+                ..Default::default()
             }),
         );
         opts2.unit_dispatcher = Some(dispatcher2.clone());

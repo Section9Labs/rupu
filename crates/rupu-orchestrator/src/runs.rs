@@ -367,6 +367,13 @@ pub struct RejectCleanupMarker {
     /// than hardcoded so a future caller with a different provenance
     /// doesn't have to widen the marker shape.
     pub via: String,
+    /// I-36: the rejecting caller's identity (`reject_gate`'s `approver`
+    /// argument — an OS username for the CLI, `"web"` for the CP HTTP
+    /// handler). `#[serde(default)]` so a marker persisted before this
+    /// field existed still deserializes (as `None`) instead of failing the
+    /// whole record read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver: Option<String>,
     /// When the marker was recorded — informational only today (no
     /// lease/staleness semantics like `resume_claimed_at`'s, since
     /// `run_reject_cleanup` is idempotent-on-retry: the chain always
@@ -1451,11 +1458,20 @@ pub enum ApprovalDecision {
     Approved {
         run_id: String,
         step_id: String,
+        /// I-36: who approved (the operator's OS username for a CLI/`web`
+        /// call, `None` only for a caller that genuinely has no identity to
+        /// give). Previously computed by every approve path and then
+        /// silently discarded (`let _ = approver;`) — now returned so the
+        /// caller can thread it into the gate's persisted decision
+        /// (`emit_gate_result`'s `approver` field) on runner re-entry.
+        approver: Option<String>,
     },
     Rejected {
         run_id: String,
         step_id: String,
         reason: String,
+        /// I-36: who rejected — same contract as `Approved::approver`.
+        approver: Option<String>,
     },
     Expired {
         run_id: String,
@@ -1632,7 +1648,6 @@ impl RunStore {
                 }
             },
         };
-        let _ = approver; // identity recorded in transcript via runner re-entry
         gates.retain(|g| g.step_id != step_id);
         record.awaiting = gates;
         record.status = if record.awaiting.is_empty() {
@@ -1643,9 +1658,17 @@ impl RunStore {
         record.sync_awaiting_compat();
         record.error_message = None;
         self.update(&record)?;
+        // I-36: `approver` is returned on the decision rather than persisted
+        // here — this method has no cross-process handoff point analogous
+        // to `reject_gate`'s `RejectCleanupMarker` (an approve-resume always
+        // re-enters `run_workflow` synchronously in the SAME process that
+        // called this method), so the immediate caller (the CLI's
+        // `resolve_approve_gate`) threads it straight into
+        // `ResumeState::from_approval_with_actor` on re-entry.
         Ok(ApprovalDecision::Approved {
             run_id: run_id.to_string(),
             step_id,
+            approver: Some(approver.to_string()),
         })
     }
 
@@ -1714,6 +1737,13 @@ impl RunStore {
                         .error_message
                         .clone()
                         .unwrap_or_else(|| "approval expired".into()),
+                    // The gate's own timeout policy made this decision, not
+                    // this call's `approver` — but the operator DID observe
+                    // and report it (this early return only fires from an
+                    // explicit reject call), so record them as the observer
+                    // rather than `None`, mirroring `resolve_approve_gate`'s
+                    // `ExpiredRejected` handling on the approve side.
+                    approver: Some(approver.to_string()),
                 });
             }
             // `Approve` leaves the record untouched — the operator's
@@ -1749,7 +1779,6 @@ impl RunStore {
                 }
             },
         };
-        let _ = approver;
         gates.retain(|g| g.step_id != step_id);
         record.awaiting = gates;
         if record.awaiting.is_empty() {
@@ -1766,10 +1795,16 @@ impl RunStore {
             // chain synchronously itself (the CLI `reject` command) clears
             // this marker right after — see `RunRecord::reject_cleanup_pending`'s
             // doc for the full contract.
+            //
+            // I-36: `approver` (previously discarded via `let _ = approver;`)
+            // rides along on the marker too — the deferred cp-serve sweep
+            // consumer runs in a DIFFERENT process from this call, so it has
+            // no other way to recover who rejected.
             record.reject_cleanup_pending = Some(RejectCleanupMarker {
                 step_id: step_id.clone(),
                 reason: reason.to_string(),
                 via: "human".to_string(),
+                approver: Some(approver.to_string()),
                 requested_at: now,
             });
         }
@@ -1789,6 +1824,7 @@ impl RunStore {
             run_id: run_id.to_string(),
             step_id,
             reason: reason.to_string(),
+            approver: Some(approver.to_string()),
         })
     }
 
@@ -1974,19 +2010,31 @@ impl RunStore {
         } else {
             record.awaiting_step_id.clone().unwrap_or_default()
         };
-        let _ = approver; // identity recorded in transcript via runner re-entry
-                          // Marker-only: leave status AwaitingApproval/Paused and keep
-                          // awaiting_step_id / approval_prompt / awaiting_since /
-                          // expires_at intact for the worker to resume.
+        // Marker-only: leave status AwaitingApproval/Paused and keep
+        // awaiting_step_id / approval_prompt / awaiting_since /
+        // expires_at intact for the worker to resume.
         record.resume_requested_at = Some(now);
         record.resume_mode = mode
             .filter(|m| matches!(*m, "ask" | "bypass" | "readonly"))
             .map(str::to_string);
         record.resume_gate_id = resolved_gate_id;
         self.update(&record)?;
+        // I-36 (sibling gap, not fully closed here): `approver` is no
+        // longer silently discarded — it's returned on the decision like
+        // every other approve/reject path. But unlike `approve_gate`
+        // (whose caller re-enters `run_workflow` in the SAME process) this
+        // is marker-only: the actual resume happens later, in a DIFFERENT
+        // process (the cp-serve resume worker spawning `rupu workflow
+        // approve`), which today re-derives its own `approver` via
+        // `whoami::username()` rather than reading it back from here or
+        // from this record. So a web-initiated approve's true identity
+        // (e.g. `"web"`) is available on the returned decision but not yet
+        // threaded through to the eventual `emit_gate_result` call —
+        // tracked as a follow-up, not solved by this change.
         Ok(ApprovalDecision::Approved {
             run_id: run_id.to_string(),
             step_id,
+            approver: Some(approver.to_string()),
         })
     }
 
@@ -3857,6 +3905,7 @@ mod tests {
             ApprovalDecision::Approved {
                 run_id: rec.id.clone(),
                 step_id: "deploy".into(),
+                approver: Some("matt".into()),
             }
         );
 
@@ -3925,6 +3974,7 @@ mod tests {
             ApprovalDecision::Approved {
                 run_id: rec.id.clone(),
                 step_id: "gate_b".into(),
+                approver: Some("web".into()),
             }
         );
 
@@ -4007,6 +4057,7 @@ mod tests {
             ApprovalDecision::Approved {
                 run_id: rec.id.clone(),
                 step_id: "deploy".into(),
+                approver: Some("web".into()),
             }
         );
         let reloaded = store.load(&rec.id).unwrap();
@@ -4066,6 +4117,7 @@ mod tests {
             ApprovalDecision::Approved {
                 run_id: rec.id.clone(),
                 step_id: "build".into(),
+                approver: Some("web".into()),
             }
         );
 
@@ -4096,6 +4148,7 @@ mod tests {
             ApprovalDecision::Approved {
                 run_id: rec.id.clone(),
                 step_id: String::new(),
+                approver: Some("web".into()),
             }
         );
     }

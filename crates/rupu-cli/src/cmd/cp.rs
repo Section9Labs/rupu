@@ -904,38 +904,41 @@ async fn run_gate_sweep(
                                 .clone()
                                 .unwrap_or_else(|| "gate timed out (on_timeout: reject)".to_string());
                             tracing::info!(run_id = %run_id, step_id = %gate_step_id, "gate sweep: on_timeout=reject → gate auto-rejected; running on_reject cleanup");
-                            if crate::cmd::workflow::cheap_on_reject_chain_len(
+                            // I-36: run this unconditionally — an empty
+                            // `on_reject:` chain must still record the
+                            // gate's rejected decision (see the identical
+                            // fix in the CLI `reject` command). No operator
+                            // is involved in this autonomous, timeout-driven
+                            // path, so `approver` is `None`.
+                            match crate::resume::build_reject_cleanup_opts(
                                 &store,
                                 &run_id,
                                 &gate_step_id,
-                            ) != Some(0)
+                                &reason,
+                                rec.resume_mode.as_deref(),
+                            )
+                            .await
                             {
-                                match crate::resume::build_reject_cleanup_opts(
-                                    &store,
-                                    &run_id,
-                                    &gate_step_id,
-                                    &reason,
-                                    rec.resume_mode.as_deref(),
-                                )
-                                .await
-                                {
-                                    Ok((opts, chain_len)) => {
-                                        match rupu_orchestrator::runner::run_reject_cleanup(
-                                            opts, &gate_step_id, &reason, "timeout",
-                                        )
-                                        .await
-                                        {
-                                            Ok(()) => {
-                                                tracing::info!(run_id = %run_id, gate = %gate_step_id, chain_len, "gate sweep: on_reject cleanup chain executed");
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(run_id = %run_id, gate = %gate_step_id, error = %e, "gate sweep: on_reject cleanup chain errored (gate already rejected)");
-                                            }
+                                Ok((opts, chain_len)) => {
+                                    match rupu_orchestrator::runner::run_reject_cleanup(
+                                        opts,
+                                        &gate_step_id,
+                                        &reason,
+                                        "timeout",
+                                        None,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            tracing::info!(run_id = %run_id, gate = %gate_step_id, chain_len, "gate sweep: on_reject cleanup chain executed");
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(run_id = %run_id, gate = %gate_step_id, error = %e, "gate sweep: on_reject cleanup chain errored (gate already rejected)");
                                         }
                                     }
-                                    Err(e) => {
-                                        tracing::warn!(run_id = %run_id, gate = %gate_step_id, error = %e, "gate sweep: could not build on_reject cleanup opts (gate already rejected)");
-                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(run_id = %run_id, gate = %gate_step_id, error = %e, "gate sweep: could not build on_reject cleanup opts (gate already rejected)");
                                 }
                             }
                         }
@@ -1002,6 +1005,7 @@ async fn run_gate_sweep(
                             &marker.step_id,
                             &marker.reason,
                             &marker.via,
+                            marker.approver.as_deref(),
                         )
                         .await
                         {

@@ -763,7 +763,7 @@ async fn reject_runs_on_reject_cleanup_chain() {
         pause: None,
     };
 
-    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human")
+    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human", None)
         .await
         .expect("cleanup never errors");
 
@@ -887,7 +887,7 @@ async fn reject_cleanup_step_failure_does_not_change_terminal_outcome() {
         pause: None,
     };
 
-    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human")
+    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human", None)
         .await
         .expect("a failing cleanup step is logged, not returned as an error");
 
@@ -1000,7 +1000,7 @@ async fn reject_cleanup_with_empty_on_reject_dispatches_nothing() {
         pause: None,
     };
 
-    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human")
+    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human", None)
         .await
         .expect("empty on_reject is Ok without dispatching anything");
 
@@ -1136,7 +1136,7 @@ async fn timeout_reject_records_via_timeout_not_human() {
         pause: None,
     };
 
-    run_reject_cleanup(opts2, &rejected_step_id, &reason, "timeout")
+    run_reject_cleanup(opts2, &rejected_step_id, &reason, "timeout", None)
         .await
         .expect("cleanup never errors");
 
@@ -1515,7 +1515,7 @@ async fn reject_one_gate_of_a_multi_gate_set_runs_its_own_cleanup_leaves_sibling
         pause: None,
     };
 
-    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human")
+    run_reject_cleanup(opts2, &rejected_step_id, &reason, "human", None)
         .await
         .expect("cleanup never errors");
 

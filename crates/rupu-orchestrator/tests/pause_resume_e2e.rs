@@ -475,6 +475,7 @@ async fn run_pause_then_resume_completes() {
                 seed_messages: seed,
             }),
             rejected_reason: None,
+            ..Default::default()
         }),
         run_id_override: None,
         strict_templates: false,
@@ -723,6 +724,7 @@ async fn workflow_pause_resume_runs_remaining_steps() {
             reason: PauseReason::Manual,
             paused_step: None,
             rejected_reason: None,
+            ..Default::default()
         }),
         run_id_override: None,
         strict_templates: false,
@@ -957,6 +959,7 @@ async fn fanout_pause_resumes_only_incomplete_units() {
             reason: PauseReason::Manual,
             paused_step: None,
             rejected_reason: None,
+            ..Default::default()
         }),
         run_id_override: None,
         strict_templates: false,

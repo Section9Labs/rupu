@@ -96,18 +96,29 @@ pub struct ResumeOutcome {
 /// `record.resume_mode` then `record.permission_mode` (the run's own
 /// launch mode, ISSUES.md I-24) before defaulting to `ask` — see
 /// [`rebuild_opts_from_disk`]'s precedence.
+///
+/// `approver`/`via_timeout` (I-36/I-38) are the gate decision provenance
+/// the CLI's `resolve_approve_gate` already resolved before calling this —
+/// threaded into [`rupu_orchestrator::ResumeState::from_approval_with_actor`]
+/// so the resumed run's gate-suppression path records the real actor and
+/// whether this was a genuine operator decision (`via: "human"`) or a
+/// `cp serve` sweep-driven `on_timeout: approve` (`via: "timeout"`).
 pub async fn resume_run(
     store: &RunStore,
     run_id: &str,
     awaited_step_id: &str,
     mode: Option<&str>,
+    approver: &str,
+    via_timeout: bool,
 ) -> anyhow::Result<ResumeOutcome> {
     let awaited_step_id = awaited_step_id.to_string();
     let (mut opts, prior_step_results) = rebuild_opts_from_disk(store, run_id, mode).await?;
-    opts.resume_from = Some(rupu_orchestrator::ResumeState::from_approval(
+    opts.resume_from = Some(rupu_orchestrator::ResumeState::from_approval_with_actor(
         run_id.to_string(),
         prior_step_results,
         awaited_step_id.clone(),
+        approver.to_string(),
+        via_timeout,
     ));
 
     let result = run_workflow(opts).await?;
