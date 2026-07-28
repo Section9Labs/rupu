@@ -1702,3 +1702,57 @@ steps:
         "a when:-skipped gate must keep kind ApprovalGate, not fall back to Linear (scheduler path)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// I-44 — a gate's `notify:` hook transcript must be reachable from a
+// persisted `StepResult`, not orphaned. `fire_notify_hooks` used to discard
+// `execute_action_step`'s `Ok(StepResult)`, so the transcript it
+// unconditionally wrote at a fresh ULID path was referenced by nothing.
+// ---------------------------------------------------------------------------
+
+// Test 16 — after a gate with a `notify:` hook parks, the hook's own
+// `StepResult` (id `<gate>.notify`) is persisted to `step_results.jsonl`
+// and its `transcript_path` points at a real file on disk.
+#[tokio::test]
+async fn notify_hook_transcript_is_referenced_by_a_persisted_step_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let wf = Workflow::parse(WF_GATE_NOTIFY).unwrap();
+    let (dispatcher, _connector) = dispatcher_with_connector(false);
+
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_gate_notify_persisted".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_GATE_NOTIFY.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: Some(dispatcher),
+        pause: None,
+    };
+
+    let res = run_workflow(opts).await.expect("a pause is Ok, not Err");
+    let awaiting = res.awaiting.clone().expect("gate must pause the run");
+    assert_eq!(awaiting.step_id, "gate");
+
+    let records = store.read_step_results(&res.run_id).unwrap();
+    let notify_record = records
+        .iter()
+        .find(|r| r.step_id == "gate.notify")
+        .expect("notify hook's StepResult must be persisted to step_results.jsonl");
+    assert!(
+        notify_record.transcript_path.exists(),
+        "notify hook's transcript_path must exist on disk: {:?}",
+        notify_record.transcript_path
+    );
+}

@@ -2079,10 +2079,12 @@ async fn run_scheduler_scoped(
                 info!(step = %step.id, "gate: pausing for approval");
                 fire_notify_hooks(
                     opts,
+                    run_id,
                     &step.id,
                     &ap.notify,
                     &ctx,
                     render_mode(opts.strict_templates),
+                    step_results,
                 )
                 .await;
                 if let Some(sink) = opts.event_sink.as_ref() {
@@ -4026,10 +4028,12 @@ async fn run_steps_over(
             info!(step = %step.id, "gate: pausing for approval");
             fire_notify_hooks(
                 opts,
+                run_id,
                 &step.id,
                 &ap.notify,
                 &ctx,
                 render_mode(opts.strict_templates),
+                step_results,
             )
             .await;
             if let Some(sink) = opts.event_sink.as_ref() {
@@ -4851,12 +4855,24 @@ async fn execute_action_step(
 /// dispatcher, render error, dispatch error) is logged and swallowed —
 /// notify never changes the park outcome, never blocks it, and never
 /// surfaces as a run error.
+///
+/// I-44: `execute_action_step` unconditionally writes an audit-trail
+/// transcript at a fresh ULID path. A hook that dispatched (`Ok(result)` —
+/// which, because `continue_on_error: true` is passed below, includes a
+/// *failed* dispatch too, just with `success: false`) has its `StepResult`
+/// persisted to `step_results.jsonl` and pushed into the live `step_results`
+/// template context under id `<step_id>.notify`, so the transcript stays
+/// reachable via `show-run` / the CP instead of being orphaned. Only a
+/// render failure (`Err`, no `StepResult` to persist — nothing was
+/// dispatched, no transcript was written) has nothing to persist.
 async fn fire_notify_hooks(
     opts: &OrchestratorRunOpts,
+    run_id: &str,
     step_id: &str,
     notify: &[crate::workflow::NotifyAction],
     ctx: &StepContext,
     mode: RenderMode,
+    step_results: &mut Vec<StepResult>,
 ) {
     if notify.is_empty() {
         return;
@@ -4890,10 +4906,15 @@ async fn fire_notify_hooks(
             action: Some(n.action.clone()),
             with: Some(n.with.clone()),
         };
-        if let Err(e) =
-            execute_action_step(dispatcher, &synth, ctx, mode, true, &opts.transcript_dir).await
+        match execute_action_step(dispatcher, &synth, ctx, mode, true, &opts.transcript_dir).await
         {
-            warn!(step = %step_id, action = %n.action, error = %e, "gate notify hook failed; continuing");
+            Ok(result) => {
+                persist_step_result(opts, run_id, &result);
+                step_results.push(result);
+            }
+            Err(e) => {
+                warn!(step = %step_id, action = %n.action, error = %e, "gate notify hook failed; continuing");
+            }
         }
     }
 }
