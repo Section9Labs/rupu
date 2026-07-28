@@ -209,8 +209,32 @@ async fn http_archive_delete_transcript_round_trip() {
         then.status(200).json_body(serde_json::json!({"ok": true, "id": "run_a"}));
     });
     let c = HttpHostConnector::new(server.base_url(), None);
-    c.archive_transcript("run_a").await.unwrap();
-    c.delete_transcript("run_a").await.unwrap();
+    c.archive_transcript("run_a", false).await.unwrap();
+    c.delete_transcript("run_a", false).await.unwrap();
+    archive_mock.assert();
+    delete_mock.assert();
+}
+
+// PID-reuse escape hatch: `ignore_liveness: true` must be forwarded as
+// `?ignore_liveness=true` on both the archive and delete requests.
+#[tokio::test]
+async fn http_archive_delete_transcript_ignore_liveness_query_param() {
+    let server = httpmock::MockServer::start_async().await;
+    let archive_mock = server.mock(|when, then| {
+        when.method("POST")
+            .path("/api/transcripts/run_b/archive")
+            .query_param("ignore_liveness", "true");
+        then.status(200).json_body(serde_json::json!({"ok": true, "id": "run_b"}));
+    });
+    let delete_mock = server.mock(|when, then| {
+        when.method("DELETE")
+            .path("/api/transcripts/run_b")
+            .query_param("ignore_liveness", "true");
+        then.status(200).json_body(serde_json::json!({"ok": true, "id": "run_b"}));
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    c.archive_transcript("run_b", true).await.unwrap();
+    c.delete_transcript("run_b", true).await.unwrap();
     archive_mock.assert();
     delete_mock.assert();
 }

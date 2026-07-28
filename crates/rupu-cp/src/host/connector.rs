@@ -250,13 +250,24 @@ pub trait HostConnector: Send + Sync {
     /// port instead, see `api/transcripts.rs`; Bucket/Tunnel — no transcript
     /// mirror) compile unchanged. SSH / HTTP override it. No `restore_transcript`
     /// exists: `rupu transcript restore` is not a real CLI verb.
-    async fn archive_transcript(&self, _id: &str) -> Result<(), HostConnectorError> {
+    ///
+    /// `ignore_liveness` is the PID-reuse escape hatch — see
+    /// `TranscriptMutator::mutate`'s doc. Defaults to `false`.
+    async fn archive_transcript(
+        &self,
+        _id: &str,
+        _ignore_liveness: bool,
+    ) -> Result<(), HostConnectorError> {
         Err(HostConnectorError::Unsupported("transcript archive".into()))
     }
 
     /// Permanently delete a standalone agent-run transcript on this host.
     /// Default: see [`archive_transcript`](Self::archive_transcript).
-    async fn delete_transcript(&self, _id: &str) -> Result<(), HostConnectorError> {
+    async fn delete_transcript(
+        &self,
+        _id: &str,
+        _ignore_liveness: bool,
+    ) -> Result<(), HostConnectorError> {
         Err(HostConnectorError::Unsupported("transcript delete".into()))
     }
 

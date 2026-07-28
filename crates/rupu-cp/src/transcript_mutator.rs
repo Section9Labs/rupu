@@ -46,10 +46,18 @@ pub enum TranscriptMutateError {
 
 #[async_trait]
 pub trait TranscriptMutator: Send + Sync {
+    /// `ignore_liveness` — skip the CLI's still-running check
+    /// (`ensure_standalone_not_running` in
+    /// `crates/rupu-cli/src/cmd/transcript.rs`). Defaults to `false`
+    /// everywhere; only set `true` to recover a transcript whose recorded
+    /// pid was reused by an unrelated process. Never bypasses the separate
+    /// session-ownership guard (`ensure_standalone_transcript`), which has
+    /// no override.
     async fn mutate(
         &self,
         id: &str,
         action: TranscriptAction,
+        ignore_liveness: bool,
     ) -> Result<(), TranscriptMutateError>;
 }
 
@@ -65,6 +73,7 @@ mod tests {
             &self,
             _id: &str,
             action: TranscriptAction,
+            _ignore_liveness: bool,
         ) -> Result<(), TranscriptMutateError> {
             if action == TranscriptAction::Delete {
                 return Err(TranscriptMutateError::NotFound("x".into()));
@@ -76,9 +85,12 @@ mod tests {
     #[tokio::test]
     async fn dispatches_through_trait_object() {
         let m: Arc<dyn TranscriptMutator> = Arc::new(Stub);
-        assert!(m.mutate("t1", TranscriptAction::Archive).await.is_ok());
+        assert!(m
+            .mutate("t1", TranscriptAction::Archive, false)
+            .await
+            .is_ok());
         assert!(matches!(
-            m.mutate("t1", TranscriptAction::Delete).await,
+            m.mutate("t1", TranscriptAction::Delete, false).await,
             Err(TranscriptMutateError::NotFound(_))
         ));
     }

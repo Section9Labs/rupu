@@ -451,22 +451,32 @@ impl HostConnector for HttpHostConnector {
             .map(|_| ())
     }
 
-    /// POST to the remote CP's `POST /api/transcripts/:id/archive`.
-    async fn archive_transcript(&self, id: &str) -> Result<(), HostConnectorError> {
+    /// POST to the remote CP's `POST /api/transcripts/:id/archive[?ignore_liveness=true]`.
+    async fn archive_transcript(
+        &self,
+        id: &str,
+        ignore_liveness: bool,
+    ) -> Result<(), HostConnectorError> {
+        let qs = if ignore_liveness { "?ignore_liveness=true" } else { "" };
         self.send(
             self.client
-                .post(self.url(&format!("/api/transcripts/{id}/archive")))
+                .post(self.url(&format!("/api/transcripts/{id}/archive{qs}")))
                 .json(&serde_json::json!({})),
         )
         .await
         .map(|_| ())
     }
 
-    /// DELETE to the remote CP's `DELETE /api/transcripts/:id`.
-    async fn delete_transcript(&self, id: &str) -> Result<(), HostConnectorError> {
+    /// DELETE to the remote CP's `DELETE /api/transcripts/:id[?ignore_liveness=true]`.
+    async fn delete_transcript(
+        &self,
+        id: &str,
+        ignore_liveness: bool,
+    ) -> Result<(), HostConnectorError> {
+        let qs = if ignore_liveness { "?ignore_liveness=true" } else { "" };
         self.send(
             self.client
-                .delete(self.url(&format!("/api/transcripts/{id}"))),
+                .delete(self.url(&format!("/api/transcripts/{id}{qs}"))),
         )
         .await
         .map(|_| ())

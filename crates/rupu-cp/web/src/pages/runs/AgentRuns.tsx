@@ -20,7 +20,7 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { RefreshCw } from 'lucide-react';
-import { api, type AgentRunRow, type RunStatusStr } from '../../lib/api';
+import { api, ApiError, type AgentRunRow, type RunStatusStr } from '../../lib/api';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import UsageBarChart from '../../components/charts/UsageBarChart';
 import { Button } from '../../components/ui/Button';
@@ -55,6 +55,47 @@ const SOURCE_OPTIONS: FilterPillOption[] = [
   { value: 'standalone', label: 'Standalone' },
   { value: 'session', label: 'Session' },
 ];
+
+// PID-reuse escape hatch (Plan 2 of the liveness-guard arc). `rupu transcript
+// archive|delete` refuses a standalone run whose metadata `pid` still looks
+// alive (`ensure_standalone_not_running`,
+// crates/rupu-cli/src/cmd/transcript.rs) — the CP surfaces that refusal as a
+// 409 with a specific, stable message shape: "cannot {archive|delete}
+// transcript {id}: it is still running (owning process {pid} is alive)".
+// There is no dedicated error code in the wire body (`{"error": "<message>"}`,
+// see `crates/rupu-cp/src/error.rs`), so detection matches this one fixed
+// substring rather than the whole sentence — narrow enough that it can't
+// collide with the OTHER refusal this same mutator can return (the
+// session-ownership guard's "is managed by session ..." message, which has
+// no override and must keep failing outright).
+const LIVENESS_REFUSAL_MARKER = 'is still running (owning process';
+
+function isLivenessRefusal(e: unknown): e is ApiError {
+  return e instanceof ApiError && e.status === 409 && e.message.includes(LIVENESS_REFUSAL_MARKER);
+}
+
+/** Pulls the pid out of the refusal message for the second-confirm copy;
+ *  `null` when the message shape ever changes (falls back to generic copy
+ *  rather than throwing). */
+function extractLivePid(e: ApiError): string | null {
+  const match = e.message.match(/owning process (\d+) is alive/);
+  return match ? match[1] : null;
+}
+
+/** Second, explicit confirmation shown only after the server has already
+ *  refused because the run looks live — deliberately NOT a one-click force
+ *  button (see Plan 2's web section). Names the real risk (a still-live run's
+ *  transcript is lost) and the legitimate reason to override (pid reuse after
+ *  a reboot/wraparound). */
+function confirmLivenessOverride(runId: string, e: ApiError): boolean {
+  const pid = extractLivePid(e);
+  const pidPhrase = pid ? `process ${pid}` : 'its recorded process';
+  return window.confirm(
+    `rupu says run ${runId} still looks alive (${pidPhrase}). If that process is unrelated ` +
+      `(pid reused after a reboot), you can override. Overriding while it IS alive loses the ` +
+      `transcript. Override?`,
+  );
+}
 
 export default function AgentRuns() {
   const [tab, setTab] = useState<Tab>('active');
@@ -144,6 +185,20 @@ export default function AgentRuns() {
       setActionError(null);
       refresh();
     } catch (e) {
+      // PID-reuse escape hatch: the server refused because the run still
+      // looks live. Offer a SECOND, explicit confirmation naming the risk
+      // before retrying with the override — never a silent/one-click force.
+      if (isLivenessRefusal(e) && confirmLivenessOverride(runId, e)) {
+        try {
+          await api.archiveTranscript(runId, host, true);
+          setActionError(null);
+          refresh();
+          return;
+        } catch (e2) {
+          setActionError(e2 instanceof Error ? e2.message : 'Archive failed');
+          return;
+        }
+      }
       setActionError(e instanceof Error ? e.message : 'Archive failed');
     }
   }
@@ -156,6 +211,18 @@ export default function AgentRuns() {
       setActionError(null);
       refresh();
     } catch (e) {
+      // See handleStandaloneArchive's comment on the liveness-override retry.
+      if (isLivenessRefusal(e) && confirmLivenessOverride(runId, e)) {
+        try {
+          await api.deleteTranscript(runId, host, true);
+          setActionError(null);
+          refresh();
+          return;
+        } catch (e2) {
+          setActionError(e2 instanceof Error ? e2.message : 'Delete failed');
+          return;
+        }
+      }
       setActionError(e instanceof Error ? e.message : 'Delete failed');
     }
   }

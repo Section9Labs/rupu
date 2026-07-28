@@ -1869,16 +1869,33 @@ export const api = {
    * `run_id` — pass this only for an `AgentRunRow` with `source ===
    * 'standalone'`; a session-owned transcript refuses with a 409. No
    * `restoreTranscript` counterpart: `rupu transcript restore` doesn't exist.
+   *
+   * `ignoreLiveness` — the PID-reuse escape hatch (Plan 2). Defaults to
+   * `false`/omitted; only pass `true` after the operator has explicitly
+   * confirmed the recorded pid was reused by an unrelated process (see
+   * `AgentRuns.tsx`'s second-confirm flow) — a still-live run's transcript
+   * is genuinely lost if this is wrong.
    */
-  async archiveTranscript(id: string, host?: string): Promise<void> {
-    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
-    await request(`/api/transcripts/${encodeURIComponent(id)}/archive${qs}`, { method: 'POST' });
+  async archiveTranscript(id: string, host?: string, ignoreLiveness?: boolean): Promise<void> {
+    const params = new URLSearchParams();
+    if (host) params.set('host', host);
+    if (ignoreLiveness) params.set('ignore_liveness', 'true');
+    const qs = params.toString();
+    await request(`/api/transcripts/${encodeURIComponent(id)}/archive${qs ? `?${qs}` : ''}`, {
+      method: 'POST',
+    });
   },
   /** Permanently delete a STANDALONE agent-run transcript (Task 2's `DELETE
-   *  /api/transcripts/:id`). See `archiveTranscript`'s doc for `id`. */
-  async deleteTranscript(id: string, host?: string): Promise<void> {
-    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
-    await request(`/api/transcripts/${encodeURIComponent(id)}${qs}`, { method: 'DELETE' });
+   *  /api/transcripts/:id`). See `archiveTranscript`'s doc for `id` and
+   *  `ignoreLiveness`. */
+  async deleteTranscript(id: string, host?: string, ignoreLiveness?: boolean): Promise<void> {
+    const params = new URLSearchParams();
+    if (host) params.set('host', host);
+    if (ignoreLiveness) params.set('ignore_liveness', 'true');
+    const qs = params.toString();
+    await request(`/api/transcripts/${encodeURIComponent(id)}${qs ? `?${qs}` : ''}`, {
+      method: 'DELETE',
+    });
   },
   /** List archived runs. Pass `kind = 'workflow'` to restrict to workflow-kind only. */
   getArchivedRuns(kind?: string): Promise<RunListRow[]> {
