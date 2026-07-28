@@ -138,7 +138,7 @@ stale. So no default needs flipping — what is removed is the alternative.
 |---|---|
 | `crates/rupu-keychain-acl/` | Entire crate (585 lines). Its only consumer is `rupu-auth`. |
 | `crates/rupu-auth/src/keyring.rs` | `KeyringBackend` (104 lines) |
-| `crates/rupu-auth/src/keychain_layout.rs` | `key_for` / `legacy_key_for` / `KeychainKey` (53 lines) — keyring addressing only |
+| `crates/rupu-auth/src/keychain_layout.rs` | **Kept, not deleted** — renamed `account_key`. See the correction below. |
 | `crates/rupu-auth/src/probe.rs` | Keychain-availability probe (148 lines) |
 | `crates/rupu-auth/src/resolver.rs` | `Storage` enum collapses to a single file path |
 | `crates/rupu-auth/src/backend.rs:60` | `AuthError::Keyring` variant |
@@ -146,9 +146,22 @@ stale. So no default needs flipping — what is removed is the alternative.
 | `crates/rupu-auth/tests/keyring_ignored.rs` | Deleted with `KeyringBackend` |
 | root `Cargo.toml:104` | The `keyring` workspace dependency |
 
-**A notable side effect:** `rupu-keychain-acl` is the only crate in the workspace exempt
-from `unsafe_code = "forbid"` (it wraps Security.framework FFI). Deleting it makes the
-unsafe ban genuinely workspace-wide, with no exemption remaining.
+**Correction (found during implementation, PR #554): `keychain_layout` must NOT be
+deleted.** It was listed above as "keyring addressing only". It is not:
+`key_for(..).account` produces `"anthropic/api-key"`, which is the **on-disk key format of
+`auth.json`** — the file backend was built to reuse the keychain's account strings.
+Deleting the module would have silently changed the key format and orphaned every existing
+user's credentials. It is instead renamed `account_key`, returns plain `String`s rather
+than a `KeychainKey` struct, and carries a test pinning the exact key strings as a
+compatibility contract. The keychain framing goes; the format contract stays.
+
+**A notable side effect, stated accurately.** `rupu-keychain-acl` wraps Security.framework
+FFI and is exempt from `unsafe_code = "forbid"`. Deleting it does **not** leave the
+workspace exemption-free, as an earlier draft of this spec claimed: `rupu-app` also sets
+`unsafe_code = "deny"` with three `#[allow(unsafe_code)]` sites for objc2/AppKit. The
+correct, narrower claim is that `rupu-app` is not in `rupu-cli`'s dependency graph (the only
+`rupu-app*` entry there is `rupu-app-canvas`, which is pure Rust), so **every crate linked
+into the shipped `rupu` binary is `forbid(unsafe_code)`**.
 
 **What explicitly stays.** `rupu-providers` reads *Claude Code's* keychain entry to import
 credentials from it (`crates/rupu-providers/src/auth/discovery.rs:69`,
@@ -166,6 +179,13 @@ one-time notice telling the user to run `rupu auth login`. No automatic import: 
 full keychain addressing scheme alive purely for migration would preserve exactly the
 complexity this removal exists to shed, and there is no clean shellout equivalent on
 Windows, so an import would silently break Windows users regardless.
+
+The probe must cover all three historical account shapes — `<name>/api-key`, `<name>/sso`,
+and the Slice A bare `<name>` — for **both built-in and user-defined (openai-compatible)
+providers**. `store_named` wrote named providers under the same accounts, so a
+built-ins-only probe misses them silently, which is the exact failure the notice exists to
+prevent. (Found during implementation by reading a real `rupu auth status` that listed a
+user-defined `oracle` provider.)
 
 **The file backend itself is unchanged:** `~/.rupu/auth.json`, permissions reset to 0600 on
 every write, a `tracing::warn!` if found wider than 0600
@@ -287,7 +307,7 @@ Three plans, each producing working software on its own, executed in order.
 `docs/superpowers/plans/2026-07-28-rupu-plan-1-retire-keyring-backend.md`
 Standalone value independent of cross-platform work: deletes `rupu-keychain-acl` and the
 keyring code paths, moves host tokens to the file store, adds the stranded-keychain
-detection notice, and leaves the workspace with no `unsafe_code` exemption. Also a
+detection notice, and leaves every crate in the shipped binary `forbid(unsafe_code)`. Also a
 prerequisite — it is what removes `libdbus-sys` from the Linux graph.
 
 **Plan 2 — Linux buildability** (spec §1, §2, §5).

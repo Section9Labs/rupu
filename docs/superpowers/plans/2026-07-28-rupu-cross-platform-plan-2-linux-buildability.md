@@ -485,6 +485,37 @@ Verified running unmodified on alpine:3.20 and debian:12."
 
 ---
 
+## CORRECTION: `main` is not green today
+
+Established while implementing Plan 1 (PR #554), each confirmed by running the test on a
+clean `origin/main` in a scratch worktree. Tasks 5 and 6 below were written assuming a green
+baseline; they are not. **None of these are Linux-specific — they fail on macOS, on `main`,
+right now:**
+
+| Failure | Nature |
+|---|---|
+| `rupu-cli --lib` → `cmd::session::tests::handle_session_live_input_queues_prompt_while_running` | The test sets `active_pid`/`worker_pid` to `std::process::id()`, so signalling the worker **SIGTERMs the test harness**. Kills the whole `--lib` target in ~6s. |
+| `rupu-mcp --test schema_snapshot` → `tools_list_matches_snapshot` | tools/list snapshot drift. Reproduces in isolation. |
+| `rupu-cli --test cli_auth` → 2 tests | Assert on plain `·  full` while ANSI codes are emitted despite `--no-color`. |
+| `rupu-config --test parse` | Flaky under parallel load; passes in isolation. |
+| `cargo clippy -p rupu-scm` | `weburl.rs:43` fires `question_mark` under local rustc 1.97.1. The pin is **1.95** and rustup is not installed locally, so the pin is not in effect on a developer machine — CI, which uses rustup, may differ. Verify against 1.95 before treating it as real. |
+
+**This must be resolved before Task 6's gate can be blocking.** Three options, in
+descending preference:
+
+1. **Fix them first, in their own PR.** The session-test self-SIGTERM is a genuine bug worth
+   fixing regardless — it is the `/bin/kill` class this arc already flagged, and it means
+   `cargo test -p rupu-cli --lib` has been unrunnable to completion for some time.
+2. **Land the gate non-blocking** (`continue-on-error: true` on the Test step) and tighten it
+   once the suite is green. Honest, but a non-blocking gate catches nothing.
+3. **Scope the gate** to the crates that are green, with the excluded set listed explicitly
+   in the workflow and a TODO naming what must be fixed to re-include them.
+
+Do **not** resolve it by deleting or `#[ignore]`-ing the failing tests to make the gate pass:
+that converts a visible failure into an invisible one, which this arc explicitly rejects.
+
+---
+
 ### Task 5: Get the Linux test suite green
 
 The file list here genuinely cannot be known in advance — nothing has ever run these tests on Linux. What *can* be specified is the decision rule for each failure, which is the part where judgment goes wrong.
@@ -505,6 +536,11 @@ lima nerdctl run --rm -v "$PWD":/work -w /work rupu-linux-build \
 ```
 
 Record the full list of failing tests in the PR description before changing anything. That list is the evidence for every judgment call below.
+
+**Subtract the pre-existing failures first** (see the CORRECTION above): anything in that
+table fails on `main` on macOS too and is not a Linux problem. Confirm rather than assume —
+`git worktree add --detach <tmp> origin/main` and run the same test there. Only what remains
+is this task's work.
 
 - [ ] **Step 2: Classify each failure and apply the matching rule**
 
@@ -609,6 +645,10 @@ jobs:
           docker run --rm -v "$PWD":/work -w /work rupu-linux-build \
             cargo clippy --workspace --exclude rupu-app --all-targets --locked -- -D warnings
 
+      # See the CORRECTION section above: `main` currently has pre-existing
+      # failures unrelated to Linux. Make this step blocking ONLY once they
+      # are fixed (option 1) — otherwise scope it explicitly (option 3) and
+      # name here what is excluded and why. Do not silence tests to go green.
       - name: Test
         run: |
           docker run --rm -v "$PWD":/work -w /work rupu-linux-build \

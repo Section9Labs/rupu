@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status: IMPLEMENTED** — PR #554 (6 commits). Three corrections found during execution are marked **CORRECTION** inline below; they are kept rather than rewritten so the reasoning is auditable.
+
 **Goal:** Make the chmod-600 file store rupu's only credential backend on every platform, and delete the keyring machinery entirely.
 
 **Architecture:** The file backend is already the default (`resolver.rs:97-135`); this removes the alternative rather than flipping a switch. Work proceeds inward-out: collapse the resolver's two-variant `Storage` to a single file path, delete the now-unreferenced `KeyringBackend` / probe / keychain-addressing modules and fix their consumers, move host tokens to a file store, delete the `rupu-keychain-acl` crate, add a one-time notice for users whose credentials are stranded in an OS keychain, and finally drop the `keyring` workspace dependency.
@@ -16,7 +18,7 @@
 
 - Rust edition 2021; toolchain pinned to **1.95** in `rust-toolchain.toml`.
 - **Workspace dependencies only.** Versions pinned in the root `Cargo.toml`; never in a crate `Cargo.toml`.
-- `#![deny(clippy::all)]` workspace-wide. `unsafe_code = "forbid"` — after Task 4 there is **no exemption left in the workspace**, and none may be reintroduced.
+- `#![deny(clippy::all)]` workspace-wide. `unsafe_code = "forbid"`. **CORRECTION:** Task 4 does *not* leave the workspace exemption-free — `rupu-app` sets `unsafe_code = "deny"` with three `#[allow]` sites for objc2/AppKit. What Task 4 achieves is narrower and still worth having: `rupu-app` is not in `rupu-cli`'s dependency graph, so every crate linked into the shipped `rupu` binary is `forbid(unsafe_code)`.
 - **No mock or silent-noop code paths.** Anything that cannot work must fail loudly. This is why the keychain option is removed rather than left to degrade.
 - **Do not touch credential *discovery*.** `rupu-providers` reads Claude Code's keychain entry to import credentials from it (`crates/rupu-providers/src/auth/discovery.rs:69`, `anthropic.rs::load_claude_code_keychain`). It does not use the `keyring` crate and is out of scope. Removing rupu's own keychain *storage* is not the same as removing the ability to *discover* credentials another tool left behind.
 - The file backend's behavior is unchanged: `~/.rupu/auth.json`, permissions reset to 0600 on every write, `tracing::warn!` if found wider than 0600, honoring `RUPU_HOME` and `RUPU_AUTH_FILE`.
@@ -208,7 +210,8 @@ lived in the keyring match arms."
 With the resolver collapsed, these modules have no remaining callers except each other and `rupu auth backend`.
 
 **Files:**
-- Delete: `crates/rupu-auth/src/keyring.rs`, `crates/rupu-auth/src/probe.rs`, `crates/rupu-auth/src/keychain_layout.rs`, `crates/rupu-auth/tests/keyring_ignored.rs`
+- Delete: `crates/rupu-auth/src/keyring.rs`, `crates/rupu-auth/src/probe.rs`, `crates/rupu-auth/tests/keyring_ignored.rs`, `crates/rupu-auth/tests/probe_cache.rs`
+- **CORRECTION — do NOT delete `crates/rupu-auth/src/keychain_layout.rs`.** `key_for(..).account` produces `"anthropic/api-key"`, which is the **on-disk key format of `auth.json`**, not merely a keychain address. Deleting it silently changes the key format and orphans every existing user's credentials. Rename it to `account_key`, have it return plain `String`s, and add a test pinning the exact key strings as a compatibility contract.
 - Modify: `crates/rupu-auth/src/lib.rs` (whole file — module list, exports, and stale module doc)
 - Modify: `crates/rupu-auth/src/backend.rs:60` (`AuthError::Keyring`)
 - Modify: `crates/rupu-cli/src/cmd/auth.rs:420-510` (the `backend` function)
@@ -552,7 +555,9 @@ store because host ids are arbitrary strings, not the ProviderId enum."
 
 ### Task 4: Delete the `rupu-keychain-acl` crate
 
-Its only consumer was the resolver's keyring arms, removed in Task 1. Deleting it leaves the workspace with no `unsafe_code` exemption at all.
+Its only consumer was the resolver's keyring arms, removed in Task 1.
+
+**CORRECTION:** this does not leave the workspace exemption-free — `rupu-app` keeps one for objc2/AppKit FFI. It does make every crate in the *shipped binary* `forbid(unsafe_code)`, which is the claim to make.
 
 **Files:**
 - Delete: `crates/rupu-keychain-acl/` (entire directory, 585 lines)
@@ -562,7 +567,7 @@ Its only consumer was the resolver's keyring arms, removed in Task 1. Deleting i
 
 **Interfaces:**
 - Consumes: Task 1 (which removed the last call sites).
-- Produces: no `rupu-keychain-acl` crate. `unsafe_code = "forbid"` applies workspace-wide with no exemption.
+- Produces: no `rupu-keychain-acl` crate. Every crate in `rupu-cli`'s dependency graph is `forbid(unsafe_code)`; `rupu-app` retains its own exemption and is out of that graph.
 
 - [ ] **Step 1: Verify there are no remaining call sites**
 
@@ -577,10 +582,12 @@ git rm -r crates/rupu-keychain-acl
 
 Remove `"crates/rupu-keychain-acl",` from the `members` list in the root `Cargo.toml` (line 20), and remove `rupu-keychain-acl = { path = "../rupu-keychain-acl" }` from `crates/rupu-auth/Cargo.toml` (line 31).
 
-- [ ] **Step 3: Verify the unsafe ban now has no exemption**
+- [ ] **Step 3: Verify the shipped binary's graph is exemption-free**
 
 Run: `grep -rn 'allow(unsafe_code)\|unsafe_code' crates/ Cargo.toml`
-Expected: exactly one hit — `unsafe_code = "forbid"` in the root `Cargo.toml` `[workspace.lints.rust]`. No `#![allow(unsafe_code)]` anywhere.
+Expected: the root `unsafe_code = "forbid"`, plus `rupu-app`'s own `deny` + three `#[allow]` sites — and nothing else. Then confirm `rupu-app` is outside the shipped graph:
+`cargo tree -p rupu-cli -e normal --prefix none | grep 'rupu-app'`
+Expected: only `rupu-app-canvas` (pure Rust, workspace-`forbid`), never `rupu-app`.
 
 - [ ] **Step 4: Update `CLAUDE.md`**
 
@@ -601,7 +608,8 @@ git add -A
 git commit -m "chore: delete rupu-keychain-acl
 
 Its only consumer was the resolver's keyring arms. The workspace now has
-no unsafe_code exemption — \`forbid\` applies everywhere with no opt-out."
+every crate in the shipped binary is now forbid(unsafe_code). rupu-app
+keeps its own exemption for objc2 FFI and is not in that graph."
 ```
 
 ---
