@@ -41,7 +41,7 @@ impl From<HostStoreError> for HostConnectorError {
 ///   return an [`HostConnectorError::Invalid`] placeholder until Task 7 wires
 ///   the deps.
 /// - All other IDs are looked up in the [`HostStore`], and an
-///   [`HttpHostConnector`] is built from the stored transport + keychain token.
+///   [`HttpHostConnector`] is built from the stored transport + stored token.
 /// - Resolved connectors are cached in a `Mutex<HashMap>` so repeated calls
 ///   reuse the same `reqwest::Client`. Cache entries are invalidated on
 ///   `add_host` / `remove_host`.
@@ -168,7 +168,7 @@ impl HostRegistry {
                         tracing::warn!(
                             host_id = %host.id,
                             error = %e,
-                            "host_registry: keychain unavailable; probing without token"
+                            "host_registry: token store unreadable; probing without token"
                         );
                         None
                     }
@@ -197,12 +197,12 @@ impl HostRegistry {
     }
 
     /// Persist a new remote host record and (optionally) store its token in the
-    /// system keychain.
+    /// chmod-600 token store.
     ///
     /// Returns the newly created [`Host`] (with its generated id).
-    /// Keychain write failure is logged as a warning rather than returned as an
+    /// Token-store write failure is logged as a warning rather than returned as an
     /// error so that this method succeeds on platforms / environments (CI) where
-    /// the system keychain is unavailable.
+    /// the token store is unreadable.
     pub fn add_host(
         &self,
         name: &str,
@@ -296,7 +296,7 @@ impl HostRegistry {
         Ok((host, token))
     }
 
-    /// Remove a persisted host, its keychain token, and its cache entry.
+    /// Remove a persisted host, its stored token, and its cache entry.
     ///
     /// Refuses `"local"` with [`HostConnectorError::Invalid`].
     pub fn remove_host(&self, host_id: &str) -> Result<(), HostConnectorError> {
@@ -308,9 +308,9 @@ impl HostRegistry {
 
         self.store.delete(host_id)?;
 
-        // Best-effort: warn but don't propagate keychain failures.
+        // Best-effort: warn but don't propagate token-store failures.
         if let Err(e) = delete_host_token(host_id) {
-            tracing::warn!(host_id, error = %e, "host_registry: could not delete token from keychain");
+            tracing::warn!(host_id, error = %e, "host_registry: could not delete host token");
         }
 
         self.cache.lock().unwrap().remove(host_id);
@@ -322,7 +322,7 @@ impl HostRegistry {
 
     /// Build a connector from a persisted `Host` record.
     ///
-    /// The keychain read is best-effort: if it fails (e.g. on CI), the
+    /// The token read is best-effort: if it fails (e.g. on CI), the
     /// connector is built without a token rather than returning an error.
     fn build_connector(&self, host: &Host) -> Result<Arc<dyn HostConnector>, HostConnectorError> {
         match &host.transport {
@@ -333,7 +333,7 @@ impl HostRegistry {
                         tracing::warn!(
                             host_id = %host.id,
                             error = %e,
-                            "host_registry: keychain unavailable; connecting without token"
+                            "host_registry: token store unreadable; connecting without token"
                         );
                         None
                     }

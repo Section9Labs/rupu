@@ -42,16 +42,15 @@ pub enum Action {
     },
     /// Show configured providers + backend.
     Status,
-    /// Inspect or change the credential storage backend.
+    /// Show where credentials are stored.
     ///
-    /// OS keychain (default) vs chmod-600 JSON file. Use `--use file`
-    /// if the macOS keychain is dropping credentials between
-    /// signed-binary updates.
+    /// There is one backend: a chmod-600 JSON file at
+    /// `~/.rupu/auth.json`. The OS keychain backend was retired.
     Backend {
-        /// `keychain` (default on macOS / Linux with secret-service /
-        /// Windows) or `file` (chmod-600 `~/.rupu/auth.json`).
-        /// Omit to print the current choice + active source
-        /// (env-var, cache, or default probe).
+        /// `file` — the only supported value, and already in effect.
+        /// Accepted so existing scripts keep working; `keychain` is
+        /// refused with an explanation. Omit to print where credentials
+        /// currently live.
         #[arg(long, value_name = "KIND")]
         r#use: Option<String>,
         /// Human snapshot density (`focused` | `compact` | `full`).
@@ -140,6 +139,27 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
     crate::output::formats::ensure_supported(command_name, format, supported)
 }
 
+/// Names of user-defined openai-compatible providers from config.
+///
+/// Best-effort: an unreadable or absent config yields an empty list
+/// rather than an error, because the only caller is a courtesy notice.
+fn configured_named_providers() -> Vec<String> {
+    let Ok(global) = crate::paths::global_dir() else {
+        return Vec::new();
+    };
+    let global_cfg = global.join("config.toml");
+    let Ok(cfg) = rupu_config::layer_files_locked(Some(&global_cfg), None) else {
+        return Vec::new();
+    };
+    cfg.providers
+        .keys()
+        .filter(|name| {
+            rupu_runtime::provider_factory::openai_compatible_params(name, &cfg.providers).is_some()
+        })
+        .cloned()
+        .collect()
+}
+
 /// Load layered config and return true if `name` is a declared
 /// openai-compatible provider.
 fn is_openai_compatible_name(name: &str) -> bool {
@@ -170,6 +190,8 @@ fn parse_provider(s: &str) -> anyhow::Result<ProviderId> {
 }
 
 async fn login(provider: &str, mode: AuthModeArg, key: Option<&str>) -> anyhow::Result<()> {
+    warn_about_stranded_keychain_credentials();
+
     if is_openai_compatible_name(provider) {
         if parse_provider(provider).is_ok() {
             anyhow::bail!(
@@ -417,6 +439,28 @@ impl DetailOutput for AuthBackendOutput {
     }
 }
 
+/// Tell the user once, at login time, if an older rupu left credentials
+/// in the macOS keychain. Without this they simply appear logged out
+/// with no explanation. Read-only and best-effort: a `security` probe
+/// that fails for any reason yields no findings and no output.
+fn warn_about_stranded_keychain_credentials() {
+    // Named (openai-compatible) providers were stored under the same
+    // account shapes as built-ins, so they have to be probed too — the
+    // built-in list alone would miss them silently.
+    let named = configured_named_providers();
+    let stranded = rupu_auth::detect_stranded_keychain_credentials(&named);
+    if stranded.is_empty() {
+        return;
+    }
+    eprintln!(
+        "note: credentials for {} are still in the macOS keychain from an older rupu.\n      \
+         That store was retired; rupu now keeps credentials in a chmod-600 file.\n      \
+         Logging in here replaces them. The old entries are left untouched and\n      \
+         can be removed with:  security delete-generic-password -s rupu -a <account>",
+        stranded.join(", ")
+    );
+}
+
 async fn backend(
     r#use: Option<&str>,
     no_color: bool,
@@ -424,85 +468,70 @@ async fn backend(
     view: LiveViewMode,
     global_format: Option<OutputFormat>,
 ) -> anyhow::Result<()> {
-    // Persist the user's choice via a tiny shell-rc-friendly env-export
-    // hint rather than writing to the cache directly: the env var
-    // lives at the session boundary, and any in-process change here
-    // wouldn't outlive `rupu auth backend` itself. The cache file is
-    // still updated below for cases where probe behavior matters.
+    // There is only one credential backend: a chmod-600 JSON file. This
+    // command survives as a way to report *where* credentials live; the
+    // `--use` flag survives only to give an explicit answer to anyone
+    // still asking for the retired keychain.
     let global = crate::paths::global_dir()?;
-    let cache_path = global.join("cache/auth-backend.json");
-    let cache = rupu_auth::ProbeCache::new(cache_path.clone());
     let auth_path = global.join("auth.json");
     let prefs = auth_ui_prefs(no_color, pager_flag, view)?;
 
-    if let Some(target) = r#use {
-        let target_norm = target.trim().to_ascii_lowercase();
-        let choice = match target_norm.as_str() {
-            "file" | "json" | "json-file" | "json_file" => rupu_auth::BackendChoice::JsonFile,
-            "keyring" | "keychain" | "os" | "os-keychain" => rupu_auth::BackendChoice::Keyring,
-            other => anyhow::bail!("unknown backend `{other}` — expected one of: file | keychain"),
-        };
-        // Update the cache so future invocations without the env var
-        // pick the same backend.
-        if let Err(e) = cache.write(choice) {
-            tracing::warn!(error = %e, "failed to write probe cache");
+    // The probe cache selected between backends that no longer both
+    // exist. Remove it rather than leave a file implying a choice is
+    // still being made.
+    let stale_cache = global.join("cache/auth-backend.json");
+    if stale_cache.exists() {
+        if let Err(e) = std::fs::remove_file(&stale_cache) {
+            tracing::warn!(
+                error = %e,
+                path = %stale_cache.display(),
+                "could not remove stale auth-backend probe cache"
+            );
         }
-        let env_value = match choice {
-            rupu_auth::BackendChoice::JsonFile => "file",
-            rupu_auth::BackendChoice::Keyring => "keychain",
-        };
-        if matches!(global_format, Some(OutputFormat::Json)) {
-            let report = AuthBackendReport {
-                kind: "auth_backend",
-                version: 1,
-                item: AuthBackendItem {
-                    requested_backend: Some(env_value.to_string()),
-                    active_backend: format!("cached: {env_value}"),
-                    cache_path: cache_path.display().to_string(),
-                    auth_path: auth_path.display().to_string(),
-                    cache_choice: Some(env_value.to_string()),
-                    env_override: None,
-                },
-            };
-            return report::emit_detail(global_format, &AuthBackendOutput { prefs, report });
+    }
+
+    if let Some(target) = r#use {
+        match target.trim().to_ascii_lowercase().as_str() {
+            "file" | "json" | "json-file" | "json_file" => {}
+            "keyring" | "keychain" | "os" | "os-keychain" => anyhow::bail!(
+                "the OS keychain backend is no longer supported — rupu stores \
+                 credentials in a chmod-600 file at `{}`. There is nothing to \
+                 select; `--use file` is the only valid value and is already in \
+                 effect.",
+                auth_path.display()
+            ),
+            other => {
+                anyhow::bail!("unknown backend `{other}` — the only supported value is: file")
+            }
         }
         let report = AuthBackendReport {
             kind: "auth_backend",
             version: 1,
             item: AuthBackendItem {
-                requested_backend: Some(env_value.to_string()),
-                active_backend: format!("cached: {env_value}"),
-                cache_path: cache_path.display().to_string(),
+                requested_backend: Some("file".to_string()),
+                active_backend: "file".to_string(),
+                cache_path: stale_cache.display().to_string(),
                 auth_path: auth_path.display().to_string(),
-                cache_choice: Some(env_value.to_string()),
+                cache_choice: None,
                 env_override: None,
             },
         };
         return report::emit_detail(global_format, &AuthBackendOutput { prefs, report });
     }
 
-    // Show current state.
-    let env_override = std::env::var(rupu_auth::ENV_BACKEND_OVERRIDE).ok();
-    let cached = cache.read();
-    let active = match (env_override.as_deref(), cached) {
-        (Some(v), _) => format!("env-var override: {v}"),
-        (None, Some(rupu_auth::BackendChoice::Keyring)) => "cached: keychain".into(),
-        (None, Some(rupu_auth::BackendChoice::JsonFile)) => "cached: file".into(),
-        (None, None) => "default: file (chmod-600 ~/.rupu/auth.json)".into(),
-    };
+    // Show current state. `RUPU_AUTH_FILE` can still relocate the store,
+    // so surface it — but it selects a path, never a different backend.
     let report = AuthBackendReport {
         kind: "auth_backend",
         version: 1,
         item: AuthBackendItem {
             requested_backend: None,
-            active_backend: active,
-            cache_path: cache_path.display().to_string(),
-            auth_path: auth_path.display().to_string(),
-            cache_choice: cached.map(|choice| match choice {
-                rupu_auth::BackendChoice::JsonFile => "file".to_string(),
-                rupu_auth::BackendChoice::Keyring => "keychain".to_string(),
-            }),
-            env_override,
+            active_backend: "file".to_string(),
+            cache_path: stale_cache.display().to_string(),
+            auth_path: std::env::var("RUPU_AUTH_FILE")
+                .unwrap_or_else(|_| auth_path.display().to_string()),
+            cache_choice: None,
+            env_override: std::env::var("RUPU_AUTH_FILE").ok(),
         },
     };
     report::emit_detail(global_format, &AuthBackendOutput { prefs, report })
@@ -650,25 +679,17 @@ fn render_auth_backend_command_rows(
     )];
     let mut table = crate::output::tables::new_table();
     table.set_header(vec!["MODE", "COMMAND", "EFFECT"]);
+    // There is one backend, so nothing here offers a choice — these are
+    // the levers that still exist: relocate the store, or populate it.
     table.add_row(vec![
-        Cell::new("persist"),
-        Cell::new("rupu auth backend --use file"),
-        Cell::new("store credentials in ~/.rupu/auth.json"),
+        Cell::new("relocate"),
+        Cell::new("export RUPU_AUTH_FILE=/path/to/auth.json"),
+        Cell::new("store credentials at an explicit path"),
     ]);
     table.add_row(vec![
-        Cell::new("persist"),
-        Cell::new("rupu auth backend --use keychain"),
-        Cell::new("store credentials in the OS keychain"),
-    ]);
-    table.add_row(vec![
-        Cell::new("shell"),
-        Cell::new("export RUPU_AUTH_BACKEND=file"),
-        Cell::new("override the backend for the current shell"),
-    ]);
-    table.add_row(vec![
-        Cell::new("shell"),
-        Cell::new("export RUPU_AUTH_BACKEND=keychain"),
-        Cell::new("override the backend for the current shell"),
+        Cell::new("relocate"),
+        Cell::new("export RUPU_HOME=/path/to/rupu-dir"),
+        Cell::new("move the whole rupu directory, auth.json included"),
     ]);
     if item.requested_backend.as_deref() == Some("file") {
         table.add_row(vec![

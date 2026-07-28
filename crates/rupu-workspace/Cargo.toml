@@ -17,7 +17,7 @@ thiserror.workspace = true
 ulid.workspace = true
 chrono.workspace = true
 tracing.workspace = true
-keyring = { workspace = true }
+dirs.workspace = true
 sha2.workspace = true
 rand.workspace = true
 tar = { workspace = true }
@@ -29,5 +29,6 @@ rupu-runtime = { path = "../rupu-runtime" }
 
 [dev-dependencies]
 tempfile.workspace = true
+serial_test.workspace = true
 assert_fs.workspace = true
 predicates.workspace = true

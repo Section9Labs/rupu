@@ -26,39 +26,29 @@ pub trait CredentialResolver: Send + Sync {
 
 // ── KeychainResolver ─────────────────────────────────────────────────────────
 
+use crate::account_key::{account_for, legacy_account_for};
 use crate::backend::ProviderId;
-#[cfg(not(target_os = "macos"))]
-use crate::keychain_layout::KeychainKey;
-use crate::keychain_layout::{key_for, legacy_key_for};
 use crate::stored::StoredCredential;
 use std::path::PathBuf;
 
-/// Production resolver: reads/writes [`StoredCredential`] JSON to the OS
-/// keychain at `rupu/<provider>/<mode>` entries — OR, when the
-/// `RUPU_AUTH_BACKEND=file` env var is set, to `~/.rupu/auth.json`
-/// (chmod 600).
+/// Production resolver: reads/writes [`StoredCredential`] JSON to a
+/// chmod-600 file at `~/.rupu/auth.json`, overridable via `RUPU_HOME`
+/// or `RUPU_AUTH_FILE`.
 ///
-/// The file backend is the escape hatch for the macOS keychain
-/// dropping credentials between signed-binary updates: every new
-/// build has a different cdhash, the keychain ACL pins the trusted
-/// app to that cdhash, and the next build's read silently fails
-/// in non-interactive contexts. Setting `RUPU_AUTH_BACKEND=file`
-/// stores secrets in a normal chmod-600 JSON file that survives
-/// updates because it's not bound to any signing identity.
+/// This is the only credential backend. The OS keychain was retired
+/// because a bare CLI binary's keychain requirement is cdhash-bound:
+/// every rebuild invalidates it and the next read silently fails, which
+/// is how "my credentials vanished after an update" kept happening.
+/// `gh`, `aws`, `gcloud`, `kubectl`, and `terraform` all store
+/// credentials in files for the same reason.
 ///
 /// On SSO entries whose access token is within [`EXPIRY_REFRESH_BUFFER_SECS`]
 /// of expiry, [`KeychainResolver::get`] performs a silent token refresh via
 /// the standard OAuth refresh-token grant before returning credentials.
 pub struct KeychainResolver {
-    storage: Storage,
-}
-
-/// Where credentials actually live for this resolver instance. The
-/// keyring path is the default; the JSON-file path is the escape
-/// hatch via `RUPU_AUTH_BACKEND=file`.
-enum Storage {
-    Keyring { service: String },
-    JsonFile { path: PathBuf },
+    /// Where credentials live: a chmod-600 JSON file. There is no
+    /// second backend — see the type docs.
+    path: PathBuf,
 }
 
 /// Resolve the global rupu directory, honoring `$RUPU_HOME` (set by
@@ -91,71 +81,15 @@ impl KeychainResolver {
         Self::with_service("rupu")
     }
 
-    pub fn with_service(service: &str) -> Self {
-        // Backend selection priority:
-        //   1. `RUPU_AUTH_BACKEND` env var — session override for
-        //      users who explicitly want the OS keychain (or for
-        //      tests that need to swap out at runtime).
-        //   2. Probe cache at `<HOME>/.rupu/cache/auth-backend.json`
-        //      — persistent choice, set via `rupu auth backend --use`.
-        //   3. Default = file (chmod-600 JSON at `~/.rupu/auth.json`).
-        //      This matches what `gh`, `aws`, `gcloud`, `claude-cli`,
-        //      `kubectl`, `terraform`, and most CLI peers do — none
-        //      of them hit the OS keychain by default. The keychain
-        //      is great for `.app` bundles whose designated
-        //      requirement is bundle-ID-based (any binary signed
-        //      under that bundle ID + Team ID matches), but for
-        //      bare CLI binaries the requirement is cdhash-bound
-        //      and breaks on every rebuild — leading to the
-        //      "credentials vanished after update" UX rupu hit
-        //      repeatedly.
-        let env_choice = std::env::var(crate::ENV_BACKEND_OVERRIDE)
-            .ok()
-            .map(|s| s.trim().to_ascii_lowercase());
-        let want_file = match env_choice.as_deref() {
-            Some("file") | Some("json") | Some("json-file") | Some("json_file") => Some(true),
-            Some("keyring") | Some("keychain") | Some("os") | Some("os-keychain") => Some(false),
-            // Empty / unset → fall through to cache.
-            _ => None,
-        }
-        .or_else(|| {
-            // Cache lives at `<RUPU_HOME>/cache/auth-backend.json` —
-            // same layout the CLI's `rupu auth backend` writes to,
-            // and honors the same `RUPU_HOME` test override.
-            let cache_path = rupu_home_dir()?.join("cache").join("auth-backend.json");
-            let text = std::fs::read_to_string(&cache_path).ok()?;
-            let choice: crate::BackendChoice = serde_json::from_str(&text).ok()?;
-            Some(matches!(choice, crate::BackendChoice::JsonFile))
-        })
-        // Default to file when no env override and no cache.
-        .unwrap_or(true);
-
-        let storage = if want_file {
-            let path = std::env::var("RUPU_AUTH_FILE")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| default_auth_json_path());
-            tracing::info!(
-                path = %path.display(),
-                "credential backend = file (chmod-600 JSON); set RUPU_AUTH_BACKEND=keychain to override"
-            );
-            Storage::JsonFile { path }
-        } else {
-            Storage::Keyring {
-                service: service.to_string(),
-            }
-        };
-        Self { storage }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn entry(&self, key: &KeychainKey) -> Result<keyring::Entry> {
-        match &self.storage {
-            Storage::Keyring { service } => keyring::Entry::new(service, &key.account)
-                .map_err(|e| anyhow::anyhow!("keychain entry: {e}")),
-            Storage::JsonFile { .. } => Err(anyhow::anyhow!(
-                "keychain entry not used in file-backend mode (programmer error)"
-            )),
-        }
+    /// The `service` argument is retained for source compatibility with
+    /// callers written against the keychain era; it no longer selects
+    /// anything, because there is only one backend.
+    pub fn with_service(_service: &str) -> Self {
+        let path = std::env::var("RUPU_AUTH_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| default_auth_json_path());
+        tracing::debug!(path = %path.display(), "credential store");
+        Self { path }
     }
 
     /// Read the chmod-600 JSON file as a flat key→value map. Missing
@@ -203,83 +137,33 @@ impl KeychainResolver {
     }
 
     fn write_account(&self, account: &str, payload: &str) -> Result<()> {
-        match &self.storage {
-            Storage::Keyring { service } => {
-                #[cfg(target_os = "macos")]
-                {
-                    rupu_keychain_acl::set_generic_password(service, account, payload.as_bytes())
-                        .map_err(|e| anyhow::anyhow!("keychain set: {e}"))?;
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    let key = KeychainKey {
-                        service: service.clone(),
-                        account: account.to_string(),
-                    };
-                    let entry = self.entry(&key)?;
-                    entry
-                        .set_password(payload)
-                        .map_err(|e| anyhow::anyhow!("keychain set: {e}"))?;
-                    crate::keyring::try_add_self_to_acl(account);
-                }
-            }
-            Storage::JsonFile { path } => {
-                let mut map = Self::read_file_map(path)?;
-                map.insert(account.to_string(), payload.to_string());
-                Self::write_file_map(path, &map)?;
-            }
-        }
+        let mut map = Self::read_file_map(&self.path)?;
+        map.insert(account.to_string(), payload.to_string());
+        Self::write_file_map(&self.path, &map)?;
         Ok(())
     }
 
     fn delete_account(&self, account: &str) -> Result<()> {
-        match &self.storage {
-            Storage::Keyring { service } => {
-                #[cfg(target_os = "macos")]
-                {
-                    match rupu_keychain_acl::delete_generic_password(service, account) {
-                        Ok(()) | Err(rupu_keychain_acl::AclError::NotFound { .. }) => Ok(()),
-                        Err(e) => Err(anyhow::anyhow!("keychain delete: {e}")),
-                    }
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    let key = KeychainKey {
-                        service: service.clone(),
-                        account: account.to_string(),
-                    };
-                    let entry = self.entry(&key)?;
-                    match entry.delete_credential() {
-                        Ok(()) => Ok(()),
-                        Err(keyring::Error::NoEntry) => Ok(()),
-                        Err(e) => Err(anyhow::anyhow!("keychain delete: {e}")),
-                    }
-                }
-            }
-            Storage::JsonFile { path } => {
-                let mut map = Self::read_file_map(path)?;
-                if map.remove(account).is_some() {
-                    Self::write_file_map(path, &map)?;
-                }
-                Ok(())
-            }
+        let mut map = Self::read_file_map(&self.path)?;
+        if map.remove(account).is_some() {
+            Self::write_file_map(&self.path, &map)?;
         }
+        Ok(())
     }
 
     pub async fn store(&self, p: ProviderId, mode: AuthMode, sc: &StoredCredential) -> Result<()> {
-        let key = key_for(p, mode);
+        let account = account_for(p, mode);
         let payload = serde_json::to_string(sc).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
-        self.write_account(&key.account, &payload)
+        self.write_account(&account, &payload)
     }
 
     pub async fn forget(&self, p: ProviderId, mode: AuthMode) -> Result<()> {
-        let key = key_for(p, mode);
-        self.delete_account(&key.account)
+        self.delete_account(&account_for(p, mode))
     }
 
     /// Read a credential by its account *base* string (e.g. `"oracle"` or a
-    /// built-in's `as_str()`), composing the `<base>/<mode>` keychain account
-    /// exactly like [`key_for`]. The `legacy_base` (if any) is the bare
+    /// built-in's `as_str()`), composing the `<base>/<mode>` store key
+    /// exactly like [`account_for`]. The `legacy_base` (if any) is the bare
     /// account tried for api-key entries written before the mode suffix.
     fn read_account(
         &self,
@@ -288,92 +172,22 @@ impl KeychainResolver {
         mode: AuthMode,
     ) -> Result<Option<StoredCredential>> {
         let account = format!("{account_base}/{}", mode.as_str());
-        match &self.storage {
-            Storage::Keyring { service } => {
-                #[cfg(target_os = "macos")]
-                {
-                    match rupu_keychain_acl::get_generic_password(service, &account) {
-                        Ok(bytes) => {
-                            let s = String::from_utf8(bytes)
-                                .map_err(|e| anyhow::anyhow!("keychain read: {e}"))?;
-                            Ok(Some(parse_stored_credential(&s, mode)?))
-                        }
-                        Err(rupu_keychain_acl::AclError::NotFound { .. }) => {
-                            if mode == AuthMode::ApiKey {
-                                if let Some(lb) = legacy_base {
-                                    match rupu_keychain_acl::get_generic_password(service, lb) {
-                                        Ok(bytes) => {
-                                            let s = String::from_utf8(bytes).map_err(|e| {
-                                                anyhow::anyhow!("keychain legacy read: {e}")
-                                            })?;
-                                            return Ok(Some(StoredCredential::api_key(s)));
-                                        }
-                                        Err(rupu_keychain_acl::AclError::NotFound { .. }) => {}
-                                        Err(e) => {
-                                            return Err(anyhow::anyhow!(
-                                                "keychain legacy read: {e}"
-                                            ))
-                                        }
-                                    }
-                                }
-                            }
-                            Ok(None)
-                        }
-                        Err(e) => Err(anyhow::anyhow!("keychain read: {e}")),
-                    }
+        let map = Self::read_file_map(&self.path)?;
+        if let Some(s) = map.get(&account) {
+            return Ok(Some(parse_stored_credential(s, mode)?));
+        }
+        if mode == AuthMode::ApiKey {
+            if let Some(lb) = legacy_base {
+                if let Some(legacy) = map.get(lb) {
+                    return Ok(Some(StoredCredential::api_key(legacy.clone())));
                 }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    let key = KeychainKey {
-                        service: service.clone(),
-                        account: account.clone(),
-                    };
-                    match self.entry(&key)?.get_password() {
-                        Ok(s) => Ok(Some(parse_stored_credential(&s, mode)?)),
-                        Err(keyring::Error::NoEntry) => {
-                            if mode == AuthMode::ApiKey {
-                                if let Some(lb) = legacy_base {
-                                    let lk = KeychainKey {
-                                        service: service.clone(),
-                                        account: lb.to_string(),
-                                    };
-                                    match self.entry(&lk)?.get_password() {
-                                        Ok(s) => return Ok(Some(StoredCredential::api_key(s))),
-                                        Err(keyring::Error::NoEntry) => {}
-                                        Err(e) => {
-                                            return Err(anyhow::anyhow!(
-                                                "keychain legacy read: {e}"
-                                            ))
-                                        }
-                                    }
-                                }
-                            }
-                            Ok(None)
-                        }
-                        Err(e) => Err(anyhow::anyhow!("keychain read: {e}")),
-                    }
-                }
-            }
-            Storage::JsonFile { path } => {
-                let map = Self::read_file_map(path)?;
-                if let Some(s) = map.get(&account) {
-                    return Ok(Some(parse_stored_credential(s, mode)?));
-                }
-                if mode == AuthMode::ApiKey {
-                    if let Some(lb) = legacy_base {
-                        if let Some(legacy) = map.get(lb) {
-                            return Ok(Some(StoredCredential::api_key(legacy.clone())));
-                        }
-                    }
-                }
-                Ok(None)
             }
         }
+        Ok(None)
     }
 
     fn read(&self, p: ProviderId, mode: AuthMode) -> Result<Option<StoredCredential>> {
-        let legacy = legacy_key_for(p);
-        self.read_account(p.as_str(), Some(&legacy.account), mode)
+        self.read_account(p.as_str(), Some(&legacy_account_for(p)), mode)
     }
 
     fn parse_provider(name: &str) -> Result<ProviderId> {

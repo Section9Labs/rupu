@@ -1,9 +1,10 @@
 //! Host registry. Lives at `~/.rupu/hosts/`.
 //!
 //! Stores connection metadata for named rupu hosts (local + remote CP instances).
-//! Tokens are kept in the system keychain via `keyring`; only transport metadata
-//! lives on disk. Tunnel hosts use token-hashed enrollment — the plaintext token
-//! is returned once from [`enroll_node`] and never persisted.
+//! Tokens are kept in a chmod-600 JSON file at `<RUPU_HOME>/hosts/tokens.json`;
+//! transport metadata lives beside it as one TOML file per host. Tunnel hosts
+//! use token-hashed enrollment — the plaintext token is returned once from
+//! [`enroll_node`] and never persisted.
 
 use crate::repo_store::sanitize_component;
 use chrono::Utc;
@@ -36,8 +37,6 @@ pub enum HostStoreError {
         #[source]
         source: toml::de::Error,
     },
-    #[error("keyring: {0}")]
-    Keyring(#[from] keyring::Error),
 }
 
 // ---------------------------------------------------------------------------
@@ -86,7 +85,7 @@ pub enum HostStatus {
     Stale,
 }
 
-/// Persisted host record (token lives in keychain, not here).
+/// Persisted host record (the token lives in `tokens.json`, not here).
 ///
 /// For `Tunnel` hosts an additional `token_hash` (SHA-256 hex of the node's
 /// bearer token) is stored so the server can verify inbound connections without
@@ -328,37 +327,105 @@ pub fn verify_node_token(host: &Host, token: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Keyring helpers
+// Token storage
 // ---------------------------------------------------------------------------
+//
+// A chmod-600 JSON map at `<RUPU_HOME>/hosts/tokens.json`. Deliberately
+// separate from rupu-auth's `JsonFileBackend`, which is keyed by the
+// fixed `ProviderId` enum — host ids are arbitrary strings, a different
+// key space. The permission discipline is identical.
+//
+// These take no root argument because their five call sites (rupu-cli's
+// `cmd::host`, rupu-cp's `host::registry`) have none to give; the global
+// store is resolved here the same way rupu-auth resolves `auth.json`.
 
-const KEYRING_SERVICE: &str = "rupu-host";
+/// Resolve the global rupu directory, honoring `$RUPU_HOME` before
+/// falling back to `~/.rupu/`. Mirrors `rupu_auth::resolver`'s resolution
+/// so the two stores never disagree about where "global" is.
+fn rupu_home_dir() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("RUPU_HOME") {
+        return Some(PathBuf::from(p));
+    }
+    dirs::home_dir().map(|h| h.join(".rupu"))
+}
 
-/// Store a token for `host_id` in the system keychain.
-pub fn set_host_token(host_id: &str, token: &str) -> Result<(), HostStoreError> {
-    keyring::Entry::new(KEYRING_SERVICE, host_id)?.set_password(token)?;
+fn tokens_path() -> PathBuf {
+    match rupu_home_dir() {
+        Some(home) => home.join("hosts").join("tokens.json"),
+        None => {
+            warn!("HOME not set; storing host tokens in the current directory");
+            PathBuf::from("./host-tokens.json")
+        }
+    }
+}
+
+fn read_tokens() -> Result<std::collections::BTreeMap<String, String>, HostStoreError> {
+    let path = tokens_path();
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|e| HostStoreError::Io {
+            action: format!("parse {}", path.display()),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(source) => Err(HostStoreError::Io {
+            action: format!("read {}", path.display()),
+            source,
+        }),
+    }
+}
+
+fn write_tokens(map: &std::collections::BTreeMap<String, String>) -> Result<(), HostStoreError> {
+    let path = tokens_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| HostStoreError::Io {
+            action: format!("create_dir_all {}", parent.display()),
+            source,
+        })?;
+    }
+    let body = serde_json::to_string_pretty(map).map_err(|e| HostStoreError::Io {
+        action: "serialize host tokens".to_string(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+    })?;
+    std::fs::write(&path, body).map_err(|source| HostStoreError::Io {
+        action: format!("write {}", path.display()),
+        source,
+    })?;
+    // Reset permissions on every write, exactly as rupu-auth's json_file
+    // backend does — a token file that is group- or world-readable is a
+    // credential leak, and a previously loose file gets tightened here.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "could not enforce mode 0600 on host tokens"
+            );
+        }
+    }
     Ok(())
 }
 
-/// Retrieve the token for `host_id` from the system keychain.
-/// Returns `Ok(None)` when no entry exists.
-pub fn get_host_token(host_id: &str) -> Result<Option<String>, HostStoreError> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, host_id)?;
-    match entry.get_password() {
-        Ok(t) => Ok(Some(t)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(HostStoreError::Keyring(e)),
-    }
+/// Store a token for `host_id`.
+pub fn set_host_token(host_id: &str, token: &str) -> Result<(), HostStoreError> {
+    let mut map = read_tokens()?;
+    map.insert(host_id.to_string(), token.to_string());
+    write_tokens(&map)
 }
 
-/// Delete the token for `host_id` from the system keychain.
-/// Silently succeeds if no entry exists.
+/// Retrieve the token for `host_id`. `Ok(None)` when none is stored.
+pub fn get_host_token(host_id: &str) -> Result<Option<String>, HostStoreError> {
+    Ok(read_tokens()?.get(host_id).cloned())
+}
+
+/// Delete the token for `host_id`. Succeeds when none is stored.
 pub fn delete_host_token(host_id: &str) -> Result<(), HostStoreError> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, host_id)?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(HostStoreError::Keyring(e)),
+    let mut map = read_tokens()?;
+    if map.remove(host_id).is_some() {
+        write_tokens(&map)?;
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -591,5 +658,75 @@ mod tests {
         let toml_str = toml::to_string(&host).unwrap();
         let decoded: Host = toml::from_str(&toml_str).unwrap();
         assert_eq!(host, decoded);
+    }
+
+    // ── Token storage ───────────────────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn host_tokens_round_trip_through_a_chmod_600_file() {
+        let home = tempdir().unwrap();
+        std::env::set_var("RUPU_HOME", home.path());
+
+        set_host_token("mini", "tok-abc").unwrap();
+        assert_eq!(get_host_token("mini").unwrap().as_deref(), Some("tok-abc"));
+
+        let path = home.path().join("hosts/tokens.json");
+        assert!(path.exists(), "tokens must land in hosts/tokens.json");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "token file must be chmod 600, got {mode:o}");
+        }
+
+        delete_host_token("mini").unwrap();
+        assert_eq!(get_host_token("mini").unwrap(), None);
+
+        std::env::remove_var("RUPU_HOME");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn missing_token_is_none_not_an_error() {
+        let home = tempdir().unwrap();
+        std::env::set_var("RUPU_HOME", home.path());
+        assert_eq!(get_host_token("never-stored").unwrap(), None);
+        std::env::remove_var("RUPU_HOME");
+    }
+
+    /// Several hosts coexist in one file — storing a second must not
+    /// clobber the first, which a naive "write the whole file" would do.
+    #[test]
+    #[serial_test::serial]
+    fn tokens_for_multiple_hosts_coexist() {
+        let home = tempdir().unwrap();
+        std::env::set_var("RUPU_HOME", home.path());
+
+        set_host_token("mini", "tok-mini").unwrap();
+        set_host_token("kuki", "tok-kuki").unwrap();
+
+        assert_eq!(get_host_token("mini").unwrap().as_deref(), Some("tok-mini"));
+        assert_eq!(get_host_token("kuki").unwrap().as_deref(), Some("tok-kuki"));
+
+        // Deleting one leaves the other intact.
+        delete_host_token("mini").unwrap();
+        assert_eq!(get_host_token("mini").unwrap(), None);
+        assert_eq!(get_host_token("kuki").unwrap().as_deref(), Some("tok-kuki"));
+
+        std::env::remove_var("RUPU_HOME");
+    }
+
+    /// Deleting a token that was never stored is a no-op, matching the
+    /// keychain behavior this replaced (callers rely on it during
+    /// `rupu host remove` for hosts that never had a token).
+    #[test]
+    #[serial_test::serial]
+    fn deleting_an_absent_token_succeeds() {
+        let home = tempdir().unwrap();
+        std::env::set_var("RUPU_HOME", home.path());
+        delete_host_token("never-stored").unwrap();
+        std::env::remove_var("RUPU_HOME");
     }
 }
