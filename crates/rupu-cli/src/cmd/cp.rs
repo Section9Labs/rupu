@@ -14,6 +14,13 @@ use tokio::sync::watch;
 #[derive(Subcommand, Debug)]
 pub enum Action {
     /// Start the control-plane HTTP server.
+    ///
+    /// Also runs three in-process background loops on a timer, not just the
+    /// HTTP server: the autoflow reconciler, the cron/event-trigger tick, and
+    /// the gate sweep (enforces gate `on_timeout` routing and reaps orphaned
+    /// runs with a dead `runner_pid`). Each loop is gated by a `[cp]` config
+    /// key and defaults to enabled at a 60s interval: `autoflow_reconcile_enabled`,
+    /// `cron_tick_enabled`, `gate_sweep_enabled` (see `rupu-config`'s `CpConfig`).
     Serve {
         /// Address to bind. Defaults to 127.0.0.1:7878.
         #[arg(long, default_value = "127.0.0.1:7878")]
