@@ -244,7 +244,7 @@ describe('Hosts page', () => {
 
   it('tunnel mode: calls enrollNode and shows command + token-once warning', async () => {
     const FAKE_TOKEN = 'abc123deadbeef';
-    const FAKE_COMMAND = `rupu node --cp-url ws://192.168.1.50:7878/api/node/connect --token ${FAKE_TOKEN} --node-id node_01JZTESTNODE001`;
+    const FAKE_COMMAND = `rupu node --cp-url wss://<your-cp-host>:7878 --token ${FAKE_TOKEN}`;
 
     vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
     const enrollSpy = vi.spyOn(api, 'enrollNode').mockResolvedValue({
@@ -415,8 +415,7 @@ describe('Hosts page', () => {
     vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
     vi.spyOn(api, 'enrollNode').mockResolvedValue({
       host: TUNNEL_HOST,
-      command:
-        'rupu node --cp-url ws://192.168.1.50:7878/api/node/connect --token t --node-id node_01JZTESTNODE001',
+      command: 'rupu node --cp-url wss://<your-cp-host>:7878 --token t',
       token: 't',
     });
 
