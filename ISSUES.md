@@ -115,7 +115,7 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-50 | P0 | README | MSRV is stated as 1.77; the workspace requires 1.88, so `cargo install` fails | open |
 | I-51 | P0 | docs | Three docs still say `actions:` is *not* a tool allowlist — since #533/#537 it narrows tools | open |
 | I-52 | P0 | docs/providers | `rupu run --agent <name>` is documented twice; the flag does not exist | open |
-| I-53 | P0 | docs/workflow-format | Approval **gate nodes** are entirely undocumented | open |
+| I-53 | P0 | docs/workflow-format | Approval **gate nodes** are entirely undocumented | fixed (in Arc 4) |
 | I-54 | P0 | docs/workflow-format | `action:` connector steps are entirely undocumented | open |
 | I-55 | P0 | docs/workflow-format | `branch:` is undocumented, including its silent-wrong-result transitive-arm rule | open |
 | I-56 | P0 | docs/workflow-format | The `wake_on:` example uses `github.pull_request.closed`, which never fires | open |
@@ -123,7 +123,7 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-58 | P1 | docs | There is no config reference page; ~25 shipped keys are documented nowhere | open |
 | I-59 | P1 | docs/workflow-format | Non-linear constructs (`next`/`depends_on`/`split`/`join`/`loops`/`max_concurrency`) are undocumented | open |
 | I-60 | P1 | docs/workflow-format | Remote placement (`host:`/`distribute:`/`workspace:`) is referenced but never defined | open |
-| I-61 | P1 | docs/workflow-format | "Timeouts are enforced lazily" is stale — the gate sweep enforces them by default | open |
+| I-61 | P1 | docs/workflow-format | "Timeouts are enforced lazily" is stale — the gate sweep enforces them by default | fixed (in Arc 4) |
 | I-62 | P1 | docs/workflow-format | `autoflow.entity` is documented as issue-only; `pull_request` ships | open |
 | I-63 | P1 | docs/agent-format | Six accepted frontmatter keys and three built-in tools are missing from the reference | open |
 | I-64 | P1 | docs/transcript-schema | `action_emitted` semantics are wrong and two shipped event types are undocumented | open |
@@ -406,6 +406,28 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-53 + I-61 — closed by Arc 4, recorded here for the ledger
+
+Both were fixed while closing [[I-37]] in Arc 4 and are recorded rather than re-worked.
+
+**I-53 — gate nodes were entirely undocumented.** Found while writing I-37's `cp serve`
+dependency note: standalone `approval:` gate nodes had **no user-facing documentation at
+all** — `on_timeout`, `auto_approve`, `on_reject` and `notify` appeared nowhere in `docs/`.
+A shipped feature with no docs. `docs/workflow-format.md` now has a "Gate nodes (standalone
+`approval:` steps)" section with the field table, the `steps.<gate-id>.decision` note, and
+the unattended-routing subsection.
+
+**I-61 — "timeouts are enforced lazily on the next run-store interaction" was stale.** True
+when written; **false since Arc 2** made the runs listing side-effect-free ([[I-25]]).
+Removed in the same edit, and replaced with the accurate statement that timeout routing is
+performed by `cp serve`'s gate sweep — which is what [[I-80]] tracks the operator
+consequence of.
+
+**Validation.** `grep -c "Gate nodes (standalone" docs/workflow-format.md` → 1;
+`grep -c "enforced lazily" docs/workflow-format.md` → 0.
+
+---
 
 ### I-45 + I-46 — the Gemini thinking config is model-gated and lowercase
 
