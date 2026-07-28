@@ -148,7 +148,14 @@ pub(crate) fn distinct_repo_workspaces(
 
 /// Scope tag for a workspace: the path's basename, falling back to the
 /// workspace id if the path has no basename (e.g. `/`).
-fn scope_name(w: &Workspace) -> String {
+///
+/// `pub(crate)` so the explicit, single-workspace resolvers
+/// (`workflows::resolve_workflow_scoped_explicit`,
+/// `agents::resolve_agent_scoped_explicit`) can derive the SAME display
+/// `scope` string for an arbitrary registered workspace — not just a
+/// [`distinct_repo_workspaces`] representative — without re-deriving (and
+/// risking drifting from) this logic.
+pub(crate) fn scope_name(w: &Workspace) -> String {
     std::path::Path::new(&w.path)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())

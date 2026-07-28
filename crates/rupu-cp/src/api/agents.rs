@@ -1,7 +1,7 @@
 use crate::{
     agent_launcher::{AgentLaunchError, AgentLaunchRequest, AgentLauncher},
     api::fs_safety::{validate_name, validate_within, write_atomic},
-    api::repo_scope::{distinct_repo_workspaces, ScopeKind, ScopeQuery},
+    api::repo_scope::{distinct_repo_workspaces, scope_name, ScopeKind, ScopeQuery},
     error::{ApiError, ApiResult},
     host::connector::HostConnectorError,
     session_starter::{SessionStartError, SessionStartRequest, SessionStarter},
@@ -116,9 +116,12 @@ pub(crate) fn resolve_agent_scoped(
 /// Resolve agent file-STEM `slug` restricted to an EXPLICIT scope — the
 /// disambiguating counterpart to [`resolve_agent_scoped`]'s implicit
 /// (project-first, then global) walk. Mirrors
-/// `workflows::resolve_workflow_scoped_explicit` exactly; see its doc
-/// comment for the full contract (global-only vs. one workspace pinned by
-/// `scope_id`, `None` on any mismatch rather than a fallback).
+/// `workflows::resolve_workflow_scoped_explicit` exactly, INCLUDING its
+/// `ScopeKind::Project` match against the FULL registered-workspace list
+/// (not just [`distinct_repo_workspaces`]'s representatives) — see that
+/// function's doc comment for the full contract (global-only vs. one
+/// workspace pinned by `scope_id`, `None` on any mismatch rather than a
+/// fallback).
 pub(crate) fn resolve_agent_scoped_explicit(
     s: &AppState,
     slug: &str,
@@ -138,15 +141,11 @@ pub(crate) fn resolve_agent_scoped_explicit(
         ScopeKind::Project => {
             let scope_id = scope_id?;
             let workspaces = store(s).list().unwrap_or_default();
-            let r = distinct_repo_workspaces(workspaces, &repo_store(s))
-                .into_iter()
-                .find(|r| r.workspace.id == scope_id)?;
-            let proj_dir = std::path::Path::new(&r.workspace.path)
-                .join(".rupu")
-                .join("agents");
+            let w = workspaces.into_iter().find(|w| w.id == scope_id)?;
+            let proj_dir = std::path::Path::new(&w.path).join(".rupu").join("agents");
             let candidate = proj_dir.join(format!("{slug}.md"));
             if candidate.exists() {
-                Some((candidate, proj_dir, r.scope, ScopeKind::Project))
+                Some((candidate, proj_dir, scope_name(&w), ScopeKind::Project))
             } else {
                 None
             }
@@ -1538,6 +1537,141 @@ mod tests {
             proj_agents.join("shared-name.md").exists(),
             "project file untouched"
         );
+    }
+
+    // ── resolve_agent_scoped_explicit: any registered workspace id, not
+    // just a distinct_repo_workspaces representative ─────────────────────
+    //
+    // Mirrors the workflows-side suite in `workflows.rs` exactly — see its
+    // doc comments for the full rationale (`/api/projects/:ws_id/*` reports
+    // the caller's REQUESTED `ws_id`, which for a multi-worktree repo is
+    // often not the representative `distinct_repo_workspaces` would pick).
+
+    /// (a) An explicit `scope_id` naming a NON-representative worktree of a
+    /// multi-worktree repo resolves to THAT worktree's own file.
+    #[tokio::test]
+    async fn explicit_project_scope_resolves_non_representative_worktree_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+
+        // proj-a sorts first -> distinct_repo_workspaces picks it as the
+        // representative when there's no tracked-repo preferred_path.
+        let proj_a = tmp.path().join("proj-a");
+        std::fs::create_dir_all(proj_a.join(".rupu").join("agents")).unwrap();
+        register_workspace_with_remote(&tmp, "ws_a", &proj_a, Some("git@github.com:acme/x.git"));
+
+        let proj_b = tmp.path().join("proj-b");
+        let agents_b = proj_b.join(".rupu").join("agents");
+        std::fs::create_dir_all(&agents_b).unwrap();
+        std::fs::write(agents_b.join("code-reviewer.md"), VALID_MD).unwrap();
+        register_workspace_with_remote(&tmp, "ws_b", &proj_b, Some("git@github.com:acme/x.git"));
+
+        // Confirm proj-a really is the representative.
+        let workspaces = store(&s).list().unwrap();
+        let reps = distinct_repo_workspaces(workspaces, &repo_store(&s));
+        assert_eq!(reps.len(), 1);
+        assert_eq!(reps[0].workspace.id, "ws_a");
+
+        let resolved =
+            resolve_agent_scoped_explicit(&s, "code-reviewer", ScopeKind::Project, Some("ws_b"))
+                .expect("must resolve against the non-representative worktree");
+        assert_eq!(resolved.0, agents_b.join("code-reviewer.md"));
+        assert_eq!(resolved.2, "proj-b");
+        assert_eq!(resolved.3, ScopeKind::Project);
+    }
+
+    /// (b) A representative's own id still resolves exactly as before.
+    #[tokio::test]
+    async fn explicit_project_scope_representative_id_still_resolves() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+
+        let proj_a = tmp.path().join("proj-a");
+        let agents_a = proj_a.join(".rupu").join("agents");
+        std::fs::create_dir_all(&agents_a).unwrap();
+        std::fs::write(agents_a.join("code-reviewer.md"), VALID_MD).unwrap();
+        register_workspace_with_remote(&tmp, "ws_a", &proj_a, Some("git@github.com:acme/x.git"));
+
+        let proj_b = tmp.path().join("proj-b");
+        std::fs::create_dir_all(proj_b.join(".rupu").join("agents")).unwrap();
+        register_workspace_with_remote(&tmp, "ws_b", &proj_b, Some("git@github.com:acme/x.git"));
+
+        let resolved =
+            resolve_agent_scoped_explicit(&s, "code-reviewer", ScopeKind::Project, Some("ws_a"))
+                .expect("representative id must still resolve");
+        assert_eq!(resolved.0, agents_a.join("code-reviewer.md"));
+        assert_eq!(resolved.2, "proj-a");
+    }
+
+    /// (c) An id matching no registered workspace at all still returns
+    /// `None` (⇒ the existing 404 path).
+    #[tokio::test]
+    async fn explicit_project_scope_unknown_id_returns_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        std::fs::create_dir_all(agents_dir(&s)).unwrap();
+
+        assert!(resolve_agent_scoped_explicit(
+            &s,
+            "code-reviewer",
+            ScopeKind::Project,
+            Some("no-such-workspace"),
+        )
+        .is_none());
+    }
+
+    /// (d) A KNOWN id whose own workspace does not contain the definition
+    /// returns `None` — no fallback to another workspace that does.
+    #[tokio::test]
+    async fn explicit_project_scope_known_id_without_def_returns_none_no_fallback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+
+        let proj_a = tmp.path().join("proj-a");
+        let agents_a = proj_a.join(".rupu").join("agents");
+        std::fs::create_dir_all(&agents_a).unwrap();
+        std::fs::write(agents_a.join("code-reviewer.md"), VALID_MD).unwrap();
+        register_workspace_with_remote(&tmp, "ws_a", &proj_a, Some("git@github.com:acme/x.git"));
+
+        // ws_b is a registered worktree of the SAME repo but has no
+        // `code-reviewer.md` of its own.
+        let proj_b = tmp.path().join("proj-b");
+        std::fs::create_dir_all(proj_b.join(".rupu").join("agents")).unwrap();
+        register_workspace_with_remote(&tmp, "ws_b", &proj_b, Some("git@github.com:acme/x.git"));
+
+        assert!(
+            resolve_agent_scoped_explicit(&s, "code-reviewer", ScopeKind::Project, Some("ws_b"))
+                .is_none(),
+            "must not fall back to ws_a's copy of the same-named def"
+        );
+        assert!(
+            agents_a.join("code-reviewer.md").exists(),
+            "ws_a's file must be untouched (never even inspected as a fallback target)"
+        );
+    }
+
+    /// (e) The `scope` string an explicit representative-id lookup returns
+    /// matches exactly what the aggregate list endpoint shows for that same
+    /// project row (both ultimately derive from `repo_scope::scope_name`).
+    #[tokio::test]
+    async fn explicit_project_scope_display_string_matches_list_endpoint() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp); // no global agents
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_agents = proj.path().join(".rupu").join("agents");
+        std::fs::create_dir_all(&proj_agents).unwrap();
+        std::fs::write(proj_agents.join("code-reviewer.md"), VALID_MD).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let Json(rows) = list_agents(State(s.clone())).await.expect("ok");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].scope_id.as_deref(), Some("ws_a"));
+
+        let resolved =
+            resolve_agent_scoped_explicit(&s, "code-reviewer", ScopeKind::Project, Some("ws_a"))
+                .expect("must resolve");
+        assert_eq!(resolved.2, rows[0].scope);
     }
 
     struct MockStarter {

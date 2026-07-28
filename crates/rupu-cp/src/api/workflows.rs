@@ -1,6 +1,6 @@
 use crate::{
     api::fs_safety,
-    api::repo_scope::{distinct_repo_workspaces, ScopeKind, ScopeQuery},
+    api::repo_scope::{distinct_repo_workspaces, scope_name, ScopeKind, ScopeQuery},
     error::{ApiError, ApiResult},
     host::connector::HostConnectorError,
     launcher::LaunchError,
@@ -151,9 +151,19 @@ pub(crate) fn resolve_workflow_path(s: &AppState, name: &str) -> Option<std::pat
 ///   workspace `id` — NOT the display `scope` string, which can collide
 ///   between two different repos whose representative workspace paths share
 ///   a basename) and looks ONLY at that ONE workspace, found by matching
-///   `scope_id` against [`distinct_repo_workspaces`]'s output. A `None`
-///   `scope_id` (or one that matches no representative workspace) resolves
-///   to `None` outright.
+///   `scope_id` against the FULL registered-workspace list (`store(s).list()`)
+///   — deliberately NOT [`distinct_repo_workspaces`]'s output. `/api/projects/
+///   :ws_id/*` (see `api::projects`) reports the caller's REQUESTED `ws_id`
+///   as `scope_id`, which for a repo with several registered worktrees is
+///   often NOT the one worktree `distinct_repo_workspaces` would pick as
+///   that repo's representative — matching only against representatives made
+///   any such id resolve to `None` unconditionally, 404ing every mutating
+///   action built on a non-representative project row. Any registered
+///   workspace id is a valid target: if the operator is looking at workspace
+///   X's definitions, a mutation must act on X's own files, never on some
+///   other worktree's copy that happens to be the representative. A `None`
+///   `scope_id` (or one matching no registered workspace) resolves to `None`
+///   outright — no fallback to another workspace.
 ///
 /// Returns `None` on ANY mismatch — file absent in the requested scope,
 /// `scope_id` not found, etc. — rather than falling back to another layer.
@@ -179,15 +189,11 @@ pub(crate) fn resolve_workflow_scoped_explicit(
         ScopeKind::Project => {
             let scope_id = scope_id?;
             let workspaces = store(s).list().unwrap_or_default();
-            let r = distinct_repo_workspaces(workspaces, &repo_store(s))
-                .into_iter()
-                .find(|r| r.workspace.id == scope_id)?;
-            let proj_dir = std::path::Path::new(&r.workspace.path)
-                .join(".rupu")
-                .join("workflows");
+            let w = workspaces.into_iter().find(|w| w.id == scope_id)?;
+            let proj_dir = std::path::Path::new(&w.path).join(".rupu").join("workflows");
             let candidate = proj_dir.join(format!("{name}.yaml"));
             if candidate.exists() {
-                Some((candidate, proj_dir, r.scope, ScopeKind::Project))
+                Some((candidate, proj_dir, scope_name(&w), ScopeKind::Project))
             } else {
                 None
             }
@@ -1441,6 +1447,158 @@ mod tests {
             proj_workflows.join("shared-name.yaml").exists(),
             "project file untouched"
         );
+    }
+
+    // ── resolve_workflow_scoped_explicit: any registered workspace id,
+    // not just a distinct_repo_workspaces representative ────────────────
+    //
+    // `/api/projects/:ws_id/*` reports the caller's REQUESTED `ws_id`
+    // (`projects::project_workflows` et al.), which for a repo with several
+    // registered worktrees is often NOT the one `distinct_repo_workspaces`
+    // would pick as that repo's representative. Matching only against
+    // representatives made such an id resolve to `None` unconditionally.
+
+    /// (a) An explicit `scope_id` naming a NON-representative worktree of a
+    /// multi-worktree repo resolves to THAT worktree's own file, not `None`
+    /// and not the representative's file.
+    #[tokio::test]
+    async fn explicit_project_scope_resolves_non_representative_worktree_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+
+        // proj-a sorts first -> distinct_repo_workspaces picks it as the
+        // representative when there's no tracked-repo preferred_path.
+        let proj_a = tmp.path().join("proj-a");
+        std::fs::create_dir_all(proj_a.join(".rupu").join("workflows")).unwrap();
+        register_workspace_with_remote(&tmp, "ws_a", &proj_a, Some("git@github.com:acme/x.git"));
+
+        let proj_b = tmp.path().join("proj-b");
+        let workflows_b = proj_b.join(".rupu").join("workflows");
+        std::fs::create_dir_all(&workflows_b).unwrap();
+        std::fs::write(
+            workflows_b.join("nightly.yaml"),
+            VALID_YAML.replace("demo", "nightly"),
+        )
+        .unwrap();
+        register_workspace_with_remote(&tmp, "ws_b", &proj_b, Some("git@github.com:acme/x.git"));
+
+        // Confirm proj-a really is the representative (and thus that a
+        // representative-only resolver could never have found ws_b's file).
+        let workspaces = store(&s).list().unwrap();
+        let reps = distinct_repo_workspaces(workspaces, &repo_store(&s));
+        assert_eq!(reps.len(), 1);
+        assert_eq!(reps[0].workspace.id, "ws_a");
+
+        let resolved =
+            resolve_workflow_scoped_explicit(&s, "nightly", ScopeKind::Project, Some("ws_b"))
+                .expect("must resolve against the non-representative worktree");
+        assert_eq!(resolved.0, workflows_b.join("nightly.yaml"));
+        assert_eq!(resolved.2, "proj-b");
+        assert_eq!(resolved.3, ScopeKind::Project);
+    }
+
+    /// (b) A representative's own id still resolves exactly as before.
+    #[tokio::test]
+    async fn explicit_project_scope_representative_id_still_resolves() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+
+        let proj_a = tmp.path().join("proj-a");
+        let workflows_a = proj_a.join(".rupu").join("workflows");
+        std::fs::create_dir_all(&workflows_a).unwrap();
+        std::fs::write(
+            workflows_a.join("nightly.yaml"),
+            VALID_YAML.replace("demo", "nightly"),
+        )
+        .unwrap();
+        register_workspace_with_remote(&tmp, "ws_a", &proj_a, Some("git@github.com:acme/x.git"));
+
+        let proj_b = tmp.path().join("proj-b");
+        std::fs::create_dir_all(proj_b.join(".rupu").join("workflows")).unwrap();
+        register_workspace_with_remote(&tmp, "ws_b", &proj_b, Some("git@github.com:acme/x.git"));
+
+        let resolved =
+            resolve_workflow_scoped_explicit(&s, "nightly", ScopeKind::Project, Some("ws_a"))
+                .expect("representative id must still resolve");
+        assert_eq!(resolved.0, workflows_a.join("nightly.yaml"));
+        assert_eq!(resolved.2, "proj-a");
+    }
+
+    /// (c) An id matching no registered workspace at all still returns
+    /// `None` (⇒ the existing 404 path).
+    #[tokio::test]
+    async fn explicit_project_scope_unknown_id_returns_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        std::fs::create_dir_all(workflows_dir(&s)).unwrap();
+
+        assert!(resolve_workflow_scoped_explicit(
+            &s,
+            "nightly",
+            ScopeKind::Project,
+            Some("no-such-workspace"),
+        )
+        .is_none());
+    }
+
+    /// (d) A KNOWN id whose own workspace does not contain the definition
+    /// returns `None` — no fallback to another workspace that does.
+    #[tokio::test]
+    async fn explicit_project_scope_known_id_without_def_returns_none_no_fallback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+
+        let proj_a = tmp.path().join("proj-a");
+        let workflows_a = proj_a.join(".rupu").join("workflows");
+        std::fs::create_dir_all(&workflows_a).unwrap();
+        std::fs::write(
+            workflows_a.join("nightly.yaml"),
+            VALID_YAML.replace("demo", "nightly"),
+        )
+        .unwrap();
+        register_workspace_with_remote(&tmp, "ws_a", &proj_a, Some("git@github.com:acme/x.git"));
+
+        // ws_b is a registered worktree of the SAME repo but has no
+        // `nightly.yaml` of its own.
+        let proj_b = tmp.path().join("proj-b");
+        std::fs::create_dir_all(proj_b.join(".rupu").join("workflows")).unwrap();
+        register_workspace_with_remote(&tmp, "ws_b", &proj_b, Some("git@github.com:acme/x.git"));
+
+        assert!(
+            resolve_workflow_scoped_explicit(&s, "nightly", ScopeKind::Project, Some("ws_b"))
+                .is_none(),
+            "must not fall back to ws_a's copy of the same-named def"
+        );
+        assert!(
+            workflows_a.join("nightly.yaml").exists(),
+            "ws_a's file must be untouched (never even inspected as a fallback target)"
+        );
+    }
+
+    /// (e) The `scope` string an explicit representative-id lookup returns
+    /// matches exactly what the aggregate list endpoint shows for that same
+    /// project row (both ultimately derive from `repo_scope::scope_name`).
+    #[tokio::test]
+    async fn explicit_project_scope_display_string_matches_list_endpoint() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        std::fs::create_dir_all(workflows_dir(&s)).unwrap(); // empty global
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_workflows = proj.path().join(".rupu").join("workflows");
+        std::fs::create_dir_all(&proj_workflows).unwrap();
+        std::fs::write(proj_workflows.join("nightly.yaml"), VALID_YAML.replace("demo", "nightly"))
+            .unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let Json(rows) = list_workflows(State(s.clone())).await.expect("ok");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].scope_id.as_deref(), Some("ws_a"));
+
+        let resolved =
+            resolve_workflow_scoped_explicit(&s, "nightly", ScopeKind::Project, Some("ws_a"))
+                .expect("must resolve");
+        assert_eq!(resolved.2, rows[0].scope);
     }
 
     /// Register a workspace record `<global_dir>/workspaces/<id>.toml` whose
