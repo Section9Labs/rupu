@@ -213,6 +213,21 @@ pub trait StepFactory: Send + Sync {
         transcript_path: PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
     ) -> AgentRunOpts;
+
+    /// The permission mode (`ask` / `bypass` / `readonly`) this factory's
+    /// tool registry enforces for the steps it builds, when the factory
+    /// tracks a single mode string. `run_workflow` reads this at
+    /// fresh-run creation to populate `RunRecord.permission_mode`
+    /// (ISSUES.md I-24) — the run's on_reject cleanup rebuild
+    /// (`crates/rupu-cli/src/resume.rs::rebuild_opts_from_disk`) falls
+    /// back to it so a `--mode readonly` run's cleanup chain can't
+    /// silently regain write access. Default `None` — a caller that
+    /// doesn't track a single mode string (e.g. a test harness's fake
+    /// factory) leaves the record's field unset, and `rebuild_opts_from_disk`
+    /// falls further back to `"ask"`.
+    fn permission_mode(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// `Clone` exists solely so [`run_scheduler`] can wrap one `Arc`-shared copy
@@ -680,6 +695,11 @@ pub async fn run_workflow(
                 resume_claimed_by: None,
                 resume_mode: None,
                 resume_gate_id: None,
+                // ISSUES.md I-24: capture the launch mode straight off the
+                // factory so it's on disk from the very first write —
+                // `rebuild_opts_from_disk` reads this back as the
+                // `on_reject`/approve-resume fallback under `resume_mode`.
+                permission_mode: opts.factory.permission_mode().map(str::to_string),
                 final_output: None,
                 loop_progress: std::collections::BTreeMap::new(),
             };
@@ -11648,6 +11668,7 @@ loops:
                     resume_claimed_by: None,
                     resume_mode: None,
                     resume_gate_id: None,
+                    permission_mode: None,
                     final_output: None,
                     loop_progress: BTreeMap::new(),
                 },

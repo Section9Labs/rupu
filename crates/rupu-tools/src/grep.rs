@@ -73,6 +73,21 @@ impl Tool for GrepTool {
             .as_deref()
             .map(|p| ctx.workspace_path.join(p))
             .unwrap_or_else(|| ctx.workspace_path.clone());
+        // Containment: `join` replaces the base for an absolute argument and
+        // does not normalize `..`, so an agent-supplied path can leave the
+        // workspace. Same guard the write tools use (ISSUES.md I-22).
+        if !crate::path_scope::is_inside(&ctx.workspace_path, &search_path) {
+            return Ok(ToolOutput {
+                stdout: String::new(),
+                error: Some(format!(
+                    "path {} escapes workspace",
+                    i.path.as_deref().unwrap_or(".")
+                )),
+                duration_ms: started.elapsed().as_millis() as u64,
+                derived: None,
+                structured: None,
+            });
+        }
 
         let out = Command::new(rg)
             .arg("--with-filename")
@@ -143,5 +158,89 @@ impl Tool for GrepTool {
             derived: None,
             structured: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool::ToolContext;
+
+    fn ctx_in(dir: &std::path::Path) -> ToolContext {
+        ToolContext {
+            workspace_path: dir.to_path_buf(),
+            ..ToolContext::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_absolute_path_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("in.txt"), "needle\n").unwrap();
+        let out = GrepTool
+            .invoke(
+                serde_json::json!({ "pattern": "needle", "path": "/etc" }),
+                &ctx_in(dir.path()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("escapes workspace"),
+            "absolute path must be refused, got: {:?} / {}",
+            out.error,
+            out.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parent_traversal_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("work");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(dir.path().join("outside.txt"), "needle\n").unwrap();
+        let out = GrepTool
+            .invoke(
+                serde_json::json!({ "pattern": "needle", "path": "../" }),
+                &ctx_in(&inner),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("escapes workspace"),
+            "got: {:?} / {}",
+            out.error,
+            out.stdout
+        );
+        assert!(
+            !out.stdout.contains("outside.txt"),
+            "refusal must not leak results from outside the workspace: {}",
+            out.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn an_in_workspace_path_still_searches() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("a.txt"), "needle\n").unwrap();
+        let out = GrepTool
+            .invoke(
+                serde_json::json!({ "pattern": "needle", "path": "src" }),
+                &ctx_in(dir.path()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.stdout.contains("a.txt"),
+            "in-workspace search broke: {}",
+            out.stdout
+        );
     }
 }

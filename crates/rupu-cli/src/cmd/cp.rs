@@ -1049,6 +1049,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            permission_mode: None,
             loop_progress: Default::default(),
         };
         rec.sync_awaiting_compat();
@@ -1270,6 +1271,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            permission_mode: None,
             loop_progress: Default::default(),
         };
         rec.sync_awaiting_compat();
@@ -1376,6 +1378,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            permission_mode: None,
             loop_progress: Default::default(),
         };
         rec.sync_awaiting_compat();
@@ -1449,6 +1452,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            permission_mode: None,
             loop_progress: Default::default(),
         };
         store.create(rec.clone(), GATE_A_REJECT_GATE_B_NONE_YAML).unwrap();

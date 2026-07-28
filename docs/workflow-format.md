@@ -175,12 +175,18 @@ Fields:
 | --- | --- | --- | --- | --- |
 | `enabled` | bool | no | `false` | Workflow appears under `rupu autoflow list` only when true |
 | `entity` | `issue` | no | `issue` | v1 supports issue ownership only |
+| `source` | string | no | none | Free-form tracker-native source tag, e.g. `linear:<team-id>` or `jira:<host>/<project>`. Disambiguates which bound tracker/repo an autoflow belongs to when more than one is configured; purely informational, not a filter |
 | `priority` | integer | no | `0` | Higher wins when multiple autoflows match the same issue |
 | `selector.states` | array<`open`\|`closed`> | no | `[]` | Empty means any issue state |
 | `selector.labels_all` | array<string> | no | `[]` | Every listed label must be present |
 | `selector.labels_any` | array<string> | no | `[]` | At least one listed label must be present |
 | `selector.labels_none` | array<string> | no | `[]` | None of the listed labels may be present |
 | `selector.limit` | integer | no | none | Candidate cap per reconciliation cycle |
+| `selector.draft` | `include`\|`exclude`\|`only` | no | none | `entity: pull_request` only; rejected on `entity: issue`. Unset behaves like `include` (both draft and ready-for-review PRs match) |
+| `selector.base` | string | no | none | `entity: pull_request` only; rejected on `entity: issue`. Restricts matches to PRs targeting this base branch (e.g. `main`) |
+| `selector.authors` | array<string> | no | `[]` | Explicit allowlist of author logins. **Empty is no restriction** — see the safety note below |
+| `selector.authors_from` | `collaborators`\|`org_members` | no | none | Broader author-scope check, resolved against the SCM at tick time. **Unset is no restriction** — see the safety note below |
+| `selector.on_skip` | `skip`\|`label_needs_human` | no | `skip` | What to do when an event is otherwise eligible but excluded by the author allowlist |
 | `wake_on` | array<string> | no | `[]` | Canonical or semantic event ids used as wake hints |
 | `reconcile_every` | duration | no | none | Re-run cadence like `10m`, `2h`, `1d` |
 | `claim.key` | `issue` | no | `issue` | v1 claim granularity |
@@ -202,6 +208,17 @@ Notes:
 - On later ticks, an idle lower-priority claim can be released and replaced by a higher-priority winner. Active or approval-paused claims are not stolen automatically.
 - Operator-facing commands surface that decision: `rupu autoflow status` lists contested issues, and `rupu autoflow claims` shows the selected priority plus losing contenders.
 - The same workflow file is portable across local scheduled mode, always-on local worker mode, and future cloud relay mode. The runtime contract is the persisted `RunEnvelope`, `WakeRecord`, `ArtifactManifest`, and `WorkerRecord` documented in `docs/using-rupu.md`.
+
+Author restriction (`selector.authors` / `selector.authors_from`):
+
+- **With neither `authors` nor `authors_from` set, any author who opens a matching issue or PR can trigger the autoflow.** Autoflows commonly run at `permission_mode: bypass` (see above), so an unrestricted selector means any outside contributor's issue/PR can start a bypass-mode agent run against your repo. This is the current default and it is intentional to preserve — tightening it would silently stop existing autoflows from firing on issues/PRs opened by non-collaborators. Set one of the two fields explicitly for any unattended autoflow.
+- Precedence between the two fields is not a simple AND/OR of independent checks — it's evaluated in this order:
+  1. If `authors` is non-empty and contains the event's author login, the author is allowed, full stop — `authors_from` is not consulted.
+  2. Otherwise, if `authors_from` is set, the author is allowed iff the SCM connector reports them as satisfying that scope (a repo collaborator, or an org member) — regardless of whether `authors` also failed to match.
+  3. Otherwise, if both `authors` is empty and `authors_from` is unset, there is no restriction at all: allowed.
+  4. Otherwise (`authors` is non-empty with no match, and `authors_from` is unset), the author is denied.
+- When an author is denied, `selector.on_skip` decides what happens: `skip` (the default) silently drops the event; `label_needs_human` also applies a label so a human notices the otherwise-eligible issue/PR was excluded.
+- Recommended for any unattended autoflow: set `selector.authors_from: collaborators` (or `org_members` for a broader org-wide allowlist) rather than relying on the default.
 
 Deployment guidance:
 

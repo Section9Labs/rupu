@@ -56,12 +56,15 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 | ID | Sev | Area | Title | Status |
 |---|---|---|---|---|
-| I-22 | P1 | rupu-tools | `grep` and `ast_grep` escape the workspace — no `path_scope` containment | open |
-| I-23 | P0 | docs/autoflow | The autoflow author allowlist is undocumented and defaults to no restriction | open |
-| I-24 | P1 | rupu-cli | `on_reject` cleanup runs at `ask` mode regardless of the run's original mode | open |
-| I-25 | P1 | rupu-cli | `rupu workflow runs` — a list command — executes `on_reject` chains as a side effect | open |
-| I-26 | P1 | rupu-cli | Action steps get allowlist `["*"]`; the code comment claims parity with agent `tools:` | open |
-| I-27 | P2 | rupu-orchestrator | `action_protocol::validate_actions` is dead code; three docs describe a check that never runs | open |
+| I-22 | P1 | rupu-tools | `grep` and `ast_grep` escape the workspace — no `path_scope` containment | fixed |
+| I-23 | P0 | docs/autoflow | The autoflow author allowlist is undocumented and defaults to no restriction | fixed |
+| I-24 | P1 | rupu-cli | `on_reject` cleanup runs at `ask` mode regardless of the run's original mode | fixed |
+| I-25 | P1 | rupu-cli | `rupu workflow runs` — a list command — executes `on_reject` chains as a side effect | fixed |
+| I-26 | P1 | rupu-cli | Action steps get allowlist `["*"]`; the code comment claims parity with agent `tools:` | fixed |
+| I-27 | P2 | rupu-orchestrator | `action_protocol::validate_actions` is dead code; three docs describe a check that never runs | fixed |
+| I-78 | P1 | rupu-orchestrator | A workflow step at `--mode ask` still gets `BypassDecider` — `ask` grants full tool access | open |
+| I-79 | P2 | rupu-cli | The action dispatcher's `["*"]` allowlist is sound only by invariant, not by construction | open |
+| I-80 | P2 | rupu-cli/docs | Reject-timeout gates now resolve only via `cp serve`'s sweep; CLI-only operators lose auto-resolution | open |
 
 ### Arc 3 — single UI path
 
@@ -132,201 +135,90 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 ## Open
 
-### I-6 — `rupu config set` corrupts `config.toml`, then silently wipes it
+### I-80 — reject-timeout gates now resolve only via `cp serve`'s sweep
 
-**Symptom.** Two commands destroy a user's configuration:
+**Symptom.** After I-25, a gate with `on_timeout: reject` whose deadline has passed
+stays parked at `AwaitingApproval` indefinitely unless `rupu cp serve` is running.
+Before I-25, the next `rupu workflow runs` would resolve it.
 
-```
-$ rupu config set ui.theme dracula     # writes a literal "ui.theme" top-level key
-$ rupu config set log_level debug      # config.toml is now an empty file
-```
+**Root cause.** Deliberate, and the correct trade for I-25: a listing command must
+not execute cleanup chains, and because `sweep_decision` only acts on runs still
+`AwaitingApproval`, the listing cannot finalize the run either without silently
+losing the chain. Resolution therefore moved entirely to the `cp serve` gate sweep
+(`[cp].gate_sweep_enabled`, default on at 60s).
 
-**Root cause.** Two independent defects in `crates/rupu-cli/src/cmd/config.rs`:
+**Impact.** Affects a real class of user: anyone driving rupu purely from the CLI who
+never starts `rupu cp serve`, plus anyone who has set `[cp].gate_sweep_enabled = false`.
+Their reject-timeout gates no longer auto-resolve. This is a behavior change rather
+than a safety regression — the gate stays parked (fail-safe) rather than firing
+unexpectedly — and `rupu workflow reject <id>` still resolves it manually at any time.
+It is filed because the dependency is currently invisible: nothing tells such an
+operator that timeout routing needs a daemon.
 
-1. `set` operates on the top-level table only — `t.insert(key.to_string(), parsed)`
-   (`config.rs:66`) inserts the dotted string `"ui.theme"` as a key rather than
-   descending into `[ui]`. `Config` is `#[serde(default, deny_unknown_fields)]`
-   (`crates/rupu-config/src/config.rs:22`), so the file no longer loads.
-2. The *next* `set` reads that now-invalid file with
-   `toml::from_str(&text).unwrap_or_else(|_| Value::Table(Default::default()))`
-   (`config.rs:54`) — on a parse failure it starts from an **empty table** and
-   writes it back, discarding every remaining setting.
-
-`get` has the same top-level-only limitation (`config.rs:42`) but is read-only.
-
-**Impact.** Data loss on the most natural input. `README.md:283` advertises the
-command as "Read / write rupu configuration"; only the clap help mentions the
-top-level restriction. Downstream, the corrupted file either hard-errors
-(`cmd/run.rs:473`) or is silently swallowed (`cmd/run.rs:339`), so the user may
-just see all their settings quietly stop applying.
-
-**Fix.** Descend dotted paths on both `get` and `set` (the CP web already does
-this — `crates/rupu-cp/src/api/config.rs` handles dotted keys). Never fall back
-to an empty table on a parse error: fail loudly and leave the file untouched.
+**Fix.** Options, in rough order of preference: document the dependency plainly in the
+gate/timeout docs and in `rupu workflow runs` output when it sees an overdue reject
+gate it is deliberately not resolving; or add an explicit opt-in
+`rupu workflow runs --resolve-expired` so the side effect is requested rather than
+implicit; or have the CLI resolve overdue reject gates on the `reject`/`approve`
+paths only, which is already true. Related: [[I-25]].
 
 ---
 
-### I-7 — `[policy].lock` is not enforced anywhere outside the web UI
+### I-78 — a workflow step at `--mode ask` still gets `BypassDecider`
 
-**Symptom.** An administrator locks `permission_mode` globally. The CP Settings
-UI shows the field locked and refuses to edit it. A project-level
-`.rupu/config.toml` still overrides it for every `rupu run`, `rupu session` and
-`rupu workflow run`.
+**Symptom.** `rupu workflow run --mode ask` grants every agent step unrestricted
+tool access. `bash`, `write_file` and `edit_file` all execute without a prompt and
+without a denial, which is precisely `bypass` behavior under a different name.
 
-**Root cause.** Lock enforcement lives entirely inside `rupu_config::resolve`
-(`crates/rupu-config/src/resolve.rs:180-197`, `is_locked` → global-wins
-precedence). `resolve()` has **6 call sites, all in rupu-cp**
-(`crates/rupu-cp/src/state.rs`, `crates/rupu-cp/src/api/config.rs`). Every CLI
-path loads configuration through `rupu_config::layer_files` instead — **43 call
-sites** — which performs ordinary project-over-global layering and never
-consults `[policy].lock`.
+**Root cause.** `DefaultStepFactory::build` (`crates/rupu-orchestrator/src/step_factory.rs`)
+hardcoded `decider: Arc::new(BypassDecider)` for every workflow step regardless of
+the run's mode. `BypassDecider`'s own doc comment describes it as a "Test/CI
+decider… always Allow". I-24's fix introduced `ReadonlyDecider` and wired it in for
+`readonly`, but deliberately left `ask` on `BypassDecider`, because the agent
+runtime's interactive `ask` decider blocks on stdin and a workflow step has no
+operator present to answer it.
 
-**Impact.** The one mechanism presented as a governance control is a UI-only
-affordance. `ConfigEditor.tsx:7-14` tells the operator "a field whose resolved
-value is enforced by the global policy lock cannot be edited", which is true of
-the web form and false of the tool.
+**Impact.** Discovered while building I-24's validation test — without it, that fix
+would have had no observable effect at the tool layer. Two live gaps remain. First,
+an operator choosing `ask` over `bypass` reasonably expects *more* restriction and
+silently gets none; this is the "silent no-op config" class the whole program
+exists to eliminate. Second, `ask` is the **default** when `--mode` is omitted, so
+every workflow run that doesn't pass a mode is effectively running at bypass.
 
-**Fix.** Route CLI config loading through a single lock-aware resolver so
-`layer_files` is no longer used directly for policy-bearing keys. Validate with a
-test that a locked global key survives a conflicting project config on a CLI
-code path — not only through `resolve()`.
-
----
-
-### I-8 — `dispatch_agent` hardcodes provider and model (the unfixed 4th I-1/I-2 site)
-
-**Symptom.** A sub-agent dispatched via `dispatch_agent` /
-`dispatch_agents_parallel` ignores `default_provider` and `default_model`, and
-cannot use a config-declared openai-compatible provider.
-
-**Root cause.** `crates/rupu-cli/src/cmd/dispatch.rs:157-162` still does
-`spec.provider.clone().unwrap_or_else(|| "anthropic".into())` and
-`unwrap_or_else(|| "claude-sonnet-4-6".into())`, calling
-`provider_factory::build_for_provider` without a `Config`. The struct has no
-`Config` field at all.
-
-**Impact.** I-1 and I-2 are recorded as fixed "at all three call sites"
-(`run.rs`, `session.rs`, `step_factory.rs`). There is a fourth. The same
-silent-noop the original fix set out to eliminate is still live on the
-sub-agent path, and this file's own "Fixed" section overstates the coverage.
-
-**Fix.** Thread `Config` into the dispatch tool and route through
-`provider_factory::resolve_provider_name()` / `resolve_model()` like the other
-three sites.
+**Fix.** Decide what `ask` means in an unattended context — there is no operator to
+prompt, so it must resolve to something non-interactive. The plausible options are
+to treat it as `readonly` (deny writers), to gate it behind the existing approval
+machinery so the *workflow* asks rather than the tool layer, or to reject
+`--mode ask` on a workflow run and force an explicit choice. Whichever is chosen,
+the current state — `ask` silently meaning `bypass` — is not defensible, and the
+default-mode case makes it P1 rather than P2. Related: [[I-24]].
 
 ---
 
-### I-9 … I-14, I-17, I-19, I-20 — dead configuration
+### I-79 — the action dispatcher's `["*"]` allowlist is sound only by invariant
 
-Nine keys parse, are documented, and in several cases are editable in the CP
-Settings UI, yet have **no runtime consumer**. Proof for each is a workspace-wide
-grep (excluding `crates/rupu-config/` and tests) returning zero hits.
+**Symptom.** `action_dispatcher_for` (`crates/rupu-cli/src/resume.rs:27`) builds its
+`McpPermission` with a wildcard tool allowlist, `vec!["*".into()]`.
 
-| ID | Key | Declared | Documented as working | Reality |
-|---|---|---|---|---|
-| I-9 | `[providers.*].timeout_ms` | `provider_config.rs:23` | `docs/providers.md:111` ("Default: `120000`") + `ConfigEditor.tsx:220` | vendor default always used |
-| I-10 | `[providers.*].max_retries` | `provider_config.rs:25` | `docs/providers.md:112` ("Default: `5`") | real budget is a hardcoded 1 (`anthropic.rs:213`) |
-| I-11 | `[providers.*].max_concurrency` | `provider_config.rs:27` | `docs/providers.md:113` + `concurrency.rs:6` | `semaphore_for` is called only by SCM clients; **no LLM call ever acquires a permit** |
-| I-12 | `[providers.*].org_id`, `.region` | `provider_config.rs:19,21` | `docs/providers/openai.md:20`, `gemini.md:23` | org-scoped keys and non-default Vertex regions are unreachable |
-| I-13 | `[retry]` (whole section) | `config.rs:113-116` | — | inert top-level section |
-| I-14 | `log_level` | `config.rs:27` | `ConfigEditor.tsx:199-207`, with a lock toggle | logging reads only `RUPU_LOG` (`logging.rs:25`) |
-| I-17 | `[scm.*].timeout_ms` | `scm_config.rs:46` | `docs/scm.md:109-119` | no consumer (sibling `base_url`/`max_concurrency` *are* consumed) |
-| I-19 | all of it, in rupu-app | — | — | `executor/mod.rs:210` passes `Config::default()`; self-admitted at `:109-115` |
-| I-20 | `resolve()` env tier | `resolve.rs:144-171` | — | both callers pass an empty map; `KeySource::Env` is unreachable |
+**Root cause.** The dispatcher is constructed once per run, while the tool it may
+call is per-step, so the construction site has no single tool name to narrow to.
 
-**Impact.** Exactly the I-1 shape, ~9×. A user reads the docs, sets a value,
-sees it accepted (and in four cases sees it in the web UI), and gets different
-behavior than documented — with no error.
+**Impact.** No exploitable hole **today**, and this was verified rather than
+assumed: `opts.action_dispatcher` has exactly three production consumers
+(`runner.rs:4293`, `:4700`, `:4923`), all of which funnel into `execute_action_step`,
+whose only dispatch is `dispatcher.call(tool, …)` with `tool = step.action`. That
+tool is validated against the live MCP catalog at parse time by
+`validate_action_step`, and a step may not carry a non-empty `actions:` alongside
+`action:` (`ActionsOnActionStep`). Agent-step tool calls never touch this dispatcher.
+So the wildcard is currently unreachable — but its safety rests on an invariant
+enforced three modules away, and any future code that hands this dispatcher to a
+less constrained caller turns it into a real hole with no local signal.
 
-**Fix.** For each: wire it to its consumer, or delete the key and its
-documentation and UI field. Deleting is a legitimate outcome — an honestly absent
-knob beats a knob that lies. Validation must observe the value *at the consumer*;
-a parse test cannot see this class of defect.
-
----
-
-### I-15 — `[scm.default]` / `[issues.default]` are inert
-
-**Symptom.** A user with both GitHub and GitLab credentials sets
-`[scm.default] platform = "gitlab"`. Every tool call that omits `platform` still
-goes to GitHub.
-
-**Root cause.** `Registry::default_platform` / `default_tracker`
-(`crates/rupu-scm/src/registry.rs:206-230`) implement a hardcoded
-GitHub-then-GitLab preference over registered connectors and never read
-`ScmDefault` / `IssuesDefault` (`crates/rupu-config/src/scm_config.rs:24-38`),
-which have no consumer anywhere. The code says so: *"Wiring to `[scm.default]`
-config lands in Task 19; this is the v0 'first registered' fallback"*
-(`registry.rs:207-208`).
-
-**Impact.** The key is written into every `rupu init` config
-(`crates/rupu-cli/src/templates.rs:155`), documented as functional
-(`docs/scm.md:100-107`), and *named in the error message users see when it is
-missing* (`crates/rupu-mcp/src/tools/scm_repos.rs:73`: "no platform arg and no
-`[scm.default]` configured"). A GitLab-primary shop silently operates against
-GitHub. `default_tracker` additionally ignores Linear even when registered.
-
-**Fix.** Read the config values, falling back to the current preference only when
-unset. Include `IssueTracker::Linear` in the fallback.
-
----
-
-### I-16 — `[scm.*].clone_protocol` is inert
-
-**Symptom.** A user on SSH-only infrastructure selects "ssh" from the
-`clone_protocol` dropdown in CP Settings. Clones still go over HTTPS.
-
-**Root cause.** `clone_protocol` (`crates/rupu-config/src/scm_config.rs:51`) has
-no consumer. The clone paths hardcode HTTPS with an embedded token —
-`connectors/gitlab/repo.rs:477-479`, `connectors/github/repo.rs:442`.
-
-**Impact.** Documented at `docs/scm.md:109-119` and given a dedicated
-`https`/`ssh` dropdown at `ConfigEditor.tsx:374,463`. Clones fail or use the
-wrong credentials on hosts that only permit SSH.
-
-**Fix.** Honor the setting in both connectors' clone paths. Note this overlaps
-the self-hosted-host defect (clone URLs also ignore `base_url`), tracked
-separately in `TODO.md`.
-
----
-
-### I-18 — `[bash]` config is dropped on the workflow path
-
-**Symptom.** `[bash].timeout_secs` and `[bash].env_allowlist` apply under
-`rupu run` and `rupu session`, and are silently ignored under
-`rupu workflow run`.
-
-**Root cause.** `crates/rupu-orchestrator/src/step_factory.rs:245-246` hardcodes
-`bash_env_allowlist: Vec::new(), bash_timeout_secs: 120`. `DefaultStepFactory`
-carries no `Config` (`step_factory.rs:36-50`). The values are read correctly at
-`cmd/session.rs:6705-6706` and `cmd/run.rs:574-575`.
-
-**Impact.** Precisely the I-2 shape: the same agent behaves differently depending
-on how it is invoked. A workflow step gets a 120s bash timeout and an empty env
-allowlist no matter what the user configured.
-
-**Fix.** Thread the `[bash]` config into `DefaultStepFactory` alongside the
-provider/model values I-2 already added.
-
----
-
-### I-21 — a malformed `config.toml` silently yields wrong cost figures
-
-**Symptom.** A typo in `[pricing]` makes `rupu run list` / `rupu run show` print
-costs computed from default rates, with no warning.
-
-**Root cause.** `crates/rupu-cli/src/cmd/run.rs:339,404` —
-`layer_files(...).unwrap_or_default()` discards a real `LayerError::Parse`
-(`crates/rupu-config/src/layer.rs:23-28`) and feeds `cfg.pricing` into
-`query_run_detail`. The fallback is deliberate per the comment at `run.rs:335`,
-but it was reasoned about for UI preferences, not for numbers the user reads.
-
-**Impact.** Wrong dollar figures presented as authoritative. The same pattern at
-`cmd/workflow.rs:993` and `cmd/cron.rs:281` affects only UI preferences and is
-harmless.
-
-**Fix.** On the pricing paths, surface the parse error (or at minimum warn that
-default rates are in use). Leave the UI-preference sites as they are.
+**Fix.** Narrow the allowlist to the single tool being invoked. This needs
+`execute_action_step` to build (or be handed) a per-step dispatcher, which means
+threading the registry rather than `&ToolDispatcher` through three call sites —
+mechanical but not free, hence P2. Defense in depth, not a live defect. Related:
+[[I-26]].
 
 ---
 
@@ -391,6 +283,320 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-25 — a list command executes `on_reject` chains as a side effect
+
+**Symptom.** `rupu workflow runs` — a read-only-looking listing — can post
+GitHub comments and run agent steps.
+
+**Root cause.** The listing path performs lazy approval-timeout expiry, and the
+timeout-reject branch invokes the full `run_reject_cleanup` chain inline.
+
+**Impact.** A command whose name and output imply pure observation has
+side effects on external systems. Previously compounded by I-24 (now fixed):
+those side effects used to run at `ask` mode regardless of how the original run
+was launched; they now correctly inherit the run's own launch mode, but the
+listing path still shouldn't be the one running them at all.
+
+**Fix.** Either move timeout-driven cleanup exclusively to the `cp serve` gate
+sweep (which exists and is default-on), or keep the lazy expiry but have the
+listing path only *finalize state* and leave chain execution to the sweep. The
+choice is a behavior decision — decided in the Arc 2 plan.
+
+**Validation.** `crates/rupu-cli/tests/workflow_runs_no_side_effects.rs`, three tests
+driving `rupu_cli::run(...)` end to end:
+`listing_runs_does_not_execute_a_reject_cleanup_chain` (the chain's marker file must
+not exist after a listing), `listing_runs_leaves_a_reject_timeout_gate_awaiting_approval`,
+and `listing_runs_still_finalizes_a_fail_timeout_gate` (the lazy expiry that remains
+is not broken). RED was observed, not claimed: against unfixed code test 1 failed with
+the marker file present and test 2 failed `left: Rejected, right: AwaitingApproval`.
+
+**The fix is "skip", not "stop cleaning up".** For `on_timeout: reject` the loop now
+`continue`s *before* `expire_if_overdue`, rather than merely dropping the inline
+cleanup call. This matters: `sweep_decision` (`crates/rupu-cli/src/cmd/cp.rs:337`)
+only produces `ExpireThenCleanupReject` for a run still `AwaitingApproval` and falls
+through to `Skip` (`:366`) for every other status. Had the listing finalized the run
+to `Rejected` without running the chain, the sweep would have skipped it forever and
+the cleanup would have been silently lost — a worse bug than the one being fixed.
+Test 2 is the assertion that pins this. `approve` and `fail`/unset are unchanged:
+`expire_if_overdue` deliberately leaves the record `AwaitingApproval` on the approve
+arm, and finalizes the fail case internally with no chain to run.
+
+**Consequence tracked as I-80.** Reject-timeout gates are now resolved only by the
+`cp serve` sweep.
+
+---
+
+### I-26 — action steps get a `["*"]` tool allowlist while the comment claims otherwise
+
+**Symptom.** An action step can call any MCP catalog tool, even in a workflow
+whose agents are narrowed to a small `tools:` roster.
+
+**Root cause.** `action_dispatcher_for` builds
+`McpPermission::new(parse_mode_for_runtime(mode_str), vec!["*".into()])`. An
+agent step's MCP allowlist is its frontmatter `tools:` (`["*"]` only when the
+agent declares none). The doc comment on the builder asserts the opposite — that
+an `action:` step "sees exactly the same allow/deny surface a `tools:`-using
+agent step would" — which is false precisely in the case it names.
+
+**Impact.** Defensible by author intent (the tool name is written in the
+workflow), but the code comment is actively misleading and there is no per-step
+narrowing knob. Note `Step.actions` *is* enforced for agent steps since
+#533/#537 (`narrow_agent_tools`), so the asymmetry is now sharper.
+
+**Fix.** At minimum correct the comment. Preferably let a step's `actions:`
+narrow its own `action:` invocation the way it narrows an agent's grant.
+
+**Scope corrected — half of this issue was based on a false premise.** The original
+fix had two halves: (a) narrow an action step by its own `actions:` list, and
+(b) correct the doc comment. Half (a) is **withdrawn as impossible and meaningless**:
+`validate_step_actions` (`crates/rupu-orchestrator/src/workflow.rs:1389`) rejects a
+step carrying both `action:` and a non-empty `actions:` at parse time with
+`WorkflowParseError::ActionsOnActionStep` — *"an `action:` step must not carry a
+non-empty `actions:` allowlist — its tool is already explicit"* — and a parse test at
+`workflow.rs:2887` already asserts it. A workflow of the shape this issue proposed to
+narrow cannot be authored at all.
+
+**The wildcard is not exploitable, and that was verified rather than assumed.**
+`opts.action_dispatcher` has exactly three production consumers (`runner.rs:4293`,
+`:4700` for notify hooks, `:4923`), all funnelling into `execute_action_step`, whose
+only dispatch is `dispatcher.call(tool, …)` with `tool = step.action`. Agent-step tool
+calls go through the `rupu-tools` registry and `DefaultStepFactory`'s own narrowing,
+never this dispatcher. Every `action:` tool is catalog-validated at parse time by
+`validate_action_step`. So the only tool reachable through `["*"]` is one named
+explicitly in the workflow source and already checked.
+
+**Validation.** The doc comment on `action_dispatcher_for`
+(`crates/rupu-cli/src/resume.rs:19`) no longer claims an `action:` step "sees exactly
+the same allow/deny surface a `tools:`-using agent step would". It now separates the
+two halves — the **mode** half genuinely does match the agent path
+(`parse_mode_for_runtime` is shared, and a `readonly` run refuses Write tools here
+too), while the **allowlist** half deliberately differs — and enumerates the three
+invariants that make the wildcard sound, naming `ActionsOnActionStep` so the next
+reader can find the enforcement. `cargo build -p rupu-cli` clean. No behavior change,
+so no new test; the invariant's existing coverage is `workflow.rs:2887`.
+
+**Follow-up filed.** Making the guarantee structural rather than invariant-dependent
+— narrowing the allowlist to the single tool being invoked — is tracked as **I-79**
+(P2). It needs `execute_action_step` to build or be handed a per-step dispatcher,
+threading the registry through three call sites.
+
+---
+
+### I-23 — the autoflow author allowlist is undocumented and defaults to open
+
+**Symptom.** Nothing in the user-facing docs describes `selector.authors` or
+`selector.authors_from`. A user writing an autoflow gets no restriction by
+default — any author who opens a matching issue or PR can trigger it.
+
+**Root cause.** `AutoflowSelector.authors` (`crates/rupu-orchestrator/src/workflow.rs:412`)
+and `.authors_from` (`:416`, with `AuthorScope::Collaborators | OrgMembers` at
+`:429`) are implemented and enforced by `author_allowed` (`:453`), but
+`docs/workflow-format.md`'s selector table documents only `states`,
+`labels_all`, `labels_any`, `labels_none`, and `limit`. The default — both
+fields unset — is *no* author restriction.
+
+**Impact.** This is the control that stops an arbitrary GitHub user from
+triggering an autonomous agent run by opening a PR — and autoflows commonly run
+at `permission_mode: bypass`. An operator who never learns the field exists has
+no reason to set it. Also undocumented on the same selector: `draft`, `base`,
+`on_skip`, and `Autoflow.source`.
+
+**Fix.** Document all of them in the selector table, with the default stated
+explicitly and a recommendation to set `authors_from: collaborators` for any
+autoflow that runs unattended. Consider whether the *default* should change —
+that is a behavior decision, so it is called out in the Arc 2 plan rather than
+assumed here.
+
+**Validation.** Documented in `docs/workflow-format.md`: the selector table gained
+`source`, `draft`, `base`, `authors`, `authors_from` and `on_skip` rows, plus a new
+"Author restriction" prose subsection. Every serialized value was verified against
+its `#[serde(rename_all = "snake_case")]` enum rather than assumed —
+`AuthorScope` → `collaborators` / `org_members` (`workflow.rs:427`), `DraftFilter`
+→ `include` / `exclude` / `only` (`:479`), `SkipAction` → `skip` /
+`label_needs_human` (`:438`). The documented precedence was read off
+`author_allowed` (`:464-476`) and is non-obvious: a match in `authors`
+short-circuits to **allow** and overrides a failing `authors_from` scope check;
+only a non-empty `authors` with no match *and* no `authors_from` denies. The prose
+states plainly that with neither field set any author can trigger the autoflow, and
+that autoflows commonly run at `permission_mode: bypass`.
+
+**Default unchanged, deliberately.** Operator decision: tightening it would silently
+stop existing autoflows from firing on outside contributors. Documented, not changed.
+
+---
+
+### I-27 — `action_protocol::validate_actions` is dead code, and three docs describe it
+
+**Symptom.** README, `docs/agent-format.md`, and `docs/triggers.md` describe a
+runtime check on emitted actions that no shipped code path performs.
+
+**Root cause.** `crates/rupu-orchestrator/src/action_protocol.rs:18`
+`validate_actions` is exported but called from nowhere in the runner — its only
+callers are its own tests. `crates/rupu-agent/src/action.rs:21` likewise ships a
+field-less, method-less `pub struct ActionValidator;` whose comment says "Real
+impl lands in Task 11", and `ActionEnvelope` has no producer in `rupu-agent`.
+
+**Impact.** Documentation-only: readers are told a safety check exists that does
+not. Now more confusing because `actions:` *does* narrow tools via a different
+mechanism (`step_factory::narrow_agent_tools`), so the docs describe the wrong
+enforcement for a field that really is enforced.
+
+**Fix.** Delete `validate_actions` and the `ActionValidator` stub, and correct
+the three docs to describe the real mechanism. (The doc corrections overlap
+I-51 in Arc 6; do the code deletion here and let Arc 6 own the prose.)
+
+**Validation.** Already fixed by commit `28ec5cc3` ("chore: delete the dead legacy
+action protocol"), which landed during Arc 1 and is an ancestor of this branch. It
+removed all five files this issue named: `rupu-agent/src/action.rs` (the
+`ActionValidator` stub), `rupu-orchestrator/src/action_protocol.rs`
+(`validate_actions`), both crates' re-exports, and
+`rupu-orchestrator/tests/action_allowlist.rs`. Validation is the deletion itself:
+`grep -rn "validate_actions\|ActionValidator" --include="*.rs" crates` now returns
+zero hits, and `cargo build --workspace` is clean. The issue was fixed without being
+closed in the tracker; this closure is the bookkeeping.
+
+**Not to be confused with live code.** `validate_action_step`
+(`crates/rupu-orchestrator/src/workflow.rs:1324`) survives and is the **live**
+catalog validator for `action:` steps and notify hooks. It is unrelated to the
+deleted `validate_actions` and must not be removed.
+
+**Prose corrections deferred.** README (×2), `docs/agent-format.md` and
+`docs/triggers.md` still describe the deleted check. Those are owned by **I-51 in
+Arc 6**, which holds the whole `actions:` documentation contradiction, so the two
+do not collide.
+
+---
+
+### I-22 — `grep` and `ast_grep` escape the workspace
+
+**Symptom.** An agent-supplied `path` argument reads outside the workspace:
+`path: "/etc"` (absolute) or `path: "../.."` both leave the sandbox. The write
+tools refuse the same input.
+
+**Root cause.** Both tools built their search root with a bare join and no
+containment check — `crates/rupu-tools/src/grep.rs:74` and
+`crates/rupu-tools/src/ast_grep.rs:150`, each
+`.map(|p| ctx.workspace_path.join(p))`. `Path::join` *replaces* the base when
+the argument is absolute, and does not normalize `..`. The crate already had
+the guard: `path_scope::is_inside` (`crates/rupu-tools/src/path_scope.rs:9`)
+canonicalizes both ends and is used by `read_file.rs:60`, `write_file.rs`, and
+`edit_file.rs`. The two search tools were simply never wired to it.
+
+**Impact.** The workspace boundary is a containment guarantee the write tools
+enforce and the read tools don't, so an agent could read `/etc`, `~/.ssh`, or a
+sibling repo through `grep`. Bounded by being read-only and still
+permission-gated, but it was a real escape from a documented boundary.
+
+**Fix.** PR (branch `arc2/safety`). Added the same `path_scope::is_inside`
+containment check `read_file`/`write_file`/`edit_file` already use, immediately
+after computing `search_path` in both `crates/rupu-tools/src/grep.rs` and
+`crates/rupu-tools/src/ast_grep.rs`. A path that resolves outside the
+workspace root now returns `ToolOutput { error: Some("path {P} escapes
+workspace"), .. }` before `rg`/`ast-grep` is ever spawned — no external command
+runs against a rejected path, so nothing outside the workspace is even
+attempted, let alone read. `glob` was left untouched: confirmed it takes no
+user-supplied path and walks only `ctx.workspace_path` (`glob.rs:54`); the
+original TODO naming it as affected was wrong.
+
+**Validation.** `cargo test -p rupu-tools --lib` — 23 tests, 6 new (a
+three-test trio per tool, added as in-file `#[cfg(test)] mod tests`):
+`grep::tests::an_absolute_path_is_refused` / `a_parent_traversal_is_refused` /
+`an_in_workspace_path_still_searches`, mirrored in `ast_grep::tests`. Each
+absolute/traversal test asserts both the refusal string (`"escapes
+workspace"`) on `ToolOutput.error` AND that the outside file's name
+(`outside.txt` / `outside.rs`) never appears in `ToolOutput.stdout`, so the
+refusal can't leak partial results gathered before the guard fired. The
+in-workspace test proves the guard doesn't regress a legitimate search.
+`ast-grep` was present on PATH in this environment (Homebrew), so its tests
+exercised the real binary rather than being gated; they still self-gate via
+`which::which("ast-grep")` so a box without the binary degrades to a skip
+rather than a failure. `cargo build --workspace`, `cargo clippy -p rupu-tools
+--lib --tests`, and `rustfmt --edition 2021 --check` on both changed files are
+all clean.
+
+---
+
+### I-24 — `on_reject` cleanup runs at `ask` mode regardless of the run's mode
+
+**Symptom.** A workflow deliberately launched with `--mode readonly` has its
+gate rejected; the `on_reject` cleanup chain then executes with **write** tools
+enabled.
+
+**Root cause.** The run's original `--mode` is never persisted on `RunRecord`
+(only `resume_mode`, set by the web-resume path). `rupu workflow reject` has no
+`--mode` flag and passes `None`; `rebuild_opts_from_disk` then does
+`mode.unwrap_or("ask")`, and `parse_mode_for_runtime` maps anything that isn't
+`bypass`/`readonly` to `Ask`, which permits Write tools.
+
+**Impact.** A readonly guarantee silently stops applying at exactly the moment a
+human rejected the work — the cleanup chain can post comments, push branches, or
+call any Write connector the agent's grant allows.
+
+**Fix.** PR (branch `arc2/safety`). Added `RunRecord.permission_mode:
+Option<String>` (`crates/rupu-orchestrator/src/runs.rs`, `#[serde(default,
+skip_serializing_if = "Option::is_none")]` so every pre-existing `run.json`
+still deserializes, reading back as `None`). Populated at fresh-run creation in
+`run_workflow` (`crates/rupu-orchestrator/src/runner.rs`) from a new
+`StepFactory::permission_mode(&self) -> Option<&str>` trait method (default
+`None`, so no other `StepFactory` impl needs a change); `DefaultStepFactory`
+implements it as `Some(&self.mode_str)`, and `rupu run`'s own `RunRecord` write
+(`crates/rupu-cli/src/cmd/run.rs`) sets it the same way for consistency, though
+that path has no `on_reject` chain of its own. `rebuild_opts_from_disk`
+(`crates/rupu-cli/src/resume.rs`, shared by both the reject-cleanup and
+approve-resume rebuilds) now resolves the effective mode with explicit
+precedence: an explicit `--mode` on the calling command (if one exists —
+`reject` has none, `approve` does) → `record.resume_mode` (the web-resume path)
+→ `record.permission_mode` (new) → `"ask"`.
+  A second, closely-related gap surfaced while writing the validation test
+below and was fixed alongside it (same PR, same file):
+  `DefaultStepFactory::build_opts_for_step` unconditionally built its agent's
+  `PermissionDecider` as `Arc::new(BypassDecider)` — a decider whose own doc
+  comment calls it a "Test/CI decider: always Allow regardless of mode" — so
+  no workflow step's tool calls, cleanup or otherwise, ever actually honored
+  `--mode readonly`/`ask` at the tool layer; only `action:` steps' separate MCP
+  permission gate did. Added `rupu_agent::runner::ReadonlyDecider` (denies
+  `bash`/`write_file`/`edit_file`, non-interactive so it's safe unattended) and
+  had `DefaultStepFactory` select it when `mode_str == "readonly"`. Without
+  this, I-24's fix would have had no observable effect: the mode would reach
+  `rebuild_opts_from_disk` correctly but still hit an always-Allow decider.
+  `ask`/`bypass` semantics for workflow steps are unchanged by this — a
+  workflow has no per-step operator to prompt, so `ask` still permits writes
+  there, exactly as documented in this write-up's "Root cause" above.
+  Separately, `DefaultStepFactory::build_opts_for_step`'s step lookup
+  (`crates/rupu-orchestrator/src/step_factory.rs`) only searched top-level
+  `workflow.steps`, so any `on_reject:` cleanup sub-step dispatched through the
+  real factory (rather than a test's fake one) panicked with `step_id from
+  orchestrator must match a workflow step` — an on_reject sub-step's id lives
+  nested under its gate's `approval.on_reject`, never in `workflow.steps`
+  itself. This is a distinct, pre-existing gap (parked, real, and unrelated to
+  the mode fallback) that blocked validating I-24 with a real agent step at
+  all; the lookup now falls back to searching every gate's `on_reject` chain
+  before giving up.
+
+**Validation.** `crates/rupu-cli/tests/reject_mode_inheritance.rs`
+(`reject_cleanup_inherits_a_readonly_run_mode`) drives `rupu_cli::run(...)` end
+to end: launches a single-gate workflow with `--mode readonly`, whose
+`on_reject` chain has one agent step that attempts `write_file`, then rejects
+the parked gate via a second `rupu_cli::run(...)` call with no `--mode`. The
+binding assertion is the filesystem effect, not a config value: the file the
+cleanup step would have written does not exist, and the run still ends
+`Rejected`. Confirmed genuinely RED pre-fix (temporarily reverting the
+`rebuild_opts_from_disk` precedence back to `mode.unwrap_or("ask")` reproduces
+the file being created) and GREEN with the fix restored. A second test,
+`runs::tests::record_json_with_no_permission_mode_key_deserializes_as_none`
+(`crates/rupu-orchestrator/src/runs.rs`), deserializes a hand-written
+`run.json` JSON payload with no `permission_mode` key at all and asserts it
+loads with the field as `None` — proving the back-compat contract, not just
+the round-trip of a struct the code itself produced. `cargo test -p rupu-cli -p
+rupu-orchestrator` is clean except the pre-existing baseline (4 `linear_runner.rs`
+tests; ANSI/terminal-color-detection assertions across `output::printer` and
+several other integration tests, all traced to this worktree's toolchain
+mismatch — see `project_rupu_toolchain_mismatch` — and confirmed unrelated by
+inspecting the diff against every failing file). `cargo build --workspace` and
+`cargo test -p rupu-cp` are both clean.
+
+---
 
 ### I-9 … I-14, I-17, I-20 — dead configuration
 
