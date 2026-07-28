@@ -83,7 +83,7 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 |---|---|---|---|---|
 | I-33 | P0 | rupu-orchestrator | Action steps cannot take a templated number — the headline use case is unexpressible | fixed |
 | I-34 | P0 | rupu-orchestrator | `{{ steps.<action>.output }}` is an unindexable JSON string; no `fromjson` filter exists | fixed |
-| I-35 | P0 | rupu-cp | Web, local/http connector, desktop-app and **both cancel** paths skip the `on_reject` chain (no TUI exists; SSH/tunnel are fine) | open |
+| I-35 | P0 | rupu-cp | Web, local/http connector, desktop-app and **both cancel** paths skip the `on_reject` chain (no TUI exists; SSH/tunnel are fine) | fixed |
 | I-36 | P1 | rupu-orchestrator | A reject with an empty `on_reject` chain records no gate decision at all | open |
 | I-37 | P1 | rupu-cli | `on_timeout: approve` never resumes without `cp serve` — the lazy path only prints a hint | open |
 | I-38 | P1 | rupu-orchestrator | A timeout-driven approval is recorded as `via: "human"` | open |
@@ -173,7 +173,15 @@ losing the chain. Resolution therefore moved entirely to the `cp serve` gate swe
 
 **Impact.** Affects a real class of user: anyone driving rupu purely from the CLI who
 never starts `rupu cp serve`, plus anyone who has set `[cp].gate_sweep_enabled = false`.
-Their reject-timeout gates no longer auto-resolve. This is a behavior change rather
+Their reject-timeout gates no longer auto-resolve.
+
+**Scope widened by [[I-35]] (Arc 4).** The sweep is now also the executor of `on_reject`
+cleanup for **web, desktop-app and cancel** rejects, which previously ran no chain at all.
+So the same "needs `cp serve`" dependency now covers materially more behavior than
+timeout routing alone. This is still a strict improvement over the prior state for those
+paths (cleanup eventually runs, versus never), but it raises the stakes on documenting the
+dependency: an operator who never starts `cp serve` now has *both* unresolved
+reject-timeout gates *and* unexecuted cleanup chains, with nothing surfacing either. This is a behavior change rather
 than a safety regression — the gate stays parked (fail-safe) rather than firing
 unexpectedly — and `rupu workflow reject <id>` still resolves it manually at any time.
 It is filed because the dependency is currently invisible: nothing tells such an
@@ -307,6 +315,64 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-35 — every reject and cancel path now runs the `on_reject` chain
+
+**Symptom.** Rejecting a gate from the CP web UI, the desktop app, a local/http host
+connector, or **cancelling** an awaiting run silently skipped the gate's `on_reject`
+cleanup chain. The operator saw a rejected run and reasonably believed cleanup had run.
+It never had, and nothing would ever retry it.
+
+**Root cause.** `run_reject_cleanup` is not merely "cleanup" — it is **the only caller of
+`emit_gate_result`**, so a path that skips it also records *no gate decision at all*.
+Five paths skipped it: CP web `POST /api/runs/:id/reject`, `LocalHostConnector::reject_run`,
+`HttpHostConnector::reject_run`, the `rupu-app` desktop reject, and — the sneakiest —
+`RunStore::cancel`, whose `AwaitingApproval` arm calls `self.reject(...)`, driving **both**
+CLI `workflow cancel` and CP web `/cancel`.
+
+**Neither `cp serve` worker covered it**, verified rather than assumed: the resume worker
+filters on `resume_requested_at.is_some()`, which a reject never sets; and the gate sweep
+matched only `AwaitingApproval`/`Running`/`Pending`, so an already-terminal `Rejected` run
+fell to `_ => {}` forever. The library documented the gap against itself at
+`runs.rs:1627-1634`.
+
+**Corrections to the filed issue** (it would have misdirected the work): there is **no
+TUI** — the affected GUI is the GPUI desktop app. And SSH/tunnel connectors were wrongly
+blamed: they **do** run the chain, because they re-enter the CLI.
+
+**Fix — marker + sweep, respecting the read-only boundary.** `rupu-cp` is deliberately
+read-only ("record-in-CP, resume-in-cp-serve") and must not grow a workflow runtime, so
+the chain is *not* called from `rupu-cp`. Instead `RunStore::reject_gate` records a
+`reject_cleanup_pending` marker when it finalizes a run `Rejected`, and the `cp serve`
+gate sweep grew an arm that picks those up, runs `build_reject_cleanup_opts` +
+`run_reject_cleanup`, and clears the marker.
+
+Because the marker lives in `RunStore::reject_gate`, the desktop app
+(`InProcessExecutor::reject` → `run_store.reject`) and **both** cancel paths
+(`RunStore::cancel` → `self.reject`) are covered with no caller-specific wiring — confirmed,
+not assumed. The CLI's own `reject` clears the marker after its existing synchronous run,
+so the sweep never double-executes.
+
+**The sweep arm matches on the MARKER, never on `status == Rejected`.** That is deliberate:
+matching on status is exactly the failure class Arc 2 hit in [[I-25]], where finalizing a
+run before the chain ran caused the sweep to skip it forever.
+
+**Validation.** RED observed by commenting out the marker assignment — all three tests
+failed at the marker assertion, then passed when restored.
+`web_reject_leaves_marker_sweep_runs_cleanup_and_records_gate_decision` stands up a **real**
+`rupu_cp::server::router` + `axum::serve` and rejects over genuine HTTP rather than calling
+the handler directly; `cancel_on_awaiting_approval_run_leaves_marker_sweep_runs_cleanup`
+covers the cancel path; and
+`empty_on_reject_chain_clears_marker_and_does_not_reprocess_on_next_tick` proves a second
+tick is a silent no-op (asserted by the absence of a duplicate gate row in
+`step_results.jsonl`), so an empty chain cannot spin. Real chain execution goes through the
+`RUPU_MOCK_PROVIDER_SCRIPT` seam with an actual `write_file` call.
+
+**Operator consequence — tracked, not buried.** Cleanup for web/app/cancel rejects now
+depends on `cp serve` running, the same dependency [[I-80]] already tracks for
+reject-timeout gates. I-80's write-up is widened rather than a duplicate being filed.
+
+---
 
 ### I-40 — an action step's rendered `with:` args are now visible
 
