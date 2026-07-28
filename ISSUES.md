@@ -66,6 +66,7 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-79 | P2 | rupu-cli | The action dispatcher's `["*"]` allowlist is sound only by invariant, not by construction | open |
 | I-80 | P2 | rupu-cli/docs | Reject-timeout gates now resolve only via `cp serve`'s sweep; CLI-only operators lose auto-resolution | open |
 | I-81 | P2 | rupu-mcp | `tools_list_matches_snapshot` fails in this worktree — schemars field-order drift under Homebrew 1.95 vs pinned 1.88 | open |
+| I-82 | P2 | rupu-cp | The CP web approve path discards the resolved decision, so a web approve's true actor is lost before the resume worker spawns | open |
 
 ### Arc 3 — single UI path
 
@@ -84,10 +85,10 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-33 | P0 | rupu-orchestrator | Action steps cannot take a templated number — the headline use case is unexpressible | fixed |
 | I-34 | P0 | rupu-orchestrator | `{{ steps.<action>.output }}` is an unindexable JSON string; no `fromjson` filter exists | fixed |
 | I-35 | P0 | rupu-cp | Web, local/http connector, desktop-app and **both cancel** paths skip the `on_reject` chain (no TUI exists; SSH/tunnel are fine) | fixed |
-| I-36 | P1 | rupu-orchestrator | A reject with an empty `on_reject` chain records no gate decision at all | open |
+| I-36 | P1 | rupu-orchestrator | A reject with an empty `on_reject` chain records no gate decision at all | fixed |
 | I-37 | P1 | rupu-cli | `on_timeout: approve` never resumes without `cp serve` — the lazy path only prints a hint | fixed (docs) |
-| I-38 | P1 | rupu-orchestrator | A timeout-driven approval is recorded as `via: "human"` | open |
-| I-39 | P1 | rupu-orchestrator | `StepKind` has no `#[serde(other)]`; an unknown kind **silently drops the whole step result** on resume (readers skip, they do not die) | open |
+| I-38 | P1 | rupu-orchestrator | A timeout-driven approval is recorded as `via: "human"` | fixed |
+| I-39 | P1 | rupu-orchestrator | `StepKind` has no `#[serde(other)]`; an unknown kind **silently drops the whole step result** on resume (readers skip, they do not die) | fixed |
 | I-40 | P2 | rupu-cp web | The CP transcript never shows an action step's rendered `with:` args (the node itself *does* render via `tool_audit`) | fixed |
 | I-41 | P2 | rupu-cli | `rupu workflow show`'s **steps table** lacks gate/action arms (the graph, the primary view, is correct) | fixed |
 | I-42 | P2 | rupu-orchestrator | A `when:`-skipped gate/action loses its kind and persists as `Linear` | fixed |
@@ -135,6 +136,32 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 ---
 
 ## Open
+
+### I-82 — a web approve's true actor is lost before the resume worker spawns
+
+**Symptom.** Approving a gate from the CP web UI records the decision, but the *identity*
+of whoever approved does not reach the gate decision row that [[I-36]]/[[I-38]] added.
+
+**Root cause.** `request_resume_approval` resolves an approval decision, but the CP's
+`approve_run` handler discards the returned value, so the actor is gone before the
+cross-process resume worker spawns and re-enters the runner. The same false comment
+I-36 corrected on `approve_gate`/`reject_gate` — *"identity recorded in transcript via
+runner re-entry"* — also sat on `request_resume_approval`; the comment was fixed there,
+but unlike the other two the plumbing behind it was **not** built, because it crosses a
+process boundary rather than staying inside one call chain.
+
+**Impact.** Audit-quality, not correctness: the decision, reason, timestamp and `via` are
+all recorded correctly; only the *who* is missing, and only for web-initiated approvals.
+CLI and sweep-driven paths carry the actor properly after I-36/I-38. Filed rather than
+folded into I-36 because it needs the resume-worker handoff to carry the actor across the
+spawn, which is a different piece of work from the in-process threading.
+
+**Fix.** Have `approve_run` persist the resolved decision's actor (the marker the resume
+worker already reads is the natural carrier), and have the worker thread it into
+`resume_run`'s existing `approver` parameter — which now exists, so the receiving end is
+already in place.
+
+---
 
 ### I-81 — `tools_list_matches_snapshot` fails in this worktree
 
@@ -315,6 +342,75 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-36 + I-38 — gate decision provenance is recorded on every path
+
+Closed together because they were one gap: **the gate audit record could not tell you who
+decided, or whether a human decided at all.**
+
+**I-36.** An **empty** `on_reject` chain short-circuited past `run_reject_cleanup` — which
+is the **only caller of `emit_gate_result`** — so no gate decision row was written at all.
+Separately, `RunStore::reject_gate` and `approve_gate` both explicitly discarded the actor
+(`let _ = approver;`), under a comment claiming *"identity recorded in transcript via runner
+re-entry"*. **That comment was false**: `emit_gate_result` had no approver field.
+
+**I-38.** When the `cp serve` sweep resolved an `on_timeout: approve` gate it spawned
+`rupu workflow approve`, which landed in the normal approve path and emitted
+`via: "human"` — a machine-initiated approval was indistinguishable from an operator's.
+Reject already threaded `"timeout"` correctly; the asymmetry was the bug.
+
+**Fix.** The decision JSON gains an `approver` field, and the plumbing the false comments
+*claimed* existed was actually built: approver → `ApprovalDecision` →
+`ResumeState::from_approval_with_actor` → `run_reject_cleanup`'s new `approver` param →
+`emit_gate_result`. Timeout provenance is threaded through the approve path so a
+sweep-driven approval records `via: "timeout"`. The I-36 unconditional-cleanup fix was
+applied to **all three** sites sharing that guard — CLI reject, CLI approve's
+`ExpiredRejected` arm, and the cp-serve sweep — not only the one named in the plan;
+`cheap_on_reject_chain_len` thereby became dead and was removed.
+
+**Validation.** Three tests, all RED pre-fix for the right reasons (no gate row /
+`via:"human"` / `approver:null`): empty-chain reject records a decision with reason **and**
+actor; a sweep timeout-approve records `via == "timeout"`; and a genuine operator approve
+still records `via == "human"` with the operator's identity — that third one is the guard
+that stops the timeout fix over-applying.
+
+**A third false comment** of the same wording was found on `request_resume_approval` and
+corrected, but its cross-process resume-worker plumbing was **not** wired — see [[I-82]].
+
+---
+
+### I-39 — an unknown `StepKind` no longer drops the whole step result
+
+**The filed title was wrong and the real defect is worse.** It said old binaries "die" on a
+new `events.jsonl`. Nothing dies: every reader is tolerant and **silently skips the line**
+(`api/events.rs`, `api/graph.rs`, `transcript_tail.rs`, `executor/file_tail.rs`,
+`agent/runner.rs` ×3, and `RunStore::read_step_results`, whose own comment says *"Skip
+malformed rows rather than failing the read"*).
+
+The severe case is **`step_results.jsonl`**: skipping a row means an older binary resuming a
+run **silently loses a prior step's output** — the template context loses values and steps
+re-run, with no error surfaced anywhere. `StepKind` had 10 variants and no `#[serde(other)]`;
+`#[serde(default)]` on `StepResultRecord.kind` covers only a *missing* field, not an unknown
+value. The `Split`/`Join`/`Loop` doc comments narrate **three separate rounds** of exactly
+this variant-addition, so this had already bitten repeatedly.
+
+**Fix.** `#[serde(other)] Unknown` as the final variant (serde requires it last), plus the
+11 resulting exhaustive-match arms across `cmd/autoflow.rs`, `output/live_run.rs` and
+`output/workflow_printer.rs` — falling back to the generic linear rendering, or
+`unreachable!()` only where an outer match had already narrowed the kind.
+
+**Validation.** RED verified by toggling `#[serde(other)]` off (the row was silently
+dropped — `rows.len() == 1` instead of 2) and back on. The binding assertion is that the
+**data survives**, not the label: `future.output == "future output survives"`.
+
+**`events.jsonl` deliberately not covered.** It is internally-tagged with struct-only
+variants, so the same treatment would require new no-op arms in GUI-adjacent `rupu-app` and
+CLI live-view matches — which this repo's rules say need runtime rendering validation a
+subagent cannot perform. Since resume reads `step_results.jsonl` exclusively, `events.jsonl`
+is diagnostic-only and did not clear the "cheap" bar. A defensible scope call, recorded
+rather than silently skipped.
+
+---
 
 ### I-42 — a `when:`-skipped gate or action keeps its kind
 

@@ -1278,11 +1278,17 @@ mod tests {
     }
 
     /// gate_a: `timeout_seconds: 10`, `on_timeout: reject`, no `on_reject:`
-    /// (an empty chain — `cheap_on_reject_chain_len` short-circuits before
-    /// the heavy `build_reject_cleanup_opts`/`run_reject_cleanup` path,
-    /// which needs real config/resolver/MCP-registry wiring this unit test
-    /// deliberately avoids). gate_b: a plain gate with NO timeout — must
-    /// never be touched by timing out gate_a.
+    /// (an empty chain). gate_b: a plain gate with NO timeout — must never be
+    /// touched by timing out gate_a.
+    ///
+    /// NOTE (I-36): this fixture used to rely on `cheap_on_reject_chain_len`
+    /// short-circuiting an empty chain before the heavy
+    /// `build_reject_cleanup_opts`/`run_reject_cleanup` path, which needs real
+    /// config/resolver/MCP-registry wiring this unit test avoids. That
+    /// short-circuit was REMOVED — skipping the chain also skipped the only
+    /// `emit_gate_result` call, so an empty-chain reject recorded no gate
+    /// decision. The empty chain here is now purely about keeping this test
+    /// focused on sibling-gate isolation.
     const GATE_A_REJECT_GATE_B_NONE_YAML: &str =
         "name: g\nsteps:\n  - id: gate_a\n    approval:\n      timeout_seconds: 10\n      on_timeout: reject\n  - id: gate_b\n    approval: {}\n";
 
