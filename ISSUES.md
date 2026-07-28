@@ -117,15 +117,15 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-51 | P0 | docs | Three docs still say `actions:` is *not* a tool allowlist — since #533/#537 it narrows tools | fixed |
 | I-52 | P0 | docs/providers | `rupu run --agent <name>` is documented twice; the flag does not exist | fixed |
 | I-53 | P0 | docs/workflow-format | Approval **gate nodes** are entirely undocumented | fixed (in Arc 4) |
-| I-54 | P0 | docs/workflow-format | `action:` connector steps are entirely undocumented | open |
-| I-55 | P0 | docs/workflow-format | `branch:` is undocumented, including its silent-wrong-result transitive-arm rule | open |
-| I-56 | P0 | docs/workflow-format | The `wake_on:` example uses `github.pull_request.closed`, which never fires | open |
-| I-57 | P0 | docs/workflow-format | The `when:` event example uses a path that renders empty, silently skipping the step forever | open |
+| I-54 | P0 | docs/workflow-format | `action:` connector steps are entirely undocumented | fixed |
+| I-55 | P0 | docs/workflow-format | `branch:` is undocumented, including its silent-wrong-result transitive-arm rule | fixed |
+| I-56 | P0 | docs/workflow-format | The `wake_on:` example uses `github.pull_request.closed`, which never fires | fixed |
+| I-57 | P0 | docs/workflow-format | The `when:` event example uses a path that renders empty, silently skipping the step forever | fixed |
 | I-58 | P1 | docs | There is no config reference page; ~25 shipped keys are documented nowhere | fixed |
-| I-59 | P1 | docs/workflow-format | Non-linear constructs (`next`/`depends_on`/`split`/`join`/`loops`/`max_concurrency`) are undocumented | open |
-| I-60 | P1 | docs/workflow-format | Remote placement (`host:`/`distribute:`/`workspace:`) is referenced but never defined | open |
+| I-59 | P1 | docs/workflow-format | Non-linear constructs (`next`/`depends_on`/`split`/`join`/`loops`/`max_concurrency`) are undocumented | fixed |
+| I-60 | P1 | docs/workflow-format | Remote placement (`host:`/`distribute:`/`workspace:`) is referenced but never defined | fixed |
 | I-61 | P1 | docs/workflow-format | "Timeouts are enforced lazily" is stale — the gate sweep enforces them by default | fixed (in Arc 4) |
-| I-62 | P1 | docs/workflow-format | `autoflow.entity` is documented as issue-only; `pull_request` ships | open |
+| I-62 | P1 | docs/workflow-format | `autoflow.entity` is documented as issue-only; `pull_request` ships | fixed |
 | I-63 | P1 | docs/agent-format | Six accepted frontmatter keys and three built-in tools are missing from the reference | fixed |
 | I-64 | P1 | docs/transcript-schema | `action_emitted` semantics are wrong and two shipped event types are undocumented | fixed |
 | I-65 | P1 | docs/scm | The capability matrix says Linear/Jira have no `issues.*` support; both work today | fixed |
@@ -428,6 +428,51 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-54 … I-57, I-59, I-60, I-62 — `docs/workflow-format.md` truth pass
+
+Closed together as one sweep of the workflow authoring reference. **Every YAML example was
+verified by actually parsing it** — the implementer stood up a scratch crate with a path
+dependency on `rupu-orchestrator` and called `Workflow::parse` directly, rather than
+eyeballing the schema. That is what caught the errors below.
+
+- **I-54** — `action:` connector steps documented: the shape, parse-time catalog validation,
+  `with:`-key checking against the tool's JSON schema, the `ActionsOnActionStep` rule
+  (a step may not carry a non-empty `actions:` alongside `action:`), and Arc 4's
+  literal/whole-template/partial-template coercion rule.
+- **I-55** — `branch:` documented, including the transitive-arm rule taken **verbatim from
+  the `Branch` struct's doc comment** and `run_scheduler`'s `branch_skipped` logic, with a
+  worked "parses but is silently wrong" example. The implementer confirmed by parsing that
+  the wrong form **does** parse — proving it is a silent runtime bug, not a schema error,
+  which is precisely why it needed documenting.
+- **I-56** — the `wake_on:` example used `github.pull_request.closed`. GitHub PR canonical
+  ids are `github.pr.*`, never `github.pull_request.*` (confirmed in the connector's
+  `events.rs`), so that trigger could never fire. Fixed to `github.pr.opened`.
+- **I-57** — the `when:` example used `event.pull_request.merged`, which renders **empty**,
+  silently skipping the step forever. `build_event_payload` nests the vendor payload under
+  `event.payload.*`; corrected, and confirmed against that function's own unit test.
+- **I-59** — `next`, `depends_on`, `split`, `join`, `loops`, `max_concurrency` documented,
+  each **confirmed live-executed** via `run_scheduler`/`is_nonlinear` rather than parse-only.
+- **I-60** — `host:`/`distribute:`/`workspace:` remote placement documented, confirmed
+  executed through `UnitDispatcher` (not stubbed), plus the
+  `ActionsUnsupportedOnRemoteStep` rule.
+- **I-62** — `autoflow.entity` accepts `issue` **and** `pull_request`. Also fixed an
+  adjacent stale row the issue didn't mention: `claim.key` was documented as issue-only but
+  also accepts `pr_head_sha`.
+
+**A broken example of my own was found and fixed.** The gate-node `on_reject` example added
+in Arc 4 (commit `f0112477`) used `action: scm.prs.comment` with `with: { project: … }` —
+but that tool takes `owner`/`repo`, not `project`, so the example **did not parse**. Written
+while fixing documentation truth, and caught only because this pass parsed its examples
+instead of trusting them. It is now
+`with: { platform: github, owner: acme, repo: widget, number: 41, body: "rolled back" }`.
+
+**Not verified, recorded honestly:** whether `rupu webhook serve` produces an identical
+`event.*` envelope to the polled-on-cron-tick path that was traced. Only the polled-events
+plan has landed, so the polled path is what is documented; webhook-specific vocabulary is
+left to `docs/triggers.md`.
+
+---
 
 ### I-50 … I-52, I-58, I-63 … I-69, I-71, I-72 — the docs truth pass (batch)
 
