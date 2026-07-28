@@ -67,6 +67,9 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-80 | P2 | rupu-cli/docs | Reject-timeout gates now resolve only via `cp serve`'s sweep; CLI-only operators lose auto-resolution | open |
 | I-81 | P2 | rupu-mcp | `tools_list_matches_snapshot` fails in this worktree — schemars field-order drift under Homebrew 1.95 vs pinned 1.88 | open |
 | I-82 | P2 | rupu-cp | The CP web approve path discards the resolved decision, so a web approve's true actor is lost before the resume worker spawns | open |
+| I-83 | P2 | rupu-providers | `RetryingProvider` ignores server-supplied `Retry-After` by design; nothing in production reads it | open |
+| I-84 | P1 | rupu-providers | Anthropic's nested idle-retry × 429-retry loops multiply attempts | open |
+| I-85 | P2 | rupu-providers | Four hand-written reasoning-effort ladders, two of them byte-identical duplicates | open |
 
 ### Arc 3 — single UI path
 
@@ -103,7 +106,7 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-46 | P2 | rupu-providers | Gemini thinking levels are sent uppercase; Google documents lowercase (our own spec says tolerance is **unverified**) | open |
 | I-47 | P2 | rupu-providers | `minimal`/`xhigh` are forwarded to any openai-compatible endpoint with no allowlist ("rejected outright" is **unproven**; none of the named vendors ship as providers) | open |
 | I-48 | **P0** | rupu-providers | `usageMetadata.thoughtsTokenCount` is never read — the **only default-reachable** defect here; Gemini spend is silently under-billed and run totals under-report | open |
-| I-49 | P2 | rupu-providers | `classify.rs` is dead code (zero production callers) — the filed "flat 60s" claim is **false at every constant**; real default is one 2s retry | open |
+| I-49 | P2 | rupu-providers | `classify.rs` is dead code (zero production callers) — the filed "flat 60s" claim is **false at every constant**; real default is one 2s retry | fixed |
 
 ### Arc 6 — docs truth pass
 
@@ -136,6 +139,67 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 ---
 
 ## Open
+
+### I-83 — `RetryingProvider` ignores server-supplied `Retry-After`
+
+**Symptom.** When a provider returns 429 with a `Retry-After` header telling us exactly how
+long to wait, rupu ignores it and uses its own exponential backoff instead.
+
+**Root cause.** `RetryingProvider` (`tuned.rs:151-174`) calls `(self.backoff)(attempt)`
+unconditionally. Nothing in production ever parsed the header — see [[I-49]], which deleted
+the inert stub that was *supposed* to.
+
+**Impact.** Low today: the default is one 2s retry, so we rarely retry long enough for the
+server's hint to matter. It becomes real for anyone raising `max_retries`, where ignoring an
+explicit `Retry-After: 30` means hammering a provider that told us to back off — which is
+how rate-limit bans escalate.
+
+**Fix.** Parse `Retry-After` from the response headers at the client boundary (rupu-scm
+already does this correctly at `error.rs:144` and is the model to copy), surface it via the
+already-existing `ProviderError::RateLimited { retry_after }`, and have `RetryingProvider`
+prefer it over its computed backoff when present. Related: [[I-49]].
+
+---
+
+### I-84 — Anthropic's nested retry loops multiply attempts
+
+**Symptom.** Anthropic requests can retry far more times than any single configured limit
+suggests.
+
+**Root cause.** Two loops nest: an outer `MAX_STREAM_IDLE_RETRIES` loop (`anthropic.rs:1088`)
+wraps an inner `max_rate_limit_retries` 429 loop (`:1101`). Attempts **multiply** rather than
+add, so the effective ceiling is the product of the two.
+
+**Impact.** Worst case is a long stall against a provider that is already rate-limiting us.
+Note this is *not* the decorator-stacking problem — that one is correctly handled:
+`provider_factory.rs:331-337` excludes Anthropic from `RetryingProvider` precisely because it
+has native retry, pinned by `only_anthropic_skips_the_retry_decorator`. This is a defect
+*inside* the native implementation.
+
+**Fix.** Give the two loops a shared attempt budget, or make the outer loop not re-enter the
+inner one after a 429-driven exhaustion. Needs a decision about intended total attempts.
+
+---
+
+### I-85 — four hand-written reasoning-effort ladders, two duplicated verbatim
+
+**Symptom.** `ThinkingLevel` is a single shared enum, but every provider hand-writes its own
+translation with no shared helper: Anthropic → `budget_tokens`
+(`anthropic.rs:1338-1349`), Gemini → level + budget (`google_gemini.rs:357-371`),
+openai_wire → `reasoning_effort` string (`:178-185`), Codex → `reasoning.effort` string
+behind a model gate (`openai_codex.rs:537-546`).
+
+**Root cause.** Incremental provider addition, each pass adding a `match` rather than
+extending a shared mapping.
+
+**Impact.** The last two are **byte-identical duplicated `match` blocks in two files**, so
+any per-provider constraint (see [[I-47]]) has to be written twice or it silently diverges.
+Maintenance risk rather than a live defect.
+
+**Fix.** Factor the translation into one place keyed by wire format. Do this **before**
+adding any per-provider allowlist, not after, or the allowlist becomes a third copy.
+
+---
 
 ### I-82 — a web approve's true actor is lost before the resume worker spawns
 
@@ -342,6 +406,42 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-49 — the dead `classify` module is deleted
+
+**The filed statement was false at every constant.** It claimed `parse_retry_after` being a
+stub meant "every 429 backs off a flat 60s". In fact:
+
+- `classify_anthropic`/`openai`/`gemini`/`copilot` had **zero production callers** — only
+  `crates/rupu-providers/tests/classify.rs`. Every real client builds `ProviderError::Api`
+  directly, and `ProviderError::RateLimited` was constructed **only inside `#[cfg(test)]`**.
+  The stub was inert; nothing in production ever reached it.
+- The real default backoff is `RetryingProvider` with `DEFAULT_MAX_RETRIES = 1` and
+  `2000ms << attempt` — **one 2-second retry**. 60s is the cap after ~5 retries, and the
+  only literal 60s is a `ModelPool` availability window whose sole caller passes `None` and
+  whose type has no production constructor at all.
+
+**The stub could never have worked as written.** It takes `body: &str`, but `Retry-After` is
+an HTTP **header**. `rupu-scm` gets this right (`crates/rupu-scm/src/error.rs:144` parses it
+from a `HeaderMap`) — so the correct implementation already exists elsewhere in the
+workspace, against a different input type.
+
+**The module docstring was also false**: *"Each adapter calls its corresponding `classify_*`
+at the boundary between raw HTTP and the agent loop."* No adapter did.
+
+**Fix: deleted**, matching how [[I-27]] was handled in Arc 2. Wiring these in would be a
+*behavior change* — honouring server-supplied `Retry-After` — and that deserves its own
+scope rather than arriving as a side effect of removing dead code. Filed as [[I-83]].
+
+`ProviderError::RateLimited` is deliberately **kept**: it is the natural target once
+`Retry-After` is honoured, and removing a public error variant is a breaking change for no
+benefit.
+
+**Validation.** `cargo build --workspace` clean and `rupu-providers` green after removing
+133 lines of source, its test file, and the `pub mod` — the compiler is the proof for a
+deletion, and nothing referenced it.
+
+---
 
 ### I-36 + I-38 — gate decision provenance is recorded on every path
 
