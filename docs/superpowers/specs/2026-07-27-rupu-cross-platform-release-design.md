@@ -37,7 +37,7 @@ These were settled during brainstorming and constrain everything below.
 | Windows | WSL2, not native | The entire native-Windows port is out of scope. See "Why not native Windows". |
 | Build host | GitHub Actions, containerized | Free on this public repo; native runners per arch, no emulation. |
 | macOS build | Moves into CI | Releasing becomes "push a tag"; notarization enters the release path. |
-| Linux credentials | File backend | Drops `libdbus-sys`, which makes a fully static musl build possible. |
+| Credentials | Retire keyring on **all** platforms | The keyring path was too complex for its value. Also drops `libdbus-sys`, which makes a static musl build possible. |
 | Arc scope | Release pipeline **and** a per-PR Linux CI gate | Linux correctness is enforced between releases, not discovered by users. |
 
 ### Why not native Windows
@@ -118,51 +118,63 @@ Confirmed by `cargo tree` against both target triples: the Windows graph does **
 `default-members`, so every Linux job must scope itself explicitly — either
 `-p rupu-cli` or `--workspace --exclude rupu-app` — or it will attempt to compile GPUI.
 
-### 3. Credentials on Linux: file backend
+### 3. Credentials: retire the keyring backend entirely
 
-**Correction to an earlier assumption:** the file backend is already the default on every
-platform. `KeychainResolver::with_service` (`crates/rupu-auth/src/resolver.rs:97-135`)
-resolves `RUPU_AUTH_BACKEND` → probe cache → **file**, and the comment there explains why
-(cdhash-bound keychain requirements break bare CLI binaries on every rebuild). Only the
-module-level doc comment at `resolver.rs:44-51` still describes keyring-as-default; it is
-stale and should be corrected. So no default-flipping work is required.
+The keyring backend is being removed on **every** platform, not gated per-platform. It was
+too complex to be worth its cost, and the file backend is already the default everywhere.
+This is a decision about rupu's credential storage generally; making Linux buildable is a
+beneficiary, not the motivation.
 
-What is actually required is removing the dependency, which is more invasive than flipping
-a default. `keyring` moves from a flat `[workspace.dependencies]` entry to per-target
-dependency tables in its two consumers, `rupu-auth` and `rupu-workspace`, so that on Linux
-the crate is absent entirely. Because `keyring::Error` is woven into public API surface,
-that requires `cfg`-gating across six files:
+**The file backend is already the default.** `KeychainResolver::with_service`
+(`crates/rupu-auth/src/resolver.rs:97-135`) resolves `RUPU_AUTH_BACKEND` → probe cache →
+**file**, and the comment there explains why: keychain requirements for a bare CLI binary
+are cdhash-bound, so every rebuild invalidates them and reads silently fail. Only the
+module-level doc comment at `resolver.rs:36-51` still describes keyring-as-default; it is
+stale. So no default needs flipping — what is removed is the alternative.
 
-| File | Keyring surface to gate |
+**What goes away:**
+
+| Target | Detail |
 |---|---|
-| `crates/rupu-auth/src/backend.rs:60` | `AuthError::Keyring(#[from] keyring::Error)` variant |
-| `crates/rupu-auth/src/keyring.rs` | whole module (`KeyringBackend`) |
-| `crates/rupu-auth/src/lib.rs:41` | `pub use keyring::KeyringBackend` |
-| `crates/rupu-auth/src/probe.rs:11` | keychain-availability probe |
-| `crates/rupu-auth/src/resolver.rs` | `Storage::Keyring` variant + its match arms |
-| `crates/rupu-workspace/src/host_store.rs:39-40` | `HostStoreError::Keyring` variant |
+| `crates/rupu-keychain-acl/` | Entire crate (585 lines). Its only consumer is `rupu-auth`. |
+| `crates/rupu-auth/src/keyring.rs` | `KeyringBackend` (104 lines) |
+| `crates/rupu-auth/src/keychain_layout.rs` | `key_for` / `legacy_key_for` / `KeychainKey` (53 lines) — keyring addressing only |
+| `crates/rupu-auth/src/probe.rs` | Keychain-availability probe (148 lines) |
+| `crates/rupu-auth/src/resolver.rs` | `Storage` enum collapses to a single file path |
+| `crates/rupu-auth/src/backend.rs:60` | `AuthError::Keyring` variant |
+| `crates/rupu-workspace/src/host_store.rs:331-360` | Three keyring helpers; host tokens move to the file store |
+| `crates/rupu-auth/tests/keyring_ignored.rs` | Deleted with `KeyringBackend` |
+| root `Cargo.toml:104` | The `keyring` workspace dependency |
 
-**No mock store.** `keyring` v3 compiles on Linux with no platform feature enabled by
-falling back to an in-memory mock credential store. That must not ship: it would accept
-writes and lose them silently, which is precisely the silent-noop failure mode this project
-rejects. Removing the dependency outright is what makes the failure honest.
+**A notable side effect:** `rupu-keychain-acl` is the only crate in the workspace exempt
+from `unsafe_code = "forbid"` (it wraps Security.framework FFI). Deleting it makes the
+unsafe ban genuinely workspace-wide, with no exemption remaining.
 
-Consequently `rupu auth backend --use keychain` must return an explicit
-"not supported on this platform" error on Linux (`crates/rupu-cli/src/cmd/auth.rs:443`
-already has the unknown-backend error path to extend), never a silent fallback.
+**What explicitly stays.** `rupu-providers` reads *Claude Code's* keychain entry to import
+credentials from it (`crates/rupu-providers/src/auth/discovery.rs:69`,
+`anthropic.rs::load_claude_code_keychain`). That is a one-way import from another tool, it
+does not use the `keyring` crate, and it is unaffected. Removing rupu's own keychain
+*storage* is not the same as removing the ability to *discover* credentials other tools
+left in a keychain.
 
-The file backend itself is unchanged: `~/.rupu/auth.json`, permissions reset to 0600 on
+**Migration: clean break with a detection notice.** There is no existing keychain→file
+migration path (`legacy_key_for` addresses a legacy keychain *account naming* scheme, not a
+file migration), so credentials still in a keychain would otherwise strand silently. On
+macOS, a `security find-generic-password` probe — a shellout, requiring no `keyring` crate,
+the same technique `rupu-providers` already uses — detects a stranded entry and prints a
+one-time notice telling the user to run `rupu auth login`. No automatic import: keeping the
+full keychain addressing scheme alive purely for migration would preserve exactly the
+complexity this removal exists to shed, and there is no clean shellout equivalent on
+Windows, so an import would silently break Windows users regardless.
+
+**The file backend itself is unchanged:** `~/.rupu/auth.json`, permissions reset to 0600 on
 every write, a `tracing::warn!` if found wider than 0600
-(`crates/rupu-auth/src/json_file.rs`).
+(`crates/rupu-auth/src/json_file.rs`), honoring `RUPU_HOME` and `RUPU_AUTH_FILE`.
 
-**Stated plainly:** with the dependency removed there is no keyring option on Linux. Desktop
-Linux users get plaintext-with-0600, not gnome-keyring or KWallet. This is accepted
-deliberately — it is already the correct behavior for the headless server and container
-case, which is the dominant Linux deployment for rupu. Per-OS credential integration is
-deferred until the platforms themselves are working, at which point Linux can get
-secret-service support the same way macOS has keychain support today.
-
-macOS and Windows credential behavior are unchanged.
+**Stated plainly:** after this change rupu stores credentials in a chmod-600 file on macOS,
+Windows, and Linux alike. No OS keystore is used anywhere. This matches what `gh`, `aws`,
+`gcloud`, `kubectl`, and `terraform` do — none of them use the OS keychain by default —
+and it is the reasoning already written into `resolver.rs:110-135`.
 
 ### 4. Release workflow
 
@@ -269,21 +281,30 @@ the test suite. Known candidates for what that finds:
 
 ## Work breakdown
 
-Seven PRs. Only #5 has meaningful external setup friction; #0 is the one that can change
-the shape of everything after it.
+Three plans, each producing working software on its own, executed in order.
 
-0. **Linux spike.** Get the CLI building and its tests passing for
-   `x86_64-unknown-linux-musl` in a container. Output is a list of required `cfg` gates and
-   image dependencies — sizing input for the rest.
-1. **Platform naming contract.** `--print-platform`, the mapping unit test, removal of the
-   `uname` derivation.
-2. **Credential target-gating.** `keyring` moves to per-target tables; Linux defaults to the
-   file backend; tests for the Linux default.
-3. **Build image + Linux CI gate.** The container definition and `ci.yml`.
-4. **Release workflow, Linux jobs.** Tag trigger, channel derivation, `web` artifact job,
-   two Linux build jobs, publish job.
-5. **Release workflow, macOS job.** Certificate import, signing, notarization.
-6. **Docs + `install.sh`.**
+**Plan 1 — Retire the keyring credential backend** (spec §3).
+`docs/superpowers/plans/2026-07-28-rupu-plan-1-retire-keyring-backend.md`
+Standalone value independent of cross-platform work: deletes `rupu-keychain-acl` and the
+keyring code paths, moves host tokens to the file store, adds the stranded-keychain
+detection notice, and leaves the workspace with no `unsafe_code` exemption. Also a
+prerequisite — it is what removes `libdbus-sys` from the Linux graph.
+
+**Plan 2 — Linux buildability** (spec §1, §2, §5).
+`docs/superpowers/plans/2026-07-28-rupu-cross-platform-plan-2-linux-buildability.md`
+The platform-naming contract, the pinned musl build container, a statically-linked
+`rupu` proven to run on `alpine:3.20` and `debian:12`, a green Linux test suite, and the
+repo's first per-PR CI gate.
+
+**Plan 3 — CI release pipeline** (spec §4, §6).
+Tag-triggered release workflow with channel derivation, the shared `web/dist` artifact job,
+Linux and macOS build jobs, macOS certificate import + signing + notarization, the atomic
+publish job, `install.sh`, and the README / `docs/RELEASING.md` rewrites. Written once
+Plan 2 lands.
+
+Only Plan 3's macOS job has meaningful external setup friction (Apple credentials as
+repository secrets). Plan 2's container task is the one that can change the shape of what
+follows it, since nothing has ever compiled this workspace for Linux.
 
 ## Out of scope
 
@@ -291,6 +312,9 @@ the shape of everything after it.
 - Intel macOS (`darwin-x64`) binaries.
 - `rupu-app` on any non-macOS platform.
 - Replacing the `/bin/sh` and `/bin/kill` shellouts with portable equivalents.
-- Secret-service or KWallet integration on Linux — deferred until the platforms work.
+- Any OS-keystore credential integration, on any platform. The keyring backend is being
+  retired outright (§3), not reimplemented per-OS.
+- Automatic migration of credentials out of an existing OS keychain (§3 ships a detection
+  notice instead).
 - Package-manager distribution (Homebrew tap, AUR, apt repo, Nix).
 - Formatting cleanup of the 532 rustfmt diff sites on `main`.

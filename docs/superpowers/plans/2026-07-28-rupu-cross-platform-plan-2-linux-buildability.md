@@ -1,23 +1,25 @@
-# Cross-Platform Plan 1: Linux Buildability Implementation Plan
+# Cross-Platform Plan 2: Linux Buildability Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make the rupu CLI build as a fully static Linux musl binary and keep it that way with a per-PR CI gate.
 
-**Architecture:** Three independent threads land in one arc. First, the release-asset platform name gets a single owner in `rupu-update` and is read back out of the built binary, killing the publisher/updater drift. Second, `keyring` is removed from the Linux dependency graph via per-target manifest tables, which drops `libdbus-sys` and makes static linking possible. Third, a pinned Alpine container reproduces the Linux build identically on a laptop and in CI, and a new `ci.yml` runs build + clippy + test on every PR.
+**Architecture:** Two threads land in one arc. First, the release-asset platform name gets a single owner in `rupu-update` and is read back out of the built binary, killing the publisher/updater drift. Second, a pinned Alpine container reproduces the Linux build identically on a laptop and in CI, producing a static musl binary, and a new `ci.yml` runs build + clippy + test on every PR. The credential work that unblocks static linking is Plan 1 and must land first.
 
 **Tech Stack:** Rust 1.95 (pinned), `cargo`, musl via `rust:alpine`, Docker/nerdctl containers, GitHub Actions, `clap` 4, `assert_cmd`.
 
 **Spec:** `docs/superpowers/specs/2026-07-27-rupu-cross-platform-release-design.md`
 
-**Scope note:** This plan covers spec §1 (naming), §2 (Linux build shape), §3 (credentials), and §5 (CI gate). Spec §4 (release workflow) and §6 (docs, `install.sh`) are Plan 2, which depends on this one landing.
+**Depends on:** Plan 1 (`2026-07-28-rupu-plan-1-retire-keyring-backend.md`) must land first. It removes `keyring`, and with it `libdbus-sys`, from the dependency graph — without that, the static musl build in Task 3 cannot link.
+
+**Scope note:** This plan covers spec §1 (naming), §2 (Linux build shape), and §5 (CI gate). Spec §3 (credentials) is Plan 1; spec §4 (release workflow) and §6 (docs, `install.sh`) are Plan 3.
 
 ## Global Constraints
 
 - Rust edition 2021; toolchain pinned to **1.95** in `rust-toolchain.toml`. CI honors that pin via rustup; local development currently runs Homebrew 1.97.1 with no rustup, so CI may surface clippy lints never seen locally.
-- **Workspace dependencies only.** Versions are pinned in the root `Cargo.toml`; never write a version in a crate `Cargo.toml`. Per-target tables use `keyring.workspace = true`, not a version.
-- `#![deny(clippy::all)]` workspace-wide via `[workspace.lints]`. `unsafe_code = "forbid"` everywhere except `rupu-keychain-acl`.
-- **No mock or silent-noop code paths.** If something cannot work on a platform, it must fail loudly with an explicit message. This is why `keyring` is removed rather than left to fall back to its in-memory mock store.
+- **Workspace dependencies only.** Versions are pinned in the root `Cargo.toml`; never write a version in a crate `Cargo.toml`.
+- `#![deny(clippy::all)]` workspace-wide via `[workspace.lints]`. `unsafe_code = "forbid"` with no exemption anywhere (Plan 1 deleted the last one).
+- **No mock or silent-noop code paths.** If something cannot work on a platform, it must fail loudly with an explicit message.
 - Canonical release-asset platform name: `rupu-<os>-<arch>`, os ∈ `{darwin, linux}`, arch ∈ `{arm64, x64}`.
 - `rupu-app` is macOS-only (GPUI + objc2). Every Linux build and test command must be scoped `--workspace --exclude rupu-app` or `-p <crate>`. The workspace declares no `default-members`, so an unscoped `cargo build` will try to compile GPUI.
 - **Never run `cargo fmt` package-wide.** `main` has 532 rustfmt diff sites. Format only the specific files you touched, e.g. `rustfmt crates/rupu-update/src/decide.rs`.
@@ -155,7 +157,7 @@ This is the fix for the naming defect. After this task, the publisher asks the b
 
 **Interfaces:**
 - Consumes: `rupu_update::current_platform()` from Task 1.
-- Produces: `rupu update --print-platform` printing `<os>-<arch>` and a trailing newline to stdout, exit 0. The release workflow in Plan 2 depends on this exact contract.
+- Produces: `rupu update --print-platform` printing `<os>-<arch>` and a trailing newline to stdout, exit 0. The release workflow in Plan 3 depends on this exact contract.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -291,7 +293,7 @@ Establishes the reproducible Linux toolchain before any Linux-specific code chan
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
-- Produces: a container image tag `rupu-linux-build`, and `make linux-build` which builds `rupu-cli` inside it into `target/linux-musl/`. Task 9's CI workflow invokes the same Dockerfile.
+- Produces: a container image tag `rupu-linux-build`, and `make linux-build` which builds `rupu-cli` inside it into `target/linux-musl/`. Task 6's CI workflow invokes the same Dockerfile.
 
 - [ ] **Step 1: Write the Dockerfile**
 
@@ -325,7 +327,7 @@ FROM rust:1.95-alpine3.20
 # git: build scripts and several tests shell out to it.
 # bash: some test fixtures write `#!/bin/sh` scripts but the test harness
 #   itself is easier to debug with a real shell present.
-# nodejs, npm: `make cp-web` builds the embedded CP UI (used by Plan 2's
+# nodejs, npm: `make cp-web` builds the embedded CP UI (used by Plan 3's
 #   release job; harmless here).
 RUN apk add --no-cache \
       musl-dev gcc g++ make perl cmake clang clang-dev \
@@ -381,9 +383,9 @@ Run:
 make linux-build CONTAINER="lima nerdctl" 2>&1 | tail -40
 ```
 
-Expected at this point: the image builds successfully and `cargo` starts compiling. The `rupu-cli` build is **expected to fail** — `keyring` still pulls `libdbus-sys`, which needs D-Bus headers not present in the image. That failure is the baseline Tasks 4–7 remove; do not fix it by adding `dbus-dev` to the image.
+Expected: the image builds and `cargo` compiles. With Plan 1 landed there is no `libdbus-sys` in the graph, so this should get a long way. If it fails on a missing D-Bus header, Plan 1 did not fully land — go verify `cargo tree --workspace --target x86_64-unknown-linux-musl | grep dbus` is empty rather than adding `dbus-dev` to the image.
 
-- [ ] **Step 5: Prove the toolchain itself is sound with a crate that has no keyring dependency**
+- [ ] **Step 5: Prove the toolchain itself is sound on the riskiest dependency**
 
 Run:
 ```bash
@@ -402,7 +404,7 @@ Run:
 lima nerdctl run --rm -v "$PWD":/work -w /work rupu-linux-build \
   sh -c 'file target/linux-musl/release/librupu_update.rlib >/dev/null && echo rlib-ok'
 ```
-Expected: `rlib-ok`. (A staticness check on an executable comes in Task 7, once `rupu-cli` links.)
+Expected: `rlib-ok`. (A staticness check on an executable comes in Task 4, once `rupu-cli` links.)
 
 - [ ] **Step 7: Commit**
 
@@ -417,312 +419,16 @@ would not run on Debian 12, RHEL 9, or Amazon Linux 2."
 
 ---
 
-### Task 4: Remove `keyring` from `rupu-auth` on Linux
+### Task 4: Get the full `rupu-cli` binary linking under musl
 
-`keyring::Error` is woven into public API surface, so the dependency cannot simply be dropped — the types that mention it must be `cfg`-gated in lockstep.
-
-**Files:**
-- Modify: `crates/rupu-auth/Cargo.toml:18`
-- Modify: `crates/rupu-auth/src/lib.rs:41`
-- Modify: `crates/rupu-auth/src/backend.rs:60`
-- Modify: `crates/rupu-auth/src/probe.rs:11`
-- Modify: `crates/rupu-auth/src/resolver.rs` (the `Storage` enum at ~line 59, `entry()` at ~line 150, and the match arms at ~lines 187-330)
-- Modify: `crates/rupu-auth/src/resolver.rs:44-51` (the stale doc comment)
-
-**Interfaces:**
-- Consumes: the container from Task 3.
-- Produces: `rupu-auth` compiling on Linux with no `keyring` in its graph. `AuthError::Keyring` and `KeyringBackend` exist only on macOS and Windows. `Storage` has a single variant, `JsonFile`, on Linux.
-
-- [ ] **Step 1: Write the failing check**
-
-This task's contract is a dependency-graph property, which no unit test can observe. The check is a shell assertion; run it now to confirm it currently fails:
-
-```bash
-cargo tree -p rupu-auth -e normal --prefix none --target x86_64-unknown-linux-musl \
-  | grep -E '^(keyring|libdbus-sys|dbus-secret-service) ' | sort -u
-```
-
-Expected now: prints `keyring v3.6.3`, `dbus-secret-service v4.1.0`, `libdbus-sys v0.2.7` — i.e. the check fails.
-
-Note `cargo tree --target` resolves the graph without needing that target's std installed, so this works on a Mac with no rustup.
-
-- [ ] **Step 2: Move the dependency to per-target tables**
-
-In `crates/rupu-auth/Cargo.toml`, delete `keyring.workspace = true` from `[dependencies]` (line 18) and add this block after the `[dependencies]` section, before `[dev-dependencies]`:
-
-```toml
-# keyring is macOS/Windows only. On Linux it would pull dbus-secret-service
-# + libdbus-sys, which blocks static musl linking — and with no platform
-# feature enabled keyring v3 silently falls back to an in-memory MOCK
-# credential store, which would accept writes and lose them. Absent is the
-# only honest option; see the Linux credential section of
-# docs/superpowers/specs/2026-07-27-rupu-cross-platform-release-design.md.
-[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
-keyring.workspace = true
-```
-
-- [ ] **Step 3: Gate the module export**
-
-In `crates/rupu-auth/src/lib.rs`, find the `pub mod keyring;` declaration and the `pub use keyring::KeyringBackend;` on line 41. Add a gate above each:
-
-```rust
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-pub mod keyring;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-pub use keyring::KeyringBackend;
-```
-
-- [ ] **Step 4: Gate the error variant**
-
-In `crates/rupu-auth/src/backend.rs`, gate the variant at line 60:
-
-```rust
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    #[error("keyring: {0}")]
-    Keyring(#[from] keyring::Error),
-```
-
-- [ ] **Step 5: Gate the probe**
-
-In `crates/rupu-auth/src/probe.rs`, gate the import at line 11 and every item that references `KeyringBackend`:
-
-```rust
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use crate::keyring::KeyringBackend;
-```
-
-Then compile and gate whatever the compiler reports as newly-unresolved in that file. Where a public function's behavior differs, do not stub it — give Linux a distinct implementation that returns an explicit "no OS keychain on this platform" result.
-
-- [ ] **Step 6: Gate the `Storage::Keyring` variant and its arms**
-
-In `crates/rupu-auth/src/resolver.rs`, gate the enum variant (~line 59):
-
-```rust
-enum Storage {
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    Keyring { service: String },
-    JsonFile { path: PathBuf },
-}
-```
-
-Gate the `entry()` method (~line 150) and every `Storage::Keyring { .. } =>` match arm (~lines 187-330) with the same attribute. In `with_service`, the `want_file == false` branch must, on Linux, produce an explicit error rather than a keyring variant — see Task 6 for the user-facing message; here it is sufficient that the code does not compile a keyring path on Linux.
-
-- [ ] **Step 7: Fix the stale doc comment**
-
-`crates/rupu-auth/src/resolver.rs:44-51` still describes the keychain as the default with the file backend as an `RUPU_AUTH_BACKEND=file` escape hatch. The code at lines 97-135 has defaulted to file for some time. Rewrite the doc comment to say the file backend is the default on every platform, the OS keychain is opt-in on macOS and Windows, and Linux has no keychain option at all.
-
-- [ ] **Step 8: Verify the dependency is gone**
-
-Run the Step 1 command again.
-Expected: no output at all.
-
-Also confirm macOS is untouched:
-```bash
-cargo tree -p rupu-auth -e normal --prefix none --target aarch64-apple-darwin | grep -c '^keyring '
-```
-Expected: `1`
-
-- [ ] **Step 9: Verify it compiles on both platforms**
-
-```bash
-cargo test -p rupu-auth
-lima nerdctl run --rm -v "$PWD":/work -w /work rupu-linux-build \
-  cargo check -p rupu-auth --target-dir target/linux-musl
-```
-Expected: macOS tests PASS; Linux check PASSES.
-
-- [ ] **Step 10: Format and commit**
-
-```bash
-rustfmt crates/rupu-auth/src/lib.rs crates/rupu-auth/src/backend.rs \
-        crates/rupu-auth/src/probe.rs crates/rupu-auth/src/resolver.rs
-git add crates/rupu-auth/
-git commit -m "build(auth): keyring is macOS/Windows only
-
-Drops dbus-secret-service + libdbus-sys from the Linux graph, which is
-what makes static musl linking possible. Absent rather than
-feature-disabled: keyring v3 with no platform feature falls back to an
-in-memory mock store that would accept writes and lose them."
-```
-
----
-
-### Task 5: Remove `keyring` from `rupu-workspace` on Linux
-
-Same treatment, much smaller surface: one error variant and the call sites that construct it.
-
-**Files:**
-- Modify: `crates/rupu-workspace/Cargo.toml:19`
-- Modify: `crates/rupu-workspace/src/host_store.rs:1-6` (module doc), `:39-40` (error variant), and the token read/write call sites
-
-**Interfaces:**
-- Consumes: the pattern established in Task 4.
-- Produces: `rupu-workspace` compiling on Linux with no `keyring` in its graph. `HostStoreError::Keyring` exists only on macOS and Windows.
-
-- [ ] **Step 1: Write the failing check**
-
-```bash
-cargo tree -p rupu-workspace -e normal --prefix none --target x86_64-unknown-linux-musl \
-  | grep -E '^(keyring|libdbus-sys|dbus-secret-service) ' | sort -u
-```
-Expected now: prints the three crates — the check fails.
-
-- [ ] **Step 2: Move the dependency**
-
-In `crates/rupu-workspace/Cargo.toml`, delete `keyring = { workspace = true }` (line 19) and add after `[dependencies]`:
-
-```toml
-# See crates/rupu-auth/Cargo.toml for why keyring is macOS/Windows only.
-[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
-keyring.workspace = true
-```
-
-- [ ] **Step 3: Gate the error variant**
-
-In `crates/rupu-workspace/src/host_store.rs`, gate lines 39-40:
-
-```rust
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    #[error("keyring: {0}")]
-    Keyring(#[from] keyring::Error),
-```
-
-- [ ] **Step 4: Handle the token storage call sites**
-
-Compile and address each error the gate produces. Host tokens on Linux must go to the same file-backed store the rest of rupu's credentials use, not to a stub. If a call site cannot be made to work without keyring, return an explicit error naming the platform — never a silent success.
-
-- [ ] **Step 5: Correct the module doc**
-
-`crates/rupu-workspace/src/host_store.rs:4` claims "Tokens are kept in the system keychain via `keyring`". Update it to state that tokens use the system keychain on macOS and Windows and the file-backed credential store on Linux.
-
-- [ ] **Step 6: Verify**
-
-```bash
-cargo tree -p rupu-workspace -e normal --prefix none --target x86_64-unknown-linux-musl \
-  | grep -E '^(keyring|libdbus-sys|dbus-secret-service) '
-cargo test -p rupu-workspace
-lima nerdctl run --rm -v "$PWD":/work -w /work rupu-linux-build \
-  cargo check -p rupu-workspace --target-dir target/linux-musl
-```
-Expected: the `cargo tree` grep prints nothing; macOS tests PASS; Linux check PASSES.
-
-- [ ] **Step 7: Format and commit**
-
-```bash
-rustfmt crates/rupu-workspace/src/host_store.rs
-git add crates/rupu-workspace/
-git commit -m "build(workspace): keyring is macOS/Windows only
-
-Host tokens use the file-backed credential store on Linux."
-```
-
----
-
-### Task 6: `rupu auth backend --use keychain` fails explicitly on Linux
-
-With `keyring` gone, asking for the keychain must produce a clear refusal. A silent downgrade to the file backend would leave a user believing their credentials are in an OS keystore when they are in a plaintext file — the worst outcome available.
-
-**Files:**
-- Modify: `crates/rupu-cli/src/cmd/auth.rs:443` (the unknown-backend error path)
-- Test: `crates/rupu-cli/tests/cli_auth_backend_platform.rs` (create)
-
-**Interfaces:**
-- Consumes: the Linux-gated `rupu-auth` from Task 4.
-- Produces: exit code 1 and a message containing "not supported on Linux" when `--use keychain` is requested on Linux. On macOS and Windows the behavior is unchanged.
-
-- [ ] **Step 1: Write the failing test**
-
-Create `crates/rupu-cli/tests/cli_auth_backend_platform.rs`:
-
-```rust
-//! Asking for the OS keychain on a platform that has none must fail
-//! loudly. Silently storing credentials in a plaintext file while the
-//! user believes they are in a keystore is a security-relevant lie, not
-//! a convenience.
-
-use assert_cmd::Command;
-
-#[cfg(target_os = "linux")]
-#[test]
-fn requesting_the_keychain_on_linux_is_an_explicit_error() {
-    Command::cargo_bin("rupu")
-        .expect("rupu binary builds")
-        .args(["auth", "backend", "--use", "keychain"])
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("not supported on Linux"));
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-#[test]
-fn requesting_the_keychain_is_accepted_where_one_exists() {
-    Command::cargo_bin("rupu")
-        .expect("rupu binary builds")
-        .args(["auth", "backend", "--use", "keychain"])
-        .assert()
-        .success();
-}
-```
-
-- [ ] **Step 2: Run the test to verify it fails**
-
-On macOS the Linux test is compiled out, so run it in the container:
-```bash
-lima nerdctl run --rm -v "$PWD":/work -w /work rupu-linux-build \
-  cargo test -p rupu-cli --test cli_auth_backend_platform --target-dir target/linux-musl
-```
-Expected: FAIL — the command currently succeeds and silently uses the file backend.
-
-- [ ] **Step 3: Add the explicit refusal**
-
-In `crates/rupu-cli/src/cmd/auth.rs`, in the match that currently ends with
-`other => anyhow::bail!("unknown backend \`{other}\` — expected one of: file | keychain")`
-(line 443), add a Linux-only arm ahead of it:
-
-```rust
-        #[cfg(target_os = "linux")]
-        "keychain" | "keyring" | "os" | "os-keychain" => anyhow::bail!(
-            "the OS keychain is not supported on Linux — rupu is built without \
-             a keyring backend there, so credentials live in the chmod-600 file \
-             store at `$RUPU_HOME/auth.json` (default `~/.rupu/auth.json`). \
-             Use `--use file`."
-        ),
-```
-
-Keep the existing `keychain` handling for macOS and Windows; gate it `#[cfg(not(target_os = "linux"))]` if the compiler reports an unreachable-pattern warning.
-
-- [ ] **Step 4: Run the test to verify it passes**
-
-```bash
-lima nerdctl run --rm -v "$PWD":/work -w /work rupu-linux-build \
-  cargo test -p rupu-cli --test cli_auth_backend_platform --target-dir target/linux-musl
-cargo test -p rupu-cli --test cli_auth_backend_platform
-```
-Expected: PASS in the container (Linux arm), PASS on the host (macOS arm).
-
-- [ ] **Step 5: Format and commit**
-
-```bash
-rustfmt crates/rupu-cli/src/cmd/auth.rs crates/rupu-cli/tests/cli_auth_backend_platform.rs
-git add crates/rupu-cli/src/cmd/auth.rs crates/rupu-cli/tests/cli_auth_backend_platform.rs
-git commit -m "feat(auth): refuse --use keychain on Linux with an explicit message
-
-Silently downgrading to the plaintext file store would leave users
-believing credentials are in an OS keystore when they are not."
-```
-
----
-
-### Task 7: Get the full `rupu-cli` binary linking under musl
-
-Tasks 4–6 removed the known blocker. This task closes out whatever remains — most likely vendored libgit2 and OpenSSL.
+Plan 1 removed the known blocker. This task closes out whatever remains — most likely vendored libgit2 and OpenSSL.
 
 **Files:**
 - Modify: `docker/linux-build.Dockerfile` (only if a genuinely missing build tool is found)
 - Modify: whichever crates fail to compile
 
 **Interfaces:**
-- Consumes: Tasks 3–6.
+- Consumes: Task 3, and Plan 1.
 - Produces: `target/linux-musl/release/rupu`, a static executable.
 
 - [ ] **Step 1: Run the full build**
@@ -779,7 +485,7 @@ Verified running unmodified on alpine:3.20 and debian:12."
 
 ---
 
-### Task 8: Get the Linux test suite green
+### Task 5: Get the Linux test suite green
 
 The file list here genuinely cannot be known in advance — nothing has ever run these tests on Linux. What *can* be specified is the decision rule for each failure, which is the part where judgment goes wrong.
 
@@ -788,8 +494,8 @@ The file list here genuinely cannot be known in advance — nothing has ever run
 - Modify: product code, where a test reveals a real Linux bug
 
 **Interfaces:**
-- Consumes: Task 7's working build.
-- Produces: `cargo test --workspace --exclude rupu-app` passing in the container. Task 9's CI gate enforces it from then on.
+- Consumes: Task 4's working build.
+- Produces: `cargo test --workspace --exclude rupu-app` passing in the container. Task 6's CI gate enforces it from then on.
 
 - [ ] **Step 1: Get the baseline**
 
@@ -805,7 +511,7 @@ Record the full list of failing tests in the PR description before changing anyt
 | Symptom | Rule |
 |---|---|
 | Test shells out to `security`, `codesign`, `xattr`, or `open` | macOS-only behavior. Gate the test `#[cfg(target_os = "macos")]`. |
-| Test asserts on a keychain backend | Now macOS/Windows-only by Task 4. Gate it the same way as the dependency: `#[cfg(any(target_os = "macos", target_os = "windows"))]`. |
+| Test asserts on a keychain backend | Should not exist — Plan 1 deleted that backend. If one survives, delete it rather than gating it. |
 | Test hardcodes `/tmp` or a macOS-specific path | Portability bug in the test. Fix it to use `tempfile`/`assert_fs`, do not gate it. |
 | Test asserts file permissions via `PermissionsExt` | Valid on Linux. If it fails, the product behavior differs — investigate before touching the test. |
 | Product code misbehaves on Linux | **Fix the product code.** Do not gate the test. |
@@ -839,7 +545,7 @@ not gated; see the PR description for the full baseline list."
 
 ---
 
-### Task 9: Per-PR Linux CI gate
+### Task 6: Per-PR Linux CI gate
 
 The repo has no build or test CI today. This adds the first, on the platform most likely to break silently.
 
@@ -847,7 +553,7 @@ The repo has no build or test CI today. This adds the first, on the platform mos
 - Create: `.github/workflows/ci.yml`
 
 **Interfaces:**
-- Consumes: `docker/linux-build.Dockerfile` from Task 3; the green test suite from Task 8.
+- Consumes: `docker/linux-build.Dockerfile` from Task 3; the green test suite from Task 5.
 - Produces: a required-status-check candidate named `ci / linux`.
 
 - [ ] **Step 1: Write the workflow**
@@ -879,8 +585,8 @@ jobs:
         run: docker build -f docker/linux-build.Dockerfile -t rupu-linux-build .
 
       # Guards the property that makes static linking possible. Without
-      # this, a future `keyring.workspace = true` in some new crate would
-      # silently reintroduce libdbus-sys and break the release build at
+      # this, a future crate re-adding `keyring` would silently
+      # reintroduce libdbus-sys and break the release build at
       # the worst possible moment.
       - name: Assert keyring and dbus stay out of the Linux graph
         run: |
@@ -960,23 +666,19 @@ If the job exceeds ~30 minutes, add `Swatinem/rust-cache@v2` and mount a persist
 | §1 mapping unit test | Task 1 |
 | §1 remove `uname` derivation from `gh-build.sh` | Task 2, Step 6 |
 | §2 static musl, native per-arch, pinned container | Tasks 3, 7 |
-| §2 `rupu-app` excluded | Global Constraints; Task 9 |
-| §3 keyring per-target tables | Tasks 4, 5 |
+| §2 `rupu-app` excluded | Global Constraints; Task 6 |
 | §3 six-file `cfg` gating table | Tasks 4, 5 |
-| §3 no mock store | Task 4, Step 2; Task 6 |
-| §3 explicit keychain refusal on Linux | Task 6 |
-| §3 stale `resolver.rs` doc comment | Task 4, Step 7 |
-| §5 per-PR Linux gate | Task 9 |
-| §5 `fmt` non-blocking | Task 9, Step 1 |
-| §5 rustup honors the 1.95 pin | Global Constraints; Task 9, Step 3 |
+| §5 per-PR Linux gate | Task 6 |
+| §5 `fmt` non-blocking | Task 6, Step 1 |
+| §5 rustup honors the 1.95 pin | Global Constraints; Task 6, Step 3 |
 | §6 Risks: aws-lc-rs under musl | Task 3, Step 5 |
-| §6 Risks: macOS-only tests need gates | Task 8 |
-| §6 Risks: vendored OpenSSL needs perl | Task 3, Step 1; Task 7, Step 2 |
+| §6 Risks: macOS-only tests need gates | Task 5 |
+| §6 Risks: vendored OpenSSL needs perl | Task 3, Step 1; Task 4, Step 2 |
 
-Spec §4 (release workflow) and §6 (docs, `install.sh`) are deliberately deferred to Plan 2 and are not gaps in this plan.
+Spec §3 (credentials) is Plan 1; spec §4 (release workflow) and §6 (docs, `install.sh`) are Plan 3. Neither is a gap in this plan.
 
-**Deferred to Plan 2:** release workflow with tag trigger and channel derivation; the `web` artifact job; macOS signing and notarization in CI; `install.sh`; README and `docs/RELEASING.md` updates; publishing the build image to ghcr for faster CI.
+**Deferred to Plan 3:** release workflow with tag trigger and channel derivation; the `web` artifact job; macOS signing and notarization in CI; `install.sh`; README and `docs/RELEASING.md` updates; publishing the build image to ghcr for faster CI.
 
-**Placeholder scan.** No "TBD"/"TODO"/"implement later". Task 8 is discovery-shaped by necessity — nothing has run these tests on Linux — so it specifies a decision rule per failure category rather than a file list, and requires the baseline failure list be recorded before any change. Task 7 Step 2 does the same for build failures.
+**Placeholder scan.** No "TBD"/"TODO"/"implement later". Task 5 is discovery-shaped by necessity — nothing has run these tests on Linux — so it specifies a decision rule per failure category rather than a file list, and requires the baseline failure list be recorded before any change. Task 4 Step 2 does the same for build failures.
 
-**Type consistency.** `platform_name(os: &str, arch: &str) -> String` is defined in Task 1 and consumed by name in Task 1 Step 4 (export), Task 2 (via `current_platform()`), and Task 7 Step 3 (via the CLI flag). `current_platform() -> String` keeps its pre-existing signature throughout. The `cfg` predicate `any(target_os = "macos", target_os = "windows")` is used identically in Tasks 4, 5, and 6 and in both `Cargo.toml` target tables. The container image tag `rupu-linux-build` is identical in Task 3's Makefile target and Task 9's workflow.
+**Type consistency.** `platform_name(os: &str, arch: &str) -> String` is defined in Task 1 and consumed by name in Task 1 Step 4 (export), Task 2 (via `current_platform()`), and Task 4 Step 3 (via the CLI flag). `current_platform() -> String` keeps its pre-existing signature throughout. The container image tag `rupu-linux-build` is identical in Task 3's Makefile target and Task 6's workflow.
