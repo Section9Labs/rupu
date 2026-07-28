@@ -4525,40 +4525,181 @@ fn step_kind_for_run_record(step: &Step) -> crate::runs::StepKind {
 /// and null pass through unchanged. `None` (no `with:` block at all) becomes
 /// an empty object, a valid call for any tool whose schema has no required
 /// parameters.
+///
+/// I-33: a rendered STRING leaf directly under a top-level `with:` key is
+/// additionally coerced against `tool`'s declared JSON-schema type — see
+/// [`render_action_leaf`]. This is the only place in the pipeline that knows
+/// both "was this leaf a template" and "what type does the tool want", so
+/// it's also the only place that can fix "comment on issue #{{ n }}"
+/// without either guessing from the rendered value's shape or teaching the
+/// dispatcher to coerce (which would blur a real author bug — sending the
+/// literal string "42" on purpose — into "helpful" magic).
 fn render_action_args(
     with: Option<&serde_json::Value>,
     ctx: &StepContext,
     mode: RenderMode,
+    tool: &str,
 ) -> Result<serde_json::Value, RenderError> {
-    fn walk(
-        value: &serde_json::Value,
-        ctx: &StepContext,
-        mode: RenderMode,
-    ) -> Result<serde_json::Value, RenderError> {
-        match value {
-            serde_json::Value::String(s) => {
-                Ok(serde_json::Value::String(render_step_prompt(s, ctx, mode)?))
-            }
-            serde_json::Value::Array(items) => Ok(serde_json::Value::Array(
-                items
-                    .iter()
-                    .map(|item| walk(item, ctx, mode))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )),
-            serde_json::Value::Object(map) => {
-                let mut out = serde_json::Map::with_capacity(map.len());
-                for (key, val) in map {
-                    out.insert(key.clone(), walk(val, ctx, mode)?);
-                }
-                Ok(serde_json::Value::Object(out))
-            }
-            // Numbers, bools, null: no template surface, pass through as-is.
-            other => Ok(other.clone()),
-        }
+    let with_map = match with {
+        None => return Ok(serde_json::json!({})),
+        Some(serde_json::Value::Object(m)) => m,
+        // `validate_action_step` (workflow.rs) already rejects a non-object
+        // `with:` at parse time; this is only reachable via direct calls
+        // (e.g. tests) that skip parsing. No property schema to key off of,
+        // so fall back to the plain (non-coercing) walk.
+        Some(other) => return walk(other, ctx, mode),
+    };
+
+    let props: Option<serde_json::Map<String, serde_json::Value>> = rupu_mcp::tools::tool_catalog()
+        .into_iter()
+        .find(|spec| spec.name == tool)
+        .and_then(|spec| spec.input_schema.get("properties").cloned())
+        .and_then(|p| p.as_object().cloned());
+
+    let mut out = serde_json::Map::with_capacity(with_map.len());
+    for (key, val) in with_map {
+        let target_kind = props
+            .as_ref()
+            .and_then(|p| p.get(key))
+            .and_then(|prop_schema| prop_schema.get("type"))
+            .and_then(crate::templates::schema_scalar_kind);
+        out.insert(
+            key.clone(),
+            render_action_leaf(val, ctx, mode, key, target_kind)?,
+        );
     }
-    match with {
-        None => Ok(serde_json::json!({})),
-        Some(v) => walk(v, ctx, mode),
+    Ok(serde_json::Value::Object(out))
+}
+
+/// Plain (non-coercing) recursive render — used for nested array/object
+/// values inside `with:` (coercion only applies at the top level; see
+/// `render_action_args`'s doc comment) and as the defensive fallback when
+/// `with:` isn't an object.
+fn walk(
+    value: &serde_json::Value,
+    ctx: &StepContext,
+    mode: RenderMode,
+) -> Result<serde_json::Value, RenderError> {
+    match value {
+        serde_json::Value::String(s) => {
+            Ok(serde_json::Value::String(render_step_prompt(s, ctx, mode)?))
+        }
+        serde_json::Value::Array(items) => Ok(serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| walk(item, ctx, mode))
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (key, val) in map {
+                out.insert(key.clone(), walk(val, ctx, mode)?);
+            }
+            Ok(serde_json::Value::Object(out))
+        }
+        // Numbers, bools, null: no template surface, pass through as-is.
+        other => Ok(other.clone()),
+    }
+}
+
+/// How a raw (pre-render) `with:` string leaf relates to minijinja's `{{ }}`
+/// delimiters — decides whether [`render_action_leaf`] may coerce it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TemplateShape {
+    /// No `{{` at all: a plain literal (e.g. `"hi"`, or `"007"` typed with
+    /// quotes on purpose). Never coerced here — see judgment call (a) in
+    /// the I-33 plan: coercion only fires when the ENTIRE leaf was a
+    /// template, never guessed from a literal's shape. A literal of the
+    /// wrong type is instead rejected at parse time (`validate_action_step`,
+    /// workflow.rs) when the mismatch is visible without rendering.
+    Literal,
+    /// The trimmed string is exactly one `{{ ... }}` expression and nothing
+    /// else — the whole leaf came from a template. Safe to coerce.
+    Whole,
+    /// `{{ }}` appears but mixed with other text (`"issue-{{ n }}"`) or
+    /// more than one expression. Judgment call (b): this is an author
+    /// error for a typed field, not something to coerce — there's no
+    /// sensible single number to extract from `"issue-42"`.
+    Partial,
+}
+
+fn template_shape(s: &str) -> TemplateShape {
+    if !s.contains("{{") {
+        return TemplateShape::Literal;
+    }
+    let t = s.trim();
+    if t.starts_with("{{")
+        && t.ends_with("}}")
+        && t.matches("{{").count() == 1
+        && t.matches("}}").count() == 1
+    {
+        TemplateShape::Whole
+    } else {
+        TemplateShape::Partial
+    }
+}
+
+/// Parse a rendered string into the JSON value `kind` names, or `None` if it
+/// doesn't fit. `kind` is always one of `schema_scalar_kind`'s outputs.
+fn coerce_scalar(rendered: &str, kind: &'static str) -> Option<serde_json::Value> {
+    let t = rendered.trim();
+    match kind {
+        "integer" => t.parse::<i64>().ok().map(serde_json::Value::from),
+        "number" => t.parse::<f64>().ok().map(serde_json::Value::from),
+        "boolean" => match t.to_ascii_lowercase().as_str() {
+            "true" => Some(serde_json::Value::Bool(true)),
+            "false" => Some(serde_json::Value::Bool(false)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Render one top-level `with:` leaf, coercing it to `target_kind` (from
+/// the tool's JSON schema) when the leaf is a string. `param` is the
+/// `with:` key, used only for error messages.
+///
+/// - Not a string (already a JSON number/bool/array/object/null): passed
+///   through the plain [`walk`] — a literal of the right shape needs no
+///   help, and arrays/objects recurse without coercion (see
+///   `render_action_args`'s doc comment; no tool in the catalog needs it).
+/// - String with `target_kind: None` (schema says `string`/`array`/
+///   `object`, or the tool/param is unknown to the catalog): rendered
+///   normally, never coerced.
+/// - String with a numeric/boolean `target_kind`:
+///   - [`TemplateShape::Literal`] — left as the rendered (== original)
+///     string; see judgment call (a).
+///   - [`TemplateShape::Whole`] — rendered, then parsed via
+///     [`coerce_scalar`]; a parse failure is reported against the
+///     RENDERED value (what the template actually produced).
+///   - [`TemplateShape::Partial`] — rejected before rendering; see
+///     judgment call (b).
+fn render_action_leaf(
+    raw: &serde_json::Value,
+    ctx: &StepContext,
+    mode: RenderMode,
+    param: &str,
+    target_kind: Option<&'static str>,
+) -> Result<serde_json::Value, RenderError> {
+    let (s, kind) = match (raw, target_kind) {
+        (serde_json::Value::String(s), Some(kind)) => (s, kind),
+        _ => return walk(raw, ctx, mode),
+    };
+    match template_shape(s) {
+        TemplateShape::Literal => Ok(serde_json::Value::String(render_step_prompt(s, ctx, mode)?)),
+        TemplateShape::Partial => Err(RenderError::ActionArgType {
+            param: param.to_string(),
+            message: format!(
+                "expected {kind}, but `{s}` mixes a template with other text — use a single `{{{{ ... }}}}` expression for a {kind} parameter, not a partial template"
+            ),
+        }),
+        TemplateShape::Whole => {
+            let rendered = render_step_prompt(s, ctx, mode)?;
+            coerce_scalar(&rendered, kind).ok_or_else(|| RenderError::ActionArgType {
+                param: param.to_string(),
+                message: format!("expected {kind}, got `{rendered}` (rendered from `{s}`)"),
+            })
+        }
     }
 }
 
@@ -4609,7 +4750,7 @@ async fn execute_action_step(
         .action
         .as_deref()
         .expect("execute_action_step called for a non-action step");
-    let args = render_action_args(step.with.as_ref(), ctx, mode).map_err(|e| {
+    let args = render_action_args(step.with.as_ref(), ctx, mode, tool).map_err(|e| {
         RunWorkflowError::Render {
             step: step.id.clone(),
             source: e,
@@ -7286,7 +7427,7 @@ mod tests {
             "labels": ["{{ steps.seed.output }}", "static"],
         });
 
-        let rendered = render_action_args(Some(&with), &ctx, RenderMode::Permissive)
+        let rendered = render_action_args(Some(&with), &ctx, RenderMode::Permissive, "issues.create")
             .expect("array-valued with: renders");
 
         assert_eq!(rendered["labels"][0], "bug-report");

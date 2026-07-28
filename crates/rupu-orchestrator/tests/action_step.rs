@@ -20,8 +20,9 @@ use rupu_orchestrator::runner::{
 use rupu_orchestrator::{ApprovalDecision, RunStore, StepKind, Workflow};
 use rupu_providers::types::StopReason;
 use rupu_scm::{
-    Branch, Comment, CreatePr, Diff, FileContent, Platform, Pr, PrFilter, PrRef, Registry,
-    RepoConnector, RepoRef, ScmError,
+    Branch, Comment, CreateIssue, CreatePr, Diff, FileContent, Issue, IssueConnector, IssueFilter,
+    IssueRef, IssueState, IssueTracker, Platform, Pr, PrFilter, PrRef, Registry, RepoConnector,
+    RepoRef, ScmError,
 };
 use rupu_tools::{PermissionMode, ToolContext};
 use std::collections::BTreeMap;
@@ -120,6 +121,67 @@ fn dispatcher_with_connector(
     // coerced to the trait object while `connector` keeps the concrete
     // `Arc<RecordingConnector>` handle tests read `.calls` off of afterward.
     reg.insert_repo_connector(Platform::Github, connector.clone());
+    let dispatcher = Arc::new(ToolDispatcher::new(
+        Arc::new(reg),
+        McpPermission::new(mode, vec!["*".into()]),
+    ));
+    (dispatcher, connector)
+}
+
+/// Records every `comment_issue` call it receives (as `(IssueRef, rendered
+/// body)`) so I-33's coercion tests can assert on the exact JSON *type* the
+/// dispatcher's typed serde parse produced for `number` — everything else is
+/// `unimplemented!()`, matching `RecordingConnector`'s shape above.
+#[derive(Default)]
+struct RecordingIssueConnector {
+    calls: Mutex<Vec<(IssueRef, String)>>,
+}
+
+#[async_trait]
+impl IssueConnector for RecordingIssueConnector {
+    fn tracker(&self) -> IssueTracker {
+        IssueTracker::Github
+    }
+    async fn list_issues(
+        &self,
+        _project: &str,
+        _filter: IssueFilter,
+    ) -> Result<Vec<Issue>, ScmError> {
+        unimplemented!()
+    }
+    async fn get_issue(&self, _i: &IssueRef) -> Result<Issue, ScmError> {
+        unimplemented!()
+    }
+    async fn comment_issue(&self, i: &IssueRef, body: &str) -> Result<Comment, ScmError> {
+        self.calls.lock().unwrap().push((i.clone(), body.to_string()));
+        Ok(Comment {
+            id: "comment_1".into(),
+            author: "rupu-bot".into(),
+            body: body.to_string(),
+            created_at: chrono::Utc::now(),
+        })
+    }
+    async fn create_issue(&self, _project: &str, _opts: CreateIssue) -> Result<Issue, ScmError> {
+        unimplemented!()
+    }
+    async fn update_issue_state(
+        &self,
+        _i: &IssueRef,
+        _state: IssueState,
+    ) -> Result<(), ScmError> {
+        unimplemented!()
+    }
+}
+
+/// Builds a `ToolDispatcher` wired to a single `RecordingIssueConnector` on
+/// `IssueTracker::Github` (the sole connector, so `resolve_tracker`'s
+/// default-tracker fallback picks it with no `tracker:` in `with:`).
+fn dispatcher_with_issue_connector(
+    mode: PermissionMode,
+) -> (Arc<ToolDispatcher>, Arc<RecordingIssueConnector>) {
+    let connector = Arc::new(RecordingIssueConnector::default());
+    let mut reg = Registry::empty();
+    reg.insert_issue_connector(IssueTracker::Github, connector.clone());
     let dispatcher = Arc::new(ToolDispatcher::new(
         Arc::new(reg),
         McpPermission::new(mode, vec!["*".into()]),
@@ -400,6 +462,186 @@ async fn templated_with_values_render_before_reaching_the_connector() {
     assert_eq!(
         calls[0].1, "done: hello world",
         "the connector must see the RENDERED body, never the raw `{{ steps.seed.output }}` template"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Case 2b (I-33) — a templated scalar must reach a typed tool parameter.
+// `issues.comment`'s `number` is `u64`; a whole-leaf template
+// (`"{{ inputs.number }}"`) renders to a `Value::String` before dispatch,
+// and the dispatcher's typed serde parse rejects a JSON string for a `u64`
+// field. Pre-fix this fails with `invalid type: string "42", expected u64`.
+// ---------------------------------------------------------------------------
+
+const WF_ISSUE_COMMENT_NUMBER_TEMPLATE: &str = r#"
+name: issue-comment-number-template
+inputs:
+  number:
+    type: int
+steps:
+  - id: comment
+    action: issues.comment
+    with:
+      project: "acme/w"
+      number: "{{ inputs.number }}"
+      body: "hi"
+"#;
+
+#[tokio::test]
+async fn templated_numeric_field_reaches_the_connector_as_a_json_number() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let wf = Workflow::parse(WF_ISSUE_COMMENT_NUMBER_TEMPLATE).unwrap();
+    let (dispatcher, connector) = dispatcher_with_issue_connector(PermissionMode::Bypass);
+
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: BTreeMap::from([("number".to_string(), "42".to_string())]),
+        workspace_id: "ws_issue_number_coerce".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_ISSUE_COMMENT_NUMBER_TEMPLATE.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: Some(dispatcher),
+        pause: None,
+    };
+
+    let res = run_workflow(opts)
+        .await
+        .expect("a whole-leaf numeric template must coerce and reach the connector");
+    assert_eq!(res.step_results.len(), 1);
+    assert!(res.step_results[0].success);
+
+    // The connector's `IssueRef.number` is `u64` — the dispatcher's typed
+    // serde parse only succeeds at all if the rendered `with.number` leaf
+    // reached it as a JSON number, not the string "42".
+    let calls = connector.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0.number, 42);
+}
+
+#[tokio::test]
+async fn non_numeric_template_into_a_numeric_field_fails_naming_step_and_param() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let yaml = r#"
+name: issue-comment-bad-number
+inputs:
+  title:
+    type: string
+steps:
+  - id: comment
+    action: issues.comment
+    with:
+      project: "acme/w"
+      number: "{{ inputs.title }}"
+      body: "hi"
+"#;
+    let wf = Workflow::parse(yaml).unwrap();
+    let (dispatcher, connector) = dispatcher_with_issue_connector(PermissionMode::Bypass);
+
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: BTreeMap::from([("title".to_string(), "abc".to_string())]),
+        workspace_id: "ws_issue_number_bad".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(yaml.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: Some(dispatcher),
+        pause: None,
+    };
+
+    let err = run_workflow(opts)
+        .await
+        .expect_err("a non-numeric rendered value must not reach the dispatcher at all");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("comment"),
+        "error must name the step `comment`; got: {msg}"
+    );
+    assert!(
+        msg.contains("number"),
+        "error must name the parameter `number`; got: {msg}"
+    );
+    assert!(
+        !matches!(err, RunWorkflowError::Action { .. }),
+        "the bad value must be caught before dispatch, not surface as a raw dispatcher/serde error; got: {err:?}"
+    );
+
+    // Never reached the connector.
+    assert_eq!(connector.calls.lock().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn numeric_looking_string_in_a_string_field_is_not_mangled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let yaml = r#"
+name: issue-comment-guard-against-overcoercion
+inputs:
+  project_suffix:
+    type: string
+steps:
+  - id: comment
+    action: issues.comment
+    with:
+      project: "{{ inputs.project_suffix }}"
+      number: 42
+      body: "007"
+"#;
+    let wf = Workflow::parse(yaml).unwrap();
+    let (dispatcher, connector) = dispatcher_with_issue_connector(PermissionMode::Bypass);
+
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: BTreeMap::from([("project_suffix".to_string(), "007".to_string())]),
+        workspace_id: "ws_issue_no_overcoerce".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(yaml.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: Some(dispatcher),
+        pause: None,
+    };
+
+    let res = run_workflow(opts)
+        .await
+        .expect("a string-schema field must never be coerced, even when it looks numeric");
+    assert!(res.step_results[0].success);
+
+    let calls = connector.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].0.project, "007",
+        "a templated `project` (string schema) must stay the string \"007\", not become a number"
     );
 }
 

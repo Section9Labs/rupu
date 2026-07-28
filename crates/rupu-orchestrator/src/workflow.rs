@@ -1318,9 +1318,17 @@ fn validate_cron_expression(expr: &str) -> Result<(), WorkflowParseError> {
 
 /// Parse-time validation of an action invocation against the static MCP
 /// catalog (spec §4.2): the tool must exist, `with:` keys must be schema
-/// properties, and required keys must be present. VALUES are not checked —
-/// they may be minijinja templates rendered at runtime (the dispatcher's
-/// typed serde parse re-validates then).
+/// properties, and required keys must be present. VALUES are mostly not
+/// checked — they may be minijinja templates rendered at runtime (the
+/// dispatcher's typed serde parse re-validates then, and I-33's
+/// `render_action_args`/`render_action_leaf` in runner.rs coerce a
+/// whole-leaf template to match). The one value shape checked HERE (I-33
+/// step 5) is a plain literal — no `{{` at all — against a schema-declared
+/// `integer`/`number`/`boolean` parameter: unlike a template, a literal's
+/// final value is already known at parse time, so a type mismatch is an
+/// author typo (usually stray quotes, e.g. `number: "7"`) that should fail
+/// fast here rather than surface as a raw dispatcher serde error at run
+/// time.
 fn validate_action_step(
     step_id: &str,
     tool: &str,
@@ -1367,6 +1375,34 @@ fn validate_action_step(
                     detail: format!("missing required parameter `{req}`"),
                 });
             }
+        }
+    }
+    // I-33 step 5: a plain literal (no `{{`) against a numeric/boolean
+    // parameter is caught here, at parse time — a template's final value
+    // isn't known until render, so this check only ever applies to a
+    // literal, never a `{{ ... }}` leaf (partial or whole).
+    if let Some(props) = props {
+        for (key, val) in with_map {
+            let serde_json::Value::String(s) = val else {
+                continue;
+            };
+            if s.contains("{{") {
+                continue;
+            }
+            let Some(kind) = props
+                .get(key)
+                .and_then(|prop_schema| prop_schema.get("type"))
+                .and_then(crate::templates::schema_scalar_kind)
+            else {
+                continue;
+            };
+            return Err(WorkflowParseError::ActionInvalidParams {
+                step: step_id.to_string(),
+                tool: tool.to_string(),
+                detail: format!(
+                    "parameter `{key}` expects {kind} but got the literal string `{s}` — remove the quotes, or use a `{{{{ ... }}}}` template"
+                ),
+            });
         }
     }
     Ok(())
