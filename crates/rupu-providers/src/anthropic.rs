@@ -231,6 +231,25 @@ const MAX_STREAM_IDLE_RETRIES: u32 = 10;
 /// block forever.
 const SEND_TOTAL_TIMEOUT_SECS: u64 = 600;
 
+/// I-84: whether `stream()`'s outer idle-restart loop should draw down the
+/// shared retry budget and re-send, or give up. `total_retry_budget` is the
+/// SUM of the idle-restart and 429-retry ceilings
+/// (`MAX_STREAM_IDLE_RETRIES` plus `max_rate_limit_retries`) — before this
+/// fix the two loops were bounded independently, so the worst case (a 429
+/// on every idle-restart pass, each eventually succeeding then stalling
+/// again) multiplied attempts instead of adding them. Extracted as a pure
+/// function so that "sum, not product" is directly unit-testable without
+/// simulating a real 120s idle stall over the network. A mid-response
+/// stall (`emitted_content`) is never retried, budget or not — re-sending
+/// would duplicate already-streamed output.
+fn should_retry_idle_stall(
+    emitted_content: bool,
+    retries_used: u32,
+    total_retry_budget: u32,
+) -> bool {
+    !emitted_content && retries_used < total_retry_budget
+}
+
 const ANTHROPIC_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
@@ -1082,10 +1101,32 @@ impl AnthropicClient {
         self.ensure_valid_token().await?;
         let body = self.build_request_body(request, true);
 
+        // I-84: idle-stall resends and 429 resends used to be independently
+        // bounded nested loops (an outer `idle_attempt` loop wrapping an
+        // inner 429-retry loop), so the worst-case request count was their
+        // PRODUCT: (MAX_STREAM_IDLE_RETRIES + 1) * (max_rate_limit_retries +
+        // 1) — e.g. 11 * 2 = 22 requests for one `stream()` call at
+        // defaults, if every idle-restart's stream also 429ed once before
+        // succeeding and then stalled again.
+        //
+        // Fix: every actual resend — whether it's a 429 retry or an
+        // idle-restart — draws down one shared budget,
+        // `total_retry_budget` (the SUM, not product, of the two
+        // individual ceilings). The inner 429 loop keeps its own
+        // `self.max_rate_limit_retries` per-pass cap (so a persistent
+        // 429 storm still fails fast, unchanged from before — it never
+        // reaches the outer idle logic), but each retry it actually takes
+        // also spends shared budget, so a stream that alternates stalls
+        // and 429s across multiple passes can't multiply past
+        // `total_retry_budget + 1` total requests.
+        let total_retry_budget = MAX_STREAM_IDLE_RETRIES + self.max_rate_limit_retries;
+        let mut retries_used = 0u32;
+
         // Outer retry loop: if the model stalls (no bytes for
         // STREAM_IDLE_TIMEOUT_SECS) during prefill — connection open, server
-        // silent — abort and re-send, up to MAX_STREAM_IDLE_RETRIES times.
-        for idle_attempt in 0..=MAX_STREAM_IDLE_RETRIES {
+        // silent — abort and re-send, drawing from the shared budget above.
+        let mut idle_attempt = 0u32;
+        loop {
             if idle_attempt > 0 {
                 warn!(
                     attempt = idle_attempt,
@@ -1094,7 +1135,11 @@ impl AnthropicClient {
                 );
             }
 
-            // Retry loop for 429 rate-limits
+            // Retry loop for 429 rate-limits. Bounded by its own per-pass
+            // cap (self.max_rate_limit_retries) exactly as before — a
+            // persistent 429 storm fails here without ever touching the
+            // outer idle-restart logic. Each retry ALSO spends shared
+            // budget so it can't multiply against outer idle-restarts.
             let response = {
                 let mut last_err = None;
                 let mut got_response = None;
@@ -1131,6 +1176,7 @@ impl AnthropicClient {
                             status: 429,
                             message: text,
                         });
+                        retries_used += 1;
                         continue;
                     }
                     if !status.is_success() {
@@ -1197,9 +1243,10 @@ impl AnthropicClient {
             }
 
             // Stalled. Retry only on a *prefill* stall (nothing emitted yet)
-            // with retries left; a mid-stream stall can't be re-sent without
-            // duplicating already-streamed output, so it fails.
-            if emitted_content || idle_attempt == MAX_STREAM_IDLE_RETRIES {
+            // with budget left; a mid-stream stall can't be re-sent without
+            // duplicating already-streamed output, so it fails regardless of
+            // budget.
+            if !should_retry_idle_stall(emitted_content, retries_used, total_retry_budget) {
                 let reason = if emitted_content {
                     "mid-response".to_string()
                 } else {
@@ -1209,8 +1256,9 @@ impl AnthropicClient {
                     "stream idle for {STREAM_IDLE_TIMEOUT_SECS}s — model stalled ({reason})"
                 )));
             }
+            retries_used += 1;
+            idle_attempt += 1;
         }
-        unreachable!("stream idle-retry loop always returns")
     }
 
     fn build_request_body(&self, request: &LlmRequest, stream: bool) -> serde_json::Value {
@@ -3510,6 +3558,71 @@ mod tests {
             ..crate::tuning::ProviderTuning::for_provider("anthropic")
         });
         let _ = client.send(&make_request(None)).await;
+        m.assert_hits(2);
+    }
+
+    // ── I-84: stream()'s idle-restart / 429-retry loops share one budget ──
+
+    /// The fixed ceiling is a SUM of the two individual limits, not their
+    /// PRODUCT — and critically, a `retries_used` count past the old
+    /// idle-only ceiling (`MAX_STREAM_IDLE_RETRIES`) must still be retried
+    /// when the configured `max_rate_limit_retries` extends the shared
+    /// budget. The old nested-loop code had no such combined budget at
+    /// all: the outer loop's own bound (`idle_attempt ==
+    /// MAX_STREAM_IDLE_RETRIES`) never referenced `max_rate_limit_retries`,
+    /// so the worst case was their product, e.g. (10 + 1) * (3 + 1) = 44
+    /// requests for one `stream()` call — vs. 10 + 3 = 13 now.
+    #[test]
+    fn should_retry_idle_stall_draws_from_a_shared_sum_budget_not_the_old_product() {
+        let max_rate_limit_retries = 3;
+        let total_retry_budget = MAX_STREAM_IDLE_RETRIES + max_rate_limit_retries;
+        assert_eq!(
+            total_retry_budget, 13,
+            "budget must be additive, not the product (44)"
+        );
+
+        // Past the old idle-only ceiling (10) but within the shared budget
+        // (13): must still retry, because max_rate_limit_retries extends it.
+        assert!(should_retry_idle_stall(false, 11, total_retry_budget));
+        assert!(should_retry_idle_stall(false, 12, total_retry_budget));
+        // Budget exactly exhausted: give up.
+        assert!(!should_retry_idle_stall(false, 13, total_retry_budget));
+    }
+
+    #[test]
+    fn should_retry_idle_stall_never_retries_after_emitted_content() {
+        // A mid-response stall can't be re-sent without duplicating
+        // already-streamed output — regardless of remaining budget.
+        assert!(!should_retry_idle_stall(true, 0, 100));
+    }
+
+    /// A stream that's persistently 429'd (never a stall) fails inside the
+    /// inner 429 loop's own `max_rate_limit_retries` cap and never touches
+    /// the outer idle-restart logic at all — so its request count must stay
+    /// exactly `max_rate_limit_retries + 1`, not get multiplied by
+    /// `MAX_STREAM_IDLE_RETRIES + 1` the way the old nested loops could for
+    /// an interleaved stall+429 stream. Regression coverage for the
+    /// unchanged half of the I-84 fix (sleeps out one real 2s backoff).
+    #[tokio::test]
+    async fn stream_persistent_429_fails_without_touching_idle_budget() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(POST).path("/v1/messages");
+            then.status(429)
+                .header("content-type", "application/json")
+                .body(r#"{"error":{"type":"rate_limit_error"}}"#);
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages", server.url("")),
+        )
+        .with_tuning(&crate::tuning::ProviderTuning {
+            max_retries: 1,
+            ..crate::tuning::ProviderTuning::for_provider("anthropic")
+        });
+        let result = client.stream(&make_request(None), |_ev| {}).await;
+        assert!(result.is_err());
         m.assert_hits(2);
     }
 
