@@ -1103,8 +1103,19 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 CallOutcome::Response(r) => r,
                 CallOutcome::Paused => break 'turns LoopOutcome::Paused,
             };
+            // I-48: reasoning tokens (Gemini's thoughtsTokenCount, reported
+            // outside candidatesTokenCount) are real, billed tokens. Folding
+            // them into the output figure here — where run totals and the
+            // persisted per-turn `Usage`/`TurnEnd` events are built — keeps
+            // every consumer of those totals (cost calc, context-budget
+            // arithmetic, transcript display) honest without a schema
+            // change. `resp.usage.reasoning_tokens` itself stays separately
+            // readable on `LlmResponse` for anyone inspecting the raw
+            // provider response.
+            let billable_output_tokens =
+                resp.usage.output_tokens as u64 + resp.usage.reasoning_tokens as u64;
             total_in += resp.usage.input_tokens as u64;
-            total_out += resp.usage.output_tokens as u64;
+            total_out += billable_output_tokens;
             writer.write(&Event::Usage {
                 provider: opts.provider_name.clone(),
                 model: opts.model.clone(), // requested model (meaningful attribution; priced)
@@ -1117,7 +1128,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                     }
                 },
                 input_tokens: resp.usage.input_tokens,
-                output_tokens: resp.usage.output_tokens,
+                output_tokens: billable_output_tokens as u32,
                 cached_tokens: resp.usage.cached_tokens,
             })?;
 
@@ -1332,7 +1343,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             writer.write(&Event::TurnEnd {
                 turn_idx,
                 tokens_in: Some(resp.usage.input_tokens as u64),
-                tokens_out: Some(resp.usage.output_tokens as u64),
+                tokens_out: Some(billable_output_tokens),
             })?;
             writer.flush()?;
 
@@ -1978,6 +1989,122 @@ mod on_tool_call_tests {
             "served_model is the provider-echoed id when it differs"
         );
     }
+
+    /// I-48 binding test: a Gemini turn that reports `thoughtsTokenCount`
+    /// (modeled here as `Usage.reasoning_tokens`, since the JSON parse
+    /// itself is covered in rupu-providers) must produce BOTH a higher
+    /// persisted `Usage.output_tokens` AND a higher dollar cost than an
+    /// otherwise-identical response with no reasoning tokens. A
+    /// usage-struct assertion alone wouldn't prove the money is right —
+    /// this runs the real accounting path (`runner.rs`'s `billable_output_tokens`)
+    /// end to end into `ModelPricing::cost_usd`.
+    #[tokio::test]
+    async fn gemini_reasoning_tokens_increase_run_totals_and_cost() {
+        use rupu_config::ModelPricing;
+
+        async fn run_with_reasoning(reasoning_tokens: u32) -> (u64, f64) {
+            let tmp_dir = tempfile::tempdir().expect("tmpdir");
+            let transcript_path = tmp_dir.path().join("run_reasoning.jsonl");
+
+            let provider = MockProvider::new(vec![ScriptedTurn::AssistantTextWithUsage {
+                text: "The answer is 42.".into(),
+                stop: StopReason::EndTurn,
+                usage: Usage {
+                    input_tokens: 15,
+                    output_tokens: 8,
+                    cached_tokens: 0,
+                    reasoning_tokens,
+                },
+            }]);
+
+            let opts = AgentRunOpts {
+                agent_name: "test-agent".into(),
+                agent_system_prompt: "test".into(),
+                agent_tools: None,
+                provider: Box::new(provider),
+                provider_name: "google".into(),
+                model: "gemini-2.5-pro".into(),
+                run_id: "run_reasoning".into(),
+                workspace_id: "ws_test".into(),
+                workspace_path: tmp_dir.path().to_path_buf(),
+                transcript_path: transcript_path.clone(),
+                max_turns: 5,
+                decider: Arc::new(BypassDecider),
+                tool_context: rupu_tools::ToolContext {
+                    workspace_path: tmp_dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                user_message: "do the thing".into(),
+                initial_messages: Vec::new(),
+                turn_index_offset: 0,
+                mode_str: "bypass".into(),
+                no_stream: true,
+                suppress_stream_stdout: false,
+                mcp_registry: None,
+                effort: None,
+                context_window: None,
+                output_format: None,
+                output_schema: None,
+                anthropic_task_budget: None,
+                anthropic_context_management: None,
+                anthropic_speed: None,
+                parent_run_id: None,
+                depth: 0,
+                dispatchable_agents: None,
+                step_id: "s1".into(),
+                on_tool_call: None,
+                on_stream_event: None,
+                concerns: None,
+                max_tokens: DEFAULT_MAX_TOKENS,
+                scope_name: None,
+                surface_tag: None,
+                context_window_tokens: None,
+                compact_at_percent: None,
+                pause: None,
+            };
+
+            let result = run_agent(opts).await.expect("agent run succeeds");
+
+            let body = std::fs::read_to_string(&transcript_path).expect("read transcript");
+            let persisted_output_tokens = body
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Event>(l).ok())
+                .find_map(|ev| match ev {
+                    Event::Usage { output_tokens, .. } => Some(output_tokens as u64),
+                    _ => None,
+                })
+                .expect("transcript has a Usage event");
+            assert_eq!(
+                persisted_output_tokens, result.total_tokens_out,
+                "the single-turn persisted Usage event and the run total must agree"
+            );
+
+            let pricing = ModelPricing {
+                input_per_mtok: 1.25,
+                output_per_mtok: 10.0,
+                cached_input_per_mtok: None,
+            };
+            let cost = pricing.cost_usd(result.total_tokens_in, result.total_tokens_out, 0);
+            (result.total_tokens_out, cost)
+        }
+
+        let (tokens_without_thinking, cost_without_thinking) = run_with_reasoning(0).await;
+        let (tokens_with_thinking, cost_with_thinking) = run_with_reasoning(200).await;
+
+        assert_eq!(
+            tokens_without_thinking, 8,
+            "no reasoning tokens: run total is exactly candidatesTokenCount"
+        );
+        assert_eq!(
+            tokens_with_thinking, 208,
+            "reasoning tokens must be added to the run's output-token total, not dropped"
+        );
+        assert!(
+            cost_with_thinking > cost_without_thinking,
+            "cost_with_thinking={cost_with_thinking} cost_without_thinking={cost_without_thinking}: \
+             a thinking response must cost strictly more, not be billed as if it never thought"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2210,6 +2337,14 @@ pub enum ScriptedTurn {
         tool_input: serde_json::Value,
         stop: StopReason,
     },
+    /// Like `AssistantText`, but carries a full [`Usage`] (including
+    /// `reasoning_tokens`) instead of the bare input/output pair —
+    /// needed to script a Gemini-shaped thinking response for I-48 tests.
+    AssistantTextWithUsage {
+        text: String,
+        stop: StopReason,
+        usage: Usage,
+    },
     /// Replay an arbitrary block sequence verbatim. Use when a turn's exact
     /// block shape matters — e.g. `Reasoning` before `Text`, or several `Text`
     /// blocks in one turn — which the higher-level variants can't express.
@@ -2279,6 +2414,13 @@ impl LlmProvider for MockProvider {
                     output_tokens: 1,
                     ..Default::default()
                 },
+            }),
+            ScriptedTurn::AssistantTextWithUsage { text, stop, usage } => Ok(LlmResponse {
+                id: "mock".to_string(),
+                model: "mock-1".to_string(),
+                content: vec![ContentBlock::Text { text }],
+                stop_reason: Some(stop),
+                usage,
             }),
             ScriptedTurn::AssistantToolUse {
                 text,

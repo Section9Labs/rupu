@@ -67,6 +67,9 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-80 | P2 | rupu-cli/docs | Reject-timeout gates now resolve only via `cp serve`'s sweep; CLI-only operators lose auto-resolution | open |
 | I-81 | P2 | rupu-mcp | `tools_list_matches_snapshot` fails in this worktree — schemars field-order drift under Homebrew 1.95 vs pinned 1.88 | open |
 | I-82 | P2 | rupu-cp | The CP web approve path discards the resolved decision, so a web approve's true actor is lost before the resume worker spawns | open |
+| I-83 | P2 | rupu-providers | `RetryingProvider` ignores server-supplied `Retry-After` by design; nothing in production reads it | open |
+| I-84 | P1 | rupu-providers | Anthropic's nested idle-retry × 429-retry loops multiply attempts | open |
+| I-85 | P2 | rupu-providers | Four hand-written reasoning-effort ladders, two of them byte-identical duplicates | open |
 
 ### Arc 3 — single UI path
 
@@ -99,11 +102,11 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 | ID | Sev | Area | Title | Status |
 |---|---|---|---|---|
-| I-45 | P0 | rupu-providers | Gemini 3 gets a guaranteed 400 — `thinkingLevel` and `thinkingBudget` are sent together | open |
-| I-46 | P1 | rupu-providers | Gemini thinking levels are sent uppercase; the API expects lowercase | open |
-| I-47 | P1 | rupu-providers | `xhigh` / `minimal` are rejected outright by DeepSeek, Groq and xAI | open |
-| I-48 | P1 | rupu-providers | `usageMetadata.thoughtsTokenCount` is never read — Gemini reasoning tokens are missing from cost | open |
-| I-49 | P2 | rupu-providers | `parse_retry_after` is a stub returning `None`; every 429 backs off a flat 60s | open |
+| I-45 | P1 | rupu-providers | `thinkingLevel` + `thinkingBudget` are always co-sent, and there is **no model gate** — the Gemini-3-only key also goes to 2.5 (the "400" is doc-derived, never observed) | fixed |
+| I-46 | P2 | rupu-providers | Gemini thinking levels are sent uppercase; Google documents lowercase (our own spec says tolerance is **unverified**) | fixed |
+| I-47 | P2 | rupu-providers | `minimal`/`xhigh` are forwarded to any openai-compatible endpoint with no allowlist ("rejected outright" is **unproven**; none of the named vendors ship as providers) | fixed (docs) |
+| I-48 | **P0** | rupu-providers | `usageMetadata.thoughtsTokenCount` is never read — the **only default-reachable** defect here; Gemini spend is silently under-billed and run totals under-report | fixed |
+| I-49 | P2 | rupu-providers | `classify.rs` is dead code (zero production callers) — the filed "flat 60s" claim is **false at every constant**; real default is one 2s retry | fixed |
 
 ### Arc 6 — docs truth pass
 
@@ -136,6 +139,67 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 ---
 
 ## Open
+
+### I-83 — `RetryingProvider` ignores server-supplied `Retry-After`
+
+**Symptom.** When a provider returns 429 with a `Retry-After` header telling us exactly how
+long to wait, rupu ignores it and uses its own exponential backoff instead.
+
+**Root cause.** `RetryingProvider` (`tuned.rs:151-174`) calls `(self.backoff)(attempt)`
+unconditionally. Nothing in production ever parsed the header — see [[I-49]], which deleted
+the inert stub that was *supposed* to.
+
+**Impact.** Low today: the default is one 2s retry, so we rarely retry long enough for the
+server's hint to matter. It becomes real for anyone raising `max_retries`, where ignoring an
+explicit `Retry-After: 30` means hammering a provider that told us to back off — which is
+how rate-limit bans escalate.
+
+**Fix.** Parse `Retry-After` from the response headers at the client boundary (rupu-scm
+already does this correctly at `error.rs:144` and is the model to copy), surface it via the
+already-existing `ProviderError::RateLimited { retry_after }`, and have `RetryingProvider`
+prefer it over its computed backoff when present. Related: [[I-49]].
+
+---
+
+### I-84 — Anthropic's nested retry loops multiply attempts
+
+**Symptom.** Anthropic requests can retry far more times than any single configured limit
+suggests.
+
+**Root cause.** Two loops nest: an outer `MAX_STREAM_IDLE_RETRIES` loop (`anthropic.rs:1088`)
+wraps an inner `max_rate_limit_retries` 429 loop (`:1101`). Attempts **multiply** rather than
+add, so the effective ceiling is the product of the two.
+
+**Impact.** Worst case is a long stall against a provider that is already rate-limiting us.
+Note this is *not* the decorator-stacking problem — that one is correctly handled:
+`provider_factory.rs:331-337` excludes Anthropic from `RetryingProvider` precisely because it
+has native retry, pinned by `only_anthropic_skips_the_retry_decorator`. This is a defect
+*inside* the native implementation.
+
+**Fix.** Give the two loops a shared attempt budget, or make the outer loop not re-enter the
+inner one after a 429-driven exhaustion. Needs a decision about intended total attempts.
+
+---
+
+### I-85 — four hand-written reasoning-effort ladders, two duplicated verbatim
+
+**Symptom.** `ThinkingLevel` is a single shared enum, but every provider hand-writes its own
+translation with no shared helper: Anthropic → `budget_tokens`
+(`anthropic.rs:1338-1349`), Gemini → level + budget (`google_gemini.rs:357-371`),
+openai_wire → `reasoning_effort` string (`:178-185`), Codex → `reasoning.effort` string
+behind a model gate (`openai_codex.rs:537-546`).
+
+**Root cause.** Incremental provider addition, each pass adding a `match` rather than
+extending a shared mapping.
+
+**Impact.** The last two are **byte-identical duplicated `match` blocks in two files**, so
+any per-provider constraint (see [[I-47]]) has to be written twice or it silently diverges.
+Maintenance risk rather than a live defect.
+
+**Fix.** Factor the translation into one place keyed by wire format. Do this **before**
+adding any per-provider allowlist, not after, or the allowlist becomes a third copy.
+
+---
 
 ### I-82 — a web approve's true actor is lost before the resume worker spawns
 
@@ -342,6 +406,158 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-45 + I-46 — the Gemini thinking config is model-gated and lowercase
+
+Closed together: both lived in the same `serde_json::json!` literal, so they were one edit.
+
+**Symptom.** For every non-`Auto` reasoning level, the Gemini request set **both**
+`thinkingLevel` and `thinkingBudget` in `generationConfig.thinkingConfig`, with the level
+string UPPERCASE.
+
+**Root cause, wider than filed.** `thinkingLevel` is a **Gemini-3-only** key, but there was
+**no model gate anywhere in `build_request_body`** — so the identical body went to
+`gemini-2.5-pro`, this provider's `ModelTier::Default`, sending it an unknown key. The filed
+issue framed this as Gemini-3-specific; the blast radius was actually *wider*. Separately
+the level strings were hardcoded uppercase; serde's `rename_all = "snake_case"` on
+`ThinkingLevel` governs config *parsing*, not the wire, so it never applied here.
+
+**Fix.** A model gate on `request.model.starts_with("gemini-3")` — a prefix match, so it is
+robust to `-preview` and future Gemini-3 variants while never matching `gemini-2.5-*` or
+`gemini-2.0-*`. Gemini 3 gets `thinkingLevel` (lowercase) only; 2.5 and earlier get
+`thinkingBudget` only. Never both. `Auto`'s existing `thinkingBudget: -1` sentinel is
+unchanged.
+
+**Honesty note — this is conformance, not a repaired failure.** The "guaranteed 400" in the
+original issue is **doc-derived and was never observed in this repo**; the sole source is
+our own design doc reading Google's documentation, which also says of the casing
+*"Unverified whether the API tolerates both."* The fix conforms to Google's documented
+contract. No commit message, comment or test claims an observed rejection, and the code
+comment records the uncertainty explicitly.
+
+**Validation.** RED: `test_build_request_body_with_thinking` previously asserted
+`thinkingLevel == "MEDIUM"` **and** `thinkingBudget == 8192` on a `gemini-2.5-pro` request —
+a test actively pinning both defects. Three such tests were revised. Two added, including
+`test_thinking_config_never_sends_both_keys`, which loops over **both model families × all
+five non-`Auto` levels** and asserts mutual exclusion — that invariant, rather than any
+single body shape, is the thing worth pinning. `rupu-providers` 511 passed / 0 failed.
+
+---
+
+### I-47 — the effort→wire translation is documented, deliberately not clamped
+
+**The filed claim was not supported.** It said `minimal`/`xhigh` are *"rejected outright by
+DeepSeek, Groq and xAI"*. Verification found:
+
+- Forwarding without an allowlist **is** real: `openai_wire.rs` maps `Minimal → "minimal"`
+  and `Max → "xhigh"` and passes them through with no per-provider or per-model gate.
+- **"Rejected outright" is unproven.** This repo's own spec says vendor behavior on an
+  unknown `reasoning_effort` — 400 versus silent ignore — is *"undocumented across
+  vendors."*
+- The per-vendor ladders in the title were garbled, and **none of DeepSeek, Groq or xAI ship
+  as providers** — no preset, no `ProviderId`. They exist only if an operator declares an
+  openai-compatible entry pointing at them.
+
+**Documented rather than clamped, deliberately.** Clamping `minimal`/`max` for
+openai-compatible endpoints was considered and rejected: it would **silently downgrade an
+explicit `effort: max`** on endpoints that *do* support `xhigh` (OpenAI's own gpt-5.5 does),
+to guard against a rejection we have no evidence occurs. Silently overriding a user's
+explicit setting is the failure mode this program exists to remove, not add.
+
+**A wider gap surfaced while writing it:** the per-provider translation was documented
+**nowhere**. `docs/agent-format.md` listed the accepted `effort` values but never said what
+any of them become on the wire. Now documents all five wire forms (Anthropic budget tokens,
+Gemini 3 level, Gemini 2.5 budget, Codex `reasoning.effort`, openai-compatible
+`reasoning_effort`), the `auto` special case, and the caveat with a concrete fallback — drop
+to `low`/`medium`/`high` — for anyone hitting an endpoint that rejects the ends of the
+ladder.
+
+Unifying the four hand-written ladders is tracked separately as [[I-85]], and must be done
+**before** any per-provider allowlist or the allowlist becomes a third copy.
+
+---
+
+### I-48 — Gemini reasoning tokens are counted in usage and cost
+
+**Promoted P1 → P0 during verification:** this was the **only** defect in Arc 5 reachable
+from a default config, and the only one that costs users money. `gemini-2.5-pro` thinks by
+default, so every stock Gemini run was affected.
+
+**Symptom.** Gemini spend was silently under-billed and run token totals under-reported,
+with no `cost_partial` marker — so a user had no way to tell.
+
+**Root cause.** Both Gemini usage sites read exactly two `usageMetadata` fields
+(`promptTokenCount`, `candidatesTokenCount`). `thoughtsTokenCount` appeared **nowhere in the
+workspace**, and `Usage` had no field to hold it. Gemini reports thinking tokens *outside*
+`candidatesTokenCount` while Google bills them at the output rate, so those tokens were
+multiplied by zero. The same `output_tokens` feeds `total_out`/`tokens_out`, so run totals
+and the context-budget arithmetic under-reported too.
+
+**Provider-specific, not a general gap** — worth stating because it looks like one: no
+provider in rupu reads a reasoning-token field, but Anthropic and the openai-compatible path
+**don't need one**, since their `output_tokens`/`completion_tokens` already include
+reasoning. Gemini is the only provider where the omission loses tokens.
+
+**Fix.** `Usage.reasoning_tokens`, populated from `thoughtsTokenCount` at both the
+non-streaming and streaming parse sites. `rupu-agent`'s runner folds it once into
+`billable_output_tokens = output_tokens + reasoning_tokens`, which feeds `total_out`,
+`Event::Usage.output_tokens` and `Event::TurnEnd.tokens_out` — so the number reaches the
+persisted transcript and every downstream cost call, rather than stopping at the struct
+boundary. Anthropic and openai-wire sites set `reasoning_tokens: 0` explicitly with a
+comment, so no path double-counts.
+
+**Validation.** RED observed with real numbers: `thoughtsTokenCount: 200` parsed to
+`Usage { input: 15, output: 8 }` — 200 tokens dropped — and billed identically to a
+non-thinking response. The binding test is
+`gemini_reasoning_tokens_increase_run_totals_and_cost` (rupu-agent), which drives the **full
+pipeline** and reads the persisted JSONL back: run total 8 → 208 tokens, cost strictly
+greater. Plus parse tests on both Gemini paths.
+
+**A dead second mechanism was removed rather than left in.** The fix initially also added
+`ModelPricing::cost_usd_with_reasoning`, whose test was cited as the binding cost test — but
+it had **no callers outside its own module**, so that test exercised a function nothing
+calls: precisely the validation-bar failure the charter exists to prevent. It was also a
+double-billing hazard, since every production caller sources `output_tokens` from the
+already-folded transcript. Deleted, with the contract documented on `cost_usd` so it is not
+reintroduced.
+
+---
+
+### I-49 — the dead `classify` module is deleted
+
+**The filed statement was false at every constant.** It claimed `parse_retry_after` being a
+stub meant "every 429 backs off a flat 60s". In fact:
+
+- `classify_anthropic`/`openai`/`gemini`/`copilot` had **zero production callers** — only
+  `crates/rupu-providers/tests/classify.rs`. Every real client builds `ProviderError::Api`
+  directly, and `ProviderError::RateLimited` was constructed **only inside `#[cfg(test)]`**.
+  The stub was inert; nothing in production ever reached it.
+- The real default backoff is `RetryingProvider` with `DEFAULT_MAX_RETRIES = 1` and
+  `2000ms << attempt` — **one 2-second retry**. 60s is the cap after ~5 retries, and the
+  only literal 60s is a `ModelPool` availability window whose sole caller passes `None` and
+  whose type has no production constructor at all.
+
+**The stub could never have worked as written.** It takes `body: &str`, but `Retry-After` is
+an HTTP **header**. `rupu-scm` gets this right (`crates/rupu-scm/src/error.rs:144` parses it
+from a `HeaderMap`) — so the correct implementation already exists elsewhere in the
+workspace, against a different input type.
+
+**The module docstring was also false**: *"Each adapter calls its corresponding `classify_*`
+at the boundary between raw HTTP and the agent loop."* No adapter did.
+
+**Fix: deleted**, matching how [[I-27]] was handled in Arc 2. Wiring these in would be a
+*behavior change* — honouring server-supplied `Retry-After` — and that deserves its own
+scope rather than arriving as a side effect of removing dead code. Filed as [[I-83]].
+
+`ProviderError::RateLimited` is deliberately **kept**: it is the natural target once
+`Retry-After` is honoured, and removing a public error variant is a breaking change for no
+benefit.
+
+**Validation.** `cargo build --workspace` clean and `rupu-providers` green after removing
+133 lines of source, its test file, and the `pub mod` — the compiler is the proof for a
+deletion, and nothing referenced it.
+
+---
 
 ### I-36 + I-38 — gate decision provenance is recorded on every path
 

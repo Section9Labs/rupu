@@ -178,6 +178,42 @@ Aliases also accepted:
 
 Use `effort` only when the task genuinely benefits from more reasoning. Setting every agent to `max` is usually wasted latency and cost.
 
+#### How `effort` reaches each provider
+
+`effort` is a single cross-provider setting, but every provider takes a different
+knob, so rupu translates it per provider:
+
+| Provider | Wire form |
+| --- | --- |
+| Anthropic | `thinking.budget_tokens` — a token budget derived from the level |
+| Gemini 3 | `generationConfig.thinkingConfig.thinkingLevel` (lowercase) |
+| Gemini 2.5 and earlier | `generationConfig.thinkingConfig.thinkingBudget` (numeric) |
+| OpenAI Codex | `reasoning.effort`, sent only for models that support reasoning |
+| OpenAI-compatible endpoints | `reasoning_effort`, forwarded verbatim |
+
+`auto` is special-cased: on Gemini it sends the `thinkingBudget: -1` sentinel
+("model decides"), and on the openai-compatible path it sends no
+`reasoning_effort` key at all.
+
+#### Caveat for OpenAI-compatible endpoints
+
+For a `[providers.<name>]` entry using the openai-compatible wire (Oracle GenAI,
+vLLM, OpenRouter, Together, DeepSeek, Groq, xAI, …), the level is mapped to a
+`reasoning_effort` string and **forwarded verbatim**. rupu applies no
+per-provider allowlist, because the accepted set differs by vendor *and by
+model* and there is no reliable way to know it ahead of time.
+
+The two values most likely to be unsupported are the ends of the ladder —
+`minimal` and `max` (which maps to `xhigh`). Vendor behavior on an unrecognized
+`reasoning_effort` is **not consistent and not well documented**: some ignore it,
+some reject the request. If a self-hosted or third-party endpoint errors on a
+request that works without `effort:`, drop back to `low`/`medium`/`high`, which
+are the values in widest use.
+
+rupu deliberately does **not** clamp `minimal`/`max` for these endpoints — doing
+so would silently downgrade an explicit setting on the endpoints that *do*
+support them.
+
 ### `contextWindow`
 
 Accepted values:

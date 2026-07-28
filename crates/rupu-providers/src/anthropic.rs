@@ -1469,10 +1469,14 @@ impl AnthropicClient {
                             .and_then(|v| v.as_u64())
                             .map(|n| n as u32)
                             .unwrap_or(0);
+                        // Anthropic's output_tokens already includes reasoning
+                        // tokens, so reasoning_tokens stays at 0 — see the
+                        // contrast note on `Usage::reasoning_tokens`.
                         on_event(StreamEvent::UsageSnapshot(Usage {
                             input_tokens: acc.input_tokens,
                             output_tokens: acc.output_tokens,
                             cached_tokens: acc.cached_tokens,
+                            reasoning_tokens: 0,
                         }));
                     }
                 }
@@ -1642,10 +1646,14 @@ impl AnthropicClient {
                         .get("output_tokens")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0) as u32;
+                    // Anthropic's output_tokens already includes reasoning
+                    // tokens, so reasoning_tokens stays at 0 — see the
+                    // contrast note on `Usage::reasoning_tokens`.
                     on_event(StreamEvent::UsageSnapshot(Usage {
                         input_tokens: acc.input_tokens,
                         output_tokens: acc.output_tokens,
                         cached_tokens: acc.cached_tokens,
+                        reasoning_tokens: 0,
                     }));
                 }
             }
@@ -1717,6 +1725,7 @@ impl StreamAccumulator {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
                 cached_tokens: self.cached_tokens,
+                reasoning_tokens: 0,
             },
         })
     }

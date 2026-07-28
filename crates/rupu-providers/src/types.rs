@@ -123,6 +123,18 @@ pub struct Usage {
     pub output_tokens: u32,
     #[serde(default, alias = "cache_read_input_tokens")]
     pub cached_tokens: u32,
+    /// Reasoning/"thinking" tokens, billed separately from `output_tokens`.
+    ///
+    /// Only Gemini populates this (from `usageMetadata.thoughtsTokenCount`,
+    /// reported *outside* `candidatesTokenCount`) — `gemini-2.5-pro` thinks
+    /// by default, so leaving this unread silently loses billed tokens from
+    /// both the transcript and the cost calculation (I-48). Anthropic's
+    /// `output_tokens` and the openai-compatible path's `completion_tokens`
+    /// already *include* reasoning tokens in their single output count, so
+    /// their parse sites correctly leave this at the default `0` — it is a
+    /// Gemini-specific correction, not a general reasoning-token feature.
+    #[serde(default)]
+    pub reasoning_tokens: u32,
 }
 
 /// A request to an LLM provider.
@@ -530,6 +542,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 cached_tokens: 0,
+                reasoning_tokens: 0,
             },
         }
     }

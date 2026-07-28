@@ -71,6 +71,23 @@ impl ModelPricing {
     /// When `cached_input_per_mtok` is unset, cached tokens fall back
     /// to the full input rate (still correct, just less favorable —
     /// over-estimates the bill rather than under-estimating).
+    ///
+    /// **`output_tokens` must already be the BILLABLE output** (I-48).
+    ///
+    /// Gemini reports "thinking" tokens (`thoughtsTokenCount`) *outside*
+    /// `candidatesTokenCount`, but Google bills them at the output rate, and
+    /// `gemini-2.5-pro` thinks by default — so ignoring them under-bills
+    /// every default-config Gemini run, silently and with no `cost_partial`
+    /// marker. The fold happens upstream, once, in `rupu-agent`'s runner
+    /// (`billable_output_tokens = output_tokens + reasoning_tokens`), so the
+    /// transcript's `output_tokens` and every downstream cost call already
+    /// include reasoning.
+    ///
+    /// There is deliberately NO `cost_usd_with_reasoning` variant taking
+    /// reasoning separately: every production caller sources `output_tokens`
+    /// from the already-folded transcript, so such a function could only ever
+    /// double-bill. The raw split stays visible on `Usage::reasoning_tokens`
+    /// for anyone who needs it.
     pub fn cost_usd(&self, input_tokens: u64, output_tokens: u64, cached_tokens: u64) -> f64 {
         let cached = cached_tokens.min(input_tokens) as f64;
         let uncached_input = (input_tokens.saturating_sub(cached_tokens)) as f64;
@@ -86,6 +103,7 @@ impl ModelPricing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
 
     #[test]
     fn cost_zero_when_no_tokens() {
