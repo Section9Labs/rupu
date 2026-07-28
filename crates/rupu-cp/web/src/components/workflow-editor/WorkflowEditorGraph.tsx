@@ -50,7 +50,6 @@ import {
 } from '../../lib/workflowGraph';
 import { autoLayout, editorNodeSize, NODE_W } from '../../lib/workflowLayout';
 import { useThemeColors, type ThemeColors } from '../../lib/useThemeColors';
-import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 import type { ToolSpec } from '../../lib/api';
 import EditableStepNode, { type NodeData } from './nodes/EditableStepNode';
 import LoopGroupNode, { type LoopGroupNodeData, loopGroupBox } from './nodes/LoopGroupNode';
@@ -485,8 +484,6 @@ interface Props {
   /** When true the YAML is currently unparseable: keep the last good graph on
    *  screen but dim it, freeze interactions, and show a "graph paused" chip. */
   paused?: boolean;
-  /** Workflow-editor-UI flag, threaded down to NodePalette / EditableStepNode. */
-  workflowEditorUi?: WorkflowEditorUi;
   /** Inspector-rail slot to portal the palette into (Task 1), owned by
    *  WorkflowEditor:
    *  - set → the palette portals in as `variant="rail"`, no floating dock.
@@ -515,7 +512,6 @@ function WorkflowEditorGraphInner({
   problemsById,
   onInvalidConnection,
   paused = false,
-  workflowEditorUi = 'classic',
   paletteContainer,
   tools,
 }: Props) {
@@ -578,10 +574,10 @@ function WorkflowEditorGraphInner({
         id: node.id,
         type: 'editable',
         position: node.position,
-        data: { node, problems: problemsById[node.id] ?? [], workflowEditorUi },
+        data: { node, problems: problemsById[node.id] ?? [] },
         selected: node.id === selectedId || selectedIds.has(node.id),
       })),
-    [graph.nodes, problemsById, selectedId, selectedIds, workflowEditorUi],
+    [graph.nodes, problemsById, selectedId, selectedIds],
   );
 
   // Loop group boundary nodes (Phase 3 Task 5) — one synthetic, non-
@@ -1055,7 +1051,6 @@ function WorkflowEditorGraphInner({
             onAdd={addNode}
             onDragStartKind={() => {}}
             disabled={paused}
-            workflowEditorUi={workflowEditorUi}
             variant="rail"
             tools={tools}
           />,

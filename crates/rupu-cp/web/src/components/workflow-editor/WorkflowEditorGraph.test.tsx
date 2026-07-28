@@ -220,39 +220,8 @@ describe('palette', () => {
   });
 });
 
-describe('node projection', () => {
-  function projectedNodes(workflowEditorUi?: 'classic' | 'next') {
-    render(
-      <WorkflowEditorGraph
-        graph={makeGraph()}
-        onChange={() => {}}
-        selectedId={null}
-        onSelect={() => {}}
-        problemsById={{}}
-        onInvalidConnection={() => {}}
-        workflowEditorUi={workflowEditorUi}
-      />,
-    );
-    const raw = screen.getByTestId('rf').getAttribute('data-nodes');
-    expect(raw).toBeTruthy();
-    return JSON.parse(raw!) as Array<{ data: { workflowEditorUi?: string } }>;
-  }
-
-  it('threads workflowEditorUi="next" onto every projected node', () => {
-    const nodes = projectedNodes('next');
-    expect(nodes.length).toBeGreaterThan(0);
-    for (const n of nodes) expect(n.data.workflowEditorUi).toBe('next');
-  });
-
-  it('defaults to workflowEditorUi="classic" when the prop is unset', () => {
-    const nodes = projectedNodes(undefined);
-    expect(nodes.length).toBeGreaterThan(0);
-    for (const n of nodes) expect(n.data.workflowEditorUi).toBe('classic');
-  });
-});
-
 describe('canvas backdrop (Task 3)', () => {
-  function bgAttrs(workflowEditorUi?: 'classic' | 'next') {
+  function bgAttrs() {
     render(
       <WorkflowEditorGraph
         graph={makeGraph()}
@@ -261,7 +230,6 @@ describe('canvas backdrop (Task 3)', () => {
         onSelect={() => {}}
         problemsById={{}}
         onInvalidConnection={() => {}}
-        workflowEditorUi={workflowEditorUi}
       />,
     );
     const bg = screen.getByTestId('bg');
@@ -269,7 +237,7 @@ describe('canvas backdrop (Task 3)', () => {
   }
 
   it('renders a Lines background with gap 28', () => {
-    const { variant, gap } = bgAttrs('next');
+    const { variant, gap } = bgAttrs();
     expect(variant).toBe('lines');
     expect(gap).toBe('28');
   });
@@ -283,7 +251,6 @@ describe('canvas backdrop (Task 3)', () => {
         onSelect={() => {}}
         problemsById={{}}
         onInvalidConnection={() => {}}
-        workflowEditorUi="next"
       />,
     );
     expect(container.querySelector('.wfx-canvas')).toBeInTheDocument();
@@ -302,7 +269,6 @@ describe('palette container / portal (Task 1: inspector-rail dock)', () => {
         onSelect={() => {}}
         problemsById={{}}
         onInvalidConnection={() => {}}
-        workflowEditorUi="next"
         paletteContainer={portalHost}
       />,
     );
@@ -321,7 +287,6 @@ describe('palette container / portal (Task 1: inspector-rail dock)', () => {
         onSelect={() => {}}
         problemsById={{}}
         onInvalidConnection={() => {}}
-        workflowEditorUi="next"
       />,
     );
     expect(container.querySelector('.wfx-palette')).not.toBeInTheDocument();
@@ -915,7 +880,6 @@ describe('branch edge rendering', () => {
         onSelect={() => {}}
         problemsById={{}}
         onInvalidConnection={() => {}}
-        workflowEditorUi="next"
       />,
     );
     const raw = screen.getByTestId('rf').getAttribute('data-edges');
@@ -950,7 +914,6 @@ describe('branch edge rendering', () => {
         onSelect={() => {}}
         problemsById={{}}
         onInvalidConnection={() => {}}
-        workflowEditorUi="next"
       />,
     );
     const raw = screen.getByTestId('rf').getAttribute('data-edges');
@@ -980,7 +943,6 @@ describe('branch edge rendering', () => {
         onSelect={() => {}}
         problemsById={{}}
         onInvalidConnection={() => {}}
-        workflowEditorUi="next"
       />,
     );
     const raw = screen.getByTestId('rf').getAttribute('data-edges');
@@ -1000,7 +962,6 @@ describe('branch edge rendering', () => {
         onSelect={() => {}}
         problemsById={{}}
         onInvalidConnection={() => {}}
-        workflowEditorUi="next"
       />,
     );
     const raw = screen.getByTestId('rf').getAttribute('data-edges');
@@ -1030,7 +991,6 @@ describe('kind-colored + animated edges (Task 1 round 2)', () => {
         onSelect={() => {}}
         problemsById={{}}
         onInvalidConnection={() => {}}
-        workflowEditorUi="next"
       />,
     );
     const raw = screen.getByTestId('rf').getAttribute('data-edges');
@@ -1058,7 +1018,6 @@ describe('kind-colored + animated edges (Task 1 round 2)', () => {
         onSelect={() => {}}
         problemsById={{}}
         onInvalidConnection={() => {}}
-        workflowEditorUi="next"
       />,
     );
     const raw = screen.getByTestId('rf').getAttribute('data-edges');
@@ -1086,7 +1045,6 @@ describe('kind-colored + animated edges (Task 1 round 2)', () => {
         onSelect={() => {}}
         problemsById={{}}
         onInvalidConnection={() => {}}
-        workflowEditorUi="next"
       />,
     );
     const raw = screen.getByTestId('rf').getAttribute('data-edges');
@@ -1113,7 +1071,7 @@ describe('kind-colored + animated edges (Task 1 round 2)', () => {
 });
 
 describe('edge selection + deletion (onEdgesChange)', () => {
-  function renderGraph(opts: { graph?: WorkflowGraph; workflowEditorUi?: 'classic' | 'next' } = {}) {
+  function renderGraph(opts: { graph?: WorkflowGraph } = {}) {
     const onChange = vi.fn();
     const graph = opts.graph ?? makeGraph();
     render(
@@ -1124,7 +1082,6 @@ describe('edge selection + deletion (onEdgesChange)', () => {
         onSelect={() => {}}
         problemsById={{}}
         onInvalidConnection={() => {}}
-        workflowEditorUi={opts.workflowEditorUi}
       />,
     );
     return { onChange, graph };
@@ -1170,7 +1127,7 @@ describe('edge selection + deletion (onEdgesChange)', () => {
   });
 
   it('unselected edges never carry a `selected` key (classic shape preserved)', () => {
-    renderGraph({ workflowEditorUi: 'classic' });
+    renderGraph();
     for (const e of currentEdges()) expect(e.selected).toBeUndefined();
   });
 
@@ -1213,7 +1170,7 @@ describe('edge selection + deletion (onEdgesChange)', () => {
   });
 
   it('next mode: selecting a plain edge bumps its inline stroke width and alpha', () => {
-    renderGraph({ workflowEditorUi: 'next' });
+    renderGraph();
     const before = currentEdges().find((e) => e.id === 'a->b');
     act(() => {
       rfCapture.onEdgesChange?.([{ type: 'select', id: 'a->b', selected: true }]);
@@ -1225,7 +1182,7 @@ describe('edge selection + deletion (onEdgesChange)', () => {
   });
 
   it('next mode: selecting a branch-arm edge bumps its stroke width beyond the default 2.5', () => {
-    renderGraph({ graph: graphWithBranch(), workflowEditorUi: 'next' });
+    renderGraph({ graph: graphWithBranch() });
     act(() => {
       rfCapture.onEdgesChange?.([{ type: 'select', id: 'br->a:then', selected: true }]);
     });
@@ -1401,7 +1358,7 @@ describe('single-source graph ops', () => {
 interface FlowNodeDto {
   id: string;
   type?: string;
-  data: { loop?: { name: string }; problems?: string[]; workflowEditorUi?: string };
+  data: { loop?: { name: string }; problems?: string[] };
 }
 
 function readFlowNodes(): FlowNodeDto[] {

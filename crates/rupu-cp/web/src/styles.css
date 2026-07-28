@@ -969,7 +969,7 @@
 /* ── Settings inspector authoring cards (Task 6): Autoflow + Lifecycle ── */
 /* Ported from the mockup's `.aftoggle`/`.switch` (enable toggle) and
  * `.lifecycle`/`.lc-*` (read-only stage ribbon). Behind
- * `workflowEditorUi === 'next'` in WorkflowSettingsForm, same as the Task 5
+ * the settings inspector in WorkflowSettingsForm, same as the
  * cards above — reuses `.wfx-card`/`.wfx-card-h`/`.wfx-seg`/`.wfx-chip`
  * rather than duplicating card chrome; only the toggle switch, nested
  * sub-card, and lifecycle-ribbon rules are new. Same `--c-*` tokens as the

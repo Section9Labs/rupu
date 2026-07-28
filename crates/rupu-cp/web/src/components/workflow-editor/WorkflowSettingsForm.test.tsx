@@ -21,17 +21,14 @@ function metaWith(rest: Record<string, unknown>): WorkflowMeta {
 function Harness({
   initial,
   spy,
-  workflowEditorUi,
 }: {
   initial: WorkflowMeta;
   spy: (m: WorkflowMeta) => void;
-  workflowEditorUi?: 'classic' | 'next';
 }) {
   const [meta, setMeta] = useState(initial);
   return (
     <WorkflowSettingsForm
       meta={meta}
-      workflowEditorUi={workflowEditorUi}
       onChange={(m) => {
         spy(m);
         setMeta(m);
@@ -57,14 +54,14 @@ describe('WorkflowSettingsForm — name/description', () => {
 
 describe('WorkflowSettingsForm — next: Trigger card', () => {
   it('renders a Trigger card and an Inputs card', () => {
-    render(<WorkflowSettingsForm meta={metaWith({})} onChange={() => {}} workflowEditorUi="next" />);
+    render(<WorkflowSettingsForm meta={metaWith({})} onChange={() => {}} />);
     expect(screen.getByTestId('trigger-card')).toBeInTheDocument();
     expect(screen.getByTestId('inputs-card')).toBeInTheDocument();
     expect(screen.queryByText('Preserved advanced keys — edit these in the YAML tab:')).not.toBeInTheDocument();
   });
 
   it('defaults on = manual with no cron/event fields shown', () => {
-    render(<WorkflowSettingsForm meta={metaWith({})} onChange={() => {}} workflowEditorUi="next" />);
+    render(<WorkflowSettingsForm meta={metaWith({})} onChange={() => {}} />);
     expect(screen.getByRole('button', { name: 'manual' })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.queryByLabelText('Trigger cron')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Trigger event')).not.toBeInTheDocument();
@@ -72,7 +69,7 @@ describe('WorkflowSettingsForm — next: Trigger card', () => {
 
   it('selecting on=event shows event+filter fields and hides the cron field', () => {
     const spy = vi.fn();
-    render(<Harness initial={metaWith({})} spy={spy} workflowEditorUi="next" />);
+    render(<Harness initial={metaWith({})} spy={spy} />);
 
     fireEvent.click(screen.getByRole('button', { name: 'event' }));
     expect(screen.getByLabelText('Trigger event')).toBeInTheDocument();
@@ -83,7 +80,7 @@ describe('WorkflowSettingsForm — next: Trigger card', () => {
 
   it('choosing on=cron and typing a cron emits rest.trigger = {on: cron, cron} with no event', () => {
     const spy = vi.fn();
-    render(<Harness initial={metaWith({})} spy={spy} workflowEditorUi="next" />);
+    render(<Harness initial={metaWith({})} spy={spy} />);
 
     fireEvent.click(screen.getByRole('button', { name: 'cron' }));
     fireEvent.change(screen.getByLabelText('Trigger cron'), { target: { value: '0 9 * * *' } });
@@ -98,7 +95,6 @@ describe('WorkflowSettingsForm — next: Trigger card', () => {
       <WorkflowSettingsForm
         meta={metaWith({ trigger: { on: 'event', event: 'github.pr.merged', filter: 'payload.merged' } })}
         onChange={() => {}}
-        workflowEditorUi="next"
       />,
     );
     expect(screen.getByRole('button', { name: 'event' })).toHaveAttribute('aria-pressed', 'true');
@@ -110,7 +106,7 @@ describe('WorkflowSettingsForm — next: Trigger card', () => {
 describe('WorkflowSettingsForm — next: Inputs card', () => {
   it('adding an input named "target" with type "int" emits a name-keyed map with type', () => {
     const spy = vi.fn();
-    render(<Harness initial={metaWith({})} spy={spy} workflowEditorUi="next" />);
+    render(<Harness initial={metaWith({})} spy={spy} />);
 
     fireEvent.click(screen.getByRole('button', { name: '+ input' }));
     fireEvent.change(screen.getByLabelText('Input 1 name'), { target: { value: 'target' } });
@@ -123,7 +119,7 @@ describe('WorkflowSettingsForm — next: Inputs card', () => {
 
   it('toggling required and setting a default round-trip through the emitted map', () => {
     const spy = vi.fn();
-    render(<Harness initial={metaWith({})} spy={spy} workflowEditorUi="next" />);
+    render(<Harness initial={metaWith({})} spy={spy} />);
 
     fireEvent.click(screen.getByRole('button', { name: '+ input' }));
     fireEvent.change(screen.getByLabelText('Input 1 name'), { target: { value: 'count' } });
@@ -138,7 +134,7 @@ describe('WorkflowSettingsForm — next: Inputs card', () => {
 
   it('adding an enum value renders a removable chip and emits it under enum', () => {
     const spy = vi.fn();
-    render(<Harness initial={metaWith({})} spy={spy} workflowEditorUi="next" />);
+    render(<Harness initial={metaWith({})} spy={spy} />);
 
     fireEvent.click(screen.getByRole('button', { name: '+ input' }));
     fireEvent.change(screen.getByLabelText('Input 1 name'), { target: { value: 'mode' } });
@@ -158,7 +154,7 @@ describe('WorkflowSettingsForm — next: Inputs card', () => {
 
   it('removing the only input omits the inputs key entirely', () => {
     const spy = vi.fn();
-    render(<Harness initial={metaWith({ inputs: { x: { type: 'string', required: false } } })} spy={spy} workflowEditorUi="next" />);
+    render(<Harness initial={metaWith({ inputs: { x: { type: 'string', required: false } } })} spy={spy} />);
 
     fireEvent.click(screen.getByRole('button', { name: 'Remove input 1' }));
     const last = spy.mock.calls[spy.mock.calls.length - 1][0] as WorkflowMeta;
@@ -167,7 +163,7 @@ describe('WorkflowSettingsForm — next: Inputs card', () => {
 
   it('adding two rows before naming either keeps BOTH visible (blank-name collision regression)', () => {
     const spy = vi.fn();
-    render(<Harness initial={metaWith({})} spy={spy} workflowEditorUi="next" />);
+    render(<Harness initial={metaWith({})} spy={spy} />);
 
     fireEvent.click(screen.getByRole('button', { name: '+ input' }));
     fireEvent.click(screen.getByRole('button', { name: '+ input' }));
@@ -197,7 +193,6 @@ describe('WorkflowSettingsForm — next: Inputs card', () => {
           inputs: { repo: { type: 'string', required: true, description: 'target repo', enum: ['a', 'b'] } },
         })}
         onChange={() => {}}
-        workflowEditorUi="next"
       />,
     );
     expect(screen.getByLabelText('Input 1 name')).toHaveValue('repo');
@@ -211,7 +206,7 @@ describe('WorkflowSettingsForm — next: Inputs card', () => {
 
 describe('WorkflowSettingsForm — next: Autoflow card + Lifecycle ribbon', () => {
   it('renders the Autoflow card (toggle only) and a disabled-hint lifecycle ribbon when absent', () => {
-    render(<WorkflowSettingsForm meta={metaWith({})} onChange={() => {}} workflowEditorUi="next" />);
+    render(<WorkflowSettingsForm meta={metaWith({})} onChange={() => {}} />);
     expect(screen.getByTestId('autoflow-card')).toBeInTheDocument();
     expect(screen.getByRole('switch', { name: 'Autoflow enabled' })).toHaveAttribute('aria-checked', 'false');
     // Sections hidden while disabled.
@@ -224,7 +219,7 @@ describe('WorkflowSettingsForm — next: Autoflow card + Lifecycle ribbon', () =
 
   it('toggling autoflow on emits rest.autoflow.enabled === true and reveals sections', () => {
     const spy = vi.fn();
-    render(<Harness initial={metaWith({})} spy={spy} workflowEditorUi="next" />);
+    render(<Harness initial={metaWith({})} spy={spy} />);
 
     fireEvent.click(screen.getByRole('switch', { name: 'Autoflow enabled' }));
 
@@ -239,7 +234,6 @@ describe('WorkflowSettingsForm — next: Autoflow card + Lifecycle ribbon', () =
       <Harness
         initial={metaWith({ autoflow: { enabled: true, entity: 'issue', selector: {} } })}
         spy={spy}
-        workflowEditorUi="next"
       />,
     );
 
@@ -273,7 +267,6 @@ describe('WorkflowSettingsForm — next: Autoflow card + Lifecycle ribbon', () =
       <Harness
         initial={metaWith({ autoflow: { enabled: true, entity: 'issue', selector: {} } })}
         spy={spy}
-        workflowEditorUi="next"
       />,
     );
 
@@ -292,7 +285,6 @@ describe('WorkflowSettingsForm — next: Autoflow card + Lifecycle ribbon', () =
       <Harness
         initial={metaWith({ autoflow: { enabled: true, entity: 'issue', selector: {} } })}
         spy={spy}
-        workflowEditorUi="next"
       />,
     );
     expect(screen.getByRole('group', { name: 'Autoflow claim key' })).toHaveTextContent('issue');
@@ -306,7 +298,6 @@ describe('WorkflowSettingsForm — next: Autoflow card + Lifecycle ribbon', () =
       <WorkflowSettingsForm
         meta={metaWith({ autoflow: { enabled: true, entity: 'issue', selector: {} } })}
         onChange={() => {}}
-        workflowEditorUi="next"
       />,
     );
     expect(screen.getByLabelText('Autoflow outcome output')).toBeDisabled();
@@ -319,7 +310,6 @@ describe('WorkflowSettingsForm — next: Autoflow card + Lifecycle ribbon', () =
           contracts: { outputs: { pr_url: {}, summary: {} } },
         })}
         onChange={() => {}}
-        workflowEditorUi="next"
       />,
     );
     const select = screen.getByLabelText('Autoflow outcome output') as HTMLSelectElement;
@@ -336,7 +326,6 @@ describe('WorkflowSettingsForm — next: Autoflow card + Lifecycle ribbon', () =
       <Harness
         initial={metaWith({ autoflow: { enabled: true, entity: 'issue', selector: {} } })}
         spy={spy}
-        workflowEditorUi="next"
       />,
     );
 
@@ -357,7 +346,6 @@ describe('WorkflowSettingsForm — next: Autoflow card + Lifecycle ribbon', () =
       <Harness
         initial={metaWith({ autoflow: { enabled: true, entity: 'issue', selector: {} } })}
         spy={spy}
-        workflowEditorUi="next"
       />,
     );
 
@@ -386,7 +374,6 @@ describe('WorkflowSettingsForm — next: Autoflow card + Lifecycle ribbon', () =
           },
         })}
         spy={spy}
-        workflowEditorUi="next"
       />,
     );
 
@@ -417,7 +404,6 @@ describe('WorkflowSettingsForm — next: Autoflow card + Lifecycle ribbon', () =
       <Harness
         initial={metaWith({ autoflow: original, contracts: { outputs: { summary: {} } } })}
         spy={spy}
-        workflowEditorUi="next"
       />,
     );
     // Touch something inert (name field) to force an emit without touching

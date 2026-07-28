@@ -32,7 +32,6 @@ import {
   type WorkflowMeta,
 } from '../../lib/workflowGraph';
 import { autoLayout, reconcileFromYaml } from '../../lib/workflowLayout';
-import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 import CodeEditor from '../CodeEditor';
 import WorkflowEditorGraph from './WorkflowEditorGraph';
 import StepForm from './StepForm';
@@ -48,10 +47,6 @@ interface WorkflowEditorProps {
   agents: AgentSummary[];
   /** Live-validate result from the page (server-side parse check). */
   validity: { ok: boolean; error?: string } | null;
-  /** Workflow-editor-UI flag — threaded down to NodePalette (gates the branch
-   *  palette card) and StepForm (gates the "Branch (if)" kind option).
-   *  Defaults to 'classic' for callers that don't thread it. */
-  workflowEditorUi?: WorkflowEditorUi;
 }
 
 /** Parse `draftYaml` into a laid-out graph. A non-object document (or a parse
@@ -71,8 +66,7 @@ function seedGraph(draftYaml: string): WorkflowGraph {
   return g;
 }
 
-// 'blocks' is `next`-only (the palette-as-tab redesign) — classic never sets
-// or renders it; its default-tab logic below is gated on workflowEditorUi.
+// 'blocks' is the palette-as-tab redesign, and the default tab.
 type PanelTab = 'blocks' | 'step' | 'settings' | 'reference';
 
 /** localStorage flag: the canonical-rewrite notice has been shown once. */
@@ -147,7 +141,6 @@ export default function WorkflowEditor({
   onYamlChange,
   agents,
   validity,
-  workflowEditorUi = 'classic',
 }: WorkflowEditorProps) {
   const [graph, setGraph] = useState<WorkflowGraph>(() => seedGraph(draftYaml));
   // MCP tool catalog for the connector ACTION cards + the action-body tool
@@ -499,7 +492,6 @@ export default function WorkflowEditor({
                 problemsById={problemsById}
                 onInvalidConnection={setConnError}
                 paused={paused}
-                workflowEditorUi={workflowEditorUi}
                 paletteContainer={paletteSlot}
                 tools={tools}
               />
@@ -532,7 +524,6 @@ export default function WorkflowEditor({
                   problemsById={problemsById}
                   onInvalidConnection={setConnError}
                   paused={paused}
-                  workflowEditorUi={workflowEditorUi}
                   paletteContainer={paletteSlot}
                   tools={tools}
                 />
@@ -645,7 +636,6 @@ export default function WorkflowEditor({
                   exprContext={exprContext}
                   allNodeIds={graph.nodes.map((n) => n.id)}
                   edges={graph.edges}
-                  workflowEditorUi={workflowEditorUi}
                   tools={tools}
                   onConvertToGate={onConvertToGate}
                 />
@@ -656,7 +646,7 @@ export default function WorkflowEditor({
           )}
           {panelTab === 'settings' && (
             <div role="tabpanel" id="inspector-settings" aria-labelledby="inspector-tab-settings">
-              <WorkflowSettingsForm meta={graph.meta} onChange={onMetaChange} workflowEditorUi={workflowEditorUi} />
+              <WorkflowSettingsForm meta={graph.meta} onChange={onMetaChange} />
             </div>
           )}
           {panelTab === 'reference' && (

@@ -16,7 +16,6 @@ import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import { hasInlineApproval, type GraphNode, type StepKind, type StepNodeData } from '../../../lib/workflowGraph';
 import { editorNodeSize } from '../../../lib/workflowLayout';
 import { useThemeColors, type ThemeColors } from '../../../lib/useThemeColors';
-import type { WorkflowEditorUi } from '../../../hooks/useWorkflowEditorUi';
 import { KIND_ACCENT, KIND_ICON, KIND_SHAPE } from '../kindVisuals';
 import { shapeFor, type HandleAnchor } from '../nodeShapes';
 
@@ -25,7 +24,6 @@ import { shapeFor, type HandleAnchor } from '../nodeShapes';
 export interface NodeData extends Record<string, unknown> {
   node: GraphNode;
   problems: string[];
-  workflowEditorUi?: WorkflowEditorUi;
 }
 
 type EditableFlowNode = Node<NodeData, 'editable'>;

@@ -13,7 +13,6 @@ import { ScopeChip } from '../components/ScopeChip';
 import LauncherSheet from '../components/LauncherSheet';
 import { Button } from '../components/ui/Button';
 import { Spinner } from '../components/ui/Spinner';
-import { useWorkflowEditorUi } from '../hooks/useWorkflowEditorUi';
 import { yamlToGraph, validateGraph } from '../lib/workflowGraph';
 
 // Lazy so the @xyflow/react canvas + CodeMirror (and the rest of the visual
@@ -80,7 +79,6 @@ function readAutoflow(workflow: Record<string, unknown>): AutoflowInfo | null {
 export default function WorkflowDetailPage() {
   const { name = '' } = useParams<{ name: string }>();
   const navigate = useNavigate();
-  const workflowEditorUi = useWorkflowEditorUi();
 
   const [detail, setDetail] = useState<WorkflowDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -438,7 +436,6 @@ export default function WorkflowDetailPage() {
             onYamlChange={setDraftYaml}
             agents={agents}
             validity={validity}
-            workflowEditorUi={workflowEditorUi}
           />
         </Suspense>
       </div>

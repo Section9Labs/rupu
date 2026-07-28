@@ -13,7 +13,6 @@ import { useState, type DragEvent } from 'react';
 import type { LucideIcon } from 'lucide-react';
 import type { StepKind, StepNodeData } from '../../lib/workflowGraph';
 import type { ToolSpec } from '../../lib/api';
-import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { KIND_ACCENT, KIND_FAMILY, KIND_ICON, KIND_SHAPE } from './kindVisuals';
 import { shapeFor } from './nodeShapes';
@@ -306,7 +305,6 @@ interface Props {
   onDragStartKind: (kind: StepKind) => void;
   /** When paused (YAML unparseable) the whole dock is inert. */
   disabled?: boolean;
-  workflowEditorUi?: WorkflowEditorUi;
   /** 'float' (default): the floating dock. 'rail': a compact, non-absolute
    *  block for the inspector rail (Task 1) — same cards, themed accent, no
    *  drag-hint copy, sub-text moved to a `title` tooltip. */
@@ -319,8 +317,6 @@ export default function NodePalette({
   onAdd,
   onDragStartKind,
   disabled = false,
-  // Unread here (Task 5 removes the prop entirely) — kept for signature stability.
-  workflowEditorUi: _workflowEditorUi = 'classic',
   variant = 'float',
   tools,
 }: Props) {

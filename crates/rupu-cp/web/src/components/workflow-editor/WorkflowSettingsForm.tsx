@@ -8,7 +8,6 @@
 // Any OTHER advanced key still surfaces as a read-only chip below the cards.
 
 import type { WorkflowMeta } from '../../lib/workflowGraph';
-import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 import TriggerCard from './settings/TriggerCard';
 import InputsCard from './settings/InputsCard';
 import AutoflowCard from './settings/AutoflowCard';
@@ -17,7 +16,6 @@ import LifecycleRibbon from './settings/LifecycleRibbon';
 interface WorkflowSettingsFormProps {
   meta: WorkflowMeta;
   onChange: (meta: WorkflowMeta) => void;
-  workflowEditorUi?: WorkflowEditorUi;
 }
 
 const fieldCls =
@@ -27,8 +25,6 @@ const labelCls = 'mb-1 block text-ui font-semibold uppercase tracking-wide text-
 export default function WorkflowSettingsForm({
   meta,
   onChange,
-  // Unread here (Task 5 removes the prop entirely) — kept for signature stability.
-  workflowEditorUi: _workflowEditorUi = 'classic',
 }: WorkflowSettingsFormProps) {
   // Spread `meta` (which carries `rest`) so unmodeled top-level keys survive.
   function patch(p: Partial<WorkflowMeta>): void {

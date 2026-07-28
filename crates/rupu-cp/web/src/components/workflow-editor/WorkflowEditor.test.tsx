@@ -174,7 +174,6 @@ describe('WorkflowEditor live reconcile', () => {
         onYamlChange={() => {}}
         agents={[]}
         validity={null}
-        workflowEditorUi="next"
       />,
     );
     const tabs = screen.getAllByRole('tab');
@@ -189,7 +188,6 @@ describe('WorkflowEditor live reconcile', () => {
         onYamlChange={() => {}}
         agents={[]}
         validity={null}
-        workflowEditorUi="next"
       />,
     );
     const panel = screen.getByRole('tabpanel');
@@ -207,7 +205,6 @@ describe('WorkflowEditor live reconcile', () => {
         onYamlChange={() => {}}
         agents={[]}
         validity={null}
-        workflowEditorUi="next"
       />,
     );
     fireEvent.click(screen.getByRole('tab', { name: 'Step' }));
@@ -222,7 +219,6 @@ describe('WorkflowEditor live reconcile', () => {
         onYamlChange={() => {}}
         agents={[]}
         validity={null}
-        workflowEditorUi="next"
       />,
     );
     fireEvent.click(screen.getByRole('button', { name: 'select-a' }));
@@ -263,7 +259,6 @@ describe('WorkflowEditor source pane toggle (Task 2)', () => {
         onYamlChange={() => {}}
         agents={[]}
         validity={{ ok: true }}
-        workflowEditorUi="next"
       />,
     );
     expect(screen.getByRole('button', { name: 'Hide source' })).toBeInTheDocument();
@@ -277,7 +272,6 @@ describe('WorkflowEditor source pane toggle (Task 2)', () => {
         onYamlChange={() => {}}
         agents={[]}
         validity={{ ok: true }}
-        workflowEditorUi="next"
       />,
     );
     expect(screen.getByText('✓ valid')).toBeInTheDocument();
@@ -304,7 +298,6 @@ describe('WorkflowEditor source pane toggle (Task 2)', () => {
         onYamlChange={() => {}}
         agents={[]}
         validity={{ ok: true }}
-        workflowEditorUi="next"
       />,
     );
     expect(screen.queryByTestId('code')).not.toBeInTheDocument();
@@ -319,7 +312,6 @@ describe('WorkflowEditor source pane toggle (Task 2)', () => {
         onYamlChange={() => {}}
         agents={[]}
         validity={{ ok: true }}
-        workflowEditorUi="next"
       />,
     );
 
@@ -366,7 +358,6 @@ describe('WorkflowEditor resizable inspector rail (Task 5, next only)', () => {
         onYamlChange={() => {}}
         agents={[]}
         validity={null}
-        workflowEditorUi="next"
       />,
     );
     const aside = container.querySelector('aside')!;
@@ -383,7 +374,6 @@ describe('WorkflowEditor resizable inspector rail (Task 5, next only)', () => {
         onYamlChange={() => {}}
         agents={[]}
         validity={null}
-        workflowEditorUi="next"
       />,
     );
     const sep = screen.getByRole('separator', { name: 'Resize inspector' });
@@ -399,7 +389,6 @@ describe('WorkflowEditor resizable inspector rail (Task 5, next only)', () => {
         onYamlChange={() => {}}
         agents={[]}
         validity={null}
-        workflowEditorUi="next"
       />,
     );
     const sep = screen.getByRole('separator', { name: 'Resize inspector' });
@@ -422,7 +411,6 @@ describe('WorkflowEditor resizable inspector rail (Task 5, next only)', () => {
         onYamlChange={() => {}}
         agents={[]}
         validity={null}
-        workflowEditorUi="next"
       />,
     );
     const sep = screen.getByRole('separator', { name: 'Resize inspector' });
@@ -443,7 +431,6 @@ describe('WorkflowEditor resizable inspector rail (Task 5, next only)', () => {
         onYamlChange={() => {}}
         agents={[]}
         validity={null}
-        workflowEditorUi="next"
       />,
     );
     const sep = screen.getByRole('separator', { name: 'Resize inspector' });
@@ -459,7 +446,6 @@ describe('WorkflowEditor resizable inspector rail (Task 5, next only)', () => {
         onYamlChange={() => {}}
         agents={[]}
         validity={null}
-        workflowEditorUi="next"
       />,
     );
     const sep = screen.getByRole('separator', { name: 'Resize inspector' });

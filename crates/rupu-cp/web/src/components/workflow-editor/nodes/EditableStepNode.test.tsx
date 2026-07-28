@@ -23,7 +23,6 @@ vi.mock('@xyflow/react', () => ({
 
 import EditableStepNode, { type NodeData } from './EditableStepNode';
 import type { GraphNode, StepNodeData } from '../../../lib/workflowGraph';
-import type { WorkflowEditorUi } from '../../../hooks/useWorkflowEditorUi';
 
 afterEach(cleanup);
 
@@ -31,10 +30,9 @@ function renderNode(
   data: StepNodeData,
   problems: string[] = [],
   selected = false,
-  workflowEditorUi?: WorkflowEditorUi,
 ) {
   const node: GraphNode = { id: data.id, data, position: { x: 0, y: 0 } };
-  const props = { data: { node, problems, workflowEditorUi }, selected } as unknown as NodeProps<
+  const props = { data: { node, problems }, selected } as unknown as NodeProps<
     Node<NodeData, 'editable'>
   >;
   return render(<EditableStepNode {...props} />);
@@ -118,24 +116,23 @@ describe('EditableStepNode', () => {
         { id: 'ship', kind: 'step', agent: 'x', approvalRequired: true },
         [],
         false,
-        'next',
       );
       expect(container.querySelector('.wfx-approval-badge')).toBeInTheDocument();
       expect(screen.getByLabelText('has an approval gate')).toBeInTheDocument();
     });
   });
 
-  it('carries data-ui="next" on the outer node when workflowEditorUi is "next"', () => {
-    const { container } = renderNode({ id: 'x', kind: 'step' }, [], false, 'next');
+  it('carries data-ui="next" on the outer node', () => {
+    const { container } = renderNode({ id: 'x', kind: 'step' }, [], false);
     expect(container.querySelector('[data-ui="next"]')).toBeInTheDocument();
   });
 
   describe('next (instrument) look', () => {
     it('renders a .wfx-node with a .wfx-kindpill (uppercase kind) and a mono .wfx-nid', () => {
-      const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], false, 'next');
+      const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], false);
       const wfxNode = container.querySelector('.wfx-node');
       expect(wfxNode).toBeInTheDocument();
-      expect(wfxNode).toHaveAttribute('data-ui', 'next');
+      expect(wfxNode).toHaveAttribute('data-ui');
 
       const pill = container.querySelector('.wfx-kindpill');
       expect(pill).toBeInTheDocument();
@@ -152,7 +149,7 @@ describe('EditableStepNode', () => {
     });
 
     it('an approval_gate node\'s kind pill reads "gate", not "approval_gate" — the full string would eat most of the trapezoid\'s safe width', () => {
-      const { container } = renderNode({ id: 'approve-deploy', kind: 'approval_gate' }, [], false, 'next');
+      const { container } = renderNode({ id: 'approve-deploy', kind: 'approval_gate' }, [], false);
       const pill = container.querySelector('.wfx-kindpill');
       expect(pill).toHaveTextContent('gate');
       expect(pill?.textContent).not.toContain('approval_gate');
@@ -170,14 +167,14 @@ describe('EditableStepNode', () => {
         [{ id: 'x', kind: 'action', action: 'scm.prs.create' }, 'action'],
       ];
       for (const [data, label] of kinds) {
-        const { container } = renderNode(data, [], false, 'next');
+        const { container } = renderNode(data, [], false);
         expect(container.querySelector('.wfx-kindpill')).toHaveTextContent(label);
         cleanup();
       }
     });
 
     it('a step shows the agent as a mono expr line', () => {
-      renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], false, 'next');
+      renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], false);
       expect(screen.getByText(/coder/)).toBeInTheDocument();
     });
 
@@ -186,7 +183,6 @@ describe('EditableStepNode', () => {
         { id: 'each', kind: 'for_each', agent: 'a', for_each: 'inputs.files' },
         [],
         false,
-        'next',
       );
       expect(container.querySelector('.wfx-expr')).toHaveTextContent('for_each: inputs.files');
     });
@@ -203,7 +199,6 @@ describe('EditableStepNode', () => {
         },
         [],
         false,
-        'next',
       );
       expect(container.querySelectorAll('.wfx-subrow')).toHaveLength(2);
       expect(screen.getByText('lint')).toBeInTheDocument();
@@ -223,7 +218,6 @@ describe('EditableStepNode', () => {
         },
         [],
         false,
-        'next',
       );
       expect(container.querySelectorAll('.wfx-port')).toHaveLength(2);
       expect(container.querySelector('.wfx-gate')).toHaveTextContent(/gate ≥ high/);
@@ -234,7 +228,6 @@ describe('EditableStepNode', () => {
         { id: 'route', kind: 'branch', condition: 'x == 1', thenTargets: ['a'], elseTargets: ['b'] },
         [],
         false,
-        'next',
       );
       expect(container.querySelector('.wfx-port-true')).toHaveTextContent('true');
       expect(container.querySelector('.wfx-port-false')).toHaveTextContent('false');
@@ -242,7 +235,7 @@ describe('EditableStepNode', () => {
     });
 
     it('renders the problem dot as .wfx-problem when problems are present', () => {
-      const { container } = renderNode({ id: 'x', kind: 'step' }, ['needs an agent'], false, 'next');
+      const { container } = renderNode({ id: 'x', kind: 'step' }, ['needs an agent'], false);
       expect(container.querySelector('.wfx-problem')).toBeInTheDocument();
       expect(screen.getByLabelText('has problems')).toBeInTheDocument();
     });
@@ -258,7 +251,7 @@ describe('EditableStepNode', () => {
               : kind === 'branch'
                 ? { id: 'x', kind, condition: '', thenTargets: [], elseTargets: [] }
                 : { id: 'x', kind, agent: 'a' };
-        const { container } = renderNode(data as StepNodeData, [], false, 'next');
+        const { container } = renderNode(data as StepNodeData, [], false);
         const pill = container.querySelector('.wfx-kindpill');
         const icon = pill?.querySelector('.wfx-kindicon');
         expect(icon).toBeInTheDocument();
@@ -268,7 +261,7 @@ describe('EditableStepNode', () => {
 
     describe('card chrome (Task 3: SVG silhouette shell, no CSS-drawn card)', () => {
       it('wraps .wfx-head and .wfx-body inside .wfx-safe — the shape-derived content box', () => {
-        const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], false, 'next');
+        const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], false);
         const safe = container.querySelector('.wfx-safe');
         expect(safe).toBeInTheDocument();
 
@@ -286,7 +279,7 @@ describe('EditableStepNode', () => {
       });
 
       it('paints the silhouette as an SVG layer, a direct child of .wfx-node', () => {
-        const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], false, 'next');
+        const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], false);
         const node = container.querySelector('.wfx-node');
         expect(node).toBeInTheDocument();
 
@@ -303,7 +296,7 @@ describe('EditableStepNode', () => {
       });
 
       it('positions the safe box at the shape safe rect, centring a branch only', () => {
-        const { container: step } = renderNode({ id: 's', kind: 'step', agent: 'a' }, [], false, 'next');
+        const { container: step } = renderNode({ id: 's', kind: 'step', agent: 'a' }, [], false);
         const stepSafe = step.querySelector('.wfx-safe') as HTMLElement;
         expect(stepSafe.className).not.toContain('wfx-safe-mid');
         expect(stepSafe.style.left).toBe('15px');
@@ -312,7 +305,6 @@ describe('EditableStepNode', () => {
           { id: 'route', kind: 'branch', condition: 'x == 1' },
           [],
           false,
-          'next',
         );
         const brSafe = br.querySelector('.wfx-safe') as HTMLElement;
         expect(brSafe.className).toContain('wfx-safe-mid');
@@ -321,8 +313,8 @@ describe('EditableStepNode', () => {
       });
 
       it('strokes the silhouette with the kind accent when selected', () => {
-        const { container: idle } = renderNode({ id: 's', kind: 'step', agent: 'a' }, [], false, 'next');
-        const { container: sel } = renderNode({ id: 's', kind: 'step', agent: 'a' }, [], true, 'next');
+        const { container: idle } = renderNode({ id: 's', kind: 'step', agent: 'a' }, [], false);
+        const { container: sel } = renderNode({ id: 's', kind: 'step', agent: 'a' }, [], true);
         // `.wfx-sil-shape` is the silhouette's own filled+stroked path — stable
         // regardless of paint order or how many `extra` rails/layers a kind
         // paints on top of it (unlike `path:last-of-type`, which resolves to
@@ -337,7 +329,6 @@ describe('EditableStepNode', () => {
           { id: 'route', kind: 'branch', condition: 'x == 1', thenTargets: ['a'], elseTargets: ['b'] },
           [],
           false,
-          'next',
         );
         // Handle is mocked away, but the surrounding structure (safe box present,
         // node still renders) must be unaffected by the branch's extra handle.
@@ -347,7 +338,7 @@ describe('EditableStepNode', () => {
       });
 
       it('an unselected next card has no inline boxShadow, borderColor, or .wfx-sel class — the shell paints nothing', () => {
-        const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], false, 'next');
+        const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], false);
         const node = container.querySelector('.wfx-node') as HTMLElement;
         expect(node.classList.contains('wfx-sel')).toBe(false);
         expect(node.style.boxShadow).toBe('');
@@ -355,7 +346,7 @@ describe('EditableStepNode', () => {
       });
 
       it('a selected next card still has no inline boxShadow/borderColor on .wfx-node — the glow lives on the SVG silhouette', () => {
-        const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], true, 'next');
+        const { container } = renderNode({ id: 'build', kind: 'step', agent: 'coder' }, [], true);
         const node = container.querySelector('.wfx-node') as HTMLElement;
         // the accent border/glow moved into the SVG silhouette (see "strokes
         // the silhouette..." above) — the shell div itself paints nothing.
@@ -369,7 +360,6 @@ describe('EditableStepNode', () => {
           { id: 'route', kind: 'branch', condition: 'x == 1' },
           [],
           false,
-          'next',
         );
         const handles = [...container.querySelectorAll('[data-testid="handle"]')].map((h) => ({
           type: h.getAttribute('data-type'),
@@ -387,7 +377,7 @@ describe('EditableStepNode', () => {
       });
 
       it('every other kind keeps a single right-edge source', () => {
-        const { container } = renderNode({ id: 's', kind: 'step', agent: 'a' }, [], false, 'next');
+        const { container } = renderNode({ id: 's', kind: 'step', agent: 'a' }, [], false);
         const handles = [...container.querySelectorAll('[data-testid="handle"]')].map((h) => ({
           type: h.getAttribute('data-type'),
           position: h.getAttribute('data-position'),

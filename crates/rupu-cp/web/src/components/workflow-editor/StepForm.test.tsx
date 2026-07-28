@@ -56,18 +56,13 @@ function nodeWith(data: Partial<StepNodeData>): GraphNode {
   return { id: data.id ?? 's1', data: { id: 's1', kind: 'step', ...data }, position: { x: 0, y: 0 } };
 }
 
-/** Controlled wrapper — re-renders StepForm with the latest emitted data.
- *  `workflowEditorUi` defaults through to StepForm's own default ('classic');
- *  pass 'next' when a test needs the Kind <select> to offer branch/action/
- *  approval_gate as switch targets. */
+/** Controlled wrapper — re-renders StepForm with the latest emitted data. */
 function Harness({
   initial,
   spy,
-  workflowEditorUi,
 }: {
   initial: GraphNode;
   spy: (d: StepNodeData) => void;
-  workflowEditorUi?: 'classic' | 'next';
 }) {
   const [node, setNode] = useState(initial);
   return (
@@ -76,7 +71,6 @@ function Harness({
       agents={AGENTS}
       problems={[]}
       exprContext={EXPR}
-      workflowEditorUi={workflowEditorUi}
       onChange={(d) => {
         spy(d);
         setNode((n) => ({ ...n, id: d.id, data: d }));
@@ -166,7 +160,7 @@ describe('StepForm', () => {
 });
 
 describe('StepForm — branch', () => {
-  it('the Kind select offers Branch (if) when workflowEditorUi is next', () => {
+  it('the Kind select offers Branch (if)', () => {
     render(
       <StepForm
         node={nodeWith({ kind: 'step', agent: 'planner' })}
@@ -174,7 +168,6 @@ describe('StepForm — branch', () => {
         problems={[]}
         exprContext={EXPR}
         onChange={() => {}}
-        workflowEditorUi="next"
       />,
     );
     expect(screen.getByRole('option', { name: 'Branch (if)' })).toBeInTheDocument();
@@ -465,7 +458,6 @@ describe('StepForm — roomier long-text fields', () => {
         problems={[]}
         exprContext={EXPR}
         onChange={() => {}}
-        workflowEditorUi="next"
       />,
     );
     expect(screen.getByLabelText('Prompt')).toHaveAttribute('data-size', 'large');
@@ -479,7 +471,6 @@ describe('StepForm — roomier long-text fields', () => {
         problems={[]}
         exprContext={EXPR}
         onChange={() => {}}
-        workflowEditorUi="next"
       />,
     );
     expect(screen.getByLabelText('Sub-step 1 prompt')).toHaveAttribute('data-size', 'large');
@@ -506,7 +497,6 @@ describe('StepForm — Approval prompt expression completions', () => {
         problems={[]}
         exprContext={EXPR}
         onChange={() => {}}
-        workflowEditorUi="next"
       />,
     );
     const field = screen.getByLabelText('Approval prompt');
@@ -523,7 +513,6 @@ describe('StepForm — Approval prompt expression completions', () => {
         problems={[]}
         exprContext={EXPR}
         onChange={spy}
-        workflowEditorUi="next"
       />,
     );
     fireEvent.change(screen.getByLabelText('Approval prompt'), { target: { value: 'confirm {{ inputs.y }}' } });
@@ -540,7 +529,6 @@ describe('StepForm — approval gate body (Task 5)', () => {
         problems={[]}
         exprContext={EXPR}
         onChange={() => {}}
-        workflowEditorUi="next"
       />,
     );
     expect(screen.getByLabelText('Approval prompt')).toBeInTheDocument();
@@ -561,7 +549,6 @@ describe('StepForm — approval gate body (Task 5)', () => {
         problems={[]}
         exprContext={EXPR}
         onChange={spy}
-        workflowEditorUi="next"
       />,
     );
     fireEvent.change(screen.getByLabelText('Auto approve'), { target: { value: '{{ inputs.ok }}' } });
@@ -966,7 +953,7 @@ describe('StepForm — switchKind', () => {
   it('switching to branch seeds an empty condition + empty then/else (F.1)', () => {
     const spy = vi.fn();
     render(
-      <Harness initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go' })} spy={spy} workflowEditorUi="next" />,
+      <Harness initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go' })} spy={spy} />,
     );
     fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'branch' } });
     const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
@@ -979,7 +966,7 @@ describe('StepForm — switchKind', () => {
   it('switching to action seeds an empty action (P0.3)', () => {
     const spy = vi.fn();
     render(
-      <Harness initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go' })} spy={spy} workflowEditorUi="next" />,
+      <Harness initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go' })} spy={spy} />,
     );
     fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'action' } });
     const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
@@ -993,7 +980,6 @@ describe('StepForm — switchKind', () => {
       <Harness
         initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go', actions: ['issues.list'] })}
         spy={spy}
-        workflowEditorUi="next"
       />,
     );
     fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'action' } });
@@ -1018,7 +1004,6 @@ describe('StepForm — switchKind', () => {
       <Harness
         initial={nodeWith({ kind: 'step', agent: 'planner', approvalRequired: true })}
         spy={spy}
-        workflowEditorUi="next"
       />,
     );
     fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'branch' } });
@@ -1029,7 +1014,7 @@ describe('StepForm — switchKind', () => {
 
   it('switching to approval_gate seeds approvalRequired true regardless of source', () => {
     const spy = vi.fn();
-    render(<Harness initial={nodeWith({ kind: 'step', agent: 'planner' })} spy={spy} workflowEditorUi="next" />);
+    render(<Harness initial={nodeWith({ kind: 'step', agent: 'planner' })} spy={spy} />);
     fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'approval_gate' } });
     const last = spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
     expect(last.kind).toBe('approval_gate');
@@ -1061,7 +1046,6 @@ describe('StepForm — switchKind', () => {
       <Harness
         initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go', next: ['b'] })}
         spy={spy}
-        workflowEditorUi="next"
       />,
     );
     fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'action' } });
@@ -1076,7 +1060,6 @@ describe('StepForm — switchKind', () => {
       <Harness
         initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go', next: ['b'] })}
         spy={spy}
-        workflowEditorUi="next"
       />,
     );
     fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: 'branch' } });
@@ -1145,7 +1128,7 @@ describe('WorkflowSettingsForm', () => {
 
   it('the description field is roomier (rows=4)', () => {
     const meta: WorkflowMeta = { name: 'wf', description: '', rest: {} };
-    render(<WorkflowSettingsForm meta={meta} onChange={() => {}} workflowEditorUi="next" />);
+    render(<WorkflowSettingsForm meta={meta} onChange={() => {}} />);
     expect(screen.getByLabelText('Workflow description')).toHaveAttribute('rows', '4');
   });
 });

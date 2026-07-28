@@ -19,7 +19,6 @@ import {
   type SubStep,
 } from '../../lib/workflowGraph';
 import type { ExprContext } from '../../lib/workflowExpressions';
-import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 import ExpressionField from './ExpressionField';
 import { Button } from '../ui/Button';
 import { parseWithValue, formatWithValue } from '../../lib/withValue';
@@ -42,7 +41,6 @@ interface StepFormProps {
    *  target that would close a cycle back onto an upstream node is excluded).
    *  Defaults to empty (no cycle guard) for callers that don't thread it. */
   edges?: GraphEdge[];
-  workflowEditorUi?: WorkflowEditorUi;
   /** MCP tool catalog — populates the action body's tool <select> and drives its
    *  `with:` key/value editor (the selected tool's `input_schema.properties`).
    *  Defaults to empty for callers that don't thread it. */
@@ -108,7 +106,6 @@ export default function StepForm({
   exprContext,
   allNodeIds = [],
   edges = [],
-  workflowEditorUi = 'classic',
   tools = [],
   onConvertToGate,
 }: StepFormProps) {
@@ -220,33 +217,20 @@ export default function StepForm({
           agents={agents}
           patch={patch}
           exprContext={exprContext}
-          workflowEditorUi={workflowEditorUi}
           tools={tools}
         />
       )}
       {d.kind === 'parallel' && (
-        <ParallelFields
-          d={d}
-          agents={agents}
-          patch={patch}
-          exprContext={exprContext}
-          workflowEditorUi={workflowEditorUi}
-        />
+        <ParallelFields d={d} agents={agents} patch={patch} exprContext={exprContext} />
       )}
       {d.kind === 'panel' && (
-        <PanelFields
-          d={d}
-          agents={agents}
-          patch={patch}
-          exprContext={exprContext}
-          workflowEditorUi={workflowEditorUi}
-        />
+        <PanelFields d={d} agents={agents} patch={patch} exprContext={exprContext} />
       )}
       {d.kind === 'branch' && (
         <BranchFields d={d} allNodeIds={allNodeIds} edges={edges} patch={patch} exprContext={exprContext} />
       )}
       {d.kind === 'approval_gate' && (
-        <GateFields d={d} agents={agents} patch={patch} exprContext={exprContext} workflowEditorUi={workflowEditorUi} />
+        <GateFields d={d} agents={agents} patch={patch} exprContext={exprContext} />
       )}
       {d.kind === 'action' && <ActionFields d={d} tools={tools} patch={patch} />}
       {d.kind === 'split' && <SplitFields d={d} allNodeIds={allNodeIds} edges={edges} patch={patch} />}
@@ -291,7 +275,6 @@ export default function StepForm({
             d={d}
             patch={patch}
             exprContext={exprContext}
-            workflowEditorUi={workflowEditorUi}
             onConvertToGate={onConvertToGate}
           />
         </>
@@ -476,15 +459,12 @@ function LinearFields({
   agents,
   patch,
   exprContext,
-  // Unread here (Task 5 removes the prop entirely) — kept for signature stability.
-  workflowEditorUi: _workflowEditorUi,
   tools,
 }: {
   d: StepNodeData;
   agents: AgentSummary[];
   patch: (p: Partial<StepNodeData>) => void;
   exprContext: StepExprContext;
-  workflowEditorUi: WorkflowEditorUi;
   tools: ToolSpec[];
 }) {
   return (
@@ -543,14 +523,11 @@ function ParallelFields({
   agents,
   patch,
   exprContext,
-  // Unread here (Task 5 removes the prop entirely) — kept for signature stability.
-  workflowEditorUi: _workflowEditorUi,
 }: {
   d: StepNodeData;
   agents: AgentSummary[];
   patch: (p: Partial<StepNodeData>) => void;
   exprContext: StepExprContext;
-  workflowEditorUi: WorkflowEditorUi;
 }) {
   const subs = d.parallel ?? [];
 
@@ -639,14 +616,11 @@ function PanelFields({
   agents,
   patch,
   exprContext,
-  // Unread here (Task 5 removes the prop entirely) — kept for signature stability.
-  workflowEditorUi: _workflowEditorUi,
 }: {
   d: StepNodeData;
   agents: AgentSummary[];
   patch: (p: Partial<StepNodeData>) => void;
   exprContext: StepExprContext;
-  workflowEditorUi: WorkflowEditorUi;
 }) {
   const panel: PanelCfg = d.panel ?? { panelists: [], subject: '' };
 
@@ -1045,14 +1019,11 @@ function GateFields({
   agents,
   patch,
   exprContext,
-  // Unread here (Task 5 removes the prop entirely) — kept for signature stability.
-  workflowEditorUi: _workflowEditorUi,
 }: {
   d: StepNodeData;
   agents: AgentSummary[];
   patch: (p: Partial<StepNodeData>) => void;
   exprContext: StepExprContext;
-  workflowEditorUi: WorkflowEditorUi;
 }) {
   const onReject = d.approvalOnReject ?? [];
   const notify = d.approvalNotify ?? [];
@@ -1525,15 +1496,12 @@ function ApprovalFields({
   d,
   patch,
   exprContext,
-  // Unread here (Task 5 removes the prop entirely) — kept for signature stability.
-  workflowEditorUi: _workflowEditorUi,
   onConvertToGate,
 }: {
   d: StepNodeData;
   patch: (p: Partial<StepNodeData>) => void;
   /** Vocabulary context for the Approval-prompt field (ExpressionField). */
   exprContext: StepExprContext;
-  workflowEditorUi: WorkflowEditorUi;
   /** Threaded from StepForm — rewrites this legacy inline approval into a
    *  standalone gate step. Renders the "Convert to gate node" button only when
    *  provided AND `hasInlineApproval(d)` (i.e. `d.approvalRequired` is set —
