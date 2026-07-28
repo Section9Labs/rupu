@@ -85,11 +85,11 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-34 | P0 | rupu-orchestrator | `{{ steps.<action>.output }}` is an unindexable JSON string; no `fromjson` filter exists | fixed |
 | I-35 | P0 | rupu-cp | Web, local/http connector, desktop-app and **both cancel** paths skip the `on_reject` chain (no TUI exists; SSH/tunnel are fine) | fixed |
 | I-36 | P1 | rupu-orchestrator | A reject with an empty `on_reject` chain records no gate decision at all | open |
-| I-37 | P1 | rupu-cli | `on_timeout: approve` never resumes without `cp serve` — the lazy path only prints a hint | open |
+| I-37 | P1 | rupu-cli | `on_timeout: approve` never resumes without `cp serve` — the lazy path only prints a hint | fixed (docs) |
 | I-38 | P1 | rupu-orchestrator | A timeout-driven approval is recorded as `via: "human"` | open |
 | I-39 | P1 | rupu-orchestrator | `StepKind` has no `#[serde(other)]`; an unknown kind **silently drops the whole step result** on resume (readers skip, they do not die) | open |
 | I-40 | P2 | rupu-cp web | The CP transcript never shows an action step's rendered `with:` args (the node itself *does* render via `tool_audit`) | fixed |
-| I-41 | P2 | rupu-cli | `rupu workflow show`'s **steps table** lacks gate/action arms (the graph, the primary view, is correct) | open |
+| I-41 | P2 | rupu-cli | `rupu workflow show`'s **steps table** lacks gate/action arms (the graph, the primary view, is correct) | fixed |
 | I-42 | P2 | rupu-orchestrator | A `when:`-skipped gate/action loses its kind and persists as `Linear` | open |
 | I-43 | P2 | rupu-cli | The gate sweep can re-spawn `workflow approve` every tick forever, with no backoff | open |
 | I-44 | P2 | rupu-orchestrator | `notify` hooks write orphan transcript files no `StepResult` references | open |
@@ -315,6 +315,55 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-41 — the steps table now renders gate and action nodes
+
+**Re-scoped from the filed title.** It claimed `rupu workflow show` renders gates and
+actions as `linear`. Only the **steps table** does. The graph renderer
+(`rupu-app-canvas`'s `git_graph.rs:278,308`) already emits `gate` and `action · <tool>`
+correctly, and the graph is the primary view — so this was never "show is broken".
+
+**Root cause.** `workflow_step_table_summary` had arms for `parallel`, `panel` and
+`for_each`, then fell through to `linear`. A gate printed `KIND=linear` with a **blank**
+PRIMARY column (gates have no `agent:`), and an action printed the same while **never
+naming the tool it calls** — which is the entire identity of an action step.
+
+**Fix.** A gate arm (prompt in PRIMARY; `auto_approve`/`timeout`/`on_timeout`/`on_reject`/
+`notify` in DETAIL) and an action arm (tool in PRIMARY, sorted `with:` keys in DETAIL —
+sorted so the column is stable across runs).
+
+**Validation.** Three tests, two **observed RED** by disabling the new arms
+(`left: "linear"`, `right: "gate"` / `"action"`). The third is a guard against the new arms
+over-matching: an agent step that merely *carries* an inline `approval:` is **not** a gate
+node and must still render `linear` with its agent name — it stayed green throughout,
+proving the guard is real rather than incidental.
+
+---
+
+### I-37 — the `cp serve` dependency for timeout routing is documented
+
+**Fixed as documentation, deliberately — and the code was left alone.** Making the runs
+listing resume an `on_timeout: approve` gate would **directly re-break [[I-25]]** from
+Arc 2, whose entire point is that a read command has no external side effects. The
+hint-only behavior is correct; what was missing is that nothing told the operator there is
+no automatic non-`cp serve` resume path.
+
+**A larger gap was found while fixing it:** standalone `approval:` **gate nodes were
+entirely undocumented** — `on_timeout`, `auto_approve`, `on_reject` and `notify` appeared
+nowhere in `docs/`. A whole shipped feature had no user-facing documentation.
+
+**Fix.** `docs/workflow-format.md` gains a gate-node section: the field table, the
+`steps.<gate-id>.decision` note, and an explicit subsection stating that
+`timeout_seconds`/`on_timeout` are acted on **only** by a running `rupu cp serve`, with the
+concrete manual fallback for each case. It also folds in the widened [[I-35]]/[[I-80]]
+consequence: `on_reject` chains triggered from the web UI, the desktop app or
+`workflow cancel` are recorded as pending and executed by the same sweep, so they wait on
+`cp serve` too.
+
+Removed the stale line *"timeouts are enforced lazily on the next run-store interaction"* —
+true when written, false since Arc 2 made the listing side-effect-free.
+
+---
 
 ### I-35 — every reject and cancel path now runs the `on_reject` chain
 
