@@ -38,37 +38,18 @@ describe('NodePalette', () => {
     expect(onAdd).not.toHaveBeenCalled();
   });
 
-  it('with no workflowEditorUi prop (default classic) the branch card is absent', () => {
-    render(<NodePalette onAdd={() => {}} onDragStartKind={() => {}} />);
-    expect(screen.queryByRole('button', { name: 'Add branch node' })).not.toBeInTheDocument();
-  });
-
-  it("with workflowEditorUi='classic' the branch card is absent", () => {
-    render(<NodePalette onAdd={() => {}} onDragStartKind={() => {}} workflowEditorUi="classic" />);
-    expect(screen.queryByRole('button', { name: 'Add branch node' })).not.toBeInTheDocument();
-  });
-
-  it("with workflowEditorUi='next' the branch card renders and adds a branch node", () => {
+  it("the branch card renders and adds a branch node", () => {
     const onAdd = vi.fn();
-    render(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} workflowEditorUi="next" />);
+    render(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} />);
     const card = screen.getByRole('button', { name: 'Add branch node' });
     expect(card).toBeInTheDocument();
     fireEvent.click(card);
     expect(onAdd).toHaveBeenCalledWith('branch');
   });
 
-  describe('classic (unchanged) dock markup', () => {
-    it('renders the current dock/card classes and no .wfx-* markers', () => {
-      const { container } = render(<NodePalette onAdd={() => {}} onDragStartKind={() => {}} workflowEditorUi="classic" />);
-      expect(container.querySelector('.rounded-lg.border.border-border.bg-panel\\/95')).toBeInTheDocument();
-      expect(container.querySelector('.wfx-palette')).not.toBeInTheDocument();
-      expect(container.querySelector('.wfx-pcard')).not.toBeInTheDocument();
-    });
-  });
-
   describe('next (instrument) look', () => {
     it('renders the .wfx-palette dock with a .wfx-pcard per item and a .wfx-picon accent icon', () => {
-      const { container } = render(<NodePalette onAdd={() => {}} onDragStartKind={() => {}} workflowEditorUi="next" />);
+      const { container } = render(<NodePalette onAdd={() => {}} onDragStartKind={() => {}} />);
       expect(container.querySelector('.wfx-palette')).toBeInTheDocument();
       // next offers the branch + gate + split + join cards too
       // (step/for_each/parallel/panel/branch/gate/split/join = 8).
@@ -83,20 +64,20 @@ describe('NodePalette', () => {
 
     it('still fires onAdd on click and stays draggable/disabled-aware', () => {
       const onAdd = vi.fn();
-      const { rerender } = render(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} workflowEditorUi="next" />);
+      const { rerender } = render(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} />);
       const card = screen.getByRole('button', { name: 'Add parallel node' });
       expect(card).toHaveAttribute('draggable', 'true');
       fireEvent.click(card);
       expect(onAdd).toHaveBeenCalledWith('parallel');
 
-      rerender(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} workflowEditorUi="next" disabled />);
+      rerender(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} disabled />);
       const disabledCard = screen.getByRole('button', { name: 'Add step node' });
       expect(disabledCard).toBeDisabled();
       expect(disabledCard).toHaveAttribute('draggable', 'false');
     });
 
     it('the branch card in next mode is also a .wfx-pcard', () => {
-      const { container } = render(<NodePalette onAdd={() => {}} onDragStartKind={() => {}} workflowEditorUi="next" />);
+      const { container } = render(<NodePalette onAdd={() => {}} onDragStartKind={() => {}} />);
       const branchCard = screen.getByRole('button', { name: 'Add branch node' });
       expect(branchCard).toHaveClass('wfx-pcard');
       expect(container.querySelectorAll('.wfx-pcard').length).toBe(8);
@@ -104,15 +85,9 @@ describe('NodePalette', () => {
   });
 
   describe('split/join orchestration cards (Task 6, next only)', () => {
-    it('classic hides the split and join cards', () => {
-      render(<NodePalette onAdd={() => {}} onDragStartKind={() => {}} />);
-      expect(screen.queryByRole('button', { name: 'Add split node' })).not.toBeInTheDocument();
-      expect(screen.queryByRole('button', { name: 'Add join node' })).not.toBeInTheDocument();
-    });
-
-    it("with workflowEditorUi='next' the split and join cards render and add their nodes", () => {
+    it("the split and join cards render and add their nodes", () => {
       const onAdd = vi.fn();
-      render(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} workflowEditorUi="next" />);
+      render(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} />);
 
       const splitCard = screen.getByRole('button', { name: 'Add split node' });
       expect(splitCard).toBeInTheDocument();
@@ -135,22 +110,16 @@ describe('NodePalette', () => {
 
     it('next offers a static Gate card that adds an approval_gate node', () => {
       const onAdd = vi.fn();
-      render(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} workflowEditorUi="next" />);
+      render(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} />);
       const card = screen.getByRole('button', { name: 'Add gate node' });
       expect(card).toBeInTheDocument();
       fireEvent.click(card);
       expect(onAdd).toHaveBeenCalledWith('approval_gate');
     });
 
-    it('classic shows neither the Gate card nor any connector card', () => {
-      render(<NodePalette onAdd={() => {}} onDragStartKind={() => {}} tools={TOOLS} />);
-      expect(screen.queryByRole('button', { name: 'Add gate node' })).not.toBeInTheDocument();
-      expect(screen.queryByRole('button', { name: 'Add scm.prs.create action' })).not.toBeInTheDocument();
-    });
-
     it('next renders one connector card per tool, grouped by prefix', () => {
       const { container } = render(
-        <NodePalette onAdd={() => {}} onDragStartKind={() => {}} workflowEditorUi="next" tools={TOOLS} />,
+        <NodePalette onAdd={() => {}} onDragStartKind={() => {}} tools={TOOLS} />,
       );
       for (const t of TOOLS) {
         expect(screen.getByRole('button', { name: `Add ${t.name} action` })).toBeInTheDocument();
@@ -163,7 +132,7 @@ describe('NodePalette', () => {
     it('clicking a connector card adds an action node seeded with that tool name', () => {
       const onAdd = vi.fn();
       render(
-        <NodePalette onAdd={onAdd} onDragStartKind={() => {}} workflowEditorUi="next" tools={TOOLS} />,
+        <NodePalette onAdd={onAdd} onDragStartKind={() => {}} tools={TOOLS} />,
       );
       fireEvent.click(screen.getByRole('button', { name: 'Add scm.prs.create action' }));
       expect(onAdd).toHaveBeenCalledWith('action', { action: 'scm.prs.create' });
@@ -192,11 +161,12 @@ describe('NodePalette', () => {
       // what keeps `parallel`/`panel` from both truncating to the same
       // "pa…" at the rail's default width. Connector-tool chips have no
       // shape and keep their icon — see the next test.
+      // 8 = step/for_each/parallel/panel/branch/gate/split/join.
       const { container } = render(
         <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" />,
       );
-      expect(container.querySelectorAll('.wfx-pcard').length).toBe(4);
-      expect(container.querySelectorAll('.wfx-pshape').length).toBe(4);
+      expect(container.querySelectorAll('.wfx-pcard').length).toBe(8);
+      expect(container.querySelectorAll('.wfx-pshape').length).toBe(8);
       expect(container.querySelectorAll('.wfx-picon').length).toBe(0);
     });
 
@@ -206,7 +176,6 @@ describe('NodePalette', () => {
           onAdd={() => {}}
           onDragStartKind={() => {}}
           variant="rail"
-          workflowEditorUi="next"
           tools={[{ name: 'scm.prs.create', description: 'Open a PR', input_schema: {}, kind: 'write' }]}
         />,
       );
@@ -237,7 +206,7 @@ describe('NodePalette', () => {
 
     it('the gate block has NO required fields (approval: is entirely optional per workflow.rs) — no `*` list renders', () => {
       render(
-        <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" workflowEditorUi="next" />,
+        <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" />,
       );
       fireEvent.click(screen.getByRole('button', { name: 'Add gate node' }));
       const detail = screen.getByRole('region', { name: 'gate details' });
@@ -296,10 +265,10 @@ describe('NodePalette', () => {
       expect(onDragStartKind).toHaveBeenCalledWith('step');
     });
 
-    it("with workflowEditorUi='next' the rail variant also offers the branch card, select-then-add", () => {
+    it("the rail variant also offers the branch card, select-then-add", () => {
       const onAdd = vi.fn();
       render(
-        <NodePalette onAdd={onAdd} onDragStartKind={() => {}} variant="rail" workflowEditorUi="next" />,
+        <NodePalette onAdd={onAdd} onDragStartKind={() => {}} variant="rail" />,
       );
       const card = screen.getByRole('button', { name: 'Add branch node' });
       expect(card).toBeInTheDocument();
@@ -311,7 +280,7 @@ describe('NodePalette', () => {
 
     it('a filter input narrows the visible block chips by label (case-insensitive)', () => {
       render(
-        <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" workflowEditorUi="next" />,
+        <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" />,
       );
       const filter = screen.getByRole('searchbox', { name: 'Filter blocks and actions' });
       fireEvent.change(filter, { target: { value: 'BRANCH' } });
@@ -347,7 +316,6 @@ describe('NodePalette', () => {
             onAdd={onAdd}
             onDragStartKind={() => {}}
             variant="rail"
-            workflowEditorUi="next"
             tools={[TOOL_WITH_SCHEMA]}
           />,
         );
@@ -369,7 +337,6 @@ describe('NodePalette', () => {
             onAdd={() => {}}
             onDragStartKind={() => {}}
             variant="rail"
-            workflowEditorUi="next"
             tools={[TOOL_WITHOUT_SCHEMA]}
           />,
         );
@@ -383,7 +350,7 @@ describe('NodePalette', () => {
 
     it('default (float) variant is unaffected by the rail addition', () => {
       const { container } = render(
-        <NodePalette onAdd={() => {}} onDragStartKind={() => {}} workflowEditorUi="next" />,
+        <NodePalette onAdd={() => {}} onDragStartKind={() => {}} />,
       );
       expect(container.querySelector('.wfx-palette')).toBeInTheDocument();
       expect(container.querySelector('.wfx-palette-rail')).not.toBeInTheDocument();
@@ -391,14 +358,14 @@ describe('NodePalette', () => {
 
     it('the float ("next" instrument) variant is unchanged: click still instantly adds', () => {
       const onAdd = vi.fn();
-      render(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} workflowEditorUi="next" />);
+      render(<NodePalette onAdd={onAdd} onDragStartKind={() => {}} />);
       fireEvent.click(screen.getByRole('button', { name: 'Add parallel node' }));
       expect(onAdd).toHaveBeenCalledWith('parallel');
     });
 
     it('each block chip previews its kind silhouette, so the shape is learned at pick time', () => {
       const { container } = render(
-        <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" workflowEditorUi="next" />,
+        <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" />,
       );
       const branchChip = container.querySelector('[aria-label="Add branch node"]');
       expect(branchChip).toBeInTheDocument();
@@ -420,19 +387,9 @@ describe('NodePalette', () => {
     });
 
     describe('Work / Orchestration grouping (Task 6, KIND_FAMILY)', () => {
-      it('classic (work-only) rail shows a single Work group and no Orchestration heading', () => {
-        const { container } = render(
-          <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" />,
-        );
-        const labels = [...container.querySelectorAll('.wfx-palette-family-label')].map((n) => n.textContent);
-        expect(labels).toEqual(['Work']);
-        expect(container.querySelector('[data-family="work"]')).toBeInTheDocument();
-        expect(container.querySelector('[data-family="orchestration"]')).not.toBeInTheDocument();
-      });
-
       it("next rail groups chips under 'Work' and 'Orchestration' subheadings, in that order", () => {
         const { container } = render(
-          <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" workflowEditorUi="next" />,
+          <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" />,
         );
         const labels = [...container.querySelectorAll('.wfx-palette-family-label')].map((n) => n.textContent);
         expect(labels).toEqual(['Work', 'Orchestration']);
@@ -454,7 +411,7 @@ describe('NodePalette', () => {
 
       it('a filter that narrows to only orchestration chips drops the empty Work heading', () => {
         const { container } = render(
-          <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" workflowEditorUi="next" />,
+          <NodePalette onAdd={() => {}} onDragStartKind={() => {}} variant="rail" />,
         );
         fireEvent.change(screen.getByRole('searchbox', { name: 'Filter blocks and actions' }), {
           target: { value: 'split' },

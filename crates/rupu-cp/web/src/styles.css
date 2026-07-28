@@ -213,26 +213,11 @@
 @keyframes rg-march {
   to { stroke-dashoffset: -28; }
 }
-/* xyflow renders the edge as `path.react-flow__edge-path`; mark the
- * active/awaiting edges via a wrapper class on the <g> and animate the
- * dashed stroke so the ants march along the rendered curve. */
-.react-flow__edge.rg-edge-active .react-flow__edge-path {
-  stroke: rgb(var(--c-status-running));
-  stroke-width: 2;
-  stroke-dasharray: 7 7;
-  animation: rg-march 0.7s linear infinite;
-}
-.react-flow__edge.rg-edge-await .react-flow__edge-path {
-  stroke: rgb(var(--c-status-awaiting));
-  stroke-width: 2;
-  stroke-dasharray: 6 6;
-  animation: rg-march 0.9s linear infinite;
-}
-
-/* `next` run-graph flow: animation only, no color. The stroke is supplied by
- * the edge's inline style (RunGraph's edge memo) so the marching-ants can
- * render in ANY per-kind accent. Classic keeps .rg-edge-active/.rg-edge-await
- * above, which bake their own blue/amber stroke. */
+/* xyflow renders the edge as `path.react-flow__edge-path`; mark the live
+ * frontier edge via a wrapper class on the <g> and animate the dashed
+ * stroke so the ants march along the rendered curve. Animation only, no
+ * color — the stroke is supplied by the edge's inline style (RunGraph's edge
+ * memo) so the marching-ants can render in ANY per-kind accent. */
 .react-flow__edge.rg-edge-flow .react-flow__edge-path {
   stroke-width: 2;
   stroke-dasharray: 7 7;
@@ -414,9 +399,7 @@
 }
 
 /* ================================================================== */
-/* Flow Designer (next) editor — namespaced .wfx-*, nothing leaks.    */
-/* Behind `data.workflowEditorUi === 'next'` (EditableStepNode); the  */
-/* `classic` render path is untouched Tailwind/inline-style markup.   */
+/* Flow Designer editor — namespaced .wfx-*, nothing leaks.           */
 /* Ported from the approved interactive mockup (flow-designer.html);  */
 /* colors come from the shared `--c-*` tokens (light + dark), same as */
 /* the Situation Room / Agent Builder blocks above/below.             */
@@ -863,14 +846,13 @@
   .wfx-palette-filter, .wfx-detail-addbtn { transition: none !important; }
 }
 
-/* ── Settings inspector authoring cards (Task 5): Trigger / Inputs ── */
+/* ── Settings inspector authoring cards: Trigger / Inputs ── */
 /* Ported from the mockup's `.card-sec`/`.sh`/`.sb` (card shell) and
- * `.seg`/`.chip` (segmented control / removable chip). Behind
- * `workflowEditorUi === 'next'` in WorkflowSettingsForm; the classic
- * rest-chips form is untouched. Field controls inside these cards reuse the
- * standard Tailwind field/label classes already used across StepForm /
- * WorkflowSettingsForm — only the card chrome + segmented control + chip list
- * are new, themed via the shared `--c-*` tokens (no new tokens added). */
+ * `.seg`/`.chip` (segmented control / removable chip). Field controls inside
+ * these cards reuse the standard Tailwind field/label classes already used
+ * across StepForm / WorkflowSettingsForm — only the card chrome + segmented
+ * control + chip list are new, themed via the shared `--c-*` tokens (no new
+ * tokens added). */
 .wfx-card {
   border: 1px solid rgb(var(--c-border));
   border-radius: 10px;
@@ -987,7 +969,7 @@
 /* ── Settings inspector authoring cards (Task 6): Autoflow + Lifecycle ── */
 /* Ported from the mockup's `.aftoggle`/`.switch` (enable toggle) and
  * `.lifecycle`/`.lc-*` (read-only stage ribbon). Behind
- * `workflowEditorUi === 'next'` in WorkflowSettingsForm, same as the Task 5
+ * the settings inspector in WorkflowSettingsForm, same as the
  * cards above — reuses `.wfx-card`/`.wfx-card-h`/`.wfx-seg`/`.wfx-chip`
  * rather than duplicating card chrome; only the toggle switch, nested
  * sub-card, and lifecycle-ribbon rules are new. Same `--c-*` tokens as the

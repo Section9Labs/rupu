@@ -16,7 +16,6 @@ import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import { hasInlineApproval, type GraphNode, type StepKind, type StepNodeData } from '../../../lib/workflowGraph';
 import { editorNodeSize } from '../../../lib/workflowLayout';
 import { useThemeColors, type ThemeColors } from '../../../lib/useThemeColors';
-import type { WorkflowEditorUi } from '../../../hooks/useWorkflowEditorUi';
 import { KIND_ACCENT, KIND_ICON, KIND_SHAPE } from '../kindVisuals';
 import { shapeFor, type HandleAnchor } from '../nodeShapes';
 
@@ -25,10 +24,6 @@ import { shapeFor, type HandleAnchor } from '../nodeShapes';
 export interface NodeData extends Record<string, unknown> {
   node: GraphNode;
   problems: string[];
-  /** Workflow-editor-UI flag, threaded through so the node can restyle itself
-   *  (Task 2+). Defaults to 'classic' when absent — no behavior/visual change
-   *  in this task beyond the `data-ui` marker. */
-  workflowEditorUi?: WorkflowEditorUi;
 }
 
 type EditableFlowNode = Node<NodeData, 'editable'>;
@@ -41,186 +36,18 @@ function kindChipStyle(colors: ThemeColors, kind: StepKind): React.CSSProperties
   return { background: colors.alpha(KIND_ACCENT[kind], 0.14), color: colors.get(KIND_ACCENT[kind]) };
 }
 
-/** `next`-path kind pill label — matches the approved design artifact, which
- *  drops the `approval_` prefix (a standalone gate node already reads as a
- *  gate via its trapezoid silhouette; the full `approval_gate` string eats
- *  ~115px of a 148px-wide safe rect, truncating the node id instead). Every
- *  other kind's label is `d.kind` verbatim, unchanged. Classic path (below)
- *  keeps its own separate, hardcoded "gate" text — not driven by this. */
+/** Kind pill label — matches the approved design artifact, which drops the
+ *  `approval_` prefix (a standalone gate node already reads as a gate via
+ *  its trapezoid silhouette; the full `approval_gate` string eats ~115px of
+ *  a 148px-wide safe rect, truncating the node id instead). Every other
+ *  kind's label is `d.kind` verbatim, unchanged. */
 function pillLabel(kind: StepKind): string {
   return kind === 'approval_gate' ? 'gate' : kind;
 }
 
-/** dashed ring badge marking a legacy inline approval (agent step carrying
- *  `approval.required` directly, rather than a standalone gate node) — a
- *  render-only marker, no serialize-side effect (see `hasInlineApproval`). */
-function LegacyApprovalBadge({ colors }: { colors: ThemeColors }) {
-  return (
-    <span
-      className="ml-auto shrink-0 rounded-full border border-dashed px-1.5 py-px text-meta font-medium"
-      style={{
-        borderColor: colors.alpha('status.paused', 0.6),
-        color: colors.get('status.paused'),
-        background: colors.alpha('status.paused', 0.08),
-      }}
-      title="Inline approval gate — this step waits for human approval before it runs"
-      aria-label="has an approval gate"
-    >
-      gate
-    </span>
-  );
-}
-
-/** kind chip + agent chip — shared by step / for_each. */
-function StepBody({ d, colors }: { d: StepNodeData; colors: ThemeColors }) {
-  return (
-    <>
-      <div className="mt-1.5 flex items-center gap-1.5">
-        <span className="rounded px-1.5 py-px text-meta font-medium" style={kindChipStyle(colors, d.kind)}>
-          {d.kind}
-        </span>
-        <span className="truncate rounded bg-surface px-1.5 py-px text-meta text-ink-dim">
-          {d.agent ?? '(no agent)'}
-        </span>
-        {hasInlineApproval(d) && <LegacyApprovalBadge colors={colors} />}
-      </div>
-      {d.kind === 'for_each' && (
-        <div className="mt-1 truncate text-meta text-ink-mute">for_each: {d.for_each ?? ''}</div>
-      )}
-    </>
-  );
-}
-
-/** header roll-up + stacked sub-step rows — mirrors ParallelNode. */
-function ParallelBody({ d, colors }: { d: StepNodeData; colors: ThemeColors }) {
-  const subs = d.parallel ?? [];
-  return (
-    <>
-      <div className="mt-1.5 flex items-center gap-1.5">
-        <span className="rounded px-1.5 py-px text-meta font-medium" style={kindChipStyle(colors, 'parallel')}>
-          parallel
-        </span>
-        <span className="text-meta text-ink-mute tabular-nums">· {subs.length}</span>
-      </div>
-      <div className="mt-1.5 flex flex-col gap-1">
-        {subs.map((sub, i) => (
-          <div
-            key={sub.id || i}
-            className="flex items-center gap-1.5 rounded-[6px] border border-border bg-panel px-1.5 py-1"
-          >
-            <span className="truncate text-note text-ink">{sub.id || `#${i}`}</span>
-            <span className="ml-auto truncate text-meta text-ink-mute">{sub.agent || '(no agent)'}</span>
-          </div>
-        ))}
-        {subs.length === 0 && <div className="px-1 py-0.5 text-meta text-ink-mute">no sub-steps</div>}
-      </div>
-    </>
-  );
-}
-
-/** panelists count + optional gate block — mirrors PanelLoopNode. */
-function PanelBody({ d, colors }: { d: StepNodeData; colors: ThemeColors }) {
-  const panelists = d.panel?.panelists ?? [];
-  const gate = d.panel?.gate;
-  return (
-    <>
-      <div className="mt-1.5 flex items-center gap-1.5">
-        <span className="rounded px-1.5 py-px text-meta font-medium" style={kindChipStyle(colors, 'panel')}>
-          panel
-        </span>
-        <span className="text-meta text-ink-mute tabular-nums">· {panelists.length} panelists</span>
-      </div>
-      {gate && (
-        <div
-          className="mt-1.5 flex items-center gap-1.5 rounded-[8px] border px-1.5 py-1"
-          style={{
-            borderColor: colors.alpha('status.awaiting', 0.45),
-            background: colors.alpha('status.awaiting', 0.12),
-          }}
-        >
-          <span className="text-meta font-medium" style={{ color: colors.status.awaiting }}>
-            gate ≥ {gate.until_no_findings_at_severity_or_above ?? '—'}
-          </span>
-        </div>
-      )}
-    </>
-  );
-}
-
-/** condition + then/else target summary — mirrors PanelBody's roll-up style.
- *  A branch step carries no agent/prompt; routing is entirely condition + the
- *  then/else target lists (edited via StepForm's BranchFields). */
-function BranchBody({ d, colors }: { d: StepNodeData; colors: ThemeColors }) {
-  const thenTargets = d.thenTargets ?? [];
-  const elseTargets = d.elseTargets ?? [];
-  return (
-    <>
-      <div className="mt-1.5 flex items-center gap-1.5">
-        <span className="rounded px-1.5 py-px text-meta font-medium" style={kindChipStyle(colors, 'branch')}>
-          branch
-        </span>
-      </div>
-      <div className="mt-1 truncate text-meta text-ink-mute">if: {d.condition || '(no condition)'}</div>
-      <div className="mt-1.5 flex flex-col gap-1">
-        <div className="flex items-center gap-1.5 rounded-[6px] border border-border bg-panel px-1.5 py-1">
-          <span className="text-meta font-medium" style={{ color: colors.status.done }}>
-            true
-          </span>
-          <span className="ml-auto truncate text-meta text-ink-mute">
-            {thenTargets.length > 0 ? thenTargets.join(', ') : '—'}
-          </span>
-        </div>
-        <div className="flex items-center gap-1.5 rounded-[6px] border border-border bg-panel px-1.5 py-1">
-          <span className="text-meta font-medium" style={{ color: colors.status.failed }}>
-            false
-          </span>
-          <span className="ml-auto truncate text-meta text-ink-mute">
-            {elseTargets.length > 0 ? elseTargets.join(', ') : '—'}
-          </span>
-        </div>
-      </div>
-    </>
-  );
-}
-
-/** connector tool name chip — classic look for an action step. */
-function ActionBody({ d, colors }: { d: StepNodeData; colors: ThemeColors }) {
-  return (
-    <>
-      <div className="mt-1.5 flex items-center gap-1.5">
-        <span className="rounded px-1.5 py-px text-meta font-medium" style={kindChipStyle(colors, 'action')}>
-          action
-        </span>
-        <span className="truncate rounded bg-surface px-1.5 py-px text-meta text-ink-dim font-mono">
-          {d.action || '(no tool)'}
-        </span>
-      </div>
-    </>
-  );
-}
-
-/** approval-gate roll-up — prompt snippet + auto tag; classic look. */
-function GateBody({ d, colors }: { d: StepNodeData; colors: ThemeColors }) {
-  return (
-    <>
-      <div className="mt-1.5 flex items-center gap-1.5">
-        <span className="rounded px-1.5 py-px text-meta font-medium" style={kindChipStyle(colors, 'approval_gate')}>
-          gate
-        </span>
-        {d.approvalAutoApprove ? (
-          <span className="text-meta text-ink-mute tabular-nums">· auto</span>
-        ) : null}
-      </div>
-      <div className="mt-1 truncate text-meta text-ink-mute">{d.approvalPrompt || 'awaiting approval'}</div>
-    </>
-  );
-}
-
-// ── "next" (instrument) look — mockup-ported bodies ────────────────────────
+// ── node bodies, per kind ────────────────────────────────────────────────
 // Ported from flow-designer.html's `.node`/`.kindpill`/`.nid`/`.expr`/`.port`.
-// Namespaced `.wfx-*` (Task 2 — CSS block in styles.css). Same underlying
-// StepNodeData fields as the classic bodies above; only the markup/classes
-// differ, so both looks stay driven by the exact same data.
+// Namespaced `.wfx-*` (CSS block in styles.css).
 
 /** mono agent line + optional for_each expr chip — next look for step/for_each. */
 function StepBodyNext({ d }: { d: StepNodeData }) {
@@ -350,7 +177,6 @@ function anchorProps(
 
 function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
   const { node, problems } = data;
-  const ui = data.workflowEditorUi ?? 'classic';
   const d = node.data;
   const colors = useThemeColors();
   const handleStyle = { background: colors.border, width: 7, height: 7, border: 'none' } as const;
@@ -359,180 +185,96 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
   const box = editorNodeSize(d);
   const hasProblems = problems.length > 0;
 
-  // "next" (instrument) look — a wholly separate render path so the classic
-  // markup below stays byte-identical. Same data (`d`/`colors`/`box`/handles),
-  // new `.wfx-*` classes only.
-  if (ui === 'next') {
-    const shape = shapeFor(KIND_SHAPE[d.kind], box.width, box.height);
-    const stroke = selected ? color : 'rgb(var(--c-border))';
-    return (
+  const shape = shapeFor(KIND_SHAPE[d.kind], box.width, box.height);
+  const stroke = selected ? color : 'rgb(var(--c-border))';
+  return (
+    <div data-ui="next" className="wfx-node" style={{ width: box.width, minHeight: box.height }}>
+      <Handle type="target" {...anchorProps(shape.target, handleStyle)} />
+
+      {/* The silhouette is painted in SVG rather than clipped with
+          `clip-path`: a clip slices the 1px border at the clip boundary and
+          cannot clip an outward selection glow. Paint order matters: the
+          filled body must land BEFORE `extra` (rails / stack layers) or an
+          opaque fill paints straight over them — `extra` is stroked-only
+          and always on top, per nodeShapes.ts's NodeShape contract. */}
+      <svg className="wfx-sil" viewBox={`0 0 ${box.width} ${box.height}`} aria-hidden>
+        {selected && (
+          <path d={shape.path} fill="none" stroke={color} strokeWidth={5} strokeLinejoin="round" opacity={0.25} />
+        )}
+        <path
+          className="wfx-sil-shape"
+          d={shape.path}
+          fill="rgb(var(--c-panel))"
+          stroke={stroke}
+          strokeWidth={1.5}
+          strokeLinejoin="round"
+        />
+        {shape.extra.map((d2, i) => (
+          <path key={i} d={d2} fill="none" stroke="rgb(var(--c-border))" strokeWidth={1.5} />
+        ))}
+      </svg>
+
+      {/* Content lives in the shape's safe rect, inscribed at the silhouette's
+          narrowest row — truncation is bounded by THIS box, not the bounding
+          box. `align` is part of the shape: a vhex (branch) centres, because
+          left-aligned text there starts on the slope and reads as spilling
+          outside the outline. */}
       <div
-        data-ui={ui}
-        className="wfx-node"
-        style={{ width: box.width, minHeight: box.height }}
+        className={shape.align === 'center' ? 'wfx-safe wfx-safe-mid' : 'wfx-safe'}
+        style={{
+          left: shape.safe.x,
+          top: shape.safe.y,
+          width: shape.safe.w,
+          height: shape.safe.h,
+        }}
       >
-        <Handle type="target" {...anchorProps(shape.target, handleStyle)} />
-
-        {/* The silhouette is painted in SVG rather than clipped with
-            `clip-path`: a clip slices the 1px border at the clip boundary and
-            cannot clip an outward selection glow. Paint order matters: the
-            filled body must land BEFORE `extra` (rails / stack layers) or an
-            opaque fill paints straight over them — `extra` is stroked-only
-            and always on top, per nodeShapes.ts's NodeShape contract. */}
-        <svg className="wfx-sil" viewBox={`0 0 ${box.width} ${box.height}`} aria-hidden>
-          {selected && (
-            <path
-              d={shape.path}
-              fill="none"
-              stroke={color}
-              strokeWidth={5}
-              strokeLinejoin="round"
-              opacity={0.25}
-            />
-          )}
-          <path
-            className="wfx-sil-shape"
-            d={shape.path}
-            fill="rgb(var(--c-panel))"
-            stroke={stroke}
-            strokeWidth={1.5}
-            strokeLinejoin="round"
-          />
-          {shape.extra.map((d2, i) => (
-            <path key={i} d={d2} fill="none" stroke="rgb(var(--c-border))" strokeWidth={1.5} />
-          ))}
-        </svg>
-
-        {/* Content lives in the shape's safe rect, inscribed at the silhouette's
-            narrowest row — truncation is bounded by THIS box, not the bounding
-            box. `align` is part of the shape: a vhex (branch) centres, because
-            left-aligned text there starts on the slope and reads as spilling
-            outside the outline. */}
-        <div
-          className={shape.align === 'center' ? 'wfx-safe wfx-safe-mid' : 'wfx-safe'}
-          style={{
-            left: shape.safe.x,
-            top: shape.safe.y,
-            width: shape.safe.w,
-            height: shape.safe.h,
-          }}
-        >
-          <div className="wfx-head">
-            <span className="wfx-kindpill" style={kindChipStyle(colors, d.kind)}>
-              <KindIcon className="wfx-kindicon" size={12} strokeWidth={2} aria-hidden />
-              {pillLabel(d.kind)}
-            </span>
-            <span className="wfx-nid">{d.id}</span>
-            {hasProblems && (
-              <span className="wfx-problem" title={problems.join('\n')} aria-label="has problems" />
-            )}
-          </div>
-
-          <div className="wfx-body">
-            {d.kind === 'parallel' ? (
-              <ParallelBodyNext d={d} />
-            ) : d.kind === 'panel' ? (
-              <PanelBodyNext d={d} />
-            ) : d.kind === 'branch' ? (
-              <BranchBodyNext d={d} />
-            ) : d.kind === 'action' ? (
-              <ActionBodyNext d={d} />
-            ) : d.kind === 'approval_gate' ? (
-              <GateBodyNext d={d} />
-            ) : (
-              <StepBodyNext d={d} />
-            )}
-          </div>
+        <div className="wfx-head">
+          <span className="wfx-kindpill" style={kindChipStyle(colors, d.kind)}>
+            <KindIcon className="wfx-kindicon" size={12} strokeWidth={2} aria-hidden />
+            {pillLabel(d.kind)}
+          </span>
+          <span className="wfx-nid">{d.id}</span>
+          {hasProblems && <span className="wfx-problem" title={problems.join('\n')} aria-label="has problems" />}
         </div>
 
-        {/* branch nodes get TWO labeled source handles (one per arm) instead of
-            the single default source handle every other kind uses. 'then'/
-            'else' are a MODEL CONTRACT — applyConnect reads these exact ids to
-            write thenTargets/elseTargets — not just a UI convenience, even
-            though their on-canvas positions are shape-derived (see
-            nodeShapes.ts's SourceAnchor). */}
-        {shape.sources.map((s) => {
-          // arm colour is a UI cue; the handle ID is a MODEL CONTRACT
-          // (applyConnect reads 'then'/'else' to write thenTargets/elseTargets).
-          const tint =
-            s.id === 'then' ? colors.status.done : s.id === 'else' ? colors.status.failed : undefined;
-          const { position, style } = anchorProps(s.anchor, handleStyle);
-          return (
-            <Handle
-              key={s.id ?? 'source'}
-              type="source"
-              id={s.id}
-              position={position}
-              style={tint ? { ...style, background: tint } : style}
-            />
-          );
-        })}
+        <div className="wfx-body">
+          {d.kind === 'parallel' ? (
+            <ParallelBodyNext d={d} />
+          ) : d.kind === 'panel' ? (
+            <PanelBodyNext d={d} />
+          ) : d.kind === 'branch' ? (
+            <BranchBodyNext d={d} />
+          ) : d.kind === 'action' ? (
+            <ActionBodyNext d={d} />
+          ) : d.kind === 'approval_gate' ? (
+            <GateBodyNext d={d} />
+          ) : (
+            <StepBodyNext d={d} />
+          )}
+        </div>
       </div>
-    );
-  }
-
-  return (
-    <div
-      data-ui={ui}
-      className={[
-        'relative rounded-[10px] border bg-panel px-3 py-2 text-left shadow-card',
-        selected ? 'ring-2 ring-brand-500' : '',
-      ].join(' ')}
-      style={{ borderColor: selected ? color : colors.border, width: box.width, minHeight: box.height }}
-    >
-      <Handle type="target" position={Position.Left} style={handleStyle} />
-
-      {/* colored top-bar — by KIND (no run-state) */}
-      <div
-        className="absolute left-0 right-0 top-0 h-[3px] rounded-t-[10px]"
-        style={{ background: color }}
-      />
-
-      <div className="flex items-center gap-2 pt-0.5">
-        <span className="flex-1 truncate text-ui font-semibold text-ink">{d.id}</span>
-        {hasProblems && (
-          <span
-            className="inline-block h-2.5 w-2.5 shrink-0 rounded-full bg-status-failed"
-            title={problems.join('\n')}
-            aria-label="has problems"
-          />
-        )}
-      </div>
-
-      {d.kind === 'parallel' ? (
-        <ParallelBody d={d} colors={colors} />
-      ) : d.kind === 'panel' ? (
-        <PanelBody d={d} colors={colors} />
-      ) : d.kind === 'branch' ? (
-        <BranchBody d={d} colors={colors} />
-      ) : d.kind === 'action' ? (
-        <ActionBody d={d} colors={colors} />
-      ) : d.kind === 'approval_gate' ? (
-        <GateBody d={d} colors={colors} />
-      ) : (
-        <StepBody d={d} colors={colors} />
-      )}
 
       {/* branch nodes get TWO labeled source handles (one per arm) instead of
-          the single default source handle every other kind uses. */}
-      {d.kind === 'branch' ? (
-        <>
+          the single default source handle every other kind uses. 'then'/
+          'else' are a MODEL CONTRACT — applyConnect reads these exact ids to
+          write thenTargets/elseTargets — not just a UI convenience, even
+          though their on-canvas positions are shape-derived (see
+          nodeShapes.ts's SourceAnchor). */}
+      {shape.sources.map((s) => {
+        // arm colour is a UI cue; the handle ID is a MODEL CONTRACT
+        // (applyConnect reads 'then'/'else' to write thenTargets/elseTargets).
+        const tint = s.id === 'then' ? colors.status.done : s.id === 'else' ? colors.status.failed : undefined;
+        const { position, style } = anchorProps(s.anchor, handleStyle);
+        return (
           <Handle
+            key={s.id ?? 'source'}
             type="source"
-            position={Position.Right}
-            id="then"
-            style={{ ...handleStyle, top: '38%', background: colors.status.done }}
+            id={s.id}
+            position={position}
+            style={tint ? { ...style, background: tint } : style}
           />
-          <Handle
-            type="source"
-            position={Position.Right}
-            id="else"
-            style={{ ...handleStyle, top: '68%', background: colors.status.failed }}
-          />
-        </>
-      ) : (
-        <Handle type="source" position={Position.Right} style={handleStyle} />
-      )}
+        );
+      })}
     </div>
   );
 }

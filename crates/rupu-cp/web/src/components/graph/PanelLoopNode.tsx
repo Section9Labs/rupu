@@ -13,14 +13,11 @@ import { stateStyle, glyphBg } from './stepStyle';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { PANEL_W, PANEL_H } from '../../lib/nodeSize';
 import { runKindAccent } from './kindBridge';
-import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 
 export interface PanelLoopNodeData extends Record<string, unknown> {
   node: GraphNode;
   /** Select a panelist/fixer unit's transcript — same callback FanoutNode uses. */
   onOpenUnit?: (stepId: string, index: number) => void;
-  /** 'next' turns on the kind-colored container tint; absent/'classic' keeps today's. */
-  ui?: WorkflowEditorUi;
 }
 
 type PanelFlowNode = Node<PanelLoopNodeData, 'panel'>;
@@ -28,10 +25,9 @@ type PanelFlowNode = Node<PanelLoopNodeData, 'panel'>;
 function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
   const { node, onOpenUnit } = data;
   const colors = useThemeColors();
-  const next = data.ui === 'next';
-  // Container identity: in next this is the SAME accent the editor paints
-  // 'panel' with (status.awaiting); classic keeps the legacy brand tint.
-  const accentKey = next ? runKindAccent(node.kind) : 'brand.500';
+  // Container identity: the SAME accent the editor paints 'panel' with
+  // (status.awaiting).
+  const accentKey = runKindAccent(node.kind);
   const handleStyle = {
     background: colors.alpha(accentKey, 0.5),
     width: 6,
@@ -60,11 +56,8 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
       <Handle type="target" position={Position.Left} style={handleStyle} />
 
       <div
-        className={[
-          'flex items-center justify-between gap-2 text-meta font-bold uppercase tracking-wide',
-          next ? '' : 'text-brand-500',
-        ].join(' ')}
-        style={next ? { color: colors.get(accentKey) } : undefined}
+        className="flex items-center justify-between gap-2 text-meta font-bold uppercase tracking-wide"
+        style={{ color: colors.get(accentKey) }}
       >
         <span className="truncate">
           panel · {node.id}

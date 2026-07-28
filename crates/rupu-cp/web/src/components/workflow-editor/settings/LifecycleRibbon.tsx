@@ -1,6 +1,5 @@
 // LifecycleRibbon — read-only viz of the autoflow lifecycle for the Settings
-// inspector (Task 6), rendered only when `workflowEditorUi === 'next'`
-// (WorkflowSettingsForm decides that; this component doesn't gate itself).
+// inspector (Task 6).
 //
 // Six stages — selector -> author gate -> claim -> run -> reconcile ->
 // outcome — summarized from `readAutoflow(rest)`. Purely derived from props;

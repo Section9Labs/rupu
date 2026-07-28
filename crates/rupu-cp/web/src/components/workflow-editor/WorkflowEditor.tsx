@@ -32,7 +32,6 @@ import {
   type WorkflowMeta,
 } from '../../lib/workflowGraph';
 import { autoLayout, reconcileFromYaml } from '../../lib/workflowLayout';
-import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 import CodeEditor from '../CodeEditor';
 import WorkflowEditorGraph from './WorkflowEditorGraph';
 import StepForm from './StepForm';
@@ -48,10 +47,6 @@ interface WorkflowEditorProps {
   agents: AgentSummary[];
   /** Live-validate result from the page (server-side parse check). */
   validity: { ok: boolean; error?: string } | null;
-  /** Workflow-editor-UI flag — threaded down to NodePalette (gates the branch
-   *  palette card) and StepForm (gates the "Branch (if)" kind option).
-   *  Defaults to 'classic' for callers that don't thread it. */
-  workflowEditorUi?: WorkflowEditorUi;
 }
 
 /** Parse `draftYaml` into a laid-out graph. A non-object document (or a parse
@@ -71,8 +66,7 @@ function seedGraph(draftYaml: string): WorkflowGraph {
   return g;
 }
 
-// 'blocks' is `next`-only (the palette-as-tab redesign) — classic never sets
-// or renders it; its default-tab logic below is gated on workflowEditorUi.
+// 'blocks' is the palette-as-tab redesign, and the default tab.
 type PanelTab = 'blocks' | 'step' | 'settings' | 'reference';
 
 /** localStorage flag: the canonical-rewrite notice has been shown once. */
@@ -147,7 +141,6 @@ export default function WorkflowEditor({
   onYamlChange,
   agents,
   validity,
-  workflowEditorUi = 'classic',
 }: WorkflowEditorProps) {
   const [graph, setGraph] = useState<WorkflowGraph>(() => seedGraph(draftYaml));
   // MCP tool catalog for the connector ACTION cards + the action-body tool
@@ -155,10 +148,9 @@ export default function WorkflowEditor({
   // cards (the palette degrades to kind cards only).
   const [tools, setTools] = useState<ToolSpec[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  // `next` defaults to the Blocks tab (the palette now lives there — Task
-  // "Flow Designer rail redesign"); classic keeps its old Settings default,
-  // since it has no Blocks tab to default to.
-  const [panelTab, setPanelTab] = useState<PanelTab>(workflowEditorUi === 'next' ? 'blocks' : 'settings');
+  // Defaults to the Blocks tab (the palette lives there — Task "Flow
+  // Designer rail redesign").
+  const [panelTab, setPanelTab] = useState<PanelTab>('blocks');
   const [connError, setConnError] = useState<string | null>(null);
   // Transient notice (e.g. selection lost on rename), auto-dismissed.
   const [notice, setNotice] = useState<string | null>(null);
@@ -489,7 +481,7 @@ export default function WorkflowEditor({
 
       {/* ── LEFT / MAIN: graph over YAML, resizable ───────────────────────── */}
       <div className="min-h-0 min-w-0 flex-1">
-        {workflowEditorUi === 'next' && !sourceOpen ? (
+        {!sourceOpen ? (
           <div className="flex h-full min-h-0 flex-col">
             <div className="min-h-0 flex-1 overflow-hidden p-3">
               <WorkflowEditorGraph
@@ -500,7 +492,6 @@ export default function WorkflowEditor({
                 problemsById={problemsById}
                 onInvalidConnection={setConnError}
                 paused={paused}
-                workflowEditorUi={workflowEditorUi}
                 paletteContainer={paletteSlot}
                 tools={tools}
               />
@@ -533,18 +524,14 @@ export default function WorkflowEditor({
                   problemsById={problemsById}
                   onInvalidConnection={setConnError}
                   paused={paused}
-                  workflowEditorUi={workflowEditorUi}
-                  paletteContainer={workflowEditorUi === 'next' ? paletteSlot : undefined}
+                  paletteContainer={paletteSlot}
                   tools={tools}
                 />
               </div>
             }
             bottom={
               <div className="flex h-full min-h-0 flex-col">
-                <div
-                  className="min-h-0 flex-1 overflow-auto p-3"
-                  {...(workflowEditorUi === 'next' ? { id: SOURCE_PANE_ID } : {})}
-                >
+                <div className="min-h-0 flex-1 overflow-auto p-3" id={SOURCE_PANE_ID}>
                   <CodeEditor
                     value={draftYaml}
                     onChange={onYamlChange}
@@ -554,17 +541,15 @@ export default function WorkflowEditor({
                 </div>
                 <div className="flex items-center gap-2 border-t border-border bg-panel px-3 py-1.5">
                   <span className="text-note text-ink-mute">⟳ synced from graph</span>
-                  {workflowEditorUi === 'next' && (
-                    <button
-                      type="button"
-                      onClick={toggleSourceOpen}
-                      aria-expanded={true}
-                      aria-controls={SOURCE_PANE_ID}
-                      className="rounded px-1.5 py-0.5 text-note font-medium text-ink-dim hover:bg-surface-hover hover:text-ink"
-                    >
-                      Hide source
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    onClick={toggleSourceOpen}
+                    aria-expanded={true}
+                    aria-controls={SOURCE_PANE_ID}
+                    className="rounded px-1.5 py-0.5 text-note font-medium text-ink-dim hover:bg-surface-hover hover:text-ink"
+                  >
+                    Hide source
+                  </button>
                   <span className="ml-auto">
                     <ValidityBadge validity={validity} />
                   </span>
@@ -577,81 +562,48 @@ export default function WorkflowEditor({
 
       {/* ── RIGHT: inspector rail ─────────────────────────────────────────── */}
       <aside
-        ref={workflowEditorUi === 'next' ? asideRef : undefined}
-        className={
-          workflowEditorUi === 'next'
-            ? 'relative flex w-full shrink-0 flex-col border-t border-border bg-panel wfx-rail-sized lg:border-l lg:border-t-0'
-            : 'flex w-full shrink-0 flex-col border-t border-border bg-panel lg:w-80 lg:border-l lg:border-t-0'
-        }
-        style={workflowEditorUi === 'next' ? ({ '--wfx-rail-w': `${railWidth}px` } as React.CSSProperties) : undefined}
+        ref={asideRef}
+        className="relative flex w-full shrink-0 flex-col border-t border-border bg-panel wfx-rail-sized lg:border-l lg:border-t-0"
+        style={{ '--wfx-rail-w': `${railWidth}px` } as React.CSSProperties}
       >
-        {workflowEditorUi === 'next' && (
-          <div
-            role="separator"
-            aria-orientation="vertical"
-            aria-label="Resize inspector"
-            aria-valuenow={railWidth}
-            aria-valuemin={RAIL_WIDTH_MIN}
-            aria-valuemax={RAIL_WIDTH_MAX}
-            tabIndex={0}
-            onPointerDown={onRailPointerDown}
-            onKeyDown={onRailKeyDown}
-            className="wfx-rail-handle hidden lg:block"
-          />
-        )}
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize inspector"
+          aria-valuenow={railWidth}
+          aria-valuemin={RAIL_WIDTH_MIN}
+          aria-valuemax={RAIL_WIDTH_MAX}
+          tabIndex={0}
+          onPointerDown={onRailPointerDown}
+          onKeyDown={onRailKeyDown}
+          className="wfx-rail-handle hidden lg:block"
+        />
         <div className="border-b border-border p-3">
           <div role="tablist" aria-label="Inspector" className="inline-flex rounded-lg border border-border bg-panel p-0.5">
-            {workflowEditorUi === 'next' && (
-              <PanelTabButton
-                active={panelTab === 'blocks'}
-                onClick={() => setPanelTab('blocks')}
-                tabId="inspector-tab-blocks"
-                controls="inspector-blocks"
-              >
-                Blocks
-              </PanelTabButton>
-            )}
-            {workflowEditorUi === 'next' ? (
-              // next order: Blocks · Step · Settings · Reference.
-              <>
-                <PanelTabButton
-                  active={panelTab === 'step'}
-                  onClick={() => setPanelTab('step')}
-                  tabId="inspector-tab-step"
-                  controls="inspector-step"
-                >
-                  Step
-                </PanelTabButton>
-                <PanelTabButton
-                  active={panelTab === 'settings'}
-                  onClick={() => setPanelTab('settings')}
-                  tabId="inspector-tab-settings"
-                  controls="inspector-settings"
-                >
-                  Settings
-                </PanelTabButton>
-              </>
-            ) : (
-              // classic order (unchanged): Settings · Step.
-              <>
-                <PanelTabButton
-                  active={panelTab === 'settings'}
-                  onClick={() => setPanelTab('settings')}
-                  tabId="inspector-tab-settings"
-                  controls="inspector-settings"
-                >
-                  Settings
-                </PanelTabButton>
-                <PanelTabButton
-                  active={panelTab === 'step'}
-                  onClick={() => setPanelTab('step')}
-                  tabId="inspector-tab-step"
-                  controls="inspector-step"
-                >
-                  Step
-                </PanelTabButton>
-              </>
-            )}
+            <PanelTabButton
+              active={panelTab === 'blocks'}
+              onClick={() => setPanelTab('blocks')}
+              tabId="inspector-tab-blocks"
+              controls="inspector-blocks"
+            >
+              Blocks
+            </PanelTabButton>
+            <PanelTabButton
+              active={panelTab === 'step'}
+              onClick={() => setPanelTab('step')}
+              tabId="inspector-tab-step"
+              controls="inspector-step"
+            >
+              Step
+            </PanelTabButton>
+            <PanelTabButton
+              active={panelTab === 'settings'}
+              onClick={() => setPanelTab('settings')}
+              tabId="inspector-tab-settings"
+              controls="inspector-settings"
+            >
+              Settings
+            </PanelTabButton>
             <PanelTabButton
               active={panelTab === 'reference'}
               onClick={() => setPanelTab('reference')}
@@ -684,7 +636,6 @@ export default function WorkflowEditor({
                   exprContext={exprContext}
                   allNodeIds={graph.nodes.map((n) => n.id)}
                   edges={graph.edges}
-                  workflowEditorUi={workflowEditorUi}
                   tools={tools}
                   onConvertToGate={onConvertToGate}
                 />
@@ -695,7 +646,7 @@ export default function WorkflowEditor({
           )}
           {panelTab === 'settings' && (
             <div role="tabpanel" id="inspector-settings" aria-labelledby="inspector-tab-settings">
-              <WorkflowSettingsForm meta={graph.meta} onChange={onMetaChange} workflowEditorUi={workflowEditorUi} />
+              <WorkflowSettingsForm meta={graph.meta} onChange={onMetaChange} />
             </div>
           )}
           {panelTab === 'reference' && (

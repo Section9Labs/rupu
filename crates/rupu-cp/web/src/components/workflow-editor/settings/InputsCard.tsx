@@ -1,6 +1,4 @@
-// InputsCard — Inputs authoring card for the Settings inspector (Task 5),
-// rendered only when `workflowEditorUi === 'next'` (WorkflowSettingsForm
-// decides that; this component doesn't gate itself).
+// InputsCard — Inputs authoring card for the Settings inspector (Task 5).
 //
 // An add/remove list of `InputModel` rows (name / type / required / default /
 // enum / description).

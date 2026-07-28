@@ -18,14 +18,11 @@ import { stateStyle, glyphBg } from './stepStyle';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { nodeSize, FANOUT_INLINE_THRESHOLD, FANOUT_INLINE_COLS } from '../../lib/nodeSize';
 import { runKindAccent } from './kindBridge';
-import type { WorkflowEditorUi } from '../../hooks/useWorkflowEditorUi';
 
 export interface FanoutNodeData extends Record<string, unknown> {
   node: GraphNode;
   onOpenUnit?: (stepId: string, index: number) => void;
   onExpandFanout?: (stepId: string) => void;
-  /** 'next' turns on the kind-colored container tint; absent/'classic' keeps today's. */
-  ui?: WorkflowEditorUi;
 }
 
 type FanoutFlowNode = Node<FanoutNodeData, 'fanout'>;
@@ -36,14 +33,12 @@ const PREVIEW_CELLS = 60;
 function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
   const { node, onOpenUnit, onExpandFanout } = data;
   const colors = useThemeColors();
-  const next = data.ui === 'next';
-  // Container identity: in next this is the SAME accent the editor paints
-  // 'for_each' with (brand.500 — violet); classic keeps the legacy
-  // running-blue tint. The empty-units placeholder card below stays
+  // Container identity: the SAME accent the editor paints 'for_each' with
+  // (brand.500 — violet). The empty-units placeholder card below stays
   // state-driven (it has no fanout yet, so there is nothing to fan out with
   // a kind identity) and the per-unit squares/progress gradient stay
   // state-colored — only the container tint switches on kind.
-  const accentKey = next ? runKindAccent(node.kind) : 'status.running';
+  const accentKey = runKindAccent(node.kind);
   const handleStyle = {
     background: colors.alpha(accentKey, 0.4),
     width: 6,

@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-// InputsCard — renders only under `workflowEditorUi === 'next'` (no classic
+// InputsCard — renders in the settings inspector (no classic
 // gating needed inside the component itself). Task 5 covers only the
 // Description field's move from a single-line input to a roomier textarea.
 

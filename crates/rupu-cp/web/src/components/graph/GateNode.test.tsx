@@ -21,8 +21,8 @@ function renderGate(props: NodeProps<GateFlowNode>) {
   );
 }
 
-function makeProps(node: GraphNode, ui?: 'classic' | 'next'): NodeProps<GateFlowNode> {
-  const data: GateNodeData = { node, ui };
+function makeProps(node: GraphNode): NodeProps<GateFlowNode> {
+  const data: GateNodeData = { node };
   return {
     id: node.id,
     data,
@@ -91,9 +91,9 @@ describe('GateNode', () => {
     expect(screen.getByText('failed')).toBeInTheDocument();
   });
 
-  it('next: renders a kind pill alongside the existing status treatment', () => {
+  it('renders a kind pill alongside the existing status treatment', () => {
     const node: GraphNode = { id: 'approve', kind: 'gate', state: 'awaiting_approval' };
-    renderGate(makeProps(node, 'next'));
+    renderGate(makeProps(node));
     expect(screen.getByTestId('rg-kindpill')).toBeInTheDocument();
     expect(screen.getByText('awaiting')).toBeInTheDocument();
   });

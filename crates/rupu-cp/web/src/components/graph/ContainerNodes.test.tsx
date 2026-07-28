@@ -1,9 +1,12 @@
 // @vitest-environment jsdom
-// Container run nodes take their KIND accent in next; the per-sub-step /
-// per-unit chips stay state-colored. We assert the container tint CHANGES
-// between classic and next rather than pinning a hex (the token resolves
-// through CSS vars that jsdom does not compute) — the point is that kind now
-// drives it, and that the status channel survives.
+// Container run nodes take their KIND accent (parallel/panel/for_each each
+// have a distinct token — see kindVisuals.KIND_ACCENT); the per-sub-step /
+// per-unit chips stay state-colored. The border-color assertions pin the
+// exact color jsdom's CSSOM normalizes the seeded CSS_VARS below to
+// (`rgb(<channels> / <alpha>)` inline style reads back as
+// `rgba(<r>, <g>, <b>, <alpha>)`), since `useThemeColors` reads the raw
+// channels directly off `document.documentElement`'s inline style (no
+// var()-resolution involved).
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it } from 'vitest';
 import { render, screen, cleanup } from '@testing-library/react';
@@ -44,11 +47,10 @@ function renderContainer(
   Component: React.ComponentType<NodeProps<any>>,
   type: string,
   node: GraphNode,
-  ui?: 'classic' | 'next',
 ) {
   const props = {
     id: node.id,
-    data: { node, ui },
+    data: { node },
     type,
     dragging: false,
     zIndex: 0,
@@ -68,16 +70,16 @@ function renderContainer(
   );
 }
 
-function renderParallel(node: GraphNode, ui?: 'classic' | 'next') {
-  return renderContainer(ParallelNode, 'parallel', node, ui);
+function renderParallel(node: GraphNode) {
+  return renderContainer(ParallelNode, 'parallel', node);
 }
 
-function renderPanel(node: GraphNode, ui?: 'classic' | 'next') {
-  return renderContainer(PanelLoopNode, 'panel', node, ui);
+function renderPanel(node: GraphNode) {
+  return renderContainer(PanelLoopNode, 'panel', node);
 }
 
-function renderFanout(node: GraphNode, ui?: 'classic' | 'next') {
-  return renderContainer(FanoutNode, 'fanout', node, ui);
+function renderFanout(node: GraphNode) {
+  return renderContainer(FanoutNode, 'fanout', node);
 }
 
 function containerBorderColor(container: HTMLElement): string {
@@ -95,20 +97,16 @@ const PARALLEL: GraphNode = {
 } as unknown as GraphNode;
 
 describe('ParallelNode', () => {
-  it('next: keeps the status channel — every sub-step chip still renders', () => {
-    renderParallel(PARALLEL, 'next');
+  it('keeps the status channel — every sub-step chip still renders', () => {
+    renderParallel(PARALLEL);
     expect(screen.getByText('lint')).toBeInTheDocument();
     expect(screen.getByText('test')).toBeInTheDocument();
     expect(screen.getByText(/parallel · fanwork/)).toBeInTheDocument();
   });
 
-  it('next: the container tint switches from the legacy brand violet to the parallel kind accent', () => {
-    const classic = renderParallel(PARALLEL, 'classic');
-    const classicTint = containerBorderColor(classic.container);
-    cleanup();
-    const next = renderParallel(PARALLEL, 'next');
-    const nextTint = containerBorderColor(next.container);
-    expect(nextTint).not.toBe(classicTint);
+  it('the container tint uses the parallel kind accent (sev.critical)', () => {
+    const { container } = renderParallel(PARALLEL);
+    expect(containerBorderColor(container)).toBe('rgba(147, 51, 234, 0.4)');
   });
 });
 
@@ -129,20 +127,16 @@ const PANEL: GraphNode = {
 } as unknown as GraphNode;
 
 describe('PanelLoopNode', () => {
-  it('next: keeps the status channel — panelist chips and the loop cue still render', () => {
-    renderPanel(PANEL, 'next');
+  it('keeps the status channel — panelist chips and the loop cue still render', () => {
+    renderPanel(PANEL);
     expect(screen.getByText('alice')).toBeInTheDocument();
     expect(screen.getByText('bob')).toBeInTheDocument();
     expect(screen.getByLabelText('looping')).toBeInTheDocument();
   });
 
-  it('next: the container tint switches from the legacy brand violet to the panel kind accent', () => {
-    const classic = renderPanel(PANEL, 'classic');
-    const classicTint = containerBorderColor(classic.container);
-    cleanup();
-    const next = renderPanel(PANEL, 'next');
-    const nextTint = containerBorderColor(next.container);
-    expect(nextTint).not.toBe(classicTint);
+  it('the container tint uses the panel kind accent (status.awaiting)', () => {
+    const { container } = renderPanel(PANEL);
+    expect(containerBorderColor(container)).toBe('rgba(245, 158, 11, 0.4)');
   });
 });
 
@@ -162,19 +156,15 @@ const FANOUT: GraphNode = {
 } as unknown as GraphNode;
 
 describe('FanoutNode', () => {
-  it('next: keeps the status channel — every unit square still renders', () => {
-    renderFanout(FANOUT, 'next');
+  it('keeps the status channel — every unit square still renders', () => {
+    renderFanout(FANOUT);
     expect(screen.getByText(/for_each · shard · 3/)).toBeInTheDocument();
     expect(screen.getByText('2', { exact: false })).toBeInTheDocument();
   });
 
-  it('next: the container tint switches from the legacy running-blue to the for_each kind accent', () => {
-    const classic = renderFanout(FANOUT, 'classic');
-    const classicTint = containerBorderColor(classic.container);
-    cleanup();
-    const next = renderFanout(FANOUT, 'next');
-    const nextTint = containerBorderColor(next.container);
-    expect(nextTint).not.toBe(classicTint);
+  it('the container tint uses the for_each kind accent (brand.500)', () => {
+    const { container } = renderFanout(FANOUT);
+    expect(containerBorderColor(container)).toBe('rgba(124, 58, 237, 0.4)');
   });
 });
 
@@ -196,26 +186,16 @@ const FANOUT_LARGE: GraphNode = {
 } as unknown as GraphNode;
 
 describe('FanoutNode (large card, total > 12)', () => {
-  it('next: the header label, the %, and the expand-all button take the for_each kind accent, not the legacy running-blue', () => {
-    renderFanout(FANOUT_LARGE, 'classic');
-    const classicHeader = screen.getByText(/for_each · bigshard/);
-    const classicHeaderColor = getComputedStyle(classicHeader).color;
-    const classicPct = screen.getByText('67%');
-    const classicPctColor = getComputedStyle(classicPct).color;
-    const classicButton = screen.getByRole('button', { name: /expand all/ });
-    const classicButtonColor = getComputedStyle(classicButton).color;
-    cleanup();
+  it('the header label, the %, and the expand-all button all take the same for_each kind accent', () => {
+    renderFanout(FANOUT_LARGE);
+    const header = screen.getByText(/for_each · bigshard/);
+    const headerColor = getComputedStyle(header).color;
+    const pct = screen.getByText('67%');
+    const pctColor = getComputedStyle(pct).color;
+    const button = screen.getByRole('button', { name: /expand all/ });
+    const buttonColor = getComputedStyle(button).color;
 
-    renderFanout(FANOUT_LARGE, 'next');
-    const nextHeader = screen.getByText(/for_each · bigshard/);
-    const nextHeaderColor = getComputedStyle(nextHeader).color;
-    const nextPct = screen.getByText('67%');
-    const nextPctColor = getComputedStyle(nextPct).color;
-    const nextButton = screen.getByRole('button', { name: /expand all/ });
-    const nextButtonColor = getComputedStyle(nextButton).color;
-
-    expect(nextHeaderColor).not.toBe(classicHeaderColor);
-    expect(nextPctColor).not.toBe(classicPctColor);
-    expect(nextButtonColor).not.toBe(classicButtonColor);
+    expect(headerColor).toBe(pctColor);
+    expect(pctColor).toBe(buttonColor);
   });
 });

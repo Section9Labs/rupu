@@ -8,19 +8,16 @@ import { ArrowLeft, Pencil, Trash2 } from 'lucide-react';
 import { api, scopeSelectorFor, type AgentDetail } from '../lib/api';
 import { cn } from '../lib/cn';
 import CodeHighlight from '../components/CodeHighlight';
-import CodeEditor from '../components/CodeEditor';
 import AgentBuilder from '../components/agentBuilder/AgentBuilder';
 import AgentLauncherSheet from '../components/AgentLauncherSheet';
 import AgentUsageTimeline from '../components/agent/AgentUsageTimeline';
 import { Button } from '../components/ui/Button';
 import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
-import { useAgentAuthoringUi } from '../hooks/useAgentAuthoringUi';
 
 export default function AgentDetailPage() {
   const { name = '' } = useParams<{ name: string }>();
   const navigate = useNavigate();
-  const agentUi = useAgentAuthoringUi();
 
   const [agent, setAgent] = useState<AgentDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -28,7 +25,6 @@ export default function AgentDetailPage() {
 
   // ── Edit / delete state ──────────────────────────────────────────────
   const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState('');
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -55,7 +51,6 @@ export default function AgentDetailPage() {
 
   function startEdit() {
     if (!agent) return;
-    setDraft(agent.raw);
     setSaveError(null);
     setEditing(true);
   }
@@ -76,17 +71,12 @@ export default function AgentDetailPage() {
       // create a hidden global shadow instead of editing the file shown.
       const updated = await api.saveAgent(name, raw, scopeSelectorFor(agent));
       setAgent(updated);
-      setDraft(updated.raw);
       setEditing(false);
     } catch (e: unknown) {
       setSaveError(e instanceof Error ? e.message : 'Failed to save agent');
     } finally {
       setSaving(false);
     }
-  }
-
-  function save() {
-    return saveFrom(draft);
   }
 
   async function remove() {
@@ -214,7 +204,7 @@ export default function AgentDetailPage() {
           )}
         </div>
 
-        {editing && agentUi === 'next' ? (
+        {editing ? (
           <div className="h-[80vh] overflow-hidden rounded-xl border border-border bg-panel shadow-card">
             <AgentBuilder
               initialRaw={agent.raw}
@@ -224,28 +214,6 @@ export default function AgentDetailPage() {
               onSubmit={saveFrom}
               onCancel={cancelEdit}
             />
-          </div>
-        ) : editing ? (
-          <div className="space-y-3">
-            <CodeEditor
-              value={draft}
-              onChange={setDraft}
-              language="markdown"
-              ariaLabel="Agent definition"
-            />
-            {saveError && (
-              <p role="alert" className="text-ui font-medium text-err">
-                {saveError}
-              </p>
-            )}
-            <div className="flex items-center justify-end gap-2">
-              <Button variant="secondary" onClick={cancelEdit} disabled={saving}>
-                Cancel
-              </Button>
-              <Button onClick={save} disabled={saving || draft === agent.raw}>
-                {saving ? 'Saving…' : 'Save'}
-              </Button>
-            </div>
           </div>
         ) : agent.raw ? (
           <CodeHighlight code={agent.raw} frontmatter />

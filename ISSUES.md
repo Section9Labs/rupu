@@ -70,11 +70,11 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 | ID | Sev | Area | Title | Status |
 |---|---|---|---|---|
-| I-28 | P1 | rupu-cp web | Delete the classic agent-authoring UI; drop `[cp].agent_authoring_ui` | open |
-| I-29 | P1 | rupu-cp web | Delete the classic workflow-editor UI; drop `[cp].workflow_editor_ui` | open |
-| I-30 | P1 | rupu-cp web | Collapse the run-graph classic/next dual paths to one | open |
-| I-31 | P2 | rupu-cp web | Remove both UI hooks and their localStorage overrides | open |
-| I-32 | P2 | rupu-cp web | Fan-out / fan-in / branch node silhouettes are placeholders | open |
+| I-28 | P1 | rupu-cp web | Delete the classic agent-authoring UI; drop `[cp].agent_authoring_ui` | fixed |
+| I-29 | P1 | rupu-cp web | Delete the classic workflow-editor UI; drop `[cp].workflow_editor_ui` | fixed |
+| I-30 | P1 | rupu-cp web | Collapse the run-graph classic/next dual paths to one | fixed |
+| I-31 | P2 | rupu-cp web | Remove both UI hooks and their localStorage overrides | fixed |
+| I-32 | P2 | rupu-cp web | Fan-out / fan-in node silhouettes are provisional art (`branch` is not — mis-scoped) | moved → TODO.md |
 
 ### Arc 4 — gate/action correctness
 
@@ -283,6 +283,184 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-31 — both UI hooks and their localStorage overrides are removed
+
+**Symptom.** Two React hooks (`useAgentAuthoringUi`, `useWorkflowEditorUi`) resolved
+the CP UI flags, each with an undocumented devtools-only localStorage override
+(`rupu.cp.agentUi`, `rupu.cp.workflowEditorUi`) that let an operator flip the UI
+behind the config's back. Nothing wrote those keys in production — they existed
+purely so a developer could hand-set them in devtools.
+
+**Fix.** With [[I-28]], [[I-29]] and [[I-30]] removing every *reader* of the flags'
+values, what remained was dead plumbing. Both hook files and their tests are gone,
+along with the `WorkflowEditorUi` type imports, the `workflowEditorUi` prop at every
+declaring and forwarding site — including the five `StepForm` sub-components I-29
+had temporarily renamed to `_workflowEditorUi` for signature stability — and the
+threading in `pages/WorkflowDetail.tsx`.
+
+The now-dead `node projection` describe in `WorkflowEditorGraph.test.tsx` was also
+removed: it asserted the flag threads onto every projected node, which is no longer
+something that happens. Comments in four settings cards and in `styles.css` that
+described components rendering "only when `workflowEditorUi === 'next'`" were
+corrected — that condition no longer exists, so the comments had become false.
+
+**Validation.**
+`grep -rn "workflowEditorUi\|WorkflowEditorUi\|useWorkflowEditorUi\|agentUi\|useAgentAuthoringUi" crates/rupu-cp/web/src`
+returns **zero hits**, and neither localStorage key has a remaining reader or
+writer anywhere in the tree. `npm run build` is TypeScript-clean — which is a real
+check here rather than a formality, since `noUnusedParameters` and the prop-type
+removals mean a half-finished removal cannot compile. `npx vitest run` green at
+179 files / 1854 tests, down from 180 / 1859; the delta reconciles exactly as one
+deleted test file (3 hook tests) plus the 2 dead node-projection tests.
+
+**Note.** The two Rust config keys are intentionally *not* removed — they survive as
+warn-only deprecation shims so an existing `config.toml` still parses. See [[I-28]]
+for why deleting them would silently discard the operator's whole config.
+
+---
+
+### I-30 — the run-graph classic/next dual paths are collapsed
+
+**Symptom.** The run-detail workflow graph rendered in two different visual
+schemes depending on `[cp].workflow_editor_ui` — the *workflow-editor* flag,
+reused for the run graph.
+
+**Root cause.** Not two renderers, but two paint schemes inside one. `RunGraph`
+resolved the flag, pushed it into every node's `data` as `ui`, and then each of
+the six node components plus the edge memo re-derived `const next = data.ui ===
+'next'` and branched. The classic arm painted flat `inkMute` edges with
+`rg-edge-active`/`rg-edge-await`; the next arm painted per-kind accents from
+`kindBridge` with `rg-edge-flow`.
+
+**Fix.** The `next` scheme is now unconditional. `RunGraph` no longer calls the
+hook, `ui` is gone from `NodeData` and from the data pushed to each node, the
+classic edge arm is deleted, and all six node components inline the next branch.
+`.rg-edge-active` and `.rg-edge-await` are removed from `styles.css` and the
+neighbouring comment — which described a classic path that no longer exists — was
+corrected. `components/graph/kindBridge.ts` is kept and becomes the
+*unconditional* source of node and edge colour; `stepStyle.ts` is kept (it is also
+used by `components/run/StepTranscriptBrowser.tsx`).
+
+**Validation.** `npm run build` TypeScript-clean; `npx vitest run` green at
+180 files / 1859 tests (down 2 from 1861 — the two deleted classic tests).
+`grep -rn "rg-edge-active\|rg-edge-await" crates/rupu-cp/web/src` returns zero
+hits and `grep -rn "data\.ui\b" crates/rupu-cp/web/src/components/` returns zero
+hits, while `rg-edge-flow` and both kept modules remain in place.
+`ContainerNodes.test.tsx` asserted *classic ≠ next* throughout; each such test was
+collapsed to a next-only assertion rather than deleted, preserving coverage of the
+surviving render.
+
+**Flake caution recorded for the next person.** The web suite is load-sensitive.
+A healthy run takes ~12s; under contention it stretched past 290s and produced
+4 spurious failures that did not reproduce. Treat a failure as real only if it
+reproduces on a fast run.
+
+---
+
+### I-29 — the classic workflow-editor UI is deleted
+
+**Symptom.** Two workflow editors shipped side by side, selected by
+`[cp].workflow_editor_ui` (default `"classic"`). Several prior plans explicitly
+required the classic renderer stay "byte-identical", so the split was implemented
+as inline early-returns and ternaries *inside shared files* rather than as separate
+modules — meaning every editor change had to be authored twice, in the same file,
+without breaking the other arm.
+
+**Fix (web).** Every `next` arm is now unconditional across six components:
+`WorkflowEditor.tsx` (default panel tab, collapsible source pane, palette portal,
+hide-source toggle, resizable rail + separator, Blocks tab, tab order),
+`WorkflowEditorGraph.tsx` (edge-memo gate, kind-tinted markers, `edge.animated`,
+branch stroke, `✓ then`/`✕ else` label chips, plain-edge accent, `wfx-canvas`,
+palette portal, background variant), `NodePalette.tsx` (item set now includes
+BRANCH/GATE/SPLIT/JOIN, connector groups, plus deletion of the classic float dock
+and the `KIND_COLOR` "classic-only fixed hex" map),
+`WorkflowSettingsForm.tsx` (the classic read-only chip form is gone),
+`StepForm.tsx` (`NEXT_ONLY_KINDS` no longer filters the kind picker, so `branch` /
+`approval_gate` / `action` / `split` / `join` are always offerable; `size="large"`;
+Approval prompt is an `ExpressionField` rather than a plain `<input>`), and
+`nodes/EditableStepNode.tsx` (the classic Tailwind card is gone; the SVG-silhouette
+render is the only one). `styles.css` comments that described the deleted arm were
+corrected. `pages/WorkflowDetail.tsx` needed no change — it only threads the value.
+
+**Fix (config).** `[cp].workflow_editor_ui` is **deprecated, not deleted**, for the
+same `deny_unknown_fields` + `.unwrap_or_default()` reason documented under
+[[I-28]]: hard-deleting it would silently discard the operator's entire config.
+
+**Validation.** `npm run build` TypeScript-clean and `npx vitest run` green at
+180 files / **1861** tests, down from 1887. The 26-test delta reconciles exactly
+against the deleted `it()` blocks per file (6+3+3+4+3+7) — accounted for rather
+than merely "still green". Where a test asserted *classic ≠ next* it was collapsed
+to a next-only assertion instead of deleted, preserving coverage of the surviving
+render; `StepForm.test.tsx`'s mixed assertion was updated, not removed.
+
+**Three places the two arms were not cleanly separable**, resolved deliberately
+rather than mechanically:
+1. `NodePalette`'s render site in `WorkflowEditorGraph` — classic was an inline
+   instant-add float dock, `next` is a portal-only select-then-"Add to canvas" rail
+   that renders only when given a container. The instant-add dock is gone; the
+   standalone-render test was rewritten to supply a container and drive the
+   two-step flow.
+2. Branch-arm edge styling (labels, marker colour, `animated`) — the two arms
+   render genuinely different shapes with no overlap, so this collapsed to `next`'s
+   shape with the default-prop tests updated to match.
+3. Five `StepForm` sub-components plus `NodePalette`/`WorkflowSettingsForm` were
+   left with a genuinely-unread `workflowEditorUi` param once the branching went.
+   The destructured binding was renamed `_workflowEditorUi` to satisfy
+   `noUnusedParameters`; **the interface and prop-passing are unchanged**, because
+   removing them is [[I-31]]'s job (Task 5), not this one.
+
+---
+
+### I-28 — the classic agent-authoring UI is deleted
+
+**Symptom.** Two agent-authoring UIs shipped side by side, selected by
+`[cp].agent_authoring_ui` (default `"classic"`) with a `rupu.cp.agentUi`
+localStorage override. The `next` card-based Agent Builder was the proven one and
+the only one in actual use, but every change had to be made twice and the classic
+raw-editor path kept accruing tests asserting behavior nobody wanted.
+
+**Fix (web).** The `next` arm is now unconditional. Deleted:
+`hooks/useAgentAuthoringUi.ts` and its test; `function NewAgentModal`
+(`pages/Agents.tsx`, ~178 lines) with its render site and `createOpen` state; and
+the classic raw-`<CodeEditor>` Cancel/Save block in `pages/AgentDetail.tsx` along
+with its now-dead `draft`/`setDraft`/`save()`. `components/CodeEditor.tsx`,
+`CodeHighlight.tsx` and `api.generateAgent` were each checked for other importers
+and **kept** — all three are still reached from the surviving path.
+
+**Fix (config).** `[cp].agent_authoring_ui` is **deprecated, not deleted.**
+`CpConfig` is `#[serde(default, deny_unknown_fields)]`, so removing the field
+outright would make any `config.toml` still setting it fail to deserialize — and
+because several call paths load config with `.unwrap_or_default()`, that parse
+error silently discards *every other key the operator set*. This is the exact
+regression Arc 1 hit when `[retry]` was deleted, and it had to be reverted into a
+warn-only shim. The same shape is used here: `Option<toml::Value>` with
+`#[serde(default, skip_serializing)]`, so the key still parses, is ignored, never
+round-trips back out, and emits one `tracing::warn!` naming it.
+
+**Validation.** Observed at the consumer, not asserted structurally.
+*Config:* `cp_agent_authoring_ui_still_parses_with_sibling_cp_keys_intact` is the
+binding test — it sets the deprecated key **and** asserts sibling `[cp]` keys
+(`gate_sweep_interval_secs = 15`, `gate_sweep_enabled = false`,
+`max_workspace_bytes`) keep their **non-default** values. Without that sibling
+assertion the test would pass even if the whole config had been discarded, which
+is precisely how the Arc 1 regression slipped through. Plus
+`cp_deprecated_ui_keys_never_round_trip_back_out` and
+`cp_deprecated_ui_keys_emit_a_deprecation_warning_each` (hand-rolled
+`tracing::Subscriber`). RED was observed: reverting the shim produced 6 compile
+errors. *Web:* `npm run build` TypeScript-clean and `npx vitest run` green at
+180 files / 1887 tests, independently re-run by the orchestrator.
+`grep -rn "agentUi|useAgentAuthoringUi|rupu.cp.agentUi" crates/rupu-cp/web/src`
+returns zero hits. `/agents/new` was confirmed unconditionally routed
+(`App.tsx:77`), so the surviving entry point does not depend on the deleted flag.
+
+**Note on history.** Two agents ran concurrently and one committed with
+`git commit -a`, sweeping the other's staged hook deletions into `0e6730d3`;
+`7f70ab8f` re-deleted them correctly. The net tree was verified clean — the two
+files are gone, the working tree is empty, the suite is green — but the deletion's
+authorship is split across those two commits. Cosmetic only.
+
+---
 
 ### I-25 — a list command executes `on_reject` chains as a side effect
 
@@ -751,14 +929,21 @@ papered over. Every `file:line` in the table was re-verified against the tip of
 | `[cp].autoflow_reconcile_enabled` / `_interval_secs` | `rupu-cli/src/cmd/cp.rs:93-94` |
 | `[cp].cron_tick_enabled` / `_interval_secs` | `rupu-cli/src/cmd/cp.rs:117-118` |
 | `[cp].gate_sweep_enabled` / `_interval_secs` | `rupu-cli/src/cmd/cp.rs:152-153` |
-| `[cp].agent_authoring_ui` | `rupu-cp/web/src/hooks/useAgentAuthoringUi.ts:9` (served through `/api/config`) |
-| `[cp].workflow_editor_ui` | `rupu-cp/web/src/hooks/useWorkflowEditorUi.ts:9` (served through `/api/config`) |
+| `[cp].agent_authoring_ui` | **none — deprecated no-op** (I-28, Arc 3) |
+| `[cp].workflow_editor_ui` | **none — deprecated no-op** (I-29/I-30/I-31, Arc 3) |
 | `[update].channel` | `rupu-cli/src/cmd/update.rs:74` |
 | `[update].check` | `rupu-cli/src/lib.rs:276` |
 
-Two keys' consumers are **not** Rust — `[cp].agent_authoring_ui` and
-`[cp].workflow_editor_ui` are read by the CP web app after `/api/config`
-serializes them. A Rust-only grep reports them as inert; they are not.
+Two keys' consumers **were not** Rust — `[cp].agent_authoring_ui` and
+`[cp].workflow_editor_ui` were read by the CP web app after `/api/config`
+serialized them, so a Rust-only grep reported them as inert when they were not.
+**As of Arc 3 both are genuinely inert**: the classic renderers they selected
+are deleted, the two React hooks that read them are gone, and the fields survive
+only as `Option<toml::Value>` deprecation shims that warn and are never read
+(see [[I-28]], [[I-29]]). They are kept solely so an existing `config.toml`
+setting them still parses — `CpConfig` is `deny_unknown_fields`, and the
+`.unwrap_or_default()` load paths would otherwise convert that parse failure
+into silent loss of the operator's whole config.
 
 **Behavioral note — why `[retry]` deprecates instead of erroring.** The first
 cut simply deleted the field. Because `Config` is `deny_unknown_fields`, that

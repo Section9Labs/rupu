@@ -50,16 +50,30 @@ pub struct CpConfig {
     /// Defaults to 60.
     #[serde(default = "CpConfig::default_background_interval_secs")]
     pub gate_sweep_interval_secs: u64,
-    /// Which agent-authoring UI the CP web app renders: "classic" (raw editor)
-    /// or "next" (the card-based Agent Builder). Defaults to classic so the new
-    /// UI is opt-in behind this flag.
-    #[serde(default = "CpConfig::default_agent_authoring_ui")]
-    pub agent_authoring_ui: String,
-    /// Which workflow-editor UI the CP web app renders: "classic" (raw editor)
-    /// or "next" (the visual branch-authoring UI). Defaults to classic so the new
-    /// UI is opt-in behind this flag.
-    #[serde(default = "CpConfig::default_workflow_editor_ui")]
-    pub workflow_editor_ui: String,
+    /// **Deprecated, inert, and never read.** Used to select between "classic"
+    /// and "next" agent-authoring UIs in the CP web app; the `next` UI is now
+    /// the only UI and the classic renderer has been deleted (ISSUES.md I-28).
+    ///
+    /// The field survives the deletion ONLY as a migration shim. `CpConfig` is
+    /// `deny_unknown_fields`, so an existing `config.toml` carrying this key
+    /// would otherwise fail to deserialize — and several call paths load
+    /// config with `.unwrap_or_default()`, which converts that parse error
+    /// into the *silent loss of every other key the user set*. Accepting the
+    /// key as an opaque no-op keeps the rest of the config intact; the
+    /// warning in [`crate::Config::warn_deprecated_keys`] tells the user to
+    /// delete it.
+    ///
+    /// `skip_serializing` keeps it out of `/api/config` and out of anything
+    /// that round-trips `CpConfig` back to TOML, so the key disappears the
+    /// first time a config is rewritten.
+    #[serde(default, skip_serializing)]
+    pub agent_authoring_ui: Option<toml::Value>,
+    /// **Deprecated, inert, and never read.** Used to select between "classic"
+    /// and "next" workflow-editor UIs in the CP web app; the `next` UI is now
+    /// the only UI and the classic renderer has been deleted (ISSUES.md I-29).
+    /// See `agent_authoring_ui` above for why the field survives as a shim.
+    #[serde(default, skip_serializing)]
+    pub workflow_editor_ui: Option<toml::Value>,
 }
 
 impl CpConfig {
@@ -69,14 +83,6 @@ impl CpConfig {
 
     fn default_background_interval_secs() -> u64 {
         60
-    }
-
-    fn default_agent_authoring_ui() -> String {
-        "classic".to_string()
-    }
-
-    fn default_workflow_editor_ui() -> String {
-        "classic".to_string()
     }
 }
 
@@ -90,8 +96,8 @@ impl Default for CpConfig {
             cron_tick_interval_secs: Self::default_background_interval_secs(),
             gate_sweep_enabled: Self::default_true(),
             gate_sweep_interval_secs: Self::default_background_interval_secs(),
-            agent_authoring_ui: Self::default_agent_authoring_ui(),
-            workflow_editor_ui: Self::default_workflow_editor_ui(),
+            agent_authoring_ui: None,
+            workflow_editor_ui: None,
         }
     }
 }
