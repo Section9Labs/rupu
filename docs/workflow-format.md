@@ -14,7 +14,11 @@ A workflow can:
 - fan out one agent across many items with `for_each:`
 - fan out many specialist agents with `parallel:`
 - run structured review panels with `panel:`
+- call an MCP connector tool directly, no agent, with `action:`
+- route to different downstream steps with `branch:`
 - pause for human approval with `approval:`
+- run out of declaration order as an explicit graph with `next:`/`depends_on:`/`split:`/`join:`/`loops:`
+- place a step (or a `for_each:` fan-out) on a remote host with `host:`/`distribute:`
 - start manually, on cron, or from an event trigger
 - carry contract-validated outputs for downstream automation
 - opt into persistent autonomous reconciliation with `autoflow:`
@@ -157,7 +161,7 @@ autoflow:
   wake_on:
     - github.issue.opened
     - issue.queue_entered
-    - github.pull_request.closed
+    - github.pr.opened
   reconcile_every: "10m"
   claim:
     key: issue
@@ -174,7 +178,7 @@ Fields:
 | Key | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
 | `enabled` | bool | no | `false` | Workflow appears under `rupu autoflow list` only when true |
-| `entity` | `issue` | no | `issue` | v1 supports issue ownership only |
+| `entity` | `issue`\|`pull_request` | no | `issue` | Which kind of tracker/SCM entity this autoflow owns |
 | `source` | string | no | none | Free-form tracker-native source tag, e.g. `linear:<team-id>` or `jira:<host>/<project>`. Disambiguates which bound tracker/repo an autoflow belongs to when more than one is configured; purely informational, not a filter |
 | `priority` | integer | no | `0` | Higher wins when multiple autoflows match the same issue |
 | `selector.states` | array<`open`\|`closed`> | no | `[]` | Empty means any issue state |
@@ -189,7 +193,7 @@ Fields:
 | `selector.on_skip` | `skip`\|`label_needs_human` | no | `skip` | What to do when an event is otherwise eligible but excluded by the author allowlist |
 | `wake_on` | array<string> | no | `[]` | Canonical or semantic event ids used as wake hints |
 | `reconcile_every` | duration | no | none | Re-run cadence like `10m`, `2h`, `1d` |
-| `claim.key` | `issue` | no | `issue` | v1 claim granularity |
+| `claim.key` | `issue`\|`pr_head_sha` | no | `issue` | Claim granularity |
 | `claim.ttl` | duration | no | none | Lease duration for persistent issue ownership |
 | `workspace.strategy` | `worktree`\|`in_place` | no | `worktree` | How repo files are materialized |
 | `workspace.branch` | string | no | generated | Strict-rendered branch template |
@@ -287,6 +291,10 @@ Every step has an `id` and exactly one execution shape:
 - `for_each:` fan-out step
 - `parallel:` multi-agent fan-out step
 - `panel:` review step
+- `action:` connector step (no agent — calls an MCP tool directly)
+- `branch:` routing step
+- an orchestration node (`split:` or `join:` — pure routing, no work of its own)
+- a gate node (a standalone `approval:` block with none of the above)
 
 Common fields:
 
@@ -397,7 +405,7 @@ step's work.
     on_reject:                # steps run when the gate is rejected
       - id: rollback
         action: scm.prs.comment
-        with: { project: "acme/widget", number: 41, body: "rolled back" }
+        with: { platform: github, owner: acme, repo: widget, number: 41, body: "rolled back" }
     notify:                   # fired best-effort as the gate parks
       - action: issues.comment
         with: { project: "acme/widget", number: 41, body: "awaiting sign-off" }
@@ -481,6 +489,52 @@ Required fields:
 - `id`
 - `agent`
 - `prompt`
+
+---
+
+## `action:` connector steps
+
+Use `action:` when a step should call an MCP catalog tool directly — no agent, no LLM turn at all.
+
+```yaml
+steps:
+  - id: fetch
+    action: issues.get
+    with: { project: "acme/widget", number: 41 }
+
+  - id: triage
+    agent: triager
+    prompt: |
+      Issue title: {{ (steps.fetch.output | fromjson).title }}
+      Labels: {{ (steps.fetch.output | fromjson)['labels'] | join(', ') }}
+```
+
+Fields:
+
+| Key | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `action` | string | yes | Tool name from the MCP catalog (`scm.*`, `issues.*`, `github.*`, `gitlab.*` — see `GET /api/tools`) |
+| `with` | map | no | Parameters passed to the tool call; string values may be minijinja templates |
+
+Rules, all enforced at parse time:
+
+- `action:` must name a real tool in the catalog. An unknown name is a parse error.
+- `with:`'s keys are validated against the tool's JSON Schema: an unknown key or a missing required key both fail parsing before the run ever starts.
+- `action:` is mutually exclusive with `agent:`/`prompt:`/`for_each:`/`parallel:`/`panel:`/`branch:`.
+- an `action:` step must not also carry a **non-empty** `actions:` allowlist. `actions:` narrows an *agent's* connector grant; an action step's tool call is already fully explicit, so there's nothing left to narrow — a non-empty `actions:` here is rejected as a parse error. An empty (or absent) `actions:` is legal, if redundant.
+
+Typed `with:` values are coerced against the tool's declared schema type:
+
+- a plain literal against a schema-declared `integer`/`number`/`boolean` field (e.g. `number: "7"` with stray quotes) is rejected at **parse** time — this is almost always an authoring typo;
+- a **whole-leaf** template (the entire string is one `{{ ... }}` expression, nothing else) is rendered, then parsed against the declared type; a render that doesn't fit the type is a runtime error;
+- a **partial** template — a `{{ ... }}` expression mixed with other text, e.g. `"issue-{{ n }}"` against a numeric field — is a runtime error rather than something the pipeline guesses at: there is no single number to extract from `"issue-42"`, so use a whole-leaf template (`"{{ n }}"`) for a typed parameter instead.
+
+Published output:
+
+- `steps.<id>.output` — the tool's return value, serialized as a JSON string
+- `steps.<id>.success` — whether the dispatcher call succeeded
+
+Because `output` is a JSON *string*, pull fields out of it with the `fromjson` filter documented under "Template filters" further down — `{{ (steps.fetch.output | fromjson).title }}`, not `{{ steps.fetch.output.title }}`.
 
 ---
 
@@ -642,6 +696,251 @@ That means fixer agents should preserve the important context in the revised sub
 
 ---
 
+## `branch:` steps
+
+Use `branch:` to route to different downstream steps depending on a condition, instead of running every subsequent step unconditionally.
+
+```yaml
+steps:
+  - id: tests
+    agent: tester
+    prompt: "run tests"
+  - id: check
+    branch:
+      condition: "{{ steps.tests.success }}"
+      then: [deploy]
+      else: [notify_failure]
+  - id: deploy
+    agent: deployer
+    prompt: "Deploy the build."
+  - id: notify_failure
+    agent: reporter
+    prompt: "Tests failed: {{ steps.tests.output }}"
+```
+
+Fields:
+
+| Key | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `condition` | string | yes | minijinja expression, reduced to truthy/falsy the same way as `when:` |
+| `then` | array<string> | no | Step ids to dispatch when `condition:` is truthy |
+| `else` | array<string> | no | Step ids to dispatch when `condition:` is falsy |
+
+Rules, all enforced at parse time:
+
+- `branch:` is mutually exclusive with `agent:`/`prompt:`/`for_each:`/`parallel:`/`panel:`/`action:`.
+- `when:` is **not allowed** on a branch step. The runner evaluates `when:` before the branch block, so a falsy `when:` on a branch step would skip only the branch step itself — its condition never evaluates, so *neither* arm is added to the run's skip-set, and both arms would run. Use the branch `condition:` itself to gate routing instead.
+- every id in `then:`/`else:` must name a real step, and that step must run strictly *after* the branch step (a forward reference) — routing backwards isn't a supported loop construct.
+- the same step id can't appear in both `then:` and `else:`.
+- a branch step can't target itself.
+
+### The transitive-arm rule
+
+This is the part that's easy to get wrong in a way that produces a **silently wrong result** rather than a parse error, so read it carefully.
+
+`then:`/`else:` must each list the **complete, transitive** set of step ids that arm covers — including the arm-target steps of any branch step nested inside it. The runner does not compute reachability at run time: when it takes (say) the `then:` arm, it skips *exactly* the ids literally written in `else:` — nothing more, nothing less.
+
+A branch nested inside a not-taken arm is therefore itself skipped, which means it never runs and never gets a chance to add its *own* sub-arms to the skip-set. If its sub-arm steps weren't already listed in the outer arm's list, they run anyway — unskipped — even though the branch that would have chosen between them never fired.
+
+```yaml
+# WRONG — parses fine, but silently over-runs on one path.
+steps:
+  - id: outer
+    branch:
+      condition: "{{ inputs.deploy }}"
+      then: [ship]
+      else: [inner]              # missing inner's own arm targets
+  - id: inner
+    branch:
+      condition: "{{ inputs.staging }}"
+      then: [inner_yes]
+      else: [inner_no]
+  - id: inner_yes
+    agent: deployer
+    prompt: "deploy to staging"
+  - id: inner_no
+    agent: deployer
+    prompt: "deploy to prod"
+  - id: ship
+    agent: deployer
+    prompt: "ship normally"
+```
+
+If `inputs.deploy` is truthy, `outer` takes `then: [ship]`, so the runner's skip-set is exactly `else`'s literal list — `[inner]`. `inner` is skipped, as intended. But `inner_yes` and `inner_no` are **not** in that skip-set, so **both** of them still run, even though the branch that was supposed to choose between them never executed. The fix is to list everything `inner` would have contributed, transitively, in `outer`'s `else:`:
+
+```yaml
+# CORRECT — outer's else: arm is the complete transitive set.
+  - id: outer
+    branch:
+      condition: "{{ inputs.deploy }}"
+      then: [ship]
+      else: [inner, inner_yes, inner_no]
+```
+
+---
+
+## Non-linear orchestration
+
+By default, steps run in declaration order (a "chain" workflow). A workflow becomes an explicit **graph** — scheduled by node readiness instead of list order — as soon as any step uses `next:`, `depends_on:`, `split:`, or `join:`, or the workflow declares a `loops:` block.
+
+### `next:` / `depends_on:`
+
+```yaml
+steps:
+  - id: a
+    agent: worker
+    prompt: p
+    next: [b]
+  - id: b
+    agent: worker
+    prompt: p
+    depends_on: [a]
+```
+
+- `next:` lists this step's successor id(s); `depends_on:` lists this step's predecessor id(s) — the symmetric inverse of `next:`. Step `a`'s `next: [b]` and step `b`'s `depends_on: [a]` describe the identical edge; author with whichever reads better, or mix both in the same workflow.
+- every edge target must name a real step id, and a step can't edge to itself.
+- the full edge set (`next`/`split`/branch-arm/`depends_on` control edges, unioned with the data edges inferred from `{{ steps.X.* }}` template references) must be acyclic; a cycle is a parse-time error.
+
+### `split:` / `join:`
+
+```yaml
+steps:
+  - id: fanout
+    split: [a, b, c]
+  - id: a
+    agent: worker
+    prompt: "do a"
+    next: [gathered]
+  - id: b
+    agent: worker
+    prompt: "do b"
+    next: [gathered]
+  - id: c
+    agent: worker
+    prompt: "do c"
+    next: [gathered]
+  - id: gathered
+    join: { wait: { count: 2 } }
+  - id: after
+    agent: worker
+    prompt: "n={{ steps.gathered.results | length }}"
+    depends_on: [gathered]
+```
+
+- `split:` fans out into N independent concurrent tracks, named by step id. A `split:` node carries no `agent:`/`action:`/etc. of its own — it's pure routing.
+- `join:` is a barrier: it waits for its inbound paths per `wait:`, then exposes its gathered results as `steps.<id>.results`. `wait:` accepts `all` (the default), `any`, or `{ count: N }`.
+- a `join:` needs at least one inbound edge — a join nothing points at would never fire, silently stranding it and everything downstream, so it's rejected at parse time — and a `{ count: N }` can't exceed the number of inbound paths that actually feed it.
+- reconvergence doesn't require an explicit `join:` node: two branches can both `next:`/`depends_on:` the same ordinary step, and it naturally waits for every inbound path before running (implicit "wait: all"). Reach for an explicit `join:` node when you want `any`/`count` semantics, or a dedicated barrier with no work of its own.
+- neither `split:` nor `join:` may carry `agent:`/`action:`/`for_each:`/`parallel:`/`panel:`/`branch:`/`approval:` — they are pure orchestration nodes.
+
+### `loops:`
+
+A workflow-level `loops:` map declares named, bounded subgraph loops: a subset of existing step ids that re-run together, in sequence, until a condition holds or an iteration cap is hit.
+
+```yaml
+name: has-loop
+steps:
+  - id: gen
+    agent: writer
+    prompt: "produce a draft"
+  - id: test
+    agent: reviewer
+    prompt: "review the draft"
+    depends_on: [gen]
+loops:
+  refine:
+    nodes: [gen, test]
+    until: "{{ steps.test.output }}"
+    max_iterations: 3
+    on_max: fail
+```
+
+Fields:
+
+| Key | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `nodes` | array<string> | yes | — | Must name real, existing steps; at least 2; a step belongs to at most one loop |
+| `until` | string | yes | — | minijinja expression (same engine as `when:`), evaluated after each iteration; truthy converges the loop |
+| `max_iterations` | integer | yes | — | Must be at least 1 |
+| `on_max` | `fail`\|`proceed` | no | `fail` | What happens when the cap is hit without `until` ever holding: `fail` fails the run; `proceed` continues downstream with the last iteration's outputs and `converged: false` |
+
+Per-loop progress is available as `{{ loops.<name>.iteration }}` / `{{ loops.<name>.converged }}` — to the loop's own members mid-iteration, to `until`'s own evaluation, and to every step downstream of the loop once it finishes.
+
+### `max_concurrency:`
+
+A workflow-level integer cap on how many nodes the scheduler runs concurrently across the **whole graph** — distinct from a `for_each:`/`parallel:`/`panel:` step's own `max_parallel:`, which caps only that one step's internal fan-out.
+
+```yaml
+name: max-concurrency-example
+max_concurrency: 4
+steps:
+  - id: fanout
+    split: [a, b]
+  - id: a
+    agent: worker
+    prompt: p
+  - id: b
+    agent: worker
+    prompt: p
+```
+
+Must be at least 1 when set. Omitted (the default) is unbounded: every node the graph's dependency structure makes ready runs, including a `split:`'s full fan-out, with no artificial cap. Only consulted for a non-linear workflow (one using any of the constructs above) — ignored by a plain chain workflow.
+
+---
+
+## Remote placement
+
+By default every step's agent runs locally, in the same process as the rest of the workflow. `host:` and `distribute:` place a step's work on a different host in your fleet instead.
+
+### `host:` — a single placed step
+
+```yaml
+name: host-example
+steps:
+  - id: edit
+    agent: editor
+    prompt: "edit foo.txt"
+    host: worker-1
+    workspace: sync
+  - id: verify
+    agent: verifier
+    prompt: "check: {{ steps.edit.output }}"
+```
+
+- valid only on a linear step (`agent:` + `prompt:`) — not on `for_each:`/`parallel:`/`panel:`/`branch:`/`action:`/an approval gate.
+- the whole step's agent runs on the named host via the fleet's `UnitDispatcher` port, and its output feeds downstream steps exactly as a local step's would.
+- must be a non-empty string.
+
+### `distribute:` — spreading a `for_each:` fan-out across hosts
+
+```yaml
+name: distribute-example
+steps:
+  - id: edit
+    agent: editor
+    for_each: "x\ny\nz"
+    prompt: "edit {{ item }}.txt"
+    max_parallel: 3
+    workspace: sync
+    distribute:
+      hosts: [w1, w2]
+```
+
+- only valid on a `for_each:` step; `hosts:` must be non-empty.
+- items are spread round-robin across the listed hosts instead of all running locally.
+
+### `workspace:`
+
+`workspace: sync` makes the coordinator's workspace available on the remote host and brings file changes back afterward. The default — `workspace:` omitted, or `workspace: none` — keeps the step self-contained: the remote step sees only its rendered prompt plus prior steps' string outputs, no files.
+
+`workspace:` is only meaningful on a remote step (one with `host:` or `distribute:`); setting `sync` on a purely local step is rejected at parse time as author confusion. A workflow-level `defaults.workspace:` sets the fallback used by every remote step that doesn't set its own.
+
+### `actions:` is not supported on a remote step
+
+A non-empty `actions:` allowlist on a `host:`/`distribute:` step is rejected at parse time (`WorkflowParseError::ActionsUnsupportedOnRemoteStep`): the tool roster never reaches the remote dispatch payload today, so a narrowed list there would otherwise be a silent no-op — the remote agent would run with its *full* tool grant while the workflow (and anything reading it) showed the step as narrowed. An empty (or absent) `actions:` stays legal on a remote step.
+
+---
+
 ## Template context
 
 Workflow templates use minijinja. Missing variables render as empty strings.
@@ -752,13 +1051,13 @@ rupu workflow run issue-to-spec-and-plan github:owner/repo/issues/42
 
 ### Event-triggered workflows
 
-If the workflow is triggered from an event source, the event payload is available under `event.*`.
-
-Example:
+If the workflow is triggered from an event source, the event payload is available under `event.*`. A handful of fields are always present regardless of vendor — `event.id` (the matched event id), `event.vendor`, `event.repo.full_name` (for repo-scoped sources) — but the vendor-native payload for the specific event (e.g. GitHub's own `pull_request`/`issue` object) is nested one level down, under `event.payload.*`, not at the top level:
 
 ```yaml
-when: "{{ event.pull_request.merged }}"
+when: "{{ event.payload.pull_request.merged }}"
 ```
+
+A top-level `event.pull_request.*` (no `payload.` segment) does not exist for a GitHub-sourced event — it renders as an empty string under minijinja's default undefined handling, so a `when:` built on that path is silently, permanently falsy rather than failing loudly.
 
 See [triggers.md](triggers.md) for the event vocabulary and common payload shapes.
 
@@ -830,10 +1129,15 @@ Common parse-time failures:
 - invalid `max_parallel` or `max_iterations`
 - invalid input defaults or enum defaults
 - extraneous fields inside `trigger:`
+- an `action:` naming an unknown tool, or `with:` failing the tool's schema
+- a `branch:` target that doesn't exist, isn't forward, or appears in both arms
+- a `join:` with no inbound edges, or a `wait: { count: N }` exceeding its inbound path count
+- a cycle anywhere in the workflow's dependency graph
 
 Common design mistakes:
 
 - leaving a shipped `actions:` list incomplete — it now really narrows the connector subset, so a partial list silently drops the tools you forgot
+- writing a `branch:` arm that isn't the complete transitive set (see [The transitive-arm rule](#the-transitive-arm-rule)) — this parses fine and fails silently at run time, not at parse time
 - making reviewers write-capable
 - building one giant workflow instead of using smaller workflows per phase
 - relying on fragile free-form prose when a downstream step needs structured output
