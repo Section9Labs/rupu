@@ -102,9 +102,9 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 | ID | Sev | Area | Title | Status |
 |---|---|---|---|---|
-| I-45 | P1 | rupu-providers | `thinkingLevel` + `thinkingBudget` are always co-sent, and there is **no model gate** — the Gemini-3-only key also goes to 2.5 (the "400" is doc-derived, never observed) | open |
-| I-46 | P2 | rupu-providers | Gemini thinking levels are sent uppercase; Google documents lowercase (our own spec says tolerance is **unverified**) | open |
-| I-47 | P2 | rupu-providers | `minimal`/`xhigh` are forwarded to any openai-compatible endpoint with no allowlist ("rejected outright" is **unproven**; none of the named vendors ship as providers) | open |
+| I-45 | P1 | rupu-providers | `thinkingLevel` + `thinkingBudget` are always co-sent, and there is **no model gate** — the Gemini-3-only key also goes to 2.5 (the "400" is doc-derived, never observed) | fixed |
+| I-46 | P2 | rupu-providers | Gemini thinking levels are sent uppercase; Google documents lowercase (our own spec says tolerance is **unverified**) | fixed |
+| I-47 | P2 | rupu-providers | `minimal`/`xhigh` are forwarded to any openai-compatible endpoint with no allowlist ("rejected outright" is **unproven**; none of the named vendors ship as providers) | fixed (docs) |
 | I-48 | **P0** | rupu-providers | `usageMetadata.thoughtsTokenCount` is never read — the **only default-reachable** defect here; Gemini spend is silently under-billed and run totals under-report | fixed |
 | I-49 | P2 | rupu-providers | `classify.rs` is dead code (zero production callers) — the filed "flat 60s" claim is **false at every constant**; real default is one 2s retry | fixed |
 
@@ -406,6 +406,76 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-45 + I-46 — the Gemini thinking config is model-gated and lowercase
+
+Closed together: both lived in the same `serde_json::json!` literal, so they were one edit.
+
+**Symptom.** For every non-`Auto` reasoning level, the Gemini request set **both**
+`thinkingLevel` and `thinkingBudget` in `generationConfig.thinkingConfig`, with the level
+string UPPERCASE.
+
+**Root cause, wider than filed.** `thinkingLevel` is a **Gemini-3-only** key, but there was
+**no model gate anywhere in `build_request_body`** — so the identical body went to
+`gemini-2.5-pro`, this provider's `ModelTier::Default`, sending it an unknown key. The filed
+issue framed this as Gemini-3-specific; the blast radius was actually *wider*. Separately
+the level strings were hardcoded uppercase; serde's `rename_all = "snake_case"` on
+`ThinkingLevel` governs config *parsing*, not the wire, so it never applied here.
+
+**Fix.** A model gate on `request.model.starts_with("gemini-3")` — a prefix match, so it is
+robust to `-preview` and future Gemini-3 variants while never matching `gemini-2.5-*` or
+`gemini-2.0-*`. Gemini 3 gets `thinkingLevel` (lowercase) only; 2.5 and earlier get
+`thinkingBudget` only. Never both. `Auto`'s existing `thinkingBudget: -1` sentinel is
+unchanged.
+
+**Honesty note — this is conformance, not a repaired failure.** The "guaranteed 400" in the
+original issue is **doc-derived and was never observed in this repo**; the sole source is
+our own design doc reading Google's documentation, which also says of the casing
+*"Unverified whether the API tolerates both."* The fix conforms to Google's documented
+contract. No commit message, comment or test claims an observed rejection, and the code
+comment records the uncertainty explicitly.
+
+**Validation.** RED: `test_build_request_body_with_thinking` previously asserted
+`thinkingLevel == "MEDIUM"` **and** `thinkingBudget == 8192` on a `gemini-2.5-pro` request —
+a test actively pinning both defects. Three such tests were revised. Two added, including
+`test_thinking_config_never_sends_both_keys`, which loops over **both model families × all
+five non-`Auto` levels** and asserts mutual exclusion — that invariant, rather than any
+single body shape, is the thing worth pinning. `rupu-providers` 511 passed / 0 failed.
+
+---
+
+### I-47 — the effort→wire translation is documented, deliberately not clamped
+
+**The filed claim was not supported.** It said `minimal`/`xhigh` are *"rejected outright by
+DeepSeek, Groq and xAI"*. Verification found:
+
+- Forwarding without an allowlist **is** real: `openai_wire.rs` maps `Minimal → "minimal"`
+  and `Max → "xhigh"` and passes them through with no per-provider or per-model gate.
+- **"Rejected outright" is unproven.** This repo's own spec says vendor behavior on an
+  unknown `reasoning_effort` — 400 versus silent ignore — is *"undocumented across
+  vendors."*
+- The per-vendor ladders in the title were garbled, and **none of DeepSeek, Groq or xAI ship
+  as providers** — no preset, no `ProviderId`. They exist only if an operator declares an
+  openai-compatible entry pointing at them.
+
+**Documented rather than clamped, deliberately.** Clamping `minimal`/`max` for
+openai-compatible endpoints was considered and rejected: it would **silently downgrade an
+explicit `effort: max`** on endpoints that *do* support `xhigh` (OpenAI's own gpt-5.5 does),
+to guard against a rejection we have no evidence occurs. Silently overriding a user's
+explicit setting is the failure mode this program exists to remove, not add.
+
+**A wider gap surfaced while writing it:** the per-provider translation was documented
+**nowhere**. `docs/agent-format.md` listed the accepted `effort` values but never said what
+any of them become on the wire. Now documents all five wire forms (Anthropic budget tokens,
+Gemini 3 level, Gemini 2.5 budget, Codex `reasoning.effort`, openai-compatible
+`reasoning_effort`), the `auto` special case, and the caveat with a concrete fallback — drop
+to `low`/`medium`/`high` — for anyone hitting an endpoint that rejects the ends of the
+ladder.
+
+Unifying the four hand-written ladders is tracked separately as [[I-85]], and must be done
+**before** any per-provider allowlist or the allowlist becomes a third copy.
+
+---
 
 ### I-48 — Gemini reasoning tokens are counted in usage and cost
 
