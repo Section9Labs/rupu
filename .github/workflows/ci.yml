@@ -62,11 +62,21 @@ jobs:
           docker run --rm -v "$PWD":/work -w /work rupu-linux-build sh -c '
             set -e
             bin=target/linux-musl/release/rupu
-            file "$bin"
+            desc=$(file "$bin")
+            echo "$desc"
             # Assert, do not merely print: a dynamically-linked binary here
             # would defeat the whole reason for choosing musl.
-            file "$bin" | grep -q "statically linked" \
-              || { echo "::error::binary is not statically linked"; exit 1; }
+            #
+            # Test for the absence of a dynamic link rather than for one
+            # spelling of "static". musl emits "static-pie linked" (a static
+            # position-independent executable), not "statically linked", so
+            # matching the latter rejects a perfectly good binary.
+            case "$desc" in
+              *"dynamically linked"*)
+                echo "::error::binary is dynamically linked: $desc"; exit 1 ;;
+            esac
+            echo "$desc" | grep -qE "static-pie linked|statically linked" \
+              || { echo "::error::could not confirm static linking: $desc"; exit 1; }
             ldd "$bin" 2>&1 | head -3 || true
             ./"$bin" --version
             ./"$bin" update --print-platform
