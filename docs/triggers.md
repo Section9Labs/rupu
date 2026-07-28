@@ -31,7 +31,7 @@ Cross-field rules (validated at parse):
 - `event:` and `filter:` only allowed when `on: event`.
 - Missing `on:` defaults to `manual`.
 
-Reminder: step `actions:` is not a tool allowlist. Keep `actions: []` unless your agent intentionally emits the workflow action protocol; the agent file's `tools:` frontmatter controls tool access.
+Reminder: a step's `actions:` only narrows the connector/MCP subset of the agent's own `tools:` grant for that step — it never touches builtin tools and can never grant a tool the agent's `tools:` doesn't already allow. Keep `actions: []` for a step that should keep the agent's full connector grant unnarrowed; the agent file's `tools:` frontmatter is what actually controls tool access. See `docs/agent-format.md`.
 
 ---
 
