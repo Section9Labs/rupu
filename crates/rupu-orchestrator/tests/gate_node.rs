@@ -1580,3 +1580,125 @@ async fn reject_one_gate_of_a_multi_gate_set_runs_its_own_cleanup_leaves_sibling
     assert_eq!(record_terminal.status, RunStatus::Rejected);
     assert!(record_terminal.awaiting.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// I-42 — a `when:`-skipped gate must keep its `kind`, not silently become
+// `Linear` (`StepKind::default()`). Two skip sites build the skipped
+// `StepResult`: the linear-loop path (single-cursor declaration-order loop,
+// no split/join/branch) and the scheduler path (`run_scheduler`, taken for
+// any nonlinear workflow — see `is_nonlinear`). Both must set
+// `kind: step_kind_for_run_record(step)`, matching the two adjacent skip
+// sites (prune/cancel, branch-not-taken) that already do.
+// ---------------------------------------------------------------------------
+
+// Test 14 — linear-loop path: a single gate step with `when: false`.
+#[tokio::test]
+async fn when_false_gate_preserves_kind_linear_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let yaml = r#"
+name: gate-when-skip-linear
+steps:
+  - id: gate
+    when: "false"
+    approval:
+      prompt: "never shown"
+"#;
+    let wf = Workflow::parse(yaml).unwrap();
+    assert!(
+        !rupu_orchestrator::workflow::is_nonlinear(&wf),
+        "fixture must be linear-loop mode to exercise the linear-loop skip site"
+    );
+
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_gate_when_skip_linear".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(yaml.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+    };
+
+    let res = run_workflow(opts).await.expect("run completes");
+    assert_eq!(res.step_results.len(), 1);
+    let gate = &res.step_results[0];
+    assert_eq!(gate.step_id, "gate");
+    assert!(gate.skipped, "when: false must skip the gate");
+    assert_eq!(
+        gate.kind,
+        StepKind::ApprovalGate,
+        "a when:-skipped gate must keep kind ApprovalGate, not fall back to Linear"
+    );
+}
+
+// Test 15 — scheduler path: same shape, but the workflow is nonlinear
+// (`split:`) so `run_workflow` routes through `run_scheduler` instead.
+#[tokio::test]
+async fn when_false_gate_preserves_kind_scheduler_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let yaml = r#"
+name: gate-when-skip-scheduler
+steps:
+  - id: fanout
+    split: [gate, other]
+  - id: gate
+    when: "false"
+    approval:
+      prompt: "never shown"
+  - id: other
+    agent: worker
+    prompt: "hi"
+"#;
+    let wf = Workflow::parse(yaml).unwrap();
+    assert!(
+        rupu_orchestrator::workflow::is_nonlinear(&wf),
+        "fixture must be nonlinear to exercise the scheduler skip site"
+    );
+
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_gate_when_skip_scheduler".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(EchoFactory::default()),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(yaml.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+    };
+
+    let res = run_workflow(opts).await.expect("run completes");
+    let gate = res
+        .step_results
+        .iter()
+        .find(|r| r.step_id == "gate")
+        .expect("gate result present");
+    assert!(gate.skipped, "when: false must skip the gate");
+    assert_eq!(
+        gate.kind,
+        StepKind::ApprovalGate,
+        "a when:-skipped gate must keep kind ApprovalGate, not fall back to Linear (scheduler path)"
+    );
+}

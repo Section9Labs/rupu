@@ -1066,3 +1066,67 @@ async fn on_reject_cleanup_dispatches_action_step_for_real() {
         serde_json::from_str(&cleanup_record.output).expect("action output is JSON");
     assert_eq!(output["body"], "cleanup: rejected");
 }
+
+// ---------------------------------------------------------------------------
+// I-42 — a `when:`-skipped action step must keep `kind: Action`, not
+// silently fall back to `StepKind::default()` (`Linear`). See the matching
+// gate-side tests in `tests/gate_node.rs`
+// (`when_false_gate_preserves_kind_{linear,scheduler}_path`) for the two
+// skip sites this covers.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn when_false_action_step_preserves_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let yaml = r#"
+name: action-when-skip
+steps:
+  - id: comment
+    when: "false"
+    action: scm.prs.comment
+    with:
+      platform: github
+      owner: acme
+      repo: widget
+      number: 7
+      body: "should never be sent"
+"#;
+    let wf = Workflow::parse(yaml).unwrap();
+    let (dispatcher, connector) = dispatcher_with_connector(PermissionMode::Ask, false);
+
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_action_when_skip".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(EchoFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(yaml.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: Some(dispatcher),
+        pause: None,
+    };
+
+    let res = run_workflow(opts).await.expect("run completes");
+    assert_eq!(res.step_results.len(), 1);
+    let comment = &res.step_results[0];
+    assert_eq!(comment.step_id, "comment");
+    assert!(comment.skipped, "when: false must skip the action step");
+    assert_eq!(
+        comment.kind,
+        StepKind::Action,
+        "a when:-skipped action step must keep kind Action, not fall back to Linear"
+    );
+
+    let calls = connector.calls.lock().unwrap();
+    assert_eq!(calls.len(), 0, "skipped action step must never reach the connector");
+}

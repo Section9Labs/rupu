@@ -1954,6 +1954,7 @@ async fn run_scheduler_scoped(
                         output: String::new(),
                         success: false,
                         skipped: true,
+                        kind: step_kind_for_run_record(step),
                         items: Vec::new(),
                         loop_iteration: current_loop_iteration,
                         ..Default::default()
@@ -3967,6 +3968,7 @@ async fn run_steps_over(
                     output: String::new(),
                     success: false,
                     skipped: true,
+                    kind: step_kind_for_run_record(step),
                     items: Vec::new(),
                     ..Default::default()
                 };
