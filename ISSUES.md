@@ -105,7 +105,7 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-45 | P1 | rupu-providers | `thinkingLevel` + `thinkingBudget` are always co-sent, and there is **no model gate** — the Gemini-3-only key also goes to 2.5 (the "400" is doc-derived, never observed) | open |
 | I-46 | P2 | rupu-providers | Gemini thinking levels are sent uppercase; Google documents lowercase (our own spec says tolerance is **unverified**) | open |
 | I-47 | P2 | rupu-providers | `minimal`/`xhigh` are forwarded to any openai-compatible endpoint with no allowlist ("rejected outright" is **unproven**; none of the named vendors ship as providers) | open |
-| I-48 | **P0** | rupu-providers | `usageMetadata.thoughtsTokenCount` is never read — the **only default-reachable** defect here; Gemini spend is silently under-billed and run totals under-report | open |
+| I-48 | **P0** | rupu-providers | `usageMetadata.thoughtsTokenCount` is never read — the **only default-reachable** defect here; Gemini spend is silently under-billed and run totals under-report | fixed |
 | I-49 | P2 | rupu-providers | `classify.rs` is dead code (zero production callers) — the filed "flat 60s" claim is **false at every constant**; real default is one 2s retry | fixed |
 
 ### Arc 6 — docs truth pass
@@ -406,6 +406,52 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-48 — Gemini reasoning tokens are counted in usage and cost
+
+**Promoted P1 → P0 during verification:** this was the **only** defect in Arc 5 reachable
+from a default config, and the only one that costs users money. `gemini-2.5-pro` thinks by
+default, so every stock Gemini run was affected.
+
+**Symptom.** Gemini spend was silently under-billed and run token totals under-reported,
+with no `cost_partial` marker — so a user had no way to tell.
+
+**Root cause.** Both Gemini usage sites read exactly two `usageMetadata` fields
+(`promptTokenCount`, `candidatesTokenCount`). `thoughtsTokenCount` appeared **nowhere in the
+workspace**, and `Usage` had no field to hold it. Gemini reports thinking tokens *outside*
+`candidatesTokenCount` while Google bills them at the output rate, so those tokens were
+multiplied by zero. The same `output_tokens` feeds `total_out`/`tokens_out`, so run totals
+and the context-budget arithmetic under-reported too.
+
+**Provider-specific, not a general gap** — worth stating because it looks like one: no
+provider in rupu reads a reasoning-token field, but Anthropic and the openai-compatible path
+**don't need one**, since their `output_tokens`/`completion_tokens` already include
+reasoning. Gemini is the only provider where the omission loses tokens.
+
+**Fix.** `Usage.reasoning_tokens`, populated from `thoughtsTokenCount` at both the
+non-streaming and streaming parse sites. `rupu-agent`'s runner folds it once into
+`billable_output_tokens = output_tokens + reasoning_tokens`, which feeds `total_out`,
+`Event::Usage.output_tokens` and `Event::TurnEnd.tokens_out` — so the number reaches the
+persisted transcript and every downstream cost call, rather than stopping at the struct
+boundary. Anthropic and openai-wire sites set `reasoning_tokens: 0` explicitly with a
+comment, so no path double-counts.
+
+**Validation.** RED observed with real numbers: `thoughtsTokenCount: 200` parsed to
+`Usage { input: 15, output: 8 }` — 200 tokens dropped — and billed identically to a
+non-thinking response. The binding test is
+`gemini_reasoning_tokens_increase_run_totals_and_cost` (rupu-agent), which drives the **full
+pipeline** and reads the persisted JSONL back: run total 8 → 208 tokens, cost strictly
+greater. Plus parse tests on both Gemini paths.
+
+**A dead second mechanism was removed rather than left in.** The fix initially also added
+`ModelPricing::cost_usd_with_reasoning`, whose test was cited as the binding cost test — but
+it had **no callers outside its own module**, so that test exercised a function nothing
+calls: precisely the validation-bar failure the charter exists to prevent. It was also a
+double-billing hazard, since every production caller sources `output_tokens` from the
+already-folded transcript. Deleted, with the contract documented on `cost_usd` so it is not
+reintroduced.
+
+---
 
 ### I-49 — the dead `classify` module is deleted
 
