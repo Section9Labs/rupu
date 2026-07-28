@@ -598,6 +598,40 @@ Workflow templates use minijinja. Missing variables render as empty strings.
 | --- | --- | --- |
 | `read_file('<path>')` | File contents as a string | Path is resolved against the run's working directory. Errors loudly (the run fails) if the file is missing. |
 
+### Template filters
+
+Beyond minijinja's builtins:
+
+| Filter | Returns | Notes |
+| --- | --- | --- |
+| `fromjson` | The parsed JSON value | The inverse of minijinja's builtin `tojson`. Fails the run if the input is not valid JSON — it never silently yields an empty value. |
+
+`fromjson` is what makes an **`action:` step's output usable**. An action step's
+`output` is a JSON *string*, so `{{ steps.<id>.output }}` interpolates the raw
+text and cannot be indexed. Pipe it through `fromjson` first:
+
+```yaml
+steps:
+  - id: fetch
+    action: issues.get
+    with: { project: "acme/widget", number: 41 }
+
+  - id: triage
+    agent: triager
+    prompt: |
+      Issue title: {{ (steps.fetch.output | fromjson).title }}
+      Labels: {{ (steps.fetch.output | fromjson)['labels'] | join(', ') }}
+```
+
+Values come back **typed**, so comparisons and arithmetic work:
+
+```yaml
+    when: "{{ (steps.fetch.output | fromjson).comments > 5 }}"
+```
+
+Approval-gate steps do not need this — a gate's decision is pre-parsed for you
+as `steps.<gate-id>.decision`.
+
 `read_file` lets control flow be driven by a **file a prior step wrote** instead of by an agent's chat output, which is far more deterministic. The canonical use is sourcing a `for_each:` list from a file:
 
 ```yaml
