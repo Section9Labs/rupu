@@ -73,7 +73,7 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-28 | P1 | rupu-cp web | Delete the classic agent-authoring UI; drop `[cp].agent_authoring_ui` | fixed |
 | I-29 | P1 | rupu-cp web | Delete the classic workflow-editor UI; drop `[cp].workflow_editor_ui` | fixed |
 | I-30 | P1 | rupu-cp web | Collapse the run-graph classic/next dual paths to one | fixed |
-| I-31 | P2 | rupu-cp web | Remove both UI hooks and their localStorage overrides | open |
+| I-31 | P2 | rupu-cp web | Remove both UI hooks and their localStorage overrides | fixed |
 | I-32 | P2 | rupu-cp web | Fan-out / fan-in node silhouettes are provisional art (`branch` is not — mis-scoped) | moved → TODO.md |
 
 ### Arc 4 — gate/action correctness
@@ -283,6 +283,42 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-31 — both UI hooks and their localStorage overrides are removed
+
+**Symptom.** Two React hooks (`useAgentAuthoringUi`, `useWorkflowEditorUi`) resolved
+the CP UI flags, each with an undocumented devtools-only localStorage override
+(`rupu.cp.agentUi`, `rupu.cp.workflowEditorUi`) that let an operator flip the UI
+behind the config's back. Nothing wrote those keys in production — they existed
+purely so a developer could hand-set them in devtools.
+
+**Fix.** With [[I-28]], [[I-29]] and [[I-30]] removing every *reader* of the flags'
+values, what remained was dead plumbing. Both hook files and their tests are gone,
+along with the `WorkflowEditorUi` type imports, the `workflowEditorUi` prop at every
+declaring and forwarding site — including the five `StepForm` sub-components I-29
+had temporarily renamed to `_workflowEditorUi` for signature stability — and the
+threading in `pages/WorkflowDetail.tsx`.
+
+The now-dead `node projection` describe in `WorkflowEditorGraph.test.tsx` was also
+removed: it asserted the flag threads onto every projected node, which is no longer
+something that happens. Comments in four settings cards and in `styles.css` that
+described components rendering "only when `workflowEditorUi === 'next'`" were
+corrected — that condition no longer exists, so the comments had become false.
+
+**Validation.**
+`grep -rn "workflowEditorUi\|WorkflowEditorUi\|useWorkflowEditorUi\|agentUi\|useAgentAuthoringUi" crates/rupu-cp/web/src`
+returns **zero hits**, and neither localStorage key has a remaining reader or
+writer anywhere in the tree. `npm run build` is TypeScript-clean — which is a real
+check here rather than a formality, since `noUnusedParameters` and the prop-type
+removals mean a half-finished removal cannot compile. `npx vitest run` green at
+179 files / 1854 tests, down from 180 / 1859; the delta reconciles exactly as one
+deleted test file (3 hook tests) plus the 2 dead node-projection tests.
+
+**Note.** The two Rust config keys are intentionally *not* removed — they survive as
+warn-only deprecation shims so an existing `config.toml` still parses. See [[I-28]]
+for why deleting them would silently discard the operator's whole config.
+
+---
 
 ### I-30 — the run-graph classic/next dual paths are collapsed
 
