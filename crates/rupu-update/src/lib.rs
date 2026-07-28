@@ -8,7 +8,7 @@ pub mod select;
 pub use select::{asset_for, select_latest};
 
 pub mod decide;
-pub use decide::{current_platform, decide, is_dev_exe, Decision};
+pub use decide::{current_platform, decide, is_dev_exe, platform_name, Decision};
 
 pub mod verify;
 pub use verify::{BinaryCheck, CodesignCheck, NoopBinaryCheck};
