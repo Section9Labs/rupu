@@ -6440,7 +6440,6 @@ dependencies = [
  "predicates",
  "rand 0.8.6",
  "reqwest 0.12.28",
- "rupu-keychain-acl",
  "rupu-providers",
  "serde",
  "serde_json",
@@ -6592,17 +6591,6 @@ dependencies = [
  "tracing",
  "ulid",
  "url",
-]
-
-[[package]]
-name = "rupu-keychain-acl"
-version = "0.69.0"
-dependencies = [
- "core-foundation 0.10.0",
- "core-foundation-sys",
- "security-framework-sys",
- "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]
