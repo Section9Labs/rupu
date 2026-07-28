@@ -4,6 +4,27 @@
 **Status:** approved (matt, 2026-07-23)
 **Depends on:** run-state closure (PR #501 — store-side terminal events), Slice B-2 SCM connectors, workflow triggers Plan 1, CP visual workflow editor.
 
+> ## ⚠️ Correction (2026-07-28, ISSUES.md I-70)
+>
+> **This is a dated design record. Parts of it do not match what shipped — do not copy
+> its YAML.** The authoritative references are `docs/workflow-format.md` (authoring) and
+> `rupu mcp` / `GET /api/tools` (the live tool catalog).
+>
+> - **`scm.prs.add_labels` does not exist** and was never implemented. §3 lists it in the
+>   v1 action set; `tool_catalog()` has no such tool, so a workflow using it fails at parse
+>   time with `ActionsUnknownTool`. The shipped catalog is: `issues.create|comment|get|list|update_state`,
+>   `scm.prs.create|comment|get|list|diff`, `scm.branches.create|list`, `scm.repos.get|list`,
+>   `scm.files.read`, `github.workflows_dispatch`, `gitlab.pipeline_trigger`.
+> - **Several `with:` examples in this spec fail schema validation** — `with:` keys are
+>   checked against the tool's JSON schema at parse time, and required keys must be present.
+> - **A step may not carry a non-empty `actions:` alongside `action:`**
+>   (`WorkflowParseError::ActionsOnActionStep`); an action step's tool is already explicit.
+> - Since Arc 4, a templated `with:` value is **coerced to the schema's declared type**, so
+>   `number: "{{ inputs.number }}"` now works where it previously failed at dispatch; a
+>   *partial* template into a typed field is rejected as an author error.
+>
+> Everything below is preserved verbatim as the record of what was approved on 2026-07-23.
+
 ## 1. Problem
 
 Two gaps in the workflow orchestrator:
