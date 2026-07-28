@@ -72,7 +72,7 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 |---|---|---|---|---|
 | I-28 | P1 | rupu-cp web | Delete the classic agent-authoring UI; drop `[cp].agent_authoring_ui` | fixed |
 | I-29 | P1 | rupu-cp web | Delete the classic workflow-editor UI; drop `[cp].workflow_editor_ui` | fixed |
-| I-30 | P1 | rupu-cp web | Collapse the run-graph classic/next dual paths to one | open |
+| I-30 | P1 | rupu-cp web | Collapse the run-graph classic/next dual paths to one | fixed |
 | I-31 | P2 | rupu-cp web | Remove both UI hooks and their localStorage overrides | open |
 | I-32 | P2 | rupu-cp web | Fan-out / fan-in node silhouettes are provisional art (`branch` is not — mis-scoped) | moved → TODO.md |
 
@@ -283,6 +283,44 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-30 — the run-graph classic/next dual paths are collapsed
+
+**Symptom.** The run-detail workflow graph rendered in two different visual
+schemes depending on `[cp].workflow_editor_ui` — the *workflow-editor* flag,
+reused for the run graph.
+
+**Root cause.** Not two renderers, but two paint schemes inside one. `RunGraph`
+resolved the flag, pushed it into every node's `data` as `ui`, and then each of
+the six node components plus the edge memo re-derived `const next = data.ui ===
+'next'` and branched. The classic arm painted flat `inkMute` edges with
+`rg-edge-active`/`rg-edge-await`; the next arm painted per-kind accents from
+`kindBridge` with `rg-edge-flow`.
+
+**Fix.** The `next` scheme is now unconditional. `RunGraph` no longer calls the
+hook, `ui` is gone from `NodeData` and from the data pushed to each node, the
+classic edge arm is deleted, and all six node components inline the next branch.
+`.rg-edge-active` and `.rg-edge-await` are removed from `styles.css` and the
+neighbouring comment — which described a classic path that no longer exists — was
+corrected. `components/graph/kindBridge.ts` is kept and becomes the
+*unconditional* source of node and edge colour; `stepStyle.ts` is kept (it is also
+used by `components/run/StepTranscriptBrowser.tsx`).
+
+**Validation.** `npm run build` TypeScript-clean; `npx vitest run` green at
+180 files / 1859 tests (down 2 from 1861 — the two deleted classic tests).
+`grep -rn "rg-edge-active\|rg-edge-await" crates/rupu-cp/web/src` returns zero
+hits and `grep -rn "data\.ui\b" crates/rupu-cp/web/src/components/` returns zero
+hits, while `rg-edge-flow` and both kept modules remain in place.
+`ContainerNodes.test.tsx` asserted *classic ≠ next* throughout; each such test was
+collapsed to a next-only assertion rather than deleted, preserving coverage of the
+surviving render.
+
+**Flake caution recorded for the next person.** The web suite is load-sensitive.
+A healthy run takes ~12s; under contention it stretched past 290s and produced
+4 spurious failures that did not reproduce. Treat a failure as real only if it
+reproduces on a fast run.
+
+---
 
 ### I-29 — the classic workflow-editor UI is deleted
 
@@ -855,14 +893,21 @@ papered over. Every `file:line` in the table was re-verified against the tip of
 | `[cp].autoflow_reconcile_enabled` / `_interval_secs` | `rupu-cli/src/cmd/cp.rs:93-94` |
 | `[cp].cron_tick_enabled` / `_interval_secs` | `rupu-cli/src/cmd/cp.rs:117-118` |
 | `[cp].gate_sweep_enabled` / `_interval_secs` | `rupu-cli/src/cmd/cp.rs:152-153` |
-| `[cp].agent_authoring_ui` | `rupu-cp/web/src/hooks/useAgentAuthoringUi.ts:9` (served through `/api/config`) |
-| `[cp].workflow_editor_ui` | `rupu-cp/web/src/hooks/useWorkflowEditorUi.ts:9` (served through `/api/config`) |
+| `[cp].agent_authoring_ui` | **none — deprecated no-op** (I-28, Arc 3) |
+| `[cp].workflow_editor_ui` | **none — deprecated no-op** (I-29/I-30/I-31, Arc 3) |
 | `[update].channel` | `rupu-cli/src/cmd/update.rs:74` |
 | `[update].check` | `rupu-cli/src/lib.rs:276` |
 
-Two keys' consumers are **not** Rust — `[cp].agent_authoring_ui` and
-`[cp].workflow_editor_ui` are read by the CP web app after `/api/config`
-serializes them. A Rust-only grep reports them as inert; they are not.
+Two keys' consumers **were not** Rust — `[cp].agent_authoring_ui` and
+`[cp].workflow_editor_ui` were read by the CP web app after `/api/config`
+serialized them, so a Rust-only grep reported them as inert when they were not.
+**As of Arc 3 both are genuinely inert**: the classic renderers they selected
+are deleted, the two React hooks that read them are gone, and the fields survive
+only as `Option<toml::Value>` deprecation shims that warn and are never read
+(see [[I-28]], [[I-29]]). They are kept solely so an existing `config.toml`
+setting them still parses — `CpConfig` is `deny_unknown_fields`, and the
+`.unwrap_or_default()` load paths would otherwise convert that parse failure
+into silent loss of the operator's whole config.
 
 **Behavioral note — why `[retry]` deprecates instead of erroring.** The first
 cut simply deleted the field. Because `Config` is `deny_unknown_fields`, that
