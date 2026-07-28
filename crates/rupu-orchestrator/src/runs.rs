@@ -515,6 +515,24 @@ pub enum StepKind {
     Loop,
     Action,
     ApprovalGate,
+    /// I-39: catches any `kind` string this binary doesn't recognize —
+    /// forward-compat for an OLDER binary reading a `step_results.jsonl`
+    /// row a NEWER binary wrote with a `StepKind` variant that didn't exist
+    /// yet when this binary was built. Must stay LAST: serde's
+    /// `#[serde(other)]` is only valid on the final variant of an
+    /// externally-tagged enum. Before this variant existed, an unrecognized
+    /// `kind` string failed the WHOLE row's deserialization, and every
+    /// reader (`RunStore::read_step_results` chief among them, since it's
+    /// the one that feeds template context on resume) silently
+    /// `filter_map`s a failed row away — so a prior step's `output` was
+    /// lost wholesale on resume with an older binary, not just its kind
+    /// label. Every OTHER field on the row (`output`, `step_id`, `success`,
+    /// ...) still deserializes normally under this variant — only the kind
+    /// label is downgraded, not the data. Every `match` on `StepKind` must
+    /// handle this arm without panicking; printer/graph dispatch falls back
+    /// to the generic linear rendering.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One entry in `step_results.jsonl`. Mirrors [`StepResult`] but with
@@ -2764,6 +2782,81 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].step_id, "a");
         assert_eq!(rows[1].step_id, "b");
+    }
+
+    /// I-39: an OLDER binary reading a `step_results.jsonl` row a NEWER
+    /// binary wrote with a `kind` this binary doesn't recognize must not
+    /// silently drop the whole row — `StepKind`'s `#[serde(other)]` catch-
+    /// all downgrades only the kind label to `Unknown`, while every other
+    /// field (crucially `output`, since losing it means a resumed run
+    /// silently loses a prior step's result and re-runs it) still
+    /// deserializes normally. Pre-fix (`StepKind` had no `#[serde(other)]`
+    /// variant), this row failed `StepResultRecord` deserialization
+    /// entirely and `read_step_results`'s `if let Ok(rec) = ...` silently
+    /// dropped it — this test would see only 1 row, not 2, and the
+    /// `future_step` output would be gone.
+    #[test]
+    fn unknown_kind_row_still_deserializes_and_preserves_output() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = sample_record("run_unknown_kind");
+        store
+            .create(
+                rec.clone(),
+                "name: x\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n",
+            )
+            .unwrap();
+
+        // A normal row, exactly like any other step result on disk today.
+        store
+            .append_step_result(&rec.id, &sample_step_result("a"))
+            .unwrap();
+
+        // A row shaped like a FUTURE binary's step_result — same fields as
+        // `sample_step_result`, but `kind` is a string this binary's
+        // `StepKind` enum has never heard of. Written directly to the
+        // JSONL file (not via `append_step_result`, which only ever
+        // constructs a real `StepKind`) to simulate exactly what
+        // `read_step_results` faces on disk.
+        let future_row = serde_json::json!({
+            "step_id": "future_step",
+            "run_id": "run_step_future_step",
+            "transcript_path": "/tmp/future_step.jsonl",
+            "output": "future output survives",
+            "success": true,
+            "skipped": false,
+            "rendered_prompt": "prompt for future_step",
+            "kind": "some_future_kind",
+            "items": [],
+            "findings": [],
+            "iterations": 0,
+            "resolved": true,
+            "finished_at": Utc::now().to_rfc3339(),
+        });
+        let path = store.step_results_log(&rec.id);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write;
+        writeln!(f, "{}", future_row).unwrap();
+
+        let rows = store.read_step_results(&rec.id).unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "the unknown-kind row must NOT be silently dropped: {rows:?}"
+        );
+        let future = rows
+            .iter()
+            .find(|r| r.step_id == "future_step")
+            .expect("future_step row must be present");
+        assert_eq!(future.kind, StepKind::Unknown);
+        assert_eq!(
+            future.output, "future output survives",
+            "the output is the actual harm if this row were dropped — it must survive"
+        );
+        assert!(future.success);
     }
 
     #[test]
