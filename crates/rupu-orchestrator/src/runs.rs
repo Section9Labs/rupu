@@ -272,6 +272,23 @@ pub struct RunRecord {
     /// when `None`. Cleared by [`RunStore::clear_resume`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_gate_id: Option<String>,
+    /// The actor who requested this delegated resume (ISSUES.md I-82) — set
+    /// alongside `resume_requested_at`/`resume_mode`/`resume_gate_id` by
+    /// [`RunStore::request_resume_approval`] from its `approver` argument
+    /// (e.g. `"web"` for a CP web approve). The marker is the only channel
+    /// that carries a web-initiated approve's true identity across the
+    /// process boundary to the background resume worker: unlike
+    /// `approve_gate` (whose caller re-enters `run_workflow` in the SAME
+    /// process, so the actor never leaves scope), `request_resume_approval`
+    /// is marker-only — the actual gate decision is recorded later, in a
+    /// DIFFERENT process, when the resume worker spawns `rupu workflow
+    /// approve --approver <this value>`. Without this field that spawn had
+    /// no way to recover the original actor and fell back to re-deriving
+    /// `whoami::username()` (the identity of whatever account runs `cp
+    /// serve`), losing the real "web" (or future per-user) identity.
+    /// Cleared by [`RunStore::clear_resume`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_approver: Option<String>,
     /// Cleanup-pending marker (I-35): set by [`RunStore::reject_gate`]'s
     /// explicit-reject branch whenever it finalizes the run `Rejected`,
     /// naming the gate whose `on_reject` chain still needs to run. Mirrors
@@ -2036,19 +2053,15 @@ impl RunStore {
             .filter(|m| matches!(*m, "ask" | "bypass" | "readonly"))
             .map(str::to_string);
         record.resume_gate_id = resolved_gate_id;
+        // I-82: persist the resolved actor onto the same marker so the
+        // cp-serve resume worker — which runs in a DIFFERENT process from
+        // this call — can carry it through to the eventual `rupu workflow
+        // approve --approver <this>` spawn, rather than that spawn falling
+        // back to re-deriving `whoami::username()` and losing the
+        // web-initiated identity. See `resume_approver`'s doc on
+        // `RunRecord`.
+        record.resume_approver = Some(approver.to_string());
         self.update(&record)?;
-        // I-36 (sibling gap, not fully closed here): `approver` is no
-        // longer silently discarded — it's returned on the decision like
-        // every other approve/reject path. But unlike `approve_gate`
-        // (whose caller re-enters `run_workflow` in the SAME process) this
-        // is marker-only: the actual resume happens later, in a DIFFERENT
-        // process (the cp-serve resume worker spawning `rupu workflow
-        // approve`), which today re-derives its own `approver` via
-        // `whoami::username()` rather than reading it back from here or
-        // from this record. So a web-initiated approve's true identity
-        // (e.g. `"web"`) is available on the returned decision but not yet
-        // threaded through to the eventual `emit_gate_result` call —
-        // tracked as a follow-up, not solved by this change.
         Ok(ApprovalDecision::Approved {
             run_id: run_id.to_string(),
             step_id,
@@ -2122,6 +2135,7 @@ impl RunStore {
         record.resume_claimed_by = None;
         record.resume_mode = None;
         record.resume_gate_id = None;
+        record.resume_approver = None;
         self.update(&record)?;
         Ok(())
     }
@@ -2585,6 +2599,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            resume_approver: None,
             reject_cleanup_pending: None,
             permission_mode: None,
             final_output: None,

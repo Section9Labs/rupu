@@ -63,6 +63,7 @@ fn seed_run(id: &str) -> RunRecord {
         resume_claimed_by: None,
         resume_mode: None,
         resume_gate_id: None,
+        resume_approver: None,
         reject_cleanup_pending: None,
         permission_mode: None,
         issue_ref: None,

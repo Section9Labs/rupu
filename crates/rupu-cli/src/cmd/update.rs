@@ -40,6 +40,11 @@ pub struct UpdateArgs {
     /// Restore the previously-installed binary from the last backup.
     #[arg(long)]
     pub rollback: bool,
+    /// Print this build's release-asset platform name (e.g. `linux-x64`)
+    /// and exit. The release pipeline uses this to name assets from the
+    /// binary itself, so the publisher and `rupu update` cannot drift.
+    #[arg(long)]
+    pub print_platform: bool,
 }
 
 /// Precedence: `--channel` flag > `[update].channel` config > "stable".
@@ -72,6 +77,15 @@ pub async fn handle(args: UpdateArgs) -> ExitCode {
 }
 
 async fn run(args: UpdateArgs) -> anyhow::Result<ExitCode> {
+    // Before config load and before any network call: this must work in a
+    // bare build container with no credentials and no network. Output is
+    // interpolated into an asset filename by the release pipeline, so it
+    // is one clean line and nothing else.
+    if args.print_platform {
+        println!("{}", rupu_update::current_platform());
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let cfg = load_cli_config();
     let channel = resolve_channel(args.channel.as_deref(), cfg.update.channel.as_deref())?;
 

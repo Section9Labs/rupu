@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
 use serde::Deserialize;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::auth::credential_store::resolve_provider_auth;
@@ -230,6 +232,25 @@ const MAX_STREAM_IDLE_RETRIES: u32 = 10;
 /// covers prefill + full generation — but bounded so a hung connection can't
 /// block forever.
 const SEND_TOTAL_TIMEOUT_SECS: u64 = 600;
+
+/// I-84: whether `stream()`'s outer idle-restart loop should draw down the
+/// shared retry budget and re-send, or give up. `total_retry_budget` is the
+/// SUM of the idle-restart and 429-retry ceilings
+/// (`MAX_STREAM_IDLE_RETRIES` plus `max_rate_limit_retries`) — before this
+/// fix the two loops were bounded independently, so the worst case (a 429
+/// on every idle-restart pass, each eventually succeeding then stalling
+/// again) multiplied attempts instead of adding them. Extracted as a pure
+/// function so that "sum, not product" is directly unit-testable without
+/// simulating a real 120s idle stall over the network. A mid-response
+/// stall (`emitted_content`) is never retried, budget or not — re-sending
+/// would duplicate already-streamed output.
+fn should_retry_idle_stall(
+    emitted_content: bool,
+    retries_used: u32,
+    total_retry_budget: u32,
+) -> bool {
+    !emitted_content && retries_used < total_retry_budget
+}
 
 const ANTHROPIC_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -646,6 +667,16 @@ pub struct AnthropicClient {
     /// `[providers.anthropic].max_retries` overrides it via
     /// [`AnthropicClient::with_tuning`] (ISSUES.md I-10).
     max_rate_limit_retries: u32,
+    /// Concurrency limiter (I-75). `None` for clients built directly by
+    /// tests/callers that never call `with_tuning` — preserves their
+    /// existing unthrottled behavior exactly. `with_tuning` (the path
+    /// every factory-built client goes through) sets this to
+    /// `Some(tuning.semaphore("anthropic"))`. Acquired fresh per HTTP
+    /// attempt (see `acquire_permit`) rather than held for a whole
+    /// `send`/`stream` call, so the permit is released across this
+    /// client's own 429 backoff sleep instead of starving every other
+    /// concurrent Anthropic call for the whole ladder.
+    semaphore: Option<Arc<Semaphore>>,
 }
 
 impl AnthropicClient {
@@ -660,24 +691,49 @@ impl AnthropicClient {
             oauth_account_uuid: None,
             oauth_system_prefix_enabled: true,
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
+            semaphore: None,
         }
     }
 
     /// Apply `[providers.anthropic]` tuning: rebuild the HTTP client with the
-    /// configured inactivity deadline (I-9) and adopt the configured 429 retry
-    /// budget (I-10). The factory calls this for every client it builds, which
-    /// is why the Anthropic client is the one provider NOT wrapped in
-    /// `RetryingProvider` — it has its own in-client retry loop and wrapping
-    /// would multiply the budget.
+    /// configured inactivity deadline (I-9), adopt the configured 429 retry
+    /// budget (I-10), and adopt the configured concurrency limit (I-11/I-75).
+    /// The factory calls this for every client it builds, which is why the
+    /// Anthropic client is the one provider NOT wrapped in `RetryingProvider`
+    /// (its own in-client retry loop makes stacking one multiply the budget)
+    /// NOR `ThrottledProvider` (its own per-attempt semaphore acquisition
+    /// below makes stacking one either double-count permits or deadlock
+    /// outright at `max_concurrency == 1`).
     pub fn with_tuning(mut self, tuning: &crate::tuning::ProviderTuning) -> Self {
         self.client = build_http_client_with_timeout(Some(tuning.timeout));
         self.max_rate_limit_retries = tuning.max_retries;
+        self.semaphore = Some(tuning.semaphore("anthropic"));
         self
     }
 
     /// The 429 retry budget this client will actually spend.
     pub fn max_rate_limit_retries(&self) -> u32 {
         self.max_rate_limit_retries
+    }
+
+    /// Acquire one permit from the configured concurrency semaphore, or
+    /// `None` when no tuning was ever applied (unthrottled — the historical
+    /// behavior for clients built directly rather than through the
+    /// factory). Called fresh for every individual HTTP attempt so the
+    /// permit can be dropped (by letting the returned guard go out of
+    /// scope) before a 429 backoff sleep, instead of being held for an
+    /// entire `send`/`stream` call the way `ThrottledProvider` holds it for
+    /// every other provider (I-75).
+    async fn acquire_permit(&self) -> Result<Option<OwnedSemaphorePermit>, ProviderError> {
+        match &self.semaphore {
+            Some(sem) => {
+                let permit = sem.clone().acquire_owned().await.map_err(|e| {
+                    ProviderError::Other(anyhow::anyhow!("provider semaphore closed: {e}"))
+                })?;
+                Ok(Some(permit))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Set the OAuth account UUID. Used by the factory after reading it
@@ -708,6 +764,7 @@ impl AnthropicClient {
             oauth_account_uuid: None,
             oauth_system_prefix_enabled: true,
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
+            semaphore: None,
         }
     }
 
@@ -725,6 +782,7 @@ impl AnthropicClient {
             oauth_account_uuid: None,
             oauth_system_prefix_enabled: true,
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
+            semaphore: None,
         }
     }
 
@@ -750,6 +808,7 @@ impl AnthropicClient {
             oauth_account_uuid: None,
             oauth_system_prefix_enabled: true,
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
+            semaphore: None,
         }
     }
 
@@ -766,6 +825,7 @@ impl AnthropicClient {
             oauth_account_uuid: None,
             oauth_system_prefix_enabled: true,
             max_rate_limit_retries: MAX_RATE_LIMIT_RETRIES,
+            semaphore: None,
         }
     }
 
@@ -997,6 +1057,12 @@ impl AnthropicClient {
                 tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
             }
 
+            // Acquired fresh each attempt (I-75): dropped at the end of
+            // this loop iteration (including via `continue` on a 429), so
+            // the backoff sleep above — on the NEXT iteration — always
+            // runs with no permit held.
+            let _permit = self.acquire_permit().await?;
+
             let builder = self
                 .client
                 .post(&self.api_url)
@@ -1082,10 +1148,32 @@ impl AnthropicClient {
         self.ensure_valid_token().await?;
         let body = self.build_request_body(request, true);
 
+        // I-84: idle-stall resends and 429 resends used to be independently
+        // bounded nested loops (an outer `idle_attempt` loop wrapping an
+        // inner 429-retry loop), so the worst-case request count was their
+        // PRODUCT: (MAX_STREAM_IDLE_RETRIES + 1) * (max_rate_limit_retries +
+        // 1) — e.g. 11 * 2 = 22 requests for one `stream()` call at
+        // defaults, if every idle-restart's stream also 429ed once before
+        // succeeding and then stalled again.
+        //
+        // Fix: every actual resend — whether it's a 429 retry or an
+        // idle-restart — draws down one shared budget,
+        // `total_retry_budget` (the SUM, not product, of the two
+        // individual ceilings). The inner 429 loop keeps its own
+        // `self.max_rate_limit_retries` per-pass cap (so a persistent
+        // 429 storm still fails fast, unchanged from before — it never
+        // reaches the outer idle logic), but each retry it actually takes
+        // also spends shared budget, so a stream that alternates stalls
+        // and 429s across multiple passes can't multiply past
+        // `total_retry_budget + 1` total requests.
+        let total_retry_budget = MAX_STREAM_IDLE_RETRIES + self.max_rate_limit_retries;
+        let mut retries_used = 0u32;
+
         // Outer retry loop: if the model stalls (no bytes for
         // STREAM_IDLE_TIMEOUT_SECS) during prefill — connection open, server
-        // silent — abort and re-send, up to MAX_STREAM_IDLE_RETRIES times.
-        for idle_attempt in 0..=MAX_STREAM_IDLE_RETRIES {
+        // silent — abort and re-send, drawing from the shared budget above.
+        let mut idle_attempt = 0u32;
+        loop {
             if idle_attempt > 0 {
                 warn!(
                     attempt = idle_attempt,
@@ -1094,10 +1182,24 @@ impl AnthropicClient {
                 );
             }
 
-            // Retry loop for 429 rate-limits
-            let response = {
+            // Retry loop for 429 rate-limits. Bounded by its own per-pass
+            // cap (self.max_rate_limit_retries) exactly as before — a
+            // persistent 429 storm fails here without ever touching the
+            // outer idle-restart logic. Each retry ALSO spends shared
+            // budget so it can't multiply against outer idle-restarts.
+            //
+            // `_stream_permit` (I-75) carries the successful attempt's
+            // concurrency permit out of this block so it stays held for
+            // the SSE-reading phase below — matching how `ThrottledProvider`
+            // holds a permit for a whole call for every other provider —
+            // while every *failed* attempt's permit is acquired fresh and
+            // dropped before its own backoff sleep, exactly like `send()`.
+            // Never read directly; kept alive purely for its `Drop`, which
+            // is why it's underscore-prefixed.
+            let (response, _stream_permit) = {
                 let mut last_err = None;
                 let mut got_response = None;
+                let mut acquired_permit = None;
                 for attempt in 0..=self.max_rate_limit_retries {
                     if attempt > 0 {
                         let backoff = INITIAL_BACKOFF_MS * 2u64.pow(attempt - 1);
@@ -1108,6 +1210,8 @@ impl AnthropicClient {
                         );
                         tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
                     }
+
+                    let permit = self.acquire_permit().await?;
 
                     let builder = self
                         .client
@@ -1131,7 +1235,8 @@ impl AnthropicClient {
                             status: 429,
                             message: text,
                         });
-                        continue;
+                        retries_used += 1;
+                        continue; // `permit` drops here, before the next iteration's backoff sleep
                     }
                     if !status.is_success() {
                         let text = resp.text().await.unwrap_or_default();
@@ -1146,10 +1251,11 @@ impl AnthropicClient {
                         });
                     }
                     got_response = Some(resp);
+                    acquired_permit = permit;
                     break;
                 }
                 match got_response {
-                    Some(r) => r,
+                    Some(r) => (r, acquired_permit),
                     None => {
                         return Err(last_err.unwrap_or_else(|| ProviderError::Api {
                             status: 429,
@@ -1163,6 +1269,10 @@ impl AnthropicClient {
             let mut accumulator = StreamAccumulator::new();
             let mut response = response;
             let mut emitted_content = false;
+            // `_stream_permit` (if any) stays alive through the SSE-reading
+            // loop below and is dropped when this outer-loop iteration
+            // ends — either by returning, or by falling through to the
+            // next idle-restart pass, which acquires its own fresh permit.
 
             // Read chunks with a per-chunk IDLE timeout. A timeout means the
             // server stopped emitting bytes — treat as a stall.
@@ -1197,9 +1307,10 @@ impl AnthropicClient {
             }
 
             // Stalled. Retry only on a *prefill* stall (nothing emitted yet)
-            // with retries left; a mid-stream stall can't be re-sent without
-            // duplicating already-streamed output, so it fails.
-            if emitted_content || idle_attempt == MAX_STREAM_IDLE_RETRIES {
+            // with budget left; a mid-stream stall can't be re-sent without
+            // duplicating already-streamed output, so it fails regardless of
+            // budget.
+            if !should_retry_idle_stall(emitted_content, retries_used, total_retry_budget) {
                 let reason = if emitted_content {
                     "mid-response".to_string()
                 } else {
@@ -1209,8 +1320,9 @@ impl AnthropicClient {
                     "stream idle for {STREAM_IDLE_TIMEOUT_SECS}s — model stalled ({reason})"
                 )));
             }
+            retries_used += 1;
+            idle_attempt += 1;
         }
-        unreachable!("stream idle-retry loop always returns")
     }
 
     fn build_request_body(&self, request: &LlmRequest, stream: bool) -> serde_json::Value {
@@ -3511,6 +3623,164 @@ mod tests {
         });
         let _ = client.send(&make_request(None)).await;
         m.assert_hits(2);
+    }
+
+    // ── I-84: stream()'s idle-restart / 429-retry loops share one budget ──
+
+    /// The fixed ceiling is a SUM of the two individual limits, not their
+    /// PRODUCT — and critically, a `retries_used` count past the old
+    /// idle-only ceiling (`MAX_STREAM_IDLE_RETRIES`) must still be retried
+    /// when the configured `max_rate_limit_retries` extends the shared
+    /// budget. The old nested-loop code had no such combined budget at
+    /// all: the outer loop's own bound (`idle_attempt ==
+    /// MAX_STREAM_IDLE_RETRIES`) never referenced `max_rate_limit_retries`,
+    /// so the worst case was their product, e.g. (10 + 1) * (3 + 1) = 44
+    /// requests for one `stream()` call — vs. 10 + 3 = 13 now.
+    #[test]
+    fn should_retry_idle_stall_draws_from_a_shared_sum_budget_not_the_old_product() {
+        let max_rate_limit_retries = 3;
+        let total_retry_budget = MAX_STREAM_IDLE_RETRIES + max_rate_limit_retries;
+        assert_eq!(
+            total_retry_budget, 13,
+            "budget must be additive, not the product (44)"
+        );
+
+        // Past the old idle-only ceiling (10) but within the shared budget
+        // (13): must still retry, because max_rate_limit_retries extends it.
+        assert!(should_retry_idle_stall(false, 11, total_retry_budget));
+        assert!(should_retry_idle_stall(false, 12, total_retry_budget));
+        // Budget exactly exhausted: give up.
+        assert!(!should_retry_idle_stall(false, 13, total_retry_budget));
+    }
+
+    #[test]
+    fn should_retry_idle_stall_never_retries_after_emitted_content() {
+        // A mid-response stall can't be re-sent without duplicating
+        // already-streamed output — regardless of remaining budget.
+        assert!(!should_retry_idle_stall(true, 0, 100));
+    }
+
+    /// A stream that's persistently 429'd (never a stall) fails inside the
+    /// inner 429 loop's own `max_rate_limit_retries` cap and never touches
+    /// the outer idle-restart logic at all — so its request count must stay
+    /// exactly `max_rate_limit_retries + 1`, not get multiplied by
+    /// `MAX_STREAM_IDLE_RETRIES + 1` the way the old nested loops could for
+    /// an interleaved stall+429 stream. Regression coverage for the
+    /// unchanged half of the I-84 fix (sleeps out one real 2s backoff).
+    #[tokio::test]
+    async fn stream_persistent_429_fails_without_touching_idle_budget() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(POST).path("/v1/messages");
+            then.status(429)
+                .header("content-type", "application/json")
+                .body(r#"{"error":{"type":"rate_limit_error"}}"#);
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages", server.url("")),
+        )
+        .with_tuning(&crate::tuning::ProviderTuning {
+            max_retries: 1,
+            ..crate::tuning::ProviderTuning::for_provider("anthropic")
+        });
+        let result = client.stream(&make_request(None), |_ev| {}).await;
+        assert!(result.is_err());
+        m.assert_hits(2);
+    }
+
+    // ── I-75: the native 429 backoff releases its concurrency permit ────
+
+    /// `send()`'s own 429 backoff sleep must not hold the concurrency
+    /// permit — otherwise every other concurrent Anthropic call is starved
+    /// for the whole backoff ladder, the exact failure mode the
+    /// `RetryingProvider(ThrottledProvider(..))` ordering avoids for every
+    /// other provider. Sleeps out one real ~2s backoff, sampling permit
+    /// availability mid-sleep. Uses a private, test-only semaphore (set
+    /// directly on the private field, not via `with_tuning`) rather than
+    /// the name-keyed process-wide registry `with_tuning` normally wires
+    /// up — that registry is cached per provider name across the whole
+    /// test binary, so a `max_concurrency: 1` requested here could
+    /// silently be ignored if some other "anthropic"-named test already
+    /// initialized it at a different size.
+    #[tokio::test]
+    async fn native_429_backoff_releases_the_concurrency_permit() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(POST).path("/v1/messages");
+            then.status(429)
+                .header("content-type", "application/json")
+                .body(r#"{"error":{"type":"rate_limit_error"}}"#);
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages", server.url("")),
+        )
+        .with_tuning(&crate::tuning::ProviderTuning {
+            max_retries: 1,
+            ..crate::tuning::ProviderTuning::for_provider("anthropic")
+        });
+        let sem = Arc::new(Semaphore::new(1));
+        client.semaphore = Some(sem.clone());
+
+        let request = make_request(None);
+        let handle = tokio::spawn(async move {
+            let _ = client.send(&request).await;
+        });
+
+        // The first attempt (429) should have completed and be mid-way
+        // through its ~2s backoff sleep by now.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the permit was still held during the native 429 backoff sleep"
+        );
+
+        handle.await.unwrap();
+        m.assert_hits(2);
+        assert_eq!(sem.available_permits(), 1, "permit leaked after the call");
+    }
+
+    /// Same property for `stream()`'s inner 429-retry loop.
+    #[tokio::test]
+    async fn native_stream_429_backoff_releases_the_concurrency_permit() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(POST).path("/v1/messages");
+            then.status(429)
+                .header("content-type", "application/json")
+                .body(r#"{"error":{"type":"rate_limit_error"}}"#);
+        });
+        let mut client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages", server.url("")),
+        )
+        .with_tuning(&crate::tuning::ProviderTuning {
+            max_retries: 1,
+            ..crate::tuning::ProviderTuning::for_provider("anthropic")
+        });
+        let sem = Arc::new(Semaphore::new(1));
+        client.semaphore = Some(sem.clone());
+
+        let request = make_request(None);
+        let handle = tokio::spawn(async move {
+            let _ = client.stream(&request, |_ev| {}).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the permit was still held during stream()'s native 429 backoff sleep"
+        );
+
+        handle.await.unwrap();
+        m.assert_hits(2);
+        assert_eq!(sem.available_permits(), 1, "permit leaked after the call");
     }
 
     #[tokio::test]

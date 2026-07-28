@@ -117,11 +117,13 @@ impl LlmProvider for LocalModelProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                message: text,
-            });
+            return Err(crate::error::api_error_from_response(
+                status.as_u16(),
+                &headers,
+                text,
+            ));
         }
 
         let json: serde_json::Value = response

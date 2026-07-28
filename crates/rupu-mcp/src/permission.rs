@@ -26,6 +26,23 @@ impl McpPermission {
         }
     }
 
+    /// Same mode and `ask` callback, but the allowlist narrowed to exactly
+    /// one tool (ISSUES.md I-79).
+    ///
+    /// Used by `execute_action_step` so an `action:` step's dispatch is
+    /// constrained *structurally* to the tool named in the workflow, rather
+    /// than relying on the invariant that the run-scoped dispatcher is only
+    /// ever handed one tool name. That invariant holds today, but it is
+    /// enforced three modules away, so any future caller reusing the
+    /// dispatcher would silently widen the surface with no local signal.
+    pub fn narrowed_to(&self, tool: &str) -> Self {
+        Self {
+            mode: self.mode,
+            allowlist: vec![tool.to_string()],
+            ask_cb: self.ask_cb.clone(),
+        }
+    }
+
     /// Bypass mode + `*` allowlist — used by `rupu mcp serve` (where the
     /// upstream MCP client handles confirmation prompts) and by tests.
     pub fn allow_all() -> Self {

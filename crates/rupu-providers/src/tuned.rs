@@ -93,12 +93,13 @@ impl LlmProvider for ThrottledProvider {
         self.inner.provider_id()
     }
 
-    // `list_models` is deliberately NOT forwarded: `async_trait` gives the
-    // `&self` default method a `Self: Sync` bound, and `Box<dyn LlmProvider>`
-    // is `Send` only. No caller reaches `list_models` through a boxed
-    // provider — `rupu models refresh` calls it on the concrete client for
-    // exactly this reason (`rupu-cli/src/cmd/models.rs:206-208`) — so the
-    // inherited empty-vec default is never observed.
+    // I-76: forwarded now that `LlmProvider: Send + Sync` (see provider.rs)
+    // makes it possible to call the inner boxed provider's real
+    // `list_models` through the trait object at all — see
+    // `tests::throttled_provider_forwards_list_models_through_a_boxed_decorator`.
+    async fn list_models(&self) -> Vec<crate::model_pool::ModelInfo> {
+        self.inner.list_models().await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -119,7 +120,36 @@ pub fn is_retryable(e: &ProviderError) -> bool {
     }
 }
 
-/// Re-issues a failed call up to `max_retries` times with exponential backoff.
+/// Ceiling on a server-supplied `Retry-After` (I-83). Chosen to match the
+/// ceiling `tuning::retry_backoff` already imposes on its own computed
+/// ladder (2s, 4s, 8s, …, capped at 60s): a well-behaved API's rate-limit
+/// window shouldn't need to outrun the worst case we'd already wait on our
+/// own backoff, and a hostile or misconfigured `Retry-After: 86400` must not
+/// be able to hang a run for a day.
+pub const RETRY_AFTER_CAP: Duration = Duration::from_secs(60);
+
+/// Extracts `retry_after` from a `RateLimited` error, if any.
+fn retry_after_of(e: &ProviderError) -> Option<Duration> {
+    match e {
+        ProviderError::RateLimited { retry_after } => *retry_after,
+        _ => None,
+    }
+}
+
+/// The delay to actually sleep before the next attempt: the server's
+/// `Retry-After` (capped) when the failed response carried one, otherwise
+/// the computed exponential backoff. The server knows its own rate-limit
+/// window better than a fixed ladder does.
+fn effective_delay(computed: Duration, retry_after: Option<Duration>) -> Duration {
+    match retry_after {
+        Some(d) => d.min(RETRY_AFTER_CAP),
+        None => computed,
+    }
+}
+
+/// Re-issues a failed call up to `max_retries` times with exponential
+/// backoff — or the server's `Retry-After` when the error carried one
+/// (I-83).
 pub struct RetryingProvider {
     inner: Box<dyn LlmProvider>,
     max_retries: u32,
@@ -158,7 +188,7 @@ impl LlmProvider for RetryingProvider {
                     if attempt >= self.max_retries || !is_retryable(&e) {
                         return Err(e);
                     }
-                    let delay = (self.backoff)(attempt);
+                    let delay = effective_delay((self.backoff)(attempt), retry_after_of(&e));
                     warn!(
                         attempt = attempt + 1,
                         budget = self.max_retries,
@@ -195,7 +225,7 @@ impl LlmProvider for RetryingProvider {
                     if emitted || attempt >= self.max_retries || !is_retryable(&e) {
                         return Err(e);
                     }
-                    let delay = (self.backoff)(attempt);
+                    let delay = effective_delay((self.backoff)(attempt), retry_after_of(&e));
                     warn!(
                         attempt = attempt + 1,
                         budget = self.max_retries,
@@ -218,12 +248,10 @@ impl LlmProvider for RetryingProvider {
         self.inner.provider_id()
     }
 
-    // `list_models` is deliberately NOT forwarded: `async_trait` gives the
-    // `&self` default method a `Self: Sync` bound, and `Box<dyn LlmProvider>`
-    // is `Send` only. No caller reaches `list_models` through a boxed
-    // provider — `rupu models refresh` calls it on the concrete client for
-    // exactly this reason (`rupu-cli/src/cmd/models.rs:206-208`) — so the
-    // inherited empty-vec default is never observed.
+    // I-76: see the matching comment on ThrottledProvider above.
+    async fn list_models(&self) -> Vec<crate::model_pool::ModelInfo> {
+        self.inner.list_models().await
+    }
 }
 
 #[cfg(test)]
@@ -320,6 +348,23 @@ mod tests {
 
         fn provider_id(&self) -> ProviderId {
             ProviderId::Anthropic
+        }
+
+        async fn list_models(&self) -> Vec<crate::model_pool::ModelInfo> {
+            vec![probe_model_info("probe-model")]
+        }
+    }
+
+    /// Minimal fixture, mirroring `github_copilot::make_model_info`.
+    fn probe_model_info(id: &str) -> crate::model_pool::ModelInfo {
+        crate::model_pool::ModelInfo {
+            id: id.to_string(),
+            provider: ProviderId::Anthropic,
+            context_window: 0,
+            max_output_tokens: 0,
+            capabilities: Vec::new(),
+            cost: crate::model_pool::ModelCost::default(),
+            status: crate::model_pool::ModelStatus::default(),
         }
     }
 
@@ -567,5 +612,176 @@ mod tests {
         assert!(!is_retryable(&ProviderError::BadRequest {
             message: String::new()
         }));
+    }
+
+    // ── I-83: server-supplied Retry-After wins over the computed backoff ────
+
+    #[test]
+    fn effective_delay_prefers_server_retry_after_over_computed_backoff() {
+        let computed = Duration::from_secs(2);
+        let server = Some(Duration::from_secs(3));
+        assert_eq!(effective_delay(computed, server), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn effective_delay_falls_back_to_computed_backoff_without_a_header() {
+        let computed = Duration::from_secs(2);
+        assert_eq!(effective_delay(computed, None), computed);
+    }
+
+    #[test]
+    fn effective_delay_caps_a_hostile_retry_after() {
+        let computed = Duration::from_secs(2);
+        let hostile = Some(Duration::from_secs(86_400));
+        assert_eq!(effective_delay(computed, hostile), RETRY_AFTER_CAP);
+    }
+
+    /// A 429 that carries `Retry-After: 3` must sleep ~3s, not the 2s the
+    /// configured backoff schedule would compute for attempt 0. Uses paused
+    /// tokio time so the test doesn't actually wait 3 real seconds: at t+2.5s
+    /// (past the computed backoff, short of the server's) the retry must not
+    /// have fired yet; at t+3.1s it must have.
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_header_is_honored_over_computed_backoff() {
+        struct RetryAfterProbe {
+            calls: Arc<AtomicUsize>,
+            retry_after: Option<Duration>,
+        }
+        #[async_trait]
+        impl LlmProvider for RetryAfterProbe {
+            async fn send(&mut self, _r: &LlmRequest) -> Result<LlmResponse, ProviderError> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    return Err(ProviderError::RateLimited {
+                        retry_after: self.retry_after,
+                    });
+                }
+                Ok(ok_response())
+            }
+            async fn stream(
+                &mut self,
+                _r: &LlmRequest,
+                _e: &mut (dyn FnMut(StreamEvent) + Send),
+            ) -> Result<LlmResponse, ProviderError> {
+                unreachable!()
+            }
+            fn default_model(&self) -> &str {
+                "m"
+            }
+            fn provider_id(&self) -> ProviderId {
+                ProviderId::Anthropic
+            }
+        }
+
+        fn fixed_2s(_attempt: u32) -> Duration {
+            Duration::from_secs(2)
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut p = RetryingProvider::new(
+            Box::new(RetryAfterProbe {
+                calls: calls.clone(),
+                retry_after: Some(Duration::from_secs(3)),
+            }),
+            1,
+        )
+        .with_backoff(fixed_2s);
+
+        let handle = tokio::spawn(async move {
+            p.send(&req()).await.unwrap();
+        });
+        // Let the spawned task run up to its sleep point (registering the
+        // backoff timer) before the clock moves — otherwise `advance` below
+        // would find no timer yet and the "still sleeping" assertion would
+        // pass vacuously regardless of which delay was actually chosen.
+        tokio::task::yield_now().await;
+
+        // Past the computed 2s backoff, short of the server's 3s: must still
+        // be sleeping.
+        tokio::time::advance(Duration::from_millis(2_500)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !handle.is_finished(),
+            "retried before the server's Retry-After elapsed \
+             (computed backoff was used instead)"
+        );
+
+        // Past the server's 3s: must have completed.
+        tokio::time::advance(Duration::from_millis(700)).await;
+        handle.await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// The counter-example: without a `Retry-After` header, the computed
+    /// backoff is used as before — a 429 with `retry_after: None` must
+    /// retry once the *computed* delay elapses, not wait for anything else.
+    #[tokio::test(start_paused = true)]
+    async fn no_retry_after_header_falls_back_to_computed_backoff() {
+        let probe = Probe::new(1); // RateLimited { retry_after: None }, then ok
+        let calls = probe.calls.clone();
+
+        fn fixed_2s(_attempt: u32) -> Duration {
+            Duration::from_secs(2)
+        }
+
+        let mut p = RetryingProvider::new(Box::new(probe), 1).with_backoff(fixed_2s);
+
+        let handle = tokio::spawn(async move {
+            p.send(&req()).await.unwrap();
+        });
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_millis(1_900)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !handle.is_finished(),
+            "retried before the computed backoff elapsed"
+        );
+
+        tokio::time::advance(Duration::from_millis(200)).await;
+        handle.await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    // ── I-76: decorators forward list_models ─────────────────────────────
+
+    /// Through a `Box<dyn LlmProvider>` — not the concrete inner type — a
+    /// `ThrottledProvider` must return the wrapped provider's real models,
+    /// not the trait's empty-vec default.
+    #[tokio::test]
+    async fn throttled_provider_forwards_list_models_through_a_boxed_decorator() {
+        let tuning = ProviderTuning::for_provider("list-models-throttle-test");
+        let throttled: Box<dyn LlmProvider> = Box::new(ThrottledProvider::wrap(
+            Box::new(Probe::new(0)),
+            "list-models-throttle-test",
+            &tuning,
+        ));
+        let models = throttled.list_models().await;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "probe-model");
+    }
+
+    /// Same property for `RetryingProvider`.
+    #[tokio::test]
+    async fn retrying_provider_forwards_list_models_through_a_boxed_decorator() {
+        let retrying: Box<dyn LlmProvider> =
+            Box::new(RetryingProvider::new(Box::new(Probe::new(0)), 1));
+        let models = retrying.list_models().await;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "probe-model");
+    }
+
+    /// Both decorators stacked, as `provider_factory::decorate` actually
+    /// builds them (`RetryingProvider(ThrottledProvider(client))`) — the
+    /// realistic factory-built shape the bug report was about.
+    #[tokio::test]
+    async fn stacked_decorators_forward_list_models() {
+        let tuning = ProviderTuning::for_provider("list-models-stacked-test");
+        let throttled =
+            ThrottledProvider::wrap(Box::new(Probe::new(0)), "list-models-stacked-test", &tuning);
+        let stacked: Box<dyn LlmProvider> = Box::new(RetryingProvider::new(Box::new(throttled), 1));
+        let models = stacked.list_models().await;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "probe-model");
     }
 }

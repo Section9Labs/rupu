@@ -15,7 +15,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-keyring.workspace = true
 tiny_http.workspace = true
 webbrowser.workspace = true
 rand.workspace = true
@@ -28,10 +27,10 @@ tokio.workspace = true
 chrono.workspace = true
 dirs.workspace = true
 rupu-providers = { path = "../rupu-providers" }
-rupu-keychain-acl = { path = "../rupu-keychain-acl" }
 
 [dev-dependencies]
 httpmock.workspace = true
 tempfile.workspace = true
 assert_fs.workspace = true
 predicates.workspace = true
+serial_test.workspace = true

@@ -174,16 +174,7 @@ pub(crate) fn build_chat_request_body(request: &LlmRequest, stream: bool) -> ser
     }
 
     if let Some(level) = &request.thinking {
-        use crate::model_tier::ThinkingLevel;
-        let effort = match level {
-            ThinkingLevel::Auto => None,
-            ThinkingLevel::Minimal => Some("minimal"),
-            ThinkingLevel::Low => Some("low"),
-            ThinkingLevel::Medium => Some("medium"),
-            ThinkingLevel::High => Some("high"),
-            ThinkingLevel::Max => Some("xhigh"),
-        };
-        if let Some(e) = effort {
+        if let Some(e) = level.openai_effort_str() {
             body["reasoning_effort"] = serde_json::json!(e);
         }
     }

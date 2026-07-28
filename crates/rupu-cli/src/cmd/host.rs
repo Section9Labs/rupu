@@ -1,7 +1,7 @@
 //! `rupu host add | list | remove` — manage named rupu-cp hosts.
 //!
 //! Each host is stored as a TOML file under `~/.rupu/hosts/`; tokens live in
-//! the system keychain. The built-in `local` host is always shown first in
+//! the chmod-600 token store. The built-in `local` host is always shown first in
 //! `list` and may not be removed.
 
 #![deny(clippy::all)]
@@ -86,13 +86,13 @@ pub async fn handle(action: Action) -> ExitCode {
 
 // ---------------------------------------------------------------------------
 // Inner helpers — `pub(crate)` so tests can call them with an explicit store
-// root (tempdir) and skip touching the real `~/.rupu/` or system keychain.
+// root (tempdir) and skip touching the real `~/.rupu/` token store.
 // ---------------------------------------------------------------------------
 
 /// Add a host. Returns the newly-minted host id.
 ///
-/// `token` is stored in the system keychain when `Some`; pass `None` to skip
-/// (useful in test environments where keychain access is unavailable).
+/// `token` is stored in the chmod-600 token store when `Some`; pass `None`
+/// to skip (useful in tests that must not write to the real store).
 pub(crate) fn add_host(
     store_root: PathBuf,
     name: String,
@@ -111,7 +111,7 @@ pub(crate) fn add_host(
     let store = HostStore { root: store_root };
     store.save(&host).context("save host record")?;
     if let Some(tok) = token {
-        set_host_token(&id, &tok).context("store token in keychain")?;
+        set_host_token(&id, &tok).context("store host token")?;
     }
     Ok(id)
 }
@@ -178,7 +178,7 @@ pub(crate) fn list_hosts(
 
 /// Remove a host by id. Refuses the built-in `"local"` id with an error.
 ///
-/// Keychain deletion is **best-effort**: a locked or unavailable keychain
+/// Token deletion is **best-effort**: an unreadable token store
 /// produces a warning but does not fail the command after the store record
 /// has already been removed — matches [`HostRegistry::remove_host`]'s
 /// behaviour so the CLI and CP are consistent.
@@ -188,9 +188,9 @@ pub(crate) fn remove_host(store_root: PathBuf, id: String) -> anyhow::Result<()>
     }
     let store = HostStore { root: store_root };
     store.delete(&id).context("delete host record")?;
-    // Best-effort: a locked keychain must not fail the command post-deletion.
+    // Best-effort: an unreadable token store must not fail the command post-deletion.
     if let Err(e) = delete_host_token(&id) {
-        tracing::warn!(host_id = %id, error = %e, "host remove: could not delete token from keychain; continuing");
+        tracing::warn!(host_id = %id, error = %e, "host remove: could not delete host token; continuing");
     }
     Ok(())
 }
@@ -266,7 +266,7 @@ mod tests {
             root.clone(),
             "prod".into(),
             "https://rupu.example.com".into(),
-            None, // skip keychain in test environments
+            None, // skip the token store in test environments
         )
         .expect("add_host failed");
         assert!(id.starts_with("host_"), "id should start with host_: {id}");

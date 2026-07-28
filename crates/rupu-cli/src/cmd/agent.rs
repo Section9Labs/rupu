@@ -418,7 +418,23 @@ async fn create(
                 model,
                 available_agents: vec![],
             };
-            let outcome = rupu_orchestrator::generate_definition(&req, &resolver).await?;
+            // ISSUES.md I-74: pass the operator's `[providers.<name>]`
+            // settings through instead of silently generating with none.
+            let gen_cfg = layered_config(&global, project_root.as_deref());
+            let gen_provider_config = rupu_runtime::provider_factory::ProviderConfig {
+                anthropic_oauth_system_prefix: None,
+                openai_compatible: rupu_runtime::provider_factory::openai_compatible_params(
+                    &req.provider,
+                    &gen_cfg.providers,
+                ),
+                tuning: Some(rupu_runtime::provider_factory::provider_tuning(
+                    &req.provider,
+                    &gen_cfg.providers,
+                )),
+            };
+            let outcome =
+                rupu_orchestrator::generate_definition(&req, &resolver, &gen_provider_config)
+                    .await?;
             outcome.content
         }
         None => AGENT_TEMPLATE.replace("{{name}}", &name),

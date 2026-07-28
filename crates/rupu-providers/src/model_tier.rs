@@ -23,6 +23,27 @@ pub enum ThinkingLevel {
     Max,
 }
 
+impl ThinkingLevel {
+    /// Shared OpenAI-flavored `reasoning_effort` / `reasoning.effort`
+    /// string mapping. Both `openai_wire` (Chat Completions'
+    /// `reasoning_effort` field) and `openai_codex` (Responses API's
+    /// `reasoning.effort` field) use this identical ladder — factored
+    /// here so there is a single definition instead of two
+    /// hand-duplicated `match` blocks. `Auto` maps to `None`: OpenAI
+    /// doesn't accept `"auto"` as a value, and omitting the field is
+    /// how you ask the server to pick adaptively.
+    pub fn openai_effort_str(&self) -> Option<&'static str> {
+        match self {
+            ThinkingLevel::Auto => None,
+            ThinkingLevel::Minimal => Some("minimal"),
+            ThinkingLevel::Low => Some("low"),
+            ThinkingLevel::Medium => Some("medium"),
+            ThinkingLevel::High => Some("high"),
+            ThinkingLevel::Max => Some("xhigh"),
+        }
+    }
+}
+
 /// Desired context-window size for a request. Each provider maps this
 /// to the right beta header / generation setting. Currently rupu
 /// recognizes the default and the 1M-token tier (Anthropic Sonnet/Opus 4

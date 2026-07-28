@@ -1201,7 +1201,7 @@ dependencies = [
  "cocoa-foundation 0.1.2",
  "core-foundation 0.9.4",
  "core-graphics 0.23.2",
- "foreign-types 0.5.0",
+ "foreign-types",
  "libc",
  "objc",
 ]
@@ -1217,7 +1217,7 @@ dependencies = [
  "cocoa-foundation 0.2.0",
  "core-foundation 0.10.0",
  "core-graphics 0.24.0",
- "foreign-types 0.5.0",
+ "foreign-types",
  "libc",
  "objc",
 ]
@@ -1428,7 +1428,7 @@ dependencies = [
  "bitflags 1.3.2",
  "core-foundation 0.9.4",
  "core-graphics-types 0.1.3",
- "foreign-types 0.5.0",
+ "foreign-types",
  "libc",
 ]
 
@@ -1441,7 +1441,7 @@ dependencies = [
  "bitflags 2.11.1",
  "core-foundation 0.10.0",
  "core-graphics-types 0.2.0",
- "foreign-types 0.5.0",
+ "foreign-types",
  "libc",
 ]
 
@@ -1454,7 +1454,7 @@ dependencies = [
  "bitflags 2.11.1",
  "core-foundation 0.9.4",
  "core-graphics-types 0.1.3",
- "foreign-types 0.5.0",
+ "foreign-types",
  "libc",
 ]
 
@@ -1501,7 +1501,7 @@ checksum = "a593227b66cbd4007b2a050dfdd9e1d1318311409c8d600dc82ba1b15ca9c130"
 dependencies = [
  "core-foundation 0.10.0",
  "core-graphics 0.24.0",
- "foreign-types 0.5.0",
+ "foreign-types",
  "libc",
 ]
 
@@ -1771,28 +1771,6 @@ name = "data-url"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
-
-[[package]]
-name = "dbus"
-version = "0.9.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b942602992bb7acfd1f51c49811c58a610ef9181b6e66f3e519d79b540a3bf73"
-dependencies = [
- "libc",
- "libdbus-sys",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "dbus-secret-service"
-version = "4.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "708b509edf7889e53d7efb0ffadd994cc6c2345ccb62f55cfd6b0682165e4fa6"
-dependencies = [
- "dbus",
- "openssl",
- "zeroize",
-]
 
 [[package]]
 name = "deflate64"
@@ -2436,21 +2414,12 @@ dependencies = [
 
 [[package]]
 name = "foreign-types"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6f339eb8adc052cd2ca78910fda869aefa38d22d5cb648e6485e4d3fc06f3b1"
-dependencies = [
- "foreign-types-shared 0.1.1",
-]
-
-[[package]]
-name = "foreign-types"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d737d9aa519fb7b749cbc3b962edcf310a8dd1f4b67c91c4f83975dbdd17d965"
 dependencies = [
  "foreign-types-macros",
- "foreign-types-shared 0.3.1",
+ "foreign-types-shared",
 ]
 
 [[package]]
@@ -2463,12 +2432,6 @@ dependencies = [
  "quote",
  "syn 2.0.117",
 ]
-
-[[package]]
-name = "foreign-types-shared"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
 name = "foreign-types-shared"
@@ -2886,7 +2849,7 @@ dependencies = [
  "derive_more",
  "embed-resource",
  "etagere",
- "foreign-types 0.5.0",
+ "foreign-types",
  "futures",
  "futures-concurrency",
  "getrandom 0.3.4",
@@ -2992,7 +2955,7 @@ dependencies = [
  "derive_more",
  "dispatch2",
  "etagere",
- "foreign-types 0.5.0",
+ "foreign-types",
  "futures",
  "gpui",
  "image",
@@ -4051,22 +4014,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "keyring"
-version = "3.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eebcc3aff044e5944a8fbaf69eb277d11986064cba30c468730e8b9909fb551c"
-dependencies = [
- "byteorder",
- "dbus-secret-service",
- "log",
- "openssl",
- "security-framework 2.11.1",
- "security-framework 3.7.0",
- "windows-sys 0.60.2",
- "zeroize",
-]
-
-[[package]]
 name = "khronos-egl"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4204,16 +4151,6 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
-
-[[package]]
-name = "libdbus-sys"
-version = "0.2.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "328c4789d42200f1eeec05bd86c9c13c7f091d2ba9a6ea35acdf51f31bc0f043"
-dependencies = [
- "cc",
- "pkg-config",
-]
 
 [[package]]
 name = "libfuzzer-sys"
@@ -4488,7 +4425,7 @@ dependencies = [
  "core-foundation 0.10.0",
  "core-video",
  "ctor",
- "foreign-types 0.5.0",
+ "foreign-types",
  "metal",
  "objc",
 ]
@@ -4532,7 +4469,7 @@ dependencies = [
  "bitflags 2.11.1",
  "block",
  "core-graphics-types 0.2.0",
- "foreign-types 0.5.0",
+ "foreign-types",
  "log",
  "objc",
  "paste",
@@ -5237,32 +5174,6 @@ dependencies = [
  "zbus_macros",
  "zeroize",
  "zvariant",
-]
-
-[[package]]
-name = "openssl"
-version = "0.10.78"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f38c4372413cdaaf3cc79dd92d29d7d9f5ab09b51b10dded508fb90bb70b9222"
-dependencies = [
- "bitflags 2.11.1",
- "cfg-if",
- "foreign-types 0.3.2",
- "libc",
- "once_cell",
- "openssl-macros",
- "openssl-sys",
-]
-
-[[package]]
-name = "openssl-macros"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a948666b637a0f465e8564c73e89d4dde00d72d4d473cc972f390fc3dcee7d9c"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -6337,8 +6248,9 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
 name = "rupu-agent"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
+ "anyhow",
  "assert_fs",
  "async-trait",
  "chrono",
@@ -6365,7 +6277,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-app"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6403,7 +6315,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-app-canvas"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
  "insta",
  "rupu-orchestrator",
@@ -6412,7 +6324,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-ast"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -6427,7 +6339,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-auth"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -6436,14 +6348,13 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "httpmock",
- "keyring",
  "predicates",
  "rand 0.8.6",
  "reqwest 0.12.28",
- "rupu-keychain-acl",
  "rupu-providers",
  "serde",
  "serde_json",
+ "serial_test",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
@@ -6456,7 +6367,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-cli"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -6517,7 +6428,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-config"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
  "serde",
  "tempfile",
@@ -6528,7 +6439,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-coverage"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
  "chrono",
  "glob",
@@ -6547,7 +6458,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-cp"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6594,19 +6505,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "rupu-keychain-acl"
-version = "0.69.0"
-dependencies = [
- "core-foundation 0.10.0",
- "core-foundation-sys",
- "security-framework-sys",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
 name = "rupu-mcp"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6626,7 +6526,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-orchestrator"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
  "assert_fs",
  "async-trait",
@@ -6658,7 +6558,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-providers"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6681,7 +6581,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-runtime"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6703,7 +6603,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-scm"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6720,6 +6620,7 @@ dependencies = [
  "rupu-auth",
  "rupu-config",
  "rupu-providers",
+ "rupu-scm",
  "serde",
  "serde_json",
  "tempfile",
@@ -6731,7 +6632,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-tools"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
  "assert_fs",
  "async-trait",
@@ -6750,7 +6651,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-transcript"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
  "chrono",
  "serde",
@@ -6763,7 +6664,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-update"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
  "async-trait",
  "reqwest 0.12.28",
@@ -6779,7 +6680,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-webhook"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6802,19 +6703,20 @@ dependencies = [
 
 [[package]]
 name = "rupu-workspace"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
  "assert_fs",
  "chrono",
+ "dirs 5.0.1",
  "git2",
  "hex",
  "ignore",
- "keyring",
  "predicates",
  "rand 0.8.6",
  "rupu-runtime",
  "serde",
  "serde_json",
+ "serial_test",
  "sha2",
  "subtle",
  "tar",
@@ -6938,7 +6840,7 @@ dependencies = [
  "openssl-probe 0.2.1",
  "rustls-pki-types",
  "schannel",
- "security-framework 3.7.0",
+ "security-framework",
 ]
 
 [[package]]
@@ -6966,7 +6868,7 @@ dependencies = [
  "rustls-native-certs",
  "rustls-platform-verifier-android",
  "rustls-webpki",
- "security-framework 3.7.0",
+ "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
  "windows-sys 0.61.2",
@@ -7161,19 +7063,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
 dependencies = [
  "zeroize",
-]
-
-[[package]]
-name = "security-framework"
-version = "2.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "897b2245f0b511c87893af39b033e5ca9cce68824c4d7e7630b5a1d339658d02"
-dependencies = [
- "bitflags 2.11.1",
- "core-foundation 0.9.4",
- "core-foundation-sys",
- "libc",
- "security-framework-sys",
 ]
 
 [[package]]

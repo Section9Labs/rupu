@@ -62,7 +62,9 @@ SaaS control plane and remote sandboxing are still out of scope here; SCM and is
 
 - Bitbucket, Linear, and Jira connectors.
 - General DAG scheduling beyond the current sequential-step engine.
-- Workflow action effects (open PR, post comment). v0 logs `action_emitted` only.
+- ~~Workflow action effects (open PR, post comment). v0 logs `action_emitted` only.~~
+  **Shipped since** — `action:` steps now execute for real through the in-process MCP
+  tool layer (`docs/superpowers/plans/2026-07-23-rupu-gate-nodes-plan-2-action-execution.md`).
 - Workflow action effects beyond today's transcripted action-protocol validation.
 - Transcript compaction, resume from aborted run, concurrent-run locking.
 - SaaS control plane, remote runs, OAuth flows.
@@ -243,12 +245,19 @@ YAML, one file per workflow at `<dir>/workflows/<name>.yaml`. Validated at parse
 
 Current `rupu` workflows run steps in declaration order, but each step can also use `when:`, `for_each:`, `parallel:`, `panel:`, and `approval:`. For the up-to-date schema, rely on `docs/workflow-format.md` rather than the original Slice A narrative below.
 
-Engine behavior per step:
+Engine behavior per step (Slice A narrative — superseded, see below):
 
 1. Render `prompt:` as a minijinja template with `inputs.*` and `steps.<id>.output` variables.
 2. Spawn an agent run with the rendered prompt.
-3. For each `action_emitted` event, check the step's `actions:` allowlist. Log `applied:
-   true|false` in the transcript. v0 does not execute effects — Slice B wires them.
+3. ~~For each `action_emitted` event, check the step's `actions:` allowlist. Log `applied:
+   true|false` in the transcript. v0 does not execute effects — Slice B wires them.~~
+   **No such per-event allowlist check ever shipped.** `actions:` is not a runtime validator
+   of emitted events — it statically narrows which MCP connector tools (`scm.*`, `issues.*`,
+   `github.*`, `gitlab.*`) the step's agent grant is allowed to call, at step-build time, via
+   `narrow_agent_tools`; builtins are never touched. Standalone `action:` steps (as opposed to
+   narrowed agent steps) execute their tool call for real through the MCP `ToolDispatcher`.
+   See `docs/workflow-format.md#actions` for the current, correct semantics — this is the
+   same phantom validator ISSUES.md I-27 deleted and I-51 corrected elsewhere.
 4. On step failure, abort the workflow.
 5. After all steps, emit `run_complete` with cumulative token counts.
 
