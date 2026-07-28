@@ -132,7 +132,7 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-67 | P1 | docs | `rupu cp`, `host`, `node`, `update`, `session`, `autoflow`, `cleanup` are undocumented | open |
 | I-68 | P1 | docs | `rupu workflow approve\|reject --gate <step-id>` is unmentioned but required for multi-gate runs | open |
 | I-69 | P1 | rupu-cli | `rupu cp serve --help` describes an HTTP server; it also runs autoflow, cron and gate-sweep daemons | open |
-| I-70 | P1 | docs/specs | The gate/action design spec's own YAML examples fail schema validation | open |
+| I-70 | P1 | docs/specs | The gate/action design spec's own YAML examples fail schema validation | fixed |
 | I-71 | P2 | README | The subcommand table omits 7 shipped commands; provider count and "not in this binary" are stale | open |
 | I-72 | P2 | docs/providers | `[pricing]` is recommended but its schema is documented nowhere | open |
 
@@ -406,6 +406,29 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-70 — the gate/action design spec is flagged as drifted
+
+**This is the drift that started the whole program.** The operator spotted that the spec's
+`with:` examples would fail schema validation and that it lists `scm.prs.add_labels`, which
+isn't in `tool_catalog()` — which prompted the audit that produced this tracker.
+
+**Verified.** `scm.prs.add_labels` appears in the spec's §3 v1 action set and **nowhere in
+the code** — a workflow copying it fails at parse time with `ActionsUnknownTool`. The real
+shipped catalog is 17 tools: `issues.create|comment|get|list|update_state`,
+`scm.prs.create|comment|get|list|diff`, `scm.branches.create|list`, `scm.repos.get|list`,
+`scm.files.read`, `github.workflows_dispatch`, `gitlab.pipeline_trigger`. The spec also
+predates two rules it therefore violates: `ActionsOnActionStep` and Arc 4's templated-value
+coercion.
+
+**Fix: a dated correction banner, not a rewrite.** Specs in this repo are records of what
+was approved on a date; editing the body would falsify the record. This is the same
+reasoning Arc 3 used to leave 18 historical plan/spec files untouched. The banner states
+plainly that the YAML must not be copied, lists the real catalog, and points at the
+authoritative references (`docs/workflow-format.md` and `rupu mcp` / `GET /api/tools`) — so
+the document stays honest as history without misleading anyone who reads it as guidance.
+
+---
 
 ### I-53 + I-61 — closed by Arc 4, recorded here for the ledger
 
