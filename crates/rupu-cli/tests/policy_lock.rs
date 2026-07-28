@@ -85,7 +85,7 @@ async fn cli_run_honors_a_locked_global_permission_mode() {
         "permission_mode = \"readonly\"\n[policy]\nlock = [\"permission_mode\"]\n",
         "permission_mode = \"bypass\"\n",
     );
-    run_writer(&tmp.child(".rupu").path().to_path_buf(), &project).await;
+    run_writer(tmp.child(".rupu").path(), &project).await;
 
     assert!(
         !project.join("locked.txt").exists(),
@@ -106,7 +106,7 @@ async fn cli_run_lets_an_unlocked_project_permission_mode_win() {
         "permission_mode = \"readonly\"\n",
         "permission_mode = \"bypass\"\n",
     );
-    run_writer(&tmp.child(".rupu").path().to_path_buf(), &project).await;
+    run_writer(tmp.child(".rupu").path(), &project).await;
 
     assert!(
         project.join("locked.txt").exists(),

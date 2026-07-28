@@ -29,7 +29,9 @@ pub struct UpdateArgs {
     /// channel's latest if this build is ahead of it).
     #[arg(long)]
     pub force: bool,
-    /// Skip the confirmation prompt.
+    /// Deprecated no-op: `rupu update` no longer prompts, so there is
+    /// nothing to skip. Still accepted so existing scripts and aliases
+    /// that pass `-y` keep working.
     #[arg(long, short = 'y')]
     pub yes: bool,
     /// Override the configured channel for this run.
@@ -146,20 +148,13 @@ async fn run(args: UpdateArgs) -> anyhow::Result<ExitCode> {
         .latest
         .clone()
         .expect("check always sets latest when an asset exists");
-    if !args.yes {
-        eprint!(
-            "Update rupu {} → {to} ({channel})? [y/N] ",
-            ctx.current_version
-        );
-        use std::io::Write;
-        std::io::stderr().flush().ok();
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line).ok();
-        if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-            println!("Aborted.");
-            return Ok(ExitCode::SUCCESS);
-        }
-    }
+    // No confirmation prompt: running `rupu update` IS the confirmation.
+    // Asking again buys nothing (the user typed the command), and it made
+    // the command unusable anywhere stdin isn't a terminal — CI, a cron
+    // tick, `rupu cp serve` — where `read_line` hit EOF and the run
+    // silently reported "Aborted." Use `--check` to see whether an update
+    // is available without installing it. The target version is not lost:
+    // `UpdateProgress::start` below renders `from → to (channel)`.
 
     // Resolve UI prefs so the progress bar matches the configured theme.
     // `resolve` also installs the active palette as a side effect — this
