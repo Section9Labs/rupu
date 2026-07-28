@@ -6,6 +6,7 @@ mod common;
 
 #[tokio::test]
 async fn get_repo_translates() {
+    rupu_scm::install_default_crypto_provider();
     let server = MockServer::start();
     let body = std::fs::read_to_string("tests/fixtures/github/repo_get_happy.json").unwrap();
     server.mock(|when, then| {
@@ -30,6 +31,7 @@ async fn get_repo_translates() {
 
 #[tokio::test]
 async fn get_pr_translates() {
+    rupu_scm::install_default_crypto_provider();
     let server = MockServer::start();
     let body = std::fs::read_to_string("tests/fixtures/github/pr_get_happy.json").unwrap();
     server.mock(|when, then| {
@@ -60,6 +62,7 @@ async fn get_pr_translates() {
 
 #[tokio::test]
 async fn diff_pr_returns_unified_diff() {
+    rupu_scm::install_default_crypto_provider();
     let server = MockServer::start();
     let body = std::fs::read_to_string("tests/fixtures/github/pr_diff_happy.patch").unwrap();
     server.mock(|when, then| {
@@ -86,6 +89,7 @@ async fn diff_pr_returns_unified_diff() {
 
 #[tokio::test]
 async fn read_file_decodes_base64() {
+    rupu_scm::install_default_crypto_provider();
     let server = MockServer::start();
     let body = std::fs::read_to_string("tests/fixtures/github/file_get_happy.json").unwrap();
     server.mock(|when, then| {
@@ -115,6 +119,7 @@ async fn read_file_decodes_base64() {
 
 #[tokio::test]
 async fn list_repos_translates_octocrab_response() {
+    rupu_scm::install_default_crypto_provider();
     let server = MockServer::start();
     let body = std::fs::read_to_string("tests/fixtures/github/repos_list_happy.json").unwrap();
     let m = server.mock(|when, then| {
@@ -144,6 +149,7 @@ async fn list_repos_translates_octocrab_response() {
 
 #[tokio::test]
 async fn list_prs_paginates_and_translates() {
+    rupu_scm::install_default_crypto_provider();
     let server = MockServer::start();
     let body = std::fs::read_to_string("tests/fixtures/github/prs_list_happy.json").unwrap();
     let m = server.mock(|when, then| {
@@ -174,6 +180,7 @@ async fn list_prs_paginates_and_translates() {
 
 #[tokio::test]
 async fn list_branches_translates() {
+    rupu_scm::install_default_crypto_provider();
     let server = MockServer::start();
     let body = std::fs::read_to_string("tests/fixtures/github/branches_list_happy.json").unwrap();
     let m = server.mock(|when, then| {
@@ -203,6 +210,7 @@ async fn list_branches_translates() {
 
 #[tokio::test]
 async fn get_issue_translates() {
+    rupu_scm::install_default_crypto_provider();
     let server = MockServer::start();
     let body = std::fs::read_to_string("tests/fixtures/github/issue_get_happy.json").unwrap();
     server.mock(|when, then| {
@@ -227,6 +235,7 @@ async fn get_issue_translates() {
 
 #[tokio::test]
 async fn list_issues_translates() {
+    rupu_scm::install_default_crypto_provider();
     let server = MockServer::start();
     let body = std::fs::read_to_string("tests/fixtures/github/issues_list_happy.json").unwrap();
     server.mock(|when, then| {
@@ -246,6 +255,7 @@ async fn list_issues_translates() {
 
 #[tokio::test]
 async fn comment_pr_posts_body() {
+    rupu_scm::install_default_crypto_provider();
     let server = MockServer::start();
     let body = std::fs::read_to_string("tests/fixtures/github/comment_create_happy.json").unwrap();
     let m = server.mock(|when, then| {
@@ -278,6 +288,7 @@ async fn comment_pr_posts_body() {
 
 #[tokio::test]
 async fn is_collaborator_204_is_true() {
+    rupu_scm::install_default_crypto_provider();
     let server = MockServer::start();
     let m = server.mock(|when, then| {
         when.method(GET)
@@ -302,6 +313,7 @@ async fn is_collaborator_204_is_true() {
 
 #[tokio::test]
 async fn is_collaborator_404_is_false() {
+    rupu_scm::install_default_crypto_provider();
     let server = MockServer::start();
     let m = server.mock(|when, then| {
         when.method(GET)
@@ -328,6 +340,7 @@ async fn is_collaborator_404_is_false() {
 
 #[tokio::test]
 async fn create_pr_posts_payload() {
+    rupu_scm::install_default_crypto_provider();
     let server = MockServer::start();
     let body = std::fs::read_to_string("tests/fixtures/github/pr_create_happy.json").unwrap();
     let m = server.mock(|when, then| {

@@ -36,6 +36,11 @@ fn run_line_stream_header_format() {
         .current_dir(&dir)
         .env("RUPU_MOCK_PROVIDER_SCRIPT", script)
         .env("RUPU_HOME", dir.path().join(".rupu"))
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .args(["run", "test-agent", "--mode", "bypass", "go"])
         .assert()
         .success()
@@ -62,6 +67,11 @@ fn run_line_stream_shows_assistant_content() {
         .current_dir(&dir)
         .env("RUPU_MOCK_PROVIDER_SCRIPT", script)
         .env("RUPU_HOME", dir.path().join(".rupu"))
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .args(["run", "reply-agent", "--mode", "bypass", "go"])
         .assert()
         .success()
@@ -83,6 +93,11 @@ fn run_line_stream_token_count_in_footer() {
         .current_dir(&dir)
         .env("RUPU_MOCK_PROVIDER_SCRIPT", script)
         .env("RUPU_HOME", dir.path().join(".rupu"))
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .args(["run", "token-agent", "--mode", "bypass", "go"])
         .assert()
         .success()
@@ -105,6 +120,11 @@ fn run_line_stream_no_ansi_on_pipe() {
         .current_dir(&dir)
         .env("RUPU_MOCK_PROVIDER_SCRIPT", script)
         .env("RUPU_HOME", dir.path().join(".rupu"))
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .args(["run", "clean-agent", "--mode", "bypass", "go"])
         .output()
         .unwrap();
@@ -130,6 +150,11 @@ fn run_line_stream_step_glyphs() {
         .current_dir(&dir)
         .env("RUPU_MOCK_PROVIDER_SCRIPT", script)
         .env("RUPU_HOME", dir.path().join(".rupu"))
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .args(["run", "glyph-agent", "--mode", "bypass", "go"])
         .assert()
         .success()
@@ -152,6 +177,11 @@ fn run_line_stream_transcript_footer() {
         .current_dir(&dir)
         .env("RUPU_MOCK_PROVIDER_SCRIPT", script)
         .env("RUPU_HOME", dir.path().join(".rupu"))
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .args(["run", "tx-agent", "--mode", "bypass", "go"])
         .assert()
         .success()
@@ -170,6 +200,11 @@ fn run_line_stream_supports_focused_and_full_view_modes() {
         .current_dir(&dir)
         .env("RUPU_MOCK_PROVIDER_SCRIPT", script)
         .env("RUPU_HOME", dir.path().join(".rupu"))
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .args([
             "run",
             "view-agent",
@@ -188,6 +223,11 @@ fn run_line_stream_supports_focused_and_full_view_modes() {
         .current_dir(&dir)
         .env("RUPU_MOCK_PROVIDER_SCRIPT", script)
         .env("RUPU_HOME", dir.path().join(".rupu"))
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .args([
             "run",
             "view-agent",

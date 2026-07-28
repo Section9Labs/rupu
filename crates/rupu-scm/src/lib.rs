@@ -30,3 +30,22 @@ pub use types::{
     Issue, IssueFilter, IssueRef, IssueState, PipelineTrigger, Pr, PrFilter, PrRef, PrState, Repo,
     RepoRef, WorkflowDispatch,
 };
+
+/// Install a process-level rustls `CryptoProvider`, once.
+///
+/// The dependency tree enables **both** rustls backends (aws-lc-rs via
+/// object_store/reqwest, ring via octocrab/jsonwebtoken), so rustls 0.23
+/// refuses to auto-select and panics on first TLS use. `rupu-cli`'s `main`
+/// installs one at startup, but anything that links this crate without going
+/// through that binary — tests, `rupu-cp` embedders, other consumers — gets
+/// the panic instead. Call this first if you are not the `rupu` binary.
+///
+/// Idempotent and safe to call from many threads: a lost race just means
+/// somebody else installed a provider, which is the desired end state.
+pub fn install_default_crypto_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}

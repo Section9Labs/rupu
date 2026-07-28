@@ -67,10 +67,7 @@ impl GitlabClient {
             .base_url
             .clone()
             .unwrap_or_else(|| "https://gitlab.com/api/v4".to_string());
-        let http = opts
-            .http_client_builder()
-            .build()
-            .expect("reqwest builder");
+        let http = opts.http_client_builder().build().expect("reqwest builder");
         let semaphore = concurrency::semaphore_for("gitlab", opts.max_concurrency);
         let cache = Arc::new(Mutex::new(LruCache::new(
             NonZeroUsize::new(CACHE_CAP).unwrap(),

@@ -142,7 +142,10 @@ impl GithubClient {
     /// typed builder API doesn't expose response headers cleanly, so
     /// this goes through reqwest directly.
     pub async fn fetch_token_scopes(&self) -> Option<Vec<String>> {
-        let http = reqwest::Client::builder().timeout(self.timeout).build().ok()?;
+        let http = reqwest::Client::builder()
+            .timeout(self.timeout)
+            .build()
+            .ok()?;
         let resp = http
             .get("https://api.github.com/user")
             .header(reqwest::header::USER_AGENT, "rupu/0")
@@ -185,9 +188,12 @@ impl GithubClient {
             let token = token.clone();
             async move {
                 let _permit = self.permit().await;
-                let http = reqwest::Client::builder().timeout(self.timeout).build().map_err(|e| {
-                    ScmError::Network(anyhow::anyhow!("github graphql client: {e}"))
-                })?;
+                let http = reqwest::Client::builder()
+                    .timeout(self.timeout)
+                    .build()
+                    .map_err(|e| {
+                        ScmError::Network(anyhow::anyhow!("github graphql client: {e}"))
+                    })?;
                 let resp = http
                     .post(&url)
                     .header(reqwest::header::USER_AGENT, "rupu/0")
@@ -392,6 +398,7 @@ mod tests {
     /// I-16 / I-17: `[scm.github]` reaches the client that acts on it.
     #[tokio::test]
     async fn platform_config_reaches_the_client() {
+        crate::install_default_crypto_provider();
         let cfg = rupu_config::ScmPlatformConfig {
             timeout_ms: Some(4_000),
             clone_protocol: Some("ssh".into()),
@@ -403,10 +410,8 @@ mod tests {
         assert_eq!(c.timeout(), Duration::from_millis(4_000));
 
         // No [scm.github] table ⇒ documented defaults.
-        let d = GithubClient::with_options(
-            "ghp".into(),
-            &ScmClientOptions::from_platform_config(None),
-        );
+        let d =
+            GithubClient::with_options("ghp".into(), &ScmClientOptions::from_platform_config(None));
         assert_eq!(d.clone_protocol(), CloneProtocol::Https);
         assert_eq!(d.timeout(), Duration::from_millis(30_000));
     }
@@ -415,6 +420,7 @@ mod tests {
     /// it — `ssh` yields the ssh form, nothing else changed.
     #[tokio::test]
     async fn configured_ssh_protocol_produces_an_ssh_clone_url() {
+        crate::install_default_crypto_provider();
         let cfg = rupu_config::ScmPlatformConfig {
             clone_protocol: Some("ssh".into()),
             ..Default::default()
@@ -435,6 +441,7 @@ mod tests {
 
     #[tokio::test]
     async fn graphql_json_posts_query_and_returns_data() {
+        crate::install_default_crypto_provider();
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(POST)
