@@ -42,16 +42,15 @@ pub enum Action {
     },
     /// Show configured providers + backend.
     Status,
-    /// Inspect or change the credential storage backend.
+    /// Show where credentials are stored.
     ///
-    /// OS keychain (default) vs chmod-600 JSON file. Use `--use file`
-    /// if the macOS keychain is dropping credentials between
-    /// signed-binary updates.
+    /// There is one backend: a chmod-600 JSON file at
+    /// `~/.rupu/auth.json`. The OS keychain backend was retired.
     Backend {
-        /// `keychain` (default on macOS / Linux with secret-service /
-        /// Windows) or `file` (chmod-600 `~/.rupu/auth.json`).
-        /// Omit to print the current choice + active source
-        /// (env-var, cache, or default probe).
+        /// `file` — the only supported value, and already in effect.
+        /// Accepted so existing scripts keep working; `keychain` is
+        /// refused with an explanation. Omit to print where credentials
+        /// currently live.
         #[arg(long, value_name = "KIND")]
         r#use: Option<String>,
         /// Human snapshot density (`focused` | `compact` | `full`).
@@ -170,6 +169,8 @@ fn parse_provider(s: &str) -> anyhow::Result<ProviderId> {
 }
 
 async fn login(provider: &str, mode: AuthModeArg, key: Option<&str>) -> anyhow::Result<()> {
+    warn_about_stranded_keychain_credentials();
+
     if is_openai_compatible_name(provider) {
         if parse_provider(provider).is_ok() {
             anyhow::bail!(
@@ -417,6 +418,24 @@ impl DetailOutput for AuthBackendOutput {
     }
 }
 
+/// Tell the user once, at login time, if an older rupu left credentials
+/// in the macOS keychain. Without this they simply appear logged out
+/// with no explanation. Read-only and best-effort: a `security` probe
+/// that fails for any reason yields no findings and no output.
+fn warn_about_stranded_keychain_credentials() {
+    let stranded = rupu_auth::detect_stranded_keychain_credentials();
+    if stranded.is_empty() {
+        return;
+    }
+    eprintln!(
+        "note: credentials for {} are still in the macOS keychain from an older rupu.\n      \
+         That store was retired; rupu now keeps credentials in a chmod-600 file.\n      \
+         Logging in here replaces them. The old entries are left untouched and\n      \
+         can be removed with:  security delete-generic-password -s rupu -a <account>",
+        stranded.join(", ")
+    );
+}
+
 async fn backend(
     r#use: Option<&str>,
     no_color: bool,
@@ -635,25 +654,17 @@ fn render_auth_backend_command_rows(
     )];
     let mut table = crate::output::tables::new_table();
     table.set_header(vec!["MODE", "COMMAND", "EFFECT"]);
+    // There is one backend, so nothing here offers a choice — these are
+    // the levers that still exist: relocate the store, or populate it.
     table.add_row(vec![
-        Cell::new("persist"),
-        Cell::new("rupu auth backend --use file"),
-        Cell::new("store credentials in ~/.rupu/auth.json"),
+        Cell::new("relocate"),
+        Cell::new("export RUPU_AUTH_FILE=/path/to/auth.json"),
+        Cell::new("store credentials at an explicit path"),
     ]);
     table.add_row(vec![
-        Cell::new("persist"),
-        Cell::new("rupu auth backend --use keychain"),
-        Cell::new("store credentials in the OS keychain"),
-    ]);
-    table.add_row(vec![
-        Cell::new("shell"),
-        Cell::new("export RUPU_AUTH_BACKEND=file"),
-        Cell::new("override the backend for the current shell"),
-    ]);
-    table.add_row(vec![
-        Cell::new("shell"),
-        Cell::new("export RUPU_AUTH_BACKEND=keychain"),
-        Cell::new("override the backend for the current shell"),
+        Cell::new("relocate"),
+        Cell::new("export RUPU_HOME=/path/to/rupu-dir"),
+        Cell::new("move the whole rupu directory, auth.json included"),
     ]);
     if item.requested_backend.as_deref() == Some("file") {
         table.add_row(vec![

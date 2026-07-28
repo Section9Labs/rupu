@@ -27,6 +27,10 @@ pub use stored::StoredCredential;
 
 pub mod in_memory;
 pub mod resolver;
+
+pub mod stranded;
+pub use stranded::detect_stranded_keychain_credentials;
+
 pub use resolver::{CredentialResolver, KeychainResolver};
 
 pub use backend::{AuthBackend, AuthError, ProviderId};
