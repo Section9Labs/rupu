@@ -533,6 +533,7 @@ fn local_terminal_record(id: &str) -> rupu_orchestrator::RunRecord {
         resume_claimed_by: None,
         resume_mode: None,
         resume_gate_id: None,
+        resume_approver: None,
         reject_cleanup_pending: None,
         permission_mode: None,
         final_output: None,

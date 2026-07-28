@@ -609,12 +609,24 @@ fn build_resume_argv<'a>(
     run_id: &'a str,
     gate: Option<&'a str>,
     mode: Option<&'a str>,
+    approver: Option<&'a str>,
 ) -> Vec<&'a str> {
     let mut argv: Vec<&str> = vec!["workflow", subcommand, run_id];
     if subcommand == "approve" {
         if let Some(g) = gate {
             argv.push("--gate");
             argv.push(g);
+        }
+        // ISSUES.md I-82: carry the web-initiated approve's true actor
+        // (persisted on the run's `resume_approver` marker by
+        // `request_resume_approval`) across the process boundary so the
+        // spawned child records it on the gate decision row instead of
+        // falling back to `whoami::username()`. `resume` (the Paused,
+        // non-gate case) has no approver/gate-decision concept, so this is
+        // approve-only, same as `--gate`.
+        if let Some(a) = approver {
+            argv.push("--approver");
+            argv.push(a);
         }
     }
     if let Some(m) = mode {
@@ -649,6 +661,7 @@ async fn resume_one_run(
     let loaded = store.load(&run_id).ok();
     let mode = loaded.as_ref().and_then(|r| r.resume_mode.clone());
     let gate = loaded.as_ref().and_then(|r| r.resume_gate_id.clone());
+    let approver = loaded.as_ref().and_then(|r| r.resume_approver.clone());
 
     let exe = match exe_override {
         Some(p) => p,
@@ -664,7 +677,13 @@ async fn resume_one_run(
         },
     };
 
-    let argv = build_resume_argv(subcommand, &run_id, gate.as_deref(), mode.as_deref());
+    let argv = build_resume_argv(
+        subcommand,
+        &run_id,
+        gate.as_deref(),
+        mode.as_deref(),
+        approver.as_deref(),
+    );
 
     match std::process::Command::new(&exe).args(&argv).spawn() {
         Ok(_child) => {
@@ -1059,25 +1078,70 @@ mod tests {
         // still parked. `--gate` must be present whenever a gate id was
         // resolved AND the subcommand is `approve`.
         assert_eq!(
-            build_resume_argv("approve", "run_x", Some("gate_b"), None),
+            build_resume_argv("approve", "run_x", Some("gate_b"), None, None),
             vec!["workflow", "approve", "run_x", "--gate", "gate_b"],
         );
         // Legacy/sole-gate marker (no gate id resolved) — back-compat,
         // `--gate` omitted exactly like before this field existed.
         assert_eq!(
-            build_resume_argv("approve", "run_x", None, None),
+            build_resume_argv("approve", "run_x", None, None, None),
             vec!["workflow", "approve", "run_x"],
         );
         // `--mode` composes with `--gate`.
         assert_eq!(
-            build_resume_argv("approve", "run_x", Some("gate_b"), Some("bypass")),
+            build_resume_argv("approve", "run_x", Some("gate_b"), Some("bypass"), None),
             vec!["workflow", "approve", "run_x", "--gate", "gate_b", "--mode", "bypass"],
         );
         // `workflow resume` (a cooperative-pause resume) has no gate
         // concept — `--gate` must never appear even if `gate` is `Some`
         // (e.g. a stale marker field left over from a different flow).
         assert_eq!(
-            build_resume_argv("resume", "run_x", Some("gate_b"), None),
+            build_resume_argv("resume", "run_x", Some("gate_b"), None, None),
+            vec!["workflow", "resume", "run_x"],
+        );
+    }
+
+    // ── ISSUES.md I-82: the resume worker's approver round-trip ──
+
+    #[test]
+    fn build_resume_argv_includes_approver_only_for_approve_when_present() {
+        // The bug: `request_resume_approval` learned the web approver but
+        // never persisted it anywhere the resume worker could read, so the
+        // spawned `workflow approve` always re-derived `whoami::username()`
+        // — the identity of whatever account runs `cp serve`, not the real
+        // web-initiated actor. `--approver` must be present whenever the
+        // marker carried one AND the subcommand is `approve`.
+        assert_eq!(
+            build_resume_argv("approve", "run_x", None, None, Some("web")),
+            vec!["workflow", "approve", "run_x", "--approver", "web"],
+        );
+        // No approver on the marker (e.g. a record written before this
+        // field existed) — `--approver` omitted, falls back to
+        // `whoami::username()` exactly like before this field existed.
+        assert_eq!(
+            build_resume_argv("approve", "run_x", None, None, None),
+            vec!["workflow", "approve", "run_x"],
+        );
+        // Composes with `--gate` and `--mode`.
+        assert_eq!(
+            build_resume_argv(
+                "approve",
+                "run_x",
+                Some("gate_b"),
+                Some("bypass"),
+                Some("web"),
+            ),
+            vec![
+                "workflow", "approve", "run_x", "--gate", "gate_b", "--approver", "web", "--mode",
+                "bypass",
+            ],
+        );
+        // `workflow resume` (a cooperative-pause resume) has no
+        // approver/gate-decision concept — `--approver` must never appear
+        // even if `approver` is `Some` (e.g. a stale marker field left
+        // over from a different flow).
+        assert_eq!(
+            build_resume_argv("resume", "run_x", None, None, Some("web")),
             vec!["workflow", "resume", "run_x"],
         );
     }
@@ -1135,6 +1199,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            resume_approver: None,
             reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
@@ -1219,12 +1284,21 @@ mod tests {
         );
         // gate_a must not appear as the target.
         assert!(!captured.contains("--gate gate_a"));
+        // ISSUES.md I-82: the web approve's true actor ("web", passed to
+        // `request_resume_approval` above) must reach the spawned child so
+        // it lands on the gate decision row, instead of the child silently
+        // re-deriving `whoami::username()`.
+        assert!(
+            captured.contains("--approver web"),
+            "spawned child's argv was: {captured:?} — missing --approver web"
+        );
 
         // The marker was cleared (spawn succeeded) — the child now owns
         // resolving gate_b for real.
         let reloaded = store.load(&rec.id).unwrap();
         assert!(reloaded.resume_requested_at.is_none());
         assert!(reloaded.resume_gate_id.is_none());
+        assert!(reloaded.resume_approver.is_none());
     }
 
     /// Single-gate parity: a legacy/sole-gate marker (`resume_gate_id:
@@ -1364,6 +1438,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            resume_approver: None,
             reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
@@ -1472,6 +1547,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            resume_approver: None,
             reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
@@ -1547,6 +1623,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            resume_approver: None,
             reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
@@ -1633,6 +1710,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            resume_approver: None,
             reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),
@@ -1936,6 +2014,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            resume_approver: None,
             reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),

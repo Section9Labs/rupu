@@ -992,6 +992,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            resume_approver: None,
             reject_cleanup_pending: None,
             // ISSUES.md I-24: `rupu run` has no on_reject cleanup path of
             // its own, but recording the launch mode here keeps this
@@ -1326,6 +1327,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            resume_approver: None,
             reject_cleanup_pending: None,
             permission_mode: None,
             loop_progress: Default::default(),

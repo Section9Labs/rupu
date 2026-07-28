@@ -1393,6 +1393,7 @@ mod tests {
                     resume_claimed_by: None,
                     resume_mode: None,
                     resume_gate_id: None,
+                    resume_approver: None,
                     reject_cleanup_pending: None,
                     permission_mode: None,
                     issue_ref: Some("github:Section9Labs/rupu-sandbox-gh/issues/10".into()),
