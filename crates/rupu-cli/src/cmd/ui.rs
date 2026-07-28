@@ -140,6 +140,13 @@ impl UiPrefs {
         } else {
             parse_color(cfg.color.as_deref()).unwrap_or(ColorMode::Auto)
         };
+        // Push the decision into the global the color writers actually
+        // consult. Without this, `--no-color` resolved to `Never` here and
+        // was then ignored by `palette::write_colored`, which asked
+        // owo-colors — and owo-colors honors FORCE_COLOR ahead of NO_COLOR.
+        if color == ColorMode::Never {
+            crate::output::palette::disable_color();
+        }
         let global = crate::paths::global_dir().ok();
         let project_root = std::env::current_dir()
             .ok()

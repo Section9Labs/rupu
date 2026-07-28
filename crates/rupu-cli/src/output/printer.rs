@@ -1363,7 +1363,13 @@ mod tests {
     use std::time::Duration;
 
     fn no_color() {
-        std::env::set_var("NO_COLOR", "1");
+        // Use the explicit override rather than env vars. owo-colors
+        // consults FORCE_COLOR *before* NO_COLOR and caches the answer on
+        // first use, so env mutation here was both too late (another test
+        // may have already locked the cache) and too weak (a developer
+        // shell exporting FORCE_COLOR beat it). That made these assertions
+        // pass alone and fail in a full run.
+        crate::output::palette::disable_color();
     }
 
     fn run_with_printer<F: FnOnce(&mut LineStreamPrinter)>(f: F) {

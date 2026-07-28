@@ -51,4 +51,21 @@ steps:
       - If the issue is waiting on a human merge or another external repo change, return `await_external`.
       - If the issue is complete, return `complete`.
 
-      Return only valid JSON for `autoflow_outcome_v1`.
+      Return only the raw JSON object for `autoflow_outcome_v1`.
+      Do not wrap it in markdown fences.
+      Do not wrap it in an `autoflow_outcome_v1` key.
+      Do not add any prose before or after the JSON.
+
+      Valid examples:
+
+      If the spec or plan is missing:
+      {"status":"continue","summary":"Create the spec and phase plan first.","dispatch":{"workflow":"issue-to-spec-and-plan","target":"{{ issue.ref }}","inputs":{}}}
+
+      If phase 1 is ready:
+      {"status":"continue","summary":"Phase 1 is ready to execute.","dispatch":{"workflow":"phase-delivery-cycle","target":"{{ issue.ref }}","inputs":{"phase":"phase-1"}}}
+
+      If waiting on a human:
+      {"status":"await_external","summary":"Waiting for a human merge decision."}
+
+      If complete:
+      {"status":"complete","summary":"The issue is complete."}

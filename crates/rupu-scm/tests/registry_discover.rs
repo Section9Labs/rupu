@@ -2,6 +2,7 @@ use rupu_scm::{IssueTracker, Platform, Registry};
 
 #[tokio::test]
 async fn empty_resolver_yields_no_connectors() {
+    rupu_scm::install_default_crypto_provider();
     use rupu_auth::in_memory::InMemoryResolver;
     let resolver = InMemoryResolver::new();
     let cfg = rupu_config::Config::default();
@@ -14,6 +15,7 @@ async fn empty_resolver_yields_no_connectors() {
 
 #[tokio::test]
 async fn github_connector_built_when_credential_present() {
+    rupu_scm::install_default_crypto_provider();
     use rupu_auth::backend::ProviderId;
     use rupu_auth::in_memory::InMemoryResolver;
     use rupu_auth::stored::StoredCredential;
@@ -38,6 +40,7 @@ async fn github_connector_built_when_credential_present() {
 
 #[tokio::test]
 async fn gitlab_connector_built_when_credential_present() {
+    rupu_scm::install_default_crypto_provider();
     use rupu_auth::backend::ProviderId;
     use rupu_auth::in_memory::InMemoryResolver;
     use rupu_auth::stored::StoredCredential;
@@ -62,6 +65,7 @@ async fn gitlab_connector_built_when_credential_present() {
 
 #[tokio::test]
 async fn linear_event_connector_built_when_credential_present() {
+    rupu_scm::install_default_crypto_provider();
     use rupu_auth::backend::ProviderId;
     use rupu_auth::in_memory::InMemoryResolver;
     use rupu_auth::stored::StoredCredential;
@@ -89,6 +93,7 @@ async fn linear_event_connector_built_when_credential_present() {
 
 #[tokio::test]
 async fn jira_event_connector_built_when_credential_present() {
+    rupu_scm::install_default_crypto_provider();
     use rupu_auth::backend::ProviderId;
     use rupu_auth::in_memory::InMemoryResolver;
     use rupu_auth::stored::StoredCredential;

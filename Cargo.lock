@@ -6621,6 +6621,7 @@ dependencies = [
  "rupu-config",
  "rupu-providers",
  "rupu-scm",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",

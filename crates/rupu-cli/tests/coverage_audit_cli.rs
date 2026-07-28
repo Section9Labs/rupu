@@ -1,5 +1,5 @@
 //! End-to-end: populate a coverage target on disk, then run
-//! `rupu coverage audit <id> --json` through the CLI entrypoint.
+//! `rupu coverage audit <id> --format json` through the CLI entrypoint.
 //!
 //! This test mutates process-global state (cwd). Hold `ENV_LOCK` for
 //! the whole body of the test to serialise any future cwd-mutating
@@ -78,7 +78,11 @@ async fn coverage_audit_cli_runs_on_populated_target() {
         "coverage".into(),
         "audit".into(),
         "tgt".into(),
-        "--json".into(),
+        // `--json` was replaced by the global `--format json` flag; this
+        // invocation was never updated, so the test has been erroring out
+        // on an unknown argument rather than exercising the audit path.
+        "--format".into(),
+        "json".into(),
     ])
     .await;
     std::env::set_current_dir(prev).unwrap();

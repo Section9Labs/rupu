@@ -224,6 +224,11 @@ async fn session_list_supports_json_output() {
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", &home)
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(tmp.path())
         .args(["--format", "json", "session", "list"])
         .assert()
@@ -243,6 +248,11 @@ async fn session_show_supports_json_output() {
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", &home)
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(tmp.path())
         .args(["--format", "json", "session", "show", "ses_show01"])
         .assert()
@@ -263,6 +273,11 @@ async fn session_show_supports_focused_compact_and_full_views() {
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", &home)
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(tmp.path())
         .args(["session", "show", "ses_show_view01"])
         .assert()
@@ -274,6 +289,11 @@ async fn session_show_supports_focused_compact_and_full_views() {
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", &home)
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(tmp.path())
         .args(["session", "show", "ses_show_view01", "--view", "compact"])
         .assert()
@@ -285,6 +305,11 @@ async fn session_show_supports_focused_compact_and_full_views() {
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", &home)
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(tmp.path())
         .args(["session", "show", "ses_show_view01", "--view", "full"])
         .assert()
@@ -307,6 +332,11 @@ async fn session_list_reconciles_stale_running_workers() {
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", &home)
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(tmp.path())
         .args(["--format", "json", "session", "list"])
         .assert()
@@ -332,6 +362,11 @@ async fn session_archive_restore_round_trip_moves_owned_transcripts() {
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", &home)
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(tmp.path())
         .args(["session", "archive", "ses_archive01"])
         .assert()
@@ -349,6 +384,11 @@ async fn session_archive_restore_round_trip_moves_owned_transcripts() {
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", &home)
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(tmp.path())
         .args(["--format", "json", "session", "list", "--archived"])
         .assert()
@@ -361,6 +401,11 @@ async fn session_archive_restore_round_trip_moves_owned_transcripts() {
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", &home)
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(tmp.path())
         .args(["session", "restore", "ses_archive01"])
         .assert()
@@ -384,6 +429,11 @@ async fn session_delete_requires_force_and_removes_files() {
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", &home)
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(tmp.path())
         .args(["session", "delete", "ses_delete01"])
         .assert()
@@ -393,6 +443,11 @@ async fn session_delete_requires_force_and_removes_files() {
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", &home)
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(tmp.path())
         .args(["session", "delete", "ses_delete01", "--force"])
         .assert()
@@ -422,6 +477,11 @@ async fn session_delete_refuses_running_worker() {
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", &home)
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(tmp.path())
         .args(["session", "delete", "ses_running01", "--force"])
         .assert()
@@ -453,6 +513,11 @@ async fn session_prune_removes_archived_sessions_older_than_cutoff() {
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", &home)
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(tmp.path())
         .args([
             "--format",
@@ -494,6 +559,11 @@ async fn session_prune_dry_run_uses_config_default() {
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", &home)
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(tmp.path())
         .args(["--format", "json", "session", "prune", "--dry-run"])
         .assert()

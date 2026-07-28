@@ -165,6 +165,11 @@ async fn workflow_show_defaults_to_full_and_supports_focused_compact_views() {
     AssertCommand::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", global.path())
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(tmp.path())
         .args(["workflow", "show", "review-def", "--no-color", "--no-pager"])
         .assert()
@@ -178,6 +183,11 @@ async fn workflow_show_defaults_to_full_and_supports_focused_compact_views() {
     AssertCommand::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", global.path())
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(tmp.path())
         .args([
             "workflow",
@@ -199,6 +209,11 @@ async fn workflow_show_defaults_to_full_and_supports_focused_compact_views() {
     AssertCommand::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", global.path())
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(tmp.path())
         .args([
             "workflow",
@@ -356,6 +371,11 @@ async fn workflow_run_supports_focused_and_full_view_modes() {
     AssertCommand::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", global.path())
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .env("RUPU_MOCK_PROVIDER_SCRIPT", MOCK_SCRIPT)
         .current_dir(project.path())
         .args(["workflow", "run", "hello-wf", "--mode", "bypass"])
@@ -366,6 +386,11 @@ async fn workflow_run_supports_focused_and_full_view_modes() {
     AssertCommand::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", global.path())
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .env("RUPU_MOCK_PROVIDER_SCRIPT", MOCK_SCRIPT)
         .current_dir(project.path())
         .args([
@@ -399,6 +424,11 @@ async fn workflow_run_focused_mode_renders_fanout_tree() {
     AssertCommand::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", global.path())
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .env("RUPU_MOCK_PROVIDER_SCRIPT", MOCK_SCRIPT)
         .current_dir(project.path())
         .args([
@@ -460,6 +490,11 @@ async fn workflow_show_run_supports_pretty_and_json_output() {
     AssertCommand::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", global.path())
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(project.path())
         .args(["--format", "pretty", "workflow", "show-run", &run_id])
         .assert()
@@ -474,6 +509,11 @@ async fn workflow_show_run_supports_pretty_and_json_output() {
     AssertCommand::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", global.path())
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(project.path())
         .args(["--format", "json", "workflow", "show-run", &run_id])
         .assert()
@@ -532,6 +572,11 @@ async fn workflow_show_run_full_renders_fanout_timeline() {
     AssertCommand::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", global.path())
+        // These assert on plain text. The binary honors FORCE_COLOR (correctly)
+        // even through a pipe, so a developer shell exporting it would embed
+        // ANSI in every assertion here.
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
         .current_dir(project.path())
         .args([
             "--format", "pretty", "workflow", "show-run", &run_id, "--view", "full",

@@ -83,9 +83,7 @@ impl ScmClientOptions {
             base_url: cfg.and_then(|c| c.base_url.clone()),
             timeout: scm_timeout(cfg.and_then(|c| c.timeout_ms)),
             max_concurrency: cfg.and_then(|c| c.max_concurrency),
-            clone_protocol: CloneProtocol::parse(
-                cfg.and_then(|c| c.clone_protocol.as_deref()),
-            ),
+            clone_protocol: CloneProtocol::parse(cfg.and_then(|c| c.clone_protocol.as_deref())),
         }
     }
 
@@ -101,7 +99,11 @@ impl ScmClientOptions {
 /// `timeout_ms` → the SCM client deadline. Absent ⇒ [`DEFAULT_TIMEOUT_MS`].
 /// `0` is treated as absent: a zero deadline would fail every call instantly.
 pub fn scm_timeout(timeout_ms: Option<u64>) -> Duration {
-    Duration::from_millis(timeout_ms.filter(|ms| *ms > 0).unwrap_or(DEFAULT_TIMEOUT_MS))
+    Duration::from_millis(
+        timeout_ms
+            .filter(|ms| *ms > 0)
+            .unwrap_or(DEFAULT_TIMEOUT_MS),
+    )
 }
 
 /// The URL `clone_to` hands to git, for `host` (e.g. `github.com`).
@@ -213,7 +215,13 @@ mod tests {
             "https://ghp_secret@github.com/o/r.git"
         );
         assert_eq!(
-            clone_url("gitlab.com", "grp/sub", "r", CloneProtocol::Ssh, "oauth2:glpat"),
+            clone_url(
+                "gitlab.com",
+                "grp/sub",
+                "r",
+                CloneProtocol::Ssh,
+                "oauth2:glpat"
+            ),
             "git@gitlab.com:grp/sub/r.git"
         );
         assert_eq!(
@@ -231,7 +239,10 @@ mod tests {
     #[test]
     fn ssh_clone_url_never_leaks_the_token() {
         let url = clone_url("github.com", "o", "r", CloneProtocol::Ssh, "ghp_secret");
-        assert!(!url.contains("ghp_secret"), "token leaked into ssh url: {url}");
+        assert!(
+            !url.contains("ghp_secret"),
+            "token leaked into ssh url: {url}"
+        );
     }
 
     #[test]
@@ -258,7 +269,10 @@ mod tests {
             clone_protocol: Some("ssh".into()),
         };
         let o = ScmClientOptions::from_platform_config(Some(&cfg));
-        assert_eq!(o.base_url.as_deref(), Some("https://ghe.example.com/api/v3"));
+        assert_eq!(
+            o.base_url.as_deref(),
+            Some("https://ghe.example.com/api/v3")
+        );
         assert_eq!(o.timeout, Duration::from_millis(7_000));
         assert_eq!(o.max_concurrency, Some(3));
         assert_eq!(o.clone_protocol, CloneProtocol::Ssh);
