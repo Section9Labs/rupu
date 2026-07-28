@@ -4844,7 +4844,15 @@ async fn execute_action_step(
     })?;
 
     let transcript_path = transcript_dir.join(format!("run_{}.jsonl", Ulid::new()));
-    let call_result = dispatcher.call(tool, args.clone()).await;
+    // ISSUES.md I-79: narrow the run-scoped dispatcher to exactly this
+    // step's tool before dispatching. The dispatcher is built once per run
+    // with a `["*"]` allowlist (the tool is per-step and unknown at
+    // construction), and today nothing can reach it with any other tool —
+    // but that safety rests on an invariant enforced three modules away.
+    // Narrowing here makes it structural: even if a future caller reuses
+    // this dispatcher, an action step can still only invoke the tool named
+    // in the workflow source.
+    let call_result = dispatcher.narrowed_to(tool).call(tool, args.clone()).await;
 
     let (allowed, applied, reason) = match &call_result {
         Ok(_) => (true, true, None),

@@ -22,6 +22,20 @@ impl ToolDispatcher {
         }
     }
 
+    /// A dispatcher over the same registry whose permission allows exactly
+    /// `tool` and nothing else (ISSUES.md I-79).
+    ///
+    /// The run-scoped `action_dispatcher` is built once per run with a `["*"]`
+    /// allowlist, because the tool it may call is per-step and unknown at
+    /// construction. Narrowing at the call site makes the single-tool
+    /// guarantee structural instead of an invariant a reader has to go find.
+    pub fn narrowed_to(&self, tool: &str) -> Self {
+        Self {
+            registry: Arc::clone(&self.registry),
+            permission: self.permission.narrowed_to(tool),
+        }
+    }
+
     pub async fn call(&self, name: &str, args: Value) -> Result<String, McpError> {
         let kind = self.kind_for(name)?;
         self.permission.check(name, kind)?;
@@ -105,5 +119,36 @@ mod is_blocked_tests {
         // "the call reached the connector and errored".
         let result: Result<String, McpError> = Err(McpError::UnknownTool("bogus".into()));
         assert!(!ToolDispatcher::is_blocked(&result));
+    }
+
+    // ── I-79: narrowing is structural, not invariant-dependent ───────
+
+    #[test]
+    fn narrowed_to_allows_only_the_named_tool() {
+        // A wildcard dispatcher narrowed to one tool must refuse every other
+        // tool, even though its parent allowed everything. This is what makes
+        // an action step's single-tool guarantee structural rather than a
+        // property of who happens to call it.
+        let wide = McpPermission::new(rupu_tools::PermissionMode::Bypass, vec!["*".into()]);
+        let narrow = wide.narrowed_to("issues.comment");
+
+        assert!(narrow.check("issues.comment", crate::tools::ToolKind::Write).is_ok());
+        assert!(
+            narrow.check("scm.prs.create", crate::tools::ToolKind::Write).is_err(),
+            "a narrowed permission must refuse a tool outside its single-entry allowlist"
+        );
+    }
+
+    #[test]
+    fn narrowing_preserves_the_mode() {
+        // Narrowing must not accidentally widen or tighten the MODE -- a
+        // readonly run stays readonly, so Write tools are still refused even
+        // when they are the named tool.
+        let ro = McpPermission::new(rupu_tools::PermissionMode::Readonly, vec!["*".into()]);
+        let narrow = ro.narrowed_to("issues.comment");
+        assert!(
+            narrow.check("issues.comment", crate::tools::ToolKind::Write).is_err(),
+            "narrowing must preserve readonly's refusal of Write tools"
+        );
     }
 }
