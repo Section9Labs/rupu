@@ -1,31 +1,24 @@
-//! rupu-auth — credential storage with OS keychain + chmod-600 fallback.
+//! rupu-auth — credential storage.
 //!
-//! Two backend implementations:
+//! One backend: [`JsonFileBackend`] stores secrets in `~/.rupu/auth.json`
+//! with permissions enforced to mode 0600, honoring `RUPU_HOME` and
+//! `RUPU_AUTH_FILE`.
 //!
-//! - [`KeyringBackend`] uses the OS keychain (macOS Keychain, Linux
-//!   Secret Service via D-Bus, Windows Credential Manager). Preferred
-//!   when reachable.
-//! - [`JsonFileBackend`] stores secrets in `~/.rupu/auth.json` with
-//!   permissions enforced to mode 0600. Used as a fallback when the
-//!   keychain is unavailable (e.g. headless Linux servers without a
-//!   running secret-service daemon).
+//! The OS keychain backend was retired. A bare CLI binary's keychain
+//! requirement is cdhash-bound, so every rebuild invalidated it and the
+//! next read failed silently — the "credentials vanished after an
+//! update" failure. Peer CLIs (`gh`, `aws`, `gcloud`, `kubectl`,
+//! `terraform`) all use files for the same reason.
 //!
-//! [`select_backend`] probes the keychain once and caches the choice
-//! at `~/.rupu/cache/auth-backend.json` so subsequent invocations
-//! avoid the probe overhead.
+//! Note this concerns where rupu stores *its own* credentials. Importing
+//! credentials another tool left in a keychain is a separate concern and
+//! lives in `rupu-providers` (`auth::discovery`).
 
 pub mod backend;
-
-// Real implementations land in Tasks 13-15:
-// - json_file: Task 13 (JsonFileBackend with chmod-600 enforcement)
-// - keyring: Task 14 (KeyringBackend with probe())
-// - probe: Task 15 (select_backend with cache file)
 pub mod json_file;
-pub mod keyring;
-pub mod probe;
 
-pub mod keychain_layout;
-pub use keychain_layout::{key_for, legacy_key_for, KeychainKey};
+pub mod account_key;
+pub use account_key::{account_for, legacy_account_for};
 
 pub mod oauth;
 
@@ -38,5 +31,3 @@ pub use resolver::{CredentialResolver, KeychainResolver};
 
 pub use backend::{AuthBackend, AuthError, ProviderId};
 pub use json_file::JsonFileBackend;
-pub use keyring::KeyringBackend;
-pub use probe::{select_backend, BackendChoice, ProbeCache, ENV_BACKEND_OVERRIDE};

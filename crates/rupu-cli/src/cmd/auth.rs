@@ -424,85 +424,70 @@ async fn backend(
     view: LiveViewMode,
     global_format: Option<OutputFormat>,
 ) -> anyhow::Result<()> {
-    // Persist the user's choice via a tiny shell-rc-friendly env-export
-    // hint rather than writing to the cache directly: the env var
-    // lives at the session boundary, and any in-process change here
-    // wouldn't outlive `rupu auth backend` itself. The cache file is
-    // still updated below for cases where probe behavior matters.
+    // There is only one credential backend: a chmod-600 JSON file. This
+    // command survives as a way to report *where* credentials live; the
+    // `--use` flag survives only to give an explicit answer to anyone
+    // still asking for the retired keychain.
     let global = crate::paths::global_dir()?;
-    let cache_path = global.join("cache/auth-backend.json");
-    let cache = rupu_auth::ProbeCache::new(cache_path.clone());
     let auth_path = global.join("auth.json");
     let prefs = auth_ui_prefs(no_color, pager_flag, view)?;
 
-    if let Some(target) = r#use {
-        let target_norm = target.trim().to_ascii_lowercase();
-        let choice = match target_norm.as_str() {
-            "file" | "json" | "json-file" | "json_file" => rupu_auth::BackendChoice::JsonFile,
-            "keyring" | "keychain" | "os" | "os-keychain" => rupu_auth::BackendChoice::Keyring,
-            other => anyhow::bail!("unknown backend `{other}` — expected one of: file | keychain"),
-        };
-        // Update the cache so future invocations without the env var
-        // pick the same backend.
-        if let Err(e) = cache.write(choice) {
-            tracing::warn!(error = %e, "failed to write probe cache");
+    // The probe cache selected between backends that no longer both
+    // exist. Remove it rather than leave a file implying a choice is
+    // still being made.
+    let stale_cache = global.join("cache/auth-backend.json");
+    if stale_cache.exists() {
+        if let Err(e) = std::fs::remove_file(&stale_cache) {
+            tracing::warn!(
+                error = %e,
+                path = %stale_cache.display(),
+                "could not remove stale auth-backend probe cache"
+            );
         }
-        let env_value = match choice {
-            rupu_auth::BackendChoice::JsonFile => "file",
-            rupu_auth::BackendChoice::Keyring => "keychain",
-        };
-        if matches!(global_format, Some(OutputFormat::Json)) {
-            let report = AuthBackendReport {
-                kind: "auth_backend",
-                version: 1,
-                item: AuthBackendItem {
-                    requested_backend: Some(env_value.to_string()),
-                    active_backend: format!("cached: {env_value}"),
-                    cache_path: cache_path.display().to_string(),
-                    auth_path: auth_path.display().to_string(),
-                    cache_choice: Some(env_value.to_string()),
-                    env_override: None,
-                },
-            };
-            return report::emit_detail(global_format, &AuthBackendOutput { prefs, report });
+    }
+
+    if let Some(target) = r#use {
+        match target.trim().to_ascii_lowercase().as_str() {
+            "file" | "json" | "json-file" | "json_file" => {}
+            "keyring" | "keychain" | "os" | "os-keychain" => anyhow::bail!(
+                "the OS keychain backend is no longer supported — rupu stores \
+                 credentials in a chmod-600 file at `{}`. There is nothing to \
+                 select; `--use file` is the only valid value and is already in \
+                 effect.",
+                auth_path.display()
+            ),
+            other => {
+                anyhow::bail!("unknown backend `{other}` — the only supported value is: file")
+            }
         }
         let report = AuthBackendReport {
             kind: "auth_backend",
             version: 1,
             item: AuthBackendItem {
-                requested_backend: Some(env_value.to_string()),
-                active_backend: format!("cached: {env_value}"),
-                cache_path: cache_path.display().to_string(),
+                requested_backend: Some("file".to_string()),
+                active_backend: "file".to_string(),
+                cache_path: stale_cache.display().to_string(),
                 auth_path: auth_path.display().to_string(),
-                cache_choice: Some(env_value.to_string()),
+                cache_choice: None,
                 env_override: None,
             },
         };
         return report::emit_detail(global_format, &AuthBackendOutput { prefs, report });
     }
 
-    // Show current state.
-    let env_override = std::env::var(rupu_auth::ENV_BACKEND_OVERRIDE).ok();
-    let cached = cache.read();
-    let active = match (env_override.as_deref(), cached) {
-        (Some(v), _) => format!("env-var override: {v}"),
-        (None, Some(rupu_auth::BackendChoice::Keyring)) => "cached: keychain".into(),
-        (None, Some(rupu_auth::BackendChoice::JsonFile)) => "cached: file".into(),
-        (None, None) => "default: file (chmod-600 ~/.rupu/auth.json)".into(),
-    };
+    // Show current state. `RUPU_AUTH_FILE` can still relocate the store,
+    // so surface it — but it selects a path, never a different backend.
     let report = AuthBackendReport {
         kind: "auth_backend",
         version: 1,
         item: AuthBackendItem {
             requested_backend: None,
-            active_backend: active,
-            cache_path: cache_path.display().to_string(),
-            auth_path: auth_path.display().to_string(),
-            cache_choice: cached.map(|choice| match choice {
-                rupu_auth::BackendChoice::JsonFile => "file".to_string(),
-                rupu_auth::BackendChoice::Keyring => "keychain".to_string(),
-            }),
-            env_override,
+            active_backend: "file".to_string(),
+            cache_path: stale_cache.display().to_string(),
+            auth_path: std::env::var("RUPU_AUTH_FILE")
+                .unwrap_or_else(|_| auth_path.display().to_string()),
+            cache_choice: None,
+            env_override: std::env::var("RUPU_AUTH_FILE").ok(),
         },
     };
     report::emit_detail(global_format, &AuthBackendOutput { prefs, report })

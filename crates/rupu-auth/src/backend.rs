@@ -56,14 +56,12 @@ pub enum AuthError {
     Io(#[from] std::io::Error),
     #[error("serialize: {0}")]
     Serialize(#[from] serde_json::Error),
-    #[error("keyring: {0}")]
-    Keyring(#[from] keyring::Error),
     #[error("not configured for provider {0}")]
     NotConfigured(ProviderId),
 }
 
-/// Credential store. Implementations: [`crate::KeyringBackend`] and
-/// [`crate::JsonFileBackend`].
+/// Credential store. The only implementation is
+/// [`crate::JsonFileBackend`]; the OS keychain backend was retired.
 pub trait AuthBackend: Send + Sync {
     /// Store `secret` for `provider`, replacing any existing value.
     fn store(&self, provider: ProviderId, secret: &str) -> Result<(), AuthError>;
