@@ -710,6 +710,11 @@ fn parse_generate_content_response(
         Usage {
             input_tokens: meta["promptTokenCount"].as_u64().unwrap_or(0) as u32,
             output_tokens: meta["candidatesTokenCount"].as_u64().unwrap_or(0) as u32,
+            // Reported outside candidatesTokenCount by Google (I-48) — a
+            // model that thinks (e.g. gemini-2.5-pro, which thinks by
+            // default) would otherwise silently drop these tokens from both
+            // the transcript and the bill.
+            reasoning_tokens: meta["thoughtsTokenCount"].as_u64().unwrap_or(0) as u32,
             ..Default::default()
         }
     } else {
@@ -745,6 +750,7 @@ struct GeminiAccumulator {
     stop_reason: Option<StopReason>,
     input_tokens: u32,
     output_tokens: u32,
+    reasoning_tokens: u32,
     tool_call_counter: u32,
     /// Every streamed part, verbatim and in arrival order, for replay.
     raw_parts: Vec<serde_json::Value>,
@@ -760,6 +766,7 @@ impl GeminiAccumulator {
             stop_reason: None,
             input_tokens: 0,
             output_tokens: 0,
+            reasoning_tokens: 0,
             tool_call_counter: 0,
             raw_parts: Vec::new(),
             thought_text: String::new(),
@@ -802,6 +809,7 @@ impl GeminiAccumulator {
             usage: Usage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
+                reasoning_tokens: self.reasoning_tokens,
                 ..Default::default()
             },
         })
@@ -888,10 +896,17 @@ fn process_gemini_sse(
         if let Some(output) = meta.get("candidatesTokenCount").and_then(|v| v.as_u64()) {
             acc.output_tokens = output as u32;
         }
+        // See the non-streaming parse site and the contrast note on
+        // `Usage::reasoning_tokens` (I-48): reported outside
+        // candidatesTokenCount by Google.
+        if let Some(reasoning) = meta.get("thoughtsTokenCount").and_then(|v| v.as_u64()) {
+            acc.reasoning_tokens = reasoning as u32;
+        }
         on_event(StreamEvent::UsageSnapshot(Usage {
             input_tokens: acc.input_tokens,
             output_tokens: acc.output_tokens,
             cached_tokens: 0,
+            reasoning_tokens: acc.reasoning_tokens,
         }));
     }
 
@@ -1440,6 +1455,35 @@ mod tests {
         assert_eq!(response.usage.output_tokens, 8);
     }
 
+    /// I-48: gemini-2.5-pro thinks by default, and Google reports those
+    /// tokens *outside* candidatesTokenCount. A realistic usageMetadata
+    /// including thoughtsTokenCount must be reflected in the parsed
+    /// `Usage`, without inflating output_tokens (candidatesTokenCount
+    /// stays exactly what Google's console would show for "output").
+    #[test]
+    fn test_parse_response_counts_thinking_tokens() {
+        let json = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "The answer is 42."}]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 15,
+                "candidatesTokenCount": 8,
+                "thoughtsTokenCount": 200,
+                "totalTokenCount": 223
+            }
+        });
+
+        let response = parse_generate_content_response(&json, "gemini-2.5-pro").unwrap();
+        assert_eq!(response.usage.input_tokens, 15);
+        assert_eq!(response.usage.output_tokens, 8);
+        assert_eq!(response.usage.reasoning_tokens, 200);
+    }
+
     #[test]
     fn test_parse_response_function_call() {
         let json = serde_json::json!({
@@ -1729,6 +1773,28 @@ mod tests {
         assert!(events.iter().any(
             |event| event.contains("UsageSnapshot(Usage { input_tokens: 10, output_tokens: 5")
         ));
+    }
+
+    /// I-48, streaming path: `thoughtsTokenCount` must reach `Usage` via
+    /// `StreamEvent::UsageSnapshot` too, not just the non-streaming parse.
+    #[test]
+    fn test_sse_usage_snapshot_counts_thinking_tokens() {
+        let mut acc = GeminiAccumulator::new("gemini-2.5-pro");
+        let mut events = Vec::new();
+
+        let event = crate::sse::SseEvent {
+            event_type: "message".into(),
+            data: r#"{"candidates":[{"content":{"parts":[{"text":"world!"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"thoughtsTokenCount":120}}"#.into(),
+        };
+        process_gemini_sse(&event, &mut acc, &mut |e| events.push(format!("{e:?}"))).unwrap();
+
+        let response = acc.into_response().unwrap();
+        assert_eq!(response.usage.input_tokens, 10);
+        assert_eq!(response.usage.output_tokens, 5);
+        assert_eq!(response.usage.reasoning_tokens, 120);
+        assert!(events.iter().any(|event| event.contains(
+            "UsageSnapshot(Usage { input_tokens: 10, output_tokens: 5, cached_tokens: 0, reasoning_tokens: 120"
+        )));
     }
 
     #[test]

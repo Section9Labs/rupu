@@ -8266,6 +8266,7 @@ mod tests {
                 input_tokens: 123,
                 output_tokens: 7,
                 cached_tokens: 9,
+                reasoning_tokens: 0,
             },))
         );
         assert_eq!(writer.usage.input_tokens, 123);

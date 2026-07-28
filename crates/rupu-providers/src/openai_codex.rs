@@ -643,10 +643,14 @@ impl OpenAiCodexClient {
                     if let Some(usage) = resp.get("usage") {
                         acc.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0) as u32;
                         acc.output_tokens = usage["output_tokens"].as_u64().unwrap_or(0) as u32;
+                        // `output_tokens` already includes reasoning tokens
+                        // on the Codex wire, so reasoning_tokens stays at 0
+                        // — see the contrast note on `Usage::reasoning_tokens`.
                         on_event(StreamEvent::UsageSnapshot(Usage {
                             input_tokens: acc.input_tokens,
                             output_tokens: acc.output_tokens,
                             cached_tokens: 0,
+                            reasoning_tokens: 0,
                         }));
                     }
                     // Extract stop reason

@@ -71,10 +71,32 @@ impl ModelPricing {
     /// When `cached_input_per_mtok` is unset, cached tokens fall back
     /// to the full input rate (still correct, just less favorable —
     /// over-estimates the bill rather than under-estimating).
+    ///
+    /// Callers with no separate reasoning-token count (every provider
+    /// except Gemini — see `Usage::reasoning_tokens`) should pass `0`;
+    /// existing behavior is unchanged in that case.
     pub fn cost_usd(&self, input_tokens: u64, output_tokens: u64, cached_tokens: u64) -> f64 {
+        self.cost_usd_with_reasoning(input_tokens, output_tokens, cached_tokens, 0)
+    }
+
+    /// Same as [`Self::cost_usd`], but also bills `reasoning_tokens` at the
+    /// output rate (I-48).
+    ///
+    /// Gemini reports "thinking" tokens (`thoughtsTokenCount`) outside
+    /// `candidatesTokenCount`, but Google bills them as output tokens —
+    /// `gemini-2.5-pro` thinks by default, so a caller that ignores this
+    /// under-bills every default-config Gemini run with no
+    /// `cost_partial` marker to say so.
+    pub fn cost_usd_with_reasoning(
+        &self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+        reasoning_tokens: u64,
+    ) -> f64 {
         let cached = cached_tokens.min(input_tokens) as f64;
         let uncached_input = (input_tokens.saturating_sub(cached_tokens)) as f64;
-        let output = output_tokens as f64;
+        let output = (output_tokens + reasoning_tokens) as f64;
         let cached_rate = self.cached_input_per_mtok.unwrap_or(self.input_per_mtok);
         (uncached_input * self.input_per_mtok
             + cached * cached_rate
@@ -86,6 +108,29 @@ impl ModelPricing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// I-48 binding test: reasoning tokens must strictly increase cost, not
+    /// be silently multiplied by zero. Billed at the output rate, since
+    /// that's what Google charges for Gemini "thinking" tokens.
+    #[test]
+    fn cost_with_reasoning_tokens_is_strictly_greater() {
+        let p = ModelPricing {
+            input_per_mtok: 1.25,
+            output_per_mtok: 10.0,
+            cached_input_per_mtok: None,
+        };
+        let baseline = p.cost_usd_with_reasoning(15, 8, 0, 0);
+        let with_thinking = p.cost_usd_with_reasoning(15, 8, 0, 200);
+        assert!(
+            with_thinking > baseline,
+            "with_thinking={with_thinking} baseline={baseline}"
+        );
+        // 200 reasoning tokens @ $10/Mtok = $0.002 on top of baseline.
+        assert!((with_thinking - baseline - 0.002).abs() < 1e-12);
+        // The old 3-arg cost_usd (still used by callers with no reasoning
+        // count) is unaffected — it must equal the reasoning=0 case.
+        assert_eq!(p.cost_usd(15, 8, 0), baseline);
+    }
 
     #[test]
     fn cost_zero_when_no_tokens() {
