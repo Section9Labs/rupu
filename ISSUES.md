@@ -367,6 +367,51 @@ mechanical but not free, hence P2. Defense in depth, not a live defect. Related:
 
 ---
 
+
+
+## Fixed
+
+### I-3 — Global `default_model` shadows a provider-scoped `default_model`
+
+**Symptom.** With a global `default_model` set and an agent pinned to an
+openai-compatible provider that has its own `[providers.<name>].default_model`,
+the *global* value wins and is sent to the custom endpoint — which typically
+rejects it as an unknown model.
+
+**Root cause.** The fallback chain in `crates/rupu-cli/src/cmd/run.rs` orders
+`cfg.default_model` *before* the provider-scoped `oai_params.default_model`:
+
+```rust
+spec.model → cfg.default_model → oai_params.default_model → "claude-sonnet-4-6"
+```
+
+The provider-scoped default is the more specific value and arguably should win
+whenever the resolved provider is that provider.
+
+**Impact.** Only bites when both a global `default_model` and a custom provider
+are configured. The documented config in `docs/providers.md` sets no global
+`default_model`, so the documented path is unaffected.
+
+**Fix.** Probably reorder to `spec.model → oai_params.default_model →
+cfg.default_model → hardcoded`. Deliberately **not** fixed alongside I-1/I-2:
+it is a behavior change to a currently-consistent path rather than a
+silent-noop, and it deserves its own decision. Needs a call from matt on
+whether global `default_model` is meant to be provider-agnostic.
+
+**Root cause.** Purely the `.or()` ordering inside `resolve_model`
+(`crates/rupu-runtime/src/provider_factory.rs`). All four call sites already passed their
+arguments correctly — the precedence was wrong one level down, which is why it survived
+Arc 1's pass over the callers.
+
+**Fix.** Reordered to `spec_model → provider_default → cfg_default → fallback`.
+
+**Validation.** `dispatch_prefers_provider_scoped_default_model_over_global_default`,
+observed RED against the old ordering: the resolved model was `"global-default-model"`
+instead of the provider's `"oracle-default"` — the concrete wrong value, not just a failed
+assertion.
+
+---
+
 ### I-4 — Four `linear_runner` tests fail on a clean `main`
 
 **Symptom.** `cargo test -p rupu-orchestrator --test linear_runner` reports
@@ -396,38 +441,26 @@ error propagation would be invisible — it looks like the pre-existing noise.
 
 **Fix.** Unassigned. Diagnose before trusting this suite as a gate.
 
----
+**Root cause (finally diagnosed).** `MockProvider` mapped `ScriptedTurn::ProviderError` —
+and its exhausted-queue error — to `ProviderError::Http`, which
+`is_retryable_provider_error` **always retries**. So the scripted single failure was
+consumed on attempt 1, attempt 2 hit an empty queue, and the agent loop then retried
+`"mock script exhausted"` through all 10 `MAX_HTTP_RETRIES`, surfacing *that* message
+instead of the `"simulated failure"` the tests assert on.
 
-### I-3 — Global `default_model` shadows a provider-scoped `default_model`
+**That also explains the 48 seconds** — the standing mystery in the original write-up. It
+was never network I/O: it was real `tokio::time::sleep` backoff, 250ms doubling to 8s across
+10 attempts, summing to ~47.75s. The suspicion of "retrying against a real endpoint" was the
+right instinct pointed at the wrong layer.
 
-**Symptom.** With a global `default_model` set and an agent pinned to an
-openai-compatible provider that has its own `[providers.<name>].default_model`,
-the *global* value wins and is sent to the custom endpoint — which typically
-rejects it as an unknown model.
+**Fix.** Map both to `ProviderError::Other` (non-retryable) in `rupu-agent`'s runner. A mock
+failure is a *scripted* outcome and must not be treated as a transient transport error.
 
-**Root cause.** The fallback chain in `crates/rupu-cli/src/cmd/run.rs` orders
-`cfg.default_model` *before* the provider-scoped `oai_params.default_model`:
-
-```rust
-spec.model → cfg.default_model → oai_params.default_model → "claude-sonnet-4-6"
-```
-
-The provider-scoped default is the more specific value and arguably should win
-whenever the resolved provider is that provider.
-
-**Impact.** Only bites when both a global `default_model` and a custom provider
-are configured. The documented config in `docs/providers.md` sets no global
-`default_model`, so the documented path is unaffected.
-
-**Fix.** Probably reorder to `spec.model → oai_params.default_model →
-cfg.default_model → hardcoded`. Deliberately **not** fixed alongside I-1/I-2:
-it is a behavior change to a currently-consistent path rather than a
-silent-noop, and it deserves its own decision. Needs a call from matt on
-whether global `default_model` is meant to be provider-agnostic.
+**Validation.** `linear_runner` now reports **28 passed / 0 failed in 0.04s**, down from
+24/4 in 47.8s. This was the known-red baseline every one of the six arcs had to work around
+and explicitly exclude from its verification — it is gone.
 
 ---
-
-## Fixed
 
 ### I-73 … I-86 — the follow-up sweep (batch)
 
