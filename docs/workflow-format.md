@@ -387,6 +387,36 @@ Behavior:
 - resume with `rupu workflow approve <run-id>`
 - reject with `rupu workflow reject <run-id> --reason "..."`
 
+### Permission modes in a workflow
+
+`rupu workflow run` accepts `--mode ask | bypass | readonly`. **`ask` and
+`bypass` behave identically for workflow agent steps**, and `ask` is the
+default when `--mode` is omitted — so a workflow run without an explicit mode
+grants its steps full tool access.
+
+That is deliberate. The agent runtime's interactive `ask` decider blocks on
+stdin waiting for a human, and a workflow step has no operator present at the
+tool layer, so a genuinely-prompting `ask` would hang every unattended run.
+Rather than silently doing something different from what the name suggests,
+`rupu workflow run` prints a warning when no mode was given:
+
+```
+warning: --mode not set; workflow steps run at `bypass`
+         (there is no operator to answer `ask` mid-run).
+         Pass --mode readonly to deny bash/write_file/edit_file.
+```
+
+| Mode | Workflow agent steps | Action steps |
+| --- | --- | --- |
+| `bypass` | all tools allowed | all catalog tools allowed |
+| `ask` | **same as `bypass`** — no prompt is possible | same as `bypass` |
+| `readonly` | `bash`, `write_file`, `edit_file` denied | Write-classified tools refused |
+
+**If you want a workflow restricted, pass `--mode readonly` explicitly** —
+`ask` will not do it. For human-in-the-loop control over *what a workflow
+does*, use a gate node (below) rather than the permission mode: gates pause the
+run at a point you choose, where an operator can actually answer.
+
 ### Gate nodes (standalone `approval:` steps)
 
 A step that carries **only** an `approval:` block — no `agent:`, `action:`,

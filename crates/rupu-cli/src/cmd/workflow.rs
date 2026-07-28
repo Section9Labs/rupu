@@ -3705,7 +3705,10 @@ async fn run_with_outcome(
             workspace_path,
             workspace_id: ws.id,
             inputs,
-            mode: mode.unwrap_or("ask").to_string(),
+            mode: {
+                warn_if_ask_mode_is_effectively_bypass(mode, mode.unwrap_or("ask"));
+                mode.unwrap_or("ask").to_string()
+            },
             invocation_source,
             event,
             issue: issue_payload,
@@ -3773,7 +3776,10 @@ async fn run_path_with_outcome(
             workspace_path,
             workspace_id: ws.id,
             inputs,
-            mode: mode.unwrap_or("ask").to_string(),
+            mode: {
+                warn_if_ask_mode_is_effectively_bypass(mode, mode.unwrap_or("ask"));
+                mode.unwrap_or("ask").to_string()
+            },
             invocation_source,
             event,
             issue: None,
@@ -4634,6 +4640,38 @@ async fn post_run_summary_to_issue(
 // DefaultStepFactory is now defined in rupu-orchestrator::step_factory.
 // Construction sites below use rupu_orchestrator::DefaultStepFactory directly.
 
+/// Warn when a workflow run will execute its agent steps at `bypass`
+/// because no `--mode` was given (ISSUES.md I-78).
+///
+/// `ask` is the default mode, but a workflow step resolves `ask` to
+/// `BypassDecider` — the agent runtime's interactive `ask` decider blocks on
+/// stdin, and an unattended workflow step has no operator to answer it, so a
+/// genuinely-prompting `ask` would hang every scheduled run.
+///
+/// The operator decision (2026-07-28) was to keep that behavior rather than
+/// tighten it: making `ask` deny writers would break every existing workflow
+/// that writes without an explicit mode, precisely *because* `ask` is the
+/// default. So the gap is made loud instead of silent.
+///
+/// Only fires when `--mode` was **omitted** — someone who typed
+/// `--mode ask`/`--mode bypass` has made a choice and does not need nagging.
+///
+/// Split from the printing so the condition is unit-testable without
+/// capturing stderr.
+fn should_warn_ask_is_bypass(mode: Option<&str>, mode_str: &str) -> bool {
+    mode.is_none() && mode_str == "ask"
+}
+
+fn warn_if_ask_mode_is_effectively_bypass(mode: Option<&str>, mode_str: &str) {
+    if should_warn_ask_is_bypass(mode, mode_str) {
+        eprintln!(
+            "warning: --mode not set; workflow steps run at `bypass` \
+             (there is no operator to answer `ask` mid-run).\n         \
+             Pass --mode readonly to deny bash/write_file/edit_file."
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5383,5 +5421,32 @@ steps:
         let (kind, primary, _detail) = workflow_step_table_summary(&step);
         assert_eq!(kind, "linear");
         assert_eq!(primary, "coder");
+    }
+
+    // ── I-78: `ask` is effectively `bypass` for workflow steps ───────
+    //
+    // Operator decision (2026-07-28): keep the behavior, make it visible.
+    // Tightening `ask` would break every workflow that writes without an
+    // explicit --mode, because `ask` is ALSO the default.
+
+    #[test]
+    fn omitting_mode_warns_that_steps_run_at_bypass() {
+        // The warning must fire only when the operator made no choice.
+        assert!(should_warn_ask_is_bypass(None, "ask"));
+    }
+
+    #[test]
+    fn an_explicit_mode_never_warns() {
+        // Someone who typed --mode has decided; nagging them is noise.
+        assert!(!should_warn_ask_is_bypass(Some("ask"), "ask"));
+        assert!(!should_warn_ask_is_bypass(Some("bypass"), "bypass"));
+        assert!(!should_warn_ask_is_bypass(Some("readonly"), "readonly"));
+    }
+
+    #[test]
+    fn a_resolved_non_ask_mode_never_warns() {
+        // Defensive: if the default ever stops being `ask`, this must not
+        // start warning about a mode that does gate writes.
+        assert!(!should_warn_ask_is_bypass(None, "readonly"));
     }
 }
