@@ -1496,6 +1496,94 @@ fn workflow_step_table_summary(step: &rupu_orchestrator::Step) -> (&'static str,
         return ("for_each", primary, parts.join("  ·  "));
     }
 
+    // ISSUES.md I-41: gate and action nodes are first-class step kinds and must
+    // not fall through to the `linear` arm below, which would print KIND=linear
+    // with a BLANK primary column — gates have no `agent:`, and an action step's
+    // whole identity is the tool it calls. The graph renderer
+    // (`rupu-app-canvas`'s `git_graph.rs`) already renders both correctly; this
+    // table was the only view that didn't.
+    if rupu_orchestrator::is_approval_gate(step) {
+        let mut parts = Vec::new();
+        if let Some(approval) = &step.approval {
+            if let Some(expr) = approval
+                .auto_approve
+                .as_deref()
+                .filter(|v| !v.trim().is_empty())
+            {
+                parts.push(format!(
+                    "auto_approve {}",
+                    crate::cmd::transcript::truncate_single_line(expr, 20)
+                ));
+            }
+            if let Some(secs) = approval.timeout_seconds {
+                parts.push(format!("timeout {secs}s"));
+            }
+            if let Some(on_timeout) = approval.on_timeout {
+                parts.push(format!(
+                    "on_timeout {}",
+                    match on_timeout {
+                        rupu_orchestrator::TimeoutAction::Approve => "approve",
+                        rupu_orchestrator::TimeoutAction::Reject => "reject",
+                        rupu_orchestrator::TimeoutAction::Fail => "fail",
+                    }
+                ));
+            }
+            if !approval.on_reject.is_empty() {
+                parts.push(format!("on_reject {} step(s)", approval.on_reject.len()));
+            }
+            if !approval.notify.is_empty() {
+                parts.push(format!("notify {}", approval.notify.len()));
+            }
+        }
+        let primary = step
+            .approval
+            .as_ref()
+            .and_then(|a| a.prompt.as_deref())
+            .map(|p| crate::cmd::transcript::truncate_single_line(p, 32))
+            .unwrap_or_else(|| "—".into());
+        return (
+            "gate",
+            primary,
+            if parts.is_empty() {
+                "—".into()
+            } else {
+                parts.join("  ·  ")
+            },
+        );
+    }
+
+    if let Some(action) = &step.action {
+        let mut parts = Vec::new();
+        if let Some(with) = &step.with {
+            if let Some(map) = with.as_object() {
+                let mut keys: Vec<String> = map.keys().cloned().collect();
+                keys.sort();
+                if !keys.is_empty() {
+                    parts.push(format!("with {}", keys.join(", ")));
+                }
+            }
+        }
+        if let Some(when) = step
+            .when
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            parts.push(format!(
+                "when {}",
+                crate::cmd::transcript::truncate_single_line(when, 28)
+            ));
+        }
+        return (
+            "action",
+            action.clone(),
+            if parts.is_empty() {
+                "—".into()
+            } else {
+                parts.join("  ·  ")
+            },
+        );
+    }
+
     let primary = step.agent.clone().unwrap_or_default();
     let mut parts = Vec::new();
     if !step.actions.is_empty() {
@@ -4905,5 +4993,86 @@ mod tests {
         assert_eq!(outcome.step_id, "step_approve");
         let reloaded = store.load(&rec.id).unwrap();
         assert_eq!(reloaded.status, RunStatus::Rejected);
+    }
+
+    // ── I-41: gate/action arms in the steps table ────────────────────
+    //
+    // Before this, both fell through to the `linear` arm, printing
+    // KIND=linear with a BLANK primary column — a gate has no `agent:`,
+    // and an action step's whole identity is the tool it calls, which was
+    // never named anywhere in the table. The graph renderer already
+    // handled both; this table was the only view that didn't.
+
+    fn parse_one_step(yaml: &str) -> rupu_orchestrator::Step {
+        let wf = rupu_orchestrator::Workflow::parse(yaml).expect("fixture must parse");
+        wf.steps.into_iter().next().expect("one step")
+    }
+
+    #[test]
+    fn steps_table_renders_a_gate_node_as_kind_gate_not_linear() {
+        let step = parse_one_step(
+            r#"
+name: gated
+steps:
+  - id: sign-off
+    approval:
+      required: true
+      prompt: "Ship this to production?"
+      timeout_seconds: 3600
+      on_timeout: reject
+"#,
+        );
+        let (kind, primary, detail) = workflow_step_table_summary(&step);
+        assert_eq!(kind, "gate", "a gate must not render as `linear`");
+        assert!(
+            primary.contains("Ship this"),
+            "the gate prompt belongs in PRIMARY, which was blank before: {primary}"
+        );
+        assert!(detail.contains("timeout 3600s"), "detail was: {detail}");
+        assert!(detail.contains("on_timeout reject"), "detail was: {detail}");
+    }
+
+    #[test]
+    fn steps_table_renders_an_action_node_naming_the_tool() {
+        let step = parse_one_step(
+            r#"
+name: acts
+steps:
+  - id: comment
+    action: issues.comment
+    with:
+      project: "acme/widget"
+      number: 7
+      body: "triaged"
+"#,
+        );
+        let (kind, primary, detail) = workflow_step_table_summary(&step);
+        assert_eq!(kind, "action", "an action must not render as `linear`");
+        assert_eq!(
+            primary, "issues.comment",
+            "the tool name is the action's identity and was never shown before"
+        );
+        // `with:` keys are listed sorted so the column is stable across runs.
+        assert!(detail.contains("with body, number, project"), "detail was: {detail}");
+    }
+
+    #[test]
+    fn steps_table_still_renders_a_plain_agent_step_as_linear() {
+        // Guard against the new arms swallowing ordinary steps: an agent step
+        // that merely *carries* an inline `approval:` is NOT a gate node.
+        let step = parse_one_step(
+            r#"
+name: plain
+steps:
+  - id: build
+    agent: coder
+    prompt: "do the thing"
+    approval:
+      required: true
+"#,
+        );
+        let (kind, primary, _detail) = workflow_step_table_summary(&step);
+        assert_eq!(kind, "linear");
+        assert_eq!(primary, "coder");
     }
 }
