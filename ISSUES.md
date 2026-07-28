@@ -71,7 +71,7 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | ID | Sev | Area | Title | Status |
 |---|---|---|---|---|
 | I-28 | P1 | rupu-cp web | Delete the classic agent-authoring UI; drop `[cp].agent_authoring_ui` | fixed |
-| I-29 | P1 | rupu-cp web | Delete the classic workflow-editor UI; drop `[cp].workflow_editor_ui` | open |
+| I-29 | P1 | rupu-cp web | Delete the classic workflow-editor UI; drop `[cp].workflow_editor_ui` | fixed |
 | I-30 | P1 | rupu-cp web | Collapse the run-graph classic/next dual paths to one | open |
 | I-31 | P2 | rupu-cp web | Remove both UI hooks and their localStorage overrides | open |
 | I-32 | P2 | rupu-cp web | Fan-out / fan-in node silhouettes are provisional art (`branch` is not — mis-scoped) | moved → TODO.md |
@@ -283,6 +283,60 @@ whether global `default_model` is meant to be provider-agnostic.
 ---
 
 ## Fixed
+
+### I-29 — the classic workflow-editor UI is deleted
+
+**Symptom.** Two workflow editors shipped side by side, selected by
+`[cp].workflow_editor_ui` (default `"classic"`). Several prior plans explicitly
+required the classic renderer stay "byte-identical", so the split was implemented
+as inline early-returns and ternaries *inside shared files* rather than as separate
+modules — meaning every editor change had to be authored twice, in the same file,
+without breaking the other arm.
+
+**Fix (web).** Every `next` arm is now unconditional across six components:
+`WorkflowEditor.tsx` (default panel tab, collapsible source pane, palette portal,
+hide-source toggle, resizable rail + separator, Blocks tab, tab order),
+`WorkflowEditorGraph.tsx` (edge-memo gate, kind-tinted markers, `edge.animated`,
+branch stroke, `✓ then`/`✕ else` label chips, plain-edge accent, `wfx-canvas`,
+palette portal, background variant), `NodePalette.tsx` (item set now includes
+BRANCH/GATE/SPLIT/JOIN, connector groups, plus deletion of the classic float dock
+and the `KIND_COLOR` "classic-only fixed hex" map),
+`WorkflowSettingsForm.tsx` (the classic read-only chip form is gone),
+`StepForm.tsx` (`NEXT_ONLY_KINDS` no longer filters the kind picker, so `branch` /
+`approval_gate` / `action` / `split` / `join` are always offerable; `size="large"`;
+Approval prompt is an `ExpressionField` rather than a plain `<input>`), and
+`nodes/EditableStepNode.tsx` (the classic Tailwind card is gone; the SVG-silhouette
+render is the only one). `styles.css` comments that described the deleted arm were
+corrected. `pages/WorkflowDetail.tsx` needed no change — it only threads the value.
+
+**Fix (config).** `[cp].workflow_editor_ui` is **deprecated, not deleted**, for the
+same `deny_unknown_fields` + `.unwrap_or_default()` reason documented under
+[[I-28]]: hard-deleting it would silently discard the operator's entire config.
+
+**Validation.** `npm run build` TypeScript-clean and `npx vitest run` green at
+180 files / **1861** tests, down from 1887. The 26-test delta reconciles exactly
+against the deleted `it()` blocks per file (6+3+3+4+3+7) — accounted for rather
+than merely "still green". Where a test asserted *classic ≠ next* it was collapsed
+to a next-only assertion instead of deleted, preserving coverage of the surviving
+render; `StepForm.test.tsx`'s mixed assertion was updated, not removed.
+
+**Three places the two arms were not cleanly separable**, resolved deliberately
+rather than mechanically:
+1. `NodePalette`'s render site in `WorkflowEditorGraph` — classic was an inline
+   instant-add float dock, `next` is a portal-only select-then-"Add to canvas" rail
+   that renders only when given a container. The instant-add dock is gone; the
+   standalone-render test was rewritten to supply a container and drive the
+   two-step flow.
+2. Branch-arm edge styling (labels, marker colour, `animated`) — the two arms
+   render genuinely different shapes with no overlap, so this collapsed to `next`'s
+   shape with the default-prop tests updated to match.
+3. Five `StepForm` sub-components plus `NodePalette`/`WorkflowSettingsForm` were
+   left with a genuinely-unread `workflowEditorUi` param once the branching went.
+   The destructured binding was renamed `_workflowEditorUi` to satisfy
+   `noUnusedParameters`; **the interface and prop-passing are unchanged**, because
+   removing them is [[I-31]]'s job (Task 5), not this one.
+
+---
 
 ### I-28 — the classic agent-authoring UI is deleted
 
