@@ -2317,6 +2317,14 @@ pub enum PauseError {
 /// Exposed so the duplicate-execution guard on the resume path
 /// (`rupu workflow resume` / the CP resume worker) can refuse to spawn a
 /// second process while a run's recorded `runner_pid` is still live.
+///
+/// This spawns a child process on every call. It is fine for a guard that
+/// checks one pid before a single mutating action, but it is NOT suitable
+/// for per-row use in a hot or unpaginated list path without an explicit
+/// bound — a few hundred rows means a few hundred blocking spawns per
+/// request. See `rupu_cp::api::run_streams::STANDALONE_LIVENESS_PROBE_CAP`
+/// for the pattern used to bound it (probe only the newest N distinct
+/// pids) when a caller needs liveness across many rows.
 pub fn pid_is_running(pid: u32) -> bool {
     std::process::Command::new("/bin/kill")
         .arg("-0")
