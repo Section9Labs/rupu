@@ -1,4 +1,5 @@
 use crate::auth_mode::AuthMode;
+use reqwest::header::HeaderMap;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -69,6 +70,37 @@ impl From<serde_json::Error> for ProviderError {
     }
 }
 
+/// Build the right `ProviderError` from a non-2xx HTTP response. 429s parse
+/// the server's `Retry-After` header into `RateLimited { retry_after }` so
+/// `tuned::RetryingProvider` can honor it (I-83); every other status keeps
+/// the existing `Api { status, message }` shape.
+///
+/// This is the client-boundary call site: `headers` must come from the same
+/// `reqwest::Response` the body was drained from (grab
+/// `response.headers().clone()` *before* consuming the response with
+/// `.text()`/`.json()` — headers are unavailable afterward).
+pub fn api_error_from_response(status: u16, headers: &HeaderMap, message: String) -> ProviderError {
+    if status == 429 {
+        ProviderError::RateLimited {
+            retry_after: parse_retry_after(headers),
+        }
+    } else {
+        ProviderError::Api { status, message }
+    }
+}
+
+/// Parse `Retry-After` as delta-seconds (RFC 9110 §10.2.3). The HTTP-date
+/// form is not handled — mirrors `rupu-scm::error::parse_retry_after`, which
+/// made the same call for the same header.
+pub fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let v = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    v.parse::<u64>().ok().map(Duration::from_secs)
+}
+
 #[cfg(test)]
 mod structured_variants_tests {
     use super::*;
@@ -83,6 +115,56 @@ mod structured_variants_tests {
         };
         let s = e.to_string();
         assert!(s.contains("rate limited"), "got: {s}");
+    }
+
+    #[test]
+    fn parse_retry_after_reads_delta_seconds() {
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "3".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn parse_retry_after_absent_is_none() {
+        assert_eq!(parse_retry_after(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn parse_retry_after_ignores_http_date_form() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn api_error_from_response_maps_429_to_rate_limited_with_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "5".parse().unwrap());
+        let e = api_error_from_response(429, &headers, "rate limited".into());
+        match e {
+            ProviderError::RateLimited { retry_after } => {
+                assert_eq!(retry_after, Some(Duration::from_secs(5)));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn api_error_from_response_maps_429_without_header_to_rate_limited_none() {
+        let e = api_error_from_response(429, &HeaderMap::new(), "rate limited".into());
+        assert!(matches!(
+            e,
+            ProviderError::RateLimited { retry_after: None }
+        ));
+    }
+
+    #[test]
+    fn api_error_from_response_keeps_other_statuses_as_api() {
+        let e = api_error_from_response(500, &HeaderMap::new(), "boom".into());
+        assert!(matches!(e, ProviderError::Api { status: 500, .. }));
     }
 
     #[test]

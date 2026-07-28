@@ -41,3 +41,8 @@ test-helpers = []
 tempfile.workspace = true
 httpmock.workspace = true
 serde_json.workspace = true
+# Self-dependency so `tests/*.rs` integration tests (compiled against a
+# separate, non-`cfg(test)` build of this crate) can reach the
+# `#[cfg(any(test, feature = "test-helpers"))]`-gated `insert_*_connector`
+# test seams. See ISSUES.md I-77.
+rupu-scm = { path = ".", features = ["test-helpers"] }

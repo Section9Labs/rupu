@@ -6339,6 +6339,7 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 name = "rupu-agent"
 version = "0.69.0"
 dependencies = [
+ "anyhow",
  "assert_fs",
  "async-trait",
  "chrono",
@@ -6720,6 +6721,7 @@ dependencies = [
  "rupu-auth",
  "rupu-config",
  "rupu-providers",
+ "rupu-scm",
  "serde",
  "serde_json",
  "tempfile",

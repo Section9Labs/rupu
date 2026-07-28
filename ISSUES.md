@@ -46,11 +46,11 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 | ID | Sev | Area | Title | Status |
 |---|---|---|---|---|
-| I-73 | P1 | rupu-scm | `[scm.default].owner`/`.repo` and `[issues.default].project` are still inert — I-15 wired only `platform`/`tracker` | open |
-| I-74 | P1 | rupu-orchestrator | `generate.rs:167` calls `build_for_provider` without `ProviderConfig`, so `generate` ignores all `[providers.*]` tuning | open |
-| I-75 | P2 | rupu-providers | Anthropic's in-client 429 loop sleeps while holding its concurrency permit (it isn't wrapped in `RetryingProvider`) | open |
-| I-76 | P2 | rupu-providers | The provider decorators don't forward `list_models`; a factory-built `Box<dyn LlmProvider>` would silently return `vec![]` | open |
-| I-77 | P2 | rupu-scm | `insert_repo_connector`/`insert_issue_connector` are documented "test/internal" but carry no `#[cfg]` gate, unlike `empty()` | open |
+| I-73 | P1 | rupu-scm | `[scm.default].owner`/`.repo` and `[issues.default].project` are still inert — I-15 wired only `platform`/`tracker` | fixed |
+| I-74 | P1 | rupu-orchestrator | `generate.rs:167` calls `build_for_provider` without `ProviderConfig`, so `generate` ignores all `[providers.*]` tuning | fixed |
+| I-75 | P2 | rupu-providers | Anthropic's in-client 429 loop sleeps while holding its concurrency permit (it isn't wrapped in `RetryingProvider`) | fixed |
+| I-76 | P2 | rupu-providers | The provider decorators don't forward `list_models`; a factory-built `Box<dyn LlmProvider>` would silently return `vec![]` | fixed |
+| I-77 | P2 | rupu-scm | `insert_repo_connector`/`insert_issue_connector` are documented "test/internal" but carry no `#[cfg]` gate, unlike `empty()` | fixed |
 
 ### Arc 2 — safety
 
@@ -62,15 +62,15 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 | I-25 | P1 | rupu-cli | `rupu workflow runs` — a list command — executes `on_reject` chains as a side effect | fixed |
 | I-26 | P1 | rupu-cli | Action steps get allowlist `["*"]`; the code comment claims parity with agent `tools:` | fixed |
 | I-27 | P2 | rupu-orchestrator | `action_protocol::validate_actions` is dead code; three docs describe a check that never runs | fixed |
-| I-78 | P1 | rupu-orchestrator | A workflow step at `--mode ask` still gets `BypassDecider` — `ask` grants full tool access | open |
-| I-79 | P2 | rupu-cli | The action dispatcher's `["*"]` allowlist is sound only by invariant, not by construction | open |
-| I-80 | P2 | rupu-cli/docs | Reject-timeout gates now resolve only via `cp serve`'s sweep; CLI-only operators lose auto-resolution | open |
-| I-81 | P2 | rupu-mcp | `tools_list_matches_snapshot` fails in this worktree — schemars field-order drift under Homebrew 1.95 vs pinned 1.88 | open |
-| I-82 | P2 | rupu-cp | The CP web approve path discards the resolved decision, so a web approve's true actor is lost before the resume worker spawns | open |
-| I-83 | P2 | rupu-providers | `RetryingProvider` ignores server-supplied `Retry-After` by design; nothing in production reads it | open |
-| I-84 | P1 | rupu-providers | Anthropic's nested idle-retry × 429-retry loops multiply attempts | open |
-| I-85 | P2 | rupu-providers | Four hand-written reasoning-effort ladders, two of them byte-identical duplicates | open |
-| I-86 | P2 | docs/spec.md | Three stale claims: `gate_requested` "not emitted in v0", an `actions:` allowlist check on `action_emitted` that never existed, and "v0 logs `action_emitted` only" | open |
+| I-78 | P1 | rupu-orchestrator | A workflow step at `--mode ask` still gets `BypassDecider` — `ask` grants full tool access | fixed |
+| I-79 | P2 | rupu-cli | The action dispatcher's `["*"]` allowlist is sound only by invariant, not by construction | fixed |
+| I-80 | P2 | rupu-cli/docs | Reject-timeout gates now resolve only via `cp serve`'s sweep; CLI-only operators lose auto-resolution | fixed |
+| I-81 | P2 | rupu-mcp | `tools_list_matches_snapshot` fails in this worktree — schemars field-order drift under Homebrew 1.95 vs pinned 1.88 | fixed |
+| I-82 | P2 | rupu-cp | The CP web approve path discards the resolved decision, so a web approve's true actor is lost before the resume worker spawns | fixed |
+| I-83 | P2 | rupu-providers | `RetryingProvider` ignores server-supplied `Retry-After` by design; nothing in production reads it | fixed |
+| I-84 | P1 | rupu-providers | Anthropic's nested idle-retry × 429-retry loops multiply attempts | fixed |
+| I-85 | P2 | rupu-providers | Four hand-written reasoning-effort ladders, two of them byte-identical duplicates | fixed |
+| I-86 | P2 | docs/spec.md | Three stale claims: `gate_requested` "not emitted in v0", an `actions:` allowlist check on `action_emitted` that never existed, and "v0 logs `action_emitted` only" | fixed |
 
 ### Arc 3 — single UI path
 
@@ -141,6 +141,9 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 ## Open
 
+
+## Fixed
+
 ### I-86 — three stale claims in `docs/spec.md`
 
 Surfaced during the Arc 6 truth pass and filed rather than fixed, because `docs/spec.md`
@@ -162,24 +165,23 @@ banner approach taken for [[I-70]]).
 
 ---
 
-### I-83 — `RetryingProvider` ignores server-supplied `Retry-After`
+### I-85 — four hand-written reasoning-effort ladders, two duplicated verbatim
 
-**Symptom.** When a provider returns 429 with a `Retry-After` header telling us exactly how
-long to wait, rupu ignores it and uses its own exponential backoff instead.
+**Symptom.** `ThinkingLevel` is a single shared enum, but every provider hand-writes its own
+translation with no shared helper: Anthropic → `budget_tokens`
+(`anthropic.rs:1338-1349`), Gemini → level + budget (`google_gemini.rs:357-371`),
+openai_wire → `reasoning_effort` string (`:178-185`), Codex → `reasoning.effort` string
+behind a model gate (`openai_codex.rs:537-546`).
 
-**Root cause.** `RetryingProvider` (`tuned.rs:151-174`) calls `(self.backoff)(attempt)`
-unconditionally. Nothing in production ever parsed the header — see [[I-49]], which deleted
-the inert stub that was *supposed* to.
+**Root cause.** Incremental provider addition, each pass adding a `match` rather than
+extending a shared mapping.
 
-**Impact.** Low today: the default is one 2s retry, so we rarely retry long enough for the
-server's hint to matter. It becomes real for anyone raising `max_retries`, where ignoring an
-explicit `Retry-After: 30` means hammering a provider that told us to back off — which is
-how rate-limit bans escalate.
+**Impact.** The last two are **byte-identical duplicated `match` blocks in two files**, so
+any per-provider constraint (see [[I-47]]) has to be written twice or it silently diverges.
+Maintenance risk rather than a live defect.
 
-**Fix.** Parse `Retry-After` from the response headers at the client boundary (rupu-scm
-already does this correctly at `error.rs:144` and is the model to copy), surface it via the
-already-existing `ProviderError::RateLimited { retry_after }`, and have `RetryingProvider`
-prefer it over its computed backoff when present. Related: [[I-49]].
+**Fix.** Factor the translation into one place keyed by wire format. Do this **before**
+adding any per-provider allowlist, not after, or the allowlist becomes a third copy.
 
 ---
 
@@ -203,23 +205,24 @@ inner one after a 429-driven exhaustion. Needs a decision about intended total a
 
 ---
 
-### I-85 — four hand-written reasoning-effort ladders, two duplicated verbatim
+### I-83 — `RetryingProvider` ignores server-supplied `Retry-After`
 
-**Symptom.** `ThinkingLevel` is a single shared enum, but every provider hand-writes its own
-translation with no shared helper: Anthropic → `budget_tokens`
-(`anthropic.rs:1338-1349`), Gemini → level + budget (`google_gemini.rs:357-371`),
-openai_wire → `reasoning_effort` string (`:178-185`), Codex → `reasoning.effort` string
-behind a model gate (`openai_codex.rs:537-546`).
+**Symptom.** When a provider returns 429 with a `Retry-After` header telling us exactly how
+long to wait, rupu ignores it and uses its own exponential backoff instead.
 
-**Root cause.** Incremental provider addition, each pass adding a `match` rather than
-extending a shared mapping.
+**Root cause.** `RetryingProvider` (`tuned.rs:151-174`) calls `(self.backoff)(attempt)`
+unconditionally. Nothing in production ever parsed the header — see [[I-49]], which deleted
+the inert stub that was *supposed* to.
 
-**Impact.** The last two are **byte-identical duplicated `match` blocks in two files**, so
-any per-provider constraint (see [[I-47]]) has to be written twice or it silently diverges.
-Maintenance risk rather than a live defect.
+**Impact.** Low today: the default is one 2s retry, so we rarely retry long enough for the
+server's hint to matter. It becomes real for anyone raising `max_retries`, where ignoring an
+explicit `Retry-After: 30` means hammering a provider that told us to back off — which is
+how rate-limit bans escalate.
 
-**Fix.** Factor the translation into one place keyed by wire format. Do this **before**
-adding any per-provider allowlist, not after, or the allowlist becomes a third copy.
+**Fix.** Parse `Retry-After` from the response headers at the client boundary (rupu-scm
+already does this correctly at `error.rs:144` and is the model to copy), surface it via the
+already-existing `ProviderError::RateLimited { retry_after }`, and have `RetryingProvider`
+prefer it over its computed backoff when present. Related: [[I-49]].
 
 ---
 
@@ -309,6 +312,33 @@ paths only, which is already true. Related: [[I-25]].
 
 ---
 
+### I-79 — the action dispatcher's `["*"]` allowlist is sound only by invariant
+
+**Symptom.** `action_dispatcher_for` (`crates/rupu-cli/src/resume.rs:27`) builds its
+`McpPermission` with a wildcard tool allowlist, `vec!["*".into()]`.
+
+**Root cause.** The dispatcher is constructed once per run, while the tool it may
+call is per-step, so the construction site has no single tool name to narrow to.
+
+**Impact.** No exploitable hole **today**, and this was verified rather than
+assumed: `opts.action_dispatcher` has exactly three production consumers
+(`runner.rs:4293`, `:4700`, `:4923`), all of which funnel into `execute_action_step`,
+whose only dispatch is `dispatcher.call(tool, …)` with `tool = step.action`. That
+tool is validated against the live MCP catalog at parse time by
+`validate_action_step`, and a step may not carry a non-empty `actions:` alongside
+`action:` (`ActionsOnActionStep`). Agent-step tool calls never touch this dispatcher.
+So the wildcard is currently unreachable — but its safety rests on an invariant
+enforced three modules away, and any future code that hands this dispatcher to a
+less constrained caller turns it into a real hole with no local signal.
+
+**Fix.** Narrow the allowlist to the single tool being invoked. This needs
+`execute_action_step` to build (or be handed) a per-step dispatcher, which means
+threading the registry rather than `&ToolDispatcher` through three call sites —
+mechanical but not free, hence P2. Defense in depth, not a live defect. Related:
+[[I-26]].
+
+---
+
 ### I-78 — a workflow step at `--mode ask` still gets `BypassDecider`
 
 **Symptom.** `rupu workflow run --mode ask` grants every agent step unrestricted
@@ -340,30 +370,44 @@ default-mode case makes it P1 rather than P2. Related: [[I-24]].
 
 ---
 
-### I-79 — the action dispatcher's `["*"]` allowlist is sound only by invariant
+### I-3 — Global `default_model` shadows a provider-scoped `default_model`
 
-**Symptom.** `action_dispatcher_for` (`crates/rupu-cli/src/resume.rs:27`) builds its
-`McpPermission` with a wildcard tool allowlist, `vec!["*".into()]`.
+**Symptom.** With a global `default_model` set and an agent pinned to an
+openai-compatible provider that has its own `[providers.<name>].default_model`,
+the *global* value wins and is sent to the custom endpoint — which typically
+rejects it as an unknown model.
 
-**Root cause.** The dispatcher is constructed once per run, while the tool it may
-call is per-step, so the construction site has no single tool name to narrow to.
+**Root cause.** The fallback chain in `crates/rupu-cli/src/cmd/run.rs` orders
+`cfg.default_model` *before* the provider-scoped `oai_params.default_model`:
 
-**Impact.** No exploitable hole **today**, and this was verified rather than
-assumed: `opts.action_dispatcher` has exactly three production consumers
-(`runner.rs:4293`, `:4700`, `:4923`), all of which funnel into `execute_action_step`,
-whose only dispatch is `dispatcher.call(tool, …)` with `tool = step.action`. That
-tool is validated against the live MCP catalog at parse time by
-`validate_action_step`, and a step may not carry a non-empty `actions:` alongside
-`action:` (`ActionsOnActionStep`). Agent-step tool calls never touch this dispatcher.
-So the wildcard is currently unreachable — but its safety rests on an invariant
-enforced three modules away, and any future code that hands this dispatcher to a
-less constrained caller turns it into a real hole with no local signal.
+```rust
+spec.model → cfg.default_model → oai_params.default_model → "claude-sonnet-4-6"
+```
 
-**Fix.** Narrow the allowlist to the single tool being invoked. This needs
-`execute_action_step` to build (or be handed) a per-step dispatcher, which means
-threading the registry rather than `&ToolDispatcher` through three call sites —
-mechanical but not free, hence P2. Defense in depth, not a live defect. Related:
-[[I-26]].
+The provider-scoped default is the more specific value and arguably should win
+whenever the resolved provider is that provider.
+
+**Impact.** Only bites when both a global `default_model` and a custom provider
+are configured. The documented config in `docs/providers.md` sets no global
+`default_model`, so the documented path is unaffected.
+
+**Fix.** Probably reorder to `spec.model → oai_params.default_model →
+cfg.default_model → hardcoded`. Deliberately **not** fixed alongside I-1/I-2:
+it is a behavior change to a currently-consistent path rather than a
+silent-noop, and it deserves its own decision. Needs a call from matt on
+whether global `default_model` is meant to be provider-agnostic.
+
+**Root cause.** Purely the `.or()` ordering inside `resolve_model`
+(`crates/rupu-runtime/src/provider_factory.rs`). All four call sites already passed their
+arguments correctly — the precedence was wrong one level down, which is why it survived
+Arc 1's pass over the callers.
+
+**Fix.** Reordered to `spec_model → provider_default → cfg_default → fallback`.
+
+**Validation.** `dispatch_prefers_provider_scoped_default_model_over_global_default`,
+observed RED against the old ordering: the resolved model was `"global-default-model"`
+instead of the provider's `"oracle-default"` — the concrete wrong value, not just a failed
+assertion.
 
 ---
 
@@ -396,38 +440,90 @@ error propagation would be invisible — it looks like the pre-existing noise.
 
 **Fix.** Unassigned. Diagnose before trusting this suite as a gate.
 
----
+**Root cause (finally diagnosed).** `MockProvider` mapped `ScriptedTurn::ProviderError` —
+and its exhausted-queue error — to `ProviderError::Http`, which
+`is_retryable_provider_error` **always retries**. So the scripted single failure was
+consumed on attempt 1, attempt 2 hit an empty queue, and the agent loop then retried
+`"mock script exhausted"` through all 10 `MAX_HTTP_RETRIES`, surfacing *that* message
+instead of the `"simulated failure"` the tests assert on.
 
-### I-3 — Global `default_model` shadows a provider-scoped `default_model`
+**That also explains the 48 seconds** — the standing mystery in the original write-up. It
+was never network I/O: it was real `tokio::time::sleep` backoff, 250ms doubling to 8s across
+10 attempts, summing to ~47.75s. The suspicion of "retrying against a real endpoint" was the
+right instinct pointed at the wrong layer.
 
-**Symptom.** With a global `default_model` set and an agent pinned to an
-openai-compatible provider that has its own `[providers.<name>].default_model`,
-the *global* value wins and is sent to the custom endpoint — which typically
-rejects it as an unknown model.
+**Fix.** Map both to `ProviderError::Other` (non-retryable) in `rupu-agent`'s runner. A mock
+failure is a *scripted* outcome and must not be treated as a transient transport error.
 
-**Root cause.** The fallback chain in `crates/rupu-cli/src/cmd/run.rs` orders
-`cfg.default_model` *before* the provider-scoped `oai_params.default_model`:
-
-```rust
-spec.model → cfg.default_model → oai_params.default_model → "claude-sonnet-4-6"
-```
-
-The provider-scoped default is the more specific value and arguably should win
-whenever the resolved provider is that provider.
-
-**Impact.** Only bites when both a global `default_model` and a custom provider
-are configured. The documented config in `docs/providers.md` sets no global
-`default_model`, so the documented path is unaffected.
-
-**Fix.** Probably reorder to `spec.model → oai_params.default_model →
-cfg.default_model → hardcoded`. Deliberately **not** fixed alongside I-1/I-2:
-it is a behavior change to a currently-consistent path rather than a
-silent-noop, and it deserves its own decision. Needs a call from matt on
-whether global `default_model` is meant to be provider-agnostic.
+**Validation.** `linear_runner` now reports **28 passed / 0 failed in 0.04s**, down from
+24/4 in 47.8s. This was the known-red baseline every one of the six arcs had to work around
+and explicitly exclude from its verification — it is gone.
 
 ---
 
-## Fixed
+### I-73 … I-86 — the follow-up sweep (batch)
+
+The fourteen issues that outlived the six planned arcs — five from the original audit that
+were never assigned one, nine discovered *by* the program. Each was verified against the
+code first, and **two filed claims did not hold as written**.
+
+- **I-73** — split verdict after checking. `[scm.default].owner`/`.repo` genuinely had zero
+  safe consumers → **deprecated** with a warn-shim. But `[issues.default].project`/`.tracker`
+  **did** have a safe consumer (`issues list --repo`'s autodetect fallback) → **wired**.
+  RED: the fallback resolved to the cwd's own git remote instead of the configured default.
+- **I-74** — `generate_definition` used the config-blind `build_for_provider`, so AI
+  definition generation ran with none of the operator's `[providers.*]` settings. Threaded a
+  real `ProviderConfig` through all three callers. The CP path mattered most: it is a button
+  in the web UI, so a user with a custom endpoint had it silently ignored.
+- **I-75** — Anthropic's backoff slept *inside* its concurrency permit, starving other
+  requests. Permit acquisition moved into the client (per-attempt, released across backoff);
+  the redundant `ThrottledProvider` wrap removed.
+- **I-76** — **the filed claim was wrong.** Not a silent oversight: `LlmProvider` lacked
+  `Sync`, so async-trait's boxed default method could not be called through
+  `Box<dyn LlmProvider>` **at all** — a compile-time impossibility, verified with a probe
+  crate. Fixed by adding `Sync` as a supertrait, then forwarding `list_models`.
+- **I-77** — test-only inserts gated `#[cfg(any(test, feature = "test-helpers"))]`, matching
+  the neighbouring `empty()`.
+- **I-78** — `ask` grants full tool access in a workflow, and `ask` is the **default**.
+  **Operator decision: keep the behavior, make it visible.** Every alternative was breaking —
+  tightening `ask` would break every workflow that writes without an explicit mode, precisely
+  *because* it is the default. `rupu workflow run` now warns when no mode was given, and
+  `docs/workflow-format.md` states it plainly with a per-mode table. Verified at the
+  consumer: warns without `--mode`, silent with it.
+- **I-79** — the wildcard allowlist is now narrowed **structurally** rather than by
+  invariant: `ToolDispatcher::narrowed_to` constrains an action step's dispatch to the tool
+  named in the workflow. Arc 2 had judged this needed threading the registry through three
+  call sites; narrowing the dispatcher avoids that entirely, changing no signature. Tests
+  assert a narrowed permission refuses other tools **and** preserves `readonly`.
+- **I-80** — the `cp serve` dependency is now surfaced at the point of confusion: the runs
+  listing says so when it sees an *actually overdue* reject gate, naming the manual remedy.
+  All three I-25 regression tests still pass, so no side effect returned.
+- **I-81** — the `tools/list` snapshot now compares **structurally** rather than by string,
+  so it tests catalog *content* instead of serialization order. Re-blessing was rejected: a
+  blessed snapshot just re-drifts for the next person's toolchain. Verified it still catches
+  a genuine catalog change.
+- **I-82** — a web approve's actor now reaches the gate decision row via a
+  `resume_approver` marker threaded into `workflow approve --approver`. RED: the row recorded
+  the OS user rather than `web`.
+- **I-83** — `RetryingProvider` now honors server-supplied `Retry-After`, parsed at every
+  non-Anthropic HTTP boundary and preferred over the computed backoff, capped at 60s (the
+  same ceiling `retry_backoff` already used).
+- **I-84** — Anthropic's nested idle-retry × 429-retry loops **multiplied** to 22 requests
+  worst-case at defaults; they now share a summed budget (13).
+- **I-85** — the two byte-identical OpenAI effort ladders are one
+  `ThinkingLevel::openai_effort_str()`. Anthropic's budget-token ladder and Gemini's
+  model-gated split were deliberately left alone — genuinely different shapes.
+- **I-86** — **one of three claims did not hold.** `:65` and `:250` were stale and were
+  corrected in place (`docs/spec.md` reads as a live reference, unlike the dated design
+  specs that got banners). `:230`'s `gate_requested` claim is **still accurate** — the filed
+  issue had conflated it with an unrelated event — so it was left unchanged.
+
+**Also fixed in passing:** a pre-existing `clippy::question_mark` violation in
+`rupu-scm/src/weburl.rs` that predated this branch but blocked `cargo clippy` workspace-wide
+under the `deny(clippy::all)` policy, meaning lint could not be verified for any crate
+depending on rupu-scm.
+
+---
 
 ### I-54 … I-57, I-59, I-60, I-62 — `docs/workflow-format.md` truth pass
 

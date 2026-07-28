@@ -19,8 +19,18 @@ use crate::types::{LlmRequest, LlmResponse, StreamEvent};
 ///
 /// The `on_event` parameter uses `&mut dyn FnMut` (trait object) rather than
 /// `impl FnMut` (generic) to maintain object safety for `Box<dyn LlmProvider>`.
+///
+/// `Sync` (not just `Send`) is a supertrait (I-76): `async_trait` boxes
+/// `&self` methods as `Pin<Box<dyn Future<Output = _> + Send>>`, and a
+/// future that holds `&self` alive across an `.await` is `Send` only if
+/// `Self: Sync`. Without this bound, `dyn LlmProvider` (the erased type
+/// behind every `Box<dyn LlmProvider>`) can't satisfy that requirement, so
+/// a decorator holding `inner: Box<dyn LlmProvider>` cannot forward
+/// `list_models` — the only method with a default body — through the
+/// trait object at all; the empty-vec default is the only thing callable.
+/// Adding `Sync` here is what makes forwarding possible.
 #[async_trait]
-pub trait LlmProvider: Send {
+pub trait LlmProvider: Send + Sync {
     /// Send a request and get the complete response (non-streaming).
     async fn send(&mut self, request: &LlmRequest) -> Result<LlmResponse, ProviderError>;
 

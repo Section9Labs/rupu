@@ -177,6 +177,36 @@ impl Config {
                  future release will reject it."
             );
         }
+        if let Some(d) = self.scm.default.as_ref() {
+            if d.owner.is_some() {
+                tracing::warn!(
+                    key = "scm.default.owner",
+                    "config.toml still declares `[scm.default].owner`. It has never \
+                     been read by anything — every command that resolves a single \
+                     target repo requires it explicit, to avoid silently targeting \
+                     the wrong repo — and is now formally deprecated: it is accepted \
+                     as a no-op so the rest of your config still loads. Delete \
+                     `[scm.default].owner`; pass `--repo <platform>:<owner>/<repo>` \
+                     explicitly, or set `[issues.default].project` (paired with \
+                     `.tracker`) if you want `rupu issues list` to default a repo. A \
+                     future release will reject it."
+                );
+            }
+            if d.repo.is_some() {
+                tracing::warn!(
+                    key = "scm.default.repo",
+                    "config.toml still declares `[scm.default].repo`. It has never \
+                     been read by anything — every command that resolves a single \
+                     target repo requires it explicit, to avoid silently targeting \
+                     the wrong repo — and is now formally deprecated: it is accepted \
+                     as a no-op so the rest of your config still loads. Delete \
+                     `[scm.default].repo`; pass `--repo <platform>:<owner>/<repo>` \
+                     explicitly, or set `[issues.default].project` (paired with \
+                     `.tracker`) if you want `rupu issues list` to default a repo. A \
+                     future release will reject it."
+                );
+            }
+        }
     }
 
     /// Validate cross-field invariants not expressible in serde.

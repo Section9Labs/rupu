@@ -325,6 +325,16 @@ pub enum Action {
         /// `awaiting_approval` until every gate is resolved.
         #[arg(long)]
         gate: Option<String>,
+        /// Override the recorded approver identity (ISSUES.md I-82).
+        /// Internal: this is how `cp serve`'s resume worker carries a
+        /// web-initiated approve's true actor (e.g. `"web"`) across the
+        /// process boundary — it reads the run's `resume_approver` marker
+        /// and re-derives this flag when spawning `rupu workflow approve`.
+        /// A direct operator invocation should omit it; the approver then
+        /// defaults to the OS user running this process, exactly as
+        /// before this flag existed.
+        #[arg(long, hide = true)]
+        approver: Option<String>,
     },
     /// Reject a paused run. Marks it `rejected`; no further steps
     /// dispatch.
@@ -502,9 +512,12 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
             };
             show_run(&run_id, view, no_color, pager_flag, global_format).await
         }
-        Action::Approve { run_id, mode, gate } => {
-            approve(&run_id, mode.as_deref(), gate.as_deref()).await
-        }
+        Action::Approve {
+            run_id,
+            mode,
+            gate,
+            approver,
+        } => approve(&run_id, mode.as_deref(), gate.as_deref(), approver.as_deref()).await,
         Action::Reject {
             run_id,
             reason,
@@ -1783,7 +1796,23 @@ async fn create(
                 model,
                 available_agents,
             };
-            let outcome = rupu_orchestrator::generate_definition(&req, &resolver).await?;
+            // ISSUES.md I-74: pass the operator's `[providers.<name>]`
+            // settings through instead of silently generating with none.
+            let gen_cfg = layered_config_workflow(&global, project_root.as_deref());
+            let gen_provider_config = rupu_runtime::provider_factory::ProviderConfig {
+                anthropic_oauth_system_prefix: None,
+                openai_compatible: rupu_runtime::provider_factory::openai_compatible_params(
+                    &req.provider,
+                    &gen_cfg.providers,
+                ),
+                tuning: Some(rupu_runtime::provider_factory::provider_tuning(
+                    &req.provider,
+                    &gen_cfg.providers,
+                )),
+            };
+            let outcome =
+                rupu_orchestrator::generate_definition(&req, &resolver, &gen_provider_config)
+                    .await?;
             outcome.content
         }
         None => WORKFLOW_TEMPLATE.replace("{{name}}", &name),
@@ -2014,6 +2043,23 @@ async fn runs(
         // `rupu workflow reject` by hand — there is no other path that
         // will resolve it.
         if on_timeout == Some(rupu_orchestrator::TimeoutAction::Reject) {
+            // ISSUES.md I-80: this listing deliberately leaves the gate
+            // parked (see the I-25 note above), which means an operator who
+            // never runs `rupu cp serve` would otherwise see an overdue gate
+            // sit here forever with no explanation. Say so once, with the
+            // manual remedy, rather than letting the dependency stay
+            // invisible. Only fires for a gate that is ACTUALLY overdue —
+            // a reject gate still within its timeout is just parked normally
+            // and needs no comment.
+            if r.expires_at.is_some_and(|exp| exp <= now) {
+                println!(
+                    "rupu: run {} has an overdue gate with on_timeout: reject — \
+                     resolution is performed by `rupu cp serve`'s gate sweep.\n      \
+                     If you don't run `cp serve`, resolve it with \
+                     `rupu workflow reject {} --reason \"...\"`.",
+                    r.id, r.id
+                );
+            }
             continue;
         }
 
@@ -2351,8 +2397,16 @@ fn resolve_approve_gate(
     store: &rupu_orchestrator::RunStore,
     run_id: &str,
     gate: Option<&str>,
+    approver_override: Option<&str>,
 ) -> anyhow::Result<ApproveGateOutcome> {
-    let approver = whoami::username();
+    // ISSUES.md I-82: a web-initiated approve threads its true actor in via
+    // `approver_override` (ultimately `--approver`, set by the cp-serve
+    // resume worker from the run's `resume_approver` marker); a direct
+    // operator invocation passes `None` and falls back to the OS user, as
+    // before this override existed.
+    let approver = approver_override
+        .map(str::to_string)
+        .unwrap_or_else(whoami::username);
 
     // `store.approve_gate()` treats a timed-out `on_timeout: approve`
     // gate identically to an operator approve (it falls through and
@@ -2451,14 +2505,19 @@ fn resolve_approve_gate(
     }
 }
 
-async fn approve(run_id: &str, mode: Option<&str>, gate: Option<&str>) -> anyhow::Result<()> {
+async fn approve(
+    run_id: &str,
+    mode: Option<&str>,
+    gate: Option<&str>,
+    approver_override: Option<&str>,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
     let runs_dir = global.join("runs");
     let store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir));
 
-    let (awaited_step_id, approver, via_timeout) = match resolve_approve_gate(&store, run_id, gate)?
-    {
+    let (awaited_step_id, approver, via_timeout) =
+        match resolve_approve_gate(&store, run_id, gate, approver_override)? {
         ApproveGateOutcome::Approved {
             step_id,
             approver,
@@ -3679,7 +3738,10 @@ async fn run_with_outcome(
             workspace_path,
             workspace_id: ws.id,
             inputs,
-            mode: mode.unwrap_or("ask").to_string(),
+            mode: {
+                warn_if_ask_mode_is_effectively_bypass(mode, mode.unwrap_or("ask"));
+                mode.unwrap_or("ask").to_string()
+            },
             invocation_source,
             event,
             issue: issue_payload,
@@ -3747,7 +3809,10 @@ async fn run_path_with_outcome(
             workspace_path,
             workspace_id: ws.id,
             inputs,
-            mode: mode.unwrap_or("ask").to_string(),
+            mode: {
+                warn_if_ask_mode_is_effectively_bypass(mode, mode.unwrap_or("ask"));
+                mode.unwrap_or("ask").to_string()
+            },
             invocation_source,
             event,
             issue: None,
@@ -4608,6 +4673,38 @@ async fn post_run_summary_to_issue(
 // DefaultStepFactory is now defined in rupu-orchestrator::step_factory.
 // Construction sites below use rupu_orchestrator::DefaultStepFactory directly.
 
+/// Warn when a workflow run will execute its agent steps at `bypass`
+/// because no `--mode` was given (ISSUES.md I-78).
+///
+/// `ask` is the default mode, but a workflow step resolves `ask` to
+/// `BypassDecider` — the agent runtime's interactive `ask` decider blocks on
+/// stdin, and an unattended workflow step has no operator to answer it, so a
+/// genuinely-prompting `ask` would hang every scheduled run.
+///
+/// The operator decision (2026-07-28) was to keep that behavior rather than
+/// tighten it: making `ask` deny writers would break every existing workflow
+/// that writes without an explicit mode, precisely *because* `ask` is the
+/// default. So the gap is made loud instead of silent.
+///
+/// Only fires when `--mode` was **omitted** — someone who typed
+/// `--mode ask`/`--mode bypass` has made a choice and does not need nagging.
+///
+/// Split from the printing so the condition is unit-testable without
+/// capturing stderr.
+fn should_warn_ask_is_bypass(mode: Option<&str>, mode_str: &str) -> bool {
+    mode.is_none() && mode_str == "ask"
+}
+
+fn warn_if_ask_mode_is_effectively_bypass(mode: Option<&str>, mode_str: &str) {
+    if should_warn_ask_is_bypass(mode, mode_str) {
+        eprintln!(
+            "warning: --mode not set; workflow steps run at `bypass` \
+             (there is no operator to answer `ask` mid-run).\n         \
+             Pass --mode readonly to deny bash/write_file/edit_file."
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4669,6 +4766,7 @@ mod tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            resume_approver: None,
             reject_cleanup_pending: None,
             permission_mode: None,
             issue_ref: None,
@@ -4931,7 +5029,7 @@ mod tests {
         let rec = two_gate_awaiting_record("run_cli_approve_b");
         store.create(rec.clone(), TWO_GATE_YAML).unwrap();
 
-        let outcome = resolve_approve_gate(&store, &rec.id, Some("gate_b")).unwrap();
+        let outcome = resolve_approve_gate(&store, &rec.id, Some("gate_b"), None).unwrap();
         match outcome {
             ApproveGateOutcome::Approved { step_id, .. } => assert_eq!(step_id, "gate_b"),
             ApproveGateOutcome::ExpiredRejected { .. } => panic!("must not have expired"),
@@ -4952,7 +5050,7 @@ mod tests {
         let rec = two_gate_awaiting_record("run_cli_approve_ambiguous");
         store.create(rec.clone(), TWO_GATE_YAML).unwrap();
 
-        let err = resolve_approve_gate(&store, &rec.id, None).unwrap_err();
+        let err = resolve_approve_gate(&store, &rec.id, None, None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("gate_a"), "message: {msg}");
         assert!(msg.contains("gate_b"), "message: {msg}");
@@ -4971,7 +5069,7 @@ mod tests {
         let rec = sample_run_record(RunStatus::AwaitingApproval, None);
         store.create(rec.clone(), "name: sample\nsteps: []\n").unwrap();
 
-        let outcome = resolve_approve_gate(&store, &rec.id, None).unwrap();
+        let outcome = resolve_approve_gate(&store, &rec.id, None, None).unwrap();
         match outcome {
             ApproveGateOutcome::Approved { step_id, .. } => assert_eq!(step_id, "step_approve"),
             ApproveGateOutcome::ExpiredRejected { .. } => panic!("must not have expired"),
@@ -4988,7 +5086,7 @@ mod tests {
         let rec = two_gate_awaiting_record("run_cli_approve_unknown");
         store.create(rec.clone(), TWO_GATE_YAML).unwrap();
 
-        let err = resolve_approve_gate(&store, &rec.id, Some("no_such_gate")).unwrap_err();
+        let err = resolve_approve_gate(&store, &rec.id, Some("no_such_gate"), None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("no_such_gate"), "message: {msg}");
         assert!(msg.contains("not awaiting approval"), "message: {msg}");
@@ -5147,7 +5245,7 @@ mod tests {
             .unwrap();
 
         std::env::set_var("RUPU_HOME", &home);
-        let result = approve(&rec.id, None, None).await;
+        let result = approve(&rec.id, None, None, None).await;
         std::env::remove_var("RUPU_HOME");
         result.expect("approve of an overdue on_timeout: approve gate should succeed");
 
@@ -5189,7 +5287,7 @@ mod tests {
             .unwrap();
 
         std::env::set_var("RUPU_HOME", &home);
-        let result = approve(&rec.id, None, None).await;
+        let result = approve(&rec.id, None, None, None).await;
         std::env::remove_var("RUPU_HOME");
         result.expect("approve of a fresh gate should succeed");
 
@@ -5202,6 +5300,79 @@ mod tests {
         assert_eq!(output["decision"], "approved");
         assert_eq!(output["via"], "human");
         assert_eq!(output["approver"], whoami::username());
+    }
+
+    /// ISSUES.md I-82: a web-initiated approve's true actor must reach the
+    /// gate decision row, not a placeholder or the OS user running `cp
+    /// serve`. Drives the exact same two-step handoff the real system
+    /// does across its process boundary:
+    ///   1. `request_resume_approval(..., "web", ...)` — what the CP web
+    ///      `approve_run` handler calls; this is the marker-only step that
+    ///      now persists the actor onto `record.resume_approver`.
+    ///   2. `approve(..., approver_override: Some("web"))` — what `cp
+    ///      serve`'s resume worker spawns as `rupu workflow approve
+    ///      --approver web <id>` once it reads `resume_approver` back off
+    ///      the marker (`resume_one_run` / `build_resume_argv`).
+    /// Pre-fix, step 2 had no override and always fell back to
+    /// `whoami::username()`, so the recorded `approver` was never `"web"`
+    /// — it was whatever account happened to run the worker process.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn approve_via_web_path_records_web_actor_not_operator_identity() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        crate::test_support::ensure_crypto_provider();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let store = rupu_orchestrator::RunStore::new(home.join("runs"));
+        let now = Utc::now();
+        let rec = single_gate_awaiting_record("run_i82_web_approve", &workspace, now, None);
+        store
+            .create(
+                rec.clone(),
+                "name: g\nsteps:\n  - id: gate\n    approval:\n      prompt: \"Approve?\"\n",
+            )
+            .unwrap();
+
+        // Step 1: the CP web handler's marker-only approve.
+        store
+            .request_resume_approval(&rec.id, "web", None, Utc::now(), None)
+            .expect("web approve marker should be recorded");
+        assert_eq!(
+            store.load(&rec.id).unwrap().resume_approver.as_deref(),
+            Some("web"),
+            "the resolved actor must be persisted onto the resume marker"
+        );
+
+        // Step 2: the resume worker's spawned `workflow approve --approver
+        // web`, simulated in-process (see `resume_one_run`'s own test for
+        // the argv-plumbing half of this round-trip).
+        std::env::set_var("RUPU_HOME", &home);
+        let result = approve(&rec.id, None, None, Some("web")).await;
+        std::env::remove_var("RUPU_HOME");
+        result.expect("web-initiated approve should succeed");
+
+        let step_results = store.read_step_results(&rec.id).unwrap();
+        let gate_record = step_results
+            .iter()
+            .find(|r| r.step_id == "gate")
+            .expect("gate decision must be recorded");
+        let output: serde_json::Value = serde_json::from_str(&gate_record.output).unwrap();
+        assert_eq!(output["decision"], "approved");
+        assert_eq!(
+            output["approver"], "web",
+            "gate decision must name the web approver, not a placeholder or \
+             the OS user running the resume worker (got {:?})",
+            output["approver"]
+        );
+        assert_ne!(
+            output["approver"],
+            serde_json::json!(whoami::username()),
+            "must not silently fall back to the OS user's identity"
+        );
     }
 
     // ── I-41: gate/action arms in the steps table ────────────────────
@@ -5283,5 +5454,32 @@ steps:
         let (kind, primary, _detail) = workflow_step_table_summary(&step);
         assert_eq!(kind, "linear");
         assert_eq!(primary, "coder");
+    }
+
+    // ── I-78: `ask` is effectively `bypass` for workflow steps ───────
+    //
+    // Operator decision (2026-07-28): keep the behavior, make it visible.
+    // Tightening `ask` would break every workflow that writes without an
+    // explicit --mode, because `ask` is ALSO the default.
+
+    #[test]
+    fn omitting_mode_warns_that_steps_run_at_bypass() {
+        // The warning must fire only when the operator made no choice.
+        assert!(should_warn_ask_is_bypass(None, "ask"));
+    }
+
+    #[test]
+    fn an_explicit_mode_never_warns() {
+        // Someone who typed --mode has decided; nagging them is noise.
+        assert!(!should_warn_ask_is_bypass(Some("ask"), "ask"));
+        assert!(!should_warn_ask_is_bypass(Some("bypass"), "bypass"));
+        assert!(!should_warn_ask_is_bypass(Some("readonly"), "readonly"));
+    }
+
+    #[test]
+    fn a_resolved_non_ask_mode_never_warns() {
+        // Defensive: if the default ever stops being `ask`, this must not
+        // start warning about a mode that does gate writes.
+        assert!(!should_warn_ask_is_bypass(None, "readonly"));
     }
 }

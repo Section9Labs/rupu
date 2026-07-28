@@ -40,12 +40,11 @@ pub fn parse_repo_remote(remote: &str) -> Option<RepoWeb> {
         let rest = rest.split_once('@').map(|(_, r)| r).unwrap_or(rest);
         let (host, path) = rest.split_once('/')?;
         (host.to_string(), path.to_string())
-    } else if let Some(rest) = remote.strip_prefix("git@") {
+    } else {
         // scp style: git@host:owner/.../repo
+        let rest = remote.strip_prefix("git@")?;
         let (host, path) = rest.split_once(':')?;
         (host.to_string(), path.to_string())
-    } else {
-        return None;
     };
 
     let platform = platform_for_host(&host)?;

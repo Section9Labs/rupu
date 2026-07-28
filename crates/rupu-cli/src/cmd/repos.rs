@@ -244,7 +244,7 @@ async fn attach_inner(args: TrackArgs) -> anyhow::Result<()> {
     let store = RepoRegistryStore {
         root: paths::repos_dir(&global),
     };
-    let repo = resolve_repo_or_autodetect(Some(&args.repo))?;
+    let repo = resolve_repo_or_autodetect(Some(&args.repo), None)?;
     let repo_ref = canonical_repo_ref(&repo);
     let path = checkout_path(args.path.as_deref())?;
     validate_checkout_matches_repo(&path, &repo_ref)?;
@@ -266,7 +266,7 @@ async fn prefer_inner(args: TrackArgs) -> anyhow::Result<()> {
     let store = RepoRegistryStore {
         root: paths::repos_dir(&global),
     };
-    let repo = resolve_repo_or_autodetect(Some(&args.repo))?;
+    let repo = resolve_repo_or_autodetect(Some(&args.repo), None)?;
     let repo_ref = canonical_repo_ref(&repo);
     let path = checkout_path(args.path.as_deref())?;
     validate_checkout_matches_repo(&path, &repo_ref)?;
@@ -407,7 +407,7 @@ async fn forget_inner(args: ForgetArgs) -> anyhow::Result<()> {
     let store = RepoRegistryStore {
         root: paths::repos_dir(&global),
     };
-    let repo = resolve_repo_or_autodetect(Some(&args.repo))?;
+    let repo = resolve_repo_or_autodetect(Some(&args.repo), None)?;
     let repo_ref = canonical_repo_ref(&repo);
     if let Some(path) = args.path.as_deref() {
         let removed = store.forget_path(&repo_ref, Path::new(path))?;

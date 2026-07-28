@@ -909,6 +909,94 @@ mod tests {
         assert_eq!(model, "oracle-default");
     }
 
+    /// ISSUES.md I-3: a global `default_model` must NOT shadow a more
+    /// specific `[providers.<name>].default_model`. An agent pinned to a
+    /// custom openai-compatible provider (no `model:` of its own) must
+    /// resolve to *that provider's* default, not the global one — the
+    /// global value would typically be rejected by the custom endpoint as
+    /// an unknown model.
+    #[tokio::test]
+    async fn dispatch_prefers_provider_scoped_default_model_over_global_default() {
+        let _guard = ENV_LOCK.lock().await;
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join("global");
+        std::fs::create_dir_all(global.join("agents")).unwrap();
+        std::fs::write(
+            global.join("agents/child.md"),
+            "---\nname: child\nprovider: oracle\nmaxTurns: 3\n---\nyou are a child agent.",
+        )
+        .unwrap();
+
+        let runs_dir = dir.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let run_store = Arc::new(RunStore::new(runs_dir));
+
+        let workspace_path = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+
+        let resolver = Arc::new(rupu_auth::KeychainResolver::new());
+        let mcp_registry = Arc::new(rupu_scm::Registry::default());
+
+        let mut oai = std::collections::HashMap::new();
+        oai.insert(
+            "oracle".to_string(),
+            provider_factory::OpenAiCompatibleParams {
+                base_url: "https://example.invalid/v1".to_string(),
+                default_model: "oracle-default".to_string(),
+                stream: false,
+                models: Vec::new(),
+            },
+        );
+
+        let dispatcher = CliAgentDispatcher::new(
+            global,
+            None,
+            "ws_test".into(),
+            workspace_path,
+            resolver,
+            "bypass".into(),
+            mcp_registry,
+            run_store,
+            None,
+            None,
+            // A global default_model IS set here — the regression this
+            // test guards against is this value winning over the more
+            // specific provider-scoped one below.
+            Some("global-default-model".to_string()),
+            oai,
+            std::collections::HashMap::new(),
+        );
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
+        );
+        let result = dispatcher
+            .dispatch("child", "do the thing".into(), "parent_run_1", 0)
+            .await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+
+        let outcome = result.expect("dispatch should succeed against the mock provider");
+
+        let events: Vec<Event> = JsonlReader::iter(&outcome.transcript_path)
+            .expect("child transcript readable")
+            .filter_map(Result::ok)
+            .collect();
+
+        let (provider, model) = events
+            .iter()
+            .find_map(|e| match e {
+                Event::RunStart {
+                    provider, model, ..
+                } => Some((provider.clone(), model.clone())),
+                _ => None,
+            })
+            .expect("child transcript must carry a RunStart");
+
+        assert_eq!(provider, "oracle");
+        assert_eq!(model, "oracle-default");
+    }
+
     /// IMPORTANT 4 fallback: `dispatch()` cannot thread the parent step's
     /// `actions:` narrowing (or an audit callback) into the child launch
     /// (see the doc comment on `dispatch()` for why), so it must never be

@@ -588,6 +588,7 @@ mod pause_resume_tests {
             resume_claimed_by: None,
             resume_mode: None,
             resume_gate_id: None,
+            resume_approver: None,
             reject_cleanup_pending: None,
             permission_mode: None,
             final_output: None,

@@ -271,11 +271,13 @@ impl OpenAiCodexClient {
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
+            let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Api {
+            return Err(crate::error::api_error_from_response(
                 status,
-                message: truncate_error(&text, 500),
-            });
+                &headers,
+                truncate_error(&text, 500),
+            ));
         }
 
         let mut parser = SseParser::new();
@@ -533,16 +535,7 @@ impl OpenAiCodexClient {
             // field so the server picks; OpenAI doesn't accept "auto" as a
             // value but treats absence as adaptive.
             if let Some(level) = &request.thinking {
-                use crate::model_tier::ThinkingLevel;
-                let effort = match level {
-                    ThinkingLevel::Auto => None,
-                    ThinkingLevel::Minimal => Some("minimal"),
-                    ThinkingLevel::Low => Some("low"),
-                    ThinkingLevel::Medium => Some("medium"),
-                    ThinkingLevel::High => Some("high"),
-                    ThinkingLevel::Max => Some("xhigh"),
-                };
-                if let Some(e) = effort {
+                if let Some(e) = level.openai_effort_str() {
                     body["reasoning"]["effort"] = serde_json::json!(e);
                 }
             }

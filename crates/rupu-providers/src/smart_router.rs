@@ -109,7 +109,8 @@ fn is_retriable(e: &ProviderError) -> bool {
         ProviderError::Api {
             status: 429 | 401 | 403,
             ..
-        } | ProviderError::TokenRefreshFailed(_)
+        } | ProviderError::RateLimited { .. }
+            | ProviderError::TokenRefreshFailed(_)
             | ProviderError::Http(_)
     )
 }
@@ -141,6 +142,9 @@ async fn record_err(
     match error {
         ProviderError::Api { status: 429, .. } => {
             pool.record_rate_limit(provider, model_id, None);
+        }
+        ProviderError::RateLimited { retry_after } => {
+            pool.record_rate_limit(provider, model_id, *retry_after);
         }
         _ => {
             pool.record_error(provider, model_id, &error.to_string());

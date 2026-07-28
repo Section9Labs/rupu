@@ -289,10 +289,23 @@ impl StepFactory for DefaultStepFactory {
             transcript_path,
             max_turns: spec.max_turns.unwrap_or(50),
             // `readonly` gets a real, non-interactive deny-writers decider
-            // (ISSUES.md I-24 needs this to be observable at the tool
-            // layer); `ask`/`bypass` keep the existing unconditional-allow
-            // behavior — prompting mid-workflow has no operator to answer,
-            // so `ask` in a workflow context is unchanged by this fix.
+            // (ISSUES.md I-24 needs this to be observable at the tool layer).
+            //
+            // `ask` and `bypass` both get `BypassDecider`, i.e. **`ask`
+            // grants full tool access in a workflow** (ISSUES.md I-78). That
+            // is deliberate, not an oversight: the agent runtime's `ask`
+            // decider blocks on stdin, and a workflow step has no operator
+            // present to answer — so a genuinely-prompting `ask` would hang
+            // every unattended run.
+            //
+            // Operator decision (2026-07-28): keep the behavior, make it
+            // visible. Changing `ask` to deny writers would break every
+            // existing workflow that writes without an explicit `--mode`,
+            // because `ask` is also the **default** when `--mode` is
+            // omitted. Instead `rupu workflow run` warns at startup when no
+            // mode was given, and `docs/workflow-format.md` states it
+            // plainly. Anyone wanting the restriction passes
+            // `--mode readonly`.
             decider: if self.mode_str == "readonly" {
                 Arc::new(ReadonlyDecider) as Arc<dyn PermissionDecider>
             } else {

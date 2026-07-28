@@ -152,26 +152,27 @@ pub fn resolve_provider_name(spec_provider: Option<&str>, cfg_default: Option<&s
         .to_string()
 }
 
-/// Resolve the model for a run: agent frontmatter `model:` wins, then
-/// `default_model` from `config.toml`, then the resolved provider's
-/// `[providers.<name>].default_model`, then [`FALLBACK_MODEL`].
+/// Resolve the model for a run: agent frontmatter `model:` wins, then the
+/// resolved provider's `[providers.<name>].default_model`, then the global
+/// `default_model` from `config.toml`, then [`FALLBACK_MODEL`].
 ///
 /// The single resolution point for `rupu run`, `rupu session`, and workflow
 /// steps — the workflow path previously skipped `cfg.default_model`, so the
 /// same agent could resolve to a different model depending on how it was
 /// invoked (ISSUES.md I-2).
 ///
-/// Note the global `default_model` is consulted *before* the provider-scoped
-/// one. That is the pre-existing `rupu run` order, preserved here deliberately;
-/// see ISSUES.md I-3 for why it is questionable.
+/// The provider-scoped default is consulted *before* the global one: it is
+/// the more specific value, and an agent pinned to a custom openai-compatible
+/// provider must get that provider's model rather than a global default the
+/// custom endpoint doesn't recognize (ISSUES.md I-3).
 pub fn resolve_model(
     spec_model: Option<&str>,
     cfg_default: Option<&str>,
     provider_default: Option<&str>,
 ) -> String {
     non_empty(spec_model)
-        .or(non_empty(cfg_default))
         .or(non_empty(provider_default))
+        .or(non_empty(cfg_default))
         .unwrap_or(FALLBACK_MODEL)
         .to_string()
 }
@@ -302,31 +303,42 @@ pub async fn build_for_provider_with_config(
 /// same provider — `tuned::tests::a_backoff_sleep_does_not_hold_a_concurrency_permit`
 /// and its `..._inverted_order_...` counterpart pin both halves of that claim.
 ///
-/// Anthropic is the one provider NOT given a `RetryingProvider`: it has its own
-/// in-client 429 loop, already driven by `tuning.max_retries` via
-/// `AnthropicClient::with_tuning`, and stacking the two would silently square
-/// the budget. That native loop *does* sleep inside the permit — the wrappers
-/// cannot reach inside a client — so anthropic keeps the starvation shape this
-/// ordering removes for everyone else. Fixing it means teaching
-/// `AnthropicClient` to release/reacquire around its own backoff; tracked as a
-/// follow-up rather than papered over here.
+/// Anthropic is the one provider given NEITHER decorator here — `client` is
+/// returned as-is. It has its own in-client 429 loop, already driven by
+/// `tuning.max_retries` via `AnthropicClient::with_tuning` (stacking
+/// `RetryingProvider` on top would silently square the retry budget), AND —
+/// since ISSUES.md I-75 — its own per-attempt semaphore acquisition, also
+/// wired up by `with_tuning`. That internal acquisition mirrors this same
+/// `RetryingProvider(ThrottledProvider(..))` shape *inside* the client: a
+/// fresh permit per HTTP attempt, dropped before that attempt's own backoff
+/// sleep, so the sleep no longer starves other concurrent Anthropic calls the
+/// way it used to when `ThrottledProvider` held one permit for the client's
+/// *entire* call (request + every internal retry). Wrapping Anthropic in
+/// `ThrottledProvider` here too would have both layers drawing from the same
+/// name-keyed semaphore (`ThrottledProvider::wrap` and
+/// `AnthropicClient::with_tuning` both resolve `tuning.semaphore("anthropic")`
+/// to the identical process-wide instance) — at best double-counting a permit
+/// per call, at worst deadlocking outright when `max_concurrency == 1` (the
+/// outer wrapper holds the only permit for the whole call while the client
+/// tries to acquire a second one from the same exhausted semaphore before its
+/// first attempt).
 fn decorate(
     client: Box<dyn LlmProvider>,
     name: &str,
     tuning: &rupu_providers::ProviderTuning,
 ) -> Box<dyn LlmProvider> {
-    let throttled = rupu_providers::ThrottledProvider::wrap(client, name, tuning);
     if provider_has_native_retry(name) {
-        Box::new(throttled)
-    } else {
-        Box::new(rupu_providers::RetryingProvider::new(
-            Box::new(throttled),
-            tuning.max_retries,
-        ))
+        return client;
     }
+    let throttled = rupu_providers::ThrottledProvider::wrap(client, name, tuning);
+    Box::new(rupu_providers::RetryingProvider::new(
+        Box::new(throttled),
+        tuning.max_retries,
+    ))
 }
 
-/// True for providers whose client already spends `tuning.max_retries` itself.
+/// True for providers whose client already spends `tuning.max_retries` (and,
+/// as of I-75, `tuning.max_concurrency`) itself — see `decorate` above.
 fn provider_has_native_retry(name: &str) -> bool {
     name == "anthropic"
 }
@@ -522,8 +534,12 @@ mod tests {
 
     #[test]
     fn only_anthropic_skips_the_retry_decorator() {
-        // Anthropic spends `max_retries` inside its own 429 loop; wrapping it
-        // in RetryingProvider too would square the budget.
+        // Anthropic spends `max_retries` inside its own 429 loop (wrapping it
+        // in RetryingProvider too would square the budget) and, as of I-75,
+        // also spends `max_concurrency` inside its own per-attempt semaphore
+        // acquisition (wrapping it in ThrottledProvider too would double-count
+        // a permit per call, or deadlock at max_concurrency == 1) — see
+        // `decorate`'s doc comment for the full reasoning.
         assert!(provider_has_native_retry("anthropic"));
         assert!(!provider_has_native_retry("openai"));
         assert!(!provider_has_native_retry("gemini"));

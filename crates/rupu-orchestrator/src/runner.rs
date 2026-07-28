@@ -736,6 +736,7 @@ pub async fn run_workflow(
                 resume_claimed_by: None,
                 resume_mode: None,
                 resume_gate_id: None,
+                resume_approver: None,
                 reject_cleanup_pending: None,
                 // ISSUES.md I-24: capture the launch mode straight off the
                 // factory so it's on disk from the very first write —
@@ -4843,7 +4844,15 @@ async fn execute_action_step(
     })?;
 
     let transcript_path = transcript_dir.join(format!("run_{}.jsonl", Ulid::new()));
-    let call_result = dispatcher.call(tool, args.clone()).await;
+    // ISSUES.md I-79: narrow the run-scoped dispatcher to exactly this
+    // step's tool before dispatching. The dispatcher is built once per run
+    // with a `["*"]` allowlist (the tool is per-step and unknown at
+    // construction), and today nothing can reach it with any other tool —
+    // but that safety rests on an invariant enforced three modules away.
+    // Narrowing here makes it structural: even if a future caller reuses
+    // this dispatcher, an action step can still only invoke the tool named
+    // in the workflow source.
+    let call_result = dispatcher.narrowed_to(tool).call(tool, args.clone()).await;
 
     let (allowed, applied, reason) = match &call_result {
         Ok(_) => (true, true, None),
@@ -9891,17 +9900,14 @@ steps:
     ///   here) is a true orchestration no-op, and gives a coarse ordering
     ///   check (a reconverge step is always the LAST id appended).
     ///
-    /// Deliberately has NO "make the agent turn itself fail" knob: `rupu-
-    /// agent`'s `run_agent` retries a `ScriptedTurn::ProviderError` up to
-    /// `MAX_HTTP_RETRIES` times with capped exponential backoff (it maps to
-    /// `ProviderError::Http`, which `is_retryable_provider_error` always
-    /// retries) — a real ~48s wall-clock cascade before giving up, the same
-    /// cost `tests/linear_runner.rs`'s `FailingFactory`-based tests already
-    /// pay. The mid-graph-failure test below instead fails via a template
-    /// render error (`RunWorkflowError::Render`), which propagates
-    /// immediately with no retry — same "hard failure, no
-    /// `continue_on_error`" contract, without the unrelated retry-timing
-    /// cost.
+    /// Deliberately has NO "make the agent turn itself fail" knob: the
+    /// mid-graph-failure test below instead fails via a template render
+    /// error (`RunWorkflowError::Render`), which propagates immediately —
+    /// same "hard failure, no `continue_on_error`" contract as a scripted
+    /// `ScriptedTurn::ProviderError`, without adding a fail-injection path
+    /// to this shared factory. (`ScriptedTurn::ProviderError` itself now
+    /// maps to a non-retryable `ProviderError::Other` — see I-4 — so it no
+    /// longer costs a ~48s retry cascade either way.)
     struct SchedulerTestFactory {
         concurrency_tracked: &'static [&'static str],
         sleep_ms: u64,
@@ -11937,6 +11943,7 @@ loops:
                     resume_claimed_by: None,
                     resume_mode: None,
                     resume_gate_id: None,
+                    resume_approver: None,
                     reject_cleanup_pending: None,
                     permission_mode: None,
                     final_output: None,

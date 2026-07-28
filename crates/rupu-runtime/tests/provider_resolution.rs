@@ -44,13 +44,16 @@ fn model_falls_back_to_config_default() {
     assert_eq!(resolve_model(None, Some("gpt-5"), None), "gpt-5");
 }
 
-/// Preserves the pre-existing `rupu run` order: the global `default_model` is
-/// consulted before the provider-scoped one. See ISSUES.md I-3 — this ordering
-/// is questionable but is deliberately locked here as current behavior so a
-/// future change to it is a conscious, visible edit.
+/// ISSUES.md I-3: a provider-scoped `[providers.<name>].default_model` is
+/// more specific than the global `default_model` and must win — otherwise an
+/// agent pinned to a custom openai-compatible provider gets the global
+/// model sent to an endpoint that doesn't recognize it.
 #[test]
-fn model_config_default_wins_over_provider_scoped_default() {
-    assert_eq!(resolve_model(None, Some("gpt-5"), Some("glm-5.2")), "gpt-5");
+fn model_provider_scoped_default_wins_over_config_default() {
+    assert_eq!(
+        resolve_model(None, Some("gpt-5"), Some("glm-5.2")),
+        "glm-5.2"
+    );
 }
 
 #[test]
