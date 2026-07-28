@@ -52,7 +52,26 @@ impl DefinitionGenerator for RuntimeDefinitionGenerator {
             model,
             available_agents,
         };
-        let out = rupu_orchestrator::generate_definition(&gen_req, &resolver)
+        // ISSUES.md I-74: honor `[providers.<name>]` here too. This path is
+        // the CP's "generate a definition" button, so it previously ran with
+        // none of the operator's timeout/retry/concurrency/base_url settings.
+        let gen_cfg = rupu_config::layer_files_locked(
+            Some(&self.global_dir.join("config.toml")),
+            None,
+        )
+        .unwrap_or_default();
+        let gen_provider_config = rupu_runtime::provider_factory::ProviderConfig {
+            anthropic_oauth_system_prefix: None,
+            openai_compatible: rupu_runtime::provider_factory::openai_compatible_params(
+                &gen_req.provider,
+                &gen_cfg.providers,
+            ),
+            tuning: Some(rupu_runtime::provider_factory::provider_tuning(
+                &gen_req.provider,
+                &gen_cfg.providers,
+            )),
+        };
+        let out = rupu_orchestrator::generate_definition(&gen_req, &resolver, &gen_provider_config)
             .await
             .map_err(|e| match e {
                 rupu_orchestrator::GenerateError::NoCredentials => GenDefError::NoCredentials,

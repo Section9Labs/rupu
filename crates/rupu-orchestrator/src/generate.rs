@@ -7,7 +7,7 @@
 //! in runtime would cycle.
 
 use rupu_providers::types::{LlmRequest, Message};
-use rupu_runtime::provider_factory::build_for_provider;
+use rupu_runtime::provider_factory::build_for_provider_with_config;
 
 /// Total send attempts (1 first try + repairs) before giving up.
 pub const MAX_ATTEMPTS: u8 = 3;
@@ -163,10 +163,24 @@ pub async fn pick_default_gen_model(
 pub async fn generate_definition(
     req: &GenerateRequest,
     resolver: &dyn rupu_auth::CredentialResolver,
+    provider_config: &rupu_runtime::ProviderConfig,
 ) -> Result<GenerateOutcome, GenerateError> {
-    let (_mode, mut provider) = build_for_provider(&req.provider, &req.model, None, resolver)
-        .await
-        .map_err(|_| GenerateError::NoCredentials)?;
+    // ISSUES.md I-74: build through the config-aware factory. The plain
+    // `build_for_provider` ignores `[providers.<name>]` entirely, so
+    // definition generation silently ran with none of the operator's
+    // `timeout_ms` / `max_retries` / `max_concurrency` / `base_url` /
+    // `org_id` / `region` settings — the same silent-dead-config class Arc 1
+    // fixed everywhere else (see I-8, the identical defect in
+    // `dispatch_agent`).
+    let (_mode, mut provider) = build_for_provider_with_config(
+        &req.provider,
+        &req.model,
+        None,
+        resolver,
+        provider_config,
+    )
+    .await
+    .map_err(|_| GenerateError::NoCredentials)?;
 
     let system = build_system_prompt(req.kind, &req.available_agents);
     let mut messages = vec![Message::user(&format!(
@@ -281,7 +295,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             available_agents: vec![],
         };
-        let out = generate_definition(&req, &resolver).await;
+        let out = generate_definition(&req, &resolver, &Default::default()).await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
         let out = out.expect("ok");
 
@@ -308,7 +322,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             available_agents: vec![],
         };
-        let out = generate_definition(&req, &resolver).await;
+        let out = generate_definition(&req, &resolver, &Default::default()).await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
         let out = out.expect("ok");
 
@@ -335,7 +349,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             available_agents: vec![],
         };
-        let out = generate_definition(&req, &resolver).await;
+        let out = generate_definition(&req, &resolver, &Default::default()).await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
         let err = out.unwrap_err();
 
