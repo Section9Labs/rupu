@@ -483,6 +483,12 @@ jobs:
           sudo dnf install ./rupu-${VERSION}.x86_64.rpm
           \`\`\`
 
+          Prefer \`apt upgrade\`/\`dnf upgrade\` over downloading a \`.deb\`/\`.rpm\`
+          by hand for every release? Set up the hosted repository once — see
+          "Linux packages" in the
+          [README](https://github.com/${{ github.repository }}#install) for
+          the \`apt\`/\`dnf\` setup snippets (stable and beta).
+
           **Windows:** install the Linux binary under WSL2.
 
           Built from \`${GITHUB_SHA}\`.
@@ -562,7 +568,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p site
-          cp docs/pages/index.html site/ 2>/dev/null || true
           cp docs/pages/rupu-archive-keyring.asc site/
           ./packaging/build-apt-repo.sh pkgs "$CHANNEL" site
           ./packaging/build-yum-repo.sh pkgs "$CHANNEL" site

@@ -42,7 +42,7 @@ Users must be able to fetch the signing key before any package exists, and the s
 
 **Files:**
 - Create: `.github/workflows/pages.yml` OR extend the release workflow — decide by reading how `release.yml` is structured, and prefer extending it if the publish step can simply push to the `gh-pages` branch.
-- Create: `docs/pages/index.html` (a minimal landing page naming the repo URLs)
+- Create: a minimal landing page under `docs/pages/` naming the repo URLs (later found to be a hazard and deleted — see the Task 6 correction below)
 - Create: `docs/pages/rupu-archive-keyring.asc` (the ASCII-armored PUBLIC key)
 
 **Interfaces:**
@@ -312,7 +312,6 @@ git commit -m "build(packaging): signed YUM repository builder"
         run: |
           set -euo pipefail
           mkdir -p site
-          cp docs/pages/index.html site/ 2>/dev/null || true
           cp docs/pages/rupu-archive-keyring.asc site/
           ./packaging/build-apt-repo.sh pkgs "$CHANNEL" site
           ./packaging/build-yum-repo.sh pkgs "$CHANNEL" site
@@ -464,8 +463,8 @@ This is the assertion that matters: it proves the signature is trusted, the inde
 
 **Files:**
 - Modify: `README.md`
-- Modify: `docs/pages/index.html`
-- Modify: `.github/workflows/release.yml` (release-notes body)
+- Delete: the landing page under `docs/pages/` (see Step 2 correction below)
+- Modify: `.github/workflows/release.yml` (release-notes body; also drop the now-dead copy of the deleted landing page)
 
 - [ ] **Step 1: README — add repository setup**
 
@@ -506,7 +505,16 @@ State plainly that each channel's repository indexes only its current
 version — pinning an older one means downloading that release's `.deb`/`.rpm`
 from its GitHub release page directly.
 
-- [ ] **Step 2: Landing page** — `docs/pages/index.html` names the two repo URLs, the key fingerprint, and links to the README section. Keep it plain HTML; no build step.
+- [x] **Step 2: Landing page — CORRECTION, found during execution.** The
+  original plan called for a landing page under `docs/pages/` naming the two
+  repo URLs and the key fingerprint. But `gh-pages` already has its own real
+  `index.html` — that file *is* rupu.sh. The publish step deliberately does
+  not copy the `docs/pages/` one over it, but leaving a second, unused
+  landing-page file sitting next to `rupu-archive-keyring.asc` invited a
+  future "fix" that would wire the copy back in and overwrite the live
+  homepage. Deleted instead of modified; `docs/pages/` now holds only the
+  keyring file. The README's "Linux packages" section is the canonical setup
+  doc.
 
 - [ ] **Step 3: Release notes** — add a line pointing at the repository setup, so someone landing on a release page finds it.
 

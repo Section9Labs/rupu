@@ -54,7 +54,7 @@ Debian/Ubuntu and Fedora/RHEL users can install a `.deb` or `.rpm` from the
 same [Releases](https://github.com/Section9Labs/rupu/releases) page instead
 of the bare binary. The package declares its own dependencies (ripgrep) and
 installs shell completions (bash/zsh/fish) and a man page (`man rupu`)
-alongside the binary:
+alongside the binary — that's the reason to prefer it over the bare binary:
 
 ```sh
 sudo apt install ./rupu_<version>_amd64.deb
@@ -63,7 +63,99 @@ sudo dnf install ./rupu-<version>.x86_64.rpm
 ```
 
 A package-installed `rupu` defers upgrades to the package manager (`rupu
-update` will tell you as much) rather than self-updating.
+update` will tell you as much) rather than self-updating. To get upgrades via
+`apt upgrade` / `dnf upgrade` instead of downloading a new `.deb`/`.rpm` by
+hand every release, add the hosted repository once — see below.
+
+**Hosted APT / YUM repositories:**
+
+rupu publishes signed APT and YUM repositories with every release, so you
+can `apt install`/`dnf install` and then upgrade in place with your normal
+package manager. Both the `stable` and `beta` channels are hosted and can be
+added side by side — they use separate suites/pools, so installing one never
+pulls in the other, and you may add both and pin whichever you want with
+`apt` preferences.
+
+Everything is signed with key fingerprint
+`6A2918F205000696D657AC61D672DF3BE13ADFDD`, whose public half is served from
+a stable URL: `https://rupu.sh/rupu-archive-keyring.asc`.
+
+Each channel's repository index carries **only the current release** —
+it does not accumulate old versions. Pinning an older version means
+downloading that release's `.deb`/`.rpm` directly from its
+[GitHub release page](https://github.com/Section9Labs/rupu/releases) rather
+than `apt install rupu=<old-version>`, which will not find it in the index.
+
+*Debian/Ubuntu — stable, deb822 format (modern `apt`, `.sources` file):*
+
+```sh
+sudo curl -fsSL -o /etc/apt/keyrings/rupu.asc \
+  https://rupu.sh/rupu-archive-keyring.asc
+sudo tee /etc/apt/sources.list.d/rupu.sources > /dev/null <<'EOF'
+Types: deb
+URIs: https://rupu.sh/apt
+Suites: stable
+Components: main
+Architectures: amd64 arm64
+Signed-By: /etc/apt/keyrings/rupu.asc
+EOF
+sudo apt update && sudo apt install rupu
+```
+
+*Debian/Ubuntu — stable, legacy one-line format (older Ubuntu LTS releases
+whose `apt` doesn't understand deb822 `.sources` files):*
+
+```sh
+sudo curl -fsSL -o /etc/apt/keyrings/rupu.asc \
+  https://rupu.sh/rupu-archive-keyring.asc
+echo "deb [signed-by=/etc/apt/keyrings/rupu.asc] https://rupu.sh/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/rupu.list
+sudo apt update && sudo apt install rupu
+```
+
+*Fedora/RHEL — stable:*
+
+```sh
+sudo rpm --import https://rupu.sh/rupu-archive-keyring.asc
+sudo tee /etc/yum.repos.d/rupu.repo > /dev/null <<'EOF'
+[rupu]
+name=rupu
+baseurl=https://rupu.sh/yum/stable
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://rupu.sh/rupu-archive-keyring.asc
+EOF
+sudo dnf install rupu
+```
+
+*Beta channel:* identical snippets with `stable` → `beta` — in the `Suites:`
+line and `deb` line for APT, and in the `baseurl` for YUM — and nothing else.
+The key, import commands, and package name are unchanged. Stable and beta
+coexist: add both if you want, since their suites and pools are separate.
+
+```sh
+# APT (deb822), beta
+sudo tee /etc/apt/sources.list.d/rupu-beta.sources > /dev/null <<'EOF'
+Types: deb
+URIs: https://rupu.sh/apt
+Suites: beta
+Components: main
+Architectures: amd64 arm64
+Signed-By: /etc/apt/keyrings/rupu.asc
+EOF
+
+# YUM/DNF, beta
+sudo tee /etc/yum.repos.d/rupu-beta.repo > /dev/null <<'EOF'
+[rupu-beta]
+name=rupu (beta)
+baseurl=https://rupu.sh/yum/beta
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://rupu.sh/rupu-archive-keyring.asc
+EOF
+```
 
 ---
 
