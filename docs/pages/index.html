@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu package repositories</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+         max-width: 40rem; margin: 3rem auto; padding: 0 1rem; line-height: 1.5; color: #1a1a1a; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+              background: #f2f2f2; padding: 0.15em 0.4em; border-radius: 3px; }
+  h1 { font-size: 1.5rem; }
+  ul { padding-left: 1.2rem; }
+  footer { margin-top: 2.5rem; color: #666; font-size: 0.9rem; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #111; color: #ddd; }
+    code, pre { background: #222; color: #eee; }
+    footer { color: #999; }
+    a { color: #6ab0f3; }
+  }
+</style>
+</head>
+<body>
+<h1>rupu package repositories</h1>
+<p>
+  <a href="https://github.com/Section9Labs/rupu">rupu</a> is an agentic
+  code-development CLI. This site hosts the APT and YUM repositories used
+  to install and update rupu's signed <code>.deb</code> and
+  <code>.rpm</code> packages, along with the public key used to verify them.
+</p>
+
+<h2>Repositories</h2>
+<ul>
+  <li>APT: <code>https://section9labs.github.io/rupu/apt</code></li>
+  <li>YUM: <code>https://section9labs.github.io/rupu/yum/&lt;channel&gt;</code></li>
+</ul>
+
+<h2>Signing key</h2>
+<p>
+  Packages are signed with the rupu package-signing key.
+  Public key: <code>https://section9labs.github.io/rupu/rupu-archive-keyring.asc</code>
+</p>
+<p>
+  Fingerprint: <code>6A2918F205000696D657AC61D672DF3BE13ADFDD</code>
+</p>
+
+<footer>
+  Setup instructions live in the
+  <a href="https://github.com/Section9Labs/rupu">rupu repository</a>.
+</footer>
+</body>
+</html>
