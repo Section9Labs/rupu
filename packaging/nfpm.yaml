@@ -1,0 +1,49 @@
+# nfpm turns one config into both .deb and .rpm from an ALREADY-BUILT
+# binary. The binary is never rebuilt here — it is the exact artifact the
+# release workflow produced and tested in the pinned musl container.
+name: rupu
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+section: devel
+priority: optional
+maintainer: Section9Labs <matias@section9labs.com>
+description: |
+  Agentic code-development CLI.
+  Runs agents and workflows against your repositories from the terminal.
+vendor: Section9Labs
+homepage: https://github.com/Section9Labs/rupu
+license: Apache-2.0
+
+# Classified from real failure behavior, not assumption:
+#   ripgrep  - crates/rupu-tools/src/grep.rs hard-errors without `rg`
+#   git      - cmd/init.rs degrades gracefully; libgit2 is vendored, so core
+#              repository operations never shell out to the git binary
+#   ast-grep - returns empty output with an explanatory message when absent
+depends:
+  - ripgrep
+recommends:
+  - git
+suggests:
+  - ast-grep
+
+contents:
+  - src: ./dist/rupu
+    dst: /usr/bin/rupu
+    file_info:
+      mode: 0755
+
+  - src: ./dist/completions/rupu.bash
+    dst: /usr/share/bash-completion/completions/rupu
+  - src: ./dist/completions/_rupu
+    dst: /usr/share/zsh/site-functions/_rupu
+  - src: ./dist/completions/rupu.fish
+    dst: /usr/share/fish/vendor_completions.d/rupu.fish
+
+  - src: ./dist/rupu.1.gz
+    dst: /usr/share/man/man1/rupu.1.gz
+
+  - src: ./LICENSE
+    dst: /usr/share/doc/rupu/LICENSE
+  - src: ./README.md
+    dst: /usr/share/doc/rupu/README.md

@@ -9,3 +9,4 @@
 .superpowers/
 crates/rupu-coverage/build/cwe/*.xml
 crates/rupu-coverage/build/cwe/*.zip
+/dist
