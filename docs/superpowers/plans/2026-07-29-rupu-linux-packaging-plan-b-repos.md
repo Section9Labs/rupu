@@ -4,7 +4,17 @@
 
 **Goal:** `sudo apt install rupu` and `sudo dnf install rupu` work after a two-line setup, and `apt upgrade` delivers new versions.
 
-**Architecture:** A `repo` job runs after `publish`, downloads the four packages the release just produced, signs them and the repository indices with a dedicated GPG key, and pushes an APT + YUM tree to GitHub Pages. The index carries only the current version; every version's packages remain permanently downloadable as GitHub release assets.
+**Architecture:** A `repo` job runs after `publish`, downloads the four packages the release just produced, signs them and the repository indices with a dedicated GPG key, and commits an APT + YUM tree into the **existing `gh-pages` branch**, alongside the site already served there. The index carries only the current version; every version's packages remain permanently downloadable as GitHub release assets.
+
+**CORRECTION, found during execution.** An earlier draft of this plan used
+`actions/upload-pages-artifact` + `actions/deploy-pages`. That is **wrong and
+destructive here**: Pages is already enabled on this repo with
+`build_type: "legacy"`, serving an existing website from the `gh-pages`
+branch at the custom domain **`rupu.sh`** (`index.html`, `styles.css`,
+`docs/`, `404.html`, `favicon.svg`, `CNAME`). `deploy-pages` replaces the
+entire published site, so adopting it would have deleted that website on the
+next release. The repositories are therefore published by **committing into
+`gh-pages` under `apt/` and `yum/`**, leaving every existing file untouched.
 
 **Tech Stack:** GitHub Actions, GitHub Pages, `dpkg-scanpackages` / `apt-ftparchive`, `createrepo_c`, `gpg`, `rpmsign`.
 
@@ -18,7 +28,7 @@
 
 - **The index carries only the current version.** GitHub Pages soft-caps near 1 GB; each version is ~100 MiB across two architectures and two formats. Every version stays permanently installable from its GitHub release assets. Do not accumulate versions in the index.
 - **Never write the private key to the repository, to `dist/`, or to any path under the Pages publish root.** It exists only as a CI secret, decrypted into `$RUNNER_TEMP`, and removed before the job ends.
-- **The public key must be served from a stable URL** that never changes across releases: `https://section9labs.github.io/rupu/rupu-archive-keyring.asc`. Users pin trust to it; moving it breaks every existing installation.
+- **The public key must be served from a stable URL** that never changes across releases: `https://rupu.sh/rupu-archive-keyring.asc`. Users pin trust to it; moving it breaks every existing installation.
 - **Signing must actually be verified, not assumed.** A repo that publishes with a broken signature fails *on the user's machine*, at install time, with a confusing error. CI must verify before publishing.
 - Beta and stable must not collide. They are separate suites in one repository, so a user opting into beta never silently receives stable, or vice versa.
 - Package name `rupu` never changes.
@@ -36,7 +46,7 @@ Users must be able to fetch the signing key before any package exists, and the s
 - Create: `docs/pages/rupu-archive-keyring.asc` (the ASCII-armored PUBLIC key)
 
 **Interfaces:**
-- Produces: `https://section9labs.github.io/rupu/rupu-archive-keyring.asc` serving the public key.
+- Produces: `https://rupu.sh/rupu-archive-keyring.asc` serving the public key.
 
 - [ ] **Step 1: Add the public key**
 
@@ -68,15 +78,17 @@ Add a check to `ci.yml` so a private key can never be committed here by accident
           fi
 ```
 
-- [ ] **Step 3: Enable GitHub Pages**
-
-Pages must serve from a branch or from Actions. Check the current setting:
+- [ ] **Step 3: Confirm Pages configuration — do NOT change it**
 
 ```bash
-gh api repos/Section9Labs/rupu/pages 2>/dev/null || echo "Pages not enabled"
+gh api repos/Section9Labs/rupu/pages --jq '{build_type, source, cname}'
 ```
 
-If not enabled, enable it with the `gh-pages` branch as source (or GitHub Actions as source, if that suits the publish job better — decide and state which, do not leave it ambiguous).
+Expected, and already verified: `build_type: "legacy"`, source branch
+`gh-pages` path `/`, cname `rupu.sh`. **Leave this exactly as it is.**
+Switching `build_type` to `workflow` would hand publishing to
+`deploy-pages`, which replaces the whole site and would delete the existing
+rupu.sh website.
 
 - [ ] **Step 4: Commit**
 
@@ -252,7 +264,7 @@ git commit -m "build(packaging): signed YUM repository builder"
 
 **Interfaces:**
 - Consumes: `asset-packages` artifact; `meta.outputs.channel`; secrets `GPG_PRIVATE_KEY`, `GPG_KEY_ID`.
-- Produces: the Pages site at `https://section9labs.github.io/rupu/`.
+- Produces: `apt/` and `yum/` trees committed into the existing `gh-pages` branch, served at `https://rupu.sh/`.
 
 - [ ] **Step 1: Add the job**
 
@@ -324,14 +336,45 @@ git commit -m "build(packaging): signed YUM repository builder"
           fi
           echo "publish root is clean"
 
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: site
-      - id: deploy
-        uses: actions/deploy-pages@v4
+      # Publish by committing into the EXISTING gh-pages branch, never by
+      # replacing the site. rupu.sh is served from that branch and already
+      # contains index.html, styles.css, docs/, 404.html, favicon.svg and
+      # CNAME — `deploy-pages` would delete all of it.
+      - name: Publish into gh-pages
+        env:
+          CHANNEL: ${{ needs.meta.outputs.channel }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch gh-pages \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" ghp
+          # Replace only this channel's trees; everything else on the branch
+          # is the website and must survive untouched.
+          rm -rf "ghp/apt/dists/$CHANNEL" "ghp/yum/$CHANNEL"
+          mkdir -p ghp/apt ghp/yum
+          cp -r site/apt/. ghp/apt/
+          cp -r site/yum/. ghp/yum/
+          cp site/rupu-archive-keyring.asc ghp/
+          # The site must still be there afterwards. If any of these is
+          # missing we are about to publish a broken rupu.sh.
+          for f in index.html CNAME .nojekyll; do
+            test -e "ghp/$f" || { echo "::error::gh-pages lost $f"; exit 1; }
+          done
+          cd ghp
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add apt yum rupu-archive-keyring.asc
+          if git diff --cached --quiet; then
+            echo "repositories already current"; exit 0
+          fi
+          git commit -m "repo: publish $CHANNEL packages for $VERSION"
+          git push origin gh-pages
 ```
 
-The job needs `permissions: pages: write` and `id-token: write`. Add them at job level rather than widening the workflow's top-level `permissions`.
+The job needs `permissions: contents: write` to push `gh-pages`. Do NOT set
+`pages: write`/`id-token: write` or use `deploy-pages` — this repo's Pages
+is `build_type: legacy` serving `gh-pages`, and switching it would take the
+website down.
 
 - [ ] **Step 2: Verify the YAML parses and every run block is valid shell**
 
@@ -427,8 +470,8 @@ Debian/Ubuntu, using the modern deb822 format with the legacy one-liner noted (U
 
 ```
 sudo curl -fsSL -o /etc/apt/keyrings/rupu.asc \
-  https://section9labs.github.io/rupu/rupu-archive-keyring.asc
-echo "deb [signed-by=/etc/apt/keyrings/rupu.asc] https://section9labs.github.io/rupu/apt stable main" \
+  https://rupu.sh/rupu-archive-keyring.asc
+echo "deb [signed-by=/etc/apt/keyrings/rupu.asc] https://rupu.sh/apt stable main" \
   | sudo tee /etc/apt/sources.list.d/rupu.list
 sudo apt update && sudo apt install rupu
 ```
@@ -436,15 +479,15 @@ sudo apt update && sudo apt install rupu
 Fedora/RHEL:
 
 ```
-sudo rpm --import https://section9labs.github.io/rupu/rupu-archive-keyring.asc
+sudo rpm --import https://rupu.sh/rupu-archive-keyring.asc
 sudo tee /etc/yum.repos.d/rupu.repo <<'EOF'
 [rupu]
 name=rupu
-baseurl=https://section9labs.github.io/rupu/yum/stable
+baseurl=https://rupu.sh/yum/stable
 enabled=1
 gpgcheck=1
 repo_gpgcheck=1
-gpgkey=https://section9labs.github.io/rupu/rupu-archive-keyring.asc
+gpgkey=https://rupu.sh/rupu-archive-keyring.asc
 EOF
 sudo dnf install rupu
 ```
