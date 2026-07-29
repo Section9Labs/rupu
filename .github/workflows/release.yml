@@ -132,8 +132,12 @@ jobs:
             -e RUPU_INSTALL_METHOD=pkg \
             -v "$PWD":/work -w /work rupu-linux-build \
             cargo build --release -p rupu-cli --target-dir target/linux-musl-pkg
-          mkdir -p dist
-          cp target/linux-musl-pkg/release/rupu "dist/rupu-${{ matrix.platform }}-pkg"
+          # Staged OUTSIDE dist/ deliberately: dist/ becomes the asset-*
+          # artifact that publish uploads verbatim to the release, and this
+          # binary is a packaging input, not something a user should ever
+          # download directly (it refuses to self-update by design).
+          mkdir -p pkgbin
+          cp target/linux-musl-pkg/release/rupu "pkgbin/rupu-${{ matrix.platform }}-pkg"
 
       - name: Stage the asset under its canonical name
         run: |
@@ -160,6 +164,15 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+      # A deliberately non-`asset-*`-named artifact: `publish` collects
+      # everything matching `asset-*` and uploads it straight to the
+      # release, and this binary must never reach a user directly.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkgbin-${{ matrix.platform }}
+          path: pkgbin/
+          if-no-files-found: error
+
   packages:
     name: build .deb and .rpm
     needs: [meta, linux]
@@ -176,13 +189,16 @@ jobs:
           sudo dpkg -i /tmp/nfpm.deb
           nfpm --version
 
+      # Pulled from pkgbin-* (the pkg-marked build), NOT asset-* (the
+      # tarball build) — asset-* is what `publish` uploads verbatim to the
+      # release, and these binaries are packaging inputs only.
       - uses: actions/download-artifact@v4
         with:
-          name: asset-linux-x64
+          name: pkgbin-linux-x64
           path: staging/x64
       - uses: actions/download-artifact@v4
         with:
-          name: asset-linux-arm64
+          name: pkgbin-linux-arm64
           path: staging/arm64
 
       # Completions and the man page are architecture-independent, and this
@@ -191,8 +207,8 @@ jobs:
       - name: Generate completions and man page (once, from the x64 binary)
         run: |
           set -euo pipefail
-          chmod +x staging/x64/rupu-linux-x64
-          bin=./staging/x64/rupu-linux-x64
+          chmod +x staging/x64/rupu-linux-x64-pkg
+          bin=./staging/x64/rupu-linux-x64-pkg
           mkdir -p shared/completions
           "$bin" completions print bash --static > shared/completions/rupu.bash
           "$bin" completions print zsh  --static > shared/completions/_rupu
