@@ -181,6 +181,9 @@ pub enum Cmd {
     Node(cmd::node::NodeArgs),
     /// Download and install the latest release for the configured channel.
     Update(cmd::update::UpdateArgs),
+    /// Render the man page to stdout.
+    #[command(hide = true)]
+    Man,
     /// Internal: privileged install step invoked by `rupu update` via
     /// `sudo` when the install directory isn't user-writable.
     #[command(name = "__apply-update", hide = true)]
@@ -308,6 +311,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Host { action } => cmd::host::handle(action).await,
         Cmd::Node(args) => cmd::node::handle(args).await,
         Cmd::Update(args) => cmd::update::handle(args).await,
+        Cmd::Man => cmd::man::handle(),
         Cmd::ApplyUpdate(args) => cmd::apply_update::handle(args),
         Cmd::Workspace { action } => cmd::workspace_helper::handle(action).await,
     }
@@ -322,15 +326,17 @@ fn ensure_output_format_supported(
             // `rupu run list` / `rupu run show` emit JSON (they are rupu-cp's
             // SSH run-listing / run-detail contracts); every other `rupu run`
             // form is Table-only.
-            let allowed: &[output::formats::OutputFormat] =
-                if matches!(argv.first().map(String::as_str), Some("list") | Some("show")) {
-                    &[
-                        output::formats::OutputFormat::Table,
-                        output::formats::OutputFormat::Json,
-                    ]
-                } else {
-                    &[output::formats::OutputFormat::Table]
-                };
+            let allowed: &[output::formats::OutputFormat] = if matches!(
+                argv.first().map(String::as_str),
+                Some("list") | Some("show")
+            ) {
+                &[
+                    output::formats::OutputFormat::Table,
+                    output::formats::OutputFormat::Json,
+                ]
+            } else {
+                &[output::formats::OutputFormat::Table]
+            };
             output::formats::ensure_supported("run", format, allowed)
         }
         Cmd::Agent { action } => cmd::agent::ensure_output_format(action, format),
@@ -392,6 +398,11 @@ fn ensure_output_format_supported(
         ),
         Cmd::Update(_) => output::formats::ensure_supported(
             "update",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
+        Cmd::Man => output::formats::ensure_supported(
+            "man",
             format,
             &[output::formats::OutputFormat::Table],
         ),

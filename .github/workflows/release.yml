@@ -124,6 +124,21 @@ jobs:
             -v "$PWD":/work -w /work rupu-linux-build \
             cargo build --release -p rupu-cli --target-dir target/linux-musl
 
+      - name: Build again with the package install marker
+        run: |
+          docker run --rm \
+            -e RUPU_RELEASE_CHANNEL="${{ needs.meta.outputs.channel }}" \
+            -e RUPU_RELEASE_VERSION="${{ needs.meta.outputs.version }}" \
+            -e RUPU_INSTALL_METHOD=pkg \
+            -v "$PWD":/work -w /work rupu-linux-build \
+            cargo build --release -p rupu-cli --target-dir target/linux-musl-pkg
+          # Staged OUTSIDE dist/ deliberately: dist/ becomes the asset-*
+          # artifact that publish uploads verbatim to the release, and this
+          # binary is a packaging input, not something a user should ever
+          # download directly (it refuses to self-update by design).
+          mkdir -p pkgbin
+          cp target/linux-musl-pkg/release/rupu "pkgbin/rupu-${{ matrix.platform }}-pkg"
+
       - name: Stage the asset under its canonical name
         run: |
           set -euo pipefail
@@ -147,6 +162,173 @@ jobs:
         with:
           name: asset-${{ matrix.platform }}
           path: dist/
+          if-no-files-found: error
+
+      # A deliberately non-`asset-*`-named artifact: `publish` collects
+      # everything matching `asset-*` and uploads it straight to the
+      # release, and this binary must never reach a user directly.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkgbin-${{ matrix.platform }}
+          path: pkgbin/
+          if-no-files-found: error
+
+  packages:
+    name: build .deb and .rpm
+    needs: [meta, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install nfpm
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /tmp/nfpm.deb \
+            https://github.com/goreleaser/nfpm/releases/download/v2.43.0/nfpm_2.43.0_amd64.deb
+          sudo dpkg -i /tmp/nfpm.deb
+          nfpm --version
+
+      # Pulled from pkgbin-* (the pkg-marked build), NOT asset-* (the
+      # tarball build) — asset-* is what `publish` uploads verbatim to the
+      # release, and these binaries are packaging inputs only.
+      - uses: actions/download-artifact@v4
+        with:
+          name: pkgbin-linux-x64
+          path: staging/x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: pkgbin-linux-arm64
+          path: staging/arm64
+
+      # Completions and the man page are architecture-independent, and this
+      # runner cannot execute the arm64 binary — so generate once from x64
+      # and reuse for both packages.
+      - name: Generate completions and man page (once, from the x64 binary)
+        run: |
+          set -euo pipefail
+          chmod +x staging/x64/rupu-linux-x64-pkg
+          bin=./staging/x64/rupu-linux-x64-pkg
+          mkdir -p shared/completions
+          "$bin" completions print bash --static > shared/completions/rupu.bash
+          "$bin" completions print zsh  --static > shared/completions/_rupu
+          "$bin" completions print fish --static > shared/completions/rupu.fish
+          "$bin" man > shared/rupu.1
+          gzip -9 -n -f shared/rupu.1
+          ls -la shared shared/completions
+
+      - name: Build all four packages
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # nfpm rejects a leading `v` and pre-release shapes vary; strip any
+          # leading v and keep the rest.
+          ver="${VERSION#v}"
+          mkdir -p out
+          # binname points at the -pkg build (RUPU_INSTALL_METHOD=pkg), not
+          # the tarball binary staged alongside it — see the "Build again
+          # with the package install marker" step in the linux job.
+          for pair in "x64:amd64:rupu-linux-x64-pkg" "arm64:arm64:rupu-linux-arm64-pkg"; do
+            src="${pair%%:*}"; rest="${pair#*:}"
+            arch="${rest%%:*}"; binname="${rest#*:}"
+            rm -rf dist && mkdir -p dist/completions
+            cp "staging/$src/$binname" dist/rupu
+            chmod +x dist/rupu
+            cp shared/completions/* dist/completions/
+            cp shared/rupu.1.gz dist/rupu.1.gz
+            ./packaging/build-packages.sh "$ver" "$arch"
+            mv dist/*.deb dist/*.rpm out/
+          done
+          ls -la out
+
+      # The architecture strings differ by format — .deb uses amd64/arm64,
+      # .rpm uses x86_64/aarch64. A mismatch ships a package that installs on
+      # the wrong machine, so assert rather than assume.
+      - name: Assert the emitted filenames
+        run: |
+          set -euo pipefail
+          ls out
+          test -n "$(ls out/*amd64.deb 2>/dev/null)"   || { echo "::error::no amd64 .deb"; exit 1; }
+          test -n "$(ls out/*arm64.deb 2>/dev/null)"   || { echo "::error::no arm64 .deb"; exit 1; }
+          test -n "$(ls out/*x86_64.rpm 2>/dev/null)"  || { echo "::error::no x86_64 .rpm"; exit 1; }
+          test -n "$(ls out/*aarch64.rpm 2>/dev/null)" || { echo "::error::no aarch64 .rpm"; exit 1; }
+          test "$(ls out | wc -l)" -eq 4 || { echo "::error::expected exactly 4 packages"; exit 1; }
+
+      - name: Verify the .deb installs and runs on Debian
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/out":/pkg debian:12 bash -c '
+            set -euo pipefail
+            apt-get update -qq
+            # `apt-get install ./file.deb` resolves declared dependencies,
+            # which is the whole point of shipping a package rather than a
+            # tarball — this proves ripgrep gets pulled in.
+            apt-get install -y -qq /pkg/*amd64.deb
+            command -v rg    >/dev/null || { echo "ripgrep dependency was not installed"; exit 1; }
+            rupu --version
+            test -f /usr/share/bash-completion/completions/rupu || { echo "bash completions missing"; exit 1; }
+            test -f /usr/share/man/man1/rupu.1.gz              || { echo "man page missing"; exit 1; }
+            # The packaged binary must refuse to update itself. Capture
+            # first, then grep the variable: `rupu update` exits nonzero on
+            # a packaged install (by design), and under `set -o pipefail`
+            # `if cmd | grep -q ...` takes its exit status from `cmd`, not
+            # from whether grep matched — so a pipeline would always fail
+            # here even when the refusal text is present.
+            out=$(rupu update 2>&1) || true
+            if echo "$out" | grep -q "apt upgrade rupu"; then
+              echo "packaged install correctly refuses self-update"
+            else
+              echo "::error::packaged install did not refuse rupu update"; exit 1
+            fi
+            # --check must remain permitted: a user must be able to learn
+            # they are behind regardless of how they installed. Tolerate a
+            # nonzero exit (exit 10 means update available, and the network
+            # may be unavailable in CI) but assert it was NOT refused.
+            out=$(rupu update --check 2>&1) || true
+            if echo "$out" | grep -q "upgrade rupu"; then
+              echo "::error::--check must not be refused on a packaged install"; exit 1
+            fi
+            echo "--check correctly permitted"
+          '
+
+      - name: Verify the .rpm installs and runs on Fedora
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/out":/pkg fedora:41 bash -c '
+            set -euo pipefail
+            dnf install -y -q /pkg/*x86_64.rpm
+            command -v rg >/dev/null || { echo "ripgrep dependency was not installed"; exit 1; }
+            rupu --version
+            test -f /usr/share/man/man1/rupu.1.gz || { echo "man page missing"; exit 1; }
+            # Fedora is RHEL-family, so the hint must say dnf — this is the
+            # check that proves runtime distro detection works and that an
+            # rpm user is not told to run apt. Capture first, then grep the
+            # variable (see the Debian step above for why: under pipefail,
+            # `cmd | grep -q ...` takes the nonzero exit of cmd even when
+            # grep matches, so the `if` would always take the else branch).
+            out=$(rupu update 2>&1) || true
+            if echo "$out" | grep -q "dnf upgrade rupu"; then
+              echo "packaged install correctly refuses self-update, naming dnf"
+            else
+              echo "::error::rpm install did not refuse with a dnf hint"; exit 1
+            fi
+            # --check must remain permitted on the rpm path too: the
+            # invariant is stated for packaged installs generally, not
+            # Debian-only. Tolerate a nonzero exit (exit 10 means update
+            # available, and the network may be unavailable in CI) but
+            # assert it was NOT refused.
+            out=$(rupu update --check 2>&1) || true
+            if echo "$out" | grep -q "upgrade rupu"; then
+              echo "::error::--check must not be refused on a packaged install"; exit 1
+            fi
+            echo "--check correctly permitted"
+          '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-packages
+          path: out/
           if-no-files-found: error
 
   macos:
@@ -241,7 +423,7 @@ jobs:
 
   publish:
     name: publish release
-    needs: [meta, linux, macos]
+    needs: [meta, linux, macos, packages]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -264,6 +446,8 @@ jobs:
             test -f "dist/rupu-$p"        || { echo "::error::missing rupu-$p"; exit 1; }
             test -f "dist/rupu-$p.sha256" || { echo "::error::missing rupu-$p.sha256"; exit 1; }
           done
+          test "$(ls dist/*.deb dist/*.rpm 2>/dev/null | wc -l)" -eq 4 \
+            || { echo "::error::expected 4 packages"; exit 1; }
           ( cd dist && sha256sum -c ./*.sha256 )
 
       - name: Publish rolling and versioned releases
@@ -284,10 +468,20 @@ jobs:
           | \`rupu-darwin-arm64\` | macOS, Apple Silicon — signed + notarized |
           | \`rupu-linux-x64\` | Linux x86_64 — static musl |
           | \`rupu-linux-arm64\` | Linux aarch64 — static musl |
+          | \`rupu_${VERSION}_amd64.deb\` / \`rupu_${VERSION}_arm64.deb\` | Debian/Ubuntu package (declares its own deps, installs completions + man page) |
+          | \`rupu-${VERSION}.x86_64.rpm\` / \`rupu-${VERSION}.aarch64.rpm\` | Fedora/RHEL package (declares its own deps, installs completions + man page) |
 
           The Linux binaries are statically linked, so they run on any
           distribution — Debian, RHEL, Alpine, distroless — regardless of its
           glibc version.
+
+          Prefer the \`.deb\`/\`.rpm\` on a Debian/Ubuntu or Fedora/RHEL
+          system — they pull in dependencies automatically:
+
+          \`\`\`sh
+          sudo apt install ./rupu_${VERSION}_amd64.deb
+          sudo dnf install ./rupu-${VERSION}.x86_64.rpm
+          \`\`\`
 
           **Windows:** install the Linux binary under WSL2.
 
@@ -306,6 +500,23 @@ jobs:
               gh release create "$tag" --title "rupu $tag" \
                 --notes "$notes" --prerelease="$PRERELEASE"
             fi
+
+            # The four packages are version-named
+            # (rupu_0.70.4~beta_amd64.deb), unlike every other asset here
+            # (rupu-linux-x64), so `--clobber` never overwrites them — every
+            # release would otherwise pile four more files onto the rolling
+            # tag forever. On the rolling tag only, delete whatever .deb/.rpm
+            # assets are already there first, so it always carries exactly
+            # the current release's packages. The versioned tag is a
+            # permanent record and keeps every package it ever published.
+            if [ "$tag" = "$ROLLING" ]; then
+              existing=$(gh release view "$tag" --json assets \
+                --jq '.assets[].name | select(endswith(".deb") or endswith(".rpm"))')
+              for name in $existing; do
+                gh release delete-asset "$tag" "$name" --yes || true
+              done
+            fi
+
             gh release upload "$tag" dist/* --clobber
           done
 

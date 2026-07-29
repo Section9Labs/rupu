@@ -43,9 +43,13 @@ pub fn maybe_print(
     // Print from cache first (cheap, no network).
     if let Some(state) = rupu_update::notice::load_state(&path) {
         if state.channel == channel {
-            if let Some(line) =
-                rupu_update::notice::notice_line(current, &state.latest_version, channel)
-            {
+            let cta = packaged_call_to_action();
+            if let Some(line) = rupu_update::notice::notice_line(
+                current,
+                &state.latest_version,
+                channel,
+                cta.as_deref(),
+            ) {
                 eprintln!("{line}");
             }
         }
@@ -95,6 +99,33 @@ pub fn stderr_is_tty() -> bool {
     std::io::stderr().is_terminal()
 }
 
+/// Override for the notice's default "Run 'rupu update'." call-to-action
+/// on a packaged install, where `rupu update` itself refuses (see
+/// `cmd::update::packaged_refusal`) and the default text would send the
+/// user straight into that refusal. `None` leaves the default in place.
+fn packaged_call_to_action() -> Option<String> {
+    packaged_call_to_action_for(
+        crate::build_info::is_packaged(),
+        crate::build_info::package_manager_hint(),
+    )
+}
+
+/// Pure so the packaged/unknown-distro matrix is testable; `is_packaged`
+/// and `package_manager_hint` are fixed at compile time / read from
+/// `/etc/os-release` and cannot be varied from a test — same reasoning as
+/// `cmd::update::packaged_refusal`, whose fallback-vs-known-pm branching
+/// this mirrors.
+fn packaged_call_to_action_for(packaged: bool, pm: &str) -> Option<String> {
+    if !packaged {
+        return None;
+    }
+    if pm == crate::build_info::UNKNOWN_PACKAGE_MANAGER_HINT {
+        Some("Upgrade it with your system package manager instead.".to_string())
+    } else {
+        Some(format!("Run 'sudo {pm} upgrade rupu'."))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +149,31 @@ mod tests {
     #[test]
     fn off_when_config_false() {
         assert!(!should_check(Some(false), false, true, false));
+    }
+
+    #[test]
+    fn unpackaged_install_keeps_the_default_call_to_action() {
+        assert!(packaged_call_to_action_for(false, "apt").is_none());
+    }
+
+    #[test]
+    fn packaged_install_names_the_package_manager() {
+        let cta = packaged_call_to_action_for(true, "apt").expect("must override");
+        assert_eq!(cta, "Run 'sudo apt upgrade rupu'.");
+
+        let cta = packaged_call_to_action_for(true, "dnf").expect("must override");
+        assert_eq!(cta, "Run 'sudo dnf upgrade rupu'.");
+    }
+
+    #[test]
+    fn packaged_install_on_an_unknown_distro_reads_as_prose() {
+        // Must not render the non-command
+        // "Run 'sudo your system package manager upgrade rupu'."
+        let cta =
+            packaged_call_to_action_for(true, crate::build_info::UNKNOWN_PACKAGE_MANAGER_HINT)
+                .expect(
+                    "must still override — the default also contradicts `rupu update`'s refusal",
+                );
+        assert_eq!(cta, "Upgrade it with your system package manager instead.");
     }
 }
