@@ -518,4 +518,4 @@ MSRV: **1.95**. Set `RUPU_LOG=debug` for verbose tracing output.
 
 ## License
 
-[MIT](LICENSE)
+[Apache-2.0](LICENSE)
