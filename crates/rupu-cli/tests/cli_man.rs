@@ -15,14 +15,15 @@ fn man_emits_a_roff_document() {
     let roff = String::from_utf8(out.stdout).expect("roff is utf-8");
 
     // `.TH` is the man-page title header — the first thing troff needs to
-    // typeset a page. clap_mangen (via the `roff` crate) always emits a
-    // 2-line apostrophe-handling preamble ahead of it, so `.TH` is the
-    // first *content* line rather than byte 0 of the document.
-    let first_content_line = roff.lines().nth(2).unwrap_or("");
+    // typeset a page. clap_mangen (via the `roff` crate, a transitive dep
+    // whose layout we don't control) emits a short apostrophe-handling
+    // preamble ahead of it, so `.TH` isn't necessarily byte 0 — but it
+    // must appear near the top. `.take(10)` still catches a malformed page
+    // where `.TH` only turns up deep in the body.
     assert!(
-        first_content_line.starts_with(".TH"),
-        "expected a .TH header on line 3, got: {:?}",
-        &roff[..roff.len().min(120)]
+        roff.lines().take(10).any(|l| l.starts_with(".TH")),
+        "expected a .TH header near the top, got: {:?}",
+        &roff[..roff.len().min(160)]
     );
     assert!(roff.contains("rupu"), "must document the rupu command");
     assert!(!roff.is_empty());
