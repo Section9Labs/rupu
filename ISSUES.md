@@ -2496,3 +2496,40 @@ built to be held across an await point, instead of papering over it).
 `cargo clippy --workspace --all-targets` is clean; `cargo build --workspace`
 is clean; `rupu-auth`/`rupu-config`/`rupu-orchestrator`/`rupu-cp` `--lib`
 suites are green.
+
+### I-87 — deprecation warnings are emitted before any tracing subscriber exists, so users never see them
+
+**Symptom.** None of `Config::validate()`'s deprecation warnings reach the
+user. `[retry]`, `[cp].agent_authoring_ui`, `[cp].workflow_editor_ui`,
+`[scm.default].owner`, and `[scm.default].repo` all carry a
+`tracing::warn!` telling the operator to delete the key and that "a future
+release will reject it" — and the operator is never told.
+
+**Root cause.** `rupu_cli::run` loads config *before* initialising logging,
+deliberately: `lib.rs:251-260` reads `[cli].log_level` first so it can act as
+the `RUPU_LOG` fallback (I-14). That load path is
+`cmd::update::load_cli_config()` → `layer_files_locked` → `resolve::resolve`
+→ `config.validate()` (`resolve.rs:227`), so every `warn!` in `validate()`
+fires while the subscriber is still `NoSubscriber`. The events are dropped,
+and `tracing` additionally caches each callsite's `Interest` process-wide on
+first hit — so those callsites register as `Interest::never()`. The later
+`tracing_subscriber::registry().try_init()` does rebuild the interest cache,
+which is why a *subsequent* `validate()` in the same process can warn
+normally; whether the user sees anything therefore depends on whether their
+command happens to re-resolve config after logging init.
+
+**Discovered via.** The same root cause made
+`crates/rupu-config/tests/parse.rs`'s two capture-based tests flake at ~8%
+(5 failures in 60 runs of the test binary): sibling tests call `validate()`
+with no subscriber, silencing a deprecation callsite process-wide for the
+thread that *did* install a capturing subscriber. That flake was fixed in the
+v0.71.0 bump PR by installing an always-enabled global default in the test
+binary — a test-only fix, which does **not** address this issue.
+
+**Fix.** Not yet implemented. The ordering constraint from I-14 is real, so
+the likely shape is to split the pre-logging read from validation: load
+without validating for the `log_level` peek, then validate once after
+`logging::init`. Whatever the shape, it needs a test that asserts a
+deprecation warning is actually *observable* through the real CLI path, not
+just through a direct `validate()` call — the existing tests pass today while
+the user-visible behaviour is broken, which is exactly how this survived.
