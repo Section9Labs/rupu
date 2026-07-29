@@ -74,7 +74,10 @@ jobs:
               # After a release the committed file carries real values, so a
               # diff is only a failure while placeholders are still present.
               if grep -q "REPLACED_BY_CI" "$out"; then
-                echo "::error::$out was hand-edited; it is generated from $tpl"
+                # Which side moved is not knowable from here, and both need
+                # the same remedy: the template is the source of truth, so
+                # copy it over the generated file and commit both.
+                echo "::error::$tpl and $out disagree while placeholders are still in place. $tpl is the source of truth — run 'cp $tpl $out' and commit both. (Editing $out directly has no effect: it is regenerated on every release.)"
                 cat /tmp/drift.diff
                 exit 1
               fi

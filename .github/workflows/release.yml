@@ -861,7 +861,12 @@ jobs:
             echo "AUR package already current"; exit 0
           fi
           git commit -m "Update to ${{ needs.meta.outputs.version }}"
-          git push
+          # Explicit refspec. `rupu-bin.git` is an empty repo on its first
+          # push, so the local branch name comes from whatever the remote
+          # advertises as its unborn HEAD — or, if AUR's git advertises
+          # nothing, from the runner's `init.defaultBranch`. The AUR rejects
+          # a push to any branch but `master`, so name it rather than infer it.
+          git push origin HEAD:master
 
       # The AUR deploy key is a real credential. Harmless on a hosted runner
       # (the VM is destroyed), a leak on a self-hosted one. Same `if: always()`
@@ -913,4 +918,10 @@ jobs:
             echo "tap formula already current"; exit 0
           fi
           git commit -m "rupu ${{ needs.meta.outputs.version }}"
-          git push
+          # Explicit refspec, aimed at the tap's configured default branch.
+          # `homebrew-tap` is empty on the first push, so the local branch
+          # name is inferred from the remote's unborn HEAD or the runner's
+          # `init.defaultBranch` — push to the wrong name and `brew` clones
+          # the default branch and finds no formula. Ask GitHub which it is.
+          DEFAULT_BRANCH="$(GH_TOKEN="$TAP_TOKEN" gh api repos/Section9Labs/homebrew-tap --jq .default_branch 2>/dev/null || true)"
+          git push origin "HEAD:${DEFAULT_BRANCH:-main}"
