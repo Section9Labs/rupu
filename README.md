@@ -44,9 +44,26 @@ cargo install --git https://github.com/Section9Labs/rupu
 
 **Prebuilt binary:**
 
-Download the tarball for your platform from the
+Download the binary for your platform from the
 [Releases](https://github.com/Section9Labs/rupu/releases) page and place `rupu`
 somewhere on your `$PATH`.
+
+**Linux packages (.deb / .rpm):**
+
+Debian/Ubuntu and Fedora/RHEL users can install a `.deb` or `.rpm` from the
+same [Releases](https://github.com/Section9Labs/rupu/releases) page instead
+of the bare binary. The package declares its own dependencies (ripgrep) and
+installs shell completions (bash/zsh/fish) and a man page (`man rupu`)
+alongside the binary:
+
+```sh
+sudo apt install ./rupu_<version>_amd64.deb
+# or
+sudo dnf install ./rupu-<version>.x86_64.rpm
+```
+
+A package-installed `rupu` defers upgrades to the package manager (`rupu
+update` will tell you as much) rather than self-updating.
 
 ---
 

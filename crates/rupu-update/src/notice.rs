@@ -35,12 +35,26 @@ pub fn is_stale(last_checked: u64, now: u64, ttl_secs: u64) -> bool {
 }
 
 /// One-line notice, only when `latest` > `current` (semver). None otherwise.
-pub fn notice_line(current: &str, latest: &str, channel: &str) -> Option<String> {
+///
+/// `call_to_action` overrides the trailing "Run 'rupu update'." sentence.
+/// Callers use this on a packaged install, where `rupu update` itself
+/// refuses and the default call-to-action would contradict it — the
+/// override then names the package manager instead. `rupu-update` has no
+/// way to know it is packaged (that lives in `rupu-cli`'s `build_info`),
+/// so the computed replacement text is handed in rather than looked up
+/// here, keeping this crate free of a dependency back up to `rupu-cli`.
+pub fn notice_line(
+    current: &str,
+    latest: &str,
+    channel: &str,
+    call_to_action: Option<&str>,
+) -> Option<String> {
     let cur = semver::Version::parse(current).ok()?;
     let lat = semver::Version::parse(latest).ok()?;
     if lat > cur {
+        let cta = call_to_action.unwrap_or("Run 'rupu update'.");
         Some(format!(
-            "A new rupu is available: {current} → {latest} ({channel}). Run 'rupu update'."
+            "A new rupu is available: {current} → {latest} ({channel}). {cta}"
         ))
     } else {
         None
@@ -70,10 +84,32 @@ mod tests {
     }
     #[test]
     fn notice_only_when_newer() {
-        assert!(notice_line("0.35.3", "0.35.4", "stable")
+        assert!(notice_line("0.35.3", "0.35.4", "stable", None)
             .unwrap()
             .contains("→ 0.35.4"));
-        assert!(notice_line("0.35.4", "0.35.4", "stable").is_none());
-        assert!(notice_line("0.35.5", "0.35.4", "beta").is_none());
+        assert!(notice_line("0.35.4", "0.35.4", "stable", None).is_none());
+        assert!(notice_line("0.35.5", "0.35.4", "beta", None).is_none());
+    }
+
+    #[test]
+    fn default_call_to_action_is_rupu_update() {
+        let line = notice_line("0.35.3", "0.35.4", "stable", None).unwrap();
+        assert!(line.ends_with("Run 'rupu update'."), "message was: {line}");
+    }
+
+    #[test]
+    fn call_to_action_override_replaces_the_default() {
+        let line = notice_line(
+            "0.35.3",
+            "0.35.4",
+            "stable",
+            Some("Run 'sudo apt upgrade rupu'."),
+        )
+        .unwrap();
+        assert!(
+            line.ends_with("Run 'sudo apt upgrade rupu'."),
+            "message was: {line}"
+        );
+        assert!(!line.contains("Run 'rupu update'."), "message was: {line}");
     }
 }

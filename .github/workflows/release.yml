@@ -269,8 +269,14 @@ jobs:
             rupu --version
             test -f /usr/share/bash-completion/completions/rupu || { echo "bash completions missing"; exit 1; }
             test -f /usr/share/man/man1/rupu.1.gz              || { echo "man page missing"; exit 1; }
-            # The packaged binary must refuse to update itself.
-            if rupu update 2>&1 | grep -q "apt upgrade rupu"; then
+            # The packaged binary must refuse to update itself. Capture
+            # first, then grep the variable: `rupu update` exits nonzero on
+            # a packaged install (by design), and under `set -o pipefail`
+            # `if cmd | grep -q ...` takes its exit status from `cmd`, not
+            # from whether grep matched — so a pipeline would always fail
+            # here even when the refusal text is present.
+            out=$(rupu update 2>&1) || true
+            if echo "$out" | grep -q "apt upgrade rupu"; then
               echo "packaged install correctly refuses self-update"
             else
               echo "::error::packaged install did not refuse rupu update"; exit 1
@@ -297,8 +303,12 @@ jobs:
             test -f /usr/share/man/man1/rupu.1.gz || { echo "man page missing"; exit 1; }
             # Fedora is RHEL-family, so the hint must say dnf — this is the
             # check that proves runtime distro detection works and that an
-            # rpm user is not told to run apt.
-            if rupu update 2>&1 | grep -q "dnf upgrade rupu"; then
+            # rpm user is not told to run apt. Capture first, then grep the
+            # variable (see the Debian step above for why: under pipefail,
+            # `cmd | grep -q ...` takes the nonzero exit of cmd even when
+            # grep matches, so the `if` would always take the else branch).
+            out=$(rupu update 2>&1) || true
+            if echo "$out" | grep -q "dnf upgrade rupu"; then
               echo "packaged install correctly refuses self-update, naming dnf"
             else
               echo "::error::rpm install did not refuse with a dnf hint"; exit 1
@@ -458,10 +468,20 @@ jobs:
           | \`rupu-darwin-arm64\` | macOS, Apple Silicon — signed + notarized |
           | \`rupu-linux-x64\` | Linux x86_64 — static musl |
           | \`rupu-linux-arm64\` | Linux aarch64 — static musl |
+          | \`rupu_${VERSION}_amd64.deb\` / \`rupu_${VERSION}_arm64.deb\` | Debian/Ubuntu package (declares its own deps, installs completions + man page) |
+          | \`rupu-${VERSION}.x86_64.rpm\` / \`rupu-${VERSION}.aarch64.rpm\` | Fedora/RHEL package (declares its own deps, installs completions + man page) |
 
           The Linux binaries are statically linked, so they run on any
           distribution — Debian, RHEL, Alpine, distroless — regardless of its
           glibc version.
+
+          Prefer the \`.deb\`/\`.rpm\` on a Debian/Ubuntu or Fedora/RHEL
+          system — they pull in dependencies automatically:
+
+          \`\`\`sh
+          sudo apt install ./rupu_${VERSION}_amd64.deb
+          sudo dnf install ./rupu-${VERSION}.x86_64.rpm
+          \`\`\`
 
           **Windows:** install the Linux binary under WSL2.
 
@@ -480,6 +500,23 @@ jobs:
               gh release create "$tag" --title "rupu $tag" \
                 --notes "$notes" --prerelease="$PRERELEASE"
             fi
+
+            # The four packages are version-named
+            # (rupu_0.70.4~beta_amd64.deb), unlike every other asset here
+            # (rupu-linux-x64), so `--clobber` never overwrites them — every
+            # release would otherwise pile four more files onto the rolling
+            # tag forever. On the rolling tag only, delete whatever .deb/.rpm
+            # assets are already there first, so it always carries exactly
+            # the current release's packages. The versioned tag is a
+            # permanent record and keeps every package it ever published.
+            if [ "$tag" = "$ROLLING" ]; then
+              existing=$(gh release view "$tag" --json assets \
+                --jq '.assets[].name | select(endswith(".deb") or endswith(".rpm"))')
+              for name in $existing; do
+                gh release delete-asset "$tag" "$name" --yes || true
+              done
+            fi
+
             gh release upload "$tag" dist/* --clobber
           done
 

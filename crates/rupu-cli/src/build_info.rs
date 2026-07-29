@@ -36,6 +36,14 @@ pub fn is_packaged() -> bool {
     is_packaged_for(INSTALL_METHOD)
 }
 
+/// The fallback [`package_manager_hint`] value for a distro this binary
+/// does not recognize (e.g. openSUSE, whose `ID_LIKE="opensuse suse"`
+/// matches neither branch below). Callers that build a "run this command"
+/// sentence must branch on this value rather than interpolating it
+/// unconditionally — it is prose, not a package-manager name, and
+/// `sudo your system package manager upgrade rupu` is not a real command.
+pub const UNKNOWN_PACKAGE_MANAGER_HINT: &str = "your system package manager";
+
 /// The upgrade command to name, derived from `/etc/os-release` contents.
 ///
 /// Falls back to a true-but-vague phrase rather than naming the wrong
@@ -53,7 +61,7 @@ pub fn package_manager_hint_from(os_release: &str) -> &'static str {
     {
         "dnf"
     } else {
-        "your system package manager"
+        UNKNOWN_PACKAGE_MANAGER_HINT
     }
 }
 

@@ -88,10 +88,20 @@ fn packaged_refusal(packaged: bool, pm: &str, check: bool, rollback: bool) -> Op
         return None;
     }
     let action = if rollback { "roll back" } else { "update" };
+    // `pm` is only ever a real command name ("apt", "dnf") or the
+    // `UNKNOWN_PACKAGE_MANAGER_HINT` prose fallback — never interpolate the
+    // fallback into a backticked command, or an unrecognized distro (e.g.
+    // openSUSE) renders the uncopy-pasteable
+    // `Run \`sudo your system package manager upgrade rupu\` instead.`
+    let upgrade_hint = if pm == crate::build_info::UNKNOWN_PACKAGE_MANAGER_HINT {
+        "Upgrade it with your system package manager instead.".to_string()
+    } else {
+        format!("Run `sudo {pm} upgrade rupu` instead.")
+    };
     Some(format!(
         "rupu was installed from a system package, so it cannot {action} itself — \
          the next `{pm} upgrade` would overwrite whatever it wrote.\n  \
-         Run `sudo {pm} upgrade rupu` instead.\n  \
+         {upgrade_hint}\n  \
          `rupu update --check` still works and will tell you if a newer version exists."
     ))
 }
@@ -440,6 +450,30 @@ mod packaged_tests {
         assert!(
             msg.contains("your system package manager"),
             "message was: {msg}"
+        );
+        // openSUSE-class fallback: must read as prose, NOT as a
+        // copy-pasteable-looking (but non-functional) backticked command.
+        assert!(
+            msg.contains("Upgrade it with your system package manager instead."),
+            "message was: {msg}"
+        );
+        assert!(
+            !msg.contains("Run `sudo your system package manager upgrade rupu`"),
+            "message was: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_known_distro_keeps_the_exact_backticked_command() {
+        let apt = packaged_refusal(true, "apt", false, false).expect("must refuse");
+        assert!(
+            apt.contains("Run `sudo apt upgrade rupu` instead."),
+            "message was: {apt}"
+        );
+        let dnf = packaged_refusal(true, "dnf", false, false).expect("must refuse");
+        assert!(
+            dnf.contains("Run `sudo dnf upgrade rupu` instead."),
+            "message was: {dnf}"
         );
     }
 
