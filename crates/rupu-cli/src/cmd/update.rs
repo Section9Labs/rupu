@@ -69,6 +69,33 @@ pub(crate) fn load_cli_config() -> rupu_config::Config {
         .unwrap_or_default()
 }
 
+/// Whether `rupu update` must refuse, and what to say.
+///
+/// `--check` is deliberately always allowed: a user should be able to learn
+/// they are behind no matter how they installed. Everything that would
+/// *write* the binary is refused, because the package manager owns
+/// `/usr/bin/rupu` — a self-update needs root and would be silently
+/// reverted by the next upgrade, leaving the version to go backwards for
+/// no visible reason.
+///
+/// Pure so the whole matrix is testable; `INSTALL_METHOD` is fixed at
+/// compile time and cannot be varied from a test.
+fn packaged_refusal(packaged: bool, pm: &str, check: bool, rollback: bool) -> Option<String> {
+    if !packaged {
+        return None;
+    }
+    if check && !rollback {
+        return None;
+    }
+    let action = if rollback { "roll back" } else { "update" };
+    Some(format!(
+        "rupu was installed from a system package, so it cannot {action} itself — \
+         the next `{pm} upgrade` would overwrite whatever it wrote.\n  \
+         Run `sudo {pm} upgrade rupu` instead.\n  \
+         `rupu update --check` still works and will tell you if a newer version exists."
+    ))
+}
+
 pub async fn handle(args: UpdateArgs) -> ExitCode {
     match run(args).await {
         Ok(code) => code,
@@ -84,6 +111,15 @@ async fn run(args: UpdateArgs) -> anyhow::Result<ExitCode> {
     if args.print_platform {
         println!("{}", rupu_update::current_platform());
         return Ok(ExitCode::SUCCESS);
+    }
+
+    if let Some(message) = packaged_refusal(
+        crate::build_info::is_packaged(),
+        crate::build_info::package_manager_hint(),
+        args.check,
+        args.rollback,
+    ) {
+        anyhow::bail!(message);
     }
 
     let cfg = load_cli_config();
@@ -349,5 +385,61 @@ mod tests {
         assert_eq!(resolve_channel(None, Some("beta")).unwrap(), Channel::Beta);
         assert_eq!(resolve_channel(None, None).unwrap(), Channel::Stable);
         assert!(resolve_channel(Some("nightly"), None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod packaged_tests {
+    use super::*;
+
+    #[test]
+    fn unpackaged_installs_are_never_refused() {
+        // Tarball / install.sh / dev builds own their own binary.
+        assert!(packaged_refusal(false, "apt", false, false).is_none());
+        assert!(packaged_refusal(false, "apt", true, false).is_none());
+        assert!(packaged_refusal(false, "apt", false, true).is_none());
+    }
+
+    #[test]
+    fn packaged_install_refuses_an_actual_update() {
+        let msg = packaged_refusal(true, "apt", false, false).expect("must refuse");
+        assert!(msg.contains("apt upgrade rupu"), "message was: {msg}");
+        assert!(
+            msg.contains("--check"),
+            "must point at the still-working alternative"
+        );
+    }
+
+    #[test]
+    fn packaged_install_refuses_rollback() {
+        // Rolling back under a package manager leaves it disagreeing with
+        // what is on disk, and the next upgrade silently undoes it.
+        let msg = packaged_refusal(true, "dnf", false, true).expect("must refuse");
+        assert!(msg.contains("dnf"), "message was: {msg}");
+    }
+
+    #[test]
+    fn packaged_install_still_allows_check() {
+        // A user must be able to learn they are behind regardless of how
+        // they installed.
+        assert!(packaged_refusal(true, "apt", true, false).is_none());
+    }
+
+    #[test]
+    fn the_message_names_the_package_manager_it_was_given() {
+        let apt = packaged_refusal(true, "apt", false, false).unwrap();
+        let dnf = packaged_refusal(true, "dnf", false, false).unwrap();
+        assert!(apt.contains("apt") && !apt.contains("dnf"));
+        assert!(dnf.contains("dnf") && !dnf.contains("apt"));
+    }
+
+    #[test]
+    fn an_unknown_distro_still_refuses_without_naming_a_wrong_command() {
+        let msg = packaged_refusal(true, "your system package manager", false, false)
+            .expect("must still refuse");
+        assert!(
+            msg.contains("your system package manager"),
+            "message was: {msg}"
+        );
     }
 }
