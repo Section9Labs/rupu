@@ -746,3 +746,102 @@ jobs:
           git add flake.nix packaging/aur/PKGBUILD packaging/homebrew/rupu.rb
           git commit -m "chore(packaging): sync community definitions to ${{ needs.meta.outputs.version }}"
           git push origin HEAD:main
+
+  publish-aur:
+    name: publish to the AUR
+    needs: [meta, community]
+    if: needs.meta.outputs.channel == 'stable'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # `main` at this point already carries the synced PKGBUILD from the
+      # `community` job (or already carried it, if this version's sync was a
+      # no-op) — checking it out here, rather than re-running the sync,
+      # keeps there being exactly one place that computes version + hashes.
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+
+      # AUR requires .SRCINFO to be regenerated for every version bump, and
+      # it can only be produced by `makepkg`, which does not exist outside
+      # Arch. This never hand-writes it — a hand-written .SRCINFO drifting
+      # from PKGBUILD is exactly the class of bug the AUR's own tooling
+      # exists to prevent.
+      - name: Regenerate .SRCINFO (makepkg is Arch-only, so run it in an Arch container)
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD":/w -w /w archlinux:latest bash -c '
+            set -euo pipefail
+            pacman -Sy --noconfirm --needed base-devel
+            # makepkg refuses to run as root (even for --printsrcinfo), so
+            # do the actual generation as an unprivileged user.
+            useradd -m builder
+            chown -R builder:builder /w/packaging/aur
+            su builder -c "cd /w/packaging/aur && makepkg --printsrcinfo > .SRCINFO"
+          '
+          test -s packaging/aur/.SRCINFO || { echo "::error::.SRCINFO was not generated"; exit 1; }
+          cat packaging/aur/.SRCINFO
+
+      - name: Push to aur.archlinux.org
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          AUR_USERNAME: ${{ secrets.AUR_USERNAME }}
+          AUR_EMAIL: ${{ secrets.AUR_EMAIL }}
+        run: |
+          set -euo pipefail
+          mkdir -p -m 700 "$HOME/.ssh"
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$HOME/.ssh/aur"
+          chmod 600 "$HOME/.ssh/aur"
+          ssh-keyscan -t ed25519 aur.archlinux.org > "$HOME/.ssh/known_hosts" 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+
+          git clone ssh://aur@aur.archlinux.org/rupu-bin.git aur-rupu-bin
+          cp packaging/aur/PKGBUILD packaging/aur/.SRCINFO aur-rupu-bin/
+          cd aur-rupu-bin
+          git config user.name "$AUR_USERNAME"
+          git config user.email "$AUR_EMAIL"
+          if git diff --quiet; then
+            echo "AUR package already current"; exit 0
+          fi
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to ${{ needs.meta.outputs.version }}"
+          git push
+
+  publish-homebrew:
+    name: publish to the Homebrew tap
+    needs: [meta, community]
+    if: needs.meta.outputs.channel == 'stable'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+
+      # TAP_TOKEN is a PAT: the ambient GITHUB_TOKEN is scoped to this repo
+      # and cannot push to Section9Labs/homebrew-tap. Its absence must not
+      # fail the release — a formula one version behind is a nuisance a
+      # maintainer fixes later; a red release blocks every other asset.
+      - name: Publish Formula/rupu.rb to Section9Labs/homebrew-tap
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_TOKEN:-}" ]; then
+            echo "TAP_TOKEN is not set — skipping the Homebrew tap publish. The formula will lag one release; this is deliberately not a release failure."
+            exit 0
+          fi
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/Section9Labs/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp packaging/homebrew/rupu.rb tap/Formula/rupu.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "tap formula already current"; exit 0
+          fi
+          git add Formula/rupu.rb
+          git commit -m "rupu ${{ needs.meta.outputs.version }}"
+          git push

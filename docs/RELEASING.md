@@ -156,3 +156,43 @@ Set under repo Settings → Secrets and variables → Actions:
 - `RUPU_LIVE_COPILOT_TOKEN`
 - `RUPU_LIVE_GITHUB_TOKEN`           # PAT, scopes: repo + read:user + read:org
 - `RUPU_LIVE_GITLAB_TOKEN`           # PAT, scopes: api + read_user + read_repository
+
+## Community package publishing (automated in CI)
+
+Note: unlike the manual runbook above, `.github/workflows/release.yml`
+*does* exist and runs on every `v*` tag push — it builds and publishes the
+binaries, `.deb`/`.rpm` packages, and hosted apt/yum repos. Three of its
+jobs additionally keep the community package definitions (Nix flake, AUR
+`PKGBUILD`, Homebrew formula) in sync and published, and all three are
+gated to **stable** releases only — a beta version must never reach the
+AUR, the Homebrew tap, or `main`'s definition files:
+
+- **`community`** rewrites `flake.nix`, `packaging/aur/PKGBUILD`, and
+  `packaging/homebrew/rupu.rb` with the just-published version and
+  checksums (via `packaging/sync-community.sh`) and commits the result
+  straight to `main`.
+- **`publish-aur`** checks out the synced `PKGBUILD`, regenerates
+  `.SRCINFO` inside a throwaway `archlinux:latest` container (`makepkg
+  --printsrcinfo` only runs on Arch — it is never hand-written), and
+  pushes both files to `ssh://aur@aur.archlinux.org/rupu-bin.git`.
+  Requires these repo secrets, already provisioned for the `rupuaur`
+  AUR account:
+  - `AUR_SSH_PRIVATE_KEY` — deploy key registered with the `rupuaur`
+    AUR account
+  - `AUR_USERNAME`, `AUR_EMAIL` — commit identity for the AUR git repo
+- **`publish-homebrew`** copies the synced `packaging/homebrew/rupu.rb`
+  to `Formula/rupu.rb` in `Section9Labs/homebrew-tap` and pushes.
+  Requires:
+  - `TAP_TOKEN` — a PAT with push access to `Section9Labs/homebrew-tap`
+    (the ambient `GITHUB_TOKEN` is scoped to this repo only and cannot
+    write to another one)
+
+  If `TAP_TOKEN` is absent, this step logs a message and exits `0`
+  rather than failing the release — a Homebrew formula one version
+  behind is a nuisance a maintainer fixes later; a red release blocks
+  every other asset (binaries, `.deb`/`.rpm`, apt/yum repos) for
+  everyone.
+
+None of this requires action on a normal release: push a `v*.*.*` tag
+(no `-beta` suffix) and the AUR package and Homebrew formula update
+themselves within the same workflow run.
