@@ -21,11 +21,17 @@ is automated in CI rather than documented as a manual chore:
    **verified working** against `aur@aur.archlinux.org` (`list-repos`
    answered). Secrets `AUR_SSH_PRIVATE_KEY`, `AUR_USERNAME` (`rupuaur`),
    `AUR_EMAIL` (`rupu-aur-ci@section9labs.com`) are set.
-2. **Homebrew tap** — `Section9Labs/homebrew-tap` exists. Pushing to it from
-   this repo's workflow uses the ambient `GITHUB_TOKEN`, which cannot write
-   to another repository, so it needs a PAT secret named `TAP_TOKEN`. If that
-   secret is absent the tap step must **skip loudly**, not fail the release —
-   a formula lagging one version is a nuisance; a failed release is not.
+2. **Homebrew tap** — `Section9Labs/homebrew-tap` exists, is seeded (README,
+   LICENSE, `Formula/`), and its CI **deploy key is registered with write
+   access and verified by a real push**. Secret `TAP_SSH_PRIVATE_KEY` is set.
+
+   The tap being public makes it world-*readable* and says nothing about who
+   may write, so the ambient `GITHUB_TOKEN` — minted per run and scoped to
+   this repository — still cannot push there. A deploy key rather than a PAT:
+   it writes to that one repo, does not expire, and revoking it touches
+   nothing else. If the secret is absent the tap step must **skip loudly**,
+   not fail the release — a formula lagging one version is a nuisance; a
+   failed release is not.
 
 The Nix flake needs nothing external — it lives here.
 
