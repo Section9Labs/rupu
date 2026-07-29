@@ -48,6 +48,12 @@ Download the binary for your platform from the
 [Releases](https://github.com/Section9Labs/rupu/releases) page and place `rupu`
 somewhere on your `$PATH`.
 
+> **Not live yet.** The three community install paths below (AUR, Homebrew,
+> Nix) become available with the first stable release after this lands — that
+> release is what publishes `rupu-bin` to the AUR, pushes the formula to the
+> tap, and fills in the flake's version and hashes. Until then, use the
+> prebuilt binary or the `.deb`/`.rpm` below.
+
 **Arch Linux (AUR):**
 
 ```sh
