@@ -12,12 +12,26 @@
 
 **Depends on:** the release workflow publishing `rupu-{darwin-arm64,linux-x64,linux-arm64}` plus `.sha256` sidecars (Phase A/earlier, merged).
 
-## Two things require maintainer credentials
+## Credentials — all provisioned, publishing is automated
 
-These block *publishing*, not authoring. Every task below can be built and tested without them:
+**UPDATE, resolved before Task 5 ran.** Both blockers are gone, so publishing
+is automated in CI rather than documented as a manual chore:
 
-1. **AUR** needs an account at aur.archlinux.org with an SSH key registered, and the package name reserved. The `PKGBUILD` and its CI check work without it; only `git push` to the AUR remote is blocked.
-2. **Homebrew tap** needs a `Section9Labs/homebrew-tap` repository to exist. The formula and its test work in-repo; only publishing to the tap is blocked.
+1. **AUR** — account `rupuaur` exists; the CI deploy key is registered and
+   **verified working** against `aur@aur.archlinux.org` (`list-repos`
+   answered). Secrets `AUR_SSH_PRIVATE_KEY`, `AUR_USERNAME` (`rupuaur`),
+   `AUR_EMAIL` (`rupu-aur-ci@section9labs.com`) are set.
+2. **Homebrew tap** — `Section9Labs/homebrew-tap` exists, is seeded (README,
+   LICENSE, `Formula/`), and its CI **deploy key is registered with write
+   access and verified by a real push**. Secret `TAP_SSH_PRIVATE_KEY` is set.
+
+   The tap being public makes it world-*readable* and says nothing about who
+   may write, so the ambient `GITHUB_TOKEN` — minted per run and scoped to
+   this repository — still cannot push there. A deploy key rather than a PAT:
+   it writes to that one repo, does not expire, and revoking it touches
+   nothing else. If the secret is absent the tap step must **skip loudly**,
+   not fail the release — a formula lagging one version is a nuisance; a
+   failed release is not.
 
 The Nix flake needs nothing external — it lives here.
 
