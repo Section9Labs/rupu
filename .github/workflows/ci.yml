@@ -19,6 +19,18 @@ jobs:
       # and now force-runs on 24 anyway (warning on every run).
       - uses: actions/checkout@v5
 
+      # docs/pages/rupu-archive-keyring.asc is served at a stable URL that
+      # users pin trust to (https://rupu.sh/rupu-archive-keyring.asc).
+      # This guards against a private key ever being committed there by accident.
+      - name: Assert the published keyring is public-only
+        run: |
+          set -euo pipefail
+          f=docs/pages/rupu-archive-keyring.asc
+          grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$f" || { echo "::error::$f is not a public key block"; exit 1; }
+          if grep -q "PRIVATE KEY BLOCK" "$f"; then
+            echo "::error::$f contains private key material"; exit 1
+          fi
+
       # The pinned Alpine/musl toolchain. Building the image here rather
       # than pulling a published one keeps the Dockerfile the single source
       # of truth; publishing it to ghcr is a later optimization.
