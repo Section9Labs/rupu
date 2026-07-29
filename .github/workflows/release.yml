@@ -124,6 +124,17 @@ jobs:
             -v "$PWD":/work -w /work rupu-linux-build \
             cargo build --release -p rupu-cli --target-dir target/linux-musl
 
+      - name: Build again with the package install marker
+        run: |
+          docker run --rm \
+            -e RUPU_RELEASE_CHANNEL="${{ needs.meta.outputs.channel }}" \
+            -e RUPU_RELEASE_VERSION="${{ needs.meta.outputs.version }}" \
+            -e RUPU_INSTALL_METHOD=pkg \
+            -v "$PWD":/work -w /work rupu-linux-build \
+            cargo build --release -p rupu-cli --target-dir target/linux-musl-pkg
+          mkdir -p dist
+          cp target/linux-musl-pkg/release/rupu "dist/rupu-${{ matrix.platform }}-pkg"
+
       - name: Stage the asset under its canonical name
         run: |
           set -euo pipefail
@@ -147,6 +158,91 @@ jobs:
         with:
           name: asset-${{ matrix.platform }}
           path: dist/
+          if-no-files-found: error
+
+  packages:
+    name: build .deb and .rpm
+    needs: [meta, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install nfpm
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /tmp/nfpm.deb \
+            https://github.com/goreleaser/nfpm/releases/download/v2.43.0/nfpm_2.43.0_amd64.deb
+          sudo dpkg -i /tmp/nfpm.deb
+          nfpm --version
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: asset-linux-x64
+          path: staging/x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: asset-linux-arm64
+          path: staging/arm64
+
+      # Completions and the man page are architecture-independent, and this
+      # runner cannot execute the arm64 binary — so generate once from x64
+      # and reuse for both packages.
+      - name: Generate completions and man page (once, from the x64 binary)
+        run: |
+          set -euo pipefail
+          chmod +x staging/x64/rupu-linux-x64
+          bin=./staging/x64/rupu-linux-x64
+          mkdir -p shared/completions
+          "$bin" completions print bash --static > shared/completions/rupu.bash
+          "$bin" completions print zsh  --static > shared/completions/_rupu
+          "$bin" completions print fish --static > shared/completions/rupu.fish
+          "$bin" man > shared/rupu.1
+          gzip -9 -n -f shared/rupu.1
+          ls -la shared shared/completions
+
+      - name: Build all four packages
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # nfpm rejects a leading `v` and pre-release shapes vary; strip any
+          # leading v and keep the rest.
+          ver="${VERSION#v}"
+          mkdir -p out
+          # binname points at the -pkg build (RUPU_INSTALL_METHOD=pkg), not
+          # the tarball binary staged alongside it — see the "Build again
+          # with the package install marker" step in the linux job.
+          for pair in "x64:amd64:rupu-linux-x64-pkg" "arm64:arm64:rupu-linux-arm64-pkg"; do
+            src="${pair%%:*}"; rest="${pair#*:}"
+            arch="${rest%%:*}"; binname="${rest#*:}"
+            rm -rf dist && mkdir -p dist/completions
+            cp "staging/$src/$binname" dist/rupu
+            chmod +x dist/rupu
+            cp shared/completions/* dist/completions/
+            cp shared/rupu.1.gz dist/rupu.1.gz
+            ./packaging/build-packages.sh "$ver" "$arch"
+            mv dist/*.deb dist/*.rpm out/
+          done
+          ls -la out
+
+      # The architecture strings differ by format — .deb uses amd64/arm64,
+      # .rpm uses x86_64/aarch64. A mismatch ships a package that installs on
+      # the wrong machine, so assert rather than assume.
+      - name: Assert the emitted filenames
+        run: |
+          set -euo pipefail
+          ls out
+          test -n "$(ls out/*amd64.deb 2>/dev/null)"   || { echo "::error::no amd64 .deb"; exit 1; }
+          test -n "$(ls out/*arm64.deb 2>/dev/null)"   || { echo "::error::no arm64 .deb"; exit 1; }
+          test -n "$(ls out/*x86_64.rpm 2>/dev/null)"  || { echo "::error::no x86_64 .rpm"; exit 1; }
+          test -n "$(ls out/*aarch64.rpm 2>/dev/null)" || { echo "::error::no aarch64 .rpm"; exit 1; }
+          test "$(ls out | wc -l)" -eq 4 || { echo "::error::expected exactly 4 packages"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-packages
+          path: out/
           if-no-files-found: error
 
   macos:
@@ -241,7 +337,7 @@ jobs:
 
   publish:
     name: publish release
-    needs: [meta, linux, macos]
+    needs: [meta, linux, macos, packages]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -264,6 +360,8 @@ jobs:
             test -f "dist/rupu-$p"        || { echo "::error::missing rupu-$p"; exit 1; }
             test -f "dist/rupu-$p.sha256" || { echo "::error::missing rupu-$p.sha256"; exit 1; }
           done
+          test "$(ls dist/*.deb dist/*.rpm 2>/dev/null | wc -l)" -eq 4 \
+            || { echo "::error::expected 4 packages"; exit 1; }
           ( cd dist && sha256sum -c ./*.sha256 )
 
       - name: Publish rolling and versioned releases
