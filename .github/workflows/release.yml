@@ -718,40 +718,84 @@ jobs:
     needs: [meta, publish]
     if: needs.meta.outputs.channel == 'stable'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
+    # This job commits to `main`. Two releases running concurrently (or a
+    # re-run of an older tag) would both check out main, both regenerate, and
+    # the second push would be rejected non-fast-forward — the same race the
+    # `repo` job serializes for gh-pages. Not cancel-in-progress: a cancel
+    # between commit and push leaves nothing published, and the next release
+    # would have to re-do it.
+    concurrency:
+      group: community-sync
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v5
         with:
           ref: main
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: asset-linux-*
-          merge-multiple: true
-          path: shas
-      - uses: actions/download-artifact@v4
-        with:
-          name: asset-darwin-arm64
-          path: shas
-      - name: Sync definitions
-        run: ./packaging/sync-community.sh "${{ needs.meta.outputs.version }}" shas
-      - name: Commit if changed
+
+      # The sidecars, and only the sidecars. The `asset-*` artifacts each
+      # carry their ~50MB binary alongside the 100-byte `.sha256`, and
+      # download-artifact cannot filter within an artifact — pulling them
+      # would move ~150MB to read 300 bytes. `publish` (a `needs` of this
+      # job) has already uploaded these exact files to the release, so
+      # fetching them from there is both narrower and closer to what the
+      # generated definitions actually point users at.
+      - name: Fetch the checksum sidecars from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.tag }}
         run: |
           set -euo pipefail
-          if git diff --quiet; then
-            echo "definitions already current"; exit 0
-          fi
+          mkdir -p shas
+          gh release download "$TAG" --pattern '*.sha256' --dir shas
+          ls -la shas
+
+      - name: Regenerate definitions from the templates
+        run: ./packaging/sync-community.sh "${{ needs.meta.outputs.version }}" shas
+
+      - name: Prove the regeneration is repeatable
+        run: ./packaging/test-sync-community.sh
+
+      - name: Commit if changed
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Stage FIRST, then diff the index: `git diff` alone is blind to a
+          # file that is untracked (a future path rename would silently
+          # publish nothing).
           git add flake.nix packaging/aur/PKGBUILD packaging/homebrew/rupu.rb
-          git commit -m "chore(packaging): sync community definitions to ${{ needs.meta.outputs.version }}"
-          git push origin HEAD:main
+          if git diff --cached --quiet; then
+            echo "definitions already current"; exit 0
+          fi
+          git commit -m "chore(packaging): sync community definitions to $VERSION"
+          # Anything landing on main between the checkout and here makes the
+          # push non-fast-forward. Rebase onto it and retry once rather than
+          # failing the release over a merge that has nothing to do with
+          # these three files.
+          for attempt in 1 2; do
+            if git push origin HEAD:main; then
+              echo "pushed on attempt $attempt"; exit 0
+            fi
+            if [ "$attempt" -eq 2 ]; then break; fi
+            echo "::warning::push to main rejected; rebasing onto origin/main and retrying once"
+            git fetch origin main
+            git rebase origin/main \
+              || { echo "::error::rebase onto origin/main failed"; exit 1; }
+          done
+          echo "::error::could not push the synced definitions to main"
+          exit 1
 
   publish-aur:
     name: publish to the AUR
     needs: [meta, community]
     if: needs.meta.outputs.channel == 'stable'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -773,7 +817,14 @@ jobs:
           set -euo pipefail
           docker run --rm -v "$PWD":/w -w /w archlinux:latest bash -c '
             set -euo pipefail
-            pacman -Sy --noconfirm --needed base-devel
+            # makepkg ships in the `pacman` package, which is in the base
+            # image — nothing to install for --printsrcinfo. Installing
+            # base-devel with a bare `-Sy` would be a partial upgrade, which
+            # errors whenever the mirror db is ahead of the image. Only fall
+            # back to an install (a FULL -Syu) if the image ever drops it.
+            if ! command -v makepkg >/dev/null 2>&1; then
+              pacman -Syu --noconfirm --needed base-devel
+            fi
             # makepkg refuses to run as root (even for --printsrcinfo), so
             # do the actual generation as an unprivileged user.
             useradd -m builder
@@ -801,18 +852,30 @@ jobs:
           cd aur-rupu-bin
           git config user.name "$AUR_USERNAME"
           git config user.email "$AUR_EMAIL"
-          if git diff --quiet; then
+          # Stage FIRST, then diff the index. A bare `git diff` sees nothing
+          # when the files are untracked — which is exactly the state of a
+          # freshly reserved, empty `rupu-bin.git` — so the very first
+          # publish would report "already current" and push nothing.
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
             echo "AUR package already current"; exit 0
           fi
-          git add PKGBUILD .SRCINFO
           git commit -m "Update to ${{ needs.meta.outputs.version }}"
           git push
+
+      # The AUR deploy key is a real credential. Harmless on a hosted runner
+      # (the VM is destroyed), a leak on a self-hosted one. Same `if: always()`
+      # pattern the GPG import above uses.
+      - name: Remove the AUR deploy key
+        if: always()
+        run: rm -f "$HOME/.ssh/aur"
 
   publish-homebrew:
     name: publish to the Homebrew tap
     needs: [meta, community]
     if: needs.meta.outputs.channel == 'stable'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -830,7 +893,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${TAP_TOKEN:-}" ]; then
-            echo "TAP_TOKEN is not set — skipping the Homebrew tap publish. The formula will lag one release; this is deliberately not a release failure."
+            # ::warning:: so this surfaces as an annotation on the run rather
+            # than as one green line in a 2000-line log.
+            echo "::warning::TAP_TOKEN is not set — skipping the Homebrew tap publish. The formula will lag one release; this is deliberately not a release failure."
             exit 0
           fi
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/Section9Labs/homebrew-tap.git" tap
@@ -839,9 +904,13 @@ jobs:
           cd tap
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet; then
+          # Stage FIRST, then diff the index. A tap that does not yet have a
+          # `Formula/rupu.rb` leaves the copy untracked, and a bare
+          # `git diff` reports it clean — the first publish to a fresh tap
+          # would say "already current" and push nothing.
+          git add Formula/rupu.rb
+          if git diff --cached --quiet; then
             echo "tap formula already current"; exit 0
           fi
-          git add Formula/rupu.rb
           git commit -m "rupu ${{ needs.meta.outputs.version }}"
           git push
