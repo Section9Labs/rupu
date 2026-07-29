@@ -589,6 +589,55 @@ jobs:
           fi
           echo "publish root is clean"
 
+      # This runs against the just-built local tree, not the live Pages
+      # site — Pages takes time to propagate, and a release must not depend
+      # on that latency. It proves the signature is trusted, the index
+      # resolves, and the dependency is pulled — the three things that
+      # break silently.
+      - name: Verify apt can install from the built repo
+        env:
+          CHANNEL: ${{ needs.meta.outputs.channel }}
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/site":/repo debian:12 bash -c '
+            set -euo pipefail
+            apt-get update -qq
+            apt-get install -y -qq ca-certificates gnupg
+            cp /repo/rupu-archive-keyring.asc /etc/apt/trusted.gpg.d/rupu.asc
+            echo "deb [signed-by=/etc/apt/trusted.gpg.d/rupu.asc] file:///repo/apt '"$CHANNEL"' main" \
+              > /etc/apt/sources.list.d/rupu.list
+            apt-get update -qq
+            apt-get install -y -qq rupu
+            rupu --version
+            command -v rg >/dev/null || { echo "ripgrep dependency not resolved"; exit 1; }
+          '
+
+      # `gpgcheck=1` and `repo_gpgcheck=1` are both deliberate: the first
+      # proves the packages are signed, the second proves the repository
+      # metadata is. Do not relax either to make this step pass — that is
+      # the whole point of Phase B.
+      - name: Verify dnf can install from the built repo
+        env:
+          CHANNEL: ${{ needs.meta.outputs.channel }}
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/site":/repo fedora:41 bash -c '
+            set -euo pipefail
+            rpm --import /repo/rupu-archive-keyring.asc
+            cat > /etc/yum.repos.d/rupu.repo <<REPO
+          [rupu]
+          name=rupu
+          baseurl=file:///repo/yum/'"$CHANNEL"'
+          enabled=1
+          gpgcheck=1
+          repo_gpgcheck=1
+          gpgkey=file:///repo/rupu-archive-keyring.asc
+          REPO
+            dnf install -y -q rupu
+            rupu --version
+            command -v rg >/dev/null || { echo "ripgrep dependency not resolved"; exit 1; }
+          '
+
       # Publish by committing into the EXISTING gh-pages branch, never by
       # replacing the site. rupu.sh is served from that branch and already
       # contains index.html, styles.css, docs/, 404.html, favicon.svg and
