@@ -71,10 +71,14 @@ hand every release, add the hosted repository once — see below.
 
 rupu publishes signed APT and YUM repositories with every release, so you
 can `apt install`/`dnf install` and then upgrade in place with your normal
-package manager. Both the `stable` and `beta` channels are hosted and can be
-added side by side — they use separate suites/pools, so installing one never
-pulls in the other, and you may add both and pin whichever you want with
-`apt` preferences.
+package manager. Both the `stable` and `beta` channels are hosted, but **do
+not add both without pinning**: a beta version string like `0.70.4.beta`
+sorts *higher* than `0.70.4` under both dpkg's and rpm's version comparison,
+so with both channels enabled and unpinned, `apt`/`dnf` will pick beta on the
+first upgrade and every upgrade after that keeps you on beta — silently, with
+no warning. If you only ever want one channel, only add that one channel. If
+you want both available but to stay on stable by default, pin as shown
+below.
 
 Everything is signed with key fingerprint
 `6A2918F205000696D657AC61D672DF3BE13ADFDD`, whose public half is served from
@@ -89,8 +93,10 @@ than `apt install rupu=<old-version>`, which will not find it in the index.
 *Debian/Ubuntu — stable, deb822 format (modern `apt`, `.sources` file):*
 
 ```sh
+sudo install -m 0755 -d /etc/apt/keyrings
 sudo curl -fsSL -o /etc/apt/keyrings/rupu.asc \
   https://rupu.sh/rupu-archive-keyring.asc
+sudo chmod 644 /etc/apt/keyrings/rupu.asc
 sudo tee /etc/apt/sources.list.d/rupu.sources > /dev/null <<'EOF'
 Types: deb
 URIs: https://rupu.sh/apt
@@ -106,8 +112,10 @@ sudo apt update && sudo apt install rupu
 whose `apt` doesn't understand deb822 `.sources` files):*
 
 ```sh
+sudo install -m 0755 -d /etc/apt/keyrings
 sudo curl -fsSL -o /etc/apt/keyrings/rupu.asc \
   https://rupu.sh/rupu-archive-keyring.asc
+sudo chmod 644 /etc/apt/keyrings/rupu.asc
 echo "deb [signed-by=/etc/apt/keyrings/rupu.asc] https://rupu.sh/apt stable main" \
   | sudo tee /etc/apt/sources.list.d/rupu.list
 sudo apt update && sudo apt install rupu
@@ -131,11 +139,20 @@ sudo dnf install rupu
 
 *Beta channel:* identical snippets with `stable` → `beta` — in the `Suites:`
 line and `deb` line for APT, and in the `baseurl` for YUM — and nothing else.
-The key, import commands, and package name are unchanged. Stable and beta
-coexist: add both if you want, since their suites and pools are separate.
+The key, import commands, and package name are unchanged.
+
+**Do not add both channels without pinning.** Version strings compare as
+`0.70.4.beta` > `0.70.4` under both dpkg's and rpm's version comparison, so
+with both sources enabled and unpinned, `apt upgrade`/`dnf upgrade` will pick
+beta the first time it's available and every upgrade after that keeps you on
+beta — silently, with no warning.
 
 ```sh
-# APT (deb822), beta
+# APT (deb822), beta — self-contained
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL -o /etc/apt/keyrings/rupu.asc \
+  https://rupu.sh/rupu-archive-keyring.asc
+sudo chmod 644 /etc/apt/keyrings/rupu.asc
 sudo tee /etc/apt/sources.list.d/rupu-beta.sources > /dev/null <<'EOF'
 Types: deb
 URIs: https://rupu.sh/apt
@@ -144,17 +161,51 @@ Components: main
 Architectures: amd64 arm64
 Signed-By: /etc/apt/keyrings/rupu.asc
 EOF
+```
 
-# YUM/DNF, beta
+If you want beta available alongside stable but to stay on stable by
+default, pin stable above beta. The repo metadata carries the fields needed
+to pin precisely — `Origin: Section9Labs`, `Label: rupu`, and
+`Suite`/`Codename` equal to the channel name:
+
+```sh
+sudo tee /etc/apt/preferences.d/rupu > /dev/null <<'EOF'
+Package: *
+Pin: release o=Section9Labs, l=rupu, a=stable
+Pin-Priority: 900
+
+Package: *
+Pin: release o=Section9Labs, l=rupu, a=beta
+Pin-Priority: 100
+EOF
+```
+
+With that pin in place, `apt install rupu` / `apt upgrade` always resolves to
+stable even with both sources enabled. Pull a beta build anyway, on demand,
+with `apt install -t beta rupu`.
+
+For YUM/DNF there is no equivalent pinning mechanism, so ship the beta repo
+**disabled** and opt in per command instead:
+
+```sh
+# YUM/DNF, beta — disabled by default
 sudo tee /etc/yum.repos.d/rupu-beta.repo > /dev/null <<'EOF'
 [rupu-beta]
 name=rupu (beta)
 baseurl=https://rupu.sh/yum/beta
-enabled=1
+enabled=0
 gpgcheck=1
 repo_gpgcheck=1
 gpgkey=https://rupu.sh/rupu-archive-keyring.asc
 EOF
+```
+
+`dnf install rupu` / `dnf upgrade` then always stay on stable. Pull a beta
+build on demand with:
+
+```sh
+sudo dnf install --enablerepo=rupu-beta rupu
+sudo dnf upgrade --enablerepo=rupu-beta rupu
 ```
 
 ---

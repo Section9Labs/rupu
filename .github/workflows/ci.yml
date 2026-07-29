@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v5
 
       # docs/pages/rupu-archive-keyring.asc is served at a stable URL that
-      # users pin trust to (https://section9labs.github.io/rupu/rupu-archive-keyring.asc).
+      # users pin trust to (https://rupu.sh/rupu-archive-keyring.asc).
       # This guards against a private key ever being committed there by accident.
       - name: Assert the published keyring is public-only
         run: |

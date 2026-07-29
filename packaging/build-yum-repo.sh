@@ -32,7 +32,8 @@ rpmsign --addsign "$REPO"/*.rpm
 # useful if the macro is wrong; an unsigned rpm in a gpgcheck=1 repo
 # fails on the user's machine, not here.
 for f in "$REPO"/*.rpm; do
-  rpm -qpi "$f" 2>/dev/null | grep -qiE "Signature *:.*Key ID" \
+  info=$(rpm -qpi "$f" 2>/dev/null)
+  echo "$info" | grep -qiE "Signature *:.*Key ID" \
     || { echo "rpm not signed: $f" >&2; exit 1; }
 done
 

@@ -533,6 +533,17 @@ jobs:
     needs: [meta, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Separate from the per-tag `release-${{ github.ref }}` group above: a
+    # beta release and a stable release run in different tag groups and can
+    # race each other here. Both clone gh-pages and push; without this, the
+    # second push is rejected non-fast-forward and that release's channel is
+    # left at the previous version. This group has nothing to do with the
+    # tag, so it serializes every gh-pages publish across both channels.
+    # NOT cancel-in-progress: cancelling mid-publish is how a half-published
+    # repo happens (same reasoning as the top-level concurrency group).
+    concurrency:
+      group: gh-pages-publish
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v5
 
@@ -643,10 +654,21 @@ jobs:
             command -v rg >/dev/null || { echo "ripgrep dependency not resolved"; exit 1; }
           '
 
-      # Publish by committing into the EXISTING gh-pages branch, never by
-      # replacing the site. rupu.sh is served from that branch and already
-      # contains index.html, styles.css, docs/, 404.html, favicon.svg and
-      # CNAME — `deploy-pages` would delete all of it.
+      # Publish by editing a checkout of the EXISTING gh-pages branch, never
+      # by replacing the site wholesale. rupu.sh is served from that branch
+      # and already contains index.html, styles.css, docs/, 404.html,
+      # favicon.svg and CNAME — `deploy-pages` would delete all of it.
+      #
+      # The resulting tree is then committed as a single ORPHAN commit and
+      # force-pushed, rather than added as a normal commit on top of history.
+      # Every superseded package blob (30MB+, compressed binaries that do not
+      # delta) would otherwise stay in gh-pages' history forever, growing the
+      # branch by ~122MB per channel-release and crossing GitHub Pages'
+      # recommended 1GB source size within a handful of releases. gh-pages is
+      # a generated publish branch, not a source of truth — its prior history
+      # is archived permanently at tag `gh-pages-archive-2026-07-29` — so
+      # force-pushing a single fresh commit here is deliberate and safe: it
+      # is the only thing that keeps this branch from growing unboundedly.
       - name: Publish into gh-pages
         env:
           CHANNEL: ${{ needs.meta.outputs.channel }}
@@ -656,23 +678,37 @@ jobs:
           git clone --depth 1 --branch gh-pages \
             "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" ghp
           # Replace only this channel's trees; everything else on the branch
-          # is the website and must survive untouched.
+          # is the website (or the other channel's repo trees) and must
+          # survive untouched.
           rm -rf "ghp/apt/dists/$CHANNEL" "ghp/apt/pool/$CHANNEL" "ghp/yum/$CHANNEL"
           mkdir -p ghp/apt ghp/yum
           cp -r site/apt/. ghp/apt/
           cp -r site/yum/. ghp/yum/
           cp site/rupu-archive-keyring.asc ghp/
-          # The site must still be there afterwards. If any of these is
+          # The full site must still be there afterwards. If any of these is
           # missing we are about to publish a broken rupu.sh.
-          for f in index.html CNAME .nojekyll; do
+          for f in index.html CNAME .nojekyll styles.css 404.html favicon.svg; do
             test -e "ghp/$f" || { echo "::error::gh-pages lost $f"; exit 1; }
           done
+          test -d ghp/docs || { echo "::error::gh-pages lost docs/"; exit 1; }
           cd ghp
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add apt yum rupu-archive-keyring.asc
-          if git diff --cached --quiet; then
+          if git diff --quiet -- apt yum rupu-archive-keyring.asc; then
             echo "repositories already current"; exit 0
           fi
+          # Rewrite as a single orphan commit: no parent, so nothing from
+          # gh-pages' prior history (including every old package blob) is
+          # reachable from the branch tip after this push.
+          git checkout --orphan gh-pages-publish
+          git add -A
           git commit -m "repo: publish $CHANNEL packages for $VERSION"
-          git push origin gh-pages
+          git push --force origin gh-pages-publish:gh-pages
+
+      # Harmless on hosted runners (the VM is destroyed after the job), but a
+      # real private-key leak if this workflow ever runs on a self-hosted
+      # runner, where $RUNNER_TEMP can persist across jobs. Runs even if an
+      # earlier step failed.
+      - name: Remove the imported signing key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/gnupg"

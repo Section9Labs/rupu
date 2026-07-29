@@ -13,6 +13,7 @@ set -euo pipefail
 DEB_DIR="${1:?usage: build-apt-repo.sh <deb-dir> <channel> <out-dir>}"
 CHANNEL="${2:?usage: build-apt-repo.sh <deb-dir> <channel> <out-dir>}"
 OUT="${3:?usage: build-apt-repo.sh <deb-dir> <channel> <out-dir>}"
+: "${GPG_KEY_ID:?GPG_KEY_ID must be set}"
 
 case "$CHANNEL" in
   beta|stable) ;;
@@ -48,9 +49,9 @@ apt-ftparchive \
   -o "APT::FTPArchive::Release::Components=main" \
   release "$OUT/apt/dists/$CHANNEL" > "$OUT/apt/dists/$CHANNEL/Release"
 
-gpg --batch --yes --armor --detach-sign \
+gpg --batch --yes --local-user "$GPG_KEY_ID" --armor --detach-sign \
   -o "$OUT/apt/dists/$CHANNEL/Release.gpg" "$OUT/apt/dists/$CHANNEL/Release"
-gpg --batch --yes --clearsign \
+gpg --batch --yes --local-user "$GPG_KEY_ID" --clearsign \
   -o "$OUT/apt/dists/$CHANNEL/InRelease" "$OUT/apt/dists/$CHANNEL/Release"
 
 echo "APT repo built for channel $CHANNEL:"
