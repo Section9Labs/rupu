@@ -33,7 +33,7 @@
 - Modify: `crates/rupu-cli/src/build_info.rs`
 
 **Interfaces:**
-- Produces: `build_info::INSTALL_METHOD: Option<&str>`, `build_info::package_manager() -> Option<&'static str>`, and the pure `build_info::package_manager_for(Option<&str>) -> Option<&'static str>`.
+- Produces: `build_info::INSTALL_METHOD: Option<&str>`; `is_packaged() -> bool` and pure `is_packaged_for(Option<&str>) -> bool`; `package_manager_hint() -> &'static str` and pure `package_manager_hint_from(&str) -> &'static str`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -41,68 +41,109 @@ Add to the existing `mod tests` in `crates/rupu-cli/src/build_info.rs`:
 
 ```rust
     #[test]
-    fn package_manager_maps_each_packaging_format() {
-        assert_eq!(package_manager_for(Some("deb")), Some("apt"));
-        assert_eq!(package_manager_for(Some("rpm")), Some("dnf"));
+    fn only_the_pkg_marker_counts_as_packaged() {
+        assert!(is_packaged_for(Some("pkg")));
+        // Tarball, install.sh, `cargo install`, and dev builds leave it
+        // unset — none are owned by a package manager, so `rupu update`
+        // must keep working for them.
+        assert!(!is_packaged_for(None));
+        assert!(!is_packaged_for(Some("")));
+        assert!(!is_packaged_for(Some("tarball")));
     }
 
     #[test]
-    fn package_manager_is_none_for_unpackaged_installs() {
-        // Tarball, install.sh, `cargo install`, and dev builds all leave the
-        // marker unset — none of them are owned by a package manager, so
-        // `rupu update` must keep working for them.
-        assert_eq!(package_manager_for(None), None);
-        assert_eq!(package_manager_for(Some("")), None);
-        assert_eq!(package_manager_for(Some("tarball")), None);
+    fn package_manager_hint_follows_the_distro_family() {
+        // A .deb only installs on a Debian-family system and an .rpm only on
+        // an RHEL-family one, so the distro IS the answer — no per-format
+        // build needed.
+        assert_eq!(package_manager_hint_from("ID=debian\nNAME=\"Debian GNU/Linux\""), "apt");
+        assert_eq!(package_manager_hint_from("ID=ubuntu\nID_LIKE=debian"), "apt");
+        assert_eq!(package_manager_hint_from("ID=fedora"), "dnf");
+        assert_eq!(package_manager_hint_from("ID=rocky\nID_LIKE=\"rhel centos fedora\""), "dnf");
+    }
+
+    #[test]
+    fn package_manager_hint_degrades_rather_than_guessing_wrong() {
+        // Unknown or unreadable /etc/os-release: say something true rather
+        // than name the wrong command.
+        assert_eq!(package_manager_hint_from(""), "your system package manager");
+        assert_eq!(package_manager_hint_from("ID=plan9"), "your system package manager");
     }
 
     #[test]
     fn no_install_method_under_cargo_test() {
         assert_eq!(INSTALL_METHOD, None);
-        assert_eq!(package_manager(), None);
+        assert!(!is_packaged());
     }
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rupu-cli --lib build_info`
-Expected: FAIL — `cannot find function 'package_manager_for' in this scope`
+Expected: FAIL — `cannot find function 'is_packaged_for' in this scope`
 
 - [ ] **Step 3: Write the implementation**
 
 Add to `crates/rupu-cli/src/build_info.rs`, after `RELEASE_VERSION`:
 
 ```rust
-/// "deb" | "rpm" when this binary was installed from a native package;
+/// `"pkg"` when this binary came from a native package (.deb or .rpm);
 /// `None` for tarball, `install.sh`, `cargo install`, and dev builds.
 ///
-/// Stamped by the packaging job exactly the way `RUPU_RELEASE_CHANNEL` is
+/// Stamped by the packaging build exactly the way `RUPU_RELEASE_CHANNEL` is
 /// stamped by the release build — same mechanism, no new pattern.
+///
+/// Deliberately format-agnostic. Stamping "deb" vs "rpm" would need a
+/// separate build per format; the distro tells us which is which at runtime
+/// for free, because a .deb only installs on a Debian-family system.
 pub const INSTALL_METHOD: Option<&str> = option_env!("RUPU_INSTALL_METHOD");
 
-/// The system package manager that owns this binary, if any.
+/// Whether this binary is owned by a system package manager.
 ///
-/// Kept pure and separate from [`package_manager`] so the whole mapping is
-/// testable — `option_env!` is fixed at compile time and cannot be varied
-/// from a test.
-pub fn package_manager_for(method: Option<&str>) -> Option<&'static str> {
-    match method {
-        Some("deb") => Some("apt"),
-        Some("rpm") => Some("dnf"),
-        _ => None,
+/// Kept pure and separate from [`is_packaged`] so it is testable —
+/// `option_env!` is fixed at compile time and cannot be varied from a test.
+pub fn is_packaged_for(method: Option<&str>) -> bool {
+    method == Some("pkg")
+}
+
+/// Whether this binary is owned by a system package manager.
+pub fn is_packaged() -> bool {
+    is_packaged_for(INSTALL_METHOD)
+}
+
+/// The upgrade command to name, derived from `/etc/os-release` contents.
+///
+/// Falls back to a true-but-vague phrase rather than naming the wrong
+/// command: telling a user to run `apt` on a system without it is worse
+/// than not naming a tool at all.
+pub fn package_manager_hint_from(os_release: &str) -> &'static str {
+    let s = os_release.to_ascii_lowercase();
+    if s.contains("debian") || s.contains("ubuntu") {
+        "apt"
+    } else if s.contains("fedora")
+        || s.contains("rhel")
+        || s.contains("centos")
+        || s.contains("rocky")
+        || s.contains("almalinux")
+    {
+        "dnf"
+    } else {
+        "your system package manager"
     }
 }
 
-/// The system package manager that owns this binary, if any.
-pub fn package_manager() -> Option<&'static str> {
-    package_manager_for(INSTALL_METHOD)
+/// The upgrade command to name for this machine.
+pub fn package_manager_hint() -> &'static str {
+    package_manager_hint_from(
+        &std::fs::read_to_string("/etc/os-release").unwrap_or_default(),
+    )
 }
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rupu-cli --lib build_info`
-Expected: PASS — four tests including the pre-existing `dev_build_when_env_absent`.
+Expected: PASS — five tests including the pre-existing `dev_build_when_env_absent`.
 
 - [ ] **Step 5: Format and commit**
 
@@ -120,8 +161,8 @@ git commit -m "feat(cli): INSTALL_METHOD build marker for packaged installs"
 - Modify: `crates/rupu-cli/src/cmd/update.rs` (`UpdateArgs` is at ~line 23; `async fn run` at ~line 77)
 
 **Interfaces:**
-- Consumes: `build_info::package_manager()` from Task 1.
-- Produces: `update::packaged_refusal(pm: Option<&str>, check: bool, rollback: bool) -> Option<String>` — `Some(message)` when the command must be refused.
+- Consumes: `build_info::is_packaged()` and `build_info::package_manager_hint()` from Task 1.
+- Produces: `update::packaged_refusal(packaged: bool, pm: &str, check: bool, rollback: bool) -> Option<String>` — `Some(message)` when the command must be refused.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -135,14 +176,14 @@ mod packaged_tests {
     #[test]
     fn unpackaged_installs_are_never_refused() {
         // Tarball / install.sh / dev builds own their own binary.
-        assert!(packaged_refusal(None, false, false).is_none());
-        assert!(packaged_refusal(None, true, false).is_none());
-        assert!(packaged_refusal(None, false, true).is_none());
+        assert!(packaged_refusal(false, "apt", false, false).is_none());
+        assert!(packaged_refusal(false, "apt", true, false).is_none());
+        assert!(packaged_refusal(false, "apt", false, true).is_none());
     }
 
     #[test]
     fn packaged_install_refuses_an_actual_update() {
-        let msg = packaged_refusal(Some("apt"), false, false).expect("must refuse");
+        let msg = packaged_refusal(true, "apt", false, false).expect("must refuse");
         assert!(msg.contains("apt upgrade rupu"), "message was: {msg}");
         assert!(msg.contains("--check"), "must point at the still-working alternative");
     }
@@ -151,7 +192,7 @@ mod packaged_tests {
     fn packaged_install_refuses_rollback() {
         // Rolling back under a package manager leaves it disagreeing with
         // what is on disk, and the next upgrade silently undoes it.
-        let msg = packaged_refusal(Some("dnf"), false, true).expect("must refuse");
+        let msg = packaged_refusal(true, "dnf", false, true).expect("must refuse");
         assert!(msg.contains("dnf"), "message was: {msg}");
     }
 
@@ -159,15 +200,22 @@ mod packaged_tests {
     fn packaged_install_still_allows_check() {
         // A user must be able to learn they are behind regardless of how
         // they installed.
-        assert!(packaged_refusal(Some("apt"), true, false).is_none());
+        assert!(packaged_refusal(true, "apt", true, false).is_none());
     }
 
     #[test]
-    fn the_message_names_the_right_package_manager() {
-        let apt = packaged_refusal(Some("apt"), false, false).unwrap();
-        let dnf = packaged_refusal(Some("dnf"), false, false).unwrap();
+    fn the_message_names_the_package_manager_it_was_given() {
+        let apt = packaged_refusal(true, "apt", false, false).unwrap();
+        let dnf = packaged_refusal(true, "dnf", false, false).unwrap();
         assert!(apt.contains("apt") && !apt.contains("dnf"));
         assert!(dnf.contains("dnf") && !dnf.contains("apt"));
+    }
+
+    #[test]
+    fn an_unknown_distro_still_refuses_without_naming_a_wrong_command() {
+        let msg = packaged_refusal(true, "your system package manager", false, false)
+            .expect("must still refuse");
+        assert!(msg.contains("your system package manager"), "message was: {msg}");
     }
 }
 ```
@@ -193,8 +241,10 @@ Add to `crates/rupu-cli/src/cmd/update.rs`, above `async fn run`:
 ///
 /// Pure so the whole matrix is testable; `INSTALL_METHOD` is fixed at
 /// compile time and cannot be varied from a test.
-fn packaged_refusal(pm: Option<&str>, check: bool, rollback: bool) -> Option<String> {
-    let pm = pm?;
+fn packaged_refusal(packaged: bool, pm: &str, check: bool, rollback: bool) -> Option<String> {
+    if !packaged {
+        return None;
+    }
     if check && !rollback {
         return None;
     }
@@ -212,7 +262,8 @@ Then wire it into `run`, immediately after the `print_platform` short-circuit an
 
 ```rust
     if let Some(message) = packaged_refusal(
-        crate::build_info::package_manager(),
+        crate::build_info::is_packaged(),
+        crate::build_info::package_manager_hint(),
         args.check,
         args.rollback,
     ) {
@@ -223,7 +274,7 @@ Then wire it into `run`, immediately after the `print_platform` short-circuit an
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rupu-cli --lib packaged_tests`
-Expected: PASS — five tests.
+Expected: PASS — six tests.
 
 - [ ] **Step 5: Confirm the normal path is unaffected**
 
@@ -626,7 +677,7 @@ In the `linux` job, after the existing `Build (channel-stamped)` step, add:
           docker run --rm \
             -e RUPU_RELEASE_CHANNEL="${{ needs.meta.outputs.channel }}" \
             -e RUPU_RELEASE_VERSION="${{ needs.meta.outputs.version }}" \
-            -e RUPU_INSTALL_METHOD=deb \
+            -e RUPU_INSTALL_METHOD=pkg \
             -v "$PWD":/work -w /work rupu-linux-build \
             cargo build --release -p rupu-cli --target-dir target/linux-musl-pkg
           mkdir -p dist
@@ -635,7 +686,16 @@ In the `linux` job, after the existing `Build (channel-stamped)` step, add:
 
 and add `dist/rupu-${{ matrix.platform }}-pkg` to the artifact upload path.
 
-**Note the `deb` value is used for the `.rpm` too.** That is wrong — `package_manager()` would tell an rpm user to run `apt`. Resolve it by building a third time with `RUPU_INSTALL_METHOD=rpm`, or by having Task 1's mapping accept a single `pkg` value and detect apt-vs-dnf at runtime. Pick one and make it explicit; do not leave the rpm binary saying "apt".
+**The marker is `pkg`, not `deb`/`rpm`, deliberately.** One extra build per
+architecture covers both package formats. The `.deb` and `.rpm` for a given
+architecture contain the *same* binary; which upgrade command to name is
+decided at runtime from `/etc/os-release` (Task 1's
+`package_manager_hint`), because a `.deb` only installs on a Debian-family
+system and an `.rpm` only on an RHEL-family one. Stamping the format instead
+would mean a third full build per architecture at ~16 minutes each.
+
+This is the packaging binary; the plain (unmarked) one built by the previous
+step remains the tarball asset, so tarball users keep working self-update.
 
 - [ ] **Step 3: Add the packages to the publish job**
 
@@ -714,15 +774,18 @@ Append to the `packages` job:
             command -v rg >/dev/null || { echo "ripgrep dependency was not installed"; exit 1; }
             rupu --version
             test -f /usr/share/man/man1/rupu.1.gz || { echo "man page missing"; exit 1; }
-            if rupu update 2>&1 | grep -qE "dnf upgrade rupu|apt upgrade rupu"; then
-              echo "packaged install correctly refuses self-update"
+            # Fedora is RHEL-family, so the hint must say dnf — this is the
+            # check that proves runtime distro detection works and that an
+            # rpm user is not told to run apt.
+            if rupu update 2>&1 | grep -q "dnf upgrade rupu"; then
+              echo "packaged install correctly refuses self-update, naming dnf"
             else
-              echo "::error::packaged install did not refuse rupu update"; exit 1
+              echo "::error::rpm install did not refuse with a dnf hint"; exit 1
             fi
           '
 ```
 
-If the rpm binary reports `apt`, that is Task 5 Step 2's unresolved marker problem surfacing — fix it there rather than loosening this check permanently.
+If the rpm binary reports `apt`, runtime distro detection is broken — fix `package_manager_hint_from` in Task 1 rather than loosening this check.
 
 - [ ] **Step 3: Verify the YAML parses**
 
@@ -758,7 +821,7 @@ Then cut a beta and confirm the release carries ten assets — three binaries, t
 
 Spec §3 (signing, hosted repos) is Phase B and §5 (AUR/Homebrew/Nix) is Phase C — deliberately absent, not gaps.
 
-**Placeholder scan.** No "TBD"/"TODO". One item is deliberately left as an explicit decision rather than a silent default: Task 5 Step 2 flags that stamping `RUPU_INSTALL_METHOD=deb` into the binary used for *both* packages would make an rpm install advise `apt`. Two concrete resolutions are given; the implementer must choose one and say which. Leaving it unstated would have shipped the wrong advice to Fedora users.
+**Placeholder scan.** No "TBD"/"TODO", and no decisions left to the implementer. The one open question in an earlier draft — whether to stamp `deb`/`rpm` per format — was resolved before execution: the marker is `pkg`, and the upgrade command is chosen at runtime from `/etc/os-release`. That costs one extra build per architecture instead of two, and Task 6's Fedora check asserts the rpm path names `dnf`, so a regression in the detection surfaces as a failed release rather than wrong advice to users.
 
 **Type consistency.** `package_manager_for(Option<&str>) -> Option<&'static str>` is defined in Task 1 and consumed by name in Task 2's wiring. `packaged_refusal(pm, check, rollback) -> Option<String>` is defined and consumed within Task 2. The staged layout `dist/{rupu, rupu.1.gz, completions/{rupu.bash,_rupu,rupu.fish}}` is written identically in Task 4's script guards, Task 4's nfpm `contents`, and Task 5's staging loop. Artifact name `asset-packages` matches between Task 5's upload and the `publish` job's existing `asset-*` pattern.
 
