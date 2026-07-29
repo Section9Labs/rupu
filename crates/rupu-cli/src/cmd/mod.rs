@@ -19,6 +19,7 @@ pub mod editor;
 pub mod host;
 pub mod init;
 pub mod issues;
+pub mod man;
 pub mod mcp;
 pub mod models;
 pub mod node;
