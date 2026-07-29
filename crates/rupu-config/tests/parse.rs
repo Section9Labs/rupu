@@ -372,11 +372,41 @@ mod capture {
     }
 }
 
+/// Guard against a `tracing` behaviour that made the two capture-based tests
+/// below flake at roughly 8% (5 failures in 60 runs of the test binary), with
+/// one of the two expected keys simply missing from the captured output.
+///
+/// `tracing` caches each callsite's `Interest` **process-wide** the first time
+/// that callsite is reached. `with_default` installs a subscriber on the
+/// *calling thread only*, so when some other test in this binary reaches one
+/// of `validate()`'s `warn!` callsites first — and several of them call
+/// `validate()` with no subscriber at all — that callsite registers as
+/// `Interest::never()` and is then silenced for every thread, including one
+/// holding a capturing subscriber. Which of the deprecation callsites lost the
+/// race was down to thread scheduling, hence the flake.
+///
+/// Installing an always-enabled global default fixes it in both directions:
+/// `set_global_default` rebuilds the interest cache, promoting any callsite
+/// already cached as `never`, and from then on no thread can register `never`
+/// because a subscriber is always present. Registration happens once per
+/// callsite, so nothing can demote it again afterwards.
+///
+/// The global default only discards events; the assertions still read from the
+/// thread-local `with_default` subscriber. It may only be set once per
+/// process, hence the `Once`.
+fn stop_other_threads_silencing_our_callsites() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(capture::CapturingSubscriber::default());
+    });
+}
+
 /// The second half of the binding test: presence of either deprecated key
 /// must emit a one-line `tracing::warn!` naming it, mirroring `[retry]`'s
 /// `warn_deprecated_keys` contract.
 #[test]
 fn cp_deprecated_ui_keys_emit_a_deprecation_warning_each() {
+    stop_other_threads_silencing_our_callsites();
     let cfg: Config = toml::from_str(
         r#"
         [cp]
@@ -441,6 +471,7 @@ fn scm_default_owner_and_repo_never_round_trip_back_out() {
 /// `warn_deprecated_keys` contract.
 #[test]
 fn scm_default_owner_and_repo_emit_deprecation_warnings() {
+    stop_other_threads_silencing_our_callsites();
     let cfg: Config = toml::from_str(
         r#"
         [scm.default]
