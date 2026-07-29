@@ -447,7 +447,7 @@ git commit -m "feat(cli): rupu man — render the man page from the clap Command
 - Create: `packaging/build-packages.sh`
 
 **Interfaces:**
-- Consumes: a staged directory `dist/` containing `rupu` (the binary), `completions/`, and `rupu.1`.
+- Consumes: a staged directory `dist/` containing `rupu` (the binary), `completions/`, and `rupu.1.gz` (already gzipped — Task 5's staging step runs `gzip -9 -n -f`).
 - Produces: `packaging/build-packages.sh <version> <arch>` emitting `dist/rupu_<version>_<debarch>.deb` and `dist/rupu-<version>.<rpmarch>.rpm`.
 
 - [ ] **Step 1: Write the nfpm config**
