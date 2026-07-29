@@ -712,3 +712,37 @@ jobs:
       - name: Remove the imported signing key
         if: always()
         run: rm -rf "$RUNNER_TEMP/gnupg"
+
+  community:
+    name: sync community package definitions
+    needs: [meta, publish]
+    if: needs.meta.outputs.channel == 'stable'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: asset-linux-*
+          merge-multiple: true
+          path: shas
+      - uses: actions/download-artifact@v4
+        with:
+          name: asset-darwin-arm64
+          path: shas
+      - name: Sync definitions
+        run: ./packaging/sync-community.sh "${{ needs.meta.outputs.version }}" shas
+      - name: Commit if changed
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "definitions already current"; exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add flake.nix packaging/aur/PKGBUILD packaging/homebrew/rupu.rb
+          git commit -m "chore(packaging): sync community definitions to ${{ needs.meta.outputs.version }}"
+          git push origin HEAD:main
