@@ -1,0 +1,294 @@
+name: release
+
+# One tag push publishes every platform. Channel is derived from the tag
+# suffix, preserving the two-tag scheme `scripts/gh-build.sh` established:
+# a rolling tag (latest-beta / latest-stable) plus a versioned tag.
+# `rupu update` resolves releases by semver + the `prerelease` flag, so that
+# flag is the part that actually has to be right.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)publish, e.g. v0.70.3-beta"
+        required: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  # Deliberately NOT cancel-in-progress: cancelling mid-upload is how a
+  # half-published release happens.
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  meta:
+    name: derive channel from tag
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.d.outputs.channel }}
+      version: ${{ steps.d.outputs.version }}
+      rolling_tag: ${{ steps.d.outputs.rolling_tag }}
+      prerelease: ${{ steps.d.outputs.prerelease }}
+      tag: ${{ steps.d.outputs.tag }}
+    steps:
+      - id: d
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          # Require a semver shape: `vfoo` would otherwise be accepted as a
+          # stable release with version "foo", and that string gets stamped
+          # into the binary via RUPU_RELEASE_VERSION.
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*-beta)
+              echo "channel=beta"            >> "$GITHUB_OUTPUT"
+              echo "rolling_tag=latest-beta" >> "$GITHUB_OUTPUT"
+              echo "prerelease=true"         >> "$GITHUB_OUTPUT" ;;
+            v[0-9]*.[0-9]*.[0-9]*)
+              echo "channel=stable"            >> "$GITHUB_OUTPUT"
+              echo "rolling_tag=latest-stable" >> "$GITHUB_OUTPUT"
+              echo "prerelease=false"          >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::tag '$tag' is not v<X.Y.Z>[-beta]"; exit 1 ;;
+          esac
+          echo "tag=$tag"          >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}"  >> "$GITHUB_OUTPUT"
+
+  web:
+    name: build embedded CP UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Built ONCE and shared, so all three binaries embed a byte-identical
+      # UI. Skipping this is what makes rupu-cp fall back to its "not built"
+      # placeholder — the CI gate does exactly that, deliberately.
+      - run: make cp-web
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: crates/rupu-cp/web/dist
+          if-no-files-found: error
+          retention-days: 1
+
+  linux:
+    name: build ${{ matrix.platform }}
+    needs: [meta, web]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux-x64
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: crates/rupu-cp/web/dist
+
+      - name: Build the pinned musl image
+        run: docker build -f docker/linux-build.Dockerfile -t rupu-linux-build .
+
+      - name: Build (channel-stamped)
+        run: |
+          docker run --rm \
+            -e RUPU_RELEASE_CHANNEL="${{ needs.meta.outputs.channel }}" \
+            -e RUPU_RELEASE_VERSION="${{ needs.meta.outputs.version }}" \
+            -v "$PWD":/work -w /work rupu-linux-build \
+            cargo build --release -p rupu-cli --target-dir target/linux-musl
+
+      - name: Stage the asset under its canonical name
+        run: |
+          set -euo pipefail
+          bin=target/linux-musl/release/rupu
+          # The binary names itself. Deriving this any other way is the
+          # defect #555 fixed (`uname -m` says x86_64 where rupu says x64).
+          platform=$(docker run --rm -v "$PWD":/work -w /work rupu-linux-build \
+            "$bin" update --print-platform)
+          # Cross-check against the matrix label so a runner/arch mix-up
+          # cannot publish a mislabelled asset.
+          if [ "$platform" != "${{ matrix.platform }}" ]; then
+            echo "::error::binary reports '$platform', matrix says '${{ matrix.platform }}'"
+            exit 1
+          fi
+          mkdir -p dist
+          cp "$bin" "dist/rupu-$platform"
+          ( cd dist && sha256sum "rupu-$platform" > "rupu-$platform.sha256" )
+          cat "dist/rupu-$platform.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-${{ matrix.platform }}
+          path: dist/
+          if-no-files-found: error
+
+  macos:
+    name: build darwin-arm64
+    needs: [meta, web]
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: crates/rupu-cp/web/dist
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+
+      # Import the Developer ID cert into a throwaway keychain rather than
+      # the runner's login keychain. Discarded with the runner.
+      - name: Import signing certificate
+        env:
+          CERT_B64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN=build.keychain
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -t 3600 -u "$KEYCHAIN"
+          echo "$CERT_B64" | base64 --decode > /tmp/cert.p12
+          security import /tmp/cert.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          rm -f /tmp/cert.p12
+          # Without this, codesign blocks on a GUI prompt that never comes.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security find-identity -v -p codesigning
+
+      - name: Build (channel-stamped)
+        env:
+          RUPU_RELEASE_CHANNEL: ${{ needs.meta.outputs.channel }}
+          RUPU_RELEASE_VERSION: ${{ needs.meta.outputs.version }}
+        run: cargo build --release -p rupu-cli
+
+      # rupu-update's verify.rs runs `codesign --verify --strict` before
+      # swapping a binary in, so an unsigned macOS asset would break
+      # self-update for every existing user.
+      - name: Sign
+        run: scripts/sign-dev.sh release
+
+      - name: Notarize
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/private_keys"
+          key="$RUNNER_TEMP/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8"
+          echo "$APPLE_API_KEY_BASE64" | base64 --decode > "$key"
+          # notarytool takes an archive, not a bare binary.
+          ditto -c -k --keepParent target/release/rupu "$RUNNER_TEMP/rupu.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/rupu.zip" \
+            --key "$key" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --wait
+          rm -rf "$RUNNER_TEMP/private_keys"
+          # Bare binaries cannot be stapled (stapler handles .app/.pkg/.dmg
+          # only); the ticket is served online. See scripts/notarize-release.sh.
+
+      - name: Stage the asset under its canonical name
+        run: |
+          set -euo pipefail
+          platform=$(./target/release/rupu update --print-platform)
+          if [ "$platform" != "darwin-arm64" ]; then
+            echo "::error::binary reports '$platform', expected darwin-arm64"
+            exit 1
+          fi
+          mkdir -p dist
+          cp target/release/rupu "dist/rupu-$platform"
+          ( cd dist && shasum -a 256 "rupu-$platform" > "rupu-$platform.sha256" )
+          cat "dist/rupu-$platform.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-darwin-arm64
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: [meta, linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: asset-*
+          merge-multiple: true
+          path: dist
+
+      # Publishing from one job, after every build has succeeded, is what
+      # makes the release atomic: a failed Linux build means no release at
+      # all, rather than a macOS-only release that looks complete.
+      - name: Sanity-check the asset set
+        run: |
+          set -euo pipefail
+          ls -la dist
+          for p in darwin-arm64 linux-x64 linux-arm64; do
+            test -f "dist/rupu-$p"        || { echo "::error::missing rupu-$p"; exit 1; }
+            test -f "dist/rupu-$p.sha256" || { echo "::error::missing rupu-$p.sha256"; exit 1; }
+          done
+          ( cd dist && sha256sum -c ./*.sha256 )
+
+      - name: Publish rolling and versioned releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ needs.meta.outputs.channel }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          ROLLING: ${{ needs.meta.outputs.rolling_tag }}
+          VERSIONED: ${{ needs.meta.outputs.tag }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          notes=$(cat <<EOF
+          ${CHANNEL} release of rupu \`${VERSION}\`.
+
+          | Asset | Platform |
+          |---|---|
+          | \`rupu-darwin-arm64\` | macOS, Apple Silicon — signed + notarized |
+          | \`rupu-linux-x64\` | Linux x86_64 — static musl |
+          | \`rupu-linux-arm64\` | Linux aarch64 — static musl |
+
+          The Linux binaries are statically linked, so they run on any
+          distribution — Debian, RHEL, Alpine, distroless — regardless of its
+          glibc version.
+
+          **Windows:** install the Linux binary under WSL2.
+
+          Built from \`${GITHUB_SHA}\`.
+          EOF
+          )
+
+          # The rolling tag floats by definition; move it to this commit.
+          git tag -f "$ROLLING" "$GITHUB_SHA"
+          git push --force origin "refs/tags/$ROLLING"
+
+          for tag in "$ROLLING" "$VERSIONED"; do
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release edit "$tag" --notes "$notes" --prerelease="$PRERELEASE"
+            else
+              gh release create "$tag" --title "rupu $tag" \
+                --notes "$notes" --prerelease="$PRERELEASE"
+            fi
+            gh release upload "$tag" dist/* --clobber
+          done
+
+          echo "published: $ROLLING and $VERSIONED"
