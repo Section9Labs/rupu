@@ -521,3 +521,104 @@ jobs:
           done
 
           echo "published: $ROLLING and $VERSIONED"
+
+  repo:
+    name: publish apt/yum repositories
+    needs: [meta, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install repository tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dpkg-dev apt-utils createrepo-c rpm
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: asset-packages
+          path: pkgs
+
+      # The key lives in RUNNER_TEMP, never under the checkout or the
+      # Pages publish root — a signing key committed to a public repo is
+      # unrecoverable.
+      - name: Import the signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          gpg --list-secret-keys --keyid-format=long
+
+      - name: Build the signed repositories
+        env:
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          CHANNEL: ${{ needs.meta.outputs.channel }}
+        run: |
+          set -euo pipefail
+          mkdir -p site
+          cp docs/pages/index.html site/ 2>/dev/null || true
+          cp docs/pages/rupu-archive-keyring.asc site/
+          ./packaging/build-apt-repo.sh pkgs "$CHANNEL" site
+          ./packaging/build-yum-repo.sh pkgs "$CHANNEL" site
+
+      # Verify BEFORE publishing. A broken signature fails on the user's
+      # machine at install time with an error they cannot diagnose.
+      - name: Verify the signatures
+        env:
+          CHANNEL: ${{ needs.meta.outputs.channel }}
+        run: |
+          set -euo pipefail
+          gpg --verify "site/apt/dists/$CHANNEL/Release.gpg" \
+                       "site/apt/dists/$CHANNEL/Release"
+          gpg --verify "site/apt/dists/$CHANNEL/InRelease"
+          gpg --verify "site/yum/$CHANNEL/repodata/repomd.xml.asc" \
+                       "site/yum/$CHANNEL/repodata/repomd.xml"
+          echo "signatures verified"
+
+      - name: Confirm no private key material is about to be published
+        run: |
+          set -euo pipefail
+          if grep -rl "PRIVATE KEY BLOCK" site/ 2>/dev/null; then
+            echo "::error::private key material found in the publish root"; exit 1
+          fi
+          echo "publish root is clean"
+
+      # Publish by committing into the EXISTING gh-pages branch, never by
+      # replacing the site. rupu.sh is served from that branch and already
+      # contains index.html, styles.css, docs/, 404.html, favicon.svg and
+      # CNAME — `deploy-pages` would delete all of it.
+      - name: Publish into gh-pages
+        env:
+          CHANNEL: ${{ needs.meta.outputs.channel }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch gh-pages \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" ghp
+          # Replace only this channel's trees; everything else on the branch
+          # is the website and must survive untouched.
+          rm -rf "ghp/apt/dists/$CHANNEL" "ghp/apt/pool/$CHANNEL" "ghp/yum/$CHANNEL"
+          mkdir -p ghp/apt ghp/yum
+          cp -r site/apt/. ghp/apt/
+          cp -r site/yum/. ghp/yum/
+          cp site/rupu-archive-keyring.asc ghp/
+          # The site must still be there afterwards. If any of these is
+          # missing we are about to publish a broken rupu.sh.
+          for f in index.html CNAME .nojekyll; do
+            test -e "ghp/$f" || { echo "::error::gh-pages lost $f"; exit 1; }
+          done
+          cd ghp
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add apt yum rupu-archive-keyring.asc
+          if git diff --cached --quiet; then
+            echo "repositories already current"; exit 0
+          fi
+          git commit -m "repo: publish $CHANNEL packages for $VERSION"
+          git push origin gh-pages
