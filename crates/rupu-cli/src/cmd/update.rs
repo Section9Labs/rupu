@@ -442,4 +442,14 @@ mod packaged_tests {
             "message was: {msg}"
         );
     }
+
+    #[test]
+    fn check_does_not_excuse_rollback_on_a_packaged_install() {
+        // `--check` alone is allowed, but pairing it with `--rollback` must
+        // not smuggle a rollback past the refusal — the flags are not
+        // mutually exclusive in clap, so this combination is reachable.
+        let msg = packaged_refusal(true, "apt", true, true)
+            .expect("check + rollback must still be refused");
+        assert!(msg.contains("roll back"), "message was: {msg}");
+    }
 }
