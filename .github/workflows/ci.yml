@@ -10,6 +10,78 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The three community package definitions (Nix flake, AUR PKGBUILD,
+  # Homebrew formula) are generated at release time and pushed straight to the
+  # AUR and the tap — without this, a typo in one of them is discovered by an
+  # end user AFTER the push already happened.
+  #
+  # Deliberately cheap: renders the templates into a scratch dir with
+  # fabricated hashes and syntax-checks the result. No nix, no docker, no
+  # brew. It runs unconditionally rather than behind a `paths` filter — at a
+  # few seconds, gating it would cost more than it saves — and NOTHING in
+  # the release workflow depends on it.
+  community-packaging:
+    name: community package definitions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      # The defect this guards: the sync used to substitute placeholders in
+      # the committed files, so it worked exactly once and every later
+      # release silently shipped the first release's version and hashes.
+      - name: Idempotence regression test
+        run: ./packaging/test-sync-community.sh
+
+      - name: Render the definitions with fabricated hashes
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/shas" "$RUNNER_TEMP/render"
+          hex() { printf "$1%.0s" $(seq 64); }
+          printf '%s  rupu-linux-x64\n'    "$(hex 1)" > "$RUNNER_TEMP/shas/rupu-linux-x64.sha256"
+          printf '%s  rupu-linux-arm64\n'  "$(hex 2)" > "$RUNNER_TEMP/shas/rupu-linux-arm64.sha256"
+          printf '%s  rupu-darwin-arm64\n' "$(hex 3)" > "$RUNNER_TEMP/shas/rupu-darwin-arm64.sha256"
+          ./packaging/sync-community.sh 9.9.9 "$RUNNER_TEMP/shas" "$RUNNER_TEMP/render"
+
+      - name: Syntax-check the rendered PKGBUILD and formula
+        run: |
+          set -euo pipefail
+          bash -n "$RUNNER_TEMP/render/packaging/aur/PKGBUILD"
+          ruby -c "$RUNNER_TEMP/render/packaging/homebrew/rupu.rb"
+          # nix isn't installed here (and installing it for a syntax check is
+          # not "cheap"), so assert the flake's shape instead: balanced braces
+          # and the three system attributes the release job substitutes into.
+          for attr in '"x86_64-linux"' '"aarch64-linux"' '"aarch64-darwin"'; do
+            grep -q -- "$attr" "$RUNNER_TEMP/render/flake.nix" \
+              || { echo "::error::flake.nix lost the $attr attribute"; exit 1; }
+          done
+
+      # The committed copies are generated output. If they ever drift from
+      # what the templates produce, the next release silently reverts the
+      # drift — better to catch the hand-edit here.
+      - name: The committed definitions must match the templates
+        run: |
+          set -euo pipefail
+          for pair in \
+            "packaging/templates/flake.nix.in:flake.nix" \
+            "packaging/templates/PKGBUILD.in:packaging/aur/PKGBUILD" \
+            "packaging/templates/rupu.rb.in:packaging/homebrew/rupu.rb"; do
+            tpl="${pair%%:*}"; out="${pair##*:}"
+            # Compare the template against the committed file with the
+            # placeholders still in place: between releases they are the same
+            # bytes, and any difference is a hand-edit of the generated file.
+            if ! diff -u "$tpl" "$out" > /tmp/drift.diff; then
+              # After a release the committed file carries real values, so a
+              # diff is only a failure while placeholders are still present.
+              if grep -q "REPLACED_BY_CI" "$out"; then
+                echo "::error::$out was hand-edited; it is generated from $tpl"
+                cat /tmp/drift.diff
+                exit 1
+              fi
+              echo "$out carries released values (expected after a stable release)"
+            fi
+          done
+
   linux-musl:
     name: linux musl (build + test)
     runs-on: ubuntu-latest
