@@ -275,7 +275,15 @@ jobs:
             else
               echo "::error::packaged install did not refuse rupu update"; exit 1
             fi
-            rupu update --check || true   # --check must still be permitted
+            # --check must remain permitted: a user must be able to learn
+            # they are behind regardless of how they installed. Tolerate a
+            # nonzero exit (exit 10 means update available, and the network
+            # may be unavailable in CI) but assert it was NOT refused.
+            out=$(rupu update --check 2>&1) || true
+            if echo "$out" | grep -q "upgrade rupu"; then
+              echo "::error::--check must not be refused on a packaged install"; exit 1
+            fi
+            echo "--check correctly permitted"
           '
 
       - name: Verify the .rpm installs and runs on Fedora
@@ -295,6 +303,16 @@ jobs:
             else
               echo "::error::rpm install did not refuse with a dnf hint"; exit 1
             fi
+            # --check must remain permitted on the rpm path too: the
+            # invariant is stated for packaged installs generally, not
+            # Debian-only. Tolerate a nonzero exit (exit 10 means update
+            # available, and the network may be unavailable in CI) but
+            # assert it was NOT refused.
+            out=$(rupu update --check 2>&1) || true
+            if echo "$out" | grep -q "upgrade rupu"; then
+              echo "::error::--check must not be refused on a packaged install"; exit 1
+            fi
+            echo "--check correctly permitted"
           '
 
       - uses: actions/upload-artifact@v4
