@@ -6248,7 +6248,7 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
 name = "rupu-agent"
-version = "0.70.1"
+version = "0.70.2"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -6277,7 +6277,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-app"
-version = "0.70.1"
+version = "0.70.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6315,7 +6315,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-app-canvas"
-version = "0.70.1"
+version = "0.70.2"
 dependencies = [
  "insta",
  "rupu-orchestrator",
@@ -6324,7 +6324,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-ast"
-version = "0.70.1"
+version = "0.70.2"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -6339,7 +6339,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-auth"
-version = "0.70.1"
+version = "0.70.2"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -6367,7 +6367,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-cli"
-version = "0.70.1"
+version = "0.70.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -6428,7 +6428,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-config"
-version = "0.70.1"
+version = "0.70.2"
 dependencies = [
  "serde",
  "tempfile",
@@ -6439,7 +6439,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-coverage"
-version = "0.70.1"
+version = "0.70.2"
 dependencies = [
  "chrono",
  "glob",
@@ -6458,7 +6458,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-cp"
-version = "0.70.1"
+version = "0.70.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6506,7 +6506,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-mcp"
-version = "0.70.1"
+version = "0.70.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6526,7 +6526,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-orchestrator"
-version = "0.70.1"
+version = "0.70.2"
 dependencies = [
  "assert_fs",
  "async-trait",
@@ -6558,7 +6558,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-providers"
-version = "0.70.1"
+version = "0.70.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6581,7 +6581,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-runtime"
-version = "0.70.1"
+version = "0.70.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6603,7 +6603,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-scm"
-version = "0.70.1"
+version = "0.70.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6633,7 +6633,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-tools"
-version = "0.70.1"
+version = "0.70.2"
 dependencies = [
  "assert_fs",
  "async-trait",
@@ -6652,7 +6652,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-transcript"
-version = "0.70.1"
+version = "0.70.2"
 dependencies = [
  "chrono",
  "serde",
@@ -6665,7 +6665,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-update"
-version = "0.70.1"
+version = "0.70.2"
 dependencies = [
  "async-trait",
  "reqwest 0.12.28",
@@ -6681,7 +6681,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-webhook"
-version = "0.70.1"
+version = "0.70.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6704,7 +6704,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-workspace"
-version = "0.70.1"
+version = "0.70.2"
 dependencies = [
  "assert_fs",
  "chrono",
