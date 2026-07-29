@@ -30,7 +30,7 @@ next release. The repositories are therefore published by **committing into
 - **Never write the private key to the repository, to `dist/`, or to any path under the Pages publish root.** It exists only as a CI secret, decrypted into `$RUNNER_TEMP`, and removed before the job ends.
 - **The public key must be served from a stable URL** that never changes across releases: `https://rupu.sh/rupu-archive-keyring.asc`. Users pin trust to it; moving it breaks every existing installation.
 - **Signing must actually be verified, not assumed.** A repo that publishes with a broken signature fails *on the user's machine*, at install time, with a confusing error. CI must verify before publishing.
-- Beta and stable must not collide. They are separate suites in one repository, so a user opting into beta never silently receives stable, or vice versa.
+- **Both channels are hosted, on the same branch, alongside the website.** Beta and stable are separate suites with **separate pools** (`apt/pool/beta`, `apt/pool/stable`) and separate YUM repos (`yum/beta`, `yum/stable`). A shared pool would leak beta packages into the stable index. A user opting into one never silently receives the other, and publishing one channel never disturbs the other's files.
 - Package name `rupu` never changes.
 - Every change goes through a feature branch and a PR.
 
@@ -106,7 +106,7 @@ git commit -m "ci(pages): publish the package signing public key"
 
 **Interfaces:**
 - Consumes: a directory of `.deb` files, the channel name (`beta`|`stable`), and an imported signing key.
-- Produces: a tree at `<out>/apt/` containing `dists/<channel>/…/Packages{,.gz}`, `dists/<channel>/Release`, `Release.gpg`, `InRelease`, and `pool/main/`.
+- Produces: a tree at `<out>/apt/` containing `dists/<channel>/…/Packages{,.gz}`, `dists/<channel>/Release`, `Release.gpg`, `InRelease`, and a per-channel `pool/<channel>/`.
 
 - [ ] **Step 1: Write the script**
 
@@ -132,14 +132,17 @@ case "$CHANNEL" in
   *) echo "channel must be beta or stable (got: $CHANNEL)" >&2; exit 1 ;;
 esac
 
-POOL="$OUT/apt/pool/main"
+# Per-channel pool. A pool shared between channels would make
+# dpkg-scanpackages index beta's .deb files into stable's Packages, and
+# would accumulate every version ever published — both wrong.
+POOL="$OUT/apt/pool/$CHANNEL"
 DIST="$OUT/apt/dists/$CHANNEL/main"
 mkdir -p "$POOL" "$DIST/binary-amd64" "$DIST/binary-arm64"
 
 cp "$DEB_DIR"/*.deb "$POOL/"
 
 for arch in amd64 arm64; do
-  ( cd "$OUT/apt" && dpkg-scanpackages --arch "$arch" pool/ /dev/null ) \
+  ( cd "$OUT/apt" && dpkg-scanpackages --arch "$arch" "pool/$CHANNEL" /dev/null ) \
     > "$DIST/binary-$arch/Packages"
   gzip -9 -k -f "$DIST/binary-$arch/Packages"
   # A Packages file with no entries means the pool did not contain a .deb
@@ -350,7 +353,7 @@ git commit -m "build(packaging): signed YUM repository builder"
             "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" ghp
           # Replace only this channel's trees; everything else on the branch
           # is the website and must survive untouched.
-          rm -rf "ghp/apt/dists/$CHANNEL" "ghp/yum/$CHANNEL"
+          rm -rf "ghp/apt/dists/$CHANNEL" "ghp/apt/pool/$CHANNEL" "ghp/yum/$CHANNEL"
           mkdir -p ghp/apt ghp/yum
           cp -r site/apt/. ghp/apt/
           cp -r site/yum/. ghp/yum/
@@ -492,7 +495,16 @@ EOF
 sudo dnf install rupu
 ```
 
-Document the beta channel as the same snippets with `stable` → `beta`, and state plainly that the repository indexes only the current version — pinning an older one means downloading that release's `.deb`/`.rpm` directly.
+**Both channels are hosted and both must be documented as first-class**, not
+beta-as-a-footnote. Give the stable snippets in full, then state that the
+beta channel is the identical snippets with `stable` → `beta` in both the
+`deb` line / `baseurl` and nothing else. Make clear they can coexist: a user
+may add both and pin with apt preferences, because the suites and pools are
+separate.
+
+State plainly that each channel's repository indexes only its current
+version — pinning an older one means downloading that release's `.deb`/`.rpm`
+from its GitHub release page directly.
 
 - [ ] **Step 2: Landing page** — `docs/pages/index.html` names the two repo URLs, the key fingerprint, and links to the README section. Keep it plain HTML; no build step.
 
