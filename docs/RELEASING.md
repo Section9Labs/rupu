@@ -170,7 +170,23 @@ AUR, the Homebrew tap, or `main`'s definition files:
 - **`community`** rewrites `flake.nix`, `packaging/aur/PKGBUILD`, and
   `packaging/homebrew/rupu.rb` with the just-published version and
   checksums (via `packaging/sync-community.sh`) and commits the result
-  straight to `main`.
+  straight to `main`. Requires:
+  - `MAIN_PUSH_KEY` — a deploy key with write access to **this**
+    repository
+
+  `main` is protected by the ruleset in `.github/rulesets/main.json`,
+  which requires a pull request; this job is a direct push, so it needs a
+  bypass actor. GitHub rejects the first-party GitHub Actions integration
+  as one (HTTP 422: *"Actor GitHub Actions integration must be part of the
+  ruleset source or owner organization"*) — repository rulesets can only
+  bypass on actors the repository owns. `DeployKey` is such an actor, so
+  the credential must be a deploy key for the bypass to be expressible.
+  See `.github/rulesets/README.md`.
+
+  Unlike the tap, an absent `MAIN_PUSH_KEY` **fails** the release rather
+  than warning: a stale `flake.nix` on `main` means `nix run
+  github:Section9Labs/rupu` silently installs the wrong version, and a
+  wrong install is worse than a missing one.
 - **`publish-aur`** checks out the synced `PKGBUILD`, regenerates
   `.SRCINFO` inside a throwaway `archlinux:latest` container (`makepkg
   --printsrcinfo` only runs on Arch — it is never hand-written), and

@@ -719,8 +719,12 @@ jobs:
     if: needs.meta.outputs.channel == 'stable'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # `contents: read` is enough now that the push to `main` goes over SSH with
+    # the MAIN_PUSH_KEY deploy key: the ambient token is only used to
+    # `gh release download` the checksum sidecars. It could not push to a
+    # ruleset-protected `main` anyway — it is not the bypass actor.
     permissions:
-      contents: write
+      contents: read
     # This job commits to `main`. Two releases running concurrently (or a
     # re-run of an older tag) would both check out main, both regenerate, and
     # the second push would be rejected non-fast-forward — the same race the
@@ -758,11 +762,44 @@ jobs:
       - name: Prove the regeneration is repeatable
         run: ./packaging/test-sync-community.sh
 
+      # Pushed over SSH with a repository deploy key rather than with the
+      # ambient GITHUB_TOKEN, because `main` is protected by a ruleset that
+      # requires a pull request — and this job is a direct push.
+      #
+      # A ruleset needs a bypass actor for that push, and GitHub rejects the
+      # first-party GitHub Actions integration as one ("Actor GitHub Actions
+      # integration must be part of the ruleset source or owner organization",
+      # HTTP 422): repository rulesets can only bypass on actors the repo
+      # itself owns. `DeployKey` is such an actor, so the credential has to be
+      # a deploy key for the bypass to be expressible at all.
+      #
+      # That constraint lands somewhere better than a PAT would have. This key
+      # can push to this one repository and do nothing else — it cannot read
+      # secrets, change settings, or reach any other repo — and it is the only
+      # deploy key on `rupu`, so the `DeployKey` bypass grants exactly this
+      # one job and nothing more.
       - name: Commit if changed
         env:
           VERSION: ${{ needs.meta.outputs.version }}
+          MAIN_PUSH_KEY: ${{ secrets.MAIN_PUSH_KEY }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          if [ -z "${MAIN_PUSH_KEY:-}" ]; then
+            echo "::error::MAIN_PUSH_KEY is not set. The community definitions cannot be pushed to protected main without it, and a stale flake.nix on main means 'nix run github:Section9Labs/rupu' installs the wrong version — that is a release failure, not a warning."
+            exit 1
+          fi
+          mkdir -p -m 700 "$HOME/.ssh"
+          printf '%s\n' "$MAIN_PUSH_KEY" > "$HOME/.ssh/main_push"
+          chmod 600 "$HOME/.ssh/main_push"
+          ssh-keyscan -t ed25519 github.com > "$HOME/.ssh/known_hosts_main" 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/main_push -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts_main"
+          # checkout@v5 wired `origin` to an HTTPS URL with the ambient token
+          # baked into an extraheader; that identity is not the bypass actor,
+          # so the remote must be re-pointed at SSH and the header dropped.
+          git config --unset-all "http.https://github.com/.extraheader" || true
+          git remote set-url origin "git@github.com:${REPO}.git"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # Stage FIRST, then diff the index: `git diff` alone is blind to a
@@ -789,6 +826,12 @@ jobs:
           done
           echo "::error::could not push the synced definitions to main"
           exit 1
+
+      # Same reasoning as the AUR and tap keys: harmless on a hosted runner
+      # whose VM is destroyed, a leak on a self-hosted one.
+      - name: Remove the main push key
+        if: always()
+        run: rm -f "$HOME/.ssh/main_push"
 
   publish-aur:
     name: publish to the AUR
