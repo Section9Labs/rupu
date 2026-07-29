@@ -183,11 +183,21 @@ AUR, the Homebrew tap, or `main`'s definition files:
 - **`publish-homebrew`** copies the synced `packaging/homebrew/rupu.rb`
   to `Formula/rupu.rb` in `Section9Labs/homebrew-tap` and pushes.
   Requires:
-  - `TAP_TOKEN` — a PAT with push access to `Section9Labs/homebrew-tap`
-    (the ambient `GITHUB_TOKEN` is scoped to this repo only and cannot
-    write to another one)
+  - `TAP_SSH_PRIVATE_KEY` — a **deploy key** with write access to
+    `Section9Labs/homebrew-tap`, already provisioned
 
-  If `TAP_TOKEN` is absent, this step logs a message and exits `0`
+  The tap being a public repository makes it world-*readable* and says
+  nothing about who may write. The ambient `GITHUB_TOKEN` is minted per
+  run and scoped to this repository, so it cannot push to another one
+  whatever that repo's visibility — a cross-repo push always needs its
+  own credential.
+
+  A deploy key rather than a PAT, deliberately: it writes to
+  `homebrew-tap` and nothing else, it does not expire, and revoking it
+  touches no other repository or account. A PAT would carry the whole of
+  the issuing user's access into the job.
+
+  If `TAP_SSH_PRIVATE_KEY` is absent, this step logs a message and exits `0`
   rather than failing the release — a Homebrew formula one version
   behind is a nuisance a maintainer fixes later; a red release blocks
   every other asset (binaries, `.deb`/`.rpm`, apt/yum repos) for

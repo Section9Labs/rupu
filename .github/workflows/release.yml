@@ -888,22 +888,39 @@ jobs:
         with:
           ref: main
 
-      # TAP_TOKEN is a PAT: the ambient GITHUB_TOKEN is scoped to this repo
-      # and cannot push to Section9Labs/homebrew-tap. Its absence must not
-      # fail the release — a formula one version behind is a nuisance a
-      # maintainer fixes later; a red release blocks every other asset.
+      # `homebrew-tap` being a public repository makes it world-READABLE; it
+      # says nothing about who may write. The ambient GITHUB_TOKEN is minted
+      # per-run and scoped to THIS repository, so it cannot push to another
+      # one regardless of that repo's visibility — a cross-repo push always
+      # needs its own credential.
+      #
+      # That credential is a per-repo deploy key, not a PAT: it can write to
+      # `homebrew-tap` and nothing else, it does not expire, and revoking it
+      # touches no other repository or account. A PAT would carry the whole
+      # of the issuing user's access into this job. Same shape as the AUR
+      # push above.
+      #
+      # Its absence must not fail the release — a formula one version behind
+      # is a nuisance a maintainer fixes later; a red release blocks every
+      # other asset.
       - name: Publish Formula/rupu.rb to Section9Labs/homebrew-tap
         env:
-          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+          TAP_SSH_PRIVATE_KEY: ${{ secrets.TAP_SSH_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-          if [ -z "${TAP_TOKEN:-}" ]; then
+          if [ -z "${TAP_SSH_PRIVATE_KEY:-}" ]; then
             # ::warning:: so this surfaces as an annotation on the run rather
             # than as one green line in a 2000-line log.
-            echo "::warning::TAP_TOKEN is not set — skipping the Homebrew tap publish. The formula will lag one release; this is deliberately not a release failure."
+            echo "::warning::TAP_SSH_PRIVATE_KEY is not set — skipping the Homebrew tap publish. The formula will lag one release; this is deliberately not a release failure."
             exit 0
           fi
-          git clone "https://x-access-token:${TAP_TOKEN}@github.com/Section9Labs/homebrew-tap.git" tap
+          mkdir -p -m 700 "$HOME/.ssh"
+          printf '%s\n' "$TAP_SSH_PRIVATE_KEY" > "$HOME/.ssh/tap"
+          chmod 600 "$HOME/.ssh/tap"
+          ssh-keyscan -t ed25519 github.com > "$HOME/.ssh/known_hosts_tap" 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/tap -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts_tap"
+
+          git clone git@github.com:Section9Labs/homebrew-tap.git tap
           mkdir -p tap/Formula
           cp packaging/homebrew/rupu.rb tap/Formula/rupu.rb
           cd tap
@@ -919,9 +936,15 @@ jobs:
           fi
           git commit -m "rupu ${{ needs.meta.outputs.version }}"
           # Explicit refspec, aimed at the tap's configured default branch.
-          # `homebrew-tap` is empty on the first push, so the local branch
-          # name is inferred from the remote's unborn HEAD or the runner's
-          # `init.defaultBranch` — push to the wrong name and `brew` clones
-          # the default branch and finds no formula. Ask GitHub which it is.
-          DEFAULT_BRANCH="$(GH_TOKEN="$TAP_TOKEN" gh api repos/Section9Labs/homebrew-tap --jq .default_branch 2>/dev/null || true)"
+          # `brew` clones the default branch, so pushing to any other name
+          # publishes a formula nobody can install. The tap is public, so the
+          # ambient GITHUB_TOKEN can READ its metadata even though it cannot
+          # write to it; fall back to `main` if the query fails.
+          DEFAULT_BRANCH="$(GH_TOKEN="${{ github.token }}" gh api repos/Section9Labs/homebrew-tap --jq .default_branch 2>/dev/null || true)"
           git push origin "HEAD:${DEFAULT_BRANCH:-main}"
+
+      # Same reasoning as the AUR key: harmless on a hosted runner whose VM is
+      # destroyed, a leak on a self-hosted one.
+      - name: Remove the tap deploy key
+        if: always()
+        run: rm -f "$HOME/.ssh/tap"
