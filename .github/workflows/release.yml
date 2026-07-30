@@ -46,6 +46,13 @@ jobs:
               echo "channel=beta"            >> "$GITHUB_OUTPUT"
               echo "rolling_tag=latest-beta" >> "$GITHUB_OUTPUT"
               echo "prerelease=true"         >> "$GITHUB_OUTPUT" ;;
+            # By this point the two well-formed beta shapes have already matched,
+            # so anything still carrying a character that is not a digit or a dot
+            # after the leading `v` is malformed — a typo'd prerelease (`-beta.x`,
+            # `-rc1`) or a junk suffix (`0.71.0extra`). Without this they fall
+            # through to the stable arm and publish as a real release.
+            v*[!0-9.]*)
+              echo "::error::tag '$tag' has a malformed version or an unrecognized prerelease suffix"; exit 1 ;;
             v[0-9]*.[0-9]*.[0-9]*)
               echo "channel=stable"            >> "$GITHUB_OUTPUT"
               echo "rolling_tag=latest-stable" >> "$GITHUB_OUTPUT"
