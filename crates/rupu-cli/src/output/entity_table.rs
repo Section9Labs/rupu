@@ -78,9 +78,9 @@ impl<'a> EntityTable<'a> {
         }
     }
 
-    /// Append a row. Panics on arity mismatch — see [`Self::try_row`] for
-    /// the checked form. Intended for call sites that build rows from a
-    /// fixed literal, where a mismatch is a programming error.
+    /// Append a row. Panics on arity mismatch. Every call site builds a
+    /// row from a fixed literal, so a mismatch is a programming error,
+    /// not a data error — the panic is the correct response.
     pub fn row(mut self, cells: Vec<CellValue>) -> Self {
         assert_eq!(
             cells.len(),
@@ -91,19 +91,6 @@ impl<'a> EntityTable<'a> {
         );
         self.rows.push(cells);
         self
-    }
-
-    /// Append a row, returning an error on arity mismatch rather than
-    /// panicking. A mismatched row would silently misalign every column.
-    pub fn try_row(&self, cells: Vec<CellValue>) -> anyhow::Result<()> {
-        if cells.len() != self.headers.len() {
-            anyhow::bail!(
-                "row arity {} does not match {} headers",
-                cells.len(),
-                self.headers.len()
-            );
-        }
-        Ok(())
     }
 
     /// Render one cell to a comfy-table `Cell`.
@@ -286,11 +273,39 @@ mod tests {
     }
 
     #[test]
-    fn row_length_mismatch_is_rejected() {
+    #[should_panic(expected = "row arity")]
+    fn row_length_mismatch_panics() {
         // A row with the wrong arity would silently misalign columns.
+        // `row()` is the only append method; a mismatch is a
+        // programming error at a call site with a fixed literal, so it
+        // panics rather than returning a recoverable error.
         let p = prefs();
-        let t = EntityTable::new(&p, RenderOpts::default(), vec!["A", "B"]);
-        assert!(t.try_row(vec![CellValue::Text("only-one".into())]).is_err());
+        let _ = EntityTable::new(&p, RenderOpts::default(), vec!["A", "B"])
+            .row(vec![CellValue::Text("only-one".into())]);
+    }
+
+    #[test]
+    fn a_successfully_added_row_appears_in_render_output() {
+        // Regression guard: a prior version of `try_row` took `&self`
+        // and silently discarded the row on the success path — the
+        // only test on it exercised the error path, so 9/9 tests
+        // passed with the row vanishing in production. This asserts
+        // the row we add is actually the row we get back.
+        let p = prefs();
+        let t = EntityTable::new(&p, RenderOpts::default(), vec!["A", "B"])
+            .row(vec![
+                CellValue::Text("alpha".to_string()),
+                CellValue::Text("beta".to_string()),
+            ])
+            .row(vec![
+                CellValue::Text("gamma".to_string()),
+                CellValue::Text("delta".to_string()),
+            ]);
+        let out = t.render(now());
+        assert!(out.contains("alpha"), "got: {out}");
+        assert!(out.contains("beta"), "got: {out}");
+        assert!(out.contains("gamma"), "got: {out}");
+        assert!(out.contains("delta"), "got: {out}");
     }
 
     #[test]
