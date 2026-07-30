@@ -166,10 +166,25 @@ mod tests {
     }
 
     #[test]
-    fn row_length_mismatch_is_rejected() {
-        // A row with the wrong arity would silently misalign columns.
-        let t = EntityTable::new(&prefs(), RenderOpts::default(), vec!["A", "B"]);
-        assert!(t.try_row(vec![CellValue::Text("only-one".into())]).is_err());
+    #[should_panic(expected = "row arity")]
+    fn row_length_mismatch_panics() {
+        // A row with the wrong arity would silently misalign every
+        // column. Arity is fixed by a literal at each call site, so a
+        // mismatch is a programming error and asserting is correct.
+        let p = prefs();
+        let _ = EntityTable::new(&p, RenderOpts::default(), vec!["A", "B"])
+            .row(vec![CellValue::Text("only-one".into())]);
+    }
+
+    #[test]
+    fn an_added_row_actually_appears_in_the_output() {
+        // Guards the class of bug where a builder validates a row and
+        // then drops it, returning success while rendering nothing.
+        let p = prefs();
+        let out = EntityTable::new(&p, RenderOpts::default(), vec!["A"])
+            .row(vec![CellValue::Text("visible".into())])
+            .render(now());
+        assert!(out.contains("visible"), "row was silently dropped: {out}");
     }
 }
 ```
@@ -291,7 +306,7 @@ impl<'a> EntityTable<'a> {
         }
     }
 
-    /// Append a row. Panics on arity mismatch — see [`Self::try_row`] for
+    /// Append a row. Panics on arity mismatch: arity is fixed by a
     /// the checked form. Intended for call sites that build rows from a
     /// fixed literal, where a mismatch is a programming error.
     pub fn row(mut self, cells: Vec<CellValue>) -> Self {
@@ -306,18 +321,6 @@ impl<'a> EntityTable<'a> {
         self
     }
 
-    /// Append a row, returning an error on arity mismatch rather than
-    /// panicking. A mismatched row would silently misalign every column.
-    pub fn try_row(&self, cells: Vec<CellValue>) -> anyhow::Result<()> {
-        if cells.len() != self.headers.len() {
-            anyhow::bail!(
-                "row arity {} does not match {} headers",
-                cells.len(),
-                self.headers.len()
-            );
-        }
-        Ok(())
-    }
 
     /// Render one cell to a comfy-table `Cell`.
     fn cell(&self, value: &CellValue, now: DateTime<Utc>) -> Cell {
