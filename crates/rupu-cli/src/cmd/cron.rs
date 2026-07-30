@@ -936,6 +936,26 @@ fn push_cron(dir: &Path, into: &mut BTreeMap<String, CronWorkflow>) {
         if wf.trigger.on != TriggerKind::Cron {
             continue;
         }
+        // An autoflow the operator disabled must not fire on the cron tick.
+        //
+        // The CP web UI's disable toggle (`api::autoflows::set_autoflow_enabled`)
+        // writes `autoflow.enabled: false` into this YAML, and the autoflow
+        // ENGINE honors it (`cmd/autoflow.rs`'s `.filter(|a| a.enabled)`). The
+        // cron tick is a SECOND, independent dispatch subsystem, and it used to
+        // select purely on `trigger.on: cron` — so a cron-triggered workflow
+        // showing as "disabled" in the UI kept firing on schedule. Observed
+        // live on `nightly-health`.
+        //
+        // Deliberately keyed on an EXPLICIT autoflow block: a workflow that
+        // never opted into autoflow has no such flag to consult and must keep
+        // firing, or this would silently break every ordinary cron job.
+        if wf.autoflow.as_ref().is_some_and(|a| !a.enabled) {
+            info!(
+                workflow = %stem,
+                "skipping: autoflow is disabled (autoflow.enabled: false)"
+            );
+            continue;
+        }
         let Some(schedule) = wf.trigger.cron.clone() else {
             // The schema validator should have caught this, but be
             // defensive — a malformed cron-trigger workflow is just
@@ -1092,5 +1112,99 @@ mod tests {
         assert_eq!(payload["source"]["project"], "workspace-123");
         assert_eq!(payload["state"]["before"]["id"], "todo");
         assert_eq!(payload["state"]["after"]["id"], "in_progress");
+    }
+
+    // ── Disabled autoflows must not fire on the cron tick ────────────
+    //
+    // The CP web UI's autoflow disable toggle writes `autoflow.enabled:
+    // false` into the workflow YAML, and the autoflow ENGINE honors it
+    // (`cmd/autoflow.rs`'s `.filter(|a| a.enabled)`). But the cron tick is a
+    // second, independent dispatch subsystem that selected purely on
+    // `trigger.on: cron` — so a cron-triggered workflow the operator had
+    // disabled in the UI kept firing on schedule, with the UI showing it as
+    // off. Observed live: `nightly-health` carried `autoflow.enabled: false`
+    // and still fired, writing `cron-state/nightly-health.last_fired`.
+
+    fn tmp_wf_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let d = tempfile::tempdir().expect("tempdir");
+        for (name, body) in files {
+            std::fs::write(d.path().join(name), body).expect("write workflow");
+        }
+        d
+    }
+
+    const CRON_DISABLED: &str = r#"
+name: nightly-health
+autoflow:
+  enabled: false
+trigger:
+  on: cron
+  cron: "0 6 * * *"
+steps:
+  - id: check
+    agent: investigator
+    prompt: "check"
+"#;
+
+    const CRON_ENABLED: &str = r#"
+name: nightly-enabled
+autoflow:
+  enabled: true
+  entity: issue
+trigger:
+  on: cron
+  cron: "0 6 * * *"
+steps:
+  - id: check
+    agent: investigator
+    prompt: "check"
+"#;
+
+    const CRON_PLAIN: &str = r#"
+name: plain-cron
+trigger:
+  on: cron
+  cron: "0 6 * * *"
+steps:
+  - id: check
+    agent: investigator
+    prompt: "check"
+"#;
+
+    #[test]
+    fn cron_tick_skips_a_workflow_disabled_in_the_cp_ui() {
+        let d = tmp_wf_dir(&[("nightly-health.yaml", CRON_DISABLED)]);
+        let mut got = std::collections::BTreeMap::new();
+        push_cron(d.path(), &mut got);
+        assert!(
+            !got.contains_key("nightly-health"),
+            "a workflow with `autoflow.enabled: false` must not be collected \
+             for the cron tick — the CP disable toggle writes exactly that flag"
+        );
+    }
+
+    #[test]
+    fn cron_tick_still_fires_a_plain_cron_workflow_with_no_autoflow_block() {
+        // Guard against over-correcting: a workflow that never opted into
+        // autoflow at all has no `enabled` flag to consult and must keep
+        // firing. Disabling would silently break every ordinary cron job.
+        let d = tmp_wf_dir(&[("plain-cron.yaml", CRON_PLAIN)]);
+        let mut got = std::collections::BTreeMap::new();
+        push_cron(d.path(), &mut got);
+        assert!(
+            got.contains_key("plain-cron"),
+            "a cron workflow with no `autoflow:` block must still fire"
+        );
+    }
+
+    #[test]
+    fn cron_tick_still_fires_an_enabled_autoflow() {
+        let d = tmp_wf_dir(&[("nightly-enabled.yaml", CRON_ENABLED)]);
+        let mut got = std::collections::BTreeMap::new();
+        push_cron(d.path(), &mut got);
+        assert!(
+            got.contains_key("nightly-enabled"),
+            "`autoflow.enabled: true` must still fire on schedule"
+        );
     }
 }
