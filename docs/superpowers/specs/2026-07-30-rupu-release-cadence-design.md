@@ -1,7 +1,7 @@
 # Scheduled release cadence — design
 
 **Date:** 2026-07-30
-**Status:** Approved, awaiting implementation plan
+**Status:** Implemented — PR #572. See "As-built corrections" below.
 **Surface:** `.github/workflows/`, `scripts/`, `Makefile`
 
 ## Problem
@@ -101,6 +101,14 @@ routing it through a PR would stall the beta channel until someone merged it.
 The exception is scoped to exactly this commit — nothing else in CI may push to
 `main`.
 
+**`main` IS protected**, by a repository *ruleset* (not legacy branch
+protection — the legacy API returns 404 for it, which misled the original
+draft of this spec). GitHub rejects the Actions integration as a ruleset bypass
+actor (HTTP 422), so the only credential that can push is a `DeployKey`. Both
+the bump commit AND every tag push therefore go over SSH using
+`secrets.MAIN_PUSH_KEY`, exactly as `release.yml`'s community-definitions job
+already does. A missing secret fails the job loudly.
+
 ## §3 — `release.yml` change
 
 Its tag matcher requires the string to *end* in `-beta`, so `v0.71.0-beta.4`
@@ -175,3 +183,51 @@ Settled with rationale, flagged as adjustable:
 - Release notes generation or changelog automation.
 - Notarization (`scripts/notarize-release.sh`) — unchanged, still invoked by
   `release.yml` where it already is.
+
+## As-built corrections
+
+Found during implementation and review; all are in PR #572.
+
+1. **Tag pushes must use the deploy key, not the ambient token.** A tag pushed
+   with `GITHUB_TOKEN` does **not** trigger another workflow — GitHub exempts
+   only `workflow_dispatch` and `repository_dispatch`. The original design would
+   have pushed tags that `release.yml` never saw: betas accumulating with no
+   releases, every run green, nothing ever published. Both workflows now push
+   over SSH with `MAIN_PUSH_KEY`.
+2. **`main` is ruleset-protected** — see §2 above. The spec originally asserted
+   the opposite.
+3. **The bump must be self-healing.** Gating it solely on "a promotion happened"
+   deadlocks permanently: with `Cargo.toml` equal to the shipped stable, the beta
+   guard skips daily and the promoter's backward guard skips weekly, and nothing
+   can ever write `Cargo.toml` again. The bump now also runs whenever the base is
+   not greater than the newest stable tag.
+4. **The stall-guard compares versions, not equality**, and the bump target is
+   `max(current base, minor-bump(promoted))` — deriving it from the promoted
+   version alone could rewrite `Cargo.toml` backwards.
+5. **A promotion must move forward.** Without a guard, today's tag state would
+   have promoted `v0.70.1` as stable and force-moved `latest-stable` *below* the
+   already-shipped `v0.71.0`.
+6. **Beta tags are annotated.** The soak window reads `creatordate`, which on a
+   lightweight tag is the *commit* date — so a 3-day-old commit tagged this
+   morning could be promoted 100 minutes later. Annotating makes `creatordate`
+   the tag's own age, which is what the window is about.
+7. **The CI-green check matches HEAD's SHA**, not merely the most recent run;
+   `ci.yml` cancels in progress, so an older commit's success could otherwise
+   green-light an untested HEAD.
+8. **`release-stable.yml` takes `tag` and `soak_days` dispatch inputs**, so a
+   same-day stable is possible. Neither bypasses the backward guard or the
+   ancestry check.
+9. The bump commit message is `make bump`'s existing
+   `release: bump workspace to vX.Y.Z`, not the `chore(release):` form §2
+   originally specified.
+
+### Before the cadence can start
+
+`Cargo.toml` is `0.71.0` and `v0.71.0` is already released. The self-healing
+bump (correction 3) resolves this on the first stable run, but the fastest path
+is to land a `make bump VERSION=0.72.0` on `main`. Until the base exceeds the
+newest stable tag, the beta cron correctly skips every morning.
+
+**Do not trust the first green run.** After the first `gh workflow run
+release-beta.yml`, confirm a `release.yml` run actually started for the pushed
+tag — that is the one behaviour no local test can prove.
