@@ -88,8 +88,15 @@ pub fn resolve<'a>(candidates: &'a [String], fragment: &str) -> Resolution<'a>;
 
 `resolve` normalizes a fragment by splitting on `…`. Given `head…tail` it
 requires `id.starts_with(head) && id.ends_with(tail)`. Given a fragment
-with no ellipsis it accepts either a prefix match or a suffix match. This
-makes all four of these resolve to the same record:
+with no ellipsis it accepts either a prefix match or a suffix match. Every
+*partial* form — bare prefix, bare suffix, and both halves of an ellipsis
+fragment combined — must carry at least `MIN_FRAGMENT_LEN` (4) characters;
+only an exact full-id match is exempt. This bound exists because `resolve`
+backs destructive commands (`workflow delete-run`, `cancel`, `reject`,
+`archive-run`): without it, a two-character typo such as `0S` — or the
+same two characters spelled as an ellipsis fragment, `…0S` — could match
+and delete an unrelated run. This makes all four of these resolve to the
+same record:
 
 ```
 ses_01KWA7HTYEDX0ACG93ZW26FG3M   full

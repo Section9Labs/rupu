@@ -3,7 +3,11 @@
 //! Governing rule: never display an identifier the CLI will not accept
 //! back. `compact_id` shortens for display; `resolve` accepts that
 //! exact compact form, plus full identifiers, bare suffixes, and
-//! prefixes.
+//! prefixes. Every *partial* form — bare suffix, bare prefix, and both
+//! halves of an ellipsis fragment — must carry at least
+//! [`MIN_FRAGMENT_LEN`] characters; only an exact full-id match is
+//! exempt. `resolve` backs destructive commands, so an unbounded short
+//! fragment is a data-loss risk, not just an ambiguity risk.
 //!
 //! Both halves matter for ULIDs specifically. The leading 10 characters
 //! after the type prefix encode a millisecond timestamp, so records
@@ -112,6 +116,14 @@ fn matches_fragment(id: &str, fragment: &str) -> bool {
         // Guard against a fragment longer than the identifier, where
         // head and tail would overlap and both match spuriously.
         if head.chars().count() + tail.chars().count() > id.chars().count() {
+            return false;
+        }
+        // MIN_FRAGMENT_LEN applies here too. An ellipsis fragment is
+        // still a *partial* match — `…0S` is exactly as unbounded a
+        // suffix as a bare `0S`, just spelled with a separator. Without
+        // this, the bare-form guard below is trivially bypassed by
+        // typing three dots in front of a short suffix.
+        if head.chars().count() + tail.chars().count() < MIN_FRAGMENT_LEN {
             return false;
         }
         return id.starts_with(head) && id.ends_with(tail);
@@ -271,20 +283,6 @@ mod tests {
         assert_eq!(resolve(&c, "ab"), Resolution::Unique("ab".to_string()));
     }
 
-    #[test]
-    fn compact_form_still_round_trips_under_the_minimum_guard() {
-        // The compact head…tail form must stay exempt from
-        // MIN_FRAGMENT_LEN — it's the exact string the CLI prints back.
-        let c = candidates();
-        for id in &c {
-            assert_eq!(
-                resolve(&c, &compact_id(id)),
-                Resolution::Unique(id.clone()),
-                "compact form of {id} failed to resolve"
-            );
-        }
-    }
-
     // ── Minor fix: ASCII `...` accepted as an ellipsis alias ──────────
 
     #[test]
@@ -295,5 +293,55 @@ mod tests {
         let ascii = real.replace('…', "...");
         assert_eq!(ascii, "ses_01KWA7HT...FG3M");
         assert_eq!(resolve(&c, &ascii), Resolution::Unique(c[0].clone()));
+    }
+
+    // ── Re-review fix: MIN_FRAGMENT_LEN applies inside the ellipsis
+    // branch too, not just the bare prefix/suffix path ────────────────
+
+    #[test]
+    fn ellipsis_fragment_shorter_than_minimum_is_not_found() {
+        let c = candidates();
+        assert_eq!(resolve(&c, "...2"), Resolution::NotFound);
+        assert_eq!(resolve(&c, "…2"), Resolution::NotFound);
+    }
+
+    #[test]
+    fn ellipsis_fragment_with_empty_tail_is_not_found() {
+        // Head-side symmetry: an empty tail with a short head must be
+        // rejected the same way an empty head with a short tail is.
+        // Single-candidate list so a pre-fix run would demonstrably
+        // match ("r" is a real prefix of the id, "" is a real,
+        // trivially-true suffix) rather than fail for an unrelated
+        // reason.
+        let c = vec!["run_01KRM1CVRC2A9XZ0CY33RN5R0S".to_string()];
+        assert_eq!(resolve(&c, "r…"), Resolution::NotFound);
+        assert_eq!(resolve(&c, "r..."), Resolution::NotFound);
+    }
+
+    #[test]
+    fn ellipsis_fragment_bypass_is_closed() {
+        // This is the demonstrated data-loss path: an empty head plus a
+        // two-character tail used to match via the ellipsis branch even
+        // though the equivalent bare suffix "0S" is rejected below the
+        // minimum.
+        let c = vec!["run_01KRM1CVRC2A9XZ0CY33RN5R0S".to_string()];
+        assert_eq!(resolve(&c, "0S"), Resolution::NotFound);
+        assert_eq!(resolve(&c, "…0S"), Resolution::NotFound);
+        assert_eq!(resolve(&c, "...0S"), Resolution::NotFound);
+    }
+
+    #[test]
+    fn compact_form_still_round_trips_under_the_minimum_guard() {
+        // The compact head…tail form (12 + 4 = 16 chars) must stay well
+        // above MIN_FRAGMENT_LEN so the fix can't over-correct — it's
+        // the exact string the CLI prints back and must always resolve.
+        let c = candidates();
+        for id in &c {
+            assert_eq!(
+                resolve(&c, &compact_id(id)),
+                Resolution::Unique(id.clone()),
+                "compact form of {id} failed to resolve"
+            );
+        }
     }
 }
