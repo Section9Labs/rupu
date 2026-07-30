@@ -1,224 +1,212 @@
-# Releasing rupu (manual runbook)
+# Releasing rupu
 
-rupu uses a build-locally-and-upload runbook for releases. There is no automated GitHub Actions release workflow — three attempts at the v0.0.3-cli release surfaced enough churn (MSRV-vs-transitive-dep drift twice, cross-stdlib quirks on macos-14) that the runbook is honester for a solo-maintained v0. When external-contributor flow needs automation, reinstate `.github/workflows/release.yml` (the deleted version is in git history at commit `6c30b31`).
+Releases are cut by GitHub Actions, on a schedule. Nothing is built or
+uploaded from a laptop.
 
-## What you need
+There is exactly one publishing workflow — **`.github/workflows/release.yml`**,
+triggered by pushing a `v*` tag. It builds every platform, signs and notarizes
+the macOS binaries, publishes the GitHub release and the `.deb`/`.rpm` +
+apt/yum repos, and (for **stable** tags only) syncs the Nix flake, the AUR
+`PKGBUILD` and the Homebrew formula.
 
-- A workstation with Rust ≥ MSRV (currently 1.95).
-- `gh` authenticated (`gh auth status`).
-- Push access to `Section9Labs/rupu`.
+Two scheduled workflows do nothing but decide which tag to push:
 
-## Steps
+| Workflow | Schedule | What it does |
+| --- | --- | --- |
+| `release-beta.yml` | daily, 07:37 UTC | pushes `v<base>-beta.N` for today's `main` |
+| `release-stable.yml` | Sundays, 09:17 UTC | re-tags a soaked beta's commit as `v<X.Y.Z>`, then bumps `main`'s base version |
 
-### 1. Bump version (if applicable)
+So the normal flow is: merge a PR → tomorrow morning a beta ships → after it
+has soaked two days, a Sunday promotes exactly that build to stable →
+Homebrew/AUR/Nix follow within the same run.
 
-In `Cargo.toml` `[workspace.package]`, set `version = "X.Y.Z"`. Stage and commit on a branch; merge via PR (this isn't manual-runbook work, just normal change control).
+## Why both schedulers push over SSH
 
-### 2. Verify clean state
+Both workflows push their tag with the `MAIN_PUSH_KEY` deploy key, **not** the
+ambient `GITHUB_TOKEN`. This is not optional and must not be "simplified":
 
-```bash
-git checkout main && git pull
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all -- --check
-cargo build --release --workspace
-```
+> Events triggered by the `GITHUB_TOKEN` will not create a new workflow run,
+> with the following exceptions: `workflow_dispatch` and `repository_dispatch`.
 
-All four must be green.
+`release.yml` triggers on `push: tags`. A tag pushed with the ambient token
+therefore appears in the repository and publishes **nothing**, while the job
+that pushed it goes green. If `MAIN_PUSH_KEY` is missing, both workflows fail
+loudly rather than push a tag that would silently do nothing.
 
-### 3. Tag
+`MAIN_PUSH_KEY` is a deploy key with write access to this repository, and it
+is also the only actor allowed to bypass the ruleset protecting `main` (see
+`.github/rulesets/README.md`) — GitHub rejects the Actions integration as a
+bypass actor, so a deploy key is the only credential that can express it.
 
-```bash
-TAG=vX.Y.Z-<slug>     # e.g., v0.0.3-cli
-git tag -a "$TAG" -m "<one-line release summary>"
-git push origin "$TAG"
-```
+## The daily beta
 
-If SSH push fails (1Password agent timeout), use HTTPS:
-```bash
-git -c url."https://github.com/".insteadOf="git@github.com:" push origin "$TAG"
-```
+`release-beta.yml` cuts `v<base>-beta.N`, where `<base>` is `Cargo.toml`'s
+workspace version and `N` is derived from the existing tag list by
+`scripts/next-beta-version.sh` (never stored, so deleting a tag simply lowers
+the maximum). The tag is **annotated** — `release-stable.yml`'s soak window
+reads the tag's own creation date, which a lightweight tag does not have.
 
-### 4. Build the binary natively (one per platform you ship)
+It skips — logging which condition fired and exiting **0**, because a skipped
+day is a normal day — when any of:
 
-For your current platform:
+1. **`main` has not moved** since the last beta of this base. Bypassable with
+   the `force` input, for re-cutting after a botched upload.
+2. **`Cargo.toml`'s version is not newer than the newest stable tag.** A
+   `v0.71.0-beta.N` sorts below the shipped `v0.71.0` and would walk
+   `rupu update` backwards on the beta channel. Not bypassable; the cure is
+   the version bump, which `release-stable.yml` owns.
+3. **`ci.yml` has not passed for this exact HEAD commit.** The check is by
+   head SHA, not "the newest run on `main`" — `ci.yml` uses
+   `cancel-in-progress`, so the newest run on the branch is frequently
+   `cancelled` and can belong to an older commit. An unanswerable query
+   (permissions, rate limit) counts as not-green. Not bypassable.
 
-```bash
-make release                       # cargo build --release + sign with Developer ID
-cd target/release
-strip rupu                         # smaller binary; no debug symbols
-# strip INVALIDATES the signature `make release` just applied — re-sign the
-# stripped binary, or macOS SIGKILLs it on launch (and codesign --verify fails).
-( cd ../.. && scripts/sign-dev.sh release )
-codesign --verify --verbose=1 rupu # sanity: must report "valid on disk"
-TARGET=$(rustc -vV | awk '/^host/ { print $2 }')   # e.g., aarch64-apple-darwin
-NAME="rupu-${TAG}-${TARGET}"
-tar -czf "${NAME}.tar.gz" rupu
-shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
-ls -la "${NAME}.tar.gz"*
-```
+## The weekly stable promotion
 
-`make release` runs `cargo build --release -p rupu-cli` and then `scripts/sign-dev.sh release`, which signs the binary with the Developer ID Application cert and the hardened runtime. Required for both the keychain-trust workflow (so successive builds don't re-prompt) and notarization in step 4a.
+`release-stable.yml` picks the newest beta that has existed for at least
+`SOAK_DAYS` (2) via `scripts/pick-promotable-beta.sh`, and re-tags **that
+beta's commit** as `vX.Y.Z`. Stable is therefore byte-identical in content to
+a beta people have already been running for two days; it is never a fresh
+build of `main`'s head.
 
-#### 4a. Notarize the macOS binary (one-time prereq + per-release submit)
+Guards, in order:
 
-**One-time setup** (skip if you've already done this once):
+1. **Soak** — nothing old enough is a normal week: log and exit 0.
+2. **Backward guard** — a version not newer than the newest stable tag is
+   skipped rather than published, so `latest-stable` can never move backwards.
+   This runs *before* the ancestry check on purpose: a stale beta left by a
+   rebase is both backwards and unreachable, and failing on it would turn
+   every subsequent Sunday red with no way to self-heal.
+3. **Ancestry** — a beta whose commit is no longer reachable from `main`
+   (force-push, rebase) is a hard **failure**. Its version is newer than
+   anything shipped, so skipping it would stall the stable channel silently.
 
-```bash
-xcrun notarytool store-credentials rupu \
-  --apple-id <your@apple.id> \
-  --team-id 995PCLM9KH
-```
+### The version bump on `main`
 
-You'll be prompted for an [app-specific password](https://appleid.apple.com/account/manage) — generate one under "Sign-In and Security → App-Specific Passwords" and paste it. Stored in your login keychain as profile `rupu`.
+After promoting, the workflow pushes one commit to `main`: `make bump
+VERSION=<next>`. This is the only commit any automation may push to `main`.
 
-**Per release** (run after step 4's sign step, before tarring):
+The target is `max(current Cargo.toml version, minor-bump of the version being
+promoted)` — never lower than what `Cargo.toml` already holds, so a human who
+has already bumped `main` further ahead is not overwritten backwards.
 
-```bash
-scripts/notarize-release.sh
-```
+The bump also runs on weeks where **nothing** was promoted, whenever `main`'s
+base is not ahead of the newest stable tag. That is deliberate and load-
+bearing: in that state the daily beta's condition 2 skips every morning, and
+nothing else in the repo will ever write `Cargo.toml` again. Gating the bump
+solely on "a promotion happened" makes the very first run — and any single
+failed bump — a permanent, all-green deadlock in which nothing is ever
+published again.
 
-This wraps `target/release/rupu` in a temp .zip, submits to `xcrun notarytool` with the `rupu` keychain profile, waits for the verdict, and exits non-zero on failure (printing the notarization log). On success the binary's signature carries the notarization ticket online; Gatekeeper will accept it on first run for end users.
+## Manual escape hatches
 
-There's no `stapler` step — bare command-line binaries can't be stapled (stapler only attaches tickets to `.app`/`.pkg`/`.dmg`). The online notarization check via Gatekeeper covers this.
-
-Repeat steps 4 + 4a on each host you have access to (macOS arm64 + Intel; Linux x86_64; Linux arm64). Linux/Windows skip the sign + notarize steps via the script's OS check. v0 only ships what you happen to build; users on unsupported platforms install via `cargo install --git https://github.com/Section9Labs/rupu --tag $TAG`.
-
-### 5. Create the GitHub release
-
-For the first artifact, use `gh release create`:
-
-```bash
-gh release create "$TAG" --repo Section9Labs/rupu \
-  --title "rupu $TAG" \
-  --notes "$(cat <<'EOF'
-**Slice X complete.** <one-paragraph summary>
-
-## What ships in this binary
-
-- <feature 1>
-- <feature 2>
-
-## Install
-
-\`\`\`bash
-TAG=vX.Y.Z-slug
-TARGET=aarch64-apple-darwin    # adjust for your platform
-curl -fsSL -o /tmp/rupu.tar.gz \
-  "https://github.com/Section9Labs/rupu/releases/download/\${TAG}/rupu-\${TAG}-\${TARGET}.tar.gz"
-tar -xzf /tmp/rupu.tar.gz -C /tmp
-sudo install -m 755 /tmp/rupu /usr/local/bin/rupu
-rupu --version
-\`\`\`
-EOF
-)" \
-  "${NAME}.tar.gz" "${NAME}.tar.gz.sha256"
-```
-
-For additional artifacts on the same release, use `gh release upload`:
+All of these are `gh workflow run`; none of them build anything locally.
 
 ```bash
-gh release upload "$TAG" --repo Section9Labs/rupu \
-  "rupu-${TAG}-other-target.tar.gz" \
-  "rupu-${TAG}-other-target.tar.gz.sha256"
+# Cut a beta right now, even if main has not moved.
+# (Conditions 2 and 3 — version stall and red CI — still apply.)
+gh workflow run release-beta.yml -f force=true
+
+# Promote the newest soaked beta right now, off-schedule.
+gh workflow run release-stable.yml
+
+# Ship a same-day stable: promote one specific beta, ignoring the soak window.
+# The backward guard and the ancestry check STILL apply.
+gh workflow run release-stable.yml -f tag=v0.72.0-beta.3
+
+# Same, but only relax the soak window rather than naming a tag.
+gh workflow run release-stable.yml -f soak_days=0
+
+# Re-publish an existing tag (a failed upload, a runner flake).
+gh workflow run release.yml -f tag=v0.72.0
 ```
 
-### 6. Smoke the release
+A bad value for `tag` or `soak_days` is operator error and fails the run
+loudly — unlike the scheduled skip conditions, which exit 0.
 
-On a fresh checkout of a different machine (or just `/tmp`):
+To ship a hotfix as stable the same day: merge the fix, wait for `ci.yml`,
+`gh workflow run release-beta.yml -f force=true`, then once that beta has
+published, `gh workflow run release-stable.yml -f tag=<that beta>`.
+
+## Bumping the version by hand
 
 ```bash
-TAG=vX.Y.Z-slug
-TARGET=aarch64-apple-darwin
-curl -fsSL "https://github.com/Section9Labs/rupu/releases/download/${TAG}/rupu-${TAG}-${TARGET}.tar.gz" \
-  | tar -xzf - -C /tmp
-/tmp/rupu --version    # rupu X.Y.Z
+make bump VERSION=X.Y.Z    # rewrites Cargo.toml + Cargo.lock, commits
 ```
 
-## Why no GitHub Actions release workflow?
+Push it on a branch and merge via PR like any other change. The next morning's
+beta picks the new base up automatically. Note that `make cp-web` must have
+run if the embedded CP UI changed — `release.yml` builds it in the `web` job,
+so this only matters for local testing.
 
-Three release attempts on `v0.0.3-cli` each hit a different transient or environmental issue:
+## The helper scripts
 
-1. Build failed on all 4 targets: `feature edition2024 is required` because `Cargo.lock` pinned `base64ct@1.8.3` etc., which require Rust 1.85+. Our MSRV pin was 1.77. Fixed by PR #9 (MSRV → 1.85).
-2. Build failed on all 4 targets again: `home@0.5.12 requires rustc 1.88`. Fixed by PR #10 (MSRV → 1.88).
-3. `x86_64-apple-darwin` failed cross-compiling from `macos-14` (arm64 host) — `targets: x86_64-apple-darwin` didn't actually install the cross-stdlib. Fixed by PR #11 (switched to `macos-13` Intel runner).
+`scripts/next-beta-version.sh` and `scripts/pick-promotable-beta.sh` are pure:
+they never call `git` or `gh`, they read their tag list on stdin, and `now` is
+a parameter. That is what makes them testable without a repository.
+`scripts/tests/release-cadence-tests.sh` runs on every PR via `ci.yml`'s
+`release-scripts` job — these scripts decide what gets published unattended,
+so a counter regression must not reach `main`.
 
-Each fix was small (a one-line MSRV bump or a runner swap), but the iteration cost was real: every retry meant deleting the existing tag, re-pushing it, and waiting for runners to pick up. The native build path takes ~10 seconds per binary on a workstation, with no surprises.
+## Secrets
 
-When external-contributor flow needs automation (Slice C+), reinstate the workflow from git history (`git show 6c30b31:.github/workflows/release.yml`).
+Set under repo Settings → Secrets and variables → Actions.
 
-## Nightly-test secrets (live-API smokes)
+**Release (`release.yml`, `release-beta.yml`, `release-stable.yml`):**
 
-Set under repo Settings → Secrets and variables → Actions:
+- `MAIN_PUSH_KEY` — deploy key with write access to **this** repository.
+  Required by both schedulers (tag pushes) and by `release.yml`'s `community`
+  job (the definitions commit to `main`). Absent → those jobs fail; a stale
+  `flake.nix` on `main` means `nix run github:Section9Labs/rupu` installs the
+  wrong version, and a wrong install is worse than a missing one.
+- `APPLE_CERT_P12_BASE64`, `APPLE_CERT_PASSWORD` — Developer ID Application
+  cert for signing the macOS binaries.
+- `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID`, `APPLE_API_KEY_BASE64` —
+  App Store Connect API key for `notarytool`. There is no `stapler` step:
+  bare command-line binaries cannot be stapled, so the ticket is served
+  online and Gatekeeper checks it on first run.
+- `GPG_PRIVATE_KEY`, `GPG_KEY_ID` — signs the apt/yum repository metadata.
+- `AUR_SSH_PRIVATE_KEY`, `AUR_USERNAME`, `AUR_EMAIL` — deploy key and commit
+  identity for the `rupuaur` AUR account. `.SRCINFO` is regenerated inside a
+  throwaway `archlinux:latest` container (`makepkg --printsrcinfo` only runs
+  on Arch — it is never hand-written).
+- `TAP_SSH_PRIVATE_KEY` — deploy key with write access to
+  `Section9Labs/homebrew-tap`. A cross-repo push always needs its own
+  credential; the ambient `GITHUB_TOKEN` is scoped to this repository
+  whatever the tap's visibility. If absent, that step logs and exits 0 — a
+  formula one version behind is a nuisance, a red release blocks every other
+  asset for everyone.
+
+Deploy keys rather than PATs throughout, deliberately: each writes to exactly
+one repository, none expire, and revoking one touches no other account.
+
+**Nightly live-API tests (`nightly-live-tests.yml`):**
+
 - `RUPU_LIVE_ANTHROPIC_KEY`
 - `RUPU_LIVE_OPENAI_KEY`
 - `RUPU_LIVE_GEMINI_KEY`
 - `RUPU_LIVE_COPILOT_TOKEN`
-- `RUPU_LIVE_GITHUB_TOKEN`           # PAT, scopes: repo + read:user + read:org
-- `RUPU_LIVE_GITLAB_TOKEN`           # PAT, scopes: api + read_user + read_repository
+- `RUPU_LIVE_GITHUB_TOKEN` — PAT, scopes: repo + read:user + read:org
+- `RUPU_LIVE_GITLAB_TOKEN` — PAT, scopes: api + read_user + read_repository
 
-## Community package publishing (automated in CI)
+## Smoking a release
 
-Note: unlike the manual runbook above, `.github/workflows/release.yml`
-*does* exist and runs on every `v*` tag push — it builds and publishes the
-binaries, `.deb`/`.rpm` packages, and hosted apt/yum repos. Three of its
-jobs additionally keep the community package definitions (Nix flake, AUR
-`PKGBUILD`, Homebrew formula) in sync and published, and all three are
-gated to **stable** releases only — a beta version must never reach the
-AUR, the Homebrew tap, or `main`'s definition files:
+Assets are bare binaries (`rupu-darwin-arm64`, `rupu-linux-x64`,
+`rupu-linux-arm64`) plus `.deb`/`.rpm` packages, each with a `.sha256`:
 
-- **`community`** rewrites `flake.nix`, `packaging/aur/PKGBUILD`, and
-  `packaging/homebrew/rupu.rb` with the just-published version and
-  checksums (via `packaging/sync-community.sh`) and commits the result
-  straight to `main`. Requires:
-  - `MAIN_PUSH_KEY` — a deploy key with write access to **this**
-    repository
+```bash
+TAG=v0.72.0
+curl -fsSL -o /tmp/rupu \
+  "https://github.com/Section9Labs/rupu/releases/download/${TAG}/rupu-darwin-arm64"
+chmod +x /tmp/rupu
+/tmp/rupu --version
+```
 
-  `main` is protected by the ruleset in `.github/rulesets/main.json`,
-  which requires a pull request; this job is a direct push, so it needs a
-  bypass actor. GitHub rejects the first-party GitHub Actions integration
-  as one (HTTP 422: *"Actor GitHub Actions integration must be part of the
-  ruleset source or owner organization"*) — repository rulesets can only
-  bypass on actors the repository owns. `DeployKey` is such an actor, so
-  the credential must be a deploy key for the bypass to be expressible.
-  See `.github/rulesets/README.md`.
+`release.yml` also publishes a rolling `latest-stable` / `latest-beta` release
+alongside the versioned one, so a download URL can be pinned to "newest".
+`rupu update` itself resolves by semver plus the release's `prerelease` flag,
+so that flag — derived from the `-beta` tag suffix — is the part that has to
+be right.
 
-  Unlike the tap, an absent `MAIN_PUSH_KEY` **fails** the release rather
-  than warning: a stale `flake.nix` on `main` means `nix run
-  github:Section9Labs/rupu` silently installs the wrong version, and a
-  wrong install is worse than a missing one.
-- **`publish-aur`** checks out the synced `PKGBUILD`, regenerates
-  `.SRCINFO` inside a throwaway `archlinux:latest` container (`makepkg
-  --printsrcinfo` only runs on Arch — it is never hand-written), and
-  pushes both files to `ssh://aur@aur.archlinux.org/rupu-bin.git`.
-  Requires these repo secrets, already provisioned for the `rupuaur`
-  AUR account:
-  - `AUR_SSH_PRIVATE_KEY` — deploy key registered with the `rupuaur`
-    AUR account
-  - `AUR_USERNAME`, `AUR_EMAIL` — commit identity for the AUR git repo
-- **`publish-homebrew`** copies the synced `packaging/homebrew/rupu.rb`
-  to `Formula/rupu.rb` in `Section9Labs/homebrew-tap` and pushes.
-  Requires:
-  - `TAP_SSH_PRIVATE_KEY` — a **deploy key** with write access to
-    `Section9Labs/homebrew-tap`, already provisioned
-
-  The tap being a public repository makes it world-*readable* and says
-  nothing about who may write. The ambient `GITHUB_TOKEN` is minted per
-  run and scoped to this repository, so it cannot push to another one
-  whatever that repo's visibility — a cross-repo push always needs its
-  own credential.
-
-  A deploy key rather than a PAT, deliberately: it writes to
-  `homebrew-tap` and nothing else, it does not expire, and revoking it
-  touches no other repository or account. A PAT would carry the whole of
-  the issuing user's access into the job.
-
-  If `TAP_SSH_PRIVATE_KEY` is absent, this step logs a message and exits `0`
-  rather than failing the release — a Homebrew formula one version
-  behind is a nuisance a maintainer fixes later; a red release blocks
-  every other asset (binaries, `.deb`/`.rpm`, apt/yum repos) for
-  everyone.
-
-None of this requires action on a normal release: push a `v*.*.*` tag
-(no `-beta` suffix) and the AUR package and Homebrew formula update
-themselves within the same workflow run.
+Or `rupu update`, which follows the configured `[update].channel`
+(`stable` by default, `beta` for the daily builds).
