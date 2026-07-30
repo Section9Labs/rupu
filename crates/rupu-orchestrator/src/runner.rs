@@ -11265,6 +11265,12 @@ loops:
         false_calls: usize,
         critique_call_offset: usize,
         critique_delay_ms: Option<u64>,
+        /// Fires the instant `critique` goes in-flight, before its delay.
+        /// A canceller that sleeps a fixed wall-clock time instead has to
+        /// assume the preceding steps finished inside that window; on a
+        /// contended runner they do not, the cancel lands before `critique`
+        /// starts, and the run aborts 0 steps rather than 1.
+        critique_started: Arc<tokio::sync::Notify>,
         critique_calls: Arc<AtomicUsize>,
         test_calls: Arc<AtomicUsize>,
         calls: Arc<Mutex<Vec<String>>>,
@@ -11277,6 +11283,7 @@ loops:
                 false_calls,
                 critique_call_offset: 0,
                 critique_delay_ms: None,
+                critique_started: Arc::new(tokio::sync::Notify::new()),
                 critique_calls: Arc::new(AtomicUsize::new(0)),
                 test_calls: Arc::new(AtomicUsize::new(0)),
                 calls: Arc::new(Mutex::new(Vec::new())),
@@ -11320,6 +11327,9 @@ loops:
             }
             let text = if step_id == "critique" {
                 if let Some(ms) = self.critique_delay_ms {
+                    // `notify_one` stores a permit when nobody is waiting yet,
+                    // so the canceller cannot miss this by arriving late.
+                    self.critique_started.notify_one();
                     tokio::time::sleep(Duration::from_millis(ms)).await;
                 }
                 let n = self.critique_call_offset
@@ -11953,11 +11963,17 @@ loops:
             )
             .unwrap();
 
-        // --- Phase 1: `critique` is slow (150ms); cancel the whole run
-        // 50ms in — iteration 0's `gen`/`test` finish near-instantly,
-        // then `critique` starts and is aborted mid-flight.
+        // --- Phase 1: `critique` is slow (150ms) and the run is cancelled
+        // the moment it goes in-flight, so exactly one step is aborted.
+        //
+        // This used to cancel on a 50ms timer and assume iteration 0's
+        // `gen`/`test` had finished by then. On a loaded CI runner they had
+        // not, the cancel landed before `critique` ever started, and the
+        // assertion below saw 0 aborted steps — which is how this test
+        // failed the v0.72.0 release with only a version string changed.
         let factory1 = ResumableRefineFactory::new(2).critique_delay_ms(150);
         let calls1 = Arc::clone(&factory1.calls);
+        let critique_started = Arc::clone(&factory1.critique_started);
         let opts1 = OrchestratorRunOpts {
             workflow: wf.clone(),
             inputs: BTreeMap::new(),
@@ -11983,8 +11999,9 @@ loops:
 
         let cancel_token = CancellationToken::new();
         let trigger = cancel_token.clone();
+        let critique_started = Arc::clone(&critique_started);
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            critique_started.notified().await;
             trigger.cancel();
         });
 
@@ -12004,7 +12021,14 @@ loops:
         .expect("cancel must not hang");
         match outcome {
             Err(RunWorkflowError::RunCancelled { aborted }) => {
-                assert_eq!(aborted, 1, "critique must have been in-flight and aborted");
+                // Report the actual count: the previous message named only
+                // the expectation, so the CI failure that motivated the
+                // signal below could not be told apart from "cancelled too
+                // early" (0) versus "gen/test still running too" (2).
+                assert_eq!(
+                    aborted, 1,
+                    "critique must have been in-flight and aborted, but {aborted} step(s) aborted"
+                );
             }
             other => panic!("expected Err(RunCancelled), got {other:?}"),
         }
