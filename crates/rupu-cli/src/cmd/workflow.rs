@@ -415,7 +415,7 @@ pub async fn handle(
     all_columns: bool,
 ) -> ExitCode {
     let result = match action {
-        Action::List => list(global_format).await,
+        Action::List => list(global_format, absolute, all_columns).await,
         Action::Show {
             name,
             view,
@@ -621,6 +621,11 @@ struct WorkflowRunsReport {
 struct WorkflowListOutput {
     prefs: crate::cmd::ui::UiPrefs,
     report: WorkflowListReport,
+    /// Enriched rows for the human table. Kept separate from
+    /// `report.rows` (`WorkflowListRow`, `Serialize`) because that
+    /// shape feeds `--format json` / `--format csv` and is frozen by
+    /// contract — see `WorkflowListDisplayRow`.
+    display_rows: Vec<WorkflowListDisplayRow>,
 }
 
 impl CollectionOutput for WorkflowListOutput {
@@ -644,17 +649,124 @@ impl CollectionOutput for WorkflowListOutput {
     }
 
     fn render_table(&self) -> anyhow::Result<()> {
-        let mut table = crate::output::tables::new_table();
-        table.set_header(vec!["NAME", "SCOPE"]);
-        for row in &self.report.rows {
-            table.add_row(vec![
-                comfy_table::Cell::new(&row.name),
-                crate::output::tables::status_cell(&row.scope, &self.prefs),
-            ]);
-        }
-        println!("{table}");
+        println!(
+            "{}",
+            render_workflow_list_table(
+                &self.display_rows,
+                &self.prefs,
+                self.prefs.render_opts(),
+                chrono::Utc::now(),
+            )
+        );
         Ok(())
     }
+}
+
+/// One workflow's row in the HUMAN listing.
+///
+/// Deliberately separate from `WorkflowListRow`, which is `Serialize`
+/// and feeds `--format json` / `--format csv`. That shape is frozen by
+/// contract, so enrichment lives here and never touches it.
+struct WorkflowListDisplayRow {
+    name: String,
+    scope: String,
+    /// `None` when the workflow file could not be parsed.
+    steps: Option<usize>,
+    /// `None` when the workflow has no cron trigger.
+    schedule: Option<String>,
+    /// `(status, started_at)` of the most recent run, if any.
+    last_run: Option<(String, chrono::DateTime<chrono::Utc>)>,
+}
+
+/// The fields of a run that the workflow listing needs.
+///
+/// An owned projection rather than a borrowed `RunRecord`, so the join
+/// below is unit-testable without building full records — `RunStore`'s
+/// only record builder is test-private to `rupu-orchestrator`.
+struct LatestRun {
+    workflow_name: String,
+    status: String,
+    started_at: chrono::DateTime<chrono::Utc>,
+    // Not read by the display path today (the table shows status +
+    // relative time only), but part of the projection's contract and
+    // exercised directly by `latest_run_keeps_only_the_most_recent_per_workflow`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    run_id: String,
+}
+
+/// Most recent run per workflow name.
+///
+/// Pure, and the reason the listing stays O(workflows + runs): the run
+/// store is read ONCE by the caller and folded here. Reading it per row
+/// would be O(workflows x runs), and `RunStore::list` deserializes every
+/// `run.json`.
+fn latest_run_by_workflow(runs: &[LatestRun]) -> std::collections::HashMap<&str, &LatestRun> {
+    let mut out: std::collections::HashMap<&str, &LatestRun> = std::collections::HashMap::new();
+    for run in runs {
+        out.entry(run.workflow_name.as_str())
+            .and_modify(|existing| {
+                if run.started_at > existing.started_at {
+                    *existing = run;
+                }
+            })
+            .or_insert(run);
+    }
+    out
+}
+
+fn render_workflow_list_table(
+    rows: &[WorkflowListDisplayRow],
+    prefs: &crate::cmd::ui::UiPrefs,
+    opts: crate::output::entity_table::RenderOpts,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    use crate::output::entity_table::{CellValue, EntityTable};
+
+    let mut table = EntityTable::new(
+        prefs,
+        opts,
+        vec!["NAME", "SCOPE", "STEPS", "LAST RUN", "SCHEDULE"],
+    )
+    .with_summary("workflow");
+
+    for row in rows {
+        table = table.row(vec![
+            CellValue::Text(row.name.clone()),
+            CellValue::Status(row.scope.clone()),
+            match row.steps {
+                Some(n) => CellValue::Text(n.to_string()),
+                None => CellValue::Missing,
+            },
+            match &row.last_run {
+                // Glyph + status + age in one cell — the facts an
+                // operator scans this column for ("did it run, and did
+                // it work"). `CellValue::Status` is deliberately NOT
+                // used here: its own glyph rendering would double up
+                // against the one built explicitly below. Because this
+                // is hand-built `Text` rather than `Timestamp`, it has
+                // to honor `opts.absolute` itself — `EntityTable` only
+                // does that switch automatically for `CellValue::Timestamp`.
+                Some((status, at)) => CellValue::Text(format!(
+                    "{} {} {}",
+                    crate::output::tables::status_glyph(status)
+                        .map(|g| g.to_string())
+                        .unwrap_or_default(),
+                    status,
+                    if opts.absolute {
+                        at.to_rfc3339()
+                    } else {
+                        crate::output::fmt::relative_time(*at, now)
+                    },
+                )),
+                None => CellValue::Missing,
+            },
+            match &row.schedule {
+                Some(s) => CellValue::Text(s.clone()),
+                None => CellValue::Missing,
+            },
+        ]);
+    }
+    table.render(now)
 }
 
 struct WorkflowRunsOutput {
@@ -997,7 +1109,11 @@ fn styled_usage_line(status: UiStatus, label: &str, detail: &str) -> String {
     buf
 }
 
-async fn list(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
+async fn list(
+    global_format: Option<OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
@@ -1012,7 +1128,55 @@ async fn list(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
         push_yaml_names(&p.join(".rupu/workflows"), "project", &mut by_name);
     }
     let cfg = layered_config_workflow(&global, project_root.as_deref());
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, None);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, None)
+        .with_table_flags(absolute, all_columns);
+
+    // Read the run store ONCE and fold it into a latest-run-per-workflow
+    // map; reading it per row would be O(workflows x runs), and
+    // `RunStore::list` deserializes every `run.json`. A read failure
+    // (e.g. the runs dir doesn't exist yet) degrades to "no runs known"
+    // rather than blanking the whole listing — this command did no I/O
+    // at all before this task and must not gain a new hard-failure mode.
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let latest_runs: Vec<LatestRun> = store
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| LatestRun {
+            workflow_name: r.workflow_name,
+            status: r.status.as_str().to_string(),
+            started_at: r.started_at,
+            run_id: r.id,
+        })
+        .collect();
+    let latest_by_name = latest_run_by_workflow(&latest_runs);
+
+    // STEPS/SCHEDULE need a real parse of each workflow file — new I/O
+    // on a command that previously only read filenames. A workflow that
+    // fails to parse still renders as a row (Missing in both columns);
+    // one malformed file must never blank the listing.
+    let display_rows: Vec<WorkflowListDisplayRow> = by_name
+        .iter()
+        .map(|(name, scope)| {
+            let (steps, schedule) = locate_workflow_in(&global, project_root.as_deref(), name)
+                .ok()
+                .and_then(|path| std::fs::read_to_string(&path).ok())
+                .and_then(|body| rupu_orchestrator::Workflow::parse(&body).ok())
+                .map(|wf| (Some(wf.steps.len()), wf.trigger.cron.clone()))
+                .unwrap_or((None, None));
+            let last_run = latest_by_name
+                .get(name.as_str())
+                .map(|r| (r.status.clone(), r.started_at));
+            WorkflowListDisplayRow {
+                name: name.clone(),
+                scope: scope.clone(),
+                steps,
+                schedule,
+                last_run,
+            }
+        })
+        .collect();
+
     let output = WorkflowListOutput {
         prefs,
         report: WorkflowListReport {
@@ -1023,6 +1187,7 @@ async fn list(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
                 .map(|(name, scope)| WorkflowListRow { name, scope })
                 .collect(),
         },
+        display_rows,
     };
     report::emit_collection(global_format, &output)
 }
@@ -5955,5 +6120,97 @@ steps:
             runs_test_now(),
         );
         assert!(out.contains("194s"), "got: {out}");
+    }
+
+    fn run_for_test(
+        id: &str,
+        workflow_name: &str,
+        status: rupu_orchestrator::RunStatus,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> LatestRun {
+        LatestRun {
+            workflow_name: workflow_name.to_string(),
+            status: format!("{status:?}").to_lowercase(),
+            started_at,
+            run_id: id.to_string(),
+        }
+    }
+
+    #[test]
+    fn latest_run_keeps_only_the_most_recent_per_workflow() {
+        use chrono::TimeZone;
+        let older = chrono::Utc.with_ymd_and_hms(2026, 7, 28, 9, 0, 0).unwrap();
+        let newer = chrono::Utc.with_ymd_and_hms(2026, 7, 30, 9, 0, 0).unwrap();
+        let runs = vec![
+            run_for_test("run_old", "nightly", rupu_orchestrator::RunStatus::Failed, older),
+            run_for_test("run_new", "nightly", rupu_orchestrator::RunStatus::Completed, newer),
+            run_for_test("run_other", "review", rupu_orchestrator::RunStatus::Completed, older),
+        ];
+        let map = latest_run_by_workflow(&runs);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("nightly").unwrap().run_id, "run_new");
+        assert_eq!(map.get("review").unwrap().run_id, "run_other");
+    }
+
+    #[test]
+    fn latest_run_on_an_empty_list_is_empty() {
+        assert!(latest_run_by_workflow(&[]).is_empty());
+    }
+
+    #[test]
+    fn workflow_list_table_shows_steps_last_run_and_schedule() {
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 7, 30, 17, 0, 0).unwrap();
+        let ran = chrono::Utc.with_ymd_and_hms(2026, 7, 30, 13, 0, 0).unwrap();
+        let rows = vec![
+            WorkflowListDisplayRow {
+                name: "nightly-health".to_string(),
+                scope: "project".to_string(),
+                steps: Some(7),
+                schedule: Some("0 7 * * *".to_string()),
+                last_run: Some(("completed".to_string(), ran)),
+            },
+            WorkflowListDisplayRow {
+                name: "action-demo".to_string(),
+                scope: "project".to_string(),
+                steps: Some(2),
+                schedule: None,
+                last_run: None,
+            },
+        ];
+        let out = render_workflow_list_table(
+            &rows,
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            now,
+        );
+
+        assert!(out.contains("STEPS"), "got: {out}");
+        assert!(out.contains("LAST RUN"), "got: {out}");
+        assert!(out.contains("SCHEDULE"), "got: {out}");
+        assert!(out.contains("✓ completed"), "got: {out}");
+        assert!(out.contains("4h ago"), "got: {out}");
+        assert!(out.contains("0 7 * * *"), "got: {out}");
+        assert!(out.contains("2 workflows"), "summary missing: {out}");
+    }
+
+    #[test]
+    fn workflow_list_renders_an_unparseable_workflow_as_a_row() {
+        // One malformed file must not blank the listing.
+        let now = chrono::Utc::now();
+        let rows = vec![WorkflowListDisplayRow {
+            name: "broken".to_string(),
+            scope: "project".to_string(),
+            steps: None,
+            schedule: None,
+            last_run: None,
+        }];
+        let out = render_workflow_list_table(
+            &rows,
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            now,
+        );
+        assert!(out.contains("broken"), "row was dropped: {out}");
     }
 }
