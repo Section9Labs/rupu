@@ -28,6 +28,14 @@ pub enum CellValue {
     /// wrapped identifier cannot be copy-pasted back — which would break
     /// the governing rule that every displayed id resolves.
     Id(String),
+    /// A human-assigned name that the CLI also accepts back as an
+    /// identifier (workflow names, agent names, cron names, model ids).
+    /// Rendered verbatim — unlike `Id`, it is never compacted — but gets
+    /// the same no-wrap constraint `Id` does: a name wrapped across two
+    /// lines is exactly as unresolvable as a wrapped id, and this cell
+    /// carries no glyph or hyphen scheme of its own for a reader to
+    /// recognize the break.
+    Name(String),
     /// A lifecycle status or classification value. Lifecycle states get a
     /// glyph; classification values get colour only.
     Status(String),
@@ -45,6 +53,7 @@ impl CellValue {
         match self {
             CellValue::Missing => true,
             CellValue::Text(s) => s.is_empty() || s == "—",
+            CellValue::Name(s) => s.is_empty(),
             _ => false,
         }
     }
@@ -111,6 +120,7 @@ impl<'a> EntityTable<'a> {
         match value {
             CellValue::Text(s) => Cell::new(s),
             CellValue::Id(id) => Cell::new(ids::compact_id(id)),
+            CellValue::Name(s) => Cell::new(s),
             CellValue::Missing => Cell::new("—"),
             CellValue::Timestamp(ts) => {
                 if self.opts.absolute {
@@ -172,7 +182,11 @@ impl<'a> EntityTable<'a> {
         // source index (src). Swapping these silently constrains the wrong
         // column once any column is suppressed.
         for (pos, &src) in keep.iter().enumerate() {
-            if self.rows.iter().any(|r| matches!(r[src], CellValue::Id(_))) {
+            if self
+                .rows
+                .iter()
+                .any(|r| matches!(r[src], CellValue::Id(_) | CellValue::Name(_)))
+            {
                 if let Some(col) = t.column_mut(pos) {
                     col.set_constraint(ColumnConstraint::ContentWidth);
                 }
@@ -244,8 +258,12 @@ impl<'a> EntityTable<'a> {
     /// the identifier no-wrap constraint under real squeeze pressure.
     /// Production callers never need to force a width — `render` always
     /// picks up the real terminal width via comfy-table's tty detection.
+    ///
+    /// `pub(crate)` (not private) so other `cmd::*` modules' own test
+    /// modules can force squeeze pressure on tables they build with this
+    /// type — e.g. `cmd::workflow`'s narrow-width NAME no-wrap test.
     #[cfg(test)]
-    fn render_at_width(&self, now: DateTime<Utc>, width: u16) -> String {
+    pub(crate) fn render_at_width(&self, now: DateTime<Utc>, width: u16) -> String {
         let keep = self.retained_columns();
         self.build_table(now, &keep, Some(width)).to_string()
     }
@@ -353,6 +371,8 @@ mod tests {
         assert!(!CellValue::Text("x".to_string()).is_empty());
         assert!(!CellValue::Id("run_1".to_string()).is_empty());
         assert!(!CellValue::Status("failed".to_string()).is_empty());
+        assert!(CellValue::Name(String::new()).is_empty());
+        assert!(!CellValue::Name("nightly".to_string()).is_empty());
     }
 
     #[test]
@@ -409,6 +429,24 @@ mod tests {
         assert!(
             out.contains("run_01KRJDKS…WFJS"),
             "compact id must survive a narrow, squeezed table intact: {out}"
+        );
+    }
+
+    #[test]
+    fn narrow_table_never_wraps_a_name() {
+        // Same governing rule as the compact-id case, for `CellValue::Name`:
+        // a workflow (or agent/cron/model) name is an identifier the CLI
+        // accepts back verbatim, so it must never be allowed to wrap
+        // across two lines under squeeze pressure either.
+        let p = prefs();
+        let t = EntityTable::new(&p, RenderOpts::default(), vec!["NAME", "NOTES"]).row(vec![
+            CellValue::Name("nightly-maintainability-security".to_string()),
+            CellValue::Text("x".repeat(120)),
+        ]);
+        let out = t.render_at_width(now(), 30);
+        assert!(
+            out.contains("nightly-maintainability-security"),
+            "name must survive a narrow, squeezed table intact on one line: {out}"
         );
     }
 

@@ -238,6 +238,58 @@ async fn session_list_supports_json_output() {
 }
 
 #[tokio::test]
+async fn session_list_survives_a_malformed_config_across_all_formats() {
+    // C-1 regression guard: `list()` reads the layered config purely to
+    // build `UiPrefs` for the human table, but (pre-fix) it propagated a
+    // parse failure with `?` unconditionally — before `emit_collection`
+    // even branches on format. A syntactically invalid config.toml took
+    // down `--format json` and `--format csv` too, even though neither
+    // format consumes `prefs` at all. All three invocations below must
+    // exit 0 and produce valid output despite the malformed config.
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    write_session(&home, "ses_cfgfail01", "idle", None, false);
+    // Deliberately invalid TOML: an unterminated key-value assignment.
+    std::fs::write(home.join("config.toml"), "default_model = \n[[[not toml").unwrap();
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
+        .current_dir(tmp.path())
+        .args(["session", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ses_cfgfail01"));
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
+        .current_dir(tmp.path())
+        .args(["--format", "json", "session", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"kind\": \"session_list\""))
+        .stdout(predicate::str::contains("\"session_id\": \"ses_cfgfail01\""));
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
+        .current_dir(tmp.path())
+        .args(["--format", "csv", "session", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ses_cfgfail01"));
+}
+
+#[tokio::test]
 async fn session_show_supports_json_output() {
     let _guard = ENV_LOCK.lock().await;
 

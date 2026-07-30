@@ -1189,16 +1189,24 @@ async fn list(
             updated_at: row.updated_at.clone(),
         })
         .collect();
-    let pwd = std::env::current_dir()?;
-    let project_root = paths::project_root_for(&pwd)?;
-    // UI prefs only — lock does not apply (I-7)
+    // UI prefs only — lock does not apply (I-7). Must never be fatal: this
+    // runs unconditionally before `emit_collection` branches on format, so a
+    // malformed config.toml would otherwise take down `--format json` and
+    // `--format csv` too, not just the human table that actually consumes
+    // `prefs` (C-1). `current_dir`/`project_root_for` failures degrade the
+    // same way — fall back to the global-only (or default) config rather
+    // than propagating.
+    let project_root = std::env::current_dir()
+        .ok()
+        .and_then(|pwd| paths::project_root_for(&pwd).ok().flatten());
     let cfg = rupu_config::layer_files(
         Some(&global.join("config.toml")),
         project_root
             .as_deref()
             .map(|root| root.join(".rupu/config.toml"))
             .as_deref(),
-    )?;
+    )
+    .unwrap_or_default();
     let prefs =
         UiPrefs::resolve(&cfg.ui, false, None, None, None).with_table_flags(absolute, all_columns);
     let output = SessionListOutput {

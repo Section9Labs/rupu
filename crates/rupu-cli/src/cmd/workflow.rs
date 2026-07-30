@@ -714,12 +714,18 @@ fn latest_run_by_workflow(runs: &[LatestRun]) -> std::collections::HashMap<&str,
     out
 }
 
-fn render_workflow_list_table(
+/// Build the `workflow list` table's `EntityTable`. Split out of
+/// `render_workflow_list_table` so tests can force a narrow render width
+/// (`EntityTable::render_at_width`) to exercise the NAME column's no-wrap
+/// constraint under real squeeze pressure — `render_workflow_list_table`
+/// itself only exposes the production `render` path, which picks up the
+/// real terminal width and cannot be forced narrow in a test.
+fn build_workflow_list_table<'a>(
     rows: &[WorkflowListDisplayRow],
-    prefs: &crate::cmd::ui::UiPrefs,
+    prefs: &'a crate::cmd::ui::UiPrefs,
     opts: crate::output::entity_table::RenderOpts,
     now: chrono::DateTime<chrono::Utc>,
-) -> String {
+) -> crate::output::entity_table::EntityTable<'a> {
     use crate::output::entity_table::{CellValue, EntityTable};
 
     let mut table = EntityTable::new(
@@ -731,7 +737,11 @@ fn render_workflow_list_table(
 
     for row in rows {
         table = table.row(vec![
-            CellValue::Text(row.name.clone()),
+            // A workflow name is an identifier the CLI accepts back
+            // (`workflow show`/`run`/`runs --workflow`) — `CellValue::Name`
+            // renders it verbatim but never lets it wrap, unlike a plain
+            // `CellValue::Text` (I-1).
+            CellValue::Name(row.name.clone()),
             CellValue::Status(row.scope.clone()),
             match row.steps {
                 Some(n) => CellValue::Text(n.to_string()),
@@ -766,7 +776,16 @@ fn render_workflow_list_table(
             },
         ]);
     }
-    table.render(now)
+    table
+}
+
+fn render_workflow_list_table(
+    rows: &[WorkflowListDisplayRow],
+    prefs: &crate::cmd::ui::UiPrefs,
+    opts: crate::output::entity_table::RenderOpts,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    build_workflow_list_table(rows, prefs, opts, now).render(now)
 }
 
 struct WorkflowRunsOutput {
@@ -964,7 +983,26 @@ fn render_workflow_runs_table(
             CellValue::Text(crate::output::fmt::format_token_compact(row.total_tokens)),
             match row.cost_usd {
                 Some(c) => CellValue::Text(format!("${c:.4}")),
-                None => CellValue::Missing,
+                // `None` means *not computable* (no usage rows, or no
+                // `[pricing]` configured) — not "this run has no cost
+                // dimension". `CellValue::Missing` would make COST
+                // suppression-eligible, so a user with no pricing
+                // configured would lose the column on every single
+                // invocation (I-2).
+                //
+                // Parent commit 7ea8904c rendered a plain em dash
+                // (`"—".to_string()`) for this same `None` case, via
+                // direct `comfy_table` construction that had no
+                // suppression logic to defeat. Reusing that literal
+                // string here would NOT fix the bug: `CellValue::Text`'s
+                // `is_empty()` treats the exact string "—" as empty too
+                // (see `entity_table.rs`'s `is_empty_distinguishes_missing_from_present`
+                // test), specifically so a hand-built cell that merely
+                // *looks like* Missing still suppresses like Missing. So
+                // an em dash here would still vanish under an
+                // all-`None` filter — the exact bug this fixes. `"n/a"`
+                // is a stable, non-empty, non-"—" label instead.
+                None => CellValue::Text("n/a".to_string()),
             },
             CellValue::Text(row.workflow.clone()),
         ]);
@@ -6106,6 +6144,39 @@ steps:
     }
 
     #[test]
+    fn workflow_runs_cost_column_survives_when_every_row_is_not_computable() {
+        // I-2 regression guard, same class as the DURATION bug above:
+        // `cost_usd: None` means *not computable* (no usage rows, or no
+        // `[pricing]` configured) — not "this run has no cost dimension".
+        // Mapping it to `CellValue::Missing` makes COST eligible for
+        // empty-column suppression, so a user with no `[pricing]`
+        // configured at all would lose the column on every invocation of
+        // `workflow runs`, not just a filtered subset.
+        let mut a = runs_row_for_test(
+            "run_a1b2c3d4e5f6g7h8i9j0k1l2",
+            "failed",
+            "2026-07-30T16:00:00+00:00",
+            None,
+        );
+        a.cost_usd = None;
+        let mut b = runs_row_for_test(
+            "run_z9y8x7w6v5u4t3s2r1q0p9o8",
+            "failed",
+            "2026-07-30T15:00:00+00:00",
+            None,
+        );
+        b.cost_usd = None;
+        let out = render_workflow_runs_table(
+            &[a, b],
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            runs_test_now(),
+        );
+        assert!(out.contains("COST"), "column was suppressed: {out}");
+        assert!(out.contains("n/a"), "got: {out}");
+    }
+
+    #[test]
     fn workflow_runs_finished_duration_is_unchanged() {
         let rows = vec![runs_row_for_test(
             "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
@@ -6212,5 +6283,39 @@ steps:
             now,
         );
         assert!(out.contains("broken"), "row was dropped: {out}");
+    }
+
+    #[test]
+    fn workflow_list_name_never_wraps_under_narrow_squeeze() {
+        // I-1 regression guard: a workflow name is an identifier the CLI
+        // accepts back (`workflow show`/`run`/`runs --workflow`). Going
+        // from 2 columns to 5 (this task) squeezed NAME below the
+        // longest real name at a normal 80-column terminal, splitting
+        // e.g. "nightly-maintainability-security" across two lines —
+        // and a wrapped name does not resolve. Force real squeeze
+        // pressure the same way `entity_table`'s own no-wrap tests do,
+        // via the shared `render_at_width` test hook, since production
+        // `render_workflow_list_table` only exposes real-terminal-width
+        // rendering.
+        let now = chrono::Utc::now();
+        let longest = "nightly-maintainability-security";
+        let rows = vec![WorkflowListDisplayRow {
+            name: longest.to_string(),
+            scope: "project".to_string(),
+            steps: Some(3),
+            schedule: Some("0 7 * * *".to_string()),
+            last_run: Some(("completed".to_string(), now - chrono::Duration::hours(9))),
+        }];
+        let out = build_workflow_list_table(
+            &rows,
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            now,
+        )
+        .render_at_width(now, 80);
+        assert!(
+            out.contains(longest),
+            "longest workflow name must render intact on one line: {out}"
+        );
     }
 }
