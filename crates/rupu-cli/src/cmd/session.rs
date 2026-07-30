@@ -760,7 +760,7 @@ fn render_session_show_footer_line(
                 .active_run_id
                 .as_deref()
                 .or(session.last_run_id.as_deref())
-                .map(compact_session_run_id)
+                .map(crate::output::ids::compact_id)
                 .unwrap_or_else(|| "none".into())
         ),
         width,
@@ -795,7 +795,7 @@ fn render_session_show_run_rows(
         let prompt = truncate_single_line(&run.prompt, 96);
         let detail = format!(
             "{}  ·  {}  ·  {}",
-            compact_session_run_id(&run.run_id),
+            crate::output::ids::compact_id(&run.run_id),
             status,
             prompt
         );
@@ -1732,7 +1732,7 @@ fn attach_blocking(
             printer.sideband_event(
                 crate::output::palette::Status::Working,
                 "waiting for session output",
-                Some(&compact_session_run_id(run_id)),
+                Some(&crate::output::ids::compact_id(run_id)),
             );
         }
     }
@@ -1788,7 +1788,7 @@ fn attach_blocking(
                         } else {
                             "following run"
                         },
-                        Some(&compact_session_run_id(run_id)),
+                        Some(&crate::output::ids::compact_id(run_id)),
                     );
                 }
             }
@@ -2930,7 +2930,7 @@ fn attach_blocking_interactive(
                 .as_deref()
                 .or(session.last_run_id.as_deref())
             {
-                println!("run: {}", compact_session_run_id(run_id));
+                println!("run: {}", crate::output::ids::compact_id(run_id));
             }
         }
         AttachExit::Quit => {
@@ -3174,7 +3174,10 @@ fn execute_session_live_command(
                 let run_id = enqueue_compact_request(global, &session.session_id)?;
                 state.push_line(
                     crate::output::palette::Status::Working,
-                    format!("compacting context  ·  {}", compact_session_run_id(&run_id)),
+                    format!(
+                        "compacting context  ·  {}",
+                        crate::output::ids::compact_id(&run_id)
+                    ),
                 );
             }
         }
@@ -3909,7 +3912,7 @@ fn render_session_entry_rows(
                         "run started",
                         &format!(
                             "{}  ·  workspace {}  ·  mode {}  ·  {}",
-                            compact_session_run_id(run_id),
+                            crate::output::ids::compact_id(run_id),
                             workspace_id,
                             format!("{mode:?}").to_lowercase(),
                             started_at.format("%Y-%m-%d %H:%M:%S UTC")
@@ -4279,7 +4282,7 @@ fn transcript_event_lines(
                     "run started",
                     &format!(
                         "{}  ·  workspace {}  ·  mode {}  ·  {}",
-                        compact_session_run_id(run_id),
+                        crate::output::ids::compact_id(run_id),
                         workspace_id,
                         format!("{mode:?}").to_lowercase(),
                         started_at.format("%Y-%m-%d %H:%M:%S UTC")
@@ -4861,7 +4864,7 @@ fn append_session_history_lines(state: &mut SessionInteractiveState, session: &S
             crate::output::palette::Status::Active,
             format!(
                 "history  ·  {}  ·  {}",
-                compact_session_run_id(&run.run_id),
+                crate::output::ids::compact_id(&run.run_id),
                 truncate_single_line(&run.prompt, 72)
             ),
         );
@@ -4895,7 +4898,7 @@ fn append_session_runs_lines(state: &mut SessionInteractiveState, session: &Sess
             crate::output::palette::Status::Active,
             format!(
                 "run  ·  {status}  ·  {}",
-                compact_session_run_id(&run.run_id)
+                crate::output::ids::compact_id(&run.run_id)
             ),
         );
     }
@@ -5038,7 +5041,7 @@ fn handle_attach_keypress(
                         session
                             .active_run_id
                             .as_deref()
-                            .map(compact_session_run_id)
+                            .map(crate::output::ids::compact_id)
                             .as_deref()
                             .unwrap_or("turn still running"),
                     ),
@@ -5168,7 +5171,7 @@ fn handle_session_input(
     let run_id = launch_turn_detached(global, &session.session_id, prompt.clone())?;
     let detail = format!(
         "{}  ·  {}",
-        compact_session_run_id(&run_id),
+        crate::output::ids::compact_id(&run_id),
         truncate_single_line(prompt.as_str(), 72)
     );
     printer.sideband_event(
@@ -5724,7 +5727,7 @@ fn session_status_detail(session: &SessionRecord) -> String {
         .as_deref()
         .or(session.last_run_id.as_deref())
     {
-        parts.push(format!("run {}", compact_session_run_id(run_id)));
+        parts.push(format!("run {}", crate::output::ids::compact_id(run_id)));
     }
     parts.join("  ·  ")
 }
@@ -5892,23 +5895,6 @@ fn session_pending_run_count(session: &SessionRecord) -> usize {
                 && session.active_run_id.as_deref() != Some(run.run_id.as_str())
         })
         .count()
-}
-
-fn compact_session_run_id(run_id: &str) -> String {
-    if run_id.chars().count() <= 18 {
-        run_id.to_string()
-    } else {
-        let head = run_id.chars().take(12).collect::<String>();
-        let tail = run_id
-            .chars()
-            .rev()
-            .take(4)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<String>();
-        format!("{head}…{tail}")
-    }
 }
 
 struct RawModeGuard {
@@ -7253,17 +7239,91 @@ fn write_session(
     Ok(())
 }
 
-fn read_session(global: &Path, session_id: &str) -> anyhow::Result<(SessionRecord, SessionScope)> {
+/// Load a session by identifier.
+///
+/// Accepts a full id, the compact `head…tail` form printed by tables,
+/// a bare suffix, or an unambiguous prefix. Ambiguity is always an
+/// error listing every candidate — never a silent pick, and never a
+/// preference for `Active` over `Archived`.
+fn read_session(global: &Path, fragment: &str) -> anyhow::Result<(SessionRecord, SessionScope)> {
+    // Fast path: an exact id, no directory scan.
     for scope in [SessionScope::Active, SessionScope::Archived] {
-        let path = session_record_path(global, scope, session_id);
-        if !path.is_file() {
+        let path = session_record_path(global, scope, fragment);
+        if path.is_file() {
+            let bytes = fs::read(&path)
+                .with_context(|| format!("read session record {}", path.display()))?;
+            return Ok((serde_json::from_slice(&bytes)?, scope));
+        }
+    }
+
+    let (id, scope) = resolve_session_fragment(global, fragment)?;
+    let path = session_record_path(global, scope, &id);
+    let bytes =
+        fs::read(&path).with_context(|| format!("read session record {}", path.display()))?;
+    Ok((serde_json::from_slice(&bytes)?, scope))
+}
+
+/// Session directory names in one scope. Reads directory entries only —
+/// no `session.json` parsing — so resolution stays cheap as history
+/// grows.
+fn session_ids_in_scope(global: &Path, scope: SessionScope) -> anyhow::Result<Vec<String>> {
+    let dir = match scope {
+        SessionScope::Active => paths::sessions_dir(global),
+        SessionScope::Archived => paths::archived_sessions_dir(global),
+    };
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        if !entry.path().join("session.json").is_file() {
             continue;
         }
-        let bytes =
-            fs::read(&path).with_context(|| format!("read session record {}", path.display()))?;
-        return Ok((serde_json::from_slice(&bytes)?, scope));
+        if let Some(name) = entry.file_name().to_str() {
+            out.push(name.to_string());
+        }
     }
-    anyhow::bail!("unknown session: {session_id}")
+    Ok(out)
+}
+
+fn resolve_session_fragment(
+    global: &Path,
+    fragment: &str,
+) -> anyhow::Result<(String, SessionScope)> {
+    use crate::output::ids::{resolve, Resolution};
+    use std::collections::HashMap;
+
+    let mut candidates = Vec::new();
+    let mut scope_of: HashMap<String, SessionScope> = HashMap::new();
+    for scope in [SessionScope::Active, SessionScope::Archived] {
+        for id in session_ids_in_scope(global, scope)? {
+            scope_of.insert(id.clone(), scope);
+            candidates.push(id);
+        }
+    }
+
+    match resolve(&candidates, fragment) {
+        Resolution::Unique(id) => {
+            let scope = scope_of
+                .get(&id)
+                .copied()
+                .expect("resolved id came from the candidate set");
+            Ok((id, scope))
+        }
+        Resolution::NotFound => anyhow::bail!("unknown session: {fragment}"),
+        Resolution::Ambiguous(matches) => {
+            let mut msg = format!(
+                "ambiguous session id — {} sessions match `{fragment}`",
+                matches.len()
+            );
+            for id in &matches {
+                let scope = scope_of.get(id).map(|s| s.as_str()).unwrap_or("unknown");
+                msg.push_str(&format!("\n  {id}  {scope}"));
+            }
+            anyhow::bail!(msg)
+        }
+    }
 }
 
 fn load_sessions_in_scope(
@@ -7607,15 +7667,6 @@ mod tests {
         assert!(detail.contains("repo github:Section9Labs/rupu"));
         assert!(detail.contains("target github:Section9Labs/rupu/issues/42"));
         assert!(detail.contains("issue github:Section9Labs/rupu/issues/42"));
-    }
-
-    #[test]
-    fn compact_session_run_id_shortens_long_values() {
-        assert_eq!(
-            compact_session_run_id("run_01KRJDKSBE7X4J49094149WFJS"),
-            "run_01KRJDKS…WFJS"
-        );
-        assert_eq!(compact_session_run_id("run_short"), "run_short");
     }
 
     #[test]
@@ -8959,5 +9010,91 @@ mod tests {
                 cmd.name
             );
         }
+    }
+
+    fn write_test_session(global: &std::path::Path, scope: SessionScope, id: &str) {
+        let mut record = test_session_record();
+        record.session_id = id.to_string();
+        let dir = session_dir(global, scope, id);
+        std::fs::create_dir_all(&dir).expect("create session dir");
+        std::fs::write(
+            dir.join("session.json"),
+            serde_json::to_vec(&record).expect("serialize"),
+        )
+        .expect("write session.json");
+    }
+
+    #[test]
+    fn read_session_resolves_a_compact_fragment() {
+        let tmp = assert_fs::TempDir::new().expect("tempdir");
+        let global = tmp.path();
+        let id = "ses_01KWA7HTYEDX0ACG93ZW26FG3M";
+        write_test_session(global, SessionScope::Active, id);
+
+        let compact = crate::output::ids::compact_id(id);
+        let (record, scope) = read_session(global, &compact).expect("resolves");
+        assert_eq!(record.session_id, id);
+        assert_eq!(scope, SessionScope::Active);
+    }
+
+    #[test]
+    fn read_session_resolves_a_bare_suffix() {
+        let tmp = assert_fs::TempDir::new().expect("tempdir");
+        let global = tmp.path();
+        let id = "ses_01KWA7HTYEDX0ACG93ZW26FG3M";
+        write_test_session(global, SessionScope::Active, id);
+
+        let (record, _) = read_session(global, "26FG3M").expect("resolves");
+        assert_eq!(record.session_id, id);
+    }
+
+    #[test]
+    fn read_session_finds_archived_sessions() {
+        let tmp = assert_fs::TempDir::new().expect("tempdir");
+        let global = tmp.path();
+        let id = "ses_01KWA7HTYEDX0ACG93ZW26FG3M";
+        write_test_session(global, SessionScope::Archived, id);
+
+        let (record, scope) = read_session(global, "26FG3M").expect("resolves");
+        assert_eq!(record.session_id, id);
+        assert_eq!(scope, SessionScope::Archived);
+    }
+
+    #[test]
+    fn read_session_errors_on_ambiguous_fragment_listing_scopes() {
+        // A fragment matching one record per scope must not silently
+        // prefer Active.
+        let tmp = assert_fs::TempDir::new().expect("tempdir");
+        let global = tmp.path();
+        let active = "ses_01KWA7HTYEDX0ACG93ZW26FG3M";
+        let archived = "ses_01KWA8RA3NE9J88X6DHSH76AC8";
+        write_test_session(global, SessionScope::Active, active);
+        write_test_session(global, SessionScope::Archived, archived);
+
+        let err = read_session(global, "ses_01KWA").expect_err("ambiguous");
+        let msg = err.to_string();
+        assert!(msg.contains("ambiguous"), "got: {msg}");
+        assert!(msg.contains(active), "got: {msg}");
+        assert!(msg.contains(archived), "got: {msg}");
+        assert!(msg.contains("active"), "got: {msg}");
+        assert!(msg.contains("archived"), "got: {msg}");
+    }
+
+    #[test]
+    fn read_session_still_accepts_a_full_id() {
+        let tmp = assert_fs::TempDir::new().expect("tempdir");
+        let global = tmp.path();
+        let id = "ses_01KWA7HTYEDX0ACG93ZW26FG3M";
+        write_test_session(global, SessionScope::Active, id);
+
+        let (record, _) = read_session(global, id).expect("resolves");
+        assert_eq!(record.session_id, id);
+    }
+
+    #[test]
+    fn read_session_reports_unknown_fragment() {
+        let tmp = assert_fs::TempDir::new().expect("tempdir");
+        let err = read_session(tmp.path(), "zzzzzz").expect_err("unknown");
+        assert!(err.to_string().contains("unknown session"));
     }
 }
