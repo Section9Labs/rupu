@@ -21,8 +21,7 @@ async fn spawn_server_with_remote(
     dir: &std::path::Path,
     mock_base_url: &str,
 ) -> (std::net::SocketAddr, String) {
-    let state =
-        rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
     let host = state
         .hosts
         .add_host("mock-remote", mock_base_url, None)
@@ -39,8 +38,7 @@ async fn spawn_server_with_remote(
 
 /// Spin up a read-only local-only server.
 async fn spawn_server(dir: &std::path::Path) -> std::net::SocketAddr {
-    let state =
-        rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
     let app = rupu_cp::server::router(state, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -153,10 +151,16 @@ async fn agent_list_fan_out_merges_local_and_remote() {
         );
     }
 
-    let local_row = body.iter().find(|r| r["run_id"] == "local_agent_r1").unwrap();
+    let local_row = body
+        .iter()
+        .find(|r| r["run_id"] == "local_agent_r1")
+        .unwrap();
     assert_eq!(local_row["host_id"], "local");
 
-    let remote_row_found = body.iter().find(|r| r["run_id"] == "remote_agent_r1").unwrap();
+    let remote_row_found = body
+        .iter()
+        .find(|r| r["run_id"] == "remote_agent_r1")
+        .unwrap();
     assert_eq!(remote_row_found["host_id"], host_id);
 }
 
@@ -236,7 +240,10 @@ async fn agent_list_host_local_returns_only_local_tagged() {
         .iter()
         .find(|r| r["run_id"] == "local_scoped_agent_r1")
         .unwrap();
-    assert_eq!(row["host_id"], "local", "local row must be tagged host_id=local");
+    assert_eq!(
+        row["host_id"], "local",
+        "local row must be tagged host_id=local"
+    );
 }
 
 /// Single local server (no remotes): fan-out tags the row `host_id=local`.
@@ -320,7 +327,10 @@ async fn autoflow_cycles_fan_out_merges_local_and_remote() {
         .unwrap();
     assert_eq!(local_row["host_id"], "local");
 
-    let remote_row_found = body.iter().find(|r| r["cycle_id"] == "remote_cycle_01").unwrap();
+    let remote_row_found = body
+        .iter()
+        .find(|r| r["cycle_id"] == "remote_cycle_01")
+        .unwrap();
     assert_eq!(remote_row_found["host_id"], host_id);
 }
 
@@ -405,7 +415,10 @@ async fn autoflow_events_fan_out_merges_local_and_remote() {
 
     // Local event should appear (tagged local)
     let has_local = body.iter().any(|r| r["host_id"] == "local");
-    assert!(has_local, "local events should be tagged host_id=local; body: {body:?}");
+    assert!(
+        has_local,
+        "local events should be tagged host_id=local; body: {body:?}"
+    );
 
     // Remote event should appear
     let remote_ev = body.iter().find(|r| r["event_id"] == "remote_event_01");

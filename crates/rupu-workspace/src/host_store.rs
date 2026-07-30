@@ -441,7 +441,9 @@ mod tests {
         Host {
             id: id.into(),
             name: format!("host {id}"),
-            transport: HostTransport::HttpCp { base_url: "https://h:8787".into() },
+            transport: HostTransport::HttpCp {
+                base_url: "https://h:8787".into(),
+            },
             token_hash: None,
             created_at: "2026-06-28T00:00:00Z".into(),
             last_seen_at: None,
@@ -451,7 +453,9 @@ mod tests {
     #[test]
     fn save_load_list_delete_roundtrip() {
         let dir = tempdir().unwrap();
-        let store = HostStore { root: dir.path().join("hosts") };
+        let store = HostStore {
+            root: dir.path().join("hosts"),
+        };
         assert!(store.list().unwrap().is_empty());
         store.save(&http_host("host_a")).unwrap();
         store.save(&http_host("host_b")).unwrap();
@@ -478,7 +482,9 @@ mod tests {
     #[test]
     fn enroll_node_returns_token_and_saves_host() {
         let dir = tempdir().unwrap();
-        let store = HostStore { root: dir.path().join("hosts") };
+        let store = HostStore {
+            root: dir.path().join("hosts"),
+        };
 
         let (host, token) = enroll_node(&store, "my-node").unwrap();
 
@@ -503,7 +509,9 @@ mod tests {
     #[test]
     fn toml_does_not_contain_plaintext_token() {
         let dir = tempdir().unwrap();
-        let store = HostStore { root: dir.path().join("hosts") };
+        let store = HostStore {
+            root: dir.path().join("hosts"),
+        };
 
         let (host, token) = enroll_node(&store, "secret-node").unwrap();
 
@@ -521,12 +529,20 @@ mod tests {
     #[test]
     fn verify_node_token_correct_and_wrong() {
         let dir = tempdir().unwrap();
-        let store = HostStore { root: dir.path().join("hosts") };
+        let store = HostStore {
+            root: dir.path().join("hosts"),
+        };
 
         let (host, token) = enroll_node(&store, "node-a").unwrap();
 
-        assert!(verify_node_token(&host, &token), "correct token must verify");
-        assert!(!verify_node_token(&host, "wrong-token"), "wrong token must not verify");
+        assert!(
+            verify_node_token(&host, &token),
+            "correct token must verify"
+        );
+        assert!(
+            !verify_node_token(&host, "wrong-token"),
+            "wrong token must not verify"
+        );
         assert!(!verify_node_token(&host, ""), "empty token must not verify");
     }
 
@@ -548,7 +564,9 @@ mod tests {
     #[test]
     fn enroll_node_is_unique() {
         let dir = tempdir().unwrap();
-        let store = HostStore { root: dir.path().join("hosts") };
+        let store = HostStore {
+            root: dir.path().join("hosts"),
+        };
 
         let (h1, t1) = enroll_node(&store, "n1").unwrap();
         let (h2, t2) = enroll_node(&store, "n2").unwrap();
@@ -582,7 +600,9 @@ mod tests {
     #[test]
     fn add_ssh_host_persists_no_token() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = HostStore { root: tmp.path().to_path_buf() };
+        let store = HostStore {
+            root: tmp.path().to_path_buf(),
+        };
         let h = add_ssh_host(&store, "edge", "deploy@edge.example", None, None).unwrap();
         assert!(h.id.starts_with("host_"));
         assert!(matches!(h.transport, HostTransport::Ssh { .. }));
@@ -607,7 +627,10 @@ mod tests {
         };
         let toml = toml::to_string(&host).unwrap();
         assert!(toml.contains(r#"kind = "bucket""#), "toml = {toml}");
-        assert!(toml.contains(r#"url = "s3://my-bucket/rupu""#), "toml = {toml}");
+        assert!(
+            toml.contains(r#"url = "s3://my-bucket/rupu""#),
+            "toml = {toml}"
+        );
         let back: Host = toml::from_str(&toml).unwrap();
         assert_eq!(back, host);
 
@@ -625,7 +648,10 @@ mod tests {
         };
         let toml2 = toml::to_string(&host2).unwrap();
         assert!(toml2.contains(r#"kind = "bucket""#), "toml2 = {toml2}");
-        assert!(!toml2.contains("prefix"), "prefix should be omitted: {toml2}");
+        assert!(
+            !toml2.contains("prefix"),
+            "prefix should be omitted: {toml2}"
+        );
         let back2: Host = toml::from_str(&toml2).unwrap();
         assert_eq!(back2, host2);
     }
@@ -633,7 +659,9 @@ mod tests {
     #[test]
     fn add_bucket_host_persists_no_token() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = HostStore { root: tmp.path().to_path_buf() };
+        let store = HostStore {
+            root: tmp.path().to_path_buf(),
+        };
         let h = add_bucket_host(&store, "my-bucket", "s3://my-bucket/rupu", None).unwrap();
         assert!(h.id.starts_with("host_"), "id = {}", h.id);
         assert!(matches!(h.transport, HostTransport::Bucket { .. }));

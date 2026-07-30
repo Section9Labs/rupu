@@ -8,10 +8,15 @@
 // Composition (final, per the composition-decision note in the P4 brief —
 // supersedes spec §5.1's split-status layout): header (range + freshness
 // strip) → KeyPointTiles → two graphs (outcomes trend + throughput) →
-// CycleSummaryLine. AttentionRow and ActiveStatusTiles are DROPPED: once
+// CycleSummaryLine → FleetStrip. AttentionRow and ActiveStatusTiles are DROPPED: once
 // KeyPointTiles grew an awaiting/paused/failed/findings/active-now row, those
 // two components duplicated it outright. Three components showing the same
 // counts is the opposite of "key points, not lists."
+//
+// FleetStrip (the trailing band) is inventory context, not a second subject:
+// it renders dim, takes weight only on an actual fault (an unhealthy
+// provider), and shows an em-dash — never a zero — for any count the fleet
+// does not report.
 //
 // Each block renders from whatever has arrived: the freshness strip paints
 // the instant the host list is known (`hosts`, seeded `loading`), and the
@@ -28,6 +33,7 @@ import { KeyPointTiles } from '../components/dashboard/KeyPointTiles';
 import { TerminalTrend } from '../components/dashboard/TerminalTrend';
 import { ThroughputChart } from '../components/dashboard/ThroughputChart';
 import { CycleSummaryLine } from '../components/dashboard/CycleSummaryLine';
+import { FleetStrip } from '../components/dashboard/FleetStrip';
 import { Spinner } from '../components/ui/Spinner';
 import type { DashboardRange } from '../lib/api';
 
@@ -124,6 +130,8 @@ export default function Dashboard() {
           </div>
 
           <CycleSummaryLine cycles={data.cycles} cyclesPartial={data.cycles_partial} />
+
+          <FleetStrip fleet={data.fleet} fleetPartial={data.fleet_partial} />
         </>
       ) : error ? (
         <div className="p-6 text-sm text-status-failed">

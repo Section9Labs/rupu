@@ -3566,12 +3566,10 @@ mod tests {
         let client = AnthropicClient::new("k".into());
         // Historical default, unchanged for non-factory constructors.
         assert_eq!(client.max_rate_limit_retries(), 1);
-        let tuned = AnthropicClient::new("k".into()).with_tuning(
-            &crate::tuning::ProviderTuning {
-                max_retries: 4,
-                ..crate::tuning::ProviderTuning::for_provider("anthropic")
-            },
-        );
+        let tuned = AnthropicClient::new("k".into()).with_tuning(&crate::tuning::ProviderTuning {
+            max_retries: 4,
+            ..crate::tuning::ProviderTuning::for_provider("anthropic")
+        });
         assert_eq!(tuned.max_rate_limit_retries(), 4);
     }
 

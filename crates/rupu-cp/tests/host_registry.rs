@@ -7,16 +7,12 @@
 //! - list_hosts puts "local" first.
 
 use rupu_cp::host::{
-    connector::{
-        EventByteStream, HostConnector, HostConnectorError, HostInfo, RunListQuery,
-    },
+    connector::{EventByteStream, HostConnector, HostConnectorError, HostInfo, RunListQuery},
     registry::HostRegistry,
 };
 use rupu_cp::{
-    agent_launcher::AgentLaunchRequest,
-    launcher::LaunchRequest,
-    session_sender::SendMessageRequest,
-    session_starter::SessionStartRequest,
+    agent_launcher::AgentLaunchRequest, launcher::LaunchRequest,
+    session_sender::SendMessageRequest, session_starter::SessionStartRequest,
 };
 use rupu_workspace::HostStore;
 use std::sync::Arc;
@@ -45,10 +41,7 @@ impl HostConnector for StubLocal {
     async fn start_session(&self, _: SessionStartRequest) -> Result<String, HostConnectorError> {
         unimplemented!()
     }
-    async fn send_session_turn(
-        &self,
-        _: SendMessageRequest,
-    ) -> Result<String, HostConnectorError> {
+    async fn send_session_turn(&self, _: SendMessageRequest) -> Result<String, HostConnectorError> {
         unimplemented!()
     }
     async fn list_runs(
@@ -75,10 +68,7 @@ impl HostConnector for StubLocal {
     async fn get_transcript(&self, _: &str) -> Result<serde_json::Value, HostConnectorError> {
         unimplemented!()
     }
-    async fn proxy_get_json(
-        &self,
-        _: &str,
-    ) -> Result<serde_json::Value, HostConnectorError> {
+    async fn proxy_get_json(&self, _: &str) -> Result<serde_json::Value, HostConnectorError> {
         Err(HostConnectorError::Invalid(
             "local host is served in-process".into(),
         ))
@@ -88,7 +78,9 @@ impl HostConnector for StubLocal {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn make_registry(tmp: &tempfile::TempDir) -> (HostRegistry, Arc<StubLocal>) {
-    let store = HostStore { root: tmp.path().join("hosts") };
+    let store = HostStore {
+        root: tmp.path().join("hosts"),
+    };
     let local: Arc<StubLocal> = Arc::new(StubLocal);
     let reg = HostRegistry::new(store, local.clone() as Arc<dyn HostConnector>);
     (reg, local)
@@ -150,7 +142,10 @@ async fn add_host_then_resolve_returns_http_connector_for_right_base_url() {
         .add_host("test-remote", &server.base_url(), None)
         .expect("add_host should succeed");
 
-    assert!(host.id.starts_with("host_"), "id should have 'host_' prefix");
+    assert!(
+        host.id.starts_with("host_"),
+        "id should have 'host_' prefix"
+    );
 
     let conn = reg
         .resolve(&host.id)
@@ -188,16 +183,24 @@ fn list_hosts_local_is_first() {
 
     // Without any persisted hosts, list should just be [local].
     let hosts = reg.list_hosts();
-    assert!(!hosts.is_empty(), "list_hosts should return at least one entry");
+    assert!(
+        !hosts.is_empty(),
+        "list_hosts should return at least one entry"
+    );
     assert_eq!(hosts[0].id, "local", "first entry must always be 'local'");
 
     // Add two remote hosts and verify local is still first.
-    reg.add_host("alpha", "https://alpha.example.com", None).unwrap();
-    reg.add_host("beta", "https://beta.example.com", None).unwrap();
+    reg.add_host("alpha", "https://alpha.example.com", None)
+        .unwrap();
+    reg.add_host("beta", "https://beta.example.com", None)
+        .unwrap();
 
     let hosts = reg.list_hosts();
     assert!(hosts.len() >= 3, "should have local + 2 remotes");
-    assert_eq!(hosts[0].id, "local", "local must remain first after add_host");
+    assert_eq!(
+        hosts[0].id, "local",
+        "local must remain first after add_host"
+    );
 }
 
 /// `resolve` after `remove_host` returns `NotFound`.
@@ -214,7 +217,8 @@ fn resolve_after_remove_returns_not_found() {
     assert!(reg.resolve(&host.id).is_ok());
 
     // After removal, should be gone.
-    reg.remove_host(&host.id).expect("remove_host should succeed");
+    reg.remove_host(&host.id)
+        .expect("remove_host should succeed");
 
     let result = reg.resolve(&host.id);
     assert!(
@@ -239,7 +243,9 @@ async fn tunnel_host_resolves_reachable_false_when_no_node_connected() {
     let tmp = tempfile::tempdir().unwrap();
 
     // Enroll a tunnel node — this writes a Tunnel Host record to HostStore.
-    let host_store = HostStore { root: tmp.path().join("hosts") };
+    let host_store = HostStore {
+        root: tmp.path().join("hosts"),
+    };
     let (host, _token) = enroll_node(&host_store, "t7-test-node").unwrap();
 
     // Build the shared deps required by TunnelHostConnector.
@@ -283,7 +289,9 @@ fn tunnel_host_without_tunnel_deps_returns_invalid() {
 
     let tmp = tempfile::tempdir().unwrap();
 
-    let host_store = HostStore { root: tmp.path().join("hosts") };
+    let host_store = HostStore {
+        root: tmp.path().join("hosts"),
+    };
     let (host, _token) = enroll_node(&host_store, "t7-unwired-node").unwrap();
 
     // Deliberately skip with_tunnel_deps.
@@ -312,7 +320,9 @@ async fn ssh_host_resolves_reachable_false_when_ssh_unreachable() {
     let tmp = tempfile::tempdir().unwrap();
 
     // Persist an SSH host record pointing at a host that will never respond.
-    let host_store = HostStore { root: tmp.path().join("hosts") };
+    let host_store = HostStore {
+        root: tmp.path().join("hosts"),
+    };
     let host = add_ssh_host(
         &host_store,
         "test-ssh-node",
@@ -375,7 +385,9 @@ async fn bucket_host_resolves_ok_with_deps() {
     std::fs::create_dir_all(&bucket_dir).unwrap();
     let bucket_url = format!("file://{}", bucket_dir.display());
 
-    let host_store = HostStore { root: tmp.path().join("hosts") };
+    let host_store = HostStore {
+        root: tmp.path().join("hosts"),
+    };
     let host = add_bucket_host(&host_store, "test-bucket-node", &bucket_url, None).unwrap();
 
     // Build the shared deps required by BucketHostConnector (same bundle as Tunnel/SSH).
@@ -421,10 +433,16 @@ fn bucket_host_without_tunnel_deps_returns_invalid() {
 
     let tmp = tempfile::tempdir().unwrap();
 
-    let host_store = HostStore { root: tmp.path().join("hosts") };
-    let host =
-        add_bucket_host(&host_store, "test-bucket-unwired", "file:///tmp/rupu-test-unwired", None)
-            .unwrap();
+    let host_store = HostStore {
+        root: tmp.path().join("hosts"),
+    };
+    let host = add_bucket_host(
+        &host_store,
+        "test-bucket-unwired",
+        "file:///tmp/rupu-test-unwired",
+        None,
+    )
+    .unwrap();
 
     // Deliberately skip with_tunnel_deps.
     let reg = HostRegistry::new(host_store, Arc::new(StubLocal) as Arc<dyn HostConnector>);
@@ -447,7 +465,9 @@ fn ssh_host_without_tunnel_deps_returns_invalid() {
 
     let tmp = tempfile::tempdir().unwrap();
 
-    let host_store = HostStore { root: tmp.path().join("hosts") };
+    let host_store = HostStore {
+        root: tmp.path().join("hosts"),
+    };
     let host = add_ssh_host(
         &host_store,
         "test-ssh-unwired",

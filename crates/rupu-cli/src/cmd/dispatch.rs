@@ -378,7 +378,11 @@ impl AgentDispatcher for CliAgentDispatcher {
 /// Best-effort: a write failure is logged and swallowed, same as every
 /// other observability side-channel in this arc — never allowed to
 /// fail the dispatch it's annotating.
-fn write_delegation_narrowing_notice(transcript_path: &Path, child_agent: &str, parent_run_id: &str) {
+fn write_delegation_narrowing_notice(
+    transcript_path: &Path,
+    child_agent: &str,
+    parent_run_id: &str,
+) {
     let call_id = format!("delegation_narrowing_notice_{child_agent}");
     let note = format!(
         "KNOWN LIMITATION: this child agent (`{child_agent}`, dispatched from parent run \

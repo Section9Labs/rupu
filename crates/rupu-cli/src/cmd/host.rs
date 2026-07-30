@@ -8,7 +8,10 @@
 
 use anyhow::Context;
 use clap::Subcommand;
-use rupu_workspace::{add_bucket_host, add_ssh_host, delete_host_token, set_host_token, Host, HostStore, HostTransport};
+use rupu_workspace::{
+    add_bucket_host, add_ssh_host, delete_host_token, set_host_token, Host, HostStore,
+    HostTransport,
+};
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -127,8 +130,8 @@ pub(crate) fn add_ssh_host_cli(
     identity_file: Option<PathBuf>,
 ) -> anyhow::Result<String> {
     let store = HostStore { root: store_root };
-    let record = add_ssh_host(&store, &name, &host, port, identity_file)
-        .context("save ssh host record")?;
+    let record =
+        add_ssh_host(&store, &name, &host, port, identity_file).context("save ssh host record")?;
     Ok(record.id)
 }
 
@@ -143,8 +146,7 @@ pub(crate) fn add_bucket_host_cli(
     prefix: Option<String>,
 ) -> anyhow::Result<String> {
     let store = HostStore { root: store_root };
-    let record = add_bucket_host(&store, &name, &url, prefix)
-        .context("save bucket host record")?;
+    let record = add_bucket_host(&store, &name, &url, prefix).context("save bucket host record")?;
     Ok(record.id)
 }
 
@@ -152,12 +154,9 @@ pub(crate) fn add_bucket_host_cli(
 /// follow sorted by id (the order `HostStore::list` already returns).
 ///
 /// Returns `(id, name, transport_label)` tuples.
-pub(crate) fn list_hosts(
-    store_root: PathBuf,
-) -> anyhow::Result<Vec<(String, String, String)>> {
+pub(crate) fn list_hosts(store_root: PathBuf) -> anyhow::Result<Vec<(String, String, String)>> {
     let local = Host::local();
-    let mut rows: Vec<(String, String, String)> =
-        vec![(local.id, local.name, "local".to_string())];
+    let mut rows: Vec<(String, String, String)> = vec![(local.id, local.name, "local".to_string())];
 
     let store = HostStore { root: store_root };
     for host in store.list().context("list host records")? {
@@ -216,7 +215,9 @@ fn add_inner(args: AddArgs) -> anyhow::Result<()> {
         println!("{id}");
     } else {
         // HttpCp transport.
-        let url = args.url.expect("clap requires --url when --ssh and --bucket are absent");
+        let url = args
+            .url
+            .expect("clap requires --url when --ssh and --bucket are absent");
         let token = if args.token_stdin {
             let mut buf = String::new();
             io::stdin().read_to_string(&mut buf)?;
@@ -334,7 +335,10 @@ mod tests {
             .find(|h| h.id == id)
             .expect("bucket host not found in store");
         assert_eq!(h.name, "my-bucket");
-        assert!(h.token_hash.is_none(), "Bucket hosts must not store a token");
+        assert!(
+            h.token_hash.is_none(),
+            "Bucket hosts must not store a token"
+        );
         match &h.transport {
             HostTransport::Bucket { url, prefix } => {
                 assert_eq!(url, "s3://my-bucket/rupu");
@@ -401,7 +405,11 @@ mod tests {
         assert_eq!(h.name, "edge");
         assert!(h.token_hash.is_none(), "Ssh hosts must not store a token");
         match &h.transport {
-            HostTransport::Ssh { host, port, identity_file } => {
+            HostTransport::Ssh {
+                host,
+                port,
+                identity_file,
+            } => {
                 assert_eq!(host, "deploy@edge.example");
                 assert!(port.is_none(), "port should be None");
                 assert!(identity_file.is_none(), "identity_file should be None");
@@ -426,7 +434,11 @@ mod tests {
             .find(|h| h.id == id2)
             .expect("second ssh host not found");
         match &h2.transport {
-            HostTransport::Ssh { host, port, identity_file } => {
+            HostTransport::Ssh {
+                host,
+                port,
+                identity_file,
+            } => {
                 assert_eq!(host, "deploy@edge2.example");
                 assert_eq!(*port, Some(2222));
                 assert_eq!(identity_file.as_deref(), Some(identity_path.as_path()));

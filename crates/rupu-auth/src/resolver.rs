@@ -558,7 +558,11 @@ mod resolver_named_tests {
     #[tokio::test]
     async fn named_provider_falls_back_to_env() {
         let _lock = ENV_LOCK.lock().await;
-        let _guard = EnvGuard(vec!["RUPU_AUTH_FILE", "RUPU_AUTH_BACKEND", "RUPU_ACME_API_KEY"]);
+        let _guard = EnvGuard(vec![
+            "RUPU_AUTH_FILE",
+            "RUPU_AUTH_BACKEND",
+            "RUPU_ACME_API_KEY",
+        ]);
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");

@@ -943,11 +943,8 @@ mod tests {
             owner: "acme".into(),
             repo: "widgets".into(),
         };
-        let r = resolve_repo_or_autodetect(
-            Some("github:Section9Labs/rupu"),
-            Some(configured),
-        )
-        .unwrap();
+        let r =
+            resolve_repo_or_autodetect(Some("github:Section9Labs/rupu"), Some(configured)).unwrap();
         assert_eq!(r.platform, Platform::Github);
         assert_eq!(r.owner, "Section9Labs");
         assert_eq!(r.repo, "rupu");

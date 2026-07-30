@@ -4,7 +4,7 @@
 
 **Goal:** Add a `FleetCounts` block to `DashboardSummary`, fill the counts that come from `<global_dir>` alone, merge them with the `findings_open` partial discipline, and render the fleet strip on the Dashboard.
 
-**Architecture:** `FleetCounts` is a new field on the existing `DashboardSummary`, so it rides the per-host `HostConnector::dashboard_summary` fan-out already in place — no new connector method. `LocalHostConnector` fills the four counts sourceable from `<global_dir>` (autoflows enabled/disabled, workers, active claims, providers configured); every other field stays `None` for Plans 2 and 3 to fill. `SshHostConnector` reports `FleetCounts::default()` (all `None`). Both the server merge (`api::dashboard`) and its client-side twin (`mergeSummaries.ts`) sum only `Some` values and raise a single `fleet_partial` flag.
+**Architecture:** `FleetCounts` is a new field on the existing `DashboardSummary`, so it rides the per-host `HostConnector::dashboard_summary` fan-out already in place — no new connector method. `LocalHostConnector` fills the counts sourceable from `<global_dir>` (autoflows enabled/disabled, workers, active claims); every other field stays `None` for Plans 2 and 3 to fill. `SshHostConnector` reports `FleetCounts::default()` (all `None`). Both the server merge (`api::dashboard`) and its client-side twin (`mergeSummaries.ts`) sum only `Some` values and raise a single `fleet_partial` flag.
 
 **Tech Stack:** Rust 2021 (axum, serde, chrono, thiserror), React + TypeScript, vitest, Tailwind.
 
@@ -1230,7 +1230,7 @@ export function FleetStrip({
 }
 ```
 
-Confirm the `/autoflows/claims` and `/workers` route paths against `crates/rupu-cp/web/src/App.tsx` before committing; if either differs, use the real path rather than adding a route.
+Confirm the `/runs/autoflows` (Claims tab) and `/workers` route paths against `crates/rupu-cp/web/src/App.tsx` before committing; if either differs, use the real path rather than adding a route.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 

@@ -132,9 +132,13 @@ mod is_blocked_tests {
         let wide = McpPermission::new(rupu_tools::PermissionMode::Bypass, vec!["*".into()]);
         let narrow = wide.narrowed_to("issues.comment");
 
-        assert!(narrow.check("issues.comment", crate::tools::ToolKind::Write).is_ok());
+        assert!(narrow
+            .check("issues.comment", crate::tools::ToolKind::Write)
+            .is_ok());
         assert!(
-            narrow.check("scm.prs.create", crate::tools::ToolKind::Write).is_err(),
+            narrow
+                .check("scm.prs.create", crate::tools::ToolKind::Write)
+                .is_err(),
             "a narrowed permission must refuse a tool outside its single-entry allowlist"
         );
     }
@@ -147,7 +151,9 @@ mod is_blocked_tests {
         let ro = McpPermission::new(rupu_tools::PermissionMode::Readonly, vec!["*".into()]);
         let narrow = ro.narrowed_to("issues.comment");
         assert!(
-            narrow.check("issues.comment", crate::tools::ToolKind::Write).is_err(),
+            narrow
+                .check("issues.comment", crate::tools::ToolKind::Write)
+                .is_err(),
             "narrowing must preserve readonly's refusal of Write tools"
         );
     }

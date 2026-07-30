@@ -683,6 +683,29 @@ export interface ActiveLongest {
 }
 
 /**
+ * One host's inventory contribution — the fleet strip beneath the ops blocks.
+ * Mirrors `FleetCounts` in `rupu-cp/src/host/dashboard_summary.rs`.
+ *
+ * Every count is `number | null`. `null` means "this host does not report the
+ * field", NOT zero — render it as an em-dash and never as a `0`.
+ */
+export interface FleetCounts {
+  repos: number | null;
+  providers_configured: number | null;
+  providers_unhealthy: number | null;
+  autoflows_enabled: number | null;
+  autoflows_disabled: number | null;
+  workers: number | null;
+  claims_active: number | null;
+  issues_pending: number | null;
+  issues_open: number | null;
+  /** True when a repo hit the per-repo issue fetch cap — `issues_open` is a floor. */
+  issues_capped: boolean;
+  /** RFC-3339. When the SCM/provider caches behind these numbers were filled. */
+  inventory_captured_at: string | null;
+}
+
+/**
  * One host's complete dashboard contribution — aggregate-only, no row
  * arrays. Mirrors `DashboardSummary` in `rupu-cp/src/host/dashboard_summary.rs`.
  */
@@ -699,6 +722,9 @@ export interface DashboardSummary {
    *  SSH — the CLI has no findings surface). `0` is a genuine zero; `null`
    *  must never be rendered as one. */
   findings_open: number | null;
+  /** This host's inventory contribution. Absent on a pre-fleet host — the
+   *  server's `#[serde(default)]` fills an all-null block in that case. */
+  fleet: FleetCounts;
   /** RFC-3339. When this host's data was actually read. */
   captured_at: string;
 }
@@ -726,6 +752,13 @@ export interface DashboardResponse extends DashboardSummary {
    * complete sum regardless — only the clean/with-failures split can be partial.
    */
   cycles_partial: boolean;
+  /**
+   * Same "not reported ≠ 0" rule as `findings_partial`, for the fleet strip:
+   * true when a reporting host contributed `null` for a count other hosts did
+   * report. The strip must mark itself partial rather than present a partial
+   * sum as a fleet total.
+   */
+  fleet_partial: boolean;
 }
 
 // ---------------------------------------------------------------------------

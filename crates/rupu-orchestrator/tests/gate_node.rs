@@ -242,7 +242,10 @@ impl RepoConnector for RecordingConnector {
                 message: "boom: connector rejected the notify comment".into(),
             });
         }
-        self.calls.lock().unwrap().push((p.clone(), body.to_string()));
+        self.calls
+            .lock()
+            .unwrap()
+            .push((p.clone(), body.to_string()));
         Ok(Comment {
             id: "comment_1".into(),
             author: "rupu-bot".into(),
@@ -349,10 +352,7 @@ async fn gate_auto_approve_completes_without_pausing() {
     assert_eq!(record.status, RunStatus::Completed);
 
     let types = read_event_types(&events_path);
-    assert!(
-        types.contains(&"step_started".to_string()),
-        "got {types:?}"
-    );
+    assert!(types.contains(&"step_started".to_string()), "got {types:?}");
     assert!(
         types.contains(&"step_completed".to_string()),
         "got {types:?}"
@@ -483,8 +483,7 @@ async fn gate_approve_resume_continues_to_next_step() {
 
     // --- Phase 2: resume with the gate as the approved step. ---
     let prior_records = store.read_step_results(&run_id).unwrap();
-    let prior_step_results: Vec<StepResult> =
-        prior_records.iter().map(StepResult::from).collect();
+    let prior_step_results: Vec<StepResult> = prior_records.iter().map(StepResult::from).collect();
     assert!(
         prior_step_results.is_empty(),
         "the gate never completed in phase 1, so no prior step results exist"
@@ -540,7 +539,10 @@ async fn gate_approve_resume_continues_to_next_step() {
 
     // Only the (non-gate) linear step ever went through the agent factory —
     // the gate never dispatches one.
-    assert_eq!(factory2.seen.lock().unwrap().clone(), vec!["after".to_string()]);
+    assert_eq!(
+        factory2.seen.lock().unwrap().clone(),
+        vec!["after".to_string()]
+    );
 
     let record_final = store.load(&run_id).unwrap();
     assert_eq!(record_final.status, RunStatus::Completed);
@@ -606,8 +608,7 @@ async fn gate_as_last_step_approve_resume_completes_run() {
 
     // --- Phase 2: resume with the gate as the approved step. ---
     let prior_records = store.read_step_results(&run_id).unwrap();
-    let prior_step_results: Vec<StepResult> =
-        prior_records.iter().map(StepResult::from).collect();
+    let prior_step_results: Vec<StepResult> = prior_records.iter().map(StepResult::from).collect();
     assert_eq!(prior_step_results.len(), 1, "setup checkpointed on disk");
 
     let opts2 = OrchestratorRunOpts {
@@ -729,8 +730,7 @@ async fn reject_runs_on_reject_cleanup_chain() {
 
     // --- Cleanup: dispatch the on_reject chain. ---
     let prior_records = store.read_step_results(&run_id).unwrap();
-    let prior_step_results: Vec<StepResult> =
-        prior_records.iter().map(StepResult::from).collect();
+    let prior_step_results: Vec<StepResult> = prior_records.iter().map(StepResult::from).collect();
     assert!(
         prior_step_results.is_empty(),
         "the gate never completed, so no prior step results exist yet"
@@ -794,7 +794,9 @@ async fn reject_runs_on_reject_cleanup_chain() {
         .expect("on_reject step result persisted");
     assert!(cleanup_record.success);
     assert!(
-        cleanup_record.output.contains("cleanup after reject: rejected"),
+        cleanup_record
+            .output
+            .contains("cleanup after reject: rejected"),
         "on_reject step should see steps.gate.decision == rejected; got {:?}",
         cleanup_record.output
     );
@@ -1450,13 +1452,22 @@ async fn reject_one_gate_of_a_multi_gate_set_runs_its_own_cleanup_leaves_sibling
     };
     let res1 = run_workflow(opts1).await.expect("both gates batch-park");
     let run_id = res1.run_id.clone();
-    let awaiting = res1.awaiting.clone().expect("both gates must pause the run");
+    let awaiting = res1
+        .awaiting
+        .clone()
+        .expect("both gates must pause the run");
     assert_eq!(awaiting.gates.len(), 2);
 
     // --- Operator rejects gate_a ONLY (mirrors `rupu workflow reject
     // <run_id> --gate gate_a`): gate_b must stay parked. ---
     let decision = store
-        .reject_gate(&run_id, "operator", "not today", chrono::Utc::now(), Some("gate_a"))
+        .reject_gate(
+            &run_id,
+            "operator",
+            "not today",
+            chrono::Utc::now(),
+            Some("gate_a"),
+        )
         .expect("reject_gate(gate_a) succeeds");
     let (rejected_step_id, reason) = match decision {
         ApprovalDecision::Rejected {
@@ -1480,10 +1491,12 @@ async fn reject_one_gate_of_a_multi_gate_set_runs_its_own_cleanup_leaves_sibling
     // preceding `fanout` (split) step that DID complete before either gate
     // parked — so `prior_step_results` carries that one entry, not none.
     let prior_records = store.read_step_results(&run_id).unwrap();
-    let prior_step_results: Vec<StepResult> =
-        prior_records.iter().map(StepResult::from).collect();
+    let prior_step_results: Vec<StepResult> = prior_records.iter().map(StepResult::from).collect();
     assert_eq!(
-        prior_step_results.iter().map(|r| r.step_id.as_str()).collect::<Vec<_>>(),
+        prior_step_results
+            .iter()
+            .map(|r| r.step_id.as_str())
+            .collect::<Vec<_>>(),
         vec!["fanout"],
         "only the split node itself has completed; neither gate has"
     );
@@ -1540,7 +1553,9 @@ async fn reject_one_gate_of_a_multi_gate_set_runs_its_own_cleanup_leaves_sibling
         .expect("on_reject step result persisted");
     assert!(cleanup_record.success);
     assert!(
-        cleanup_record.output.contains("cleanup after gate_a reject: rejected"),
+        cleanup_record
+            .output
+            .contains("cleanup after gate_a reject: rejected"),
         "on_reject step should see steps.gate_a.decision == rejected; got {:?}",
         cleanup_record.output
     );
@@ -1573,7 +1588,13 @@ async fn reject_one_gate_of_a_multi_gate_set_runs_its_own_cleanup_leaves_sibling
 
     // --- Now reject gate_b too: the set empties, the run finalizes. ---
     let decision2 = store
-        .reject_gate(&run_id, "operator", "not today either", chrono::Utc::now(), Some("gate_b"))
+        .reject_gate(
+            &run_id,
+            "operator",
+            "not today either",
+            chrono::Utc::now(),
+            Some("gate_b"),
+        )
         .expect("reject_gate(gate_b) succeeds");
     assert!(matches!(decision2, ApprovalDecision::Rejected { .. }));
     let record_terminal = store.load(&run_id).unwrap();

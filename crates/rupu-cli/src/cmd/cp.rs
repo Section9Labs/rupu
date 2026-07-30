@@ -2,7 +2,7 @@
 
 use crate::paths;
 use clap::Subcommand;
-use rupu_cp::host::bucket::{ObjectStoreBucket, poll_bucket_run};
+use rupu_cp::host::bucket::{poll_bucket_run, ObjectStoreBucket};
 use rupu_orchestrator::runs::RunStore;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -76,12 +76,16 @@ pub async fn handle(action: Action) -> ExitCode {
             let worker_handle = tokio::spawn(run_resume_worker(
                 Arc::clone(&store),
                 worker_id,
-                rupu_workspace::HostStore { root: global_dir.join("hosts") },
+                rupu_workspace::HostStore {
+                    root: global_dir.join("hosts"),
+                },
                 shutdown_rx,
             ));
             let poller_handle = tokio::spawn(run_bucket_poller(
                 Arc::clone(&store),
-                rupu_workspace::HostStore { root: global_dir.join("hosts") },
+                rupu_workspace::HostStore {
+                    root: global_dir.join("hosts"),
+                },
                 shutdown_tx.subscribe(),
             ));
 
@@ -152,7 +156,9 @@ pub async fn handle(action: Action) -> ExitCode {
             // `[cp].gate_sweep_enabled` (default: on); cadence from
             // `[cp].gate_sweep_interval_secs` (default: 60s).
             let gate_sweep_store = Arc::clone(&store);
-            let gate_sweep_hosts = rupu_workspace::HostStore { root: global_dir.join("hosts") };
+            let gate_sweep_hosts = rupu_workspace::HostStore {
+                root: global_dir.join("hosts"),
+            };
             let gate_sweep_exe = exe.clone();
             let gate_sweep_handle = tokio::spawn(run_periodic_tick(
                 "gate-sweep",
@@ -161,7 +167,9 @@ pub async fn handle(action: Action) -> ExitCode {
                 shutdown_tx.subscribe(),
                 move || {
                     let store = Arc::clone(&gate_sweep_store);
-                    let hosts = rupu_workspace::HostStore { root: gate_sweep_hosts.root.clone() };
+                    let hosts = rupu_workspace::HostStore {
+                        root: gate_sweep_hosts.root.clone(),
+                    };
                     let exe = gate_sweep_exe.clone();
                     let worker_id = gate_sweep_worker_id.clone();
                     async move {
@@ -925,10 +933,9 @@ async fn run_gate_sweep(
                                 tracing::warn!(run_id = %run_id, gate = %gate_step_id, "gate sweep: expected reject outcome for on_timeout=reject but got {outcome:?}; skipping cleanup");
                                 continue;
                             }
-                            let reason = rec
-                                .error_message
-                                .clone()
-                                .unwrap_or_else(|| "gate timed out (on_timeout: reject)".to_string());
+                            let reason = rec.error_message.clone().unwrap_or_else(|| {
+                                "gate timed out (on_timeout: reject)".to_string()
+                            });
                             tracing::info!(run_id = %run_id, step_id = %gate_step_id, "gate sweep: on_timeout=reject → gate auto-rejected; running on_reject cleanup");
                             // I-36: run this unconditionally — an empty
                             // `on_reject:` chain must still record the
@@ -1132,7 +1139,14 @@ mod tests {
                 Some("web"),
             ),
             vec![
-                "workflow", "approve", "run_x", "--gate", "gate_b", "--approver", "web", "--mode",
+                "workflow",
+                "approve",
+                "run_x",
+                "--gate",
+                "gate_b",
+                "--approver",
+                "web",
+                "--mode",
                 "bypass",
             ],
         );
@@ -1315,7 +1329,10 @@ mod tests {
         rec.awaiting.truncate(1);
         rec.sync_awaiting_compat();
         store
-            .create(rec.clone(), "name: g\nsteps:\n  - id: gate_a\n    approval: {}\n")
+            .create(
+                rec.clone(),
+                "name: g\nsteps:\n  - id: gate_a\n    approval: {}\n",
+            )
             .unwrap();
 
         let now = chrono::Utc::now();
@@ -1444,15 +1461,11 @@ mod tests {
             loop_progress: Default::default(),
         };
         rec.sync_awaiting_compat();
-        store.create(rec.clone(), GATE_A_REJECT_GATE_B_NONE_YAML).unwrap();
+        store
+            .create(rec.clone(), GATE_A_REJECT_GATE_B_NONE_YAML)
+            .unwrap();
 
-        run_gate_sweep(
-            Arc::clone(&store),
-            hosts,
-            exe,
-            "sweep-test".to_string(),
-        )
-        .await;
+        run_gate_sweep(Arc::clone(&store), hosts, exe, "sweep-test".to_string()).await;
 
         let reloaded = store.load(&rec.id).unwrap();
         assert_eq!(
@@ -1628,15 +1641,11 @@ mod tests {
             permission_mode: None,
             loop_progress: Default::default(),
         };
-        store.create(rec.clone(), GATE_A_REJECT_GATE_B_NONE_YAML).unwrap();
+        store
+            .create(rec.clone(), GATE_A_REJECT_GATE_B_NONE_YAML)
+            .unwrap();
 
-        run_gate_sweep(
-            Arc::clone(&store),
-            hosts,
-            exe,
-            "sweep-test".to_string(),
-        )
-        .await;
+        run_gate_sweep(Arc::clone(&store), hosts, exe, "sweep-test".to_string()).await;
 
         let reloaded = store.load(&rec.id).unwrap();
         assert_eq!(
@@ -1723,7 +1732,13 @@ mod tests {
             )
             .unwrap();
 
-        run_gate_sweep(Arc::clone(&store), hosts.clone(), exe.clone(), "sweep-test".to_string()).await;
+        run_gate_sweep(
+            Arc::clone(&store),
+            hosts.clone(),
+            exe.clone(),
+            "sweep-test".to_string(),
+        )
+        .await;
 
         let after_tick1 = store.load(&rec.id).unwrap();
         assert_eq!(
@@ -1848,7 +1863,13 @@ mod tests {
             RunStatus::Paused,
         ] {
             assert_eq!(
-                sweep_decision(status, Some(TimeoutAction::Reject), true, Some(false), false),
+                sweep_decision(
+                    status,
+                    Some(TimeoutAction::Reject),
+                    true,
+                    Some(false),
+                    false
+                ),
                 SweepAction::Skip
             );
         }

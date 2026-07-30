@@ -38,7 +38,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, type DashboardRange, type DashboardSummary } from '../api';
-import { mergeSummaries } from './mergeSummaries';
+import { mergeSummaries, reportsAnyFleetNull } from './mergeSummaries';
 
 /** Burst window. An autoflow cycle firing 12 runs must cost ONE refetch. */
 const COALESCE_MS = 250;
@@ -99,11 +99,12 @@ export interface DashboardHostState {
   reason?: string | null;
 }
 
-/** The merged fleet-wide view: `mergeSummaries`'s output plus the two
+/** The merged fleet-wide view: `mergeSummaries`'s output plus the three
  *  response-level partial flags (see the module doc comment for the split). */
 export type MergedDashboard = DashboardSummary & {
   findings_partial: boolean;
   cycles_partial: boolean;
+  fleet_partial: boolean;
 };
 
 export function useDashboardData(range: DashboardRange) {
@@ -267,7 +268,12 @@ export function useDashboardData(range: DashboardRange) {
     // per-host summaries are already in hand (see module doc comment).
     const findings_partial = okSummaries.some((s) => s.findings_open === null);
     const cycles_partial = okSummaries.some((s) => s.cycles.clean === null || s.cycles.with_failures === null);
-    return { ...merged, findings_partial, cycles_partial };
+    // A reporting host that contributed null for ANY fleet count makes the
+    // strip's numbers a partial sum. Mirrors the server's single
+    // `fleet_partial` flag rather than one flag per field; the key list lives
+    // in mergeSummaries.ts so it cannot drift from what actually gets summed.
+    const fleet_partial = okSummaries.some(reportsAnyFleetNull);
+    return { ...merged, findings_partial, cycles_partial, fleet_partial };
   }, [okSummaries]);
 
   return { data, hosts, loading, error, refresh: refreshAllHosts };

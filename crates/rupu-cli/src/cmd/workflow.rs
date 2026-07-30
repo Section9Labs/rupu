@@ -517,7 +517,15 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
             mode,
             gate,
             approver,
-        } => approve(&run_id, mode.as_deref(), gate.as_deref(), approver.as_deref()).await,
+        } => {
+            approve(
+                &run_id,
+                mode.as_deref(),
+                gate.as_deref(),
+                approver.as_deref(),
+            )
+            .await
+        }
         Action::Reject {
             run_id,
             reason,
@@ -2351,7 +2359,10 @@ fn ambiguous_gate_message(action: &str, run_id: &str, candidates: &[String]) -> 
          e.g. `rupu workflow {action} {run_id} --gate {}`",
         candidates.len(),
         candidates.join(", "),
-        candidates.first().map(String::as_str).unwrap_or("<STEP_ID>"),
+        candidates
+            .first()
+            .map(String::as_str)
+            .unwrap_or("<STEP_ID>"),
     )
 }
 
@@ -2518,53 +2529,55 @@ async fn approve(
 
     let (awaited_step_id, approver, via_timeout) =
         match resolve_approve_gate(&store, run_id, gate, approver_override)? {
-        ApproveGateOutcome::Approved {
-            step_id,
-            approver,
-            via_timeout,
-        } => (step_id, approver, via_timeout),
-        ApproveGateOutcome::ExpiredRejected {
-            step_id,
-            reason,
-            approver,
-        } => {
-            // I-36: run the cleanup chain unconditionally, not only when
-            // `cheap_on_reject_chain_len` reports a non-empty chain — an
-            // empty chain must still record the gate's rejected decision
-            // (`run_reject_cleanup` itself already handles a zero-length
-            // chain fine; `chain_len` is only used below to decide whether
-            // to print "cleanup: N step(s) executed").
-            match crate::resume::build_reject_cleanup_opts(&store, run_id, &step_id, &reason, mode)
+            ApproveGateOutcome::Approved {
+                step_id,
+                approver,
+                via_timeout,
+            } => (step_id, approver, via_timeout),
+            ApproveGateOutcome::ExpiredRejected {
+                step_id,
+                reason,
+                approver,
+            } => {
+                // I-36: run the cleanup chain unconditionally, not only when
+                // `cheap_on_reject_chain_len` reports a non-empty chain — an
+                // empty chain must still record the gate's rejected decision
+                // (`run_reject_cleanup` itself already handles a zero-length
+                // chain fine; `chain_len` is only used below to decide whether
+                // to print "cleanup: N step(s) executed").
+                match crate::resume::build_reject_cleanup_opts(
+                    &store, run_id, &step_id, &reason, mode,
+                )
                 .await
-            {
-                Ok((opts, chain_len)) => {
-                    match rupu_orchestrator::runner::run_reject_cleanup(
-                        opts,
-                        &step_id,
-                        &reason,
-                        "timeout",
-                        Some(&approver),
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            if chain_len > 0 {
-                                println!("cleanup: {chain_len} step(s) executed");
+                {
+                    Ok((opts, chain_len)) => {
+                        match rupu_orchestrator::runner::run_reject_cleanup(
+                            opts,
+                            &step_id,
+                            &reason,
+                            "timeout",
+                            Some(&approver),
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                if chain_len > 0 {
+                                    println!("cleanup: {chain_len} step(s) executed");
+                                }
                             }
+                            Err(e) => eprintln!("warning: on_reject cleanup chain errored: {e}"),
                         }
-                        Err(e) => eprintln!("warning: on_reject cleanup chain errored: {e}"),
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "warning: could not load workflow for on_reject cleanup: {e} \
+                         (run is already correctly rejected)"
+                        );
                     }
                 }
-                Err(e) => {
-                    eprintln!(
-                        "warning: could not load workflow for on_reject cleanup: {e} \
-                         (run is already correctly rejected)"
-                    );
-                }
+                return Ok(());
             }
-            return Ok(());
-        }
-    };
+        };
     // Phase 2 — the resume — lives in `crate::resume::resume_run` so the
     // background session worker can resume an approved gate identically.
     // `awaited_step_id` is threaded in because `approve` clears the
@@ -5007,7 +5020,8 @@ mod tests {
         rec
     }
 
-    const TWO_GATE_YAML: &str = "name: g\nsteps:\n  - id: gate_a\n    approval: {}\n  - id: gate_b\n    approval: {}\n";
+    const TWO_GATE_YAML: &str =
+        "name: g\nsteps:\n  - id: gate_a\n    approval: {}\n  - id: gate_b\n    approval: {}\n";
 
     #[test]
     fn ambiguous_gate_message_lists_every_candidate_and_the_gate_flag() {
@@ -5067,7 +5081,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
         let rec = sample_run_record(RunStatus::AwaitingApproval, None);
-        store.create(rec.clone(), "name: sample\nsteps: []\n").unwrap();
+        store
+            .create(rec.clone(), "name: sample\nsteps: []\n")
+            .unwrap();
 
         let outcome = resolve_approve_gate(&store, &rec.id, None, None).unwrap();
         match outcome {
@@ -5099,7 +5115,8 @@ mod tests {
         let rec = two_gate_awaiting_record("run_cli_reject_a");
         store.create(rec.clone(), TWO_GATE_YAML).unwrap();
 
-        let outcome = resolve_reject_gate(&store, &rec.id, Some("no thanks"), Some("gate_a")).unwrap();
+        let outcome =
+            resolve_reject_gate(&store, &rec.id, Some("no thanks"), Some("gate_a")).unwrap();
         assert_eq!(outcome.step_id, "gate_a");
         assert_eq!(outcome.via, "human");
 
@@ -5130,7 +5147,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
         let rec = sample_run_record(RunStatus::AwaitingApproval, None);
-        store.create(rec.clone(), "name: sample\nsteps: []\n").unwrap();
+        store
+            .create(rec.clone(), "name: sample\nsteps: []\n")
+            .unwrap();
 
         let outcome = resolve_reject_gate(&store, &rec.id, Some("no"), None).unwrap();
         assert_eq!(outcome.step_id, "step_approve");
@@ -5433,7 +5452,10 @@ steps:
             "the tool name is the action's identity and was never shown before"
         );
         // `with:` keys are listed sorted so the column is stable across runs.
-        assert!(detail.contains("with body, number, project"), "detail was: {detail}");
+        assert!(
+            detail.contains("with body, number, project"),
+            "detail was: {detail}"
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { coalesce, useDashboardData } from './useDashboardData';
 import { api, type DashboardResponse, type RegisteredHostView } from '../api';
+import { emptyFleet } from './mergeSummaries';
 
 // `getDashboard` resolves `DashboardResponse` on the wire (`DashboardSummary`
 // flattened with `hosts` / `findings_partial` / `cycles_partial` — see
@@ -21,6 +22,8 @@ function summary(overrides: Partial<DashboardResponse> = {}, hostId = 'local'): 
     throughput_buckets: [],
     cycles: { total: 0, clean: 0, with_failures: 0 },
     findings_open: 0,
+    fleet: emptyFleet(),
+    fleet_partial: false,
     captured_at,
     hosts: [{ host_id: hostId, name: hostId, transport_kind: 'local', state: 'ok', captured_at, reason: null }],
     findings_partial: false,
@@ -170,6 +173,8 @@ describe('useDashboardData', () => {
       throughput_buckets: [],
       cycles: { total: 0, clean: null, with_failures: null },
       findings_open: null,
+      fleet: emptyFleet(),
+      fleet_partial: false,
       captured_at: '2026-07-16T12:00:00Z',
       hosts: [
         {

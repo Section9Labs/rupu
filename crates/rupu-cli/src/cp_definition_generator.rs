@@ -55,11 +55,9 @@ impl DefinitionGenerator for RuntimeDefinitionGenerator {
         // ISSUES.md I-74: honor `[providers.<name>]` here too. This path is
         // the CP's "generate a definition" button, so it previously ran with
         // none of the operator's timeout/retry/concurrency/base_url settings.
-        let gen_cfg = rupu_config::layer_files_locked(
-            Some(&self.global_dir.join("config.toml")),
-            None,
-        )
-        .unwrap_or_default();
+        let gen_cfg =
+            rupu_config::layer_files_locked(Some(&self.global_dir.join("config.toml")), None)
+                .unwrap_or_default();
         let gen_provider_config = rupu_runtime::provider_factory::ProviderConfig {
             anthropic_oauth_system_prefix: None,
             openai_compatible: rupu_runtime::provider_factory::openai_compatible_params(

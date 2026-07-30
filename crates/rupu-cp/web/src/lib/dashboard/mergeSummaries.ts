@@ -28,9 +28,84 @@ import type {
   ActiveLongest,
   CycleCounts,
   DashboardSummary,
+  FleetCounts,
   TerminalBucket,
   ThroughputBucket,
 } from '../api';
+
+/** An all-null fleet block — the "this host reports nothing" shape. */
+export function emptyFleet(): FleetCounts {
+  return {
+    repos: null,
+    providers_configured: null,
+    providers_unhealthy: null,
+    autoflows_enabled: null,
+    autoflows_disabled: null,
+    workers: null,
+    claims_active: null,
+    issues_pending: null,
+    issues_open: null,
+    issues_capped: false,
+    inventory_captured_at: null,
+  };
+}
+
+/** The numeric fleet fields, i.e. everything that sums. */
+const FLEET_NUMERIC_KEYS = [
+  'repos',
+  'providers_configured',
+  'providers_unhealthy',
+  'autoflows_enabled',
+  'autoflows_disabled',
+  'workers',
+  'claims_active',
+  'issues_pending',
+  'issues_open',
+] as const;
+
+/**
+ * True when this host omitted any fleet count — the input to the
+ * response-level `fleet_partial` flag. Exported so useDashboardData derives
+ * the flag from the same key list this file sums, instead of a hand-written
+ * second list that could fall out of step when Plan 2/3 fills more fields.
+ */
+export function reportsAnyFleetNull(s: DashboardSummary): boolean {
+  const fleet = s.fleet ?? emptyFleet();
+  return FLEET_NUMERIC_KEYS.some((k) => fleet[k] === null || fleet[k] === undefined);
+}
+
+/**
+ * Sum only the non-null contributors — the `mergeFindingsOpen` rule, not the
+ * poisoning `mergeCycles` rule. A host that does not report a field is skipped;
+ * the response-level `fleet_partial` flag (derived in useDashboardData.ts from
+ * these same per-host summaries) is what tells the user the sum is partial.
+ *
+ * `issues_capped` ORs — one capped host makes the merged open count a floor.
+ * `inventory_captured_at` takes the OLDEST stamp, the honest staleness bound.
+ */
+function mergeFleet(byHost: DashboardSummary[]): FleetCounts {
+  const out = emptyFleet();
+
+  for (const s of byHost) {
+    // A host from a pre-fleet rupu has no `fleet` key at all; treat it as
+    // reporting nothing rather than letting an undefined access throw.
+    const fleet = s.fleet ?? emptyFleet();
+    for (const k of FLEET_NUMERIC_KEYS) {
+      const v = fleet[k];
+      if (v !== null && v !== undefined) out[k] = (out[k] ?? 0) + v;
+    }
+    if (fleet.issues_capped) out.issues_capped = true;
+    const ts = fleet.inventory_captured_at;
+    if (
+      ts &&
+      (out.inventory_captured_at === null || Date.parse(ts) < Date.parse(out.inventory_captured_at))
+    ) {
+      out.inventory_captured_at = ts;
+    }
+  }
+
+  return out;
+}
 
 function mergeActive(byHost: DashboardSummary[]): ActiveCounts {
   const active: ActiveCounts = { running: 0, awaiting_approval: 0, paused: 0, pending: 0 };
@@ -200,6 +275,7 @@ export function mergeSummaries(byHost: DashboardSummary[], now: Date = new Date(
     throughput_buckets: mergeBuckets(byHost.map((s) => s.throughput_buckets), zeroThroughput, sumThroughput),
     cycles: mergeCycles(byHost),
     findings_open: mergeFindingsOpen(byHost),
+    fleet: mergeFleet(byHost),
     captured_at: mergeCapturedAt(byHost, now),
   };
 }

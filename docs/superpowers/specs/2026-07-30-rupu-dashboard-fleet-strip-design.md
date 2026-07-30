@@ -50,7 +50,7 @@ FleetStrip  (new)      7 repos · 4 providers (1 unhealthy) · 6 autoflows
 | providers  | `/settings`         |
 | autoflows  | `/autoflows`        |
 | workers    | `/workers`          |
-| claimed    | `/autoflows/claims` |
+| claimed    | `/runs/autoflows`   |
 | issues     | `/settings`         |
 
 Repos and issues link to Settings deliberately: neither has a CP list page, and

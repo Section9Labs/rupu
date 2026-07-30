@@ -24,7 +24,10 @@ pub fn coverage_concerns_detail(
             None => not_found.push(id.clone()),
         }
     }
-    CoverageConcernsDetailOutput { concerns, not_found }
+    CoverageConcernsDetailOutput {
+        concerns,
+        not_found,
+    }
 }
 
 #[cfg(test)]
@@ -67,10 +70,7 @@ mod tests {
         let out = coverage_concerns_detail(
             &cat,
             CoverageConcernsDetailInput {
-                concern_ids: vec![
-                    "stride:spoofing".to_string(),
-                    "stride:not-real".to_string(),
-                ],
+                concern_ids: vec!["stride:spoofing".to_string(), "stride:not-real".to_string()],
             },
         );
         assert_eq!(out.concerns.len(), 1);
