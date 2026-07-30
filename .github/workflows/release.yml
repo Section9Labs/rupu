@@ -694,7 +694,25 @@ jobs:
           cd ghp
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- apt yum rupu-archive-keyring.asc; then
+          # Stage FIRST, then diff the index. A bare `git diff` compares only
+          # tracked paths, so it is blind to a file that is untracked — and on
+          # a gh-pages branch that has never carried a repository, EVERY file
+          # copied in above is untracked. The bare form therefore reported
+          # "already current" and exited 0 on the very first publish, which is
+          # exactly what happened for v0.71.0: the job went green having
+          # published nothing, and `apt install rupu` 404'd while the release
+          # looked complete.
+          git add -A -- apt yum rupu-archive-keyring.asc
+          if git diff --cached --quiet -- apt yum rupu-archive-keyring.asc; then
+            # "Already current" only means anything if a previous publish
+            # actually landed. If the branch carries no repository at all,
+            # then an unchanged index means we are about to report success
+            # for a publish that did nothing — the failure above, which was
+            # green and silent. Refuse instead.
+            git cat-file -e HEAD:rupu-archive-keyring.asc 2>/dev/null || {
+              echo "::error::gh-pages carries no repository, yet nothing is staged to publish. Refusing to report success without publishing."
+              exit 1
+            }
             echo "repositories already current"; exit 0
           fi
           # Rewrite as a single orphan commit: no parent, so nothing from
