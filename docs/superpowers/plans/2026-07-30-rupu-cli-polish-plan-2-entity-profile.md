@@ -558,7 +558,11 @@ keeps all headers rather than collapsing to a void."
 **Interfaces:**
 - Produces: `EntityTable::with_summary(noun: &'static str)` — builder method; `render` emits the line when set.
 
-Counts by lifecycle status, using the first column whose cells are `CellValue::Status`. Emitted only in the human format; Tasks 5-7 must not emit it under `--format json` / `--format csv`.
+Counts by lifecycle status, selecting the column whose **header is literally `STATUS`** (case-insensitive). Emitted only in the human format; Tasks 5-7 must not emit it under `--format json` / `--format csv`.
+
+**Select by header name, NOT by "the first `CellValue::Status` column".** `CellValue::Status` carries both lifecycle states and classification values, and `session list` has two such columns — `SCOPE` (index 2, `project`/`global`) before `STATUS` (index 3, `failed`/`idle`/`stopped`). Picking the first would summarise `8 sessions · 8 project` instead of `8 sessions · 2 failed · 5 idle · 1 stopped`, rendering the feature useless for its flagship consumer.
+
+Header-name selection gives the right answer for all three consumers in this plan: `session list` and `workflow runs` both have a `STATUS` header; `workflow list` has none, so it falls back to the bare count (`18 workflows`), which is what its example shows. No configurable selector — nothing in Plans 2-4 needs one.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -650,8 +654,13 @@ Add `summary_noun: Option<&'static str>` to the struct (default `None` in `new`)
         } else {
             format!("{n} {noun}s")
         };
-        let status_col = (0..self.headers.len())
-            .find(|&i| self.rows.iter().any(|r| matches!(r[i], CellValue::Status(_))));
+        // By header name, not by cell type: `session list` has both a
+        // SCOPE and a STATUS column and both are `CellValue::Status`,
+        // so "first Status column" would summarise by scope.
+        let status_col = self
+            .headers
+            .iter()
+            .position(|h| h.eq_ignore_ascii_case("STATUS"));
         if let Some(col) = status_col {
             // BTreeMap keeps the breakdown in a stable order across runs.
             let mut counts: std::collections::BTreeMap<&str, usize> =
