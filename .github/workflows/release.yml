@@ -42,7 +42,7 @@ jobs:
           # stable release with version "foo", and that string gets stamped
           # into the binary via RUPU_RELEASE_VERSION.
           case "$tag" in
-            v[0-9]*.[0-9]*.[0-9]*-beta)
+            v[0-9]*.[0-9]*.[0-9]*-beta|v[0-9]*.[0-9]*.[0-9]*-beta.[0-9]*)
               echo "channel=beta"            >> "$GITHUB_OUTPUT"
               echo "rolling_tag=latest-beta" >> "$GITHUB_OUTPUT"
               echo "prerelease=true"         >> "$GITHUB_OUTPUT" ;;
