@@ -24,14 +24,24 @@
 
 use crate::cmd::ui::UiPrefs;
 use crate::output::palette;
-use comfy_table::{presets, Cell, Color as TableColor, ContentArrangement, Table};
+use comfy_table::{presets, Cell, Color as TableColor, ContentArrangement, Table, TableComponent};
 
-/// Build a `comfy-table::Table` with rupu's default visual style:
-/// UTF8 borders, dynamic content arrangement, no separator lines
-/// inside the body.
+/// Build a `comfy-table::Table` with rupu's default visual style: a
+/// segmented rule under the header, no borders, and no per-row
+/// separators.
+///
+/// The previous `UTF8_FULL` preset drew `├╌╌┼╌╌┤` between every row —
+/// twenty rows rendered as forty-one lines.
+///
+/// `MiddleHeaderIntersections` must be blanked explicitly. Without it
+/// the header rule renders as one continuous run across the full table
+/// width, because `NOTHING` leaves the intersection as a space that
+/// `HeaderLines` then overdraws. Verified against comfy-table 7.2.2.
 pub fn new_table() -> Table {
     let mut t = Table::new();
-    t.load_preset(presets::UTF8_FULL);
+    t.load_preset(presets::NOTHING);
+    t.set_style(TableComponent::HeaderLines, '─');
+    t.set_style(TableComponent::MiddleHeaderIntersections, ' ');
     t.set_content_arrangement(ContentArrangement::Dynamic);
     t
 }
@@ -588,5 +598,42 @@ mod tests {
         assert_eq!(status_color("pending", &prefs), Some(dim));
         assert_eq!(status_color("eligible", &prefs), Some(dim));
         assert_eq!(status_color("released", &prefs), Some(dim));
+    }
+
+    #[test]
+    fn table_style_is_a_segmented_header_rule() {
+        // Guards the house style for all 55 call sites. Colour is off,
+        // so this asserts structure only.
+        let mut t = new_table();
+        t.set_header(vec!["SESSION", "AGENT", "STATUS", "UPDATED"]);
+        t.add_row(vec![
+            "ses_01KWA7HT…FG3M",
+            "oracle-assessor",
+            "✗ failed",
+            "2w ago",
+        ]);
+        t.add_row(vec![
+            "ses_01KWAA6X…FJM0",
+            "oracle-assessor",
+            "○ idle",
+            "2w ago",
+        ]);
+        insta::assert_snapshot!(t.to_string());
+    }
+
+    #[test]
+    fn table_draws_no_per_row_separators() {
+        // The specific regression: UTF8_FULL drew ├╌╌┼╌╌┤ between every
+        // row, doubling the height of every list in the CLI.
+        let mut t = new_table();
+        t.set_header(vec!["A", "B"]);
+        t.add_row(vec!["1", "2"]);
+        t.add_row(vec!["3", "4"]);
+        let out = t.to_string();
+        assert!(!out.contains('┼'), "found row-separator intersection");
+        assert!(!out.contains('╌'), "found dashed row separator");
+        assert!(!out.contains('│'), "found vertical border");
+        // The header rule itself must survive.
+        assert!(out.contains('─'), "header rule missing");
     }
 }

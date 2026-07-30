@@ -1,0 +1,8 @@
+---
+source: crates/rupu-cli/src/output/tables.rs
+expression: t.to_string()
+---
+ SESSION             AGENT             STATUS     UPDATED 
+─────────────────── ───────────────── ────────── ─────────
+ ses_01KWA7HT…FG3M   oracle-assessor   ✗ failed   2w ago  
+ ses_01KWAA6X…FJM0   oracle-assessor   ○ idle     2w ago
