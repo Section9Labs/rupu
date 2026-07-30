@@ -156,10 +156,41 @@ impl<'a> EntityTable<'a> {
         t
     }
 
+    /// Indices of columns worth rendering.
+    ///
+    /// A column is dropped when every displayed cell is empty. With no
+    /// rows at all, every column is vacuously empty — keep them all, or
+    /// an empty list renders as a headerless void.
+    fn retained_columns(&self) -> Vec<usize> {
+        if self.opts.all_columns || self.rows.is_empty() {
+            return (0..self.headers.len()).collect();
+        }
+        (0..self.headers.len())
+            .filter(|&i| self.rows.iter().any(|r| !r[i].is_empty()))
+            .collect()
+    }
+
     /// Build the table. `now` is a parameter so tests are deterministic;
     /// callers pass `Utc::now()`.
     pub fn render(&self, now: DateTime<Utc>) -> String {
-        self.build(now).to_string()
+        let keep = self.retained_columns();
+        let mut t = tables::new_table();
+        t.set_header(keep.iter().map(|&i| self.headers[i]).collect::<Vec<_>>());
+        for row in &self.rows {
+            t.add_row(
+                keep.iter()
+                    .map(|&i| self.cell(&row[i], now))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        for (pos, &src) in keep.iter().enumerate() {
+            if self.rows.iter().any(|r| matches!(r[src], CellValue::Id(_))) {
+                if let Some(col) = t.column_mut(pos) {
+                    col.set_constraint(ColumnConstraint::ContentWidth);
+                }
+            }
+        }
+        t.to_string()
     }
 
     /// Test-only: render after forcing a narrow table width, to exercise
@@ -257,8 +288,14 @@ mod tests {
     #[test]
     fn missing_renders_as_em_dash() {
         let p = prefs();
-        let t = EntityTable::new(&p, RenderOpts::default(), vec!["TARGET"])
-            .row(vec![CellValue::Missing]);
+        // With an entirely-empty column, suppression drops it. To test that
+        // Missing renders as em dash, use a column that won't be suppressed.
+        let t = EntityTable::new(&p, RenderOpts::default(), vec!["TARGET", "DATA"])
+            .row(vec![CellValue::Missing, CellValue::Text("x".into())])
+            .row(vec![
+                CellValue::Text("y".into()),
+                CellValue::Text("z".into()),
+            ]);
         assert!(t.render(now()).contains('—'));
     }
 
@@ -327,5 +364,60 @@ mod tests {
             out.contains("run_01KRJDKS…WFJS"),
             "compact id must survive a narrow, squeezed table intact: {out}"
         );
+    }
+
+    #[test]
+    fn all_empty_column_is_dropped() {
+        let p = prefs();
+        let t = EntityTable::new(&p, RenderOpts::default(), vec!["A", "TARGET", "B"])
+            .row(vec![
+                CellValue::Text("1".into()),
+                CellValue::Missing,
+                CellValue::Text("2".into()),
+            ])
+            .row(vec![
+                CellValue::Text("3".into()),
+                CellValue::Missing,
+                CellValue::Text("4".into()),
+            ]);
+        let out = t.render(now());
+        assert!(!out.contains("TARGET"), "empty column survived: {out}");
+        assert!(out.contains('A') && out.contains('B'), "got: {out}");
+    }
+
+    #[test]
+    fn partially_populated_column_is_kept() {
+        let p = prefs();
+        let t = EntityTable::new(&p, RenderOpts::default(), vec!["A", "TARGET"])
+            .row(vec![CellValue::Text("1".into()), CellValue::Missing])
+            .row(vec![
+                CellValue::Text("2".into()),
+                CellValue::Text("here".into()),
+            ]);
+        let out = t.render(now());
+        assert!(out.contains("TARGET"), "populated column dropped: {out}");
+        assert!(out.contains("here"), "got: {out}");
+    }
+
+    #[test]
+    fn all_columns_opt_keeps_empty_columns() {
+        let p = prefs();
+        let opts = RenderOpts {
+            all_columns: true,
+            ..RenderOpts::default()
+        };
+        let t = EntityTable::new(&p, opts, vec!["A", "TARGET"])
+            .row(vec![CellValue::Text("1".into()), CellValue::Missing]);
+        assert!(t.render(now()).contains("TARGET"));
+    }
+
+    #[test]
+    fn a_table_with_no_rows_keeps_all_headers() {
+        // With zero rows every column is vacuously empty. Dropping them
+        // all would render a headerless void instead of an empty list.
+        let p = prefs();
+        let t = EntityTable::new(&p, RenderOpts::default(), vec!["A", "B"]);
+        let out = t.render(now());
+        assert!(out.contains('A') && out.contains('B'), "got: {out}");
     }
 }
