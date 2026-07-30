@@ -1,0 +1,95 @@
+name: release-beta
+
+# Cuts a beta every day that `main` actually moved. Publishing itself is
+# `release.yml`'s job — this workflow only decides on a tag and pushes it.
+on:
+  schedule:
+    # 07:37 UTC. Off the :00 mark (every scheduled workflow on GitHub piles
+    # onto it) and clear of nightly-live-tests.yml's 08:00 slot.
+    - cron: "37 7 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Release even if main has not moved since the last beta"
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-beta
+  # Two beta cuts racing would compute the same counter and one would fail to
+  # push. Queue instead of cancelling.
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  cut:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          # Full history + tags: the counter is derived from the tag list.
+          fetch-depth: 0
+
+      - name: Decide whether to cut a beta
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          base=$(grep -E '^version = "[0-9]+\.[0-9]+\.[0-9]+' Cargo.toml \
+            | head -n1 | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+[^"]*)".*/\1/')
+          echo "base version: $base"
+
+          # -- Condition 2: the stall-guard. ------------------------------
+          # After stable v0.71.0 ships, a v0.71.0-beta.N sorts BELOW it under
+          # semver and would walk `rupu update` backwards on the beta channel.
+          # Deliberately NOT bypassable by `force`.
+          latest_stable=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' \
+            | grep -vE -- '-beta' | sort -V | tail -n1 || true)
+          if [ -n "$latest_stable" ] && [ "v$base" = "$latest_stable" ]; then
+            echo "::notice::base $base equals the shipped stable $latest_stable — waiting for the version bump; skipping"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # -- Condition 3: main must be green. ---------------------------
+          # Without this a red main ships a broken beta every morning.
+          # Deliberately NOT bypassable by `force`.
+          conclusion=$(gh run list --branch main --workflow ci.yml \
+            --limit 1 --json conclusion --jq '.[0].conclusion // "none"')
+          if [ "$conclusion" != "success" ]; then
+            echo "::notice::latest ci.yml run on main concluded '$conclusion' — skipping"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # -- Condition 1: main must have moved. -------------------------
+          # This one IS bypassable: re-releasing an unchanged main is a
+          # legitimate manual act (a botched upload, a signing fix).
+          prev=$(git tag -l "v$base-beta" "v$base-beta.*" | sort -V | tail -n1 || true)
+          if [ -n "$prev" ] && [ "$FORCE" != "true" ]; then
+            if [ "$(git rev-parse HEAD)" = "$(git rev-parse "$prev^{commit}")" ]; then
+              echo "::notice::main is unchanged since $prev — skipping"
+              echo "go=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          tag=$(git tag -l | scripts/next-beta-version.sh "$base")
+          echo "next tag: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "go=true"  >> "$GITHUB_OUTPUT"
+
+      - name: Push the tag
+        if: steps.decide.outputs.go == 'true'
+        run: |
+          set -euo pipefail
+          git tag "${{ steps.decide.outputs.tag }}"
+          git push origin "${{ steps.decide.outputs.tag }}"
+          echo "::notice::pushed ${{ steps.decide.outputs.tag }} — release.yml takes it from here"
