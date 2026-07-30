@@ -36,9 +36,49 @@ pub fn new_table() -> Table {
     t
 }
 
+/// Map a status string to its lifecycle position, for glyph selection.
+///
+/// Returns `None` for classification values — scope (`project` /
+/// `global`), issue state (`open` / `closed` / `merged`), and severity.
+/// Those get colour but never a glyph: in this CLI a glyph always means
+/// "where is this in its lifecycle", and attaching one to a
+/// classification value would imply progress that doesn't exist.
+///
+/// Deliberately NOT used to pick colours. `Status::Waiting.color()` is
+/// `palette.skipped` (203,213,225) while `pending` / `eligible` /
+/// `released` have always rendered as `palette.dim` (100,116,139).
+/// Routing colour through here would silently restyle them, so
+/// `status_color` below keeps its own explicit mapping. Do not merge
+/// the two.
+pub fn status_of(status: &str) -> Option<crate::output::palette::Status> {
+    use crate::output::palette::Status;
+    Some(match status {
+        "running" | "claimed" => Status::Active,
+        "completed" | "complete" => Status::Complete,
+        "failed" | "blocked" => Status::Failed,
+        "awaiting_approval" | "awaiting" | "paused" | "await_human" | "await_external" => {
+            Status::Awaiting
+        }
+        "rejected" | "retry_backoff" => Status::Retrying,
+        "pending" | "eligible" | "released" | "idle" => Status::Waiting,
+        "skipped" => Status::Skipped,
+        _ => return None,
+    })
+}
+
+/// The glyph for a lifecycle status, or `None` for classification
+/// values and unknown strings.
+pub fn status_glyph(status: &str) -> Option<char> {
+    status_of(status).map(|s| s.glyph())
+}
+
 /// Foreground color for a status string. Returns `None` when colors
 /// are disabled OR when the status doesn't match a known semantic
 /// bucket — caller falls back to a plain `Cell::new(status)`.
+///
+/// Kept separate from `status_of` on purpose: the palette's `dim` and
+/// `skipped` differ, so deriving these colours from `Status` would
+/// change `pending` / `eligible` / `released`. See `status_of`.
 pub fn status_color(status: &str, prefs: &UiPrefs) -> Option<TableColor> {
     if !prefs.use_color() {
         return None;
@@ -491,5 +531,62 @@ mod tests {
         // the smoke is that the cell builds without panic and the
         // yellow branch is taken (covered by status_color_known_buckets).
         let _ = cell;
+    }
+
+    #[test]
+    fn status_of_maps_lifecycle_states() {
+        use crate::output::palette::Status;
+        assert_eq!(status_of("running"), Some(Status::Active));
+        assert_eq!(status_of("claimed"), Some(Status::Active));
+        assert_eq!(status_of("completed"), Some(Status::Complete));
+        assert_eq!(status_of("complete"), Some(Status::Complete));
+        assert_eq!(status_of("failed"), Some(Status::Failed));
+        assert_eq!(status_of("blocked"), Some(Status::Failed));
+        assert_eq!(status_of("awaiting_approval"), Some(Status::Awaiting));
+        assert_eq!(status_of("await_human"), Some(Status::Awaiting));
+        assert_eq!(status_of("paused"), Some(Status::Awaiting));
+        assert_eq!(status_of("rejected"), Some(Status::Retrying));
+        assert_eq!(status_of("retry_backoff"), Some(Status::Retrying));
+        assert_eq!(status_of("pending"), Some(Status::Waiting));
+        assert_eq!(status_of("idle"), Some(Status::Waiting));
+        assert_eq!(status_of("skipped"), Some(Status::Skipped));
+    }
+
+    #[test]
+    fn status_of_rejects_classification_values() {
+        // Scope and issue state are not lifecycle positions. Giving
+        // them a glyph would imply progress semantics they don't have.
+        assert_eq!(status_of("project"), None);
+        assert_eq!(status_of("global"), None);
+        assert_eq!(status_of("open"), None);
+        assert_eq!(status_of("closed"), None);
+        assert_eq!(status_of("merged"), None);
+        assert_eq!(status_of("critical"), None);
+    }
+
+    #[test]
+    fn status_glyph_matches_the_palette_vocabulary() {
+        assert_eq!(status_glyph("running"), Some('●'));
+        assert_eq!(status_glyph("completed"), Some('✓'));
+        assert_eq!(status_glyph("failed"), Some('✗'));
+        assert_eq!(status_glyph("awaiting"), Some('⏸'));
+        assert_eq!(status_glyph("rejected"), Some('↺'));
+        assert_eq!(status_glyph("idle"), Some('○'));
+        assert_eq!(status_glyph("skipped"), Some('⊘'));
+        assert_eq!(status_glyph("project"), None);
+    }
+
+    #[test]
+    fn pending_keeps_its_dim_colour_not_the_waiting_colour() {
+        // Regression guard. Status::Waiting.color() is palette.skipped
+        // (203,213,225) but pending has always rendered as palette.dim
+        // (100,116,139). Deriving colour from Status would silently
+        // restyle it. Glyph and colour are mapped separately on
+        // purpose — see status_of's docstring.
+        let prefs = prefs_color_always();
+        let dim = crate::output::palette::active_palette().dim.into_table();
+        assert_eq!(status_color("pending", &prefs), Some(dim));
+        assert_eq!(status_color("eligible", &prefs), Some(dim));
+        assert_eq!(status_color("released", &prefs), Some(dim));
     }
 }
