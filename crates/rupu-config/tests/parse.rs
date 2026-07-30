@@ -265,8 +265,7 @@ fn cp_agent_authoring_ui_still_parses_with_sibling_cp_keys_intact() {
         gate_sweep_enabled = false
         max_workspace_bytes = 1048576
     "#;
-    let cfg: Config =
-        toml::from_str(toml).expect("`[cp].agent_authoring_ui` must not fail the parse");
+    let cfg: Config = toml::from_str(toml).expect("`[cp].agent_authoring_ui` must not fail the parse");
 
     // The deprecated key is accepted opaquely...
     assert!(cfg.cp.agent_authoring_ui.is_some());

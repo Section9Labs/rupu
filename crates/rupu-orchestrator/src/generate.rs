@@ -172,10 +172,15 @@ pub async fn generate_definition(
     // `org_id` / `region` settings — the same silent-dead-config class Arc 1
     // fixed everywhere else (see I-8, the identical defect in
     // `dispatch_agent`).
-    let (_mode, mut provider) =
-        build_for_provider_with_config(&req.provider, &req.model, None, resolver, provider_config)
-            .await
-            .map_err(|_| GenerateError::NoCredentials)?;
+    let (_mode, mut provider) = build_for_provider_with_config(
+        &req.provider,
+        &req.model,
+        None,
+        resolver,
+        provider_config,
+    )
+    .await
+    .map_err(|_| GenerateError::NoCredentials)?;
 
     let system = build_system_prompt(req.kind, &req.available_agents);
     let mut messages = vec![Message::user(&format!(

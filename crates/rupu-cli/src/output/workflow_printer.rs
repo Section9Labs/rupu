@@ -1575,13 +1575,8 @@ fn workflow_transcript_event_lines(
             blocked,
             ..
         } => {
-            let status = if *blocked {
-                UiStatus::Failed
-            } else {
-                UiStatus::Complete
-            };
-            let detail =
-                format!("{tool}  ·  declared={declared} granted={granted} blocked={blocked}");
+            let status = if *blocked { UiStatus::Failed } else { UiStatus::Complete };
+            let detail = format!("{tool}  ·  declared={declared} granted={granted} blocked={blocked}");
             vec![WorkflowViewLine {
                 status,
                 text: retained_workflow_event_line_raw(status, "tool audit", &detail),

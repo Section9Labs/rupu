@@ -113,10 +113,10 @@ async fn second_step_sees_first_step_output_via_template() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
     let b_prompt = &res.step_results[1].rendered_prompt;
@@ -163,10 +163,10 @@ async fn event_payload_is_visible_in_step_prompts() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 1);
     let prompt = &res.step_results[0].rendered_prompt;
@@ -222,10 +222,10 @@ async fn issue_payload_is_visible_in_step_prompts_and_when_filters() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
     let read_prompt = &res.step_results[0].rendered_prompt;
@@ -287,10 +287,10 @@ async fn for_each_dispatches_one_item_per_line_and_binds_loop_metadata() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
 
@@ -352,10 +352,10 @@ async fn for_each_accepts_a_json_array_of_objects() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
     assert_eq!(fan.items.len(), 2);
@@ -400,10 +400,10 @@ steps:
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
     assert_eq!(fan.items.len(), 2, "should fan out over the file's 2 items");
@@ -448,10 +448,10 @@ async fn for_each_pulls_items_from_workflow_inputs_with_max_parallel_cap() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
     assert_eq!(fan.items.len(), 2);
@@ -569,10 +569,10 @@ async fn for_each_continue_on_error_records_failures_and_keeps_going() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
     assert_eq!(fan.items.len(), 3);
@@ -617,10 +617,10 @@ async fn for_each_without_continue_on_error_aborts_workflow_on_first_failure() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let err = run_workflow(opts).await.expect_err("should abort");
     let msg = err.to_string();
     assert!(
@@ -678,10 +678,10 @@ async fn parallel_dispatches_each_sub_step_with_its_own_agent_and_prompt() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
 
@@ -745,10 +745,10 @@ async fn parallel_continue_on_error_records_per_sub_step_failures() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     let triage = &res.step_results[0];
     assert_eq!(triage.items.len(), 2);
@@ -793,10 +793,10 @@ async fn parallel_without_continue_on_error_aborts_with_sub_step_id_in_message()
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let err = run_workflow(opts).await.expect_err("should abort");
     let msg = err.to_string();
     assert!(
@@ -842,10 +842,10 @@ async fn run_store_records_run_metadata_and_per_step_rows() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     assert!(!res.run_id.is_empty(), "run_id should be populated");
 
@@ -912,10 +912,10 @@ async fn run_store_marks_run_failed_with_error_message() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let _ = run_workflow(opts).await.expect_err("workflow should fail");
 
     // The Completed=>Failed transition must happen even though the
@@ -961,10 +961,10 @@ async fn no_run_store_skips_persistence_and_emits_empty_run_id() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     assert!(
         res.run_id.is_empty(),
@@ -1019,10 +1019,10 @@ async fn approval_gate_pauses_run_and_persists_awaiting_state() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
 
     // The first step ran; the second step (with `approval: required`)
@@ -1083,10 +1083,10 @@ async fn resume_from_approval_picks_up_at_awaited_step() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     let run_id = res.run_id.clone();
     assert!(res.awaiting.is_some());
@@ -1126,10 +1126,10 @@ async fn resume_from_approval_picks_up_at_awaited_step() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
 
     // Run completed this time.
@@ -1201,10 +1201,10 @@ steps:
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     assert!(res.awaiting.is_none());
     assert_eq!(res.step_results.len(), 1);
@@ -1336,10 +1336,10 @@ async fn panel_step_runs_panelists_in_parallel_and_aggregates_findings() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
     assert!(panel.success);
@@ -1407,10 +1407,10 @@ steps:
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     let summary_prompt = &res.step_results[1].rendered_prompt;
     assert!(
@@ -1458,10 +1458,10 @@ steps:
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
     assert_eq!(panel.items.len(), 2);
@@ -1611,10 +1611,10 @@ async fn panel_gate_loops_with_fixer_until_severity_clears() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
     // First iteration produced 1 HIGH finding; fixer ran; second
@@ -1667,10 +1667,10 @@ async fn panel_gate_marks_unresolved_when_max_iterations_exhausted() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
     assert!(!panel.resolved, "max_iterations exhausted → unresolved");
@@ -1728,10 +1728,10 @@ steps:
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
     assert!(panel.resolved);
@@ -1795,10 +1795,10 @@ async fn approval_with_timeout_seconds_persists_awaiting_since_and_expires_at() 
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     let info = res.awaiting.expect("workflow should pause");
     let expires_at = info
@@ -1856,10 +1856,10 @@ steps:
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     let info = res.awaiting.unwrap();
     assert!(info.expires_at.is_none());
@@ -1908,10 +1908,10 @@ async fn unit_checkpoints_persist_each_fanout_item() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let res = run_workflow(opts).await.unwrap();
     let checkpoints = store.read_unit_checkpoints(&res.run_id).unwrap();
     assert_eq!(checkpoints.len(), 3, "one checkpoint per fan-out unit");
@@ -2051,10 +2051,10 @@ async fn resume_reruns_only_failed_fanout_units() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
     let err = run_workflow(opts)
         .await
         .expect_err("first pass should fail");

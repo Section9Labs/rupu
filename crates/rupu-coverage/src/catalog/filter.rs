@@ -103,12 +103,7 @@ mod tests {
             tags: vec!["lang:rust".to_string(), "owasp".to_string()],
             ..Default::default()
         };
-        assert!(f.matches(&concern(
-            "a",
-            Severity::High,
-            &["lang:rust", "owasp"],
-            &["**"]
-        )));
+        assert!(f.matches(&concern("a", Severity::High, &["lang:rust", "owasp"], &["**"])));
         assert!(!f.matches(&concern("b", Severity::High, &["lang:rust"], &["**"])));
     }
 

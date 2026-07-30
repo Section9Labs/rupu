@@ -731,9 +731,7 @@ async fn archive_session(
         conn.archive_session(&id)
             .await
             .map_err(map_host_session_mutate_err)?;
-        return Ok(Json(
-            serde_json::json!({ "ok": true, "id": id, "host_id": host }),
-        ));
+        return Ok(Json(serde_json::json!({ "ok": true, "id": id, "host_id": host })));
     }
     mutate_session(&s, &id, crate::session_mutator::SessionAction::Archive).await
 }
@@ -751,9 +749,7 @@ async fn restore_session(
         conn.restore_session(&id)
             .await
             .map_err(map_host_session_mutate_err)?;
-        return Ok(Json(
-            serde_json::json!({ "ok": true, "id": id, "host_id": host }),
-        ));
+        return Ok(Json(serde_json::json!({ "ok": true, "id": id, "host_id": host })));
     }
     mutate_session(&s, &id, crate::session_mutator::SessionAction::Restore).await
 }
@@ -771,9 +767,7 @@ async fn delete_session(
         conn.delete_session(&id)
             .await
             .map_err(map_host_session_mutate_err)?;
-        return Ok(Json(
-            serde_json::json!({ "ok": true, "id": id, "host_id": host }),
-        ));
+        return Ok(Json(serde_json::json!({ "ok": true, "id": id, "host_id": host })));
     }
     mutate_session(&s, &id, crate::session_mutator::SessionAction::Delete).await
 }
@@ -1061,10 +1055,7 @@ mod tests {
         .0;
 
         assert_eq!(absent, serde_json::json!({ "ok": true, "id": "s1" }));
-        assert_eq!(
-            explicit_local,
-            serde_json::json!({ "ok": true, "id": "s1" })
-        );
+        assert_eq!(explicit_local, serde_json::json!({ "ok": true, "id": "s1" }));
     }
 
     #[tokio::test]

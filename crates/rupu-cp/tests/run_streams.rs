@@ -6,7 +6,8 @@ use rupu_runtime::{
 
 /// Construct an AppState rooted at `dir` and spin up an axum test server.
 async fn spawn_server(dir: &std::path::Path) -> std::net::SocketAddr {
-    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    let state =
+        rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
     let app = rupu_cp::server::router(state, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -54,12 +55,7 @@ async fn list_autoflows_returns_seeded_cycle() {
 
     let body: serde_json::Value = resp.json().await.unwrap();
     let arr = body.as_array().expect("body should be a JSON array");
-    assert_eq!(
-        arr.len(),
-        1,
-        "expected exactly one cycle; got {}",
-        arr.len()
-    );
+    assert_eq!(arr.len(), 1, "expected exactly one cycle; got {}", arr.len());
 
     let row = &arr[0];
     assert_eq!(
@@ -73,7 +69,11 @@ async fn list_autoflows_returns_seeded_cycle() {
         Some(3),
         "workflow_count mismatch"
     );
-    assert_eq!(row["ran_cycles"].as_u64(), Some(2), "ran_cycles mismatch");
+    assert_eq!(
+        row["ran_cycles"].as_u64(),
+        Some(2),
+        "ran_cycles mismatch"
+    );
     assert_eq!(
         row["skipped_cycles"].as_u64(),
         Some(1),
@@ -86,9 +86,7 @@ async fn list_autoflows_returns_seeded_cycle() {
     );
 
     // The run_id from the embedded event should be surfaced.
-    let run_ids = row["run_ids"]
-        .as_array()
-        .expect("run_ids should be an array");
+    let run_ids = row["run_ids"].as_array().expect("run_ids should be an array");
     assert_eq!(run_ids.len(), 1, "expected one run_id; got {run_ids:?}");
     assert_eq!(
         run_ids[0].as_str(),
@@ -135,12 +133,7 @@ async fn list_autoflow_events_returns_seeded_launch() {
 
     let body: serde_json::Value = resp.json().await.unwrap();
     let arr = body.as_array().expect("body should be a JSON array");
-    assert_eq!(
-        arr.len(),
-        1,
-        "expected exactly one event; got {}",
-        arr.len()
-    );
+    assert_eq!(arr.len(), 1, "expected exactly one event; got {}", arr.len());
 
     let row = &arr[0];
     assert_eq!(
@@ -290,11 +283,7 @@ async fn list_agent_runs_returns_standalone_meta() {
         .find(|r| r["run_id"].as_str() == Some("run_standalone_01"))
         .expect("run_standalone_01 should be present");
 
-    assert_eq!(
-        row["source"].as_str(),
-        Some("standalone"),
-        "source mismatch"
-    );
+    assert_eq!(row["source"].as_str(), Some("standalone"), "source mismatch");
     assert_eq!(
         row["trigger_source"].as_str(),
         Some("run_cli"),

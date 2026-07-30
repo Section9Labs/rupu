@@ -524,9 +524,7 @@ mod tests {
         let dto = map_step(&step);
         assert_eq!(dto.kind, "gate");
         assert_eq!(dto.action, None);
-        let gate = dto
-            .approval_gate
-            .expect("approval_gate populated for a gate node");
+        let gate = dto.approval_gate.expect("approval_gate populated for a gate node");
         assert!(gate.auto_approve);
         assert!(gate.has_on_reject);
         assert_eq!(gate.timeout_seconds, Some(3600));

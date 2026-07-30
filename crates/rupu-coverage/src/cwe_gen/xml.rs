@@ -61,7 +61,8 @@ pub fn parse_cwe_xml_str(xml: &str) -> Result<ParsedCwe, CweXmlError> {
     let mut weaknesses: Vec<RawWeakness> = Vec::new();
     let mut views_raw: Vec<RawView> = Vec::new();
     // category id -> list of weakness ids it contains
-    let mut categories: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+    let mut categories: std::collections::HashMap<u32, Vec<u32>> =
+        std::collections::HashMap::new();
 
     // current-context tracking
     let mut cur_weakness: Option<RawWeakness> = None;
@@ -101,9 +102,7 @@ pub fn parse_cwe_xml_str(xml: &str) -> Result<ParsedCwe, CweXmlError> {
                     "Description" if cur_weakness.is_some() && depth == weakness_depth + 1 => {
                         in_description = true
                     }
-                    "Extended_Description"
-                        if cur_weakness.is_some() && depth == weakness_depth + 1 =>
-                    {
+                    "Extended_Description" if cur_weakness.is_some() && depth == weakness_depth + 1 => {
                         in_extended = true
                     }
                     // <Impact> only appears in Common_Consequences/Consequence;
@@ -285,12 +284,15 @@ fn attr_u32(
 ) -> Result<Option<u32>, CweXmlError> {
     match attr_string(e, key, reader)? {
         None => Ok(None),
-        Some(s) => s.parse::<u32>().map(Some).map_err(|_| {
-            CweXmlError::Malformed(format!(
-                "expected u32 for {:?}, got {s:?}",
-                String::from_utf8_lossy(key)
-            ))
-        }),
+        Some(s) => s
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| {
+                CweXmlError::Malformed(format!(
+                    "expected u32 for {:?}, got {s:?}",
+                    String::from_utf8_lossy(key)
+                ))
+            }),
     }
 }
 
@@ -332,9 +334,7 @@ mod tests {
         assert_eq!(parsed.weaknesses.len(), 1);
         assert_eq!(parsed.weaknesses[0].id, 787);
         assert_eq!(parsed.weaknesses[0].name, "Out-of-bounds Write");
-        assert!(parsed.weaknesses[0]
-            .description
-            .contains("writes data past the end"));
+        assert!(parsed.weaknesses[0].description.contains("writes data past the end"));
         assert_eq!(parsed.weaknesses[0].applicable_languages, vec!["C", "C++"]);
         assert_eq!(parsed.weaknesses[0].impact_tags, vec!["Modify Memory"]);
 
@@ -495,10 +495,7 @@ mod tests {
         let w = &parsed.weaknesses[0];
         // The weakness's own description — NOT the Consequence or
         // Detection_Method descriptions nested deeper.
-        assert_eq!(
-            w.description,
-            "The product uses a cookie without the HttpOnly flag."
-        );
+        assert_eq!(w.description, "The product uses a cookie without the HttpOnly flag.");
         assert_eq!(
             w.extended_description.as_deref(),
             Some("This allows client-side scripts to read the cookie.")

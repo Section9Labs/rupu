@@ -178,18 +178,15 @@ async fn http_archive_restore_delete_session_round_trip() {
     let server = httpmock::MockServer::start_async().await;
     let archive_mock = server.mock(|when, then| {
         when.method("POST").path("/api/sessions/sess_a/archive");
-        then.status(200)
-            .json_body(serde_json::json!({"ok": true, "id": "sess_a"}));
+        then.status(200).json_body(serde_json::json!({"ok": true, "id": "sess_a"}));
     });
     let restore_mock = server.mock(|when, then| {
         when.method("POST").path("/api/sessions/sess_a/restore");
-        then.status(200)
-            .json_body(serde_json::json!({"ok": true, "id": "sess_a"}));
+        then.status(200).json_body(serde_json::json!({"ok": true, "id": "sess_a"}));
     });
     let delete_mock = server.mock(|when, then| {
         when.method("DELETE").path("/api/sessions/sess_a");
-        then.status(200)
-            .json_body(serde_json::json!({"ok": true, "id": "sess_a"}));
+        then.status(200).json_body(serde_json::json!({"ok": true, "id": "sess_a"}));
     });
     let c = HttpHostConnector::new(server.base_url(), None);
     c.archive_session("sess_a").await.unwrap();
@@ -205,13 +202,11 @@ async fn http_archive_delete_transcript_round_trip() {
     let server = httpmock::MockServer::start_async().await;
     let archive_mock = server.mock(|when, then| {
         when.method("POST").path("/api/transcripts/run_a/archive");
-        then.status(200)
-            .json_body(serde_json::json!({"ok": true, "id": "run_a"}));
+        then.status(200).json_body(serde_json::json!({"ok": true, "id": "run_a"}));
     });
     let delete_mock = server.mock(|when, then| {
         when.method("DELETE").path("/api/transcripts/run_a");
-        then.status(200)
-            .json_body(serde_json::json!({"ok": true, "id": "run_a"}));
+        then.status(200).json_body(serde_json::json!({"ok": true, "id": "run_a"}));
     });
     let c = HttpHostConnector::new(server.base_url(), None);
     c.archive_transcript("run_a", false).await.unwrap();
@@ -229,15 +224,13 @@ async fn http_archive_delete_transcript_ignore_liveness_query_param() {
         when.method("POST")
             .path("/api/transcripts/run_b/archive")
             .query_param("ignore_liveness", "true");
-        then.status(200)
-            .json_body(serde_json::json!({"ok": true, "id": "run_b"}));
+        then.status(200).json_body(serde_json::json!({"ok": true, "id": "run_b"}));
     });
     let delete_mock = server.mock(|when, then| {
         when.method("DELETE")
             .path("/api/transcripts/run_b")
             .query_param("ignore_liveness", "true");
-        then.status(200)
-            .json_body(serde_json::json!({"ok": true, "id": "run_b"}));
+        then.status(200).json_body(serde_json::json!({"ok": true, "id": "run_b"}));
     });
     let c = HttpHostConnector::new(server.base_url(), None);
     c.archive_transcript("run_b", true).await.unwrap();

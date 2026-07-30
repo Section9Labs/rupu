@@ -38,10 +38,7 @@ fn fixture(global_cfg: &str, project_cfg: &str) -> (assert_fs::TempDir, std::pat
     let global = tmp.child(".rupu");
     global.create_dir_all().unwrap();
     global.child("agents").create_dir_all().unwrap();
-    global
-        .child("agents/writer.md")
-        .write_str(WRITER_AGENT)
-        .unwrap();
+    global.child("agents/writer.md").write_str(WRITER_AGENT).unwrap();
     global.child("config.toml").write_str(global_cfg).unwrap();
 
     let project = tmp.child("proj");

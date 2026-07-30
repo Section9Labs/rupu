@@ -470,7 +470,10 @@ async fn archive_run_with_remote_host_does_not_touch_local_run_store() {
 
     // Seed a LOCAL run under the same id the remote mock uses.
     local_store
-        .create(local_terminal_record("run_shared_id"), "name: x\n")
+        .create(
+            local_terminal_record("run_shared_id"),
+            "name: x\n",
+        )
         .unwrap();
 
     let app = rupu_cp::server::router(state, None);
@@ -491,16 +494,8 @@ async fn archive_run_with_remote_host_does_not_touch_local_run_store() {
     m.assert();
 
     // The LOCAL run must be completely untouched — still active, not archived.
-    assert_eq!(
-        local_store.list().unwrap().len(),
-        1,
-        "local run must still be active"
-    );
-    assert_eq!(
-        local_store.list_archived().unwrap().len(),
-        0,
-        "local archive scope must stay empty"
-    );
+    assert_eq!(local_store.list().unwrap().len(), 1, "local run must still be active");
+    assert_eq!(local_store.list_archived().unwrap().len(), 0, "local archive scope must stay empty");
 }
 
 fn local_terminal_record(id: &str) -> rupu_orchestrator::RunRecord {
@@ -592,8 +587,7 @@ async fn archive_session_with_remote_host_proxies_and_returns_host_id() {
     });
 
     let tmp = tempfile::tempdir().unwrap();
-    let (addr, host_id) =
-        spawn_with_remote_and_session_mutator(tmp.path(), &remote.base_url()).await;
+    let (addr, host_id) = spawn_with_remote_and_session_mutator(tmp.path(), &remote.base_url()).await;
 
     let resp = reqwest::Client::new()
         .post(format!(
@@ -620,13 +614,10 @@ async fn delete_session_with_remote_host_proxies_and_returns_host_id() {
     });
 
     let tmp = tempfile::tempdir().unwrap();
-    let (addr, host_id) =
-        spawn_with_remote_and_session_mutator(tmp.path(), &remote.base_url()).await;
+    let (addr, host_id) = spawn_with_remote_and_session_mutator(tmp.path(), &remote.base_url()).await;
 
     let resp = reqwest::Client::new()
-        .delete(format!(
-            "http://{addr}/api/sessions/sess_del?host={host_id}"
-        ))
+        .delete(format!("http://{addr}/api/sessions/sess_del?host={host_id}"))
         .send()
         .await
         .unwrap();
@@ -648,8 +639,7 @@ async fn archive_session_absent_host_still_uses_local_mutator_not_remote() {
     // remote's default httpmock behavior (connection accepted, 404-ish
     // response) would surface as an error instead of `ok: true`.
     let tmp = tempfile::tempdir().unwrap();
-    let (addr, _host_id) =
-        spawn_with_remote_and_session_mutator(tmp.path(), &remote.base_url()).await;
+    let (addr, _host_id) = spawn_with_remote_and_session_mutator(tmp.path(), &remote.base_url()).await;
 
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/api/sessions/sess_local/archive"))
@@ -726,9 +716,7 @@ async fn unknown_host_in_delete_run_returns_404() {
     let addr = spawn_readonly(tmp.path()).await;
 
     let resp = reqwest::Client::new()
-        .delete(format!(
-            "http://{addr}/api/runs/run_x?host=host_nonexistent"
-        ))
+        .delete(format!("http://{addr}/api/runs/run_x?host=host_nonexistent"))
         .send()
         .await
         .unwrap();

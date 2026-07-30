@@ -652,7 +652,10 @@ mod tests {
             detect_language(std::path::Path::new("A.Py")),
             Some("python")
         );
-        assert_eq!(detect_language(std::path::Path::new("a.YML")), Some("yaml"));
+        assert_eq!(
+            detect_language(std::path::Path::new("a.YML")),
+            Some("yaml")
+        );
     }
 
     #[test]

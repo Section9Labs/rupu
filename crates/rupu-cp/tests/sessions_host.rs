@@ -41,7 +41,8 @@ fn seed_session(global: &std::path::Path, id: &str, updated_at: &str) {
 
 /// Spin up a CP server at an ephemeral port.
 async fn spawn_server(dir: &std::path::Path) -> std::net::SocketAddr {
-    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    let state =
+        rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
     let app = rupu_cp::server::router(state, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -56,7 +57,8 @@ async fn spawn_server_with_remote(
     dir: &std::path::Path,
     mock_base_url: &str,
 ) -> (std::net::SocketAddr, String) {
-    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    let state =
+        rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
     let host = state
         .hosts
         .add_host("mock-remote", mock_base_url, None)
@@ -110,10 +112,7 @@ async fn session_list_fan_out_merges_local_and_remote() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let body: Vec<serde_json::Value> = resp.json().await.unwrap();
-    let ids: Vec<&str> = body
-        .iter()
-        .filter_map(|r| r["session_id"].as_str())
-        .collect();
+    let ids: Vec<&str> = body.iter().filter_map(|r| r["session_id"].as_str()).collect();
 
     assert!(
         ids.contains(&"local_sess_01"),
@@ -132,16 +131,10 @@ async fn session_list_fan_out_merges_local_and_remote() {
         );
     }
 
-    let local_row = body
-        .iter()
-        .find(|r| r["session_id"] == "local_sess_01")
-        .unwrap();
+    let local_row = body.iter().find(|r| r["session_id"] == "local_sess_01").unwrap();
     assert_eq!(local_row["host_id"], "local");
 
-    let remote_found = body
-        .iter()
-        .find(|r| r["session_id"] == "remote_sess_01")
-        .unwrap();
+    let remote_found = body.iter().find(|r| r["session_id"] == "remote_sess_01").unwrap();
     assert_eq!(remote_found["host_id"], host_id);
 }
 
@@ -174,18 +167,9 @@ async fn session_list_host_all_fans_out() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let body: Vec<serde_json::Value> = resp.json().await.unwrap();
-    let ids: Vec<&str> = body
-        .iter()
-        .filter_map(|r| r["session_id"].as_str())
-        .collect();
-    assert!(
-        ids.contains(&"local_sess_all_01"),
-        "local missing; got {ids:?}"
-    );
-    assert!(
-        ids.contains(&"remote_sess_all_01"),
-        "remote missing; got {ids:?}"
-    );
+    let ids: Vec<&str> = body.iter().filter_map(|r| r["session_id"].as_str()).collect();
+    assert!(ids.contains(&"local_sess_all_01"), "local missing; got {ids:?}");
+    assert!(ids.contains(&"remote_sess_all_01"), "remote missing; got {ids:?}");
 }
 
 /// `?host=local` returns only local sessions, tagged `host_id=local`.
@@ -212,23 +196,14 @@ async fn session_list_host_local_only() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let body: Vec<serde_json::Value> = resp.json().await.unwrap();
-    let ids: Vec<&str> = body
-        .iter()
-        .filter_map(|r| r["session_id"].as_str())
-        .collect();
-    assert!(
-        ids.contains(&"local_only_sess_01"),
-        "local missing; got {ids:?}"
-    );
+    let ids: Vec<&str> = body.iter().filter_map(|r| r["session_id"].as_str()).collect();
+    assert!(ids.contains(&"local_only_sess_01"), "local missing; got {ids:?}");
     assert!(
         !ids.contains(&"should_not_appear"),
         "remote session must not appear with ?host=local; got {ids:?}"
     );
 
-    let row = body
-        .iter()
-        .find(|r| r["session_id"] == "local_only_sess_01")
-        .unwrap();
+    let row = body.iter().find(|r| r["session_id"] == "local_only_sess_01").unwrap();
     assert_eq!(row["host_id"], "local");
 }
 
@@ -258,10 +233,7 @@ async fn session_list_offline_host_tolerated() {
     assert_eq!(resp.status(), StatusCode::OK, "offline host must not 500");
 
     let body: Vec<serde_json::Value> = resp.json().await.unwrap();
-    let ids: Vec<&str> = body
-        .iter()
-        .filter_map(|r| r["session_id"].as_str())
-        .collect();
+    let ids: Vec<&str> = body.iter().filter_map(|r| r["session_id"].as_str()).collect();
     assert!(
         ids.contains(&"local_offline_sess_01"),
         "local session must still appear; got {ids:?}"
@@ -283,8 +255,7 @@ async fn get_session_proxies_to_remote_host() {
     });
     let mock = httpmock::MockServer::start_async().await;
     let _m = mock.mock(|when, then| {
-        when.method("GET")
-            .path("/api/sessions/remote_detail_sess_01");
+        when.method("GET").path("/api/sessions/remote_detail_sess_01");
         then.status(200).json_body(remote_response.clone());
     });
 
@@ -319,8 +290,7 @@ async fn get_session_runs_proxies_to_remote_host() {
     }]);
     let mock = httpmock::MockServer::start_async().await;
     let _m = mock.mock(|when, then| {
-        when.method("GET")
-            .path("/api/sessions/remote_runs_sess_01/runs");
+        when.method("GET").path("/api/sessions/remote_runs_sess_01/runs");
         then.status(200).json_body(remote_rows.clone());
     });
 

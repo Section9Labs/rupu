@@ -12,8 +12,8 @@
 //! is consumed by the agent runtime in Plan 2 — tools themselves
 //! are not aware of permission state.
 
-pub mod coverage_emit;
 pub mod tool;
+pub mod coverage_emit;
 
 mod path_scope;
 

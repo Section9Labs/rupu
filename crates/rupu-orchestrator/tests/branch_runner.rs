@@ -191,8 +191,7 @@ async fn branch_take_then_skips_else_arm_and_reconverges() {
         join.rendered_prompt
     );
     assert!(
-        join.rendered_prompt
-            .contains("a=[step arm_a agent ag echo:"),
+        join.rendered_prompt.contains("a=[step arm_a agent ag echo:"),
         "join should see arm_a's real output, got: {}",
         join.rendered_prompt
     );
@@ -200,9 +199,7 @@ async fn branch_take_then_skips_else_arm_and_reconverges() {
     // The StepSkipped event for arm_b carries the branch reason.
     let events = sink.events.lock().unwrap();
     let skip_reason = events.iter().find_map(|e| match e {
-        Event::StepSkipped {
-            step_id, reason, ..
-        } if step_id == "arm_b" => Some(reason.clone()),
+        Event::StepSkipped { step_id, reason, .. } if step_id == "arm_b" => Some(reason.clone()),
         _ => None,
     });
     assert!(
@@ -242,8 +239,7 @@ async fn branch_take_else_skips_then_arm() {
         join.rendered_prompt
     );
     assert!(
-        join.rendered_prompt
-            .contains("b=[step arm_b agent ag echo:"),
+        join.rendered_prompt.contains("b=[step arm_b agent ag echo:"),
         "join should see arm_b's real output, got: {}",
         join.rendered_prompt
     );

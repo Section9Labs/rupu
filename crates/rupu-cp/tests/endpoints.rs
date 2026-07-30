@@ -9,7 +9,10 @@ use std::path::Path;
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-async fn spawn_server(global: &Path, workspace: &Path) -> std::net::SocketAddr {
+async fn spawn_server(
+    global: &Path,
+    workspace: &Path,
+) -> std::net::SocketAddr {
     let state = rupu_cp::state::AppState::new(global.into(), PricingConfig::default())
         .with_workspace_dir(workspace.into());
     let app = rupu_cp::server::router(state, None);
@@ -123,10 +126,7 @@ async fn workflows_list_returns_seeded_workflow() {
     let names: Vec<&str> = arr.iter().filter_map(|v| v["name"].as_str()).collect();
     assert!(names.contains(&"wf"), "expected 'wf' in {names:?}");
     let scopes: Vec<&str> = arr.iter().filter_map(|v| v["scope"].as_str()).collect();
-    assert!(
-        scopes.iter().all(|&s| s == "global"),
-        "all scopes should be global"
-    );
+    assert!(scopes.iter().all(|&s| s == "global"), "all scopes should be global");
 }
 
 #[tokio::test]
@@ -210,16 +210,11 @@ async fn sessions_list_returns_active_session_with_scope() {
     let body: serde_json::Value = resp.json().await.unwrap();
     let arr = body.as_array().expect("should be array");
     assert!(!arr.is_empty(), "expected at least one session");
-    let item = arr
-        .iter()
-        .find(|v| v["session_id"].as_str() == Some("sess1"))
+    let item = arr.iter().find(|v| v["session_id"].as_str() == Some("sess1"))
         .expect("sess1 not found");
     assert_eq!(item["scope"].as_str(), Some("active"));
     // message_history must NOT be present
-    assert!(
-        item.get("message_history").is_none(),
-        "message_history should not be present"
-    );
+    assert!(item.get("message_history").is_none(), "message_history should not be present");
 }
 
 #[tokio::test]
@@ -228,11 +223,7 @@ async fn sessions_list_returns_archived_session_with_scope() {
     let global = tmp.path();
     let archive_dir = global.join("sessions-archive").join("sess2");
     std::fs::create_dir_all(&archive_dir).unwrap();
-    std::fs::write(
-        archive_dir.join("session.json"),
-        minimal_session_json("sess2"),
-    )
-    .unwrap();
+    std::fs::write(archive_dir.join("session.json"), minimal_session_json("sess2")).unwrap();
 
     let addr = spawn_server(global, global).await;
 
@@ -242,9 +233,7 @@ async fn sessions_list_returns_archived_session_with_scope() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     let arr = body.as_array().unwrap();
-    let item = arr
-        .iter()
-        .find(|v| v["session_id"].as_str() == Some("sess2"))
+    let item = arr.iter().find(|v| v["session_id"].as_str() == Some("sess2"))
         .expect("sess2 not found in archive");
     assert_eq!(item["scope"].as_str(), Some("archived"));
 }
@@ -307,11 +296,7 @@ async fn session_detail_500_for_corrupt_session_json() {
     let resp = reqwest::get(format!("http://{addr}/api/sessions/sess-corrupt"))
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        500,
-        "corrupt session.json should yield 500, not 404"
-    );
+    assert_eq!(resp.status(), 500, "corrupt session.json should yield 500, not 404");
 }
 
 // ---------------------------------------------------------------------------

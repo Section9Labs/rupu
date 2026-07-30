@@ -57,7 +57,8 @@ fn seed_run(
 }
 
 async fn spawn_server(dir: &std::path::Path) -> std::net::SocketAddr {
-    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    let state =
+        rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
     let app = rupu_cp::server::router(state, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -100,23 +101,13 @@ async fn workers_endpoint_enriches_with_run_activity() {
     let newer = Utc::now();
     run_store
         .create(
-            seed_run(
-                "run_done",
-                RunStatus::Completed,
-                Some(&worker.worker_id),
-                older,
-            ),
+            seed_run("run_done", RunStatus::Completed, Some(&worker.worker_id), older),
             "name: x\n",
         )
         .unwrap();
     run_store
         .create(
-            seed_run(
-                "run_live",
-                RunStatus::Running,
-                Some(&worker.worker_id),
-                newer,
-            ),
+            seed_run("run_live", RunStatus::Running, Some(&worker.worker_id), newer),
             "name: x\n",
         )
         .unwrap();

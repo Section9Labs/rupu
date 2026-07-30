@@ -68,8 +68,7 @@ mod tests {
 
     #[test]
     fn parse_run_id_finds_run_line() {
-        let stdout =
-            "session: sess_01XYZ\nrun: run_01ABCDEF\nattach: rupu session attach sess_01XYZ\n";
+        let stdout = "session: sess_01XYZ\nrun: run_01ABCDEF\nattach: rupu session attach sess_01XYZ\n";
         assert_eq!(parse_run_id(stdout), Some("run_01ABCDEF".to_string()));
     }
 

@@ -58,10 +58,7 @@ fn render_one_full(concern: &Concern) -> String {
     let mut out = String::new();
     out.push_str(&format!("### {}\n", concern.id));
     out.push_str(&format!("**Name:** {}\n", concern.name));
-    out.push_str(&format!(
-        "**Severity:** {}\n",
-        severity_str(concern.severity)
-    ));
+    out.push_str(&format!("**Severity:** {}\n", severity_str(concern.severity)));
     if !concern.applicable_globs.is_empty() {
         out.push_str(&format!(
             "**Applies to:** {}\n",

@@ -194,12 +194,7 @@ async fn list_autoflow_defs(State(s): State<AppState>) -> ApiResult<Json<Vec<Aut
             .join(".rupu")
             .join("workflows");
         let scope_id = Some(r.workspace.id.clone());
-        project_rows.extend(scan_autoflow_defs(
-            &dir,
-            r.scope,
-            ScopeKind::Project,
-            scope_id,
-        ));
+        project_rows.extend(scan_autoflow_defs(&dir, r.scope, ScopeKind::Project, scope_id));
     }
 
     let project_names: std::collections::BTreeSet<&str> =
@@ -755,13 +750,9 @@ mod tests {
         let path = seed_global_autoflow(&tmp, "nightly.yaml", AUTOFLOW_ENABLED_TRUE);
         let s = with_dummy_launcher(test_state(&tmp));
 
-        let resp = disable_autoflow(
-            State(s),
-            Path("nightly".into()),
-            Query(ScopeQuery::default()),
-        )
-        .await
-        .expect("disable should succeed");
+        let resp = disable_autoflow(State(s), Path("nightly".into()), Query(ScopeQuery::default()))
+            .await
+            .expect("disable should succeed");
         assert!(!resp.0.enabled);
         assert_eq!(resp.0.name, "nightly");
 
@@ -789,13 +780,9 @@ mod tests {
         let path = seed_global_autoflow(&tmp, "nightly.yaml", AUTOFLOW_ENABLED_FALSE);
         let s = with_dummy_launcher(test_state(&tmp));
 
-        let resp = enable_autoflow(
-            State(s),
-            Path("nightly".into()),
-            Query(ScopeQuery::default()),
-        )
-        .await
-        .expect("enable should succeed");
+        let resp = enable_autoflow(State(s), Path("nightly".into()), Query(ScopeQuery::default()))
+            .await
+            .expect("enable should succeed");
         assert!(resp.0.enabled);
 
         let on_disk = std::fs::read_to_string(&path).unwrap();
@@ -823,11 +810,7 @@ mod tests {
             let workflows = root.join(".rupu").join("workflows");
             std::fs::create_dir_all(&workflows).unwrap();
             let path = workflows.join("issue-triage.yaml");
-            std::fs::write(
-                &path,
-                AUTOFLOW_ENABLED_TRUE.replace("nightly", "issue-triage"),
-            )
-            .unwrap();
+            std::fs::write(&path, AUTOFLOW_ENABLED_TRUE.replace("nightly", "issue-triage")).unwrap();
             worktree_paths.insert(name.to_string(), path);
             register_workspace_with_remote(&tmp, &format!("ws_{name}"), &root, Some(remote));
         }
@@ -840,13 +823,9 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].scope, "worktree-a");
 
-        let resp = disable_autoflow(
-            State(s),
-            Path("issue-triage".into()),
-            Query(ScopeQuery::default()),
-        )
-        .await
-        .expect("disable should succeed");
+        let resp = disable_autoflow(State(s), Path("issue-triage".into()), Query(ScopeQuery::default()))
+            .await
+            .expect("disable should succeed");
         assert!(!resp.0.enabled);
 
         let a_disk = std::fs::read_to_string(&worktree_paths["worktree-a"]).unwrap();
@@ -882,11 +861,7 @@ mod tests {
         let proj_workflows = proj.path().join(".rupu").join("workflows");
         std::fs::create_dir_all(&proj_workflows).unwrap();
         let proj_path = proj_workflows.join("shared-name.yaml");
-        std::fs::write(
-            &proj_path,
-            AUTOFLOW_ENABLED_TRUE.replace("nightly", "shared-name"),
-        )
-        .unwrap();
+        std::fs::write(&proj_path, AUTOFLOW_ENABLED_TRUE.replace("nightly", "shared-name")).unwrap();
         register_workspace(&tmp, "ws_a", proj.path());
 
         let s = with_dummy_launcher(test_state(&tmp));
@@ -955,10 +930,7 @@ mod tests {
         assert!(!resp.0.enabled);
 
         let y_disk = std::fs::read_to_string(&path_y).unwrap();
-        assert!(
-            y_disk.contains("enabled: false"),
-            "repo Y's file must be flipped"
-        );
+        assert!(y_disk.contains("enabled: false"), "repo Y's file must be flipped");
         let x_disk = std::fs::read_to_string(&path_x).unwrap();
         assert!(
             x_disk.contains("enabled: true"),
@@ -972,13 +944,9 @@ mod tests {
         seed_global_autoflow(&tmp, "nightly.yaml", AUTOFLOW_ENABLED_FALSE);
         let s = test_state(&tmp); // no launcher installed — read-only deploy
 
-        let err = enable_autoflow(
-            State(s),
-            Path("nightly".into()),
-            Query(ScopeQuery::default()),
-        )
-        .await
-        .expect_err("no launcher should be rejected");
+        let err = enable_autoflow(State(s), Path("nightly".into()), Query(ScopeQuery::default()))
+            .await
+            .expect_err("no launcher should be rejected");
         assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
     }
 
@@ -988,13 +956,9 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("workflows")).unwrap();
         let s = with_dummy_launcher(test_state(&tmp));
 
-        let err = enable_autoflow(
-            State(s),
-            Path("does-not-exist".into()),
-            Query(ScopeQuery::default()),
-        )
-        .await
-        .expect_err("unknown name should 404");
+        let err = enable_autoflow(State(s), Path("does-not-exist".into()), Query(ScopeQuery::default()))
+            .await
+            .expect_err("unknown name should 404");
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
     }
 
@@ -1009,13 +973,9 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("workflows")).unwrap();
         let s = with_dummy_launcher(test_state(&tmp));
 
-        let err = enable_autoflow(
-            State(s),
-            Path("../evil".into()),
-            Query(ScopeQuery::default()),
-        )
-        .await
-        .expect_err("traversal name must be rejected");
+        let err = enable_autoflow(State(s), Path("../evil".into()), Query(ScopeQuery::default()))
+            .await
+            .expect_err("traversal name must be rejected");
         assert_eq!(
             err.0,
             axum::http::StatusCode::BAD_REQUEST,
@@ -1041,13 +1001,9 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("workflows")).unwrap();
         let s = with_dummy_launcher(test_state(&tmp));
 
-        let err = disable_autoflow(
-            State(s),
-            Path("../evil".into()),
-            Query(ScopeQuery::default()),
-        )
-        .await
-        .expect_err("traversal name must be rejected");
+        let err = disable_autoflow(State(s), Path("../evil".into()), Query(ScopeQuery::default()))
+            .await
+            .expect_err("traversal name must be rejected");
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
 
         let on_disk = std::fs::read_to_string(&outside_target).unwrap();
@@ -1066,13 +1022,9 @@ mod tests {
         let path = seed_global_autoflow(&tmp, "nightly.yaml", body);
         let s = with_dummy_launcher(test_state(&tmp));
 
-        let err = enable_autoflow(
-            State(s),
-            Path("nightly".into()),
-            Query(ScopeQuery::default()),
-        )
-        .await
-        .expect_err("unsupported edit should be rejected");
+        let err = enable_autoflow(State(s), Path("nightly".into()), Query(ScopeQuery::default()))
+            .await
+            .expect_err("unsupported edit should be rejected");
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
 
         let on_disk = std::fs::read_to_string(&path).unwrap();

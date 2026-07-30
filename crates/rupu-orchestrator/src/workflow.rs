@@ -164,9 +164,7 @@ pub enum WorkflowParseError {
     },
     #[error("step `{step}`: approval.{field} is only valid on a standalone approval gate step (remove agent/prompt to make this a gate node)")]
     GateFieldsOnInlineApproval { step: String, field: &'static str },
-    #[error(
-        "step `{step}`: `action:` is mutually exclusive with agent/prompt/for_each/parallel/panel"
-    )]
+    #[error("step `{step}`: `action:` is mutually exclusive with agent/prompt/for_each/parallel/panel")]
     ActionMutuallyExclusive { step: String },
     #[error("step `{step}`: `action:` must name a tool (e.g. scm.prs.create)")]
     ActionEmptyName { step: String },
@@ -2200,11 +2198,7 @@ pub fn is_nonlinear(wf: &Workflow) -> bool {
     if !wf.loops.is_empty() {
         return true;
     }
-    if wf
-        .steps
-        .iter()
-        .any(|s| s.split.is_some() || s.join.is_some())
-    {
+    if wf.steps.iter().any(|s| s.split.is_some() || s.join.is_some()) {
         return true;
     }
     // The deduped control-edge set (next/split/branch-arm/depends_on) shared
@@ -2343,7 +2337,10 @@ fn declaration_order_is_topological(wf: &Workflow) -> bool {
 pub(crate) fn workflow_has_explicit_edges(wf: &Workflow) -> bool {
     !wf.loops.is_empty()
         || wf.steps.iter().any(|s| {
-            !s.next.is_empty() || s.split.is_some() || s.join.is_some() || !s.depends_on.is_empty()
+            !s.next.is_empty()
+                || s.split.is_some()
+                || s.join.is_some()
+                || !s.depends_on.is_empty()
         })
 }
 
@@ -2904,8 +2901,7 @@ steps:
 
     #[test]
     fn empty_string_action_entry_is_rejected() {
-        let raw =
-            "name: w\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n    actions: [\"\", \"\"]\n";
+        let raw = "name: w\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n    actions: [\"\", \"\"]\n";
         assert!(matches!(
             Workflow::parse(raw).unwrap_err(),
             WorkflowParseError::ActionsUnknownTool { .. }
@@ -3148,9 +3144,10 @@ steps:
 
     #[test]
     fn branch_struct_parses() {
-        let b: Branch =
-            serde_yaml::from_str("condition: \"{{ steps.a.output }}\"\nthen: [x, y]\nelse: [z]\n")
-                .unwrap();
+        let b: Branch = serde_yaml::from_str(
+            "condition: \"{{ steps.a.output }}\"\nthen: [x, y]\nelse: [z]\n",
+        )
+        .unwrap();
         assert_eq!(b.condition, "{{ steps.a.output }}");
         assert_eq!(b.then, vec!["x", "y"]);
         assert_eq!(b.r#else, vec!["z"]);
@@ -3742,9 +3739,8 @@ steps:
         // order) reference and must NOT be rejected now that the workflow
         // has explicit edges — validate_graph governs ordering instead.
         let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: \"use {{ steps.later.output }}\"\n  - id: later\n    agent: x\n    prompt: p\n    next: [a]\n";
-        Workflow::parse(raw).expect(
-            "graph workflow with a valid edge-ordered forward-declared reference should parse",
-        );
+        Workflow::parse(raw)
+            .expect("graph workflow with a valid edge-ordered forward-declared reference should parse");
     }
 
     #[test]
@@ -4027,11 +4023,7 @@ loops:
         let def = wf.loops.get("refine").expect("loop `refine` must parse");
         assert_eq!(
             def.nodes,
-            vec![
-                "gen".to_string(),
-                "test".to_string(),
-                "critique".to_string()
-            ]
+            vec!["gen".to_string(), "test".to_string(), "critique".to_string()]
         );
         assert_eq!(def.until, "{{ steps.critique.approved }}");
         assert_eq!(def.max_iterations, 5);
@@ -4445,10 +4437,7 @@ loops:
     #[test]
     fn is_nonlinear_true_for_a_loop_workflow() {
         let wf = Workflow::parse(VALID_REFINE_LOOP).unwrap();
-        assert!(
-            is_nonlinear(&wf),
-            "a loop is a super-node — always nonlinear"
-        );
+        assert!(is_nonlinear(&wf), "a loop is a super-node — always nonlinear");
     }
 
     #[test]

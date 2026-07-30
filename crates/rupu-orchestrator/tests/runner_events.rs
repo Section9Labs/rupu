@@ -123,10 +123,10 @@ async fn run_workflow_emits_run_and_step_events_in_order() {
         run_id_override: None,
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
 
     run_workflow(opts).await.unwrap();
 
@@ -211,10 +211,10 @@ steps:
         run_id_override: None,
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
 
     run_workflow(opts).await.unwrap();
 
@@ -269,10 +269,10 @@ steps:
         run_id_override: None,
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
 
     run_workflow(opts).await.unwrap();
 
@@ -447,10 +447,10 @@ steps:
         run_id_override: None,
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
 
     run_workflow(opts).await.unwrap();
 
@@ -471,19 +471,13 @@ steps:
     let max_iter: Vec<u32> = events
         .iter()
         .filter_map(|e| match e {
-            Event::PanelRound {
-                step_id,
-                max_iterations,
-                ..
-            } if step_id == "scan" => Some(*max_iterations),
+            Event::PanelRound { step_id, max_iterations, .. } if step_id == "scan" => {
+                Some(*max_iterations)
+            }
             _ => None,
         })
         .collect();
-    assert_eq!(
-        max_iter,
-        vec![2, 2],
-        "max_iterations must be 2 for both rounds"
-    );
+    assert_eq!(max_iter, vec![2, 2], "max_iterations must be 2 for both rounds");
 }
 
 #[tokio::test]
@@ -508,10 +502,10 @@ async fn no_event_sink_does_not_emit_any_events() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-        unit_dispatcher: None,
-        action_dispatcher: None,
-        pause: None,
-    };
+                unit_dispatcher: None,
+                action_dispatcher: None,
+                pause: None,
+            };
 
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);

@@ -180,12 +180,22 @@ impl NodeMirror {
         match file {
             ArtifactFile::Events => {
                 let path = self.run_store.events_path(run_id);
-                let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+                let mut f = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
                 writeln!(f, "{line}")?;
             }
             ArtifactFile::StepResults => {
-                let path = self.run_store.root.join(run_id).join("step_results.jsonl");
-                let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+                let path = self
+                    .run_store
+                    .root
+                    .join(run_id)
+                    .join("step_results.jsonl");
+                let mut f = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
                 writeln!(f, "{line}")?;
             }
             ArtifactFile::UnitCheckpoints => {
@@ -194,7 +204,10 @@ impl NodeMirror {
                     .root
                     .join(run_id)
                     .join("unit_checkpoints.jsonl");
-                let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+                let mut f = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
                 writeln!(f, "{line}")?;
             }
             ArtifactFile::RunJson => {
