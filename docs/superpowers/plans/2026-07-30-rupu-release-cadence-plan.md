@@ -407,14 +407,28 @@ The bare `-beta` alternative is kept deliberately: pre-existing tags and manual
 `workflow_dispatch` re-publishes of them must keep resolving to the beta
 channel.
 
+Then add a reject arm immediately AFTER the two beta alternatives and BEFORE
+the stable arm:
+
+```sh
+            # By here both well-formed beta shapes have matched, so anything
+            # still carrying a non-digit, non-dot character after the leading
+            # `v` is malformed — a typo'd prerelease (`-beta.x`, `-rc1`) or a
+            # junk suffix (`0.71.0extra`). The stable pattern's trailing `*`
+            # would otherwise swallow it and publish a REAL release.
+            v*[!0-9.]*)
+              echo "::error::tag '$tag' has a malformed version or an unrecognized prerelease suffix"; exit 1 ;;
+```
+
 - [ ] **Step 2: Verify the matcher by hand**
 
 The `case` logic is a pure shell fragment, so exercise it directly rather than by dispatching a workflow:
 
 ```bash
-for tag in v0.71.0-beta v0.71.0-beta.4 v0.71.0 v0.71.0-beta.x vfoo; do
+for tag in v0.71.0-beta v0.71.0-beta.4 v0.71.0-beta.10 v0.71.0 v0.71.0-beta.x v0.71.0extra v0.71.0-rc1 vfoo; do
   case "$tag" in
     v[0-9]*.[0-9]*.[0-9]*-beta|v[0-9]*.[0-9]*.[0-9]*-beta.[0-9]*) echo "$tag -> beta" ;;
+    v*[!0-9.]*) echo "$tag -> REJECTED" ;;
     v[0-9]*.[0-9]*.[0-9]*) echo "$tag -> stable" ;;
     *) echo "$tag -> REJECTED" ;;
   esac
@@ -426,8 +440,11 @@ Expected exactly:
 ```
 v0.71.0-beta -> beta
 v0.71.0-beta.4 -> beta
+v0.71.0-beta.10 -> beta
 v0.71.0 -> stable
 v0.71.0-beta.x -> REJECTED
+v0.71.0extra -> REJECTED
+v0.71.0-rc1 -> REJECTED
 vfoo -> REJECTED
 ```
 
