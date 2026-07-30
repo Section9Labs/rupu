@@ -324,7 +324,7 @@ and are not repeated here.
 - [ ] Structured OpenRouter `reasoning_details` replay; Copilot `reasoning_text` capture.
 - [ ] Configurable compaction summarizer model (`compactModel`) — compaction burns tokens on the primary model.
 - [ ] Coverage: `rerun` for session/workflow/autoflow surfaces (agent-only today); `run_shaping` capture; sampling-parameter control; stable finding identity across runs.
-- [ ] **Multi-platform release assets** — `make gh-beta` builds only the host binary, so `rupu update` finds no asset on Linux or Intel macOS.
+- [ ] **Intel macOS release asset** — `release.yml`'s CI matrix builds `darwin-arm64` + `linux-x64` + `linux-arm64`; there is no `darwin-x64` job, so `rupu update` finds no asset on Intel macOS. (The local `make gh-beta`/`make gh-stable` path this item used to describe is retired; publishing is now `gh workflow run release-beta.yml` / weekly promotion via `release-stable.yml`.)
 - [ ] Adaptive backoff for multi-source trigger polling (~100 repos on a 1-minute tick exhausts the GitHub hourly budget); GitHub Projects polling.
 - [ ] Best-effort worktree teardown when releasing an autoflow claim from the web (leaks a worktree).
 - [ ] Reap detached `cp serve` children (zombie accumulation; the stdio + process-group half already shipped).
