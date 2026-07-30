@@ -49,8 +49,10 @@ assert_out "first beta on a fresh base" "v0.71.0-beta.1" \
 
 # The bug this whole test file exists to catch: lexical sort puts beta.9
 # above beta.10, so a naive `sort | tail -1` regresses to beta.2 forever.
-assert_out "beta.9 goes to beta.10, not beta.2" "v0.71.0-beta.10" \
-  sh -c "printf 'v0.71.0-beta.8\nv0.71.0-beta.9\n' | '$NEXT' 0.71.0"
+# This test discriminates: with both 9 and 10 present, lexical would pick 9,
+# numeric picks 10.
+assert_out "beta.9 vs beta.10 compares numerically, not lexically" "v0.71.0-beta.11" \
+  sh -c "printf 'v0.71.0-beta.9\nv0.71.0-beta.10\n' | '$NEXT' 0.71.0"
 
 # Betas belonging to a different base must not influence the counter.
 assert_out "counter resets after a base bump" "v0.72.0-beta.1" \
@@ -63,6 +65,20 @@ assert_out "legacy bare -beta tag counts as 1" "v0.71.0-beta.2" \
 # Unrelated refs must be ignored rather than parsed as a counter.
 assert_out "ignores rolling and unrelated tags" "v0.71.0-beta.1" \
   sh -c "printf 'latest-beta\nlatest-stable\nnightly\n' | '$NEXT' 0.71.0"
+
+# Leading zeros in counters must be handled without octal-interpretation crashes.
+assert_out "leading-zero counter is incremented correctly" "v0.71.0-beta.10" \
+  sh -c "printf 'v0.71.0-beta.09\n' | '$NEXT' 0.71.0"
+
+# Base version validation must be strict: exactly three dot-separated components.
+assert_fails "rejects base with trailing suffix" \
+  sh -c "printf '' | '$NEXT' '0.71.0-beta.5'"
+
+assert_fails "rejects base with extra component" \
+  sh -c "printf '' | '$NEXT' '0.71.0.1'"
+
+assert_fails "rejects base with non-numeric suffix" \
+  sh -c "printf '' | '$NEXT' '0.71.0extra'"
 
 assert_fails "rejects a malformed base version" \
   sh -c "printf '' | '$NEXT' 'not-a-version'"

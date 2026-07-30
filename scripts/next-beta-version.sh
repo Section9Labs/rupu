@@ -13,10 +13,18 @@
 set -euo pipefail
 
 base="${1:-}"
+# Base version must be exactly three dot-separated numeric components.
+bad=0
 case "$base" in
-  [0-9]*.[0-9]*.[0-9]*) ;;
-  *) echo "usage: $0 <base-version>  (e.g. 0.71.0)" >&2; exit 2 ;;
+  *[!0-9.]*|*..*|.*|*.) bad=1 ;;
+  *.*.*.*)              bad=1 ;;
+  *.*.*)                bad=0 ;;
+  *)                    bad=1 ;;
 esac
+if [ "$bad" -eq 1 ]; then
+  echo "usage: $0 <base-version>  (e.g. 0.71.0)" >&2
+  exit 2
+fi
 
 # Highest existing counter for THIS base. `-beta` with no suffix is the legacy
 # single-tag form and counts as 1.
@@ -34,6 +42,8 @@ while IFS= read -r tag; do
   case "$n" in
     ''|*[!0-9]*) continue ;;
   esac
+  # Use base-10 explicit arithmetic to avoid octal interpretation of leading zeros.
+  n=$((10#$n))
   if [ "$n" -gt "$max" ]; then
     max="$n"
   fi
