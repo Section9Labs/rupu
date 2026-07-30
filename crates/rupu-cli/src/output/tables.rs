@@ -71,7 +71,7 @@ pub fn status_of(status: &str) -> Option<crate::output::palette::Status> {
         }
         "rejected" | "retry_backoff" => Status::Retrying,
         "pending" | "eligible" | "released" | "idle" => Status::Waiting,
-        "skipped" => Status::Skipped,
+        "skipped" | "stopped" => Status::Skipped,
         _ => return None,
     })
 }
@@ -109,6 +109,8 @@ pub fn status_color(status: &str, prefs: &UiPrefs) -> Option<TableColor> {
         "blocked" => palette.failed.into_table(),
         "complete" => palette.complete.into_table(),
         "eligible" | "released" => palette.dim.into_table(),
+        "idle" | "stopped" => palette.dim.into_table(),
+        "skipped" => palette.skipped.into_table(),
         // Issue / PR states.
         "open" => palette.complete.into_table(),
         "closed" => palette.brand_subtle.into_table(),
