@@ -17,7 +17,7 @@
 - `rupu-cli` uses `anyhow` for errors; libraries use `thiserror`.
 - Unit tests live in-module under `#[cfg(test)] mod tests`, matching `output/fmt.rs` and `output/tables.rs`.
 - `--output json` output must remain byte-identical. Identifiers in JSON are always full-length.
-- Never run a package-wide `cargo fmt` — this repo is fmt-dirty under the pinned toolchain. Format only the files you touched: `cargo fmt -- <path>`.
+- Never run a package-wide `cargo fmt` — this repo is fmt-dirty under the pinned toolchain. Format only the files you touched: `rustfmt --edition 2021 <path>`.
 - Verified baseline: `cargo check -p rupu-cli --lib` exits 0 on this worktree (rustc 1.97.1). Any error you see is yours.
 - Glyphs come from `palette::Status` and are never invented. Classification values (scope, issue state, severity) get colour only, never a glyph.
 
@@ -300,7 +300,7 @@ Expected: PASS — 12 tests.
 - [ ] **Step 6: Format and lint**
 
 ```bash
-cargo fmt -- crates/rupu-cli/src/output/ids.rs crates/rupu-cli/src/output/mod.rs
+rustfmt --edition 2021 crates/rupu-cli/src/output/ids.rs crates/rupu-cli/src/output/mod.rs
 cargo clippy -p rupu-cli --lib 2>&1 | tail -5
 ```
 Expected: no warnings introduced by these files.
@@ -459,7 +459,7 @@ Expected: PASS — the four pre-existing tests plus seven new ones.
 - [ ] **Step 5: Format, lint, and commit**
 
 ```bash
-cargo fmt -- crates/rupu-cli/src/output/fmt.rs
+rustfmt --edition 2021 crates/rupu-cli/src/output/fmt.rs
 cargo clippy -p rupu-cli --lib 2>&1 | tail -5
 git add crates/rupu-cli/src/output/fmt.rs
 git commit -m "feat(cli): relative_time formatter
@@ -614,7 +614,7 @@ Expected: PASS — all pre-existing tests plus four new ones.
 - [ ] **Step 5: Format, lint, and commit**
 
 ```bash
-cargo fmt -- crates/rupu-cli/src/output/tables.rs
+rustfmt --edition 2021 crates/rupu-cli/src/output/tables.rs
 cargo clippy -p rupu-cli --lib 2>&1 | tail -5
 git add crates/rupu-cli/src/output/tables.rs
 git commit -m "feat(cli): status_of / status_glyph lifecycle mapping
@@ -767,7 +767,7 @@ Expected: header rule, no per-row separators, roughly half the previous vertical
 - [ ] **Step 8: Format and commit**
 
 ```bash
-cargo fmt -- crates/rupu-cli/src/output/tables.rs
+rustfmt --edition 2021 crates/rupu-cli/src/output/tables.rs
 git add crates/rupu-cli/src/output/tables.rs crates/rupu-cli/Cargo.toml \
         crates/rupu-cli/src/output/snapshots/
 git commit -m "feat(cli): quiet table preset, segmented header rule
@@ -1028,7 +1028,7 @@ Run: `cargo test -p rupu-cli 2>&1 | tail -10`
 Expected: PASS.
 
 ```bash
-cargo fmt -- crates/rupu-cli/src/cmd/session.rs
+rustfmt --edition 2021 crates/rupu-cli/src/cmd/session.rs
 cargo clippy -p rupu-cli --lib 2>&1 | tail -5
 git add crates/rupu-cli/src/cmd/session.rs
 git commit -m "feat(cli): resolve session ids from fragments
@@ -1218,7 +1218,7 @@ Expected: resolves to the full run.
 - [ ] **Step 8: Format, lint, and commit**
 
 ```bash
-cargo fmt -- crates/rupu-cli/src/cmd/workflow.rs
+rustfmt --edition 2021 crates/rupu-cli/src/cmd/workflow.rs
 cargo clippy -p rupu-cli --lib 2>&1 | tail -5
 git add crates/rupu-cli/src/cmd/workflow.rs
 git commit -m "feat(cli): resolve run ids from fragments
