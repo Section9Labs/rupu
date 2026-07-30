@@ -58,9 +58,22 @@ jobs:
 
   web:
     name: build embedded CP UI
+    # `needs: meta` purely so the checkout below can pin `meta.outputs.tag`;
+    # nothing else here reads a meta output.
+    needs: [meta]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Pin the tag explicitly. On a tag push `github.ref_name` is
+          # already the tag, but a `workflow_dispatch` re-publish runs
+          # from the default branch — a bare checkout would then build
+          # `main` while `publish` uploads with `--clobber`, silently
+          # replacing the tag's assets with binaries from a different
+          # tree. The AUR PKGBUILD, Homebrew formula and flake.nix all
+          # pin those checksums, so every community install path would
+          # start failing hash verification.
+          ref: ${{ needs.meta.outputs.tag }}
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -108,6 +121,16 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Pin the tag explicitly. On a tag push `github.ref_name` is
+          # already the tag, but a `workflow_dispatch` re-publish runs
+          # from the default branch — a bare checkout would then build
+          # `main` while `publish` uploads with `--clobber`, silently
+          # replacing the tag's assets with binaries from a different
+          # tree. The AUR PKGBUILD, Homebrew formula and flake.nix all
+          # pin those checksums, so every community install path would
+          # start failing hash verification.
+          ref: ${{ needs.meta.outputs.tag }}
       - uses: actions/download-artifact@v4
         with:
           name: web-dist
@@ -180,6 +203,16 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Pin the tag explicitly. On a tag push `github.ref_name` is
+          # already the tag, but a `workflow_dispatch` re-publish runs
+          # from the default branch — a bare checkout would then build
+          # `main` while `publish` uploads with `--clobber`, silently
+          # replacing the tag's assets with binaries from a different
+          # tree. The AUR PKGBUILD, Homebrew formula and flake.nix all
+          # pin those checksums, so every community install path would
+          # start failing hash verification.
+          ref: ${{ needs.meta.outputs.tag }}
 
       - name: Install nfpm
         run: |
@@ -338,6 +371,16 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Pin the tag explicitly. On a tag push `github.ref_name` is
+          # already the tag, but a `workflow_dispatch` re-publish runs
+          # from the default branch — a bare checkout would then build
+          # `main` while `publish` uploads with `--clobber`, silently
+          # replacing the tag's assets with binaries from a different
+          # tree. The AUR PKGBUILD, Homebrew formula and flake.nix all
+          # pin those checksums, so every community install path would
+          # start failing hash verification.
+          ref: ${{ needs.meta.outputs.tag }}
       - uses: actions/download-artifact@v4
         with:
           name: web-dist
@@ -428,6 +471,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          # Pin the tag explicitly. On a tag push `github.ref_name` is
+          # already the tag, but a `workflow_dispatch` re-publish runs
+          # from the default branch — a bare checkout would then build
+          # `main` while `publish` uploads with `--clobber`, silently
+          # replacing the tag's assets with binaries from a different
+          # tree. The AUR PKGBUILD, Homebrew formula and flake.nix all
+          # pin those checksums, so every community install path would
+          # start failing hash verification.
+          ref: ${{ needs.meta.outputs.tag }}
           fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
@@ -546,6 +598,16 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Pin the tag explicitly. On a tag push `github.ref_name` is
+          # already the tag, but a `workflow_dispatch` re-publish runs
+          # from the default branch — a bare checkout would then build
+          # `main` while `publish` uploads with `--clobber`, silently
+          # replacing the tag's assets with binaries from a different
+          # tree. The AUR PKGBUILD, Homebrew formula and flake.nix all
+          # pin those checksums, so every community install path would
+          # start failing hash verification.
+          ref: ${{ needs.meta.outputs.tag }}
 
       - name: Install repository tooling
         run: |
