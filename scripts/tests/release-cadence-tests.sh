@@ -15,16 +15,25 @@ PASS=0
 FAIL=0
 
 # assert_out <name> <expected> <script> [args...]  -- fixture lines on stdin
+#
+# Asserts BOTH stdout and an exit status of 0. The status half is not
+# ceremony: release-beta.yml and release-stable.yml run these scripts inside
+# steps that begin `set -euo pipefail`, so a script that prints the right
+# answer and then exits non-zero aborts the step — no tag, no release, and
+# (for the picker, whose empty output is a legitimate "nothing to promote")
+# a red workflow where a green skip was correct. Mutation testing proved the
+# gap: `exit 3` in place of `exit 0` left all 20 cases passing.
 assert_out() {
   name="$1"; expected="$2"; shift 2
   actual="$("$@" 2>/dev/null)"
-  if [ "$actual" = "$expected" ]; then
+  status=$?
+  if [ "$actual" = "$expected" ] && [ "$status" -eq 0 ]; then
     PASS=$((PASS + 1))
     printf '  ok   %s\n' "$name"
   else
     FAIL=$((FAIL + 1))
-    printf '  FAIL %s\n       expected: %s\n       actual:   %s\n' \
-      "$name" "$expected" "$actual"
+    printf '  FAIL %s\n       expected: %s (exit 0)\n       actual:   %s (exit %s)\n' \
+      "$name" "$expected" "$actual" "$status"
   fi
 }
 
@@ -122,6 +131,37 @@ assert_out "empty input yields no output" "" \
 assert_out "prefers the higher base version" "v0.72.0-beta.1" \
   sh -c "printf 'v0.71.0-beta.9\t%d\nv0.72.0-beta.1\t%d\n' \
     \$(( $NOW - 6 * $DAY )) \$(( $NOW - 3 * $DAY )) | '$PICK' 2 $NOW"
+
+# -- PATCH ordering. --------------------------------------------------------
+# Every other fixture uses patch 0, which left the patch branch of the
+# comparison unverified: a mutant that ignored patch entirely passed all 20
+# cases. The gap is live — the real tag set holds v0.70.1-beta … v0.70.4-beta,
+# differing in NOTHING but the patch, and the promoter has to pick .4.
+#
+# Order is load-bearing here. Both bare `-beta` tags carry counter 1, so with
+# patch ignored the second line is never "newer" and the FIRST one wins;
+# listing the lower patch first is what makes this case discriminate.
+assert_out "prefers the higher patch version" "v0.70.4-beta" \
+  sh -c "printf 'v0.70.1-beta\t%d\nv0.70.4-beta\t%d\n' \
+    \$(( $NOW - 5 * $DAY )) \$(( $NOW - 4 * $DAY )) | '$PICK' 2 $NOW"
+
+# Same pair in the opposite input order: the answer must not depend on which
+# line git happened to emit first.
+assert_out "higher patch wins regardless of input order" "v0.70.4-beta" \
+  sh -c "printf 'v0.70.4-beta\t%d\nv0.70.1-beta\t%d\n' \
+    \$(( $NOW - 4 * $DAY )) \$(( $NOW - 5 * $DAY )) | '$PICK' 2 $NOW"
+
+# -- MAJOR ordering. --------------------------------------------------------
+# Likewise every other fixture is major 0, so the major branch was unverified.
+# v0.9.0 vs v1.0.0 is the case that matters: ignore the major and the minor
+# comparison reads 9 > 0 and promotes the OLD line as stable.
+assert_out "crosses a major boundary correctly" "v1.0.0-beta" \
+  sh -c "printf 'v0.9.0-beta\t%d\nv1.0.0-beta\t%d\n' \
+    \$(( $NOW - 5 * $DAY )) \$(( $NOW - 4 * $DAY )) | '$PICK' 2 $NOW"
+
+assert_out "higher major wins regardless of input order" "v1.0.0-beta" \
+  sh -c "printf 'v1.0.0-beta\t%d\nv0.9.0-beta\t%d\n' \
+    \$(( $NOW - 4 * $DAY )) \$(( $NOW - 5 * $DAY )) | '$PICK' 2 $NOW"
 
 assert_fails "rejects a non-numeric soak window" \
   sh -c "printf '' | '$PICK' two $NOW"
