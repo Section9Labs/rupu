@@ -1023,6 +1023,17 @@ impl RunStore {
         Ok(serde_json::from_slice(&body)?)
     }
 
+    /// Cheap existence check across both scopes: true if `run_id` names a
+    /// `run.json` under the active run dir OR the archived one. Two
+    /// `is_file` stats, no directory scan and no JSON parse — the fast
+    /// path a fragment resolver uses to skip `list()`/`list_archived()`
+    /// (which deserialize every run.json) when the caller already passed
+    /// an exact id.
+    pub fn exists(&self, run_id: &str) -> bool {
+        self.run_json(run_id).is_file()
+            || self.archive_root().join(run_id).join("run.json").is_file()
+    }
+
     pub fn run_json_path(&self, run_id: &str) -> PathBuf {
         self.run_json(run_id)
     }
@@ -2711,6 +2722,35 @@ mod tests {
             .unwrap();
         let loaded = store.read_run_envelope(&envelope.run_id).unwrap();
         assert_eq!(loaded, envelope);
+    }
+
+    #[test]
+    fn exists_finds_active_and_archived_runs_without_a_scan() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+
+        let mut active = sample_record("run_exists_active");
+        active.status = RunStatus::Running;
+        store.create(active.clone(), "x").unwrap();
+
+        let mut archived = sample_record("run_exists_archived");
+        archived.status = RunStatus::Completed;
+        store.create(archived.clone(), "x").unwrap();
+        store.archive(&archived.id).unwrap();
+
+        assert!(
+            store.exists(&active.id),
+            "an active run's exact id must be found"
+        );
+        assert!(
+            store.exists(&archived.id),
+            "an archived run's exact id must still be found — the fast path \
+             must not make an archived run unreachable"
+        );
+        assert!(
+            !store.exists("run_does_not_exist"),
+            "an unknown id must report false, not panic or false-positive"
+        );
     }
 
     #[test]

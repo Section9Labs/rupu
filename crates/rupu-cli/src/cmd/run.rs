@@ -420,6 +420,13 @@ async fn show(
 ) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    // Resolve a fragment (compact form / bare suffix / unambiguous prefix)
+    // through the SAME resolver `rupu workflow show-run` uses
+    // (`cmd::workflow::resolve_run_fragment`), so both commands accept
+    // identical identifiers instead of `run show` requiring an exact id
+    // while `workflow show-run` accepts a 6-char suffix. Resolved once,
+    // right here, then the full id flows downstream.
+    let run_id = crate::cmd::workflow::resolve_run_fragment(&store, &run_id)?;
     let global_cfg_path = global.join("config.toml");
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), None).map_err(|e| {
         tracing::warn!(

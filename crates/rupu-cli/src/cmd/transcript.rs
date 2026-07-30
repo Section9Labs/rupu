@@ -579,7 +579,11 @@ fn render_transcript_header_line(
     }
     if let Some(run_id) = meta.run_id.as_deref() {
         let _ = palette::write_colored(&mut buf, "  ·  ", palette::DIM);
-        let _ = palette::write_colored(&mut buf, &compact_run_id(run_id), palette::DIM);
+        let _ = palette::write_colored(
+            &mut buf,
+            &crate::output::ids::compact_id(run_id),
+            palette::DIM,
+        );
     }
     let _ = palette::write_colored(&mut buf, "  ·  ", palette::DIM);
     let _ = palette::write_colored(&mut buf, view_mode.as_str(), palette::DIM);
@@ -657,7 +661,7 @@ fn transcript_event_lines(
                 "run started",
                 &format!(
                     "{}  ·  workspace {}  ·  mode {}  ·  {}",
-                    compact_run_id(run_id),
+                    crate::output::ids::compact_id(run_id),
                     workspace_id,
                     format!("{mode:?}").to_lowercase(),
                     started_at.format("%Y-%m-%d %H:%M:%S UTC")
@@ -1128,7 +1132,7 @@ pub(crate) fn render_pretty_transcript_event(
             }
             let detail = format!(
                 "{}  ·  workspace {workspace_id}  ·  mode {}  ·  {}",
-                compact_run_id(run_id),
+                crate::output::ids::compact_id(run_id),
                 format!("{mode:?}").to_lowercase(),
                 started_at.format("%Y-%m-%d %H:%M:%S UTC")
             );
@@ -1330,23 +1334,6 @@ pub(crate) enum TranscriptPrettyContext {
     SessionAttached,
 }
 
-fn compact_run_id(run_id: &str) -> String {
-    if run_id.chars().count() <= 18 {
-        run_id.to_string()
-    } else {
-        let head = run_id.chars().take(12).collect::<String>();
-        let tail = run_id
-            .chars()
-            .rev()
-            .take(4)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<String>();
-        format!("{head}…{tail}")
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TranscriptScope {
     Active,
@@ -1526,7 +1513,9 @@ async fn show(
     pager_flag: Option<bool>,
     global_format: Option<OutputFormat>,
 ) -> anyhow::Result<()> {
-    let path = locate_transcript(run_id)?.transcript_path;
+    let location = locate_transcript(run_id)?;
+    let path = location.transcript_path;
+    let run_id = location.run_id.as_str();
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
@@ -1565,6 +1554,12 @@ async fn show(
 }
 
 struct TranscriptLocation {
+    /// The resolved run id — always the full id, even when
+    /// `locate_transcript` was called with a fragment. Callers that
+    /// build further paths or messages from a run id MUST use this
+    /// field, not whatever string the user originally typed: a fragment
+    /// used verbatim would point at a file that doesn't exist.
+    run_id: String,
     transcript_path: PathBuf,
     metadata_path: PathBuf,
     archived: bool,
@@ -1572,6 +1567,9 @@ struct TranscriptLocation {
 
 async fn archive(run_id: &str, ignore_liveness: bool) -> anyhow::Result<()> {
     let location = locate_transcript(run_id)?;
+    // Resolved full id from here on — `run_id` may have been a
+    // fragment, and paths built below must use the real id.
+    let run_id = location.run_id.as_str();
     if location.archived {
         anyhow::bail!("transcript already archived: {run_id}");
     }
@@ -1606,14 +1604,16 @@ async fn delete(args: DeleteArgs) -> anyhow::Result<()> {
         anyhow::bail!("transcript delete requires --force");
     }
     let location = locate_transcript(&args.run_id)?;
+    // Resolved full id — see the comment in `archive`.
+    let run_id = location.run_id.as_str();
     let metadata = load_metadata_if_present(&location)?;
-    ensure_standalone_transcript(&args.run_id, metadata.as_ref())?;
+    ensure_standalone_transcript(run_id, metadata.as_ref())?;
     if !args.ignore_liveness {
-        ensure_standalone_not_running(&args.run_id, "delete", metadata.as_ref())?;
+        ensure_standalone_not_running(run_id, "delete", metadata.as_ref())?;
     }
     remove_file_if_exists(&location.transcript_path)?;
     remove_file_if_exists(&location.metadata_path)?;
-    println!("deleted transcript {}", args.run_id);
+    println!("deleted transcript {run_id}");
     Ok(())
 }
 
@@ -1706,7 +1706,57 @@ pub(crate) fn prune_archived_transcripts(
     Ok(rows)
 }
 
-fn locate_transcript(run_id: &str) -> anyhow::Result<TranscriptLocation> {
+/// Resolve `fragment` to a transcript and locate it on disk.
+///
+/// Tries an exact-id lookup first (the common case of pasting back a
+/// full id costs only a handful of `is_file` stats). When that misses,
+/// falls back to fragment resolution over every transcript id actually
+/// present across the same roots, via the shared [`crate::output::ids`]
+/// resolver — the same acceptance rule (compact form / prefix / suffix)
+/// as `rupu run show` and `rupu session show`, so an id this CLI prints
+/// (e.g. the compact form `transcript show` puts in its own header) is
+/// always an id it will accept back.
+fn locate_transcript(fragment: &str) -> anyhow::Result<TranscriptLocation> {
+    if let Some(location) = locate_transcript_exact(fragment)? {
+        return Ok(location);
+    }
+
+    use crate::output::ids::{resolve, Resolution};
+    let candidates = transcript_ids_present();
+    match resolve(&candidates, fragment) {
+        Resolution::Unique(id) => locate_transcript_exact(&id)?
+            .ok_or_else(|| anyhow::anyhow!("transcript not found: {id}")),
+        Resolution::NotFound => Err(anyhow::anyhow!("unknown transcript: {fragment}")),
+        Resolution::Ambiguous(matches) => {
+            let mut msg = format!(
+                "ambiguous transcript id — {} transcripts match `{fragment}`",
+                matches.len()
+            );
+            for id in &matches {
+                msg.push_str(&format!("\n  {id}"));
+            }
+            Err(anyhow::anyhow!(msg))
+        }
+    }
+}
+
+/// Every transcript id (`.jsonl` stem) present across the project-local
+/// and global, active and archived transcript roots — exactly the roots
+/// `locate_transcript_exact` probes. Reuses the shell-completion scan
+/// (`cmd::completers::transcript_run_ids`) rather than re-walking the
+/// same directories a second way; an empty prefix matches everything.
+fn transcript_ids_present() -> Vec<String> {
+    crate::cmd::completers::transcript_run_ids(std::ffi::OsStr::new(""))
+        .into_iter()
+        .map(|c| c.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Exact-id-only lookup: the four roots `locate_transcript` searches, in
+/// precedence order. Returns `Ok(None)` on a clean miss (not an error —
+/// the fragment-resolution fallback in `locate_transcript` needs to tell
+/// "no exact file" apart from a real IO failure).
+fn locate_transcript_exact(run_id: &str) -> anyhow::Result<Option<TranscriptLocation>> {
     let filename = format!("{run_id}.jsonl");
 
     let global = paths::global_dir()?;
@@ -1718,20 +1768,22 @@ fn locate_transcript(run_id: &str) -> anyhow::Result<TranscriptLocation> {
         let active_root = proj.join(".rupu/transcripts");
         let candidate = active_root.join(&filename);
         if candidate.is_file() {
-            return Ok(TranscriptLocation {
+            return Ok(Some(TranscriptLocation {
+                run_id: run_id.to_string(),
                 metadata_path: metadata_path_for_run(&active_root, run_id),
                 transcript_path: candidate,
                 archived: false,
-            });
+            }));
         }
         let archived_root = paths::archived_transcripts_dir(&active_root);
         let archived_candidate = archived_root.join(&filename);
         if archived_candidate.is_file() {
-            return Ok(TranscriptLocation {
+            return Ok(Some(TranscriptLocation {
+                run_id: run_id.to_string(),
                 metadata_path: metadata_path_for_run(&archived_root, run_id),
                 transcript_path: archived_candidate,
                 archived: true,
-            });
+            }));
         }
     }
 
@@ -1739,23 +1791,25 @@ fn locate_transcript(run_id: &str) -> anyhow::Result<TranscriptLocation> {
     let active_root = global.join("transcripts");
     let candidate = active_root.join(&filename);
     if candidate.is_file() {
-        return Ok(TranscriptLocation {
+        return Ok(Some(TranscriptLocation {
+            run_id: run_id.to_string(),
             metadata_path: metadata_path_for_run(&active_root, run_id),
             transcript_path: candidate,
             archived: false,
-        });
+        }));
     }
     let archived_root = paths::archived_transcripts_dir(&active_root);
     let archived_candidate = archived_root.join(&filename);
     if archived_candidate.is_file() {
-        return Ok(TranscriptLocation {
+        return Ok(Some(TranscriptLocation {
+            run_id: run_id.to_string(),
             metadata_path: metadata_path_for_run(&archived_root, run_id),
             transcript_path: archived_candidate,
             archived: true,
-        });
+        }));
     }
 
-    Err(anyhow::anyhow!("transcript not found: {run_id}"))
+    Ok(None)
 }
 
 fn ensure_standalone_transcript(
@@ -1837,8 +1891,10 @@ fn scan_archived_transcripts(
             let Some(run_id) = run_id_from_transcript_path(&path) else {
                 continue;
             };
+            let metadata_path = metadata_path_for_run(root, &run_id);
             out.push(TranscriptLocation {
-                metadata_path: metadata_path_for_run(root, &run_id),
+                run_id,
+                metadata_path,
                 transcript_path: path,
                 archived: true,
             });
