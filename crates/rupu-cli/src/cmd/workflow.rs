@@ -19,6 +19,7 @@ use crate::output::palette::{self, Status as UiStatus, BRAND, DIM};
 use crate::output::printer::{visible_len, wrap_with_ansi};
 use crate::output::report::{self, CollectionOutput, DetailOutput, EventOutput};
 use crate::paths;
+use anyhow::Context;
 use clap::Subcommand;
 use clap_complete::ArgValueCompleter;
 use rupu_agent::load_agents as load_agent_specs;
@@ -517,7 +518,15 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
             mode,
             gate,
             approver,
-        } => approve(&run_id, mode.as_deref(), gate.as_deref(), approver.as_deref()).await,
+        } => {
+            approve(
+                &run_id,
+                mode.as_deref(),
+                gate.as_deref(),
+                approver.as_deref(),
+            )
+            .await
+        }
         Action::Reject {
             run_id,
             reason,
@@ -2225,6 +2234,56 @@ fn layered_config_workflow(
         .unwrap_or_default()
 }
 
+/// Resolve a run-id fragment against a candidate list.
+///
+/// Pure, so it is unit-testable without a `RunStore` — building a
+/// `RunRecord` outside `rupu-orchestrator` would mean spelling out
+/// every field, and that crate's `sample_record` helper is test-private.
+///
+/// Accepts a full id, the compact `head…tail` form printed by tables, a
+/// bare suffix, or an unambiguous prefix.
+fn resolve_run_id(candidates: &[String], fragment: &str) -> anyhow::Result<String> {
+    use crate::output::ids::{resolve, Resolution};
+
+    match resolve(candidates, fragment) {
+        Resolution::Unique(id) => Ok(id),
+        Resolution::NotFound => anyhow::bail!("unknown run: {fragment}"),
+        Resolution::Ambiguous(matches) => {
+            let mut msg = format!(
+                "ambiguous run id — {} runs match `{fragment}`",
+                matches.len()
+            );
+            for id in &matches {
+                msg.push_str(&format!("\n  {id}"));
+            }
+            anyhow::bail!(msg)
+        }
+    }
+}
+
+/// Gather active and archived run ids and resolve `fragment` against
+/// both, so an archived run is never shadowed by an active one.
+fn resolve_run_fragment(
+    store: &rupu_orchestrator::RunStore,
+    fragment: &str,
+) -> anyhow::Result<String> {
+    // NOTE: the field is `id`, not `run_id` (runs.rs:107).
+    let mut candidates: Vec<String> = store
+        .list()
+        .context("list runs")?
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    candidates.extend(
+        store
+            .list_archived()
+            .context("list archived runs")?
+            .into_iter()
+            .map(|r| r.id),
+    );
+    resolve_run_id(&candidates, fragment)
+}
+
 async fn show_run(
     run_id: &str,
     view: Option<LiveViewMode>,
@@ -2239,6 +2298,8 @@ async fn show_run(
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, pager_flag, view);
     let runs_dir = global.join("runs");
     let store = rupu_orchestrator::RunStore::new(runs_dir.clone());
+    let run_id = resolve_run_fragment(&store, run_id)?;
+    let run_id = run_id.as_str();
     let record = store.load(run_id).map_err(|e| {
         anyhow::anyhow!(
             "run not found: {e}\n  hint: list runs with `rupu workflow runs` \
@@ -2351,7 +2412,10 @@ fn ambiguous_gate_message(action: &str, run_id: &str, candidates: &[String]) -> 
          e.g. `rupu workflow {action} {run_id} --gate {}`",
         candidates.len(),
         candidates.join(", "),
-        candidates.first().map(String::as_str).unwrap_or("<STEP_ID>"),
+        candidates
+            .first()
+            .map(String::as_str)
+            .unwrap_or("<STEP_ID>"),
     )
 }
 
@@ -2515,56 +2579,60 @@ async fn approve(
     paths::ensure_dir(&global)?;
     let runs_dir = global.join("runs");
     let store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir));
+    let run_id = resolve_run_fragment(&store, run_id)?;
+    let run_id = run_id.as_str();
 
     let (awaited_step_id, approver, via_timeout) =
         match resolve_approve_gate(&store, run_id, gate, approver_override)? {
-        ApproveGateOutcome::Approved {
-            step_id,
-            approver,
-            via_timeout,
-        } => (step_id, approver, via_timeout),
-        ApproveGateOutcome::ExpiredRejected {
-            step_id,
-            reason,
-            approver,
-        } => {
-            // I-36: run the cleanup chain unconditionally, not only when
-            // `cheap_on_reject_chain_len` reports a non-empty chain — an
-            // empty chain must still record the gate's rejected decision
-            // (`run_reject_cleanup` itself already handles a zero-length
-            // chain fine; `chain_len` is only used below to decide whether
-            // to print "cleanup: N step(s) executed").
-            match crate::resume::build_reject_cleanup_opts(&store, run_id, &step_id, &reason, mode)
+            ApproveGateOutcome::Approved {
+                step_id,
+                approver,
+                via_timeout,
+            } => (step_id, approver, via_timeout),
+            ApproveGateOutcome::ExpiredRejected {
+                step_id,
+                reason,
+                approver,
+            } => {
+                // I-36: run the cleanup chain unconditionally, not only when
+                // `cheap_on_reject_chain_len` reports a non-empty chain — an
+                // empty chain must still record the gate's rejected decision
+                // (`run_reject_cleanup` itself already handles a zero-length
+                // chain fine; `chain_len` is only used below to decide whether
+                // to print "cleanup: N step(s) executed").
+                match crate::resume::build_reject_cleanup_opts(
+                    &store, run_id, &step_id, &reason, mode,
+                )
                 .await
-            {
-                Ok((opts, chain_len)) => {
-                    match rupu_orchestrator::runner::run_reject_cleanup(
-                        opts,
-                        &step_id,
-                        &reason,
-                        "timeout",
-                        Some(&approver),
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            if chain_len > 0 {
-                                println!("cleanup: {chain_len} step(s) executed");
+                {
+                    Ok((opts, chain_len)) => {
+                        match rupu_orchestrator::runner::run_reject_cleanup(
+                            opts,
+                            &step_id,
+                            &reason,
+                            "timeout",
+                            Some(&approver),
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                if chain_len > 0 {
+                                    println!("cleanup: {chain_len} step(s) executed");
+                                }
                             }
+                            Err(e) => eprintln!("warning: on_reject cleanup chain errored: {e}"),
                         }
-                        Err(e) => eprintln!("warning: on_reject cleanup chain errored: {e}"),
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "warning: could not load workflow for on_reject cleanup: {e} \
+                         (run is already correctly rejected)"
+                        );
                     }
                 }
-                Err(e) => {
-                    eprintln!(
-                        "warning: could not load workflow for on_reject cleanup: {e} \
-                         (run is already correctly rejected)"
-                    );
-                }
+                return Ok(());
             }
-            return Ok(());
-        }
-    };
+        };
     // Phase 2 — the resume — lives in `crate::resume::resume_run` so the
     // background session worker can resume an approved gate identically.
     // `awaited_step_id` is threaded in because `approve` clears the
@@ -2652,6 +2720,8 @@ pub(crate) async fn resume_run(
     paths::ensure_dir(&global)?;
     let runs_dir = global.join("runs");
     let store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir));
+    let run_id = resolve_run_fragment(&store, run_id)?;
+    let run_id = run_id.as_str();
 
     let mut record = store.load(run_id).map_err(|e| match e {
         rupu_orchestrator::RunStoreError::NotFound(id) => {
@@ -3125,6 +3195,8 @@ fn resolve_reject_gate(
 async fn reject(run_id: &str, reason: Option<&str>, gate: Option<&str>) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let run_id = resolve_run_fragment(&store, run_id)?;
+    let run_id = run_id.as_str();
 
     let RejectGateOutcome {
         step_id: rejected_step_id,
@@ -3206,6 +3278,8 @@ async fn reject(run_id: &str, reason: Option<&str>, gate: Option<&str>) -> anyho
 async fn cancel(run_id: &str) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let run_id = resolve_run_fragment(&store, run_id)?;
+    let run_id = run_id.as_str();
     let outcome = cancel_with_store(&store, run_id, "cancelled by operator")?;
     match outcome {
         CancelOutcome::RejectedAwaitingApproval => {
@@ -3265,6 +3339,8 @@ fn cancel_with_store(
 pub(crate) async fn pause(run_id: &str) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let run_id = resolve_run_fragment(&store, run_id)?;
+    let run_id = run_id.as_str();
     pause_with_store(&store, run_id)?;
     println!(
         "rupu: pause requested for run {run_id} (resume with `rupu workflow resume {run_id}`)"
@@ -3310,6 +3386,8 @@ pub(crate) fn pause_with_store(
 async fn archive_run(run_id: &str) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let run_id = resolve_run_fragment(&store, run_id)?;
+    let run_id = run_id.as_str();
     store.archive(run_id)?;
     println!("archived run {run_id}");
     Ok(())
@@ -3318,6 +3396,8 @@ async fn archive_run(run_id: &str) -> anyhow::Result<()> {
 async fn restore_run(run_id: &str) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let run_id = resolve_run_fragment(&store, run_id)?;
+    let run_id = run_id.as_str();
     store.restore(run_id)?;
     println!("restored run {run_id}");
     Ok(())
@@ -3329,6 +3409,8 @@ async fn delete_run(run_id: &str, force: bool) -> anyhow::Result<()> {
     }
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let run_id = resolve_run_fragment(&store, run_id)?;
+    let run_id = run_id.as_str();
     delete_run_with_store(&store, run_id)?;
     println!("deleted run {run_id}");
     Ok(())
@@ -5007,7 +5089,8 @@ mod tests {
         rec
     }
 
-    const TWO_GATE_YAML: &str = "name: g\nsteps:\n  - id: gate_a\n    approval: {}\n  - id: gate_b\n    approval: {}\n";
+    const TWO_GATE_YAML: &str =
+        "name: g\nsteps:\n  - id: gate_a\n    approval: {}\n  - id: gate_b\n    approval: {}\n";
 
     #[test]
     fn ambiguous_gate_message_lists_every_candidate_and_the_gate_flag() {
@@ -5067,7 +5150,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
         let rec = sample_run_record(RunStatus::AwaitingApproval, None);
-        store.create(rec.clone(), "name: sample\nsteps: []\n").unwrap();
+        store
+            .create(rec.clone(), "name: sample\nsteps: []\n")
+            .unwrap();
 
         let outcome = resolve_approve_gate(&store, &rec.id, None, None).unwrap();
         match outcome {
@@ -5099,7 +5184,8 @@ mod tests {
         let rec = two_gate_awaiting_record("run_cli_reject_a");
         store.create(rec.clone(), TWO_GATE_YAML).unwrap();
 
-        let outcome = resolve_reject_gate(&store, &rec.id, Some("no thanks"), Some("gate_a")).unwrap();
+        let outcome =
+            resolve_reject_gate(&store, &rec.id, Some("no thanks"), Some("gate_a")).unwrap();
         assert_eq!(outcome.step_id, "gate_a");
         assert_eq!(outcome.via, "human");
 
@@ -5130,7 +5216,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
         let rec = sample_run_record(RunStatus::AwaitingApproval, None);
-        store.create(rec.clone(), "name: sample\nsteps: []\n").unwrap();
+        store
+            .create(rec.clone(), "name: sample\nsteps: []\n")
+            .unwrap();
 
         let outcome = resolve_reject_gate(&store, &rec.id, Some("no"), None).unwrap();
         assert_eq!(outcome.step_id, "step_approve");
@@ -5433,7 +5521,10 @@ steps:
             "the tool name is the action's identity and was never shown before"
         );
         // `with:` keys are listed sorted so the column is stable across runs.
-        assert!(detail.contains("with body, number, project"), "detail was: {detail}");
+        assert!(
+            detail.contains("with body, number, project"),
+            "detail was: {detail}"
+        );
     }
 
     #[test]
@@ -5481,5 +5572,54 @@ steps:
         // Defensive: if the default ever stops being `ask`, this must not
         // start warning about a mode that does gate writes.
         assert!(!should_warn_ask_is_bypass(None, "readonly"));
+    }
+
+    // ── Task 6: run-id fragment resolution ────────────────────────────
+
+    fn run_candidates() -> Vec<String> {
+        vec![
+            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ".to_string(),
+            "run_01KYSM3KE60KM2P2EDJR1V1BCP".to_string(),
+            "run_01KYPASX18NYRER5NQPDWB2HZV".to_string(),
+        ]
+    }
+
+    #[test]
+    fn resolve_run_id_accepts_compact_form() {
+        let c = run_candidates();
+        let compact = crate::output::ids::compact_id(&c[0]);
+        assert_eq!(compact, "run_01KYSMDN…GKYJ");
+        assert_eq!(resolve_run_id(&c, &compact).expect("resolves"), c[0]);
+    }
+
+    #[test]
+    fn resolve_run_id_accepts_bare_suffix() {
+        let c = run_candidates();
+        assert_eq!(resolve_run_id(&c, "P3GKYJ").expect("resolves"), c[0]);
+    }
+
+    #[test]
+    fn resolve_run_id_accepts_full_id() {
+        let c = run_candidates();
+        assert_eq!(resolve_run_id(&c, &c[2]).expect("resolves"), c[2]);
+    }
+
+    #[test]
+    fn resolve_run_id_errors_on_ambiguity_listing_candidates() {
+        // ULIDs from the same era share a long prefix — the common case.
+        let c = run_candidates();
+        let err = resolve_run_id(&c, "run_01KYSM").expect_err("ambiguous");
+        let msg = err.to_string();
+        assert!(msg.contains("ambiguous"), "got: {msg}");
+        assert!(msg.contains(&c[0]), "got: {msg}");
+        assert!(msg.contains(&c[1]), "got: {msg}");
+        // The non-matching run must not be listed.
+        assert!(!msg.contains(&c[2]), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_run_id_reports_unknown() {
+        let err = resolve_run_id(&run_candidates(), "zzzzzz").expect_err("unknown");
+        assert!(err.to_string().contains("unknown run"));
     }
 }
