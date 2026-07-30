@@ -207,11 +207,10 @@ impl<'a> EntityTable<'a> {
         } else {
             format!("{n} {noun}s")
         };
-        let status_col = (0..self.headers.len()).find(|&i| {
-            self.rows
-                .iter()
-                .any(|r| matches!(r[i], CellValue::Status(_)))
-        });
+        let status_col = self
+            .headers
+            .iter()
+            .position(|&h| h.eq_ignore_ascii_case("STATUS"));
         if let Some(col) = status_col {
             // BTreeMap keeps the breakdown in a stable order across runs.
             let mut counts: std::collections::BTreeMap<&str, usize> =
@@ -550,5 +549,41 @@ mod tests {
             .row(vec![CellValue::Text("b".into())]);
         let out = t.render(now());
         assert!(out.contains("2 workflows"), "got: {out}");
+    }
+
+    #[test]
+    fn summary_with_two_status_columns_uses_the_status_header() {
+        // Regression guard: session list has both SCOPE and STATUS as Status cells.
+        // Must break down by STATUS (lifecycle), not SCOPE (classification).
+        let p = prefs();
+        let t = EntityTable::new(
+            &p,
+            RenderOpts::default(),
+            vec!["SESSION", "SCOPE", "STATUS"],
+        )
+        .with_summary("session")
+        .row(vec![
+            CellValue::Id("s1".into()),
+            CellValue::Status("project".into()),
+            CellValue::Status("failed".into()),
+        ])
+        .row(vec![
+            CellValue::Id("s2".into()),
+            CellValue::Status("project".into()),
+            CellValue::Status("idle".into()),
+        ])
+        .row(vec![
+            CellValue::Id("s3".into()),
+            CellValue::Status("project".into()),
+            CellValue::Status("idle".into()),
+        ]);
+        let out = t.render(now());
+        assert!(out.contains("3 sessions"), "got: {out}");
+        assert!(out.contains("2 idle"), "got: {out}");
+        assert!(out.contains("1 failed"), "got: {out}");
+        assert!(
+            !out.contains("3 project"),
+            "should not summarize by SCOPE: {out}"
+        );
     }
 }
