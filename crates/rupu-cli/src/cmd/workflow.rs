@@ -816,11 +816,20 @@ fn render_workflow_runs_table(
     .with_summary("run");
 
     for row in rows {
-        // A malformed stored timestamp must not hide the run.
-        let started = match chrono::DateTime::parse_from_rfc3339(&row.started_at) {
-            Ok(ts) => CellValue::Timestamp(ts.with_timezone(&chrono::Utc)),
-            Err(_) => CellValue::Text(row.started_at.clone()),
-        };
+        // `WorkflowRunsRow.started_at` is written (workflow.rs's `runs`
+        // builder) as `run.started_at.format("%Y-%m-%d %H:%M:%S")` — the
+        // source `DateTime<Utc>` stringified without an offset. Try that
+        // exact format first (interpreting the naive result as UTC is
+        // correct, not a guess: the source value already was UTC before
+        // stringifying). RFC3339 is a second chance for any other writer
+        // of this field. A value matching neither must not hide the run.
+        let started = chrono::NaiveDateTime::parse_from_str(&row.started_at, "%Y-%m-%d %H:%M:%S")
+            .map(|naive| CellValue::Timestamp(naive.and_utc()))
+            .or_else(|_| {
+                chrono::DateTime::parse_from_rfc3339(&row.started_at)
+                    .map(|ts| CellValue::Timestamp(ts.with_timezone(&chrono::Utc)))
+            })
+            .unwrap_or_else(|_| CellValue::Text(row.started_at.clone()));
         table = table.row(vec![
             CellValue::Id(row.run_id.clone()),
             CellValue::Status(row.status.clone()),
@@ -5826,5 +5835,50 @@ steps:
             runs_test_now(),
         );
         assert!(out.contains("not-a-timestamp"), "row was dropped: {out}");
+    }
+
+    #[test]
+    fn workflow_runs_parses_the_real_stored_started_at_format() {
+        // `WorkflowRunsRow.started_at` is written (see `runs()`) as
+        // `run.started_at.format("%Y-%m-%d %H:%M:%S")` — not RFC3339.
+        // The real format must recover the instant and render a
+        // relative age, not fall through to the literal-text branch.
+        let rows = vec![runs_row_for_test(
+            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+            "completed",
+            "2026-07-30 13:00:00",
+            None,
+        )];
+        let out = render_workflow_runs_table(
+            &rows,
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            runs_test_now(),
+        );
+        assert!(out.contains("4h ago"), "got: {out}");
+        assert!(
+            !out.contains("2026-07-30 13:00:00"),
+            "literal text leaked instead of a relative age: {out}"
+        );
+    }
+
+    #[test]
+    fn workflow_runs_stored_format_renders_iso_under_absolute() {
+        let rows = vec![runs_row_for_test(
+            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+            "completed",
+            "2026-07-30 13:00:00",
+            None,
+        )];
+        let out = render_workflow_runs_table(
+            &rows,
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts {
+                absolute: true,
+                all_columns: false,
+            },
+            runs_test_now(),
+        );
+        assert!(out.contains("2026-07-30T13:00:00"), "got: {out}");
     }
 }
