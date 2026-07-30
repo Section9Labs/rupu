@@ -14,7 +14,8 @@
 
 ## Global Constraints
 
-- **Every script is POSIX `sh`-compatible and runs under `set -euo pipefail`.** These run unattended; a silent failure publishes a wrong tag.
+- **Every script uses `#!/usr/bin/env bash` and runs under `set -euo pipefail`.** These run unattended; a silent failure publishes a wrong tag. (`pipefail` is a bashism — bash, not POSIX `sh`, is the target.)
+  - **The one exception is the test harness**, which uses `set -uo pipefail` *without* `-e` on purpose: it must run every assertion and report a total, not abort on the first failure. It signals failure via its final exit status instead.
 - **The scripts never invoke `git` or `gh`.** They read tag data on stdin and write one line to stdout. The workflow supplies the data. This is the whole reason they can be tested.
 - **A skipped run is a success.** Both workflows `exit 0` when there is nothing to do, and log which condition stopped them.
 - **Only `release-stable.yml` may push to `main`, and only the bump commit.** This is the narrowly-scoped carve-out from the never-commit-to-main rule (spec §2). Nothing else in CI pushes to `main`.
