@@ -22,6 +22,10 @@ concurrency:
 
 permissions:
   contents: write
+  # Explicitly listing any scope forces every unlisted one to `none`, so
+  # the Actions API read that the CI-green check needs must be named here
+  # or `gh run list` 403s.
+  actions: read
 
 jobs:
   cut:
@@ -61,8 +65,11 @@ jobs:
           # -- Condition 3: main must be green. ---------------------------
           # Without this a red main ships a broken beta every morning.
           # Deliberately NOT bypassable by `force`.
+          # A failed query (permissions, rate limit, transient API error) must not
+          # abort the step under `set -euo pipefail`. Degrade to "unknown", which
+          # is then treated as not-green: never publish on an answer we don't have.
           conclusion=$(gh run list --branch main --workflow ci.yml \
-            --limit 1 --json conclusion --jq '.[0].conclusion // "none"')
+            --limit 1 --json conclusion --jq '.[0].conclusion // "none"' 2>/dev/null || echo "unknown")
           if [ "$conclusion" != "success" ]; then
             echo "::notice::latest ci.yml run on main concluded '$conclusion' — skipping"
             echo "go=false" >> "$GITHUB_OUTPUT"
