@@ -2263,10 +2263,25 @@ fn resolve_run_id(candidates: &[String], fragment: &str) -> anyhow::Result<Strin
 
 /// Gather active and archived run ids and resolve `fragment` against
 /// both, so an archived run is never shadowed by an active one.
-fn resolve_run_fragment(
+///
+/// `pub(crate)` so `cmd::run` can route through the SAME resolution
+/// `cmd::workflow` uses — one shared implementation means `rupu run show`
+/// and `rupu workflow show-run` accept identical identifiers instead of
+/// silently diverging.
+///
+/// Checks `store.exists(fragment)` first: an exact id — the common case of
+/// pasting back what a previous command just printed — costs two `is_file`
+/// stats via [`RunStore::exists`], not a full deserialize of every run on
+/// disk. `exists` covers both the active and archived scopes, so an
+/// archived run's exact id still resolves without falling through to the
+/// `list()`/`list_archived()` scan below.
+pub(crate) fn resolve_run_fragment(
     store: &rupu_orchestrator::RunStore,
     fragment: &str,
 ) -> anyhow::Result<String> {
+    if store.exists(fragment) {
+        return Ok(fragment.to_string());
+    }
     // NOTE: the field is `id`, not `run_id` (runs.rs:107).
     let mut candidates: Vec<String> = store
         .list()
