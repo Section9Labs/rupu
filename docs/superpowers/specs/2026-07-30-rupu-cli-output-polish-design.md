@@ -198,10 +198,25 @@ is replaced by:
 ```rust
 /// Lifecycle states only. Returns `None` for classification values.
 pub fn status_of(status: &str) -> Option<Status>;
+
+/// The glyph for a lifecycle status.
+pub fn status_glyph(status: &str) -> Option<char>;
 ```
 
-Colour and glyph both derive from the returned `Status`. Lifecycle
-strings map as follows, preserving today's colour assignments:
+`status_of` drives the **glyph only**. Colour keeps its existing
+explicit string mapping, and the two are deliberately not merged.
+
+This corrects an earlier version of this section, which said colour and
+glyph should both derive from the returned `Status`. They must not.
+`Status::Waiting.color()` resolves to `palette.skipped` =
+`rgb(203, 213, 225)`, while `status_color` currently renders `pending` /
+`eligible` / `released` as `palette.dim` = `rgb(100, 116, 139)`.
+Deriving colour from `Status` would silently restyle those three states
+from mid-slate to light-slate. The implementation carries a regression
+test pinning their colour, and a comment on both functions explaining
+why they stay separate.
+
+Lifecycle strings map to glyphs as follows:
 
 | String                                    | `Status`     |
 | ----------------------------------------- | ------------ |
