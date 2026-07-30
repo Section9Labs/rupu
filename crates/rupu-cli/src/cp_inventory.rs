@@ -185,19 +185,27 @@ impl CpFleetInventory {
         };
 
         // One issue listing per connected repo, capped. A per-repo failure
-        // drops that repo from the tally rather than the whole count.
+        // drops that repo from the tally rather than the whole count — but it
+        // ALSO makes the total a floor, exactly as hitting the cap does. A
+        // repo we could not read (private, blocked, rate-limited) would
+        // otherwise silently shrink the number with no marker at all.
         let mut per_repo: Vec<(u64, bool)> = Vec::new();
+        let mut any_repo_unread = false;
         if let Some(entries) = &repo_entries {
             for entry in entries {
                 match count_open_issues(&deps.scm, &entry.platform, &entry.repo).await {
                     Ok(n) => per_repo.push((n, n >= u64::from(ISSUE_FETCH_CAP))),
                     Err(e) => {
-                        tracing::warn!(repo = %entry.repo, error = %e, "fleet inventory: issue listing failed; repo omitted from the open tally")
+                        any_repo_unread = true;
+                        tracing::warn!(repo = %entry.repo, error = %e, "fleet inventory: issue listing failed; repo omitted from the open tally (count is now a floor)")
                     }
                 }
             }
         }
-        let (issues_open, issues_capped) = tally_open_issues(&per_repo);
+        let (issues_open, hit_cap) = tally_open_issues(&per_repo);
+        // Only a total we actually have can be a floor; with `None` there is
+        // nothing to qualify.
+        let issues_capped = issues_open.is_some() && (hit_cap || any_repo_unread);
 
         let issues_pending = self.derive_pending(deps).await;
 
@@ -543,6 +551,42 @@ mod tests {
     fn tally_of_repos_with_no_open_issues_is_some_zero() {
         let (total, _) = tally_open_issues(&[(0, false), (0, false)]);
         assert_eq!(total, Some(0));
+    }
+
+    /// A repo that could not be read is dropped from the tally, so the total
+    /// must be marked a floor exactly as hitting the cap does. This is the
+    /// `451 Repository access blocked` case seen against a real account: 158
+    /// of 159 repos tallied, and the number must not present itself as
+    /// complete.
+    #[test]
+    fn an_unreadable_repo_makes_the_total_a_floor() {
+        // `tally_open_issues` sees only the repos that succeeded …
+        let (total, hit_cap) = tally_open_issues(&[(100, false), (19, false)]);
+        assert_eq!(total, Some(119));
+        assert!(!hit_cap, "no repo hit the cap");
+
+        // … so `refresh_scm` ORs in the unread-repo flag. Mirror that rule
+        // here, which is the invariant the caller must preserve.
+        let any_repo_unread = true;
+        let issues_capped = total.is_some() && (hit_cap || any_repo_unread);
+        assert!(
+            issues_capped,
+            "a dropped repo silently shrinks the total; it must render as a floor"
+        );
+    }
+
+    /// With nothing readable at all there is no total to qualify — `None`
+    /// must not be dressed up as a capped zero.
+    #[test]
+    fn no_readable_repos_reports_none_and_is_not_marked_a_floor() {
+        let (total, hit_cap) = tally_open_issues(&[]);
+        let any_repo_unread = true;
+        let issues_capped = total.is_some() && (hit_cap || any_repo_unread);
+        assert_eq!(total, None);
+        assert!(
+            !issues_capped,
+            "there is no number to call a floor when nothing was read"
+        );
     }
 
     // ── Pending vs claims ────────────────────────────────────────────

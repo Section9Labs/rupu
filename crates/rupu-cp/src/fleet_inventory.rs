@@ -50,8 +50,12 @@ pub struct InventorySnapshot {
     pub repos: Option<u64>,
     pub issues_pending: Option<u64>,
     pub issues_open: Option<u64>,
-    /// True when a repo hit the per-repo issue fetch cap, making
-    /// `issues_open` a floor rather than a total.
+    /// True when `issues_open` is a FLOOR rather than a total — either a repo
+    /// hit the per-repo fetch cap, or a repo could not be read at all (private,
+    /// blocked, rate-limited) and was dropped from the tally. Both cases mean
+    /// "at least this many", and both must be marked: a dropped repo that
+    /// silently shrank the number would be exactly the quiet under-report this
+    /// whole contract exists to prevent.
     pub issues_capped: bool,
     /// When the underlying caches were filled. `None` = never filled.
     pub captured_at: Option<DateTime<Utc>>,
