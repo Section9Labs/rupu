@@ -63,6 +63,15 @@ pub struct Cli {
     /// Structured output format for commands that support tabular/report views.
     #[arg(long, global = true)]
     pub format: Option<output::formats::OutputFormat>,
+    /// Show absolute ISO timestamps in tables instead of relative ages.
+    /// Useful when correlating a run against external logs.
+    #[arg(long, global = true)]
+    pub absolute: bool,
+    /// Keep every table column, including ones that are empty for every
+    /// row shown. Columns are otherwise suppressed based on the rows
+    /// actually displayed, so a filtered listing may show fewer columns.
+    #[arg(long, global = true)]
+    pub all_columns: bool,
     #[command(subcommand)]
     pub command: Cmd,
 }
@@ -581,5 +590,15 @@ mod arg_parse_tests {
             }
             other => panic!("expected Workflow(Resume), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn global_table_flags_parse() {
+        let cli = crate::Cli::try_parse_from(["rupu", "--absolute", "session", "list"])
+            .expect("cli parses");
+        assert!(cli.absolute);
+        let cli = crate::Cli::try_parse_from(["rupu", "--all-columns", "session", "list"])
+            .expect("cli parses");
+        assert!(cli.all_columns);
     }
 }

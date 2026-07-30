@@ -215,6 +215,8 @@ mod tests {
             palette: crate::output::palette::UiPaletteTheme::default(),
             live_view: crate::cmd::ui::LiveViewMode::Focused,
             pager: crate::cmd::ui::PagerMode::Never,
+            absolute: false,
+            all_columns: false,
         }
     }
 
