@@ -66,6 +66,7 @@ pub struct EntityTable<'a> {
     opts: RenderOpts,
     headers: Vec<&'static str>,
     rows: Vec<Vec<CellValue>>,
+    summary_noun: Option<&'static str>,
 }
 
 impl<'a> EntityTable<'a> {
@@ -75,6 +76,7 @@ impl<'a> EntityTable<'a> {
             opts,
             headers,
             rows: Vec::new(),
+            summary_noun: None,
         }
     }
 
@@ -90,6 +92,17 @@ impl<'a> EntityTable<'a> {
             self.headers.len()
         );
         self.rows.push(cells);
+        self
+    }
+
+    /// Emit a summary line above the table, e.g.
+    /// `8 sessions · 2 failed · 5 idle · 1 stopped`.
+    ///
+    /// `noun` is the singular form; it is pluralised with a trailing `s`
+    /// when the count is not 1. Human output only — callers must not use
+    /// this under `--format json` / `--format csv`.
+    pub fn with_summary(mut self, noun: &'static str) -> Self {
+        self.summary_noun = Some(noun);
         self
     }
 
@@ -185,11 +198,47 @@ impl<'a> EntityTable<'a> {
             .collect()
     }
 
+    /// `8 sessions · 2 failed · 5 idle`, or just the count when the table
+    /// has no status column to break down by.
+    fn summary_line(&self, noun: &str) -> String {
+        let n = self.rows.len();
+        let mut out = if n == 1 {
+            format!("{n} {noun}")
+        } else {
+            format!("{n} {noun}s")
+        };
+        let status_col = (0..self.headers.len()).find(|&i| {
+            self.rows
+                .iter()
+                .any(|r| matches!(r[i], CellValue::Status(_)))
+        });
+        if let Some(col) = status_col {
+            // BTreeMap keeps the breakdown in a stable order across runs.
+            let mut counts: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            for row in &self.rows {
+                if let CellValue::Status(s) = &row[col] {
+                    *counts.entry(s.as_str()).or_default() += 1;
+                }
+            }
+            for (status, count) in counts {
+                out.push_str(&format!(" · {count} {status}"));
+            }
+        }
+        out
+    }
+
     /// Build the table. `now` is a parameter so tests are deterministic;
     /// callers pass `Utc::now()`.
     pub fn render(&self, now: DateTime<Utc>) -> String {
+        let mut out = String::new();
+        if let Some(noun) = self.summary_noun {
+            out.push_str(&self.summary_line(noun));
+            out.push_str("\n\n");
+        }
         let keep = self.retained_columns();
-        self.build_table(now, &keep, None).to_string()
+        out.push_str(&self.build_table(now, &keep, None).to_string());
+        out
     }
 
     /// Test-only: render after forcing a narrow table width, to exercise
@@ -441,5 +490,65 @@ mod tests {
         let t = EntityTable::new(&p, RenderOpts::default(), vec!["A", "B"]);
         let out = t.render(now());
         assert!(out.contains('A') && out.contains('B'), "got: {out}");
+    }
+
+    #[test]
+    fn summary_counts_by_status() {
+        let p = prefs();
+        let t = EntityTable::new(&p, RenderOpts::default(), vec!["ID", "STATUS"])
+            .with_summary("session")
+            .row(vec![
+                CellValue::Id("a".into()),
+                CellValue::Status("failed".into()),
+            ])
+            .row(vec![
+                CellValue::Id("b".into()),
+                CellValue::Status("idle".into()),
+            ])
+            .row(vec![
+                CellValue::Id("c".into()),
+                CellValue::Status("idle".into()),
+            ]);
+        let out = t.render(now());
+        assert!(out.contains("3 sessions"), "got: {out}");
+        assert!(out.contains("2 idle"), "got: {out}");
+        assert!(out.contains("1 failed"), "got: {out}");
+    }
+
+    #[test]
+    fn summary_singularises_one() {
+        let p = prefs();
+        let t = EntityTable::new(&p, RenderOpts::default(), vec!["STATUS"])
+            .with_summary("run")
+            .row(vec![CellValue::Status("failed".into())]);
+        let out = t.render(now());
+        assert!(out.contains("1 run"), "got: {out}");
+        assert!(!out.contains("1 runs"), "got: {out}");
+    }
+
+    #[test]
+    fn summary_absent_when_not_requested() {
+        let p = prefs();
+        let t = EntityTable::new(&p, RenderOpts::default(), vec!["STATUS"])
+            .row(vec![CellValue::Status("failed".into())]);
+        assert!(!t.render(now()).contains("1 "), "unexpected summary");
+    }
+
+    #[test]
+    fn summary_on_empty_list_says_zero() {
+        let p = prefs();
+        let t = EntityTable::new(&p, RenderOpts::default(), vec!["STATUS"]).with_summary("session");
+        assert!(t.render(now()).contains("0 sessions"));
+    }
+
+    #[test]
+    fn summary_without_a_status_column_shows_only_the_count() {
+        let p = prefs();
+        let t = EntityTable::new(&p, RenderOpts::default(), vec!["NAME"])
+            .with_summary("workflow")
+            .row(vec![CellValue::Text("a".into())])
+            .row(vec![CellValue::Text("b".into())]);
+        let out = t.render(now());
+        assert!(out.contains("2 workflows"), "got: {out}");
     }
 }
