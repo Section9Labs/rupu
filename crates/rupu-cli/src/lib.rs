@@ -600,5 +600,16 @@ mod arg_parse_tests {
         let cli = crate::Cli::try_parse_from(["rupu", "--all-columns", "session", "list"])
             .expect("cli parses");
         assert!(cli.all_columns);
+
+        // `global = true` is what lets these flags land AFTER the
+        // subcommand too (`session list --absolute`), not just before it.
+        // Without asserting this position, dropping `global = true` from
+        // the `Cli` field would still pass the two cases above.
+        let cli = crate::Cli::try_parse_from(["rupu", "session", "list", "--absolute"])
+            .expect("cli parses with flag after subcommand");
+        assert!(cli.absolute);
+        let cli = crate::Cli::try_parse_from(["rupu", "session", "list", "--all-columns"])
+            .expect("cli parses with flag after subcommand");
+        assert!(cli.all_columns);
     }
 }

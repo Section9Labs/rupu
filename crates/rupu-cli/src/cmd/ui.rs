@@ -926,9 +926,15 @@ mod tests {
     #[test]
     fn with_table_flags_sets_both() {
         let cfg = rupu_config::UiConfig::default();
-        let prefs = UiPrefs::resolve(&cfg, true, None, None, None).with_table_flags(true, true);
+        let prefs = UiPrefs::resolve(&cfg, true, None, None, None).with_table_flags(true, false);
         let opts = prefs.render_opts();
         assert!(opts.absolute);
+        assert!(!opts.all_columns);
+
+        let cfg = rupu_config::UiConfig::default();
+        let prefs = UiPrefs::resolve(&cfg, true, None, None, None).with_table_flags(false, true);
+        let opts = prefs.render_opts();
+        assert!(!opts.absolute);
         assert!(opts.all_columns);
     }
 }
