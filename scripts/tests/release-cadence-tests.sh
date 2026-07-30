@@ -126,5 +126,15 @@ assert_out "prefers the higher base version" "v0.72.0-beta.1" \
 assert_fails "rejects a non-numeric soak window" \
   sh -c "printf '' | '$PICK' two $NOW"
 
+# Unterminated final line handling: read returns non-zero at EOF when the line
+# has no trailing newline, so it would be silently dropped without the fix.
+assert_out "single qualifying line without trailing newline yields its tag" "v0.71.0-beta.5" \
+  sh -c "printf 'v0.71.0-beta.5\t%d' \$(( $NOW - 3 * $DAY )) | '$PICK' 2 $NOW"
+
+# When the newer beta is last and unterminated, it must still be picked.
+assert_out "newer unterminated line at EOF is correctly picked" "v0.71.0-beta.10" \
+  sh -c "printf 'v0.71.0-beta.9\t%d\nv0.71.0-beta.10\t%d' \
+    \$(( $NOW - 5 * $DAY )) \$(( $NOW - 4 * $DAY )) | '$PICK' 2 $NOW"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

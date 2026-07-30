@@ -23,7 +23,11 @@ cutoff=$(( now - soak_days * 86400 ))
 best_tag=""
 best_major=-1; best_minor=-1; best_patch=-1; best_counter=-1
 
-while IFS="$(printf '\t')" read -r tag ts; do
+# The `|| [ -n "${tag:-}" ]` ensures a final unterminated line is processed.
+# `read` returns non-zero at EOF when the line has no trailing newline, so the
+# loop body would never run for that record and it would be silently dropped —
+# a critical bug on a release path.
+while IFS="$(printf '\t')" read -r tag ts || [ -n "${tag:-}" ]; do
   [ -n "${tag:-}" ] || continue
   case "$ts" in ''|*[!0-9]*) continue ;; esac
   # Too fresh: it has not soaked. This is the check that guarantees a stable
