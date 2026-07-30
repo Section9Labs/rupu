@@ -2,8 +2,8 @@
 //!
 //! Entity lists — sessions, runs, workflows — are scanned by an operator
 //! looking for one row to act on. They get compacted identifiers,
-//! relative timestamps, lifecycle glyphs, and (via later tasks)
-//! empty-column suppression and a summary line.
+//! relative timestamps, lifecycle glyphs, empty-column suppression,
+//! and (via later tasks) a summary line.
 //!
 //! Dense numeric reports (coverage, usage, auth) are a different
 //! profile and deliberately do NOT use this — a zero in a coverage grid
@@ -119,13 +119,21 @@ impl<'a> EntityTable<'a> {
         }
     }
 
-    /// Build the underlying `comfy-table::Table`, shared by [`Self::render`]
-    /// and (test-only) [`Self::render_at_width`].
-    fn build(&self, now: DateTime<Utc>) -> Table {
+    /// Build the underlying `comfy-table::Table` with optional forced width.
+    ///
+    /// Projects columns through `keep` (display → source mapping), applies
+    /// identifier constraints at display indices, and optionally forces a
+    /// width for testing squeeze behavior. Both [`Self::render`] and
+    /// (test-only) [`Self::render_at_width`] call this.
+    fn build_table(&self, now: DateTime<Utc>, keep: &[usize], forced_width: Option<u16>) -> Table {
         let mut t = tables::new_table();
-        t.set_header(self.headers.clone());
+        t.set_header(keep.iter().map(|&i| self.headers[i]).collect::<Vec<_>>());
         for row in &self.rows {
-            t.add_row(row.iter().map(|c| self.cell(c, now)).collect::<Vec<_>>());
+            t.add_row(
+                keep.iter()
+                    .map(|&i| self.cell(&row[i], now))
+                    .collect::<Vec<_>>(),
+            );
         }
         // Identifier columns must never wrap — a compacted id split
         // across two lines cannot be pasted back.
@@ -146,12 +154,19 @@ impl<'a> EntityTable<'a> {
         // content width for good; it is never revisited by the
         // squeeze/redistribute passes. See
         // `output::entity_table::tests::narrow_table_never_wraps_a_compact_id`.
-        for (idx, _) in self.headers.iter().enumerate() {
-            if self.rows.iter().any(|r| matches!(r[idx], CellValue::Id(_))) {
-                if let Some(col) = t.column_mut(idx) {
+        //
+        // Critical: apply constraint at display index (pos), read cell from
+        // source index (src). Swapping these silently constrains the wrong
+        // column once any column is suppressed.
+        for (pos, &src) in keep.iter().enumerate() {
+            if self.rows.iter().any(|r| matches!(r[src], CellValue::Id(_))) {
+                if let Some(col) = t.column_mut(pos) {
                     col.set_constraint(ColumnConstraint::ContentWidth);
                 }
             }
+        }
+        if let Some(width) = forced_width {
+            t.set_width(width);
         }
         t
     }
@@ -174,23 +189,7 @@ impl<'a> EntityTable<'a> {
     /// callers pass `Utc::now()`.
     pub fn render(&self, now: DateTime<Utc>) -> String {
         let keep = self.retained_columns();
-        let mut t = tables::new_table();
-        t.set_header(keep.iter().map(|&i| self.headers[i]).collect::<Vec<_>>());
-        for row in &self.rows {
-            t.add_row(
-                keep.iter()
-                    .map(|&i| self.cell(&row[i], now))
-                    .collect::<Vec<_>>(),
-            );
-        }
-        for (pos, &src) in keep.iter().enumerate() {
-            if self.rows.iter().any(|r| matches!(r[src], CellValue::Id(_))) {
-                if let Some(col) = t.column_mut(pos) {
-                    col.set_constraint(ColumnConstraint::ContentWidth);
-                }
-            }
-        }
-        t.to_string()
+        self.build_table(now, &keep, None).to_string()
     }
 
     /// Test-only: render after forcing a narrow table width, to exercise
@@ -199,9 +198,8 @@ impl<'a> EntityTable<'a> {
     /// picks up the real terminal width via comfy-table's tty detection.
     #[cfg(test)]
     fn render_at_width(&self, now: DateTime<Utc>, width: u16) -> String {
-        let mut t = self.build(now);
-        t.set_width(width);
-        t.to_string()
+        let keep = self.retained_columns();
+        self.build_table(now, &keep, Some(width)).to_string()
     }
 }
 
@@ -363,6 +361,30 @@ mod tests {
         assert!(
             out.contains("run_01KRJDKS…WFJS"),
             "compact id must survive a narrow, squeezed table intact: {out}"
+        );
+    }
+
+    #[test]
+    fn suppressed_column_with_narrow_squeeze_never_wraps_id() {
+        // Critical regression guard: production render() and test-only
+        // render_at_width() now share the same builder path. This combines
+        // both conditions: a column that gets suppressed (entirely Missing),
+        // plus an id column under narrow squeeze. The display/source index
+        // discipline (applying constraint at pos, reading cell from src) is
+        // only exposed when suppression is active — if those indices are
+        // swapped, the id column gets no constraint and wraps, but the test
+        // sees no wrapping because constraint was (wrongly) applied elsewhere.
+        let p = prefs();
+        let t =
+            EntityTable::new(&p, RenderOpts::default(), vec!["TARGET", "RUN", "NOTES"]).row(vec![
+                CellValue::Missing,
+                CellValue::Id("run_01KRJDKSBE7X4J49094149WFJS".to_string()),
+                CellValue::Text("x".repeat(120)),
+            ]);
+        let out = t.render_at_width(now(), 30);
+        assert!(
+            out.contains("run_01KRJDKS…WFJS"),
+            "compact id must survive suppression + narrow squeeze intact: {out}"
         );
     }
 
