@@ -139,10 +139,86 @@ planned deferrals. None are regressions from Arc 1; all pre-date it.
 
 ---
 
+### Post-program finds (tracker reopened 2026-07-30)
+
+The seven-arc program closed I-1…I-86 and emptied this tracker. It is **reopened** for
+defects found afterwards: the codebase keeps moving, and post-program finds were otherwise
+landing straight into PRs with nothing recording them. Same rules as before — severity
+P0/P1/P2, and a fix closes an issue only when it is observed at the consumer.
+
+| ID | Sev | Area | Title | Status |
+|---|---|---|---|---|
+| I-88 | P1 | rupu-cli | A disabled autoflow still fires on the cron tick — the CP toggle writes `autoflow.enabled: false` and `push_cron` never reads it | fixed |
+| I-89 | P2 | rupu-config | `--test parse` fails intermittently under heavy parallel load; not reproducible in isolation | open |
+
+
 ## Open
+
+### I-89 — `rupu-config --test parse` fails intermittently under parallel load
+
+**Symptom.** One test in `crates/rupu-config/tests/parse.rs` fails during a full-workspace
+run under heavy parallelism, then passes on its own.
+
+**Observed twice, independently.** A subagent reported it during Arc 5 and I could not
+reproduce it — `--test parse` was 17/17 green immediately afterwards, so I recorded it as a
+spurious report. PR #557 then hit the same thing and explicitly logged it as *"Known, not
+fixed … Passed in isolation three times and in two subsequent full-suite runs; not
+reproducible."* Two independent sightings makes it a real flake rather than noise, which is
+why it is now tracked rather than dismissed a second time.
+
+**Root cause.** Unknown. Candidates worth checking before anything else: a process-global
+env seam (`RUPU_MOCK_PROVIDER_SCRIPT` caused exactly this class of flake once already, fixed
+by routing through the crate's shared `ENV_LOCK`), a shared temp path, or a lock file
+contended across parallel test binaries.
+
+**Fix.** Reproduce first — run the full workspace suite under load repeatedly and capture
+*which* test and *what* assertion. A flake that only appears under contention is usually
+shared mutable state, and the fix is to isolate it, not to retry the test.
+
+---
 
 
 ## Fixed
+
+### I-88 — a disabled autoflow still fired on the cron tick
+
+**Symptom.** Autoflows switched off in the CP web UI kept running. Reported live:
+`nightly-health` was executing while the UI showed it disabled.
+
+**Root cause — two dispatch subsystems, only one honored the flag.** The CP disable toggle
+(`api::autoflows::set_autoflow_enabled`) writes `autoflow.enabled: false` into the workflow
+YAML, and that part worked. The **autoflow engine** honors it (`cmd/autoflow.rs`'s
+`.filter(|a| a.enabled)`). But the **cron tick is a separate dispatch path**, and
+`push_cron` selected on exactly two conditions — `trigger.on == Cron` and a present `cron:`
+field. It never consulted `autoflow.enabled`; the only occurrence of that word in `cron.rs`
+was a test comment.
+
+So any workflow with `trigger.on: cron` kept firing on schedule regardless of the toggle.
+
+**Evidence.** `nightly-health.yaml` carried `autoflow.enabled: false` alongside
+`trigger.on: cron` / `cron: "0 6 * * *"`, and had runs on 2026-07-28 (completed), 07-29
+(failed) and 07-30 (running), with `cron-state/nightly-health.last_fired` written by the
+tick itself.
+
+**Fix.** `push_cron` skips a workflow whose **explicit** `autoflow:` block says
+`enabled: false`, and logs why. Keyed on an explicit block deliberately: a workflow that
+never opted into autoflow has no such flag to consult and must keep firing — gating on its
+absence would silently disable every ordinary cron job, a worse bug than the one being
+fixed.
+
+**Validation.** Three tests with RED observed (the disabled workflow *was* collected; the
+two guard tests passed both before and after, which is what proves the fix does not
+over-correct). Then verified **at the real consumer** rather than only against fixtures:
+`rupu cron tick --dry-run` over the live workflow directory now skips the affected
+workflows where it previously fired them.
+
+**That verification found a second victim** the report hadn't mentioned:
+`nightly-maintainability-security` was also disabled and also still firing. Checking against
+real state rather than a fixture is what surfaced it.
+
+Fixed in PR #567.
+
+---
 
 ### I-86 — three stale claims in `docs/spec.md`
 
