@@ -79,10 +79,7 @@ impl TunnelHostConnector {
     /// [`HostConnectorError::Unreachable`] with a descriptive message.
     fn live_conn(&self) -> Result<Arc<crate::node::NodeConn>, HostConnectorError> {
         self.registry.get(&self.node_id).ok_or_else(|| {
-            HostConnectorError::Unreachable(format!(
-                "node {} is not connected",
-                self.node_id
-            ))
+            HostConnectorError::Unreachable(format!("node {} is not connected", self.node_id))
         })
     }
 }
@@ -183,10 +180,7 @@ impl HostConnector for TunnelHostConnector {
         Ok(run_id)
     }
 
-    async fn start_session(
-        &self,
-        _req: SessionStartRequest,
-    ) -> Result<String, HostConnectorError> {
+    async fn start_session(&self, _req: SessionStartRequest) -> Result<String, HostConnectorError> {
         Err(HostConnectorError::Invalid(
             "sessions not supported over tunnel (slice 2)".into(),
         ))
@@ -260,17 +254,11 @@ impl HostConnector for TunnelHostConnector {
         })
     }
 
-    async fn stream_run_events(
-        &self,
-        run_id: &str,
-    ) -> Result<EventByteStream, HostConnectorError> {
+    async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
         mirror_stream_run_events(&self.run_store, &self.node_id, run_id).await
     }
 
-    async fn get_transcript(
-        &self,
-        path: &str,
-    ) -> Result<serde_json::Value, HostConnectorError> {
+    async fn get_transcript(&self, path: &str) -> Result<serde_json::Value, HostConnectorError> {
         read_transcript_file(path)
     }
 

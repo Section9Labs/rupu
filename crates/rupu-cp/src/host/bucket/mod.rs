@@ -69,7 +69,8 @@ pub trait Bucket: Send + Sync {
     async fn get_job(&self, run_id: &str) -> Result<Vec<u8>, BucketError>;
 
     /// Write a control message at `control/<run_id>/<seq:020>.json`.
-    async fn put_control(&self, run_id: &str, seq: u64, envelope: &[u8]) -> Result<(), BucketError>;
+    async fn put_control(&self, run_id: &str, seq: u64, envelope: &[u8])
+        -> Result<(), BucketError>;
 
     /// Return all control messages for `run_id`, sorted ascending by seq.
     async fn list_control(&self, run_id: &str) -> Result<Vec<(u64, Vec<u8>)>, BucketError>;

@@ -25,7 +25,10 @@ use serde::Deserialize;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/transcripts/:id/archive", post(archive_transcript))
-        .route("/api/transcripts/:id", axum::routing::delete(delete_transcript))
+        .route(
+            "/api/transcripts/:id",
+            axum::routing::delete(delete_transcript),
+        )
 }
 
 /// Optional `?host=<id>` query param, same shape as `sessions.rs`'s
@@ -96,7 +99,9 @@ async fn archive_transcript(
         conn.archive_transcript(&id, q.ignore_liveness)
             .await
             .map_err(map_host_transcript_mutate_err)?;
-        return Ok(Json(serde_json::json!({ "ok": true, "id": id, "host_id": host })));
+        return Ok(Json(
+            serde_json::json!({ "ok": true, "id": id, "host_id": host }),
+        ));
     }
     mutate_transcript(
         &s,
@@ -120,7 +125,9 @@ async fn delete_transcript(
         conn.delete_transcript(&id, q.ignore_liveness)
             .await
             .map_err(map_host_transcript_mutate_err)?;
-        return Ok(Json(serde_json::json!({ "ok": true, "id": id, "host_id": host })));
+        return Ok(Json(
+            serde_json::json!({ "ok": true, "id": id, "host_id": host }),
+        ));
     }
     mutate_transcript(
         &s,
@@ -187,10 +194,7 @@ mod tests {
         )
         .await
         .expect("ok");
-        assert_eq!(
-            resp.0,
-            serde_json::json!({ "ok": true, "id": "run_1" })
-        );
+        assert_eq!(resp.0, serde_json::json!({ "ok": true, "id": "run_1" }));
     }
 
     #[tokio::test]
@@ -205,10 +209,7 @@ mod tests {
         )
         .await
         .expect("ok");
-        assert_eq!(
-            resp.0,
-            serde_json::json!({ "ok": true, "id": "run_1" })
-        );
+        assert_eq!(resp.0, serde_json::json!({ "ok": true, "id": "run_1" }));
     }
 
     /// SAFETY-CRITICAL: a session-owned transcript must be REFUSED (409),
@@ -329,10 +330,8 @@ mod tests {
     // 409 here too, not fall through to the generic 500 `other` arm.
     #[test]
     fn map_host_transcript_mutate_err_preserves_remote_409_as_conflict() {
-        let err = map_host_transcript_mutate_err(HostConnectorError::Remote(
-            409,
-            "still running".into(),
-        ));
+        let err =
+            map_host_transcript_mutate_err(HostConnectorError::Remote(409, "still running".into()));
         assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
     }
 

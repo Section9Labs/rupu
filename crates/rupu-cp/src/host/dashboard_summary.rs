@@ -104,6 +104,65 @@ pub struct ActiveLongest {
     pub age_ms: u64,
 }
 
+/// One host's inventory contribution — the fleet strip beneath the ops
+/// blocks (spec §2).
+///
+/// Every count is `Option<u64>` for the same reason `findings_open` is: a
+/// host that cannot source a field is NOT a host whose count is zero. The
+/// aggregation layer (`api::dashboard`) sums only `Some` values and raises
+/// `fleet_partial` when any reporting host contributed `None`.
+///
+/// Fields are filled across three plans. Plan 1 fills the ones readable from
+/// `<global_dir>` alone (`autoflows_*`, `workers`, `claims_active`); Plan 2
+/// fills the `providers_*` pair; Plan 3 fills `repos` and the `issues_*`
+/// family. An unfilled field is `None` and renders as an em-dash — never as a
+/// zero.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FleetCounts {
+    /// Repos visible to the SCM connector. Plan 3.
+    pub repos: Option<u64>,
+    /// Providers rupu holds usable credentials for. Plan 2.
+    ///
+    /// Deliberately NOT `config.providers.len()`: that map holds per-provider
+    /// knob overrides (`base_url`, `models`, …), so an operator authenticated
+    /// to Anthropic via OAuth with no `[providers.anthropic]` block would
+    /// count as zero. The honest source is the credential store, which lives
+    /// behind rupu-providers — a crate rupu-cp does not depend on. It
+    /// therefore arrives through the Plan 2 port, not from a config read.
+    pub providers_configured: Option<u64>,
+    /// Providers whose last probe failed (auth or reachability). Plan 2.
+    /// `None` without a probe cache — the strip then claims nothing about
+    /// health, which is the point: config presence is not evidence a
+    /// provider works.
+    pub providers_unhealthy: Option<u64>,
+    /// Workflow definitions carrying `autoflow.enabled: true`.
+    pub autoflows_enabled: Option<u64>,
+    /// Workflow definitions carrying `autoflow.enabled: false`.
+    pub autoflows_disabled: Option<u64>,
+    /// Registered local worker identities.
+    pub workers: Option<u64>,
+    /// Tracked autoflow claims that are still in flight — every
+    /// `ClaimStatus` except `Complete` and `Released`. Named `_active`
+    /// rather than the spec's `_queued` because `ClaimStatus` has no
+    /// `Queued` variant.
+    pub claims_active: Option<u64>,
+    /// Issues matched by an enabled autoflow's selector and not yet
+    /// claimed. Plan 3.
+    pub issues_pending: Option<u64>,
+    /// Open issues across connected repos. Plan 3.
+    pub issues_open: Option<u64>,
+    /// True when a repo hit the per-repo issue fetch cap, making
+    /// `issues_open` a floor rather than a total. ORs across hosts at the
+    /// merge. Plan 3.
+    #[serde(default)]
+    pub issues_capped: bool,
+    /// When the SCM / provider caches behind these numbers were filled.
+    /// Deliberately distinct from [`DashboardSummary::captured_at`], which
+    /// stamps the run-store read — the inventory is minutes-stale by design
+    /// while the run data is seconds-stale. Plans 2 and 3.
+    pub inventory_captured_at: Option<DateTime<Utc>>,
+}
+
 /// One host's complete dashboard contribution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardSummary {
@@ -120,6 +179,14 @@ pub struct DashboardSummary {
     /// (`api::dashboard` sums only `Some` values and flags the aggregate as
     /// partial when any reporting host contributed `None`).
     pub findings_open: Option<u64>,
+    /// This host's inventory contribution. `#[serde(default)]` is
+    /// load-bearing: `HttpHostConnector` parses a remote CP's body as a bare
+    /// `DashboardSummary`, and a remote running an older rupu emits no
+    /// `fleet` key at all. Without the default that host would fail to parse
+    /// and drop off the dashboard entirely instead of degrading to an
+    /// all-`None` strip contribution.
+    #[serde(default)]
+    pub fleet: FleetCounts,
     /// When this host's data was actually read. Drives the per-host freshness
     /// strip — a host 30s stale must not render as "live". Never synthesized
     /// at the aggregation layer; always set by the connector that read it.
@@ -145,6 +212,43 @@ mod tests {
         assert_eq!(a.awaiting_approval, 0);
         assert_eq!(a.paused, 0);
         assert_eq!(a.pending, 0);
+    }
+
+    #[test]
+    fn fleet_counts_default_is_all_none() {
+        let f = FleetCounts::default();
+        assert_eq!(f.repos, None);
+        assert_eq!(f.providers_configured, None);
+        assert_eq!(f.providers_unhealthy, None);
+        assert_eq!(f.autoflows_enabled, None);
+        assert_eq!(f.autoflows_disabled, None);
+        assert_eq!(f.workers, None);
+        assert_eq!(f.claims_active, None);
+        assert_eq!(f.issues_pending, None);
+        assert_eq!(f.issues_open, None);
+        assert!(!f.issues_capped);
+        assert!(f.inventory_captured_at.is_none());
+    }
+
+    /// A summary produced by an OLDER rupu (no `fleet` key at all) must still
+    /// deserialize — `HttpHostConnector` parses remote-CP bodies as a bare
+    /// `DashboardSummary`, so a missing key here would take the whole remote
+    /// host offline rather than degrade one strip segment.
+    #[test]
+    fn summary_without_a_fleet_key_deserializes_to_default() {
+        let json = serde_json::json!({
+            "active": {"running": 1, "awaiting_approval": 0, "paused": 0, "pending": 0},
+            "terminal_buckets": [],
+            "throughput_buckets": [],
+            "cycles": {"total": 0, "clean": null, "with_failures": null},
+            "findings_open": null,
+            "captured_at": "2026-07-30T00:00:00Z",
+        });
+        let sum: DashboardSummary = serde_json::from_value(json).expect("must deserialize");
+        assert_eq!(
+            sum.fleet.workers, None,
+            "a pre-fleet host must degrade to all-None, never to fabricated zeros"
+        );
     }
 
     #[test]
@@ -236,6 +340,7 @@ mod tests {
             throughput_buckets: vec![],
             cycles: CycleCounts::default(),
             findings_open: Some(0),
+            fleet: FleetCounts::default(),
             captured_at: chrono::Utc::now(),
         };
         let v = serde_json::to_value(&s).unwrap();
@@ -254,6 +359,7 @@ mod tests {
             throughput_buckets: vec![],
             cycles: CycleCounts::default(),
             findings_open: None,
+            fleet: FleetCounts::default(),
             captured_at: chrono::Utc::now(),
         };
         let v = serde_json::to_value(&s).unwrap();
@@ -300,6 +406,7 @@ mod tests {
                 with_failures: Some(2),
             },
             findings_open: Some(3),
+            fleet: FleetCounts::default(),
             captured_at: chrono::Utc::now(),
         };
         let v = serde_json::to_value(&s).unwrap();

@@ -190,7 +190,9 @@ pub(crate) fn resolve_workflow_scoped_explicit(
             let scope_id = scope_id?;
             let workspaces = store(s).list().unwrap_or_default();
             let w = workspaces.into_iter().find(|w| w.id == scope_id)?;
-            let proj_dir = std::path::Path::new(&w.path).join(".rupu").join("workflows");
+            let proj_dir = std::path::Path::new(&w.path)
+                .join(".rupu")
+                .join("workflows");
             let candidate = proj_dir.join(format!("{name}.yaml"));
             if candidate.exists() {
                 Some((candidate, proj_dir, scope_name(&w), ScopeKind::Project))
@@ -339,7 +341,12 @@ async fn list_workflows(State(s): State<AppState>) -> ApiResult<Json<Vec<Workflo
             .join(".rupu")
             .join("workflows");
         let scope_id = Some(r.workspace.id.clone());
-        project_rows.extend(scan_workflow_names(&dir, r.scope, ScopeKind::Project, scope_id));
+        project_rows.extend(scan_workflow_names(
+            &dir,
+            r.scope,
+            ScopeKind::Project,
+            scope_id,
+        ));
     }
 
     let project_names: std::collections::BTreeSet<&str> =
@@ -986,7 +993,9 @@ mod tests {
         register_workspace(&tmp, "ws_a", proj.path());
         let ws_id = "ws_a".to_string();
 
-        let edited = VALID_YAML.replace("demo", "nightly-sweep").replace("hi", "edited");
+        let edited = VALID_YAML
+            .replace("demo", "nightly-sweep")
+            .replace("hi", "edited");
         let resp = write_workflow(
             State(s.clone()),
             Path("nightly-sweep".into()),
@@ -1087,7 +1096,9 @@ mod tests {
                 scope_id: Some("no-such-workspace".to_string()),
             }),
             Json(WorkflowWriteBody {
-                raw: VALID_YAML.replace("demo", "shared-name").replace("hi", "should-not-land"),
+                raw: VALID_YAML
+                    .replace("demo", "shared-name")
+                    .replace("hi", "should-not-land"),
             }),
         )
         .await
@@ -1123,7 +1134,9 @@ mod tests {
         .unwrap();
         register_workspace(&tmp, "ws_a", proj.path());
 
-        let edited = VALID_YAML.replace("demo", "nightly-sweep").replace("hi", "edited");
+        let edited = VALID_YAML
+            .replace("demo", "nightly-sweep")
+            .replace("hi", "edited");
         let resp = write_workflow(
             State(s.clone()),
             Path("nightly-sweep".into()),
@@ -1247,8 +1260,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
         std::fs::create_dir_all(workflows_dir(&s)).unwrap();
-        std::fs::write(wf_path(&s, "nightly-sweep"), VALID_YAML.replace("demo", "nightly-sweep"))
-            .unwrap();
+        std::fs::write(
+            wf_path(&s, "nightly-sweep"),
+            VALID_YAML.replace("demo", "nightly-sweep"),
+        )
+        .unwrap();
 
         let proj = tempfile::TempDir::new().unwrap();
         let proj_workflows = proj.path().join(".rupu").join("workflows");
@@ -1316,8 +1332,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
         std::fs::create_dir_all(workflows_dir(&s)).unwrap();
-        std::fs::write(wf_path(&s, "shared-name"), VALID_YAML.replace("demo", "shared-name"))
-            .unwrap();
+        std::fs::write(
+            wf_path(&s, "shared-name"),
+            VALID_YAML.replace("demo", "shared-name"),
+        )
+        .unwrap();
 
         let proj = tempfile::TempDir::new().unwrap();
         let proj_workflows = proj.path().join(".rupu").join("workflows");
@@ -1415,8 +1434,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
         std::fs::create_dir_all(workflows_dir(&s)).unwrap();
-        std::fs::write(wf_path(&s, "shared-name"), VALID_YAML.replace("demo", "shared-name"))
-            .unwrap();
+        std::fs::write(
+            wf_path(&s, "shared-name"),
+            VALID_YAML.replace("demo", "shared-name"),
+        )
+        .unwrap();
 
         let proj = tempfile::TempDir::new().unwrap();
         let proj_workflows = proj.path().join(".rupu").join("workflows");
@@ -1587,8 +1609,11 @@ mod tests {
         let proj = tempfile::TempDir::new().unwrap();
         let proj_workflows = proj.path().join(".rupu").join("workflows");
         std::fs::create_dir_all(&proj_workflows).unwrap();
-        std::fs::write(proj_workflows.join("nightly.yaml"), VALID_YAML.replace("demo", "nightly"))
-            .unwrap();
+        std::fs::write(
+            proj_workflows.join("nightly.yaml"),
+            VALID_YAML.replace("demo", "nightly"),
+        )
+        .unwrap();
         register_workspace(&tmp, "ws_a", proj.path());
 
         let Json(rows) = list_workflows(State(s.clone())).await.expect("ok");
@@ -2017,12 +2042,7 @@ mod tests {
                 "name: issue-triage\nautoflow:\n  enabled: true\nsteps:\n  - id: s1\n    agent: ag\n    prompt: p\n",
             )
             .unwrap();
-            register_workspace_with_remote(
-                &tmp,
-                &format!("ws_{name}"),
-                &root,
-                Some(remote),
-            );
+            register_workspace_with_remote(&tmp, &format!("ws_{name}"), &root, Some(remote));
         }
 
         // The list's row scope names the representative worktree...

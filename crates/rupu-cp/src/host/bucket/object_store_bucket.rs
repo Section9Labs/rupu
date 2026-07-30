@@ -15,14 +15,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::TryStreamExt;
-use object_store::{
-    path::Path, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
-};
+use object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 
 use super::{
-    BucketError, Bucket,
-    key_claim, key_control, key_finished, key_job, key_result,
-    prefix_control, prefix_results,
+    key_claim, key_control, key_finished, key_job, key_result, prefix_control, prefix_results,
+    Bucket, BucketError,
 };
 
 // ── struct ────────────────────────────────────────────────────────────────────
@@ -177,7 +174,12 @@ impl Bucket for ObjectStoreBucket {
         }
     }
 
-    async fn put_control(&self, run_id: &str, seq: u64, envelope: &[u8]) -> Result<(), BucketError> {
+    async fn put_control(
+        &self,
+        run_id: &str,
+        seq: u64,
+        envelope: &[u8],
+    ) -> Result<(), BucketError> {
         let path = self.path(&key_control(run_id, seq));
         self.put_bytes(&path, envelope).await
     }
@@ -306,10 +308,7 @@ mod tests {
         b.put_control("run_1", 2, b"c2").await.unwrap();
         b.put_control("run_1", 1, b"c1").await.unwrap();
         let ctl = b.list_control("run_1").await.unwrap();
-        assert_eq!(
-            ctl.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
-            vec![1, 2]
-        );
+        assert_eq!(ctl.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![1, 2]);
         b.put_result("run_1", "events.0001.jsonl", b"line")
             .await
             .unwrap();

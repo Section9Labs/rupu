@@ -379,10 +379,9 @@ mod tests {
 
     #[test]
     fn split_dotted_key_quoted_segment() {
-        let parts = split_dotted_key(
-            "pricing.oracle.\"/raid/models/zai-org/GLM-5.2-FP8\".input_per_mtok",
-        )
-        .unwrap();
+        let parts =
+            split_dotted_key("pricing.oracle.\"/raid/models/zai-org/GLM-5.2-FP8\".input_per_mtok")
+                .unwrap();
         assert_eq!(
             parts,
             vec![
@@ -415,9 +414,12 @@ mod tests {
         // must reject them outright rather than silently dropping the
         // implied-empty segment (the bug this test set closes).
         for bad in [".", "a.", ".x", "a..b", "\"x\"."] {
-            let err = split_dotted_key(bad)
-                .expect_err(&format!("expected Err for {bad:?}, got Ok"));
-            assert!(matches!(err, ConfigWriteError::Validate(_)), "{bad:?}: {err:?}");
+            let err =
+                split_dotted_key(bad).expect_err(&format!("expected Err for {bad:?}, got Ok"));
+            assert!(
+                matches!(err, ConfigWriteError::Validate(_)),
+                "{bad:?}: {err:?}"
+            );
         }
     }
 

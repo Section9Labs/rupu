@@ -379,10 +379,15 @@ impl HostConnector for LocalHostConnector {
         // host that cannot report findings (e.g. SSH) sets. `count_open_findings`
         // is infallible (see its doc comment).
         let findings_open = Some(count_open_findings(&self.global_dir));
+        // This host reads its own stores, so it reports the `<global_dir>`
+        // fleet counts directly. The SCM- and probe-backed fields stay `None`
+        // until Plans 2 and 3 install the inventory port.
+        let fleet = crate::host::fleet_counts::collect_fleet_counts(&self.global_dir);
         Ok(crate::host::summary_build::build_summary(
             &runs,
             &cycles,
             findings_open,
+            fleet,
             range,
             chrono::Utc::now(),
         ))
@@ -668,7 +673,10 @@ mod pause_resume_tests {
         let tmp = tempfile::tempdir().unwrap();
         let (conn, store) = local(tmp.path().to_path_buf());
         store
-            .create(record("run_local_archive", RunStatus::Completed), "name: x\n")
+            .create(
+                record("run_local_archive", RunStatus::Completed),
+                "name: x\n",
+            )
             .unwrap();
 
         conn.archive_run("run_local_archive").await.unwrap();
@@ -685,7 +693,10 @@ mod pause_resume_tests {
         let tmp = tempfile::tempdir().unwrap();
         let (conn, store) = local(tmp.path().to_path_buf());
         store
-            .create(record("run_local_archive_running", RunStatus::Running), "name: x\n")
+            .create(
+                record("run_local_archive_running", RunStatus::Running),
+                "name: x\n",
+            )
             .unwrap();
 
         let err = conn
@@ -700,7 +711,10 @@ mod pause_resume_tests {
         let tmp = tempfile::tempdir().unwrap();
         let (conn, store) = local(tmp.path().to_path_buf());
         store
-            .create(record("run_local_delete", RunStatus::Completed), "name: x\n")
+            .create(
+                record("run_local_delete", RunStatus::Completed),
+                "name: x\n",
+            )
             .unwrap();
 
         conn.delete_run("run_local_delete").await.unwrap();
@@ -716,7 +730,10 @@ mod pause_resume_tests {
         let tmp = tempfile::tempdir().unwrap();
         let (conn, store) = local(tmp.path().to_path_buf());
         store
-            .create(record("run_local_delete_running", RunStatus::Running), "name: x\n")
+            .create(
+                record("run_local_delete_running", RunStatus::Running),
+                "name: x\n",
+            )
             .unwrap();
 
         let err = conn

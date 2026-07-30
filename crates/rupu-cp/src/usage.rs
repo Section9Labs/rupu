@@ -655,7 +655,8 @@ mod tests {
     #[test]
     fn run_metrics_paths_usage_matches_old_two_pass_shape_across_transcripts() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("rupu-cp-metrics-multi-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rupu-cp-metrics-multi-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let p1 = dir.join("t1.jsonl");
