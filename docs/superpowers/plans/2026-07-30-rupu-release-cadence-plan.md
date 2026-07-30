@@ -312,7 +312,10 @@ cutoff=$(( now - soak_days * 86400 ))
 best_tag=""
 best_major=-1; best_minor=-1; best_patch=-1; best_counter=-1
 
-while IFS="$(printf '\t')" read -r tag ts; do
+# `|| [ -n "${tag:-}" ]` is load-bearing: `read` returns non-zero at EOF
+# when the final line has no trailing newline, so that record would be
+# silently dropped — promoting an older beta, or nothing, with exit 0.
+while IFS="$(printf '\t')" read -r tag ts || [ -n "${tag:-}" ]; do
   [ -n "${tag:-}" ] || continue
   case "$ts" in ''|*[!0-9]*) continue ;; esac
   # Too fresh: it has not soaked. This is the check that guarantees a stable
@@ -365,7 +368,7 @@ chmod +x scripts/pick-promotable-beta.sh
 scripts/tests/release-cadence-tests.sh
 ```
 
-Expected: `18 passed, 0 failed`.
+Expected: `20 passed, 0 failed`.
 
 - [ ] **Step 5: Commit**
 
@@ -453,7 +456,7 @@ surrounding style (the file already has a `runs-on: ubuntu-latest` +
 scripts/tests/release-cadence-tests.sh
 ```
 
-Expected: `18 passed, 0 failed`.
+Expected: `20 passed, 0 failed`.
 
 - [ ] **Step 5: Commit**
 
@@ -838,7 +841,7 @@ git commit -m "refactor(release): retire the macOS-only local publish path"
 
 ## What is NOT covered by automated tests
 
-Both scripts are unit-tested (18 cases). Three conditions live in workflow YAML
+Both scripts are unit-tested (20 cases). Three conditions live in workflow YAML
 and are exercised only by the manual steps in Tasks 4 and 5:
 
 - the **stall-guard** (base version equal to the shipped stable),
@@ -854,7 +857,7 @@ does not actually exercise the workflow.
 
 After all six tasks:
 
-- [ ] `scripts/tests/release-cadence-tests.sh` → `18 passed, 0 failed`.
+- [ ] `scripts/tests/release-cadence-tests.sh` → `20 passed, 0 failed`.
 - [ ] Both new workflow files parse as YAML.
 - [ ] `gh workflow list` shows `release-beta` and `release-stable` once the branch is on `main`.
 - [ ] **Dry-run the beta cut before trusting the cron:** merge to `main`, then `gh workflow run release-beta.yml` and confirm it either pushes a sensible `-beta.N` tag or logs a specific skip reason. This is the one end-to-end check that cannot be done from a branch, because the workflow checks out `main`.
