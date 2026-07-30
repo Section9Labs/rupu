@@ -1,0 +1,111 @@
+name: release-stable
+
+# Promotes a beta that has already soaked. Stable is therefore always a build
+# that shipped as a beta first — never code nobody has installed.
+on:
+  schedule:
+    # Sunday 09:17 UTC, after the morning beta slot.
+    - cron: "17 9 * * 0"
+  workflow_dispatch: {}
+
+concurrency:
+  group: release-stable
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  # Days a beta must have existed before it can become stable. Two means a
+  # Thursday beta can promote on Sunday but Saturday's cannot.
+  SOAK_DAYS: "2"
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          # A PAT is not needed — contents:write plus the default token can
+          # push to an unprotected branch. If main ever gains protection, this
+          # step is the one that breaks, loudly.
+          token: ${{ github.token }}
+
+      - name: Pick a promotable beta
+        id: pick
+        run: |
+          set -euo pipefail
+
+          # `creatordate` is the tag's own date for annotated tags; these are
+          # lightweight, so it resolves to the commit date — which is the age
+          # the soak window is actually about.
+          candidates=$(git for-each-ref --format='%(refname:short)%09%(creatordate:unix)' \
+            'refs/tags/v*-beta' 'refs/tags/v*-beta.*')
+
+          tag=$(printf '%s\n' "$candidates" \
+            | scripts/pick-promotable-beta.sh "$SOAK_DAYS" "$(date -u +%s)" || true)
+
+          if [ -z "$tag" ]; then
+            echo "::notice::no beta older than ${SOAK_DAYS}d to promote — skipping this week"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Refuse a beta whose commit is no longer reachable from main (a
+          # force-push or rebase dropped it). Promoting it would ship code
+          # that is no longer in the tree.
+          sha=$(git rev-parse "$tag^{commit}")
+          # HEAD, not origin/main: the checkout above already put us on main,
+          # and a remote-tracking ref is not guaranteed to exist in the
+          # actions/checkout working copy.
+          if ! git merge-base --is-ancestor "$sha" HEAD; then
+            echo "::error::$tag ($sha) is not an ancestor of main — refusing to promote unreachable code"
+            exit 1
+          fi
+
+          version="${tag#v}"; version="${version%%-beta*}"
+          echo "tag=$tag"          >> "$GITHUB_OUTPUT"
+          echo "sha=$sha"          >> "$GITHUB_OUTPUT"
+          echo "version=$version"  >> "$GITHUB_OUTPUT"
+          echo "go=true"           >> "$GITHUB_OUTPUT"
+          echo "promoting $tag ($sha) -> v$version"
+
+      - name: Tag the promoted commit as stable
+        if: steps.pick.outputs.go == 'true'
+        run: |
+          set -euo pipefail
+          v="v${{ steps.pick.outputs.version }}"
+          if git rev-parse "$v" >/dev/null 2>&1; then
+            echo "::notice::$v already exists — nothing to promote"
+            exit 0
+          fi
+          # Tag the BETA's commit, not main's head: that is what makes stable
+          # byte-identical in content to the beta that soaked.
+          git tag "$v" "${{ steps.pick.outputs.sha }}"
+          git push origin "$v"
+          echo "::notice::pushed $v — release.yml publishes it"
+
+      - name: Bump the base version for the next beta series
+        if: steps.pick.outputs.go == 'true'
+        run: |
+          set -euo pipefail
+          # Without this the next beta would be v<same>-beta.N, which sorts
+          # BELOW the stable just shipped and walks `rupu update` backwards.
+          #
+          # This push to main is the one narrowly-scoped exception to the
+          # never-commit-to-main rule (see the design doc). Nothing else in CI
+          # may push to main.
+          version="${{ steps.pick.outputs.version }}"
+          major="${version%%.*}"
+          minor="${version#*.}"; minor="${minor%%.*}"
+          next="$major.$((minor + 1)).0"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          make bump VERSION="$next"
+          git push origin HEAD:main
+          echo "::notice::bumped base version to $next for the next beta series"
