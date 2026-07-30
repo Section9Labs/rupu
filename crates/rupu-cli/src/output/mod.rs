@@ -7,6 +7,7 @@
 pub mod diag;
 pub mod fmt;
 pub mod formats;
+pub mod ids;
 pub mod jsonl_reader;
 pub mod live_run;
 pub mod palette;
