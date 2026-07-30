@@ -42,6 +42,10 @@ pub struct LocalHostConnector {
     /// staging scratch dirs live under `<global_dir>/workspace-sync/`.
     global_dir: PathBuf,
     pricing: rupu_config::PricingConfig,
+    /// Optional fleet-inventory port. `None` in a read-only `rupu cp` (no
+    /// adapter is installed without `cp serve`), which is why every field it
+    /// feeds is `Option` — absent means unreported, not zero.
+    inventory: Option<Arc<dyn crate::fleet_inventory::FleetInventory>>,
 }
 
 impl LocalHostConnector {
@@ -64,12 +68,24 @@ impl LocalHostConnector {
             run_store,
             global_dir,
             pricing: rupu_config::PricingConfig::default(),
+            inventory: None,
         }
     }
 
     /// Override the pricing configuration used for usage summaries.
     pub fn with_pricing(mut self, pricing: rupu_config::PricingConfig) -> Self {
         self.pricing = pricing;
+        self
+    }
+
+    /// Install the fleet-inventory port (or clear it with `None`). `cp serve`
+    /// calls this; a read-only `rupu cp` does not, and then the provider- and
+    /// SCM-backed strip segments correctly report nothing.
+    pub fn with_inventory(
+        mut self,
+        inventory: Option<Arc<dyn crate::fleet_inventory::FleetInventory>>,
+    ) -> Self {
+        self.inventory = inventory;
         self
     }
 }
@@ -380,9 +396,14 @@ impl HostConnector for LocalHostConnector {
         // is infallible (see its doc comment).
         let findings_open = Some(count_open_findings(&self.global_dir));
         // This host reads its own stores, so it reports the `<global_dir>`
-        // fleet counts directly. The SCM- and probe-backed fields stay `None`
-        // until Plans 2 and 3 install the inventory port.
-        let fleet = crate::host::fleet_counts::collect_fleet_counts(&self.global_dir);
+        // fleet counts directly, then folds the inventory port's snapshot on
+        // top for the provider- and SCM-backed fields. `snapshot()` reads an
+        // already-refreshed cache — no network here, so a dead provider can
+        // never slow the dashboard down.
+        let mut fleet = crate::host::fleet_counts::collect_fleet_counts(&self.global_dir);
+        if let Some(inv) = &self.inventory {
+            fleet = crate::host::fleet_counts::apply_inventory(fleet, &inv.snapshot());
+        }
         Ok(crate::host::summary_build::build_summary(
             &runs,
             &cycles,
@@ -743,5 +764,76 @@ mod pause_resume_tests {
         assert!(matches!(err, HostConnectorError::Invalid(_)));
         // Guard fired BEFORE any filesystem mutation.
         assert_eq!(store.list().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod inventory_fold_tests {
+    use super::*;
+    use crate::fleet_inventory::{FleetInventory, InventorySnapshot, ProbeState, ProviderProbeRow};
+
+    fn local(global_dir: PathBuf) -> LocalHostConnector {
+        let run_store = Arc::new(RunStore::new(global_dir.join("runs")));
+        LocalHostConnector::new(None, None, None, None, run_store, global_dir)
+    }
+
+    struct Fake;
+    impl FleetInventory for Fake {
+        fn snapshot(&self) -> InventorySnapshot {
+            InventorySnapshot {
+                providers: vec![
+                    ProviderProbeRow {
+                        provider: "anthropic".into(),
+                        state: ProbeState::Ok,
+                        probed_at: None,
+                    },
+                    ProviderProbeRow {
+                        provider: "google".into(),
+                        state: ProbeState::Unreachable {
+                            detail: "dns".into(),
+                        },
+                        probed_at: None,
+                    },
+                ],
+                ..InventorySnapshot::default()
+            }
+        }
+    }
+
+    /// With an inventory installed, its provider counts reach the summary.
+    #[tokio::test]
+    async fn dashboard_summary_folds_in_the_inventory_when_installed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let conn = local(tmp.path().to_path_buf()).with_inventory(Some(Arc::new(Fake)));
+
+        let sum = conn
+            .dashboard_summary(crate::host::dashboard_summary::DashboardRange::All)
+            .await
+            .expect("summary");
+
+        assert_eq!(sum.fleet.providers_configured, Some(2));
+        assert_eq!(sum.fleet.providers_unhealthy, Some(1));
+        // The disk-sourced counts must still be there alongside.
+        assert_eq!(sum.fleet.workers, Some(0));
+    }
+
+    /// Without one — a read-only `rupu cp`, where `cp serve` never installed an
+    /// adapter — the strip must claim nothing about providers rather than
+    /// reporting a fabricated zero.
+    #[tokio::test]
+    async fn dashboard_summary_reports_no_provider_counts_without_an_inventory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let conn = local(tmp.path().to_path_buf());
+
+        let sum = conn
+            .dashboard_summary(crate::host::dashboard_summary::DashboardRange::All)
+            .await
+            .expect("summary");
+
+        assert_eq!(sum.fleet.providers_configured, None);
+        assert_eq!(
+            sum.fleet.providers_unhealthy, None,
+            "no adapter means no probe has run; the strip must claim nothing"
+        );
     }
 }

@@ -13,6 +13,7 @@ pub mod launcher;
 pub mod net;
 pub mod node;
 pub mod pagination;
+pub mod fleet_inventory;
 pub mod repos;
 pub mod server;
 pub mod session_mutator;

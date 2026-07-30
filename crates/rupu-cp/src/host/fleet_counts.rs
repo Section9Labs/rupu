@@ -8,6 +8,7 @@
 #![deny(clippy::all)]
 
 use crate::api::repo_scope::{distinct_repo_workspaces, ScopeKind};
+use crate::fleet_inventory::InventorySnapshot;
 use crate::host::dashboard_summary::FleetCounts;
 use rupu_workspace::worker_store::WorkerStore;
 use rupu_workspace::{AutoflowClaimStore, ClaimStatus, RepoRegistryStore, WorkspaceStore};
@@ -28,6 +29,27 @@ pub fn collect_fleet_counts(global_dir: &std::path::Path) -> FleetCounts {
         issues_open: None,
         issues_capped: false,
         inventory_captured_at: None,
+    }
+}
+
+/// Fold an inventory snapshot into the disk-sourced counts.
+///
+/// Only fields the snapshot owns are touched; everything read from
+/// `<global_dir>` passes through untouched. An empty snapshot (no providers
+/// known) leaves the provider fields `None` — "the cache has not filled yet"
+/// must not render as "you have zero providers", which is why this keys off
+/// `providers.is_empty()` rather than unconditionally calling the counters.
+pub fn apply_inventory(base: FleetCounts, snap: &InventorySnapshot) -> FleetCounts {
+    let providers_known = !snap.providers.is_empty();
+    FleetCounts {
+        providers_configured: providers_known.then(|| snap.providers_configured()),
+        providers_unhealthy: providers_known.then(|| snap.providers_unhealthy()),
+        repos: snap.repos,
+        issues_pending: snap.issues_pending,
+        issues_open: snap.issues_open,
+        issues_capped: snap.issues_capped,
+        inventory_captured_at: snap.captured_at,
+        ..base
     }
 }
 
@@ -171,6 +193,56 @@ mod tests {
             Some(1),
             "a workflow with no autoflow: block is not a disabled autoflow — it is not an autoflow"
         );
+    }
+
+    /// The snapshot fills ONLY the fields it owns. A base count sourced from
+    /// disk must survive untouched.
+    #[test]
+    fn apply_inventory_fills_provider_fields_without_clobbering_local_counts() {
+        use crate::fleet_inventory::{ProbeState, ProviderProbeRow};
+
+        let base = FleetCounts {
+            workers: Some(3),
+            claims_active: Some(9),
+            ..FleetCounts::default()
+        };
+        let stamp = chrono::Utc::now();
+        let snap = InventorySnapshot {
+            providers: vec![
+                ProviderProbeRow {
+                    provider: "anthropic".into(),
+                    state: ProbeState::Ok,
+                    probed_at: Some(stamp),
+                },
+                ProviderProbeRow {
+                    provider: "google".into(),
+                    state: ProbeState::AuthFailed {
+                        detail: "401".into(),
+                    },
+                    probed_at: Some(stamp),
+                },
+            ],
+            captured_at: Some(stamp),
+            ..InventorySnapshot::default()
+        };
+
+        let out = apply_inventory(base, &snap);
+
+        assert_eq!(out.providers_configured, Some(2));
+        assert_eq!(out.providers_unhealthy, Some(1));
+        assert_eq!(out.workers, Some(3), "local counts must survive");
+        assert_eq!(out.claims_active, Some(9));
+        assert_eq!(out.inventory_captured_at, Some(stamp));
+    }
+
+    /// With no providers known at all, report nothing rather than `Some(0)` —
+    /// "the adapter has not filled its cache yet" is not "you have no
+    /// providers".
+    #[test]
+    fn apply_inventory_with_an_empty_snapshot_reports_no_provider_counts() {
+        let out = apply_inventory(FleetCounts::default(), &InventorySnapshot::default());
+        assert_eq!(out.providers_configured, None);
+        assert_eq!(out.providers_unhealthy, None);
     }
 
     /// `Complete` and `Released` claims are finished work, not in-flight
