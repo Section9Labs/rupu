@@ -62,7 +62,7 @@ The spec names the claims field `claims_queued`. `ClaimStatus` (`crates/rupu-wor
 **Interfaces:**
 - Produces: `pub struct FleetCounts` with fields `repos`, `providers_configured`, `providers_unhealthy`, `autoflows_enabled`, `autoflows_disabled`, `workers`, `claims_active` (all `Option<u64>`), `issues_pending`, `issues_open` (`Option<u64>`), `issues_capped: bool`, `inventory_captured_at: Option<DateTime<Utc>>`. Derives `Default`. `DashboardSummary` gains `pub fleet: FleetCounts` carrying `#[serde(default)]`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to the existing `mod tests` block at the bottom of `crates/rupu-cp/src/host/dashboard_summary.rs`:
 
@@ -105,12 +105,12 @@ Append to the existing `mod tests` block at the bottom of `crates/rupu-cp/src/ho
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rupu-cp fleet_counts_default_is_all_none summary_without_a_fleet_key`
 Expected: FAIL — `cannot find type FleetCounts in this scope`.
 
-- [ ] **Step 3: Add the type and the field**
+- [x] **Step 3: Add the type and the field**
 
 In `crates/rupu-cp/src/host/dashboard_summary.rs`, insert immediately above `pub struct DashboardSummary`:
 
@@ -188,12 +188,12 @@ Then add the field to `DashboardSummary`, immediately after `findings_open`:
     pub fleet: FleetCounts,
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rupu-cp fleet_counts_default_is_all_none summary_without_a_fleet_key`
 Expected: 2 passed. Other crates will not compile yet — `DashboardSummary` now has a field every constructor must supply. That is Task 2's job.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 rustfmt --edition 2021 crates/rupu-cp/src/host/dashboard_summary.rs
@@ -216,7 +216,7 @@ git commit -m "feat(cp): FleetCounts DTO on DashboardSummary"
 - Consumes: `FleetCounts` from Task 1.
 - Produces: `pub fn collect_fleet_counts(global_dir: &std::path::Path) -> FleetCounts`. `build_summary` gains a `fleet: FleetCounts` parameter, inserted **after** `findings_open` and **before** `range`: `build_summary(runs, cycles, findings_open, fleet, range, now)`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `crates/rupu-cp/src/host/fleet_counts.rs` containing ONLY the test module and the module doc for now:
 
@@ -330,12 +330,12 @@ mod tests {
 > If a required field is missing from the TOML above, add it to the fixture —
 > do not change the assertion.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rupu-cp fleet_counts::`
 Expected: FAIL — the module is not registered and `collect_fleet_counts` does not exist.
 
-- [ ] **Step 3: Implement the collector**
+- [x] **Step 3: Implement the collector**
 
 Register the module in `crates/rupu-cp/src/host/mod.rs`, next to the existing `pub mod dashboard_summary;`:
 
@@ -457,12 +457,12 @@ fn count_autoflow_defs(global_dir: &std::path::Path) -> (Option<u64>, Option<u64
 
 `scan_autoflow_defs` and `AutoflowDefRow::enabled` are `pub(crate)` in `crate::api::autoflows` — reachable from here without a visibility change. If `AutoflowClaimStore` / `ClaimStatus` / `WorkerStore` are not re-exported at `rupu_workspace`'s root, import them from their declaring modules instead; do not widen any visibility to make the import shorter.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rupu-cp fleet_counts::`
 Expected: 3 passed.
 
-- [ ] **Step 5: Thread `fleet` through `build_summary`**
+- [x] **Step 5: Thread `fleet` through `build_summary`**
 
 In `crates/rupu-cp/src/host/summary_build.rs`, change the signature and the constructed value:
 
@@ -507,12 +507,12 @@ In `crates/rupu-cp/src/host/ssh.rs`, in the `DashboardSummary { .. }` literal bu
 
 Fix any other `DashboardSummary { .. }` literals the compiler flags (test fixtures in `api/dashboard.rs`, `local.rs`, `ssh.rs`) by adding `fleet: FleetCounts::default(),` — or, where the fixture already uses `..empty_summary(now)`, add the field to that helper only.
 
-- [ ] **Step 6: Run the full crate test suite**
+- [x] **Step 6: Run the full crate test suite**
 
 Run: `cargo test -p rupu-cp`
 Expected: PASS. Any failure here is a fixture that still omits `fleet`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 rustfmt --edition 2021 crates/rupu-cp/src/host/fleet_counts.rs
@@ -535,7 +535,7 @@ git commit -m "feat(cp): collect global-dir fleet counts on the local host"
 - Consumes: `FleetCounts` (Task 1), `DashboardSummary::fleet` (Task 2).
 - Produces: `merge_dashboard_summaries` returns a 4-tuple `(DashboardSummary, bool, bool, bool)` — the fourth element is `fleet_partial`. `DashboardResponse` gains `fleet_partial: bool`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `mod merge_tests` in `crates/rupu-cp/src/api/dashboard.rs`. Note every existing call to `merge_dashboard_summaries` in this module destructures a 3-tuple and must be widened to 4 — do that in Step 3, not now.
 
@@ -671,12 +671,12 @@ Append to `mod merge_tests` in `crates/rupu-cp/src/api/dashboard.rs`. Note every
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rupu-cp merge_tests`
 Expected: FAIL — `merge_dashboard_summaries` returns a 3-tuple.
 
-- [ ] **Step 3: Implement the merge**
+- [x] **Step 3: Implement the merge**
 
 Add `FleetCounts` to the `dashboard_summary::{...}` import list at the top of `crates/rupu-cp/src/api/dashboard.rs`.
 
@@ -768,12 +768,12 @@ Update the handler's destructuring and the response literal:
 
 Widen every pre-existing 3-tuple destructuring in `mod merge_tests` to 4 by adding a trailing `_fleet_partial` binding.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rupu-cp`
 Expected: PASS, including the four new merge tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 rustfmt --edition 2021 crates/rupu-cp/src/api/dashboard.rs
@@ -795,7 +795,7 @@ git commit -m "feat(cp): merge fleet counts with the findings_open partial rule"
 - Consumes: the wire shape from Task 3.
 - Produces: `export interface FleetCounts`; `DashboardSummary.fleet: FleetCounts`; `DashboardResponse.fleet_partial: boolean`; `mergeSummaries` merges `fleet`; the hook returns `fleet_partial`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `crates/rupu-cp/web/src/lib/dashboard/mergeSummaries.test.ts`. Reuse the file's existing summary-fixture helper; if it is named something other than `emptySummary`, adapt these calls rather than adding a second helper.
 
@@ -864,12 +864,12 @@ function emptyFleet(): FleetCounts {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cd crates/rupu-cp/web && npm test -- mergeSummaries`
 Expected: FAIL — `FleetCounts` is not exported and `merged.fleet` is undefined.
 
-- [ ] **Step 3: Add the types**
+- [x] **Step 3: Add the types**
 
 In `crates/rupu-cp/web/src/lib/api.ts`, above `interface DashboardSummary`:
 
@@ -910,7 +910,7 @@ Add `fleet: FleetCounts;` to `interface DashboardSummary`, and to `interface Das
   fleet_partial: boolean;
 ```
 
-- [ ] **Step 4: Implement the client merge**
+- [x] **Step 4: Implement the client merge**
 
 In `crates/rupu-cp/web/src/lib/dashboard/mergeSummaries.ts`, add `FleetCounts` to the type import and add:
 
@@ -969,7 +969,7 @@ function mergeFleet(byHost: DashboardSummary[]): FleetCounts {
 
 Add `fleet: mergeFleet(byHost),` to the object `mergeSummaries` returns.
 
-- [ ] **Step 5: Derive `fleet_partial` in the hook**
+- [x] **Step 5: Derive `fleet_partial` in the hook**
 
 In `crates/rupu-cp/web/src/lib/dashboard/useDashboardData.ts`, add to the result interface beside `cycles_partial`:
 
@@ -998,12 +998,12 @@ and beside the existing derivations near line 268:
     return { ...merged, findings_partial, cycles_partial, fleet_partial };
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `cd crates/rupu-cp/web && npm test -- mergeSummaries useDashboardData`
 Expected: PASS. Fix any pre-existing fixture in these test files that now lacks `fleet` by adding `fleet: emptyFleet()`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/rupu-cp/web/src/lib/
@@ -1022,7 +1022,7 @@ git commit -m "feat(cp-web): fleet counts in the wire types and the client merge
 - Consumes: `FleetCounts` (Task 4).
 - Produces: `export function FleetStrip({ fleet, fleetPartial }: { fleet: FleetCounts; fleetPartial: boolean })`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `crates/rupu-cp/web/src/components/dashboard/FleetStrip.test.tsx`:
 
@@ -1120,12 +1120,12 @@ describe('FleetStrip', () => {
 });
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cd crates/rupu-cp/web && npm test -- FleetStrip`
 Expected: FAIL — cannot resolve `./FleetStrip`.
 
-- [ ] **Step 3: Implement the component**
+- [x] **Step 3: Implement the component**
 
 Create `crates/rupu-cp/web/src/components/dashboard/FleetStrip.tsx`:
 
@@ -1236,12 +1236,12 @@ export function FleetStrip({
 
 Confirm the `/runs/autoflows` (Claims tab) and `/workers` route paths against `crates/rupu-cp/web/src/App.tsx` before committing; if either differs, use the real path rather than adding a route.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cd crates/rupu-cp/web && npm test -- FleetStrip`
 Expected: 8 passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/rupu-cp/web/src/components/dashboard/FleetStrip.tsx crates/rupu-cp/web/src/components/dashboard/FleetStrip.test.tsx
@@ -1259,7 +1259,7 @@ git commit -m "feat(cp-web): FleetStrip component"
 **Interfaces:**
 - Consumes: `FleetStrip` (Task 5), `data.fleet` / `data.fleet_partial` (Task 4).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `crates/rupu-cp/web/src/pages/Dashboard.test.tsx`, adapting the file's existing mocking of `useDashboardData` rather than introducing a second mocking style:
 
@@ -1289,12 +1289,12 @@ Append to `crates/rupu-cp/web/src/pages/Dashboard.test.tsx`, adapting the file's
   });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cd crates/rupu-cp/web && npm test -- Dashboard`
 Expected: FAIL — no element with testid `fleet-strip`.
 
-- [ ] **Step 3: Render it**
+- [x] **Step 3: Render it**
 
 Add the import in `crates/rupu-cp/web/src/pages/Dashboard.tsx`:
 
@@ -1310,17 +1310,17 @@ and render it immediately after `<CycleSummaryLine ... />`:
 
 Update the module doc comment at the top of the file: the composition list now ends `→ CycleSummaryLine → FleetStrip`, and the strip is inventory context that takes weight only on a fault.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cd crates/rupu-cp/web && npm test -- Dashboard`
 Expected: PASS.
 
-- [ ] **Step 5: Run the full suite both sides**
+- [x] **Step 5: Run the full suite both sides**
 
 Run: `cd crates/rupu-cp/web && npm test -- --run` then `cargo test -p rupu-cp`
 Expected: both green.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/rupu-cp/web/src/pages/Dashboard.tsx crates/rupu-cp/web/src/pages/Dashboard.test.tsx
@@ -1333,8 +1333,9 @@ git commit -m "feat(cp-web): render the fleet strip on the Dashboard"
 
 Beyond the suites, confirm the honest-degradation behaviour by hand — this is the part unit tests cannot fully cover:
 
-- [ ] `cargo build -p rupu-cp && cargo clippy -p rupu-cp -- -D warnings` clean.
-- [ ] `cd crates/rupu-cp/web && npx tsc -b` clean.
-- [ ] Run `rupu cp` (read-only, no `cp serve`) against a real `~/.rupu`: the strip shows real autoflow / worker / claim counts, and em-dashes for repos, providers, and issues. **No segment shows a fabricated `0`.**
-- [ ] With a registered SSH host in the fleet, the strip renders `(partial)`.
-- [ ] `make cp-web` rebuilds the embedded UI (required before any release — the binary embeds `web/dist`).
+- [x] `cargo build -p rupu-cp && cargo clippy -p rupu-cp -- -D warnings` clean.
+- [x] `cd crates/rupu-cp/web && npx tsc -b` clean.
+- [x] Run `rupu cp` (read-only, no `cp serve`) against a real `~/.rupu`: the strip shows real autoflow / worker / claim counts, and em-dashes for repos, providers, and issues. **No segment shows a fabricated `0`.** — verified via `cp serve` run before the Plan 2 adapter existed: identical code path for these fields; repos/providers/issues were em-dashes, no fabricated 0.
+- [x] With a registered SSH host in the fleet, the strip renders `(partial)`. — `fleet_partial: true` while the ssh host `mini` was reporting.
+- [ ] `make cp-web` rebuilds the embedded UI (required before any release — the binary embeds `web/dist`).  
+      **NOT DONE — release-time step, not required to review this branch.**

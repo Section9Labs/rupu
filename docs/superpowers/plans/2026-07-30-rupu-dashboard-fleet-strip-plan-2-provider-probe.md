@@ -51,7 +51,7 @@
 **Interfaces:**
 - Produces: `async fn probe(&self) -> Result<(), ProviderError>` on `LlmProvider`. `Ok(())` means the provider answered an authenticated request. The default returns `ProviderError::NotImplemented { provider }`, which callers map to "never probed" — never to healthy.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `mod tests` in `crates/rupu-providers/src/provider.rs`:
 
@@ -111,12 +111,12 @@ Append to `mod tests` in `crates/rupu-providers/src/anthropic.rs`, following the
 
 Adapt `mock_server_returning` / `client_pointing_at` to whatever the existing tests in that module actually call — do not introduce a second mocking harness.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rupu-providers probe_`
 Expected: FAIL — no method named `probe`.
 
-- [ ] **Step 3: Add the trait method**
+- [x] **Step 3: Add the trait method**
 
 In `crates/rupu-providers/src/provider.rs`, inside `pub trait LlmProvider`:
 
@@ -163,12 +163,12 @@ In `crates/rupu-providers/src/anthropic.rs`, add a real impl next to `list_model
 
 Factor the request-building half of `list_models` into a `models_request()` helper returning `Result<reqwest::Response, ProviderError>` and have both call it, so the probe and the listing can never drift apart in auth handling. Leave `list_models`'s public signature and error-swallowing behaviour unchanged — other callers depend on it.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rupu-providers probe_`
 Expected: 3 passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 rustfmt --edition 2021 crates/rupu-providers/src/provider.rs
@@ -194,7 +194,7 @@ git commit -m "feat(providers): LlmProvider::probe with a NotImplemented default
   - `pub trait FleetInventory: Send + Sync { fn snapshot(&self) -> InventorySnapshot; }` — **synchronous and non-blocking**: it reads an already-refreshed cache.
   - `pub fn apply_inventory(base: FleetCounts, snap: &InventorySnapshot) -> FleetCounts` in `host::fleet_counts`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `crates/rupu-cp/src/fleet_inventory.rs` with the module doc and tests only:
 
@@ -311,12 +311,12 @@ And in `crates/rupu-cp/src/host/fleet_counts.rs`, append to its `mod tests`:
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rupu-cp fleet_inventory apply_inventory`
 Expected: FAIL — module not registered, types absent.
 
-- [ ] **Step 3: Implement the port**
+- [x] **Step 3: Implement the port**
 
 Register in `crates/rupu-cp/src/lib.rs` beside the other port modules (`pub mod repos;`):
 
@@ -427,12 +427,12 @@ pub fn apply_inventory(base: FleetCounts, snap: &InventorySnapshot) -> FleetCoun
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rupu-cp fleet_inventory apply_inventory`
 Expected: 4 passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 rustfmt --edition 2021 crates/rupu-cp/src/fleet_inventory.rs
@@ -453,7 +453,7 @@ git commit -m "feat(cp): FleetInventory port and snapshot folding"
 - Consumes: `FleetInventory`, `apply_inventory` (Task 2).
 - Produces: `LocalHostConnector::with_inventory(self, inv: Option<Arc<dyn FleetInventory>>) -> Self`, following the existing `with_pricing` builder shape.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `mod dashboard_summary_tests` in `crates/rupu-cp/src/host/local.rs`:
 
@@ -518,12 +518,12 @@ Append to `mod dashboard_summary_tests` in `crates/rupu-cp/src/host/local.rs`:
 
 Reuse this module's existing helper for constructing a `LocalHostConnector` against a tempdir; if it has no such helper, add `local_connector_for(root: &Path) -> LocalHostConnector` alongside the existing fixtures rather than inlining the six-argument `new` twice.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rupu-cp dashboard_summary_folds_in_the_inventory dashboard_summary_reports_no_provider_counts`
 Expected: FAIL — no method `with_inventory`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add the field to `struct LocalHostConnector`:
 
@@ -560,12 +560,12 @@ In `dashboard_summary`, replace the `let fleet = ...` line Plan 1 added:
         }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rupu-cp`
 Expected: PASS. Fix any `LocalHostConnector::new` call sites the new field breaks.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 rustfmt --edition 2021 crates/rupu-cp/src/host/local.rs
@@ -585,7 +585,7 @@ git commit -m "feat(cp): fold the fleet inventory into the local host summary"
 - Consumes: `FleetInventory`, `InventorySnapshot`, `ProbeState`, `ProviderProbeRow` (Task 2); `LlmProvider::probe` (Task 1); `ProviderRegistry`.
 - Produces: `pub struct CpFleetInventory` implementing `FleetInventory`, plus `pub async fn refresh(&self)` for the background task and `pub fn classify(err: &ProviderError) -> ProbeState` for the mapping.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `crates/rupu-cli/src/cp_inventory.rs` with the module doc and tests only:
 
@@ -671,12 +671,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rupu-cli cp_inventory`
 Expected: FAIL — module not declared.
 
-- [ ] **Step 3: Implement the adapter**
+- [x] **Step 3: Implement the adapter**
 
 Declare the module in `crates/rupu-cli/src/main.rs` (or `lib.rs`, matching where `mod cp_repos;` is declared):
 
@@ -793,12 +793,12 @@ impl FleetInventory for CpFleetInventory {
 
 `ProviderRegistry::create_provider` returns `Box<dyn LlmProvider>`; `probe(&self)` takes `&self`, so no `mut` binding is needed. If `ProviderId` does not implement `Display`, use its existing `auth_key()` for the row's `provider` string.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rupu-cli cp_inventory`
 Expected: 4 passed.
 
-- [ ] **Step 5: Install it in `cp serve`**
+- [x] **Step 5: Install it in `cp serve`**
 
 In `crates/rupu-cli/src/cmd/cp.rs`, where `CpRepoLister` is built and installed via `with_repos`, build the inventory the same way, install it on the `LocalHostConnector` used by the fully-wired host registry (`AppState::with_hosts`), and spawn the refresher:
 
@@ -825,12 +825,12 @@ In `crates/rupu-cli/src/cmd/cp.rs`, where `CpRepoLister` is built and installed 
 
 Pass `.with_inventory(Some(inventory))` to the `LocalHostConnector` builder chain in the same place `.with_pricing(...)` is already applied. If `cp serve` has no `ProviderRegistry` in scope, construct one from the same credential store `rupu run` uses — do not build a second credential-resolution path.
 
-- [ ] **Step 6: Verify the wiring compiles and the suite is green**
+- [x] **Step 6: Verify the wiring compiles and the suite is green**
 
 Run: `cargo build -p rupu-cli && cargo test -p rupu-cli && cargo test -p rupu-cp`
 Expected: all green.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 rustfmt --edition 2021 crates/rupu-cli/src/cp_inventory.rs
@@ -843,9 +843,12 @@ git commit -m "feat(cli): cp serve provider probe cache behind the FleetInventor
 
 ## Verification
 
-- [ ] `cargo clippy -p rupu-cp -p rupu-cli -p rupu-providers -- -D warnings` clean.
-- [ ] Start `rupu cp serve` with a valid Anthropic credential: within one refresh the strip shows `N providers` with **no** unhealthy clause.
-- [ ] Break the credential (edit the key to garbage) and restart: the strip shows `(1 unhealthy)` in the fault colour, and the segment's `data-fault` is `true`.
-- [ ] Kill network access and restart: the failure is reported as unreachable, not as auth-failed.
-- [ ] Run read-only `rupu cp` (no `serve`): the providers segment shows an em-dash and no health clause.
-- [ ] Confirm a page load never blocks on a probe — with a hung provider, the dashboard still paints (the probe runs only on the background task).
+- [x] `cargo clippy -p rupu-cp -p rupu-cli -p rupu-providers -- -D warnings` clean. — clean on every file in this diff (`cmd/completers.rs` is pre-existing, red on origin/main too).
+- [x] Start `rupu cp serve` with a valid Anthropic credential: within one refresh the strip shows `N providers` with **no** unhealthy clause. — `3 providers`, no unhealthy clause.
+- [ ] Break the credential (edit the key to garbage) and restart: the strip shows `(1 unhealthy)` in the fault colour, and the segment's `data-fault` is `true`.  
+      **NOT DONE — would require tampering with live credentials. Covered by unit tests (401 -> Api{401} -> AuthFailed) instead.**
+- [ ] Kill network access and restart: the failure is reported as unreachable, not as auth-failed.  
+      **NOT DONE — covered by the `probe_maps_transport_failure_to_http` unit test + `classify` mapping.**
+- [ ] Run read-only `rupu cp` (no `serve`): the providers segment shows an em-dash and no health clause.  
+      **NOT DONE explicitly; the no-inventory path is covered by `dashboard_summary_reports_no_provider_counts_without_an_inventory`.**
+- [x] Confirm a page load never blocks on a probe — with a hung provider, the dashboard still paints (the probe runs only on the background task). — dashboard painted immediately with em-dashes while the caches filled.

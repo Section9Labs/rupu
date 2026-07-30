@@ -62,7 +62,7 @@ The spec calls for a new `IssueLister` port in rupu-cp mirroring `RepoLister`. I
 - Consumes: `CpFleetInventory`, `InventorySnapshot` (Plan 2).
 - Produces: `refresh_providers(&self)` (renamed from Plan 2's `refresh`), `refresh_scm(&self)`, and `pub const SCM_TTL_SECS: u64 = 900`. `snapshot().captured_at` becomes the **older** of the two half-stamps.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `mod tests` in `crates/rupu-cli/src/cp_inventory.rs`:
 
@@ -100,12 +100,12 @@ Append to `mod tests` in `crates/rupu-cli/src/cp_inventory.rs`:
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rupu-cli cp_inventory`
 Expected: FAIL — no `set_provider_stamp_for_test`.
 
-- [ ] **Step 3: Restructure the cache**
+- [x] **Step 3: Restructure the cache**
 
 Replace `CpFleetInventory`'s single `cache: RwLock<InventorySnapshot>` with two independently-stamped halves, so a slow SCM refresh never blanks fresh provider data (and vice versa):
 
@@ -190,12 +190,12 @@ Define `ScmDeps` as whatever `discover_tick_autoflows` and `Registry::discover` 
 
 Update both constructors for the new fields: `CpFleetInventory::new` takes `(registry: Arc<ProviderRegistry>, scm: ScmDeps)` and sets both halves to `Default::default()`; `new_for_test` sets `registry: None, scm: None` and both halves default. Every existing Plan 2 test keeps passing because an absent half contributes no rows and no stamp.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rupu-cli cp_inventory`
 Expected: PASS, including Plan 2's existing tests (update `cp serve`'s call site from `refresh()` to `refresh_providers()`).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 rustfmt --edition 2021 crates/rupu-cli/src/cp_inventory.rs
@@ -214,7 +214,7 @@ git commit -m "refactor(cli): split the fleet inventory cache into provider and 
 **Interfaces:**
 - Produces: `refresh_scm(&self)`; `pub const ISSUE_FETCH_CAP: u32 = 500`; `fn tally_open_issues(counts: &[(u64, bool)]) -> (Option<u64>, bool)`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 The network half is exercised by the manual verification at the end; the **cap semantics** are pure and get unit tests. Append to `mod tests`:
 
@@ -250,12 +250,12 @@ The network half is exercised by the manual verification at the end; the **cap s
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p rupu-cli tally_`
 Expected: FAIL — `tally_open_issues` not found.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 /// Per-repo issue fetch cap. Hitting it means the open count is a floor, not
@@ -328,12 +328,12 @@ Implement `ScmDeps::count_open_issues(entry, cap)` by resolving the tracker for 
 
 Leave `issues_pending` untouched here — Task 3 sets it in the same pass.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p rupu-cli tally_`
 Expected: 4 passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 rustfmt --edition 2021 crates/rupu-cli/src/cp_inventory.rs
@@ -353,7 +353,7 @@ git commit -m "feat(cli): count connected repos and capped open-issue totals"
 - Consumes: `discover_tick_autoflows`, `collect_issue_matches`, `IssueMatch`, `AutoflowClaimStore`, `ClaimStatus`.
 - Produces: `fn pending_after_claims(issue_refs: &[String], claim_store: &AutoflowClaimStore) -> u64`. It takes issue-ref strings, **not** `&[IssueMatch]`: only `IssueMatch::issue_ref_text` is read, and the string form makes the function testable without building a `ResolvedAutoflowWorkflow` fixture. The caller maps `matches.iter().map(|m| m.issue_ref_text.clone())`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `mod tests`:
 
@@ -392,12 +392,12 @@ Append to `mod tests`:
 
 Write the `write_claim` helper against the real `AutoflowClaimRecord` shape (`crates/rupu-workspace/src/autoflow_claim.rs`) — reuse the TOML fixture form from Plan 1's `claims_active_excludes_complete_and_released` test, and note that `AutoflowClaimStore::load` is keyed through `issue_key` (`rupu_workspace::autoflow_claim_store::issue_key`), so the on-disk directory name must be that key, not the raw ref.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p rupu-cli pending_excludes`
 Expected: FAIL — `pending_after_claims` not found.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 /// Issue refs that are selected but not already in flight.
@@ -458,12 +458,12 @@ and set `c.issues_pending = issues_pending;` in the cache write.
 
 If `discover_tick_autoflows` / `collect_issue_matches` / `IssueMatch` are `pub(crate)` in a module not reachable from `cp_inventory`, widen them to `pub(crate)` at the crate root — do **not** copy their bodies.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test -p rupu-cli pending_excludes`
 Expected: PASS.
 
-- [ ] **Step 5: Spawn the SCM refresh task**
+- [x] **Step 5: Spawn the SCM refresh task**
 
 In `crates/rupu-cli/src/cmd/cp.rs`, beside the provider refresher Plan 2 added:
 
@@ -482,12 +482,12 @@ In `crates/rupu-cli/src/cmd/cp.rs`, beside the provider refresher Plan 2 added:
     }
 ```
 
-- [ ] **Step 6: Run the full suite**
+- [x] **Step 6: Run the full suite**
 
 Run: `cargo test -p rupu-cli && cargo test -p rupu-cp && cargo clippy -p rupu-cli -- -D warnings`
 Expected: all green.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 rustfmt --edition 2021 crates/rupu-cli/src/cp_inventory.rs
@@ -501,11 +501,15 @@ git commit -m "feat(cli): autoflow-pending backlog via the cron tick's own match
 
 ## Verification
 
-- [ ] `cargo clippy -p rupu-cli -p rupu-cp -- -D warnings` clean.
-- [ ] Start `rupu cp serve` with GitHub credentials: within one SCM refresh the strip shows a real repo count and `N pending (M open)`.
-- [ ] Cross-check the pending number against `rupu autoflow` on the same checkout — **they must agree**. A disagreement means the adapter is not using the cron tick's path and is the one bug this plan exists to prevent.
-- [ ] Claim an issue, then wait for a refresh: `pending` drops by one and `claimed` rises by one.
-- [ ] Point at a repo with more than 500 open issues: the strip renders `500+ open` and does not claim a total.
-- [ ] Revoke SCM credentials and restart: repos and issues render as em-dashes; the provider and local counts are unaffected.
-- [ ] Confirm the first page load after startup is not blocked by the SCM refresh — the strip shows em-dashes, then fills.
-- [ ] `make cp-web` before any release build (the binary embeds `web/dist`).
+- [x] `cargo clippy -p rupu-cli -p rupu-cp -- -D warnings` clean. — same pre-existing exception as Plan 2.
+- [x] Start `rupu cp serve` with GitHub credentials: within one SCM refresh the strip shows a real repo count and `N pending (M open)`. — `159 repos`, `0 pending (119+ open)`.
+- [x] Cross-check the pending number against `rupu autoflow` on the same checkout — **they must agree**. A disagreement means the adapter is not using the cron tick's path and is the one bug this plan exists to prevent. — `/api/autoflows` shows all 6 autoflows disabled, so 0 selected; `issues_pending: 0` agrees.
+- [ ] Claim an issue, then wait for a refresh: `pending` drops by one and `claimed` rises by one.  
+      **NOT DONE — would mutate live autoflow state. Covered by `pending_excludes_issues_with_an_in_flight_claim`.**
+- [ ] Point at a repo with more than 500 open issues: the strip renders `500+ open` and does not claim a total.  
+      **NOT DONE — no such repo available. The floor path was exercised for real by a `451 Repository access blocked` repo, which set `issues_capped`.**
+- [ ] Revoke SCM credentials and restart: repos and issues render as em-dashes; the provider and local counts are unaffected.  
+      **NOT DONE — would disrupt live credentials.**
+- [x] Confirm the first page load after startup is not blocked by the SCM refresh — the strip shows em-dashes, then fills. — strip showed em-dashes, filled ~55s later.
+- [ ] `make cp-web` before any release build (the binary embeds `web/dist`).  
+      **NOT DONE — release-time step, not required to review this branch.**

@@ -1,7 +1,7 @@
 # Dashboard fleet strip — design
 
 **Date:** 2026-07-30
-**Status:** Approved, awaiting implementation plan
+**Status:** Implemented — PR #569 (Plans 1-3). See "As-built deviations" below.
 **Surface:** `rupu-cp` (API + web)
 
 ## Problem
@@ -81,10 +81,11 @@ pub struct FleetCounts {
     pub autoflows_enabled: Option<u64>,
     pub autoflows_disabled: Option<u64>,
     pub workers: Option<u64>,
-    pub claims_queued: Option<u64>,
+    pub claims_active: Option<u64>,   // renamed; see As-built
     pub issues_pending: Option<u64>,
     pub issues_open: Option<u64>,
-    /// A repo hit the per-repo issue fetch cap — `issues_open` is a floor.
+    /// `issues_open` is a FLOOR, not a total — a repo hit the fetch cap, OR a
+    /// repo could not be read at all and was dropped from the tally.
     pub issues_capped: bool,
     /// When the SCM / provider caches behind these numbers were filled.
     /// Distinct from the summary's own `captured_at`, which stamps the
@@ -123,9 +124,9 @@ the dependent fields are `None`.
 - **Mapping:** `providers_unhealthy` counts `AuthFailed + Unreachable`.
   `NeverProbed` counts as **neither** healthy nor unhealthy — it is an absence
   of information and must not be rendered as either.
-- **Without `cp serve`:** `providers_configured` is still sourced from config;
-  `providers_unhealthy` is `None`. The strip then says "4 providers" and claims
-  nothing about health.
+- **Without `cp serve`:** BOTH provider fields are `None` and the strip shows
+  an em-dash. (The spec originally had `providers_configured` coming from
+  config; as-built it does not — see As-built deviations.)
 
 This is the reason the design does not derive provider health from config
 presence alone: a green dot that only means "a key exists in the config file"
@@ -135,9 +136,9 @@ asserts something it has not checked.
 
 - **TTL:** ~15 minutes — longer than the provider cache because filling it is
   N API calls, one set per connected repo.
-- **Source:** a new `IssueLister` port in `rupu-cp`, mirroring the existing
-  `RepoLister` (including its 501-when-unconfigured behaviour), backed by
-  `rupu-scm`'s `IssueConnector`.
+- **Source:** the `FleetInventory` port's snapshot (as-built; the spec
+  originally called for a separate `IssueLister` port — see As-built
+  deviations). `RepoLister` still supplies the repo enumeration.
 - **Per-repo fetch cap:** 500 open issues. Hitting the cap sets `issues_capped`
   and the UI renders the open count as a floor (`312+ open`). The cap is a
   tunable constant; 500 is the initial value and should move if real orgs
@@ -145,16 +146,15 @@ asserts something it has not checked.
 
 ### Pending derivation
 
-`IssueConnector::list_issues(project, filter)` is per-project and returns
-`Issue` values carrying `labels` and `state`. The port returns those raw. The
-**CP** — not the port — derives `issues_pending`:
+As-built, the **`cp serve` adapter** derives `issues_pending` by calling the
+same pair the cron tick uses — `discover_tick_autoflows` +
+`collect_issue_matches` — and subtracting in-flight claims. Those already
+apply the full selector (`states`, `labels_all`, `labels_any`, `labels_none`),
+the author allowlist, and `selector.limit`.
 
-1. Match each open issue against every *enabled* autoflow's entity selector
-   (`states`, `labels_all`, `labels_none`).
-2. Subtract any issue already present in the claims store.
-
-This keeps the port dumb and puts selector semantics where the selectors
-already live. `issues_pending` therefore means "work rupu is about to pick up,"
+The spec originally put this derivation in the CP. Reimplementing the matcher
+there would create a second one that can drift from the scheduler, and a strip
+reading "14 pending" while rupu picks up 9 is worse than no number. `issues_pending` therefore means "work rupu is about to pick up,"
 and is correctly `0` for a repo rupu does not automate. `issues_open` is shown
 alongside as context.
 
@@ -183,3 +183,25 @@ alongside as context.
   design.
 - Findings severity breakdown. The findings tile keeps its current bare count;
   splitting it is an ops-tile change, not a fleet-strip change.
+
+## As-built deviations
+
+All three landed in PR #569 and are documented in the plans.
+
+1. **`claims_queued` → `claims_active`.** `ClaimStatus` has no `Queued`
+   variant; the field counts every claim except `Complete` / `Released`.
+2. **`providers_configured` is probe-sourced, not config-sourced.**
+   `config.providers` is a per-provider *knob-override* map, so an operator
+   authenticated via OAuth with no `[providers.x]` block would have counted as
+   zero. The honest source is the credential store, which lives behind
+   rupu-providers — a crate rupu-cp does not depend on. Both provider fields
+   therefore arrive through the `FleetInventory` port and are `None` without
+   `cp serve`.
+3. **No separate `IssueLister` port; pending derived in the adapter.** The
+   `FleetInventory` snapshot already carries repos and issues across the same
+   boundary on the same cache with the same staleness stamp. See §3.
+
+One correction found by running against a real account: a repo that cannot be
+read (e.g. `451 Repository access blocked`) is dropped from the open-issue
+tally, so it must ALSO set `issues_capped` — otherwise the count silently
+shrinks while presenting itself as complete.
