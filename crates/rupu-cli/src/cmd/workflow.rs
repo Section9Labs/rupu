@@ -2234,27 +2234,67 @@ fn layered_config_workflow(
         .unwrap_or_default()
 }
 
+/// Minimal per-run metadata needed to disambiguate a run-id fragment
+/// match. Deliberately not `RunRecord` itself: building a full record
+/// in a unit test means spelling out every field, and that crate's
+/// `sample_record` helper is test-private. This holds only what the
+/// ambiguity message needs.
+struct RunCandidate {
+    id: String,
+    workflow_name: String,
+    status: rupu_orchestrator::RunStatus,
+    started_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Resolve a run-id fragment against a candidate list.
 ///
-/// Pure, so it is unit-testable without a `RunStore` — building a
-/// `RunRecord` outside `rupu-orchestrator` would mean spelling out
-/// every field, and that crate's `sample_record` helper is test-private.
+/// Pure, so it is unit-testable without a `RunStore`.
 ///
 /// Accepts a full id, the compact `head…tail` form printed by tables, a
 /// bare suffix, or an unambiguous prefix.
-fn resolve_run_id(candidates: &[String], fragment: &str) -> anyhow::Result<String> {
+fn resolve_run_id(candidates: &[RunCandidate], fragment: &str) -> anyhow::Result<String> {
     use crate::output::ids::{resolve, Resolution};
 
-    match resolve(candidates, fragment) {
+    let ids: Vec<String> = candidates.iter().map(|c| c.id.clone()).collect();
+    match resolve(&ids, fragment) {
         Resolution::Unique(id) => Ok(id),
         Resolution::NotFound => anyhow::bail!("unknown run: {fragment}"),
         Resolution::Ambiguous(matches) => {
+            // Every candidate at full length, with disambiguating
+            // context (workflow name, status, started-at) — the fast
+            // path above (`store.exists`) already returned for the
+            // common case, so this branch, which needs the records
+            // anyway to detect the ambiguity, is the only place this
+            // context is needed. No extra I/O.
+            let now = chrono::Utc::now();
+            let name_width = matches
+                .iter()
+                .filter_map(|id| candidates.iter().find(|c| &c.id == id))
+                .map(|c| c.workflow_name.chars().count())
+                .max()
+                .unwrap_or(0);
+            let status_width = matches
+                .iter()
+                .filter_map(|id| candidates.iter().find(|c| &c.id == id))
+                .map(|c| c.status.as_str().chars().count())
+                .max()
+                .unwrap_or(0);
             let mut msg = format!(
                 "ambiguous run id — {} runs match `{fragment}`",
                 matches.len()
             );
             for id in &matches {
-                msg.push_str(&format!("\n  {id}"));
+                match candidates.iter().find(|c| &c.id == id) {
+                    Some(c) => {
+                        let when = crate::output::fmt::relative_time(c.started_at, now);
+                        msg.push_str(&format!(
+                            "\n  {id}  {:<name_width$}  {:<status_width$}  {when}",
+                            c.workflow_name,
+                            c.status.as_str(),
+                        ));
+                    }
+                    None => msg.push_str(&format!("\n  {id}")),
+                }
             }
             anyhow::bail!(msg)
         }
@@ -2283,19 +2323,17 @@ pub(crate) fn resolve_run_fragment(
         return Ok(fragment.to_string());
     }
     // NOTE: the field is `id`, not `run_id` (runs.rs:107).
-    let mut candidates: Vec<String> = store
-        .list()
-        .context("list runs")?
+    let mut records = store.list().context("list runs")?;
+    records.extend(store.list_archived().context("list archived runs")?);
+    let candidates: Vec<RunCandidate> = records
         .into_iter()
-        .map(|r| r.id)
+        .map(|r| RunCandidate {
+            id: r.id,
+            workflow_name: r.workflow_name,
+            status: r.status,
+            started_at: r.started_at,
+        })
         .collect();
-    candidates.extend(
-        store
-            .list_archived()
-            .context("list archived runs")?
-            .into_iter()
-            .map(|r| r.id),
-    );
     resolve_run_id(&candidates, fragment)
 }
 
@@ -5591,32 +5629,48 @@ steps:
 
     // ── Task 6: run-id fragment resolution ────────────────────────────
 
-    fn run_candidates() -> Vec<String> {
+    fn run_candidates() -> Vec<RunCandidate> {
+        let now = chrono::Utc::now();
         vec![
-            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ".to_string(),
-            "run_01KYSM3KE60KM2P2EDJR1V1BCP".to_string(),
-            "run_01KYPASX18NYRER5NQPDWB2HZV".to_string(),
+            RunCandidate {
+                id: "run_01KYSMDNG84N9Z8XXHQZP3GKYJ".to_string(),
+                workflow_name: "nightly-health".to_string(),
+                status: rupu_orchestrator::RunStatus::Completed,
+                started_at: now,
+            },
+            RunCandidate {
+                id: "run_01KYSM3KE60KM2P2EDJR1V1BCP".to_string(),
+                workflow_name: "pr-code-review".to_string(),
+                status: rupu_orchestrator::RunStatus::Failed,
+                started_at: now,
+            },
+            RunCandidate {
+                id: "run_01KYPASX18NYRER5NQPDWB2HZV".to_string(),
+                workflow_name: "issue-triage".to_string(),
+                status: rupu_orchestrator::RunStatus::Running,
+                started_at: now,
+            },
         ]
     }
 
     #[test]
     fn resolve_run_id_accepts_compact_form() {
         let c = run_candidates();
-        let compact = crate::output::ids::compact_id(&c[0]);
+        let compact = crate::output::ids::compact_id(&c[0].id);
         assert_eq!(compact, "run_01KYSMDN…GKYJ");
-        assert_eq!(resolve_run_id(&c, &compact).expect("resolves"), c[0]);
+        assert_eq!(resolve_run_id(&c, &compact).expect("resolves"), c[0].id);
     }
 
     #[test]
     fn resolve_run_id_accepts_bare_suffix() {
         let c = run_candidates();
-        assert_eq!(resolve_run_id(&c, "P3GKYJ").expect("resolves"), c[0]);
+        assert_eq!(resolve_run_id(&c, "P3GKYJ").expect("resolves"), c[0].id);
     }
 
     #[test]
     fn resolve_run_id_accepts_full_id() {
         let c = run_candidates();
-        assert_eq!(resolve_run_id(&c, &c[2]).expect("resolves"), c[2]);
+        assert_eq!(resolve_run_id(&c, &c[2].id).expect("resolves"), c[2].id);
     }
 
     #[test]
@@ -5626,10 +5680,25 @@ steps:
         let err = resolve_run_id(&c, "run_01KYSM").expect_err("ambiguous");
         let msg = err.to_string();
         assert!(msg.contains("ambiguous"), "got: {msg}");
-        assert!(msg.contains(&c[0]), "got: {msg}");
-        assert!(msg.contains(&c[1]), "got: {msg}");
+        assert!(msg.contains(&c[0].id), "got: {msg}");
+        assert!(msg.contains(&c[1].id), "got: {msg}");
         // The non-matching run must not be listed.
-        assert!(!msg.contains(&c[2]), "got: {msg}");
+        assert!(!msg.contains(&c[2].id), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_run_id_ambiguity_message_includes_disambiguating_context() {
+        // Finding 3: bare ids alone are indistinguishable ULIDs. The
+        // ambiguity error must carry workflow name and status per
+        // candidate — the data is already in hand from the records
+        // used to detect the ambiguity, so this costs no extra I/O.
+        let c = run_candidates();
+        let err = resolve_run_id(&c, "run_01KYSM").expect_err("ambiguous");
+        let msg = err.to_string();
+        assert!(msg.contains(&c[0].workflow_name), "got: {msg}");
+        assert!(msg.contains(&c[1].workflow_name), "got: {msg}");
+        assert!(msg.contains(c[0].status.as_str()), "got: {msg}");
+        assert!(msg.contains(c[1].status.as_str()), "got: {msg}");
     }
 
     #[test]

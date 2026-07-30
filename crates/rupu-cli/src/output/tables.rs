@@ -602,7 +602,7 @@ mod tests {
 
     #[test]
     fn table_style_is_a_segmented_header_rule() {
-        // Guards the house style for all 55 call sites. Colour is off,
+        // Guards the house style for all 54 call sites. Colour is off,
         // so this asserts structure only.
         let mut t = new_table();
         t.set_header(vec!["SESSION", "AGENT", "STATUS", "UPDATED"]);
