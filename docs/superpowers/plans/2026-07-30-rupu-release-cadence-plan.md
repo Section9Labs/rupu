@@ -101,10 +101,24 @@ NEXT="$ROOT/scripts/next-beta-version.sh"
 assert_out "first beta on a fresh base" "v0.71.0-beta.1" \
   sh -c "printf 'v0.70.0-beta.1\nv0.70.0\n' | '$NEXT' 0.71.0"
 
-# The bug this whole test file exists to catch: lexical sort puts beta.9
-# above beta.10, so a naive `sort | tail -1` regresses to beta.2 forever.
-assert_out "beta.9 goes to beta.10, not beta.2" "v0.71.0-beta.10" \
-  sh -c "printf 'v0.71.0-beta.8\nv0.71.0-beta.9\n' | '$NEXT' 0.71.0"
+# The bug this whole test file exists to catch: a lexical sort ranks "9"
+# above "10". The fixture MUST contain a one-digit AND a two-digit counter
+# at once — 8-vs-9 sorts identically either way, so it would pass against a
+# broken implementation and prove nothing.
+assert_out "beta.9 vs beta.10 compares numerically, not lexically" "v0.71.0-beta.11" \
+  sh -c "printf 'v0.71.0-beta.9\nv0.71.0-beta.10\n' | '$NEXT' 0.71.0"
+
+# A leading-zero counter is all-digits but is an invalid octal literal to
+# bash arithmetic; read it base-10 via $((10#$n)) or the script aborts.
+assert_out "leading-zero counter is incremented correctly" "v0.71.0-beta.10" \
+  sh -c "printf 'v0.71.0-beta.09\n' | '$NEXT' 0.71.0"
+
+# The base must be exactly three numeric components — the original
+# `[0-9]*.[0-9]*.[0-9]*` wildcards wrongly accepted all of these.
+assert_fails "rejects a base carrying a prerelease suffix" \
+  sh -c "printf '' | '$NEXT' 0.71.0-beta.5"
+assert_fails "rejects a four-component base" \
+  sh -c "printf '' | '$NEXT' 0.71.0.1"
 
 # Betas belonging to a different base must not influence the counter.
 assert_out "counter resets after a base bump" "v0.72.0-beta.1" \
@@ -193,7 +207,7 @@ chmod +x scripts/next-beta-version.sh
 scripts/tests/release-cadence-tests.sh
 ```
 
-Expected: `7 passed, 0 failed`.
+Expected: `11 passed, 0 failed`.
 
 - [ ] **Step 5: Commit**
 
@@ -266,7 +280,7 @@ assert_fails "rejects a non-numeric soak window" \
 scripts/tests/release-cadence-tests.sh
 ```
 
-Expected: Task 1's 7 cases still pass; the 7 new cases FAIL — `scripts/pick-promotable-beta.sh` does not exist.
+Expected: Task 1's 11 cases still pass; the 7 new cases FAIL — `scripts/pick-promotable-beta.sh` does not exist.
 
 - [ ] **Step 3: Implement the script**
 
@@ -351,7 +365,7 @@ chmod +x scripts/pick-promotable-beta.sh
 scripts/tests/release-cadence-tests.sh
 ```
 
-Expected: `14 passed, 0 failed`.
+Expected: `18 passed, 0 failed`.
 
 - [ ] **Step 5: Commit**
 
@@ -439,7 +453,7 @@ surrounding style (the file already has a `runs-on: ubuntu-latest` +
 scripts/tests/release-cadence-tests.sh
 ```
 
-Expected: `14 passed, 0 failed`.
+Expected: `18 passed, 0 failed`.
 
 - [ ] **Step 5: Commit**
 
@@ -824,7 +838,7 @@ git commit -m "refactor(release): retire the macOS-only local publish path"
 
 ## What is NOT covered by automated tests
 
-Both scripts are unit-tested (14 cases). Three conditions live in workflow YAML
+Both scripts are unit-tested (18 cases). Three conditions live in workflow YAML
 and are exercised only by the manual steps in Tasks 4 and 5:
 
 - the **stall-guard** (base version equal to the shipped stable),
@@ -840,7 +854,7 @@ does not actually exercise the workflow.
 
 After all six tasks:
 
-- [ ] `scripts/tests/release-cadence-tests.sh` → `14 passed, 0 failed`.
+- [ ] `scripts/tests/release-cadence-tests.sh` → `18 passed, 0 failed`.
 - [ ] Both new workflow files parse as YAML.
 - [ ] `gh workflow list` shows `release-beta` and `release-stable` once the branch is on `main`.
 - [ ] **Dry-run the beta cut before trusting the cron:** merge to `main`, then `gh workflow run release-beta.yml` and confirm it either pushes a sensible `-beta.N` tag or logs a specific skip reason. This is the one end-to-end check that cannot be done from a branch, because the workflow checks out `main`.
