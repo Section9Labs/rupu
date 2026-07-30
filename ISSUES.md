@@ -149,31 +149,59 @@ P0/P1/P2, and a fix closes an issue only when it is observed at the consumer.
 | ID | Sev | Area | Title | Status |
 |---|---|---|---|---|
 | I-88 | P1 | rupu-cli | A disabled autoflow still fires on the cron tick — the CP toggle writes `autoflow.enabled: false` and `push_cron` never reads it | fixed |
-| I-89 | P2 | rupu-config | `--test parse` fails intermittently under heavy parallel load; not reproducible in isolation | open |
+| I-89 | P2 | rupu-config | `--test parse` fails intermittently under heavy parallel load — **not reproduced in 5 attempts**; needs the failing test name captured | open |
 
 
 ## Open
 
 ### I-89 — `rupu-config --test parse` fails intermittently under parallel load
 
-**Symptom.** One test in `crates/rupu-config/tests/parse.rs` fails during a full-workspace
-run under heavy parallelism, then passes on its own.
+**Symptom.** One test in `crates/rupu-config/tests/parse.rs` reportedly fails during a
+full-workspace run under heavy parallelism, then passes on its own.
 
-**Observed twice, independently.** A subagent reported it during Arc 5 and I could not
-reproduce it — `--test parse` was 17/17 green immediately afterwards, so I recorded it as a
-spurious report. PR #557 then hit the same thing and explicitly logged it as *"Known, not
-fixed … Passed in isolation three times and in two subsequent full-suite runs; not
-reproducible."* Two independent sightings makes it a real flake rather than noise, which is
-why it is now tracked rather than dismissed a second time.
+**Seen twice, independently.** A subagent reported it during Arc 5 and it would not
+reproduce, so it was recorded as spurious. PR #557 then hit the same thing and logged it as
+*"Known, not fixed … Passed in isolation three times and in two subsequent full-suite runs;
+not reproducible."*
 
-**Root cause.** Unknown. Candidates worth checking before anything else: a process-global
-env seam (`RUPU_MOCK_PROVIDER_SCRIPT` caused exactly this class of flake once already, fixed
-by routing through the crate's shared `ENV_LOCK`), a shared temp path, or a lock file
-contended across parallel test binaries.
+**Investigated 2026-07-30 — NOT REPRODUCED across five escalating attempts.** Recorded in
+full so the next sighting starts from evidence rather than from scratch:
 
-**Fix.** Reproduce first — run the full workspace suite under load repeatedly and capture
-*which* test and *what* assertion. A flake that only appears under contention is usually
-shared mutable state, and the fix is to isolate it, not to retry the test.
+| Attempt | Conditions | Result |
+|---|---|---|
+| 1 | `cargo test -p rupu-config --test parse` | 19/19 pass |
+| 2 | 16 concurrent runs of the test binary | 0 failures |
+| 3 | 24 concurrent × `--test-threads=16`, freshly built binary | 0 failures |
+| 4 | Full `cargo test --workspace` (the reported trigger) | **50 suites, 0 failures** |
+| 5 | 30 concurrent runs × 8 threads under 4 parallel workspace builds, load avg ≈ 9 | 0 failures |
+
+**Ruled out, with evidence:**
+- *rupu-config's tests racing each other* — attempts 2, 3 and 5 are clean at high thread counts.
+- *File-lock contention* — there is no file locking in `rupu-config`. `~/.rupu/config.lock`
+  is a stale 0-byte artifact from 2026-07-22, and `policy.lock` is a config **key**, not a lock.
+- *Unsynchronized env mutation in rupu-config* — `set_var`/`remove_var` appear nowhere in the
+  crate or its tests.
+- *Cross-crate `HOME` mutation* — `rupu-app` does call `env::set_var("HOME", …)`, which is
+  process-global and would be exactly this class of bug, but it is correctly serialized with
+  `serial_test::serial`, and runs in a separate test binary so it cannot reach rupu-config's
+  process.
+- *Tests touching the real global dir* — none in `rupu-config`; the lock tests use
+  `tempfile::tempdir()`.
+
+**Most likely explanation, not proven:** resource exhaustion rather than a code-level race.
+Both sightings occurred while several subagents were running cargo builds and test suites
+concurrently on this machine. The same session saw the web suite stretch from ~12s to 295s
+and emit four failures that vanished on a clean re-run — demonstrably contention, not
+defects. Attempt 5 reached load ≈ 9 without reproducing, so if it is load-induced it needs a
+heavier load than that.
+
+**No speculative fix was written.** A fix for an unreproduced race cannot be validated at the
+consumer, which is this tracker's whole bar; it would be a symptom fix that looks like
+progress while changing nothing.
+
+**What the next sighting must capture** — the one fact both reports omitted:
+**which test failed, and what the assertion said.** Run with `--nocapture` and keep the log.
+Until then this stays open and un-actioned rather than guessed at.
 
 ---
 
