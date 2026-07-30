@@ -38,7 +38,7 @@ The spec calls for a new `IssueLister` port in rupu-cp mirroring `RepoLister`. I
 - Workspace deps only — versions pinned in the root `Cargo.toml`.
 - `#![deny(clippy::all)]`; `unsafe_code` forbidden.
 - **rupu-cp must not gain a dependency on rupu-providers or grow SCM credential handling.**
-- **Never run package-wide `cargo fmt`** — format only the files you touched.
+- **Never run `cargo fmt` in any form — including `cargo fmt -- <path>`**, which resolves the whole workspace despite reading like a per-file filter. Use `rustfmt --edition 2021 <file>`, one file at a time.
 - **`snapshot()` stays synchronous and non-blocking.** All network work happens on the refresh tasks.
 - Per-repo issue fetch cap: **500**, a tunable constant. Hitting it sets `issues_capped`, and the UI renders the open count as a floor.
 - A count that could not be read is `None`, never `Some(0)`.
@@ -198,7 +198,8 @@ Expected: PASS, including Plan 2's existing tests (update `cp serve`'s call site
 - [ ] **Step 5: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-cli/src/cp_inventory.rs crates/rupu-cli/src/cmd/cp.rs
+rustfmt --edition 2021 crates/rupu-cli/src/cp_inventory.rs
+rustfmt --edition 2021 crates/rupu-cli/src/cmd/cp.rs
 git add crates/rupu-cli/src/cp_inventory.rs crates/rupu-cli/src/cmd/cp.rs
 git commit -m "refactor(cli): split the fleet inventory cache into provider and scm halves"
 ```
@@ -335,7 +336,7 @@ Expected: 4 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-cli/src/cp_inventory.rs
+rustfmt --edition 2021 crates/rupu-cli/src/cp_inventory.rs
 git add crates/rupu-cli/src/cp_inventory.rs
 git commit -m "feat(cli): count connected repos and capped open-issue totals"
 ```
@@ -489,7 +490,9 @@ Expected: all green.
 - [ ] **Step 7: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-cli/src/cp_inventory.rs crates/rupu-cli/src/cmd/cp.rs crates/rupu-cli/src/cmd/autoflow.rs
+rustfmt --edition 2021 crates/rupu-cli/src/cp_inventory.rs
+rustfmt --edition 2021 crates/rupu-cli/src/cmd/cp.rs
+rustfmt --edition 2021 crates/rupu-cli/src/cmd/autoflow.rs
 git add crates/rupu-cli/src/
 git commit -m "feat(cli): autoflow-pending backlog via the cron tick's own matcher"
 ```

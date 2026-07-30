@@ -18,7 +18,7 @@ The spec spans three subsystems. Each plan ships working, testable software:
 
 - **Plan 1 (this document)** — the `FleetCounts` contract, the counts readable from `<global_dir>`, the merge, and the strip UI. After this plan the strip is live and honest: it shows autoflows / workers / claims, and renders an em-dash for everything not yet sourced.
 - **Plan 2** — `LlmProvider::probe()`, the `ProviderProbe` port, the probe cache, and `cp serve` wiring. Fills `providers_configured` and `providers_unhealthy`. Both live here rather than in Plan 1 because the honest source for "configured" is the credential store, which sits behind rupu-providers — a crate rupu-cp deliberately does not depend on.
-- **Plan 3** — the `IssueLister` port, `ScmInventoryCache`, and the pending derivation. Fills `repos`, `issues_pending`, `issues_open`, `issues_capped`.
+- **Plan 3** — repos, open-issue totals with a per-repo cap, and the pending backlog derived through the cron tick's own matcher. Fills `repos`, `issues_pending`, `issues_open`, `issues_capped`. (No separate `IssueLister` port: Plan 2's snapshot already carries these across the same boundary — see Plan 3's deviation note.)
 
 ## Global Constraints
 
@@ -26,7 +26,7 @@ The spec spans three subsystems. Each plan ships working, testable software:
 - `#![deny(clippy::all)]` workspace-wide; `unsafe_code` forbidden.
 - `rupu-cli` stays thin: arg parsing + delegation, no business logic. Nothing in this plan touches it.
 - Errors: `thiserror` in libraries, `anyhow` in the CLI binary.
-- **Never run package-wide `cargo fmt`.** `main` is fmt-dirty under the pinned toolchain; format only the individual files you touched (`cargo fmt -- <path>`).
+- **Never run `cargo fmt` in any form — including `cargo fmt -- <path>`.** That form reads like a per-file filter but resolves the whole workspace and treats the paths as rustfmt flags; `main` is fmt-dirty under the pinned toolchain, so it rewrites ~100 unrelated files. Use `rustfmt --edition 2021 <file>`, one file at a time, and `git diff` each to confirm it touched only your additions.
 - **A host that cannot report is not a host with zero.** Every count added here is `Option<u64>`; `None` is never summed as `0`, and any `None` from a reporting host raises `fleet_partial`.
 - Web tests run from `crates/rupu-cp/web` with `npm test`. Rust tests run with `cargo test -p rupu-cp`.
 
@@ -196,7 +196,7 @@ Expected: 2 passed. Other crates will not compile yet — `DashboardSummary` now
 - [ ] **Step 5: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-cp/src/host/dashboard_summary.rs
+rustfmt --edition 2021 crates/rupu-cp/src/host/dashboard_summary.rs
 git add crates/rupu-cp/src/host/dashboard_summary.rs
 git commit -m "feat(cp): FleetCounts DTO on DashboardSummary"
 ```
@@ -515,7 +515,11 @@ Expected: PASS. Any failure here is a fixture that still omits `fleet`.
 - [ ] **Step 7: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-cp/src/host/fleet_counts.rs crates/rupu-cp/src/host/local.rs crates/rupu-cp/src/host/ssh.rs crates/rupu-cp/src/host/summary_build.rs crates/rupu-cp/src/host/mod.rs
+rustfmt --edition 2021 crates/rupu-cp/src/host/fleet_counts.rs
+rustfmt --edition 2021 crates/rupu-cp/src/host/local.rs
+rustfmt --edition 2021 crates/rupu-cp/src/host/ssh.rs
+rustfmt --edition 2021 crates/rupu-cp/src/host/summary_build.rs
+rustfmt --edition 2021 crates/rupu-cp/src/host/mod.rs
 git add crates/rupu-cp/src/host/
 git commit -m "feat(cp): collect global-dir fleet counts on the local host"
 ```
@@ -772,7 +776,7 @@ Expected: PASS, including the four new merge tests.
 - [ ] **Step 5: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-cp/src/api/dashboard.rs
+rustfmt --edition 2021 crates/rupu-cp/src/api/dashboard.rs
 git add crates/rupu-cp/src/api/dashboard.rs
 git commit -m "feat(cp): merge fleet counts with the findings_open partial rule"
 ```

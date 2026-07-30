@@ -23,7 +23,7 @@
 - **rupu-cp must not gain a dependency on rupu-providers.** The probe crosses that boundary as a port, exactly like `RepoLister` (`crates/rupu-cp/src/repos.rs`) and its adapter (`crates/rupu-cli/src/cp_repos.rs`).
 - `rupu-cli` stays thin — but a port *adapter* is not business logic; `cp_repos.rs` is the precedent for where it lives.
 - Errors: `thiserror` in libraries, `anyhow` in the CLI binary.
-- **Never run package-wide `cargo fmt`** — format only the files you touched.
+- **Never run `cargo fmt` in any form — including `cargo fmt -- <path>`**, which resolves the whole workspace despite reading like a per-file filter. Use `rustfmt --edition 2021 <file>`, one file at a time.
 - **The dashboard must never block on a probe.** Building a summary reads the cache; the network happens only on the background refresh task.
 - A provider that has never been probed is neither healthy nor unhealthy.
 
@@ -171,7 +171,8 @@ Expected: 3 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-providers/src/provider.rs crates/rupu-providers/src/anthropic.rs
+rustfmt --edition 2021 crates/rupu-providers/src/provider.rs
+rustfmt --edition 2021 crates/rupu-providers/src/anthropic.rs
 git add crates/rupu-providers/src/provider.rs crates/rupu-providers/src/anthropic.rs
 git commit -m "feat(providers): LlmProvider::probe with a NotImplemented default"
 ```
@@ -434,7 +435,9 @@ Expected: 4 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-cp/src/fleet_inventory.rs crates/rupu-cp/src/host/fleet_counts.rs crates/rupu-cp/src/lib.rs
+rustfmt --edition 2021 crates/rupu-cp/src/fleet_inventory.rs
+rustfmt --edition 2021 crates/rupu-cp/src/host/fleet_counts.rs
+rustfmt --edition 2021 crates/rupu-cp/src/lib.rs
 git add crates/rupu-cp/src/fleet_inventory.rs crates/rupu-cp/src/host/fleet_counts.rs crates/rupu-cp/src/lib.rs
 git commit -m "feat(cp): FleetInventory port and snapshot folding"
 ```
@@ -565,7 +568,7 @@ Expected: PASS. Fix any `LocalHostConnector::new` call sites the new field break
 - [ ] **Step 5: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-cp/src/host/local.rs
+rustfmt --edition 2021 crates/rupu-cp/src/host/local.rs
 git add crates/rupu-cp/src/host/local.rs
 git commit -m "feat(cp): fold the fleet inventory into the local host summary"
 ```
@@ -830,7 +833,8 @@ Expected: all green.
 - [ ] **Step 7: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-cli/src/cp_inventory.rs crates/rupu-cli/src/cmd/cp.rs
+rustfmt --edition 2021 crates/rupu-cli/src/cp_inventory.rs
+rustfmt --edition 2021 crates/rupu-cli/src/cmd/cp.rs
 git add crates/rupu-cli/src/cp_inventory.rs crates/rupu-cli/src/cmd/cp.rs crates/rupu-cli/src/main.rs
 git commit -m "feat(cli): cp serve provider probe cache behind the FleetInventory port"
 ```
