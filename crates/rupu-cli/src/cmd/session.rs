@@ -8,6 +8,7 @@ use crate::cmd::transcript::{
     render_pretty_transcript_event, truncate_single_line, TranscriptPrettyContext,
 };
 use crate::cmd::ui::{LiveViewMode, UiPrefs};
+use crate::output::entity_table::{CellValue, EntityTable};
 use crate::output::formats::OutputFormat;
 use crate::output::palette::{self, BRAND, DIM};
 use crate::output::printer::{
@@ -473,6 +474,7 @@ struct SessionListReport {
 struct SessionListOutput {
     report: SessionListReport,
     csv_rows: Vec<SessionListCsvRow>,
+    prefs: UiPrefs,
 }
 
 #[derive(Serialize)]
@@ -597,24 +599,57 @@ impl CollectionOutput for SessionListOutput {
     }
 
     fn render_table(&self) -> anyhow::Result<()> {
-        let mut table = crate::output::tables::new_table();
-        table.set_header(vec![
-            "SESSION", "AGENT", "SCOPE", "STATUS", "TARGET", "RUN", "UPDATED",
-        ]);
-        for row in &self.report.rows {
-            table.add_row(vec![
-                Cell::new(&row.session_id),
-                Cell::new(&row.agent),
-                Cell::new(&row.scope),
-                Cell::new(&row.status),
-                Cell::new(row.target.as_deref().unwrap_or("—")),
-                Cell::new(row.active_run_id.as_deref().unwrap_or("—")),
-                Cell::new(&row.updated_at),
-            ]);
-        }
-        println!("{table}");
+        println!(
+            "{}",
+            render_session_list_table(&self.report, &self.prefs, Utc::now())
+        );
         Ok(())
     }
+}
+
+/// Build the `session list` human table: compacted ids, lifecycle glyphs
+/// on SCOPE/STATUS, empty-column suppression, and a summary line.
+/// Extracted from `render_table` so it can be asserted directly against
+/// its returned string instead of through captured stdout. `now` is a
+/// parameter so tests are deterministic; `render_table` passes `Utc::now()`.
+fn render_session_list_table(
+    report: &SessionListReport,
+    prefs: &UiPrefs,
+    now: DateTime<Utc>,
+) -> String {
+    let mut table = EntityTable::new(
+        prefs,
+        prefs.render_opts(),
+        vec![
+            "SESSION", "AGENT", "SCOPE", "STATUS", "TARGET", "RUN", "UPDATED",
+        ],
+    )
+    .with_summary("session");
+    for row in &report.rows {
+        // A malformed stored timestamp must not make the session
+        // invisible — fall back to the raw text rather than dropping
+        // the row.
+        let updated = match DateTime::parse_from_rfc3339(&row.updated_at) {
+            Ok(dt) => CellValue::Timestamp(dt.with_timezone(&Utc)),
+            Err(_) => CellValue::Text(row.updated_at.clone()),
+        };
+        table = table.row(vec![
+            CellValue::Id(row.session_id.clone()),
+            CellValue::Text(row.agent.clone()),
+            CellValue::Status(row.scope.clone()),
+            CellValue::Status(row.status.clone()),
+            row.target
+                .clone()
+                .map(CellValue::Text)
+                .unwrap_or(CellValue::Missing),
+            row.active_run_id
+                .clone()
+                .map(CellValue::Id)
+                .unwrap_or(CellValue::Missing),
+            updated,
+        ]);
+    }
+    table.render(now)
 }
 
 impl DetailOutput for SessionShowOutput {
@@ -1049,10 +1084,15 @@ impl CollectionOutput for SessionPruneOutput {
     }
 }
 
-pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> ExitCode {
+pub async fn handle(
+    action: Action,
+    global_format: Option<OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
+) -> ExitCode {
     let result = match action {
         Action::Start(args) => start(args).await,
-        Action::List(args) => list(args, global_format).await,
+        Action::List(args) => list(args, global_format, absolute, all_columns).await,
         Action::Show {
             session_id,
             view,
@@ -1105,7 +1145,12 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
     crate::output::formats::ensure_supported(command_name, format, supported)
 }
 
-async fn list(args: ListArgs, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
+async fn list(
+    args: ListArgs,
+    global_format: Option<OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let mut rows = Vec::new();
     let scopes: &[SessionScope] = if args.all {
@@ -1144,6 +1189,18 @@ async fn list(args: ListArgs, global_format: Option<OutputFormat>) -> anyhow::Re
             updated_at: row.updated_at.clone(),
         })
         .collect();
+    let pwd = std::env::current_dir()?;
+    let project_root = paths::project_root_for(&pwd)?;
+    // UI prefs only — lock does not apply (I-7)
+    let cfg = rupu_config::layer_files(
+        Some(&global.join("config.toml")),
+        project_root
+            .as_deref()
+            .map(|root| root.join(".rupu/config.toml"))
+            .as_deref(),
+    )?;
+    let prefs =
+        UiPrefs::resolve(&cfg.ui, false, None, None, None).with_table_flags(absolute, all_columns);
     let output = SessionListOutput {
         report: SessionListReport {
             kind: "session_list",
@@ -1151,6 +1208,7 @@ async fn list(args: ListArgs, global_format: Option<OutputFormat>) -> anyhow::Re
             rows,
         },
         csv_rows,
+        prefs,
     };
     report::emit_collection(global_format, &output)
 }
@@ -9096,5 +9154,89 @@ mod tests {
         let tmp = assert_fs::TempDir::new().expect("tempdir");
         let err = read_session(tmp.path(), "zzzzzz").expect_err("unknown");
         assert!(err.to_string().contains("unknown session"));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn session_list_row_for_test(
+        session_id: &str,
+        agent: &str,
+        scope: &str,
+        status: &str,
+        target: Option<&str>,
+        active_run_id: Option<&str>,
+        updated_at: &str,
+    ) -> SessionListRow {
+        SessionListRow {
+            session_id: session_id.to_string(),
+            agent: agent.to_string(),
+            scope: scope.to_string(),
+            status: status.to_string(),
+            target: target.map(str::to_string),
+            active_run_id: active_run_id.map(str::to_string),
+            updated_at: updated_at.to_string(),
+        }
+    }
+
+    fn test_prefs() -> UiPrefs {
+        let cfg = rupu_config::UiConfig::default();
+        UiPrefs::resolve(&cfg, true, None, None, None)
+    }
+
+    fn test_now() -> DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(2026, 7, 30, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn session_list_table_compacts_ids_and_drops_empty_columns() {
+        let report = SessionListReport {
+            kind: "session_list",
+            version: 1,
+            rows: vec![session_list_row_for_test(
+                "ses_01KWA7HTYEDX0ACG93ZW26FG3M",
+                "oracle-assessor",
+                "active",
+                "failed",
+                None,
+                None,
+                "2026-07-16T22:23:19.165766+00:00",
+            )],
+        };
+        let prefs = test_prefs();
+        let out = render_session_list_table(&report, &prefs, test_now());
+
+        assert!(out.contains("ses_01KWA7HT…FG3M"), "got: {out}");
+        assert!(
+            !out.contains("ses_01KWA7HTYEDX0ACG93ZW26FG3M"),
+            "full id leaked into a cell: {out}"
+        );
+        assert!(out.contains("✗ failed"), "got: {out}");
+        assert!(!out.contains("TARGET"), "empty TARGET survived: {out}");
+        assert!(!out.contains("RUN"), "empty RUN survived: {out}");
+        assert!(out.contains("1 session"), "summary missing: {out}");
+        assert!(
+            !out.contains("2026-07-16T22:23:19"),
+            "raw ISO timestamp in a cell: {out}"
+        );
+    }
+
+    #[test]
+    fn session_list_survives_an_unparseable_timestamp() {
+        let report = SessionListReport {
+            kind: "session_list",
+            version: 1,
+            rows: vec![session_list_row_for_test(
+                "ses_01KWA7HTYEDX0ACG93ZW26FG3M",
+                "oracle-assessor",
+                "active",
+                "failed",
+                None,
+                None,
+                "not-a-timestamp",
+            )],
+        };
+        let prefs = test_prefs();
+        let out = render_session_list_table(&report, &prefs, test_now());
+        assert!(out.contains("not-a-timestamp"), "row was dropped: {out}");
     }
 }

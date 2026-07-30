@@ -307,7 +307,9 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Auth { action } => cmd::auth::handle(action, cli.format).await,
         Cmd::Models { action } => cmd::models::handle(action, cli.format).await,
         Cmd::Repos { action } => cmd::repos::handle(action, cli.format).await,
-        Cmd::Session { action } => cmd::session::handle(action, cli.format).await,
+        Cmd::Session { action } => {
+            cmd::session::handle(action, cli.format, cli.absolute, cli.all_columns).await
+        }
         Cmd::Issues { action } => cmd::issues::handle(action, cli.format).await,
         Cmd::Init(args) => cmd::init::handle(args).await,
         Cmd::Mcp { action } => cmd::mcp::handle(action).await,
