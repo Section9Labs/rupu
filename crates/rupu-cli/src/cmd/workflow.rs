@@ -836,7 +836,13 @@ fn render_workflow_runs_table(
             started,
             match row.duration_seconds {
                 Some(s) => CellValue::Text(format!("{s}s")),
-                None => CellValue::Missing,
+                // Pre-task `render_table` (parent commit 6c312895) printed
+                // this exact label for a run with no `finished_at` yet
+                // (running / awaiting). `CellValue::Missing` would both
+                // regress that to an em dash AND make DURATION eligible
+                // for empty-column suppression, dropping the column
+                // outright on an all-`--status running` listing.
+                None => CellValue::Text("(in flight)".to_string()),
             },
             // seconds-until, not a point in time
             match row.expires_in_seconds {
@@ -5880,5 +5886,74 @@ steps:
             runs_test_now(),
         );
         assert!(out.contains("2026-07-30T13:00:00"), "got: {out}");
+    }
+
+    #[test]
+    fn workflow_runs_in_flight_duration_shows_the_pre_task_label() {
+        // A run with no `finished_at` yet (running / awaiting) must keep
+        // the explicit "(in flight)" label from the pre-task
+        // `render_table`, not an em dash from `CellValue::Missing`.
+        let mut row = runs_row_for_test(
+            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+            "running",
+            "2026-07-30T13:00:00+00:00",
+            None,
+        );
+        row.duration_seconds = None;
+        let out = render_workflow_runs_table(
+            &[row],
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            runs_test_now(),
+        );
+        assert!(out.contains("(in flight)"), "got: {out}");
+    }
+
+    #[test]
+    fn workflow_runs_duration_column_survives_when_every_row_is_in_flight() {
+        // The regression this guards against: mapping an unfinished
+        // run's duration to `CellValue::Missing` makes DURATION eligible
+        // for empty-column suppression, so a listing where every
+        // displayed row is still running (e.g. `--status running`) would
+        // drop the column outright.
+        let mut a = runs_row_for_test(
+            "run_a1b2c3d4e5f6g7h8i9j0k1l2",
+            "running",
+            "2026-07-30T16:00:00+00:00",
+            None,
+        );
+        a.duration_seconds = None;
+        let mut b = runs_row_for_test(
+            "run_z9y8x7w6v5u4t3s2r1q0p9o8",
+            "running",
+            "2026-07-30T15:00:00+00:00",
+            None,
+        );
+        b.duration_seconds = None;
+        let out = render_workflow_runs_table(
+            &[a, b],
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            runs_test_now(),
+        );
+        assert!(out.contains("DURATION"), "column was suppressed: {out}");
+        assert!(out.contains("(in flight)"), "got: {out}");
+    }
+
+    #[test]
+    fn workflow_runs_finished_duration_is_unchanged() {
+        let rows = vec![runs_row_for_test(
+            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+            "completed",
+            "2026-07-30T13:00:00+00:00",
+            None,
+        )];
+        let out = render_workflow_runs_table(
+            &rows,
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            runs_test_now(),
+        );
+        assert!(out.contains("194s"), "got: {out}");
     }
 }
