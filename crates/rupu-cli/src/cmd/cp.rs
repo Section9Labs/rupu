@@ -223,6 +223,29 @@ pub async fn handle(action: Action) -> ExitCode {
                 Some(Arc::new(crate::cp_repos::CpRepoLister { registry }))
             };
 
+            // Fleet inventory for the dashboard's fleet strip: probe providers
+            // on a TTL so the dashboard reads a cache instead of the network.
+            // One immediate refresh so the strip is populated by the time the
+            // operator's first page load lands.
+            let inventory = Arc::new(crate::cp_inventory::CpFleetInventory::new(Arc::new(
+                rupu_auth::resolver::KeychainResolver::new(),
+            )));
+            let inventory_handle = {
+                let inv = Arc::clone(&inventory);
+                let mut shutdown = shutdown_tx.subscribe();
+                tokio::spawn(async move {
+                    loop {
+                        inv.refresh_providers().await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(
+                                crate::cp_inventory::PROBE_TTL_SECS,
+                            )) => {}
+                            _ = shutdown.changed() => break,
+                        }
+                    }
+                })
+            };
+
             let serve_result = rupu_cp::serve(rupu_cp::ServeOpts {
                 bind,
                 token,
@@ -236,6 +259,7 @@ pub async fn handle(action: Action) -> ExitCode {
                 generator,
                 session_mutator,
                 transcript_mutator,
+                inventory: Some(inventory),
             })
             .await;
 
@@ -246,6 +270,7 @@ pub async fn handle(action: Action) -> ExitCode {
             let _ = autoflow_reconcile_handle.await;
             let _ = cron_tick_handle.await;
             let _ = gate_sweep_handle.await;
+            let _ = inventory_handle.await;
 
             serve_result
         }
