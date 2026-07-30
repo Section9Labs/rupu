@@ -408,7 +408,12 @@ fn parse_kv(s: &str) -> Result<(String, String), String> {
     Ok((k.to_string(), v.to_string()))
 }
 
-pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> ExitCode {
+pub async fn handle(
+    action: Action,
+    global_format: Option<OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
+) -> ExitCode {
     let result = match action {
         Action::List => list(global_format).await,
         Action::Show {
@@ -494,6 +499,8 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
                 issue.as_deref(),
                 no_color,
                 global_format,
+                absolute,
+                all_columns,
             )
             .await
         }
@@ -773,44 +780,69 @@ impl CollectionOutput for WorkflowRunsOutput {
     }
 
     fn render_table(&self) -> anyhow::Result<()> {
-        let mut table = crate::output::tables::new_table();
-        table.set_header(vec![
-            "RUN ID",
-            "STATUS",
-            "STARTED (UTC)",
-            "DURATION",
-            "EXPIRES",
-            "TOKENS",
-            "COST",
-            "WORKFLOW",
-        ]);
-        for row in &self.report.rows {
-            let expires_cell = match row.expires_in_seconds {
-                Some(delta) => crate::output::tables::relative_time_cell(delta, &self.prefs),
-                None => comfy_table::Cell::new(""),
-            };
-            let duration = row
-                .duration_seconds
-                .map(|seconds| format!("{seconds}s"))
-                .unwrap_or_else(|| "(in flight)".to_string());
-            let cost = row
-                .cost_usd
-                .map(|value| format!("${value:.4}"))
-                .unwrap_or_else(|| "—".to_string());
-            table.add_row(vec![
-                comfy_table::Cell::new(&row.run_id),
-                crate::output::tables::status_cell(&row.status, &self.prefs),
-                comfy_table::Cell::new(&row.started_at),
-                comfy_table::Cell::new(duration),
-                expires_cell,
-                comfy_table::Cell::new(format_tokens_total(row.total_tokens)),
-                comfy_table::Cell::new(cost),
-                comfy_table::Cell::new(&row.workflow),
-            ]);
-        }
-        println!("{table}");
+        println!(
+            "{}",
+            render_workflow_runs_table(
+                &self.report.rows,
+                &self.prefs,
+                self.prefs.render_opts(),
+                chrono::Utc::now()
+            )
+        );
         Ok(())
     }
+}
+
+/// Build the `workflow runs` table. Split out of `render_table` so it
+/// can be asserted directly instead of through captured stdout.
+///
+/// `now` is a parameter for deterministic tests; the caller passes
+/// `Utc::now()`.
+fn render_workflow_runs_table(
+    rows: &[WorkflowRunsRow],
+    prefs: &crate::cmd::ui::UiPrefs,
+    opts: crate::output::entity_table::RenderOpts,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    use crate::output::entity_table::{CellValue, EntityTable};
+
+    let mut table = EntityTable::new(
+        prefs,
+        opts,
+        vec![
+            "RUN ID", "STATUS", "STARTED", "DURATION", "EXPIRES", "TOKENS", "COST", "WORKFLOW",
+        ],
+    )
+    .with_summary("run");
+
+    for row in rows {
+        // A malformed stored timestamp must not hide the run.
+        let started = match chrono::DateTime::parse_from_rfc3339(&row.started_at) {
+            Ok(ts) => CellValue::Timestamp(ts.with_timezone(&chrono::Utc)),
+            Err(_) => CellValue::Text(row.started_at.clone()),
+        };
+        table = table.row(vec![
+            CellValue::Id(row.run_id.clone()),
+            CellValue::Status(row.status.clone()),
+            started,
+            match row.duration_seconds {
+                Some(s) => CellValue::Text(format!("{s}s")),
+                None => CellValue::Missing,
+            },
+            // seconds-until, not a point in time
+            match row.expires_in_seconds {
+                Some(s) => CellValue::Text(crate::output::tables::format_seconds(s)),
+                None => CellValue::Missing,
+            },
+            CellValue::Text(crate::output::fmt::format_token_compact(row.total_tokens)),
+            match row.cost_usd {
+                Some(c) => CellValue::Text(format!("${c:.4}")),
+                None => CellValue::Missing,
+            },
+            CellValue::Text(row.workflow.clone()),
+        ]);
+    }
+    table.render(now)
 }
 
 impl DetailOutput for WorkflowShowOutput {
@@ -2005,6 +2037,8 @@ async fn runs(
     issue_filter: Option<&str>,
     no_color: bool,
     global_format: Option<OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
 ) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let runs_dir = global.join("runs");
@@ -2132,7 +2166,8 @@ async fn runs(
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     let cfg = layered_config_workflow(&global, project_root.as_deref());
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None)
+        .with_table_flags(absolute, all_columns);
 
     let rows: Vec<WorkflowRunsRow> = filtered
         .iter()
@@ -2197,16 +2232,6 @@ fn aggregate_run_usage_from_store(
 
 fn total_tokens(rows: &[rupu_transcript::UsageRow]) -> u64 {
     rows.iter().map(|r| r.input_tokens + r.output_tokens).sum()
-}
-
-fn format_tokens_total(total: u64) -> String {
-    if total >= 1_000_000 {
-        format!("{:.2}M", total as f64 / 1_000_000.0)
-    } else if total >= 1_000 {
-        format!("{:.1}K", total as f64 / 1_000.0)
-    } else {
-        total.to_string()
-    }
 }
 
 fn run_cost_usd(
@@ -5705,5 +5730,101 @@ steps:
     fn resolve_run_id_reports_unknown() {
         let err = resolve_run_id(&run_candidates(), "zzzzzz").expect_err("unknown");
         assert!(err.to_string().contains("unknown run"));
+    }
+
+    fn runs_row_for_test(
+        run_id: &str,
+        status: &str,
+        started_at: &str,
+        expires_in_seconds: Option<i64>,
+    ) -> WorkflowRunsRow {
+        WorkflowRunsRow {
+            run_id: run_id.to_string(),
+            status: status.to_string(),
+            started_at: started_at.to_string(),
+            duration_seconds: Some(194),
+            expires_in_seconds,
+            total_tokens: 1_820_000,
+            cost_usd: Some(5.522),
+            workflow: "nightly-maintainability-security".to_string(),
+        }
+    }
+
+    fn runs_test_now() -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(2026, 7, 30, 17, 0, 0).unwrap()
+    }
+
+    fn runs_test_prefs() -> crate::cmd::ui::UiPrefs {
+        let cfg = rupu_config::UiConfig::default();
+        crate::cmd::ui::UiPrefs::resolve(&cfg, true, None, None, None)
+    }
+
+    #[test]
+    fn workflow_runs_table_compacts_glyphs_and_drops_empty_expires() {
+        let rows = vec![
+            runs_row_for_test(
+                "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+                "completed",
+                "2026-07-30T13:46:31+00:00",
+                None,
+            ),
+            runs_row_for_test(
+                "run_01KYPASX18NYRER5NQPDWB2HZV",
+                "failed",
+                "2026-07-29T07:00:43+00:00",
+                None,
+            ),
+        ];
+        let out = render_workflow_runs_table(
+            &rows,
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            runs_test_now(),
+        );
+
+        assert!(out.contains("run_01KYSMDN…GKYJ"), "got: {out}");
+        assert!(
+            !out.contains("run_01KYSMDNG84N9Z8XXHQZP3GKYJ"),
+            "full id leaked into a cell: {out}"
+        );
+        assert!(out.contains("✓ completed"), "got: {out}");
+        assert!(out.contains("✗ failed"), "got: {out}");
+        assert!(out.contains("3h ago"), "relative start missing: {out}");
+        assert!(!out.contains("EXPIRES"), "empty EXPIRES survived: {out}");
+        assert!(out.contains("2 runs"), "summary missing: {out}");
+    }
+
+    #[test]
+    fn workflow_runs_keeps_expires_when_a_run_has_one() {
+        // Suppression must be driven by the data, not hardcoded.
+        let rows = vec![
+            runs_row_for_test("run_a1b2c3d4e5f6g7h8i9j0k1l2", "running", "2026-07-30T16:00:00+00:00", Some(300)),
+            runs_row_for_test("run_z9y8x7w6v5u4t3s2r1q0p9o8", "completed", "2026-07-30T15:00:00+00:00", None),
+        ];
+        let out = render_workflow_runs_table(
+            &rows,
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            runs_test_now(),
+        );
+        assert!(out.contains("EXPIRES"), "populated EXPIRES dropped: {out}");
+    }
+
+    #[test]
+    fn workflow_runs_survives_an_unparseable_started_at() {
+        let rows = vec![runs_row_for_test(
+            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+            "completed",
+            "not-a-timestamp",
+            None,
+        )];
+        let out = render_workflow_runs_table(
+            &rows,
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            runs_test_now(),
+        );
+        assert!(out.contains("not-a-timestamp"), "row was dropped: {out}");
     }
 }

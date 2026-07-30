@@ -298,7 +298,9 @@ pub async fn run(args: Vec<String>) -> ExitCode {
     match cli.command {
         Cmd::Run { argv } => cmd::run::handle(argv, cli.format).await,
         Cmd::Agent { action } => cmd::agent::handle(action, cli.format).await,
-        Cmd::Workflow { action } => cmd::workflow::handle(action, cli.format).await,
+        Cmd::Workflow { action } => {
+            cmd::workflow::handle(action, cli.format, cli.absolute, cli.all_columns).await
+        }
         Cmd::Autoflow { action } => cmd::autoflow::handle(action, cli.format).await,
         Cmd::Transcript { action } => cmd::transcript::handle(action, cli.format).await,
         Cmd::Config { action } => cmd::config::handle(action).await,

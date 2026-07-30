@@ -318,7 +318,7 @@ pub fn relative_time_cell(seconds_until: i64, prefs: &UiPrefs) -> Cell {
     }
 }
 
-fn format_seconds(s: i64) -> String {
+pub(crate) fn format_seconds(s: i64) -> String {
     let abs = s.unsigned_abs();
     let body = if abs < 60 {
         format!("{abs}s")
