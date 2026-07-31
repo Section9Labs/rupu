@@ -630,13 +630,37 @@ fn render_autoflow_wakes_table(
     );
 
     for row in rows {
-        // `not_before` is confirmed rendered today through
-        // `compact_timestamp`, which parses RFC3339 first — reuse that
-        // exact parse here, falling back to the verbatim text so a
-        // malformed value never drops the row.
-        let not_before = chrono::DateTime::parse_from_rfc3339(&row.not_before)
-            .map(|ts| CellValue::Timestamp(ts.with_timezone(&chrono::Utc)))
-            .unwrap_or_else(|_| CellValue::Text(row.not_before.clone()));
+        // A queued wake's `not_before` is, by definition, in the
+        // future. `CellValue::Timestamp` routes through
+        // `fmt::relative_time`, which deliberately clamps any *future*
+        // instant to "just now" — clock-skew protection that assumes
+        // the timestamp is in the past, which is true for
+        // started_at/updated_at but never true here. That clamp turned
+        // a wake queued 3 days out into "just now", indistinguishable
+        // from actually due. `cron list`'s `IN` column hit this exact
+        // trap (see the long comment on `render_cron_list_table` in
+        // cron.rs) and was fixed by hand-building a signed countdown
+        // via `tables::format_seconds` instead of routing through
+        // `CellValue::Timestamp`. Reuse that approach here: parse
+        // RFC3339 first, falling back to the verbatim text so a
+        // malformed value never drops the row. Unlike cron's
+        // `NEXT (UTC)`, this column keeps `--absolute` as a live
+        // toggle — there is no separate always-absolute column here to
+        // carry that meaning, so `--absolute` still yields the ISO
+        // instant on request.
+        let not_before = match chrono::DateTime::parse_from_rfc3339(&row.not_before) {
+            Ok(ts) => {
+                let ts = ts.with_timezone(&chrono::Utc);
+                if prefs.render_opts().absolute {
+                    CellValue::Text(ts.to_rfc3339())
+                } else {
+                    CellValue::Text(crate::output::tables::format_seconds(
+                        (ts - now).num_seconds(),
+                    ))
+                }
+            }
+            Err(_) => CellValue::Text(row.not_before.clone()),
+        };
         table = table.row(vec![
             CellValue::Id(row.wake_id.clone()),
             CellValue::Status(row.state.clone()),
@@ -12300,6 +12324,27 @@ mod tests {
             render_autoflow_wakes_table(&rows, &wakes_table_test_prefs(), wakes_table_test_now());
         assert!(out.contains("ago"), "got: {out}");
         assert!(!out.contains("2026-07-30T13:00:00"), "got: {out}");
+    }
+
+    #[test]
+    fn autoflow_wakes_table_future_not_before_renders_countdown_not_just_now() {
+        // C2 regression guard: `wakes()` lists queued wakes via
+        // `list_queued()` with no due-time filter, so a queued wake's
+        // `not_before` is, by definition, always in the future. Prior to
+        // this fix, routing a future instant through `CellValue::Timestamp`
+        // clamped it to "just now" (the clock-skew guard in
+        // `fmt::relative_time` assumes a past instant) — an operator who
+        // ran `autoflow requeue --not-before 24h` would see the fresh
+        // backoff wake reported as already due.
+        let rows = vec![wake_row(
+            "wake_01KRJDKSBE7X4J49094149WFJS",
+            "queued",
+            "2026-08-02T17:00:00Z", // 3 days after wakes_table_test_now()
+        )];
+        let out =
+            render_autoflow_wakes_table(&rows, &wakes_table_test_prefs(), wakes_table_test_now());
+        assert!(out.contains("in 3d"), "got: {out}");
+        assert!(!out.contains("just now"), "got: {out}");
     }
 
     #[test]

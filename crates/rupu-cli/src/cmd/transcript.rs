@@ -338,6 +338,25 @@ fn render_transcript_list_table(
     prefs: &crate::cmd::ui::UiPrefs,
     now: chrono::DateTime<chrono::Utc>,
 ) -> String {
+    build_transcript_list_table(rows, prefs, now).render(now)
+}
+
+/// Build the `transcript list` table's `EntityTable`. Split out of
+/// `render_transcript_list_table` so tests can force a narrow render
+/// width (`EntityTable::render_at_width`) to exercise the AGENT
+/// column's wrapping under real squeeze pressure — `render_transcript_list_table`
+/// itself only exposes the production `render` path, which picks up the
+/// real terminal width and cannot be forced narrow in a test.
+fn build_transcript_list_table<'a>(
+    rows: &[TranscriptListRow],
+    prefs: &'a crate::cmd::ui::UiPrefs,
+    // Unused today (STARTED is a `CellValue::Timestamp`, which only
+    // needs `now` at `render` time), kept in the signature to mirror
+    // `render_transcript_list_table` / `cmd::workflow`'s
+    // `build_workflow_list_table` and so a future hand-built relative
+    // cell here doesn't need a signature change to get it.
+    _now: chrono::DateTime<chrono::Utc>,
+) -> crate::output::entity_table::EntityTable<'a> {
     use crate::output::entity_table::{CellValue, EntityTable};
 
     let mut table = EntityTable::new(
@@ -372,13 +391,22 @@ fn render_transcript_list_table(
                 .clone()
                 .map(|t| CellValue::Text(one_line_preview(&t, 60)))
                 .unwrap_or(CellValue::Missing),
-            CellValue::Name(row.agent.clone()),
+            // I-1: AGENT is plain `CellValue::Text`, not `CellValue::Name`.
+            // An agent name comes from that agent file's own `name:`
+            // frontmatter and nobody bounds its length; `Name`'s no-wrap
+            // `ContentWidth` constraint has no upper bound, so a long
+            // agent name at a normal terminal width starved every other
+            // column (SCOPE/TITLE/STATUS/TOKENS/STARTED down to one
+            // character per line) instead of wrapping onto its own row.
+            // This matches `session list`, which already renders the
+            // same concept (its AGENT column) as `Text`.
+            CellValue::Text(row.agent.clone()),
             CellValue::Status(row.status.clone()),
             CellValue::Text(row.total_tokens.to_string()),
             started,
         ]);
     }
-    table.render(now)
+    table
 }
 
 impl CollectionOutput for TranscriptPruneOutput {
@@ -2333,9 +2361,11 @@ mod tests {
     }
 
     #[test]
-    fn transcript_list_agent_never_wraps() {
-        // AGENT maps to `CellValue::Name`: the CLI accepts it back via
-        // `agent show`, so like `Id` it must never wrap across lines.
+    fn transcript_list_agent_renders_verbatim() {
+        // AGENT is `CellValue::Text` (I-1) — rendered verbatim, just no
+        // longer no-wrap. The narrow-squeeze regression guard for the
+        // fix itself is `transcript_list_long_agent_name_does_not_collapse_other_columns`
+        // below.
         let rows = vec![transcript_row_for_test(
             "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
             "active",
@@ -2350,6 +2380,48 @@ mod tests {
             transcript_list_test_now(),
         );
         assert!(out.contains("issue-reader"), "got: {out}");
+    }
+
+    #[test]
+    fn transcript_list_long_agent_name_does_not_collapse_other_columns() {
+        // I-1 regression guard: AGENT used to map to `CellValue::Name`,
+        // whose no-wrap `ContentWidth` constraint has no upper bound —
+        // an agent name comes from that agent file's own `name:`
+        // frontmatter and nobody bounds its length. A 63-char agent name
+        // at 80 columns squeezed SCOPE/TITLE/STATUS/TOKENS/STARTED down
+        // to one character per line. AGENT is now plain `CellValue::Text`
+        // (matching `session list`), which wraps under pressure instead
+        // of starving its neighbours. Force real squeeze pressure via
+        // the shared `render_at_width` test hook, since production
+        // `render_transcript_list_table` only exposes real-terminal-width
+        // rendering, and assert a known value from a later column
+        // (TOKENS) still renders intact on one line.
+        //
+        // Verified this actually discriminates the bug: temporarily
+        // reverting AGENT to `CellValue::Name` and re-running this exact
+        // scenario prints TOKENS as `1\n2\n0\n0` (and every other column
+        // similarly one-character-per-line) — "1200" does not appear as
+        // a contiguous substring. With `CellValue::Text`, TOKENS wraps
+        // normally and "1200" survives intact.
+        let long_agent = "a".repeat(63);
+        let rows = vec![transcript_row_for_test(
+            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+            "active",
+            Some("fix the flaky test"),
+            &long_agent,
+            "completed",
+            "2026-07-30 13:00:00",
+        )];
+        let out = build_transcript_list_table(
+            &rows,
+            &transcript_list_test_prefs(),
+            transcript_list_test_now(),
+        )
+        .render_at_width(transcript_list_test_now(), 80);
+        assert!(
+            out.contains("1200"),
+            "TOKENS column collapsed under a long AGENT name: {out}"
+        );
     }
 
     fn prune_row(
