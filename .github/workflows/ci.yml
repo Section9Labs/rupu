@@ -85,63 +85,68 @@ jobs:
             fi
           done
 
-  linux-musl:
-    name: linux musl (build + test)
+  # ── Linux musl gate ───────────────────────────────────────────────────
+  #
+  # Previously one sequential job that took 37-51 minutes (measured over four
+  # runs: 2229s / 2369s / 3029s / 3046s). Two things made it slow:
+  #
+  #   1. No caching of any kind. Every run recompiled the whole dependency
+  #      graph for musl from cold, including the expensive C builds
+  #      (aws-lc-rs, git2's vendored libgit2 + OpenSSL).
+  #   2. Build / Test / Clippy ran back to back and shared nothing. `Build`
+  #      is `--release` into `target/linux-musl`; `Test` and `Clippy` are
+  #      debug into `target/`. Different profile AND different target dir, so
+  #      the 800-1137s release build contributed nothing to the 957-1278s
+  #      test build.
+  #
+  # Now they are three parallel jobs, each with its own warm cache. Wall
+  # clock is the slowest one rather than the sum.
+  #
+  # Building the docker image is NOT the problem — measured at 20-25s, under
+  # 1% of the job. It stays inline so the Dockerfile remains the single
+  # source of truth. Publishing it to ghcr would buy ~20s and is not worth
+  # the moving parts.
+  #
+  # The required status check is named `linux musl (build + test)`
+  # (.github/rulesets/main.json). That name is preserved by the aggregator
+  # job at the bottom — renaming or removing it would silently un-gate main.
+
+  linux-musl-build:
+    name: linux musl · build
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     steps:
-      # v5 targets Node 24; v4 targets Node 20, which GitHub has deprecated
-      # and now force-runs on 24 anyway (warning on every run).
       - uses: actions/checkout@v5
 
-      # docs/pages/rupu-archive-keyring.asc is served at a stable URL that
-      # users pin trust to (https://rupu.sh/rupu-archive-keyring.asc).
-      # This guards against a private key ever being committed there by accident.
-      - name: Assert the published keyring is public-only
-        run: |
-          set -euo pipefail
-          f=docs/pages/rupu-archive-keyring.asc
-          grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$f" || { echo "::error::$f is not a public key block"; exit 1; }
-          if grep -q "PRIVATE KEY BLOCK" "$f"; then
-            echo "::error::$f contains private key material"; exit 1
-          fi
-
-      # The pinned Alpine/musl toolchain. Building the image here rather
-      # than pulling a published one keeps the Dockerfile the single source
-      # of truth; publishing it to ghcr is a later optimization.
       - name: Build the pinned musl image
         run: docker build -f docker/linux-build.Dockerfile -t rupu-linux-build .
 
-      # Guards the property that makes static linking possible. `keyring`
-      # was removed from the workspace (#554) precisely so the Linux graph
-      # has no D-Bus dependency; a future crate re-adding it would break the
-      # release build at the worst possible moment, silently.
-      - name: Assert keyring and dbus stay out of the Linux graph
-        run: |
-          leaked=$(docker run --rm -v "$PWD":/work -w /work rupu-linux-build \
-            cargo tree --workspace -e normal --prefix none \
-            | grep -E '^(keyring|libdbus-sys|dbus-secret-service) ' | sort -u || true)
-          if [ -n "$leaked" ]; then
-            echo "::error::keyring/dbus leaked back into the Linux dependency graph:"
-            echo "$leaked"
-            exit 1
-          fi
-          echo "Linux graph is clean."
-
-      # NOTE: this build deliberately does NOT run `make cp-web`, so the CP
-      # web UI embeds its "not built" placeholder and the build log carries a
-      # warning saying so. That is correct for a gate — it is faster and the
-      # UI is not what is under test. Plan 3's *release* workflow must run
-      # `make cp-web` before the cargo build (the image already carries
-      # nodejs/npm for that), or the published binary ships a placeholder UI.
+      # `cache-directories` picks up the in-workspace CARGO_HOME mounted into
+      # the container below. The container's own CARGO_HOME is baked into the
+      # image and thrown away with it, so without this mount the registry and
+      # git checkouts are re-fetched on every run no matter what else is
+      # cached.
       #
-      # The real spike: this is the first time this workspace has ever been
-      # compiled for Linux. aws-lc-rs (the rustls provider rupu installs at
-      # startup) and git2's vendored libgit2 + OpenSSL are the risky C
-      # dependencies under musl.
+      # `save-if` restricts writes to main. GitHub scopes caches so that a
+      # cache written on the default branch is readable from every branch,
+      # but not vice versa — so PRs restore main's cache and never thrash it.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: musl-build
+          key: ${{ hashFiles('docker/linux-build.Dockerfile', 'rust-toolchain.toml') }}
+          # This job builds into target/linux-musl, not target/. Pointing the
+          # action at the wrong directory would let its pruning pass discard
+          # precisely the artifacts we are trying to keep.
+          workspaces: ". -> target/linux-musl"
+          cache-directories: ".cargo-musl"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Build the static CLI
         run: |
-          docker run --rm -v "$PWD":/work -w /work rupu-linux-build \
+          mkdir -p .cargo-musl
+          docker run --rm -v "$PWD":/work -w /work \
+            -v "$PWD/.cargo-musl":/cargo -e CARGO_HOME=/cargo \
+            rupu-linux-build \
             cargo build --release -p rupu-cli --target-dir target/linux-musl
 
       - name: Verify the binary is genuinely static and self-describing
@@ -179,17 +184,102 @@ jobs:
           docker run --rm -v "$PWD":/work -w /work alpine:3.21 \
             /work/target/linux-musl/release/rupu update --print-platform
 
+      # The container runs as root, so everything it wrote under target/ and
+      # .cargo-musl is root-owned. The cache action runs as the runner user
+      # and cannot read those, so its post-step would silently save nothing.
+      - name: Hand the artifacts back to the runner user
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" target .cargo-musl 2>/dev/null || true
+
+  linux-musl-test:
+    name: linux musl · test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build the pinned musl image
+        run: docker build -f docker/linux-build.Dockerfile -t rupu-linux-build .
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: musl-test
+          key: ${{ hashFiles('docker/linux-build.Dockerfile', 'rust-toolchain.toml') }}
+          workspaces: ". -> target"
+          cache-directories: ".cargo-musl"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       # rupu-app is macOS-only (GPUI + objc2). The workspace declares no
       # default-members, so this must be scoped explicitly or it tries to
       # compile GPUI.
       - name: Test
         run: |
-          docker run --rm -v "$PWD":/work -w /work rupu-linux-build \
+          mkdir -p .cargo-musl
+          docker run --rm -v "$PWD":/work -w /work \
+            -v "$PWD/.cargo-musl":/cargo -e CARGO_HOME=/cargo \
+            rupu-linux-build \
             cargo test --workspace --exclude rupu-app --locked
+
+      - name: Hand the artifacts back to the runner user
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" target .cargo-musl 2>/dev/null || true
+
+  linux-musl-lint:
+    name: linux musl · lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      # docs/pages/rupu-archive-keyring.asc is served at a stable URL that
+      # users pin trust to (https://rupu.sh/rupu-archive-keyring.asc).
+      # This guards against a private key ever being committed there by
+      # accident. Costs milliseconds, so it rides along here rather than
+      # occupying a job of its own.
+      - name: Assert the published keyring is public-only
+        run: |
+          set -euo pipefail
+          f=docs/pages/rupu-archive-keyring.asc
+          grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$f" || { echo "::error::$f is not a public key block"; exit 1; }
+          if grep -q "PRIVATE KEY BLOCK" "$f"; then
+            echo "::error::$f contains private key material"; exit 1
+          fi
+
+      - name: Build the pinned musl image
+        run: docker build -f docker/linux-build.Dockerfile -t rupu-linux-build .
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: musl-lint
+          key: ${{ hashFiles('docker/linux-build.Dockerfile', 'rust-toolchain.toml') }}
+          workspaces: ". -> target"
+          cache-directories: ".cargo-musl"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Guards the property that makes static linking possible. `keyring`
+      # was removed from the workspace (#554) precisely so the Linux graph
+      # has no D-Bus dependency; a future crate re-adding it would break the
+      # release build at the worst possible moment, silently.
+      - name: Assert keyring and dbus stay out of the Linux graph
+        run: |
+          mkdir -p .cargo-musl
+          leaked=$(docker run --rm -v "$PWD":/work -w /work \
+            -v "$PWD/.cargo-musl":/cargo -e CARGO_HOME=/cargo \
+            rupu-linux-build \
+            cargo tree --workspace -e normal --prefix none \
+            | grep -E '^(keyring|libdbus-sys|dbus-secret-service) ' | sort -u || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::keyring/dbus leaked back into the Linux dependency graph:"
+            echo "$leaked"
+            exit 1
+          fi
+          echo "Linux graph is clean."
 
       - name: Clippy
         run: |
-          docker run --rm -v "$PWD":/work -w /work rupu-linux-build \
+          docker run --rm -v "$PWD":/work -w /work \
+            -v "$PWD/.cargo-musl":/cargo -e CARGO_HOME=/cargo \
+            rupu-linux-build \
             cargo clippy --workspace --exclude rupu-app --all-targets --locked -- -D warnings
 
       # Informational only: `main` carries a large number of rustfmt diff
@@ -201,6 +291,39 @@ jobs:
           docker run --rm -v "$PWD":/work -w /work rupu-linux-build \
             cargo fmt --all --check
 
+      - name: Hand the artifacts back to the runner user
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" target .cargo-musl 2>/dev/null || true
+
+  # Aggregator. Exists solely to preserve the required status check name
+  # `linux musl (build + test)` from .github/rulesets/main.json while the
+  # actual work runs in the three parallel jobs above. Renaming this job
+  # un-gates main without any other visible symptom.
+  #
+  # `if: always()` plus the explicit result check is deliberate: without it a
+  # skipped or cancelled dependency reports success and the gate passes on a
+  # build that never ran.
+  linux-musl:
+    name: linux musl (build + test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [linux-musl-build, linux-musl-test, linux-musl-lint]
+    if: always()
+    steps:
+      - name: Require every musl job to have succeeded
+        run: |
+          set -euo pipefail
+          build='${{ needs.linux-musl-build.result }}'
+          test='${{ needs.linux-musl-test.result }}'
+          lint='${{ needs.linux-musl-lint.result }}'
+          echo "build=$build test=$test lint=$lint"
+          for r in "$build" "$test" "$lint"; do
+            if [ "$r" != "success" ]; then
+              echo "::error::a linux musl job did not succeed"
+              exit 1
+            fi
+          done
+          echo "All linux musl jobs succeeded."
   release-scripts:
     name: release cadence scripts
     runs-on: ubuntu-latest
