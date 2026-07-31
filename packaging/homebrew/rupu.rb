@@ -17,18 +17,18 @@ class Rupu < Formula
   on_macos do
     on_arm do
       url "https://github.com/Section9Labs/rupu/releases/download/v#{version}/rupu-darwin-arm64"
-      sha256 "20bdc143766a6d8b63ab73b84b4fb07dfbe68cbddd3669cffec9b38eeccfcf42"
+      sha256 "2fd131ae99933e83b5fef28df4936b30b71f0260bcf3ddab0f02b2909b4bf334"
     end
   end
 
   on_linux do
     on_intel do
       url "https://github.com/Section9Labs/rupu/releases/download/v#{version}/rupu-linux-x64"
-      sha256 "9e4658b78d43db21d4405f1854abc15a5180b4eee109a40692c5724aa3b8030b"
+      sha256 "3c47a2079340be0a3bf91f5be6304d3a5b61e2b70c9a0b8368d88278719845e3"
     end
     on_arm do
       url "https://github.com/Section9Labs/rupu/releases/download/v#{version}/rupu-linux-arm64"
-      sha256 "1083db3741a9dc73eb6d5c288c10894d7237d815001486b68028737dccd807c8"
+      sha256 "42ea942c3917ff16d9f1a39d6a3e0a852b93bbddb975a2070e5507a0818acb01"
     end
   end
 
