@@ -82,12 +82,19 @@ pub enum Action {
     },
 }
 
-pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> ExitCode {
+pub async fn handle(
+    action: Action,
+    global_format: Option<OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
+) -> ExitCode {
     match action {
-        Action::List { no_color } => match list(no_color, global_format).await {
-            Ok(()) => ExitCode::from(0),
-            Err(e) => crate::output::diag::fail(e),
-        },
+        Action::List { no_color } => {
+            match list(no_color, global_format, absolute, all_columns).await {
+                Ok(()) => ExitCode::from(0),
+                Err(e) => crate::output::diag::fail(e),
+            }
+        }
         Action::Show {
             name,
             no_color,
@@ -249,14 +256,20 @@ impl DetailOutput for AgentShowOutput {
     }
 }
 
-async fn list(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
+async fn list(
+    no_color: bool,
+    global_format: Option<OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     let project_agents_parent = project_root.as_ref().map(|p| p.join(".rupu"));
     let agents = load_agents(&global, project_agents_parent.as_deref())?;
     let cfg = layered_config(&global, project_root.as_deref());
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None)
+        .with_table_flags(absolute, all_columns);
 
     if agents.is_empty()
         && matches!(

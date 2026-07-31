@@ -103,13 +103,28 @@ pub struct PruneArgs {
     pub dry_run: bool,
 }
 
-pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> ExitCode {
+pub async fn handle(
+    action: Action,
+    global_format: Option<OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
+) -> ExitCode {
     let result = match action {
         Action::List {
             no_color,
             all,
             archived,
-        } => list(no_color, all, archived, global_format).await,
+        } => {
+            list(
+                no_color,
+                all,
+                archived,
+                global_format,
+                absolute,
+                all_columns,
+            )
+            .await
+        }
         Action::Show {
             run_id,
             view,
@@ -1354,6 +1369,8 @@ async fn list(
     all: bool,
     archived: bool,
     global_format: Option<OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
 ) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
@@ -1465,7 +1482,8 @@ async fn list(
         // UI prefs only — lock does not apply (I-7)
         rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default()
     };
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None)
+        .with_table_flags(absolute, all_columns);
     let report_rows: Vec<TranscriptListRow> = rows
         .iter()
         .map(|row| TranscriptListRow {

@@ -77,9 +77,14 @@ pub enum Action {
     },
 }
 
-pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> ExitCode {
+pub async fn handle(
+    action: Action,
+    global_format: Option<OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
+) -> ExitCode {
     let result = match action {
-        Action::List { no_color } => list(no_color, global_format).await,
+        Action::List { no_color } => list(no_color, global_format, absolute, all_columns).await,
         Action::Tick {
             dry_run,
             skip_events,
@@ -230,7 +235,12 @@ impl CollectionOutput for CronEventsOutput {
     }
 }
 
-async fn list(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
+async fn list(
+    no_color: bool,
+    global_format: Option<OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
+) -> anyhow::Result<()> {
     let workflows = collect_cron_workflows()?;
     if workflows.is_empty()
         && matches!(
@@ -245,7 +255,7 @@ async fn list(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::Re
         return Ok(());
     }
     let now = Utc::now();
-    let prefs = ui_prefs(no_color)?;
+    let prefs = ui_prefs(no_color, absolute, all_columns)?;
     let rows = workflows
         .iter()
         .map(|workflow| {
@@ -271,7 +281,11 @@ async fn list(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::Re
     report::emit_collection(global_format, &output)
 }
 
-fn ui_prefs(no_color: bool) -> anyhow::Result<crate::cmd::ui::UiPrefs> {
+fn ui_prefs(
+    no_color: bool,
+    absolute: bool,
+    all_columns: bool,
+) -> anyhow::Result<crate::cmd::ui::UiPrefs> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
@@ -280,9 +294,10 @@ fn ui_prefs(no_color: bool) -> anyhow::Result<crate::cmd::ui::UiPrefs> {
     // UI prefs only — lock does not apply (I-7)
     let cfg =
         rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default();
-    Ok(crate::cmd::ui::UiPrefs::resolve(
-        &cfg.ui, no_color, None, None, None,
-    ))
+    Ok(
+        crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None)
+            .with_table_flags(absolute, all_columns),
+    )
 }
 
 /// The `rupu cron tick` core: fires due cron-scheduled workflows, then
