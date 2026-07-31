@@ -24,7 +24,9 @@
 
 use crate::cmd::ui::UiPrefs;
 use crate::output::palette;
-use comfy_table::{presets, Cell, Color as TableColor, ContentArrangement, Table, TableComponent};
+use comfy_table::{
+    presets, Cell, CellAlignment, Color as TableColor, ContentArrangement, Table, TableComponent,
+};
 
 /// Build a `comfy-table::Table` with rupu's default visual style: a
 /// segmented rule under the header, no borders, and no per-row
@@ -393,6 +395,23 @@ pub fn coverage_status_color(status: &str, prefs: &UiPrefs) -> Option<TableColor
         "notapplicable" | "n/a" => palette.skipped.into_table(),
         _ => return None,
     })
+}
+
+/// Right-align the given column indices.
+///
+/// Counts and costs are read by comparing magnitudes down a column,
+/// which only works when the digits line up. `coverage audit` has
+/// seven adjacent count columns and `usage`'s breakdown has five.
+///
+/// Out-of-range indices are ignored rather than panicking: call sites
+/// write these sets by hand, and a stale index must not take down a
+/// render.
+pub fn align_numeric(table: &mut Table, columns: &[usize]) {
+    for &idx in columns {
+        if let Some(col) = table.column_mut(idx) {
+            col.set_cell_alignment(CellAlignment::Right);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -774,6 +793,32 @@ mod tests {
         let prefs = prefs_color_always();
         assert_eq!(coverage_status_color("running", &prefs), None);
         assert_eq!(coverage_status_color("failed", &prefs), None);
+    }
+
+    #[test]
+    fn align_numeric_right_aligns_the_named_columns() {
+        let mut t = new_table();
+        t.set_header(vec!["NAME", "COUNT"]);
+        t.add_row(vec![Cell::new("a"), Cell::new("7")]);
+        t.add_row(vec![Cell::new("b"), Cell::new("1234")]);
+        align_numeric(&mut t, &[1]);
+        let out = t.to_string();
+        let row_a = out.lines().find(|l| l.contains(" a ")).expect("row a");
+        assert!(
+            row_a.trim_end().ends_with('7'),
+            "not right-aligned: {row_a}"
+        );
+    }
+
+    #[test]
+    fn align_numeric_ignores_out_of_range_indices() {
+        // Call sites write these index sets by hand; a stale index
+        // after a column change must not panic mid-render.
+        let mut t = new_table();
+        t.set_header(vec!["ONLY"]);
+        t.add_row(vec![Cell::new("x")]);
+        align_numeric(&mut t, &[0, 5, 99]);
+        assert!(t.to_string().contains('x'));
     }
 
     #[test]
