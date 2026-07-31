@@ -178,11 +178,12 @@ impl CollectionOutput for CronListOutput {
 }
 
 /// Build the `cron list` human table: workflow names never wrap, a
-/// populated `NEXT (UTC)` renders relative (absolute under `--absolute`),
-/// and a bare `N workflows` summary (no `STATUS` header here, so no
-/// breakdown). Extracted from `render_table` so it can be asserted
-/// directly against its returned string. `now` is a parameter so tests
-/// are deterministic; `render_table` passes `Utc::now()`.
+/// populated `NEXT (UTC)` renders the absolute wall-clock instant while
+/// `IN` renders the countdown to it, and a bare `N workflows` summary (no
+/// `STATUS` header here, so no breakdown). Extracted from `render_table`
+/// so it can be asserted directly against its returned string. `now` is
+/// a parameter so tests are deterministic; `render_table` passes
+/// `Utc::now()`.
 ///
 /// `next_utc` / `in_seconds` are computed together (`list()`, below) and
 /// are both `None` in exactly one case: the schedule failed to parse, or
@@ -220,34 +221,33 @@ fn render_cron_list_table(
         // writer of this field, and finally to the verbatim text so a
         // malformed value never drops the row.
         //
-        // Deliberately NOT `CellValue::Timestamp`: `fmt::relative_time`
-        // (the renderer behind it) clamps every future instant to "just
-        // now" — correct for the started_at/updated_at columns it was
-        // built for (clock-skew guard on values that are normally past),
-        // wrong here, since a cron `next_utc` is *always* in the future.
-        // A schedule firing in 5 hours would render as "just now",
-        // silently destroying the one thing this column exists to show.
-        // Hand-building the cell — same pattern `render_workflow_list_table`
-        // (workflow.rs) uses for its own "LAST RUN" column — lets it self
-        // -manage `opts.absolute` while rendering a real signed countdown
-        // (`tables::format_seconds`, which already handles both "Xh ago"
-        // and "in Xh" correctly) instead of the past-only renderer.
+        // Deliberately NOT `CellValue::Timestamp`, and deliberately
+        // ALWAYS absolute, not toggled by `--absolute`: this column is
+        // explicitly labelled "(UTC)" — it answers "when exactly does
+        // this fire," a wall-clock question. `IN` (below) is the
+        // complementary countdown answering "how long until." An
+        // earlier version of this function routed `NEXT (UTC)` through
+        // `fmt::relative_time` (via `CellValue::Timestamp`, or by hand
+        // via `tables::format_seconds`), which made it byte-identical to
+        // `IN` under the default view and, worse, made `fmt::relative_time`
+        // clamp every row to "just now" — that renderer assumes a past
+        // instant (correct for started_at/updated_at, wrong for a value
+        // that is *always* future). Both problems went away by making
+        // `NEXT (UTC)` unconditionally absolute: `--absolute` now has
+        // nothing left to toggle on this table (both columns already
+        // show their one true representation), which is fine and
+        // honest, not a bug — the flag still matters for every other
+        // entity-table command.
         let next_cell = match &row.next_utc {
             Some(text) => chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
                 .map(|naive| naive.and_utc())
                 .or_else(|_| DateTime::parse_from_rfc3339(text).map(|ts| ts.with_timezone(&Utc)))
-                .map(|ts| {
-                    if prefs.render_opts().absolute {
-                        CellValue::Text(ts.to_rfc3339())
-                    } else {
-                        CellValue::Text(crate::output::tables::format_seconds(
-                            (ts - now).num_seconds(),
-                        ))
-                    }
-                })
+                .map(|ts| CellValue::Text(ts.to_rfc3339()))
                 .unwrap_or_else(|_| CellValue::Text(text.clone())),
             None => CellValue::Text("unschedulable".to_string()),
         };
+        // `IN` is the countdown companion to `NEXT (UTC)`'s wall-clock
+        // time — always the signed relative delta, never absolute.
         let in_cell = match row.in_seconds {
             Some(seconds) => CellValue::Text(crate::output::tables::format_seconds(seconds)),
             None => CellValue::Text("unschedulable".to_string()),
@@ -1341,11 +1341,14 @@ steps:
     }
 
     #[test]
-    fn cron_list_table_next_utc_renders_relative_for_the_real_stored_format() {
+    fn cron_list_table_next_utc_renders_absolute_for_the_real_stored_format() {
         // `CronListRow.next_utc` is written (see `list()`) as
         // `time.format("%Y-%m-%d %H:%M:%S")` — not RFC3339. The real
-        // stored format must recover the instant and render a relative
-        // age, not fall through to the literal-text branch.
+        // stored format must recover the instant and render it as an
+        // absolute wall-clock instant, not fall through to the
+        // literal-text branch. `NEXT (UTC)` is always absolute — it's
+        // the column that answers "when exactly," complementary to
+        // `IN`'s countdown — so this is not conditioned on `--absolute`.
         let rows = vec![cron_row(
             "nightly-health",
             "0 6 * * *",
@@ -1353,22 +1356,24 @@ steps:
             Some(3600),
         )];
         let out = render_cron_list_table(&rows, &cron_list_test_prefs(), cron_list_test_now());
-        assert!(out.contains("4h ago"), "got: {out}");
+        assert!(out.contains("2026-07-30T13:00:00"), "got: {out}");
         assert!(
             !out.contains("2026-07-30 13:00:00"),
-            "literal text leaked instead of a relative age: {out}"
+            "literal naive text leaked instead of a reformatted absolute instant: {out}"
         );
     }
 
     #[test]
-    fn cron_list_table_next_utc_in_the_future_renders_a_countdown_not_just_now() {
+    fn cron_list_table_next_utc_in_the_future_never_renders_just_now() {
         // The real production shape: `next_utc` is always in the
         // *future* relative to `now` (it's the schedule's next fire
-        // time). `CellValue::Timestamp`'s renderer (`fmt::relative_time`)
-        // clamps every future instant to "just now" — a real bug caught
-        // by running the actual binary against this repo's own nightly
-        // workflows (5h/6h out), which is exactly why `next_cell` is
-        // hand-built instead of routed through `CellValue::Timestamp`.
+        // time). Routing it through `CellValue::Timestamp`/
+        // `fmt::relative_time` (as an earlier version of this function
+        // did) clamps every future instant to "just now" — a real bug
+        // caught by running the actual binary against this repo's own
+        // nightly workflows (5h/6h out). Rendering `NEXT (UTC)` as an
+        // unconditional absolute instant sidesteps that renderer
+        // entirely, so this guards against it coming back.
         let rows = vec![cron_row(
             "nightly-health",
             "0 6 * * *",
@@ -1376,7 +1381,7 @@ steps:
             Some(4 * 3600),
         )];
         let out = render_cron_list_table(&rows, &cron_list_test_prefs(), cron_list_test_now());
-        assert!(out.contains("in 4h"), "got: {out}");
+        assert!(out.contains("2026-07-30T21:00:00"), "got: {out}");
         assert!(
             !out.contains("just now"),
             "future next_utc must not render as \"just now\": {out}"
@@ -1384,19 +1389,58 @@ steps:
     }
 
     #[test]
-    fn cron_list_table_next_utc_renders_iso_under_absolute() {
-        // The behavioural proof that Task 2's `--absolute` plumbing
-        // actually reaches this renderer, not just clap parsing.
+    fn cron_list_table_next_utc_and_in_carry_different_information() {
+        // NEXT (UTC) and IN exist to answer different questions —
+        // "when exactly" vs. "how long until" — and must not collapse
+        // to the same text. A prior version of this function rendered
+        // both as the same relative countdown ("in 4h" / "in 4h"),
+        // which silently lost the wall-clock answer NEXT (UTC) is
+        // labelled to give.
         let rows = vec![cron_row(
             "nightly-health",
             "0 6 * * *",
-            Some("2026-07-30 13:00:00"),
-            Some(3600),
+            Some("2026-07-30 21:00:00"),
+            Some(4 * 3600),
         )];
-        let prefs = cron_list_test_prefs().with_table_flags(true, false);
-        let out = render_cron_list_table(&rows, &prefs, cron_list_test_now());
-        assert!(out.contains("2026-07-30T13:00:00"), "got: {out}");
-        assert!(!out.contains("4h ago"), "got: {out}");
+        let out = render_cron_list_table(&rows, &cron_list_test_prefs(), cron_list_test_now());
+        // IN carries the countdown...
+        assert!(out.contains("in 4h"), "got: {out}");
+        // ...exactly once — not duplicated into NEXT (UTC) too.
+        assert_eq!(
+            out.matches("in 4h").count(),
+            1,
+            "NEXT (UTC) must not also render the countdown: {out}"
+        );
+        // NEXT (UTC) carries the absolute instant instead.
+        assert!(out.contains("2026-07-30T21:00:00"), "got: {out}");
+    }
+
+    #[test]
+    fn cron_list_table_absolute_flag_has_no_effect() {
+        // `NEXT (UTC)` is unconditionally absolute and `IN` is
+        // unconditionally the countdown — neither column has anything
+        // left to toggle on this table, unlike `transcript list`/
+        // `session list`'s `CellValue::Timestamp` columns. That's fine
+        // and honest, not a missed wiring: assert `--absolute` is a
+        // true no-op here rather than inventing a toggle to justify the
+        // flag existing on this command.
+        let rows = vec![
+            cron_row(
+                "nightly-health",
+                "0 6 * * *",
+                Some("2026-07-30 13:00:00"),
+                Some(3600),
+            ),
+            cron_row("broken-cron", "not a schedule", None, None),
+        ];
+        let now = cron_list_test_now();
+        let default_out = render_cron_list_table(&rows, &cron_list_test_prefs(), now);
+        let absolute_prefs = cron_list_test_prefs().with_table_flags(true, false);
+        let absolute_out = render_cron_list_table(&rows, &absolute_prefs, now);
+        assert_eq!(
+            default_out, absolute_out,
+            "--absolute should be a no-op on this table"
+        );
     }
 
     #[test]
