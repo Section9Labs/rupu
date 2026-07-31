@@ -39,7 +39,7 @@ Revisit `issues list` and `models list` if `EntityTable` later gains a per-colum
 - **`--format json` / `--format csv` byte-identical** for every command touched. Every row struct in this plan derives `Serialize` and is FROZEN — never add or rename its fields. Table headers are independent of struct field names; changing a header does not change JSON.
 - **Never run `cargo fmt`** — reformats ~106 files here. Use `rustfmt --edition 2021 <path>` and verify with `git diff --stat`.
 - **Never `rustfmt` module-root files** (`lib.rs`, `output/mod.rs`) — they cascade into siblings (`lib.rs` measured hitting 12).
-- **Never `rustfmt` `cmd/autoflow.rs` or `cmd/workflow.rs`** — pre-existing drift; hand-write additions correctly formatted.
+- **Never `rustfmt` `cmd/autoflow.rs`, `cmd/workflow.rs`, or `cmd/transcript.rs`** — all three carry pre-existing formatting drift and will reformat unrelated lines. Hand-write additions already correctly formatted. (`transcript.rs` was confirmed during Task 2, which had to revert two spurious hunks by hand.) After any `rustfmt`, inspect the FULL `git diff`, not just `--stat` — a stat line hides which hunks are yours.
 - **Never use `git stash` in any form.** The stash stack is shared across every worktree of this repo; a bare `stash pop` in an earlier session applied an unrelated entry and dirtied 104 files. Use `git checkout -- <paths>`.
 - Never `git add -A`; always explicit paths.
 - Baseline: `cargo clippy -p rupu-cli --lib` has ONE pre-existing error in `cmd/completers.rs` (`question_mark`). Not yours.
