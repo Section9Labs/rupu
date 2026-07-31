@@ -10,3 +10,7 @@
 crates/rupu-coverage/build/cwe/*.xml
 crates/rupu-coverage/build/cwe/*.zip
 /dist
+
+# CI mounts an in-workspace CARGO_HOME into the musl build container
+# so the registry survives between runs (.github/workflows/ci.yml).
+.cargo-musl/
