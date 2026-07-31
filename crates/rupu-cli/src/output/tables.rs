@@ -71,7 +71,7 @@ pub fn status_of(status: &str) -> Option<crate::output::palette::Status> {
         }
         "rejected" | "retry_backoff" => Status::Retrying,
         "pending" | "eligible" | "released" | "idle" => Status::Waiting,
-        "skipped" => Status::Skipped,
+        "skipped" | "stopped" => Status::Skipped,
         _ => return None,
     })
 }
@@ -109,6 +109,8 @@ pub fn status_color(status: &str, prefs: &UiPrefs) -> Option<TableColor> {
         "blocked" => palette.failed.into_table(),
         "complete" => palette.complete.into_table(),
         "eligible" | "released" => palette.dim.into_table(),
+        "idle" | "stopped" => palette.dim.into_table(),
+        "skipped" => palette.skipped.into_table(),
         // Issue / PR states.
         "open" => palette.complete.into_table(),
         "closed" => palette.brand_subtle.into_table(),
@@ -316,7 +318,7 @@ pub fn relative_time_cell(seconds_until: i64, prefs: &UiPrefs) -> Cell {
     }
 }
 
-fn format_seconds(s: i64) -> String {
+pub(crate) fn format_seconds(s: i64) -> String {
     let abs = s.unsigned_abs();
     let body = if abs < 60 {
         format!("{abs}s")
@@ -352,6 +354,8 @@ mod tests {
             palette: palette::UiPaletteTheme::default(),
             live_view: LiveViewMode::Focused,
             pager: PagerMode::Never,
+            absolute: false,
+            all_columns: false,
         }
     }
 
@@ -363,6 +367,8 @@ mod tests {
             palette: palette::UiPaletteTheme::default(),
             live_view: LiveViewMode::Focused,
             pager: PagerMode::Never,
+            absolute: false,
+            all_columns: false,
         }
     }
 

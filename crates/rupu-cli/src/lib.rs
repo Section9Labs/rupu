@@ -63,6 +63,15 @@ pub struct Cli {
     /// Structured output format for commands that support tabular/report views.
     #[arg(long, global = true)]
     pub format: Option<output::formats::OutputFormat>,
+    /// Show absolute ISO timestamps in tables instead of relative ages.
+    /// Useful when correlating a run against external logs.
+    #[arg(long, global = true)]
+    pub absolute: bool,
+    /// Keep every table column, including ones that are empty for every
+    /// row shown. Columns are otherwise suppressed based on the rows
+    /// actually displayed, so a filtered listing may show fewer columns.
+    #[arg(long, global = true)]
+    pub all_columns: bool,
     #[command(subcommand)]
     pub command: Cmd,
 }
@@ -289,7 +298,9 @@ pub async fn run(args: Vec<String>) -> ExitCode {
     match cli.command {
         Cmd::Run { argv } => cmd::run::handle(argv, cli.format).await,
         Cmd::Agent { action } => cmd::agent::handle(action, cli.format).await,
-        Cmd::Workflow { action } => cmd::workflow::handle(action, cli.format).await,
+        Cmd::Workflow { action } => {
+            cmd::workflow::handle(action, cli.format, cli.absolute, cli.all_columns).await
+        }
         Cmd::Autoflow { action } => cmd::autoflow::handle(action, cli.format).await,
         Cmd::Transcript { action } => cmd::transcript::handle(action, cli.format).await,
         Cmd::Config { action } => cmd::config::handle(action).await,
@@ -298,7 +309,9 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Auth { action } => cmd::auth::handle(action, cli.format).await,
         Cmd::Models { action } => cmd::models::handle(action, cli.format).await,
         Cmd::Repos { action } => cmd::repos::handle(action, cli.format).await,
-        Cmd::Session { action } => cmd::session::handle(action, cli.format).await,
+        Cmd::Session { action } => {
+            cmd::session::handle(action, cli.format, cli.absolute, cli.all_columns).await
+        }
         Cmd::Issues { action } => cmd::issues::handle(action, cli.format).await,
         Cmd::Init(args) => cmd::init::handle(args).await,
         Cmd::Mcp { action } => cmd::mcp::handle(action).await,
@@ -581,5 +594,26 @@ mod arg_parse_tests {
             }
             other => panic!("expected Workflow(Resume), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn global_table_flags_parse() {
+        let cli = crate::Cli::try_parse_from(["rupu", "--absolute", "session", "list"])
+            .expect("cli parses");
+        assert!(cli.absolute);
+        let cli = crate::Cli::try_parse_from(["rupu", "--all-columns", "session", "list"])
+            .expect("cli parses");
+        assert!(cli.all_columns);
+
+        // `global = true` is what lets these flags land AFTER the
+        // subcommand too (`session list --absolute`), not just before it.
+        // Without asserting this position, dropping `global = true` from
+        // the `Cli` field would still pass the two cases above.
+        let cli = crate::Cli::try_parse_from(["rupu", "session", "list", "--absolute"])
+            .expect("cli parses with flag after subcommand");
+        assert!(cli.absolute);
+        let cli = crate::Cli::try_parse_from(["rupu", "session", "list", "--all-columns"])
+            .expect("cli parses with flag after subcommand");
+        assert!(cli.all_columns);
     }
 }

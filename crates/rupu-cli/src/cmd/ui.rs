@@ -70,6 +70,12 @@ pub struct UiPrefs {
     pub palette: crate::output::palette::UiPaletteTheme,
     pub live_view: LiveViewMode,
     pub pager: PagerMode,
+    /// Render table timestamps as absolute ISO instead of relative ages.
+    /// Always `false` out of `resolve`; set via `with_table_flags`.
+    pub absolute: bool,
+    /// Keep every table column, even ones empty for every row shown.
+    /// Always `false` out of `resolve`; set via `with_table_flags`.
+    pub all_columns: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,6 +207,27 @@ impl UiPrefs {
             palette: palette_spec.palette,
             live_view,
             pager,
+            absolute: false,
+            all_columns: false,
+        }
+    }
+
+    /// Apply the global table-rendering flags. Chained by commands that
+    /// render entity lists; every other caller keeps the defaults.
+    ///
+    /// Deliberately a builder rather than two more `resolve` parameters —
+    /// `resolve` has 76 call sites and none of the others care.
+    pub fn with_table_flags(mut self, absolute: bool, all_columns: bool) -> Self {
+        self.absolute = absolute;
+        self.all_columns = all_columns;
+        self
+    }
+
+    /// The entity-table rendering options implied by these prefs.
+    pub fn render_opts(&self) -> crate::output::entity_table::RenderOpts {
+        crate::output::entity_table::RenderOpts {
+            absolute: self.absolute,
+            all_columns: self.all_columns,
         }
     }
 
@@ -885,5 +912,29 @@ mod tests {
             parse_live_view(Some("compact")),
             Some(LiveViewMode::Compact)
         );
+    }
+
+    #[test]
+    fn table_flags_default_to_off() {
+        let cfg = rupu_config::UiConfig::default();
+        let prefs = UiPrefs::resolve(&cfg, true, None, None, None);
+        let opts = prefs.render_opts();
+        assert!(!opts.absolute);
+        assert!(!opts.all_columns);
+    }
+
+    #[test]
+    fn with_table_flags_sets_both() {
+        let cfg = rupu_config::UiConfig::default();
+        let prefs = UiPrefs::resolve(&cfg, true, None, None, None).with_table_flags(true, false);
+        let opts = prefs.render_opts();
+        assert!(opts.absolute);
+        assert!(!opts.all_columns);
+
+        let cfg = rupu_config::UiConfig::default();
+        let prefs = UiPrefs::resolve(&cfg, true, None, None, None).with_table_flags(false, true);
+        let opts = prefs.render_opts();
+        assert!(!opts.absolute);
+        assert!(opts.all_columns);
     }
 }

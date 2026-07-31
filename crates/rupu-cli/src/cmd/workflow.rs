@@ -408,9 +408,14 @@ fn parse_kv(s: &str) -> Result<(String, String), String> {
     Ok((k.to_string(), v.to_string()))
 }
 
-pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> ExitCode {
+pub async fn handle(
+    action: Action,
+    global_format: Option<OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
+) -> ExitCode {
     let result = match action {
-        Action::List => list(global_format).await,
+        Action::List => list(global_format, absolute, all_columns).await,
         Action::Show {
             name,
             view,
@@ -494,6 +499,8 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
                 issue.as_deref(),
                 no_color,
                 global_format,
+                absolute,
+                all_columns,
             )
             .await
         }
@@ -614,6 +621,11 @@ struct WorkflowRunsReport {
 struct WorkflowListOutput {
     prefs: crate::cmd::ui::UiPrefs,
     report: WorkflowListReport,
+    /// Enriched rows for the human table. Kept separate from
+    /// `report.rows` (`WorkflowListRow`, `Serialize`) because that
+    /// shape feeds `--format json` / `--format csv` and is frozen by
+    /// contract — see `WorkflowListDisplayRow`.
+    display_rows: Vec<WorkflowListDisplayRow>,
 }
 
 impl CollectionOutput for WorkflowListOutput {
@@ -637,17 +649,143 @@ impl CollectionOutput for WorkflowListOutput {
     }
 
     fn render_table(&self) -> anyhow::Result<()> {
-        let mut table = crate::output::tables::new_table();
-        table.set_header(vec!["NAME", "SCOPE"]);
-        for row in &self.report.rows {
-            table.add_row(vec![
-                comfy_table::Cell::new(&row.name),
-                crate::output::tables::status_cell(&row.scope, &self.prefs),
-            ]);
-        }
-        println!("{table}");
+        println!(
+            "{}",
+            render_workflow_list_table(
+                &self.display_rows,
+                &self.prefs,
+                self.prefs.render_opts(),
+                chrono::Utc::now(),
+            )
+        );
         Ok(())
     }
+}
+
+/// One workflow's row in the HUMAN listing.
+///
+/// Deliberately separate from `WorkflowListRow`, which is `Serialize`
+/// and feeds `--format json` / `--format csv`. That shape is frozen by
+/// contract, so enrichment lives here and never touches it.
+struct WorkflowListDisplayRow {
+    name: String,
+    scope: String,
+    /// `None` when the workflow file could not be parsed.
+    steps: Option<usize>,
+    /// `None` when the workflow has no cron trigger.
+    schedule: Option<String>,
+    /// `(status, started_at)` of the most recent run, if any.
+    last_run: Option<(String, chrono::DateTime<chrono::Utc>)>,
+}
+
+/// The fields of a run that the workflow listing needs.
+///
+/// An owned projection rather than a borrowed `RunRecord`, so the join
+/// below is unit-testable without building full records — `RunStore`'s
+/// only record builder is test-private to `rupu-orchestrator`.
+struct LatestRun {
+    workflow_name: String,
+    status: String,
+    started_at: chrono::DateTime<chrono::Utc>,
+    // Not read by the display path today (the table shows status +
+    // relative time only), but part of the projection's contract and
+    // exercised directly by `latest_run_keeps_only_the_most_recent_per_workflow`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    run_id: String,
+}
+
+/// Most recent run per workflow name.
+///
+/// Pure, and the reason the listing stays O(workflows + runs): the run
+/// store is read ONCE by the caller and folded here. Reading it per row
+/// would be O(workflows x runs), and `RunStore::list` deserializes every
+/// `run.json`.
+fn latest_run_by_workflow(runs: &[LatestRun]) -> std::collections::HashMap<&str, &LatestRun> {
+    let mut out: std::collections::HashMap<&str, &LatestRun> = std::collections::HashMap::new();
+    for run in runs {
+        out.entry(run.workflow_name.as_str())
+            .and_modify(|existing| {
+                if run.started_at > existing.started_at {
+                    *existing = run;
+                }
+            })
+            .or_insert(run);
+    }
+    out
+}
+
+/// Build the `workflow list` table's `EntityTable`. Split out of
+/// `render_workflow_list_table` so tests can force a narrow render width
+/// (`EntityTable::render_at_width`) to exercise the NAME column's no-wrap
+/// constraint under real squeeze pressure — `render_workflow_list_table`
+/// itself only exposes the production `render` path, which picks up the
+/// real terminal width and cannot be forced narrow in a test.
+fn build_workflow_list_table<'a>(
+    rows: &[WorkflowListDisplayRow],
+    prefs: &'a crate::cmd::ui::UiPrefs,
+    opts: crate::output::entity_table::RenderOpts,
+    now: chrono::DateTime<chrono::Utc>,
+) -> crate::output::entity_table::EntityTable<'a> {
+    use crate::output::entity_table::{CellValue, EntityTable};
+
+    let mut table = EntityTable::new(
+        prefs,
+        opts,
+        vec!["NAME", "SCOPE", "STEPS", "LAST RUN", "SCHEDULE"],
+    )
+    .with_summary("workflow");
+
+    for row in rows {
+        table = table.row(vec![
+            // A workflow name is an identifier the CLI accepts back
+            // (`workflow show`/`run`/`runs --workflow`) — `CellValue::Name`
+            // renders it verbatim but never lets it wrap, unlike a plain
+            // `CellValue::Text` (I-1).
+            CellValue::Name(row.name.clone()),
+            CellValue::Status(row.scope.clone()),
+            match row.steps {
+                Some(n) => CellValue::Text(n.to_string()),
+                None => CellValue::Missing,
+            },
+            match &row.last_run {
+                // Glyph + status + age in one cell — the facts an
+                // operator scans this column for ("did it run, and did
+                // it work"). `CellValue::Status` is deliberately NOT
+                // used here: its own glyph rendering would double up
+                // against the one built explicitly below. Because this
+                // is hand-built `Text` rather than `Timestamp`, it has
+                // to honor `opts.absolute` itself — `EntityTable` only
+                // does that switch automatically for `CellValue::Timestamp`.
+                Some((status, at)) => CellValue::Text(format!(
+                    "{} {} {}",
+                    crate::output::tables::status_glyph(status)
+                        .map(|g| g.to_string())
+                        .unwrap_or_default(),
+                    status,
+                    if opts.absolute {
+                        at.to_rfc3339()
+                    } else {
+                        crate::output::fmt::relative_time(*at, now)
+                    },
+                )),
+                None => CellValue::Missing,
+            },
+            match &row.schedule {
+                Some(s) => CellValue::Text(s.clone()),
+                None => CellValue::Missing,
+            },
+        ]);
+    }
+    table
+}
+
+fn render_workflow_list_table(
+    rows: &[WorkflowListDisplayRow],
+    prefs: &crate::cmd::ui::UiPrefs,
+    opts: crate::output::entity_table::RenderOpts,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    build_workflow_list_table(rows, prefs, opts, now).render(now)
 }
 
 struct WorkflowRunsOutput {
@@ -773,44 +911,103 @@ impl CollectionOutput for WorkflowRunsOutput {
     }
 
     fn render_table(&self) -> anyhow::Result<()> {
-        let mut table = crate::output::tables::new_table();
-        table.set_header(vec![
-            "RUN ID",
-            "STATUS",
-            "STARTED (UTC)",
-            "DURATION",
-            "EXPIRES",
-            "TOKENS",
-            "COST",
-            "WORKFLOW",
-        ]);
-        for row in &self.report.rows {
-            let expires_cell = match row.expires_in_seconds {
-                Some(delta) => crate::output::tables::relative_time_cell(delta, &self.prefs),
-                None => comfy_table::Cell::new(""),
-            };
-            let duration = row
-                .duration_seconds
-                .map(|seconds| format!("{seconds}s"))
-                .unwrap_or_else(|| "(in flight)".to_string());
-            let cost = row
-                .cost_usd
-                .map(|value| format!("${value:.4}"))
-                .unwrap_or_else(|| "—".to_string());
-            table.add_row(vec![
-                comfy_table::Cell::new(&row.run_id),
-                crate::output::tables::status_cell(&row.status, &self.prefs),
-                comfy_table::Cell::new(&row.started_at),
-                comfy_table::Cell::new(duration),
-                expires_cell,
-                comfy_table::Cell::new(format_tokens_total(row.total_tokens)),
-                comfy_table::Cell::new(cost),
-                comfy_table::Cell::new(&row.workflow),
-            ]);
-        }
-        println!("{table}");
+        println!(
+            "{}",
+            render_workflow_runs_table(
+                &self.report.rows,
+                &self.prefs,
+                self.prefs.render_opts(),
+                chrono::Utc::now()
+            )
+        );
         Ok(())
     }
+}
+
+/// Build the `workflow runs` table. Split out of `render_table` so it
+/// can be asserted directly instead of through captured stdout.
+///
+/// `now` is a parameter for deterministic tests; the caller passes
+/// `Utc::now()`.
+fn render_workflow_runs_table(
+    rows: &[WorkflowRunsRow],
+    prefs: &crate::cmd::ui::UiPrefs,
+    opts: crate::output::entity_table::RenderOpts,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    use crate::output::entity_table::{CellValue, EntityTable};
+
+    let mut table = EntityTable::new(
+        prefs,
+        opts,
+        vec![
+            "RUN ID", "STATUS", "STARTED", "DURATION", "EXPIRES", "TOKENS", "COST", "WORKFLOW",
+        ],
+    )
+    .with_summary("run");
+
+    for row in rows {
+        // `WorkflowRunsRow.started_at` is written (workflow.rs's `runs`
+        // builder) as `run.started_at.format("%Y-%m-%d %H:%M:%S")` — the
+        // source `DateTime<Utc>` stringified without an offset. Try that
+        // exact format first (interpreting the naive result as UTC is
+        // correct, not a guess: the source value already was UTC before
+        // stringifying). RFC3339 is a second chance for any other writer
+        // of this field. A value matching neither must not hide the run.
+        let started = chrono::NaiveDateTime::parse_from_str(&row.started_at, "%Y-%m-%d %H:%M:%S")
+            .map(|naive| CellValue::Timestamp(naive.and_utc()))
+            .or_else(|_| {
+                chrono::DateTime::parse_from_rfc3339(&row.started_at)
+                    .map(|ts| CellValue::Timestamp(ts.with_timezone(&chrono::Utc)))
+            })
+            .unwrap_or_else(|_| CellValue::Text(row.started_at.clone()));
+        table = table.row(vec![
+            CellValue::Id(row.run_id.clone()),
+            CellValue::Status(row.status.clone()),
+            started,
+            match row.duration_seconds {
+                Some(s) => CellValue::Text(format!("{s}s")),
+                // Pre-task `render_table` (parent commit 6c312895) printed
+                // this exact label for a run with no `finished_at` yet
+                // (running / awaiting). `CellValue::Missing` would both
+                // regress that to an em dash AND make DURATION eligible
+                // for empty-column suppression, dropping the column
+                // outright on an all-`--status running` listing.
+                None => CellValue::Text("(in flight)".to_string()),
+            },
+            // seconds-until, not a point in time
+            match row.expires_in_seconds {
+                Some(s) => CellValue::Text(crate::output::tables::format_seconds(s)),
+                None => CellValue::Missing,
+            },
+            CellValue::Text(crate::output::fmt::format_token_compact(row.total_tokens)),
+            match row.cost_usd {
+                Some(c) => CellValue::Text(format!("${c:.4}")),
+                // `None` means *not computable* (no usage rows, or no
+                // `[pricing]` configured) — not "this run has no cost
+                // dimension". `CellValue::Missing` would make COST
+                // suppression-eligible, so a user with no pricing
+                // configured would lose the column on every single
+                // invocation (I-2).
+                //
+                // Parent commit 7ea8904c rendered a plain em dash
+                // (`"—".to_string()`) for this same `None` case, via
+                // direct `comfy_table` construction that had no
+                // suppression logic to defeat. Reusing that literal
+                // string here would NOT fix the bug: `CellValue::Text`'s
+                // `is_empty()` treats the exact string "—" as empty too
+                // (see `entity_table.rs`'s `is_empty_distinguishes_missing_from_present`
+                // test), specifically so a hand-built cell that merely
+                // *looks like* Missing still suppresses like Missing. So
+                // an em dash here would still vanish under an
+                // all-`None` filter — the exact bug this fixes. `"n/a"`
+                // is a stable, non-empty, non-"—" label instead.
+                None => CellValue::Text("n/a".to_string()),
+            },
+            CellValue::Text(row.workflow.clone()),
+        ]);
+    }
+    table.render(now)
 }
 
 impl DetailOutput for WorkflowShowOutput {
@@ -950,7 +1147,11 @@ fn styled_usage_line(status: UiStatus, label: &str, detail: &str) -> String {
     buf
 }
 
-async fn list(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
+async fn list(
+    global_format: Option<OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
@@ -965,7 +1166,55 @@ async fn list(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
         push_yaml_names(&p.join(".rupu/workflows"), "project", &mut by_name);
     }
     let cfg = layered_config_workflow(&global, project_root.as_deref());
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, None);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, None)
+        .with_table_flags(absolute, all_columns);
+
+    // Read the run store ONCE and fold it into a latest-run-per-workflow
+    // map; reading it per row would be O(workflows x runs), and
+    // `RunStore::list` deserializes every `run.json`. A read failure
+    // (e.g. the runs dir doesn't exist yet) degrades to "no runs known"
+    // rather than blanking the whole listing — this command did no I/O
+    // at all before this task and must not gain a new hard-failure mode.
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let latest_runs: Vec<LatestRun> = store
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| LatestRun {
+            workflow_name: r.workflow_name,
+            status: r.status.as_str().to_string(),
+            started_at: r.started_at,
+            run_id: r.id,
+        })
+        .collect();
+    let latest_by_name = latest_run_by_workflow(&latest_runs);
+
+    // STEPS/SCHEDULE need a real parse of each workflow file — new I/O
+    // on a command that previously only read filenames. A workflow that
+    // fails to parse still renders as a row (Missing in both columns);
+    // one malformed file must never blank the listing.
+    let display_rows: Vec<WorkflowListDisplayRow> = by_name
+        .iter()
+        .map(|(name, scope)| {
+            let (steps, schedule) = locate_workflow_in(&global, project_root.as_deref(), name)
+                .ok()
+                .and_then(|path| std::fs::read_to_string(&path).ok())
+                .and_then(|body| rupu_orchestrator::Workflow::parse(&body).ok())
+                .map(|wf| (Some(wf.steps.len()), wf.trigger.cron.clone()))
+                .unwrap_or((None, None));
+            let last_run = latest_by_name
+                .get(name.as_str())
+                .map(|r| (r.status.clone(), r.started_at));
+            WorkflowListDisplayRow {
+                name: name.clone(),
+                scope: scope.clone(),
+                steps,
+                schedule,
+                last_run,
+            }
+        })
+        .collect();
+
     let output = WorkflowListOutput {
         prefs,
         report: WorkflowListReport {
@@ -976,6 +1225,7 @@ async fn list(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
                 .map(|(name, scope)| WorkflowListRow { name, scope })
                 .collect(),
         },
+        display_rows,
     };
     report::emit_collection(global_format, &output)
 }
@@ -2005,6 +2255,8 @@ async fn runs(
     issue_filter: Option<&str>,
     no_color: bool,
     global_format: Option<OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
 ) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let runs_dir = global.join("runs");
@@ -2132,7 +2384,8 @@ async fn runs(
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     let cfg = layered_config_workflow(&global, project_root.as_deref());
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None)
+        .with_table_flags(absolute, all_columns);
 
     let rows: Vec<WorkflowRunsRow> = filtered
         .iter()
@@ -2197,16 +2450,6 @@ fn aggregate_run_usage_from_store(
 
 fn total_tokens(rows: &[rupu_transcript::UsageRow]) -> u64 {
     rows.iter().map(|r| r.input_tokens + r.output_tokens).sum()
-}
-
-fn format_tokens_total(total: u64) -> String {
-    if total >= 1_000_000 {
-        format!("{:.2}M", total as f64 / 1_000_000.0)
-    } else if total >= 1_000 {
-        format!("{:.1}K", total as f64 / 1_000.0)
-    } else {
-        total.to_string()
-    }
 }
 
 fn run_cost_usd(
@@ -5705,5 +5948,374 @@ steps:
     fn resolve_run_id_reports_unknown() {
         let err = resolve_run_id(&run_candidates(), "zzzzzz").expect_err("unknown");
         assert!(err.to_string().contains("unknown run"));
+    }
+
+    fn runs_row_for_test(
+        run_id: &str,
+        status: &str,
+        started_at: &str,
+        expires_in_seconds: Option<i64>,
+    ) -> WorkflowRunsRow {
+        WorkflowRunsRow {
+            run_id: run_id.to_string(),
+            status: status.to_string(),
+            started_at: started_at.to_string(),
+            duration_seconds: Some(194),
+            expires_in_seconds,
+            total_tokens: 1_820_000,
+            cost_usd: Some(5.522),
+            workflow: "nightly-maintainability-security".to_string(),
+        }
+    }
+
+    fn runs_test_now() -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(2026, 7, 30, 17, 0, 0).unwrap()
+    }
+
+    fn runs_test_prefs() -> crate::cmd::ui::UiPrefs {
+        let cfg = rupu_config::UiConfig::default();
+        crate::cmd::ui::UiPrefs::resolve(&cfg, true, None, None, None)
+    }
+
+    #[test]
+    fn workflow_runs_table_compacts_glyphs_and_drops_empty_expires() {
+        let rows = vec![
+            runs_row_for_test(
+                "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+                "completed",
+                "2026-07-30T13:46:31+00:00",
+                None,
+            ),
+            runs_row_for_test(
+                "run_01KYPASX18NYRER5NQPDWB2HZV",
+                "failed",
+                "2026-07-29T07:00:43+00:00",
+                None,
+            ),
+        ];
+        let out = render_workflow_runs_table(
+            &rows,
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            runs_test_now(),
+        );
+
+        assert!(out.contains("run_01KYSMDN…GKYJ"), "got: {out}");
+        assert!(
+            !out.contains("run_01KYSMDNG84N9Z8XXHQZP3GKYJ"),
+            "full id leaked into a cell: {out}"
+        );
+        assert!(out.contains("✓ completed"), "got: {out}");
+        assert!(out.contains("✗ failed"), "got: {out}");
+        assert!(out.contains("3h ago"), "relative start missing: {out}");
+        assert!(!out.contains("EXPIRES"), "empty EXPIRES survived: {out}");
+        assert!(out.contains("2 runs"), "summary missing: {out}");
+    }
+
+    #[test]
+    fn workflow_runs_keeps_expires_when_a_run_has_one() {
+        // Suppression must be driven by the data, not hardcoded.
+        let rows = vec![
+            runs_row_for_test("run_a1b2c3d4e5f6g7h8i9j0k1l2", "running", "2026-07-30T16:00:00+00:00", Some(300)),
+            runs_row_for_test("run_z9y8x7w6v5u4t3s2r1q0p9o8", "completed", "2026-07-30T15:00:00+00:00", None),
+        ];
+        let out = render_workflow_runs_table(
+            &rows,
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            runs_test_now(),
+        );
+        assert!(out.contains("EXPIRES"), "populated EXPIRES dropped: {out}");
+    }
+
+    #[test]
+    fn workflow_runs_survives_an_unparseable_started_at() {
+        let rows = vec![runs_row_for_test(
+            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+            "completed",
+            "not-a-timestamp",
+            None,
+        )];
+        let out = render_workflow_runs_table(
+            &rows,
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            runs_test_now(),
+        );
+        assert!(out.contains("not-a-timestamp"), "row was dropped: {out}");
+    }
+
+    #[test]
+    fn workflow_runs_parses_the_real_stored_started_at_format() {
+        // `WorkflowRunsRow.started_at` is written (see `runs()`) as
+        // `run.started_at.format("%Y-%m-%d %H:%M:%S")` — not RFC3339.
+        // The real format must recover the instant and render a
+        // relative age, not fall through to the literal-text branch.
+        let rows = vec![runs_row_for_test(
+            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+            "completed",
+            "2026-07-30 13:00:00",
+            None,
+        )];
+        let out = render_workflow_runs_table(
+            &rows,
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            runs_test_now(),
+        );
+        assert!(out.contains("4h ago"), "got: {out}");
+        assert!(
+            !out.contains("2026-07-30 13:00:00"),
+            "literal text leaked instead of a relative age: {out}"
+        );
+    }
+
+    #[test]
+    fn workflow_runs_stored_format_renders_iso_under_absolute() {
+        let rows = vec![runs_row_for_test(
+            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+            "completed",
+            "2026-07-30 13:00:00",
+            None,
+        )];
+        let out = render_workflow_runs_table(
+            &rows,
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts {
+                absolute: true,
+                all_columns: false,
+            },
+            runs_test_now(),
+        );
+        assert!(out.contains("2026-07-30T13:00:00"), "got: {out}");
+    }
+
+    #[test]
+    fn workflow_runs_in_flight_duration_shows_the_pre_task_label() {
+        // A run with no `finished_at` yet (running / awaiting) must keep
+        // the explicit "(in flight)" label from the pre-task
+        // `render_table`, not an em dash from `CellValue::Missing`.
+        let mut row = runs_row_for_test(
+            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+            "running",
+            "2026-07-30T13:00:00+00:00",
+            None,
+        );
+        row.duration_seconds = None;
+        let out = render_workflow_runs_table(
+            &[row],
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            runs_test_now(),
+        );
+        assert!(out.contains("(in flight)"), "got: {out}");
+    }
+
+    #[test]
+    fn workflow_runs_duration_column_survives_when_every_row_is_in_flight() {
+        // The regression this guards against: mapping an unfinished
+        // run's duration to `CellValue::Missing` makes DURATION eligible
+        // for empty-column suppression, so a listing where every
+        // displayed row is still running (e.g. `--status running`) would
+        // drop the column outright.
+        let mut a = runs_row_for_test(
+            "run_a1b2c3d4e5f6g7h8i9j0k1l2",
+            "running",
+            "2026-07-30T16:00:00+00:00",
+            None,
+        );
+        a.duration_seconds = None;
+        let mut b = runs_row_for_test(
+            "run_z9y8x7w6v5u4t3s2r1q0p9o8",
+            "running",
+            "2026-07-30T15:00:00+00:00",
+            None,
+        );
+        b.duration_seconds = None;
+        let out = render_workflow_runs_table(
+            &[a, b],
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            runs_test_now(),
+        );
+        assert!(out.contains("DURATION"), "column was suppressed: {out}");
+        assert!(out.contains("(in flight)"), "got: {out}");
+    }
+
+    #[test]
+    fn workflow_runs_cost_column_survives_when_every_row_is_not_computable() {
+        // I-2 regression guard, same class as the DURATION bug above:
+        // `cost_usd: None` means *not computable* (no usage rows, or no
+        // `[pricing]` configured) — not "this run has no cost dimension".
+        // Mapping it to `CellValue::Missing` makes COST eligible for
+        // empty-column suppression, so a user with no `[pricing]`
+        // configured at all would lose the column on every invocation of
+        // `workflow runs`, not just a filtered subset.
+        let mut a = runs_row_for_test(
+            "run_a1b2c3d4e5f6g7h8i9j0k1l2",
+            "failed",
+            "2026-07-30T16:00:00+00:00",
+            None,
+        );
+        a.cost_usd = None;
+        let mut b = runs_row_for_test(
+            "run_z9y8x7w6v5u4t3s2r1q0p9o8",
+            "failed",
+            "2026-07-30T15:00:00+00:00",
+            None,
+        );
+        b.cost_usd = None;
+        let out = render_workflow_runs_table(
+            &[a, b],
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            runs_test_now(),
+        );
+        assert!(out.contains("COST"), "column was suppressed: {out}");
+        assert!(out.contains("n/a"), "got: {out}");
+    }
+
+    #[test]
+    fn workflow_runs_finished_duration_is_unchanged() {
+        let rows = vec![runs_row_for_test(
+            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+            "completed",
+            "2026-07-30T13:00:00+00:00",
+            None,
+        )];
+        let out = render_workflow_runs_table(
+            &rows,
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            runs_test_now(),
+        );
+        assert!(out.contains("194s"), "got: {out}");
+    }
+
+    fn run_for_test(
+        id: &str,
+        workflow_name: &str,
+        status: rupu_orchestrator::RunStatus,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> LatestRun {
+        LatestRun {
+            workflow_name: workflow_name.to_string(),
+            status: format!("{status:?}").to_lowercase(),
+            started_at,
+            run_id: id.to_string(),
+        }
+    }
+
+    #[test]
+    fn latest_run_keeps_only_the_most_recent_per_workflow() {
+        use chrono::TimeZone;
+        let older = chrono::Utc.with_ymd_and_hms(2026, 7, 28, 9, 0, 0).unwrap();
+        let newer = chrono::Utc.with_ymd_and_hms(2026, 7, 30, 9, 0, 0).unwrap();
+        let runs = vec![
+            run_for_test("run_old", "nightly", rupu_orchestrator::RunStatus::Failed, older),
+            run_for_test("run_new", "nightly", rupu_orchestrator::RunStatus::Completed, newer),
+            run_for_test("run_other", "review", rupu_orchestrator::RunStatus::Completed, older),
+        ];
+        let map = latest_run_by_workflow(&runs);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("nightly").unwrap().run_id, "run_new");
+        assert_eq!(map.get("review").unwrap().run_id, "run_other");
+    }
+
+    #[test]
+    fn latest_run_on_an_empty_list_is_empty() {
+        assert!(latest_run_by_workflow(&[]).is_empty());
+    }
+
+    #[test]
+    fn workflow_list_table_shows_steps_last_run_and_schedule() {
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 7, 30, 17, 0, 0).unwrap();
+        let ran = chrono::Utc.with_ymd_and_hms(2026, 7, 30, 13, 0, 0).unwrap();
+        let rows = vec![
+            WorkflowListDisplayRow {
+                name: "nightly-health".to_string(),
+                scope: "project".to_string(),
+                steps: Some(7),
+                schedule: Some("0 7 * * *".to_string()),
+                last_run: Some(("completed".to_string(), ran)),
+            },
+            WorkflowListDisplayRow {
+                name: "action-demo".to_string(),
+                scope: "project".to_string(),
+                steps: Some(2),
+                schedule: None,
+                last_run: None,
+            },
+        ];
+        let out = render_workflow_list_table(
+            &rows,
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            now,
+        );
+
+        assert!(out.contains("STEPS"), "got: {out}");
+        assert!(out.contains("LAST RUN"), "got: {out}");
+        assert!(out.contains("SCHEDULE"), "got: {out}");
+        assert!(out.contains("✓ completed"), "got: {out}");
+        assert!(out.contains("4h ago"), "got: {out}");
+        assert!(out.contains("0 7 * * *"), "got: {out}");
+        assert!(out.contains("2 workflows"), "summary missing: {out}");
+    }
+
+    #[test]
+    fn workflow_list_renders_an_unparseable_workflow_as_a_row() {
+        // One malformed file must not blank the listing.
+        let now = chrono::Utc::now();
+        let rows = vec![WorkflowListDisplayRow {
+            name: "broken".to_string(),
+            scope: "project".to_string(),
+            steps: None,
+            schedule: None,
+            last_run: None,
+        }];
+        let out = render_workflow_list_table(
+            &rows,
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            now,
+        );
+        assert!(out.contains("broken"), "row was dropped: {out}");
+    }
+
+    #[test]
+    fn workflow_list_name_never_wraps_under_narrow_squeeze() {
+        // I-1 regression guard: a workflow name is an identifier the CLI
+        // accepts back (`workflow show`/`run`/`runs --workflow`). Going
+        // from 2 columns to 5 (this task) squeezed NAME below the
+        // longest real name at a normal 80-column terminal, splitting
+        // e.g. "nightly-maintainability-security" across two lines —
+        // and a wrapped name does not resolve. Force real squeeze
+        // pressure the same way `entity_table`'s own no-wrap tests do,
+        // via the shared `render_at_width` test hook, since production
+        // `render_workflow_list_table` only exposes real-terminal-width
+        // rendering.
+        let now = chrono::Utc::now();
+        let longest = "nightly-maintainability-security";
+        let rows = vec![WorkflowListDisplayRow {
+            name: longest.to_string(),
+            scope: "project".to_string(),
+            steps: Some(3),
+            schedule: Some("0 7 * * *".to_string()),
+            last_run: Some(("completed".to_string(), now - chrono::Duration::hours(9))),
+        }];
+        let out = build_workflow_list_table(
+            &rows,
+            &runs_test_prefs(),
+            crate::output::entity_table::RenderOpts::default(),
+            now,
+        )
+        .render_at_width(now, 80);
+        assert!(
+            out.contains(longest),
+            "longest workflow name must render intact on one line: {out}"
+        );
     }
 }

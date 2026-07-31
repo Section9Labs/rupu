@@ -5,6 +5,7 @@
 //! any pipe, and any CI runner.
 
 pub mod diag;
+pub mod entity_table;
 pub mod fmt;
 pub mod formats;
 pub mod ids;
