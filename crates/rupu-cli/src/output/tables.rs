@@ -348,6 +348,53 @@ pub(crate) fn format_seconds(s: i64) -> String {
     }
 }
 
+/// Colour for a `rupu_coverage` severity level.
+///
+/// Deliberately separate from [`status_color`], whose vocabulary is
+/// lifecycle states and a few classification values and knows nothing
+/// of `Severity`. Merging unrelated vocabularies is how a call site
+/// ends up silently depending on which function it happened to call.
+///
+/// Values arrive as `Debug` reprs (`Critical`, `High`, …), so matching
+/// is case-insensitive — a call site that lowercases must not lose the
+/// colour.
+pub fn severity_color(severity: &str, prefs: &UiPrefs) -> Option<TableColor> {
+    if !prefs.use_color() {
+        return None;
+    }
+    let palette = palette::active_palette();
+    Some(match severity.to_ascii_lowercase().as_str() {
+        "critical" => palette.sev_critical.into_table(),
+        "high" => palette.sev_high.into_table(),
+        "medium" => palette.sev_medium.into_table(),
+        "low" => palette.sev_low.into_table(),
+        "info" => palette.sev_info.into_table(),
+        _ => return None,
+    })
+}
+
+/// Colour for a coverage assertion status or audit verdict.
+///
+/// `Clean` / `Finding` / `Examined` / `NotApplicable` come from
+/// `AssertionStatus`; `ok` / `GAP` are the literals `coverage audit`
+/// renders in its Status column.
+///
+/// Returns `None` for lifecycle states — those belong to
+/// [`status_color`], and the two vocabularies must not overlap.
+pub fn coverage_status_color(status: &str, prefs: &UiPrefs) -> Option<TableColor> {
+    if !prefs.use_color() {
+        return None;
+    }
+    let palette = palette::active_palette();
+    Some(match status.to_ascii_lowercase().as_str() {
+        "finding" | "gap" => palette.failed.into_table(),
+        "clean" | "ok" => palette.complete.into_table(),
+        "examined" => palette.dim.into_table(),
+        "notapplicable" | "n/a" => palette.skipped.into_table(),
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,6 +684,96 @@ mod tests {
             "2w ago",
         ]);
         insta::assert_snapshot!(t.to_string());
+    }
+
+    #[test]
+    fn severity_color_maps_the_five_levels() {
+        let prefs = prefs_color_always();
+        let p = crate::output::palette::active_palette();
+        assert_eq!(
+            severity_color("Critical", &prefs),
+            Some(p.sev_critical.into_table())
+        );
+        assert_eq!(
+            severity_color("High", &prefs),
+            Some(p.sev_high.into_table())
+        );
+        assert_eq!(
+            severity_color("Medium", &prefs),
+            Some(p.sev_medium.into_table())
+        );
+        assert_eq!(severity_color("Low", &prefs), Some(p.sev_low.into_table()));
+        assert_eq!(
+            severity_color("Info", &prefs),
+            Some(p.sev_info.into_table())
+        );
+    }
+
+    #[test]
+    fn severity_color_is_case_insensitive() {
+        // Call sites may or may not lowercase the Debug repr; a casing
+        // change must not silently drop the colour.
+        let prefs = prefs_color_always();
+        assert_eq!(
+            severity_color("critical", &prefs),
+            severity_color("Critical", &prefs)
+        );
+        assert_eq!(
+            severity_color("HIGH", &prefs),
+            severity_color("High", &prefs)
+        );
+    }
+
+    #[test]
+    fn severity_color_rejects_unknown_and_respects_no_color() {
+        assert_eq!(severity_color("banana", &prefs_color_always()), None);
+        assert_eq!(severity_color("Critical", &prefs_no_color()), None);
+    }
+
+    #[test]
+    fn coverage_status_color_maps_assertion_states() {
+        let prefs = prefs_color_always();
+        let p = crate::output::palette::active_palette();
+        assert_eq!(
+            coverage_status_color("Finding", &prefs),
+            Some(p.failed.into_table())
+        );
+        assert_eq!(
+            coverage_status_color("Clean", &prefs),
+            Some(p.complete.into_table())
+        );
+        assert_eq!(
+            coverage_status_color("Examined", &prefs),
+            Some(p.dim.into_table())
+        );
+        assert_eq!(
+            coverage_status_color("NotApplicable", &prefs),
+            Some(p.skipped.into_table())
+        );
+    }
+
+    #[test]
+    fn coverage_status_color_covers_the_audit_verdicts() {
+        // `coverage audit` renders a literal "ok"/"GAP" Status column.
+        let prefs = prefs_color_always();
+        let p = crate::output::palette::active_palette();
+        assert_eq!(
+            coverage_status_color("GAP", &prefs),
+            Some(p.failed.into_table())
+        );
+        assert_eq!(
+            coverage_status_color("ok", &prefs),
+            Some(p.complete.into_table())
+        );
+    }
+
+    #[test]
+    fn coverage_status_color_does_not_hijack_lifecycle_states() {
+        // These belong to status_color. Overlap would make which
+        // function a call site used silently significant.
+        let prefs = prefs_color_always();
+        assert_eq!(coverage_status_color("running", &prefs), None);
+        assert_eq!(coverage_status_color("failed", &prefs), None);
     }
 
     #[test]
