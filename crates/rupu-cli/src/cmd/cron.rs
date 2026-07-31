@@ -169,22 +169,97 @@ impl CollectionOutput for CronListOutput {
     }
 
     fn render_table(&self) -> anyhow::Result<()> {
-        let mut table = crate::output::tables::new_table();
-        table.set_header(vec!["NAME", "SCHEDULE", "NEXT (UTC)", "IN"]);
-        for row in &self.report.rows {
-            table.add_row(vec![
-                comfy_table::Cell::new(&row.name),
-                comfy_table::Cell::new(&row.schedule),
-                comfy_table::Cell::new(row.next_utc.as_deref().unwrap_or("<unschedulable>")),
-                match row.in_seconds {
-                    Some(delta) => crate::output::tables::relative_time_cell(delta, &self.prefs),
-                    None => comfy_table::Cell::new(""),
-                },
-            ]);
-        }
-        println!("{table}");
+        println!(
+            "{}",
+            render_cron_list_table(&self.report.rows, &self.prefs, Utc::now())
+        );
         Ok(())
     }
+}
+
+/// Build the `cron list` human table: workflow names never wrap, a
+/// populated `NEXT (UTC)` renders relative (absolute under `--absolute`),
+/// and a bare `N workflows` summary (no `STATUS` header here, so no
+/// breakdown). Extracted from `render_table` so it can be asserted
+/// directly against its returned string. `now` is a parameter so tests
+/// are deterministic; `render_table` passes `Utc::now()`.
+///
+/// `next_utc` / `in_seconds` are computed together (`list()`, below) and
+/// are both `None` in exactly one case: the schedule failed to parse, or
+/// has no future occurrence. That is NOT "this entity has no such
+/// dimension" — every cron workflow has a schedule — it is "we could not
+/// compute it," which is precisely the failure state an operator runs
+/// `cron list` to discover. `CellValue::Missing` is suppression-eligible:
+/// mapping both columns to it would mean a listing where *every*
+/// schedule is broken drops both columns, hiding the exact failure the
+/// command exists to surface. So `None` renders as the stable
+/// `CellValue::Text("unschedulable")` on both columns instead — never
+/// empty, never `"—"`, so `is_empty()` never suppresses it even when
+/// every row shares it.
+fn render_cron_list_table(
+    rows: &[CronListRow],
+    prefs: &crate::cmd::ui::UiPrefs,
+    now: DateTime<Utc>,
+) -> String {
+    use crate::output::entity_table::{CellValue, EntityTable};
+
+    let mut table = EntityTable::new(
+        prefs,
+        prefs.render_opts(),
+        vec!["NAME", "SCHEDULE", "NEXT (UTC)", "IN"],
+    )
+    .with_summary("workflow");
+
+    for row in rows {
+        // `next_utc` is written (`list()`) as
+        // `time.format("%Y-%m-%d %H:%M:%S")` — the same naive format
+        // `render_transcript_list_table` parses (transcript.rs). Try
+        // that exact format first (the source `DateTime<Utc>` was UTC
+        // before stringifying, so interpreting the naive result as UTC
+        // is correct, not a guess), fall back to RFC3339 for any other
+        // writer of this field, and finally to the verbatim text so a
+        // malformed value never drops the row.
+        //
+        // Deliberately NOT `CellValue::Timestamp`: `fmt::relative_time`
+        // (the renderer behind it) clamps every future instant to "just
+        // now" — correct for the started_at/updated_at columns it was
+        // built for (clock-skew guard on values that are normally past),
+        // wrong here, since a cron `next_utc` is *always* in the future.
+        // A schedule firing in 5 hours would render as "just now",
+        // silently destroying the one thing this column exists to show.
+        // Hand-building the cell — same pattern `render_workflow_list_table`
+        // (workflow.rs) uses for its own "LAST RUN" column — lets it self
+        // -manage `opts.absolute` while rendering a real signed countdown
+        // (`tables::format_seconds`, which already handles both "Xh ago"
+        // and "in Xh" correctly) instead of the past-only renderer.
+        let next_cell = match &row.next_utc {
+            Some(text) => chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
+                .map(|naive| naive.and_utc())
+                .or_else(|_| DateTime::parse_from_rfc3339(text).map(|ts| ts.with_timezone(&Utc)))
+                .map(|ts| {
+                    if prefs.render_opts().absolute {
+                        CellValue::Text(ts.to_rfc3339())
+                    } else {
+                        CellValue::Text(crate::output::tables::format_seconds(
+                            (ts - now).num_seconds(),
+                        ))
+                    }
+                })
+                .unwrap_or_else(|_| CellValue::Text(text.clone())),
+            None => CellValue::Text("unschedulable".to_string()),
+        };
+        let in_cell = match row.in_seconds {
+            Some(seconds) => CellValue::Text(crate::output::tables::format_seconds(seconds)),
+            None => CellValue::Text("unschedulable".to_string()),
+        };
+        table = table.row(vec![
+            CellValue::Name(row.name.clone()),
+            CellValue::Text(row.schedule.clone()),
+            next_cell,
+            in_cell,
+        ]);
+    }
+    table.render(now)
 }
 
 struct CronEventsOutput {
@@ -1221,5 +1296,189 @@ steps:
             got.contains_key("nightly-enabled"),
             "`autoflow.enabled: true` must still fire on schedule"
         );
+    }
+
+
+    fn cron_list_test_now() -> DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(2026, 7, 30, 17, 0, 0).unwrap()
+    }
+
+    fn cron_list_test_prefs() -> crate::cmd::ui::UiPrefs {
+        let cfg = rupu_config::UiConfig::default();
+        crate::cmd::ui::UiPrefs::resolve(&cfg, true, None, None, None)
+    }
+
+    fn cron_row(
+        name: &str,
+        schedule: &str,
+        next_utc: Option<&str>,
+        in_seconds: Option<i64>,
+    ) -> CronListRow {
+        CronListRow {
+            name: name.to_string(),
+            schedule: schedule.to_string(),
+            next_utc: next_utc.map(str::to_string),
+            in_seconds,
+        }
+    }
+
+    #[test]
+    fn cron_list_table_name_never_wraps() {
+        // NAME maps to `CellValue::Name`: `workflow show`/`run` accept it
+        // back, so like `Id` it must never wrap across lines.
+        let rows = vec![cron_row(
+            "nightly-maintainability-security",
+            "0 7 * * *",
+            Some("2026-07-30 13:00:00"),
+            Some(3600),
+        )];
+        let out = render_cron_list_table(&rows, &cron_list_test_prefs(), cron_list_test_now());
+        assert!(
+            out.contains("nightly-maintainability-security"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn cron_list_table_next_utc_renders_relative_for_the_real_stored_format() {
+        // `CronListRow.next_utc` is written (see `list()`) as
+        // `time.format("%Y-%m-%d %H:%M:%S")` — not RFC3339. The real
+        // stored format must recover the instant and render a relative
+        // age, not fall through to the literal-text branch.
+        let rows = vec![cron_row(
+            "nightly-health",
+            "0 6 * * *",
+            Some("2026-07-30 13:00:00"),
+            Some(3600),
+        )];
+        let out = render_cron_list_table(&rows, &cron_list_test_prefs(), cron_list_test_now());
+        assert!(out.contains("4h ago"), "got: {out}");
+        assert!(
+            !out.contains("2026-07-30 13:00:00"),
+            "literal text leaked instead of a relative age: {out}"
+        );
+    }
+
+    #[test]
+    fn cron_list_table_next_utc_in_the_future_renders_a_countdown_not_just_now() {
+        // The real production shape: `next_utc` is always in the
+        // *future* relative to `now` (it's the schedule's next fire
+        // time). `CellValue::Timestamp`'s renderer (`fmt::relative_time`)
+        // clamps every future instant to "just now" — a real bug caught
+        // by running the actual binary against this repo's own nightly
+        // workflows (5h/6h out), which is exactly why `next_cell` is
+        // hand-built instead of routed through `CellValue::Timestamp`.
+        let rows = vec![cron_row(
+            "nightly-health",
+            "0 6 * * *",
+            Some("2026-07-30 21:00:00"),
+            Some(4 * 3600),
+        )];
+        let out = render_cron_list_table(&rows, &cron_list_test_prefs(), cron_list_test_now());
+        assert!(out.contains("in 4h"), "got: {out}");
+        assert!(
+            !out.contains("just now"),
+            "future next_utc must not render as \"just now\": {out}"
+        );
+    }
+
+    #[test]
+    fn cron_list_table_next_utc_renders_iso_under_absolute() {
+        // The behavioural proof that Task 2's `--absolute` plumbing
+        // actually reaches this renderer, not just clap parsing.
+        let rows = vec![cron_row(
+            "nightly-health",
+            "0 6 * * *",
+            Some("2026-07-30 13:00:00"),
+            Some(3600),
+        )];
+        let prefs = cron_list_test_prefs().with_table_flags(true, false);
+        let out = render_cron_list_table(&rows, &prefs, cron_list_test_now());
+        assert!(out.contains("2026-07-30T13:00:00"), "got: {out}");
+        assert!(!out.contains("4h ago"), "got: {out}");
+    }
+
+    #[test]
+    fn cron_list_table_survives_an_unparseable_next_utc() {
+        let rows = vec![cron_row(
+            "nightly-health",
+            "0 6 * * *",
+            Some("not-a-timestamp"),
+            Some(3600),
+        )];
+        let out = render_cron_list_table(&rows, &cron_list_test_prefs(), cron_list_test_now());
+        assert!(out.contains("not-a-timestamp"), "row was dropped: {out}");
+    }
+
+    #[test]
+    fn cron_list_table_unschedulable_row_still_shows_both_columns() {
+        // A single broken-schedule row mixed in with a healthy one: NEXT
+        // (UTC) and IN must both still render a stable, non-empty label
+        // for the broken row rather than an empty cell.
+        let rows = vec![
+            cron_row(
+                "nightly-health",
+                "0 6 * * *",
+                Some("2026-07-30 13:00:00"),
+                Some(3600),
+            ),
+            cron_row("broken-cron", "not a schedule", None, None),
+        ];
+        let out = render_cron_list_table(&rows, &cron_list_test_prefs(), cron_list_test_now());
+        assert!(out.contains("broken-cron"), "got: {out}");
+        assert!(out.contains("unschedulable"), "got: {out}");
+        // Both NEXT (UTC) and IN carry the label for the broken row — not
+        // just one of the two columns.
+        assert_eq!(
+            out.matches("unschedulable").count(),
+            2,
+            "expected both NEXT (UTC) and IN to show the label: {out}"
+        );
+    }
+
+    #[test]
+    fn cron_list_table_every_row_unschedulable_still_shows_both_columns() {
+        // The guard for this task's whole point: `next_utc` and
+        // `in_seconds` are both `None` together when a schedule can't be
+        // computed — not "this entity has no such dimension" (every cron
+        // workflow has a schedule). If both mapped to `CellValue::Missing`,
+        // a listing where *every* row is broken would suppress both
+        // columns entirely, hiding the exact failure `cron list` exists to
+        // surface. With every row sharing the same non-empty
+        // `CellValue::Text("unschedulable")`, `retained_columns` must NOT
+        // drop NEXT (UTC) or IN.
+        let rows = vec![
+            cron_row("broken-one", "not a schedule", None, None),
+            cron_row("broken-two", "also not a schedule", None, None),
+        ];
+        let out = render_cron_list_table(&rows, &cron_list_test_prefs(), cron_list_test_now());
+        assert!(
+            out.contains("NEXT (UTC)"),
+            "NEXT (UTC) header dropped: {out}"
+        );
+        assert!(out.contains("IN"), "IN header dropped: {out}");
+        assert_eq!(
+            out.matches("unschedulable").count(),
+            4,
+            "expected all 4 cells (2 rows × 2 columns) to show the label: {out}"
+        );
+    }
+
+    #[test]
+    fn cron_list_table_summary_is_a_bare_count() {
+        // No `STATUS` header on this table, so `.with_summary("workflow")`
+        // must not attempt a breakdown.
+        let rows = vec![
+            cron_row(
+                "nightly-health",
+                "0 6 * * *",
+                Some("2026-07-30 13:00:00"),
+                Some(3600),
+            ),
+            cron_row("broken-cron", "not a schedule", None, None),
+        ];
+        let out = render_cron_list_table(&rows, &cron_list_test_prefs(), cron_list_test_now());
+        assert!(out.starts_with("2 workflows\n\n"), "got: {out}");
     }
 }
