@@ -200,3 +200,14 @@ jobs:
         run: |
           docker run --rm -v "$PWD":/work -w /work rupu-linux-build \
             cargo fmt --all --check
+
+  release-scripts:
+    name: release cadence scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      # These scripts decide what gets published unattended every morning. A
+      # counter regression here silently republishes an old version, so they
+      # are gated on every PR rather than trusted.
+      - run: scripts/tests/release-cadence-tests.sh

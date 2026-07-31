@@ -1,0 +1,323 @@
+name: release-stable
+
+# Promotes a beta that has already soaked. Stable is therefore always a build
+# that shipped as a beta first — never code nobody has installed.
+#
+# This workflow also owns the base-version bump on `main`. That bump is not a
+# side effect of promoting: it runs whenever `main`'s `Cargo.toml` is not
+# ahead of the newest stable tag, because in that state release-beta.yml's
+# stall-guard skips every single morning and nothing else on the repo will
+# ever move the version again. See the `needs_bump` output below.
+on:
+  schedule:
+    # Sunday 09:17 UTC, after the morning beta slot.
+    - cron: "17 9 * * 0"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Promote this specific beta tag (e.g. v0.71.0-beta.3) instead of picking the newest soaked one"
+        required: false
+        type: string
+      soak_days:
+        description: "Override the soak window in days for this run only (default 2)"
+        required: false
+        type: string
+
+concurrency:
+  group: release-stable
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  # Days a beta must have existed before it can become stable. Two means a
+  # Thursday beta can promote on Sunday but Saturday's cannot.
+  SOAK_DAYS: "2"
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          # The default token is fine for READING; it cannot write here.
+          # `main` is protected by the ruleset in `.github/rulesets/main.json`
+          # whose sole bypass actor is `DeployKey`, and a tag pushed with the
+          # ambient token does not trigger release.yml at all. Both pushes in
+          # this job therefore re-point `origin` at SSH and use MAIN_PUSH_KEY.
+          token: ${{ github.token }}
+
+      - name: Pick a promotable beta
+        id: pick
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_SOAK_DAYS: ${{ inputs.soak_days }}
+        run: |
+          set -euo pipefail
+
+          # ---- Computed FIRST, and emitted before any early exit. --------
+          # `needs_bump` must reach the bump step on every path through this
+          # step — including the "nothing to promote" and "would go backwards"
+          # skips. Those are exactly the weeks where the version is stuck and
+          # the bump is the only thing that can unstick it.
+          #
+          # Strict `^v<major>.<minor>.<patch>$`: the repo carries legacy tags
+          # like `v0.45.0-cli` that release.yml would reject as malformed, and
+          # letting one become `newest_stable` would break the minor-bump
+          # arithmetic below.
+          base=$(grep -E '^version = "[0-9]+\.[0-9]+\.[0-9]+' Cargo.toml \
+            | head -n1 | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+[^"]*)".*/\1/')
+          newest_stable=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)
+
+          needs_bump=false
+          if [ -n "$newest_stable" ]; then
+            highest=$(printf '%s\nv%s\n' "$newest_stable" "$base" | sort -V | tail -n1)
+            if [ "$highest" = "$newest_stable" ]; then
+              needs_bump=true
+            fi
+          fi
+          echo "base=$base"                    >> "$GITHUB_OUTPUT"
+          echo "newest_stable=$newest_stable"  >> "$GITHUB_OUTPUT"
+          echo "needs_bump=$needs_bump"        >> "$GITHUB_OUTPUT"
+          echo "base $base / newest stable ${newest_stable:-none} / needs_bump $needs_bump"
+
+          # ---- Soak window, overridable for one run. ---------------------
+          soak="$SOAK_DAYS"
+          if [ -n "${INPUT_SOAK_DAYS:-}" ]; then
+            case "$INPUT_SOAK_DAYS" in
+              ''|*[!0-9]*)
+                echo "::error::soak_days must be a whole number of days (got '$INPUT_SOAK_DAYS')"
+                exit 1 ;;
+            esac
+            soak="$INPUT_SOAK_DAYS"
+            echo "::notice::soak window overridden to ${soak}d for this run"
+          fi
+
+          # ---- Which beta? -----------------------------------------------
+          # A `tag` input is the break-glass path for shipping a same-day
+          # fix as stable: it bypasses the pick and the soak window, and
+          # NOTHING else. The backward guard and the ancestry check below
+          # still apply to it. A bad value here is operator error, so it
+          # fails loudly rather than skipping.
+          if [ -n "${INPUT_TAG:-}" ]; then
+            tag="$INPUT_TAG"
+            case "$tag" in
+              v[0-9]*.[0-9]*.[0-9]*-beta|v[0-9]*.[0-9]*.[0-9]*-beta.[0-9]*) ;;
+              *) echo "::error::tag input '$tag' is not a v<X.Y.Z>-beta[.N] tag"; exit 1 ;;
+            esac
+            if ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+              echo "::error::tag input '$tag' does not exist in this repository"
+              exit 1
+            fi
+            echo "::notice::promoting the explicitly requested $tag, bypassing the pick and the soak window"
+          else
+            # `creatordate` is the tag's own creation time. release-beta.yml
+            # creates ANNOTATED tags precisely so that this is true — for a
+            # lightweight tag it degrades to the commit date, which would let
+            # a commit that sat unreleased for days count as pre-soaked the
+            # instant its beta was cut.
+            candidates=$(git for-each-ref --format='%(refname:short)%09%(creatordate:unix)' \
+              'refs/tags/v*-beta' 'refs/tags/v*-beta.*')
+
+            tag=$(printf '%s\n' "$candidates" \
+              | scripts/pick-promotable-beta.sh "$soak" "$(date -u +%s)")
+
+            if [ -z "$tag" ]; then
+              echo "::notice::no beta older than ${soak}d to promote — skipping this week"
+              echo "go=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          version="${tag#v}"; version="${version%%-beta*}"
+
+          # ---- Backward guard, BEFORE the ancestry check. ----------------
+          # Order matters. A stale beta left behind by a rebase is both
+          # unreachable AND backwards; checking ancestry first would turn
+          # every single Sunday red over a tag whose version this guard was
+          # always going to skip, and the picker would choose the same tag
+          # again next week — a permanent red with no self-healing.
+          #
+          # Without the guard itself, a stale beta from an older line would
+          # publish as stable and force-move `latest-stable` below the release
+          # users already have. This is the promoter's counterpart to
+          # release-beta.yml's stall-guard.
+          if [ -n "$newest_stable" ]; then
+            highest=$(printf '%s\nv%s\n' "$newest_stable" "$version" | sort -V | tail -n1)
+            if [ "$highest" = "$newest_stable" ]; then
+              echo "::notice::$tag would publish v$version, which is not newer than the shipped $newest_stable — skipping rather than moving latest-stable backwards"
+              echo "go=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          # ---- Ancestry. --------------------------------------------------
+          # Refuse a beta whose commit is no longer reachable from main (a
+          # force-push or rebase dropped it). Promoting it would ship code
+          # that is no longer in the tree. This one IS a hard failure: the
+          # version is newer than everything shipped, so silently skipping it
+          # would stall the stable channel with no signal.
+          sha=$(git rev-parse "$tag^{commit}")
+          # HEAD, not origin/main: the checkout above already put us on main,
+          # and a remote-tracking ref is not guaranteed to exist in the
+          # actions/checkout working copy.
+          if ! git merge-base --is-ancestor "$sha" HEAD; then
+            echo "::error::$tag ($sha) is not an ancestor of main — refusing to promote unreachable code"
+            exit 1
+          fi
+
+          echo "tag=$tag"          >> "$GITHUB_OUTPUT"
+          echo "sha=$sha"          >> "$GITHUB_OUTPUT"
+          echo "version=$version"  >> "$GITHUB_OUTPUT"
+          echo "go=true"           >> "$GITHUB_OUTPUT"
+          echo "promoting $tag ($sha) -> v$version"
+
+      - name: Tag the promoted commit as stable
+        id: tag
+        if: steps.pick.outputs.go == 'true'
+        env:
+          MAIN_PUSH_KEY: ${{ secrets.MAIN_PUSH_KEY }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ steps.pick.outputs.version }}
+          SHA: ${{ steps.pick.outputs.sha }}
+        run: |
+          set -euo pipefail
+          v="v$VERSION"
+          if git rev-parse -q --verify "refs/tags/$v" >/dev/null; then
+            echo "::notice::$v already exists — nothing to promote"
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # THE TAG MUST BE PUSHED OVER SSH WITH A DEPLOY KEY. Do not
+          # "simplify" this back to the ambient token.
+          #
+          # GitHub: "Events triggered by the GITHUB_TOKEN will not create a
+          # new workflow run, with the following exceptions: workflow_dispatch
+          # and repository_dispatch." release.yml triggers on `push: tags`, so
+          # a tag pushed with the token that actions/checkout@v5 baked into
+          # `http.extraheader` appears in the repo and publishes NOTHING —
+          # no binaries, no Homebrew, no AUR, no Nix — while this job goes
+          # green and the next run happily promotes the phantom.
+          if [ -z "${MAIN_PUSH_KEY:-}" ]; then
+            echo "::error::MAIN_PUSH_KEY is not set — the tag would push over the ambient token, which does not trigger release.yml, so nothing would be published."
+            exit 1
+          fi
+          mkdir -p -m 700 "$HOME/.ssh"
+          printf '%s\n' "$MAIN_PUSH_KEY" > "$HOME/.ssh/main_push"
+          chmod 600 "$HOME/.ssh/main_push"
+          ssh-keyscan -t ed25519 github.com > "$HOME/.ssh/known_hosts_main" 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/main_push -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts_main"
+          # checkout@v5 wired `origin` to an HTTPS URL with the ambient token
+          # baked into an extraheader; that identity is the one that does not
+          # trigger workflows.
+          git config --unset-all "http.https://github.com/.extraheader" || true
+          git remote set-url origin "git@github.com:${REPO}.git"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Tag the BETA's commit, not main's head: that is what makes stable
+          # byte-identical in content to the beta that soaked.
+          git tag -a "$v" -m "$v" "$SHA"
+          git push origin "$v"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::pushed $v — release.yml publishes it"
+
+      # Gated on EITHER a promotion this week OR main's base having fallen
+      # behind the newest stable. The second half is what makes the cadence
+      # self-healing: with the gate on `pushed` alone, a single failed bump —
+      # or the very first run, where Cargo.toml already equals the shipped
+      # stable — leaves release-beta.yml's stall-guard skipping every morning
+      # and nothing on the repo able to write Cargo.toml again. Green forever,
+      # publishing nothing.
+      - name: Bump the base version for the next beta series
+        if: steps.tag.outputs.pushed == 'true' || steps.pick.outputs.needs_bump == 'true'
+        env:
+          MAIN_PUSH_KEY: ${{ secrets.MAIN_PUSH_KEY }}
+          REPO: ${{ github.repository }}
+          PROMOTED: ${{ steps.pick.outputs.version }}
+          NEWEST_STABLE: ${{ steps.pick.outputs.newest_stable }}
+          NEEDS_BUMP: ${{ steps.pick.outputs.needs_bump }}
+        run: |
+          set -euo pipefail
+          # Without this the next beta would sort BELOW the stable just
+          # shipped and walk `rupu update` backwards on the beta channel.
+          #
+          # This push to main is the one narrowly-scoped exception to the
+          # never-commit-to-main rule, and the version bump is the only thing
+          # it may ever push. main is protected by a ruleset, and GitHub
+          # rejects the Actions integration as a bypass actor (HTTP 422) —
+          # only a DeployKey can be one, so this must push over SSH with
+          # MAIN_PUSH_KEY exactly as release.yml's community-definitions
+          # job does.
+          if [ -z "${MAIN_PUSH_KEY:-}" ]; then
+            echo "::error::MAIN_PUSH_KEY is not set. Without it the version bump cannot reach protected main, and the beta channel stalls from tomorrow."
+            exit 1
+          fi
+          mkdir -p -m 700 "$HOME/.ssh"
+          printf '%s\n' "$MAIN_PUSH_KEY" > "$HOME/.ssh/main_push"
+          chmod 600 "$HOME/.ssh/main_push"
+          ssh-keyscan -t ed25519 github.com > "$HOME/.ssh/known_hosts_main" 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/main_push -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts_main"
+          git config --unset-all "http.https://github.com/.extraheader" || true
+          git remote set-url origin "git@github.com:${REPO}.git"
+
+          minor_bump() {
+            local v="$1"
+            local major="${v%%.*}"
+            local minor="${v#*.}"; minor="${minor%%.*}"
+            printf '%s.%s.0\n' "$major" "$((minor + 1))"
+          }
+          highest_of() { printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1; }
+
+          # The target is max(what Cargo.toml already holds, minor-bump of the
+          # thing we must get above). Deriving it from the promoted version
+          # ALONE would rewrite Cargo.toml BACKWARDS whenever a human had
+          # already bumped main further than the beta being promoted (bump to
+          # 0.74.0, promote a v0.72.0 beta, `make bump VERSION=0.73.0`).
+          cur=$(grep -E '^version = "[0-9]+\.[0-9]+\.[0-9]+' Cargo.toml \
+            | head -n1 | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+[^"]*)".*/\1/')
+          next="$cur"
+          if [ -n "${PROMOTED:-}" ]; then
+            next=$(highest_of "$next" "$(minor_bump "$PROMOTED")")
+          fi
+          if [ "$NEEDS_BUMP" = "true" ] && [ -n "${NEWEST_STABLE:-}" ]; then
+            next=$(highest_of "$next" "$(minor_bump "${NEWEST_STABLE#v}")")
+          fi
+
+          if [ "$next" = "$cur" ]; then
+            echo "::notice::Cargo.toml is already at $cur, ahead of everything shipped — no bump needed"
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          make bump VERSION="$next"
+
+          # Anything landing on main between checkout and here makes the push
+          # non-fast-forward. Rebase and retry once rather than failing over
+          # an unrelated merge.
+          for attempt in 1 2; do
+            if git push origin HEAD:main; then
+              echo "::notice::bumped base version $cur -> $next for the next beta series"
+              exit 0
+            fi
+            if [ "$attempt" -eq 2 ]; then break; fi
+            echo "::warning::push to main rejected; rebasing onto origin/main and retrying once"
+            git fetch origin main
+            git rebase origin/main || { echo "::error::rebase onto origin/main failed"; exit 1; }
+          done
+          echo "::error::could not push the version bump to main"
+          exit 1
+
+      # Same reasoning as release.yml's paired cleanup: harmless on a hosted
+      # runner whose VM is destroyed, a leak on a self-hosted one.
+      - name: Remove the main push key
+        if: always()
+        run: rm -f "$HOME/.ssh/main_push"

@@ -1,0 +1,187 @@
+name: release-beta
+
+# Cuts a beta every day that `main` actually moved. Publishing itself is
+# `release.yml`'s job — this workflow only decides on a tag and pushes it.
+on:
+  schedule:
+    # 07:37 UTC. Off the :00 mark (every scheduled workflow on GitHub piles
+    # onto it) and clear of nightly-live-tests.yml's 08:00 slot.
+    - cron: "37 7 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Release even if main has not moved since the last beta"
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-beta
+  # Two beta cuts racing would compute the same counter and one would fail to
+  # push. Queue instead of cancelling.
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  # Explicitly listing any scope forces every unlisted one to `none`, so
+  # the Actions API read that the CI-green check needs must be named here
+  # or `gh run list` 403s.
+  actions: read
+
+jobs:
+  cut:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          # Full history + tags: the counter is derived from the tag list.
+          fetch-depth: 0
+
+      - name: Decide whether to cut a beta
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          base=$(grep -E '^version = "[0-9]+\.[0-9]+\.[0-9]+' Cargo.toml \
+            | head -n1 | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+[^"]*)".*/\1/')
+          echo "base version: $base"
+
+          # -- Condition 2: the stall-guard. ------------------------------
+          # After stable v0.71.0 ships, a v0.71.0-beta.N sorts BELOW it under
+          # semver and would walk `rupu update` backwards on the beta channel.
+          # Deliberately NOT bypassable by `force`.
+          #
+          # The comparison is `sort -V`, not `=`: equality alone would let a
+          # base that had somehow ended up BELOW the newest stable (a bad
+          # manual edit, a reverted bump commit) sail through the guard and
+          # cut a backward-sorting beta. Anything not strictly greater than
+          # the shipped stable is a stall, not just an exact match.
+          #
+          # release-stable.yml's `needs_bump` path is what clears this state:
+          # it re-runs the version bump whenever main's base is not above the
+          # newest stable, whether or not a promotion happened that week.
+          # Without that counterpart this skip is a permanent, silent deadlock.
+          # Strict `^v<major>.<minor>.<patch>$`, byte-identical to the filter
+          # release-stable.yml uses. The two MUST agree on what "the newest
+          # stable" is: if this one skipped against a legacy tag like
+          # `v0.45.0-cli` that the promoter's filter excluded, the promoter
+          # would see no reason to bump and the beta channel would deadlock.
+          latest_stable=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)
+          if [ -n "$latest_stable" ]; then
+            highest=$(printf '%s\nv%s\n' "$latest_stable" "$base" | sort -V | tail -n1)
+            if [ "$highest" = "$latest_stable" ]; then
+              echo "::notice::base $base is not newer than the shipped stable $latest_stable — waiting for the version bump; skipping"
+              echo "go=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          # -- Condition 3: main must be green. ---------------------------
+          # Without this a red main ships a broken beta every morning.
+          # Deliberately NOT bypassable by `force`.
+          #
+          # The query is by HEAD SHA, not "the newest run on main". ci.yml
+          # sets `cancel-in-progress: true`, so the most recent run on the
+          # branch is very often `cancelled` — and, worse, it can belong to an
+          # OLDER commit than the one about to be tagged, green-lighting an
+          # untested HEAD. Asking "has THIS tree ever passed ci.yml" is the
+          # property the tag actually depends on.
+          #
+          # A failed query (permissions, rate limit, transient API error) must not
+          # abort the step under `set -euo pipefail`. Degrade to "unknown", which
+          # is then treated as not-green: never publish on an answer we don't have.
+          head_sha=$(git rev-parse HEAD)
+          green=$(gh run list --branch main --workflow ci.yml --limit 50 \
+            --json headSha,conclusion \
+            --jq "[.[] | select(.headSha == \"$head_sha\" and .conclusion == \"success\")] | length" \
+            2>/dev/null || echo "unknown")
+          case "$green" in
+            ''|*[!0-9]*)
+              echo "::notice::could not determine ci.yml status for $head_sha (query returned '$green') — skipping"
+              echo "go=false" >> "$GITHUB_OUTPUT"
+              exit 0 ;;
+            0)
+              echo "::notice::no successful ci.yml run for HEAD $head_sha — skipping"
+              echo "go=false" >> "$GITHUB_OUTPUT"
+              exit 0 ;;
+          esac
+          echo "ci.yml is green for $head_sha ($green successful run(s))"
+
+          # -- Condition 1: main must have moved. -------------------------
+          # This one IS bypassable: re-releasing an unchanged main is a
+          # legitimate manual act (a botched upload, a signing fix).
+          prev=$(git tag -l "v$base-beta" "v$base-beta.*" | sort -V | tail -n1 || true)
+          if [ -n "$prev" ] && [ "$FORCE" != "true" ]; then
+            if [ "$(git rev-parse HEAD)" = "$(git rev-parse "$prev^{commit}")" ]; then
+              echo "::notice::main is unchanged since $prev — skipping"
+              echo "go=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          tag=$(git tag -l | scripts/next-beta-version.sh "$base")
+          echo "next tag: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "go=true"  >> "$GITHUB_OUTPUT"
+
+      - name: Push the tag
+        if: steps.decide.outputs.go == 'true'
+        env:
+          MAIN_PUSH_KEY: ${{ secrets.MAIN_PUSH_KEY }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.decide.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # THE TAG MUST BE PUSHED OVER SSH WITH A DEPLOY KEY. Do not
+          # "simplify" this back to the ambient token.
+          #
+          # GitHub: "Events triggered by the GITHUB_TOKEN will not create a
+          # new workflow run, with the following exceptions: workflow_dispatch
+          # and repository_dispatch." release.yml triggers on `push: tags`, so
+          # a tag pushed with the token that actions/checkout@v5 baked into
+          # `http.extraheader` appears in the repo and publishes NOTHING —
+          # and this job still goes green. Silent, permanent, every morning.
+          #
+          # MAIN_PUSH_KEY is the repo's deploy key (the same credential
+          # release.yml's `community` job pushes main with). Pushes from a
+          # deploy key are not "triggered by GITHUB_TOKEN", so release.yml
+          # runs.
+          if [ -z "${MAIN_PUSH_KEY:-}" ]; then
+            echo "::error::MAIN_PUSH_KEY is not set — the tag would push over the ambient token, which does not trigger release.yml, so nothing would be published."
+            exit 1
+          fi
+          mkdir -p -m 700 "$HOME/.ssh"
+          printf '%s\n' "$MAIN_PUSH_KEY" > "$HOME/.ssh/main_push"
+          chmod 600 "$HOME/.ssh/main_push"
+          ssh-keyscan -t ed25519 github.com > "$HOME/.ssh/known_hosts_main" 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/main_push -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts_main"
+          # checkout@v5 wired `origin` to an HTTPS URL with the ambient token
+          # baked into an extraheader; that identity is the one that does not
+          # trigger workflows, so the header must go and the remote must be
+          # re-pointed at SSH.
+          git config --unset-all "http.https://github.com/.extraheader" || true
+          git remote set-url origin "git@github.com:${REPO}.git"
+
+          # ANNOTATED, not lightweight. release-stable.yml's soak window reads
+          # `%(creatordate:unix)`, which for a lightweight tag is the COMMIT
+          # date — so a commit that sat red on main for two days would count
+          # as fully soaked the minute its beta was cut. An annotated tag
+          # carries its own creation time, which is what "has been installable
+          # as a beta for N days" actually means. Annotating needs a committer
+          # identity, hence the git config below.
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "$TAG"
+          git push origin "$TAG"
+          echo "::notice::pushed $TAG — release.yml takes it from here"
+
+      # Same reasoning as release.yml's paired cleanup: harmless on a hosted
+      # runner whose VM is destroyed, a leak on a self-hosted one.
+      - name: Remove the main push key
+        if: always()
+        run: rm -f "$HOME/.ssh/main_push"
