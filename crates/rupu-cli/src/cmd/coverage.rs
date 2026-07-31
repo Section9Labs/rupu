@@ -843,6 +843,42 @@ impl DetailOutput for DiffOutput {
     }
 }
 
+/// Resolve a coverage run-id fragment against a candidate list.
+///
+/// Pure, so it is testable without a coverage store. `coverage rerun`
+/// and `coverage diff` both match run ids by exact string equality
+/// (`find_manifest`, `resolve_selector`), so this must run BEFORE the
+/// id reaches them — and before `coverage runs` compacts what it
+/// displays, or a pasted id would stop working.
+fn resolve_coverage_run_id(candidates: &[String], fragment: &str) -> anyhow::Result<String> {
+    use crate::output::ids::{resolve, Resolution};
+    match resolve(candidates, fragment) {
+        Resolution::Unique(id) => Ok(id),
+        Resolution::NotFound => anyhow::bail!("unknown coverage run: {fragment}"),
+        Resolution::Ambiguous(matches) => {
+            let mut msg = format!(
+                "ambiguous coverage run id — {} runs match `{fragment}`",
+                matches.len()
+            );
+            for id in &matches {
+                msg.push_str(&format!("\n  {id}"));
+            }
+            anyhow::bail!(msg)
+        }
+    }
+}
+
+/// `latest` / `previous` are [`rupu_coverage::RunSelector`] keywords, not
+/// run ids — they must pass through untouched, or `coverage diff <target>
+/// latest` would 404 against the run-id candidate list.
+fn resolve_diff_selector(candidates: &[String], selector: String) -> anyhow::Result<String> {
+    if selector == "latest" || selector == "previous" {
+        Ok(selector)
+    } else {
+        resolve_coverage_run_id(candidates, &selector)
+    }
+}
+
 fn run_diff_in(
     workspace: &Path,
     target_id: &str,
@@ -855,11 +891,23 @@ fn run_diff_in(
         (Some(b), Some(c)) => (b, c),
         _ => anyhow::bail!("provide both base and compare run selectors, or neither"),
     };
+
+    let paths = rupu_coverage::CoveragePaths::new(workspace, target_id);
+
+    // Candidates sourced the same way `coverage runs` builds its listing
+    // (`list_runs`), so a fragment resolves here iff `resolve_selector`
+    // would accept the resulting full id below.
+    let candidates: Vec<String> = rupu_coverage::list_runs(&paths)?
+        .into_iter()
+        .map(|r| r.run_id)
+        .collect();
+    let base = resolve_diff_selector(&candidates, base)?;
+    let compare = resolve_diff_selector(&candidates, compare)?;
+
     // RunSelector::from_str is infallible (any non-keyword is a run id).
     let base_sel: rupu_coverage::RunSelector = base.parse().unwrap();
     let compare_sel: rupu_coverage::RunSelector = compare.parse().unwrap();
 
-    let paths = rupu_coverage::CoveragePaths::new(workspace, target_id);
     let diff = rupu_coverage::run_diff(&paths, &base_sel, &compare_sel)?;
 
     let output = DiffOutput {
@@ -993,6 +1041,24 @@ async fn run_rerun_in(target_id: &str, run_id: &str) -> ExitCode {
         }
     };
     let paths = rupu_coverage::CoveragePaths::new(&ws, target_id);
+
+    // Candidates sourced from the same runs.jsonl `find_manifest` below
+    // reads, so a resolved fragment is guaranteed to match there too.
+    let candidates: Vec<String> = match rupu_coverage::read_manifests(&paths) {
+        Ok(manifests) => manifests.into_iter().map(|m| m.run_id).collect(),
+        Err(e) => {
+            eprintln!("coverage error: reading manifests: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let run_id = match resolve_coverage_run_id(&candidates, run_id) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("coverage error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let run_id = run_id.as_str();
 
     let manifest = match rupu_coverage::find_manifest(&paths, run_id) {
         Ok(Some(m)) => m,
@@ -1345,5 +1411,203 @@ mod tests {
         let empty = CoveragePaths::new(tmp.path(), "empty");
         empty.ensure_dir().unwrap();
         assert!(run_runs_in(tmp.path(), "empty", None).is_ok());
+    }
+
+    // ── run-id fragment resolution (pure layer) ─────────────────────────
+
+    fn coverage_run_candidates() -> Vec<String> {
+        vec![
+            "run_01KRM1CVRC2A9XZ0CY33RN5R0S".to_string(),
+            "run_01KRJDKSBE7X4J49094149WFJS".to_string(),
+        ]
+    }
+
+    #[test]
+    fn coverage_resolve_accepts_a_full_id() {
+        let c = coverage_run_candidates();
+        assert_eq!(resolve_coverage_run_id(&c, &c[0]).expect("resolves"), c[0]);
+    }
+
+    #[test]
+    fn coverage_resolve_accepts_the_compact_form_the_table_prints() {
+        let c = coverage_run_candidates();
+        let shown = crate::output::ids::compact_id(&c[0]);
+        assert_eq!(resolve_coverage_run_id(&c, &shown).expect("resolves"), c[0]);
+    }
+
+    #[test]
+    fn coverage_resolve_accepts_a_bare_suffix() {
+        let c = coverage_run_candidates();
+        assert_eq!(resolve_coverage_run_id(&c, "5R0S").expect("resolves"), c[0]);
+    }
+
+    #[test]
+    fn coverage_resolve_errors_on_ambiguity_listing_candidates() {
+        let c = coverage_run_candidates();
+        let err = resolve_coverage_run_id(&c, "run_01KR").expect_err("ambiguous");
+        let msg = err.to_string();
+        assert!(msg.contains("ambiguous"), "got: {msg}");
+        assert!(msg.contains(&c[0]) && msg.contains(&c[1]), "got: {msg}");
+    }
+
+    #[test]
+    fn coverage_resolve_reports_unknown() {
+        let err =
+            resolve_coverage_run_id(&coverage_run_candidates(), "zzzzzz").expect_err("unknown");
+        assert!(err.to_string().contains("unknown"));
+    }
+
+    // ── run-id fragment resolution wired into diff / rerun ──────────────
+
+    #[test]
+    fn diff_resolves_a_pasted_run_fragment() {
+        use chrono::{DateTime, Utc};
+        use rupu_coverage::{
+            AssertionStatus, Attribution, ConcernAssertion, CoveragePaths, Evidence, Surface,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "tgt");
+        paths.ensure_dir().unwrap();
+
+        let mark = |run: &str, status: AssertionStatus, secs: i64| ConcernAssertion {
+            concern_id: "c1".to_string(),
+            file_path: "src/a.rs".to_string(),
+            status,
+            evidence: Evidence {
+                summary: "s".to_string(),
+                line_ranges: vec![],
+                finding_ids: vec![],
+            },
+            declared_by: Attribution {
+                run_id: run.to_string(),
+                model: "m".to_string(),
+                surface: Surface::Session,
+            },
+            declared_at: DateTime::<Utc>::from_timestamp(secs, 0).unwrap(),
+        };
+        let concerns = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&mark(
+                "run_01KRM1CVRC2A9XZ0CY33RN5R0S",
+                AssertionStatus::Clean,
+                100
+            ))
+            .unwrap(),
+            serde_json::to_string(&mark(
+                "run_01KRJDKSBE7X4J49094149WFJS",
+                AssertionStatus::Finding,
+                200
+            ))
+            .unwrap(),
+        );
+        std::fs::write(&paths.concerns, concerns).unwrap();
+
+        // A bare suffix of the base run id — exactly what a user would
+        // paste back from a compacted `coverage runs` listing — must
+        // resolve to the full id before it reaches `resolve_selector`'s
+        // exact-match check.
+        assert!(run_diff_in(
+            tmp.path(),
+            "tgt",
+            Some("5R0S".to_string()),
+            Some("run_01KRJDKSBE7X4J49094149WFJS".to_string()),
+            None
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn diff_selector_keywords_pass_through_unresolved() {
+        use chrono::{DateTime, Utc};
+        use rupu_coverage::{
+            AssertionStatus, Attribution, ConcernAssertion, CoveragePaths, Evidence, Surface,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "tgt");
+        paths.ensure_dir().unwrap();
+
+        let mark = |run: &str, status: AssertionStatus, secs: i64| ConcernAssertion {
+            concern_id: "c1".to_string(),
+            file_path: "src/a.rs".to_string(),
+            status,
+            evidence: Evidence {
+                summary: "s".to_string(),
+                line_ranges: vec![],
+                finding_ids: vec![],
+            },
+            declared_by: Attribution {
+                run_id: run.to_string(),
+                model: "m".to_string(),
+                surface: Surface::Session,
+            },
+            declared_at: DateTime::<Utc>::from_timestamp(secs, 0).unwrap(),
+        };
+        let concerns = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&mark("run_old", AssertionStatus::Clean, 100)).unwrap(),
+            serde_json::to_string(&mark("run_new", AssertionStatus::Finding, 200)).unwrap(),
+        );
+        std::fs::write(&paths.concerns, concerns).unwrap();
+
+        // `latest` and `previous` are keywords, never candidates in the
+        // run-id fragment list — if resolution swallowed them, this
+        // would 404 instead of resolving via RunSelector.
+        assert!(run_diff_in(
+            tmp.path(),
+            "tgt",
+            Some("previous".to_string()),
+            Some("latest".to_string()),
+            None
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rerun_resolves_a_pasted_run_fragment_before_find_manifest() {
+        use chrono::{DateTime, Utc};
+        use rupu_coverage::{
+            append_manifest, CatalogMode, ConcernsBlock, ConcernsEntry, CoveragePaths,
+            IncludeDirective, RunManifest, Surface,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "tgt");
+        let full_id = "run_01KRM1CVRC2A9XZ0CY33RN5R0S".to_string();
+        let m = RunManifest {
+            run_id: full_id.clone(),
+            started_at: DateTime::<Utc>::from_timestamp(1, 0).unwrap(),
+            surface: Surface::Agent,
+            agent_name: "a".to_string(),
+            provider: "anthropic".to_string(),
+            model: "m".to_string(),
+            permission_mode: "bypass".to_string(),
+            user_prompt: "go".to_string(),
+            concerns: ConcernsBlock {
+                entries: vec![ConcernsEntry::Include(IncludeDirective {
+                    include: "stride".to_string(),
+                    overrides: vec![],
+                    mode: CatalogMode::Auto,
+                    filter: None,
+                })],
+            },
+            scope_name: "a".to_string(),
+            workspace_path: tmp.path().to_path_buf(),
+        };
+        append_manifest(&paths, &m).unwrap();
+
+        let candidates: Vec<String> = rupu_coverage::read_manifests(&paths)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.run_id)
+            .collect();
+        // Proves the candidate source `run_rerun_in` will use (manifests,
+        // not the diff-side ledgers) actually contains the full id a bare
+        // suffix must resolve against.
+        assert_eq!(
+            resolve_coverage_run_id(&candidates, "5R0S").unwrap(),
+            full_id
+        );
     }
 }
