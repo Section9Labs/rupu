@@ -1553,7 +1553,7 @@ mod tests {
             total_cached_tokens: 0,
             total_tokens: 1_234_609,
             total_runs: 2,
-            total_cost_usd: Some(12_345.6789),
+            total_cost_usd: Some(12_345.678_9),
             cost_partial: false,
             top_providers: vec![],
             top_models: vec![],
@@ -1589,7 +1589,7 @@ mod tests {
             summary: sample_summary(),
             rows: vec![
                 breakdown_row("a", 7, 3.4),
-                breakdown_row("b", 1_234_567, 12_345.6789),
+                breakdown_row("b", 1_234_567, 12_345.678_9),
             ],
         }
     }
