@@ -1101,7 +1101,28 @@ fn print_breakdown_table(report: &UsageBreakdownReport, prefs: &crate::cmd::ui::
         return;
     }
     print_summary_table(&report.window, &report.summary, prefs);
+    println!("{}", render_breakdown_table(report, prefs));
+    print_cost_note(
+        report.summary.total_cost_usd.is_none(),
+        report.summary.cost_partial,
+    );
+}
 
+/// Build `usage`'s main breakdown table, including the TOTAL footer
+/// row. Split out of `print_breakdown_table` so it can be asserted
+/// directly instead of through captured stdout, following
+/// `render_session_list_table`'s shape.
+///
+/// The numeric columns (INPUT/OUTPUT/CACHED/RUNS/COST) sit at
+/// different indices depending on `group_by`: `Composite` has three
+/// leading identifier columns (PROVIDER/MODEL/AGENT) before them,
+/// every other grouping has one (the group label). The footer row is
+/// built with the same column count, so `align_numeric` applies to it
+/// too — that's what keeps it aligned with the data rows above it.
+fn render_breakdown_table(
+    report: &UsageBreakdownReport,
+    prefs: &crate::cmd::ui::UiPrefs,
+) -> String {
     let mut table = crate::output::tables::new_table();
     match report.group_by {
         UsageGroupBy::Composite => table.set_header(vec![
@@ -1217,11 +1238,12 @@ fn print_breakdown_table(report: &UsageBreakdownReport, prefs: &crate::cmd::ui::
         ],
     });
 
-    println!("{table}");
-    print_cost_note(
-        report.summary.total_cost_usd.is_none(),
-        report.summary.cost_partial,
-    );
+    let numeric_cols: &[usize] = match report.group_by {
+        UsageGroupBy::Composite => &[3, 4, 5, 6, 7],
+        _ => &[1, 2, 3, 4, 5],
+    };
+    crate::output::tables::align_numeric(&mut table, numeric_cols);
+    table.to_string()
 }
 
 fn print_run_table(report: &UsageRunsReport, prefs: &crate::cmd::ui::UiPrefs) {
@@ -1230,7 +1252,26 @@ fn print_run_table(report: &UsageRunsReport, prefs: &crate::cmd::ui::UiPrefs) {
         return;
     }
     print_summary_table(&report.window, &report.summary, prefs);
+    println!("{}", render_run_table(report, prefs, Utc::now()));
+    let no_pricing = report.summary.total_cost_usd.is_none();
+    print_cost_note(no_pricing, report.summary.cost_partial);
+}
 
+/// Build `usage runs`' table: compact `RUN_ID` (display-only — no
+/// `usage` subcommand accepts a run id back as an argument, so unlike
+/// `coverage runs` there is no resolver to wire first), relative
+/// `STARTED_AT`, and right-aligned token/cost columns. Split out of
+/// `print_run_table` so it can be asserted directly instead of through
+/// captured stdout.
+///
+/// `STATUS` already goes through `status_cell`, untouched by this
+/// plan. `now` is a parameter for deterministic tests; the caller
+/// passes `Utc::now()`.
+fn render_run_table(
+    report: &UsageRunsReport,
+    prefs: &crate::cmd::ui::UiPrefs,
+    now: DateTime<Utc>,
+) -> String {
     let mut table = crate::output::tables::new_table();
     table.set_header(vec![
         "STARTED_AT",
@@ -1252,8 +1293,8 @@ fn print_run_table(report: &UsageRunsReport, prefs: &crate::cmd::ui::UiPrefs) {
     ]);
     for row in &report.rows {
         table.add_row(vec![
-            Cell::new(format_timestamp(row.started_at)),
-            Cell::new(&row.run_id),
+            Cell::new(crate::output::fmt::relative_time(row.started_at, now)),
+            Cell::new(crate::output::ids::compact_id(&row.run_id)),
             crate::output::tables::status_cell(&row.status, prefs),
             Cell::new(row.workflow.as_deref().unwrap_or("—")),
             Cell::new(row.repo.as_deref().unwrap_or("—")),
@@ -1270,9 +1311,8 @@ fn print_run_table(report: &UsageRunsReport, prefs: &crate::cmd::ui::UiPrefs) {
             cost_cell(row.cost_usd, row.cost_partial, prefs),
         ]);
     }
-    println!("{table}");
-    let no_pricing = report.summary.total_cost_usd.is_none();
-    print_cost_note(no_pricing, report.summary.cost_partial);
+    crate::output::tables::align_numeric(&mut table, &[12, 13, 14, 15]);
+    table.to_string()
 }
 
 fn print_backfill_table(report: &UsageBackfillReport, _prefs: &crate::cmd::ui::UiPrefs) {
@@ -1480,5 +1520,226 @@ mod tests {
         assert!(window.default_last_30d);
         assert!(window.since.is_some());
         assert!(window.until.is_none());
+    }
+
+    // ── Task 5: `usage` breakdown and runs readability ──────────────────
+
+    fn prefs_no_color() -> crate::cmd::ui::UiPrefs {
+        crate::cmd::ui::UiPrefs {
+            color: crate::cmd::ui::ColorMode::Never,
+            theme: "base16-ocean.dark".into(),
+            palette_theme: "rupu-dark".into(),
+            palette: crate::output::palette::UiPaletteTheme::default(),
+            live_view: crate::cmd::ui::LiveViewMode::Focused,
+            pager: crate::cmd::ui::PagerMode::Never,
+            absolute: false,
+            all_columns: false,
+        }
+    }
+
+    fn sample_window() -> UsageWindowOutput {
+        UsageWindowOutput {
+            since: None,
+            until: None,
+            default_last_30d: true,
+            label: "last 30d".to_string(),
+        }
+    }
+
+    fn sample_summary() -> UsageSummary {
+        UsageSummary {
+            total_input_tokens: 1_234_567,
+            total_output_tokens: 42,
+            total_cached_tokens: 0,
+            total_tokens: 1_234_609,
+            total_runs: 2,
+            total_cost_usd: Some(12_345.678_9),
+            cost_partial: false,
+            top_providers: vec![],
+            top_models: vec![],
+            top_agents: vec![],
+        }
+    }
+
+    fn breakdown_row(group: &str, input_tokens: u64, cost_usd: f64) -> UsageBreakdownRow {
+        UsageBreakdownRow {
+            group: group.to_string(),
+            provider: Some("anthropic".to_string()),
+            model: Some("claude-opus".to_string()),
+            agent: Some("reviewer".to_string()),
+            workflow: None,
+            repo: None,
+            day: None,
+            input_tokens,
+            output_tokens: 5,
+            cached_tokens: 0,
+            runs: 1,
+            cost_usd: Some(cost_usd),
+            cost_partial: false,
+        }
+    }
+
+    fn breakdown_report(group_by: UsageGroupBy) -> UsageBreakdownReport {
+        UsageBreakdownReport {
+            kind: "usage_breakdown",
+            version: 1,
+            window: sample_window(),
+            filters: UsageFiltersOutput::from_scope(&UsageScopeArgs::default(), None, false),
+            group_by,
+            summary: sample_summary(),
+            rows: vec![
+                breakdown_row("a", 7, 3.4),
+                breakdown_row("b", 1_234_567, 12_345.678_9),
+            ],
+        }
+    }
+
+    #[test]
+    fn breakdown_table_composite_right_aligns_numeric_columns_including_the_footer() {
+        // COST is the rightmost column in both layouts, so
+        // `trim_end().ends_with(...)` can't distinguish aligned from
+        // unaligned (trimming eats the very padding alignment moves —
+        // see the equivalent coverage.rs regression this mirrors).
+        // Right-alignment pads the shorter value on the LEFT, so every
+        // row — including the TOTAL footer — ends in exactly one
+        // trailing space (comfy-table's fixed column margin);
+        // left-alignment would leave a variable-width gap instead.
+        let report = breakdown_report(UsageGroupBy::Composite);
+        let prefs = prefs_no_color();
+        let out = render_breakdown_table(&report, &prefs);
+        let mut checked = 0;
+        for line in out.lines().filter(|l| !l.trim().is_empty()) {
+            if line.contains('─') {
+                continue; // header rule
+            }
+            let trailing = line.len() - line.trim_end().len();
+            assert_eq!(
+                trailing, 1,
+                "expected exactly one trailing space (right-aligned COST column): {line:?}"
+            );
+            checked += 1;
+        }
+        // header + 2 data rows + TOTAL footer
+        assert_eq!(
+            checked, 4,
+            "expected to inspect every row including the footer"
+        );
+    }
+
+    #[test]
+    fn breakdown_table_non_composite_group_by_right_aligns_numeric_columns() {
+        let report = breakdown_report(UsageGroupBy::Provider);
+        let prefs = prefs_no_color();
+        let out = render_breakdown_table(&report, &prefs);
+        for line in out
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.contains('─'))
+        {
+            let trailing = line.len() - line.trim_end().len();
+            assert_eq!(
+                trailing, 1,
+                "expected exactly one trailing space (right-aligned COST column): {line:?}"
+            );
+        }
+    }
+
+    fn sample_run_row(run_id: &str, started_secs: i64, input_tokens: u64) -> UsageRunRow {
+        UsageRunRow {
+            started_at: DateTime::<Utc>::from_timestamp(started_secs, 0).unwrap(),
+            run_id: run_id.to_string(),
+            source: "standalone_run".to_string(),
+            status: "completed".to_string(),
+            workflow: None,
+            repo: None,
+            issue: None,
+            worker: None,
+            backend: None,
+            trigger: None,
+            providers: "anthropic".to_string(),
+            models: "claude-opus".to_string(),
+            agents: "reviewer".to_string(),
+            input_tokens,
+            output_tokens: 5,
+            cached_tokens: 0,
+            cost_usd: Some(3.4),
+            cost_partial: false,
+        }
+    }
+
+    fn run_report(rows: Vec<UsageRunRow>) -> UsageRunsReport {
+        UsageRunsReport {
+            kind: "usage_runs",
+            version: 1,
+            window: sample_window(),
+            filters: UsageFiltersOutput::from_scope(&UsageScopeArgs::default(), None, false),
+            summary: sample_summary(),
+            rows,
+        }
+    }
+
+    #[test]
+    fn run_table_compacts_the_run_id_and_the_full_id_is_absent() {
+        let rows = vec![sample_run_row("run_01KRM1CVRC2A9XZ0CY33RN5R0S", 1_000, 7)];
+        let report = run_report(rows);
+        let prefs = prefs_no_color();
+        let out = render_run_table(&report, &prefs, Utc::now());
+        assert!(
+            !out.contains(&report.rows[0].run_id),
+            "full run id leaked into the table: {out}"
+        );
+        assert!(
+            out.contains(&crate::output::ids::compact_id(&report.rows[0].run_id)),
+            "compact run id missing: {out}"
+        );
+    }
+
+    #[test]
+    fn run_table_renders_started_at_as_relative_time() {
+        let rows = vec![sample_run_row("run_short", 1_000, 7)];
+        let report = run_report(rows);
+        let prefs = prefs_no_color();
+        let now = report.rows[0].started_at + chrono::Duration::hours(2);
+        let out = render_run_table(&report, &prefs, now);
+        assert!(out.contains("2h ago"), "no relative time rendered: {out}");
+        assert!(
+            !out.contains("1970-01-01"),
+            "leaked the old absolute STARTED_AT format: {out}"
+        );
+    }
+
+    #[test]
+    fn run_table_right_aligns_token_and_cost_columns() {
+        // COST is the rightmost column, so — as with the breakdown
+        // table above — alignment is verified via trailing whitespace,
+        // not `ends_with`.
+        let rows = vec![
+            sample_run_row("run_a", 1_000, 7),
+            sample_run_row("run_b", 2_000, 1_234_567),
+        ];
+        let report = run_report(rows);
+        let prefs = prefs_no_color();
+        let out = render_run_table(&report, &prefs, Utc::now());
+        for line in out
+            .lines()
+            .filter(|l| l.contains("run_a") || l.contains("run_b"))
+        {
+            let trailing = line.len() - line.trim_end().len();
+            assert_eq!(
+                trailing, 1,
+                "expected exactly one trailing space (right-aligned COST column): {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_table_status_cell_untouched() {
+        // Guard against accidentally changing STATUS rendering while
+        // touching everything around it — this plan explicitly leaves
+        // `status_cell` alone.
+        let rows = vec![sample_run_row("run_a", 1_000, 7)];
+        let report = run_report(rows);
+        let prefs = prefs_no_color();
+        let out = render_run_table(&report, &prefs, Utc::now());
+        assert!(out.contains("completed"));
     }
 }

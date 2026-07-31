@@ -1,8 +1,10 @@
 //! `rupu coverage` — inspect agentic coverage ledgers and concern catalogs.
 
+use crate::cmd::ui::UiPrefs;
 use crate::output::formats::OutputFormat;
 use crate::output::report::{self, CollectionOutput, DetailOutput};
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -70,6 +72,57 @@ pub enum TemplatesAction {
 
 fn workspace() -> Result<PathBuf> {
     Ok(std::env::current_dir()?)
+}
+
+/// Resolve `UiPrefs` for a coverage command. Layers the same
+/// global/project config every other command reads, but tolerates a
+/// missing or unreadable config — `coverage` commands ran with no
+/// prefs at all before this plan, and a config error must not turn
+/// "make the table readable" into "coverage now fails to run".
+fn ui_prefs(workspace: &Path) -> UiPrefs {
+    let global = crate::paths::global_dir().ok();
+    let project_root = crate::paths::project_root_for(workspace).ok().flatten();
+    let global_cfg = global.as_deref().map(|g| g.join("config.toml"));
+    let project_cfg = project_root.as_deref().map(|p| p.join(".rupu/config.toml"));
+    let cfg = rupu_config::layer_files_locked(global_cfg.as_deref(), project_cfg.as_deref())
+        .unwrap_or_default();
+    UiPrefs::resolve(&cfg.ui, false, None, None, None)
+}
+
+/// Wrap `text` in a cell colored per [`crate::output::tables::severity_color`],
+/// or a plain cell when colors are off or the value isn't a known severity.
+fn severity_cell(text: &str, prefs: &UiPrefs) -> comfy_table::Cell {
+    let cell = comfy_table::Cell::new(text);
+    match crate::output::tables::severity_color(text, prefs) {
+        Some(c) => cell.fg(c),
+        None => cell,
+    }
+}
+
+/// Wrap `text` in a cell colored per
+/// [`crate::output::tables::coverage_status_color`], or a plain cell
+/// when colors are off or the value isn't a known assertion/verdict.
+fn coverage_status_cell(text: &str, prefs: &UiPrefs) -> comfy_table::Cell {
+    let cell = comfy_table::Cell::new(text);
+    match crate::output::tables::coverage_status_color(text, prefs) {
+        Some(c) => cell.fg(c),
+        None => cell,
+    }
+}
+
+/// comfy-table only paints `.fg()` colors when it believes stdout is a
+/// live tty (`Table::is_tty`) — otherwise `.fg()` is silently a no-op,
+/// which would make `--color always` (and `[ui].color = "always"`)
+/// invisible the moment output is piped or captured, defeating the
+/// entire point of forcing color on. `UiPrefs::use_color()` already
+/// encodes exactly the right condition — explicitly forced, or Auto
+/// on a real terminal — so mirroring it here via `enforce_styling`
+/// keeps the two in lockstep without touching comfy-table's own tty
+/// auto-detection for anyone who left color on `Auto` and is piping.
+fn enforce_styling_if_colored(table: &mut comfy_table::Table, prefs: &UiPrefs) {
+    if prefs.use_color() {
+        table.enforce_styling();
+    }
 }
 
 pub async fn handle(action: Action, format: Option<OutputFormat>) -> ExitCode {
@@ -276,6 +329,7 @@ struct CoverageTemplateConcernsReport {
 
 struct TemplatesShowOutput {
     report: CoverageTemplateConcernsReport,
+    prefs: UiPrefs,
 }
 
 impl CollectionOutput for TemplatesShowOutput {
@@ -299,18 +353,30 @@ impl CollectionOutput for TemplatesShowOutput {
     }
 
     fn render_table(&self) -> anyhow::Result<()> {
-        let mut table = crate::output::tables::new_table();
-        table.set_header(vec!["Concern", "Severity", "Name"]);
-        for c in &self.report.rows {
-            table.add_row(vec![
-                comfy_table::Cell::new(&c.id),
-                comfy_table::Cell::new(&c.severity),
-                comfy_table::Cell::new(&c.name),
-            ]);
-        }
-        println!("{table}");
+        println!(
+            "{}",
+            render_concern_rows_table(&self.report.rows, &self.prefs)
+        );
         Ok(())
     }
+}
+
+/// Build the shared `Concern | Severity | Name` table used by both
+/// `coverage templates show` and `coverage catalog`. Split out of
+/// `render_table` so it can be asserted directly instead of through
+/// captured stdout, following `render_session_list_table`'s shape.
+fn render_concern_rows_table(rows: &[ConcernRow], prefs: &UiPrefs) -> String {
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec!["Concern", "Severity", "Name"]);
+    for c in rows {
+        table.add_row(vec![
+            comfy_table::Cell::new(&c.id),
+            severity_cell(&c.severity, prefs),
+            comfy_table::Cell::new(&c.name),
+        ]);
+    }
+    enforce_styling_if_colored(&mut table, prefs);
+    table.to_string()
 }
 
 fn run_templates(action: TemplatesAction, format: Option<OutputFormat>) -> Result<()> {
@@ -343,12 +409,14 @@ fn run_templates(action: TemplatesAction, format: Option<OutputFormat>) -> Resul
                     name: concern.name.clone(),
                 })
                 .collect::<Vec<_>>();
+            let prefs = ui_prefs(&workspace()?);
             let output = TemplatesShowOutput {
                 report: CoverageTemplateConcernsReport {
                     kind: "coverage_template_concerns",
                     version: 1,
                     rows,
                 },
+                prefs,
             };
             report::emit_collection(format, &output)
         }
@@ -366,6 +434,7 @@ struct CoverageCatalogReport {
 
 struct CatalogOutput {
     report: CoverageCatalogReport,
+    prefs: UiPrefs,
 }
 
 impl CollectionOutput for CatalogOutput {
@@ -390,16 +459,10 @@ impl CollectionOutput for CatalogOutput {
 
     fn render_table(&self) -> anyhow::Result<()> {
         println!("{} concerns in effective catalog", self.report.rows.len());
-        let mut table = crate::output::tables::new_table();
-        table.set_header(vec!["Concern", "Severity", "Name"]);
-        for c in &self.report.rows {
-            table.add_row(vec![
-                comfy_table::Cell::new(&c.id),
-                comfy_table::Cell::new(&c.severity),
-                comfy_table::Cell::new(&c.name),
-            ]);
-        }
-        println!("{table}");
+        println!(
+            "{}",
+            render_concern_rows_table(&self.report.rows, &self.prefs)
+        );
         Ok(())
     }
 }
@@ -425,6 +488,7 @@ fn run_catalog_in(workspace: &Path, target_id: &str, format: Option<OutputFormat
             version: 1,
             rows,
         },
+        prefs: ui_prefs(workspace),
     };
     report::emit_collection(format, &output)
 }
@@ -442,6 +506,7 @@ struct CoverageShowReport {
 
 struct CoverageShowOutput {
     report: CoverageShowReport,
+    prefs: UiPrefs,
 }
 
 impl DetailOutput for CoverageShowOutput {
@@ -496,22 +561,31 @@ impl DetailOutput for CoverageShowOutput {
 
         println!();
         println!("Findings ({})", findings.len());
-        {
-            let mut table = crate::output::tables::new_table();
-            table.set_header(vec!["ID", "Severity", "File", "Summary"]);
-            for f in findings {
-                table.add_row(vec![
-                    comfy_table::Cell::new(&f.id),
-                    comfy_table::Cell::new(format!("{:?}", f.severity)),
-                    comfy_table::Cell::new(f.file_path.as_deref().unwrap_or("(repo)")),
-                    comfy_table::Cell::new(&f.summary),
-                ]);
-            }
-            println!("{table}");
-        }
+        println!("{}", render_show_findings_table(findings, &self.prefs));
 
         Ok(())
     }
+}
+
+/// Build `coverage show`'s Findings table. Split out of `render_human`
+/// so it can be asserted directly instead of through captured stdout.
+fn render_show_findings_table(
+    findings: &[rupu_coverage::FindingRecord],
+    prefs: &UiPrefs,
+) -> String {
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec!["ID", "Severity", "File", "Summary"]);
+    for f in findings {
+        let severity_text = format!("{:?}", f.severity);
+        table.add_row(vec![
+            comfy_table::Cell::new(&f.id),
+            severity_cell(&severity_text, prefs),
+            comfy_table::Cell::new(f.file_path.as_deref().unwrap_or("(repo)")),
+            comfy_table::Cell::new(&f.summary),
+        ]);
+    }
+    enforce_styling_if_colored(&mut table, prefs);
+    table.to_string()
 }
 
 fn run_show_in(workspace: &Path, target_id: &str, format: Option<OutputFormat>) -> Result<()> {
@@ -529,6 +603,7 @@ fn run_show_in(workspace: &Path, target_id: &str, format: Option<OutputFormat>) 
             assertions,
             findings,
         },
+        prefs: ui_prefs(workspace),
     };
     report::emit_detail(format, &output)
 }
@@ -537,6 +612,7 @@ fn run_show_in(workspace: &Path, target_id: &str, format: Option<OutputFormat>) 
 
 struct AuditOutput {
     report: rupu_coverage::AuditReport,
+    prefs: UiPrefs,
 }
 
 impl DetailOutput for AuditOutput {
@@ -563,28 +639,10 @@ impl DetailOutput for AuditOutput {
             report.total_concerns,
             report.total_gap_files
         );
-        {
-            let mut table = crate::output::tables::new_table();
-            table.set_header(vec![
-                "Concern", "Severity", "In-scope", "Asserted", "Gap", "Clean", "Finding",
-                "Examined", "N/A", "Status",
-            ]);
-            for c in &report.concerns {
-                table.add_row(vec![
-                    comfy_table::Cell::new(&c.concern_id),
-                    comfy_table::Cell::new(format!("{:?}", c.severity)),
-                    comfy_table::Cell::new(c.in_scope_files.len().to_string()),
-                    comfy_table::Cell::new(c.asserted_files.len().to_string()),
-                    comfy_table::Cell::new(c.gap_files.len().to_string()),
-                    comfy_table::Cell::new(c.clean.to_string()),
-                    comfy_table::Cell::new(c.findings.to_string()),
-                    comfy_table::Cell::new(c.examined.to_string()),
-                    comfy_table::Cell::new(c.not_applicable.to_string()),
-                    comfy_table::Cell::new(if c.is_complete() { "ok" } else { "GAP" }),
-                ]);
-            }
-            println!("{table}");
-        }
+        println!(
+            "{}",
+            render_coverage_audit_concerns_table(&report.concerns, &self.prefs)
+        );
         if !report.cross_model.is_empty() {
             println!();
             println!("Cross-model ({}):", report.cross_model.len());
@@ -618,10 +676,54 @@ impl DetailOutput for AuditOutput {
     }
 }
 
+/// Build `coverage audit`'s main concerns table: severity + verdict
+/// colour, the seven count columns right-aligned. Split out of
+/// `render_human` so it can be asserted directly instead of through
+/// captured stdout, following `render_session_list_table`'s shape.
+///
+/// Every count column keeps every value, including zeros — this is the
+/// one table in the CLI where "a zero is data, not absence" genuinely
+/// holds (a concern with zero clean/finding/examined/N/A files is a
+/// concern nobody has looked at yet, which is exactly what `coverage
+/// audit` exists to surface). No `CellValue`/`EntityTable` suppression
+/// is introduced here; this stays a plain `comfy_table::Cell` render.
+fn render_coverage_audit_concerns_table(
+    concerns: &[rupu_coverage::ConcernCoverage],
+    prefs: &UiPrefs,
+) -> String {
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec![
+        "Concern", "Severity", "In-scope", "Asserted", "Gap", "Clean", "Finding", "Examined",
+        "N/A", "Status",
+    ]);
+    for c in concerns {
+        let severity_text = format!("{:?}", c.severity);
+        let status_text = if c.is_complete() { "ok" } else { "GAP" };
+        table.add_row(vec![
+            comfy_table::Cell::new(&c.concern_id),
+            severity_cell(&severity_text, prefs),
+            comfy_table::Cell::new(c.in_scope_files.len().to_string()),
+            comfy_table::Cell::new(c.asserted_files.len().to_string()),
+            comfy_table::Cell::new(c.gap_files.len().to_string()),
+            comfy_table::Cell::new(c.clean.to_string()),
+            comfy_table::Cell::new(c.findings.to_string()),
+            comfy_table::Cell::new(c.examined.to_string()),
+            comfy_table::Cell::new(c.not_applicable.to_string()),
+            coverage_status_cell(status_text, prefs),
+        ]);
+    }
+    crate::output::tables::align_numeric(&mut table, &[2, 3, 4, 5, 6, 7, 8]);
+    enforce_styling_if_colored(&mut table, prefs);
+    table.to_string()
+}
+
 fn run_audit_in(workspace: &Path, target_id: &str, format: Option<OutputFormat>) -> Result<()> {
     let paths = rupu_coverage::CoveragePaths::new(workspace, target_id);
     let report = rupu_coverage::run_audit(&paths)?;
-    let output = AuditOutput { report };
+    let output = AuditOutput {
+        report,
+        prefs: ui_prefs(workspace),
+    };
     report::emit_detail(format, &output)
 }
 
@@ -843,6 +945,42 @@ impl DetailOutput for DiffOutput {
     }
 }
 
+/// Resolve a coverage run-id fragment against a candidate list.
+///
+/// Pure, so it is testable without a coverage store. `coverage rerun`
+/// and `coverage diff` both match run ids by exact string equality
+/// (`find_manifest`, `resolve_selector`), so this must run BEFORE the
+/// id reaches them — and before `coverage runs` compacts what it
+/// displays, or a pasted id would stop working.
+fn resolve_coverage_run_id(candidates: &[String], fragment: &str) -> anyhow::Result<String> {
+    use crate::output::ids::{resolve, Resolution};
+    match resolve(candidates, fragment) {
+        Resolution::Unique(id) => Ok(id),
+        Resolution::NotFound => anyhow::bail!("unknown coverage run: {fragment}"),
+        Resolution::Ambiguous(matches) => {
+            let mut msg = format!(
+                "ambiguous coverage run id — {} runs match `{fragment}`",
+                matches.len()
+            );
+            for id in &matches {
+                msg.push_str(&format!("\n  {id}"));
+            }
+            anyhow::bail!(msg)
+        }
+    }
+}
+
+/// `latest` / `previous` are [`rupu_coverage::RunSelector`] keywords, not
+/// run ids — they must pass through untouched, or `coverage diff <target>
+/// latest` would 404 against the run-id candidate list.
+fn resolve_diff_selector(candidates: &[String], selector: String) -> anyhow::Result<String> {
+    if selector == "latest" || selector == "previous" {
+        Ok(selector)
+    } else {
+        resolve_coverage_run_id(candidates, &selector)
+    }
+}
+
 fn run_diff_in(
     workspace: &Path,
     target_id: &str,
@@ -855,11 +993,23 @@ fn run_diff_in(
         (Some(b), Some(c)) => (b, c),
         _ => anyhow::bail!("provide both base and compare run selectors, or neither"),
     };
+
+    let paths = rupu_coverage::CoveragePaths::new(workspace, target_id);
+
+    // Candidates sourced the same way `coverage runs` builds its listing
+    // (`list_runs`), so a fragment resolves here iff `resolve_selector`
+    // would accept the resulting full id below.
+    let candidates: Vec<String> = rupu_coverage::list_runs(&paths)?
+        .into_iter()
+        .map(|r| r.run_id)
+        .collect();
+    let base = resolve_diff_selector(&candidates, base)?;
+    let compare = resolve_diff_selector(&candidates, compare)?;
+
     // RunSelector::from_str is infallible (any non-keyword is a run id).
     let base_sel: rupu_coverage::RunSelector = base.parse().unwrap();
     let compare_sel: rupu_coverage::RunSelector = compare.parse().unwrap();
 
-    let paths = rupu_coverage::CoveragePaths::new(workspace, target_id);
     let diff = rupu_coverage::run_diff(&paths, &base_sel, &compare_sel)?;
 
     let output = DiffOutput {
@@ -933,24 +1083,40 @@ impl CollectionOutput for RunsOutput {
         if runs.is_empty() {
             return Ok(());
         }
-        let mut table = crate::output::tables::new_table();
-        table.set_header(vec![
-            "Run", "Started", "Surface", "Model", "Cells", "Findings", "Files",
-        ]);
-        for r in runs {
-            table.add_row(vec![
-                comfy_table::Cell::new(&r.run_id),
-                comfy_table::Cell::new(r.started_at.to_rfc3339()),
-                comfy_table::Cell::new(format!("{:?}", r.surface)),
-                comfy_table::Cell::new(&r.model),
-                comfy_table::Cell::new(r.cells_asserted.to_string()),
-                comfy_table::Cell::new(r.findings.to_string()),
-                comfy_table::Cell::new(r.files_touched.to_string()),
-            ]);
-        }
-        println!("{table}");
+        println!("{}", render_coverage_runs_table(runs, Utc::now()));
         Ok(())
     }
+}
+
+/// Build `coverage runs`' table: compact run ids (resolvable via
+/// `resolve_coverage_run_id` since the previous commit), relative
+/// start times, and right-aligned counts. Split out of `render_table`
+/// so it can be asserted directly instead of through captured stdout.
+///
+/// No colour applies here — Surface/Model are plain classification
+/// text, and the only colourable value in this table (a coverage
+/// verdict) lives in `coverage audit`, not `coverage runs`.
+///
+/// `now` is a parameter for deterministic tests; the caller passes
+/// `Utc::now()`.
+fn render_coverage_runs_table(runs: &[rupu_coverage::RunListEntry], now: DateTime<Utc>) -> String {
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec![
+        "Run", "Started", "Surface", "Model", "Cells", "Findings", "Files",
+    ]);
+    for r in runs {
+        table.add_row(vec![
+            comfy_table::Cell::new(crate::output::ids::compact_id(&r.run_id)),
+            comfy_table::Cell::new(crate::output::fmt::relative_time(r.started_at, now)),
+            comfy_table::Cell::new(format!("{:?}", r.surface)),
+            comfy_table::Cell::new(&r.model),
+            comfy_table::Cell::new(r.cells_asserted.to_string()),
+            comfy_table::Cell::new(r.findings.to_string()),
+            comfy_table::Cell::new(r.files_touched.to_string()),
+        ]);
+    }
+    crate::output::tables::align_numeric(&mut table, &[4, 5, 6]);
+    table.to_string()
 }
 
 fn run_runs_in(workspace: &Path, target_id: &str, format: Option<OutputFormat>) -> Result<()> {
@@ -993,6 +1159,24 @@ async fn run_rerun_in(target_id: &str, run_id: &str) -> ExitCode {
         }
     };
     let paths = rupu_coverage::CoveragePaths::new(&ws, target_id);
+
+    // Candidates sourced from the same runs.jsonl `find_manifest` below
+    // reads, so a resolved fragment is guaranteed to match there too.
+    let candidates: Vec<String> = match rupu_coverage::read_manifests(&paths) {
+        Ok(manifests) => manifests.into_iter().map(|m| m.run_id).collect(),
+        Err(e) => {
+            eprintln!("coverage error: reading manifests: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let run_id = match resolve_coverage_run_id(&candidates, run_id) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("coverage error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let run_id = run_id.as_str();
 
     let manifest = match rupu_coverage::find_manifest(&paths, run_id) {
         Ok(Some(m)) => m,
@@ -1345,5 +1529,457 @@ mod tests {
         let empty = CoveragePaths::new(tmp.path(), "empty");
         empty.ensure_dir().unwrap();
         assert!(run_runs_in(tmp.path(), "empty", None).is_ok());
+    }
+
+    // ── run-id fragment resolution (pure layer) ─────────────────────────
+
+    fn coverage_run_candidates() -> Vec<String> {
+        vec![
+            "run_01KRM1CVRC2A9XZ0CY33RN5R0S".to_string(),
+            "run_01KRJDKSBE7X4J49094149WFJS".to_string(),
+        ]
+    }
+
+    #[test]
+    fn coverage_resolve_accepts_a_full_id() {
+        let c = coverage_run_candidates();
+        assert_eq!(resolve_coverage_run_id(&c, &c[0]).expect("resolves"), c[0]);
+    }
+
+    #[test]
+    fn coverage_resolve_accepts_the_compact_form_the_table_prints() {
+        let c = coverage_run_candidates();
+        let shown = crate::output::ids::compact_id(&c[0]);
+        assert_eq!(resolve_coverage_run_id(&c, &shown).expect("resolves"), c[0]);
+    }
+
+    #[test]
+    fn coverage_resolve_accepts_a_bare_suffix() {
+        let c = coverage_run_candidates();
+        assert_eq!(resolve_coverage_run_id(&c, "5R0S").expect("resolves"), c[0]);
+    }
+
+    #[test]
+    fn coverage_resolve_errors_on_ambiguity_listing_candidates() {
+        let c = coverage_run_candidates();
+        let err = resolve_coverage_run_id(&c, "run_01KR").expect_err("ambiguous");
+        let msg = err.to_string();
+        assert!(msg.contains("ambiguous"), "got: {msg}");
+        assert!(msg.contains(&c[0]) && msg.contains(&c[1]), "got: {msg}");
+    }
+
+    #[test]
+    fn coverage_resolve_reports_unknown() {
+        let err =
+            resolve_coverage_run_id(&coverage_run_candidates(), "zzzzzz").expect_err("unknown");
+        assert!(err.to_string().contains("unknown"));
+    }
+
+    // ── run-id fragment resolution wired into diff / rerun ──────────────
+
+    #[test]
+    fn diff_resolves_a_pasted_run_fragment() {
+        use chrono::{DateTime, Utc};
+        use rupu_coverage::{
+            AssertionStatus, Attribution, ConcernAssertion, CoveragePaths, Evidence, Surface,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "tgt");
+        paths.ensure_dir().unwrap();
+
+        let mark = |run: &str, status: AssertionStatus, secs: i64| ConcernAssertion {
+            concern_id: "c1".to_string(),
+            file_path: "src/a.rs".to_string(),
+            status,
+            evidence: Evidence {
+                summary: "s".to_string(),
+                line_ranges: vec![],
+                finding_ids: vec![],
+            },
+            declared_by: Attribution {
+                run_id: run.to_string(),
+                model: "m".to_string(),
+                surface: Surface::Session,
+            },
+            declared_at: DateTime::<Utc>::from_timestamp(secs, 0).unwrap(),
+        };
+        let concerns = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&mark(
+                "run_01KRM1CVRC2A9XZ0CY33RN5R0S",
+                AssertionStatus::Clean,
+                100
+            ))
+            .unwrap(),
+            serde_json::to_string(&mark(
+                "run_01KRJDKSBE7X4J49094149WFJS",
+                AssertionStatus::Finding,
+                200
+            ))
+            .unwrap(),
+        );
+        std::fs::write(&paths.concerns, concerns).unwrap();
+
+        // A bare suffix of the base run id — exactly what a user would
+        // paste back from a compacted `coverage runs` listing — must
+        // resolve to the full id before it reaches `resolve_selector`'s
+        // exact-match check.
+        assert!(run_diff_in(
+            tmp.path(),
+            "tgt",
+            Some("5R0S".to_string()),
+            Some("run_01KRJDKSBE7X4J49094149WFJS".to_string()),
+            None
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn diff_selector_keywords_pass_through_unresolved() {
+        use chrono::{DateTime, Utc};
+        use rupu_coverage::{
+            AssertionStatus, Attribution, ConcernAssertion, CoveragePaths, Evidence, Surface,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "tgt");
+        paths.ensure_dir().unwrap();
+
+        let mark = |run: &str, status: AssertionStatus, secs: i64| ConcernAssertion {
+            concern_id: "c1".to_string(),
+            file_path: "src/a.rs".to_string(),
+            status,
+            evidence: Evidence {
+                summary: "s".to_string(),
+                line_ranges: vec![],
+                finding_ids: vec![],
+            },
+            declared_by: Attribution {
+                run_id: run.to_string(),
+                model: "m".to_string(),
+                surface: Surface::Session,
+            },
+            declared_at: DateTime::<Utc>::from_timestamp(secs, 0).unwrap(),
+        };
+        let concerns = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&mark("run_old", AssertionStatus::Clean, 100)).unwrap(),
+            serde_json::to_string(&mark("run_new", AssertionStatus::Finding, 200)).unwrap(),
+        );
+        std::fs::write(&paths.concerns, concerns).unwrap();
+
+        // `latest` and `previous` are keywords, never candidates in the
+        // run-id fragment list — if resolution swallowed them, this
+        // would 404 instead of resolving via RunSelector.
+        assert!(run_diff_in(
+            tmp.path(),
+            "tgt",
+            Some("previous".to_string()),
+            Some("latest".to_string()),
+            None
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rerun_resolves_a_pasted_run_fragment_before_find_manifest() {
+        use chrono::{DateTime, Utc};
+        use rupu_coverage::{
+            append_manifest, CatalogMode, ConcernsBlock, ConcernsEntry, CoveragePaths,
+            IncludeDirective, RunManifest, Surface,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "tgt");
+        let full_id = "run_01KRM1CVRC2A9XZ0CY33RN5R0S".to_string();
+        let m = RunManifest {
+            run_id: full_id.clone(),
+            started_at: DateTime::<Utc>::from_timestamp(1, 0).unwrap(),
+            surface: Surface::Agent,
+            agent_name: "a".to_string(),
+            provider: "anthropic".to_string(),
+            model: "m".to_string(),
+            permission_mode: "bypass".to_string(),
+            user_prompt: "go".to_string(),
+            concerns: ConcernsBlock {
+                entries: vec![ConcernsEntry::Include(IncludeDirective {
+                    include: "stride".to_string(),
+                    overrides: vec![],
+                    mode: CatalogMode::Auto,
+                    filter: None,
+                })],
+            },
+            scope_name: "a".to_string(),
+            workspace_path: tmp.path().to_path_buf(),
+        };
+        append_manifest(&paths, &m).unwrap();
+
+        let candidates: Vec<String> = rupu_coverage::read_manifests(&paths)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.run_id)
+            .collect();
+        // Proves the candidate source `run_rerun_in` will use (manifests,
+        // not the diff-side ledgers) actually contains the full id a bare
+        // suffix must resolve against.
+        assert_eq!(
+            resolve_coverage_run_id(&candidates, "5R0S").unwrap(),
+            full_id
+        );
+    }
+
+    // ── Task 4: `coverage runs` and `coverage audit` readability ────────
+
+    // Construct UiPrefs directly (mirroring tables.rs's own test helpers)
+    // rather than going through `ui_prefs`, which reads real config —
+    // these tests must be deterministic regardless of the machine
+    // running them.
+    fn prefs_color_always() -> UiPrefs {
+        UiPrefs {
+            color: crate::cmd::ui::ColorMode::Always,
+            theme: "base16-ocean.dark".into(),
+            palette_theme: "rupu-dark".into(),
+            palette: crate::output::palette::UiPaletteTheme::default(),
+            live_view: crate::cmd::ui::LiveViewMode::Focused,
+            pager: crate::cmd::ui::PagerMode::Never,
+            absolute: false,
+            all_columns: false,
+        }
+    }
+
+    fn prefs_no_color() -> UiPrefs {
+        UiPrefs {
+            color: crate::cmd::ui::ColorMode::Never,
+            theme: "base16-ocean.dark".into(),
+            palette_theme: "rupu-dark".into(),
+            palette: crate::output::palette::UiPaletteTheme::default(),
+            live_view: crate::cmd::ui::LiveViewMode::Focused,
+            pager: crate::cmd::ui::PagerMode::Never,
+            absolute: false,
+            all_columns: false,
+        }
+    }
+
+    fn sample_run_list_entry(run_id: &str, secs: i64) -> rupu_coverage::RunListEntry {
+        rupu_coverage::RunListEntry {
+            run_id: run_id.to_string(),
+            started_at: DateTime::<Utc>::from_timestamp(secs, 0).unwrap(),
+            model: "claude-opus".to_string(),
+            surface: rupu_coverage::Surface::Agent,
+            cells_asserted: 12,
+            findings: 3,
+            files_touched: 7,
+        }
+    }
+
+    #[test]
+    fn coverage_runs_table_compacts_the_run_id_and_the_full_id_is_absent() {
+        let runs = vec![sample_run_list_entry(
+            "run_01KRM1CVRC2A9XZ0CY33RN5R0S",
+            1_000,
+        )];
+        let out = render_coverage_runs_table(&runs, Utc::now());
+        assert!(
+            !out.contains(&runs[0].run_id),
+            "full run id leaked into the table: {out}"
+        );
+        assert!(
+            out.contains(&crate::output::ids::compact_id(&runs[0].run_id)),
+            "compact run id missing: {out}"
+        );
+    }
+
+    #[test]
+    fn coverage_runs_table_renders_started_as_relative_time() {
+        let runs = vec![sample_run_list_entry("run_short", 1_000)];
+        let now = runs[0].started_at + chrono::Duration::hours(1);
+        let out = render_coverage_runs_table(&runs, now);
+        assert!(out.contains("1h ago"), "no relative time rendered: {out}");
+        // No parsing needed here — `started_at` is already a real
+        // `DateTime<Utc>`, unlike `workflow runs`'s pre-stringified field.
+        assert!(
+            !out.contains("1970-01-01T00:16:40"),
+            "leaked a raw rfc3339 timestamp: {out}"
+        );
+    }
+
+    #[test]
+    fn coverage_runs_table_right_aligns_the_trailing_count_column() {
+        // `Files` is the rightmost column, so `trim_end().ends_with(...)`
+        // (tables.rs's own trick for a last column) can't distinguish
+        // aligned from unaligned here — trimming eats the very padding
+        // that alignment moves. Verified empirically: with alignment,
+        // BOTH rows end in exactly one trailing space (comfy-table's
+        // fixed column margin); without it, the shorter value ("7")
+        // leaves 5, the longer ("1234") leaves 2 — because left-align
+        // pads on the right instead of the left. So "exactly one
+        // trailing space, for every row" is what alignment actually
+        // buys, and that's what this asserts.
+        let mut short = sample_run_list_entry("run_short_a", 1_000);
+        short.files_touched = 7;
+        let mut long = sample_run_list_entry("run_short_b", 2_000);
+        long.files_touched = 1234;
+        let out = render_coverage_runs_table(&[short, long], Utc::now());
+        for row in out.lines().filter(|l| l.contains("run_short")) {
+            let trailing = row.len() - row.trim_end().len();
+            assert_eq!(
+                trailing, 1,
+                "expected exactly one trailing space (right-aligned Files column): {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn coverage_runs_table_keeps_every_run_visible_when_empty_is_handled_by_caller() {
+        // render_coverage_runs_table itself doesn't special-case an empty
+        // slice (the caller does, per render_table's early return) — it
+        // must still produce a valid (headers-only) table rather than
+        // panicking.
+        let out = render_coverage_runs_table(&[], Utc::now());
+        assert!(out.contains("Run"));
+    }
+
+    fn sample_concern_coverage(
+        severity: rupu_coverage::Severity,
+        clean: u32,
+        findings: u32,
+        examined: u32,
+        not_applicable: u32,
+        gap: bool,
+    ) -> rupu_coverage::ConcernCoverage {
+        rupu_coverage::ConcernCoverage {
+            concern_id: "stride:tampering".to_string(),
+            name: "Tampering".to_string(),
+            severity,
+            in_scope_files: if gap {
+                vec!["a.rs".to_string()]
+            } else {
+                vec![]
+            },
+            asserted_files: vec![],
+            gap_files: if gap {
+                vec!["a.rs".to_string()]
+            } else {
+                vec![]
+            },
+            clean,
+            findings,
+            examined,
+            not_applicable,
+        }
+    }
+
+    #[test]
+    fn audit_table_keeps_every_count_column_including_all_zeros() {
+        // The one table in the whole CLI where "a zero is data, not
+        // absence" genuinely holds — a concern with zero clean/finding/
+        // examined/N/A files is a concern nobody has looked at, which is
+        // exactly what `coverage audit` exists to surface. No
+        // CellValue/EntityTable suppression must apply here.
+        let concern = sample_concern_coverage(rupu_coverage::Severity::Medium, 0, 0, 0, 0, false);
+        let prefs = prefs_no_color();
+        let out = render_coverage_audit_concerns_table(std::slice::from_ref(&concern), &prefs);
+        let row = out
+            .lines()
+            .find(|l| l.contains("stride:tampering"))
+            .expect("row");
+        let zero_fields = row.split_whitespace().filter(|s| *s == "0").count();
+        assert_eq!(
+            zero_fields, 7,
+            "expected all seven count columns to show 0, got {zero_fields} in: {row}"
+        );
+    }
+
+    #[test]
+    fn audit_table_right_aligns_the_trailing_count_column() {
+        // N/A (not_applicable) is the last of the seven count columns,
+        // immediately before Status. Verified empirically: with
+        // right-alignment the shorter value renders as `7   ok`
+        // (3-space gap matching the padded column width `1234` forces);
+        // without it, comfy-table's default left alignment renders
+        // `7      ok` instead — so this distinguishes the two.
+        let mut low = sample_concern_coverage(rupu_coverage::Severity::Low, 0, 0, 0, 7, false);
+        low.concern_id = "concern_a".to_string();
+        let mut high = sample_concern_coverage(rupu_coverage::Severity::High, 0, 0, 0, 0, false);
+        high.concern_id = "concern_b".to_string();
+        high.not_applicable = 1234;
+        let prefs = prefs_no_color();
+        let out = render_coverage_audit_concerns_table(&[low, high], &prefs);
+        let row = out
+            .lines()
+            .find(|l| l.contains("concern_a"))
+            .expect("row for concern_a");
+        assert!(
+            row.contains("7   ok"),
+            "N/A column not right-aligned: {row}"
+        );
+    }
+
+    #[test]
+    fn audit_table_colors_severity_and_status_when_forced() {
+        let concern = sample_concern_coverage(rupu_coverage::Severity::Critical, 0, 1, 0, 0, true);
+        let prefs = prefs_color_always();
+        let out = render_coverage_audit_concerns_table(std::slice::from_ref(&concern), &prefs);
+        assert!(
+            out.contains("\x1b["),
+            "expected ANSI color codes when forced on: {out}"
+        );
+    }
+
+    #[test]
+    fn audit_table_plain_when_no_color() {
+        let concern = sample_concern_coverage(rupu_coverage::Severity::Critical, 0, 1, 0, 0, true);
+        let prefs = prefs_no_color();
+        let out = render_coverage_audit_concerns_table(std::slice::from_ref(&concern), &prefs);
+        assert!(!out.contains("\x1b["), "no color expected: {out}");
+        assert!(out.contains("Critical") && out.contains("GAP"));
+    }
+
+    #[test]
+    fn concern_rows_table_colors_severity_when_forced() {
+        let rows = vec![ConcernRow {
+            id: "stride:spoofing".to_string(),
+            severity: "Critical".to_string(),
+            name: "Spoofing".to_string(),
+        }];
+        let out = render_concern_rows_table(&rows, &prefs_color_always());
+        assert!(out.contains("\x1b["), "expected severity color: {out}");
+        let out_plain = render_concern_rows_table(&rows, &prefs_no_color());
+        assert!(!out_plain.contains("\x1b["));
+        assert!(out_plain.contains("Critical"));
+    }
+
+    fn sample_finding_record(severity: rupu_coverage::Severity) -> rupu_coverage::FindingRecord {
+        rupu_coverage::FindingRecord {
+            id: "f1".to_string(),
+            file_path: Some("src/auth.rs".to_string()),
+            line_range: None,
+            scope: rupu_coverage::FindingScope::File,
+            summary: "insecure default".to_string(),
+            severity,
+            concern_id: Some("stride:spoofing".to_string()),
+            evidence: rupu_coverage::FindingEvidence {
+                code_excerpt: None,
+                rationale: "r".to_string(),
+                references: vec![],
+            },
+            declared_by: rupu_coverage::Attribution {
+                run_id: "run_1".to_string(),
+                model: "m".to_string(),
+                surface: rupu_coverage::Surface::Agent,
+            },
+            declared_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn show_findings_table_colors_severity_when_forced() {
+        let findings = vec![sample_finding_record(rupu_coverage::Severity::High)];
+        let out = render_show_findings_table(&findings, &prefs_color_always());
+        assert!(out.contains("\x1b["), "expected severity color: {out}");
+        let out_plain = render_show_findings_table(&findings, &prefs_no_color());
+        assert!(!out_plain.contains("\x1b["));
+        assert!(out_plain.contains("High"));
     }
 }
