@@ -177,13 +177,15 @@ deletion preview would read as reassurance the CLI hasn't earned."
 
 ### Task 2: Thread `--absolute` / `--all-columns` into the commands this plan converts
 
-**Files:** Modify `crates/rupu-cli/src/lib.rs`, `crates/rupu-cli/src/cmd/{transcript,cron,agent,autoflow}.rs`
+**Files:** Modify `crates/rupu-cli/src/lib.rs`, `crates/rupu-cli/src/cmd/{transcript,cron,agent}.rs`
+
+**`autoflow` is deliberately NOT in this task.** A survey during execution found `wakes()` builds no `UiPrefs` at all — it renders with raw `Cell::new` and its output struct has no `prefs` field. Threading the flags here would mean either an unused parameter or a discarded config read, both of which are dead code this project's standards reject. Task 6 adds the `UiPrefs::resolve` call when it converts that table, giving the flags a real consumer from their first commit.
 
 **Interfaces:** Extends four `handle()` signatures with `absolute: bool, all_columns: bool` and threads each to `UiPrefs::with_table_flags(...)`.
 
 Only `Cmd::Workflow` and `Cmd::Session` receive these flags today (`lib.rs:300-313`). Without this, the relative timestamps the later tasks add cannot be toggled back to ISO, and `--all-columns` silently does nothing — a silent no-op, which this project's standards explicitly reject.
 
-Thread only the four commands this plan converts. Do NOT thread `models`/`cleanup`/`repos`/`issues` — they aren't being converted, and adding parameters they don't use is dead plumbing.
+Thread the three commands that already build a `UiPrefs` on a converted path. Do NOT thread `models`/`cleanup`/`repos`/`issues` — they aren't being converted, and adding parameters they don't use is dead plumbing.
 
 Follow the established pattern: `cmd/session.rs:1211` and `cmd/workflow.rs:1170` show `UiPrefs::resolve(...).with_table_flags(absolute, all_columns)`.
 
