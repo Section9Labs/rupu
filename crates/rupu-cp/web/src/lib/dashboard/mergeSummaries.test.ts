@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mergeSummaries } from './mergeSummaries';
+import { emptyFleet, mergeSummaries } from './mergeSummaries';
 import type { DashboardSummary } from '../api';
 
 function empty(capturedAt: string): DashboardSummary {
@@ -10,6 +10,7 @@ function empty(capturedAt: string): DashboardSummary {
     throughput_buckets: [],
     cycles: { total: 0, clean: null, with_failures: null },
     findings_open: null,
+    fleet: emptyFleet(),
     captured_at: capturedAt,
   };
 }
@@ -192,5 +193,78 @@ describe('mergeSummaries', () => {
     expect(merged.cycles).toEqual({ total: 0, clean: null, with_failures: null });
     expect(merged.findings_open).toBeNull();
     expect(merged.captured_at).toBe(now.toISOString());
+  });
+});
+
+describe('fleet merge', () => {
+  const T = '2026-07-30T00:00:00Z';
+
+  it('sums only reporting hosts and never fabricates a zero', () => {
+    const local: DashboardSummary = {
+      ...empty(T),
+      fleet: { ...emptyFleet(), workers: 3, claims_active: 9, autoflows_enabled: 4 },
+    };
+    const ssh: DashboardSummary = { ...empty(T), fleet: emptyFleet() };
+
+    const merged = mergeSummaries([local, ssh]);
+
+    expect(merged.fleet.workers).toBe(3);
+    expect(merged.fleet.claims_active).toBe(9);
+    expect(merged.fleet.autoflows_enabled).toBe(4);
+  });
+
+  it('leaves a field null when no host reports it', () => {
+    const merged = mergeSummaries([{ ...empty(T), fleet: emptyFleet() }]);
+    expect(merged.fleet.workers).toBeNull();
+    expect(merged.fleet.repos).toBeNull();
+  });
+
+  it('keeps a genuine zero distinct from an unreported field', () => {
+    const merged = mergeSummaries([{ ...empty(T), fleet: { ...emptyFleet(), workers: 0 } }]);
+    expect(merged.fleet.workers).toBe(0);
+    expect(merged.fleet.repos).toBeNull();
+  });
+
+  it('ORs issues_capped and takes the oldest inventory stamp', () => {
+    const older = '2026-07-30T10:00:00Z';
+    const newer = '2026-07-30T10:20:00Z';
+    const a: DashboardSummary = {
+      ...empty(T),
+      fleet: {
+        ...emptyFleet(),
+        issues_open: 300,
+        issues_capped: true,
+        inventory_captured_at: older,
+      },
+    };
+    const b: DashboardSummary = {
+      ...empty(T),
+      fleet: {
+        ...emptyFleet(),
+        issues_open: 12,
+        issues_capped: false,
+        inventory_captured_at: newer,
+      },
+    };
+
+    const merged = mergeSummaries([a, b]);
+
+    expect(merged.fleet.issues_open).toBe(312);
+    expect(merged.fleet.issues_capped).toBe(true);
+    expect(merged.fleet.inventory_captured_at).toBe(older);
+  });
+
+  /* A host from a pre-fleet rupu emits no `fleet` key at all. The merge must
+     treat it as reporting nothing rather than throwing on an undefined read —
+     one stale remote CP must not blank the whole dashboard. */
+  it('tolerates a host with no fleet block at all', () => {
+    const preFleet = { ...empty(T) } as DashboardSummary;
+    // @ts-expect-error deliberately modelling a pre-fleet wire payload
+    delete preFleet.fleet;
+    const modern: DashboardSummary = { ...empty(T), fleet: { ...emptyFleet(), workers: 2 } };
+
+    const merged = mergeSummaries([preFleet, modern]);
+
+    expect(merged.fleet.workers).toBe(2);
   });
 });

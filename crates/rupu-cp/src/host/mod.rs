@@ -10,6 +10,7 @@
 pub mod bucket;
 pub mod connector;
 pub mod dashboard_summary;
+pub mod fleet_counts;
 pub mod http;
 pub mod local;
 pub mod registry;

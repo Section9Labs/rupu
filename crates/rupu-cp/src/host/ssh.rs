@@ -1618,6 +1618,10 @@ impl HostConnector for SshHostConnector {
             // `Some` values and flags the aggregate `findings_partial` when
             // any reporting host contributed `None`.
             findings_open: None,
+            // SSH shells to the remote `rupu` CLI, which has no fleet-inventory
+            // surface. Report nothing rather than zeros — the merge raises
+            // `fleet_partial` so the strip says so.
+            fleet: crate::host::dashboard_summary::FleetCounts::default(),
             captured_at: now,
         })
     }
@@ -1714,13 +1718,16 @@ mod tests {
         let err = classify_remote_cli_failure(
             "Error: transcript run_x is managed by session ses_1; use `rupu session archive|delete` instead",
         );
-        assert!(matches!(err, HostConnectorError::Invalid(m) if m.contains("is managed by session")));
+        assert!(
+            matches!(err, HostConnectorError::Invalid(m) if m.contains("is managed by session"))
+        );
     }
 
     #[test]
     fn classify_remote_cli_failure_recognizes_non_terminal_refusal() {
-        let err =
-            classify_remote_cli_failure("Error: run run_x is not terminal (running) — cancel it first");
+        let err = classify_remote_cli_failure(
+            "Error: run run_x is not terminal (running) — cancel it first",
+        );
         assert!(matches!(err, HostConnectorError::Invalid(_)));
     }
 
@@ -1732,7 +1739,8 @@ mod tests {
 
     #[test]
     fn classify_remote_cli_failure_falls_back_to_unreachable() {
-        let err = classify_remote_cli_failure("ssh: connect to host edge port 22: Connection refused");
+        let err =
+            classify_remote_cli_failure("ssh: connect to host edge port 22: Connection refused");
         assert!(matches!(err, HostConnectorError::Unreachable(_)));
     }
 
@@ -2935,13 +2943,15 @@ mod tests {
 
         let cmds = fake.commands.lock().unwrap();
         assert!(
-            cmds.iter()
-                .any(|c| c.contains("'session'") && c.contains("'archive'") && c.contains(&format!("'{id}'"))),
+            cmds.iter().any(|c| c.contains("'session'")
+                && c.contains("'archive'")
+                && c.contains(&format!("'{id}'"))),
             "session archive command not found in: {cmds:?}"
         );
         assert!(
-            cmds.iter()
-                .any(|c| c.contains("'session'") && c.contains("'restore'") && c.contains(&format!("'{id}'"))),
+            cmds.iter().any(|c| c.contains("'session'")
+                && c.contains("'restore'")
+                && c.contains(&format!("'{id}'"))),
             "session restore command not found in: {cmds:?}"
         );
         assert!(

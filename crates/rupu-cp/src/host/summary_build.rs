@@ -7,8 +7,8 @@
 #![deny(clippy::all)]
 
 use crate::host::dashboard_summary::{
-    ActiveCounts, ActiveLongest, CycleCounts, DashboardRange, DashboardSummary, TerminalBucket,
-    ThroughputBucket,
+    ActiveCounts, ActiveLongest, CycleCounts, DashboardRange, DashboardSummary, FleetCounts,
+    TerminalBucket, ThroughputBucket,
 };
 use chrono::{DateTime, Duration, Timelike, Utc};
 use rupu_orchestrator::runs::{RunRecord, RunStatus};
@@ -51,6 +51,7 @@ pub fn build_summary(
     runs: &[RunRecord],
     cycles: &[CycleRollup],
     findings_open: Option<u64>,
+    fleet: FleetCounts,
     range: DashboardRange,
     now: DateTime<Utc>,
 ) -> DashboardSummary {
@@ -161,6 +162,7 @@ pub fn build_summary(
         throughput_buckets,
         cycles,
         findings_open,
+        fleet,
         captured_at: now,
     }
 }
@@ -341,7 +343,14 @@ mod tests {
             rec("r6", Completed, 6),
             rec("r7", Failed, 7),
         ];
-        let s = build_summary(&runs, &[], Some(0), DashboardRange::All, chrono::Utc::now());
+        let s = build_summary(
+            &runs,
+            &[],
+            Some(0),
+            FleetCounts::default(),
+            DashboardRange::All,
+            chrono::Utc::now(),
+        );
         assert_eq!(s.active.running, 2);
         assert_eq!(s.active.awaiting_approval, 1);
         assert_eq!(s.active.paused, 1);
@@ -356,7 +365,14 @@ mod tests {
             rec("r2", Failed, 10),
             rec("r3", Running, 10),
         ];
-        let s = build_summary(&runs, &[], Some(0), DashboardRange::All, chrono::Utc::now());
+        let s = build_summary(
+            &runs,
+            &[],
+            Some(0),
+            FleetCounts::default(),
+            DashboardRange::All,
+            chrono::Utc::now(),
+        );
         let completed: u64 = s.terminal_buckets.iter().map(|b| b.completed).sum();
         let failed: u64 = s.terminal_buckets.iter().map(|b| b.failed).sum();
         assert_eq!(completed, 1);
@@ -375,6 +391,7 @@ mod tests {
             &runs,
             &[],
             Some(0),
+            FleetCounts::default(),
             DashboardRange::Days7,
             chrono::Utc::now(),
         );
@@ -398,6 +415,7 @@ mod tests {
             &runs,
             &[],
             Some(0),
+            FleetCounts::default(),
             DashboardRange::Days7,
             chrono::Utc::now(),
         );
@@ -418,6 +436,7 @@ mod tests {
             &[cron, manual],
             &[],
             Some(0),
+            FleetCounts::default(),
             DashboardRange::All,
             chrono::Utc::now(),
         );
@@ -438,6 +457,7 @@ mod tests {
             &[rec("r1", Running, 5)],
             &[],
             Some(0),
+            FleetCounts::default(),
             DashboardRange::All,
             chrono::Utc::now(),
         );
@@ -465,6 +485,7 @@ mod tests {
             &runs,
             &[],
             Some(0),
+            FleetCounts::default(),
             DashboardRange::Days7,
             chrono::Utc::now(),
         );
@@ -483,7 +504,14 @@ mod tests {
             rec("older", Running, 50),
             rec("done", Completed, 100),
         ];
-        let s = build_summary(&runs, &[], Some(0), DashboardRange::All, chrono::Utc::now());
+        let s = build_summary(
+            &runs,
+            &[],
+            Some(0),
+            FleetCounts::default(),
+            DashboardRange::All,
+            chrono::Utc::now(),
+        );
         let al = s
             .active_longest
             .expect("two non-terminal runs in hand — expected an active_longest");
@@ -498,6 +526,7 @@ mod tests {
             &[rec("done", Completed, 5)],
             &[],
             Some(0),
+            FleetCounts::default(),
             DashboardRange::All,
             chrono::Utc::now(),
         );
@@ -516,7 +545,14 @@ mod tests {
             rec("running_newer", Running, 5),
             rec("awaiting_much_older", AwaitingApproval, 60 * 24 * 71),
         ];
-        let s = build_summary(&runs, &[], Some(0), DashboardRange::All, chrono::Utc::now());
+        let s = build_summary(
+            &runs,
+            &[],
+            Some(0),
+            FleetCounts::default(),
+            DashboardRange::All,
+            chrono::Utc::now(),
+        );
         let al = s
             .active_longest
             .expect("one running run in hand — expected an active_longest");
@@ -531,7 +567,14 @@ mod tests {
             rec("paused", Paused, 20),
             rec("pending", Pending, 30),
         ];
-        let s = build_summary(&runs, &[], Some(0), DashboardRange::All, chrono::Utc::now());
+        let s = build_summary(
+            &runs,
+            &[],
+            Some(0),
+            FleetCounts::default(),
+            DashboardRange::All,
+            chrono::Utc::now(),
+        );
         assert!(
             s.active_longest.is_none(),
             "no run is Running, so active_longest must be None even though \
@@ -556,7 +599,14 @@ mod tests {
                 failed: 2,
             },
         ];
-        let s = build_summary(&[], &cycles, Some(0), DashboardRange::All, now);
+        let s = build_summary(
+            &[],
+            &cycles,
+            Some(0),
+            FleetCounts::default(),
+            DashboardRange::All,
+            now,
+        );
         assert_eq!(s.cycles.total, 3);
         assert_eq!(s.cycles.clean, Some(2));
         assert_eq!(s.cycles.with_failures, Some(1));
@@ -573,7 +623,14 @@ mod tests {
             started_at: now - chrono::Duration::hours(1),
             failed: 0,
         };
-        let s = build_summary(&[], &[old, recent], Some(0), DashboardRange::Days7, now);
+        let s = build_summary(
+            &[],
+            &[old, recent],
+            Some(0),
+            FleetCounts::default(),
+            DashboardRange::Days7,
+            now,
+        );
         assert_eq!(
             s.cycles.total, 1,
             "the 10-day-old cycle must fall outside the 7d range"

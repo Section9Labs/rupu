@@ -13,6 +13,7 @@ pub mod launcher;
 pub mod net;
 pub mod node;
 pub mod pagination;
+pub mod fleet_inventory;
 pub mod repos;
 pub mod server;
 pub mod session_mutator;
@@ -67,6 +68,11 @@ pub struct ServeOpts {
     /// `None` → the transcript archive/delete endpoints return 501.
     pub transcript_mutator:
         Option<std::sync::Arc<dyn crate::transcript_mutator::TranscriptMutator>>,
+    /// Optional fleet-inventory adapter (provider probes + SCM inventory).
+    /// rupu-cli's `cp serve` provides it; `None` → the dashboard's fleet strip
+    /// reports nothing for the provider- and SCM-backed counts rather than
+    /// fabricating zeros.
+    pub inventory: Option<std::sync::Arc<dyn crate::fleet_inventory::FleetInventory>>,
 }
 
 /// The browser-clickable URL for a bound address. An unspecified bind host
@@ -144,7 +150,8 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         std::sync::Arc::clone(&app_state.run_store),
         app_state.global_dir.clone(),
     )
-    .with_pricing(pricing);
+    .with_pricing(pricing)
+    .with_inventory(opts.inventory);
     let store = rupu_workspace::HostStore {
         root: app_state.global_dir.join("hosts"),
     };

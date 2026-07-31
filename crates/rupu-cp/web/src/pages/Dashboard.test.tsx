@@ -5,6 +5,7 @@ import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import Dashboard from './Dashboard';
 import { api, type DashboardResponse, type RegisteredHostView } from '../lib/api';
+import { emptyFleet } from '../lib/dashboard/mergeSummaries';
 
 afterEach(() => {
   cleanup();
@@ -29,8 +30,10 @@ function summary(overrides: Partial<DashboardResponse> = {}, hostId = 'local'): 
     findings_open: 3,
     captured_at,
     hosts: [{ host_id: hostId, name: hostId, transport_kind: 'local', state: 'ok', captured_at, reason: null }],
+    fleet: emptyFleet(),
     findings_partial: false,
     cycles_partial: false,
+    fleet_partial: false,
     ...overrides,
   };
 }
@@ -109,5 +112,39 @@ describe('Dashboard', () => {
     );
 
     await waitFor(() => expect(sub).toHaveBeenCalled());
+  });
+});
+
+describe('Dashboard fleet strip', () => {
+  it('renders the fleet strip, with real counts and em-dashes for unreported fields', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getDashboard').mockResolvedValue(
+      summary({
+        fleet: {
+          ...emptyFleet(),
+          autoflows_enabled: 6,
+          autoflows_disabled: 2,
+          workers: 3,
+          claims_active: 9,
+        },
+      }),
+    );
+    vi.spyOn(api, 'subscribeEvents').mockReturnValue(() => {});
+
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId('fleet-strip')).toBeInTheDocument());
+    expect(screen.getByTestId('fleet-workers')).toHaveTextContent('3 workers');
+    expect(screen.getByTestId('fleet-claims')).toHaveTextContent('9 claimed');
+    expect(screen.getByTestId('fleet-autoflows')).toHaveTextContent('2 off');
+    // repos / providers / issues are Plan 2 and Plan 3 territory: unreported,
+    // so they must render as em-dashes rather than fabricated zeros.
+    expect(screen.getByTestId('fleet-repos')).toHaveTextContent('—');
+    expect(screen.getByTestId('fleet-providers')).toHaveTextContent('—');
+    expect(screen.getByTestId('fleet-issues')).toHaveTextContent('—');
   });
 });

@@ -2,7 +2,7 @@
 
 use crate::paths;
 use clap::Subcommand;
-use rupu_cp::host::bucket::{ObjectStoreBucket, poll_bucket_run};
+use rupu_cp::host::bucket::{poll_bucket_run, ObjectStoreBucket};
 use rupu_orchestrator::runs::RunStore;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -76,12 +76,16 @@ pub async fn handle(action: Action) -> ExitCode {
             let worker_handle = tokio::spawn(run_resume_worker(
                 Arc::clone(&store),
                 worker_id,
-                rupu_workspace::HostStore { root: global_dir.join("hosts") },
+                rupu_workspace::HostStore {
+                    root: global_dir.join("hosts"),
+                },
                 shutdown_rx,
             ));
             let poller_handle = tokio::spawn(run_bucket_poller(
                 Arc::clone(&store),
-                rupu_workspace::HostStore { root: global_dir.join("hosts") },
+                rupu_workspace::HostStore {
+                    root: global_dir.join("hosts"),
+                },
                 shutdown_tx.subscribe(),
             ));
 
@@ -152,7 +156,9 @@ pub async fn handle(action: Action) -> ExitCode {
             // `[cp].gate_sweep_enabled` (default: on); cadence from
             // `[cp].gate_sweep_interval_secs` (default: 60s).
             let gate_sweep_store = Arc::clone(&store);
-            let gate_sweep_hosts = rupu_workspace::HostStore { root: global_dir.join("hosts") };
+            let gate_sweep_hosts = rupu_workspace::HostStore {
+                root: global_dir.join("hosts"),
+            };
             let gate_sweep_exe = exe.clone();
             let gate_sweep_handle = tokio::spawn(run_periodic_tick(
                 "gate-sweep",
@@ -161,7 +167,9 @@ pub async fn handle(action: Action) -> ExitCode {
                 shutdown_tx.subscribe(),
                 move || {
                     let store = Arc::clone(&gate_sweep_store);
-                    let hosts = rupu_workspace::HostStore { root: gate_sweep_hosts.root.clone() };
+                    let hosts = rupu_workspace::HostStore {
+                        root: gate_sweep_hosts.root.clone(),
+                    };
                     let exe = gate_sweep_exe.clone();
                     let worker_id = gate_sweep_worker_id.clone();
                     async move {
@@ -213,14 +221,67 @@ pub async fn handle(action: Action) -> ExitCode {
                     },
                 ));
 
-            // Repo lister for the web Run target picker.
-            let repos: Option<Arc<dyn rupu_cp::repos::RepoLister>> = {
-                let resolver = rupu_auth::KeychainResolver::new();
+            // Repo lister for the web Run target picker. The same SCM registry
+            // and repo lister feed the fleet strip's SCM half below — one
+            // credential resolution, not two.
+            let scm_resolver = Arc::new(rupu_auth::resolver::KeychainResolver::new());
+            let scm_registry = {
                 let global_cfg = global_dir.join("config.toml");
                 let cfg =
                     rupu_config::layer_files_locked(Some(&global_cfg), None).unwrap_or_default();
-                let registry = Arc::new(rupu_scm::Registry::discover(&resolver, &cfg).await);
-                Some(Arc::new(crate::cp_repos::CpRepoLister { registry }))
+                Arc::new(rupu_scm::Registry::discover(scm_resolver.as_ref(), &cfg).await)
+            };
+            let repo_lister: Arc<dyn rupu_cp::repos::RepoLister> =
+                Arc::new(crate::cp_repos::CpRepoLister {
+                    registry: Arc::clone(&scm_registry),
+                });
+            let repos: Option<Arc<dyn rupu_cp::repos::RepoLister>> = Some(Arc::clone(&repo_lister));
+
+            // Fleet inventory for the dashboard's fleet strip. Two halves on
+            // very different TTLs — providers are one cheap call each, the SCM
+            // half is one issue listing per connected repo — so they refresh on
+            // separate tasks against one cache. The dashboard only ever reads
+            // that cache, never the network.
+            let inventory = Arc::new(crate::cp_inventory::CpFleetInventory::new(
+                Arc::clone(&scm_resolver),
+                Some(crate::cp_inventory::ScmDeps {
+                    global_dir: global_dir.clone(),
+                    resolver: Arc::clone(&scm_resolver),
+                    repos: repo_lister,
+                    scm: scm_registry,
+                }),
+            ));
+            // One immediate refresh per half so the strip is populated by the
+            // time the operator's first page load lands.
+            let inventory_handle = {
+                let inv = Arc::clone(&inventory);
+                let mut shutdown = shutdown_tx.subscribe();
+                tokio::spawn(async move {
+                    loop {
+                        inv.refresh_providers().await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(
+                                crate::cp_inventory::PROBE_TTL_SECS,
+                            )) => {}
+                            _ = shutdown.changed() => break,
+                        }
+                    }
+                })
+            };
+            let scm_inventory_handle = {
+                let inv = Arc::clone(&inventory);
+                let mut shutdown = shutdown_tx.subscribe();
+                tokio::spawn(async move {
+                    loop {
+                        inv.refresh_scm().await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(
+                                crate::cp_inventory::SCM_TTL_SECS,
+                            )) => {}
+                            _ = shutdown.changed() => break,
+                        }
+                    }
+                })
             };
 
             let serve_result = rupu_cp::serve(rupu_cp::ServeOpts {
@@ -236,6 +297,7 @@ pub async fn handle(action: Action) -> ExitCode {
                 generator,
                 session_mutator,
                 transcript_mutator,
+                inventory: Some(inventory),
             })
             .await;
 
@@ -246,6 +308,8 @@ pub async fn handle(action: Action) -> ExitCode {
             let _ = autoflow_reconcile_handle.await;
             let _ = cron_tick_handle.await;
             let _ = gate_sweep_handle.await;
+            let _ = inventory_handle.await;
+            let _ = scm_inventory_handle.await;
 
             serve_result
         }
@@ -925,10 +989,9 @@ async fn run_gate_sweep(
                                 tracing::warn!(run_id = %run_id, gate = %gate_step_id, "gate sweep: expected reject outcome for on_timeout=reject but got {outcome:?}; skipping cleanup");
                                 continue;
                             }
-                            let reason = rec
-                                .error_message
-                                .clone()
-                                .unwrap_or_else(|| "gate timed out (on_timeout: reject)".to_string());
+                            let reason = rec.error_message.clone().unwrap_or_else(|| {
+                                "gate timed out (on_timeout: reject)".to_string()
+                            });
                             tracing::info!(run_id = %run_id, step_id = %gate_step_id, "gate sweep: on_timeout=reject → gate auto-rejected; running on_reject cleanup");
                             // I-36: run this unconditionally — an empty
                             // `on_reject:` chain must still record the
@@ -1132,7 +1195,14 @@ mod tests {
                 Some("web"),
             ),
             vec![
-                "workflow", "approve", "run_x", "--gate", "gate_b", "--approver", "web", "--mode",
+                "workflow",
+                "approve",
+                "run_x",
+                "--gate",
+                "gate_b",
+                "--approver",
+                "web",
+                "--mode",
                 "bypass",
             ],
         );
@@ -1315,7 +1385,10 @@ mod tests {
         rec.awaiting.truncate(1);
         rec.sync_awaiting_compat();
         store
-            .create(rec.clone(), "name: g\nsteps:\n  - id: gate_a\n    approval: {}\n")
+            .create(
+                rec.clone(),
+                "name: g\nsteps:\n  - id: gate_a\n    approval: {}\n",
+            )
             .unwrap();
 
         let now = chrono::Utc::now();
@@ -1444,15 +1517,11 @@ mod tests {
             loop_progress: Default::default(),
         };
         rec.sync_awaiting_compat();
-        store.create(rec.clone(), GATE_A_REJECT_GATE_B_NONE_YAML).unwrap();
+        store
+            .create(rec.clone(), GATE_A_REJECT_GATE_B_NONE_YAML)
+            .unwrap();
 
-        run_gate_sweep(
-            Arc::clone(&store),
-            hosts,
-            exe,
-            "sweep-test".to_string(),
-        )
-        .await;
+        run_gate_sweep(Arc::clone(&store), hosts, exe, "sweep-test".to_string()).await;
 
         let reloaded = store.load(&rec.id).unwrap();
         assert_eq!(
@@ -1628,15 +1697,11 @@ mod tests {
             permission_mode: None,
             loop_progress: Default::default(),
         };
-        store.create(rec.clone(), GATE_A_REJECT_GATE_B_NONE_YAML).unwrap();
+        store
+            .create(rec.clone(), GATE_A_REJECT_GATE_B_NONE_YAML)
+            .unwrap();
 
-        run_gate_sweep(
-            Arc::clone(&store),
-            hosts,
-            exe,
-            "sweep-test".to_string(),
-        )
-        .await;
+        run_gate_sweep(Arc::clone(&store), hosts, exe, "sweep-test".to_string()).await;
 
         let reloaded = store.load(&rec.id).unwrap();
         assert_eq!(
@@ -1723,7 +1788,13 @@ mod tests {
             )
             .unwrap();
 
-        run_gate_sweep(Arc::clone(&store), hosts.clone(), exe.clone(), "sweep-test".to_string()).await;
+        run_gate_sweep(
+            Arc::clone(&store),
+            hosts.clone(),
+            exe.clone(),
+            "sweep-test".to_string(),
+        )
+        .await;
 
         let after_tick1 = store.load(&rec.id).unwrap();
         assert_eq!(
@@ -1848,7 +1919,13 @@ mod tests {
             RunStatus::Paused,
         ] {
             assert_eq!(
-                sweep_decision(status, Some(TimeoutAction::Reject), true, Some(false), false),
+                sweep_decision(
+                    status,
+                    Some(TimeoutAction::Reject),
+                    true,
+                    Some(false),
+                    false
+                ),
                 SweepAction::Skip
             );
         }

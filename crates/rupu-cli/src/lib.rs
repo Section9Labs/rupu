@@ -9,6 +9,7 @@ pub mod build_info;
 pub mod cmd;
 pub mod cp_agent_launcher;
 pub mod cp_definition_generator;
+pub mod cp_inventory;
 pub mod cp_launcher;
 pub mod cp_repos;
 pub mod cp_session_mutator;

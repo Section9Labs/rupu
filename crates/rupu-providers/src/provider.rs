@@ -53,6 +53,26 @@ pub trait LlmProvider: Send + Sync {
     async fn list_models(&self) -> Vec<crate::model_pool::ModelInfo> {
         Vec::new()
     }
+
+    /// Liveness + authorization probe: does this provider answer an
+    /// authenticated request right now?
+    ///
+    /// `Ok(())` means an authenticated call succeeded. Errors carry WHY, which
+    /// is the point — an operator needs to tell "the key is wrong" from "the
+    /// host is unreachable".
+    ///
+    /// The default is `NotImplemented`, NOT a [`list_models`](Self::list_models)-derived
+    /// guess. `list_models` returns a bare `Vec` and folds every failure into
+    /// an empty result, so a 401 would be indistinguishable from a provider
+    /// with no models — reporting that as healthy is precisely the false green
+    /// light this exists to avoid. A provider without a real probe reports
+    /// "never probed" instead, which callers must count as neither healthy nor
+    /// unhealthy.
+    async fn probe(&self) -> Result<(), ProviderError> {
+        Err(ProviderError::NotImplemented {
+            provider: self.provider_id().to_string(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -86,6 +106,25 @@ mod tests {
         fn provider_id(&self) -> ProviderId {
             ProviderId::Anthropic
         }
+    }
+
+    /// A provider that has not implemented `probe` must report
+    /// `NotImplemented` — never `Ok`. Callers map that to "never probed" and
+    /// count it as neither healthy nor unhealthy; an `Ok` default would put a
+    /// green light on something nobody checked.
+    #[tokio::test]
+    async fn probe_default_is_not_implemented_never_ok() {
+        let p = MockProvider {
+            response: mock_response(),
+        };
+        let err = p
+            .probe()
+            .await
+            .expect_err("the default must not report success");
+        assert!(
+            matches!(err, ProviderError::NotImplemented { .. }),
+            "expected NotImplemented, got {err:?}"
+        );
     }
 
     fn mock_response() -> LlmResponse {

@@ -19,7 +19,7 @@ use crate::{
         connector::HostConnectorError,
         dashboard_summary::{
             ActiveCounts, ActiveLongest, CycleCounts, DashboardRange, DashboardSummary,
-            TerminalBucket, ThroughputBucket,
+            FleetCounts, TerminalBucket, ThroughputBucket,
         },
         summary_build,
     },
@@ -81,6 +81,11 @@ struct DashboardResponse {
     /// `cycles.total` (via the flatten) is always a complete sum regardless;
     /// only the clean/with-failures split can be partial.
     cycles_partial: bool,
+    /// Same "not reported ≠ 0" rule as `findings_partial`, for the fleet
+    /// strip: true when at least one reporting host contributed `None` for a
+    /// fleet count that other hosts DID report. When true the strip's numbers
+    /// are a partial sum across the reporting hosts, never a fleet total.
+    fleet_partial: bool,
     #[serde(flatten)]
     summary: crate::host::dashboard_summary::DashboardSummary,
 }
@@ -206,13 +211,14 @@ async fn get_dashboard(
         }
     }
 
-    let (summary, findings_partial, cycles_partial) =
+    let (summary, findings_partial, cycles_partial, fleet_partial) =
         merge_dashboard_summaries(reported, range, Utc::now());
 
     Ok(Json(DashboardResponse {
         hosts,
         findings_partial,
         cycles_partial,
+        fleet_partial,
         summary,
     }))
 }
@@ -234,7 +240,7 @@ fn merge_dashboard_summaries(
     reported: Vec<DashboardSummary>,
     range: DashboardRange,
     now: DateTime<Utc>,
-) -> (DashboardSummary, bool, bool) {
+) -> (DashboardSummary, bool, bool, bool) {
     let mut active = ActiveCounts::default();
     let mut active_longest: Option<ActiveLongest> = None;
     let mut cycles_total: u64 = 0;
@@ -247,6 +253,8 @@ fn merge_dashboard_summaries(
     let mut with_failures_poisoned = false;
     let mut findings_open: Option<u64> = None;
     let mut findings_partial = false;
+    let mut fleet = FleetCounts::default();
+    let mut fleet_partial = false;
     let mut terminal_merge: BTreeMap<DateTime<Utc>, TerminalBucket> = BTreeMap::new();
     let mut throughput_merge: BTreeMap<DateTime<Utc>, ThroughputBucket> = BTreeMap::new();
     // The oldest `captured_at` among hosts that actually reported — the
@@ -301,6 +309,41 @@ fn merge_dashboard_summaries(
             // (SSH). Never fold it in as a zero — flag the aggregate partial
             // instead.
             None => findings_partial = true,
+        }
+
+        // Every fleet count follows the `findings_open` rule — sum the
+        // `Some`s, flag partial on a `None`, never fabricate a zero. Kept as
+        // one closure so a field added in Plan 2 or 3 cannot accidentally get
+        // different semantics from the rest.
+        let mut add = |acc: &mut Option<u64>, v: Option<u64>| match v {
+            Some(n) => *acc = Some(acc.unwrap_or(0) + n),
+            None => fleet_partial = true,
+        };
+        add(&mut fleet.repos, sum.fleet.repos);
+        add(
+            &mut fleet.providers_configured,
+            sum.fleet.providers_configured,
+        );
+        add(
+            &mut fleet.providers_unhealthy,
+            sum.fleet.providers_unhealthy,
+        );
+        add(&mut fleet.autoflows_enabled, sum.fleet.autoflows_enabled);
+        add(&mut fleet.autoflows_disabled, sum.fleet.autoflows_disabled);
+        add(&mut fleet.workers, sum.fleet.workers);
+        add(&mut fleet.claims_active, sum.fleet.claims_active);
+        add(&mut fleet.issues_pending, sum.fleet.issues_pending);
+        add(&mut fleet.issues_open, sum.fleet.issues_open);
+
+        // A cap anywhere makes the merged open count a floor.
+        fleet.issues_capped |= sum.fleet.issues_capped;
+        // Oldest wins, for the same reason `oldest_captured_at` does: a fleet
+        // number is only as fresh as its stalest contributing cache.
+        if let Some(ts) = sum.fleet.inventory_captured_at {
+            fleet.inventory_captured_at = Some(match fleet.inventory_captured_at {
+                Some(cur) => cur.min(ts),
+                None => ts,
+            });
         }
 
         for b in sum.terminal_buckets {
@@ -363,10 +406,12 @@ fn merge_dashboard_summaries(
             throughput_buckets,
             cycles,
             findings_open,
+            fleet,
             captured_at: oldest_captured_at.unwrap_or(now),
         },
         findings_partial,
         cycles_partial,
+        fleet_partial,
     )
 }
 
@@ -402,6 +447,7 @@ mod merge_tests {
             throughput_buckets: vec![],
             cycles: CycleCounts::default(),
             findings_open: None,
+            fleet: FleetCounts::default(),
             captured_at,
         }
     }
@@ -432,7 +478,7 @@ mod merge_tests {
             ..empty_summary(now)
         };
 
-        let (merged, findings_partial, _cycles_partial) =
+        let (merged, findings_partial, _cycles_partial, _fleet_partial) =
             merge_dashboard_summaries(vec![local, ssh], DashboardRange::Days7, now);
 
         let day_buckets: Vec<_> = merged
@@ -475,7 +521,7 @@ mod merge_tests {
             ..empty_summary(now)
         };
 
-        let (merged, _findings_partial, _cycles_partial) =
+        let (merged, _findings_partial, _cycles_partial, _fleet_partial) =
             merge_dashboard_summaries(vec![local, ssh], DashboardRange::Days7, now);
 
         let day_buckets: Vec<_> = merged
@@ -513,7 +559,7 @@ mod merge_tests {
             }),
             ..empty_summary(now)
         };
-        let (merged, _, _) =
+        let (merged, _, _, _) =
             merge_dashboard_summaries(vec![shorter, longer], DashboardRange::All, now);
         let al = merged
             .active_longest
@@ -529,7 +575,7 @@ mod merge_tests {
     fn active_longest_is_none_when_no_host_reports_one() {
         let now = Utc::now();
         let a = empty_summary(now);
-        let (merged, _, _) = merge_dashboard_summaries(vec![a], DashboardRange::All, now);
+        let (merged, _, _, _) = merge_dashboard_summaries(vec![a], DashboardRange::All, now);
         assert!(merged.active_longest.is_none());
     }
 
@@ -556,7 +602,7 @@ mod merge_tests {
             },
             ..empty_summary(now)
         };
-        let (merged, _findings_partial, cycles_partial) =
+        let (merged, _findings_partial, cycles_partial, _fleet_partial) =
             merge_dashboard_summaries(vec![local, ssh], DashboardRange::All, now);
         assert_eq!(
             merged.cycles.total, 6,
@@ -592,7 +638,7 @@ mod merge_tests {
             },
             ..empty_summary(now)
         };
-        let (merged, _, cycles_partial) =
+        let (merged, _, cycles_partial, _) =
             merge_dashboard_summaries(vec![a, b], DashboardRange::All, now);
         assert_eq!(merged.cycles.total, 8);
         assert_eq!(merged.cycles.clean, Some(6));
@@ -614,7 +660,7 @@ mod merge_tests {
             findings_open: None,
             ..empty_summary(now)
         };
-        let (merged, partial, _cycles_partial) =
+        let (merged, partial, _cycles_partial, _fleet_partial) =
             merge_dashboard_summaries(vec![a, b], DashboardRange::All, now);
         assert_eq!(
             merged.findings_open,
@@ -627,10 +673,150 @@ mod merge_tests {
         );
     }
 
+    /// The `findings_open` rule, applied to every fleet count: sum only the
+    /// hosts that reported, flag the aggregate partial, and NEVER fold a
+    /// non-reporting host in as a zero.
+    #[test]
+    fn fleet_counts_sum_only_reporting_hosts_and_flag_partial() {
+        let now = Utc::now();
+        let local = DashboardSummary {
+            fleet: FleetCounts {
+                workers: Some(3),
+                claims_active: Some(9),
+                autoflows_enabled: Some(4),
+                providers_configured: Some(2),
+                ..FleetCounts::default()
+            },
+            ..empty_summary(now)
+        };
+        let ssh = DashboardSummary {
+            fleet: FleetCounts::default(),
+            ..empty_summary(now)
+        };
+
+        let (merged, _findings, _cycles, fleet_partial) =
+            merge_dashboard_summaries(vec![local, ssh], DashboardRange::All, now);
+
+        assert_eq!(
+            merged.fleet.workers,
+            Some(3),
+            "must not fabricate 0 for ssh"
+        );
+        assert_eq!(merged.fleet.claims_active, Some(9));
+        assert_eq!(merged.fleet.autoflows_enabled, Some(4));
+        assert!(
+            fleet_partial,
+            "the ssh host reported None for every fleet field; the aggregate is partial"
+        );
+    }
+
+    #[test]
+    fn fleet_counts_sum_across_hosts_and_are_not_partial_when_all_report() {
+        let now = Utc::now();
+        let a = DashboardSummary {
+            fleet: FleetCounts {
+                repos: Some(1),
+                providers_configured: Some(3),
+                providers_unhealthy: Some(0),
+                autoflows_enabled: Some(1),
+                autoflows_disabled: Some(0),
+                workers: Some(2),
+                claims_active: Some(1),
+                issues_pending: Some(0),
+                issues_open: Some(0),
+                issues_capped: false,
+                inventory_captured_at: None,
+            },
+            ..empty_summary(now)
+        };
+        let b = DashboardSummary {
+            fleet: FleetCounts {
+                repos: Some(6),
+                providers_configured: Some(3),
+                providers_unhealthy: Some(0),
+                autoflows_enabled: Some(2),
+                autoflows_disabled: Some(1),
+                workers: Some(5),
+                claims_active: Some(4),
+                issues_pending: Some(0),
+                issues_open: Some(0),
+                issues_capped: false,
+                inventory_captured_at: None,
+            },
+            ..empty_summary(now)
+        };
+
+        let (merged, _f, _c, fleet_partial) =
+            merge_dashboard_summaries(vec![a, b], DashboardRange::All, now);
+
+        assert_eq!(merged.fleet.workers, Some(7));
+        assert_eq!(merged.fleet.claims_active, Some(5));
+        assert_eq!(merged.fleet.autoflows_enabled, Some(3));
+        assert_eq!(merged.fleet.autoflows_disabled, Some(1));
+        assert_eq!(merged.fleet.providers_configured, Some(6));
+        assert!(
+            !fleet_partial,
+            "every host reported every field it was asked for"
+        );
+        assert!(!merged.fleet.issues_capped, "no host reported a cap");
+    }
+
+    /// `issues_capped` is a disjunction, not a sum: one capped host makes the
+    /// whole aggregate a floor.
+    #[test]
+    fn issues_capped_ors_across_hosts_and_inventory_stamp_takes_the_oldest() {
+        let now = Utc::now();
+        let older = now - chrono::Duration::minutes(20);
+        let a = DashboardSummary {
+            fleet: FleetCounts {
+                issues_open: Some(300),
+                issues_capped: true,
+                inventory_captured_at: Some(older),
+                ..FleetCounts::default()
+            },
+            ..empty_summary(now)
+        };
+        let b = DashboardSummary {
+            fleet: FleetCounts {
+                issues_open: Some(12),
+                issues_capped: false,
+                inventory_captured_at: Some(now),
+                ..FleetCounts::default()
+            },
+            ..empty_summary(now)
+        };
+
+        let (merged, _f, _c, _p) = merge_dashboard_summaries(vec![a, b], DashboardRange::All, now);
+
+        assert_eq!(merged.fleet.issues_open, Some(312));
+        assert!(
+            merged.fleet.issues_capped,
+            "one capped host makes the merged open count a floor"
+        );
+        assert_eq!(
+            merged.fleet.inventory_captured_at,
+            Some(older),
+            "the honest staleness bound is the OLDEST contributing cache, not the newest"
+        );
+    }
+
+    #[test]
+    fn fleet_is_not_partial_when_no_host_reports_at_all() {
+        let now = Utc::now();
+        let (merged, _f, _c, fleet_partial) =
+            merge_dashboard_summaries(vec![], DashboardRange::All, now);
+        assert_eq!(merged.fleet.workers, None);
+        assert!(
+            !fleet_partial,
+            "partial means 'a reporting host omitted a field' — with zero reporting \
+             hosts there is nothing to be partial about (hosts[] carries the outage)"
+        );
+    }
+
     #[test]
     fn findings_open_is_none_and_not_partial_when_no_host_reports_at_all() {
         let now = Utc::now();
-        let (merged, partial, cycles_partial) =
+        let (merged, partial, cycles_partial, _fleet_partial) =
             merge_dashboard_summaries(vec![], DashboardRange::All, now);
         assert_eq!(merged.findings_open, None);
         assert!(

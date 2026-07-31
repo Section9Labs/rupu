@@ -983,6 +983,54 @@ fn stream_event_counts_as_emitted_content(ev: &StreamEvent) -> bool {
 }
 
 impl AnthropicClient {
+    /// Build and send the authenticated `GET /v1/models` request.
+    ///
+    /// Shared by [`LlmProvider::list_models`] (which swallows failures into an
+    /// empty vec) and [`LlmProvider::probe`] (which propagates them). Kept as
+    /// one function so the two can never drift apart in auth handling — a
+    /// probe that authenticated differently from the real call would be
+    /// testing the wrong thing.
+    ///
+    /// Deliberately does NOT go through `apply_auth_headers`: that injects
+    /// `X-Stainless-*` + `X-Claude-Code-Session-Id` plus a per-request beta
+    /// CSV, some of which get this endpoint to reject the request.
+    async fn models_request(&self) -> Result<reqwest::Response, ProviderError> {
+        // Strip the `/v1/messages` (and optional `?beta=true`) suffix off
+        // `api_url` to get the API root, then append `/v1/models`.
+        let base = self
+            .api_url
+            .split('?')
+            .next()
+            .unwrap_or(&self.api_url)
+            .trim_end_matches("/v1/messages")
+            .trim_end_matches('/');
+        let url = format!("{base}/v1/models");
+
+        let mut req = self
+            .client
+            .get(&url)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("Accept", "application/json");
+        match &self.auth {
+            AuthMethod::ApiKey(key) => {
+                req = req.header("x-api-key", key);
+            }
+            AuthMethod::OAuth { access_token, .. } => {
+                req = req
+                    .header("Authorization", format!("Bearer {access_token}"))
+                    // The `oauth-2025-04-20` beta is what the first-party
+                    // Claude client sends on every OAuth request; the
+                    // discovery endpoint accepts it and (in some quotas)
+                    // requires it.
+                    .header("anthropic-beta", "oauth-2025-04-20");
+            }
+        }
+
+        req.send()
+            .await
+            .map_err(|e| ProviderError::Http(e.to_string()))
+    }
+
     /// One-shot, best-effort GET to `/api/claude_cli/bootstrap`. The
     /// reference Claude Code client makes this call once on session
     /// startup; it appears to register the session with Anthropic's
@@ -1960,42 +2008,7 @@ impl crate::provider::LlmProvider for AnthropicClient {
     /// rather than propagating, so the CLI's "show what we got"
     /// fallback still renders the baked-in list.
     async fn list_models(&self) -> Vec<crate::model_pool::ModelInfo> {
-        // Strip the `/v1/messages` (and optional `?beta=true`) suffix
-        // off `api_url` to get the API root, then append `/v1/models`.
-        // We can't reuse `apply_auth_headers` because it injects
-        // `X-Stainless-*` + `X-Claude-Code-Session-Id` plus a per-
-        // request beta CSV — none of which the discovery endpoint
-        // wants (some of them get the request rejected here).
-        let base = self
-            .api_url
-            .split('?')
-            .next()
-            .unwrap_or(&self.api_url)
-            .trim_end_matches("/v1/messages")
-            .trim_end_matches('/');
-        let url = format!("{base}/v1/models");
-
-        let mut req = self
-            .client
-            .get(&url)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("Accept", "application/json");
-        match &self.auth {
-            AuthMethod::ApiKey(key) => {
-                req = req.header("x-api-key", key);
-            }
-            AuthMethod::OAuth { access_token, .. } => {
-                req = req
-                    .header("Authorization", format!("Bearer {access_token}"))
-                    // The `oauth-2025-04-20` beta is what the
-                    // first-party Claude client sends on every
-                    // OAuth request; the discovery endpoint accepts
-                    // it and (in some quotas) requires it.
-                    .header("anthropic-beta", "oauth-2025-04-20");
-            }
-        }
-
-        let resp = match req.send().await {
+        let resp = match self.models_request().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, "anthropic list_models: HTTP error");
@@ -2046,6 +2059,30 @@ impl crate::provider::LlmProvider for AnthropicClient {
                 Vec::new()
             }
         }
+    }
+
+    /// Probe via the same authenticated `GET /v1/models` call `list_models`
+    /// makes — but here the status IS the answer, so nothing is swallowed. A
+    /// 2xx means the credential works, even if the account lists no models.
+    async fn probe(&self) -> Result<(), ProviderError> {
+        let resp = self.models_request().await?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        // Bound the body: this string ends up in a cache the dashboard reads,
+        // not in a log the operator greps.
+        let message = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect::<String>();
+        Err(ProviderError::Api {
+            status: status.as_u16(),
+            message,
+        })
     }
 }
 
@@ -3566,12 +3603,10 @@ mod tests {
         let client = AnthropicClient::new("k".into());
         // Historical default, unchanged for non-factory constructors.
         assert_eq!(client.max_rate_limit_retries(), 1);
-        let tuned = AnthropicClient::new("k".into()).with_tuning(
-            &crate::tuning::ProviderTuning {
-                max_retries: 4,
-                ..crate::tuning::ProviderTuning::for_provider("anthropic")
-            },
-        );
+        let tuned = AnthropicClient::new("k".into()).with_tuning(&crate::tuning::ProviderTuning {
+            max_retries: 4,
+            ..crate::tuning::ProviderTuning::for_provider("anthropic")
+        });
         assert_eq!(tuned.max_rate_limit_retries(), 4);
     }
 
@@ -3797,6 +3832,71 @@ mod tests {
             AnthropicClient::with_url("bad-key".into(), format!("{}/v1/messages", server.url("")));
         let models = <AnthropicClient as crate::provider::LlmProvider>::list_models(&client).await;
         assert!(models.is_empty());
+    }
+
+    /// The same 401 `list_models` swallows into an empty vec must surface as a
+    /// real error from `probe` — that difference is the whole reason `probe`
+    /// exists rather than being derived from `list_models`.
+    #[tokio::test]
+    async fn probe_surfaces_401_instead_of_swallowing_it() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(401)
+                .header("content-type", "application/json")
+                .body(r#"{"error":{"type":"authentication_error"}}"#);
+        });
+        let client =
+            AnthropicClient::with_url("bad-key".into(), format!("{}/v1/messages", server.url("")));
+
+        let err = <AnthropicClient as crate::provider::LlmProvider>::probe(&client)
+            .await
+            .expect_err("a 401 must never be reported as healthy");
+
+        assert!(
+            matches!(err, ProviderError::Api { status: 401, .. }),
+            "expected Api{{status:401}}, got {err:?}"
+        );
+    }
+
+    /// A 2xx means the credential works — even when the account lists no
+    /// models at all, which is exactly the case `list_models` cannot
+    /// distinguish from a failure.
+    #[tokio::test]
+    async fn probe_succeeds_on_2xx_with_no_models() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"data":[]}"#);
+        });
+        let client =
+            AnthropicClient::with_url("good-key".into(), format!("{}/v1/messages", server.url("")));
+
+        <AnthropicClient as crate::provider::LlmProvider>::probe(&client)
+            .await
+            .expect("a 2xx must probe clean even with zero models");
+    }
+
+    /// A transport failure (nothing listening) is Unreachable-shaped, NOT
+    /// auth-shaped — the adapter's `classify` depends on that split.
+    #[tokio::test]
+    async fn probe_maps_transport_failure_to_http() {
+        // Port 1 is reserved and never listening.
+        let client =
+            AnthropicClient::with_url("k".into(), "http://127.0.0.1:1/v1/messages".to_string());
+
+        let err = <AnthropicClient as crate::provider::LlmProvider>::probe(&client)
+            .await
+            .expect_err("nothing is listening");
+
+        assert!(
+            matches!(err, ProviderError::Http(_)),
+            "a transport failure must be Http, not an auth error; got {err:?}"
+        );
     }
 
     // ── Reasoning capture (Task 2) ───────────────────────────────────
