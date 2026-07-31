@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Bring colour to the classification values that currently render as bare grey text, and adopt the `EntityTable` profile in the five commands where it is a clear win — leaving the ones where adoption would regress behaviour explicitly alone.
+**Goal:** Adopt the `EntityTable` profile in the five commands where it is a clear win, giving their identifiers, timestamps and classification values proper rendering — leaving the ones where adoption would regress behaviour explicitly alone.
 
-**Architecture:** One vocabulary extension to `output/tables.rs` that benefits every table in the CLI at once, then per-command adoption. No changes to `EntityTable` itself except where a command genuinely needs a capability it lacks.
+**Architecture:** One vocabulary extension to `output/tables.rs` that the per-command adoptions then consume. No changes to `EntityTable` itself except where a command genuinely needs a capability it lacks.
 
 **Tech Stack:** Rust 2021, `comfy-table` 7.2.2, `owo-colors`, `chrono`, `anyhow`.
 
@@ -51,9 +51,13 @@ Revisit `issues list` and `models list` if `EntityTable` later gains a per-colum
 
 **Files:** Modify `crates/rupu-cli/src/output/tables.rs`
 
-**Interfaces:** Extends `status_color`'s match. Every later task and several untouched commands benefit immediately.
+**Interfaces:** Extends `status_color`'s match. Consumed by Tasks 3, 5, and 6 via `EntityTable`'s `CellValue::Status`. Nothing else in the CLI reads it today — see the note below.
 
-**Why first, and why it is the highest-value task here.** A dozen classification values render as bare grey text today because `status_color` has no arm for them. Adding arms colours them **everywhere at once**, including in the six commands this plan deliberately skips. That is a broad UX win for a small, low-risk change.
+**Why first.** A dozen classification values have no arm in `status_color`, so any call site that renders them gets no colour. The later tasks in this plan route those values through `EntityTable`'s `CellValue::Status`, which consults `status_color` — so the vocabulary has to exist before they land.
+
+**This task produces no visible change on its own.** An earlier draft of this plan claimed it would colour these values "everywhere at once, including in commands this plan skips." That was wrong, and verifying it is why the claim is gone: `cleanup.rs` contains **zero** `status_cell` / `status_color` calls and never colours anything, and `transcript list` renders SCOPE as a plain `Cell::new(&row.scope)` — only its STATUS column routes through `status_cell`. A vocabulary entry only reaches a screen when a call site actually asks for it.
+
+So treat this as preparation, not payoff. The payoff arrives in Tasks 3, 5, and 6. Do not go looking for colour in untouched commands afterwards, and do not "helpfully" convert extra call sites to `status_cell` to manufacture the breadth — that is other tasks' scope, with their own tests and reviews.
 
 Values confirmed present in real output but uncoloured:
 
@@ -138,13 +142,15 @@ Add arms to `status_color`'s match only. Do not restructure the function, and do
 Run: `cargo test -p rupu-cli --lib output::tables`
 Expected: PASS, including `pending_keeps_its_dim_colour_not_the_waiting_colour`.
 
-- [ ] **Step 5: See it working before committing**
+- [ ] **Step 5: Confirm the vocabulary is reachable, not that it is visible**
+
+There is nothing to see yet — see the note above. Instead, verify the arms are wired correctly by unit test only, and record in your report which call sites will consume them (Tasks 3, 5, 6) so the next implementer knows where the payoff lands.
+
+Optionally, confirm the negative for yourself so it is not a surprise later:
 
 ```bash
-cargo run -p rupu-cli -- transcript list | head -5   # SCOPE now coloured
-cargo run -p rupu-cli -- cleanup --stats             # KIND/SCOPE now coloured
+grep -c "status_cell\|status_color" crates/rupu-cli/src/cmd/cleanup.rs   # expect 0
 ```
-Paste both into your report. These commands are otherwise untouched by this plan — that is the point.
 
 - [ ] **Step 6: Format, lint, commit**
 
@@ -484,7 +490,7 @@ renaming one to force a breakdown would misrepresent the column."
 - [ ] `--format json` / `--format csv` byte-identical for all five converted commands.
 - [ ] `--absolute` visibly changes timestamps on `transcript list` and `cron list`; `--all-columns` restores suppressed columns.
 - [ ] **`cron list` still shows NEXT and IN when every row's schedule is broken.** The single most important behavioural check in this plan.
-- [ ] Colour appears on `cleanup --stats` and `repos list` — commands this plan otherwise doesn't touch, proving Task 1's reach.
+- [ ] Colour appears on the converted commands' Status columns (`transcript list` SCOPE, `autoflow wakes` State, `transcript prune` ACTION). It does NOT appear on `cleanup --stats` — that file has zero `status_cell` calls and is not converted here. Do not treat its absence as a bug.
 - [ ] No identifier wraps at a narrow width (try `COLUMNS=60`).
 
 ## Deliberately not done
