@@ -118,6 +118,18 @@ pub fn status_color(status: &str, prefs: &UiPrefs) -> Option<TableColor> {
         // Agent / workflow scope.
         "project" => palette.brand.into_table(),
         "global" => palette.dim.into_table(),
+        // Transcript / session scope.
+        "active" => palette.complete.into_table(),
+        "archived" => palette.dim.into_table(),
+        // Cleanup / transcript prune action (dry-run vs. done).
+        "would_delete" => palette.awaiting.into_table(),
+        "deleted" => palette.failed.into_table(),
+        // Autoflow wake state.
+        "queued" => palette.dim.into_table(),
+        "due" => palette.awaiting.into_table(),
+        "processed" => palette.complete.into_table(),
+        // Autoflow entity / cleanup kind.
+        "issue" | "pull_request" | "session" | "transcript" => palette.brand_subtle.into_table(),
         _ => return None,
     })
 }
@@ -641,5 +653,67 @@ mod tests {
         assert!(!out.contains('│'), "found vertical border");
         // The header rule itself must survive.
         assert!(out.contains('─'), "header rule missing");
+    }
+
+    #[test]
+    fn status_color_covers_scope_and_lifecycle_classifications() {
+        let prefs = prefs_color_always();
+        let p = crate::output::palette::active_palette();
+        assert_eq!(
+            status_color("active", &prefs),
+            Some(p.complete.into_table())
+        );
+        assert_eq!(status_color("archived", &prefs), Some(p.dim.into_table()));
+        assert_eq!(
+            status_color("would_delete", &prefs),
+            Some(p.awaiting.into_table())
+        );
+        assert_eq!(status_color("deleted", &prefs), Some(p.failed.into_table()));
+    }
+
+    #[test]
+    fn status_color_covers_autoflow_wake_states() {
+        let prefs = prefs_color_always();
+        let p = crate::output::palette::active_palette();
+        assert_eq!(status_color("queued", &prefs), Some(p.dim.into_table()));
+        assert_eq!(status_color("due", &prefs), Some(p.awaiting.into_table()));
+        assert_eq!(
+            status_color("processed", &prefs),
+            Some(p.complete.into_table())
+        );
+    }
+
+    #[test]
+    fn status_color_covers_entity_and_kind_classifications() {
+        let prefs = prefs_color_always();
+        let p = crate::output::palette::active_palette();
+        for v in ["issue", "pull_request", "session", "transcript"] {
+            assert_eq!(
+                status_color(v, &prefs),
+                Some(p.brand_subtle.into_table()),
+                "no colour for {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_classification_values_get_no_lifecycle_glyph() {
+        // A glyph means "where is this in its lifecycle". None of these
+        // are lifecycle positions, so status_of must still reject them.
+        for v in [
+            "active",
+            "archived",
+            "would_delete",
+            "deleted",
+            "queued",
+            "due",
+            "processed",
+            "issue",
+            "pull_request",
+            "session",
+            "transcript",
+        ] {
+            assert_eq!(status_of(v), None, "{v} must not get a glyph");
+        }
     }
 }
