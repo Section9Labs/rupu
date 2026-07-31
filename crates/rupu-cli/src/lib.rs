@@ -303,7 +303,9 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Workflow { action } => {
             cmd::workflow::handle(action, cli.format, cli.absolute, cli.all_columns).await
         }
-        Cmd::Autoflow { action } => cmd::autoflow::handle(action, cli.format).await,
+        Cmd::Autoflow { action } => {
+            cmd::autoflow::handle(action, cli.format, cli.absolute, cli.all_columns).await
+        }
         Cmd::Transcript { action } => {
             cmd::transcript::handle(action, cli.format, cli.absolute, cli.all_columns).await
         }
