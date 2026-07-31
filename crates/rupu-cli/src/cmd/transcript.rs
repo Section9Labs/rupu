@@ -26,7 +26,6 @@ use crate::paths;
 use crate::standalone_run_metadata::{metadata_path_for_run, read_metadata};
 use clap::{Args as ClapArgs, Subcommand};
 use clap_complete::ArgValueCompleter;
-use comfy_table::Cell;
 use rupu_transcript::{Event as TranscriptEvent, JsonlReader, RunStatus};
 use serde::Serialize;
 use std::cmp::Reverse;
@@ -103,13 +102,28 @@ pub struct PruneArgs {
     pub dry_run: bool,
 }
 
-pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> ExitCode {
+pub async fn handle(
+    action: Action,
+    global_format: Option<OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
+) -> ExitCode {
     let result = match action {
         Action::List {
             no_color,
             all,
             archived,
-        } => list(no_color, all, archived, global_format).await,
+        } => {
+            list(
+                no_color,
+                all,
+                archived,
+                global_format,
+                absolute,
+                all_columns,
+            )
+            .await
+        }
         Action::Show {
             run_id,
             view,
@@ -131,7 +145,7 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
             ignore_liveness,
         } => archive(&run_id, ignore_liveness).await,
         Action::Delete(args) => delete(args).await,
-        Action::Prune(args) => prune(args, global_format).await,
+        Action::Prune(args) => prune(args, global_format, absolute, all_columns).await,
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -241,6 +255,7 @@ struct TranscriptPruneReport {
 }
 
 struct TranscriptPruneOutput {
+    prefs: crate::cmd::ui::UiPrefs,
     report: TranscriptPruneReport,
     csv_rows: Vec<TranscriptPruneCsvRow>,
 }
@@ -304,34 +319,94 @@ impl CollectionOutput for TranscriptListOutput {
     }
 
     fn render_table(&self) -> anyhow::Result<()> {
-        let mut table = crate::output::tables::new_table();
-        table.set_header(vec![
-            "RUN ID", "SCOPE", "TITLE", "AGENT", "STATUS", "TOKENS", "STARTED",
-        ]);
-        for row in &self.report.rows {
-            let title_cell = match &row.title {
-                Some(title) => Cell::new(one_line_preview(title, 60)),
-                None => {
-                    if self.prefs.use_color() {
-                        Cell::new("\x1b[2m—\x1b[0m")
-                    } else {
-                        Cell::new("—")
-                    }
-                }
-            };
-            table.add_row(vec![
-                Cell::new(&row.run_id),
-                Cell::new(&row.scope),
-                title_cell,
-                Cell::new(&row.agent),
-                crate::output::tables::status_cell(&row.status, &self.prefs),
-                Cell::new(row.total_tokens.to_string()),
-                Cell::new(&row.started_at),
-            ]);
-        }
-        println!("{table}");
+        println!(
+            "{}",
+            render_transcript_list_table(&self.report.rows, &self.prefs, chrono::Utc::now())
+        );
         Ok(())
     }
+}
+
+/// Build the `transcript list` human table: compacted run ids, coloured
+/// SCOPE/STATUS, a one-line TITLE preview (or an em dash), relative
+/// start times, and a STATUS breakdown in the summary. Extracted from
+/// `render_table` so it can be asserted directly against its returned
+/// string instead of through captured stdout. `now` is a parameter so
+/// tests are deterministic; `render_table` passes `Utc::now()`.
+fn render_transcript_list_table(
+    rows: &[TranscriptListRow],
+    prefs: &crate::cmd::ui::UiPrefs,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    build_transcript_list_table(rows, prefs, now).render(now)
+}
+
+/// Build the `transcript list` table's `EntityTable`. Split out of
+/// `render_transcript_list_table` so tests can force a narrow render
+/// width (`EntityTable::render_at_width`) to exercise the AGENT
+/// column's wrapping under real squeeze pressure — `render_transcript_list_table`
+/// itself only exposes the production `render` path, which picks up the
+/// real terminal width and cannot be forced narrow in a test.
+fn build_transcript_list_table<'a>(
+    rows: &[TranscriptListRow],
+    prefs: &'a crate::cmd::ui::UiPrefs,
+    // Unused today (STARTED is a `CellValue::Timestamp`, which only
+    // needs `now` at `render` time), kept in the signature to mirror
+    // `render_transcript_list_table` / `cmd::workflow`'s
+    // `build_workflow_list_table` and so a future hand-built relative
+    // cell here doesn't need a signature change to get it.
+    _now: chrono::DateTime<chrono::Utc>,
+) -> crate::output::entity_table::EntityTable<'a> {
+    use crate::output::entity_table::{CellValue, EntityTable};
+
+    let mut table = EntityTable::new(
+        prefs,
+        prefs.render_opts(),
+        vec![
+            "RUN ID", "SCOPE", "TITLE", "AGENT", "STATUS", "TOKENS", "STARTED",
+        ],
+    )
+    .with_summary("transcript");
+
+    for row in rows {
+        // `TranscriptListRow.started_at` is written (`list()`) as
+        // `row.started_at.format("%Y-%m-%d %H:%M:%S")` — the same naive
+        // format `render_workflow_runs_table` parses (workflow.rs). Try
+        // that exact format first (the source `DateTime<Utc>` was UTC
+        // before stringifying, so interpreting the naive result as UTC
+        // is correct, not a guess), fall back to RFC3339 for any other
+        // writer of this field, and finally to the verbatim text so a
+        // malformed value never drops the row.
+        let started = chrono::NaiveDateTime::parse_from_str(&row.started_at, "%Y-%m-%d %H:%M:%S")
+            .map(|naive| CellValue::Timestamp(naive.and_utc()))
+            .or_else(|_| {
+                chrono::DateTime::parse_from_rfc3339(&row.started_at)
+                    .map(|ts| CellValue::Timestamp(ts.with_timezone(&chrono::Utc)))
+            })
+            .unwrap_or_else(|_| CellValue::Text(row.started_at.clone()));
+        table = table.row(vec![
+            CellValue::Id(row.run_id.clone()),
+            CellValue::Status(row.scope.clone()),
+            row.title
+                .clone()
+                .map(|t| CellValue::Text(one_line_preview(&t, 60)))
+                .unwrap_or(CellValue::Missing),
+            // I-1: AGENT is plain `CellValue::Text`, not `CellValue::Name`.
+            // An agent name comes from that agent file's own `name:`
+            // frontmatter and nobody bounds its length; `Name`'s no-wrap
+            // `ContentWidth` constraint has no upper bound, so a long
+            // agent name at a normal terminal width starved every other
+            // column (SCOPE/TITLE/STATUS/TOKENS/STARTED down to one
+            // character per line) instead of wrapping onto its own row.
+            // This matches `session list`, which already renders the
+            // same concept (its AGENT column) as `Text`.
+            CellValue::Text(row.agent.clone()),
+            CellValue::Status(row.status.clone()),
+            CellValue::Text(row.total_tokens.to_string()),
+            started,
+        ]);
+    }
+    table
 }
 
 impl CollectionOutput for TranscriptPruneOutput {
@@ -355,20 +430,50 @@ impl CollectionOutput for TranscriptPruneOutput {
     }
 
     fn render_table(&self) -> anyhow::Result<()> {
-        let mut table = crate::output::tables::new_table();
-        table.set_header(vec!["RUN ID", "SCOPE", "LOCATION", "ARCHIVED", "ACTION"]);
-        for row in &self.report.rows {
-            table.add_row(vec![
-                Cell::new(&row.run_id),
-                Cell::new(&row.scope),
-                Cell::new(&row.location),
-                Cell::new(&row.archived_at),
-                Cell::new(&row.action),
-            ]);
-        }
-        println!("{table}");
+        println!(
+            "{}",
+            render_transcript_prune_table(&self.report.rows, &self.prefs, chrono::Utc::now())
+        );
         Ok(())
     }
+}
+
+/// Build the `transcript prune` human table: compacted run ids, coloured
+/// SCOPE (`global` / `project`) and ACTION (`would_delete` / `deleted`),
+/// and `ARCHIVED` rendered relative unless `--absolute`. No summary
+/// line: `ACTION` isn't literally `STATUS`, and renaming it to force a
+/// breakdown would misrepresent the column. Extracted from
+/// `render_table` so it can be asserted directly against its returned
+/// string; `now` is a parameter so tests are deterministic.
+fn render_transcript_prune_table(
+    rows: &[TranscriptPruneRow],
+    prefs: &crate::cmd::ui::UiPrefs,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    use crate::output::entity_table::{CellValue, EntityTable};
+
+    let mut table = EntityTable::new(
+        prefs,
+        prefs.render_opts(),
+        vec!["RUN ID", "SCOPE", "LOCATION", "ARCHIVED", "ACTION"],
+    );
+
+    for row in rows {
+        // `archived_at` is written (`prune_archived_transcripts`) via
+        // `archived_at.to_rfc3339()` — try RFC3339 first, falling back
+        // to the verbatim text so a malformed value never drops the row.
+        let archived = chrono::DateTime::parse_from_rfc3339(&row.archived_at)
+            .map(|ts| CellValue::Timestamp(ts.with_timezone(&chrono::Utc)))
+            .unwrap_or_else(|_| CellValue::Text(row.archived_at.clone()));
+        table = table.row(vec![
+            CellValue::Id(row.run_id.clone()),
+            CellValue::Status(row.scope.clone()),
+            CellValue::Text(row.location.clone()),
+            archived,
+            CellValue::Status(row.action.clone()),
+        ]);
+    }
+    table.render(now)
 }
 
 impl EventOutput for TranscriptShowOutput {
@@ -1354,6 +1459,8 @@ async fn list(
     all: bool,
     archived: bool,
     global_format: Option<OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
 ) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
@@ -1465,7 +1572,8 @@ async fn list(
         // UI prefs only — lock does not apply (I-7)
         rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default()
     };
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None)
+        .with_table_flags(absolute, all_columns);
     let report_rows: Vec<TranscriptListRow> = rows
         .iter()
         .map(|row| TranscriptListRow {
@@ -1617,7 +1725,12 @@ async fn delete(args: DeleteArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn prune(args: PruneArgs, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
+async fn prune(
+    args: PruneArgs,
+    global_format: Option<OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
+) -> anyhow::Result<()> {
     let mut pruned = prune_archived_transcripts(args.older_than.as_deref(), args.dry_run)?;
     pruned.sort_by(|a, b| a.run_id.cmp(&b.run_id));
     let rows = pruned
@@ -1640,7 +1753,9 @@ async fn prune(args: PruneArgs, global_format: Option<OutputFormat>) -> anyhow::
             action: row.action.clone(),
         })
         .collect();
+    let prefs = prune_ui_prefs()?.with_table_flags(absolute, all_columns);
     let output = TranscriptPruneOutput {
+        prefs,
         report: TranscriptPruneReport {
             kind: "transcript_prune",
             version: 1,
@@ -1649,6 +1764,24 @@ async fn prune(args: PruneArgs, global_format: Option<OutputFormat>) -> anyhow::
         csv_rows,
     };
     report::emit_collection(global_format, &output)
+}
+
+/// `transcript prune` has no `--no-color` flag of its own (unlike
+/// `list`/`show`) — resolve UI prefs the same way `autoflow_ui_prefs`
+/// does for its own flagless commands: config + env only, `no_color`
+/// hardcoded `false` so `NO_COLOR` / `[ui].color = "never"` still work.
+fn prune_ui_prefs() -> anyhow::Result<crate::cmd::ui::UiPrefs> {
+    let global = paths::global_dir()?;
+    let pwd = std::env::current_dir()?;
+    let project_root = paths::project_root_for(&pwd)?;
+    let global_cfg = global.join("config.toml");
+    let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
+    // UI prefs only — lock does not apply (I-7)
+    let cfg =
+        rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default();
+    Ok(crate::cmd::ui::UiPrefs::resolve(
+        &cfg.ui, false, None, None, None,
+    ))
 }
 
 pub(crate) fn prune_archived_transcripts(
@@ -2048,5 +2181,370 @@ mod tests {
         let meta = sample_metadata(None);
         ensure_standalone_not_running("run_legacy", "archive", Some(&meta)).unwrap();
         ensure_standalone_not_running("run_no_meta", "archive", None).unwrap();
+    }
+
+    fn transcript_list_test_now() -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(2026, 7, 30, 17, 0, 0).unwrap()
+    }
+
+    fn transcript_list_test_prefs() -> crate::cmd::ui::UiPrefs {
+        let cfg = rupu_config::UiConfig::default();
+        crate::cmd::ui::UiPrefs::resolve(&cfg, true, None, None, None)
+    }
+
+    fn transcript_row_for_test(
+        run_id: &str,
+        scope: &str,
+        title: Option<&str>,
+        agent: &str,
+        status: &str,
+        started_at: &str,
+    ) -> TranscriptListRow {
+        TranscriptListRow {
+            run_id: run_id.to_string(),
+            scope: scope.to_string(),
+            title: title.map(str::to_string),
+            agent: agent.to_string(),
+            status: status.to_string(),
+            total_tokens: 1_200,
+            started_at: started_at.to_string(),
+        }
+    }
+
+    #[test]
+    fn transcript_list_table_compacts_id_and_colours_scope_and_status() {
+        let rows = vec![transcript_row_for_test(
+            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+            "active",
+            Some("fix the flaky test"),
+            "issue-reader",
+            "completed",
+            "2026-07-30 13:00:00",
+        )];
+        let out = render_transcript_list_table(
+            &rows,
+            &transcript_list_test_prefs(),
+            transcript_list_test_now(),
+        );
+        assert!(out.contains("run_01KYSMDN…GKYJ"), "got: {out}");
+        assert!(
+            !out.contains("run_01KYSMDNG84N9Z8XXHQZP3GKYJ"),
+            "full id leaked into a cell: {out}"
+        );
+        assert!(out.contains("✓ completed"), "got: {out}");
+    }
+
+    #[test]
+    fn transcript_list_started_at_renders_relative_for_the_real_stored_format() {
+        // `TranscriptListRow.started_at` is written (see `list()`) as
+        // `row.started_at.format("%Y-%m-%d %H:%M:%S")` — not RFC3339. The
+        // real stored format must recover the instant and render a
+        // relative age, not fall through to the literal-text branch.
+        let rows = vec![transcript_row_for_test(
+            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+            "active",
+            None,
+            "issue-reader",
+            "completed",
+            "2026-07-30 13:00:00",
+        )];
+        let out = render_transcript_list_table(
+            &rows,
+            &transcript_list_test_prefs(),
+            transcript_list_test_now(),
+        );
+        assert!(out.contains("4h ago"), "got: {out}");
+        assert!(
+            !out.contains("2026-07-30 13:00:00"),
+            "literal text leaked instead of a relative age: {out}"
+        );
+    }
+
+    #[test]
+    fn transcript_list_started_at_renders_iso_under_absolute() {
+        // The behavioural proof that Task 2's `--absolute` plumbing
+        // actually reaches this renderer, not just clap parsing.
+        let rows = vec![transcript_row_for_test(
+            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+            "active",
+            None,
+            "issue-reader",
+            "completed",
+            "2026-07-30 13:00:00",
+        )];
+        let prefs = transcript_list_test_prefs().with_table_flags(true, false);
+        let out = render_transcript_list_table(&rows, &prefs, transcript_list_test_now());
+        assert!(out.contains("2026-07-30T13:00:00"), "got: {out}");
+        assert!(!out.contains("4h ago"), "got: {out}");
+    }
+
+    #[test]
+    fn transcript_list_survives_an_unparseable_started_at() {
+        let rows = vec![transcript_row_for_test(
+            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+            "active",
+            None,
+            "issue-reader",
+            "completed",
+            "not-a-timestamp",
+        )];
+        let out = render_transcript_list_table(
+            &rows,
+            &transcript_list_test_prefs(),
+            transcript_list_test_now(),
+        );
+        assert!(out.contains("not-a-timestamp"), "row was dropped: {out}");
+    }
+
+    #[test]
+    fn transcript_list_missing_title_renders_an_em_dash() {
+        // A single row with no title would leave TITLE entirely empty
+        // and eligible for suppression — mix in a row that does have
+        // one so the column survives and the em dash is visible.
+        let rows = vec![
+            transcript_row_for_test(
+                "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+                "active",
+                Some("has a title"),
+                "issue-reader",
+                "completed",
+                "2026-07-30 13:00:00",
+            ),
+            transcript_row_for_test(
+                "run_01KYPASX18NYRER5NQPDWB2HZV",
+                "active",
+                None,
+                "issue-reader",
+                "completed",
+                "2026-07-29 07:00:43",
+            ),
+        ];
+        let out = render_transcript_list_table(
+            &rows,
+            &transcript_list_test_prefs(),
+            transcript_list_test_now(),
+        );
+        assert!(out.contains('—'), "got: {out}");
+        assert!(out.contains("has a title"), "got: {out}");
+    }
+
+    #[test]
+    fn transcript_list_summary_breaks_down_by_status() {
+        let rows = vec![
+            transcript_row_for_test(
+                "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+                "active",
+                Some("first run"),
+                "issue-reader",
+                "completed",
+                "2026-07-30 13:00:00",
+            ),
+            transcript_row_for_test(
+                "run_01KYPASX18NYRER5NQPDWB2HZV",
+                "active",
+                None,
+                "issue-reader",
+                "failed",
+                "2026-07-29 07:00:43",
+            ),
+        ];
+        let out = render_transcript_list_table(
+            &rows,
+            &transcript_list_test_prefs(),
+            transcript_list_test_now(),
+        );
+        assert!(
+            out.contains("2 transcripts · 1 completed · 1 failed"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn transcript_list_agent_renders_verbatim() {
+        // AGENT is `CellValue::Text` (I-1) — rendered verbatim, just no
+        // longer no-wrap. The narrow-squeeze regression guard for the
+        // fix itself is `transcript_list_long_agent_name_does_not_collapse_other_columns`
+        // below.
+        let rows = vec![transcript_row_for_test(
+            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+            "active",
+            None,
+            "issue-reader",
+            "completed",
+            "2026-07-30 13:00:00",
+        )];
+        let out = render_transcript_list_table(
+            &rows,
+            &transcript_list_test_prefs(),
+            transcript_list_test_now(),
+        );
+        assert!(out.contains("issue-reader"), "got: {out}");
+    }
+
+    #[test]
+    fn transcript_list_long_agent_name_does_not_collapse_other_columns() {
+        // I-1 regression guard: AGENT used to map to `CellValue::Name`,
+        // whose no-wrap `ContentWidth` constraint has no upper bound —
+        // an agent name comes from that agent file's own `name:`
+        // frontmatter and nobody bounds its length. A 63-char agent name
+        // at 80 columns squeezed SCOPE/TITLE/STATUS/TOKENS/STARTED down
+        // to one character per line. AGENT is now plain `CellValue::Text`
+        // (matching `session list`), which wraps under pressure instead
+        // of starving its neighbours. Force real squeeze pressure via
+        // the shared `render_at_width` test hook, since production
+        // `render_transcript_list_table` only exposes real-terminal-width
+        // rendering, and assert a known value from a later column
+        // (TOKENS) still renders intact on one line.
+        //
+        // Verified this actually discriminates the bug: temporarily
+        // reverting AGENT to `CellValue::Name` and re-running this exact
+        // scenario prints TOKENS as `1\n2\n0\n0` (and every other column
+        // similarly one-character-per-line) — "1200" does not appear as
+        // a contiguous substring. With `CellValue::Text`, TOKENS wraps
+        // normally and "1200" survives intact.
+        let long_agent = "a".repeat(63);
+        let rows = vec![transcript_row_for_test(
+            "run_01KYSMDNG84N9Z8XXHQZP3GKYJ",
+            "active",
+            Some("fix the flaky test"),
+            &long_agent,
+            "completed",
+            "2026-07-30 13:00:00",
+        )];
+        let out = build_transcript_list_table(
+            &rows,
+            &transcript_list_test_prefs(),
+            transcript_list_test_now(),
+        )
+        .render_at_width(transcript_list_test_now(), 80);
+        assert!(
+            out.contains("1200"),
+            "TOKENS column collapsed under a long AGENT name: {out}"
+        );
+    }
+
+    fn prune_row(
+        run_id: &str,
+        scope: &str,
+        location: &str,
+        archived_at: &str,
+        action: &str,
+    ) -> TranscriptPruneRow {
+        TranscriptPruneRow {
+            run_id: run_id.to_string(),
+            scope: scope.to_string(),
+            location: location.to_string(),
+            archived_at: archived_at.to_string(),
+            action: action.to_string(),
+        }
+    }
+
+    #[test]
+    fn transcript_prune_table_id_is_compacted() {
+        // LOCATION is a real filesystem path and legitimately embeds the
+        // full run id in its filename — that's a `CellValue::Text` cell,
+        // not the identifier cell, so the "full id absent" guard below
+        // only checks the compacted RUN ID cell renders short, using a
+        // location string that doesn't itself embed the id.
+        let rows = vec![prune_row(
+            "run_01KRJDKSBE7X4J49094149WFJS",
+            "global",
+            "/home/.rupu/transcripts/archived/transcript.jsonl",
+            "2026-07-30T13:00:00Z",
+            "would_delete",
+        )];
+        let out = render_transcript_prune_table(
+            &rows,
+            &transcript_list_test_prefs(),
+            transcript_list_test_now(),
+        );
+        assert!(out.contains("run_01KRJDKS…WFJS"), "got: {out}");
+        assert!(
+            !out.contains("run_01KRJDKSBE7X4J49094149WFJS"),
+            "full id must not appear in a table cell: {out}"
+        );
+    }
+
+    #[test]
+    fn transcript_prune_table_archived_renders_relative() {
+        let rows = vec![prune_row(
+            "run_01KRJDKSBE7X4J49094149WFJS",
+            "project",
+            "/proj/.rupu/transcripts/archived/run_01KRJDKSBE7X4J49094149WFJS.jsonl",
+            "2026-07-30T13:00:00Z",
+            "deleted",
+        )];
+        let out = render_transcript_prune_table(
+            &rows,
+            &transcript_list_test_prefs(),
+            transcript_list_test_now(),
+        );
+        assert!(out.contains("ago"), "got: {out}");
+        assert!(!out.contains("2026-07-30T13:00:00"), "got: {out}");
+    }
+
+    #[test]
+    fn transcript_prune_table_absolute_flag_renders_iso() {
+        let rows = vec![prune_row(
+            "run_01KRJDKSBE7X4J49094149WFJS",
+            "project",
+            "/proj/.rupu/transcripts/archived/run_01KRJDKSBE7X4J49094149WFJS.jsonl",
+            "2026-07-30T13:00:00Z",
+            "deleted",
+        )];
+        let absolute_prefs = transcript_list_test_prefs().with_table_flags(true, false);
+        let out =
+            render_transcript_prune_table(&rows, &absolute_prefs, transcript_list_test_now());
+        assert!(out.contains("2026-07-30T13:00:00"), "got: {out}");
+    }
+
+    #[test]
+    fn transcript_prune_table_survives_an_unparseable_archived_at() {
+        let rows = vec![prune_row(
+            "run_01KRJDKSBE7X4J49094149WFJS",
+            "global",
+            "/home/.rupu/transcripts/archived/run_01KRJDKSBE7X4J49094149WFJS.jsonl",
+            "not-a-timestamp",
+            "would_delete",
+        )];
+        let out = render_transcript_prune_table(
+            &rows,
+            &transcript_list_test_prefs(),
+            transcript_list_test_now(),
+        );
+        assert!(out.contains("not-a-timestamp"), "row was dropped: {out}");
+    }
+
+    #[test]
+    fn transcript_prune_table_has_no_summary_line() {
+        // No literal `STATUS` header — SCOPE and ACTION are both
+        // `CellValue::Status` for their colour, but neither is named
+        // `STATUS`, so `.with_summary` is deliberately not called.
+        let rows = vec![
+            prune_row(
+                "run_01KRJDKSBE7X4J49094149WFJS",
+                "global",
+                "/home/.rupu/transcripts/archived/run_01KRJDKSBE7X4J49094149WFJS.jsonl",
+                "2026-07-30T13:00:00Z",
+                "would_delete",
+            ),
+            prune_row(
+                "run_01KRJDKSBE7X4J49094149ABCD",
+                "project",
+                "/proj/.rupu/transcripts/archived/run_01KRJDKSBE7X4J49094149ABCD.jsonl",
+                "2026-07-29T13:00:00Z",
+                "deleted",
+            ),
+        ];
+        let out = render_transcript_prune_table(
+            &rows,
+            &transcript_list_test_prefs(),
+            transcript_list_test_now(),
+        );
+        assert!(
+            !out.contains(" transcripts\n\n"),
+            "unexpected summary line: {out}"
+        );
     }
 }

@@ -121,7 +121,19 @@ impl<'a> EntityTable<'a> {
             CellValue::Text(s) => Cell::new(s),
             CellValue::Id(id) => Cell::new(ids::compact_id(id)),
             CellValue::Name(s) => Cell::new(s),
-            CellValue::Missing => Cell::new("—"),
+            CellValue::Missing => {
+                // M3: restore the pre-branch dim styling an absent value
+                // used to get (`Cell::new("\x1b[2m—\x1b[0m")`) — plain
+                // `Cell::new("—")` lost it. Gated on `use_color()` like
+                // every other coloured cell in this match, so `--no-color`
+                // / non-tty output stays a bare em dash.
+                let cell = Cell::new("—");
+                if self.prefs.use_color() {
+                    cell.fg(crate::output::palette::active_palette().dim.into_table())
+                } else {
+                    cell
+                }
+            }
             CellValue::Timestamp(ts) => {
                 if self.opts.absolute {
                     Cell::new(ts.to_rfc3339())

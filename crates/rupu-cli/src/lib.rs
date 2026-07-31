@@ -297,12 +297,18 @@ pub async fn run(args: Vec<String>) -> ExitCode {
 
     match cli.command {
         Cmd::Run { argv } => cmd::run::handle(argv, cli.format).await,
-        Cmd::Agent { action } => cmd::agent::handle(action, cli.format).await,
+        Cmd::Agent { action } => {
+            cmd::agent::handle(action, cli.format, cli.absolute, cli.all_columns).await
+        }
         Cmd::Workflow { action } => {
             cmd::workflow::handle(action, cli.format, cli.absolute, cli.all_columns).await
         }
-        Cmd::Autoflow { action } => cmd::autoflow::handle(action, cli.format).await,
-        Cmd::Transcript { action } => cmd::transcript::handle(action, cli.format).await,
+        Cmd::Autoflow { action } => {
+            cmd::autoflow::handle(action, cli.format, cli.absolute, cli.all_columns).await
+        }
+        Cmd::Transcript { action } => {
+            cmd::transcript::handle(action, cli.format, cli.absolute, cli.all_columns).await
+        }
         Cmd::Config { action } => cmd::config::handle(action).await,
         Cmd::Ui { action } => cmd::ui::handle(action, cli.format).await,
         Cmd::Cleanup(args) => cmd::cleanup::handle(args, cli.format).await,
@@ -316,7 +322,9 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Init(args) => cmd::init::handle(args).await,
         Cmd::Mcp { action } => cmd::mcp::handle(action).await,
         Cmd::Coverage { action } => cmd::coverage::handle(action, cli.format).await,
-        Cmd::Cron { action } => cmd::cron::handle(action, cli.format).await,
+        Cmd::Cron { action } => {
+            cmd::cron::handle(action, cli.format, cli.absolute, cli.all_columns).await
+        }
         Cmd::Webhook { action } => cmd::webhook::handle(action).await,
         Cmd::Cp { action } => cmd::cp::handle(action).await,
         Cmd::Usage(args) => cmd::usage::handle(*args, cli.format).await,
@@ -615,5 +623,30 @@ mod arg_parse_tests {
         let cli = crate::Cli::try_parse_from(["rupu", "session", "list", "--all-columns"])
             .expect("cli parses with flag after subcommand");
         assert!(cli.all_columns);
+    }
+
+    // Threading proof: the flag must reach the renderer, not just parse —
+    // that behavioural proof belongs to Task 3/4/5's tests, where
+    // --absolute must visibly change a rendered timestamp. This only
+    // proves parsing, which already worked (`global = true` above).
+    #[test]
+    fn transcript_list_honours_absolute() {
+        let cli = crate::Cli::try_parse_from(["rupu", "transcript", "list", "--absolute"])
+            .expect("parses");
+        assert!(cli.absolute);
+    }
+
+    #[test]
+    fn cron_list_honours_all_columns() {
+        let cli = crate::Cli::try_parse_from(["rupu", "cron", "list", "--all-columns"])
+            .expect("parses");
+        assert!(cli.all_columns);
+    }
+
+    #[test]
+    fn agent_list_honours_absolute() {
+        let cli = crate::Cli::try_parse_from(["rupu", "agent", "list", "--absolute"])
+            .expect("parses");
+        assert!(cli.absolute);
     }
 }

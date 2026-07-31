@@ -82,12 +82,19 @@ pub enum Action {
     },
 }
 
-pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> ExitCode {
+pub async fn handle(
+    action: Action,
+    global_format: Option<OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
+) -> ExitCode {
     match action {
-        Action::List { no_color } => match list(no_color, global_format).await {
-            Ok(()) => ExitCode::from(0),
-            Err(e) => crate::output::diag::fail(e),
-        },
+        Action::List { no_color } => {
+            match list(no_color, global_format, absolute, all_columns).await {
+                Ok(()) => ExitCode::from(0),
+                Err(e) => crate::output::diag::fail(e),
+            }
+        }
         Action::Show {
             name,
             no_color,
@@ -218,18 +225,56 @@ impl CollectionOutput for AgentListOutput {
     }
 
     fn render_table(&self) -> anyhow::Result<()> {
-        let mut table = crate::output::tables::new_table();
-        table.set_header(vec!["NAME", "SCOPE", "DESCRIPTION"]);
-        for row in &self.report.rows {
-            table.add_row(vec![
-                comfy_table::Cell::new(&row.name),
-                crate::output::tables::status_cell(&row.scope, &self.prefs),
-                comfy_table::Cell::new(row.description.as_deref().unwrap_or("-")),
-            ]);
-        }
-        println!("{table}");
+        println!(
+            "{}",
+            render_agent_list_table(&self.report.rows, &self.prefs, chrono::Utc::now())
+        );
         Ok(())
     }
+}
+
+/// Build the `agent list` human table: names never wrap, SCOPE keeps its
+/// colour (`project` / `global`), an absent DESCRIPTION renders an em
+/// dash, and a bare `N agents` summary (no `STATUS` header here, so no
+/// breakdown). Extracted from `render_table` so it can be asserted
+/// directly against its returned string. `now` is unused by this table
+/// today (no timestamp column) but is threaded through for the same
+/// shape as `render_transcript_list_table` / `render_cron_list_table`.
+///
+/// `DESCRIPTION` is the safe `Missing` case, in deliberate contrast to
+/// `cron list`'s `NEXT (UTC)`/`IN`: there, `None` means "we couldn't
+/// compute it" — a failure the command exists to surface, so suppression
+/// would hide it. Here, `None` means the agent's frontmatter simply
+/// declares no `description:` — if every agent in a project lacks one,
+/// suppressing the column is correct, because there is genuinely nothing
+/// to show. See
+/// `agent_description_column_is_suppressed_when_all_absent` below, the
+/// inverse of cron's `..._survives_when_all_unschedulable`.
+fn render_agent_list_table(
+    rows: &[AgentListRow],
+    prefs: &UiPrefs,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    use crate::output::entity_table::{CellValue, EntityTable};
+
+    let mut table = EntityTable::new(
+        prefs,
+        prefs.render_opts(),
+        vec!["NAME", "SCOPE", "DESCRIPTION"],
+    )
+    .with_summary("agent");
+
+    for row in rows {
+        table = table.row(vec![
+            CellValue::Name(row.name.clone()),
+            CellValue::Status(row.scope.clone()),
+            row.description
+                .clone()
+                .map(CellValue::Text)
+                .unwrap_or(CellValue::Missing),
+        ]);
+    }
+    table.render(now)
 }
 
 impl DetailOutput for AgentShowOutput {
@@ -249,14 +294,20 @@ impl DetailOutput for AgentShowOutput {
     }
 }
 
-async fn list(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
+async fn list(
+    no_color: bool,
+    global_format: Option<OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     let project_agents_parent = project_root.as_ref().map(|p| p.join(".rupu"));
     let agents = load_agents(&global, project_agents_parent.as_deref())?;
     let cfg = layered_config(&global, project_root.as_deref());
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None)
+        .with_table_flags(absolute, all_columns);
 
     if agents.is_empty()
         && matches!(
@@ -589,5 +640,100 @@ fn scope_for(name: &str, global: &std::path::Path, project: Option<&std::path::P
         "global".to_string()
     } else {
         "?".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn agent_list_test_now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 7, 30, 17, 0, 0).unwrap()
+    }
+
+    fn agent_list_test_prefs() -> UiPrefs {
+        let cfg = rupu_config::UiConfig::default();
+        UiPrefs::resolve(&cfg, true, None, None, None)
+    }
+
+    fn agent_row(name: &str, scope: &str, description: Option<&str>) -> AgentListRow {
+        AgentListRow {
+            name: name.to_string(),
+            scope: scope.to_string(),
+            description: description.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn agent_list_table_name_never_wraps() {
+        // NAME maps to `CellValue::Name`: `agent show`/`edit` accept it
+        // back, so like `Id` it must never wrap across lines.
+        let rows = vec![agent_row(
+            "oracle-security-code-review-triage",
+            "project",
+            Some("reviews diffs for security issues"),
+        )];
+        let out = render_agent_list_table(&rows, &agent_list_test_prefs(), agent_list_test_now());
+        assert!(
+            out.contains("oracle-security-code-review-triage"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn agent_list_table_scope_is_present() {
+        let rows = vec![agent_row("foo", "global", Some("desc"))];
+        let out = render_agent_list_table(&rows, &agent_list_test_prefs(), agent_list_test_now());
+        assert!(out.contains("global"), "got: {out}");
+    }
+
+    #[test]
+    fn agent_list_table_missing_description_renders_em_dash() {
+        // A mix of present and absent DESCRIPTION: the column is kept
+        // (not every cell is empty), and the absent one renders as an
+        // em dash via `CellValue::Missing`.
+        let rows = vec![
+            agent_row("foo", "project", None),
+            agent_row("bar", "project", Some("does things")),
+        ];
+        let out = render_agent_list_table(&rows, &agent_list_test_prefs(), agent_list_test_now());
+        assert!(out.contains('—'), "got: {out}");
+        assert!(out.contains("does things"), "got: {out}");
+    }
+
+    #[test]
+    fn agent_description_column_is_suppressed_when_all_absent() {
+        // The instructive contrast with cron list's
+        // `..._survives_when_all_unschedulable`: there, `None` means "we
+        // couldn't compute it" — a failure the command exists to
+        // surface, so `Missing` would wrongly hide it, and the fix was a
+        // stable non-empty label instead. Here `None` means the agent's
+        // frontmatter simply declares no `description:` — if every agent
+        // in a project lacks one, there is genuinely nothing to show, so
+        // suppressing the column via `CellValue::Missing` is correct,
+        // not a bug.
+        let rows = vec![
+            agent_row("foo", "project", None),
+            agent_row("bar", "global", None),
+        ];
+        let out = render_agent_list_table(&rows, &agent_list_test_prefs(), agent_list_test_now());
+        assert!(
+            !out.contains("DESCRIPTION"),
+            "DESCRIPTION should be suppressed when every row lacks one: {out}"
+        );
+    }
+
+    #[test]
+    fn agent_list_table_summary_is_a_bare_count() {
+        // No `STATUS` header on this table (SCOPE isn't literally
+        // named STATUS), so `.with_summary("agent")` must not attempt a
+        // breakdown.
+        let rows = vec![
+            agent_row("foo", "project", Some("a")),
+            agent_row("bar", "global", Some("b")),
+        ];
+        let out = render_agent_list_table(&rows, &agent_list_test_prefs(), agent_list_test_now());
+        assert!(out.starts_with("2 agents\n\n"), "got: {out}");
     }
 }

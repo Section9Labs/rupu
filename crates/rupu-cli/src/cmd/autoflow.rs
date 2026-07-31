@@ -567,6 +567,7 @@ impl CollectionOutput for AutoflowListOutput {
 }
 
 struct AutoflowWakesOutput {
+    prefs: UiPrefs,
     report: AutoflowWakesReport,
 }
 
@@ -599,30 +600,78 @@ impl CollectionOutput for AutoflowWakesOutput {
     }
 
     fn render_table(&self) -> anyhow::Result<()> {
-        let mut table = crate::output::tables::new_table();
-        table.set_header(vec![
-            "Wake",
-            "State",
-            "Source",
-            "Event",
-            "Entity",
-            "Not Before",
-            "Repo",
-        ]);
-        for row in &self.report.rows {
-            table.add_row(vec![
-                Cell::new(&row.wake_id),
-                Cell::new(&row.state),
-                Cell::new(&row.source),
-                Cell::new(&row.event),
-                Cell::new(&row.entity),
-                Cell::new(compact_timestamp(&row.not_before)),
-                Cell::new(&row.repo),
-            ]);
-        }
-        println!("{table}");
+        println!(
+            "{}",
+            render_autoflow_wakes_table(&self.report.rows, &self.prefs, chrono::Utc::now())
+        );
         Ok(())
     }
+}
+
+/// Build the `autoflow wakes` human table: compacted wake ids, State
+/// coloured via the classification vocabulary (`queued` / `due` /
+/// `processed`), and `Not Before` rendered relative unless `--absolute`.
+/// No summary line: this table has no literal `STATUS` header (it's
+/// `State`), and renaming it to force a breakdown would misrepresent the
+/// column. Extracted from `render_table` so it can be asserted directly
+/// against its returned string; `now` is a parameter so tests are
+/// deterministic.
+fn render_autoflow_wakes_table(
+    rows: &[AutoflowWakeRow],
+    prefs: &UiPrefs,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    use crate::output::entity_table::{CellValue, EntityTable};
+
+    let mut table = EntityTable::new(
+        prefs,
+        prefs.render_opts(),
+        vec!["Wake", "State", "Source", "Event", "Entity", "Not Before", "Repo"],
+    );
+
+    for row in rows {
+        // A queued wake's `not_before` is, by definition, in the
+        // future. `CellValue::Timestamp` routes through
+        // `fmt::relative_time`, which deliberately clamps any *future*
+        // instant to "just now" — clock-skew protection that assumes
+        // the timestamp is in the past, which is true for
+        // started_at/updated_at but never true here. That clamp turned
+        // a wake queued 3 days out into "just now", indistinguishable
+        // from actually due. `cron list`'s `IN` column hit this exact
+        // trap (see the long comment on `render_cron_list_table` in
+        // cron.rs) and was fixed by hand-building a signed countdown
+        // via `tables::format_seconds` instead of routing through
+        // `CellValue::Timestamp`. Reuse that approach here: parse
+        // RFC3339 first, falling back to the verbatim text so a
+        // malformed value never drops the row. Unlike cron's
+        // `NEXT (UTC)`, this column keeps `--absolute` as a live
+        // toggle — there is no separate always-absolute column here to
+        // carry that meaning, so `--absolute` still yields the ISO
+        // instant on request.
+        let not_before = match chrono::DateTime::parse_from_rfc3339(&row.not_before) {
+            Ok(ts) => {
+                let ts = ts.with_timezone(&chrono::Utc);
+                if prefs.render_opts().absolute {
+                    CellValue::Text(ts.to_rfc3339())
+                } else {
+                    CellValue::Text(crate::output::tables::format_seconds(
+                        (ts - now).num_seconds(),
+                    ))
+                }
+            }
+            Err(_) => CellValue::Text(row.not_before.clone()),
+        };
+        table = table.row(vec![
+            CellValue::Id(row.wake_id.clone()),
+            CellValue::Status(row.state.clone()),
+            CellValue::Text(row.source.clone()),
+            CellValue::Text(row.event.clone()),
+            CellValue::Text(row.entity.clone()),
+            not_before,
+            CellValue::Text(row.repo.clone()),
+        ]);
+    }
+    table.render(now)
 }
 
 struct AutoflowStatusOutput {
@@ -1381,9 +1430,12 @@ struct AutoflowHistoryQuery<'a> {
 pub async fn handle(
     action: Action,
     global_format: Option<crate::output::formats::OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
 ) -> ExitCode {
     let resolver: Arc<dyn CredentialResolver> = Arc::new(KeychainResolver::new());
-    let result = handle_with_resolver(action, resolver, global_format).await;
+    let result =
+        handle_with_resolver(action, resolver, global_format, absolute, all_columns).await;
     match result {
         Ok(()) => ExitCode::from(0),
         Err(e) => crate::output::diag::fail(e),
@@ -1394,6 +1446,8 @@ async fn handle_with_resolver(
     action: Action,
     resolver: Arc<dyn CredentialResolver>,
     global_format: Option<crate::output::formats::OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
 ) -> anyhow::Result<()> {
     match action {
         Action::List(args) => list(args.repo.as_deref(), global_format).await,
@@ -1423,7 +1477,9 @@ async fn handle_with_resolver(
             .await
         }
         Action::Stop { worker, repo } => stop_worker(worker.as_deref(), repo.as_deref()),
-        Action::Wakes(args) => wakes(args.repo.as_deref(), global_format).await,
+        Action::Wakes(args) => {
+            wakes(args.repo.as_deref(), global_format, absolute, all_columns).await
+        }
         Action::Monitor {
             repo,
             worker,
@@ -4553,6 +4609,8 @@ fn live_run_event_lines(
 async fn wakes(
     repo: Option<&str>,
     global_format: Option<crate::output::formats::OutputFormat>,
+    absolute: bool,
+    all_columns: bool,
 ) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let repo_filter = normalize_repo_filter(repo)?;
@@ -4598,7 +4656,9 @@ async fn wakes(
         not_before: wake.not_before,
         repo: wake.repo_ref,
     }));
+    let prefs = autoflow_ui_prefs()?.with_table_flags(absolute, all_columns);
     let output = AutoflowWakesOutput {
+        prefs,
         report: AutoflowWakesReport {
             kind: "autoflow_wakes",
             version: 1,
@@ -12214,6 +12274,141 @@ fn format_contenders(contenders: &[AutoflowContender]) -> String {
 mod tests {
     use super::*;
     use crate::cmd::autoflow_wake;
+
+    fn wakes_table_test_now() -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(2026, 7, 30, 17, 0, 0).unwrap()
+    }
+
+    fn wakes_table_test_prefs() -> UiPrefs {
+        let cfg = rupu_config::UiConfig::default();
+        UiPrefs::resolve(&cfg, true, None, None, None)
+    }
+
+    fn wake_row(wake_id: &str, state: &str, not_before: &str) -> AutoflowWakeRow {
+        AutoflowWakeRow {
+            wake_id: wake_id.to_string(),
+            state: state.to_string(),
+            source: "github".to_string(),
+            event: "issue.labeled".to_string(),
+            entity: "issue#42".to_string(),
+            not_before: not_before.to_string(),
+            repo: "github:Section9Labs/rupu".to_string(),
+        }
+    }
+
+    #[test]
+    fn autoflow_wakes_table_id_is_compacted() {
+        let rows = vec![wake_row(
+            "wake_01KRJDKSBE7X4J49094149WFJS",
+            "queued",
+            "2026-07-30T13:00:00Z",
+        )];
+        let out =
+            render_autoflow_wakes_table(&rows, &wakes_table_test_prefs(), wakes_table_test_now());
+        assert!(out.contains("wake_01KRJDK…WFJS"), "got: {out}");
+        assert!(
+            !out.contains("wake_01KRJDKSBE7X4J49094149WFJS"),
+            "full id must not appear in a table cell: {out}"
+        );
+    }
+
+    #[test]
+    fn autoflow_wakes_table_not_before_renders_relative() {
+        let rows = vec![wake_row(
+            "wake_01KRJDKSBE7X4J49094149WFJS",
+            "processed",
+            "2026-07-30T13:00:00Z",
+        )];
+        let out =
+            render_autoflow_wakes_table(&rows, &wakes_table_test_prefs(), wakes_table_test_now());
+        assert!(out.contains("ago"), "got: {out}");
+        assert!(!out.contains("2026-07-30T13:00:00"), "got: {out}");
+    }
+
+    #[test]
+    fn autoflow_wakes_table_future_not_before_renders_countdown_not_just_now() {
+        // C2 regression guard: `wakes()` lists queued wakes via
+        // `list_queued()` with no due-time filter, so a queued wake's
+        // `not_before` is, by definition, always in the future. Prior to
+        // this fix, routing a future instant through `CellValue::Timestamp`
+        // clamped it to "just now" (the clock-skew guard in
+        // `fmt::relative_time` assumes a past instant) — an operator who
+        // ran `autoflow requeue --not-before 24h` would see the fresh
+        // backoff wake reported as already due.
+        let rows = vec![wake_row(
+            "wake_01KRJDKSBE7X4J49094149WFJS",
+            "queued",
+            "2026-08-02T17:00:00Z", // 3 days after wakes_table_test_now()
+        )];
+        let out =
+            render_autoflow_wakes_table(&rows, &wakes_table_test_prefs(), wakes_table_test_now());
+        assert!(out.contains("in 3d"), "got: {out}");
+        assert!(!out.contains("just now"), "got: {out}");
+    }
+
+    #[test]
+    fn autoflow_wakes_table_absolute_flag_renders_iso() {
+        let rows = vec![wake_row(
+            "wake_01KRJDKSBE7X4J49094149WFJS",
+            "processed",
+            "2026-07-30T13:00:00Z",
+        )];
+        let absolute_prefs = wakes_table_test_prefs().with_table_flags(true, false);
+        let out = render_autoflow_wakes_table(&rows, &absolute_prefs, wakes_table_test_now());
+        assert!(out.contains("2026-07-30T13:00:00"), "got: {out}");
+    }
+
+    #[test]
+    fn autoflow_wakes_table_state_is_a_classification_not_a_lifecycle_glyph() {
+        // `queued` / `due` / `processed` are classification values, not
+        // lifecycle positions — `status_of` deliberately excludes them
+        // (`output::tables::new_classification_values_get_no_lifecycle_glyph`),
+        // so `State` must render the bare word with no glyph prefix.
+        // Colour itself (`status_color` now has an arm for `queued` as
+        // of Task 1) can't be observed through comfy-table's
+        // `to_string()` outside a real tty — verified instead by
+        // `output::tables`'s own `status_color_covers_autoflow_wake_states`
+        // unit test and by running the real binary.
+        let rows = vec![wake_row(
+            "wake_01KRJDKSBE7X4J49094149WFJS",
+            "queued",
+            "2026-07-30T13:00:00Z",
+        )];
+        let out =
+            render_autoflow_wakes_table(&rows, &wakes_table_test_prefs(), wakes_table_test_now());
+        assert!(out.contains("queued"), "got: {out}");
+        for glyph in ['✓', '✗', '○', '●', '⏸', '↺', '⊘'] {
+            assert!(!out.contains(glyph), "unexpected glyph {glyph} in: {out}");
+        }
+    }
+
+    #[test]
+    fn autoflow_wakes_table_survives_an_unparseable_not_before() {
+        let rows = vec![wake_row(
+            "wake_01KRJDKSBE7X4J49094149WFJS",
+            "queued",
+            "not-a-timestamp",
+        )];
+        let out =
+            render_autoflow_wakes_table(&rows, &wakes_table_test_prefs(), wakes_table_test_now());
+        assert!(out.contains("not-a-timestamp"), "row was dropped: {out}");
+    }
+
+    #[test]
+    fn autoflow_wakes_table_has_no_summary_line() {
+        // No literal `STATUS` header (it's `State`) — `.with_summary`
+        // is deliberately not called, so no count/breakdown line above
+        // the table.
+        let rows = vec![wake_row(
+            "wake_01KRJDKSBE7X4J49094149WFJS",
+            "queued",
+            "2026-07-30T13:00:00Z",
+        )];
+        let out =
+            render_autoflow_wakes_table(&rows, &wakes_table_test_prefs(), wakes_table_test_now());
+        assert!(!out.contains(" wakes\n\n"), "unexpected summary line: {out}");
+    }
 
     /// Everything the `rupu autoflow create` scaffold writes must be
     /// schema-valid. It regressed once (`wake_on:` emitted as a mapping and a
