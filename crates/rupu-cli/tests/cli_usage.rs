@@ -560,7 +560,10 @@ fn usage_supports_issue_worker_backend_and_trigger_filters() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("run_standalone_issue_42"))
+        // `usage runs`' RUN_ID column now renders compacted
+        // (head…tail); "run_standalone_issue_42" is long enough to be
+        // shortened to "run_standalo…e_42".
+        .stdout(predicate::str::contains("run_standalo…e_42"))
         .stdout(predicate::str::contains(
             "github:Section9Labs/rupu/issues/42",
         ))
