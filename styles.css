@@ -205,6 +205,58 @@ footer { border-top: 1px solid var(--line-soft); padding: 40px 0 56px; }
 }
 .copy-btn:hover { color: var(--ink); border-color: rgba(167,139,250,0.5); }
 
+/* ── Download: package-manager tabs ──────────────────────── */
+/* Mono/uppercase to match .dl-or and the nav pill; the active tab borrows
+   the violet accent rather than a filled background, so the card keeps its
+   flat, unboxed feel. */
+.dl-tabs {
+  display: flex; flex-wrap: wrap; gap: 6px; justify-content: center;
+  margin-bottom: 12px;
+}
+.dl-tab {
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.10em; text-transform: uppercase;
+  color: var(--ink-mute); background: transparent;
+  border: 1px solid var(--line); border-radius: 999px; padding: 5px 11px;
+  cursor: pointer; transition: color .2s, border-color .2s, background .2s;
+}
+.dl-tab:hover { color: var(--ink-dim); border-color: rgba(167,139,250,0.35); }
+.dl-tab.is-on {
+  color: var(--violet-lite); border-color: rgba(167,139,250,0.45);
+  background: rgba(124,58,237,0.08);
+}
+.dl-panel { display: none; }
+.dl-panel.is-on { display: block; animation: dl-fade .28s ease; }
+@keyframes dl-fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.dl-note {
+  margin: 10px 2px 0; font-size: 12.5px; line-height: 1.55;
+  color: var(--ink-mute); text-align: left;
+}
+
+/* ── Beta channel strip ──────────────────────────────────── */
+/* Deliberately quieter than .dl-card: no panel background, hairline rule,
+   muted ink. Stable stays the obvious default. */
+.beta-strip {
+  max-width: 560px; margin: 18px auto 0; padding: 14px 18px;
+  display: flex; align-items: baseline; gap: 12px;
+  border: 1px solid var(--line-soft); border-radius: 14px;
+  text-align: left;
+}
+.beta-tag {
+  flex-shrink: 0;
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase;
+  color: var(--violet-lite); border: 1px solid rgba(167,139,250,0.30);
+  border-radius: 999px; padding: 3px 9px;
+}
+.beta-txt { font-size: 13px; color: var(--ink-mute); line-height: 1.6; }
+.beta-txt .link { color: var(--ink-dim); }
+.beta-txt .link:hover { color: var(--violet-lite); }
+
+@media (max-width: 560px) {
+  .beta-strip { flex-direction: column; gap: 8px; }
+  .dl-tabs { gap: 5px; }
+  .dl-tab { font-size: 10px; padding: 5px 9px; }
+}
+
 /* ── Code blocks (docs) ──────────────────────────────────── */
 pre.code {
   margin: 18px 0; padding: 18px 20px; background: #000; border: 1px solid var(--line);

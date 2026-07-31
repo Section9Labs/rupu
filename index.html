@@ -176,8 +176,10 @@
   <section id="download" class="wrap download">
     <p class="eyebrow reveal">Download</p>
     <p class="lede reveal">Get rupu.</p>
+
     <div class="dl-card reveal">
       <div class="dl-ver" id="dl-ver">Latest release</div>
+
       <div class="dl-primary">
         <a class="btn primary" id="dl-btn" href="https://github.com/Section9Labs/rupu/releases" target="_blank" rel="noopener">Download for macOS</a>
       </div>
@@ -189,13 +191,74 @@
         <button class="copy-btn" data-copy="#dl-install" type="button">Copy</button>
       </div>
 
-      <div class="dl-or">or build from source</div>
-      <div class="code-line">
-        <code id="dl-cargo">cargo install --git https://github.com/Section9Labs/rupu</code>
-        <button class="copy-btn" data-copy="#dl-cargo" type="button">Copy</button>
+      <div class="dl-or">or use a package manager</div>
+      <div class="dl-tabs" role="tablist">
+        <button class="dl-tab is-on" type="button" data-panel="pm-brew" role="tab">Homebrew</button>
+        <button class="dl-tab" type="button" data-panel="pm-deb" role="tab">Debian ·  Ubuntu</button>
+        <button class="dl-tab" type="button" data-panel="pm-rpm" role="tab">Fedora · RHEL</button>
+        <button class="dl-tab" type="button" data-panel="pm-arch" role="tab">Arch</button>
+        <button class="dl-tab" type="button" data-panel="pm-nix" role="tab">Nix</button>
+        <button class="dl-tab" type="button" data-panel="pm-src" role="tab">Source</button>
       </div>
 
-      <p class="dl-sub">Then <code class="inline">rupu init</code> — and keep it current with <code class="inline">rupu update</code> (add <code class="inline">--channel beta</code> for early access). See the <a class="link" href="/docs/">docs</a>.</p>
+      <div class="dl-panel is-on" id="pm-brew">
+        <div class="code-line">
+          <code id="cp-brew">brew install section9labs/tap/rupu</code>
+          <button class="copy-btn" data-copy="#cp-brew" type="button">Copy</button>
+        </div>
+        <p class="dl-note">macOS and Linux.</p>
+      </div>
+
+      <div class="dl-panel" id="pm-deb">
+        <div class="code-line">
+          <code id="cp-deb">sudo apt install ./rupu_&lt;version&gt;_amd64.deb</code>
+          <button class="copy-btn" data-copy="#cp-deb" type="button">Copy</button>
+        </div>
+        <p class="dl-note">Pulls in <code class="inline">ripgrep</code> and installs shell completions plus <code class="inline">man rupu</code>. For in-place upgrades via <code class="inline">apt upgrade</code>, add the hosted repository — see the <a class="link" href="https://github.com/Section9Labs/rupu#hosted-apt--yum-repositories" target="_blank" rel="noopener">repository setup</a>.</p>
+      </div>
+
+      <div class="dl-panel" id="pm-rpm">
+        <div class="code-line">
+          <code id="cp-rpm">sudo dnf install ./rupu-&lt;version&gt;.x86_64.rpm</code>
+          <button class="copy-btn" data-copy="#cp-rpm" type="button">Copy</button>
+        </div>
+        <p class="dl-note">Same completions and man page as the <code class="inline">.deb</code>. Hosted YUM repository setup lives in the <a class="link" href="https://github.com/Section9Labs/rupu#hosted-apt--yum-repositories" target="_blank" rel="noopener">README</a>.</p>
+      </div>
+
+      <div class="dl-panel" id="pm-arch">
+        <div class="code-line">
+          <code id="cp-arch">yay -S rupu-bin</code>
+          <button class="copy-btn" data-copy="#cp-arch" type="button">Copy</button>
+        </div>
+        <p class="dl-note">Or <code class="inline">paru -S rupu-bin</code>. Installs the published release binary.</p>
+      </div>
+
+      <div class="dl-panel" id="pm-nix">
+        <div class="code-line">
+          <code id="cp-nix">nix profile install github:Section9Labs/rupu</code>
+          <button class="copy-btn" data-copy="#cp-nix" type="button">Copy</button>
+        </div>
+        <p class="dl-note">Or run it once with <code class="inline">nix run github:Section9Labs/rupu</code>.</p>
+      </div>
+
+      <div class="dl-panel" id="pm-src">
+        <div class="code-line">
+          <code id="dl-cargo">cargo install --git https://github.com/Section9Labs/rupu</code>
+          <button class="copy-btn" data-copy="#dl-cargo" type="button">Copy</button>
+        </div>
+        <p class="dl-note">Requires Rust 1.95+.</p>
+      </div>
+
+      <p class="dl-sub">Then <code class="inline">rupu init</code> — and keep it current with <code class="inline">rupu update</code>. See the <a class="link" href="/docs/">docs</a>.</p>
+    </div>
+
+    <!-- Beta channel: deliberately understated. Stable stays the default. -->
+    <div class="beta-strip reveal" id="beta-strip" hidden>
+      <span class="beta-tag">Beta</span>
+      <span class="beta-txt">
+        <a class="link" id="beta-link" href="https://github.com/Section9Labs/rupu/releases" target="_blank" rel="noopener"><span id="beta-ver">latest beta</span></a>
+        — ships ahead of stable. Switch with <code class="inline">rupu update --channel beta</code>.
+      </span>
     </div>
   </section>
 
@@ -241,33 +304,68 @@
     });
   });
 
-  // live "latest release" — the stable channel. /releases/latest returns the
-  // newest NON-prerelease (i.e. the stable `v<X.Y.Z>` release, not `-beta`).
-  // Assets are the canonical `rupu-<os>-<arch>` bare binary (+ .sha256).
+  // Package-manager tabs.
+  (function () {
+    var tabs = [].slice.call(document.querySelectorAll('.dl-tab'));
+    if (!tabs.length) return;
+    tabs.forEach(function (t) {
+      t.addEventListener('click', function () {
+        tabs.forEach(function (o) { o.classList.remove('is-on'); });
+        [].slice.call(document.querySelectorAll('.dl-panel')).forEach(function (p) { p.classList.remove('is-on'); });
+        t.classList.add('is-on');
+        var panel = document.getElementById(t.dataset.panel);
+        if (panel) panel.classList.add('is-on');
+      });
+    });
+  })();
+
+  // Live channel versions.
+  //
+  // Deliberately /releases, not /releases/latest: the latter returns only the
+  // newest NON-prerelease, so the beta channel would be invisible. One call
+  // gives both — newest stable for the primary button, newest prerelease for
+  // the beta strip. The strip stays hidden unless a beta actually exists that
+  // is NEWER than stable, so it never advertises a stale prerelease.
   (function () {
     var verEl = document.getElementById('dl-ver');
     var btn = document.getElementById('dl-btn');
     var sub = document.getElementById('dl-sub');
     if (!verEl || !btn) return;
-    fetch('https://api.github.com/repos/Section9Labs/rupu/releases/latest', {
+
+    fetch('https://api.github.com/repos/Section9Labs/rupu/releases?per_page=30', {
       headers: { 'Accept': 'application/vnd.github+json' }
-    }).then(function (r) { return r.ok ? r.json() : null; }).then(function (rel) {
-      if (!rel) return;
-      var ver = (rel.tag_name || '').replace(/-(cli|build|beta)$/, '');
-      verEl.textContent = ver ? 'Latest · ' + ver : 'Latest release';
-      var assets = rel.assets || [];
-      // prefer the canonical macOS binary (rupu-darwin-arm64), then any bare
-      // rupu-<os>-<arch> binary, then the legacy .tar.gz, then a bare `rupu`.
-      var bin = assets.filter(function (a) { return a.name === 'rupu-darwin-arm64'; })[0]
-             || assets.filter(function (a) { return /^rupu-[a-z0-9_]+-[a-z0-9_]+$/i.test(a.name); })[0]
-             || assets.filter(function (a) { return /\.tar\.gz$/.test(a.name) && !/\.sha256$/.test(a.name); })[0]
-             || assets.filter(function (a) { return a.name === 'rupu'; })[0];
-      if (bin) {
-        btn.href = bin.browser_download_url;
-        btn.removeAttribute('target');
-        if (sub) sub.innerHTML = 'macOS · Apple Silicon · signed binary (' + ver + ') · <a class="link" href="' + rel.html_url + '" target="_blank" rel="noopener">all releases</a>';
-      } else {
-        btn.href = rel.html_url;
+    }).then(function (r) { return r.ok ? r.json() : null; }).then(function (list) {
+      if (!list || !list.length) return;
+      var live = list.filter(function (r) { return !r.draft; });
+      var stable = live.filter(function (r) { return !r.prerelease; })[0];
+      var beta = live.filter(function (r) { return r.prerelease; })[0];
+
+      if (stable) {
+        var ver = (stable.tag_name || '').replace(/-(cli|build)$/, '');
+        verEl.textContent = ver ? 'Stable · ' + ver : 'Latest release';
+        var assets = stable.assets || [];
+        // Prefer the canonical macOS binary, then any bare rupu-<os>-<arch>.
+        var bin = assets.filter(function (a) { return a.name === 'rupu-darwin-arm64'; })[0]
+               || assets.filter(function (a) { return /^rupu-[a-z0-9_]+-[a-z0-9_]+$/i.test(a.name); })[0];
+        if (bin) {
+          btn.href = bin.browser_download_url;
+          btn.removeAttribute('target');
+          if (sub) sub.innerHTML = 'macOS · Apple Silicon · signed binary (' + ver + ') · <a class="link" href="' + stable.html_url + '" target="_blank" rel="noopener">all releases</a>';
+        } else {
+          btn.href = stable.html_url;
+        }
+      }
+
+      // Only surface a beta that is actually ahead of stable. GitHub returns
+      // releases newest-first, so "beta appears before stable in the list" is
+      // the ordering test — no semver parsing needed.
+      if (beta && (!stable || live.indexOf(beta) < live.indexOf(stable))) {
+        var strip = document.getElementById('beta-strip');
+        var bver = document.getElementById('beta-ver');
+        var blink = document.getElementById('beta-link');
+        if (bver) bver.textContent = beta.tag_name || 'latest beta';
+        if (blink) blink.href = beta.html_url;
+        if (strip) strip.hidden = false;
       }
     }).catch(function () { /* keep the static fallback (releases page) */ });
   })();
