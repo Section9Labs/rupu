@@ -931,7 +931,24 @@ async fn run_writer(
                 let _ = file.flush().await;
                 let _ = ack.send(());
             }
-            WriteRequest::Stop => break,
+            WriteRequest::Stop => {
+                // Close first, THEN drain. `Stop` is FIFO-ordered against
+                // concurrent producers, so a clone's `try_send` can land
+                // behind it; breaking immediately would discard that
+                // record with no counter bump — silent loss, the exact
+                // defect this ledger exists to prevent.
+                //
+                // `close()` makes every subsequent `try_send` fail, so
+                // `offer()` counts those as dropped (visible), while
+                // `recv()` still yields everything already queued.
+                rx.close();
+                while let Some(pending) = rx.recv().await {
+                    if let WriteRequest::Line(line) = pending {
+                        write_line(&mut file, &line, &dropped_counter).await;
+                    }
+                }
+                break;
+            }
         }
     }
 
