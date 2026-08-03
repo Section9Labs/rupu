@@ -6,11 +6,13 @@
 //! microVM backend (spec §9). Every record carries a [`Fidelity`] so no
 //! view ever claims coverage it does not have.
 
+pub mod asn;
 pub mod ctx;
 pub mod ledger;
 pub mod record;
 pub mod sink;
 
+pub use asn::{AsnInfo, AsnTable};
 pub use ctx::{FlowCtx, Origin};
 pub use ledger::{NetflowPaths, NetflowWriter, NetflowWriterHandle};
 pub use record::{Fidelity, FlowId, FlowRecord, LedgerLine, Outcome};
