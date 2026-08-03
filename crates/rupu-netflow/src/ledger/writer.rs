@@ -15,6 +15,11 @@ const CHANNEL_CAPACITY: usize = 1024;
 enum WriteRequest {
     Line(Box<LedgerLine>),
     Flush(tokio::sync::oneshot::Sender<()>),
+    /// Explicit shutdown signal. `shutdown()` must not rely on the last
+    /// `Sender` being dropped to end the task — callers legitimately hold
+    /// `Arc<NetflowWriter>` clones (e.g. a client built with `handle.writer.clone()`)
+    /// whose lifetime outlives the handle, which would otherwise hang `shutdown`.
+    Stop,
 }
 
 /// Best-effort append-only ledger sink.
@@ -87,10 +92,16 @@ impl NetflowWriterHandle {
 
     /// Flush pending writes, emit a final `Dropped` line if anything was
     /// lost, then stop the task.
+    ///
+    /// Sends an explicit `Stop` after the flush ack rather than relying on
+    /// the last `Sender` being dropped — a caller may hold its own
+    /// `Arc<NetflowWriter>` clone (via the public `writer` field) whose
+    /// `Sender` would otherwise keep the task's `rx.recv()` alive forever.
     pub async fn shutdown(self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = self.writer.tx.send(WriteRequest::Flush(tx)).await;
         let _ = rx.await;
+        let _ = self.writer.tx.send(WriteRequest::Stop).await;
         drop(self.writer);
         let _ = self.task.await;
     }
@@ -119,42 +130,59 @@ async fn run_writer(
     while let Some(req) = rx.recv().await {
         match req {
             WriteRequest::Line(line) => {
-                write_line(&mut file, &line).await;
+                write_line(&mut file, &line, &dropped_counter).await;
             }
             WriteRequest::Flush(ack) => {
-                let dropped = dropped_counter.load(Ordering::Relaxed);
-                if dropped > last_dropped {
-                    let line = LedgerLine::Dropped {
-                        count: dropped - last_dropped,
-                        ts: chrono::Utc::now(),
-                    };
-                    write_line(&mut file, &line).await;
-                    last_dropped = dropped;
-                }
+                last_dropped = flush_dropped(&mut file, &dropped_counter, last_dropped).await;
                 let _ = file.flush().await;
                 let _ = ack.send(());
             }
+            WriteRequest::Stop => break,
         }
     }
 
+    flush_dropped(&mut file, &dropped_counter, last_dropped).await;
+    let _ = file.flush().await;
+}
+
+/// Compute how many records have been lost since `last_dropped`, write a
+/// `Dropped` line covering the delta if any, and return the new total.
+/// Shared by the `Flush` request and the terminal drain so the accounting
+/// logic isn't duplicated.
+async fn flush_dropped(
+    file: &mut tokio::fs::File,
+    dropped_counter: &AtomicU64,
+    last_dropped: u64,
+) -> u64 {
     let dropped = dropped_counter.load(Ordering::Relaxed);
     if dropped > last_dropped {
         let line = LedgerLine::Dropped {
             count: dropped - last_dropped,
             ts: chrono::Utc::now(),
         };
-        write_line(&mut file, &line).await;
+        write_line(file, &line, dropped_counter).await;
     }
-    let _ = file.flush().await;
+    dropped
 }
 
-async fn write_line(file: &mut tokio::fs::File, line: &LedgerLine) {
-    let Ok(mut json) = serde_json::to_string(line) else {
-        return;
+/// Append one line. A failure here is REAL LOSS and must be counted —
+/// a full disk or revoked permission must not silently vanish a record any
+/// more than channel overflow may.
+async fn write_line(file: &mut tokio::fs::File, line: &LedgerLine, dropped: &AtomicU64) {
+    let json = match serde_json::to_string(line) {
+        Ok(mut j) => {
+            j.push('\n');
+            j
+        }
+        Err(e) => {
+            dropped.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(error = %e, "netflow ledger serialize failed; record lost");
+            return;
+        }
     };
-    json.push('\n');
     if let Err(e) = file.write_all(json.as_bytes()).await {
-        tracing::debug!(error = %e, "netflow ledger write failed");
+        dropped.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(error = %e, "netflow ledger write failed; record lost");
     }
 }
 
@@ -236,11 +264,23 @@ mod tests {
             .expect("writer shutdown deadlocked");
 
         let text = std::fs::read_to_string(&paths.flows).unwrap();
-        let recorded = text.lines().count() as u64;
-        // Whatever was lost is accounted for, never silently vanished.
-        if dropped > 0 {
-            assert!(text.contains("\"type\":\"dropped\""));
-        }
-        assert!(recorded > 0);
+
+        // DETERMINISTIC, not scheduler-dependent: current-thread runtime,
+        // no await point in record(), capacity 1 — the first send is
+        // buffered and the other 4,999 overflow.
+        assert!(dropped > 0, "flooding a capacity-1 channel must drop");
+
+        let dropped_line = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<LedgerLine>(l).ok())
+            .find_map(|l| match l {
+                LedgerLine::Dropped { count, .. } => Some(count),
+                _ => None,
+            })
+            .expect("loss must leave a Dropped line in the ledger");
+        assert_eq!(
+            dropped_line, dropped,
+            "the ledger must account for every lost record"
+        );
     }
 }
