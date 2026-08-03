@@ -1189,7 +1189,10 @@ mod tests {
         assert_eq!(rollup[0].calls, 2, "calls are still exact");
         assert_eq!(rollup[0].bytes_in, None);
         assert_eq!(rollup[0].bytes_out, None);
-        assert_eq!(rollup[0].p50_ms, 20, "timings are still exact");
+        // Durations are [10, 20]; nearest-rank p50 = ceil(0.5*2) = rank 1
+        // = the LOWER of the two. Timings stay exact even though bytes
+        // became unknowable.
+        assert_eq!(rollup[0].p50_ms, 10, "timings are still exact");
     }
 
     #[test]
@@ -1353,7 +1356,13 @@ fn is_error(f: &FlowRecord) -> bool {
     !matches!(f.outcome, Outcome::Ok)
 }
 
-/// Nearest-rank percentile. `pct` in 0.0..=1.0. `sorted` must be ascending.
+/// Nearest-rank percentile — the standard definition: the smallest value
+/// at or below which at least `pct` of the samples fall, i.e. index
+/// `ceil(pct * n) - 1`. `pct` in 0.0..=1.0. `sorted` must be ascending.
+///
+/// Do NOT "fix" this to `ceil(pct * (n - 1))` to make a test pass. That
+/// is a different, nonstandard definition; if a test disagrees with
+/// nearest-rank, the test's expected value is what is wrong.
 fn percentile(sorted: &[u64], pct: f64) -> u64 {
     if sorted.is_empty() {
         return 0;
