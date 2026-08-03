@@ -12,6 +12,7 @@ http = ["dep:reqwest", "dep:reqwest-middleware", "dep:http"]
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
+flate2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -6563,6 +6563,7 @@ version = "0.72.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "flate2",
  "http 1.4.0",
  "httpmock",
  "reqwest 0.12.28",
