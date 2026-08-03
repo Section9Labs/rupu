@@ -718,7 +718,14 @@ mod tests {
         let id = FlowId::from_parts(9, 9);
         handle.writer.record(flow(id)).await;
         handle.writer.complete(id, 4096, 250).await;
-        handle.shutdown().await;
+        // Bounded: a shutdown deadlock must FAIL the test, not hang the
+        // suite forever. An `Arc` cycle between `NetflowWriter` (which
+        // owns the channel sender) and the writer task produces exactly
+        // that hang, and a bare `.await` here would wedge CI instead of
+        // reporting it.
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle.shutdown())
+            .await
+            .expect("writer shutdown deadlocked");
 
         let text = std::fs::read_to_string(&paths.flows).unwrap();
         let lines: Vec<LedgerLine> = text
@@ -749,7 +756,9 @@ mod tests {
                 .await;
         }
         let dropped = handle.writer.dropped();
-        handle.shutdown().await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle.shutdown())
+            .await
+            .expect("writer shutdown deadlocked");
 
         let text = std::fs::read_to_string(&paths.flows).unwrap();
         let recorded = text.lines().count() as u64;
@@ -798,7 +807,9 @@ enum WriteRequest {
 #[derive(Debug)]
 pub struct NetflowWriter {
     tx: mpsc::Sender<WriteRequest>,
-    dropped: AtomicU64,
+    /// Shared with the writer task. This MUST be a separate `Arc`, not
+    /// reached via `Arc<NetflowWriter>` — see `spawn_with_capacity`.
+    dropped: Arc<AtomicU64>,
 }
 
 impl NetflowWriter {
@@ -842,11 +853,19 @@ impl NetflowWriterHandle {
     pub fn spawn_with_capacity(paths: NetflowPaths, capacity: usize) -> std::io::Result<Self> {
         paths.ensure_dir()?;
         let (tx, rx) = mpsc::channel(capacity);
+        let dropped = Arc::new(AtomicU64::new(0));
         let writer = Arc::new(NetflowWriter {
             tx,
-            dropped: AtomicU64::new(0),
+            dropped: dropped.clone(),
         });
-        let task = tokio::spawn(run_writer(paths, rx, writer.clone()));
+        // Hand the writer task ONLY the counter, never `writer.clone()`.
+        // `NetflowWriter` owns `tx`; if the task held an `Arc<NetflowWriter>`
+        // that sender would outlive `shutdown`'s `drop(self.writer)`, so
+        // `rx.recv()` would never yield `None`, the task would never exit,
+        // and `self.task.await` would hang forever. This is a real deadlock
+        // that was hit and fixed during implementation — do not "simplify"
+        // it back.
+        let task = tokio::spawn(run_writer(paths, rx, dropped));
         Ok(Self { writer, task })
     }
 
@@ -864,7 +883,7 @@ impl NetflowWriterHandle {
 async fn run_writer(
     paths: NetflowPaths,
     mut rx: mpsc::Receiver<WriteRequest>,
-    writer: Arc<NetflowWriter>,
+    dropped_counter: Arc<AtomicU64>,
 ) {
     let mut file = match OpenOptions::new()
         .create(true)
@@ -887,7 +906,7 @@ async fn run_writer(
                 write_line(&mut file, &line).await;
             }
             WriteRequest::Flush(ack) => {
-                let dropped = writer.dropped();
+                let dropped = dropped_counter.load(Ordering::Relaxed);
                 if dropped > last_dropped {
                     let line = LedgerLine::Dropped {
                         count: dropped - last_dropped,
@@ -902,7 +921,7 @@ async fn run_writer(
         }
     }
 
-    let dropped = writer.dropped();
+    let dropped = dropped_counter.load(Ordering::Relaxed);
     if dropped > last_dropped {
         let line = LedgerLine::Dropped {
             count: dropped - last_dropped,
