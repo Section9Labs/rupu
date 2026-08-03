@@ -1078,12 +1078,31 @@ mod tests {
         assert_eq!(rollup[0].host, "api.anthropic.com");
         assert_eq!(rollup[0].calls, 3);
         assert_eq!(rollup[0].errors, 1);
-        assert_eq!(rollup[0].bytes_in, 600);
-        assert_eq!(rollup[0].bytes_out, 300);
+        assert_eq!(rollup[0].bytes_in, Some(600));
+        assert_eq!(rollup[0].bytes_out, Some(300));
         assert_eq!(rollup[0].p50_ms, 20);
         assert_eq!(rollup[0].p95_ms, 100);
         assert_eq!(rollup[1].host, "api.github.com");
         assert_eq!(rollup[1].calls, 1);
+    }
+
+    #[test]
+    fn one_unknown_byte_count_makes_the_host_total_unknown() {
+        // A Coarse record cannot be summed into a total that claims to
+        // be complete. `None` says "we could not see it"; 600 would be
+        // a false claim and 0 would be worse.
+        let mut coarse = flow(1, "api.github.com", Some("r1"), 10, true);
+        coarse.fidelity = Fidelity::Coarse;
+        coarse.bytes_in = None;
+        coarse.bytes_out = None;
+
+        let flows = vec![flow(2, "api.github.com", Some("r1"), 20, true), coarse];
+        let rollup = host_rollup(&flows);
+
+        assert_eq!(rollup[0].calls, 2, "calls are still exact");
+        assert_eq!(rollup[0].bytes_in, None);
+        assert_eq!(rollup[0].bytes_out, None);
+        assert_eq!(rollup[0].p50_ms, 20, "timings are still exact");
     }
 
     #[test]
@@ -1232,8 +1251,12 @@ pub struct HostRollup {
     pub host: String,
     pub port: u16,
     pub calls: u64,
-    pub bytes_in: u64,
-    pub bytes_out: u64,
+    /// `None` when ANY contributing flow had an unknown byte count — a
+    /// `Coarse` record cannot be summed into a total that claims to be
+    /// complete. Summing `unwrap_or(0)` would silently turn "we could
+    /// not see it" into "it was zero".
+    pub bytes_in: Option<u64>,
+    pub bytes_out: Option<u64>,
     pub errors: u64,
     pub p50_ms: u64,
     pub p95_ms: u64,
@@ -1253,36 +1276,55 @@ fn percentile(sorted: &[u64], pct: f64) -> u64 {
     sorted[idx]
 }
 
+#[derive(Default)]
+struct RollupAcc {
+    calls: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    /// Cleared the moment any flow contributes an unknown byte count.
+    bytes_known: bool,
+    errors: u64,
+    ms: Vec<u64>,
+}
+
 pub fn host_rollup(flows: &[FlowRecord]) -> Vec<HostRollup> {
-    let mut acc: HashMap<(String, u16), (u64, u64, u64, u64, Vec<u64>)> = HashMap::new();
+    let mut acc: HashMap<(String, u16), RollupAcc> = HashMap::new();
 
     for f in flows {
-        let entry = acc
-            .entry((f.host.clone(), f.port))
-            .or_insert_with(|| (0, 0, 0, 0, Vec::new()));
-        entry.0 += 1;
-        entry.1 += f.bytes_in.unwrap_or(0);
-        entry.2 += f.bytes_out.unwrap_or(0);
+        let entry = acc.entry((f.host.clone(), f.port)).or_insert(RollupAcc {
+            bytes_known: true,
+            ..Default::default()
+        });
+        entry.calls += 1;
+        match (f.bytes_in, f.bytes_out) {
+            (Some(i), Some(o)) => {
+                entry.bytes_in += i;
+                entry.bytes_out += o;
+            }
+            // One unobservable contributor makes the whole total
+            // unknowable. Say so rather than under-reporting.
+            _ => entry.bytes_known = false,
+        }
         if is_error(f) {
-            entry.3 += 1;
+            entry.errors += 1;
         }
         if let Some(ms) = f.duration_ms {
-            entry.4.push(ms);
+            entry.ms.push(ms);
         }
     }
 
     acc.into_iter()
-        .map(|((host, port), (calls, bytes_in, bytes_out, errors, mut ms))| {
-            ms.sort_unstable();
+        .map(|((host, port), mut a)| {
+            a.ms.sort_unstable();
             HostRollup {
                 host,
                 port,
-                calls,
-                bytes_in,
-                bytes_out,
-                errors,
-                p50_ms: percentile(&ms, 0.50),
-                p95_ms: percentile(&ms, 0.95),
+                calls: a.calls,
+                bytes_in: a.bytes_known.then_some(a.bytes_in),
+                bytes_out: a.bytes_known.then_some(a.bytes_out),
+                errors: a.errors,
+                p50_ms: percentile(&a.ms, 0.50),
+                p95_ms: percentile(&a.ms, 0.95),
             }
         })
         .collect()
@@ -1350,6 +1392,11 @@ pub fn graph_view(flows: &[FlowRecord]) -> GraphView {
                 errors: 0,
             });
         edge.calls += 1;
+        // Edge weight is a VISUAL scale for stroke thickness, not a
+        // reported total — unlike `HostRollup::bytes_in`, which must
+        // stay `None` when unknown. A Coarse flow contributes 0 here,
+        // so its edge simply renders thin. Never surface this number
+        // as a byte count in a table.
         edge.bytes += f.bytes_in.unwrap_or(0) + f.bytes_out.unwrap_or(0);
         if is_error(f) {
             edge.errors += 1;
@@ -1376,7 +1423,7 @@ pub use views::{
 - [ ] **Step 5: Run tests**
 
 Run: `cargo test -p rupu-netflow`
-Expected: PASS — 17 tests.
+Expected: PASS — 18 tests.
 
 - [ ] **Step 6: Verify lints**
 
@@ -1660,7 +1707,7 @@ pub use asn::{AsnInfo, AsnTable};
 - [ ] **Step 6: Run tests**
 
 Run: `cargo test -p rupu-netflow`
-Expected: PASS — 25 tests.
+Expected: PASS — 26 tests.
 
 - [ ] **Step 7: Commit**
 
@@ -2005,7 +2052,7 @@ pub use acquire::refresh;
 - [ ] **Step 6: Run tests both ways**
 
 Run: `cargo test -p rupu-netflow --features http`
-Expected: PASS — 31 tests.
+Expected: PASS — 32 tests.
 
 Run: `cargo test -p rupu-netflow`
 Expected: PASS — the `http`-gated tests are compiled out; the rest still pass. This proves the default feature set carries no HTTP dependency.

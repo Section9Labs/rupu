@@ -277,7 +277,7 @@ Flows are `rupu_transcript::Event`s, so they land in the run's transcript JSONL 
 
 To be precise about what this does *not* mean: flows are **not** `rupu_orchestrator::executor::Event`s and do not appear in `events.jsonl`. That log is step-level workflow lifecycle, and a per-request record has no business in it.
 
-They are also **not** promoted to the Situation Room editorial wall by default: every LLM call is a flow, and the wall would drown. A filter toggle opts in.
+They are also **not** promoted to the Situation Room editorial wall: every LLM call is a flow, and the wall would drown. An opt-in filter toggle there is **explicitly out of scope for this arc** — it belongs with the Situation Room work, whose filter model does not exist yet, and inventing a one-off toggle here would be the wrong place to put it. Nothing in Plans 1–3 touches the wall.
 
 ## 9. Deferred: the microVM capture backend
 
