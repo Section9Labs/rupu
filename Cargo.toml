@@ -20,6 +20,7 @@ members = [
     "crates/rupu-cp",
     "crates/rupu-cli",
     "crates/rupu-update",
+    "crates/rupu-netflow",
 ]
 
 [workspace.package]
@@ -70,6 +71,7 @@ git2 = { version = "0.19", default-features = false, features = ["https", "vendo
 gitlab = "0.1710"
 octocrab = "0.42"
 http = "1"
+reqwest-middleware = "0.5"
 
 # Crypto (lifted)
 ed25519-dalek = { version = "2", features = ["serde", "rand_core", "zeroize"] }
@@ -160,6 +162,9 @@ directories = "5"
 objc2 = "0.5"
 objc2-app-kit = "0.2"
 objc2-foundation = "0.2"
+
+# Network egress observability (netflow)
+rupu-netflow = { path = "crates/rupu-netflow", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

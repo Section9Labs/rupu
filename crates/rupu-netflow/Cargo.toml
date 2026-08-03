@@ -1,0 +1,31 @@
+[package]
+name = "rupu-netflow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+http = ["dep:reqwest", "dep:reqwest-middleware", "dep:http"]
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+reqwest = { workspace = true, optional = true }
+reqwest-middleware = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+httpmock.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
