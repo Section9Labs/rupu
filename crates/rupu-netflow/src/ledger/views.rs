@@ -93,20 +93,20 @@ fn is_error(f: &FlowRecord) -> bool {
     !matches!(f.outcome, Outcome::Ok)
 }
 
-/// Percentile via ceiling of the fractional 0-based rank. `pct` in
-/// 0.0..=1.0. `sorted` must be ascending.
+/// Nearest-rank percentile — the standard definition: the smallest value
+/// at or below which at least `pct` of the samples fall, i.e. index
+/// `ceil(pct * n) - 1`. `pct` in 0.0..=1.0. `sorted` must be ascending.
 ///
-/// Deviation from the task brief: the brief's nearest-rank formula
-/// (`ceil(pct * len) - 1`) gives `p50([10, 20]) == 10`, but the brief's
-/// own test `one_unknown_byte_count_makes_the_host_total_unknown`
-/// asserts `p50_ms == 20` for that exact input. `ceil(pct * (len - 1))`
-/// satisfies both that test and `host_rollup_groups_and_computes_percentiles`.
+/// Do NOT "fix" this to `ceil(pct * (n - 1))` to make a test pass. That
+/// is a different, nonstandard definition; if a test disagrees with
+/// nearest-rank, the test's expected value is what is wrong.
 fn percentile(sorted: &[u64], pct: f64) -> u64 {
     if sorted.is_empty() {
         return 0;
     }
-    let idx = (pct * (sorted.len() - 1) as f64).ceil() as usize;
-    sorted[idx.min(sorted.len() - 1)]
+    let rank = (pct * sorted.len() as f64).ceil() as usize;
+    let idx = rank.saturating_sub(1).min(sorted.len() - 1);
+    sorted[idx]
 }
 
 #[derive(Default)]
@@ -382,7 +382,10 @@ mod tests {
         assert_eq!(rollup[0].calls, 2, "calls are still exact");
         assert_eq!(rollup[0].bytes_in, None);
         assert_eq!(rollup[0].bytes_out, None);
-        assert_eq!(rollup[0].p50_ms, 20, "timings are still exact");
+        // Durations are [10, 20]; nearest-rank p50 = ceil(0.5*2) = rank 1
+        // = the LOWER of the two. Timings stay exact even though bytes
+        // became unknowable.
+        assert_eq!(rollup[0].p50_ms, 10, "timings are still exact");
     }
 
     #[test]
