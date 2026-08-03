@@ -20,7 +20,7 @@
 - **`rupu-netflow` must never depend on `rupu-transcript`.** The dependency runs the other way. A cycle here is a hard failure.
 - **Migration preserves existing tuning.** Timeouts, `http1_only`, connect/read timeouts and proxy settings must survive; pass the tuned `reqwest::ClientBuilder` into `client_from`, never discard it.
 - **`PENDING_PLAN_2` in `crates/rupu-netflow/tests/choke_point.rs` must only ever shrink.** It is empty by the end of this plan.
-- **Never run package-wide `cargo fmt`** — format ONLY files you touched, with `rustfmt --edition 2021 <path>`. `cargo fmt -- <path>` does NOT scope and reformats the whole workspace.
+- **Never run package-wide `cargo fmt`** — format ONLY files you touched, with `rustfmt --edition 2021 <path>`. `cargo fmt -- <path>` does NOT scope and reformats the whole workspace. **And `rustfmt` on a crate root (`lib.rs`, `mod.rs`) walks its whole `mod` tree**, so it too reaches untouched files. After ANY formatting, run `git status --porcelain` and `git checkout --` anything you did not intend to change.
 - **Never use bare `git stash` / `git stash pop`** — the stash stack is shared across worktrees.
 - **`rupu-cp` already contains two `reqwest` majors.** `object_store 0.14` pulls `reqwest 0.13.4` while the workspace pins `0.12`; this predates netflow and is out of scope. When you migrate `rupu-cp` (Task 7), `rupu_netflow::http::client` returns a `reqwest 0.12`-based `ClientWithMiddleware` — that is correct and expected. Do not try to reconcile the two majors, and do not use a lockfile-wide `reqwest` count as a health check.
 
