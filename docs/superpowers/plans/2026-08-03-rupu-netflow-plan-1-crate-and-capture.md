@@ -1196,6 +1196,28 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_bytes_in_does_not_blank_a_known_bytes_out() {
+        // The ordinary in-flight streaming shape: response body still
+        // draining, so `bytes_in` is unknown while `bytes_out` (the
+        // request we sent) is perfectly well known. A single shared
+        // "bytes known" flag would wrongly blank the host's bytes_out
+        // total too, discarding data we actually have.
+        let mut streaming = flow(1, "api.anthropic.com", Some("r1"), 10, true);
+        streaming.bytes_in = None;
+        streaming.body_complete = false;
+
+        let flows = vec![flow(2, "api.anthropic.com", Some("r1"), 20, true), streaming];
+        let rollup = host_rollup(&flows);
+
+        assert_eq!(rollup[0].bytes_in, None, "one unknown in makes the in-total unknown");
+        assert_eq!(
+            rollup[0].bytes_out,
+            Some(200),
+            "every bytes_out was known, so the out-total must survive"
+        );
+    }
+
+    #[test]
     fn graph_view_is_bipartite_source_to_endpoint() {
         let flows = vec![
             flow(1, "api.anthropic.com", Some("r1"), 10, true),
@@ -1372,35 +1394,52 @@ fn percentile(sorted: &[u64], pct: f64) -> u64 {
     sorted[idx]
 }
 
-#[derive(Default)]
+/// `bytes_in` and `bytes_out` are tracked INDEPENDENTLY. A single shared
+/// "known" flag would be wrong: an in-flight streamed flow has a known
+/// `bytes_out` and an unknown `bytes_in`, and one shared flag would blank
+/// the host's `bytes_out` total too — discarding data we actually have.
 struct RollupAcc {
     calls: u64,
-    bytes_in: u64,
-    bytes_out: u64,
-    /// Cleared the moment any flow contributes an unknown byte count.
-    bytes_known: bool,
+    /// `None` once any contributor's own `bytes_in` is unknown.
+    bytes_in: Option<u64>,
+    /// `None` once any contributor's own `bytes_out` is unknown.
+    bytes_out: Option<u64>,
     errors: u64,
     ms: Vec<u64>,
+}
+
+impl Default for RollupAcc {
+    fn default() -> Self {
+        Self {
+            calls: 0,
+            bytes_in: Some(0),
+            bytes_out: Some(0),
+            errors: 0,
+            ms: Vec::new(),
+        }
+    }
+}
+
+/// Add one flow's contribution, collapsing to `None` on its own gap only.
+fn accumulate(total: Option<u64>, sample: Option<u64>) -> Option<u64> {
+    match (total, sample) {
+        (Some(a), Some(b)) => Some(a + b),
+        _ => None,
+    }
 }
 
 pub fn host_rollup(flows: &[FlowRecord]) -> Vec<HostRollup> {
     let mut acc: HashMap<(String, u16), RollupAcc> = HashMap::new();
 
     for f in flows {
-        let entry = acc.entry((f.host.clone(), f.port)).or_insert(RollupAcc {
-            bytes_known: true,
-            ..Default::default()
-        });
+        let entry = acc
+            .entry((f.host.clone(), f.port))
+            .or_insert_with(RollupAcc::default);
         entry.calls += 1;
-        match (f.bytes_in, f.bytes_out) {
-            (Some(i), Some(o)) => {
-                entry.bytes_in += i;
-                entry.bytes_out += o;
-            }
-            // One unobservable contributor makes the whole total
-            // unknowable. Say so rather than under-reporting.
-            _ => entry.bytes_known = false,
-        }
+        // Per-field: one unobservable contributor makes THAT total
+        // unknowable, and only that one.
+        entry.bytes_in = accumulate(entry.bytes_in, f.bytes_in);
+        entry.bytes_out = accumulate(entry.bytes_out, f.bytes_out);
         if is_error(f) {
             entry.errors += 1;
         }
@@ -1416,8 +1455,8 @@ pub fn host_rollup(flows: &[FlowRecord]) -> Vec<HostRollup> {
                 host,
                 port,
                 calls: a.calls,
-                bytes_in: a.bytes_known.then_some(a.bytes_in),
-                bytes_out: a.bytes_known.then_some(a.bytes_out),
+                bytes_in: a.bytes_in,
+                bytes_out: a.bytes_out,
                 errors: a.errors,
                 p50_ms: percentile(&a.ms, 0.50),
                 p95_ms: percentile(&a.ms, 0.95),
