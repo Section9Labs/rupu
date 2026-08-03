@@ -2078,6 +2078,41 @@ mod tests {
 
     #[cfg(feature = "http")]
     #[tokio::test]
+    async fn a_garbage_body_never_replaces_a_working_table() {
+        // Valid gzip, but not TSV — e.g. a maintenance page, or upstream
+        // changing its column layout. `compact_from_tsv` skips every row
+        // and returns Ok(empty), so without the guard this would
+        // atomically clobber a good table with nothing.
+        let server = httpmock::MockServer::start_async().await;
+        let body = gzipped("<html>502 Bad Gateway</html>\n");
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path("/garbage");
+                then.status(200).body(body.clone());
+            })
+            .await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("asn.db");
+        AsnTable::compact_from_tsv(std::io::Cursor::new(TSV))
+            .unwrap()
+            .write(&dest)
+            .unwrap();
+        let before = std::fs::read(&dest).unwrap();
+
+        let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let err = refresh(&server.url("/garbage"), &dest, &client).await;
+
+        assert!(matches!(err, Err(AsnError::Empty)));
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            before,
+            "a working table must survive a garbage response"
+        );
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
     async fn refresh_leaves_an_existing_db_intact_when_the_source_fails() {
         let server = httpmock::MockServer::start_async().await;
         server
@@ -2125,6 +2160,13 @@ use std::time::{Duration, SystemTime};
 pub enum AsnError {
     #[error("asn source returned HTTP {0}")]
     Status(u16),
+    /// The body decompressed and parsed, but yielded no usable ranges.
+    /// `compact_from_tsv` skips malformed rows rather than failing, so a
+    /// gzipped error page or a reformatted upstream file parses
+    /// "successfully" into an empty table. Replacing a working table
+    /// with that would silently destroy enrichment.
+    #[error("asn source parsed to an empty table; refusing to replace")]
+    Empty,
     #[error("asn source request failed: {0}")]
     Transport(String),
     #[error("asn table io: {0}")]
@@ -2190,6 +2232,11 @@ pub async fn refresh(
         .map_err(|e| AsnError::Transport(e.to_string()))?;
 
     let table = ingest_gz(std::io::Cursor::new(bytes))?;
+    // Guard BEFORE the atomic replace. Parsing cannot fail, so "Ok" is
+    // not evidence the body was really an ASN table.
+    if table.is_empty() {
+        return Err(AsnError::Empty);
+    }
     table.write(dest)?;
     Ok(())
 }
