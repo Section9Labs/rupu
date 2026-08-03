@@ -137,7 +137,23 @@ async fn run_writer(
                 let _ = file.flush().await;
                 let _ = ack.send(());
             }
-            WriteRequest::Stop => break,
+            WriteRequest::Stop => {
+                // Close first, THEN drain. `Stop` is FIFO-ordered against
+                // concurrent producers, so a clone's `try_send` can land
+                // behind it; breaking immediately would discard that
+                // record with no counter bump — silent loss.
+                //
+                // `close()` makes every subsequent `try_send` fail, so
+                // `offer()` counts those as dropped (visible), while
+                // `recv()` still yields everything already queued.
+                rx.close();
+                while let Some(pending) = rx.recv().await {
+                    if let WriteRequest::Line(line) = pending {
+                        write_line(&mut file, &line, &dropped_counter).await;
+                    }
+                }
+                break;
+            }
         }
     }
 
@@ -242,6 +258,61 @@ mod tests {
             lines[1],
             LedgerLine::Complete { id: got, bytes_in: 4096, duration_ms: 250 } if got == id
         ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_a_record_queued_behind_stop() {
+        // Regression test for the "Stop discards a concurrently-queued
+        // record" bug: `Stop` is FIFO-ordered against other producers, so a
+        // caller holding a live `Arc<NetflowWriter>` clone can have its
+        // `record()` land BEHIND `Stop` in the channel. An immediate
+        // `break` on `Stop` (the pre-fix code) would silently discard that
+        // record — no ledger line, no `dropped()` bump.
+        //
+        // Reproduced DETERMINISTICALLY, not as a timing race: the writer
+        // task is spawned but never gets a chance to run until the test
+        // task's first genuine yield point (current-thread runtime; no
+        // `.await` before this point actually suspends, since `try_send`
+        // is synchronous and `record()`'s body has no internal await). So
+        // pre-seeding `Stop` via the private `tx` field (this `tests`
+        // module is a descendant of `writer`, so it can see private
+        // fields), then enqueuing the clone's record through the real
+        // `FlowSink::record` path, deterministically produces the exact
+        // queue order the bug depends on: `Stop` first, the clone's `Line`
+        // right behind it, both sitting unread when the writer task
+        // finally runs. Only then is the production `shutdown()` called,
+        // exercising the real close-then-drain fix end to end.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = NetflowPaths::new(tmp.path());
+        let handle = NetflowWriterHandle::spawn(paths.clone()).unwrap();
+        let writer_clone = handle.writer.clone();
+
+        handle
+            .writer
+            .tx
+            .try_send(WriteRequest::Stop)
+            .expect("pre-seeding Stop must succeed before the writer task has run");
+
+        let id = FlowId::from_parts(42, 42);
+        writer_clone.record(flow(id)).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle.shutdown())
+            .await
+            .expect("writer shutdown deadlocked");
+
+        let text = std::fs::read_to_string(&paths.flows).unwrap();
+        let lines: Vec<LedgerLine> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+
+        assert!(
+            lines
+                .iter()
+                .any(|l| matches!(l, LedgerLine::Flow(f) if f.id == id)),
+            "the clone's record must survive shutdown even though it was \
+             queued behind Stop; ledger contents: {lines:?}"
+        );
     }
 
     #[tokio::test]
