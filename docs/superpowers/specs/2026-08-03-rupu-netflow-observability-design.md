@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-03
 **Status:** Design — approved by matt (capture scope, map semantics, telemetry-only stance locked in §2). Ready to plan.
-**Scope:** new `crates/rupu-netflow` (types, ports, ledger, ASN, HTTP capture); `crates/rupu-transcript` (`Event::NetFlow`); `crates/rupu-config` (`NetflowConfig`); the seven crates that construct HTTP clients (`rupu-providers`, `rupu-scm`, `rupu-auth`, `rupu-update`, `rupu-webhook`, `rupu-cp`, `rupu-cli`); `crates/rupu-cp` (`api/netflow.rs` + `web/src/components/netflow/`).
+**Scope:** new `crates/rupu-netflow` (types, sink port, ledger, ASN, HTTP capture); `crates/rupu-transcript` (`Event::NetFlow` + the transcript sink); `crates/rupu-config` (`NetflowConfig`); the six crates that construct HTTP clients (`rupu-providers`, `rupu-scm`, `rupu-auth`, `rupu-update`, `rupu-cp`, `rupu-cli`); `crates/rupu-cp` (`api/netflow.rs` + `web/src/components/netflow/`).
 **Out of scope (this arc):** the microVM capture backend (§9 — a later arc, designed-for but not built); egress *enforcement* / deny-by-default policy; findings integration (explicitly rejected — §2.5); TLS interception.
 
 ## 1. The problem
@@ -13,7 +13,8 @@ Verified against the code:
 
 - `BashTool` (`crates/rupu-tools/src/bash.rs`) locks cwd to the workspace and clears the environment down to an allowlist, but the subprocess has **unrestricted network access**. Nothing records that `cargo build` contacted `crates.io`, or that an `npm install` postinstall script phoned home.
 - rupu's own outbound traffic — provider APIs, SCM connectors, MCP, webhooks, the update checker — is equally unrecorded.
-- There is **no HTTP choke point**. Roughly 30 `reqwest::Client::new()` / `Client::builder()` sites are scattered across seven crates. One dependency (`octocrab`, in `crates/rupu-scm/src/connectors/github/client.rs`) brings its own `hyper`/`tower` stack. The workspace `gitlab = "0.1710"` pin is **not** used by `rupu-scm` — the GitLab, Jira and Linear connectors are hand-rolled `reqwest`, so they migrate cleanly.
+- There is **no HTTP choke point**. Roughly 30 `reqwest::Client::new()` / `Client::builder()` sites are scattered across six crates — `rupu-providers`, `rupu-scm`, `rupu-auth`, `rupu-update`, `rupu-cp`, `rupu-cli`. One dependency (`octocrab`, in `crates/rupu-scm/src/connectors/github/client.rs`) brings its own `hyper`/`tower` stack.
+- Two dependency-hygiene findings fell out of the audit: `rupu-webhook` declares `reqwest` but has **no uses in `src/`** — an unused dependency to drop, not a client to migrate. And the workspace `gitlab = "0.1710"` pin is **not** used by `rupu-scm`; the GitLab, Jira and Linear connectors are hand-rolled `reqwest`, so they migrate cleanly.
 
 So the first task is not "add capture" — it is "create the choke point that does not exist, then keep it the only door."
 
@@ -272,7 +273,11 @@ Follows the rule already established for findings: **a tab on RunDetail, a proje
 
 ### 8.4 Live Events
 
-Flows are `Event`s, so they arrive on the run's live stream at no additional cost. They are **not** promoted to the Situation Room editorial wall by default: every LLM call is a flow, and the wall would drown. A filter toggle opts in.
+Flows are `rupu_transcript::Event`s, so they land in the run's transcript JSONL — which CP's transcript viewer and the app's drill-down pane already tail. That is where they appear live, with no new plumbing.
+
+To be precise about what this does *not* mean: flows are **not** `rupu_orchestrator::executor::Event`s and do not appear in `events.jsonl`. That log is step-level workflow lifecycle, and a per-request record has no business in it.
+
+They are also **not** promoted to the Situation Room editorial wall by default: every LLM call is a flow, and the wall would drown. A filter toggle opts in.
 
 ## 9. Deferred: the microVM capture backend
 
