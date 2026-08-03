@@ -71,7 +71,7 @@ git2 = { version = "0.19", default-features = false, features = ["https", "vendo
 gitlab = "0.1710"
 octocrab = "0.42"
 http = "1"
-reqwest-middleware = "0.5"
+reqwest-middleware = "0.4"
 
 # Crypto (lifted)
 ed25519-dalek = { version = "2", features = ["serde", "rand_core", "zeroize"] }
