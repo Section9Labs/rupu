@@ -8,6 +8,8 @@
 
 pub mod ctx;
 pub mod record;
+pub mod sink;
 
 pub use ctx::{FlowCtx, Origin};
 pub use record::{Fidelity, FlowId, FlowRecord, LedgerLine, Outcome};
+pub use sink::{FanoutSink, FlowSink, MemorySink, NullSink};
