@@ -21,7 +21,7 @@
 - **No TLS version/cipher fields.** `reqwest` does not expose them; a permanently-`None` field must not exist.
 - **No `asn` field on `FlowRecord`.** ASN is resolved at read time.
 - **`Origin` variants carry `String`, not `&'static str`** — the record must `Deserialize` from the ledger.
-- **Never run package-wide `cargo fmt`** on this repo (main is fmt-dirty under the pinned toolchain). Format only the files you touched: `cargo fmt -- <path>`.
+- **Never run package-wide `cargo fmt`** on this repo (main is fmt-dirty under the pinned toolchain). Format only the files you touched: `rustfmt --edition 2021 <path>`.
 - **Never use bare `git stash` / `git stash pop`** — the stash stack is shared across worktrees.
 
 ---
@@ -86,11 +86,21 @@ workspace = true
 If `reqwest-middleware` or `http` are absent from the root `[workspace.dependencies]`, add them:
 
 ```toml
-reqwest-middleware = "0.5"
+reqwest-middleware = "0.4"
 http = "1"
 ```
 
-Verified against the registry: `reqwest-middleware` 0.5.x is current and targets `reqwest` 0.12, which is the workspace pin. Do not downgrade to 0.4. The `Middleware::handle` signature this plan uses — `(&self, req: Request, extensions: &mut http::Extensions, next: Next<'_>)` — is the 0.5 shape. If `cargo build` disagrees with any signature in this plan, follow the compiler and note the deviation in your report; the trait's exact shape is the compiler's to state, not this document's.
+**Use 0.4, not 0.5 — this is verified, not a guess.** The workspace pins `reqwest = "0.12"`. `reqwest-middleware` 0.5.x requires `reqwest ^0.13`, so pinning 0.5 resolves BOTH `reqwest 0.12.28` and `reqwest 0.13.4` into `Cargo.lock`, and `ClientWithMiddleware` then wraps a `reqwest 0.13` `Client` that is type-incompatible with every existing call site. 0.4.x is the line that targets `reqwest 0.12`.
+
+After adding it, confirm the resolution is clean:
+
+```bash
+grep -c 'name = "reqwest"$' Cargo.lock   # must print 1, not 2
+```
+
+If it prints 2, the pin is wrong — stop and report rather than building on a split dependency graph.
+
+If `cargo build` disagrees with any signature in this plan, follow the compiler and note the deviation in your report; the trait's exact shape is the compiler's to state, not this document's.
 
 - [ ] **Step 3: Write the failing test**
 
@@ -369,7 +379,7 @@ Expected: no warnings.
 - [ ] **Step 10: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-netflow/src/lib.rs crates/rupu-netflow/src/record.rs crates/rupu-netflow/src/ctx.rs
+rustfmt --edition 2021 crates/rupu-netflow/src/lib.rs crates/rupu-netflow/src/record.rs crates/rupu-netflow/src/ctx.rs
 git add Cargo.toml crates/rupu-netflow/
 git commit -m "feat(netflow): FlowRecord, FlowCtx and ledger line types"
 ```
@@ -580,7 +590,7 @@ Expected: PASS — 6 tests.
 - [ ] **Step 6: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-netflow/src/sink.rs crates/rupu-netflow/src/lib.rs
+rustfmt --edition 2021 crates/rupu-netflow/src/sink.rs crates/rupu-netflow/src/lib.rs
 git add crates/rupu-netflow/
 git commit -m "feat(netflow): FlowSink port with null, fanout and memory adapters"
 ```
@@ -942,7 +952,7 @@ Expected: no warnings.
 - [ ] **Step 11: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-netflow/src/ledger/mod.rs crates/rupu-netflow/src/ledger/paths.rs crates/rupu-netflow/src/ledger/writer.rs crates/rupu-netflow/src/lib.rs
+rustfmt --edition 2021 crates/rupu-netflow/src/ledger/mod.rs crates/rupu-netflow/src/ledger/paths.rs crates/rupu-netflow/src/ledger/writer.rs crates/rupu-netflow/src/lib.rs
 git add crates/rupu-netflow/
 git commit -m "feat(netflow): append-only ledger writer with visible drop accounting"
 ```
@@ -1435,7 +1445,7 @@ Expected: no warnings.
 - [ ] **Step 7: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-netflow/src/ledger/views.rs crates/rupu-netflow/src/ledger/mod.rs
+rustfmt --edition 2021 crates/rupu-netflow/src/ledger/views.rs crates/rupu-netflow/src/ledger/mod.rs
 git add crates/rupu-netflow/
 git commit -m "feat(netflow): ledger read views, host rollup and bipartite graph"
 ```
@@ -1714,7 +1724,7 @@ Expected: PASS — 26 tests.
 - [ ] **Step 7: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-netflow/src/asn/mod.rs crates/rupu-netflow/src/asn/table.rs crates/rupu-netflow/src/lib.rs
+rustfmt --edition 2021 crates/rupu-netflow/src/asn/mod.rs crates/rupu-netflow/src/asn/table.rs crates/rupu-netflow/src/lib.rs
 git add crates/rupu-netflow/
 git commit -m "feat(netflow): ASN range table with TSV ingest and binary-search lookup"
 ```
@@ -1819,7 +1829,7 @@ Expected: PASS, including the two new tests.
 - [ ] **Step 6: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-config/src/lib.rs
+rustfmt --edition 2021 crates/rupu-config/src/lib.rs
 git add crates/rupu-config/
 git commit -m "feat(config): [netflow] section for automatic ASN refresh"
 ```
@@ -2062,7 +2072,7 @@ Expected: PASS — the `http`-gated tests are compiled out; the rest still pass.
 - [ ] **Step 7: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-netflow/src/asn/acquire.rs crates/rupu-netflow/src/asn/mod.rs
+rustfmt --edition 2021 crates/rupu-netflow/src/asn/acquire.rs crates/rupu-netflow/src/asn/mod.rs
 git add Cargo.toml crates/rupu-netflow/
 git commit -m "feat(netflow): automatic ASN table acquisition with atomic replace"
 ```
@@ -2516,7 +2526,7 @@ Expected: no warnings.
 - [ ] **Step 10: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-netflow/src/http/mod.rs crates/rupu-netflow/src/http/middleware.rs crates/rupu-netflow/src/http/resolver.rs crates/rupu-netflow/tests/capture.rs crates/rupu-netflow/src/lib.rs
+rustfmt --edition 2021 crates/rupu-netflow/src/http/mod.rs crates/rupu-netflow/src/http/middleware.rs crates/rupu-netflow/src/http/resolver.rs crates/rupu-netflow/tests/capture.rs crates/rupu-netflow/src/lib.rs
 git add crates/rupu-netflow/
 git commit -m "feat(netflow): instrumented reqwest client with capture middleware"
 ```
@@ -2616,7 +2626,7 @@ Expected: PASS — all tests.
 - [ ] **Step 5: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-netflow/tests/capture.rs
+rustfmt --edition 2021 crates/rupu-netflow/tests/capture.rs
 git add crates/rupu-netflow/
 git commit -m "test(netflow): end-to-end two-phase completion for streamed bodies"
 ```
@@ -2779,7 +2789,7 @@ Expected: no warnings.
 - [ ] **Step 9: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-providers/src/anthropic.rs crates/rupu-providers/src/tuning.rs crates/rupu-providers/src/local.rs crates/rupu-providers/src/openai_compatible.rs crates/rupu-providers/src/github_copilot.rs crates/rupu-providers/src/openai_codex.rs crates/rupu-providers/src/google_gemini.rs crates/rupu-providers/src/broker_client.rs crates/rupu-providers/tests/netflow_capture.rs
+rustfmt --edition 2021 crates/rupu-providers/src/anthropic.rs crates/rupu-providers/src/tuning.rs crates/rupu-providers/src/local.rs crates/rupu-providers/src/openai_compatible.rs crates/rupu-providers/src/github_copilot.rs crates/rupu-providers/src/openai_codex.rs crates/rupu-providers/src/google_gemini.rs crates/rupu-providers/src/broker_client.rs crates/rupu-providers/tests/netflow_capture.rs
 git add crates/rupu-providers/
 git commit -m "feat(providers): route provider egress through the netflow client"
 ```

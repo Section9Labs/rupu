@@ -19,7 +19,7 @@
 - **Dropped flows are surfaced.** If `read_dropped_total` is non-zero, the UI says so. Silent loss is the thing this design exists to avoid.
 - **ASN absence is an honest empty state**, not a blank column with no explanation.
 - **Rebuild the embedded UI before any release:** `make cp-web` then `make release`. Skipping `cp-web` ships a stale UI inside the binary.
-- **Never run package-wide `cargo fmt`** — format only files you touched.
+- **Never run package-wide `cargo fmt`** — format ONLY files you touched, with `rustfmt --edition 2021 <path>`. `cargo fmt -- <path>` does NOT scope and reformats the whole workspace.
 - **Never use bare `git stash` / `git stash pop`** — the stash stack is shared across worktrees.
 
 ---
@@ -313,7 +313,7 @@ Expected: PASS — 5 tests.
 - [ ] **Step 7: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-cp/src/api/netflow.rs crates/rupu-cp/src/api/mod.rs crates/rupu-cp/src/server.rs
+rustfmt --edition 2021 crates/rupu-cp/src/api/netflow.rs crates/rupu-cp/src/api/mod.rs crates/rupu-cp/src/server.rs
 git add crates/rupu-cp/
 git commit -m "feat(cp): run-scoped netflow API with read-time ASN enrichment"
 ```
@@ -464,7 +464,7 @@ Expected: PASS — 8 tests.
 - [ ] **Step 6: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-cp/src/api/netflow.rs
+rustfmt --edition 2021 crates/rupu-cp/src/api/netflow.rs
 git add crates/rupu-cp/
 git commit -m "feat(cp): project, global and graph netflow endpoints"
 ```
@@ -579,7 +579,7 @@ Expected: PASS — 9 tests.
 - [ ] **Step 5: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-cp/src/api/netflow.rs
+rustfmt --edition 2021 crates/rupu-cp/src/api/netflow.rs
 git add crates/rupu-cp/
 git commit -m "feat(cp): lazy ASN refresh on netflow read, single-flight guarded"
 ```

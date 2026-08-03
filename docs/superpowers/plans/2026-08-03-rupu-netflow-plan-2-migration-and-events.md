@@ -20,7 +20,7 @@
 - **`rupu-netflow` must never depend on `rupu-transcript`.** The dependency runs the other way. A cycle here is a hard failure.
 - **Migration preserves existing tuning.** Timeouts, `http1_only`, connect/read timeouts and proxy settings must survive; pass the tuned `reqwest::ClientBuilder` into `client_from`, never discard it.
 - **`PENDING_PLAN_2` in `crates/rupu-netflow/tests/choke_point.rs` must only ever shrink.** It is empty by the end of this plan.
-- **Never run package-wide `cargo fmt`** — format only files you touched.
+- **Never run package-wide `cargo fmt`** — format ONLY files you touched, with `rustfmt --edition 2021 <path>`. `cargo fmt -- <path>` does NOT scope and reformats the whole workspace.
 - **Never use bare `git stash` / `git stash pop`** — the stash stack is shared across worktrees.
 
 ---
@@ -139,7 +139,7 @@ Expected: `0`.
 - [ ] **Step 7: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-transcript/src/event.rs
+rustfmt --edition 2021 crates/rupu-transcript/src/event.rs
 git add crates/rupu-transcript/
 git commit -m "feat(transcript): Event::NetFlow carrying a FlowRecord"
 ```
@@ -317,7 +317,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-transcript/src/netflow_sink.rs crates/rupu-transcript/src/lib.rs
+rustfmt --edition 2021 crates/rupu-transcript/src/netflow_sink.rs crates/rupu-transcript/src/lib.rs
 git add crates/rupu-transcript/
 git commit -m "feat(transcript): TranscriptSink bridging flows into run JSONL"
 ```
@@ -427,7 +427,7 @@ Expected: PASS both. The choke-point test now proves `rupu-auth` has no raw clie
 - [ ] **Step 7: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-auth/src/oauth/device.rs crates/rupu-auth/src/oauth/callback.rs crates/rupu-auth/src/resolver.rs crates/rupu-auth/tests/netflow_capture.rs
+rustfmt --edition 2021 crates/rupu-auth/src/oauth/device.rs crates/rupu-auth/src/oauth/callback.rs crates/rupu-auth/src/resolver.rs crates/rupu-auth/tests/netflow_capture.rs
 git add crates/rupu-auth/ crates/rupu-netflow/
 git commit -m "feat(auth): route OAuth egress through the netflow client"
 ```
@@ -557,7 +557,7 @@ Expected: PASS both.
 - [ ] **Step 8: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-update/src/github.rs crates/rupu-update/tests/netflow_capture.rs
+rustfmt --edition 2021 crates/rupu-update/src/github.rs crates/rupu-update/tests/netflow_capture.rs
 git add crates/rupu-update/ crates/rupu-netflow/
 git commit -m "feat(update): route release-check and download egress through netflow"
 ```
@@ -738,7 +738,7 @@ Expected: PASS both.
 - [ ] **Step 9: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-scm/src/client_options.rs crates/rupu-scm/src/connectors/gitlab/events.rs crates/rupu-scm/src/connectors/linear/events.rs crates/rupu-scm/src/connectors/jira/events.rs crates/rupu-scm/src/connectors/jira/issues.rs crates/rupu-scm/src/connectors/github/client.rs crates/rupu-scm/tests/netflow_capture.rs
+rustfmt --edition 2021 crates/rupu-scm/src/client_options.rs crates/rupu-scm/src/connectors/gitlab/events.rs crates/rupu-scm/src/connectors/linear/events.rs crates/rupu-scm/src/connectors/jira/events.rs crates/rupu-scm/src/connectors/jira/issues.rs crates/rupu-scm/src/connectors/github/client.rs crates/rupu-scm/tests/netflow_capture.rs
 git add crates/rupu-scm/ crates/rupu-netflow/
 git commit -m "feat(scm): route GitLab, Jira, Linear and ad-hoc GitHub egress through netflow"
 ```
@@ -914,7 +914,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-scm/src/connectors/github/client.rs crates/rupu-scm/tests/netflow_coarse.rs
+rustfmt --edition 2021 crates/rupu-scm/src/connectors/github/client.rs crates/rupu-scm/tests/netflow_coarse.rs
 git add crates/rupu-scm/
 git commit -m "feat(scm): record octocrab attempts at Coarse fidelity"
 ```
@@ -1033,7 +1033,7 @@ Expected: PASS.
 - [ ] **Step 8: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-cp/src/host/http.rs crates/rupu-cli/src/cmd/cp.rs crates/rupu-cp/tests/netflow_capture.rs
+rustfmt --edition 2021 crates/rupu-cp/src/host/http.rs crates/rupu-cli/src/cmd/cp.rs crates/rupu-cp/tests/netflow_capture.rs
 git add crates/rupu-cp/ crates/rupu-cli/ crates/rupu-netflow/
 git commit -m "feat(cp): route fleet-host egress through the netflow client"
 ```
@@ -1170,7 +1170,7 @@ Expected: at least one line, whose `flow.host` is the configured provider's host
 - [ ] **Step 6: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-cli/src/cmd/dispatch.rs crates/rupu-cli/tests/netflow_run.rs
+rustfmt --edition 2021 crates/rupu-cli/src/cmd/dispatch.rs crates/rupu-cli/tests/netflow_run.rs
 git add crates/rupu-cli/
 git commit -m "feat(cli): install the netflow fanout sink at run start"
 ```
@@ -1292,7 +1292,7 @@ Expected: the file exists and is non-trivial in size. If it does not appear, che
 - [ ] **Step 8: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-cli/src/cmd/cp.rs
+rustfmt --edition 2021 crates/rupu-cli/src/cmd/cp.rs
 git add crates/rupu-cli/
 git commit -m "feat(cp): refresh the netflow ASN table automatically on the sweep tick"
 ```
@@ -1384,7 +1384,7 @@ Expected: PASS.
 - [ ] **Step 8: Commit**
 
 ```bash
-cargo fmt -- crates/rupu-netflow/src/lib.rs
+rustfmt --edition 2021 crates/rupu-netflow/src/lib.rs
 git add Cargo.toml crates/rupu-netflow/ crates/rupu-webhook/
 git commit -m "feat(netflow): deny raw reqwest clients workspace-wide"
 ```
