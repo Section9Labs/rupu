@@ -8,6 +8,8 @@
 
 pub mod asn;
 pub mod ctx;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod ledger;
 pub mod record;
 pub mod sink;
