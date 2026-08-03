@@ -7,9 +7,11 @@
 //! view ever claims coverage it does not have.
 
 pub mod ctx;
+pub mod ledger;
 pub mod record;
 pub mod sink;
 
 pub use ctx::{FlowCtx, Origin};
+pub use ledger::{NetflowPaths, NetflowWriter, NetflowWriterHandle};
 pub use record::{Fidelity, FlowId, FlowRecord, LedgerLine, Outcome};
 pub use sink::{FanoutSink, FlowSink, MemorySink, NullSink};
