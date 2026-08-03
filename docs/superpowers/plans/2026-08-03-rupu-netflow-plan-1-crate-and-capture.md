@@ -86,9 +86,11 @@ workspace = true
 If `reqwest-middleware` or `http` are absent from the root `[workspace.dependencies]`, add them:
 
 ```toml
-reqwest-middleware = "0.4"
+reqwest-middleware = "0.5"
 http = "1"
 ```
+
+Verified against the registry: `reqwest-middleware` 0.5.x is current and targets `reqwest` 0.12, which is the workspace pin. Do not downgrade to 0.4. The `Middleware::handle` signature this plan uses — `(&self, req: Request, extensions: &mut http::Extensions, next: Next<'_>)` — is the 0.5 shape. If `cargo build` disagrees with any signature in this plan, follow the compiler and note the deviation in your report; the trait's exact shape is the compiler's to state, not this document's.
 
 - [ ] **Step 3: Write the failing test**
 
