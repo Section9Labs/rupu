@@ -18,6 +18,13 @@ pub enum AsnError {
     Transport(String),
     #[error("asn table io: {0}")]
     Io(#[from] std::io::Error),
+    /// The body decompressed and parsed, but yielded no usable ranges.
+    /// `compact_from_tsv` skips malformed rows rather than failing, so a
+    /// gzipped error page or a reformatted upstream file parses
+    /// "successfully" into an empty table. Replacing a working table
+    /// with that would silently destroy enrichment.
+    #[error("asn source parsed to an empty table; refusing to replace")]
+    Empty,
 }
 
 /// `~/.rupu/netflow/asn.db`. `None` when the home directory is unknown.
@@ -79,6 +86,11 @@ pub async fn refresh(
         .map_err(|e| AsnError::Transport(e.to_string()))?;
 
     let table = ingest_gz(std::io::Cursor::new(bytes))?;
+    // Guard BEFORE the atomic replace. Parsing cannot fail, so "Ok" is
+    // not evidence the body was really an ASN table.
+    if table.is_empty() {
+        return Err(AsnError::Empty);
+    }
     table.write(dest)?;
     Ok(())
 }
@@ -170,5 +182,36 @@ mod tests {
 
         assert!(err.is_err());
         assert_eq!(std::fs::read(&dest).unwrap(), before);
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn a_garbage_body_never_replaces_a_working_table() {
+        let server = httpmock::MockServer::start_async().await;
+        let body = gzipped("<html>502 Bad Gateway</html>\n");
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path("/garbage");
+                then.status(200).body(body.clone());
+            })
+            .await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("asn.db");
+        AsnTable::compact_from_tsv(std::io::Cursor::new(TSV))
+            .unwrap()
+            .write(&dest)
+            .unwrap();
+        let before = std::fs::read(&dest).unwrap();
+
+        let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let err = refresh(&server.url("/garbage"), &dest, &client).await;
+
+        assert!(matches!(err, Err(AsnError::Empty)));
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            before,
+            "a working table must survive a garbage response"
+        );
     }
 }
