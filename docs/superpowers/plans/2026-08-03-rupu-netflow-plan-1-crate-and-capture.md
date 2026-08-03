@@ -2051,6 +2051,7 @@ mod tests {
         assert!(is_stale(&path, 0));
     }
 
+    #[cfg(feature = "http")]
     #[tokio::test]
     async fn refresh_downloads_decompresses_and_writes_the_table() {
         let server = httpmock::MockServer::start_async().await;
@@ -2075,6 +2076,7 @@ mod tests {
         assert_eq!(table.lookup("1.0.0.7".parse().unwrap()).unwrap().asn, 13335);
     }
 
+    #[cfg(feature = "http")]
     #[tokio::test]
     async fn refresh_leaves_an_existing_db_intact_when_the_source_fails() {
         let server = httpmock::MockServer::start_async().await;
