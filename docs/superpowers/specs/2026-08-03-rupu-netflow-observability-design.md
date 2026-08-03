@@ -54,30 +54,22 @@ The operator never has to run a command to get ASN enrichment. See §6.
 
 ## 3. Architecture — `crates/rupu-netflow`
 
-A new lib crate defining **two ports** plus the phase-1 adapter for each, per the workspace hexagonal rule.
+A new lib crate defining the `FlowSink` port plus its adapters, per the workspace hexagonal rule. Capture backends are discussed below.
 
 ### 3.1 Ports
 
 ```rust
-/// A capture backend. Pumps records into a sink for as long as it runs.
-#[async_trait]
-pub trait FlowSource: Send + Sync {
-    fn fidelity(&self) -> Fidelity;
-    /// Drive capture until cancelled. `HttpCapture` returns immediately —
-    /// its middleware pushes into the sink from the request path — while
-    /// `MicroVmCapture` (§9) parks here reading the guest's frames.
-    async fn run(self: Arc<Self>, sink: Arc<dyn FlowSink>) -> Result<(), FlowError>;
-}
-
 /// Where flow records go.
 #[async_trait]
 pub trait FlowSink: Send + Sync {
     async fn record(&self, flow: FlowRecord);
-    async fn complete(&self, id: FlowId, bytes_in: u64);
+    async fn complete(&self, id: FlowId, bytes_in: u64, duration_ms: u64);
 }
 ```
 
-`FlowSource` phase-1 adapter: `HttpCapture` (a `reqwest` middleware). The microVM lands later as `MicroVmCapture` behind the same trait; the schema, ledger, API and views are unchanged by that addition.
+**On the second port.** The phase-1 capture adapter is a `reqwest` middleware that *pushes* into a sink from the request path. A `FlowSource` trait to abstract capture backends is deliberately **not** built in this arc: with a single push-based implementation it would be an indirection with nothing on the other side of it, and a trait whose only impl is a no-op is exactly the kind of speculative scaffolding this codebase avoids. It lands together with the microVM backend, which is the first implementation that genuinely needs it (a pull-based loop reading guest frames).
+
+What actually guarantees the microVM "slots in without re-plumbing" is not a trait — it is the stability of `FlowRecord`, the ledger line format, and the CP API contract. Those are fixed by this arc.
 
 `FlowSink` adapters compose via a `FanoutSink`:
 
@@ -139,16 +131,19 @@ let client = rupu_netflow::client(FlowCtx {
 ```
 
 ```rust
+#[serde(tag = "kind", content = "name", rename_all = "snake_case")]
 pub enum Origin {
-    Provider(&'static str),   // anthropic, openai, gemini, copilot, codex, local…
-    Scm(&'static str),        // github, gitlab, jira, linear
-    Mcp(String),              // server name
+    Provider(String),   // anthropic, openai, gemini, copilot, codex, local…
+    Scm(String),        // github, gitlab, jira, linear
+    Mcp(String),        // server name
     Webhook,
     Update,
     Cp,
     System,
 }
 ```
+
+`String` rather than `&'static str` throughout: the record must round-trip through `Deserialize` when read back from the ledger, which a borrowed static cannot do.
 
 **Process-global clients** — the update checker, CP's host registry — pass `run_id: None` with `Origin::Update` / `Origin::Cp` / `Origin::System`. Those flows go to the ledger only, because there is no transcript to write them to. This is the honest shape of the data and is precisely why the ledger must exist alongside the events rather than being a convenience index.
 
@@ -244,7 +239,11 @@ A custom `dns_resolver` on the builder captures every A/AAAA answer for a host (
 - When `Content-Length` is present, `bytes_in` is exact and `body_complete: true` at emit.
 - For SSE streams (every provider chat path), the middleware emits at header time with `bytes_in: None, body_complete: false`. The provider's stream-consuming loop — which already counts bytes — calls `netflow::complete(flow_id, bytes_in)` to finalize.
 
+The caller learns the `FlowId` to finalize without any ambient context: it mints the id and attaches it via `reqwest_middleware`'s `RequestBuilder::with_extension`, and the middleware uses that id rather than generating one. Explicit, no magic.
+
 This is an explicit second choke point at roughly four call sites. The alternative is estimating the byte count, which this design does not do.
+
+Because the record is written at header time and finalized later, the ledger is a small line enum rather than bare records — `Flow` / `Complete` / `Dropped` — and `read_flows` folds `Complete` into its matching `Flow` at read time. This keeps the ledger strictly append-only.
 
 ### 7.3 Holding the choke point
 
@@ -275,9 +274,9 @@ Follows the rule already established for findings: **a tab on RunDetail, a proje
 
 Flows are `Event`s, so they arrive on the run's live stream at no additional cost. They are **not** promoted to the Situation Room editorial wall by default: every LLM call is a flow, and the wall would drown. A filter toggle opts in.
 
-## 9. Deferred: the microVM `FlowSource`
+## 9. Deferred: the microVM capture backend
 
-Its own arc, gated on the guest image supply chain. When it lands it implements `FlowSource` with `Fidelity::Full` and adds, without schema change:
+Its own arc, gated on the guest image supply chain. It introduces the `FlowSource` port (§3.1) — being the first pull-based backend, it is what makes that abstraction earn its keep — feeds the existing `FlowSink` with `Fidelity::Full`, and adds, without schema change:
 
 - Attribution that is definitional rather than correlated — the VM *is* the run.
 - DNS visibility, including lookups that resolve and never connect (rupu is the resolver).
@@ -312,4 +311,4 @@ Capture must never break a request. Non-negotiable.
 | **1** | `crates/rupu-netflow`: record, ports, ledger, ASN acquisition + read-time enrichment, client factory + middleware. Migrate `rupu-providers` (incl. the two-phase streaming completion). Land the `clippy.toml` guard. |
 | **2** | Migrate the remaining sites — `rupu-scm`, `rupu-auth`, `rupu-update`, `rupu-webhook`, `rupu-cp`, `rupu-cli`. Coarse-fidelity adapter for `octocrab`. `Event::NetFlow` + live streaming. |
 | **3** | CP API + views: `api/netflow.rs`, `NetflowGraph`, `NetflowTable`, `NetflowSummary`, run tab / project panel / global page. |
-| *later arc* | microVM `FlowSource` (§9). |
+| *later arc* | microVM capture backend + the `FlowSource` port (§9). |
