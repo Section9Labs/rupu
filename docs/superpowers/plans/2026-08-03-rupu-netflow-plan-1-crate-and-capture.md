@@ -21,7 +21,7 @@
 - **No TLS version/cipher fields.** `reqwest` does not expose them; a permanently-`None` field must not exist.
 - **No `asn` field on `FlowRecord`.** ASN is resolved at read time.
 - **`Origin` variants carry `String`, not `&'static str`** — the record must `Deserialize` from the ledger.
-- **Never run package-wide `cargo fmt`** on this repo (main is fmt-dirty under the pinned toolchain). Format only the files you touched: `rustfmt --edition 2021 <path>`.
+- **Never run package-wide `cargo fmt`** on this repo (main is fmt-dirty under the pinned toolchain). Format ONLY the files you touched: `rustfmt --edition 2021 <path>`. Note `cargo fmt -- <path>` does NOT scope, and `rustfmt` on a crate root (`lib.rs`, `mod.rs`) walks its whole `mod` tree — after ANY formatting run `git status --porcelain` and `git checkout --` anything you did not intend to change.
 - **Never use bare `git stash` / `git stash pop`** — the stash stack is shared across worktrees.
 
 ---
