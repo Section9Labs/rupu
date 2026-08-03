@@ -1631,6 +1631,24 @@ mod tests {
     }
 
     #[test]
+    fn an_address_below_every_range_returns_none() {
+        // Guards the `checked_sub(1)` underflow path in `find`: with no
+        // range whose start <= needle, `partition_point` returns 0 and
+        // the subtraction must yield None rather than wrapping.
+        let t = table();
+        assert!(t.lookup("0.0.0.1".parse().unwrap()).is_none());
+        assert!(t.lookup("::1".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn an_empty_table_looks_up_to_none_without_panicking() {
+        let t = AsnTable::default();
+        assert!(t.is_empty());
+        assert!(t.lookup("8.8.8.8".parse().unwrap()).is_none());
+        assert!(t.lookup("2606:4700::1".parse().unwrap()).is_none());
+    }
+
+    #[test]
     fn unmapped_address_returns_none() {
         let t = table();
         assert!(t.lookup("192.0.2.1".parse().unwrap()).is_none());
