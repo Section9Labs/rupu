@@ -42,13 +42,30 @@ impl FanoutSink {
 impl FlowSink for FanoutSink {
     async fn record(&self, flow: FlowRecord) {
         for child in &self.children {
-            child.record(flow.clone()).await;
+            let child = child.clone();
+            let flow = flow.clone();
+            if tokio::task::spawn(async move { child.record(flow).await })
+                .await
+                .is_err()
+            {
+                tracing::debug!(
+                    "netflow sink child panicked during record; continuing to remaining sinks"
+                );
+            }
         }
     }
 
     async fn complete(&self, id: FlowId, bytes_in: u64, duration_ms: u64) {
         for child in &self.children {
-            child.complete(id, bytes_in, duration_ms).await;
+            let child = child.clone();
+            if tokio::task::spawn(async move { child.complete(id, bytes_in, duration_ms).await })
+                .await
+                .is_err()
+            {
+                tracing::debug!(
+                    "netflow sink child panicked during complete; continuing to remaining sinks"
+                );
+            }
         }
     }
 }
@@ -157,5 +174,40 @@ mod tests {
         sink.record(flow(FlowId::from_parts(3, 3))).await;
         sink.complete(FlowId::from_parts(3, 3), 1, 1).await;
         // No panic, no state. Nothing to assert beyond reaching here.
+    }
+
+    /// A sink that panics on every record call, used to test isolation.
+    struct PanicSink;
+
+    #[async_trait]
+    impl FlowSink for PanicSink {
+        async fn record(&self, _flow: FlowRecord) {
+            panic!("intentional panic in PanicSink");
+        }
+
+        async fn complete(&self, _id: FlowId, _bytes_in: u64, _duration_ms: u64) {
+            panic!("intentional panic in PanicSink");
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_isolates_panicking_child() {
+        // Suppress panic output to keep test output clean.
+        let old_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let panicker = Arc::new(PanicSink);
+        let healthy = Arc::new(MemorySink::default());
+        let fan = FanoutSink::new(vec![panicker, healthy.clone()]);
+
+        let id = FlowId::from_parts(4, 4);
+        fan.record(flow(id)).await;
+
+        // Restore the panic hook.
+        std::panic::set_hook(old_hook);
+
+        // Assert the healthy sink still received the record despite the panic.
+        assert_eq!(healthy.records().len(), 1);
+        assert_eq!(healthy.records()[0].id, id);
     }
 }
