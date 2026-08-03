@@ -92,13 +92,15 @@ http = "1"
 
 **Use 0.4, not 0.5 — this is verified, not a guess.** The workspace pins `reqwest = "0.12"`. `reqwest-middleware` 0.5.x requires `reqwest ^0.13`, so pinning 0.5 resolves BOTH `reqwest 0.12.28` and `reqwest 0.13.4` into `Cargo.lock`, and `ClientWithMiddleware` then wraps a `reqwest 0.13` `Client` that is type-incompatible with every existing call site. 0.4.x is the line that targets `reqwest 0.12`.
 
-After adding it, confirm the resolution is clean:
+After adding it, confirm `rupu-netflow` resolves against the workspace `reqwest`:
 
 ```bash
-grep -c 'name = "reqwest"$' Cargo.lock   # must print 1, not 2
+cargo tree -p rupu-netflow --features http -i reqwest
 ```
 
-If it prints 2, the pin is wrong — stop and report rather than building on a split dependency graph.
+Every line must show `reqwest v0.12.x`. If `reqwest-middleware` appears under a `v0.13.x` root, the pin is wrong — stop and report rather than building on a split graph.
+
+Do **not** grep the whole `Cargo.lock` for this. The lockfile legitimately contains two `reqwest` majors already: `object_store 0.14` (via `rupu-cp` → `rupu-cli`) pulls `reqwest 0.13.4`, and has since before this plan started. That split is pre-existing, unrelated to netflow, and out of scope — the two never interoperate. A lockfile-wide check reports it as a failure and sends you chasing someone else's dependency.
 
 If `cargo build` disagrees with any signature in this plan, follow the compiler and note the deviation in your report; the trait's exact shape is the compiler's to state, not this document's.
 
