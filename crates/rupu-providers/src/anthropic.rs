@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use reqwest::Client;
+use reqwest_middleware::{ClientWithMiddleware, RequestBuilder};
 use serde::Deserialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
@@ -255,13 +255,13 @@ fn should_retry_idle_stall(
 const ANTHROPIC_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
-/// Build the reqwest client used for Anthropic requests.
+/// Build the netflow-instrumented client used for Anthropic requests.
 ///
 /// Forces HTTP/1.1: MITM capture of the first-party Claude Code binary
 /// shows it negotiates HTTP/1.1 for `/v1/messages`. Matching that on
 /// the wire keeps rupu's requests in the same Cloudflare/WAF
 /// classification bucket as claude-code traffic.
-fn build_http_client() -> reqwest::Client {
+fn build_http_client() -> (ClientWithMiddleware, Arc<dyn rupu_netflow::FlowSink>) {
     build_http_client_with_timeout(None)
 }
 
@@ -271,12 +271,50 @@ fn build_http_client() -> reqwest::Client {
 /// Applied as connect + read timeouts, never as reqwest's total `timeout`:
 /// a total deadline would abort a long generation mid-stream. `None` keeps
 /// the historical no-deadline client (used by every non-factory constructor).
-fn build_http_client_with_timeout(timeout: Option<std::time::Duration>) -> reqwest::Client {
+///
+/// No run context is available at this layer — every client built here is
+/// stamped `FlowCtx::system(Origin::Provider("anthropic"))`. Plan 2 threads
+/// the real run id through once the provider factory is touched.
+///
+/// The builder below is never `.build()`'d directly — it flows straight
+/// into `rupu_netflow::http::client_with`, the sanctioned pattern (see
+/// Task 11's `clippy.toml`); only `ClientBuilder::build()` is
+/// clippy-disallowed, and this function never calls it.
+///
+/// Returns the `Arc<dyn FlowSink>` the client was actually bound to,
+/// alongside the client itself. `AnthropicClient` stores both, and its
+/// two-phase streaming completion (`FlowCompletionGuard`) calls `complete`
+/// on this stored sink directly rather than re-resolving
+/// `rupu_netflow::http::sink()` a second time at completion. Today those
+/// are the same object (a single process-wide global), so this has no
+/// behavioral effect yet — but it is what makes the completion pair safe
+/// once a per-workspace sink (Plan 2) replaces the global for some
+/// clients: the `Flow` and its `Complete` are then guaranteed to travel
+/// together instead of the `Complete` silently re-targeting whatever the
+/// global happens to be at completion time. See the 2026-08-03
+/// whole-branch review, Fix 1.
+fn build_http_client_with_timeout(
+    timeout: Option<std::time::Duration>,
+) -> (ClientWithMiddleware, Arc<dyn rupu_netflow::FlowSink>) {
     let mut builder = reqwest::Client::builder().http1_only();
     if let Some(t) = timeout {
         builder = builder.connect_timeout(t).read_timeout(t);
     }
-    builder.build().expect("reqwest build")
+    let sink = rupu_netflow::http::sink();
+    let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider(PROVIDER_TAG.into()));
+    match rupu_netflow::http::client_with(ctx, builder, sink.clone()) {
+        Ok(client) => (client, sink),
+        Err(_) => {
+            // The panicking-only-as-last-resort factory: see its own
+            // docstring for why a second failure here means the process
+            // cannot do TLS at all. It re-resolves `sink()` internally,
+            // but since `sink()` is a `OnceLock` (first-call-wins), that
+            // is guaranteed to be the SAME object as `sink` above.
+            let ctx =
+                rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider(PROVIDER_TAG.into()));
+            (rupu_netflow::http::client(ctx), sink)
+        }
+    }
 }
 
 /// Whether the model string carries the explicit 1M-context opt-in
@@ -520,7 +558,7 @@ pub(crate) fn load_claude_code_keychain() -> Option<AuthMethod> {
 /// Refresh an Anthropic OAuth token. Returns updated AuthMethod.
 /// Uses application/x-www-form-urlencoded as required by the token endpoint.
 pub async fn refresh_anthropic_token(
-    client: &Client,
+    client: &ClientWithMiddleware,
     refresh_token: &str,
 ) -> Result<AuthMethod, ProviderError> {
     info!("refreshing Anthropic OAuth token");
@@ -645,7 +683,13 @@ pub fn save_auth_json(path: &Path, auth_method: &AuthMethod) -> Result<(), Provi
 /// Anthropic Messages API client with SSE streaming.
 /// Supports both API key (`x-api-key`) and OAuth (`Authorization: Bearer`) auth.
 pub struct AnthropicClient {
-    client: Client,
+    client: ClientWithMiddleware,
+    /// The exact sink `client` was bound to. Stored alongside the client
+    /// (rather than re-resolved from `rupu_netflow::http::sink()` at
+    /// completion time) so `FlowCompletionGuard`'s two-phase streaming
+    /// completion always targets the same ledger its `Flow` line was
+    /// written to. See `build_http_client_with_timeout`'s docstring.
+    sink: Arc<dyn rupu_netflow::FlowSink>,
     auth: AuthMethod,
     api_url: String,
     /// Path to auth.json for writing refreshed tokens back (legacy).
@@ -682,8 +726,10 @@ pub struct AnthropicClient {
 impl AnthropicClient {
     /// Create a new client from a resolved AuthMethod.
     pub fn from_auth(auth: AuthMethod) -> Self {
+        let (client, sink) = build_http_client();
         Self {
-            client: build_http_client(),
+            client,
+            sink,
             auth,
             api_url: ANTHROPIC_API_URL.to_string(),
             auth_json_path: None,
@@ -705,7 +751,9 @@ impl AnthropicClient {
     /// below makes stacking one either double-count permits or deadlock
     /// outright at `max_concurrency == 1`).
     pub fn with_tuning(mut self, tuning: &crate::tuning::ProviderTuning) -> Self {
-        self.client = build_http_client_with_timeout(Some(tuning.timeout));
+        let (client, sink) = build_http_client_with_timeout(Some(tuning.timeout));
+        self.client = client;
+        self.sink = sink;
         self.max_rate_limit_retries = tuning.max_retries;
         self.semaphore = Some(tuning.semaphore("anthropic"));
         self
@@ -755,8 +803,10 @@ impl AnthropicClient {
 
     /// Create a client with an auth.json path for persisting refreshed tokens.
     pub fn from_auth_with_path(auth: AuthMethod, auth_json_path: std::path::PathBuf) -> Self {
+        let (client, sink) = build_http_client();
         Self {
-            client: build_http_client(),
+            client,
+            sink,
             auth,
             api_url: ANTHROPIC_API_URL.to_string(),
             auth_json_path: Some(auth_json_path),
@@ -773,8 +823,10 @@ impl AnthropicClient {
         auth: AuthMethod,
         store: std::sync::Arc<dyn crate::credential_source::CredentialSource>,
     ) -> Self {
+        let (client, sink) = build_http_client();
         Self {
-            client: build_http_client(),
+            client,
+            sink,
             auth,
             api_url: ANTHROPIC_API_URL.to_string(),
             auth_json_path: None,
@@ -799,8 +851,10 @@ impl AnthropicClient {
 
     /// Create a client pointing at a custom URL (for testing with mock servers).
     pub fn with_url(api_key: String, api_url: String) -> Self {
+        let (client, sink) = build_http_client();
         Self {
-            client: build_http_client(),
+            client,
+            sink,
             auth: AuthMethod::ApiKey(api_key),
             api_url,
             auth_json_path: None,
@@ -816,8 +870,10 @@ impl AnthropicClient {
     /// (for testing OAuth flows against mock servers — the api-key-only
     /// `with_url` cannot exercise the OAuth header path).
     pub fn from_auth_with_url(auth: AuthMethod, api_url: String) -> Self {
+        let (client, sink) = build_http_client();
         Self {
-            client: build_http_client(),
+            client,
+            sink,
             auth,
             api_url,
             auth_json_path: None,
@@ -891,11 +947,11 @@ impl AnthropicClient {
     /// non-Haiku tiers.
     fn apply_auth_headers(
         &self,
-        builder: reqwest::RequestBuilder,
+        builder: RequestBuilder,
         model: &str,
         context_window: Option<crate::model_tier::ContextWindow>,
         wants_context_management: bool,
-    ) -> reqwest::RequestBuilder {
+    ) -> RequestBuilder {
         // Headers verbatim from MITM capture of real `claude --print`
         // against api.anthropic.com. Order is preserved to match the
         // fingerprint. Anthropic's WAF / OAuth-quota router checks for
@@ -980,6 +1036,108 @@ fn stream_event_counts_as_emitted_content(ev: &StreamEvent) -> bool {
             | StreamEvent::InputJsonDelta(_)
             | StreamEvent::ReasoningDelta(_)
     )
+}
+
+/// Guards one flow attempt's completion against `stream()` being cancelled
+/// mid-flight.
+///
+/// `rupu-agent`'s runner races `stream()` against a pause signal in a
+/// `tokio::select!` and drops the losing branch outright — plain sequential
+/// code placed after an `.await` (like an unconditional `complete()` call at
+/// the end of the chunk loop) simply never runs in that case, silently
+/// discarding every byte already accounted for. This guard closes that gap:
+/// the normal path calls [`Self::complete`] explicitly, which disarms
+/// `Drop` *before* its own `.await` so a cancellation during that very call
+/// can never cause a second, conflicting completion. If the guard is
+/// dropped while still armed — the enclosing future was cancelled — `Drop`
+/// spawns a best-effort completion with whatever byte count had been
+/// observed so far. `Drop` cannot `await`, so this only fires when a tokio
+/// runtime is still current; outside one it logs at debug and gives up,
+/// matching this subsystem's rule that capture may degrade but must never
+/// panic or fail the request that produced it.
+///
+/// Carries the `Arc<dyn FlowSink>` the client was built with (rather than
+/// completing through the free-standing `rupu_netflow::http::complete`,
+/// which re-resolves the process-global sink) so this guard's `Complete`
+/// line is guaranteed to land in the same ledger as the `Flow` line the
+/// middleware wrote for this same `id` — see Fix 1 of the 2026-08-03
+/// whole-branch review.
+///
+/// Only ever constructed AFTER `.send()` has returned `Ok`: a `?` on the
+/// `.send()` future itself must never drop an armed guard, or its `Drop`
+/// impl fabricates a `bytes_in: Some(0)` completion for a request whose
+/// body was never observed — the middleware's own `Err` arm already wrote
+/// the honest record (`bytes_in: None, body_complete: true`) in that case.
+/// See Fix 2 of the same review.
+struct FlowCompletionGuard {
+    id: rupu_netflow::FlowId,
+    started: std::time::Instant,
+    bytes: u64,
+    fired: bool,
+    sink: Arc<dyn rupu_netflow::FlowSink>,
+}
+
+impl FlowCompletionGuard {
+    fn new(
+        id: rupu_netflow::FlowId,
+        started: std::time::Instant,
+        sink: Arc<dyn rupu_netflow::FlowSink>,
+    ) -> Self {
+        Self {
+            id,
+            started,
+            bytes: 0,
+            fired: false,
+            sink,
+        }
+    }
+
+    /// Accumulate observed body bytes as they arrive, so `Drop` has an
+    /// accurate count even if the explicit completion below never runs.
+    fn add_bytes(&mut self, n: u64) {
+        self.bytes += n;
+    }
+
+    /// Explicit, precise completion on the normal path. Disarms `Drop`
+    /// first — not after — so a cancellation mid-`.await` here cannot also
+    /// trigger `Drop`'s fallback completion for the same flow.
+    async fn complete(mut self) {
+        self.fired = true;
+        self.sink
+            .complete(
+                self.id,
+                self.bytes,
+                self.started.elapsed().as_millis() as u64,
+            )
+            .await;
+    }
+}
+
+impl Drop for FlowCompletionGuard {
+    fn drop(&mut self) {
+        if self.fired {
+            return;
+        }
+        let id = self.id;
+        let bytes = self.bytes;
+        let elapsed_ms = self.started.elapsed().as_millis() as u64;
+        let sink = self.sink.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    sink.complete(id, bytes, elapsed_ms).await;
+                });
+            }
+            Err(_) => {
+                debug!(
+                    ?id,
+                    bytes,
+                    "netflow: flow dropped mid-flight with no tokio runtime current; \
+                     record left incomplete"
+                );
+            }
+        }
+    }
 }
 
 impl AnthropicClient {
@@ -1244,10 +1402,9 @@ impl AnthropicClient {
             // dropped before its own backoff sleep, exactly like `send()`.
             // Never read directly; kept alive purely for its `Drop`, which
             // is why it's underscore-prefixed.
-            let (response, _stream_permit) = {
+            let (response, _stream_permit, mut flow_guard) = {
                 let mut last_err = None;
-                let mut got_response = None;
-                let mut acquired_permit = None;
+                let mut winner = None;
                 for attempt in 0..=self.max_rate_limit_retries {
                     if attempt > 0 {
                         let backoff = INITIAL_BACKOFF_MS * 2u64.pow(attempt - 1);
@@ -1261,6 +1418,15 @@ impl AnthropicClient {
 
                     let permit = self.acquire_permit().await?;
 
+                    // Every attempt here is a genuinely separate connection —
+                    // a 429 retry as much as an idle-restart pass — so each
+                    // gets its own fresh `FlowId`. Minted before `.send()` and
+                    // attached via `with_extension` so the middleware defers
+                    // finalizing this record until we call `complete` below,
+                    // instead of (mis)completing it at header time.
+                    let attempt_flow_id = rupu_netflow::FlowId::new();
+                    let attempt_started = std::time::Instant::now();
+
                     let builder = self
                         .client
                         .post(&self.api_url)
@@ -1273,12 +1439,36 @@ impl AnthropicClient {
                             request.context_window,
                             request.anthropic_context_management.is_some(),
                         )
+                        .with_extension(attempt_flow_id)
                         .send()
                         .await?;
+
+                    // Constructed ONLY after `.send()` returned `Ok` — Fix 2
+                    // of the 2026-08-03 review. If `.send()` itself fails,
+                    // the `?` above returns before any guard exists, so
+                    // nothing is armed to fabricate a completion for a body
+                    // that was never observed; the middleware's own `Err`
+                    // arm already wrote the honest record
+                    // (`bytes_in: None, body_complete: true`). A
+                    // cancellation DURING `.send()` cannot dangle either:
+                    // the whole future — including the not-yet-created
+                    // guard — is simply dropped with it, and no record
+                    // exists to finalize. Wrapped in a `FlowCompletionGuard`
+                    // from here on so a cancellation mid-attempt (e.g. a
+                    // user pause) while draining the body still finalizes
+                    // the record with whatever was observed, instead of
+                    // leaving it dangling.
+                    let mut flow_guard = FlowCompletionGuard::new(
+                        attempt_flow_id,
+                        attempt_started,
+                        self.sink.clone(),
+                    );
 
                     let status = resp.status();
                     if status.as_u16() == 429 {
                         let text = resp.text().await.unwrap_or_default();
+                        flow_guard.add_bytes(text.len() as u64);
+                        flow_guard.complete().await;
                         last_err = Some(ProviderError::Api {
                             status: 429,
                             message: text,
@@ -1288,22 +1478,24 @@ impl AnthropicClient {
                     }
                     if !status.is_success() {
                         let text = resp.text().await.unwrap_or_default();
+                        let bytes_in = text.len() as u64;
                         let truncated = if text.len() > 4096 {
                             format!("{}... (truncated)", &text[..4096])
                         } else {
                             text
                         };
+                        flow_guard.add_bytes(bytes_in);
+                        flow_guard.complete().await;
                         return Err(ProviderError::Api {
                             status: status.as_u16(),
                             message: truncated,
                         });
                     }
-                    got_response = Some(resp);
-                    acquired_permit = permit;
+                    winner = Some((resp, permit, flow_guard));
                     break;
                 }
-                match got_response {
-                    Some(r) => (r, acquired_permit),
+                match winner {
+                    Some(w) => w,
                     None => {
                         return Err(last_err.unwrap_or_else(|| ProviderError::Api {
                             status: 429,
@@ -1323,30 +1515,45 @@ impl AnthropicClient {
             // next idle-restart pass, which acquires its own fresh permit.
 
             // Read chunks with a per-chunk IDLE timeout. A timeout means the
-            // server stopped emitting bytes — treat as a stall.
-            let stalled = loop {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS),
-                    response.chunk(),
-                )
-                .await
-                {
-                    Ok(chunk_result) => match chunk_result? {
-                        Some(chunk) => {
-                            for event in parser.feed(&chunk)? {
-                                self.process_sse_event(&event, &mut accumulator, &mut |ev| {
-                                    if stream_event_counts_as_emitted_content(&ev) {
-                                        emitted_content = true;
-                                    }
-                                    on_event(ev);
-                                })?;
+            // server stopped emitting bytes — treat as a stall. Wrapped in an
+            // inner async block so the explicit `flow_guard.complete()` below
+            // fires exactly once on every NORMAL exit — stream end, idle
+            // stall, or any `?` error. If `stream()` itself is cancelled
+            // instead (dropped mid-`.await`, e.g. by a user pause racing this
+            // call — see rupu-agent's runner), this block never finishes and
+            // that explicit call never runs; `flow_guard`'s own `Drop` is
+            // what finalizes the record in that case, with whatever byte
+            // count had been accumulated via `add_bytes` so far.
+            let stalled_result: Result<bool, ProviderError> = async {
+                loop {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS),
+                        response.chunk(),
+                    )
+                    .await
+                    {
+                        Ok(chunk_result) => match chunk_result? {
+                            Some(chunk) => {
+                                flow_guard.add_bytes(chunk.len() as u64);
+                                for event in parser.feed(&chunk)? {
+                                    self.process_sse_event(&event, &mut accumulator, &mut |ev| {
+                                        if stream_event_counts_as_emitted_content(&ev) {
+                                            emitted_content = true;
+                                        }
+                                        on_event(ev);
+                                    })?;
+                                }
                             }
-                        }
-                        None => break false, // stream completed normally
-                    },
-                    Err(_elapsed) => break true, // idle timeout → stalled
+                            None => return Ok(false), // stream completed normally
+                        },
+                        Err(_elapsed) => return Ok(true), // idle timeout → stalled
+                    }
                 }
-            };
+            }
+            .await;
+
+            flow_guard.complete().await;
+            let stalled = stalled_result?;
 
             if !stalled {
                 return accumulator

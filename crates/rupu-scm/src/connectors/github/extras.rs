@@ -36,7 +36,7 @@ impl GithubExtras {
         let ref_ = w.ref_.clone();
         let inputs = w.inputs.clone();
         self.client
-            .with_retry(|| {
+            .with_retry_octocrab(|| {
                 let inner = inner.clone();
                 let owner = owner.clone();
                 let repo = repo.clone();

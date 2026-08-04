@@ -77,7 +77,7 @@ impl ProviderTuning {
         crate::concurrency::semaphore_for(provider, Some(self.max_concurrency))
     }
 
-    /// An HTTP client honoring [`Self::timeout`].
+    /// A tuned [`reqwest::ClientBuilder`] honoring [`Self::timeout`].
     ///
     /// The timeout is applied as `connect_timeout` + `read_timeout`, NOT as
     /// reqwest's total `timeout`. A total deadline would abort a legitimately
@@ -86,6 +86,17 @@ impl ProviderTuning {
     /// pre-existing hand-rolled `STREAM_IDLE_TIMEOUT_SECS = 120` in the
     /// Anthropic client, which is where the documented 120000 ms default
     /// comes from.
+    ///
+    /// Callers must never `.build()` this directly (rupu-netflow Plan 1 Task
+    /// 10 / Task 11's `clippy.toml` lint) — pass it through
+    /// `rupu_netflow::http::client_from` so the resulting client is
+    /// instrumented, preserving every option set here.
+    ///
+    /// `client_from` takes a caller-tuned `ClientBuilder` by design, so
+    /// constructing one here (never calling `.build()` on it) is the
+    /// sanctioned pattern, not a bypass. `Client::builder()` itself is
+    /// not clippy-disallowed (see Task 11's `clippy.toml`) — only
+    /// `ClientBuilder::build()` is, and this function never calls it.
     pub fn http_client_builder(&self) -> reqwest::ClientBuilder {
         reqwest::Client::builder()
             .connect_timeout(self.timeout)
@@ -97,7 +108,11 @@ impl ProviderTuning {
 /// [`DEFAULT_TIMEOUT_MS`]. `0` is treated as absent: a zero-length deadline
 /// would fail every request instantly, which is never what a user means.
 pub fn client_timeout(timeout_ms: Option<u64>) -> Duration {
-    Duration::from_millis(timeout_ms.filter(|ms| *ms > 0).unwrap_or(DEFAULT_TIMEOUT_MS))
+    Duration::from_millis(
+        timeout_ms
+            .filter(|ms| *ms > 0)
+            .unwrap_or(DEFAULT_TIMEOUT_MS),
+    )
 }
 
 /// `max_retries` → retries after the first attempt. Absent ⇒
@@ -123,6 +138,12 @@ pub fn retry_backoff(attempt: u32) -> Duration {
 }
 
 #[cfg(test)]
+// Two tests below call `.http_client_builder().build()` directly to unit-
+// test the builder's timeout configuration in isolation against a real
+// httpmock server — that's the builder-construction function itself
+// under test, not live provider traffic bypassing capture. Same pattern
+// as rupu-netflow's own `asn/acquire.rs` test module.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+  html, body, #root { height: 100%; }
+  body { margin: 0; background: #FAFAFA; color: #0F172A; -webkit-font-smoothing: antialiased; font-feature-settings: "cv11", "ss01"; }
+  a { color: #5B21B6; text-decoration: none; }
+  a:hover { color: #6D28D9; }
+</style>
+</helmet>
+<div style="display:flex; height:100vh; overflow:hidden; font-family:-apple-system, BlinkMacSystemFont, Inter, system-ui, sans-serif; font-size:14px; background:#FAFAFA; color:#0F172A;">
+
+  <aside style="width:240px; flex-shrink:0; border-right:1px solid #E5E7EB; background:#FFFFFF; display:flex; flex-direction:column;">
+    <a href="#" style="padding:20px; display:flex; align-items:center; border-bottom:1px solid #E5E7EB; color:inherit;">
+      <span style="display:flex; align-items:center; gap:8px;">
+        <span style="display:flex; height:28px; width:28px; flex-shrink:0; align-items:center; justify-content:center; border-radius:6px; background:#6D28D9; color:#fff;">
+          <span style="font-size:15px; font-weight:300; line-height:1;">&#8734;</span>
+        </span>
+        <span style="line-height:1.25;">
+          <span style="display:block; font-size:14px; font-weight:600; color:#0F172A;">rupu</span>
+          <span style="display:block; font-size:11px; color:#94A3B8;">Control Plane</span>
+        </span>
+      </span>
+    </a>
+
+    <nav style="flex:1; padding:12px 8px; overflow-y:auto;">
+      <a href="#" onClick="{{ goDashboard }}" style="display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:6px; font-size:14px; margin-bottom:2px; background: {{ navBg.dashboard }}; color: {{ navFg.dashboard }};">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="9" x="3" y="3" rx="1"></rect><rect width="7" height="5" x="14" y="3" rx="1"></rect><rect width="7" height="9" x="14" y="12" rx="1"></rect><rect width="7" height="5" x="3" y="16" rx="1"></rect></svg>
+        <span>Dashboard</span>
+      </a>
+      <a href="#" onClick="{{ goProjects }}" style="display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:6px; font-size:14px; margin-bottom:2px; background: {{ navBg.projects }}; color: {{ navFg.projects }};">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 20H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H20a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-5"></path><circle cx="13" cy="12" r="2"></circle><path d="M18 19c-2.8 0-5-2.2-5-5v8"></path><circle cx="20" cy="19" r="2"></circle></svg>
+        <span>Projects</span>
+      </a>
+      <a href="#" style="display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:6px; font-size:14px; margin-bottom:2px; background:transparent; color:#0F172A;" style-hover="background:#E2E8F0;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.9 19.1C1 15.2 1 8.8 4.9 4.9"></path><path d="M7.8 16.2c-2.3-2.3-2.3-6.1 0-8.5"></path><circle cx="12" cy="12" r="2"></circle><path d="M16.2 7.8c2.3 2.3 2.3 6.1 0 8.5"></path><path d="M19.1 4.9C23 8.8 23 15.1 19.1 19"></path></svg>
+        <span>Live Events</span>
+      </a>
+      <a href="#" style="display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:6px; font-size:14px; margin-bottom:2px; background:transparent; color:#0F172A;" style-hover="background:#E2E8F0;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" x2="12" y1="2" y2="22"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg>
+        <span>Usage</span>
+      </a>
+
+      <div style="border-top:1px solid #E5E7EB; margin:8px 0;"></div>
+
+      <div style="user-select:none;">
+        <button type="button" style="width:100%; display:flex; align-items:center; justify-content:space-between; padding:12px 16px 4px; font-size:10px; text-transform:uppercase; letter-spacing:0.025em; font-weight:600; color:#94A3B8; background:none; border:0; cursor:pointer; font-family:inherit;">
+          <span>Runs</span>
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg>
+        </button>
+        <a href="#" style="display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:6px; font-size:14px; color:#0F172A;" style-hover="background:#E2E8F0;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"></path><path d="M20 3v4"></path><path d="M22 5h-4"></path></svg>
+          <span>Agents</span>
+        </a>
+        <a href="#" style="display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:6px; font-size:14px; color:#0F172A;" style-hover="background:#E2E8F0;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="8" height="8" x="3" y="3" rx="2"></rect><path d="M7 11v4a2 2 0 0 0 2 2h4"></path><rect width="8" height="8" x="13" y="13" rx="2"></rect></svg>
+          <span>Workflows</span>
+        </a>
+        <a href="#" style="display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:6px; font-size:14px; color:#0F172A;" style-hover="background:#E2E8F0;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m17 2 4 4-4 4"></path><path d="M3 11v-1a4 4 0 0 1 4-4h14"></path><path d="m7 22-4-4 4-4"></path><path d="M21 13v1a4 4 0 0 1-4 4H3"></path></svg>
+          <span>Autoflows</span>
+        </a>
+        <a href="#" style="display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:6px; font-size:14px; color:#0F172A;" style-hover="background:#E2E8F0;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+          <span>Sessions</span>
+        </a>
+      </div>
+
+      <div style="user-select:none;">
+        <button type="button" style="width:100%; display:flex; align-items:center; justify-content:space-between; padding:12px 16px 4px; font-size:10px; text-transform:uppercase; letter-spacing:0.025em; font-weight:600; color: {{ navFg.securityHdr }}; background:none; border:0; cursor:pointer; font-family:inherit;">
+          <span>Security</span>
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg>
+        </button>
+        <a href="#" style="display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:6px; font-size:14px; color:#0F172A;" style-hover="background:#E2E8F0;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"></path><path d="m9 12 2 2 4-4"></path></svg>
+          <span>Coverage</span>
+        </a>
+        <a href="#" onClick="{{ goFindings }}" style="display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:6px; font-size:14px; background: {{ navBg.findings }}; color: {{ navFg.findings }};">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"></path><path d="M12 8v4"></path><path d="M12 16h.01"></path></svg>
+          <span>Findings</span>
+        </a>
+      </div>
+
+      <div style="user-select:none;">
+        <button type="button" style="width:100%; display:flex; align-items:center; justify-content:space-between; padding:12px 16px 4px; font-size:10px; text-transform:uppercase; letter-spacing:0.025em; font-weight:600; color:#94A3B8; background:none; border:0; cursor:pointer; font-family:inherit;">
+          <span>Build</span>
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg>
+        </button>
+        <a href="#" style="display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:6px; font-size:14px; color:#0F172A;" style-hover="background:#E2E8F0;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"></path><path d="M20 3v4"></path><path d="M22 5h-4"></path></svg>
+          <span>Agents</span>
+        </a>
+        <a href="#" style="display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:6px; font-size:14px; color:#0F172A;" style-hover="background:#E2E8F0;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="8" height="8" x="3" y="3" rx="2"></rect><path d="M7 11v4a2 2 0 0 0 2 2h4"></path><rect width="8" height="8" x="13" y="13" rx="2"></rect></svg>
+          <span>Workflows</span>
+        </a>
+        <a href="#" style="display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:6px; font-size:14px; color:#0F172A;" style-hover="background:#E2E8F0;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m17 2 4 4-4 4"></path><path d="M3 11v-1a4 4 0 0 1 4-4h14"></path><path d="m7 22-4-4 4-4"></path><path d="M21 13v1a4 4 0 0 1-4 4H3"></path></svg>
+          <span>Autoflows</span>
+        </a>
+      </div>
+
+      <div style="user-select:none;">
+        <button type="button" style="width:100%; display:flex; align-items:center; justify-content:space-between; padding:12px 16px 4px; font-size:10px; text-transform:uppercase; letter-spacing:0.025em; font-weight:600; color:#94A3B8; background:none; border:0; cursor:pointer; font-family:inherit;">
+          <span>Fleet</span>
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg>
+        </button>
+        <a href="#" style="display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:6px; font-size:14px; color:#0F172A;" style-hover="background:#E2E8F0;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="8" x="2" y="2" rx="2"></rect><rect width="20" height="8" x="2" y="14" rx="2"></rect><line x1="6" x2="6.01" y1="6" y2="6"></line><line x1="6" x2="6.01" y1="18" y2="18"></line></svg>
+          <span>Hosts</span>
+        </a>
+        <a href="#" style="display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:6px; font-size:14px; color:#0F172A;" style-hover="background:#E2E8F0;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="8" x="2" y="2" rx="2"></rect><rect width="20" height="8" x="2" y="14" rx="2"></rect><line x1="6" x2="6.01" y1="6" y2="6"></line><line x1="6" x2="6.01" y1="18" y2="18"></line></svg>
+          <span>Workers</span>
+        </a>
+      </div>
+
+      <div style="border-top:1px solid #E5E7EB; margin:8px 0;"></div>
+
+      <a href="#" style="display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:6px; font-size:14px; color:#0F172A;" style-hover="background:#E2E8F0;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+        <span>Settings</span>
+      </a>
+    </nav>
+
+    <div style="border-top:1px solid #E5E7EB; padding:8px;">
+      <button type="button" style="width:100%; display:inline-flex; align-items:center; justify-content:flex-start; gap:8px; padding:6px 10px; border-radius:6px; border:0; background:transparent; font-family:inherit; font-size:13px; font-weight:500; color:#64748B; cursor:pointer;" style-hover="background:#E2E8F0; color:#0F172A;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"></rect><line x1="8" x2="16" y1="21" y2="21"></line><line x1="12" x2="12" y1="17" y2="21"></line></svg>
+        <span>System</span>
+      </button>
+    </div>
+  </aside>
+
+  <main style="flex:1; overflow:auto;">
+
+    <sc-if value="{{ isDashboard }}" hint-placeholder-val="{{ true }}">
+    <div style="padding:16px; display:flex; flex-direction:column; gap:16px;">
+      <header style="display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:12px;">
+        <div>
+          <h1 style="margin:0; font-size:18px; line-height:28px; font-weight:600; color:#0F172A;">Dashboard</h1>
+          <div style="margin-top:4px; display:flex; flex-wrap:wrap; align-items:center; gap:4px 16px; font-size:12px;">
+            <span style="display:inline-flex; align-items:center; gap:6px; color:#64748B;">
+              <span style="height:6px; width:6px; border-radius:50%; background:#3B82F6;"></span>
+              <span style="font-weight:500; color:#0F172A;">local</span><span style="color:#94A3B8;">·</span><span>live</span>
+            </span>
+            <span style="display:inline-flex; align-items:center; gap:6px; color:#64748B;">
+              <span style="height:6px; width:6px; border-radius:50%; background:#94A3B8;"></span>
+              <span style="font-weight:500; color:#0F172A;">build-01</span><span style="color:#94A3B8;">·</span><span>12s</span>
+            </span>
+            <span style="display:inline-flex; align-items:center; gap:6px; color:#64748B;">
+              <span style="height:6px; width:6px; border-radius:50%; background:#94A3B8;"></span>
+              <span style="font-weight:500; color:#0F172A;">eu-ssh-2</span><span style="color:#94A3B8;">·</span><span>3m</span>
+            </span>
+            <span style="display:inline-flex; align-items:center; gap:6px; color:#64748B;">
+              <span style="height:6px; width:6px; border-radius:50%; background:#EF4444;"></span>
+              <span style="font-weight:500; color:#0F172A;">tunnel-a</span><span style="color:#94A3B8;">·</span><span>unavailable</span>
+            </span>
+          </div>
+        </div>
+        <div style="display:flex; align-items:center; gap:8px;">
+          <div style="display:flex; border:1px solid #E5E7EB; border-radius:6px; overflow:hidden;">
+            <button type="button" style="padding:4px 8px; font-size:12px; border:0; background:transparent; color:#94A3B8; font-family:inherit; cursor:pointer;">7d</button>
+            <button type="button" style="padding:4px 8px; font-size:12px; border:0; background:#F1F5F9; color:#0F172A; font-family:inherit; cursor:pointer;">30d</button>
+            <button type="button" style="padding:4px 8px; font-size:12px; border:0; background:transparent; color:#94A3B8; font-family:inherit; cursor:pointer;">all</button>
+          </div>
+          <a href="#" style="border:1px solid #E5E7EB; border-radius:6px; padding:4px 12px; font-size:12px; color:#64748B;">Spend →</a>
+        </div>
+      </header>
+
+      <div style="display:grid; grid-template-columns:repeat(6, minmax(0,1fr)); gap:12px;">
+        <div style="border-radius:8px; border:1px solid #F59E0B; background:#F1F5F9; padding:12px;">
+          <div style="font-size:12px; color:#64748B;">Awaiting you</div>
+          <div style="margin-top:4px; font-variant-numeric:tabular-nums; color:#0F172A; font-size:30px; line-height:36px; font-weight:600;">3</div>
+        </div>
+        <div style="border-radius:8px; border:1px solid #06B6D4; background:#F1F5F9; padding:12px;">
+          <div style="font-size:12px; color:#64748B;">Paused</div>
+          <div style="margin-top:4px; font-variant-numeric:tabular-nums; color:#0F172A; font-size:30px; line-height:36px; font-weight:600;">1</div>
+        </div>
+        <div style="border-radius:8px; border:1px solid #EF4444; background:#F1F5F9; padding:12px;">
+          <div style="font-size:12px; color:#64748B;">Failed</div>
+          <div style="margin-top:4px; font-variant-numeric:tabular-nums; color:#0F172A; font-size:24px; line-height:32px;">7</div>
+          <div style="margin-top:4px; height:32px; width:100%;">
+            <svg width="100%" height="32" viewBox="0 0 120 32" preserveAspectRatio="none" style="display:block;">
+              <path d="M0,18.8 C6.7,18.8 13.3,13.2 20,13.2 C26.7,13.2 33.3,24.4 40,24.4 C46.7,24.4 53.3,2 60,2 C66.7,2 73.3,18.8 80,18.8 C86.7,18.8 93.3,7.6 100,7.6 C106.7,7.6 113.3,24.4 120,24.4 L120,32 L0,32 Z" fill="#EF4444" fill-opacity="0.25"></path>
+              <path d="M0,18.8 C6.7,18.8 13.3,13.2 20,13.2 C26.7,13.2 33.3,24.4 40,24.4 C46.7,24.4 53.3,2 60,2 C66.7,2 73.3,18.8 80,18.8 C86.7,18.8 93.3,7.6 100,7.6 C106.7,7.6 113.3,24.4 120,24.4" fill="none" stroke="#EF4444" stroke-width="1.5" vector-effect="non-scaling-stroke"></path>
+            </svg>
+          </div>
+        </div>
+        <div style="border-radius:8px; border:1px solid #E5E7EB; background:#FFFFFF; padding:12px;">
+          <div style="font-size:12px; color:#64748B;">Success rate</div>
+          <div style="margin-top:4px; font-variant-numeric:tabular-nums; color:#0F172A; font-size:24px; line-height:32px;">86%</div>
+        </div>
+        <a href="#" style="border-radius:8px; border:1px solid #E5E7EB; background:#FFFFFF; padding:12px; color:inherit; display:block;" style-hover="background:#E2E8F0;">
+          <div style="font-size:12px; color:#64748B;">Active now</div>
+          <div style="margin-top:4px; font-variant-numeric:tabular-nums; color:#0F172A;">
+            <span style="font-size:24px; line-height:32px;">4</span>
+            <span style="margin-left:4px; font-size:14px; font-weight:400; color:#64748B;">· longest 2h14m — nightly-review</span>
+          </div>
+        </a>
+        <a href="#" onClick="{{ goFindings }}" style="border-radius:8px; border:1px solid #E5E7EB; background:#FFFFFF; padding:12px; color:inherit; display:block;" style-hover="background:#E2E8F0;">
+          <div style="font-size:12px; color:#64748B;">Open findings (partial)</div>
+          <div style="margin-top:4px; font-variant-numeric:tabular-nums; color:#0F172A; font-size:24px; line-height:32px;">41+</div>
+        </a>
+      </div>
+
+      <div style="display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:16px;">
+        <section style="border-radius:8px; border:1px solid #E5E7EB; background:#FFFFFF; padding:12px;">
+          <h2 style="margin:0 0 8px; font-size:12px; font-weight:500; text-transform:uppercase; letter-spacing:0.025em; color:#64748B;">Outcomes over time</h2>
+          <div style="height:192px; width:100%;">
+            <svg width="100%" height="192" viewBox="0 0 320 192" preserveAspectRatio="none" style="display:block; overflow:visible;">
+              <g stroke="#E5E7EB" stroke-width="1" vector-effect="non-scaling-stroke">
+                <line x1="26" y1="170" x2="316" y2="170"></line>
+                <line x1="26" y1="128.5" x2="316" y2="128.5"></line>
+                <line x1="26" y1="87" x2="316" y2="87"></line>
+                <line x1="26" y1="45.5" x2="316" y2="45.5"></line>
+                <line x1="26" y1="4" x2="316" y2="4"></line>
+              </g>
+              <path d="M26,92.2 C42,92.2 58.3,55.9 74.3,55.9 C90.3,55.9 106.7,118.1 122.7,118.1 C138.7,118.1 155,9.2 171,9.2 C187,9.2 203.3,76.6 219.3,76.6 C235.3,76.6 251.7,35.1 267.7,35.1 C283.7,35.1 300,76.6 316,76.6 L316,170 L26,170 Z" fill="#64748B" fill-opacity="0.25"></path>
+              <path d="M26,97.4 C42,97.4 58.3,55.9 74.3,55.9 C90.3,55.9 106.7,118.1 122.7,118.1 C138.7,118.1 155,19.6 171,19.6 C187,19.6 203.3,76.6 219.3,76.6 C235.3,76.6 251.7,40.3 267.7,40.3 C283.7,40.3 300,76.6 316,76.6 L316,170 L26,170 Z" fill="#EF4444" fill-opacity="0.25"></path>
+              <path d="M26,97.4 C42,97.4 58.3,61.1 74.3,61.1 C90.3,61.1 106.7,118.1 122.7,118.1 C138.7,118.1 155,19.6 171,19.6 C187,19.6 203.3,81.8 219.3,81.8 C235.3,81.8 251.7,40.3 267.7,40.3 C283.7,40.3 300,76.6 316,76.6 L316,170 L26,170 Z" fill="#EF4444" fill-opacity="0.25"></path>
+              <path d="M26,107.8 C42,107.8 58.3,76.6 74.3,76.6 C90.3,76.6 106.7,123.3 122.7,123.3 C138.7,123.3 155,45.5 171,45.5 C187,45.5 203.3,92.2 219.3,92.2 C235.3,92.2 251.7,61.1 267.7,61.1 C283.7,61.1 300,81.8 316,81.8 L316,170 L26,170 Z" fill="#22C55E" fill-opacity="0.25"></path>
+              <path d="M26,92.2 C42,92.2 58.3,55.9 74.3,55.9 C90.3,55.9 106.7,118.1 122.7,118.1 C138.7,118.1 155,9.2 171,9.2 C187,9.2 203.3,76.6 219.3,76.6 C235.3,76.6 251.7,35.1 267.7,35.1 C283.7,35.1 300,76.6 316,76.6" fill="none" stroke="#64748B" stroke-width="1.5" vector-effect="non-scaling-stroke"></path>
+              <path d="M26,97.4 C42,97.4 58.3,55.9 74.3,55.9 C90.3,55.9 106.7,118.1 122.7,118.1 C138.7,118.1 155,19.6 171,19.6 C187,19.6 203.3,76.6 219.3,76.6 C235.3,76.6 251.7,40.3 267.7,40.3 C283.7,40.3 300,76.6 316,76.6" fill="none" stroke="#EF4444" stroke-width="1.5" vector-effect="non-scaling-stroke"></path>
+              <path d="M26,107.8 C42,107.8 58.3,76.6 74.3,76.6 C90.3,76.6 106.7,123.3 122.7,123.3 C138.7,123.3 155,45.5 171,45.5 C187,45.5 203.3,92.2 219.3,92.2 C235.3,92.2 251.7,61.1 267.7,61.1 C283.7,61.1 300,81.8 316,81.8" fill="none" stroke="#22C55E" stroke-width="1.5" vector-effect="non-scaling-stroke"></path>
+              <g fill="#94A3B8" font-size="11" font-family="-apple-system, BlinkMacSystemFont, system-ui, sans-serif">
+                <text x="20" y="174" text-anchor="end">0</text>
+                <text x="20" y="132.5" text-anchor="end">8</text>
+                <text x="20" y="91" text-anchor="end">16</text>
+                <text x="20" y="49.5" text-anchor="end">24</text>
+                <text x="20" y="8" text-anchor="end">32</text>
+                <text x="26" y="186" text-anchor="middle">Jul 6</text>
+                <text x="74.3" y="186" text-anchor="middle">Jul 10</text>
+                <text x="122.7" y="186" text-anchor="middle">Jul 14</text>
+                <text x="171" y="186" text-anchor="middle">Jul 18</text>
+                <text x="219.3" y="186" text-anchor="middle">Jul 22</text>
+                <text x="267.7" y="186" text-anchor="middle">Jul 26</text>
+                <text x="310" y="186" text-anchor="middle">Jul 30</text>
+              </g>
+            </svg>
+          </div>
+        </section>
+        <section style="border-radius:8px; border:1px solid #E5E7EB; background:#FFFFFF; padding:12px;">
+          <h2 style="margin:0 0 8px; font-size:12px; font-weight:500; text-transform:uppercase; letter-spacing:0.025em; color:#64748B;">Throughput by trigger</h2>
+          <div style="height:192px; width:100%;">
+            <svg width="100%" height="192" viewBox="0 0 320 192" preserveAspectRatio="none" style="display:block; overflow:visible;">
+              <g stroke="#E5E7EB" stroke-width="1" vector-effect="non-scaling-stroke">
+                <line x1="26" y1="170" x2="316" y2="170"></line>
+                <line x1="26" y1="128.5" x2="316" y2="128.5"></line>
+                <line x1="26" y1="87" x2="316" y2="87"></line>
+                <line x1="26" y1="45.5" x2="316" y2="45.5"></line>
+                <line x1="26" y1="4" x2="316" y2="4"></line>
+              </g>
+              <path d="M26,92.2 C42,92.2 58.3,55.9 74.3,55.9 C90.3,55.9 106.7,118.1 122.7,118.1 C138.7,118.1 155,9.2 171,9.2 C187,9.2 203.3,76.6 219.3,76.6 C235.3,76.6 251.7,35.1 267.7,35.1 C283.7,35.1 300,76.6 316,76.6 L316,170 L26,170 Z" fill="#2563EB" fill-opacity="0.25"></path>
+              <path d="M26,102.6 C42,102.6 58.3,71.4 74.3,71.4 C90.3,71.4 106.7,123.3 122.7,123.3 C138.7,123.3 155,35.1 171,35.1 C187,35.1 203.3,87 219.3,87 C235.3,87 251.7,50.7 267.7,50.7 C283.7,50.7 300,87 316,87 L316,170 L26,170 Z" fill="#6D28D9" fill-opacity="0.25"></path>
+              <path d="M26,154.4 C42,154.4 58.3,144.1 74.3,144.1 C90.3,144.1 106.7,159.6 122.7,159.6 C138.7,159.6 155,138.9 171,138.9 C187,138.9 203.3,149.3 219.3,149.3 C235.3,149.3 251.7,144.1 267.7,144.1 C283.7,144.1 300,154.4 316,154.4 L316,170 L26,170 Z" fill="#64748B" fill-opacity="0.25"></path>
+              <path d="M26,92.2 C42,92.2 58.3,55.9 74.3,55.9 C90.3,55.9 106.7,118.1 122.7,118.1 C138.7,118.1 155,9.2 171,9.2 C187,9.2 203.3,76.6 219.3,76.6 C235.3,76.6 251.7,35.1 267.7,35.1 C283.7,35.1 300,76.6 316,76.6" fill="none" stroke="#2563EB" stroke-width="1.5" vector-effect="non-scaling-stroke"></path>
+              <path d="M26,102.6 C42,102.6 58.3,71.4 74.3,71.4 C90.3,71.4 106.7,123.3 122.7,123.3 C138.7,123.3 155,35.1 171,35.1 C187,35.1 203.3,87 219.3,87 C235.3,87 251.7,50.7 267.7,50.7 C283.7,50.7 300,87 316,87" fill="none" stroke="#6D28D9" stroke-width="1.5" vector-effect="non-scaling-stroke"></path>
+              <path d="M26,154.4 C42,154.4 58.3,144.1 74.3,144.1 C90.3,144.1 106.7,159.6 122.7,159.6 C138.7,159.6 155,138.9 171,138.9 C187,138.9 203.3,149.3 219.3,149.3 C235.3,149.3 251.7,144.1 267.7,144.1 C283.7,144.1 300,154.4 316,154.4" fill="none" stroke="#64748B" stroke-width="1.5" vector-effect="non-scaling-stroke"></path>
+              <g fill="#94A3B8" font-size="11" font-family="-apple-system, BlinkMacSystemFont, system-ui, sans-serif">
+                <text x="20" y="174" text-anchor="end">0</text>
+                <text x="20" y="132.5" text-anchor="end">8</text>
+                <text x="20" y="91" text-anchor="end">16</text>
+                <text x="20" y="49.5" text-anchor="end">24</text>
+                <text x="20" y="8" text-anchor="end">32</text>
+                <text x="26" y="186" text-anchor="middle">Jul 6</text>
+                <text x="74.3" y="186" text-anchor="middle">Jul 10</text>
+                <text x="122.7" y="186" text-anchor="middle">Jul 14</text>
+                <text x="171" y="186" text-anchor="middle">Jul 18</text>
+                <text x="219.3" y="186" text-anchor="middle">Jul 22</text>
+                <text x="267.7" y="186" text-anchor="middle">Jul 26</text>
+                <text x="310" y="186" text-anchor="middle">Jul 30</text>
+              </g>
+            </svg>
+          </div>
+        </section>
+      </div>
+
+      <div style="display:flex; align-items:center; justify-content:space-between; font-size:14px; color:#64748B;">
+        <span>
+          <span style="font-weight:500; color:#0F172A;">128</span> cycles · <span style="color:#0F172A;">96</span> clean · <span style="color:#0F172A;">32</span> with failures (partial)
+        </span>
+        <a href="#" style="color:#94A3B8;">see all →</a>
+      </div>
+
+      <div style="display:flex; flex-wrap:wrap; align-items:center; gap:4px 8px; border-top:1px solid #E5E7EB; padding-top:8px; font-size:12px; color:#94A3B8;">
+        <a href="#" style="color:#94A3B8;">14 repos</a>
+        <span>·</span>
+        <a href="#" style="color:#EF4444;">4 providers (1 unhealthy)</a>
+        <span>·</span>
+        <a href="#" style="color:#94A3B8;">9 autoflows (2 off)</a>
+        <span>·</span>
+        <a href="#" style="color:#94A3B8;">6 workers</a>
+        <span>·</span>
+        <a href="#" style="color:#94A3B8;">3 claimed</a>
+        <span>·</span>
+        <a href="#" style="color:#94A3B8;">12 pending (58 open)</a>
+        <span style="color:#64748B;">(partial)</span>
+      </div>
+    </div>
+    </sc-if>
+
+    <sc-if value="{{ isProjects }}" hint-placeholder-val="{{ false }}">
+    <div style="padding:32px;">
+      <header style="margin-bottom:24px;">
+        <h1 style="margin:0; font-size:24px; line-height:32px; font-weight:600; color:#0F172A;">Projects</h1>
+        <p style="margin:4px 0 0; font-size:14px; color:#64748B;">Workspaces registered with this control plane — each with its own runs, sessions, and coverage.</p>
+      </header>
+
+      <div style="margin-bottom:16px; border-radius:12px; border:1px solid #E5E7EB; background:rgba(255,255,255,0.5); padding:16px;">
+        <div style="display:flex; align-items:flex-end; gap:10px; height:96px;">
+          <div style="flex:1; display:flex; flex-direction:column; justify-content:flex-end; height:100%; gap:2px;">
+            <div style="height:38%; background:#7C3AED; border-radius:2px 2px 0 0;"></div>
+            <div style="height:22%; background:#A78BFA;"></div>
+            <div style="height:10%; background:#DDD6FE; border-radius:0 0 2px 2px;"></div>
+          </div>
+          <div style="flex:1; display:flex; flex-direction:column; justify-content:flex-end; height:100%; gap:2px;">
+            <div style="height:26%; background:#7C3AED; border-radius:2px 2px 0 0;"></div>
+            <div style="height:14%; background:#A78BFA;"></div>
+            <div style="height:8%; background:#DDD6FE; border-radius:0 0 2px 2px;"></div>
+          </div>
+          <div style="flex:1; display:flex; flex-direction:column; justify-content:flex-end; height:100%; gap:2px;">
+            <div style="height:18%; background:#7C3AED; border-radius:2px 2px 0 0;"></div>
+            <div style="height:9%; background:#A78BFA;"></div>
+            <div style="height:5%; background:#DDD6FE; border-radius:0 0 2px 2px;"></div>
+          </div>
+          <div style="flex:1; display:flex; flex-direction:column; justify-content:flex-end; height:100%; gap:2px;">
+            <div style="height:12%; background:#7C3AED; border-radius:2px 2px 0 0;"></div>
+            <div style="height:6%; background:#A78BFA;"></div>
+            <div style="height:3%; background:#DDD6FE; border-radius:0 0 2px 2px;"></div>
+          </div>
+          <div style="flex:1; display:flex; flex-direction:column; justify-content:flex-end; height:100%; gap:2px;">
+            <div style="height:7%; background:#7C3AED; border-radius:2px 2px 0 0;"></div>
+            <div style="height:4%; background:#A78BFA;"></div>
+            <div style="height:2%; background:#DDD6FE; border-radius:0 0 2px 2px;"></div>
+          </div>
+        </div>
+      </div>
+
+      <div style="background:#FFFFFF; border:1px solid #E5E7EB; border-radius:12px; box-shadow:0 1px 2px rgba(15,23,42,0.04), 0 0 0 1px rgba(15,23,42,0.06); overflow:hidden;">
+        <table style="width:100%; font-size:14px; border-collapse:collapse;">
+          <thead>
+            <tr style="border-bottom:1px solid #E5E7EB; font-size:10px; text-transform:uppercase; letter-spacing:0.025em; color:#94A3B8;">
+              <th scope="col" style="padding:8px 16px; font-weight:500; text-align:left; width:1%; white-space:nowrap;">Source</th>
+              <th scope="col" style="padding:8px 16px; font-weight:500; text-align:left;">Name</th>
+              <th scope="col" style="padding:8px 16px; font-weight:500; text-align:left; width:1%; white-space:nowrap;">Path</th>
+              <th scope="col" style="padding:8px 16px; font-weight:500; text-align:left; width:1%; white-space:nowrap;">Branch</th>
+              <th scope="col" style="padding:8px 16px; font-weight:500; text-align:right; width:1%; white-space:nowrap;">Runs</th>
+              <th scope="col" style="padding:8px 16px; font-weight:500; text-align:right; width:1%; white-space:nowrap;">Tokens</th>
+              <th scope="col" style="padding:8px 16px; font-weight:500; text-align:right; width:1%; white-space:nowrap;">Cost</th>
+              <th scope="col" style="padding:8px 16px; font-weight:500; text-align:right; width:1%; white-space:nowrap;">Last active ▾</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr style="border-bottom:1px solid #E5E7EB;">
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="display:inline-flex; color:#64748B;"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.4 5.4 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4"></path><path d="M9 18c-4.51 2-5-2-7-2"></path></svg></span></td>
+              <td style="padding:10px 16px;"><span style="font-size:14px; font-weight:600; color:#0F172A;">rupu</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="font-size:11px; color:#94A3B8; font-family:ui-monospace, SFMono-Regular, Menlo, monospace;">~/src/section9labs/rupu</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;">
+                <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+                  <span style="display:inline-flex; align-items:center; gap:4px; font-size:10px; color:#0F172A; background:#F1F5F9; border-radius:4px; padding:2px 6px;">section9labs/rupu</span>
+                  <span style="display:inline-flex; align-items:center; gap:4px; font-size:10px; color:#0F172A; background:#F1F5F9; border-radius:4px; padding:2px 6px;">main</span>
+                </div>
+              </td>
+              <td style="padding:10px 16px; text-align:right; font-variant-numeric:tabular-nums; width:1%; white-space:nowrap;"><span style="color:#0F172A;">412</span></td>
+              <td style="padding:10px 16px; text-align:right; font-variant-numeric:tabular-nums; width:1%; white-space:nowrap;"><span style="color:#64748B;">18.4M</span></td>
+              <td style="padding:10px 16px; text-align:right; font-variant-numeric:tabular-nums; width:1%; white-space:nowrap;"><span style="color:#0F172A; font-weight:500;">$284.10</span></td>
+              <td style="padding:10px 16px; text-align:right; font-variant-numeric:tabular-nums; width:1%; white-space:nowrap;"><span style="color:#94A3B8;">4m ago</span></td>
+            </tr>
+            <tr style="border-bottom:1px solid #E5E7EB;">
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="display:inline-flex; color:#64748B;"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m22 13.29-3.33-10a.42.42 0 0 0-.14-.18.38.38 0 0 0-.22-.11.39.39 0 0 0-.23.07.42.42 0 0 0-.14.18l-2.26 6.67H8.32L6.06 3.26a.42.42 0 0 0-.14-.18.38.38 0 0 0-.22-.11.39.39 0 0 0-.23.07.42.42 0 0 0-.14.18L2 13.29a.74.74 0 0 0 .27.83L12 21l9.73-6.88a.74.74 0 0 0 .27-.83Z"></path></svg></span></td>
+              <td style="padding:10px 16px;"><span style="font-size:14px; font-weight:600; color:#0F172A;">edge-gateway</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="font-size:11px; color:#94A3B8; font-family:ui-monospace, SFMono-Regular, Menlo, monospace;">/srv/edge-gateway</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;">
+                <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+                  <span style="display:inline-flex; align-items:center; gap:4px; font-size:10px; color:#0F172A; background:#F1F5F9; border-radius:4px; padding:2px 6px;">infra/edge-gateway</span>
+                  <span style="display:inline-flex; align-items:center; gap:4px; font-size:10px; color:#0F172A; background:#F1F5F9; border-radius:4px; padding:2px 6px;">release/1.8</span>
+                </div>
+              </td>
+              <td style="padding:10px 16px; text-align:right; font-variant-numeric:tabular-nums; width:1%; white-space:nowrap;"><span style="color:#0F172A;">96</span></td>
+              <td style="padding:10px 16px; text-align:right; font-variant-numeric:tabular-nums; width:1%; white-space:nowrap;"><span style="color:#64748B;">4.1M</span></td>
+              <td style="padding:10px 16px; text-align:right; font-variant-numeric:tabular-nums; width:1%; white-space:nowrap;"><span style="color:#0F172A; font-weight:500;">$61.88</span></td>
+              <td style="padding:10px 16px; text-align:right; font-variant-numeric:tabular-nums; width:1%; white-space:nowrap;"><span style="color:#94A3B8;">1h ago</span></td>
+            </tr>
+            <tr style="border-bottom:1px solid #E5E7EB;">
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="display:inline-flex; color:#64748B;"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" x2="2" y1="12" y2="12"></line><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"></path><line x1="6" x2="6.01" y1="16" y2="16"></line><line x1="10" x2="10.01" y1="16" y2="16"></line></svg></span></td>
+              <td style="padding:10px 16px;"><span style="font-size:14px; font-weight:600; color:#0F172A;">scratch-notebook</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="font-size:11px; color:#94A3B8; font-family:ui-monospace, SFMono-Regular, Menlo, monospace;">~/tmp/scratch-notebook</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="color:#94A3B8;">—</span></td>
+              <td style="padding:10px 16px; text-align:right; font-variant-numeric:tabular-nums; width:1%; white-space:nowrap;"><span style="color:#0F172A;">—</span></td>
+              <td style="padding:10px 16px; text-align:right; font-variant-numeric:tabular-nums; width:1%; white-space:nowrap;"><span style="color:#64748B;">—</span></td>
+              <td style="padding:10px 16px; text-align:right; font-variant-numeric:tabular-nums; width:1%; white-space:nowrap;"><span style="color:#0F172A; font-weight:500;">—</span></td>
+              <td style="padding:10px 16px; text-align:right; font-variant-numeric:tabular-nums; width:1%; white-space:nowrap;"><span style="color:#94A3B8;">no runs</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    </sc-if>
+
+    <sc-if value="{{ isFindings }}" hint-placeholder-val="{{ false }}">
+    <div style="padding:32px;">
+      <header style="margin-bottom:24px;">
+        <h1 style="margin:0; font-size:24px; line-height:32px; font-weight:600; color:#0F172A;">Findings</h1>
+        <p style="margin:4px 0 0; font-size:14px; color:#64748B;">Every finding recorded across all coverage runs, worst first.</p>
+      </header>
+
+      <div style="background:#FFFFFF; border:1px solid #E5E7EB; border-radius:12px; box-shadow:0 1px 2px rgba(15,23,42,0.04), 0 0 0 1px rgba(15,23,42,0.06); overflow:hidden;">
+        <table style="width:100%; font-size:14px; border-collapse:collapse;">
+          <thead>
+            <tr style="border-bottom:1px solid #E5E7EB; font-size:10px; text-transform:uppercase; letter-spacing:0.025em; color:#94A3B8;">
+              <th scope="col" style="width:32px;"></th>
+              <th scope="col" style="padding:8px 16px; font-weight:500; text-align:left; width:1%; white-space:nowrap;">Severity</th>
+              <th scope="col" style="padding:8px 16px; font-weight:500; text-align:left;">Summary</th>
+              <th scope="col" style="padding:8px 16px; font-weight:500; text-align:left; width:1%; white-space:nowrap;">File:Line</th>
+              <th scope="col" style="padding:8px 16px; font-weight:500; text-align:left; width:1%; white-space:nowrap;">CWE</th>
+              <th scope="col" style="padding:8px 16px; font-weight:500; text-align:left; width:1%; white-space:nowrap;">Concern</th>
+              <th scope="col" style="padding:8px 16px; font-weight:500; text-align:left; width:1%; white-space:nowrap;">Project</th>
+              <th scope="col" style="padding:8px 16px; font-weight:500; text-align:left; width:1%; white-space:nowrap;">Target</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr style="border-bottom:1px solid #E5E7EB;">
+              <td style="width:32px; padding-left:12px; vertical-align:middle;"><span style="display:flex; height:20px; width:20px; align-items:center; justify-content:center; color:#94A3B8;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"></path></svg></span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; border-radius:4px; padding:2px 6px; font-size:11px; font-weight:500; background:#FAF5FF; color:#9333EA; box-shadow:inset 0 0 0 1px rgba(147,51,234,0.3);">CRITICAL</span></td>
+              <td style="padding:10px 16px;"><span style="color:#0F172A; line-height:1.375;">Unauthenticated tunnel enrollment accepts any node token</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#5B21B6;">crates/rupu-cp/src/node/server.rs:142–171</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; border-radius:4px; background:#F1F5F9; padding:2px 6px; font-size:11px; font-weight:500; color:#0F172A; box-shadow:inset 0 0 0 1px #E5E7EB;">CWE-306</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#94A3B8;">owasp.a01.broken-access</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="color:#64748B;">rupu</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#94A3B8;">pr/1284</span></td>
+            </tr>
+            <tr style="border-bottom:1px solid #E5E7EB;">
+              <td style="width:32px; padding-left:12px; vertical-align:middle;"><span style="display:flex; height:20px; width:20px; align-items:center; justify-content:center; color:#94A3B8;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"></path></svg></span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; border-radius:4px; padding:2px 6px; font-size:11px; font-weight:500; background:#FEF2F2; color:#DC2626; box-shadow:inset 0 0 0 1px rgba(220,38,38,0.3);">HIGH</span></td>
+              <td style="padding:10px 16px;"><span style="color:#0F172A; line-height:1.375;">Agent bypass mode inherits shell env including provider keys</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#5B21B6;">crates/rupu-tools/src/bash.rs:88–104</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; border-radius:4px; background:#F1F5F9; padding:2px 6px; font-size:11px; font-weight:500; color:#0F172A; box-shadow:inset 0 0 0 1px #E5E7EB;">CWE-526</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#94A3B8;">stride.information-disclosure</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="color:#64748B;">rupu</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#94A3B8;">branch/main</span></td>
+            </tr>
+            <tr style="border-bottom:1px solid #E5E7EB;">
+              <td style="width:32px; padding-left:12px; vertical-align:middle;"><span style="display:flex; height:20px; width:20px; align-items:center; justify-content:center; color:#94A3B8;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"></path></svg></span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; border-radius:4px; padding:2px 6px; font-size:11px; font-weight:500; background:#FFF7ED; color:#EA580C; box-shadow:inset 0 0 0 1px rgba(234,88,12,0.3);">MEDIUM</span></td>
+              <td style="padding:10px 16px;"><span style="color:#0F172A; line-height:1.375;">Webhook signature comparison is not constant-time</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#5B21B6;">crates/rupu-webhook/src/verify.rs:31–39</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; border-radius:4px; background:#F1F5F9; padding:2px 6px; font-size:11px; font-weight:500; color:#0F172A; box-shadow:inset 0 0 0 1px #E5E7EB;">CWE-208</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#94A3B8;">owasp.a02.crypto-failures</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="color:#64748B;">edge-gateway</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#94A3B8;">pr/318</span></td>
+            </tr>
+            <tr>
+              <td style="width:32px; padding-left:12px; vertical-align:middle;"><span style="display:flex; height:20px; width:20px; align-items:center; justify-content:center; color:#94A3B8;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"></path></svg></span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; border-radius:4px; padding:2px 6px; font-size:11px; font-weight:500; background:#FEFCE8; color:#CA8A04; box-shadow:inset 0 0 0 1px rgba(202,138,4,0.3);">LOW</span></td>
+              <td style="padding:10px 16px;"><span style="color:#0F172A; line-height:1.375;">Transcript JSONL written with 0644 in a shared temp dir</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#5B21B6;">crates/rupu-transcript/src/sink.rs:57–62</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; border-radius:4px; background:#F1F5F9; padding:2px 6px; font-size:11px; font-weight:500; color:#0F172A; box-shadow:inset 0 0 0 1px #E5E7EB;">CWE-732</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#94A3B8;">cwe.file-permissions</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="color:#64748B;">rupu</span></td>
+              <td style="padding:10px 16px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#94A3B8;">branch/main</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    </sc-if>
+
+  </main>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+const ACTIVE_BG = '#F5F3FF';
+const ACTIVE_FG = '#5B21B6';
+const IDLE_FG = '#0F172A';
+
+class Component extends DCLogic {
+  state = { route: 'dashboard' };
+
+  go(route) {
+    return (e) => { e.preventDefault(); this.setState({ route }); };
+  }
+
+  renderVals() {
+    const r = this.state.route;
+    const on = (k) => (r === k ? ACTIVE_BG : 'transparent');
+    const fg = (k) => (r === k ? ACTIVE_FG : IDLE_FG);
+    return {
+      isDashboard: r === 'dashboard',
+      isProjects: r === 'projects',
+      isFindings: r === 'findings',
+      navBg: { dashboard: on('dashboard'), projects: on('projects'), findings: on('findings') },
+      navFg: {
+        dashboard: fg('dashboard'),
+        projects: fg('projects'),
+        findings: fg('findings'),
+        securityHdr: r === 'findings' ? '#5B21B6' : '#94A3B8',
+      },
+      goDashboard: this.go('dashboard'),
+      goProjects: this.go('projects'),
+      goFindings: this.go('findings'),
+    };
+  }
+}
+
+</script>
+</body>
+</html>

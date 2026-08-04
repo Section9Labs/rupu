@@ -197,7 +197,8 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
     let token_url = std::env::var("RUPU_OAUTH_TOKEN_URL_OVERRIDE")
         .unwrap_or_else(|_| oauth.token_url.to_string());
 
-    let client = reqwest::Client::new();
+    let client =
+        rupu_netflow::http::client(rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System));
     let mut params: Vec<(&str, String)> = vec![
         ("grant_type", "authorization_code".into()),
         ("code", code.clone()),

@@ -30,7 +30,7 @@ use crate::types::{EventSourceRef, EventSubjectRef, IssueRef};
 const DEFAULT_BASE_URL: &str = "https://api.linear.app/graphql";
 
 pub struct LinearEventConnector {
-    http: reqwest::Client,
+    http: reqwest_middleware::ClientWithMiddleware,
     token: String,
     base_url: String,
     snapshot_root: PathBuf,
@@ -39,9 +39,15 @@ pub struct LinearEventConnector {
 impl LinearEventConnector {
     pub fn new(token: String, base_url: Option<String>, snapshot_root: Option<PathBuf>) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .build()
-                .expect("reqwest client build"),
+            http: rupu_netflow::http::client_from(
+                rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm("linear".into())),
+                reqwest::Client::builder(),
+            )
+            .unwrap_or_else(|_| {
+                rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
+                    rupu_netflow::Origin::Scm("linear".into()),
+                ))
+            }),
             token,
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             snapshot_root: snapshot_root.unwrap_or_else(default_snapshot_root),

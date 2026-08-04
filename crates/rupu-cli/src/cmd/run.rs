@@ -535,61 +535,12 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         warn!(path = %pwd.display(), error = %err, "failed to auto-track checkout");
     }
 
-    // Provider build via CredentialResolver. Wrapped in an `Arc` so the
-    // same resolver instance can also be handed to `CliAgentDispatcher`
-    // below without a second construction; existing call sites that need
-    // `&dyn CredentialResolver` now go through `resolver.as_ref()`.
-    let resolver = Arc::new(rupu_auth::KeychainResolver::new());
-
-    // Build the SCM/issue registry from the same resolver + config the
-    // LLM provider factory uses. Cheap when no platforms are configured;
-    // missing credentials are skipped with INFO logs.
-    let scm_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
-
-    let provider_name = provider_factory::resolve_provider_name(
-        spec.provider.as_deref(),
-        cfg.default_provider.as_deref(),
-    );
-    let oai_params = provider_factory::openai_compatible_params(&provider_name, &cfg.providers);
-    if !provider_factory::is_builtin_provider(&provider_name) && oai_params.is_none() {
-        anyhow::bail!(
-            "provider '{provider_name}' is not a built-in provider and is not declared as \
-             [providers.{provider_name}] with kind = \"openai-compatible\" in config.toml"
-        );
-    }
-    // For an openai-compatible provider, prefer its configured default_model
-    // when the agent/spec didn't pin one.
-    let model = provider_factory::resolve_model(
-        spec.model.as_deref(),
-        cfg.default_model.as_deref(),
-        oai_params.as_ref().map(|p| p.default_model.as_str()),
-    );
-    let auth_hint = spec.auth;
-    let provider_config = provider_factory::ProviderConfig {
-        anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
-        openai_compatible: oai_params,
-        tuning: Some(provider_factory::provider_tuning(
-            &provider_name,
-            &cfg.providers,
-        )),
-    };
-    let (_resolved_auth, provider) = provider_factory::build_for_provider_with_config(
-        &provider_name,
-        &model,
-        auth_hint,
-        resolver.as_ref(),
-        &provider_config,
-    )
-    .await?;
-
-    // Print the agent header via the line-stream printer.
-    // The run_id isn't known yet; we'll use a placeholder.
-    let agent_header_name = spec.name.clone();
-    let agent_header_provider = provider_name.clone();
-    let agent_header_model = model.clone();
-    // (printed after run_id is set below)
-
-    // Transcript path.
+    // Transcript path. Computed here — earlier than it logically "belongs"
+    // relative to the provider build below — because the netflow sink
+    // installed right after it needs a concrete path to stream into, and
+    // that install must land before `build_for_provider_with_config` (a
+    // few lines down) constructs the provider client. See the netflow
+    // comment below for why the ordering is load-bearing.
     let run_id = args
         .run_id
         .clone()
@@ -598,442 +549,602 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     paths::ensure_dir(&transcripts)?;
     let transcript_path = transcripts.join(format!("{run_id}.jsonl"));
 
-    // Construct ONE LineStreamPrinter for the whole run. Keeping a
-    // single instance means a single MultiProgress + ticker — earlier
-    // we built one for the header and another for the tail loop, and
-    // their indicatif draw targets stomped on each other (visible as
-    // two stale spinner rows under heavy tool-call traffic).
-    let mut printer = crate::output::LineStreamPrinter::new();
-    printer.agent_header(
-        &agent_header_name,
-        &agent_header_provider,
-        &agent_header_model,
-        &run_id,
-    );
+    // Netflow capture. Two destinations: the ledger (persists across
+    // runs — rooted at the project when one is found, `pwd` otherwise,
+    // never the resolved `workspace_path` below; see `netflow_root`'s
+    // doc comment. Also the only home for `Origin::System` egress that
+    // has no run to attach to) and this run's transcript (streams live).
+    //
+    // MUST run before `build_for_provider_with_config` below —
+    // provider clients resolve `rupu_netflow::http::sink()` into their own
+    // field at construction time, so installing the sink after the
+    // provider is built would leave it permanently wired to the default
+    // `NullSink` for the whole run.
+    //
+    // `netflow_handle` is kept alive (not just the `Arc<dyn FlowSink>`
+    // handed to `init`) so the tail of this function can `shutdown()` it
+    // — see the comment down at `body_result`'s `.await` for why that
+    // matters (Fix 2, Task 10 review round 2: nothing else in production
+    // ever calls `shutdown()`, so the writer task's own periodic ticker is
+    // the primary safety net, but a clean CLI exit should still flush
+    // promptly rather than rely on that ticker's multi-second cadence).
+    let (netflow_sink, netflow_handle) =
+        build_netflow_sink(project_root.as_deref(), &pwd, &transcript_path);
+    rupu_netflow::http::init(netflow_sink);
 
-    // Tool context config (the path is filled in after target resolution below).
-    let bash_timeout = cfg.bash.timeout_secs.unwrap_or(120);
-    let bash_allowlist = cfg.bash.env_allowlist.clone().unwrap_or_default();
+    // Everything below that can generate outbound HTTP (provider build,
+    // SCM registry discovery, repo clone, the agent run itself) is wrapped
+    // in this block so `netflow_handle.shutdown()` below runs whether the
+    // run below succeeds OR fails (a failed run must still flush its
+    // ledger — that's the whole reason invariant 2 exists). Plain `?`
+    // inside would otherwise short-circuit straight out of `run_inner`
+    // and skip the shutdown entirely.
+    let body_result: anyhow::Result<()> = async move {
+        // Provider build via CredentialResolver. Wrapped in an `Arc` so the
+        // same resolver instance can also be handed to `CliAgentDispatcher`
+        // below without a second construction; existing call sites that need
+        // `&dyn CredentialResolver` now go through `resolver.as_ref()`.
+        let resolver = Arc::new(rupu_auth::KeychainResolver::new());
 
-    // The --prompt flag takes precedence over the positional `prompt` argument.
-    // This avoids the positional prompt being mis-parsed as a RunTarget when
-    // the caller passes a prompt but no target (e.g. `rupu run agent "github:org/repo ..."`
-    // would bind the string to `target` and attempt to parse it as a repo ref).
-    let effective_prompt = args.prompt_flag.clone().or_else(|| args.prompt.clone());
+        // Build the SCM/issue registry from the same resolver + config the
+        // LLM provider factory uses. Cheap when no platforms are configured;
+        // missing credentials are skipped with INFO logs.
+        let scm_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
 
-    // Disambiguate: if `args.target` parses as a RunTarget, it's a target.
-    // Otherwise treat it (plus the remainder) as part of the user prompt.
-    let (run_target, user_message) = match args.target.as_deref() {
-        None => (None, effective_prompt.unwrap_or_else(|| "go".into())),
-        Some(s) => match crate::run_target::parse_run_target(s) {
-            Ok(t) => (Some(t), effective_prompt.unwrap_or_else(|| "go".into())),
-            Err(_) => {
-                // Not a target → it's the leading word(s) of the prompt.
-                let combined = match effective_prompt.as_deref() {
-                    Some(p) => format!("{s} {p}"),
-                    None => s.to_string(),
+        let provider_name = provider_factory::resolve_provider_name(
+            spec.provider.as_deref(),
+            cfg.default_provider.as_deref(),
+        );
+        let oai_params = provider_factory::openai_compatible_params(&provider_name, &cfg.providers);
+        if !provider_factory::is_builtin_provider(&provider_name) && oai_params.is_none() {
+            anyhow::bail!(
+                "provider '{provider_name}' is not a built-in provider and is not declared as \
+             [providers.{provider_name}] with kind = \"openai-compatible\" in config.toml"
+            );
+        }
+        // For an openai-compatible provider, prefer its configured default_model
+        // when the agent/spec didn't pin one.
+        let model = provider_factory::resolve_model(
+            spec.model.as_deref(),
+            cfg.default_model.as_deref(),
+            oai_params.as_ref().map(|p| p.default_model.as_str()),
+        );
+        let auth_hint = spec.auth;
+        let provider_config = provider_factory::ProviderConfig {
+            anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
+            openai_compatible: oai_params,
+            tuning: Some(provider_factory::provider_tuning(
+                &provider_name,
+                &cfg.providers,
+            )),
+        };
+        let (_resolved_auth, provider) = provider_factory::build_for_provider_with_config(
+            &provider_name,
+            &model,
+            auth_hint,
+            resolver.as_ref(),
+            &provider_config,
+        )
+        .await?;
+
+        // Print the agent header via the line-stream printer.
+        // `run_id`/`transcript_path` were resolved earlier (see the netflow
+        // comment above) so they're already in scope here.
+        let agent_header_name = spec.name.clone();
+        let agent_header_provider = provider_name.clone();
+        let agent_header_model = model.clone();
+
+        // Construct ONE LineStreamPrinter for the whole run. Keeping a
+        // single instance means a single MultiProgress + ticker — earlier
+        // we built one for the header and another for the tail loop, and
+        // their indicatif draw targets stomped on each other (visible as
+        // two stale spinner rows under heavy tool-call traffic).
+        let mut printer = crate::output::LineStreamPrinter::new();
+        printer.agent_header(
+            &agent_header_name,
+            &agent_header_provider,
+            &agent_header_model,
+            &run_id,
+        );
+
+        // Tool context config (the path is filled in after target resolution below).
+        let bash_timeout = cfg.bash.timeout_secs.unwrap_or(120);
+        let bash_allowlist = cfg.bash.env_allowlist.clone().unwrap_or_default();
+
+        // The --prompt flag takes precedence over the positional `prompt` argument.
+        // This avoids the positional prompt being mis-parsed as a RunTarget when
+        // the caller passes a prompt but no target (e.g. `rupu run agent "github:org/repo ..."`
+        // would bind the string to `target` and attempt to parse it as a repo ref).
+        let effective_prompt = args.prompt_flag.clone().or_else(|| args.prompt.clone());
+
+        // Disambiguate: if `args.target` parses as a RunTarget, it's a target.
+        // Otherwise treat it (plus the remainder) as part of the user prompt.
+        let (run_target, user_message) = match args.target.as_deref() {
+            None => (None, effective_prompt.unwrap_or_else(|| "go".into())),
+            Some(s) => match crate::run_target::parse_run_target(s) {
+                Ok(t) => (Some(t), effective_prompt.unwrap_or_else(|| "go".into())),
+                Err(_) => {
+                    // Not a target → it's the leading word(s) of the prompt.
+                    let combined = match effective_prompt.as_deref() {
+                        Some(p) => format!("{s} {p}"),
+                        None => s.to_string(),
+                    };
+                    (None, combined)
+                }
+            },
+        };
+
+        // Preload `## Run target` into the agent system prompt when a target is set.
+        let agent_system_prompt = match run_target.as_ref() {
+            Some(t) => format!(
+                "{}\n\n## Run target\n\n{}",
+                spec.system_prompt,
+                crate::run_target::format_run_target_for_prompt(t),
+            ),
+            None => spec.system_prompt.clone(),
+        };
+
+        // Clone the target repo for Repo/Pr targets. Three destination
+        // modes, in priority order:
+        //   1. `--tmp`           → tempfile::TempDir, auto-deleted on exit
+        //   2. `--into <path>`   → that path, persistent. Refuse if it exists.
+        //   3. (no flag)         → `./<repo>/` in cwd, persistent. Refuse if it exists.
+        //
+        // Refuse-by-default on existing paths to protect uncommitted work
+        // and prevent surprising clobbers. The error message points at the
+        // available escape hatches.
+        //
+        // _clone_guard holds the TempDir handle in mode 1 so Drop runs on
+        // function exit, keeping the directory alive for the run. Modes 2
+        // and 3 set it to None — the user owns cleanup.
+        let _clone_guard: Option<tempfile::TempDir>;
+        let workspace_path: std::path::PathBuf = match run_target.as_ref() {
+            Some(crate::run_target::RunTarget::Repo {
+                platform,
+                owner,
+                repo,
+                ..
+            })
+            | Some(crate::run_target::RunTarget::Pr {
+                platform,
+                owner,
+                repo,
+                ..
+            }) => {
+                let r = rupu_scm::RepoRef {
+                    platform: *platform,
+                    owner: owner.clone(),
+                    repo: repo.clone(),
                 };
-                (None, combined)
+                let conn = scm_registry.repo(*platform).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no {} credential — run `rupu auth login --provider {}`",
+                        platform,
+                        platform
+                    )
+                })?;
+
+                let (dest, guard) = resolve_clone_dest(&pwd, repo, args.into.as_deref(), args.tmp)?;
+                // Brief progress line on stderr so the user knows where the
+                // clone is landing — the LineStreamPrinter rail has already
+                // printed `▶ <agent>` on stdout and we don't want to break
+                // its visual flow with a clone-progress line in the middle.
+                eprintln!("  cloning {}/{} → {}", owner, repo, dest.display());
+                conn.clone_to(&r, &dest).await?;
+                _clone_guard = guard;
+                dest
             }
-        },
-    };
-
-    // Preload `## Run target` into the agent system prompt when a target is set.
-    let agent_system_prompt = match run_target.as_ref() {
-        Some(t) => format!(
-            "{}\n\n## Run target\n\n{}",
-            spec.system_prompt,
-            crate::run_target::format_run_target_for_prompt(t),
-        ),
-        None => spec.system_prompt.clone(),
-    };
-
-    // Clone the target repo for Repo/Pr targets. Three destination
-    // modes, in priority order:
-    //   1. `--tmp`           → tempfile::TempDir, auto-deleted on exit
-    //   2. `--into <path>`   → that path, persistent. Refuse if it exists.
-    //   3. (no flag)         → `./<repo>/` in cwd, persistent. Refuse if it exists.
-    //
-    // Refuse-by-default on existing paths to protect uncommitted work
-    // and prevent surprising clobbers. The error message points at the
-    // available escape hatches.
-    //
-    // _clone_guard holds the TempDir handle in mode 1 so Drop runs on
-    // function exit, keeping the directory alive for the run. Modes 2
-    // and 3 set it to None — the user owns cleanup.
-    let _clone_guard: Option<tempfile::TempDir>;
-    let workspace_path: std::path::PathBuf = match run_target.as_ref() {
-        Some(crate::run_target::RunTarget::Repo {
-            platform,
-            owner,
-            repo,
-            ..
-        })
-        | Some(crate::run_target::RunTarget::Pr {
-            platform,
-            owner,
-            repo,
-            ..
-        }) => {
-            let r = rupu_scm::RepoRef {
-                platform: *platform,
-                owner: owner.clone(),
-                repo: repo.clone(),
-            };
-            let conn = scm_registry.repo(*platform).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no {} credential — run `rupu auth login --provider {}`",
-                    platform,
-                    platform
-                )
-            })?;
-
-            let (dest, guard) = resolve_clone_dest(&pwd, repo, args.into.as_deref(), args.tmp)?;
-            // Brief progress line on stderr so the user knows where the
-            // clone is landing — the LineStreamPrinter rail has already
-            // printed `▶ <agent>` on stdout and we don't want to break
-            // its visual flow with a clone-progress line in the middle.
-            eprintln!("  cloning {}/{} → {}", owner, repo, dest.display());
-            conn.clone_to(&r, &dest).await?;
-            _clone_guard = guard;
-            dest
-        }
-        _ => {
-            _clone_guard = None;
-            pwd.clone()
-        }
-    };
-
-    let mode_str = match mode {
-        PermissionMode::Ask => "ask",
-        PermissionMode::Bypass => "bypass",
-        PermissionMode::Readonly => "readonly",
-    };
-
-    // Run-store, hoisted above the tool context so it can back both the
-    // dispatcher (below) and the run.json write further down — a single
-    // `RunStore` instance for the whole `run_inner` call, never two.
-    let runs_root = global.join("runs");
-    let run_store = Arc::new(rupu_orchestrator::RunStore::new(runs_root.clone()));
-
-    // Build tool context now that the resolved workspace_path is known.
-    // Sub-agent dispatch is now wired for bare `rupu run` too, mirroring
-    // `rupu workflow run`: `parent_run_id` is this run's id, so any
-    // `dispatch_agent`/`dispatch_agents_parallel` tool call anchors its
-    // child sub-run(s) under `<run>/sub/`. No event sink is threaded
-    // through — bare `rupu run` uses the `LineStreamPrinter`, which
-    // renders dispatch children post-hoc from the parent transcript's
-    // tool_call/tool_result entries rather than tailing `events.jsonl`.
-    let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
-        global.clone(),
-        project_root.clone(),
-        ws.id.clone(),
-        workspace_path.clone(),
-        Arc::clone(&resolver),
-        mode_str.to_string(),
-        Arc::clone(&scm_registry),
-        Arc::clone(&run_store),
-        None,
-        cfg.default_provider.clone(),
-        cfg.default_model.clone(),
-        provider_factory::openai_compatible_map(&cfg.providers),
-        provider_factory::provider_tuning_map(&cfg.providers),
-    );
-    let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
-
-    let tool_context = ToolContext {
-        workspace_path: workspace_path.clone(),
-        bash_env_allowlist: bash_allowlist,
-        bash_timeout_secs: bash_timeout,
-        dispatcher: Some(dispatcher_dyn),
-        dispatchable_agents: spec.dispatchable_agents.clone(),
-        parent_run_id: Some(run_id.clone()),
-        depth: 0,
-        coverage_writer: None,
-        surface_tag: None,
-        run_id: None,
-        model: None,
-        tool_mappings: None,
-    };
-
-    let backend_id = "local_checkout".to_string();
-    let repo_ref = standalone_repo_ref(run_target.as_ref(), &workspace_path);
-    let issue_ref = standalone_issue_ref(run_target.as_ref());
-    let workspace_strategy =
-        standalone_workspace_strategy(run_target.as_ref(), &workspace_path, args.tmp);
-    let worker_ctx = crate::cmd::workflow::default_execution_worker_context(WorkerKind::Cli, None);
-    let worker_record = crate::cmd::workflow::upsert_worker_record(
-        &global,
-        &worker_ctx,
-        &backend_id,
-        mode_str,
-        repo_ref.as_deref(),
-    )?;
-    let metadata = StandaloneRunMetadata {
-        version: StandaloneRunMetadata::VERSION,
-        run_id: run_id.clone(),
-        session_id: None,
-        archived_at: None,
-        workspace_path: canonicalize_if_exists(&workspace_path),
-        project_root: project_root.clone(),
-        repo_ref,
-        issue_ref,
-        backend_id,
-        worker_id: Some(worker_record.worker_id.clone()),
-        trigger_source: "run_cli".into(),
-        target: if run_target.is_some() {
-            args.target.clone()
-        } else {
-            None
-        },
-        workspace_strategy,
-        // Captured here, before the agent loop starts — the liveness signal
-        // `rupu transcript archive|delete` checks (I4: an in-flight run must
-        // not be labelled done and deleted mid-write).
-        pid: Some(std::process::id()),
-    };
-    write_metadata(&metadata_path_for_run(&transcripts, &run_id), &metadata)?;
-
-    let decider: Arc<dyn PermissionDecider> = pick_decider(mode, Some(printer.multi_handle()));
-
-    let opts = AgentRunOpts {
-        agent_name: spec.name.clone(),
-        agent_system_prompt,
-        agent_tools: spec.tools.clone(),
-        provider,
-        provider_name,
-        model,
-        run_id: run_id.clone(),
-        workspace_id: ws.id.clone(),
-        workspace_path: workspace_path.clone(),
-        transcript_path: transcript_path.clone(),
-        max_turns: spec.max_turns.unwrap_or(50),
-        decider,
-        tool_context,
-        user_message,
-        initial_messages: Vec::new(),
-        turn_index_offset: 0,
-        mode_str: mode_str.to_string(),
-        no_stream: args.no_stream,
-        // Suppress the agent runner's inline stdout writes; the CLI's
-        // line-stream printer reads tokens from the JSONL transcript
-        // instead. This prevents duplicate output when the printer is
-        // active and ensures clean output when stdout is piped.
-        suppress_stream_stdout: true,
-        mcp_registry: Some(scm_registry),
-        effort: spec.effort,
-        context_window: spec.context_window,
-        output_format: spec.output_format,
-        output_schema: spec.output_schema.clone(),
-        anthropic_task_budget: spec.anthropic_task_budget,
-        anthropic_context_management: spec.anthropic_context_management,
-        anthropic_speed: spec.anthropic_speed,
-        // Top-level `rupu run` invocation — no parent, depth 0,
-        // dispatch surface taken from the agent's frontmatter.
-        parent_run_id: None,
-        depth: 0,
-        dispatchable_agents: spec.dispatchable_agents.clone(),
-        step_id: String::new(),
-        on_tool_call: None,
-        on_stream_event: None,
-        concerns: spec.concerns.clone(),
-        max_tokens: spec
-            .max_tokens
-            .unwrap_or(rupu_agent::runner::DEFAULT_MAX_TOKENS),
-        scope_name: None,
-        surface_tag: None,
-        context_window_tokens: spec.context_window_tokens,
-        compact_at_percent: spec.compact_at_percent,
-        pause: None,
-    };
-
-    // Spawn the agent in a background task and tail the transcript with
-    // the line-stream printer while it runs.
-    let transcript_path_for_printer = transcript_path.clone();
-    let run_id_for_printer = run_id.clone();
-    let spec_name_for_printer = spec.name.clone();
-
-    // Capture the run start time before spawning so run.json has an accurate
-    // started_at regardless of how long setup takes.
-    let started_at = chrono::Utc::now();
-
-    // Run the agent. The printer reads from the JSONL transcript file;
-    // since the agent is async and the printer is sync, we run the
-    // printer in a background thread that polls the transcript while
-    // the tokio task drives the agent.
-    let agent_task = tokio::spawn(rupu_agent::run_agent(opts));
-
-    // Tail the transcript in this thread, reusing the printer from
-    // the agent_header above so we don't construct a second
-    // MultiProgress that would double-render the bottom-row ticker.
-    {
-        printer.step_start(&spec_name_for_printer, None, None, None);
-        let mut tailer = crate::output::TranscriptTailer::new(&transcript_path_for_printer);
-        let mut total_tokens = 0u64;
-
-        loop {
-            let events = tailer.drain();
-            for ev in events {
-                match &ev {
-                    rupu_transcript::Event::AssistantMessage { content, .. }
-                        if !content.trim().is_empty() =>
-                    {
-                        render_assistant_output(&mut printer, content, prefs.live_view);
-                    }
-                    rupu_transcript::Event::ToolCall { tool, input, .. } => {
-                        let summary = crate::output::workflow_printer::tool_summary(tool, input);
-                        printer.tool_call(tool, &summary);
-                    }
-                    rupu_transcript::Event::RunComplete {
-                        status,
-                        total_tokens: tokens,
-                        duration_ms,
-                        error,
-                        ..
-                    } => {
-                        total_tokens = *tokens;
-                        let dur = std::time::Duration::from_millis(*duration_ms);
-                        match status {
-                            rupu_transcript::RunStatus::Ok => {
-                                printer.step_done(&run_id_for_printer, dur, *tokens);
-                            }
-                            _ => {
-                                let reason = error.as_deref().unwrap_or("unknown");
-                                printer.step_failed(&run_id_for_printer, reason);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                // Once we see RunComplete, we can stop tailing.
-                if matches!(ev, rupu_transcript::Event::RunComplete { .. }) {
-                    break;
-                }
+            _ => {
+                _clone_guard = None;
+                pwd.clone()
             }
-
-            // Check if the agent task has finished.
-            if agent_task.is_finished() {
-                // Drain any remaining events.
-                let tail_events = tailer.drain();
-                for ev in tail_events {
-                    if let rupu_transcript::Event::AssistantMessage { content, .. } = &ev {
-                        if !content.trim().is_empty() {
-                            render_assistant_output(&mut printer, content, prefs.live_view);
-                        }
-                    }
-                }
-                if total_tokens == 0 {
-                    // RunComplete wasn't seen yet; print a plain done.
-                    printer.step_done(&run_id_for_printer, std::time::Duration::ZERO, 0);
-                }
-                break;
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    }
-
-    // Await the agent task; flatten only the JoinError so run.json is written
-    // for both success and failure before propagating.
-    let run_result = agent_task
-        .await
-        .map_err(|e| anyhow::anyhow!("agent task panicked: {e}"))?;
-    let success = run_result.is_ok();
-
-    // Write run.json so the run is observable via RunStore and the mirror
-    // can carry final_output back to the central control-plane.
-    {
-        let store = &run_store;
-        let final_output = if success {
-            Some(rupu_orchestrator::read_final_assistant_text(
-                &transcript_path,
-                true,
-                &run_id,
-                "agent",
-            ))
-        } else {
-            None
         };
-        let finished_at = chrono::Utc::now();
-        // RunStatus is Copy so `status` remains usable after the struct literal.
-        let status = if success {
-            rupu_orchestrator::RunStatus::Completed
-        } else {
-            rupu_orchestrator::RunStatus::Failed
+
+        let mode_str = match mode {
+            PermissionMode::Ask => "ask",
+            PermissionMode::Bypass => "bypass",
+            PermissionMode::Readonly => "readonly",
         };
-        let error_message = run_result.as_ref().err().map(|e| e.to_string());
-        let rec = rupu_orchestrator::RunRecord {
-            id: run_id.clone(),
-            workflow_name: format!("agent:{}", spec.name),
-            status,
-            inputs: std::collections::BTreeMap::new(),
-            event: None,
+
+        // Run-store, hoisted above the tool context so it can back both the
+        // dispatcher (below) and the run.json write further down — a single
+        // `RunStore` instance for the whole `run_inner` call, never two.
+        let runs_root = global.join("runs");
+        let run_store = Arc::new(rupu_orchestrator::RunStore::new(runs_root.clone()));
+
+        // Build tool context now that the resolved workspace_path is known.
+        // Sub-agent dispatch is now wired for bare `rupu run` too, mirroring
+        // `rupu workflow run`: `parent_run_id` is this run's id, so any
+        // `dispatch_agent`/`dispatch_agents_parallel` tool call anchors its
+        // child sub-run(s) under `<run>/sub/`. No event sink is threaded
+        // through — bare `rupu run` uses the `LineStreamPrinter`, which
+        // renders dispatch children post-hoc from the parent transcript's
+        // tool_call/tool_result entries rather than tailing `events.jsonl`.
+        let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
+            global.clone(),
+            project_root.clone(),
+            ws.id.clone(),
+            workspace_path.clone(),
+            Arc::clone(&resolver),
+            mode_str.to_string(),
+            Arc::clone(&scm_registry),
+            Arc::clone(&run_store),
+            None,
+            cfg.default_provider.clone(),
+            cfg.default_model.clone(),
+            provider_factory::openai_compatible_map(&cfg.providers),
+            provider_factory::provider_tuning_map(&cfg.providers),
+        );
+        let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
+
+        let tool_context = ToolContext {
+            workspace_path: workspace_path.clone(),
+            bash_env_allowlist: bash_allowlist,
+            bash_timeout_secs: bash_timeout,
+            dispatcher: Some(dispatcher_dyn),
+            dispatchable_agents: spec.dispatchable_agents.clone(),
+            parent_run_id: Some(run_id.clone()),
+            depth: 0,
+            coverage_writer: None,
+            surface_tag: None,
+            run_id: None,
+            model: None,
+            tool_mappings: None,
+        };
+
+        let backend_id = "local_checkout".to_string();
+        let repo_ref = standalone_repo_ref(run_target.as_ref(), &workspace_path);
+        let issue_ref = standalone_issue_ref(run_target.as_ref());
+        let workspace_strategy =
+            standalone_workspace_strategy(run_target.as_ref(), &workspace_path, args.tmp);
+        let worker_ctx =
+            crate::cmd::workflow::default_execution_worker_context(WorkerKind::Cli, None);
+        let worker_record = crate::cmd::workflow::upsert_worker_record(
+            &global,
+            &worker_ctx,
+            &backend_id,
+            mode_str,
+            repo_ref.as_deref(),
+        )?;
+        let metadata = StandaloneRunMetadata {
+            version: StandaloneRunMetadata::VERSION,
+            run_id: run_id.clone(),
+            session_id: None,
+            archived_at: None,
+            workspace_path: canonicalize_if_exists(&workspace_path),
+            project_root: project_root.clone(),
+            repo_ref,
+            issue_ref,
+            backend_id,
+            worker_id: Some(worker_record.worker_id.clone()),
+            trigger_source: "run_cli".into(),
+            target: if run_target.is_some() {
+                args.target.clone()
+            } else {
+                None
+            },
+            workspace_strategy,
+            // Captured here, before the agent loop starts — the liveness signal
+            // `rupu transcript archive|delete` checks (I4: an in-flight run must
+            // not be labelled done and deleted mid-write).
+            pid: Some(std::process::id()),
+        };
+        write_metadata(&metadata_path_for_run(&transcripts, &run_id), &metadata)?;
+
+        let decider: Arc<dyn PermissionDecider> = pick_decider(mode, Some(printer.multi_handle()));
+
+        let opts = AgentRunOpts {
+            agent_name: spec.name.clone(),
+            agent_system_prompt,
+            agent_tools: spec.tools.clone(),
+            provider,
+            provider_name,
+            model,
+            run_id: run_id.clone(),
             workspace_id: ws.id.clone(),
             workspace_path: workspace_path.clone(),
-            transcript_dir: transcripts.clone(),
-            started_at,
-            finished_at: Some(finished_at),
-            final_output: final_output.clone(),
-            error_message: error_message.clone(),
-            awaiting: Vec::new(),
-            awaiting_step_id: None,
-            approval_prompt: None,
-            awaiting_since: None,
-            expires_at: None,
-            issue_ref: None,
-            issue: None,
+            transcript_path: transcript_path.clone(),
+            max_turns: spec.max_turns.unwrap_or(50),
+            decider,
+            tool_context,
+            user_message,
+            initial_messages: Vec::new(),
+            turn_index_offset: 0,
+            mode_str: mode_str.to_string(),
+            no_stream: args.no_stream,
+            // Suppress the agent runner's inline stdout writes; the CLI's
+            // line-stream printer reads tokens from the JSONL transcript
+            // instead. This prevents duplicate output when the printer is
+            // active and ensures clean output when stdout is piped.
+            suppress_stream_stdout: true,
+            mcp_registry: Some(scm_registry),
+            effort: spec.effort,
+            context_window: spec.context_window,
+            output_format: spec.output_format,
+            output_schema: spec.output_schema.clone(),
+            anthropic_task_budget: spec.anthropic_task_budget,
+            anthropic_context_management: spec.anthropic_context_management,
+            anthropic_speed: spec.anthropic_speed,
+            // Top-level `rupu run` invocation — no parent, depth 0,
+            // dispatch surface taken from the agent's frontmatter.
             parent_run_id: None,
-            // "local_checkout" is intentional for standalone agent runs;
-            // workflow runs use "local_worktree".
-            backend_id: Some(metadata.backend_id.clone()),
-            worker_id: Some(worker_record.worker_id.clone()),
-            artifact_manifest_path: None,
-            runner_pid: None,
-            source_wake_id: None,
-            active_step_id: None,
-            active_step_kind: None,
-            active_step_agent: None,
-            active_step_transcript_path: None,
-            resume_requested_at: None,
-            resume_claimed_at: None,
-            resume_claimed_by: None,
-            resume_mode: None,
-            resume_gate_id: None,
-            resume_approver: None,
-            reject_cleanup_pending: None,
-            // ISSUES.md I-24: `rupu run` has no on_reject cleanup path of
-            // its own, but recording the launch mode here keeps this
-            // record consistent with the workflow-run creation site.
-            permission_mode: Some(mode_str.to_string()),
-            loop_progress: Default::default(),
+            depth: 0,
+            dispatchable_agents: spec.dispatchable_agents.clone(),
+            step_id: String::new(),
+            on_tool_call: None,
+            on_stream_event: None,
+            concerns: spec.concerns.clone(),
+            max_tokens: spec
+                .max_tokens
+                .unwrap_or(rupu_agent::runner::DEFAULT_MAX_TOKENS),
+            scope_name: None,
+            surface_tag: None,
+            context_window_tokens: spec.context_window_tokens,
+            compact_at_percent: spec.compact_at_percent,
+            pause: None,
         };
-        match store.create(rec, "") {
-            Ok(_) => {}
-            Err(rupu_orchestrator::RunStoreError::AlreadyExists(_)) => {
-                // --run-id was pre-assigned and create already wrote the stub;
-                // update it in-place with the terminal status + final_output.
-                match store.load(&run_id) {
-                    Ok(mut loaded) => {
-                        loaded.status = status;
-                        loaded.finished_at = Some(finished_at);
-                        loaded.final_output = final_output;
-                        loaded.error_message = error_message;
-                        if let Err(e) = store.update(&loaded) {
-                            warn!(error = %e, "failed to update agent run.json");
+
+        // Spawn the agent in a background task and tail the transcript with
+        // the line-stream printer while it runs.
+        let transcript_path_for_printer = transcript_path.clone();
+        let run_id_for_printer = run_id.clone();
+        let spec_name_for_printer = spec.name.clone();
+
+        // Capture the run start time before spawning so run.json has an accurate
+        // started_at regardless of how long setup takes.
+        let started_at = chrono::Utc::now();
+
+        // Run the agent. The printer reads from the JSONL transcript file;
+        // since the agent is async and the printer is sync, we run the
+        // printer in a background thread that polls the transcript while
+        // the tokio task drives the agent.
+        let agent_task = tokio::spawn(rupu_agent::run_agent(opts));
+
+        // Tail the transcript in this thread, reusing the printer from
+        // the agent_header above so we don't construct a second
+        // MultiProgress that would double-render the bottom-row ticker.
+        {
+            printer.step_start(&spec_name_for_printer, None, None, None);
+            let mut tailer = crate::output::TranscriptTailer::new(&transcript_path_for_printer);
+            let mut total_tokens = 0u64;
+
+            loop {
+                let events = tailer.drain();
+                for ev in events {
+                    match &ev {
+                        rupu_transcript::Event::AssistantMessage { content, .. }
+                            if !content.trim().is_empty() =>
+                        {
+                            render_assistant_output(&mut printer, content, prefs.live_view);
+                        }
+                        rupu_transcript::Event::ToolCall { tool, input, .. } => {
+                            let summary =
+                                crate::output::workflow_printer::tool_summary(tool, input);
+                            printer.tool_call(tool, &summary);
+                        }
+                        rupu_transcript::Event::RunComplete {
+                            status,
+                            total_tokens: tokens,
+                            duration_ms,
+                            error,
+                            ..
+                        } => {
+                            total_tokens = *tokens;
+                            let dur = std::time::Duration::from_millis(*duration_ms);
+                            match status {
+                                rupu_transcript::RunStatus::Ok => {
+                                    printer.step_done(&run_id_for_printer, dur, *tokens);
+                                }
+                                _ => {
+                                    let reason = error.as_deref().unwrap_or("unknown");
+                                    printer.step_failed(&run_id_for_printer, reason);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    // Once we see RunComplete, we can stop tailing.
+                    if matches!(ev, rupu_transcript::Event::RunComplete { .. }) {
+                        break;
+                    }
+                }
+
+                // Check if the agent task has finished.
+                if agent_task.is_finished() {
+                    // Drain any remaining events.
+                    let tail_events = tailer.drain();
+                    for ev in tail_events {
+                        if let rupu_transcript::Event::AssistantMessage { content, .. } = &ev {
+                            if !content.trim().is_empty() {
+                                render_assistant_output(&mut printer, content, prefs.live_view);
+                            }
                         }
                     }
-                    Err(e) => warn!(error = %e, "failed to load agent run for update"),
+                    if total_tokens == 0 {
+                        // RunComplete wasn't seen yet; print a plain done.
+                        printer.step_done(&run_id_for_printer, std::time::Duration::ZERO, 0);
+                    }
+                    break;
                 }
+
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            Err(e) => warn!(error = %e, "failed to write agent run.json"),
         }
+
+        // Await the agent task; flatten only the JoinError so run.json is written
+        // for both success and failure before propagating.
+        let run_result = agent_task
+            .await
+            .map_err(|e| anyhow::anyhow!("agent task panicked: {e}"))?;
+        let success = run_result.is_ok();
+
+        // Write run.json so the run is observable via RunStore and the mirror
+        // can carry final_output back to the central control-plane.
+        {
+            let store = &run_store;
+            let final_output = if success {
+                Some(rupu_orchestrator::read_final_assistant_text(
+                    &transcript_path,
+                    true,
+                    &run_id,
+                    "agent",
+                ))
+            } else {
+                None
+            };
+            let finished_at = chrono::Utc::now();
+            // RunStatus is Copy so `status` remains usable after the struct literal.
+            let status = if success {
+                rupu_orchestrator::RunStatus::Completed
+            } else {
+                rupu_orchestrator::RunStatus::Failed
+            };
+            let error_message = run_result.as_ref().err().map(|e| e.to_string());
+            let rec = rupu_orchestrator::RunRecord {
+                id: run_id.clone(),
+                workflow_name: format!("agent:{}", spec.name),
+                status,
+                inputs: std::collections::BTreeMap::new(),
+                event: None,
+                workspace_id: ws.id.clone(),
+                workspace_path: workspace_path.clone(),
+                transcript_dir: transcripts.clone(),
+                started_at,
+                finished_at: Some(finished_at),
+                final_output: final_output.clone(),
+                error_message: error_message.clone(),
+                awaiting: Vec::new(),
+                awaiting_step_id: None,
+                approval_prompt: None,
+                awaiting_since: None,
+                expires_at: None,
+                issue_ref: None,
+                issue: None,
+                parent_run_id: None,
+                // "local_checkout" is intentional for standalone agent runs;
+                // workflow runs use "local_worktree".
+                backend_id: Some(metadata.backend_id.clone()),
+                worker_id: Some(worker_record.worker_id.clone()),
+                artifact_manifest_path: None,
+                runner_pid: None,
+                source_wake_id: None,
+                active_step_id: None,
+                active_step_kind: None,
+                active_step_agent: None,
+                active_step_transcript_path: None,
+                resume_requested_at: None,
+                resume_claimed_at: None,
+                resume_claimed_by: None,
+                resume_mode: None,
+                resume_gate_id: None,
+                resume_approver: None,
+                reject_cleanup_pending: None,
+                // ISSUES.md I-24: `rupu run` has no on_reject cleanup path of
+                // its own, but recording the launch mode here keeps this
+                // record consistent with the workflow-run creation site.
+                permission_mode: Some(mode_str.to_string()),
+                loop_progress: Default::default(),
+            };
+            match store.create(rec, "") {
+                Ok(_) => {}
+                Err(rupu_orchestrator::RunStoreError::AlreadyExists(_)) => {
+                    // --run-id was pre-assigned and create already wrote the stub;
+                    // update it in-place with the terminal status + final_output.
+                    match store.load(&run_id) {
+                        Ok(mut loaded) => {
+                            loaded.status = status;
+                            loaded.finished_at = Some(finished_at);
+                            loaded.final_output = final_output;
+                            loaded.error_message = error_message;
+                            if let Err(e) = store.update(&loaded) {
+                                warn!(error = %e, "failed to update agent run.json");
+                            }
+                        }
+                        Err(e) => warn!(error = %e, "failed to load agent run for update"),
+                    }
+                }
+                Err(e) => warn!(error = %e, "failed to write agent run.json"),
+            }
+        }
+
+        // Print a brief footer.
+        println!("transcript: {}", transcript_path.display());
+        // Propagate agent failure so the CLI exits non-zero on a failed run.
+        run_result?;
+        Ok(())
+    }
+    .await;
+
+    // Flush the ledger — including the `Dropped` accounting line if
+    // anything overflowed the channel — before the process exits, on
+    // BOTH the success and failure paths above. `shutdown()` is the only
+    // thing in this binary that guarantees the write lands before exit;
+    // the writer task's periodic ticker (see `writer.rs`) is a safety net
+    // for long-running daemons like `rupu cp serve`, not a substitute for
+    // this for a one-shot CLI process that may exit within milliseconds
+    // of the ticker's last check.
+    if let Some(handle) = netflow_handle {
+        handle.shutdown().await;
     }
 
-    // Print a brief footer.
-    println!("transcript: {}", transcript_path.display());
-    // Propagate agent failure so the CLI exits non-zero on a failed run.
-    run_result?;
-    Ok(())
+    body_result
+}
+
+/// Where the netflow ledger lives for this invocation: the project root
+/// when `rupu run` was invoked inside (or under) one, `pwd` otherwise.
+///
+/// Deliberately NOT the raw `pwd` unconditionally — `rupu run` is
+/// routinely invoked from a subdirectory of an initialised project (the
+/// same `<dir>/.rupu` marker `paths::project_root_for` already walks up
+/// to find), and anchoring the ledger to the exact invocation directory
+/// would fragment it into a disconnected `.rupu/netflow/` per subdirectory
+/// instead of the one canonical `<project_root>/.rupu/netflow/` — directly
+/// undermining the "persists across runs" property the ledger exists for.
+/// Mirrors the `<repo>/.rupu/agents/`, `<repo>/.rupu/workflows/`
+/// convention this project already relies on.
+fn netflow_root<'a>(project_root: Option<&'a Path>, pwd: &'a Path) -> &'a Path {
+    project_root.unwrap_or(pwd)
+}
+
+/// Build the process-wide netflow sink for this run: a ledger writer
+/// rooted at [`netflow_root`] plus a `TranscriptSink` streaming into this
+/// run's own transcript. Best-effort — a ledger that cannot be opened
+/// degrades to transcript-only capture, never a hard failure.
+///
+/// Split out from the `rupu_netflow::http::init` call site at the call
+/// site in [`run_inner`] so the root-selection logic is unit-testable on
+/// its own, without touching the process-wide `OnceLock` `init` installs
+/// into (that `OnceLock` is first-call-wins for the whole test binary, so
+/// exercising it from more than one test in the same process is unsafe).
+/// Returns the composed sink for `rupu_netflow::http::init`, plus the
+/// `NetflowWriterHandle` (when the ledger opened) so the caller can
+/// `shutdown()` it once the run is over — see the Fix 2 comment at the
+/// `run_inner` call site for why that matters. `None` here means the
+/// ledger was unavailable (best-effort degrade to transcript-only
+/// capture, never a hard failure); there's nothing to shut down.
+fn build_netflow_sink(
+    project_root: Option<&Path>,
+    pwd: &Path,
+    transcript_path: &Path,
+) -> (
+    Arc<dyn rupu_netflow::FlowSink>,
+    Option<rupu_netflow::NetflowWriterHandle>,
+) {
+    let netflow_paths = rupu_netflow::NetflowPaths::new(netflow_root(project_root, pwd));
+    let mut sinks: Vec<Arc<dyn rupu_netflow::FlowSink>> = vec![Arc::new(
+        rupu_transcript::TranscriptSink::new(transcript_path.to_path_buf()),
+    )];
+    let handle = match rupu_netflow::NetflowWriterHandle::spawn(netflow_paths) {
+        Ok(handle) => {
+            sinks.push(handle.writer.clone());
+            Some(handle)
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "netflow ledger unavailable for this run");
+            None
+        }
+    };
+    (Arc::new(rupu_netflow::FanoutSink::new(sinks)), handle)
 }
 
 fn render_assistant_output(
@@ -1452,6 +1563,95 @@ mod tests {
             list_result.is_ok(),
             "a missing (not malformed) config.toml must not fail the command: {list_result:?}"
         );
+    }
+
+    /// Finding 1 (Task 8 fix round 1): a nested `pwd` inside an
+    /// initialised project must NOT fragment the netflow ledger into a
+    /// disconnected `.rupu/netflow/` at the invocation directory — it
+    /// must land at the one canonical `<project_root>/.rupu/netflow/`.
+    #[test]
+    fn netflow_root_prefers_project_root_over_a_nested_pwd() {
+        let project_root = Path::new("/work/myproject");
+        let nested_pwd = Path::new("/work/myproject/src/deep/nested");
+        assert_eq!(netflow_root(Some(project_root), nested_pwd), project_root);
+    }
+
+    /// Outside any initialised project, `pwd` is all there is.
+    #[test]
+    fn netflow_root_falls_back_to_pwd_when_no_project_root() {
+        let pwd = Path::new("/tmp/scratch/somewhere");
+        assert_eq!(netflow_root(None, pwd), pwd);
+    }
+
+    /// `build_netflow_sink` composes a working `FanoutSink` — a flow
+    /// recorded through it lands in BOTH the ledger (rooted via
+    /// `netflow_root`) and the transcript. This exercises the exact
+    /// construction `run_inner` hands to `rupu_netflow::http::init`,
+    /// short of the `OnceLock` install itself (unsafe to touch from more
+    /// than one test in the same process — see `build_netflow_sink`'s
+    /// doc comment).
+    ///
+    /// Also exercises the Fix 2 half of `build_netflow_sink`'s contract:
+    /// it now hands back the `NetflowWriterHandle`, and `run_inner`
+    /// `shutdown()`s it once the run is over. Doing the same here gives a
+    /// synchronous flush point instead of the polling loop the pre-fix
+    /// version of this test needed (there was no handle to shut down).
+    #[tokio::test]
+    async fn build_netflow_sink_writes_to_the_project_rooted_ledger_and_the_transcript() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let nested_pwd = project_root.join("src/deep/nested");
+        std::fs::create_dir_all(&nested_pwd).unwrap();
+        let transcript_path = tmp.path().join("transcript.jsonl");
+        rupu_transcript::JsonlWriter::create(&transcript_path).unwrap();
+
+        let (sink, handle) = build_netflow_sink(Some(&project_root), &nested_pwd, &transcript_path);
+
+        let flow = rupu_netflow::FlowRecord {
+            id: rupu_netflow::FlowId::from_parts(1, 1),
+            ts: chrono::Utc::now(),
+            ctx: rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Update),
+            fidelity: rupu_netflow::Fidelity::Http,
+            method: "GET".into(),
+            scheme: "https".into(),
+            host: "example.test".into(),
+            port: 443,
+            path: "/".into(),
+            peer_ip: None,
+            resolved_ips: vec![],
+            http_version: None,
+            status: Some(200),
+            outcome: rupu_netflow::Outcome::Ok,
+            error: None,
+            bytes_out: None,
+            bytes_in: None,
+            body_complete: false,
+            ttfb_ms: None,
+            duration_ms: None,
+        };
+        sink.record(flow).await;
+
+        // Synchronous flush point (Fix 2) — no more polling needed.
+        handle
+            .expect("ledger must open under a fresh tempdir")
+            .shutdown()
+            .await;
+
+        let ledger_path = project_root.join(".rupu/netflow/flows.jsonl");
+        let text = std::fs::read_to_string(&ledger_path)
+            .unwrap_or_else(|e| panic!("netflow ledger at {ledger_path:?} was never written: {e}"));
+        assert!(!text.trim().is_empty());
+
+        // Ledger landed under the PROJECT root, not the nested pwd.
+        assert!(
+            !nested_pwd.join(".rupu/netflow/flows.jsonl").exists(),
+            "netflow must not fragment into the nested invocation directory"
+        );
+
+        // And the transcript got the same flow.
+        let transcript_text = std::fs::read_to_string(&transcript_path).unwrap();
+        assert!(transcript_text.contains(r#""type":"net_flow""#));
     }
 }
 

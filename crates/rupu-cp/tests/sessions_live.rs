@@ -4,6 +4,12 @@
 //! NOTE: rupu_transcript::Event is adjacently tagged (#[serde(tag = "type",
 //! content = "data", rename_all = "snake_case")]), so each JSONL line must
 //! wrap the payload in a "data" key.
+
+// Throwaway in-process mock-server client, not rupu's egress
+// (choke_point.rs's guard test already exempts everything under `/tests/`
+// on that basis).
+#![allow(clippy::disallowed_methods)]
+
 use futures_util::StreamExt as _;
 use std::time::Duration;
 use tokio::io::AsyncReadExt as _;

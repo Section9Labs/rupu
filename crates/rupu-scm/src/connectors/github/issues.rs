@@ -37,7 +37,7 @@ impl IssueConnector for GithubIssueConnector {
         let project_str = project.to_string();
         let pages = self
             .client
-            .with_retry(|| {
+            .with_retry_octocrab(|| {
                 let inner = inner.clone();
                 let owner = owner.clone();
                 let repo = repo.clone();
@@ -69,7 +69,7 @@ impl IssueConnector for GithubIssueConnector {
         let inner = self.client.inner.clone();
         let model = self
             .client
-            .with_retry(|| {
+            .with_retry_octocrab(|| {
                 let inner = inner.clone();
                 let owner = owner.clone();
                 let repo = repo.clone();
@@ -93,7 +93,7 @@ impl IssueConnector for GithubIssueConnector {
         let body = body.to_string();
         let model = self
             .client
-            .with_retry(|| {
+            .with_retry_octocrab(|| {
                 let inner = inner.clone();
                 let owner = owner.clone();
                 let repo = repo.clone();
@@ -122,7 +122,7 @@ impl IssueConnector for GithubIssueConnector {
         let project_str = project.to_string();
         let model = self
             .client
-            .with_retry(|| {
+            .with_retry_octocrab(|| {
                 let inner = inner.clone();
                 let owner = owner.clone();
                 let repo = repo.clone();
@@ -148,7 +148,7 @@ impl IssueConnector for GithubIssueConnector {
         let number = i.number;
         let inner = self.client.inner.clone();
         self.client
-            .with_retry(|| {
+            .with_retry_octocrab(|| {
                 let inner = inner.clone();
                 let owner = owner.clone();
                 let repo = repo.clone();

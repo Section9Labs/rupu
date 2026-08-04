@@ -137,12 +137,13 @@ pub struct AutoflowRunContext {
 const RUN_LOCATION_CACHE_TTL: Duration = Duration::from_secs(8);
 
 /// Bound on the host-probe fallback's per-host HTTP call. Deliberately much
-/// shorter than an explicit `?host=<id>` request (which keeps the default,
-/// effectively-unbounded `reqwest::Client` — a caller who names a host
-/// explicitly may accept a longer wait): this path fires at *every*
-/// registered host speculatively, so a single unreachable one must fail fast
-/// rather than stalling on the OS's TCP connect timeout (which can be
-/// minutes).
+/// shorter than an explicit `?host=<id>` request (which keeps
+/// [`HttpHostConnector::new`](crate::host::http::HttpHostConnector::new)'s
+/// fixed 5s-connect/30s-total bound, routed through
+/// `rupu_netflow::http::client_from` — a caller who names a host explicitly
+/// may accept that longer wait): this path fires at *every* registered host
+/// speculatively, so a single unreachable one must fail fast rather than
+/// making the page wait out that full 5s/30s bound.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Resolve where `run_id`'s artifacts live. See the module doc for the full

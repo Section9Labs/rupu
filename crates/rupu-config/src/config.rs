@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::autoflow_config::AutoflowConfig;
+use crate::netflow_config::NetflowConfig;
 use crate::pricing_config::PricingConfig;
 use crate::provider_config::ProviderConfig;
 use crate::scm_config::{IssuesSection, ScmSection};
@@ -64,6 +65,8 @@ pub struct Config {
     #[serde(default)]
     pub cp: crate::policy_config::CpConfig,
     #[serde(default)]
+    pub netflow: NetflowConfig,
+    #[serde(default)]
     pub update: crate::update_config::UpdateConfig,
     #[serde(default)]
     pub workflow: crate::policy_config::WorkflowConfig,
@@ -97,6 +100,9 @@ pub struct UiConfig {
     /// `workflow edit`/`create`. May include flags (e.g. `code --wait`,
     /// `vim -p`). Resolves between `--editor` (flag) and `$VISUAL`.
     pub editor: Option<String>,
+    /// `[ui.cp]` — Control Plane web UI preferences.
+    #[serde(default)]
+    pub cp: UiCpConfig,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -111,6 +117,16 @@ pub struct UiSyntaxConfig {
 pub struct UiPaletteConfig {
     /// Named rupu UI palette theme. Defaults to `rupu-dark`.
     pub theme: Option<String>,
+}
+
+/// `[ui.cp]` — Control Plane web UI preferences.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiCpConfig {
+    /// Web shell generation served by `rupu cp serve`: `"v1"` (default,
+    /// classic sidebar shell) or `"v2"` (Shell v2 redesign). Any other
+    /// value is treated as `"v1"` by the consumer.
+    pub shell: Option<String>,
 }
 
 /// Bash tool configuration.
@@ -303,5 +319,22 @@ mod tests {
         );
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("default_model"));
+    }
+
+    #[test]
+    fn ui_cp_shell_parses() {
+        let cfg: Config = toml::from_str("[ui.cp]\nshell = \"v2\"\n").unwrap();
+        assert_eq!(cfg.ui.cp.shell.as_deref(), Some("v2"));
+    }
+
+    #[test]
+    fn ui_cp_defaults_to_absent() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.ui.cp.shell, None);
+    }
+
+    #[test]
+    fn ui_cp_rejects_unknown_keys() {
+        assert!(toml::from_str::<Config>("[ui.cp]\nshel = \"v2\"\n").is_err());
     }
 }

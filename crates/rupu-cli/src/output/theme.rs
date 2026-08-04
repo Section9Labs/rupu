@@ -841,7 +841,13 @@ fn serialize_theme_file(theme: &ThemeSpec) -> String {
 
 async fn read_theme_source(source: &str) -> anyhow::Result<String> {
     if source.starts_with("http://") || source.starts_with("https://") {
-        let response = reqwest::get(source).await?;
+        // Not tied to any specific subsystem (provider/scm/mcp/webhook/
+        // update/cp) — a one-off fetch of a user-supplied theme URL, so
+        // `Origin::System` (same call shape as the ASN-table refresh in
+        // cmd/cp.rs).
+        let client =
+            rupu_netflow::http::client(rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System));
+        let response = client.get(source).send().await?;
         if !response.status().is_success() {
             anyhow::bail!("failed to fetch theme: HTTP {}", response.status());
         }

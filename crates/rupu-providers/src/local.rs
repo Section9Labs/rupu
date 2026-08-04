@@ -22,7 +22,7 @@ use crate::types::{
 pub struct LocalModelProvider {
     endpoint: String,
     model_name: String,
-    client: reqwest::Client,
+    client: reqwest_middleware::ClientWithMiddleware,
 }
 
 impl LocalModelProvider {
@@ -34,7 +34,12 @@ impl LocalModelProvider {
         Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             model_name: model_name.to_string(),
-            client: reqwest::Client::new(),
+            // No run context is available at construction — stamped
+            // `FlowCtx::system(Origin::Provider("local"))`. Plan 2 threads
+            // the real run id through once the provider factory is touched.
+            client: rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
+                rupu_netflow::Origin::Provider("local".into()),
+            )),
         }
     }
 

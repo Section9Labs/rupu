@@ -5,6 +5,11 @@
 //! report (offline, or `Unsupported`) must surface in `hosts[]` as
 //! `offline` / `unavailable` rather than contributing zeroed counts.
 
+// Throwaway in-process mock-server client, not rupu's egress
+// (choke_point.rs's guard test already exempts everything under `/tests/`
+// on that basis).
+#![allow(clippy::disallowed_methods)]
+
 // ---------------------------------------------------------------------------
 // Spawn helpers (mirrors tests/host_reads.rs; helpers are duplicated per file
 // — there is no shared `tests/common/` module in this crate).

@@ -7,6 +7,7 @@ use rupu_orchestrator::runs::RunStore;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -52,15 +53,56 @@ pub async fn handle(action: Action) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+
+            // Install the process-wide netflow sink BEFORE anything below
+            // can construct a `HostConnector` (Fix 3, Task 10 review
+            // round 2): `rupu_netflow::http::client_from` resolves
+            // `rupu_netflow::http::sink()` at CLIENT construction time,
+            // and rupu-cp's `HostRegistry` (built inside `rupu_cp::serve`
+            // further down, plus caches connectors) never rebuilds its
+            // connectors afterward. Installing the sink any later than
+            // this line would leave `HttpHostConnector`'s fleet egress —
+            // and the ASN refresh's own `Origin::System` traffic just
+            // below — permanently wired to the default `NullSink` for the
+            // life of the daemon, exactly like `rupu run` would be if its
+            // own `init` call moved after `build_for_provider_with_config`
+            // (see that call site's comment).
+            //
+            // Ledger-only: a daemon has no run transcript to stream into.
+            // Rooted at the global `$RUPU_HOME/netflow/` — `cp serve` has
+            // no single project it's serving (it's the fleet-wide control
+            // plane), so there is no sensible project root to anchor a
+            // `NetflowPaths::new(...)`-style project-relative ledger at.
+            // `NetflowPaths` isn't used here for that reason: it always
+            // appends `.rupu/netflow/`, which would double up `.rupu`
+            // since `global_dir` already IS `~/.rupu` (or `$RUPU_HOME`).
+            let netflow_paths = rupu_netflow::NetflowPaths {
+                root: global_dir.join("netflow"),
+                flows: global_dir.join("netflow").join("flows.jsonl"),
+            };
+            let netflow_handle = match rupu_netflow::NetflowWriterHandle::spawn(netflow_paths) {
+                Ok(handle) => {
+                    rupu_netflow::http::init(handle.writer.clone());
+                    Some(handle)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "netflow ledger unavailable for cp serve; egress capture degrades to nothing recorded");
+                    None
+                }
+            };
+
             // `[cp]` runtime settings gate the two background-tick loops
             // below (autoflow reconcile / cron tick). A missing/malformed
             // config file just falls back to `CpConfig::default()` — both
             // loops enabled, 60s cadence — same as an absent `[cp]` section.
-            let cp_runtime_cfg = {
+            // `[netflow]` rides along in the same load: the gate-sweep tick
+            // (below) also drives the automatic ASN-table refresh, so it
+            // needs `NetflowConfig` alongside `CpConfig`.
+            let (cp_runtime_cfg, netflow_cfg) = {
                 let global_cfg_path = global_dir.join("config.toml");
-                rupu_config::layer_files_locked(Some(&global_cfg_path), None)
-                    .unwrap_or_default()
-                    .cp
+                let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), None)
+                    .unwrap_or_default();
+                (cfg.cp, cfg.netflow)
             };
             // Spawn the background resume worker. It builds the SAME
             // RunStore the CP's AppState does (`<global_dir>/runs`), so it
@@ -152,17 +194,38 @@ pub async fn handle(action: Action) -> ExitCode {
             // AwaitingApproval runs, runs the `on_reject` cleanup chain for
             // web-initiated timeout-rejects, and reaps orphaned local runs
             // whose runner process died — so a timed-out gate or a dead
-            // runner never wedges Live Events. Gated by
-            // `[cp].gate_sweep_enabled` (default: on); cadence from
-            // `[cp].gate_sweep_interval_secs` (default: 60s).
+            // runner never wedges Live Events. The gate-sweep BODY (not the
+            // loop itself, see below) is gated by `[cp].gate_sweep_enabled`
+            // (default: on); cadence from `[cp].gate_sweep_interval_secs`
+            // (default: 60s).
+            //
+            // The same tick also drives the netflow ASN-table refresh
+            // (netflow Plan 2, Task 9): rather than a dedicated timer, it
+            // piggybacks on this already-running loop and checks
+            // `should_refresh_asn` — cheap (an `fs::metadata` call) on every
+            // tick, with the actual download spawned off, never inline,
+            // only on the rare tick where the table is missing or older
+            // than `[netflow].asn_refresh_interval_days`. The operator must
+            // never have to run a command for enrichment to work.
+            //
+            // The loop's own `enabled` flag (below) is therefore
+            // `sweep_loop_enabled(cp, netflow)` (`gate_sweep_enabled ||
+            // asn_auto_refresh`), NOT `gate_sweep_enabled` alone: collapsing
+            // the two into one boolean would mean an operator who disables
+            // gate-timeout enforcement but leaves ASN auto-refresh on (the
+            // default for both) gets zero refresh ticks. `gate_sweep_enabled`
+            // still independently guards whether `run_gate_sweep` itself
+            // runs each tick; `should_refresh_asn` remains the sole
+            // authority over whether the ASN refresh fires.
             let gate_sweep_store = Arc::clone(&store);
             let gate_sweep_hosts = rupu_workspace::HostStore {
                 root: global_dir.join("hosts"),
             };
             let gate_sweep_exe = exe.clone();
+            let gate_sweep_enabled = cp_runtime_cfg.gate_sweep_enabled;
             let gate_sweep_handle = tokio::spawn(run_periodic_tick(
                 "gate-sweep",
-                cp_runtime_cfg.gate_sweep_enabled,
+                sweep_loop_enabled(&cp_runtime_cfg, &netflow_cfg),
                 Duration::from_secs(cp_runtime_cfg.gate_sweep_interval_secs.max(1)),
                 shutdown_tx.subscribe(),
                 move || {
@@ -172,8 +235,70 @@ pub async fn handle(action: Action) -> ExitCode {
                     };
                     let exe = gate_sweep_exe.clone();
                     let worker_id = gate_sweep_worker_id.clone();
+                    let netflow_cfg = netflow_cfg.clone();
                     async move {
-                        run_gate_sweep(store, hosts, exe, worker_id).await;
+                        if gate_sweep_enabled {
+                            run_gate_sweep(store, hosts, exe, worker_id).await;
+                        }
+
+                        // ASN freshness. Best-effort and never blocking: a
+                        // failed refresh leaves the existing table
+                        // untouched and enrichment degrades to "not
+                        // loaded" rather than to wrong answers.
+                        //
+                        // Single-flight guarded: `should_refresh_asn` only
+                        // looks at on-disk mtime, so a download that stalls
+                        // forever (no server-side close, dead connection
+                        // that never times out at the TCP layer) would
+                        // otherwise still look "stale" next tick and spawn
+                        // a second, overlapping refresh. `AsnTable::write`
+                        // uses a FIXED `<path>.db.tmp` intermediate file,
+                        // not a per-call unique name, so two concurrent
+                        // refreshes would race writing that same file — a
+                        // data race, not just wasted bandwidth.
+                        // `try_claim_asn_refresh` makes at most one refresh
+                        // in flight at a time; the guard is released on
+                        // BOTH the `Ok` and `Err` arms so a failed refresh
+                        // can never wedge it shut.
+                        //
+                        // A bounded total timeout closes the other half of
+                        // that same hazard: without ONE, a genuinely stuck
+                        // download (not a race, just a slow/dead peer)
+                        // holds `ASN_REFRESH_IN_FLIGHT` forever, and the
+                        // guard above then silently ends auto-refresh for
+                        // the rest of the daemon's life — every future tick
+                        // sees the guard held and skips. Generous because
+                        // this is a multi-megabyte download, not a normal
+                        // API call: minutes, not the usual per-request
+                        // seconds-scale timeout.
+                        const ASN_REFRESH_TIMEOUT: std::time::Duration =
+                            std::time::Duration::from_secs(300);
+                        if let Some(db) = rupu_netflow::asn::asn_db_path() {
+                            if should_refresh_asn(&netflow_cfg, &db)
+                                && try_claim_asn_refresh(&ASN_REFRESH_IN_FLIGHT)
+                            {
+                                let url = netflow_cfg.asn_source_url.clone();
+                                tokio::spawn(async move {
+                                    let ctx =
+                                        rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System);
+                                    let client = rupu_netflow::http::client_from(
+                                        ctx.clone(),
+                                        reqwest::Client::builder().timeout(ASN_REFRESH_TIMEOUT),
+                                    )
+                                    .unwrap_or_else(|_| rupu_netflow::http::client(ctx));
+                                    match rupu_netflow::asn::refresh(&url, &db, &client).await {
+                                        Ok(()) => {
+                                            tracing::info!(path = ?db, "netflow ASN table refreshed")
+                                        }
+                                        Err(e) => tracing::warn!(
+                                            error = %e,
+                                            "netflow ASN refresh failed; keeping existing table"
+                                        ),
+                                    }
+                                    ASN_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+                                });
+                            }
+                        }
                     }
                 },
             ));
@@ -310,6 +435,15 @@ pub async fn handle(action: Action) -> ExitCode {
             let _ = gate_sweep_handle.await;
             let _ = inventory_handle.await;
             let _ = scm_inventory_handle.await;
+            // Best-effort final flush on a clean shutdown. Not load-bearing
+            // for loss VISIBILITY — the writer task's own periodic ticker
+            // (`DROPPED_VISIBILITY_INTERVAL`) already surfaces drops while
+            // the daemon runs, unprompted — this just lets an orderly
+            // `Ctrl-C` land the last few records promptly instead of
+            // whenever the process actually terminates.
+            if let Some(handle) = netflow_handle {
+                handle.shutdown().await;
+            }
 
             serve_result
         }
@@ -1119,14 +1253,67 @@ async fn run_gate_sweep(
     }
 }
 
+/// Whether the ASN table should be refreshed right now.
+///
+/// Pure so the policy is testable without a network or a timer: `false`
+/// when auto-refresh is off in config, otherwise delegates staleness to
+/// `rupu_netflow::asn::is_stale` (missing / unreadable / stale mtime / a
+/// zero-day interval all count as stale).
+pub(crate) fn should_refresh_asn(cfg: &rupu_config::NetflowConfig, path: &std::path::Path) -> bool {
+    cfg.asn_auto_refresh && rupu_netflow::asn::is_stale(path, cfg.asn_refresh_interval_days)
+}
+
+/// Whether the shared gate-sweep/ASN-refresh background loop should run at
+/// all in this process.
+///
+/// Deliberately NOT `cp.gate_sweep_enabled` alone: the loop drives two
+/// independent things (gate-timeout enforcement and ASN auto-refresh), and
+/// an operator who disables the former while leaving the latter on — the
+/// default for both — must still get refresh ticks. `cp.gate_sweep_enabled`
+/// separately gates whether `run_gate_sweep` itself executes inside the
+/// tick body; `should_refresh_asn` remains the sole authority over whether
+/// an ASN refresh actually fires on a given tick.
+pub(crate) fn sweep_loop_enabled(
+    cp: &rupu_config::CpConfig,
+    netflow: &rupu_config::NetflowConfig,
+) -> bool {
+    cp.gate_sweep_enabled || netflow.asn_auto_refresh
+}
+
+/// Process-wide single-flight guard for the ASN refresh spawned from the
+/// gate-sweep tick. `should_refresh_asn` only observes on-disk mtime, so a
+/// download that stalls past one tick interval (the netflow HTTP client
+/// sets no request timeout) would otherwise look stale again on the next
+/// tick and get refreshed a second time concurrently. `AsnTable::write`'s
+/// intermediate file is a FIXED `<path>.db.tmp`, not a per-call unique
+/// name, so two concurrent refreshes racing to write it is a genuine data
+/// race, not merely wasted bandwidth.
+static ASN_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Attempts to claim a single-flight guard so at most one ASN refresh is
+/// ever in flight at a time. Returns `true` if this call claimed it (the
+/// caller may proceed and MUST clear the guard — via
+/// `guard.store(false, Ordering::Release)` — when the refresh finishes, on
+/// BOTH the success and failure path; clearing only on success would let a
+/// failed refresh wedge the guard shut forever). Returns `false` if a
+/// refresh is already in flight.
+///
+/// Generic over the guard so it is unit-testable against a fresh local
+/// `AtomicBool`, without touching the process-wide [`ASN_REFRESH_IN_FLIGHT`].
+pub(crate) fn try_claim_asn_refresh(guard: &AtomicBool) -> bool {
+    guard
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        build_resume_argv, resume_one_run, run_gate_sweep, run_periodic_tick, sweep_decision,
-        SweepAction,
+        build_resume_argv, resume_one_run, run_gate_sweep, run_periodic_tick, should_refresh_asn,
+        sweep_decision, sweep_loop_enabled, try_claim_asn_refresh, SweepAction,
     };
     use rupu_orchestrator::{RunStatus, TimeoutAction};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -2129,7 +2316,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let client = reqwest::Client::new();
+        let client =
+            rupu_netflow::http::client(rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Cp));
         let resp = client
             .post(format!("http://{addr}/api/runs/{}/reject", rec.id))
             .json(&serde_json::json!({ "reason": "not today" }))
@@ -2326,5 +2514,97 @@ mod tests {
             gate_rows_after_second, 1,
             "a second sweep tick must not reprocess an already-cleared marker"
         );
+    }
+
+    // ── Task 9: automatic ASN table refresh on the sweep tick ──
+
+    #[test]
+    fn asn_refresh_is_skipped_when_auto_refresh_is_off() {
+        let cfg = rupu_config::NetflowConfig {
+            asn_auto_refresh: false,
+            ..Default::default()
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(!should_refresh_asn(&cfg, &tmp.path().join("asn.db")));
+    }
+
+    #[test]
+    fn asn_refresh_is_requested_when_the_table_is_missing() {
+        let cfg = rupu_config::NetflowConfig::default();
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(should_refresh_asn(&cfg, &tmp.path().join("asn.db")));
+    }
+
+    #[test]
+    fn asn_refresh_is_skipped_for_a_fresh_table() {
+        let cfg = rupu_config::NetflowConfig::default();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("asn.db");
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(!should_refresh_asn(&cfg, &path));
+    }
+
+    // ── Fix round 1, Finding 1: single-flight guard against overlapping
+    // downloads racing on AsnTable::write's fixed temp filename ──
+
+    #[test]
+    fn asn_refresh_single_flight_guard_admits_only_one_claimant_until_released() {
+        // A fresh, local guard — never touches the process-wide static —
+        // so this test has no interference with any other test in the
+        // binary regardless of parallel test execution.
+        let guard = AtomicBool::new(false);
+        assert!(
+            try_claim_asn_refresh(&guard),
+            "first claim while unclaimed must succeed"
+        );
+        assert!(
+            !try_claim_asn_refresh(&guard),
+            "a second claim while one refresh is in flight must fail — this is exactly \
+             the race that would otherwise let two overlapping downloads corrupt \
+             AsnTable::write's shared <path>.db.tmp"
+        );
+
+        // Release on the FAILURE path must also free the guard — the
+        // production spawn releases on both Ok and Err arms so a failed
+        // refresh can never wedge future refreshes shut.
+        guard.store(false, Ordering::Release);
+        assert!(
+            try_claim_asn_refresh(&guard),
+            "claiming must succeed again once released"
+        );
+    }
+
+    // ── Fix round 1, Finding 2: gate_sweep_enabled must not silently gate
+    // the ASN refresh check ──
+
+    #[test]
+    fn sweep_loop_stays_enabled_for_asn_refresh_when_gate_sweep_is_disabled() {
+        let cp_cfg = rupu_config::CpConfig {
+            gate_sweep_enabled: false,
+            ..Default::default()
+        };
+        let netflow_cfg = rupu_config::NetflowConfig {
+            asn_auto_refresh: true,
+            ..Default::default()
+        };
+        assert!(
+            sweep_loop_enabled(&cp_cfg, &netflow_cfg),
+            "an operator who disables gate-timeout enforcement but leaves ASN \
+             auto-refresh on (the default for both) must still reach the ASN \
+             refresh check every tick"
+        );
+    }
+
+    #[test]
+    fn sweep_loop_disables_when_both_gate_sweep_and_asn_auto_refresh_are_off() {
+        let cp_cfg = rupu_config::CpConfig {
+            gate_sweep_enabled: false,
+            ..Default::default()
+        };
+        let netflow_cfg = rupu_config::NetflowConfig {
+            asn_auto_refresh: false,
+            ..Default::default()
+        };
+        assert!(!sweep_loop_enabled(&cp_cfg, &netflow_cfg));
     }
 }

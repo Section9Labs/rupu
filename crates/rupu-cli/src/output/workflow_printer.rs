@@ -1712,6 +1712,9 @@ fn workflow_transcript_event_lines(
                 kind: WorkflowViewLineKind::Event,
             }]
         }
+        // No dedicated workflow-view row for netflow yet — it streams
+        // into the JSONL for offline inspection, not this pretty view.
+        TxEvent::NetFlow { .. } => Vec::new(),
     }
 }
 

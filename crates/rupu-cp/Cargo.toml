@@ -27,6 +27,8 @@ tokio-stream = { workspace = true }
 object_store = { workspace = true }
 url = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream"] }
+reqwest-middleware.workspace = true
+rupu-netflow = { workspace = true, features = ["http"] }
 ulid.workspace = true
 rust-embed.workspace = true
 mime_guess.workspace = true
@@ -49,6 +51,7 @@ rupu-mcp = { path = "../rupu-mcp" }
 [dev-dependencies]
 chrono.workspace = true
 tempfile.workspace = true
+serial_test.workspace = true
 git2.workspace = true
 rupu-config = { path = "../rupu-config" }
 rupu-transcript = { path = "../rupu-transcript" }

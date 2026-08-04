@@ -20,6 +20,8 @@ tokio.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 reqwest.workspace = true
+reqwest-middleware.workspace = true
+rupu-netflow = { workspace = true, features = ["http"] }
 url.workspace = true
 octocrab.workspace = true
 http.workspace = true

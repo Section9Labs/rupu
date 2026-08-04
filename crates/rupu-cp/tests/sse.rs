@@ -2,6 +2,11 @@
 //! - `GET /api/runs/:id/log`
 //! - `GET /api/events/stream`
 
+// Throwaway in-process mock-server client, not rupu's egress
+// (choke_point.rs's guard test already exempts everything under `/tests/`
+// on that basis).
+#![allow(clippy::disallowed_methods)]
+
 use chrono::Utc;
 use reqwest::StatusCode;
 use rupu_orchestrator::{

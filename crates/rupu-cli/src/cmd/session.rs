@@ -2524,6 +2524,12 @@ impl SessionInteractiveState {
                     error: error.clone(),
                 });
             }
+            // Netflow capture streams into the transcript for offline
+            // inspection (`rupu transcript show`), but the interactive
+            // session view has no dedicated row for it yet — silently
+            // skip rather than clutter the entry list. Out of scope for
+            // the capture-wiring task; a future task can add rendering.
+            TranscriptEvent::NetFlow { .. } => {}
         }
     }
 
@@ -4792,6 +4798,9 @@ fn transcript_event_lines(
                 continuation: false,
             }]
         }
+        // No dedicated session-view row for netflow yet (see the
+        // matching no-op in `push_transcript_event` above).
+        TranscriptEvent::NetFlow { .. } => Vec::new(),
     }
 }
 
