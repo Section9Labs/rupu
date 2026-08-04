@@ -4,6 +4,13 @@
 use rupu_netflow::{FlowCtx, MemorySink, Origin};
 use std::sync::Arc;
 
+/// Exercises `rupu_netflow::http::client_with` directly with a hand-built
+/// `FlowCtx` — this is the same shape as `rupu-netflow`'s own factory tests
+/// and proves the netflow client factory itself attributes correctly. It
+/// does NOT touch any migrated provider constructor (`AnthropicClient::new`,
+/// `build_http_client_with_timeout`, `with_tuning`, etc.), so on its own it
+/// would not catch a provider reverting to a bare `reqwest::Client`. See
+/// `anthropic_client_reaches_the_netflow_sink` below for that half.
 #[tokio::test]
 async fn provider_client_records_flows_with_provider_origin() {
     let server = httpmock::MockServer::start_async().await;
@@ -37,4 +44,48 @@ async fn provider_client_records_flows_with_provider_origin() {
         Origin::Provider("anthropic".to_string())
     );
     assert_eq!(records[0].ctx.run_id.as_deref(), Some("run-1"));
+}
+
+/// Drives an actual migrated provider constructor (`AnthropicClient::with_url`
+/// → `build_http_client` → `client_from`) against a mock server and asserts
+/// the resulting flow lands in the netflow sink with `Origin::Provider`. This
+/// is the test that would catch a provider reverting to a bare
+/// `reqwest::Client::new()` — the test above cannot, since it never calls
+/// into `rupu-providers`' own client-construction code.
+///
+/// `rupu_netflow::http::init` is process-wide and first-call-wins; this is
+/// the only test in this binary that calls it (the test above uses
+/// `client_with`'s explicit-sink overload, which never touches the global
+/// one), so there is no cross-test race.
+#[tokio::test]
+async fn anthropic_client_reaches_the_netflow_sink() {
+    let server = httpmock::MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::GET).path("/v1/models");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"data":[]}"#);
+        })
+        .await;
+
+    let sink = Arc::new(MemorySink::default());
+    rupu_netflow::http::init(sink.clone());
+
+    let client = rupu_providers::AnthropicClient::with_url(
+        "test-key".into(),
+        format!("{}/v1/messages", server.url("")),
+    );
+
+    <rupu_providers::AnthropicClient as rupu_providers::LlmProvider>::probe(&client)
+        .await
+        .expect("probe should succeed against the mocked /v1/models endpoint");
+
+    let records = sink.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].path, "/v1/models");
+    assert_eq!(
+        records[0].ctx.origin,
+        Origin::Provider("anthropic".to_string())
+    );
 }

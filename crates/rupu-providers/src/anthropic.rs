@@ -991,6 +991,86 @@ fn stream_event_counts_as_emitted_content(ev: &StreamEvent) -> bool {
     )
 }
 
+/// Guards one flow attempt's completion against `stream()` being cancelled
+/// mid-flight.
+///
+/// `rupu-agent`'s runner races `stream()` against a pause signal in a
+/// `tokio::select!` and drops the losing branch outright — plain sequential
+/// code placed after an `.await` (like an unconditional `complete()` call at
+/// the end of the chunk loop) simply never runs in that case, silently
+/// discarding every byte already accounted for. This guard closes that gap:
+/// the normal path calls [`Self::complete`] explicitly, which disarms
+/// `Drop` *before* its own `.await` so a cancellation during that very call
+/// can never cause a second, conflicting completion. If the guard is
+/// dropped while still armed — the enclosing future was cancelled — `Drop`
+/// spawns a best-effort completion with whatever byte count had been
+/// observed so far. `Drop` cannot `await`, so this only fires when a tokio
+/// runtime is still current; outside one it logs at debug and gives up,
+/// matching this subsystem's rule that capture may degrade but must never
+/// panic or fail the request that produced it.
+struct FlowCompletionGuard {
+    id: rupu_netflow::FlowId,
+    started: std::time::Instant,
+    bytes: u64,
+    fired: bool,
+}
+
+impl FlowCompletionGuard {
+    fn new(id: rupu_netflow::FlowId, started: std::time::Instant) -> Self {
+        Self {
+            id,
+            started,
+            bytes: 0,
+            fired: false,
+        }
+    }
+
+    /// Accumulate observed body bytes as they arrive, so `Drop` has an
+    /// accurate count even if the explicit completion below never runs.
+    fn add_bytes(&mut self, n: u64) {
+        self.bytes += n;
+    }
+
+    /// Explicit, precise completion on the normal path. Disarms `Drop`
+    /// first — not after — so a cancellation mid-`.await` here cannot also
+    /// trigger `Drop`'s fallback completion for the same flow.
+    async fn complete(mut self) {
+        self.fired = true;
+        rupu_netflow::http::complete(
+            self.id,
+            self.bytes,
+            self.started.elapsed().as_millis() as u64,
+        )
+        .await;
+    }
+}
+
+impl Drop for FlowCompletionGuard {
+    fn drop(&mut self) {
+        if self.fired {
+            return;
+        }
+        let id = self.id;
+        let bytes = self.bytes;
+        let elapsed_ms = self.started.elapsed().as_millis() as u64;
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    rupu_netflow::http::complete(id, bytes, elapsed_ms).await;
+                });
+            }
+            Err(_) => {
+                debug!(
+                    ?id,
+                    bytes,
+                    "netflow: flow dropped mid-flight with no tokio runtime current; \
+                     record left incomplete"
+                );
+            }
+        }
+    }
+}
+
 impl AnthropicClient {
     /// Build and send the authenticated `GET /v1/models` request.
     ///
@@ -1253,7 +1333,7 @@ impl AnthropicClient {
             // dropped before its own backoff sleep, exactly like `send()`.
             // Never read directly; kept alive purely for its `Drop`, which
             // is why it's underscore-prefixed.
-            let (response, _stream_permit, flow_id, flow_started) = {
+            let (response, _stream_permit, mut flow_guard) = {
                 let mut last_err = None;
                 let mut winner = None;
                 for attempt in 0..=self.max_rate_limit_retries {
@@ -1274,9 +1354,13 @@ impl AnthropicClient {
                     // gets its own fresh `FlowId`. Minted before `.send()` and
                     // attached via `with_extension` so the middleware defers
                     // finalizing this record until we call `complete` below,
-                    // instead of (mis)completing it at header time.
+                    // instead of (mis)completing it at header time. Wrapped
+                    // in a `FlowCompletionGuard` so a cancellation mid-attempt
+                    // (e.g. a user pause) still finalizes the record with
+                    // whatever was observed, instead of leaving it dangling.
                     let attempt_flow_id = rupu_netflow::FlowId::new();
                     let attempt_started = std::time::Instant::now();
+                    let mut flow_guard = FlowCompletionGuard::new(attempt_flow_id, attempt_started);
 
                     let builder = self
                         .client
@@ -1297,12 +1381,8 @@ impl AnthropicClient {
                     let status = resp.status();
                     if status.as_u16() == 429 {
                         let text = resp.text().await.unwrap_or_default();
-                        rupu_netflow::http::complete(
-                            attempt_flow_id,
-                            text.len() as u64,
-                            attempt_started.elapsed().as_millis() as u64,
-                        )
-                        .await;
+                        flow_guard.add_bytes(text.len() as u64);
+                        flow_guard.complete().await;
                         last_err = Some(ProviderError::Api {
                             status: 429,
                             message: text,
@@ -1318,18 +1398,14 @@ impl AnthropicClient {
                         } else {
                             text
                         };
-                        rupu_netflow::http::complete(
-                            attempt_flow_id,
-                            bytes_in,
-                            attempt_started.elapsed().as_millis() as u64,
-                        )
-                        .await;
+                        flow_guard.add_bytes(bytes_in);
+                        flow_guard.complete().await;
                         return Err(ProviderError::Api {
                             status: status.as_u16(),
                             message: truncated,
                         });
                     }
-                    winner = Some((resp, permit, attempt_flow_id, attempt_started));
+                    winner = Some((resp, permit, flow_guard));
                     break;
                 }
                 match winner {
@@ -1347,7 +1423,6 @@ impl AnthropicClient {
             let mut accumulator = StreamAccumulator::new();
             let mut response = response;
             let mut emitted_content = false;
-            let mut flow_bytes_in: u64 = 0;
             // `_stream_permit` (if any) stays alive through the SSE-reading
             // loop below and is dropped when this outer-loop iteration
             // ends — either by returning, or by falling through to the
@@ -1355,9 +1430,14 @@ impl AnthropicClient {
 
             // Read chunks with a per-chunk IDLE timeout. A timeout means the
             // server stopped emitting bytes — treat as a stall. Wrapped in an
-            // inner async block so `complete` below fires exactly once on
-            // EVERY exit — normal completion, idle stall, or any `?`
-            // error — no matter which branch actually exits the loop.
+            // inner async block so the explicit `flow_guard.complete()` below
+            // fires exactly once on every NORMAL exit — stream end, idle
+            // stall, or any `?` error. If `stream()` itself is cancelled
+            // instead (dropped mid-`.await`, e.g. by a user pause racing this
+            // call — see rupu-agent's runner), this block never finishes and
+            // that explicit call never runs; `flow_guard`'s own `Drop` is
+            // what finalizes the record in that case, with whatever byte
+            // count had been accumulated via `add_bytes` so far.
             let stalled_result: Result<bool, ProviderError> = async {
                 loop {
                     match tokio::time::timeout(
@@ -1368,7 +1448,7 @@ impl AnthropicClient {
                     {
                         Ok(chunk_result) => match chunk_result? {
                             Some(chunk) => {
-                                flow_bytes_in += chunk.len() as u64;
+                                flow_guard.add_bytes(chunk.len() as u64);
                                 for event in parser.feed(&chunk)? {
                                     self.process_sse_event(&event, &mut accumulator, &mut |ev| {
                                         if stream_event_counts_as_emitted_content(&ev) {
@@ -1386,12 +1466,7 @@ impl AnthropicClient {
             }
             .await;
 
-            rupu_netflow::http::complete(
-                flow_id,
-                flow_bytes_in,
-                flow_started.elapsed().as_millis() as u64,
-            )
-            .await;
+            flow_guard.complete().await;
             let stalled = stalled_result?;
 
             if !stalled {
