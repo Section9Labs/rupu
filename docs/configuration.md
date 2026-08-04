@@ -90,6 +90,7 @@ Full narrative reference: [scm.md](scm.md#configuration).
 | `editor`           | string | `$VISUAL`/`$EDITOR`  | Command used by `agent edit`/`create`, `workflow edit`/`create` |
 | `[ui.syntax].theme`  | string | `base16-ocean.dark`  | syntect theme name |
 | `[ui.palette].theme` | string | `rupu-dark`          | Named rupu CLI palette |
+| `[ui.cp].shell`      | string | `v1`                 | `v1` \| `v2` — CP web shell generation (Shell v2 redesign). Requires rupu ≥ the version this lands in: older binaries reject unknown `[ui]` keys and silently fall back to a default config. |
 
 ---
 
