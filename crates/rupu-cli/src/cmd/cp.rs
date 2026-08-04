@@ -56,11 +56,14 @@ pub async fn handle(action: Action) -> ExitCode {
             // below (autoflow reconcile / cron tick). A missing/malformed
             // config file just falls back to `CpConfig::default()` — both
             // loops enabled, 60s cadence — same as an absent `[cp]` section.
-            let cp_runtime_cfg = {
+            // `[netflow]` rides along in the same load: the gate-sweep tick
+            // (below) also drives the automatic ASN-table refresh, so it
+            // needs `NetflowConfig` alongside `CpConfig`.
+            let (cp_runtime_cfg, netflow_cfg) = {
                 let global_cfg_path = global_dir.join("config.toml");
-                rupu_config::layer_files_locked(Some(&global_cfg_path), None)
-                    .unwrap_or_default()
-                    .cp
+                let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), None)
+                    .unwrap_or_default();
+                (cfg.cp, cfg.netflow)
             };
             // Spawn the background resume worker. It builds the SAME
             // RunStore the CP's AppState does (`<global_dir>/runs`), so it
@@ -155,6 +158,15 @@ pub async fn handle(action: Action) -> ExitCode {
             // runner never wedges Live Events. Gated by
             // `[cp].gate_sweep_enabled` (default: on); cadence from
             // `[cp].gate_sweep_interval_secs` (default: 60s).
+            //
+            // The same tick also drives the netflow ASN-table refresh
+            // (netflow Plan 2, Task 9): rather than a dedicated timer, it
+            // piggybacks on this already-running loop and checks
+            // `should_refresh_asn` — cheap (an `fs::metadata` call) on every
+            // tick, with the actual download spawned off, never inline,
+            // only on the rare tick where the table is missing or older
+            // than `[netflow].asn_refresh_interval_days`. The operator must
+            // never have to run a command for enrichment to work.
             let gate_sweep_store = Arc::clone(&store);
             let gate_sweep_hosts = rupu_workspace::HostStore {
                 root: global_dir.join("hosts"),
@@ -172,8 +184,33 @@ pub async fn handle(action: Action) -> ExitCode {
                     };
                     let exe = gate_sweep_exe.clone();
                     let worker_id = gate_sweep_worker_id.clone();
+                    let netflow_cfg = netflow_cfg.clone();
                     async move {
                         run_gate_sweep(store, hosts, exe, worker_id).await;
+
+                        // ASN freshness. Best-effort and never blocking: a
+                        // failed refresh leaves the existing table
+                        // untouched and enrichment degrades to "not
+                        // loaded" rather than to wrong answers.
+                        if let Some(db) = rupu_netflow::asn::asn_db_path() {
+                            if should_refresh_asn(&netflow_cfg, &db) {
+                                let url = netflow_cfg.asn_source_url.clone();
+                                tokio::spawn(async move {
+                                    let client = rupu_netflow::http::client(
+                                        rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System),
+                                    );
+                                    match rupu_netflow::asn::refresh(&url, &db, &client).await {
+                                        Ok(()) => {
+                                            tracing::info!(path = ?db, "netflow ASN table refreshed")
+                                        }
+                                        Err(e) => tracing::warn!(
+                                            error = %e,
+                                            "netflow ASN refresh failed; keeping existing table"
+                                        ),
+                                    }
+                                });
+                            }
+                        }
                     }
                 },
             ));
@@ -1119,11 +1156,21 @@ async fn run_gate_sweep(
     }
 }
 
+/// Whether the ASN table should be refreshed right now.
+///
+/// Pure so the policy is testable without a network or a timer: `false`
+/// when auto-refresh is off in config, otherwise delegates staleness to
+/// `rupu_netflow::asn::is_stale` (missing / unreadable / stale mtime / a
+/// zero-day interval all count as stale).
+pub(crate) fn should_refresh_asn(cfg: &rupu_config::NetflowConfig, path: &std::path::Path) -> bool {
+    cfg.asn_auto_refresh && rupu_netflow::asn::is_stale(path, cfg.asn_refresh_interval_days)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        build_resume_argv, resume_one_run, run_gate_sweep, run_periodic_tick, sweep_decision,
-        SweepAction,
+        build_resume_argv, resume_one_run, run_gate_sweep, run_periodic_tick, should_refresh_asn,
+        sweep_decision, SweepAction,
     };
     use rupu_orchestrator::{RunStatus, TimeoutAction};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2327,5 +2374,33 @@ mod tests {
             gate_rows_after_second, 1,
             "a second sweep tick must not reprocess an already-cleared marker"
         );
+    }
+
+    // ── Task 9: automatic ASN table refresh on the sweep tick ──
+
+    #[test]
+    fn asn_refresh_is_skipped_when_auto_refresh_is_off() {
+        let cfg = rupu_config::NetflowConfig {
+            asn_auto_refresh: false,
+            ..Default::default()
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(!should_refresh_asn(&cfg, &tmp.path().join("asn.db")));
+    }
+
+    #[test]
+    fn asn_refresh_is_requested_when_the_table_is_missing() {
+        let cfg = rupu_config::NetflowConfig::default();
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(should_refresh_asn(&cfg, &tmp.path().join("asn.db")));
+    }
+
+    #[test]
+    fn asn_refresh_is_skipped_for_a_fresh_table() {
+        let cfg = rupu_config::NetflowConfig::default();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("asn.db");
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(!should_refresh_asn(&cfg, &path));
     }
 }
