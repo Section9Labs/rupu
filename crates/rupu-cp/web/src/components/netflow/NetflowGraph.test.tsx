@@ -35,18 +35,27 @@ describe('NetflowGraph', () => {
     expect(document.querySelector('svg')).not.toBeInTheDocument();
   });
 
-  it('never claims CP fleet traffic in the empty-state hint at project or run scope', () => {
+  it('never claims CP fleet traffic or ASN refresh in the empty-state hint at project or run scope', () => {
     // Fix 2, round 4 (Blocker 1): `Origin::Cp` flows live only in the CP
     // daemon's global ledger — the project/run scopes' empty state must not
     // imply it could show up there.
+    //
+    // Round 5: the SAME defect, one example over — `Origin::System`
+    // ASN-refresh downloads are exactly as global-only as `Origin::Cp`
+    // flows (see `netflowSystemSourceHint`'s doc comment), so "ASN refresh"
+    // is checked here too. This is the guard that was missing last round:
+    // it would have failed against the round-4 version of this hint.
     render(<NetflowGraph graph={{ nodes: [], edges: [] }} scope="project" />);
     expect(screen.queryByText(/CP fleet traffic/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/ASN refresh/i)).not.toBeInTheDocument();
     cleanup();
     render(<NetflowGraph graph={{ nodes: [], edges: [] }} scope="run" />);
     expect(screen.queryByText(/CP fleet traffic/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/ASN refresh/i)).not.toBeInTheDocument();
     cleanup();
     render(<NetflowGraph graph={{ nodes: [], edges: [] }} scope="global" />);
     expect(screen.getByText(/CP fleet traffic/i)).toBeInTheDocument();
+    expect(screen.getByText(/ASN refresh/i)).toBeInTheDocument();
   });
 
   it('never surfaces GraphEdge.bytes as a byte count, even for a Coarse (bytes: 0) edge', () => {

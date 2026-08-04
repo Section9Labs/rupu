@@ -83,10 +83,30 @@ export function NetflowScopeDisclosure({
  *  NetflowGraph.tsx itself, independently of `NETFLOW_COVERAGE_LIST`, and
  *  claimed both "updater" and "CP fleet traffic" unconditionally — the same
  *  two defects as the main disclosure, just in a fourth, un-centralized
- *  copy. */
+ *  copy.
+ *
+ *  Round 5 fixed a THIRD instance of the same defect, one example over:
+ *  "ASN refresh" is exactly as global-only as "CP fleet traffic" is. Every
+ *  `Origin::System` ASN-refresh download — whether from `cmd/cp.rs`'s sweep
+ *  or from this crate's own `maybe_refresh_asn` — resolves the sink
+ *  `cp serve` installs at startup, which is always the daemon's
+ *  global-only ledger; `get_project_netflow`/`collect_run_netflow` never
+ *  read it, only `read_all_workspaces_sync` (global scope) does, and there
+ *  is no other `asn::refresh` call site in the workspace. So it can never
+ *  appear at project or run scope — offering it as an example there was
+ *  false in exactly the way the round-4 fix was supposed to close off.
+ *
+ *  The `system` SOURCE ITSELF stays valid at every scope, though — that's
+ *  a decision, not an oversight: `Origin::System` also covers auth/oauth
+ *  token exchange (`rupu-auth`'s resolver / oauth/device / oauth/callback),
+ *  which genuinely can reach project scope (the project's own ledger, no
+ *  run_id filter) and run scope (the run's own transcript, which records
+ *  every flow observed while the run was active regardless of
+ *  `ctx.run_id`). Only the PARENTHETICAL EXAMPLE is scope-gated here, not
+ *  the "or system for unattributed egress" clause that names the source. */
 export function netflowSystemSourceHint(scope: NetflowScope): string {
-  const examples = scope === 'global' ? 'ASN refresh, CP fleet traffic' : 'e.g. ASN refresh';
-  return `Sources — runs, or system for unattributed egress (${examples}) — connect to the host:port endpoints they reached.`;
+  const examples = scope === 'global' ? ' (ASN refresh, CP fleet traffic)' : '';
+  return `Sources — runs, or system for unattributed egress${examples} — connect to the host:port endpoints they reached.`;
 }
 
 export default NetflowScopeDisclosure;

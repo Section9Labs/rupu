@@ -11,7 +11,12 @@
 import '@testing-library/jest-dom/vitest';
 import { render, screen, cleanup } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
-import { NetflowScopeDisclosure, netflowCoverageList, type NetflowScope } from './ScopeDisclosure';
+import {
+  NetflowScopeDisclosure,
+  netflowCoverageList,
+  netflowSystemSourceHint,
+  type NetflowScope,
+} from './ScopeDisclosure';
 
 afterEach(() => {
   cleanup();
@@ -43,6 +48,34 @@ describe('netflowCoverageList', () => {
   it.each(SCOPES)('never claims MCP or webhook coverage at %s scope', (scope) => {
     expect(netflowCoverageList(scope)).not.toMatch(/MCP/i);
     expect(netflowCoverageList(scope)).not.toMatch(/webhook/i);
+  });
+});
+
+describe('netflowSystemSourceHint', () => {
+  it('includes ASN refresh and CP fleet traffic ONLY for global scope', () => {
+    // Round 5: the same defect as Blocker 1, one example over — every
+    // `Origin::System` ASN-refresh download resolves the sink `cp serve`
+    // installs at startup (always the daemon's global-only ledger); there
+    // is no other `asn::refresh` call site, so it can never appear at
+    // project or run scope either. Guarding both strings in one test keeps
+    // them from drifting apart the way round 4 -> round 5 just showed they
+    // can.
+    expect(netflowSystemSourceHint('project')).not.toMatch(/ASN refresh/i);
+    expect(netflowSystemSourceHint('project')).not.toMatch(/CP fleet traffic/i);
+    expect(netflowSystemSourceHint('run')).not.toMatch(/ASN refresh/i);
+    expect(netflowSystemSourceHint('run')).not.toMatch(/CP fleet traffic/i);
+    expect(netflowSystemSourceHint('global')).toMatch(/ASN refresh/i);
+    expect(netflowSystemSourceHint('global')).toMatch(/CP fleet traffic/i);
+  });
+
+  it.each(SCOPES)('still names `system` as a source at %s scope', (scope) => {
+    // The scope-gated piece is the PARENTHETICAL EXAMPLE, not the "or
+    // system for unattributed egress" clause itself — `Origin::System`
+    // also covers auth/oauth token exchange, which genuinely can reach
+    // project scope (the project's own ledger) and run scope (the run's
+    // own transcript). Dropping the whole clause at those scopes would
+    // overcorrect into a different inaccuracy.
+    expect(netflowSystemSourceHint(scope)).toMatch(/system for unattributed egress/i);
   });
 });
 
