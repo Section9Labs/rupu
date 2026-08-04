@@ -139,13 +139,22 @@ fn merge_with_transcript(
     by_id.into_values().collect()
 }
 
-pub(crate) fn build_response(flows: Vec<FlowRecord>, dropped: u64) -> NetflowResponse {
-    let table = load_asn_table();
+/// Build the response, enriching with `table` if given.
+///
+/// `table` is a parameter rather than an internal `load_asn_table()` call so
+/// this function is testable in both directions (table present / absent)
+/// without touching the real `$RUPU_HOME` on disk — every caller (the route
+/// handlers below) loads the table itself and passes it in.
+pub(crate) fn build_response(
+    flows: Vec<FlowRecord>,
+    dropped: u64,
+    table: Option<&AsnTable>,
+) -> NetflowResponse {
     let hosts = rupu_netflow::ledger::host_rollup(&flows);
     NetflowResponse {
         flows: flows
             .into_iter()
-            .map(|f| FlowView::from_flow(f, table.as_ref()))
+            .map(|f| FlowView::from_flow(f, table))
             .collect(),
         hosts,
         dropped,
@@ -175,7 +184,8 @@ fn collect_run_netflow(store: &RunStore, run_id: &str, workspace: &StdPath) -> N
     let paths = NetflowPaths::new(workspace);
     let dropped = rupu_netflow::ledger::read_dropped_total(&paths.flows).unwrap_or(0);
     let merged = run_scoped_flows(store, run_id, workspace);
-    build_response(merged, dropped)
+    let table = load_asn_table();
+    build_response(merged, dropped, table.as_ref())
 }
 
 /// A registered workspace store, rooted at `<global_dir>/workspaces/` —
@@ -229,13 +239,15 @@ async fn get_project_netflow(
     let paths = NetflowPaths::new(&workspace);
     let flows = rupu_netflow::ledger::read_flows(&paths.flows).unwrap_or_default();
     let dropped = rupu_netflow::ledger::read_dropped_total(&paths.flows).unwrap_or(0);
-    Ok(Json(build_response(flows, dropped)))
+    let table = load_asn_table();
+    Ok(Json(build_response(flows, dropped, table.as_ref())))
 }
 
 /// `GET /api/netflow` — the union across every registered workspace.
 async fn get_global_netflow(State(state): State<AppState>) -> ApiResult<Json<NetflowResponse>> {
     let (flows, dropped) = read_all_workspaces(&state);
-    Ok(Json(build_response(flows, dropped)))
+    let table = load_asn_table();
+    Ok(Json(build_response(flows, dropped, table.as_ref())))
 }
 
 #[derive(Debug, Deserialize)]
@@ -347,7 +359,10 @@ async fn get_run_netflow(
         // No artifacts anywhere: the run never persisted a workspace to
         // read a ledger or transcript from. Empty, not an error — mirrors
         // `run_graph`'s `Unpersisted` branch.
-        RunLocation::Unpersisted { .. } => Ok(Json(build_response(Vec::new(), 0))),
+        RunLocation::Unpersisted { .. } => {
+            let table = load_asn_table();
+            Ok(Json(build_response(Vec::new(), 0, table.as_ref())))
+        }
         RunLocation::NotFound => Err(ApiError::not_found(format!("run {run_id} not found"))),
     }
 }
@@ -402,10 +417,59 @@ mod tests {
     #[test]
     fn build_response_wires_a_server_computed_host_rollup() {
         let f = flow(FlowId::new(), Some("r"), "api.anthropic.com");
-        let resp = build_response(vec![f], 0);
+        let resp = build_response(vec![f], 0, None);
         assert_eq!(resp.hosts.len(), 1);
         assert_eq!(resp.hosts[0].host, "api.anthropic.com");
         assert_eq!(resp.hosts[0].calls, 1);
+    }
+
+    /// The other half of `build_response`'s contract, previously untested:
+    /// with no table injected, `asn_loaded` must be `false` AND every
+    /// flow's `asn` must be `None` — not just the boolean flipped while the
+    /// enrichment silently still ran (or vice versa). Before this fix
+    /// `build_response` called `load_asn_table()` internally, so no test
+    /// could force the "table absent" branch independent of whatever
+    /// happened to exist on the real machine's `$RUPU_HOME`.
+    #[test]
+    fn build_response_with_no_table_reports_unloaded_and_enriches_nothing() {
+        let mut f = flow(FlowId::new(), Some("r"), "api.anthropic.com");
+        f.peer_ip = Some("1.0.0.7".parse().unwrap());
+
+        let resp = build_response(vec![f], 0, None);
+
+        assert!(!resp.asn_loaded, "no table was supplied");
+        assert!(
+            resp.flows.iter().all(|v| v.asn.is_none()),
+            "asn_loaded: false must mean no flow got enriched, even one with a resolvable peer_ip"
+        );
+    }
+
+    /// The mirror case: a table IS supplied and resolves the flow's peer.
+    /// `asn_loaded` must be `true` and the resolving flow must carry its
+    /// `AsnInfo` — proving `build_response` actually threads `table`
+    /// through to `FlowView::from_flow` rather than the field being
+    /// hardcoded or disconnected from the enrichment it claims to describe.
+    #[test]
+    fn build_response_with_a_resolving_table_reports_loaded_and_enriches_the_match() {
+        use std::io::Cursor;
+        let table = rupu_netflow::AsnTable::compact_from_tsv(Cursor::new(
+            "1.0.0.0\t1.0.0.255\t13335\tUS\tCLOUDFLARENET\n",
+        ))
+        .unwrap();
+
+        let mut f = flow(FlowId::new(), Some("r"), "api.anthropic.com");
+        f.peer_ip = Some("1.0.0.7".parse().unwrap());
+
+        let resp = build_response(vec![f], 0, Some(&table));
+
+        assert!(resp.asn_loaded);
+        assert_eq!(resp.flows.len(), 1);
+        let asn = resp.flows[0]
+            .asn
+            .as_ref()
+            .expect("peer_ip resolves in the table");
+        assert_eq!(asn.asn, 13335);
+        assert_eq!(asn.org, "CLOUDFLARENET");
     }
 
     #[test]
