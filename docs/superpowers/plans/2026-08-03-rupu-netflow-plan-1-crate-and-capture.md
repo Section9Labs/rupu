@@ -3037,6 +3037,36 @@ fn repo_root() -> std::path::PathBuf {
         .to_path_buf()
 }
 
+/// Every way to obtain a raw reqwest client. `reqwest::Client::builder`
+/// is deliberately absent — see `clippy.toml` for why.
+const BANNED: &[&str] = &[
+    "reqwest::Client::new",
+    "reqwest::Client::default",
+    "reqwest::ClientBuilder::new",
+    "reqwest::ClientBuilder::default",
+    "reqwest::ClientBuilder::build",
+];
+
+/// Strip a trailing line comment WITHOUT being fooled by `//` inside a
+/// string literal. A naive `split("//")` truncates at a URL and silently
+/// hides any offending call later on the same line — the worst possible
+/// failure for a guard.
+fn strip_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_string => i += 1,
+            b'"' => in_string = !in_string,
+            b'/' if !in_string && bytes[i + 1] == b'/' => return &line[..i],
+            _ => {}
+        }
+        i += 1;
+    }
+    line
+}
+
 fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -3078,8 +3108,8 @@ fn no_raw_reqwest_client_outside_rupu_netflow() {
             continue;
         };
         for (i, line) in text.lines().enumerate() {
-            let code = line.split("//").next().unwrap_or(line);
-            if code.contains("reqwest::Client::new") || code.contains("reqwest::Client::builder") {
+            let code = strip_comment(line);
+            if BANNED.iter().any(|pat| code.contains(pat)) {
                 offenders.push(format!("{rel}:{}", i + 1));
             }
         }
@@ -3153,8 +3183,20 @@ Create `clippy.toml` at the repo root:
 # / client_from. A raw reqwest client bypasses netflow capture entirely.
 # See docs/superpowers/specs/2026-08-03-rupu-netflow-observability-design.md §7.3
 disallowed-methods = [
+    # Direct construction — bypasses capture entirely.
     { path = "reqwest::Client::new", reason = "use rupu_netflow::http::client(ctx) so the flow is captured" },
-    { path = "reqwest::Client::builder", reason = "use rupu_netflow::http::client_from(ctx, builder) so the flow is captured" },
+    { path = "reqwest::Client::default", reason = "use rupu_netflow::http::client(ctx) so the flow is captured" },
+    # Equivalent back doors: Client::builder() IS ClientBuilder::new(), and
+    # ClientBuilder: Default delegates to it. Without these, a one-token
+    # rename defeats the whole guard.
+    { path = "reqwest::ClientBuilder::new", reason = "use reqwest::Client::builder() and pass it to rupu_netflow::http::client_from(ctx, builder)" },
+    { path = "reqwest::ClientBuilder::default", reason = "use reqwest::Client::builder() and pass it to rupu_netflow::http::client_from(ctx, builder)" },
+    # THE actual bypass point. `Client::builder()` is deliberately NOT
+    # disallowed: `client_from`'s signature requires callers to build a
+    # tuned builder, so banning it would force an #[allow] at every
+    # legitimate call site while leaving the real escape hatch open.
+    # Banning `.build()` instead needs exactly ONE allow, in the factory.
+    { path = "reqwest::ClientBuilder::build", reason = "pass the builder to rupu_netflow::http::client_from(ctx, builder) instead of building it yourself" },
 ]
 ```
 
