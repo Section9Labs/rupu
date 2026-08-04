@@ -293,7 +293,8 @@ impl KeychainResolver {
         // Provider-agnostic refresh: standard OAuth refresh-token grant.
         let token_url = std::env::var("RUPU_OAUTH_TOKEN_URL_OVERRIDE")
             .unwrap_or_else(|_| oauth.token_url.to_string());
-        let client = reqwest::Client::new();
+        let client =
+            rupu_netflow::http::client(rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System));
         let resp = client
             .post(&token_url)
             .form(&[
@@ -558,7 +559,11 @@ mod resolver_named_tests {
     #[tokio::test]
     async fn named_provider_falls_back_to_env() {
         let _lock = ENV_LOCK.lock().await;
-        let _guard = EnvGuard(vec!["RUPU_AUTH_FILE", "RUPU_AUTH_BACKEND", "RUPU_ACME_API_KEY"]);
+        let _guard = EnvGuard(vec![
+            "RUPU_AUTH_FILE",
+            "RUPU_AUTH_BACKEND",
+            "RUPU_ACME_API_KEY",
+        ]);
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");

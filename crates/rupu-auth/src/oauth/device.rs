@@ -51,7 +51,8 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
     let token_url = std::env::var("RUPU_DEVICE_TOKEN_URL_OVERRIDE")
         .unwrap_or_else(|_| oauth.token_url.to_string());
 
-    let client = reqwest::Client::new();
+    let client =
+        rupu_netflow::http::client(rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System));
     let dc: DeviceCodeResponse = client
         .post(&device_url)
         .header("Accept", "application/json")

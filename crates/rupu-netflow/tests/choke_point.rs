@@ -74,9 +74,6 @@ const ALLOWED: &[&str] = &[
 /// checklist is `cargo clippy --workspace --all-targets 2>&1 | grep
 /// disallowed`, not this constant.
 const PENDING_PLAN_2: &[&str] = &[
-    "crates/rupu-auth/src/oauth/device.rs",
-    "crates/rupu-auth/src/oauth/callback.rs",
-    "crates/rupu-auth/src/resolver.rs",
     "crates/rupu-cli/src/cmd/cp.rs",
     "crates/rupu-cp/src/host/http.rs",
     "crates/rupu-update/src/github.rs",
