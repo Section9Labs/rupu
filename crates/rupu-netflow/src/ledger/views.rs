@@ -10,19 +10,28 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-/// Read every flow, folding `Complete` lines into their flow.
+/// Read every flow (folding `Complete` lines into their flow) AND the
+/// total dropped-count, in a single pass over the ledger file.
 ///
-/// A missing file is an empty ledger, not an error. Malformed lines are
-/// skipped — a torn write at the tail must not lose the whole history.
-pub fn read_flows(path: &Path) -> std::io::Result<Vec<FlowRecord>> {
+/// [`read_flows`] and [`read_dropped_total`] both delegate here — calling
+/// both of them back-to-back for the common "I need flows and the dropped
+/// count" case (every CP netflow endpoint) would open and line-scan the
+/// same file twice for no reason. Callers that want both should call this
+/// directly rather than the two single-purpose wrappers.
+///
+/// A missing file is an empty ledger (`(vec![], 0)`), not an error.
+/// Malformed lines are skipped — a torn write at the tail must not lose
+/// the whole history.
+pub fn read_flows_and_dropped(path: &Path) -> std::io::Result<(Vec<FlowRecord>, u64)> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(e) => return Err(e),
     };
 
     let mut flows: Vec<FlowRecord> = Vec::new();
     let mut index: HashMap<FlowId, usize> = HashMap::new();
+    let mut dropped = 0u64;
 
     for line in BufReader::new(file).lines() {
         let line = line?;
@@ -48,29 +57,32 @@ pub fn read_flows(path: &Path) -> std::io::Result<Vec<FlowRecord>> {
                     flows[i].body_complete = true;
                 }
             }
-            LedgerLine::Dropped { .. } => {}
+            LedgerLine::Dropped { count, .. } => {
+                dropped += count;
+            }
         }
     }
 
-    Ok(flows)
+    Ok((flows, dropped))
+}
+
+/// Read every flow, folding `Complete` lines into their flow.
+///
+/// A missing file is an empty ledger, not an error. Malformed lines are
+/// skipped — a torn write at the tail must not lose the whole history.
+///
+/// Prefer [`read_flows_and_dropped`] if the caller also needs the dropped
+/// count — that reads the file once instead of twice.
+pub fn read_flows(path: &Path) -> std::io::Result<Vec<FlowRecord>> {
+    Ok(read_flows_and_dropped(path)?.0)
 }
 
 /// Total records lost to writer-channel overflow.
+///
+/// Prefer [`read_flows_and_dropped`] if the caller also needs the flows —
+/// that reads the file once instead of twice.
 pub fn read_dropped_total(path: &Path) -> std::io::Result<u64> {
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e),
-    };
-
-    let mut total = 0u64;
-    for line in BufReader::new(file).lines() {
-        let line = line?;
-        if let Ok(LedgerLine::Dropped { count, .. }) = serde_json::from_str::<LedgerLine>(&line) {
-            total += count;
-        }
-    }
-    Ok(total)
+    Ok(read_flows_and_dropped(path)?.1)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -523,6 +535,35 @@ mod tests {
         let g = graph_view(&flows);
         let source = g.nodes.iter().find(|n| n.side == NodeSide::Source).unwrap();
         assert_eq!(source.id, "system");
+    }
+
+    #[test]
+    fn read_flows_and_dropped_matches_the_two_single_purpose_readers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("flows.jsonl");
+        write_lines(
+            &path,
+            &[
+                LedgerLine::Flow(Box::new(flow(1, "api.anthropic.com", Some("r1"), 10, true))),
+                LedgerLine::Dropped {
+                    count: 5,
+                    ts: chrono::Utc::now(),
+                },
+            ],
+        );
+
+        let (flows, dropped) = read_flows_and_dropped(&path).unwrap();
+        assert_eq!(flows.len(), read_flows(&path).unwrap().len());
+        assert_eq!(dropped, read_dropped_total(&path).unwrap());
+        assert_eq!(dropped, 5);
+    }
+
+    #[test]
+    fn read_flows_and_dropped_on_missing_file_is_empty_not_an_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (flows, dropped) = read_flows_and_dropped(&tmp.path().join("absent.jsonl")).unwrap();
+        assert!(flows.is_empty());
+        assert_eq!(dropped, 0);
     }
 
     #[test]

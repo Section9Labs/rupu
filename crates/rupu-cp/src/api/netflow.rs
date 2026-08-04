@@ -17,6 +17,17 @@
 //! run regardless of `ctx.run_id`, which is exactly the set that recovers
 //! that gap. [`merge_with_transcript`] does the merge; see its doc for the
 //! dedup rule.
+//!
+//! ## Blocking I/O never runs on the async task
+//!
+//! `rupu-netflow` has no ledger rotation, retention or compaction — a
+//! ledger grows unbounded for the life of a `cp serve` daemon. Every
+//! ledger/transcript/ASN-table read in this module is a synchronous
+//! `std::fs` call, so running it directly on an async handler would block
+//! whatever tokio worker thread picked up the request — stalling *every
+//! other* concurrent CP request sharing that thread (approvals, the gate
+//! sweep, unrelated API calls), not just the netflow caller. [`run_blocking`]
+//! is the one place every such read goes through instead.
 
 use crate::{
     api::run_resolve::{resolve_run_location, RunLocation},
@@ -37,6 +48,7 @@ use rupu_workspace::WorkspaceStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path as StdPath, PathBuf};
+use std::sync::Arc;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -44,6 +56,19 @@ pub fn routes() -> Router<AppState> {
         .route("/api/projects/:id/netflow", get(get_project_netflow))
         .route("/api/netflow", get(get_global_netflow))
         .route("/api/netflow/graph", get(get_netflow_graph))
+}
+
+/// Run `f` — a synchronous ledger/transcript/ASN-table read — on the tokio
+/// blocking thread pool instead of inline on the async task. See the module
+/// doc's "Blocking I/O" note for why this matters once a ledger has grown
+/// past trivial size. A panic inside `f` becomes `ApiError::internal`
+/// rather than propagating (there's nothing sensible for the caller to
+/// degrade to here — unlike a missing/corrupt ledger file, which the
+/// `rupu_netflow::ledger` readers already turn into an empty result).
+async fn run_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> ApiResult<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ApiError::internal(format!("netflow blocking read task failed: {e}")))
 }
 
 /// A flow plus its read-time enrichment.
@@ -163,27 +188,37 @@ pub(crate) fn build_response(
 }
 
 /// The ledger's run-scoped flows for `run_id`, merged with the run's own
-/// transcript (see the module doc for why the ledger alone under-reports).
-/// Shared by [`collect_run_netflow`] (which wraps this into the enriched
-/// [`NetflowResponse`]) and the graph endpoint's `run:` scope (which only
-/// needs raw [`FlowRecord`]s to feed [`rupu_netflow::ledger::graph_view`]).
-fn run_scoped_flows(store: &RunStore, run_id: &str, workspace: &StdPath) -> Vec<FlowRecord> {
+/// transcript (see the module doc for why the ledger alone under-reports),
+/// plus the workspace's total dropped-count — both from ONE pass over the
+/// ledger file via [`rupu_netflow::ledger::read_flows_and_dropped`], not two
+/// (re-scanning the same file just to recount `dropped` doubles exactly the
+/// I/O the "Blocking I/O" module-doc note is about). Synchronous — every
+/// caller runs this through [`run_blocking`], never inline on the async
+/// task. Shared by [`collect_run_netflow`] (which wraps this into the
+/// enriched [`NetflowResponse`]) and the graph endpoint's `run:` scope
+/// (which only needs raw [`FlowRecord`]s to feed
+/// [`rupu_netflow::ledger::graph_view`]).
+fn run_scoped_flows_and_dropped(
+    store: &RunStore,
+    run_id: &str,
+    workspace: &StdPath,
+) -> (Vec<FlowRecord>, u64) {
     let paths = NetflowPaths::new(workspace);
-    let all = rupu_netflow::ledger::read_flows(&paths.flows).unwrap_or_default();
+    let (all, dropped) =
+        rupu_netflow::ledger::read_flows_and_dropped(&paths.flows).unwrap_or_default();
     let scoped = filter_by_run(&all, run_id);
     let transcript_paths = crate::usage::run_transcript_paths(store, run_id);
-    merge_with_transcript(scoped, &transcript_paths)
+    let merged = merge_with_transcript(scoped, &transcript_paths);
+    (merged, dropped)
 }
 
 /// Read the ledger + run transcript for a run whose artifacts live under
 /// `workspace` (a project root, `<workspace>/.rupu/netflow/flows.jsonl` and
 /// whatever `store` reports as this run's step transcript paths), scope to
 /// `run_id`, merge, and build the response. A missing ledger is an empty
-/// result, not an error.
+/// result, not an error. Synchronous — see [`run_scoped_flows_and_dropped`].
 fn collect_run_netflow(store: &RunStore, run_id: &str, workspace: &StdPath) -> NetflowResponse {
-    let paths = NetflowPaths::new(workspace);
-    let dropped = rupu_netflow::ledger::read_dropped_total(&paths.flows).unwrap_or(0);
-    let merged = run_scoped_flows(store, run_id, workspace);
+    let (merged, dropped) = run_scoped_flows_and_dropped(store, run_id, workspace);
     let table = load_asn_table();
     build_response(merged, dropped, table.as_ref())
 }
@@ -199,6 +234,13 @@ fn workspace_store(s: &AppState) -> WorkspaceStore {
 
 /// Resolve a `:id` path param (a `WorkspaceStore` id, e.g. `ws_...`) to its
 /// registered workspace path. 404 when no such workspace is registered.
+///
+/// Not run through [`run_blocking`]: this is a single small `<id>.toml`
+/// lookup in the workspace registry, not a ledger — it doesn't grow
+/// unbounded the way a netflow ledger does, so it doesn't carry the same
+/// stall risk the module doc's "Blocking I/O" note is about (existing
+/// call sites for the same registry, e.g. `coverage.rs`/`projects.rs`,
+/// make the same call inline for the same reason).
 pub(crate) fn workspace_for_project(s: &AppState, project_id: &str) -> ApiResult<PathBuf> {
     let ws = workspace_store(s)
         .load(project_id)
@@ -208,20 +250,29 @@ pub(crate) fn workspace_for_project(s: &AppState, project_id: &str) -> ApiResult
 }
 
 /// Every flow across every registered workspace's ledger, and the summed
-/// dropped-count. Mirrors `coverage.rs`'s `list_coverage`: a workspace whose
-/// path is gone/unreadable is skipped (its ledger read degrades to empty via
-/// `read_flows`'s own missing-file tolerance), never a hard error — an
-/// unregistered/empty registry yields `([], 0)`.
-fn read_all_workspaces(s: &AppState) -> (Vec<FlowRecord>, u64) {
-    let workspaces = workspace_store(s).list().unwrap_or_default();
+/// dropped-count — one [`rupu_netflow::ledger::read_flows_and_dropped`] pass
+/// per workspace, not two. Mirrors `coverage.rs`'s `list_coverage`: a
+/// workspace whose path is gone/unreadable is skipped (its ledger read
+/// degrades to empty via the reader's own missing-file tolerance), never a
+/// hard error — an unregistered/empty registry yields `([], 0)`.
+/// Synchronous — always run through [`run_blocking`] (this is the read that
+/// scales with the number of registered workspaces, so it's the one most
+/// worth keeping off the async task).
+fn read_all_workspaces_sync(global_dir: &StdPath) -> (Vec<FlowRecord>, u64) {
+    let workspaces = (WorkspaceStore {
+        root: global_dir.join("workspaces"),
+    })
+    .list()
+    .unwrap_or_default();
 
     let mut flows = Vec::new();
     let mut dropped = 0u64;
     for w in &workspaces {
         let wp = std::path::Path::new(&w.path);
         let paths = NetflowPaths::new(wp);
-        flows.extend(rupu_netflow::ledger::read_flows(&paths.flows).unwrap_or_default());
-        dropped += rupu_netflow::ledger::read_dropped_total(&paths.flows).unwrap_or(0);
+        let (f, d) = rupu_netflow::ledger::read_flows_and_dropped(&paths.flows).unwrap_or_default();
+        flows.extend(f);
+        dropped += d;
     }
     (flows, dropped)
 }
@@ -236,23 +287,36 @@ async fn get_project_netflow(
     Path(project_id): Path<String>,
 ) -> ApiResult<Json<NetflowResponse>> {
     let workspace = workspace_for_project(&state, &project_id)?;
-    let paths = NetflowPaths::new(&workspace);
-    let flows = rupu_netflow::ledger::read_flows(&paths.flows).unwrap_or_default();
-    let dropped = rupu_netflow::ledger::read_dropped_total(&paths.flows).unwrap_or(0);
-    let table = load_asn_table();
-    Ok(Json(build_response(flows, dropped, table.as_ref())))
+    let resp = run_blocking(move || {
+        let paths = NetflowPaths::new(&workspace);
+        let (flows, dropped) =
+            rupu_netflow::ledger::read_flows_and_dropped(&paths.flows).unwrap_or_default();
+        let table = load_asn_table();
+        build_response(flows, dropped, table.as_ref())
+    })
+    .await?;
+    Ok(Json(resp))
 }
 
 /// `GET /api/netflow` — the union across every registered workspace.
 async fn get_global_netflow(State(state): State<AppState>) -> ApiResult<Json<NetflowResponse>> {
-    let (flows, dropped) = read_all_workspaces(&state);
-    let table = load_asn_table();
-    Ok(Json(build_response(flows, dropped, table.as_ref())))
+    let global_dir = state.global_dir.clone();
+    let resp = run_blocking(move || {
+        let (flows, dropped) = read_all_workspaces_sync(&global_dir);
+        let table = load_asn_table();
+        build_response(flows, dropped, table.as_ref())
+    })
+    .await?;
+    Ok(Json(resp))
 }
 
 #[derive(Debug, Deserialize)]
 pub struct GraphQuery {
-    /// `run:<id>`, `project:<id>`, or absent for global.
+    /// `run:<id>`, `project:<id>`, or absent for global. An unrecognized
+    /// prefix (or any other value that isn't `run:`/`project:`) is NOT a
+    /// 400 — it falls through to the same global branch as an absent
+    /// `scope`, matching the brief's own catch-all for this endpoint. This
+    /// is a deliberate permissive default, not an unhandled error path.
     pub scope: Option<String>,
 }
 
@@ -260,6 +324,8 @@ pub struct GraphQuery {
 /// `get_run_netflow`'s dispatch on [`resolve_run_location`] so a run graph
 /// looks in exactly the same places the run's own netflow page does
 /// (global store / project-local store / remote host / unpersisted / 404).
+/// The `Global`/`ProjectLocal` branches read through [`run_blocking`]; the
+/// `Host` branch is a network proxy call, not disk I/O, so it stays inline.
 async fn run_scoped_flows_for_graph(s: &AppState, run_id: &str) -> ApiResult<Vec<FlowRecord>> {
     match resolve_run_location(s, run_id).await {
         RunLocation::Global => {
@@ -267,11 +333,18 @@ async fn run_scoped_flows_for_graph(s: &AppState, run_id: &str) -> ApiResult<Vec
                 .run_store
                 .load(run_id)
                 .map_err(|e| run_not_found_or_internal(run_id, e))?;
-            Ok(run_scoped_flows(&s.run_store, run_id, &run.workspace_path))
+            let store = Arc::clone(&s.run_store);
+            let run_id = run_id.to_string();
+            let workspace = run.workspace_path.clone();
+            run_blocking(move || run_scoped_flows_and_dropped(&store, &run_id, &workspace).0).await
         }
         RunLocation::ProjectLocal { path } => {
-            let store = RunStore::new(path.join(".rupu").join("runs"));
-            Ok(run_scoped_flows(&store, run_id, &path))
+            let run_id = run_id.to_string();
+            run_blocking(move || {
+                let store = RunStore::new(path.join(".rupu").join("runs"));
+                run_scoped_flows_and_dropped(&store, &run_id, &path).0
+            })
+            .await
         }
         RunLocation::Host { host_id } => {
             let resp = run_netflow_from_host(s, &host_id, run_id).await?;
@@ -295,10 +368,16 @@ async fn get_netflow_graph(
         run_scoped_flows_for_graph(&state, run_id).await?
     } else if let Some(project_id) = q.scope.as_deref().and_then(|s| s.strip_prefix("project:")) {
         let workspace = workspace_for_project(&state, project_id)?;
-        let paths = NetflowPaths::new(&workspace);
-        rupu_netflow::ledger::read_flows(&paths.flows).unwrap_or_default()
+        run_blocking(move || {
+            let paths = NetflowPaths::new(&workspace);
+            rupu_netflow::ledger::read_flows_and_dropped(&paths.flows)
+                .unwrap_or_default()
+                .0
+        })
+        .await?
     } else {
-        read_all_workspaces(&state).0
+        let global_dir = state.global_dir.clone();
+        run_blocking(move || read_all_workspaces_sync(&global_dir).0).await?
     };
     Ok(Json(rupu_netflow::ledger::graph_view(&flows)))
 }
@@ -343,25 +422,36 @@ async fn get_run_netflow(
                 .run_store
                 .load(&run_id)
                 .map_err(|e| run_not_found_or_internal(&run_id, e))?;
-            Ok(Json(collect_run_netflow(
-                &s.run_store,
-                &run_id,
-                &run.workspace_path,
-            )))
+            let store = Arc::clone(&s.run_store);
+            let rid = run_id.clone();
+            let workspace = run.workspace_path.clone();
+            let resp = run_blocking(move || collect_run_netflow(&store, &rid, &workspace)).await?;
+            Ok(Json(resp))
         }
         RunLocation::ProjectLocal { path } => {
-            let store = RunStore::new(path.join(".rupu").join("runs"));
-            Ok(Json(collect_run_netflow(&store, &run_id, &path)))
+            let rid = run_id.clone();
+            let resp = run_blocking(move || {
+                let store = RunStore::new(path.join(".rupu").join("runs"));
+                collect_run_netflow(&store, &rid, &path)
+            })
+            .await?;
+            Ok(Json(resp))
         }
         RunLocation::Host { host_id } => {
             run_netflow_from_host(&s, &host_id, &run_id).await.map(Json)
         }
         // No artifacts anywhere: the run never persisted a workspace to
         // read a ledger or transcript from. Empty, not an error — mirrors
-        // `run_graph`'s `Unpersisted` branch.
+        // `run_graph`'s `Unpersisted` branch. Still routed through
+        // `run_blocking`: `load_asn_table()` reads a TSV table from disk
+        // and can be sizable, same rationale as every other branch here.
         RunLocation::Unpersisted { .. } => {
-            let table = load_asn_table();
-            Ok(Json(build_response(Vec::new(), 0, table.as_ref())))
+            let resp = run_blocking(|| {
+                let table = load_asn_table();
+                build_response(Vec::new(), 0, table.as_ref())
+            })
+            .await?;
+            Ok(Json(resp))
         }
         RunLocation::NotFound => Err(ApiError::not_found(format!("run {run_id} not found"))),
     }
