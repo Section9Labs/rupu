@@ -1,0 +1,1175 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+  html, body, #root { height: 100%; }
+  body { margin: 0; background: #0A0A0A; color: #F5F5F5; -webkit-font-smoothing: antialiased; font-feature-settings: "cv11", "ss01"; }
+  a { color: #A78BFA; text-decoration: none; }
+  a:hover { color: #C4B5FD; }
+  @keyframes rg-pulse-blue { 0%, 100% { box-shadow: 0 0 0 0 rgba(96,165,250,0.45); } 50% { box-shadow: 0 0 0 6px rgba(96,165,250,0); } }
+  @keyframes rg-pulse-amber { 0%, 100% { box-shadow: 0 0 0 0 rgba(251,191,36,0.5); } 50% { box-shadow: 0 0 0 6px rgba(251,191,36,0); } }
+  @keyframes sr-beacon { 0% { box-shadow: 0 0 0 0 currentColor; } 70% { box-shadow: 0 0 0 6px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+  .pulse-run { animation: rg-pulse-blue 1.7s ease-in-out infinite; }
+  .pulse-await { animation: rg-pulse-amber 1.7s ease-in-out infinite; }
+  .beacon { animation: sr-beacon 2s ease-out infinite; }
+  @media (prefers-reduced-motion: reduce) { .pulse-run, .pulse-await, .beacon { animation: none !important; } }
+</style>
+</helmet>
+
+<div style="display:flex; height:100vh; overflow:hidden; background:#0A0A0A; color:#F5F5F5; font-family:-apple-system, BlinkMacSystemFont, Inter, system-ui, sans-serif; font-size:13px;">
+
+  <aside style="width:204px; flex-shrink:0; border-right:1px solid #26262A; background:#141416; display:flex; flex-direction:column;">
+    <div style="height:48px; flex-shrink:0; padding:0 14px; display:flex; align-items:center; gap:9px; border-bottom:1px solid #26262A;">
+      <span style="display:flex; height:24px; width:24px; flex-shrink:0; align-items:center; justify-content:center; border-radius:6px; background:linear-gradient(145deg,#7C3AED,#A78BFA); color:#fff; box-shadow:0 0 0 1px rgba(124,58,237,0.35);">
+        <span style="font-size:14px; font-weight:300; line-height:1; font-family:ui-monospace, SFMono-Regular, Menlo, monospace;">&#8734;</span>
+      </span>
+      <span style="font-size:13px; font-weight:600; letter-spacing:-0.01em;">rupu</span>
+      <span style="margin-left:auto; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; color:#71717A;">cp</span>
+    </div>
+
+    <nav style="flex:1; padding:8px 6px; overflow-y:auto; display:flex; flex-direction:column; gap:1px;">
+      <a href="#" onClick="{{ goOverview }}" style="display:flex; align-items:center; gap:9px; height:30px; padding:0 8px; border-radius:5px; background: {{ nav.overviewBg }}; color: {{ nav.overviewFg }}; box-shadow: {{ nav.overviewRule }};">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="9" x="3" y="3" rx="1"></rect><rect width="7" height="5" x="14" y="3" rx="1"></rect><rect width="7" height="9" x="14" y="12" rx="1"></rect><rect width="7" height="5" x="3" y="16" rx="1"></rect></svg>
+        <span>Overview</span>
+        <span style="margin-left:auto; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; font-weight:600; color:#FBBF24; background:rgba(251,191,36,0.13); border-radius:4px; padding:1px 5px;">4</span>
+      </a>
+      <a href="#" onClick="{{ goActivity }}" style="display:flex; align-items:center; gap:9px; height:30px; padding:0 8px; border-radius:5px; background: {{ nav.activityBg }}; color: {{ nav.activityFg }}; box-shadow: {{ nav.activityRule }};">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"></path></svg>
+        <span>Activity</span>
+        <span style="margin-left:auto; display:inline-flex; align-items:center; gap:4px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#60A5FA;">
+          <span class="beacon" style="height:5px; width:5px; border-radius:50%; background:currentColor;"></span>4
+        </span>
+      </a>
+      <a href="#" onClick="{{ goProjects }}" style="display:flex; align-items:center; gap:9px; height:30px; padding:0 8px; border-radius:5px; background: {{ nav.projectsBg }}; color: {{ nav.projectsFg }}; box-shadow: {{ nav.projectsRule }};">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 20H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H20a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-5"></path><circle cx="13" cy="12" r="2"></circle><path d="M18 19c-2.8 0-5-2.2-5-5v8"></path><circle cx="20" cy="19" r="2"></circle></svg>
+        <span>Projects</span>
+        <span style="margin-left:auto; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">14</span>
+      </a>
+      <a href="#" onClick="{{ goSecurity }}" style="display:flex; align-items:center; gap:9px; height:30px; padding:0 8px; border-radius:5px; background: {{ nav.securityBg }}; color: {{ nav.securityFg }}; box-shadow: {{ nav.securityRule }};">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"></path><path d="m9 12 2 2 4-4"></path></svg>
+        <span>Security</span>
+        <span style="margin-left:auto; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; font-weight:600; color:#A855F7; background:rgba(168,85,247,0.14); border-radius:4px; padding:1px 5px;">1</span>
+      </a>
+      <a href="#" onClick="{{ goLibrary }}" style="display:flex; align-items:center; gap:9px; height:30px; padding:0 8px; border-radius:5px; background: {{ nav.libraryBg }}; color: {{ nav.libraryFg }}; box-shadow: {{ nav.libraryRule }};">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H19a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1H6.5a1 1 0 0 1 0-5H20"></path></svg>
+        <span>Library</span>
+      </a>
+      <a href="#" onClick="{{ goFleet }}" style="display:flex; align-items:center; gap:9px; height:30px; padding:0 8px; border-radius:5px; background: {{ nav.fleetBg }}; color: {{ nav.fleetFg }}; box-shadow: {{ nav.fleetRule }};">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="8" x="2" y="2" rx="2"></rect><rect width="20" height="8" x="2" y="14" rx="2"></rect><line x1="6" x2="6.01" y1="6" y2="6"></line><line x1="6" x2="6.01" y1="18" y2="18"></line></svg>
+        <span>Fleet</span>
+        <span style="margin-left:auto; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#F87171;">1</span>
+      </a>
+      <a href="#" onClick="{{ goUsage }}" style="display:flex; align-items:center; gap:9px; height:30px; padding:0 8px; border-radius:5px; background: {{ nav.usageBg }}; color: {{ nav.usageFg }}; box-shadow: {{ nav.usageRule }};">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" x2="12" y1="2" y2="22"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg>
+        <span>Usage</span>
+      </a>
+
+      <div style="margin-top:auto; padding-top:8px;">
+        <a href="#" style="display:flex; align-items:center; gap:9px; height:30px; padding:0 8px; border-radius:5px; color:#A1A1AA;" style-hover="background:#232327; color:#F5F5F5;">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+          <span>Settings</span>
+        </a>
+      </div>
+    </nav>
+
+    <div style="border-top:1px solid #26262A; padding:9px 12px; display:flex; align-items:center; gap:7px;">
+      <span style="height:6px; width:6px; border-radius:50%; background:#4ADE80; flex-shrink:0;"></span>
+      <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A; letter-spacing:0.04em;">4 hosts · 1 down</span>
+    </div>
+  </aside>
+
+  <div style="flex:1; min-width:0; display:flex; flex-direction:column;">
+
+    <header style="height:48px; flex-shrink:0; border-bottom:1px solid #26262A; background:#141416; display:flex; align-items:center; gap:14px; padding:0 16px;">
+      <div style="display:flex; align-items:center; gap:8px; min-width:0;">
+        <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A;">scope</span>
+        <button type="button" style="display:inline-flex; align-items:center; gap:7px; height:26px; padding:0 9px; border:1px solid #26262A; border-radius:5px; background:#1B1B1F; color:#F5F5F5; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; cursor:pointer;" style-hover="border-color:#3F3F46;">
+          <span style="height:5px; width:5px; border-radius:50%; background:#7C3AED;"></span>
+          <span>all projects</span>
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#71717A" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg>
+        </button>
+        <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#3F3F46;">/</span>
+        <button type="button" style="display:inline-flex; align-items:center; gap:7px; height:26px; padding:0 9px; border:1px solid #26262A; border-radius:5px; background:#1B1B1F; color:#A1A1AA; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; cursor:pointer;" style-hover="border-color:#3F3F46; color:#F5F5F5;">
+          <span>30d</span>
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#71717A" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg>
+        </button>
+      </div>
+
+      <button type="button" style="flex:1; max-width:420px; height:28px; display:flex; align-items:center; gap:8px; padding:0 10px; border:1px solid #26262A; border-radius:5px; background:#0A0A0A; color:#71717A; font-family:inherit; font-size:12px; cursor:text; text-align:left;" style-hover="border-color:#3F3F46;">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>
+        <span>Jump to run, project, agent, finding…</span>
+        <span style="margin-left:auto; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A; border:1px solid #26262A; border-radius:3px; padding:1px 4px;">⌘K</span>
+      </button>
+
+      <div style="margin-left:auto; display:flex; align-items:center; gap:10px;">
+        <span style="display:inline-flex; align-items:center; gap:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:600; color:#4ADE80; padding:3px 9px 3px 8px; border-radius:999px; background:rgba(74,222,128,0.1); border:1px solid rgba(74,222,128,0.3);">
+          <span class="beacon" style="height:6px; width:6px; border-radius:50%; background:currentColor;"></span>
+          live
+        </span>
+        <button type="button" style="height:26px; width:26px; display:grid; place-items:center; border:1px solid #26262A; border-radius:5px; background:#1B1B1F; color:#A1A1AA; cursor:pointer;" style-hover="color:#F5F5F5; border-color:#3F3F46;">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6.364 6.364 0 0 0 9 9 9 9 0 1 1-9-9Z"></path></svg>
+        </button>
+      </div>
+    </header>
+
+    <main style="flex:1; overflow-y:auto; min-height:0;">
+
+      <sc-if value="{{ isOverview }}" hint-placeholder-val="{{ true }}">
+      <div style="padding:16px; display:flex; flex-direction:column; gap:16px;">
+
+        <section style="border:1px solid #26262A; border-radius:7px; background:#141416; overflow:hidden;">
+          <div style="display:flex; align-items:center; gap:10px; height:36px; padding:0 14px; border-bottom:1px solid #26262A; background:linear-gradient(90deg, rgba(124,58,237,0.10), rgba(124,58,237,0));">
+            <span style="height:14px; width:2px; border-radius:1px; background:#7C3AED;"></span>
+            <h2 style="margin:0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase; font-weight:700; color:#F5F5F5;">Needs you</h2>
+            <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">4 items · oldest 1h04m</span>
+            <a href="#" style="margin-left:auto; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">mute for 1h</a>
+          </div>
+
+          <div style="display:flex; align-items:center; gap:12px; padding:11px 14px; border-bottom:1px solid #26262A; border-left:2px solid #FBBF24;">
+            <span class="pulse-await" style="flex-shrink:0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; font-weight:700; padding:3px 7px; border-radius:4px; color:#FBBF24; background:rgba(251,191,36,0.13);">gate</span>
+            <div style="min-width:0; flex:1;">
+              <div style="display:flex; align-items:baseline; gap:8px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px;">
+                <span style="color:#F5F5F5; font-weight:600;">rupu</span>
+                <span style="color:#3F3F46;">/</span>
+                <span style="color:#A78BFA;">nightly-review</span>
+                <span style="color:#71717A;">#a41f0c</span>
+                <span style="color:#71717A;">step deploy-approval</span>
+              </div>
+              <div style="margin-top:4px; font-size:12.5px; color:#F5F5F5; line-height:1.4;">Merge 3 reviewed PRs into <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; color:#A1A1AA;">main</span> — 0 blocking findings, 2 advisory</div>
+            </div>
+            <span style="flex-shrink:0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#FBBF24; font-variant-numeric:tabular-nums;">1h04m</span>
+            <div style="flex-shrink:0; display:flex; gap:6px;">
+              <button type="button" style="height:26px; padding:0 12px; border-radius:5px; border:1px solid rgba(74,222,128,0.35); background:rgba(74,222,128,0.14); color:#4ADE80; font-family:inherit; font-size:11.5px; font-weight:600; cursor:pointer;" style-hover="background:rgba(74,222,128,0.22);">Approve</button>
+              <button type="button" style="height:26px; padding:0 12px; border-radius:5px; border:1px solid rgba(248,113,113,0.35); background:rgba(248,113,113,0.12); color:#F87171; font-family:inherit; font-size:11.5px; font-weight:600; cursor:pointer;" style-hover="background:rgba(248,113,113,0.2);">Reject</button>
+              <button type="button" style="height:26px; padding:0 10px; border-radius:5px; border:1px solid #26262A; background:#1B1B1F; color:#A1A1AA; font-family:inherit; font-size:11.5px; cursor:pointer;" style-hover="color:#F5F5F5;">Diff</button>
+            </div>
+          </div>
+
+          <div style="display:flex; align-items:center; gap:12px; padding:11px 14px; border-bottom:1px solid #26262A; border-left:2px solid #FBBF24;">
+            <span style="flex-shrink:0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; font-weight:700; padding:3px 7px; border-radius:4px; color:#FBBF24; background:rgba(251,191,36,0.13);">gate</span>
+            <div style="min-width:0; flex:1;">
+              <div style="display:flex; align-items:baseline; gap:8px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px;">
+                <span style="color:#F5F5F5; font-weight:600;">edge-gateway</span>
+                <span style="color:#3F3F46;">/</span>
+                <span style="color:#A78BFA;">release-cut</span>
+                <span style="color:#71717A;">#77b2e1</span>
+                <span style="color:#71717A;">step sign-off</span>
+              </div>
+              <div style="margin-top:4px; font-size:12.5px; color:#F5F5F5; line-height:1.4;">Tag <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; color:#A1A1AA;">v1.8.3</span> and publish release notes</div>
+            </div>
+            <span style="flex-shrink:0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A1A1AA; font-variant-numeric:tabular-nums;">12m</span>
+            <div style="flex-shrink:0; display:flex; gap:6px;">
+              <button type="button" style="height:26px; padding:0 12px; border-radius:5px; border:1px solid rgba(74,222,128,0.35); background:rgba(74,222,128,0.14); color:#4ADE80; font-family:inherit; font-size:11.5px; font-weight:600; cursor:pointer;" style-hover="background:rgba(74,222,128,0.22);">Approve</button>
+              <button type="button" style="height:26px; padding:0 12px; border-radius:5px; border:1px solid rgba(248,113,113,0.35); background:rgba(248,113,113,0.12); color:#F87171; font-family:inherit; font-size:11.5px; font-weight:600; cursor:pointer;" style-hover="background:rgba(248,113,113,0.2);">Reject</button>
+              <button type="button" style="height:26px; padding:0 10px; border-radius:5px; border:1px solid #26262A; background:#1B1B1F; color:#A1A1AA; font-family:inherit; font-size:11.5px; cursor:pointer;" style-hover="color:#F5F5F5;">Diff</button>
+            </div>
+          </div>
+
+          <div style="display:flex; align-items:center; gap:12px; padding:11px 14px; border-bottom:1px solid #26262A; border-left:2px solid #F87171;">
+            <span style="flex-shrink:0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; font-weight:700; padding:3px 7px; border-radius:4px; color:#F87171; background:rgba(248,113,113,0.12);">failed</span>
+            <div style="min-width:0; flex:1;">
+              <div style="display:flex; align-items:baseline; gap:8px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px;">
+                <span style="color:#F5F5F5; font-weight:600;">rupu</span>
+                <span style="color:#3F3F46;">/</span>
+                <span style="color:#A78BFA;">add-tests</span>
+                <span style="color:#71717A;">#31c9ae</span>
+                <span style="color:#71717A;">host build-01</span>
+              </div>
+              <div style="margin-top:4px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11.5px; color:#A1A1AA; line-height:1.4;">step <span style="color:#F5F5F5;">run-tests</span> exited 1 · <span style="color:#F87171;">2 failing in rupu-cp/tests/sse.rs</span></div>
+            </div>
+            <span style="flex-shrink:0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A1A1AA; font-variant-numeric:tabular-nums;">8m</span>
+            <div style="flex-shrink:0; display:flex; gap:6px;">
+              <button type="button" style="height:26px; padding:0 12px; border-radius:5px; border:1px solid #3F3F46; background:#232327; color:#F5F5F5; font-family:inherit; font-size:11.5px; font-weight:600; cursor:pointer;" style-hover="background:#2E2E33;">Transcript</button>
+              <button type="button" style="height:26px; padding:0 10px; border-radius:5px; border:1px solid #26262A; background:#1B1B1F; color:#A1A1AA; font-family:inherit; font-size:11.5px; cursor:pointer;" style-hover="color:#F5F5F5;">Retry</button>
+            </div>
+          </div>
+
+          <div style="display:flex; align-items:center; gap:12px; padding:11px 14px; border-left:2px solid #A855F7;">
+            <span style="flex-shrink:0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; font-weight:700; padding:3px 7px; border-radius:4px; color:#A855F7; background:#2A1C38;">critical</span>
+            <div style="min-width:0; flex:1;">
+              <div style="display:flex; align-items:baseline; gap:8px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px;">
+                <span style="color:#F5F5F5; font-weight:600;">rupu</span>
+                <span style="color:#3F3F46;">/</span>
+                <span style="color:#A1A1AA;">crates/rupu-cp/src/node/server.rs:142</span>
+                <span style="color:#71717A;">CWE-306</span>
+              </div>
+              <div style="margin-top:4px; font-size:12.5px; color:#F5F5F5; line-height:1.4;">Unauthenticated tunnel enrollment accepts any node token</div>
+            </div>
+            <span style="flex-shrink:0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A1A1AA; font-variant-numeric:tabular-nums;">31m</span>
+            <div style="flex-shrink:0; display:flex; gap:6px;">
+              <button type="button" style="height:26px; padding:0 12px; border-radius:5px; border:1px solid #3F3F46; background:#232327; color:#F5F5F5; font-family:inherit; font-size:11.5px; font-weight:600; cursor:pointer;" style-hover="background:#2E2E33;">Review code</button>
+              <button type="button" style="height:26px; padding:0 10px; border-radius:5px; border:1px solid #26262A; background:#1B1B1F; color:#A1A1AA; font-family:inherit; font-size:11.5px; cursor:pointer;" style-hover="color:#F5F5F5;">Triage</button>
+            </div>
+          </div>
+        </section>
+
+        <section style="border:1px solid #26262A; border-radius:7px; background:#141416; display:flex; overflow:hidden;">
+          <div style="flex:1; min-width:0; padding:11px 16px; border-right:1px solid #26262A;">
+            <div style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.14em; text-transform:uppercase; color:#71717A;">Active now</div>
+            <div style="margin-top:5px; display:flex; align-items:baseline; gap:7px;">
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:26px; font-weight:600; line-height:1; letter-spacing:-0.02em; font-variant-numeric:tabular-nums; color:#F5F5F5;">4</span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#71717A;">longest 2h14m</span>
+            </div>
+            <div style="margin-top:7px; display:flex; height:3px; border-radius:2px; overflow:hidden; background:#1B1B1F;">
+              <span style="flex:4; background:#60A5FA;"></span>
+              <span style="flex:2; background:#FBBF24;"></span>
+              <span style="flex:1; background:#22D3EE;"></span>
+            </div>
+            <div style="margin-top:6px; display:flex; gap:10px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">
+              <span><span style="color:#60A5FA;">4</span> running</span>
+              <span><span style="color:#FBBF24;">2</span> gated</span>
+              <span><span style="color:#22D3EE;">1</span> paused</span>
+            </div>
+          </div>
+
+          <div style="flex:1; min-width:0; padding:11px 16px; border-right:1px solid #26262A;">
+            <div style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.14em; text-transform:uppercase; color:#71717A;">Success rate</div>
+            <div style="margin-top:5px; display:flex; align-items:baseline; gap:7px;">
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:26px; font-weight:600; line-height:1; letter-spacing:-0.02em; font-variant-numeric:tabular-nums; color:#F5F5F5;">86<span style="font-size:14px; color:#71717A;">%</span></span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#4ADE80;">+3 vs prev</span>
+            </div>
+            <div style="margin-top:7px; display:flex; height:3px; border-radius:2px; overflow:hidden; background:#1B1B1F;">
+              <span style="flex:86; background:#4ADE80;"></span>
+              <span style="flex:14; background:#26262A;"></span>
+            </div>
+            <div style="margin-top:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">96 of 112 terminal runs</div>
+          </div>
+
+          <div style="flex:1; min-width:0; padding:11px 16px; border-right:1px solid #26262A;">
+            <div style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.14em; text-transform:uppercase; color:#71717A;">Failed · 30d</div>
+            <div style="margin-top:5px; display:flex; align-items:baseline; gap:7px;">
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:26px; font-weight:600; line-height:1; letter-spacing:-0.02em; font-variant-numeric:tabular-nums; color:#F87171;">7</span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#71717A;">3 in last 24h</span>
+            </div>
+            <div style="margin-top:5px; height:22px;">
+              <svg width="100%" height="22" viewBox="0 0 120 22" preserveAspectRatio="none" style="display:block;">
+                <path d="M0,13 C6.7,13 13.3,9 20,9 C26.7,9 33.3,17 40,17 C46.7,17 53.3,2 60,2 C66.7,2 73.3,13 80,13 C86.7,13 93.3,5.5 100,5.5 C106.7,5.5 113.3,17 120,17 L120,22 L0,22 Z" fill="#F87171" fill-opacity="0.2"></path>
+                <path d="M0,13 C6.7,13 13.3,9 20,9 C26.7,9 33.3,17 40,17 C46.7,17 53.3,2 60,2 C66.7,2 73.3,13 80,13 C86.7,13 93.3,5.5 100,5.5 C106.7,5.5 113.3,17 120,17" fill="none" stroke="#F87171" stroke-width="1.25" vector-effect="non-scaling-stroke"></path>
+              </svg>
+            </div>
+          </div>
+
+          <div style="flex:1; min-width:0; padding:11px 16px; border-right:1px solid #26262A;">
+            <div style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.14em; text-transform:uppercase; color:#71717A;">Open findings</div>
+            <div style="margin-top:5px; display:flex; align-items:baseline; gap:7px;">
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:26px; font-weight:600; line-height:1; letter-spacing:-0.02em; font-variant-numeric:tabular-nums; color:#F5F5F5;">41<span style="font-size:14px; color:#71717A;">+</span></span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#71717A;">partial sum</span>
+            </div>
+            <div style="margin-top:7px; display:flex; height:3px; border-radius:2px; overflow:hidden; background:#1B1B1F;">
+              <span style="flex:1; background:#A855F7;"></span>
+              <span style="flex:6; background:#F87171;"></span>
+              <span style="flex:13; background:#FB923C;"></span>
+              <span style="flex:21; background:#FACC15;"></span>
+            </div>
+            <div style="margin-top:6px; display:flex; gap:9px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">
+              <span><span style="color:#A855F7;">1</span>C</span>
+              <span><span style="color:#F87171;">6</span>H</span>
+              <span><span style="color:#FB923C;">13</span>M</span>
+              <span><span style="color:#FACC15;">21</span>L</span>
+            </div>
+          </div>
+
+          <div style="flex:1; min-width:0; padding:11px 16px;">
+            <div style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.14em; text-transform:uppercase; color:#71717A;">Spend · 30d</div>
+            <div style="margin-top:5px; display:flex; align-items:baseline; gap:7px;">
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:26px; font-weight:600; line-height:1; letter-spacing:-0.02em; font-variant-numeric:tabular-nums; color:#F5F5F5;"><span style="font-size:14px; color:#71717A;">$</span>1,284</span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#FB923C;">+18%</span>
+            </div>
+            <div style="margin-top:7px; display:flex; height:3px; border-radius:2px; overflow:hidden; background:#1B1B1F;">
+              <span style="flex:52; background:#7C3AED;"></span>
+              <span style="flex:31; background:#A78BFA;"></span>
+              <span style="flex:17; background:#3F3F46;"></span>
+            </div>
+            <div style="margin-top:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">62.4M tokens · 24% cached</div>
+          </div>
+        </section>
+
+        <sc-if value="{{ showCharts }}" hint-placeholder-val="{{ true }}">
+        <div style="display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:16px;">
+          <section style="border:1px solid #26262A; border-radius:7px; background:#141416; overflow:hidden;">
+            <div style="display:flex; align-items:center; gap:12px; height:32px; padding:0 14px; border-bottom:1px solid #26262A;">
+              <h2 style="margin:0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9.5px; letter-spacing:0.14em; text-transform:uppercase; font-weight:700; color:#A1A1AA;">Outcomes</h2>
+              <div style="margin-left:auto; display:flex; gap:10px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9.5px; color:#71717A;">
+                <span style="display:inline-flex; align-items:center; gap:4px;"><span style="height:6px; width:6px; border-radius:1px; background:#4ADE80;"></span>completed</span>
+                <span style="display:inline-flex; align-items:center; gap:4px;"><span style="height:6px; width:6px; border-radius:1px; background:#F87171;"></span>failed</span>
+                <span style="display:inline-flex; align-items:center; gap:4px;"><span style="height:6px; width:6px; border-radius:1px; background:#A1A1AA;"></span>cancelled</span>
+              </div>
+            </div>
+            <div style="padding:10px 12px 4px;">
+              <svg width="100%" height="164" viewBox="0 0 320 164" preserveAspectRatio="none" style="display:block; overflow:visible;">
+                <g stroke="#26262A" stroke-width="1" vector-effect="non-scaling-stroke">
+                  <line x1="24" y1="142" x2="316" y2="142"></line>
+                  <line x1="24" y1="107.5" x2="316" y2="107.5"></line>
+                  <line x1="24" y1="73" x2="316" y2="73"></line>
+                  <line x1="24" y1="38.5" x2="316" y2="38.5"></line>
+                  <line x1="24" y1="4" x2="316" y2="4"></line>
+                </g>
+                <path d="M24,76.7 C40,76.7 58.3,46.5 74.4,46.5 C90.4,46.5 106.9,98.3 122.9,98.3 C138.9,98.3 155.4,7.6 171.4,7.6 C187.4,7.6 203.9,63.8 219.9,63.8 C235.9,63.8 252.4,29.2 268.4,29.2 C284.4,29.2 300,63.8 316,63.8 L316,142 L24,142 Z" fill="#A1A1AA" fill-opacity="0.18"></path>
+                <path d="M24,81.1 C40,81.1 58.3,46.5 74.4,46.5 C90.4,46.5 106.9,98.3 122.9,98.3 C138.9,98.3 155.4,16.3 171.4,16.3 C187.4,16.3 203.9,63.8 219.9,63.8 C235.9,63.8 252.4,33.5 268.4,33.5 C284.4,33.5 300,63.8 316,63.8 L316,142 L24,142 Z" fill="#F87171" fill-opacity="0.22"></path>
+                <path d="M24,89.8 C40,89.8 58.3,63.8 74.4,63.8 C90.4,63.8 106.9,102.6 122.9,102.6 C138.9,102.6 155.4,38.5 171.4,38.5 C187.4,38.5 203.9,76.7 219.9,76.7 C235.9,76.7 252.4,50.7 268.4,50.7 C284.4,50.7 300,68.1 316,68.1 L316,142 L24,142 Z" fill="#4ADE80" fill-opacity="0.22"></path>
+                <path d="M24,81.1 C40,81.1 58.3,46.5 74.4,46.5 C90.4,46.5 106.9,98.3 122.9,98.3 C138.9,98.3 155.4,16.3 171.4,16.3 C187.4,16.3 203.9,63.8 219.9,63.8 C235.9,63.8 252.4,33.5 268.4,33.5 C284.4,33.5 300,63.8 316,63.8" fill="none" stroke="#F87171" stroke-width="1.5" vector-effect="non-scaling-stroke"></path>
+                <path d="M24,89.8 C40,89.8 58.3,63.8 74.4,63.8 C90.4,63.8 106.9,102.6 122.9,102.6 C138.9,102.6 155.4,38.5 171.4,38.5 C187.4,38.5 203.9,76.7 219.9,76.7 C235.9,76.7 252.4,50.7 268.4,50.7 C284.4,50.7 300,68.1 316,68.1" fill="none" stroke="#4ADE80" stroke-width="1.5" vector-effect="non-scaling-stroke"></path>
+                <g fill="#52525B" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">
+                  <text x="18" y="145" text-anchor="end">0</text>
+                  <text x="18" y="110.5" text-anchor="end">8</text>
+                  <text x="18" y="76" text-anchor="end">16</text>
+                  <text x="18" y="41.5" text-anchor="end">24</text>
+                  <text x="18" y="8" text-anchor="end">32</text>
+                  <text x="26" y="158" text-anchor="start">Jul 6</text>
+                  <text x="122.9" y="158" text-anchor="middle">Jul 14</text>
+                  <text x="219.9" y="158" text-anchor="middle">Jul 22</text>
+                  <text x="314" y="158" text-anchor="end">Jul 30</text>
+                </g>
+              </svg>
+            </div>
+          </section>
+
+          <section style="border:1px solid #26262A; border-radius:7px; background:#141416; overflow:hidden;">
+            <div style="display:flex; align-items:center; gap:12px; height:32px; padding:0 14px; border-bottom:1px solid #26262A;">
+              <h2 style="margin:0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9.5px; letter-spacing:0.14em; text-transform:uppercase; font-weight:700; color:#A1A1AA;">Throughput by trigger</h2>
+              <div style="margin-left:auto; display:flex; gap:10px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9.5px; color:#71717A;">
+                <span style="display:inline-flex; align-items:center; gap:4px;"><span style="height:6px; width:6px; border-radius:1px; background:#A1A1AA;"></span>manual</span>
+                <span style="display:inline-flex; align-items:center; gap:4px;"><span style="height:6px; width:6px; border-radius:1px; background:#7C3AED;"></span>cron</span>
+                <span style="display:inline-flex; align-items:center; gap:4px;"><span style="height:6px; width:6px; border-radius:1px; background:#60A5FA;"></span>event</span>
+              </div>
+            </div>
+            <div style="padding:10px 12px 4px;">
+              <svg width="100%" height="164" viewBox="0 0 320 164" preserveAspectRatio="none" style="display:block; overflow:visible;">
+                <g stroke="#26262A" stroke-width="1" vector-effect="non-scaling-stroke">
+                  <line x1="24" y1="142" x2="316" y2="142"></line>
+                  <line x1="24" y1="107.5" x2="316" y2="107.5"></line>
+                  <line x1="24" y1="73" x2="316" y2="73"></line>
+                  <line x1="24" y1="38.5" x2="316" y2="38.5"></line>
+                  <line x1="24" y1="4" x2="316" y2="4"></line>
+                </g>
+                <path d="M24,76.7 C40,76.7 58.3,46.5 74.4,46.5 C90.4,46.5 106.9,98.3 122.9,98.3 C138.9,98.3 155.4,7.6 171.4,7.6 C187.4,7.6 203.9,63.8 219.9,63.8 C235.9,63.8 252.4,29.2 268.4,29.2 C284.4,29.2 300,63.8 316,63.8 L316,142 L24,142 Z" fill="#60A5FA" fill-opacity="0.2"></path>
+                <path d="M24,85.4 C40,85.4 58.3,59.5 74.4,59.5 C90.4,59.5 106.9,102.6 122.9,102.6 C138.9,102.6 155.4,29.2 171.4,29.2 C187.4,29.2 203.9,72.5 219.9,72.5 C235.9,72.5 252.4,42.2 268.4,42.2 C284.4,42.2 300,72.5 316,72.5 L316,142 L24,142 Z" fill="#7C3AED" fill-opacity="0.28"></path>
+                <path d="M24,129 C40,129 58.3,120.4 74.4,120.4 C90.4,120.4 106.9,133.4 122.9,133.4 C138.9,133.4 155.4,116 171.4,116 C187.4,116 203.9,124.7 219.9,124.7 C235.9,124.7 252.4,120.4 268.4,120.4 C284.4,120.4 300,129 316,129 L316,142 L24,142 Z" fill="#A1A1AA" fill-opacity="0.2"></path>
+                <path d="M24,76.7 C40,76.7 58.3,46.5 74.4,46.5 C90.4,46.5 106.9,98.3 122.9,98.3 C138.9,98.3 155.4,7.6 171.4,7.6 C187.4,7.6 203.9,63.8 219.9,63.8 C235.9,63.8 252.4,29.2 268.4,29.2 C284.4,29.2 300,63.8 316,63.8" fill="none" stroke="#60A5FA" stroke-width="1.5" vector-effect="non-scaling-stroke"></path>
+                <path d="M24,85.4 C40,85.4 58.3,59.5 74.4,59.5 C90.4,59.5 106.9,102.6 122.9,102.6 C138.9,102.6 155.4,29.2 171.4,29.2 C187.4,29.2 203.9,72.5 219.9,72.5 C235.9,72.5 252.4,42.2 268.4,42.2 C284.4,42.2 300,72.5 316,72.5" fill="none" stroke="#7C3AED" stroke-width="1.5" vector-effect="non-scaling-stroke"></path>
+                <g fill="#52525B" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">
+                  <text x="18" y="145" text-anchor="end">0</text>
+                  <text x="18" y="110.5" text-anchor="end">8</text>
+                  <text x="18" y="76" text-anchor="end">16</text>
+                  <text x="18" y="41.5" text-anchor="end">24</text>
+                  <text x="18" y="8" text-anchor="end">32</text>
+                  <text x="26" y="158" text-anchor="start">Jul 6</text>
+                  <text x="122.9" y="158" text-anchor="middle">Jul 14</text>
+                  <text x="219.9" y="158" text-anchor="middle">Jul 22</text>
+                  <text x="314" y="158" text-anchor="end">Jul 30</text>
+                </g>
+              </svg>
+            </div>
+          </section>
+        </div>
+        </sc-if>
+
+        <sc-if value="{{ showLiveTail }}" hint-placeholder-val="{{ true }}">
+        <div style="display:grid; grid-template-columns:minmax(0,1.6fr) minmax(0,1fr); gap:16px;">
+          <section style="border:1px solid #26262A; border-radius:7px; background:#141416; overflow:hidden;">
+            <div style="display:flex; align-items:center; gap:10px; height:32px; padding:0 14px; border-bottom:1px solid #26262A;">
+              <h2 style="margin:0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9.5px; letter-spacing:0.14em; text-transform:uppercase; font-weight:700; color:#A1A1AA;">Live stream</h2>
+              <span class="beacon" style="height:5px; width:5px; border-radius:50%; background:#4ADE80; color:#4ADE80;"></span>
+              <a href="#" onClick="{{ goActivity }}" style="margin-left:auto; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">open activity →</a>
+            </div>
+            <div style="display:flex; align-items:center; gap:10px; padding:8px 14px; border-bottom:1px solid #1B1B1F; border-left:2px solid #7C3AED;">
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A; width:38px; flex-shrink:0; font-variant-numeric:tabular-nums;">now</span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; font-weight:700; color:#A78BFA; background:#211738; border-radius:4px; padding:2px 6px; flex-shrink:0;">tool</span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; flex-shrink:0;">rupu</span>
+              <span style="font-size:12px; color:#A1A1AA; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">review-diff ran <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; color:#F5F5F5;">ast_grep</span> over 41 files</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:10px; padding:8px 14px; border-bottom:1px solid #1B1B1F; border-left:2px solid #4ADE80;">
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A; width:38px; flex-shrink:0; font-variant-numeric:tabular-nums;">12s</span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; font-weight:700; color:#4ADE80; background:rgba(74,222,128,0.12); border-radius:4px; padding:2px 6px; flex-shrink:0;">done</span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; flex-shrink:0;">edge-gateway</span>
+              <span style="font-size:12px; color:#A1A1AA; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">summarize-diff completed in 41s · 82k tokens</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:10px; padding:8px 14px; border-bottom:1px solid #1B1B1F; border-left:2px solid #FB923C;">
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A; width:38px; flex-shrink:0; font-variant-numeric:tabular-nums;">48s</span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; font-weight:700; color:#FB923C; background:#302012; border-radius:4px; padding:2px 6px; flex-shrink:0;">medium</span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; flex-shrink:0;">edge-gateway</span>
+              <span style="font-size:12px; color:#A1A1AA; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">Webhook signature comparison is not constant-time</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:10px; padding:8px 14px; border-bottom:1px solid #1B1B1F; border-left:2px solid #60A5FA;">
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A; width:38px; flex-shrink:0; font-variant-numeric:tabular-nums;">2m</span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; font-weight:700; color:#60A5FA; background:rgba(96,165,250,0.12); border-radius:4px; padding:2px 6px; flex-shrink:0;">start</span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; flex-shrink:0;">rupu</span>
+              <span style="font-size:12px; color:#A1A1AA; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">autoflow claimed issue #1284 on <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; color:#F5F5F5;">build-01</span></span>
+            </div>
+            <div style="display:flex; align-items:center; gap:10px; padding:8px 14px; border-left:2px solid #26262A;">
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A; width:38px; flex-shrink:0; font-variant-numeric:tabular-nums;">4m</span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; font-weight:700; color:#71717A; background:#1B1B1F; border-radius:4px; padding:2px 6px; flex-shrink:0;">cron</span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; flex-shrink:0;">payments-api</span>
+              <span style="font-size:12px; color:#A1A1AA; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">nightly-review scheduled tick fired</span>
+            </div>
+          </section>
+
+          <section style="border:1px solid #26262A; border-radius:7px; background:#141416; overflow:hidden;">
+            <div style="display:flex; align-items:center; gap:10px; height:32px; padding:0 14px; border-bottom:1px solid #26262A;">
+              <h2 style="margin:0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9.5px; letter-spacing:0.14em; text-transform:uppercase; font-weight:700; color:#A1A1AA;">Hosts</h2>
+              <a href="#" onClick="{{ goFleet }}" style="margin-left:auto; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">fleet →</a>
+            </div>
+            <div style="padding:10px 12px; display:flex; flex-direction:column; gap:8px;">
+              <div style="border:1px solid #26262A; border-radius:6px; background:#1B1B1F; padding:9px 11px;">
+                <div style="display:flex; align-items:center; gap:8px;">
+                  <span style="height:7px; width:7px; border-radius:50%; background:#4ADE80; box-shadow:0 0 0 3px rgba(74,222,128,0.15); flex-shrink:0;"></span>
+                  <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11.5px; font-weight:600; color:#F5F5F5;">local</span>
+                  <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.08em; text-transform:uppercase; color:#71717A;">sse</span>
+                  <span style="margin-left:auto; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#4ADE80;">live</span>
+                </div>
+                <div style="margin-top:7px; display:flex; height:3px; border-radius:2px; overflow:hidden; background:#0A0A0A;">
+                  <span style="flex:2; background:#60A5FA;"></span><span style="flex:6; background:#26262A;"></span>
+                </div>
+                <div style="margin-top:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">2 running · 0 queued · 8 slots</div>
+              </div>
+              <div style="border:1px solid #26262A; border-radius:6px; background:#1B1B1F; padding:9px 11px;">
+                <div style="display:flex; align-items:center; gap:8px;">
+                  <span style="height:7px; width:7px; border-radius:50%; background:#60A5FA; box-shadow:0 0 0 3px rgba(96,165,250,0.15); flex-shrink:0;"></span>
+                  <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11.5px; font-weight:600; color:#F5F5F5;">build-01</span>
+                  <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.08em; text-transform:uppercase; color:#71717A;">http</span>
+                  <span style="margin-left:auto; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#A1A1AA;">12s</span>
+                </div>
+                <div style="margin-top:7px; display:flex; height:3px; border-radius:2px; overflow:hidden; background:#0A0A0A;">
+                  <span style="flex:11; background:#60A5FA;"></span><span style="flex:3; background:#FBBF24;"></span><span style="flex:2; background:#26262A;"></span>
+                </div>
+                <div style="margin-top:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">11 running · 3 queued · 16 slots</div>
+              </div>
+              <div style="border:1px solid #26262A; border-radius:6px; background:#1B1B1F; padding:9px 11px;">
+                <div style="display:flex; align-items:center; gap:8px;">
+                  <span style="height:7px; width:7px; border-radius:50%; background:#71717A; flex-shrink:0;"></span>
+                  <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11.5px; font-weight:600; color:#F5F5F5;">eu-ssh-2</span>
+                  <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.08em; text-transform:uppercase; color:#71717A;">ssh</span>
+                  <span style="margin-left:auto; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#A1A1AA;">3m</span>
+                </div>
+                <div style="margin-top:7px; display:flex; height:3px; border-radius:2px; overflow:hidden; background:#0A0A0A;">
+                  <span style="flex:1; background:#60A5FA;"></span><span style="flex:7; background:#26262A;"></span>
+                </div>
+                <div style="margin-top:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">1 running · poll-bounded</div>
+              </div>
+              <div style="border:1px solid rgba(248,113,113,0.4); border-radius:6px; background:#2B1616; padding:9px 11px;">
+                <div style="display:flex; align-items:center; gap:8px;">
+                  <span style="height:7px; width:7px; border-radius:50%; background:#F87171; box-shadow:0 0 0 3px rgba(248,113,113,0.18); flex-shrink:0;"></span>
+                  <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11.5px; font-weight:600; color:#F5F5F5;">tunnel-a</span>
+                  <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.08em; text-transform:uppercase; color:#71717A;">tunnel</span>
+                  <span style="margin-left:auto; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#F87171;">unavailable</span>
+                </div>
+                <div style="margin-top:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#F87171;">dial-home lost 14m ago · last seen 09:41</div>
+              </div>
+            </div>
+          </section>
+        </div>
+        </sc-if>
+      </div>
+      </sc-if>
+
+      <sc-if value="{{ isActivity }}" hint-placeholder-val="{{ false }}">
+      <div style="padding:16px; display:flex; flex-direction:column; gap:14px;">
+        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+          <h1 style="margin:0; font-size:16px; font-weight:600; letter-spacing:-0.01em;">Activity</h1>
+          <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A;">every execution — agents, workflows, autoflows, sessions</span>
+          <label style="margin-left:auto; display:inline-flex; align-items:center; gap:7px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#A1A1AA; cursor:pointer;">
+            <span style="width:26px; height:15px; border-radius:999px; background:#4ADE80; position:relative; display:inline-block;">
+              <span style="position:absolute; top:2px; left:13px; height:11px; width:11px; border-radius:50%; background:#0A0A0A;"></span>
+            </span>
+            live tail
+          </label>
+        </div>
+
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+          <div style="display:inline-flex; background:#1B1B1F; border:1px solid #26262A; border-radius:6px; padding:2px;">
+            <button type="button" style="height:24px; padding:0 11px; border:0; border-radius:4px; background:#141416; color:#A78BFA; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; font-weight:600; cursor:pointer; box-shadow:0 1px 2px rgba(0,0,0,0.3);">all 412</button>
+            <button type="button" style="height:24px; padding:0 11px; border:0; border-radius:4px; background:transparent; color:#71717A; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; cursor:pointer;" style-hover="color:#F5F5F5;">agents 186</button>
+            <button type="button" style="height:24px; padding:0 11px; border:0; border-radius:4px; background:transparent; color:#71717A; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; cursor:pointer;" style-hover="color:#F5F5F5;">workflows 122</button>
+            <button type="button" style="height:24px; padding:0 11px; border:0; border-radius:4px; background:transparent; color:#71717A; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; cursor:pointer;" style-hover="color:#F5F5F5;">autoflows 68</button>
+            <button type="button" style="height:24px; padding:0 11px; border:0; border-radius:4px; background:transparent; color:#71717A; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; cursor:pointer;" style-hover="color:#F5F5F5;">sessions 36</button>
+          </div>
+          <span style="width:1px; height:20px; background:#26262A;"></span>
+          <button type="button" style="height:26px; padding:0 10px; border:1px solid rgba(251,191,36,0.35); border-radius:5px; background:rgba(251,191,36,0.12); color:#FBBF24; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; font-weight:600; cursor:pointer;">gated 2</button>
+          <button type="button" style="height:26px; padding:0 10px; border:1px solid #26262A; border-radius:5px; background:#1B1B1F; color:#71717A; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; cursor:pointer;" style-hover="color:#F5F5F5;">running 4</button>
+          <button type="button" style="height:26px; padding:0 10px; border:1px solid #26262A; border-radius:5px; background:#1B1B1F; color:#71717A; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; cursor:pointer;" style-hover="color:#F5F5F5;">failed 7</button>
+          <button type="button" style="height:26px; padding:0 10px; border:1px solid #26262A; border-radius:5px; background:#1B1B1F; color:#71717A; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; cursor:pointer;" style-hover="color:#F5F5F5;">completed 96</button>
+          <button type="button" style="margin-left:auto; height:26px; padding:0 10px; border:1px dashed #3F3F46; border-radius:5px; background:transparent; color:#A1A1AA; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; cursor:pointer;" style-hover="color:#F5F5F5; border-color:#71717A;">+ save view</button>
+        </div>
+
+        <section style="border:1px solid #26262A; border-radius:7px; background:#141416; overflow:hidden;">
+          <div style="overflow-x:auto;">
+          <table style="width:100%; border-collapse:collapse; font-size:12px;">
+            <thead>
+              <tr style="border-bottom:1px solid #26262A; background:#1B1B1F;">
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Status</th>
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Kind</th>
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:100%;">Subject</th>
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Project</th>
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Host</th>
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Trigger</th>
+                <th scope="col" style="padding:7px 12px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Dur</th>
+                <th scope="col" style="padding:7px 12px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Cost</th>
+                <th scope="col" style="padding:7px 12px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Started</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr style="border-bottom:1px solid #1B1B1F; background:rgba(251,191,36,0.04);">
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span class="pulse-await" style="display:inline-flex; align-items:center; gap:5px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; font-weight:600; padding:2px 7px; border-radius:999px; color:#FBBF24; background:rgba(251,191,36,0.12); box-shadow:inset 0 0 0 1px rgba(251,191,36,0.3);">gated</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#A78BFA;">workflow</span></td>
+                <td style="padding:8px 12px; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; color:#F5F5F5;">nightly-review</span> <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A;">· deploy-approval</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="color:#A1A1AA;">rupu</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A1A1AA;">build-01</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#A78BFA;">cron</span></td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#FBBF24; width:1%; white-space:nowrap;">2h14m</td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; width:1%; white-space:nowrap;">$18.40</td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">02:00</td>
+              </tr>
+              <tr style="border-bottom:1px solid #1B1B1F;">
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span class="pulse-run" style="display:inline-flex; align-items:center; gap:5px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; font-weight:600; padding:2px 7px; border-radius:999px; color:#60A5FA; background:rgba(96,165,250,0.1); box-shadow:inset 0 0 0 1px rgba(96,165,250,0.3);">running</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#A1A1AA;">agent</span></td>
+                <td style="padding:8px 12px; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; color:#F5F5F5;">review-diff</span> <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A;">· ast_grep 41 files</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="color:#A1A1AA;">rupu</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A1A1AA;">local</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">manual</span></td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#60A5FA; width:1%; white-space:nowrap;">3m12s</td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; width:1%; white-space:nowrap;">$1.02</td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">09:52</td>
+              </tr>
+              <tr style="border-bottom:1px solid #1B1B1F;">
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; gap:5px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; font-weight:600; padding:2px 7px; border-radius:999px; color:#F87171; background:rgba(248,113,113,0.1); box-shadow:inset 0 0 0 1px rgba(248,113,113,0.3);">failed</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#A1A1AA;">agent</span></td>
+                <td style="padding:8px 12px; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; color:#F5F5F5;">add-tests</span> <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F87171;">· run-tests exited 1</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="color:#A1A1AA;">rupu</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A1A1AA;">build-01</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#60A5FA;">event</span></td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A1A1AA; width:1%; white-space:nowrap;">6m48s</td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; width:1%; white-space:nowrap;">$2.71</td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">09:44</td>
+              </tr>
+              <tr style="border-bottom:1px solid #1B1B1F;">
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; gap:5px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; font-weight:600; padding:2px 7px; border-radius:999px; color:#22D3EE; background:rgba(34,211,238,0.1); box-shadow:inset 0 0 0 1px rgba(34,211,238,0.3);">paused</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#FB923C;">autoflow</span></td>
+                <td style="padding:8px 12px; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; color:#F5F5F5;">issue-intake</span> <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A;">· claim #1284</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="color:#A1A1AA;">payments-api</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A1A1AA;">eu-ssh-2</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#60A5FA;">event</span></td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A1A1AA; width:1%; white-space:nowrap;">41m</td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; width:1%; white-space:nowrap;">$6.15</td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">09:11</td>
+              </tr>
+              <tr style="border-bottom:1px solid #1B1B1F;">
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; gap:5px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; font-weight:600; padding:2px 7px; border-radius:999px; color:#4ADE80; background:rgba(74,222,128,0.1); box-shadow:inset 0 0 0 1px rgba(74,222,128,0.3);">done</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#22D3EE;">session</span></td>
+                <td style="padding:8px 12px; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; color:#F5F5F5;">refactor-sse</span> <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A;">· 14 turns</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="color:#A1A1AA;">rupu</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A1A1AA;">local</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">manual</span></td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A1A1AA; width:1%; white-space:nowrap;">1h02m</td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; width:1%; white-space:nowrap;">$9.88</td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">08:30</td>
+              </tr>
+              <tr>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; gap:5px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; font-weight:600; padding:2px 7px; border-radius:999px; color:#4ADE80; background:rgba(74,222,128,0.1); box-shadow:inset 0 0 0 1px rgba(74,222,128,0.3);">done</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#A78BFA;">workflow</span></td>
+                <td style="padding:8px 12px; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; color:#F5F5F5;">scm-pr-review</span> <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A;">· panel of 3 · pr/318</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="color:#A1A1AA;">edge-gateway</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A1A1AA;">build-01</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#60A5FA;">event</span></td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A1A1AA; width:1%; white-space:nowrap;">4m03s</td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; width:1%; white-space:nowrap;">$3.44</td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">08:12</td>
+              </tr>
+            </tbody>
+          </table>
+          </div>
+        </section>
+      </div>
+      </sc-if>
+
+      <sc-if value="{{ isSecurity }}" hint-placeholder-val="{{ false }}">
+      <div style="padding:16px; display:flex; flex-direction:column; gap:14px;">
+        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+          <h1 style="margin:0; font-size:16px; font-weight:600; letter-spacing:-0.01em;">Security</h1>
+          <div style="display:inline-flex; background:#1B1B1F; border:1px solid #26262A; border-radius:6px; padding:2px;">
+            <button type="button" style="height:24px; padding:0 12px; border:0; border-radius:4px; background:#141416; color:#A78BFA; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; font-weight:600; cursor:pointer; box-shadow:0 1px 2px rgba(0,0,0,0.3);">findings</button>
+            <button type="button" style="height:24px; padding:0 12px; border:0; border-radius:4px; background:transparent; color:#71717A; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; cursor:pointer;" style-hover="color:#F5F5F5;">coverage</button>
+            <button type="button" style="height:24px; padding:0 12px; border:0; border-radius:4px; background:transparent; color:#71717A; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; cursor:pointer;" style-hover="color:#F5F5F5;">catalog</button>
+          </div>
+        </div>
+
+        <section style="border:1px solid #26262A; border-radius:7px; background:#141416; display:flex; overflow:hidden;">
+          <div style="flex:1; padding:11px 16px; border-right:1px solid #26262A;">
+            <div style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.14em; text-transform:uppercase; color:#71717A;">Concern coverage</div>
+            <div style="margin-top:5px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:26px; font-weight:600; line-height:1; font-variant-numeric:tabular-nums; color:#F5F5F5;">74<span style="font-size:14px; color:#71717A;">%</span></div>
+            <div style="margin-top:7px; display:flex; height:3px; border-radius:2px; overflow:hidden; background:#1B1B1F;"><span style="flex:74; background:#7C3AED;"></span><span style="flex:26; background:#26262A;"></span></div>
+            <div style="margin-top:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">31 of 42 concerns examined</div>
+          </div>
+          <div style="flex:1; padding:11px 16px; border-right:1px solid #26262A;">
+            <div style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.14em; text-transform:uppercase; color:#71717A;">Gaps</div>
+            <div style="margin-top:5px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:26px; font-weight:600; line-height:1; font-variant-numeric:tabular-nums; color:#FBBF24;">11</div>
+            <div style="margin-top:11px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">a03 injection · a07 authn · stride.dos</div>
+          </div>
+          <div style="flex:1.6; padding:11px 16px;">
+            <div style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.14em; text-transform:uppercase; color:#71717A;">Open findings by severity</div>
+            <div style="margin-top:8px; display:flex; align-items:flex-end; gap:14px;">
+              <div style="display:flex; flex-direction:column; gap:5px;">
+                <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:19px; font-weight:600; line-height:1; color:#A855F7; font-variant-numeric:tabular-nums;">1</span>
+                <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; color:#71717A;">critical</span>
+              </div>
+              <div style="display:flex; flex-direction:column; gap:5px;">
+                <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:19px; font-weight:600; line-height:1; color:#F87171; font-variant-numeric:tabular-nums;">6</span>
+                <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; color:#71717A;">high</span>
+              </div>
+              <div style="display:flex; flex-direction:column; gap:5px;">
+                <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:19px; font-weight:600; line-height:1; color:#FB923C; font-variant-numeric:tabular-nums;">13</span>
+                <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; color:#71717A;">medium</span>
+              </div>
+              <div style="display:flex; flex-direction:column; gap:5px;">
+                <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:19px; font-weight:600; line-height:1; color:#FACC15; font-variant-numeric:tabular-nums;">21</span>
+                <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; color:#71717A;">low</span>
+              </div>
+              <div style="margin-left:auto; padding-left:18px; display:flex; flex-direction:column; gap:5px; align-items:flex-end; flex-shrink:0;">
+                <span style="white-space:nowrap; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#4ADE80;">−8 vs last run</span>
+                <span style="white-space:nowrap; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">coverage run 31m ago</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section style="border:1px solid #26262A; border-radius:7px; background:#141416; overflow:hidden;">
+          <div style="overflow-x:auto;">
+          <table style="width:100%; border-collapse:collapse; font-size:12px;">
+            <thead>
+              <tr style="border-bottom:1px solid #26262A; background:#1B1B1F;">
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Sev</th>
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:100%;">Summary</th>
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Location</th>
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">CWE</th>
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Concern</th>
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Project</th>
+                <th scope="col" style="padding:7px 12px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Age</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr style="border-bottom:1px solid #1B1B1F; border-left:2px solid #A855F7;">
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.08em; text-transform:uppercase; font-weight:700; padding:2px 6px; border-radius:4px; color:#A855F7; background:#2A1C38; box-shadow:inset 0 0 0 1px rgba(168,85,247,0.3);">crit</span></td>
+                <td style="padding:8px 12px; color:#F5F5F5; white-space:nowrap;">Unauthenticated tunnel enrollment accepts any node token</td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A78BFA;">node/server.rs:142</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#A1A1AA; background:#1B1B1F; border-radius:4px; padding:2px 6px;">CWE-306</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">a01.broken-access</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="color:#A1A1AA;">rupu</span></td>
+                <td style="padding:8px 12px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">31m</td>
+              </tr>
+              <tr style="border-bottom:1px solid #1B1B1F; border-left:2px solid #F87171;">
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.08em; text-transform:uppercase; font-weight:700; padding:2px 6px; border-radius:4px; color:#F87171; background:#301818; box-shadow:inset 0 0 0 1px rgba(248,113,113,0.3);">high</span></td>
+                <td style="padding:8px 12px; color:#F5F5F5; white-space:nowrap;">Agent bypass mode inherits shell env including provider keys</td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A78BFA;">tools/src/bash.rs:88</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#A1A1AA; background:#1B1B1F; border-radius:4px; padding:2px 6px;">CWE-526</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">stride.info-disclosure</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="color:#A1A1AA;">rupu</span></td>
+                <td style="padding:8px 12px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">2h</td>
+              </tr>
+              <tr style="border-bottom:1px solid #1B1B1F; border-left:2px solid #F87171;">
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.08em; text-transform:uppercase; font-weight:700; padding:2px 6px; border-radius:4px; color:#F87171; background:#301818; box-shadow:inset 0 0 0 1px rgba(248,113,113,0.3);">high</span></td>
+                <td style="padding:8px 12px; color:#F5F5F5; white-space:nowrap;">Host registry accepts SSH host keys without pinning</td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A78BFA;">host/ssh.rs:204</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#A1A1AA; background:#1B1B1F; border-radius:4px; padding:2px 6px;">CWE-322</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">a02.crypto-failures</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="color:#A1A1AA;">rupu</span></td>
+                <td style="padding:8px 12px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">6h</td>
+              </tr>
+              <tr style="border-bottom:1px solid #1B1B1F; border-left:2px solid #FB923C;">
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.08em; text-transform:uppercase; font-weight:700; padding:2px 6px; border-radius:4px; color:#FB923C; background:#302012; box-shadow:inset 0 0 0 1px rgba(251,146,60,0.3);">med</span></td>
+                <td style="padding:8px 12px; color:#F5F5F5; white-space:nowrap;">Webhook signature comparison is not constant-time</td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A78BFA;">webhook/verify.rs:31</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#A1A1AA; background:#1B1B1F; border-radius:4px; padding:2px 6px;">CWE-208</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">a02.crypto-failures</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="color:#A1A1AA;">edge-gateway</span></td>
+                <td style="padding:8px 12px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">48s</td>
+              </tr>
+              <tr style="border-left:2px solid #FACC15;">
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.08em; text-transform:uppercase; font-weight:700; padding:2px 6px; border-radius:4px; color:#FACC15; background:#2E2810; box-shadow:inset 0 0 0 1px rgba(250,204,21,0.3);">low</span></td>
+                <td style="padding:8px 12px; color:#F5F5F5; white-space:nowrap;">Transcript JSONL written with 0644 in a shared temp dir</td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A78BFA;">transcript/sink.rs:57</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#A1A1AA; background:#1B1B1F; border-radius:4px; padding:2px 6px;">CWE-732</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">cwe.file-permissions</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="color:#A1A1AA;">rupu</span></td>
+                <td style="padding:8px 12px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">1d</td>
+              </tr>
+            </tbody>
+          </table>
+          </div>
+        </section>
+      </div>
+      </sc-if>
+
+      <sc-if value="{{ isFleet }}" hint-placeholder-val="{{ false }}">
+      <div style="padding:16px; display:flex; flex-direction:column; gap:14px;">
+        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+          <h1 style="margin:0; font-size:16px; font-weight:600; letter-spacing:-0.01em;">Fleet</h1>
+          <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A;">4 hosts · 6 workers · 1 fault</span>
+          <button type="button" style="margin-left:auto; height:26px; padding:0 11px; border:1px solid #3F3F46; border-radius:5px; background:#232327; color:#F5F5F5; font-family:inherit; font-size:11.5px; font-weight:600; cursor:pointer;" style-hover="background:#2E2E33;">Add host</button>
+        </div>
+
+        <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(268px, 1fr)); gap:12px;">
+          <div style="border:1px solid #26262A; border-radius:7px; background:#141416; padding:13px 14px;">
+            <div style="display:flex; align-items:center; gap:8px;">
+              <span style="height:8px; width:8px; border-radius:50%; background:#4ADE80; box-shadow:0 0 0 3px rgba(74,222,128,0.15); flex-shrink:0;"></span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:13px; font-weight:600; color:#F5F5F5;">local</span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; color:#71717A; border:1px solid #26262A; border-radius:3px; padding:1px 5px;">sse</span>
+              <span style="margin-left:auto; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#4ADE80;">live</span>
+            </div>
+            <div style="margin-top:11px; display:flex; height:4px; border-radius:2px; overflow:hidden; background:#1B1B1F;">
+              <span style="flex:2; background:#60A5FA;"></span><span style="flex:6; background:#26262A;"></span>
+            </div>
+            <div style="margin-top:11px; display:grid; grid-template-columns:repeat(3, 1fr); gap:8px;">
+              <div><div style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; color:#71717A;">running</div><div style="margin-top:3px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:15px; font-weight:600; color:#60A5FA; font-variant-numeric:tabular-nums;">2</div></div>
+              <div><div style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; color:#71717A;">queued</div><div style="margin-top:3px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:15px; font-weight:600; color:#A1A1AA; font-variant-numeric:tabular-nums;">0</div></div>
+              <div><div style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; color:#71717A;">slots</div><div style="margin-top:3px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:15px; font-weight:600; color:#A1A1AA; font-variant-numeric:tabular-nums;">8</div></div>
+            </div>
+            <div style="margin-top:11px; padding-top:9px; border-top:1px solid #1B1B1F; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">3 projects · anthropic, openai · rupu 0.71.2</div>
+          </div>
+
+          <div style="border:1px solid #26262A; border-radius:7px; background:#141416; padding:13px 14px;">
+            <div style="display:flex; align-items:center; gap:8px;">
+              <span class="pulse-run" style="height:8px; width:8px; border-radius:50%; background:#60A5FA; flex-shrink:0;"></span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:13px; font-weight:600; color:#F5F5F5;">build-01</span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; color:#71717A; border:1px solid #26262A; border-radius:3px; padding:1px 5px;">http</span>
+              <span style="margin-left:auto; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#A1A1AA;">12s</span>
+            </div>
+            <div style="margin-top:11px; display:flex; height:4px; border-radius:2px; overflow:hidden; background:#1B1B1F;">
+              <span style="flex:11; background:#60A5FA;"></span><span style="flex:3; background:#FBBF24;"></span><span style="flex:2; background:#26262A;"></span>
+            </div>
+            <div style="margin-top:11px; display:grid; grid-template-columns:repeat(3, 1fr); gap:8px;">
+              <div><div style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; color:#71717A;">running</div><div style="margin-top:3px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:15px; font-weight:600; color:#60A5FA; font-variant-numeric:tabular-nums;">11</div></div>
+              <div><div style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; color:#71717A;">queued</div><div style="margin-top:3px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:15px; font-weight:600; color:#FBBF24; font-variant-numeric:tabular-nums;">3</div></div>
+              <div><div style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; color:#71717A;">slots</div><div style="margin-top:3px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:15px; font-weight:600; color:#A1A1AA; font-variant-numeric:tabular-nums;">16</div></div>
+            </div>
+            <div style="margin-top:11px; padding-top:9px; border-top:1px solid #1B1B1F; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">9 projects · anthropic, copilot · rupu 0.71.2</div>
+          </div>
+
+          <div style="border:1px solid #26262A; border-radius:7px; background:#141416; padding:13px 14px;">
+            <div style="display:flex; align-items:center; gap:8px;">
+              <span style="height:8px; width:8px; border-radius:50%; background:#71717A; flex-shrink:0;"></span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:13px; font-weight:600; color:#F5F5F5;">eu-ssh-2</span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; color:#71717A; border:1px solid #26262A; border-radius:3px; padding:1px 5px;">ssh</span>
+              <span style="margin-left:auto; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#A1A1AA;">3m · poll</span>
+            </div>
+            <div style="margin-top:11px; display:flex; height:4px; border-radius:2px; overflow:hidden; background:#1B1B1F;">
+              <span style="flex:1; background:#60A5FA;"></span><span style="flex:7; background:#26262A;"></span>
+            </div>
+            <div style="margin-top:11px; display:grid; grid-template-columns:repeat(3, 1fr); gap:8px;">
+              <div><div style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; color:#71717A;">running</div><div style="margin-top:3px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:15px; font-weight:600; color:#60A5FA; font-variant-numeric:tabular-nums;">1</div></div>
+              <div><div style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; color:#71717A;">queued</div><div style="margin-top:3px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:15px; font-weight:600; color:#71717A; font-variant-numeric:tabular-nums;">—</div></div>
+              <div><div style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; color:#71717A;">slots</div><div style="margin-top:3px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:15px; font-weight:600; color:#A1A1AA; font-variant-numeric:tabular-nums;">8</div></div>
+            </div>
+            <div style="margin-top:11px; padding-top:9px; border-top:1px solid #1B1B1F; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">2 projects · gemini · rupu 0.70.4</div>
+          </div>
+
+          <div style="border:1px solid rgba(248,113,113,0.4); border-radius:7px; background:#141416; padding:13px 14px; box-shadow:inset 3px 0 0 #F87171;">
+            <div style="display:flex; align-items:center; gap:8px;">
+              <span style="height:8px; width:8px; border-radius:50%; background:#F87171; box-shadow:0 0 0 3px rgba(248,113,113,0.18); flex-shrink:0;"></span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:13px; font-weight:600; color:#F5F5F5;">tunnel-a</span>
+              <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.1em; text-transform:uppercase; color:#71717A; border:1px solid #26262A; border-radius:3px; padding:1px 5px;">tunnel</span>
+              <span style="margin-left:auto; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#F87171;">unavailable</span>
+            </div>
+            <div style="margin-top:11px; padding:9px 10px; border-radius:5px; background:#2B1616; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#F87171; line-height:1.5;">
+              dial-home lost 14m ago<br>last seen 09:41 · 2 runs orphaned
+            </div>
+            <div style="margin-top:11px; display:flex; gap:6px;">
+              <button type="button" style="flex:1; height:26px; border-radius:5px; border:1px solid #3F3F46; background:#232327; color:#F5F5F5; font-family:inherit; font-size:11.5px; font-weight:600; cursor:pointer;" style-hover="background:#2E2E33;">Reconnect</button>
+              <button type="button" style="flex:1; height:26px; border-radius:5px; border:1px solid #26262A; background:#1B1B1F; color:#A1A1AA; font-family:inherit; font-size:11.5px; cursor:pointer;" style-hover="color:#F5F5F5;">Logs</button>
+            </div>
+          </div>
+        </div>
+
+        <section style="border:1px solid #26262A; border-radius:7px; background:#141416; overflow:hidden;">
+          <div style="display:flex; align-items:center; height:32px; padding:0 14px; border-bottom:1px solid #26262A;">
+            <h2 style="margin:0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9.5px; letter-spacing:0.14em; text-transform:uppercase; font-weight:700; color:#A1A1AA;">Workers</h2>
+          </div>
+          <div style="overflow-x:auto;">
+          <table style="width:100%; border-collapse:collapse; font-size:12px;">
+            <thead>
+              <tr style="border-bottom:1px solid #26262A;">
+                <th scope="col" style="padding:7px 14px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">State</th>
+                <th scope="col" style="padding:7px 14px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A;">Worker</th>
+                <th scope="col" style="padding:7px 14px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Host</th>
+                <th scope="col" style="padding:7px 14px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Current</th>
+                <th scope="col" style="padding:7px 14px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Uptime</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr style="border-bottom:1px solid #1B1B1F;">
+                <td style="padding:8px 14px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; gap:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#60A5FA;"><span style="height:6px; width:6px; border-radius:50%; background:currentColor;"></span>busy</span></td>
+                <td style="padding:8px 14px;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; color:#F5F5F5;">w-build01-a</span></td>
+                <td style="padding:8px 14px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A1A1AA;">build-01</span></td>
+                <td style="padding:8px 14px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A78BFA;">nightly-review #a41f0c</span></td>
+                <td style="padding:8px 14px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">6d 4h</td>
+              </tr>
+              <tr style="border-bottom:1px solid #1B1B1F;">
+                <td style="padding:8px 14px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; gap:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#60A5FA;"><span style="height:6px; width:6px; border-radius:50%; background:currentColor;"></span>busy</span></td>
+                <td style="padding:8px 14px;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; color:#F5F5F5;">w-build01-b</span></td>
+                <td style="padding:8px 14px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A1A1AA;">build-01</span></td>
+                <td style="padding:8px 14px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A78BFA;">add-tests #31c9ae</span></td>
+                <td style="padding:8px 14px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">6d 4h</td>
+              </tr>
+              <tr style="border-bottom:1px solid #1B1B1F;">
+                <td style="padding:8px 14px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; gap:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;"><span style="height:6px; width:6px; border-radius:50%; background:currentColor;"></span>idle</span></td>
+                <td style="padding:8px 14px;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; color:#F5F5F5;">w-local-a</span></td>
+                <td style="padding:8px 14px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A1A1AA;">local</span></td>
+                <td style="padding:8px 14px; width:1%; white-space:nowrap;"><span style="color:#71717A;">—</span></td>
+                <td style="padding:8px 14px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">2h 11m</td>
+              </tr>
+              <tr>
+                <td style="padding:8px 14px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; gap:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#F87171;"><span style="height:6px; width:6px; border-radius:50%; background:currentColor;"></span>lost</span></td>
+                <td style="padding:8px 14px;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; color:#F5F5F5;">w-tunnela-a</span></td>
+                <td style="padding:8px 14px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#A1A1AA;">tunnel-a</span></td>
+                <td style="padding:8px 14px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F87171;">2 orphaned runs</span></td>
+                <td style="padding:8px 14px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">—</td>
+              </tr>
+            </tbody>
+          </table>
+          </div>
+        </section>
+      </div>
+      </sc-if>
+
+      <sc-if value="{{ isProjects }}" hint-placeholder-val="{{ false }}">
+      <div style="padding:16px; display:flex; flex-direction:column; gap:14px;">
+        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+          <h1 style="margin:0; font-size:16px; font-weight:600; letter-spacing:-0.01em;">Projects</h1>
+          <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A;">the subject of every run — one row per registered workspace</span>
+          <div style="margin-left:auto; display:inline-flex; background:#1B1B1F; border:1px solid #26262A; border-radius:6px; padding:2px;">
+            <button type="button" style="height:24px; padding:0 11px; border:0; border-radius:4px; background:#141416; color:#A78BFA; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; font-weight:600; cursor:pointer; box-shadow:0 1px 2px rgba(0,0,0,0.3);">active 9</button>
+            <button type="button" style="height:24px; padding:0 11px; border:0; border-radius:4px; background:transparent; color:#71717A; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; cursor:pointer;" style-hover="color:#F5F5F5;">all 14</button>
+            <button type="button" style="height:24px; padding:0 11px; border:0; border-radius:4px; background:transparent; color:#71717A; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; cursor:pointer;" style-hover="color:#F5F5F5;">dormant 5</button>
+          </div>
+        </div>
+
+        <section style="border:1px solid #26262A; border-radius:7px; background:#141416; overflow:hidden;">
+          <div style="overflow-x:auto;">
+          <table style="width:100%; border-collapse:collapse; font-size:12px; table-layout:auto;">
+            <thead>
+              <tr style="border-bottom:1px solid #26262A; background:#1B1B1F;">
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:100%;">Project</th>
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Branch</th>
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Now</th>
+                <th scope="col" style="padding:7px 12px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Runs 30d</th>
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Success</th>
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Findings</th>
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Coverage</th>
+                <th scope="col" style="padding:7px 12px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Spend 30d</th>
+                <th scope="col" style="padding:7px 12px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Active</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr style="border-bottom:1px solid #1B1B1F;">
+                <td style="padding:8px 12px; white-space:nowrap;">
+                  <span style="display:inline-flex; align-items:center; gap:8px;">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#71717A" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;"><path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.4 5.4 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4"></path><path d="M9 18c-4.51 2-5-2-7-2"></path></svg>
+                    <span style="font-weight:600; color:#F5F5F5;">rupu</span>
+                    <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A;">section9labs/rupu</span>
+                  </span>
+                </td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#A1A1AA; background:#1B1B1F; border-radius:4px; padding:2px 6px;">main</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;">
+                  <span style="display:inline-flex; align-items:center; gap:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px;">
+                    <span style="color:#60A5FA;">2 run</span><span style="color:#FBBF24;">1 gate</span>
+                  </span>
+                </td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; width:1%; white-space:nowrap;">412</td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;">
+                  <span style="display:inline-flex; align-items:center; gap:7px;">
+                    <span style="display:flex; width:44px; height:3px; border-radius:2px; overflow:hidden; background:#26262A;"><span style="flex:88; background:#4ADE80;"></span><span style="flex:12; background:transparent;"></span></span>
+                    <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#A1A1AA; font-variant-numeric:tabular-nums;">88%</span>
+                  </span>
+                </td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;">
+                  <span style="display:inline-flex; align-items:center; gap:7px;">
+                    <span style="display:flex; width:44px; height:3px; border-radius:2px; overflow:hidden; background:#26262A;"><span style="flex:1; background:#A855F7;"></span><span style="flex:3; background:#F87171;"></span><span style="flex:8; background:#FB923C;"></span><span style="flex:12; background:#FACC15;"></span></span>
+                    <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#A855F7; font-variant-numeric:tabular-nums;">24</span>
+                  </span>
+                </td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;">
+                  <span style="display:inline-flex; align-items:center; gap:7px;">
+                    <span style="display:flex; width:44px; height:3px; border-radius:2px; overflow:hidden; background:#26262A;"><span style="flex:74; background:#7C3AED;"></span><span style="flex:26; background:transparent;"></span></span>
+                    <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#A1A1AA; font-variant-numeric:tabular-nums;">74%</span>
+                  </span>
+                </td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; width:1%; white-space:nowrap;">$284.10</td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">4m</td>
+              </tr>
+              <tr style="border-bottom:1px solid #1B1B1F;">
+                <td style="padding:8px 12px; white-space:nowrap;">
+                  <span style="display:inline-flex; align-items:center; gap:8px;">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#71717A" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;"><path d="m22 13.29-3.33-10a.42.42 0 0 0-.14-.18.38.38 0 0 0-.22-.11.39.39 0 0 0-.23.07.42.42 0 0 0-.14.18l-2.26 6.67H8.32L6.06 3.26a.42.42 0 0 0-.14-.18.38.38 0 0 0-.22-.11.39.39 0 0 0-.23.07.42.42 0 0 0-.14.18L2 13.29a.74.74 0 0 0 .27.83L12 21l9.73-6.88a.74.74 0 0 0 .27-.83Z"></path></svg>
+                    <span style="font-weight:600; color:#F5F5F5;">edge-gateway</span>
+                    <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A;">infra/edge-gateway</span>
+                  </span>
+                </td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#A1A1AA; background:#1B1B1F; border-radius:4px; padding:2px 6px;">release/1.8</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;">
+                  <span style="display:inline-flex; align-items:center; gap:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px;">
+                    <span style="color:#FBBF24;">1 gate</span>
+                  </span>
+                </td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; width:1%; white-space:nowrap;">96</td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;">
+                  <span style="display:inline-flex; align-items:center; gap:7px;">
+                    <span style="display:flex; width:44px; height:3px; border-radius:2px; overflow:hidden; background:#26262A;"><span style="flex:79; background:#4ADE80;"></span><span style="flex:21; background:transparent;"></span></span>
+                    <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#A1A1AA; font-variant-numeric:tabular-nums;">79%</span>
+                  </span>
+                </td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;">
+                  <span style="display:inline-flex; align-items:center; gap:7px;">
+                    <span style="display:flex; width:44px; height:3px; border-radius:2px; overflow:hidden; background:#26262A;"><span style="flex:2; background:#F87171;"></span><span style="flex:5; background:#FB923C;"></span><span style="flex:6; background:#FACC15;"></span></span>
+                    <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#F87171; font-variant-numeric:tabular-nums;">13</span>
+                  </span>
+                </td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;">
+                  <span style="display:inline-flex; align-items:center; gap:7px;">
+                    <span style="display:flex; width:44px; height:3px; border-radius:2px; overflow:hidden; background:#26262A;"><span style="flex:61; background:#7C3AED;"></span><span style="flex:39; background:transparent;"></span></span>
+                    <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#A1A1AA; font-variant-numeric:tabular-nums;">61%</span>
+                  </span>
+                </td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; width:1%; white-space:nowrap;">$61.88</td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">1h</td>
+              </tr>
+              <tr style="border-bottom:1px solid #1B1B1F;">
+                <td style="padding:8px 12px; white-space:nowrap;">
+                  <span style="display:inline-flex; align-items:center; gap:8px;">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#71717A" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;"><path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.4 5.4 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4"></path><path d="M9 18c-4.51 2-5-2-7-2"></path></svg>
+                    <span style="font-weight:600; color:#F5F5F5;">payments-api</span>
+                    <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A;">section9labs/payments-api</span>
+                  </span>
+                </td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#A1A1AA; background:#1B1B1F; border-radius:4px; padding:2px 6px;">main</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;">
+                  <span style="display:inline-flex; align-items:center; gap:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px;">
+                    <span style="color:#22D3EE;">1 paused</span>
+                  </span>
+                </td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; width:1%; white-space:nowrap;">138</td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;">
+                  <span style="display:inline-flex; align-items:center; gap:7px;">
+                    <span style="display:flex; width:44px; height:3px; border-radius:2px; overflow:hidden; background:#26262A;"><span style="flex:94; background:#4ADE80;"></span><span style="flex:6; background:transparent;"></span></span>
+                    <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#A1A1AA; font-variant-numeric:tabular-nums;">94%</span>
+                  </span>
+                </td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;">
+                  <span style="display:inline-flex; align-items:center; gap:7px;">
+                    <span style="display:flex; width:44px; height:3px; border-radius:2px; overflow:hidden; background:#26262A;"><span style="flex:1; background:#FB923C;"></span><span style="flex:3; background:#FACC15;"></span></span>
+                    <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#FB923C; font-variant-numeric:tabular-nums;">4</span>
+                  </span>
+                </td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;">
+                  <span style="display:inline-flex; align-items:center; gap:7px;">
+                    <span style="display:flex; width:44px; height:3px; border-radius:2px; overflow:hidden; background:#26262A;"><span style="flex:88; background:#7C3AED;"></span><span style="flex:12; background:transparent;"></span></span>
+                    <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#A1A1AA; font-variant-numeric:tabular-nums;">88%</span>
+                  </span>
+                </td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; width:1%; white-space:nowrap;">$142.55</td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">3h</td>
+              </tr>
+              <tr>
+                <td style="padding:8px 12px; white-space:nowrap;">
+                  <span style="display:inline-flex; align-items:center; gap:8px;">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#52525B" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;"><line x1="22" x2="2" y1="12" y2="12"></line><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"></path><line x1="6" x2="6.01" y1="16" y2="16"></line></svg>
+                    <span style="font-weight:600; color:#A1A1AA;">scratch-notebook</span>
+                    <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A;">~/tmp/scratch-notebook</span>
+                  </span>
+                </td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="color:#71717A;">—</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="color:#71717A;">—</span></td>
+                <td style="padding:8px 12px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">—</td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="color:#71717A;">—</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="color:#71717A;">—</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="color:#71717A;">—</span></td>
+                <td style="padding:8px 12px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">—</td>
+                <td style="padding:8px 12px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">no runs</td>
+              </tr>
+            </tbody>
+          </table>
+          </div>
+        </section>
+
+        <p style="margin:0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">an em-dash is "not reported", never a fabricated zero — same contract as the host summaries</p>
+      </div>
+      </sc-if>
+
+      <sc-if value="{{ isLibrary }}" hint-placeholder-val="{{ false }}">
+      <div style="padding:16px; display:flex; flex-direction:column; gap:14px;">
+        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+          <h1 style="margin:0; font-size:16px; font-weight:600; letter-spacing:-0.01em;">Library</h1>
+          <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A;">definitions, not executions — the files in <span style="color:#A1A1AA;">.rupu/</span></span>
+          <div style="display:inline-flex; background:#1B1B1F; border:1px solid #26262A; border-radius:6px; padding:2px;">
+            <button type="button" style="height:24px; padding:0 12px; border:0; border-radius:4px; background:#141416; color:#A78BFA; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; font-weight:600; cursor:pointer; box-shadow:0 1px 2px rgba(0,0,0,0.3);">agents 12</button>
+            <button type="button" style="height:24px; padding:0 12px; border:0; border-radius:4px; background:transparent; color:#71717A; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; cursor:pointer;" style-hover="color:#F5F5F5;">workflows 9</button>
+            <button type="button" style="height:24px; padding:0 12px; border:0; border-radius:4px; background:transparent; color:#71717A; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; cursor:pointer;" style-hover="color:#F5F5F5;">autoflows 6</button>
+            <button type="button" style="height:24px; padding:0 12px; border:0; border-radius:4px; background:transparent; color:#71717A; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; cursor:pointer;" style-hover="color:#F5F5F5;">contracts 4</button>
+          </div>
+          <button type="button" style="margin-left:auto; height:26px; padding:0 11px; border:1px solid #3F3F46; border-radius:5px; background:#232327; color:#F5F5F5; font-family:inherit; font-size:11.5px; font-weight:600; cursor:pointer;" style-hover="background:#2E2E33;">New agent</button>
+        </div>
+
+        <section style="border:1px solid #26262A; border-radius:7px; background:#141416; overflow:hidden;">
+          <div style="overflow-x:auto;">
+          <table style="width:100%; border-collapse:collapse; font-size:12px; table-layout:auto;">
+            <thead>
+              <tr style="border-bottom:1px solid #26262A; background:#1B1B1F;">
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:100%;">Agent</th>
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Model</th>
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Permission</th>
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Tools</th>
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Used by</th>
+                <th scope="col" style="padding:7px 12px; text-align:left; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Scope</th>
+                <th scope="col" style="padding:7px 12px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Runs 30d</th>
+                <th scope="col" style="padding:7px 12px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; font-weight:700; color:#71717A; width:1%; white-space:nowrap;">Last run</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr style="border-bottom:1px solid #1B1B1F;">
+                <td style="padding:8px 12px; white-space:nowrap;">
+                  <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-weight:600; color:#F5F5F5;">review-diff</span>
+                  <span style="font-size:11.5px; color:#71717A;"> — inspects staged diff for bugs and coverage gaps</span>
+                </td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; gap:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#A1A1AA;"><span style="height:6px; width:6px; border-radius:2px; background:#7C3AED;"></span>sonnet-4.6</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9.5px; letter-spacing:0.06em; text-transform:uppercase; font-weight:600; padding:2px 6px; border-radius:4px; color:#4ADE80; background:rgba(74,222,128,0.1);">read-only</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#A1A1AA;">6</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#A78BFA;">3 workflows</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">global</span></td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; width:1%; white-space:nowrap;">184</td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#60A5FA; width:1%; white-space:nowrap;">running</td>
+              </tr>
+              <tr style="border-bottom:1px solid #1B1B1F;">
+                <td style="padding:8px 12px; white-space:nowrap;">
+                  <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-weight:600; color:#F5F5F5;">add-tests</span>
+                  <span style="font-size:11.5px; color:#71717A;"> — writes failing-case tests until the suite passes</span>
+                </td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; gap:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#A1A1AA;"><span style="height:6px; width:6px; border-radius:2px; background:#7C3AED;"></span>opus-4.1</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9.5px; letter-spacing:0.06em; text-transform:uppercase; font-weight:600; padding:2px 6px; border-radius:4px; color:#F87171; background:rgba(248,113,113,0.12);">bypass</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#A1A1AA;">9</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#A78BFA;">2 autoflows</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">rupu</span></td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; width:1%; white-space:nowrap;">62</td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F87171; width:1%; white-space:nowrap;">failed 8m</td>
+              </tr>
+              <tr style="border-bottom:1px solid #1B1B1F;">
+                <td style="padding:8px 12px; white-space:nowrap;">
+                  <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-weight:600; color:#F5F5F5;">scm-pr-review</span>
+                  <span style="font-size:11.5px; color:#71717A;"> — reviews a pull request through the SCM connector</span>
+                </td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; gap:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#A1A1AA;"><span style="height:6px; width:6px; border-radius:2px; background:#4ADE80;"></span>gpt-5.2</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9.5px; letter-spacing:0.06em; text-transform:uppercase; font-weight:600; padding:2px 6px; border-radius:4px; color:#FBBF24; background:rgba(251,191,36,0.12);">ask</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#A1A1AA;">4</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#A78BFA;">1 workflow</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">global</span></td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; width:1%; white-space:nowrap;">41</td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">1h</td>
+              </tr>
+              <tr style="border-bottom:1px solid #1B1B1F;">
+                <td style="padding:8px 12px; white-space:nowrap;">
+                  <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-weight:600; color:#F5F5F5;">triage-classifier</span>
+                  <span style="font-size:11.5px; color:#71717A;"> — labels incoming issues against the routing table</span>
+                </td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; gap:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#A1A1AA;"><span style="height:6px; width:6px; border-radius:2px; background:#60A5FA;"></span>gemini-3-pro</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9.5px; letter-spacing:0.06em; text-transform:uppercase; font-weight:600; padding:2px 6px; border-radius:4px; color:#4ADE80; background:rgba(74,222,128,0.1);">read-only</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#A1A1AA;">3</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#A78BFA;">2 autoflows</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">payments-api</span></td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#F5F5F5; width:1%; white-space:nowrap;">96</td>
+                <td style="padding:8px 12px; text-align:right; font-variant-numeric:tabular-nums; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">3h</td>
+              </tr>
+              <tr>
+                <td style="padding:8px 12px; white-space:nowrap;">
+                  <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-weight:600; color:#A1A1AA;">scaffold</span>
+                  <span style="font-size:11.5px; color:#71717A;"> — never run in this window</span>
+                </td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="display:inline-flex; align-items:center; gap:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#71717A;"><span style="height:6px; width:6px; border-radius:2px; background:#3F3F46;"></span>sonnet-4.6</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:9.5px; letter-spacing:0.06em; text-transform:uppercase; font-weight:600; padding:2px 6px; border-radius:4px; color:#71717A; background:#1B1B1F;">ask</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#71717A;">7</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10.5px; color:#71717A;">—</span></td>
+                <td style="padding:8px 12px; width:1%; white-space:nowrap;"><span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">global</span></td>
+                <td style="padding:8px 12px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">—</td>
+                <td style="padding:8px 12px; text-align:right; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#71717A; width:1%; white-space:nowrap;">never</td>
+              </tr>
+            </tbody>
+          </table>
+          </div>
+        </section>
+
+        <p style="margin:0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; color:#71717A;">"used by" and "runs 30d" are the two links out to <a href="#" onClick="{{ goActivity }}">Activity</a> — a definition never shows its own run list here</p>
+      </div>
+      </sc-if>
+
+      <sc-if value="{{ isPlaceholder }}" hint-placeholder-val="{{ false }}">
+      <div style="padding:16px;">
+        <section style="border:1px dashed #3F3F46; border-radius:7px; background:#141416; padding:40px; display:flex; flex-direction:column; align-items:center; gap:10px;">
+          <span style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:10px; letter-spacing:0.14em; text-transform:uppercase; color:#71717A;">{{ placeholderLabel }}</span>
+          <p style="margin:0; max-width:440px; text-align:center; font-size:12.5px; line-height:1.6; color:#A1A1AA;">Not designed in this pass. Six screens carry the redesign: Overview, Activity, Projects, Security, Library and Fleet — say the word and this one gets the same treatment.</p>
+          <button type="button" onClick="{{ goOverview }}" style="margin-top:4px; height:28px; padding:0 14px; border-radius:5px; border:1px solid #3F3F46; background:#232327; color:#F5F5F5; font-family:inherit; font-size:12px; font-weight:600; cursor:pointer;" style-hover="background:#2E2E33;">Back to Overview</button>
+        </section>
+      </div>
+      </sc-if>
+
+    </main>
+  </div>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;startScreen&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;overview&quot;,&quot;activity&quot;,&quot;projects&quot;,&quot;security&quot;,&quot;library&quot;,&quot;fleet&quot;],&quot;default&quot;:&quot;overview&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Demo&quot;},&quot;showLiveTail&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Overview layout&quot;},&quot;showCharts&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Overview layout&quot;}}">
+const ACTIVE_BG = '#1B1B1F';
+const ACTIVE_FG = '#F5F5F5';
+const IDLE_FG = '#A1A1AA';
+const ACTIVE_RULE = 'inset 2px 0 0 #7C3AED';
+const KEYS = ['overview', 'activity', 'projects', 'security', 'library', 'fleet', 'usage'];
+const LABELS = { projects: 'Projects', library: 'Library', usage: 'Usage' };
+
+class Component extends DCLogic {
+  constructor(props) {
+    super(props);
+    const start = props && props.startScreen;
+    this.state = { route: KEYS.indexOf(start) >= 0 ? start : 'overview' };
+  }
+
+  go(route) {
+    return (e) => { e.preventDefault(); this.setState({ route }); };
+  }
+
+  renderVals() {
+    const r = this.state.route;
+    const nav = {};
+    for (const k of KEYS) {
+      const on = r === k;
+      nav[k + 'Bg'] = on ? ACTIVE_BG : 'transparent';
+      nav[k + 'Fg'] = on ? ACTIVE_FG : IDLE_FG;
+      nav[k + 'Rule'] = on ? ACTIVE_RULE : 'none';
+    }
+    const designed = ['overview', 'activity', 'security', 'fleet', 'projects', 'library'];
+    return {
+      nav,
+      isOverview: r === 'overview',
+      isActivity: r === 'activity',
+      isSecurity: r === 'security',
+      isFleet: r === 'fleet',
+      isProjects: r === 'projects',
+      isLibrary: r === 'library',
+      isPlaceholder: designed.indexOf(r) < 0,
+      placeholderLabel: LABELS[r] || r,
+      showLiveTail: this.props.showLiveTail ?? true,
+      showCharts: this.props.showCharts ?? true,
+      goOverview: this.go('overview'),
+      goActivity: this.go('activity'),
+      goProjects: this.go('projects'),
+      goSecurity: this.go('security'),
+      goLibrary: this.go('library'),
+      goFleet: this.go('fleet'),
+      goUsage: this.go('usage'),
+    };
+  }
+}
+
+</script>
+</body>
+</html>
