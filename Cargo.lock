@@ -6711,12 +6711,14 @@ dependencies = [
 name = "rupu-transcript"
 version = "0.72.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "rupu-netflow",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "ulid",
 ]
