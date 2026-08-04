@@ -17,9 +17,13 @@ struct Assets;
 /// as `GET /api/config`).
 fn resolve_shell(state: &AppState) -> &'static str {
     let global = state.global_dir.join("config.toml");
-    let shell = rupu_config::resolve(Some(&global), None)
-        .ok()
-        .and_then(|r| r.config.ui.cp.shell);
+    let shell = match rupu_config::resolve(Some(&global), None) {
+        Ok(r) => r.config.ui.cp.shell,
+        Err(e) => {
+            tracing::warn!(path = %global.display(), error = %e, "failed to resolve global config for shell flag; using v1");
+            None
+        }
+    };
     match shell.as_deref() {
         Some("v2") => "v2",
         _ => "v1",
@@ -50,7 +54,11 @@ fn serve_index(state: &AppState) -> Response {
             let html = inject_shell_meta(&html, resolve_shell(state));
             ([(header::CONTENT_TYPE, "text/html")], html).into_response()
         }
-        None => (StatusCode::NOT_FOUND, "web UI not embedded").into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            "web UI not built: run `npm run build` in crates/rupu-cp/web",
+        )
+            .into_response(),
     }
 }
 

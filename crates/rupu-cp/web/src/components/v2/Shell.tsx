@@ -67,7 +67,7 @@ function HostFooter() {
   if (hosts === null) {
     return (
       <div className="border-t border-border px-3 py-[9px] flex items-center gap-2 font-mono text-[10px] text-ink-mute">
-        <span className="h-[6px] w-[6px] rounded-full bg-status-failed" aria-hidden />
+        <span className="h-[6px] w-[6px] rounded-full bg-status-pending" aria-hidden />
         <span>— hosts</span>
       </div>
     );

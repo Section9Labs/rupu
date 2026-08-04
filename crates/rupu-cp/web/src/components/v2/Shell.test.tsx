@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor, act, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { api } from '../../lib/api';
-import type { RunEvent } from '../../lib/api';
+import type { HostView, RunEvent } from '../../lib/api';
 import { ThemeProvider } from '../theme/ThemeProvider';
 import { SHELL_STATE_KEY } from './shellState';
 
@@ -143,6 +143,27 @@ describe('Shell v2', () => {
     act(() => subscribeOnEvent?.({} as RunEvent));
 
     expect(await screen.findByText('live')).toHaveAttribute('data-state', 'live');
+  });
+
+  it('host footer shows a neutral dot before hosts load, not the failed color', async () => {
+    mockApi();
+    let resolveHosts: (rows: HostView[]) => void = () => {};
+    const pending = new Promise<HostView[]>((resolve) => {
+      resolveHosts = resolve;
+    });
+    vi.spyOn(api, 'getHosts').mockReturnValue(pending);
+
+    renderShell();
+
+    const label = screen.getByText('— hosts');
+    const dot = label.previousElementSibling;
+    expect(dot).toHaveClass('bg-status-pending');
+    expect(dot).not.toHaveClass('bg-status-failed');
+
+    await act(async () => {
+      resolveHosts([]);
+      await pending;
+    });
   });
 
   it('range segmented reflects 30d default and persists 7d to localStorage', async () => {
