@@ -319,6 +319,12 @@ pub struct FlowRecord {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes_out: Option<u64>,
+    /// DECLARED, not confirmed-drained, when no explicit `complete()`
+    /// follows: the middleware records at response-header time and takes
+    /// this from `Content-Length`. If the connection drops mid-body the
+    /// record still shows the declared count. A value finalized by a
+    /// `LedgerLine::Complete` (i.e. `body_complete == true` via the fold)
+    /// IS an observed count. Do not present the two as equally exact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes_in: Option<u64>,
     /// `false` while a streamed body is still draining. Flipped by a
@@ -2590,15 +2596,17 @@ impl Middleware for NetflowMiddleware {
                 }
             }
             Err(e) => {
-                let msg = e.to_string();
-                record.outcome = if msg.to_ascii_lowercase().contains("timed out")
-                    || msg.to_ascii_lowercase().contains("timeout")
-                {
+                // Type-based, NOT substring matching on the message.
+                // `reqwest::Error`'s Display appends " for url (<url>)",
+                // so matching on "timeout" would misclassify an ordinary
+                // connection failure to any host whose URL contains that
+                // word.
+                record.outcome = if e.is_timeout() {
                     Outcome::Timeout
                 } else {
                     Outcome::TransportError
                 };
-                record.error = Some(msg);
+                record.error = Some(e.to_string());
                 record.duration_ms = Some(elapsed_ms);
                 record.body_complete = true;
             }
