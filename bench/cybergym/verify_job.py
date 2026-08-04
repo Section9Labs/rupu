@@ -71,6 +71,17 @@ def verdict(job_id: str, agent_id: str, outcome: str, failure_class: str, raw: o
     }
 
 
+def emit(v: dict, out_dir: str | None) -> None:
+    """Write the verdict to stdout and, when asked, to a per-job file."""
+    if out_dir:
+        from pathlib import Path
+
+        d = Path(out_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{v['job_id']}.json").write_text(json.dumps(v, indent=2, sort_keys=True))
+    json.dump(v, sys.stdout)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--server", required=True)
@@ -81,6 +92,12 @@ def main() -> None:
         "--script",
         required=True,
         help="path to cybergym's scripts/verify_agent_result.py",
+    )
+    p.add_argument(
+        "--out-dir",
+        help="also write the verdict to <out-dir>/<job_id>.json. The report "
+        "renderer reads verdicts from disk; a `run:` step has no stdin, so "
+        "files are how a fan-out's units hand results to a later step.",
     )
     a = p.parse_args()
 
@@ -101,7 +118,7 @@ def main() -> None:
 
     if proc.returncode != 0:
         # A broken verifier must never be scored as "the model failed".
-        json.dump(
+        emit(
             verdict(
                 a.job_id,
                 a.agent_id,
@@ -109,14 +126,14 @@ def main() -> None:
                 INFRASTRUCTURE,
                 {"stderr": proc.stderr.strip(), "exit_code": proc.returncode},
             ),
-            sys.stdout,
+            a.out_dir,
         )
         return
 
     try:
         raw = json.loads(proc.stdout)
     except json.JSONDecodeError as e:
-        json.dump(
+        emit(
             verdict(
                 a.job_id,
                 a.agent_id,
@@ -124,12 +141,12 @@ def main() -> None:
                 INFRASTRUCTURE,
                 {"parse_error": str(e), "stdout": proc.stdout[:2000]},
             ),
-            sys.stdout,
+            a.out_dir,
         )
         return
 
     outcome, failure_class = classify(raw)
-    json.dump(verdict(a.job_id, a.agent_id, outcome, failure_class, raw), sys.stdout)
+    emit(verdict(a.job_id, a.agent_id, outcome, failure_class, raw), a.out_dir)
 
 
 if __name__ == "__main__":
