@@ -69,14 +69,14 @@ export default function ProjectNetworkTab({ wsId }: { wsId: string }) {
 
   return (
     <div className="space-y-4">
-      <NetflowScopeDisclosure />
+      <NetflowScopeDisclosure scope="project" />
       {error ? (
         <p className="text-sm text-err">{error}</p>
       ) : data === null ? (
         <p className="text-sm text-ink-dim">Loading network flows…</p>
       ) : (
         <>
-          {graph && <NetflowGraph graph={graph} />}
+          {graph && <NetflowGraph graph={graph} scope="project" />}
           <NetflowSummary hosts={data.hosts} />
           <NetflowTable flows={data.flows} dropped={data.dropped} asnLoaded={data.asn_loaded} />
         </>

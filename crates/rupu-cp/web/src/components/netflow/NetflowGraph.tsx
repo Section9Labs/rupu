@@ -31,16 +31,22 @@ import type { GraphView } from '../../lib/netflow';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { EmptyState } from '../ui/EmptyState';
 import { layoutBipartite } from './layout';
+import { netflowSystemSourceHint, type NetflowScope } from './ScopeDisclosure';
 
 export interface NetflowGraphProps {
   graph: GraphView;
+  /** Which Network tab this graph renders on — gates the empty-state hint's
+   *  "system" source examples the same way NetflowScopeDisclosure gates the
+   *  main disclosure (Fix 2, round 4): CP fleet traffic is only true at
+   *  global scope. See `netflowSystemSourceHint`'s doc comment. */
+  scope: NetflowScope;
   width?: number;
 }
 
 const ROW_HEIGHT = 34;
 const NODE_R = 4;
 
-export function NetflowGraph({ graph, width = 880 }: NetflowGraphProps) {
+export function NetflowGraph({ graph, scope, width = 880 }: NetflowGraphProps) {
   const colors = useThemeColors();
   const laid = useMemo(
     () => layoutBipartite(graph, { width, rowHeight: ROW_HEIGHT }),
@@ -49,10 +55,7 @@ export function NetflowGraph({ graph, width = 880 }: NetflowGraphProps) {
 
   if (graph.nodes.length === 0) {
     return (
-      <EmptyState
-        title="No flows to graph for this scope"
-        hint="Sources — runs, or system for unattributed egress (updater, ASN refresh, CP fleet traffic) — connect to the host:port endpoints they reached."
-      />
+      <EmptyState title="No flows to graph for this scope" hint={netflowSystemSourceHint(scope)} />
     );
   }
 

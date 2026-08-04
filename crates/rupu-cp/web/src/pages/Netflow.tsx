@@ -70,7 +70,7 @@ export default function Netflow() {
           Every flow recorded across all runs, plus unattributed system egress that belongs to no
           single run.
         </p>
-        <NetflowScopeDisclosure className="mt-2" />
+        <NetflowScopeDisclosure scope="global" className="mt-2" />
       </header>
 
       {error ? (
@@ -79,7 +79,7 @@ export default function Netflow() {
         <p className="text-sm text-ink-dim">Loading network flows…</p>
       ) : (
         <div className="space-y-6">
-          {graph && <NetflowGraph graph={graph} />}
+          {graph && <NetflowGraph graph={graph} scope="global" />}
           <NetflowSummary hosts={data.hosts} />
           <NetflowTable flows={data.flows} dropped={data.dropped} asnLoaded={data.asn_loaded} />
         </div>

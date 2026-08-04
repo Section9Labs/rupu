@@ -19,20 +19,34 @@ const graph: GraphView = {
 
 describe('NetflowGraph', () => {
   it('labels both sides of the topology', () => {
-    render(<NetflowGraph graph={graph} />);
+    render(<NetflowGraph graph={graph} scope="global" />);
     expect(screen.getByText('run-1')).toBeInTheDocument();
     expect(screen.getByText('api.anthropic.com')).toBeInTheDocument();
   });
 
   it('draws one line per edge', () => {
-    const { container } = render(<NetflowGraph graph={graph} />);
+    const { container } = render(<NetflowGraph graph={graph} scope="global" />);
     expect(container.querySelectorAll('line')).toHaveLength(1);
   });
 
   it('renders an explicit empty state rather than a blank canvas', () => {
-    render(<NetflowGraph graph={{ nodes: [], edges: [] }} />);
+    render(<NetflowGraph graph={{ nodes: [], edges: [] }} scope="global" />);
     expect(screen.getByText(/No flows to graph/i)).toBeInTheDocument();
     expect(document.querySelector('svg')).not.toBeInTheDocument();
+  });
+
+  it('never claims CP fleet traffic in the empty-state hint at project or run scope', () => {
+    // Fix 2, round 4 (Blocker 1): `Origin::Cp` flows live only in the CP
+    // daemon's global ledger — the project/run scopes' empty state must not
+    // imply it could show up there.
+    render(<NetflowGraph graph={{ nodes: [], edges: [] }} scope="project" />);
+    expect(screen.queryByText(/CP fleet traffic/i)).not.toBeInTheDocument();
+    cleanup();
+    render(<NetflowGraph graph={{ nodes: [], edges: [] }} scope="run" />);
+    expect(screen.queryByText(/CP fleet traffic/i)).not.toBeInTheDocument();
+    cleanup();
+    render(<NetflowGraph graph={{ nodes: [], edges: [] }} scope="global" />);
+    expect(screen.getByText(/CP fleet traffic/i)).toBeInTheDocument();
   });
 
   it('never surfaces GraphEdge.bytes as a byte count, even for a Coarse (bytes: 0) edge', () => {
@@ -48,7 +62,7 @@ describe('NetflowGraph', () => {
       ],
       edges: [{ from: 'run-1', to: 'host:443', calls: 1, bytes: 0, errors: 0 }],
     };
-    const { container } = render(<NetflowGraph graph={coarseGraph} />);
+    const { container } = render(<NetflowGraph graph={coarseGraph} scope="global" />);
     expect(container.querySelectorAll('line')).toHaveLength(1);
     expect(screen.queryByText(/0 B/)).not.toBeInTheDocument();
   });
@@ -65,7 +79,7 @@ describe('NetflowGraph', () => {
         { from: 'run-2', to: 'host:443', calls: 1, bytes: 10, errors: 1 },
       ],
     };
-    const { container } = render(<NetflowGraph graph={errGraph} />);
+    const { container } = render(<NetflowGraph graph={errGraph} scope="global" />);
     const lines = Array.from(container.querySelectorAll('line'));
     expect(lines).toHaveLength(2);
     const strokes = new Set(lines.map((l) => l.getAttribute('stroke')));

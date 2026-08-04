@@ -1283,14 +1283,14 @@ export default function RunDetail() {
         )}
         {tab === 'netflow' && (
           <div className="h-full min-h-0 space-y-4 overflow-auto">
-            <NetflowScopeDisclosure />
+            <NetflowScopeDisclosure scope="run" />
             {netflowError ? (
               <p className="text-sm text-err">{netflowError}</p>
             ) : netflow === null ? (
               <p className="text-sm text-ink-dim">Loading network flows…</p>
             ) : (
               <>
-                {netflowGraph && <NetflowGraph graph={netflowGraph} />}
+                {netflowGraph && <NetflowGraph graph={netflowGraph} scope="run" />}
                 <NetflowSummary hosts={netflow.hosts} />
                 <NetflowTable
                   flows={netflow.flows}
