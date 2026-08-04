@@ -174,3 +174,9 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
+# rupu-auth, rupu-update, rupu-scm, rupu-cp, rupu-cli are not yet migrated
+# onto rupu-netflow (Plan 2's job — see PENDING_PLAN_2 in
+# crates/rupu-netflow/tests/choke_point.rs). "deny" now would break the
+# build on every one of them; Plan 2's final task raises this once that
+# list is empty.
+disallowed_methods = "warn"

@@ -275,6 +275,11 @@ fn build_http_client() -> ClientWithMiddleware {
 /// No run context is available at this layer — every client built here is
 /// stamped `FlowCtx::system(Origin::Provider("anthropic"))`. Plan 2 threads
 /// the real run id through once the provider factory is touched.
+///
+/// The builder below is never `.build()`'d directly — it flows straight
+/// into `rupu_netflow::http::client_from`, the sanctioned pattern (see
+/// Task 11's `clippy.toml`), not a bypass of it.
+#[allow(clippy::disallowed_methods)]
 fn build_http_client_with_timeout(timeout: Option<std::time::Duration>) -> ClientWithMiddleware {
     let mut builder = reqwest::Client::builder().http1_only();
     if let Some(t) = timeout {

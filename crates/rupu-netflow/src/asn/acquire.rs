@@ -96,6 +96,9 @@ pub async fn refresh(
 }
 
 #[cfg(test)]
+// Throwaway clients to exercise `refresh` — not rupu's egress. Listed in
+// `ALLOWED` in crates/rupu-netflow/tests/choke_point.rs (Task 11).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::io::Write;

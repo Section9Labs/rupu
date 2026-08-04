@@ -91,6 +91,11 @@ impl ProviderTuning {
     /// 10 / Task 11's `clippy.toml` lint) — pass it through
     /// `rupu_netflow::http::client_from` so the resulting client is
     /// instrumented, preserving every option set here.
+    ///
+    /// `client_from` takes a caller-tuned `ClientBuilder` by design, so
+    /// constructing one here (never calling `.build()` on it) is the
+    /// sanctioned pattern, not a bypass — see Task 11's `clippy.toml`.
+    #[allow(clippy::disallowed_methods)]
     pub fn http_client_builder(&self) -> reqwest::ClientBuilder {
         reqwest::Client::builder()
             .connect_timeout(self.timeout)

@@ -1,0 +1,7 @@
+# rupu has exactly one door for outbound HTTP: rupu_netflow::http::client
+# / client_from. A raw reqwest client bypasses netflow capture entirely.
+# See docs/superpowers/specs/2026-08-03-rupu-netflow-observability-design.md §7.3
+disallowed-methods = [
+    { path = "reqwest::Client::new", reason = "use rupu_netflow::http::client(ctx) so the flow is captured" },
+    { path = "reqwest::Client::builder", reason = "use rupu_netflow::http::client_from(ctx, builder) so the flow is captured" },
+]
