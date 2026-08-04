@@ -164,7 +164,9 @@ pub enum WorkflowParseError {
     },
     #[error("step `{step}`: approval.{field} is only valid on a standalone approval gate step (remove agent/prompt to make this a gate node)")]
     GateFieldsOnInlineApproval { step: String, field: &'static str },
-    #[error("step `{step}`: `action:` is mutually exclusive with agent/prompt/for_each/parallel/panel")]
+    #[error(
+        "step `{step}`: `action:` is mutually exclusive with agent/prompt/for_each/parallel/panel"
+    )]
     ActionMutuallyExclusive { step: String },
     #[error("step `{step}`: `action:` must name a tool (e.g. scm.prs.create)")]
     ActionEmptyName { step: String },
@@ -862,6 +864,61 @@ pub struct Distribute {
     pub hosts: Vec<String>,
 }
 
+/// Output parsing mode for a `run:` step's stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ParseMode {
+    /// stdout binds verbatim as a string. Default.
+    #[default]
+    Raw,
+    /// stdout is parsed as JSON; `steps.<id>.output` binds the parsed value.
+    Json,
+    /// stdout is split on newlines; empty lines dropped.
+    Lines,
+}
+
+fn default_allow_exit_codes() -> Vec<i32> {
+    vec![0]
+}
+
+/// A deterministic, non-LLM command step. Mutually exclusive with
+/// `agent`/`prompt`, `parallel:`, `panel:`, `branch:`, `action:`,
+/// `split:`, and `join:` — but deliberately COMPATIBLE with `for_each:`,
+/// which fans the same command across items.
+///
+/// `cmd` and `args` are passed to the OS as an argv vector. There is no
+/// shell: no pipes, no redirection, no globbing, no word splitting. A
+/// template-rendered value containing shell metacharacters is passed as
+/// literal argument text (see `run_step::execute`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RunStep {
+    /// Executable name or path. Rendered as a template.
+    pub cmd: String,
+    /// Argument vector. Each element is rendered as a template
+    /// independently and becomes exactly one argv element — a rendered
+    /// value is never re-split on whitespace.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Working directory. Rendered as a template. Defaults to the run's
+    /// workspace root when absent.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Extra environment variables. Values are rendered as templates and
+    /// merged over the inherited environment.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// How to interpret stdout when binding `steps.<id>.output`.
+    #[serde(default)]
+    pub parse: ParseMode,
+    /// Kill the child after this many seconds. `None` ⇒ no timeout.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    /// Exit codes treated as success. Defaults to `[0]`.
+    #[serde(default = "default_allow_exit_codes")]
+    pub allow_exit_codes: Vec<i32>,
+}
+
 /// Bare-keyword form of a join's wait policy (`wait: all` / `wait: any`).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -1069,6 +1126,9 @@ pub struct Step {
     /// Parameters for `action:`; values are minijinja-rendered at execution time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub with: Option<serde_json::Value>,
+    /// Deterministic command step (Bench Plan 0). See [`RunStep`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunStep>,
 }
 
 /// One sub-step inside a `parallel:` block. Same surface as a linear
@@ -2198,7 +2258,11 @@ pub fn is_nonlinear(wf: &Workflow) -> bool {
     if !wf.loops.is_empty() {
         return true;
     }
-    if wf.steps.iter().any(|s| s.split.is_some() || s.join.is_some()) {
+    if wf
+        .steps
+        .iter()
+        .any(|s| s.split.is_some() || s.join.is_some())
+    {
         return true;
     }
     // The deduped control-edge set (next/split/branch-arm/depends_on) shared
@@ -2337,10 +2401,7 @@ fn declaration_order_is_topological(wf: &Workflow) -> bool {
 pub(crate) fn workflow_has_explicit_edges(wf: &Workflow) -> bool {
     !wf.loops.is_empty()
         || wf.steps.iter().any(|s| {
-            !s.next.is_empty()
-                || s.split.is_some()
-                || s.join.is_some()
-                || !s.depends_on.is_empty()
+            !s.next.is_empty() || s.split.is_some() || s.join.is_some() || !s.depends_on.is_empty()
         })
 }
 
@@ -2901,7 +2962,8 @@ steps:
 
     #[test]
     fn empty_string_action_entry_is_rejected() {
-        let raw = "name: w\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n    actions: [\"\", \"\"]\n";
+        let raw =
+            "name: w\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n    actions: [\"\", \"\"]\n";
         assert!(matches!(
             Workflow::parse(raw).unwrap_err(),
             WorkflowParseError::ActionsUnknownTool { .. }
@@ -3144,10 +3206,9 @@ steps:
 
     #[test]
     fn branch_struct_parses() {
-        let b: Branch = serde_yaml::from_str(
-            "condition: \"{{ steps.a.output }}\"\nthen: [x, y]\nelse: [z]\n",
-        )
-        .unwrap();
+        let b: Branch =
+            serde_yaml::from_str("condition: \"{{ steps.a.output }}\"\nthen: [x, y]\nelse: [z]\n")
+                .unwrap();
         assert_eq!(b.condition, "{{ steps.a.output }}");
         assert_eq!(b.then, vec!["x", "y"]);
         assert_eq!(b.r#else, vec!["z"]);
@@ -3739,8 +3800,9 @@ steps:
         // order) reference and must NOT be rejected now that the workflow
         // has explicit edges — validate_graph governs ordering instead.
         let raw = "name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: \"use {{ steps.later.output }}\"\n  - id: later\n    agent: x\n    prompt: p\n    next: [a]\n";
-        Workflow::parse(raw)
-            .expect("graph workflow with a valid edge-ordered forward-declared reference should parse");
+        Workflow::parse(raw).expect(
+            "graph workflow with a valid edge-ordered forward-declared reference should parse",
+        );
     }
 
     #[test]
@@ -4023,7 +4085,11 @@ loops:
         let def = wf.loops.get("refine").expect("loop `refine` must parse");
         assert_eq!(
             def.nodes,
-            vec!["gen".to_string(), "test".to_string(), "critique".to_string()]
+            vec![
+                "gen".to_string(),
+                "test".to_string(),
+                "critique".to_string()
+            ]
         );
         assert_eq!(def.until, "{{ steps.critique.approved }}");
         assert_eq!(def.max_iterations, 5);
@@ -4437,7 +4503,10 @@ loops:
     #[test]
     fn is_nonlinear_true_for_a_loop_workflow() {
         let wf = Workflow::parse(VALID_REFINE_LOOP).unwrap();
-        assert!(is_nonlinear(&wf), "a loop is a super-node — always nonlinear");
+        assert!(
+            is_nonlinear(&wf),
+            "a loop is a super-node — always nonlinear"
+        );
     }
 
     #[test]
@@ -4554,5 +4623,47 @@ loops:
                 p.file_name().unwrap()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod run_step_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parses_run_step_with_defaults() {
+        // Parse surface only — the validation arm that lets a `run:` step
+        // through without an `agent:` lands in Task 2, so this asserts
+        // against `Step` directly (same convention as the `distribute`
+        // tests above).
+        let yaml = r#"
+id: score
+run:
+  cmd: python3
+  args: ["tools/score.py", "{{ item }}"]
+"#;
+        let step: Step = serde_yaml::from_str(yaml).expect("parses");
+        let run = step.run.as_ref().expect("run block");
+        assert_eq!(run.cmd, "python3");
+        assert_eq!(run.args, vec!["tools/score.py", "{{ item }}"]);
+        assert_eq!(run.parse, ParseMode::Raw);
+        assert_eq!(run.allow_exit_codes, vec![0]);
+        assert!(run.timeout_seconds.is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_run_field() {
+        // `shell: true` must never be a thing — the executor has no shell,
+        // and silently ignoring the key would be worse than refusing it.
+        let yaml = r#"
+id: score
+run:
+  cmd: python3
+  shell: true
+"#;
+        assert!(
+            serde_yaml::from_str::<Step>(yaml).is_err(),
+            "`shell:` must not parse"
+        );
     }
 }
