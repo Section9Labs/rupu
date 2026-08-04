@@ -77,13 +77,17 @@ const ALLOWED: &[&str] = &[
 /// crate clean, `rupu-scm`'s former `#![warn(clippy::disallowed_methods)]`
 /// override in `lib.rs` has been REMOVED — `#![deny(clippy::all)]` alone
 /// now enforces it, so a regression is a hard build error, not a warning.
-/// This list is therefore a strict subset of "genuinely unmigrated files" — Plan 2's
-/// real checklist is `cargo clippy --workspace --all-targets 2>&1 |
-/// grep disallowed`, not this constant.
-const PENDING_PLAN_2: &[&str] = &[
-    "crates/rupu-cli/src/cmd/cp.rs",
-    "crates/rupu-cp/src/host/http.rs",
-];
+///
+/// Plan 2 Task 7 (2026-08-04) migrated the last two entries —
+/// `crates/rupu-cli/src/cmd/cp.rs`'s test-only client and
+/// `crates/rupu-cp/src/host/http.rs`'s fleet-host `HttpHostConnector` (both
+/// constructors, `new` and `new_with_timeout`, now route through
+/// `rupu_netflow::http::client_from` with their existing timeout tuning
+/// preserved) — onto `rupu_netflow::http::client` / `client_from`. This
+/// list is now empty; the authoritative check remains
+/// `cargo clippy --workspace --all-targets 2>&1 | grep disallowed`, not
+/// this constant.
+const PENDING_PLAN_2: &[&str] = &[];
 
 fn repo_root() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

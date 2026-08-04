@@ -137,15 +137,18 @@ impl HostRegistry {
     ///   `"local"` — but this keeps the method total).
     /// - `HttpCp` transport → a **fresh, uncached** [`HttpHostConnector`]
     ///   built with [`HttpHostConnector::new_with_timeout`], so an
-    ///   unreachable host fails fast instead of stalling on the OS's TCP
-    ///   connect timeout. Deliberately bypasses the connector cache: the
-    ///   cached connector (built by [`Self::resolve`]) is shared with the
-    ///   explicit `?host=<id>` path, which must keep its current
-    ///   (effectively unbounded) timeout behavior.
+    ///   unreachable host fails fast under this method's caller-chosen
+    ///   `timeout` instead of [`HttpHostConnector::new`]'s fixed
+    ///   5s-connect/30s-total bound. Deliberately bypasses the connector
+    ///   cache: the cached connector (built by [`Self::resolve`] via
+    ///   [`HttpHostConnector::new`]) is shared with the explicit
+    ///   `?host=<id>` path, which must keep that longer, fixed bound.
     /// - Every other transport (SSH/Tunnel/Bucket) falls back to
     ///   [`Self::resolve`] unchanged — bounding those is out of scope for
-    ///   this fix (they don't share `HttpHostConnector`'s unbounded
-    ///   `reqwest::Client::new()` root cause).
+    ///   this fix (they don't share `HttpHostConnector`'s original
+    ///   unbounded-client root cause; both of its constructors build their
+    ///   client through `rupu_netflow::http::client_from` now and are
+    ///   bounded either way).
     pub fn resolve_for_probe(
         &self,
         host_id: &str,

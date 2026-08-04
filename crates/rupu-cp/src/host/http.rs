@@ -5,14 +5,6 @@
 //! and maps transport / status errors so every method stays DRY.
 
 #![deny(clippy::all)]
-// disallowed_methods is grouped under clippy::all in this clippy version;
-// the workspace-level `disallowed_methods = "warn"` (root Cargo.toml) is
-// meant to keep this module buildable under clippy until Plan 2 migrates
-// it onto rupu-netflow, but this module's own `deny(clippy::all)` would
-// otherwise silently escalate it back to a hard error. Downgrade it back
-// to warn here explicitly; Plan 2's final task removes this override
-// along with the last raw reqwest call in this file.
-#![warn(clippy::disallowed_methods)]
 
 use futures_util::StreamExt as _;
 use std::time::Duration;
@@ -33,7 +25,7 @@ use crate::{
 /// Remote-host connector: forwards every [`HostConnector`] call as an HTTP
 /// request to a running `rupu cp serve`.
 pub struct HttpHostConnector {
-    client: reqwest::Client,
+    client: reqwest_middleware::ClientWithMiddleware,
     base_url: String,
     token: Option<String>,
 }
@@ -56,11 +48,12 @@ impl HttpHostConnector {
         // Bounded so one unreachable host cannot stall a fan-out on the OS TCP
         // connect timeout. Fan-out is concurrent (join_all), so wall-clock is
         // the slowest host — which must therefore be bounded.
-        let client = reqwest::Client::builder()
+        let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Cp);
+        let builder = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .timeout(std::time::Duration::from_secs(30));
+        let client = rupu_netflow::http::client_from(ctx.clone(), builder)
+            .unwrap_or_else(|_| rupu_netflow::http::client(ctx));
         Self {
             client,
             base_url,
@@ -84,11 +77,12 @@ impl HttpHostConnector {
     /// itself fails to build (e.g. an invalid TLS config) — best-effort, not
     /// a hard requirement for probing to function.
     pub fn new_with_timeout(base_url: String, token: Option<String>, timeout: Duration) -> Self {
-        let client = reqwest::Client::builder()
+        let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Cp);
+        let builder = reqwest::Client::builder()
             .connect_timeout(timeout)
-            .timeout(timeout)
-            .build()
-            .unwrap_or_default();
+            .timeout(timeout);
+        let client = rupu_netflow::http::client_from(ctx.clone(), builder)
+            .unwrap_or_else(|_| rupu_netflow::http::client(ctx));
         Self {
             client,
             base_url,
@@ -112,7 +106,7 @@ impl HttpHostConnector {
     /// - 2xx → `Ok(Response)`
     async fn send(
         &self,
-        req: reqwest::RequestBuilder,
+        req: reqwest_middleware::RequestBuilder,
     ) -> Result<reqwest::Response, HostConnectorError> {
         let req = match &self.token {
             Some(tok) => req.header("Authorization", format!("Bearer {tok}")),

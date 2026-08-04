@@ -2129,7 +2129,8 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let client = reqwest::Client::new();
+        let client =
+            rupu_netflow::http::client(rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Cp));
         let resp = client
             .post(format!("http://{addr}/api/runs/{}/reject", rec.id))
             .json(&serde_json::json!({ "reason": "not today" }))

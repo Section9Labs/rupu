@@ -27,6 +27,8 @@ tokio-stream = { workspace = true }
 object_store = { workspace = true }
 url = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream"] }
+reqwest-middleware.workspace = true
+rupu-netflow = { workspace = true, features = ["http"] }
 ulid.workspace = true
 rust-embed.workspace = true
 mime_guess.workspace = true

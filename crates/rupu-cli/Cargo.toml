@@ -65,6 +65,7 @@ tempfile.workspace = true
 syntect.workspace = true
 minijinja.workspace = true
 reqwest.workspace = true
+reqwest-middleware.workspace = true
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 
