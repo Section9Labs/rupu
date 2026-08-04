@@ -379,7 +379,12 @@ pub enum PauseReason {
 #[derive(Debug, Clone)]
 pub struct StepResult {
     /// Process outcome for a `run:` step; `None` for every other kind.
-    pub run_outcome: Option<crate::runs::RunOutcome>,
+    ///
+    /// Boxed deliberately: `StepResult` is the payload of
+    /// `Completed(..)` in three hot enums, and an inline `RunOutcome`
+    /// (two Strings + i32 + u64) grows every StepResult by ~64 bytes to
+    /// serve the one step kind that uses it.
+    pub run_outcome: Option<Box<crate::runs::RunOutcome>>,
     pub step_id: String,
     pub rendered_prompt: String,
     pub run_id: String,
@@ -5062,13 +5067,13 @@ async fn execute_run_step(
         skipped: false,
         kind: crate::runs::StepKind::Run,
         transcript_path,
-        run_outcome: Some(crate::runs::RunOutcome {
+        run_outcome: Some(Box::new(crate::runs::RunOutcome {
             parsed: out.parsed,
             stdout: out.stdout,
             stderr: out.stderr,
             exit_code: out.exit_code,
             duration_ms: out.duration_ms,
-        }),
+        })),
         ..Default::default()
     })
 }
@@ -6226,7 +6231,7 @@ async fn run_fanout_run_step(
 
     // Fold the replayed units back in so the step's result covers the
     // whole list, not just what re-ran.
-    collected.extend(resumed.into_iter());
+    collected.extend(resumed);
     collected.sort_by_key(|(idx, _)| *idx);
     let unit_results: Vec<ItemResult> = collected.into_iter().map(|(_, r)| r).collect();
 
