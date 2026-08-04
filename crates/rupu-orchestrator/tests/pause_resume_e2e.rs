@@ -305,6 +305,7 @@ async fn run_pause_then_resume_completes() {
     let recorder1 = Arc::new(EventRecorder::default());
 
     let opts1 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf.clone(),
         inputs: BTreeMap::new(),
         workspace_id: "ws_pause_run".into(),
@@ -453,6 +454,7 @@ async fn run_pause_then_resume_completes() {
     let recorder2 = Arc::new(EventRecorder::default());
 
     let opts2 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: record2.workspace_id.clone(),
@@ -636,6 +638,7 @@ async fn workflow_pause_resume_runs_remaining_steps() {
     let recorder1 = Arc::new(EventRecorder::default());
 
     let opts1 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf.clone(),
         inputs: BTreeMap::new(),
         workspace_id: "ws_pause_wf".into(),
@@ -705,6 +708,7 @@ async fn workflow_pause_resume_runs_remaining_steps() {
     let factory2 = Arc::new(EchoFactory::default());
     let recorder2 = Arc::new(EventRecorder::default());
     let opts2 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: record2.workspace_id.clone(),
@@ -847,6 +851,7 @@ async fn fanout_pause_resumes_only_incomplete_units() {
     let recorder1 = Arc::new(EventRecorder::default());
 
     let opts1 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf.clone(),
         inputs: BTreeMap::new(),
         workspace_id: "ws_pause_fanout".into(),
@@ -940,6 +945,7 @@ async fn fanout_pause_resumes_only_incomplete_units() {
     let dispatcher2 = Arc::new(RecordingUnitDispatcher::default());
     let recorder2 = Arc::new(EventRecorder::default());
     let opts2 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: record2.workspace_id.clone(),

@@ -4151,6 +4151,7 @@ mod tests {
             ],
         );
         let record = StepResultRecord {
+            run_outcome: None,
             step_id: "understand".into(),
             run_id: "run_linear".into(),
             transcript_path: transcript,
@@ -4423,6 +4424,7 @@ mod tests {
         std::fs::write(&transcript_path, format!("{body}\n")).unwrap();
 
         let rec = StepResultRecord {
+            run_outcome: None,
             step_id: "review_each".into(),
             run_id: "run_parent".into(),
             transcript_path: PathBuf::new(),

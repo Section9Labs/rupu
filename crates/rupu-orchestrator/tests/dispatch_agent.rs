@@ -222,6 +222,7 @@ async fn parent_step_dispatches_child_and_sees_its_output() {
 
     let wf = Workflow::parse(WF).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_dispatch".into(),
@@ -386,6 +387,7 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
 
     let wf = Workflow::parse(WF).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_dispatch".into(),

@@ -176,6 +176,18 @@ pub struct LoopProgress {
 #[derive(Debug, Serialize, Clone)]
 pub struct StepOutput {
     pub output: String,
+    /// `run:` step stdout, verbatim. Empty for every other kind.
+    #[serde(default)]
+    pub stdout: String,
+    /// `run:` step stderr, verbatim. Empty for every other kind.
+    #[serde(default)]
+    pub stderr: String,
+    /// `run:` step exit code. `0` for every other kind.
+    #[serde(default)]
+    pub exit_code: i32,
+    /// `run:` step wall-clock duration. `0` for every other kind.
+    #[serde(default)]
+    pub duration_ms: u64,
     #[serde(default)]
     pub success: bool,
     #[serde(default)]
@@ -255,6 +267,10 @@ impl Default for StepOutput {
     fn default() -> Self {
         Self {
             output: String::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+            duration_ms: 0,
             success: false,
             skipped: false,
             results: Vec::new(),

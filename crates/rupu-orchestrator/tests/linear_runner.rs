@@ -98,6 +98,7 @@ async fn second_step_sees_first_step_output_via_template() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let wf = Workflow::parse(WF).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_orch".into(),
@@ -148,6 +149,7 @@ async fn event_payload_is_visible_in_step_prompts() {
         "repository": { "full_name": "Section9Labs/rupu" }
     });
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_orch_evt".into(),
@@ -207,6 +209,7 @@ async fn issue_payload_is_visible_in_step_prompts_and_when_filters() {
         "number": 42
     });
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_orch_issue".into(),
@@ -272,6 +275,7 @@ async fn for_each_dispatches_one_item_per_line_and_binds_loop_metadata() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let wf = Workflow::parse(WF_FOREACH).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_orch_fanout".into(),
@@ -337,6 +341,7 @@ async fn for_each_accepts_a_json_array_of_objects() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let wf = Workflow::parse(WF_FOREACH_JSON).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_orch_json".into(),
@@ -385,6 +390,7 @@ steps:
     .replace("UNITS_PATH", &units.display().to_string());
     let wf = Workflow::parse(&wf_yaml).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_orch_readfile".into(),
@@ -433,6 +439,7 @@ async fn for_each_pulls_items_from_workflow_inputs_with_max_parallel_cap() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let wf = Workflow::parse(WF_FOREACH_FROM_INPUTS).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_orch_inputs".into(),
@@ -554,6 +561,7 @@ async fn for_each_continue_on_error_records_failures_and_keeps_going() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let wf = Workflow::parse(WF_FOREACH_FAILS).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_orch_fails".into(),
@@ -602,6 +610,7 @@ async fn for_each_without_continue_on_error_aborts_workflow_on_first_failure() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let wf = Workflow::parse(WF_FOREACH_ABORTS).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_orch_aborts".into(),
@@ -663,6 +672,7 @@ async fn parallel_dispatches_each_sub_step_with_its_own_agent_and_prompt() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let wf = Workflow::parse(WF_PARALLEL).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_orch_par".into(),
@@ -730,6 +740,7 @@ async fn parallel_continue_on_error_records_per_sub_step_failures() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let wf = Workflow::parse(WF_PARALLEL_FAIL).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_orch_par_fail".into(),
@@ -778,6 +789,7 @@ async fn parallel_without_continue_on_error_aborts_with_sub_step_id_in_message()
     let tmp = assert_fs::TempDir::new().unwrap();
     let wf = Workflow::parse(WF_PARALLEL_ABORTS).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_orch_par_aborts".into(),
@@ -827,6 +839,7 @@ async fn run_store_records_run_metadata_and_per_step_rows() {
     let store = std::sync::Arc::new(rupu_orchestrator::RunStore::new(runs_root.clone()));
     let wf = Workflow::parse(WF_PERSIST).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_persist".into(),
@@ -897,6 +910,7 @@ async fn run_store_marks_run_failed_with_error_message() {
     let store = std::sync::Arc::new(rupu_orchestrator::RunStore::new(runs_root.clone()));
     let wf = Workflow::parse(WF_PERSIST_FAIL).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_persist_fail".into(),
@@ -946,6 +960,7 @@ async fn no_run_store_skips_persistence_and_emits_empty_run_id() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let wf = Workflow::parse(WF_PERSIST).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_no_persist".into(),
@@ -1004,6 +1019,7 @@ async fn approval_gate_pauses_run_and_persists_awaiting_state() {
     let store = std::sync::Arc::new(rupu_orchestrator::RunStore::new(runs_root));
     let wf = Workflow::parse(WF_APPROVAL).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_appr".into(),
@@ -1068,6 +1084,7 @@ async fn resume_from_approval_picks_up_at_awaited_step() {
 
     // First pass — pause at the deploy step.
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf.clone(),
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_resume".into(),
@@ -1107,6 +1124,7 @@ async fn resume_from_approval_picks_up_at_awaited_step() {
     let body = store.read_workflow_snapshot(&run_id).unwrap();
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: Workflow::parse(&body).unwrap(),
         inputs: std::collections::BTreeMap::new(),
         workspace_id: record.workspace_id.clone(),
@@ -1186,6 +1204,7 @@ steps:
     let tmp = assert_fs::TempDir::new().unwrap();
     let wf = Workflow::parse(s).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_no_pause".into(),
@@ -1321,6 +1340,7 @@ async fn panel_step_runs_panelists_in_parallel_and_aggregates_findings() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let wf = Workflow::parse(WF_PANEL).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_panel".into(),
@@ -1392,6 +1412,7 @@ steps:
     let tmp = assert_fs::TempDir::new().unwrap();
     let wf = Workflow::parse(s).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_panel_seq".into(),
@@ -1443,6 +1464,7 @@ steps:
     let tmp = assert_fs::TempDir::new().unwrap();
     let wf = Workflow::parse(s).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_panel_garbage".into(),
@@ -1596,6 +1618,7 @@ async fn panel_gate_loops_with_fixer_until_severity_clears() {
     let factory = Arc::new(LoopingPanelFactory::new());
     let wf = Workflow::parse(WF_PANEL_GATE).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_gate".into(),
@@ -1652,6 +1675,7 @@ async fn panel_gate_marks_unresolved_when_max_iterations_exhausted() {
     let factory = Arc::new(LoopingPanelFactory::new());
     let wf = Workflow::parse(WF_PANEL_GATE_EXHAUSTED).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_stubborn".into(),
@@ -1713,6 +1737,7 @@ steps:
     let factory = Arc::new(LoopingPanelFactory::new());
     let wf = Workflow::parse(s).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_low".into(),
@@ -1780,6 +1805,7 @@ async fn approval_with_timeout_seconds_persists_awaiting_since_and_expires_at() 
     let store = std::sync::Arc::new(rupu_orchestrator::RunStore::new(runs_root));
     let wf = Workflow::parse(WF_APPROVAL_WITH_TIMEOUT).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_to".into(),
@@ -1841,6 +1867,7 @@ steps:
     let store = std::sync::Arc::new(rupu_orchestrator::RunStore::new(runs_root));
     let wf = Workflow::parse(s).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_no_to".into(),
@@ -1893,6 +1920,7 @@ async fn unit_checkpoints_persist_each_fanout_item() {
     let store = std::sync::Arc::new(rupu_orchestrator::RunStore::new(runs_root));
     let wf = Workflow::parse(WF_FANOUT_CHECKPOINT).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_cp".into(),
@@ -2036,6 +2064,7 @@ async fn resume_reruns_only_failed_fanout_units() {
     let mut inputs = std::collections::BTreeMap::new();
     inputs.insert("units".to_string(), "ok-0\nFAIL-1\nok-2".to_string());
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf.clone(),
         inputs: inputs.clone(),
         workspace_id: "ws_resume_fanout".into(),
@@ -2122,6 +2151,7 @@ async fn resume_reruns_only_failed_fanout_units() {
     let mut resume_inputs = std::collections::BTreeMap::new();
     resume_inputs.insert("units".to_string(), "ok-0\nnow-1\nok-2".to_string());
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: resume_inputs,
         workspace_id: record.workspace_id.clone(),

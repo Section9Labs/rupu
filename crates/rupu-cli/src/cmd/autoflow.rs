@@ -13643,6 +13643,7 @@ steps:
             .append_step_result(
                 "run_dispatch",
                 &StepResultRecord {
+                    run_outcome: None,
                     step_id: "decide".into(),
                     run_id: "step_1".into(),
                     transcript_path: global.join("transcripts/step.jsonl"),
@@ -13796,6 +13797,7 @@ steps:
             .append_step_result(
                 "run_wrapped",
                 &StepResultRecord {
+                    run_outcome: None,
                     step_id: "decide".into(),
                     run_id: "step_1".into(),
                     transcript_path: global.join("transcripts/step.jsonl"),
@@ -13934,6 +13936,7 @@ steps:
             .append_step_result(
                 "run_fenced",
                 &StepResultRecord {
+                    run_outcome: None,
                     step_id: "decide".into(),
                     run_id: "step_1".into(),
                     transcript_path: global.join("transcripts/step.jsonl"),
@@ -14087,6 +14090,7 @@ steps:
             .append_step_result(
                 "run_shorthand",
                 &StepResultRecord {
+                    run_outcome: None,
                     step_id: "decide".into(),
                     run_id: "step_1".into(),
                     transcript_path: global.join("transcripts/step.jsonl"),
@@ -14230,6 +14234,7 @@ steps:
             .append_step_result(
                 "run_decision",
                 &StepResultRecord {
+                    run_outcome: None,
                     step_id: "decide".into(),
                     run_id: "step_1".into(),
                     transcript_path: global.join("transcripts/step.jsonl"),
@@ -14692,6 +14697,7 @@ steps:
             .append_step_result(
                 "run_done",
                 &StepResultRecord {
+                    run_outcome: None,
                     step_id: "decide".into(),
                     run_id: "step_1".into(),
                     transcript_path: global.join("transcripts/step.jsonl"),

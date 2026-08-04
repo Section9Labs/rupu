@@ -85,6 +85,7 @@ fn seed_run(id: &str) -> RunRecord {
 
 fn seed_step(run_id: &str, step_id: &str) -> StepResultRecord {
     StepResultRecord {
+        run_outcome: None,
         step_id: step_id.into(),
         run_id: run_id.into(),
         transcript_path: PathBuf::from(format!("/tmp/{step_id}.jsonl")),

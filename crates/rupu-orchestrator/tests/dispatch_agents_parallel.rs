@@ -242,6 +242,7 @@ async fn parent_step_fans_out_two_children_and_aggregates() {
 
     let wf = Workflow::parse(WF).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_dispatch".into(),
@@ -301,6 +302,7 @@ async fn one_child_failure_marks_all_succeeded_false_but_parent_continues() {
 
     let wf = Workflow::parse(WF).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_dispatch".into(),
@@ -352,6 +354,7 @@ async fn allowlist_violation_blocks_dispatch_at_the_parallel_layer() {
 
     let wf = Workflow::parse(WF).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_dispatch".into(),

@@ -99,6 +99,7 @@ impl StepFactory for FakeFactory {
 
 fn opts_for(wf: Workflow, tmp: &assert_fs::TempDir, sink: Arc<CollectSink>) -> OrchestratorRunOpts {
     OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_branch".into(),

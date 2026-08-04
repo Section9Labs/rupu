@@ -138,6 +138,7 @@ fn seed_transcript_with_model(dir: &std::path::Path, run_id: &str, model: &str) 
         .append_step_result(
             run_id,
             &rupu_orchestrator::runs::StepResultRecord {
+                run_outcome: None,
                 step_id: "s1".into(),
                 run_id: run_id.into(),
                 transcript_path,
@@ -261,6 +262,7 @@ async fn usage_priced_only_reports_empty_unpriced_gap() {
         .append_step_result(
             "run_priced",
             &rupu_orchestrator::runs::StepResultRecord {
+                run_outcome: None,
                 step_id: "s1".into(),
                 run_id: "run_priced".into(),
                 transcript_path,
@@ -606,6 +608,7 @@ fn seed_run_with_usage(
         .append_step_result(
             run_id,
             &rupu_orchestrator::runs::StepResultRecord {
+                run_outcome: None,
                 step_id: "s1".into(),
                 run_id: run_id.into(),
                 transcript_path,

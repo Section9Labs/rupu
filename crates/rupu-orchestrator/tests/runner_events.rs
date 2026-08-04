@@ -108,6 +108,7 @@ async fn run_workflow_emits_run_and_step_events_in_order() {
 
     let wf = Workflow::parse(WF_TWO_STEPS).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_events".into(),
@@ -196,6 +197,7 @@ steps:
 
     let wf = Workflow::parse(wf_yaml).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_skip".into(),
@@ -254,6 +256,7 @@ steps:
 
     let wf = Workflow::parse(wf_yaml).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_panel".into(),
@@ -432,6 +435,7 @@ steps:
     let sink: Arc<CollectSink2> = Arc::new(CollectSink2::default());
     let wf = Workflow::parse(wf_yaml).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_gate".into(),
@@ -493,6 +497,7 @@ async fn no_event_sink_does_not_emit_any_events() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let wf = Workflow::parse(WF_TWO_STEPS).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_no_sink".into(),

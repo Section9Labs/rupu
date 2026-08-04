@@ -598,6 +598,21 @@ pub struct StepResultRecord {
     /// `step_results.jsonl` round-trips byte-for-byte.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loop_iteration: Option<u32>,
+    /// Process outcome for a `run:` step. Absent (not null) for every
+    /// other kind and for records written before `run:` existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_outcome: Option<RunOutcome>,
+}
+
+/// Captured process outcome for a `run:` step. `None` for every other
+/// step kind, so a `step_results.jsonl` written before `run:` existed
+/// round-trips byte-for-byte (same approach as `loop_iteration`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunOutcome {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub duration_ms: u64,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -667,6 +682,7 @@ pub struct UnitCheckpoint {
 impl From<&StepResult> for StepResultRecord {
     fn from(sr: &StepResult) -> Self {
         Self {
+            run_outcome: None,
             step_id: sr.step_id.clone(),
             run_id: sr.run_id.clone(),
             transcript_path: sr.transcript_path.clone(),
@@ -712,6 +728,7 @@ impl From<&ItemResult> for ItemResultRecord {
 impl From<&StepResultRecord> for StepResult {
     fn from(rec: &StepResultRecord) -> Self {
         Self {
+            run_outcome: None,
             step_id: rec.step_id.clone(),
             rendered_prompt: rec.rendered_prompt.clone(),
             run_id: rec.run_id.clone(),
@@ -2625,6 +2642,7 @@ mod tests {
 
     fn sample_step_result(step_id: &str) -> StepResultRecord {
         StepResultRecord {
+            run_outcome: None,
             step_id: step_id.into(),
             run_id: format!("run_step_{step_id}"),
             transcript_path: PathBuf::from(format!("/tmp/{step_id}.jsonl")),

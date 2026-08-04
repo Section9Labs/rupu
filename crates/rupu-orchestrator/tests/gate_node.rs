@@ -311,6 +311,7 @@ async fn gate_auto_approve_completes_without_pausing() {
     let sink = Arc::new(JsonlSink::create(&events_path).expect("create jsonl sink"));
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_gate_auto".into(),
@@ -385,6 +386,7 @@ async fn gate_without_auto_approve_parks_awaiting_approval() {
     let sink = Arc::new(JsonlSink::create(&events_path).expect("create jsonl sink"));
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_gate_manual".into(),
@@ -449,6 +451,7 @@ async fn gate_approve_resume_continues_to_next_step() {
 
     // --- Phase 1: pause at the gate. ---
     let opts1 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf.clone(),
         inputs: BTreeMap::new(),
         workspace_id: "ws_gate_resume".into(),
@@ -491,6 +494,7 @@ async fn gate_approve_resume_continues_to_next_step() {
 
     let factory2 = Arc::new(EchoFactory::default());
     let opts2 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: record.workspace_id.clone(),
@@ -573,6 +577,7 @@ async fn gate_as_last_step_approve_resume_completes_run() {
     // --- Phase 1: setup runs, then pauses at the gate. ---
     let factory1 = Arc::new(EchoFactory::default());
     let opts1 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf.clone(),
         inputs: BTreeMap::new(),
         workspace_id: "ws_gate_last".into(),
@@ -612,6 +617,7 @@ async fn gate_as_last_step_approve_resume_completes_run() {
     assert_eq!(prior_step_results.len(), 1, "setup checkpointed on disk");
 
     let opts2 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: record.workspace_id.clone(),
@@ -683,6 +689,7 @@ async fn reject_runs_on_reject_cleanup_chain() {
 
     // --- Phase 1: pause at the gate. ---
     let opts1 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf.clone(),
         inputs: BTreeMap::new(),
         workspace_id: "ws_gate_reject".into(),
@@ -738,6 +745,7 @@ async fn reject_runs_on_reject_cleanup_chain() {
 
     let factory = Arc::new(EchoFactory::default());
     let opts2 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: record_after_reject.workspace_id.clone(),
@@ -829,6 +837,7 @@ async fn reject_cleanup_step_failure_does_not_change_terminal_outcome() {
     let wf = Workflow::parse(WF_GATE_REJECT_FAILING_CLEANUP).unwrap();
 
     let opts1 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf.clone(),
         inputs: BTreeMap::new(),
         workspace_id: "ws_gate_reject_fail".into(),
@@ -864,6 +873,7 @@ async fn reject_cleanup_step_failure_does_not_change_terminal_outcome() {
     let record_after_reject = store.load(&run_id).unwrap();
 
     let opts2 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: record_after_reject.workspace_id.clone(),
@@ -928,6 +938,7 @@ async fn reject_cleanup_with_empty_on_reject_dispatches_nothing() {
     let wf = Workflow::parse(WF_GATE_REJECT_EMPTY).unwrap();
 
     let opts1 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf.clone(),
         inputs: BTreeMap::new(),
         workspace_id: "ws_gate_reject_empty".into(),
@@ -977,6 +988,7 @@ async fn reject_cleanup_with_empty_on_reject_dispatches_nothing() {
     // PanicFactory proves nothing is ever dispatched — an empty on_reject
     // chain must not call the factory at all.
     let opts2 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: record_after_reject.workspace_id.clone(),
@@ -1063,6 +1075,7 @@ async fn timeout_reject_records_via_timeout_not_human() {
 
     // --- Phase 1: pause at the gate. ---
     let opts1 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf.clone(),
         inputs: BTreeMap::new(),
         workspace_id: "ws_gate_timeout_reject".into(),
@@ -1113,6 +1126,7 @@ async fn timeout_reject_records_via_timeout_not_human() {
     // what the CLI's timeout-driven call sites pass. ---
     let factory = Arc::new(EchoFactory::default());
     let opts2 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: record_after_reject.workspace_id.clone(),
@@ -1205,6 +1219,7 @@ async fn notify_fires_when_gate_parks() {
     let (dispatcher, connector) = dispatcher_with_connector(false);
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_gate_notify".into(),
@@ -1271,6 +1286,7 @@ steps:
     let (dispatcher, connector) = dispatcher_with_connector(false);
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_gate_notify_auto".into(),
@@ -1314,6 +1330,7 @@ async fn notify_failure_does_not_block_the_park() {
     let (dispatcher, _connector) = dispatcher_with_connector(true);
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_gate_notify_fail".into(),
@@ -1357,6 +1374,7 @@ async fn notify_skips_gracefully_with_no_action_dispatcher() {
     let wf = Workflow::parse(WF_GATE_NOTIFY).unwrap();
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_gate_notify_no_dispatcher".into(),
@@ -1431,6 +1449,7 @@ async fn reject_one_gate_of_a_multi_gate_set_runs_its_own_cleanup_leaves_sibling
     // can't be built ahead of time anyway (every other test in this file
     // takes the same `event_sink: None` shape for phase 1). ---
     let opts1 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf.clone(),
         inputs: BTreeMap::new(),
         workspace_id: "ws_multi_gate_reject".into(),
@@ -1503,6 +1522,7 @@ async fn reject_one_gate_of_a_multi_gate_set_runs_its_own_cleanup_leaves_sibling
 
     let factory = Arc::new(EchoFactory::default());
     let opts2 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: record_after_reject.workspace_id.clone(),
@@ -1632,6 +1652,7 @@ steps:
     );
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_gate_when_skip_linear".into(),
@@ -1690,6 +1711,7 @@ steps:
     );
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_gate_when_skip_scheduler".into(),
@@ -1742,6 +1764,7 @@ async fn notify_hook_transcript_is_referenced_by_a_persisted_step_result() {
     let (dispatcher, _connector) = dispatcher_with_connector(false);
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_gate_notify_persisted".into(),

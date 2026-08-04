@@ -340,6 +340,7 @@ async fn happy_path_action_step_dispatches_through_tool_dispatcher() {
     let sink = Arc::new(JsonlSink::create(&events_path).expect("create jsonl sink"));
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_action_happy".into(),
@@ -438,6 +439,7 @@ async fn templated_with_values_render_before_reaching_the_connector() {
     let (dispatcher, connector) = dispatcher_with_connector(PermissionMode::Bypass, false);
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_action_templated".into(),
@@ -498,6 +500,7 @@ async fn templated_numeric_field_reaches_the_connector_as_a_json_number() {
     let (dispatcher, connector) = dispatcher_with_issue_connector(PermissionMode::Bypass);
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::from([("number".to_string(), "42".to_string())]),
         workspace_id: "ws_issue_number_coerce".into(),
@@ -553,6 +556,7 @@ steps:
     let (dispatcher, connector) = dispatcher_with_issue_connector(PermissionMode::Bypass);
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::from([("title".to_string(), "abc".to_string())]),
         workspace_id: "ws_issue_number_bad".into(),
@@ -615,6 +619,7 @@ steps:
     let (dispatcher, connector) = dispatcher_with_issue_connector(PermissionMode::Bypass);
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::from([("project_suffix".to_string(), "007".to_string())]),
         workspace_id: "ws_issue_no_overcoerce".into(),
@@ -677,6 +682,7 @@ async fn connector_error_fails_the_run_by_default() {
     let sink = Arc::new(JsonlSink::create(&events_path).expect("create jsonl sink"));
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_action_fail".into(),
@@ -737,6 +743,7 @@ steps:
     let (dispatcher, _connector) = dispatcher_with_connector(PermissionMode::Bypass, true);
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_action_fail_tolerated".into(),
@@ -826,6 +833,7 @@ async fn readonly_mode_blocks_write_tool_before_the_connector_is_called() {
     let (dispatcher, connector) = dispatcher_with_connector(PermissionMode::Readonly, false);
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_action_readonly".into(),
@@ -886,6 +894,7 @@ steps:
     let (dispatcher, connector) = dispatcher_with_connector(PermissionMode::Readonly, false);
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_action_readonly_tolerated".into(),
@@ -952,6 +961,7 @@ async fn missing_action_dispatcher_errors_naming_the_step() {
     let wf = Workflow::parse(WF_ACTION_FAILS).unwrap();
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_action_missing".into(),
@@ -1013,6 +1023,7 @@ async fn on_reject_cleanup_dispatches_action_step_for_real() {
     // --- Phase 1: pause at the gate (no dispatcher needed — gates never
     // dispatch actions themselves). ---
     let opts1 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf.clone(),
         inputs: BTreeMap::new(),
         workspace_id: "ws_gate_reject_action".into(),
@@ -1058,6 +1069,7 @@ async fn on_reject_cleanup_dispatches_action_step_for_real() {
     // --- Cleanup: dispatch the on_reject chain with a REAL dispatcher. ---
     let (dispatcher, connector) = dispatcher_with_connector(PermissionMode::Bypass, false);
     let opts2 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: record_after_reject.workspace_id.clone(),
@@ -1136,6 +1148,7 @@ steps:
     let (dispatcher, connector) = dispatcher_with_connector(PermissionMode::Ask, false);
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_action_when_skip".into(),

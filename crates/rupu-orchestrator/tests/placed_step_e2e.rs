@@ -173,6 +173,7 @@ async fn placed_steps_run_remotely_and_chain() {
 
     let wf = Workflow::parse(WF_PLACED).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs,
         workspace_id: "ws_placed_e2e".into(),
@@ -272,6 +273,7 @@ async fn no_host_control_runs_locally() {
 
     let wf = Workflow::parse(WF_LOCAL).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs,
         workspace_id: "ws_placed_e2e_local".into(),

@@ -203,6 +203,7 @@ fn sample_envelope(
 
 fn sample_step_result(run_id: &str, transcript_path: &Path) -> StepResultRecord {
     StepResultRecord {
+        run_outcome: None,
         step_id: "implement".into(),
         run_id: run_id.into(),
         transcript_path: transcript_path.to_path_buf(),

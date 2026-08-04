@@ -246,8 +246,41 @@ pub trait StepFactory: Send + Sync {
 /// not only inside one fan-out step. Every field is itself `Clone` (plain
 /// data or an `Arc<dyn Trait + Send + Sync>`), so this is a cheap,
 /// non-semantic addition — no behavior depends on it outside the scheduler.
+/// Policy governing `run:` step execution: whether they may run at all,
+/// which executables are permitted, the permission mode to gate under,
+/// and the default working directory for a step with no `cwd:`.
+///
+/// Bundled into one field so `run:` support did not require a
+/// three-field change at every one of the ~120 `OrchestratorRunOpts`
+/// construction sites.
+#[derive(Debug, Clone)]
+pub struct RunStepPolicy {
+    /// Permission mode this run was launched under.
+    pub mode: rupu_tools::permission::PermissionMode,
+    /// The resolved `[workflow]` config block.
+    pub config: rupu_config::policy_config::WorkflowConfig,
+    /// Default `cwd` for a `run:` step that does not declare one.
+    pub workspace_root: PathBuf,
+}
+
+impl Default for RunStepPolicy {
+    fn default() -> Self {
+        Self {
+            // `Ask` is the safe default: a caller that never wires an
+            // operator decider gets a refusal, never silent execution.
+            mode: rupu_tools::permission::PermissionMode::Ask,
+            // Mirrors `[workflow].run_step_enabled` defaulting to false —
+            // a harness that does not opt in cannot run commands.
+            config: rupu_config::policy_config::WorkflowConfig::default(),
+            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct OrchestratorRunOpts {
+    /// Policy for `run:` steps. Defaults to "disabled, ask mode".
+    pub run_step: RunStepPolicy,
     pub workflow: Workflow,
     pub inputs: BTreeMap<String, String>,
     pub workspace_id: String,
@@ -345,6 +378,8 @@ pub enum PauseReason {
 
 #[derive(Debug, Clone)]
 pub struct StepResult {
+    /// Process outcome for a `run:` step; `None` for every other kind.
+    pub run_outcome: Option<crate::runs::RunOutcome>,
     pub step_id: String,
     pub rendered_prompt: String,
     pub run_id: String,
@@ -411,6 +446,7 @@ pub struct Finding {
 impl Default for StepResult {
     fn default() -> Self {
         Self {
+            run_outcome: None,
             step_id: String::new(),
             rendered_prompt: String::new(),
             run_id: String::new(),
@@ -4565,6 +4601,10 @@ fn base_context_for_step(
         ctx.steps.insert(
             sr.step_id.clone(),
             StepOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+                duration_ms: 0,
                 output: sr.output.clone(),
                 success: sr.success,
                 skipped: sr.skipped,
@@ -7017,6 +7057,7 @@ impl PanelPass {
         )
         .unwrap_or_else(|_| "[]".into());
         StepResult {
+            run_outcome: None,
             step_id: step.id.clone(),
             rendered_prompt: rendered_subject.to_string(),
             run_id: String::new(),
@@ -7545,6 +7586,7 @@ mod tests {
         dispatcher: Arc<dyn UnitDispatcher>,
     ) -> OrchestratorRunOpts {
         OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_test".into(),
@@ -7862,6 +7904,7 @@ steps:
         // Build opts directly (without `make_opts`) so we can set
         // `unit_dispatcher: None`.
         let opts = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_test".into(),
@@ -8362,6 +8405,7 @@ steps:
         sink: Arc<dyn crate::executor::EventSink>,
     ) -> OrchestratorRunOpts {
         OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_pause".into(),
@@ -8859,6 +8903,7 @@ steps:
         });
         let sink1 = Arc::new(CollectingSink::default());
         let opts1 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf.clone(),
             inputs: BTreeMap::new(),
             workspace_id: "ws_fanout_pause".into(),
@@ -8952,6 +8997,7 @@ steps:
         let dispatcher2 = Arc::new(FakeUnitDispatcher::new());
         let sink2 = Arc::new(CollectingSink::default());
         let opts2 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: record.workspace_id.clone(),
@@ -9748,6 +9794,7 @@ mod dag_scheduler_golden {
         let wf = Workflow::parse(raw).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
         let (inputs, issue, event) = fixture_for(name);
         let opts = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs,
             workspace_id: format!("ws_{name}"),
@@ -10065,6 +10112,7 @@ steps:
         tmp: &tempfile::TempDir,
     ) -> OrchestratorRunOpts {
         OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_sched".into(),
@@ -10582,6 +10630,7 @@ loops:
         tmp: &tempfile::TempDir,
     ) -> OrchestratorRunOpts {
         OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_loop".into(),
@@ -10774,6 +10823,7 @@ loops:
             calls: Arc::clone(&calls),
         };
         let opts = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_loop".into(),
@@ -11055,6 +11105,7 @@ loops:
 
     fn opts_for_never_converges(wf: Workflow, tmp: &tempfile::TempDir) -> OrchestratorRunOpts {
         OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_loop".into(),
@@ -11253,6 +11304,7 @@ loops:
         };
         let max_seen = Arc::clone(&factory.max_seen);
         let opts = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_loop".into(),
@@ -11478,6 +11530,7 @@ loops:
         resume_from: Option<ResumeState>,
     ) -> OrchestratorRunOpts {
         OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_loop_resume".into(),
@@ -11768,6 +11821,7 @@ loops:
             }
         }
         let opts2 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_loop_resume".into(),
@@ -11916,6 +11970,7 @@ loops:
         }
 
         let opts1 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf.clone(),
             inputs: BTreeMap::new(),
             workspace_id: "ws_loop_resume".into(),
@@ -11958,6 +12013,7 @@ loops:
             .approve_gate(&run_id, "matt", chrono::Utc::now(), None)
             .unwrap();
         let opts2 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_loop_resume".into(),
@@ -12067,6 +12123,7 @@ loops:
         let calls1 = Arc::clone(&factory1.calls);
         let critique_started = Arc::clone(&factory1.critique_started);
         let opts1 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf.clone(),
             inputs: BTreeMap::new(),
             workspace_id: "ws_loop_resume".into(),
@@ -12164,6 +12221,7 @@ loops:
         let factory2 = ResumableRefineFactory::new(2);
         let calls2 = Arc::clone(&factory2.calls);
         let opts2 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_loop_resume".into(),
@@ -12342,6 +12400,7 @@ mod join_and_prune {
         tmp: &tempfile::TempDir,
     ) -> OrchestratorRunOpts {
         OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_join".into(),
@@ -13414,6 +13473,7 @@ steps:
         let factory1 = JoinTestFactory::new(&[("indep", 60)]);
         let calls1 = Arc::clone(&factory1.calls);
         let opts1 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf.clone(),
             inputs: BTreeMap::new(),
             workspace_id: "ws_two_gate".into(),
@@ -13494,6 +13554,7 @@ steps:
         let factory2 = JoinTestFactory::new(&[]);
         let calls2 = Arc::clone(&factory2.calls);
         let opts2 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf.clone(),
             inputs: BTreeMap::new(),
             workspace_id: "ws_two_gate".into(),
@@ -13552,6 +13613,7 @@ steps:
         let factory3 = JoinTestFactory::new(&[]);
         let calls3 = Arc::clone(&factory3.calls);
         let opts3 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_two_gate".into(),
@@ -13641,6 +13703,7 @@ steps:
         // --- Phase 1: fanout parks both gates in one batch. ---
         let factory1 = JoinTestFactory::new(&[]);
         let opts1 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf.clone(),
             inputs: BTreeMap::new(),
             workspace_id: "ws_gate_clock".into(),
@@ -13690,6 +13753,7 @@ steps:
 
         let factory2 = JoinTestFactory::new(&[]);
         let opts2 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf.clone(),
             inputs: BTreeMap::new(),
             workspace_id: "ws_gate_clock".into(),
@@ -13766,6 +13830,7 @@ steps:
         let wf = Workflow::parse(WF).unwrap();
 
         let opts1 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf.clone(),
             inputs: BTreeMap::new(),
             workspace_id: "ws_new_gate_clock".into(),
@@ -13799,6 +13864,7 @@ steps:
             .expect("approve gate_a");
 
         let opts2 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_new_gate_clock".into(),
@@ -13958,6 +14024,7 @@ mod resume_and_cancel {
         resume_from: Option<ResumeState>,
     ) -> OrchestratorRunOpts {
         OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_resume_cancel".into(),

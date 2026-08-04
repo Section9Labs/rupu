@@ -1505,6 +1505,7 @@ mod tests {
             .append_step_result(
                 "run_123",
                 &StepResultRecord {
+                    run_outcome: None,
                     step_id: "implement".into(),
                     run_id: "step_run_1".into(),
                     transcript_path,

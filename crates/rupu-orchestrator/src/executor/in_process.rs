@@ -156,6 +156,7 @@ impl WorkflowExecutor for InProcessExecutor {
 
         // 6. Build OrchestratorRunOpts.
         let orchestrator_opts = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow,
             inputs: opts.vars.clone(),
             workspace_id: self.workspace_id.clone(),

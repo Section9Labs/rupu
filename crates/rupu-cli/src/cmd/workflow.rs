@@ -3289,6 +3289,7 @@ pub(crate) async fn resume_run(
         spawn_pause_marker_poller(Arc::clone(&store), run_id.to_string(), pause_token.clone());
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow,
         inputs: inputs_map,
         workspace_id: record.workspace_id.clone(),
@@ -4714,6 +4715,7 @@ async fn execute_workflow_invocation(
     );
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow,
         inputs: inputs_map,
         workspace_id: ctx.workspace_id,
@@ -4894,6 +4896,7 @@ async fn execute_workflow_invocation(
                         cfg.pricing.clone(),
                     );
                     let resume_opts = OrchestratorRunOpts {
+                        run_step: Default::default(),
                         workflow: workflow_for_resume.clone(),
                         inputs: inputs_for_resume.clone(),
                         workspace_id: workspace_id_for_resume.clone(),
