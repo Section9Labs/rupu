@@ -3,6 +3,14 @@
 **Date:** 2026-08-04
 **Status:** approved (brainstorm), pending implementation plans
 
+> **Where this landed (2026-08-04).** Only Part 0 — the `run:` step kind — lives in
+> the rupu repository; it is an engine capability any workflow author can use.
+> The benchmark workflows and their harness scripts were extracted to
+> `~/Code/Oracle/cyberbench-runner`, because rupu is the tool and a benchmark
+> needing a 240GB dataset and a Docker daemon is a workload, not a sample
+> workflow. Parts 1 and 2 below describe work that now lives in that repo; its
+> `docs/plans/` holds the implementation plans.
+
 ## Summary
 
 Two benchmark workflows for rupu, plus the engine primitive both require:

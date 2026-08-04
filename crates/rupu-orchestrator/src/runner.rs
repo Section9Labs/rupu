@@ -10072,27 +10072,6 @@ mod dag_scheduler_golden {
         Option<serde_json::Value>,
     ) {
         match name {
-            // Benchmark workflows: every required input gets a placeholder,
-            // so any test that resolves inputs for every sample workflow
-            // still works. The golden scheduler tests skip `run:` workflows
-            // outright (see `sample_workflow_files`), but other callers of
-            // `fixture_for` do not.
-            "cybergym.yaml" => (
-                BTreeMap::from([
-                    ("task_ids_file".to_string(), "/tmp/tasks.txt".to_string()),
-                    ("data_dir".to_string(), "/tmp/cybergym-data".to_string()),
-                    (
-                        "server_url".to_string(),
-                        "http://127.0.0.1:8666".to_string(),
-                    ),
-                    ("mask_map".to_string(), "/tmp/mask_map.json".to_string()),
-                    ("verify_script".to_string(), "/tmp/verify.py".to_string()),
-                    ("run_dir".to_string(), "/tmp/cybergym-run".to_string()),
-                    ("run_salt".to_string(), "golden".to_string()),
-                ]),
-                None,
-                None,
-            ),
             "code-review-panel.yaml" => (
                 BTreeMap::from([("diff".to_string(), "+ x".to_string())]),
                 None,
