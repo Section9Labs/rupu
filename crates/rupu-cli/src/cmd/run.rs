@@ -549,28 +549,22 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     paths::ensure_dir(&transcripts)?;
     let transcript_path = transcripts.join(format!("{run_id}.jsonl"));
 
-    // Netflow capture. Two destinations: the ledger under `<pwd>/.rupu/netflow/`
-    // (persists across runs — `pwd`, not the resolved `workspace_path` below,
-    // so a `--tmp`/`--into` clone target being torn down doesn't take the
-    // ledger with it; it is also the only home for `Origin::System` egress
-    // that has no run to attach to) and this run's transcript (streams live).
-    // Best-effort: a ledger that cannot be opened degrades to transcript-only
-    // capture, never a hard failure.
+    // Netflow capture. Two destinations: the ledger (persists across
+    // runs — rooted at the project when one is found, `pwd` otherwise,
+    // never the resolved `workspace_path` below; see `netflow_root`'s
+    // doc comment. Also the only home for `Origin::System` egress that
+    // has no run to attach to) and this run's transcript (streams live).
     //
     // MUST run before `build_for_provider_with_config` below —
     // provider clients resolve `rupu_netflow::http::sink()` into their own
     // field at construction time, so installing the sink after the
     // provider is built would leave it permanently wired to the default
     // `NullSink` for the whole run.
-    let netflow_paths = rupu_netflow::NetflowPaths::new(&pwd);
-    let mut netflow_sinks: Vec<Arc<dyn rupu_netflow::FlowSink>> = vec![Arc::new(
-        rupu_transcript::TranscriptSink::new(transcript_path.clone()),
-    )];
-    match rupu_netflow::NetflowWriterHandle::spawn(netflow_paths) {
-        Ok(handle) => netflow_sinks.push(handle.writer.clone()),
-        Err(e) => tracing::debug!(error = %e, "netflow ledger unavailable for this run"),
-    }
-    rupu_netflow::http::init(Arc::new(rupu_netflow::FanoutSink::new(netflow_sinks)));
+    rupu_netflow::http::init(build_netflow_sink(
+        project_root.as_deref(),
+        &pwd,
+        &transcript_path,
+    ));
 
     // Provider build via CredentialResolver. Wrapped in an `Arc` so the
     // same resolver instance can also be handed to `CliAgentDispatcher`
@@ -1064,6 +1058,48 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Where the netflow ledger lives for this invocation: the project root
+/// when `rupu run` was invoked inside (or under) one, `pwd` otherwise.
+///
+/// Deliberately NOT the raw `pwd` unconditionally — `rupu run` is
+/// routinely invoked from a subdirectory of an initialised project (the
+/// same `<dir>/.rupu` marker `paths::project_root_for` already walks up
+/// to find), and anchoring the ledger to the exact invocation directory
+/// would fragment it into a disconnected `.rupu/netflow/` per subdirectory
+/// instead of the one canonical `<project_root>/.rupu/netflow/` — directly
+/// undermining the "persists across runs" property the ledger exists for.
+/// Mirrors the `<repo>/.rupu/agents/`, `<repo>/.rupu/workflows/`
+/// convention this project already relies on.
+fn netflow_root<'a>(project_root: Option<&'a Path>, pwd: &'a Path) -> &'a Path {
+    project_root.unwrap_or(pwd)
+}
+
+/// Build the process-wide netflow sink for this run: a ledger writer
+/// rooted at [`netflow_root`] plus a `TranscriptSink` streaming into this
+/// run's own transcript. Best-effort — a ledger that cannot be opened
+/// degrades to transcript-only capture, never a hard failure.
+///
+/// Split out from the `rupu_netflow::http::init` call site at the call
+/// site in [`run_inner`] so the root-selection logic is unit-testable on
+/// its own, without touching the process-wide `OnceLock` `init` installs
+/// into (that `OnceLock` is first-call-wins for the whole test binary, so
+/// exercising it from more than one test in the same process is unsafe).
+fn build_netflow_sink(
+    project_root: Option<&Path>,
+    pwd: &Path,
+    transcript_path: &Path,
+) -> Arc<dyn rupu_netflow::FlowSink> {
+    let netflow_paths = rupu_netflow::NetflowPaths::new(netflow_root(project_root, pwd));
+    let mut sinks: Vec<Arc<dyn rupu_netflow::FlowSink>> = vec![Arc::new(
+        rupu_transcript::TranscriptSink::new(transcript_path.to_path_buf()),
+    )];
+    match rupu_netflow::NetflowWriterHandle::spawn(netflow_paths) {
+        Ok(handle) => sinks.push(handle.writer.clone()),
+        Err(e) => tracing::debug!(error = %e, "netflow ledger unavailable for this run"),
+    }
+    Arc::new(rupu_netflow::FanoutSink::new(sinks))
+}
+
 fn render_assistant_output(
     printer: &mut crate::output::LineStreamPrinter,
     content: &str,
@@ -1480,6 +1516,97 @@ mod tests {
             list_result.is_ok(),
             "a missing (not malformed) config.toml must not fail the command: {list_result:?}"
         );
+    }
+
+    /// Finding 1 (Task 8 fix round 1): a nested `pwd` inside an
+    /// initialised project must NOT fragment the netflow ledger into a
+    /// disconnected `.rupu/netflow/` at the invocation directory — it
+    /// must land at the one canonical `<project_root>/.rupu/netflow/`.
+    #[test]
+    fn netflow_root_prefers_project_root_over_a_nested_pwd() {
+        let project_root = Path::new("/work/myproject");
+        let nested_pwd = Path::new("/work/myproject/src/deep/nested");
+        assert_eq!(netflow_root(Some(project_root), nested_pwd), project_root);
+    }
+
+    /// Outside any initialised project, `pwd` is all there is.
+    #[test]
+    fn netflow_root_falls_back_to_pwd_when_no_project_root() {
+        let pwd = Path::new("/tmp/scratch/somewhere");
+        assert_eq!(netflow_root(None, pwd), pwd);
+    }
+
+    /// `build_netflow_sink` composes a working `FanoutSink` — a flow
+    /// recorded through it lands in BOTH the ledger (rooted via
+    /// `netflow_root`) and the transcript. This exercises the exact
+    /// construction `run_inner` hands to `rupu_netflow::http::init`,
+    /// short of the `OnceLock` install itself (unsafe to touch from more
+    /// than one test in the same process — see `build_netflow_sink`'s
+    /// doc comment).
+    #[tokio::test]
+    async fn build_netflow_sink_writes_to_the_project_rooted_ledger_and_the_transcript() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let nested_pwd = project_root.join("src/deep/nested");
+        std::fs::create_dir_all(&nested_pwd).unwrap();
+        let transcript_path = tmp.path().join("transcript.jsonl");
+        rupu_transcript::JsonlWriter::create(&transcript_path).unwrap();
+
+        let sink = build_netflow_sink(Some(&project_root), &nested_pwd, &transcript_path);
+
+        let flow = rupu_netflow::FlowRecord {
+            id: rupu_netflow::FlowId::from_parts(1, 1),
+            ts: chrono::Utc::now(),
+            ctx: rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Update),
+            fidelity: rupu_netflow::Fidelity::Http,
+            method: "GET".into(),
+            scheme: "https".into(),
+            host: "example.test".into(),
+            port: 443,
+            path: "/".into(),
+            peer_ip: None,
+            resolved_ips: vec![],
+            http_version: None,
+            status: Some(200),
+            outcome: rupu_netflow::Outcome::Ok,
+            error: None,
+            bytes_out: None,
+            bytes_in: None,
+            body_complete: false,
+            ttfb_ms: None,
+            duration_ms: None,
+        };
+        sink.record(flow).await;
+
+        // Poll for the background ledger writer task to land the write —
+        // `build_netflow_sink` deliberately doesn't expose the
+        // `NetflowWriterHandle` for an explicit `shutdown()` (matching
+        // what `run_inner` does), so there's no synchronous flush point.
+        let ledger_path = project_root.join(".rupu/netflow/flows.jsonl");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&ledger_path) {
+                if !text.trim().is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "netflow ledger at {ledger_path:?} was never written"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Ledger landed under the PROJECT root, not the nested pwd.
+        assert!(
+            !nested_pwd.join(".rupu/netflow/flows.jsonl").exists(),
+            "netflow must not fragment into the nested invocation directory"
+        );
+
+        // And the transcript got the same flow.
+        let transcript_text = std::fs::read_to_string(&transcript_path).unwrap();
+        assert!(transcript_text.contains(r#""type":"net_flow""#));
     }
 }
 
