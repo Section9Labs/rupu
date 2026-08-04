@@ -5,6 +5,14 @@
 //! and maps transport / status errors so every method stays DRY.
 
 #![deny(clippy::all)]
+// disallowed_methods is grouped under clippy::all in this clippy version;
+// the workspace-level `disallowed_methods = "warn"` (root Cargo.toml) is
+// meant to keep this module buildable under clippy until Plan 2 migrates
+// it onto rupu-netflow, but this module's own `deny(clippy::all)` would
+// otherwise silently escalate it back to a hard error. Downgrade it back
+// to warn here explicitly; Plan 2's final task removes this override
+// along with the last raw reqwest call in this file.
+#![warn(clippy::disallowed_methods)]
 
 use futures_util::StreamExt as _;
 use std::time::Duration;

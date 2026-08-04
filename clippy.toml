@@ -2,6 +2,23 @@
 # / client_from. A raw reqwest client bypasses netflow capture entirely.
 # See docs/superpowers/specs/2026-08-03-rupu-netflow-observability-design.md §7.3
 disallowed-methods = [
+    # Direct construction — bypasses capture entirely.
     { path = "reqwest::Client::new", reason = "use rupu_netflow::http::client(ctx) so the flow is captured" },
-    { path = "reqwest::Client::builder", reason = "use rupu_netflow::http::client_from(ctx, builder) so the flow is captured" },
+    # `Client: Default` delegates to `Client::new()`, but is trait-derived
+    # rather than an inherent fn, so clippy cannot resolve this path to a
+    # reachable function to enforce it (confirmed: clippy warns "does not
+    # refer to a reachable function" without `allow-invalid`). Kept as
+    # documented intent + `allow-invalid` so a future clippy/reqwest that
+    # CAN resolve it picks the ban up for free; enforcement today still
+    # relies on `Client::new` above catching the common case and on the
+    # choke_point.rs guard test's literal-text match as a weak backstop.
+    { path = "reqwest::Client::default", reason = "use rupu_netflow::http::client(ctx) so the flow is captured", allow-invalid = true },
+    # Equivalent back doors: Client::builder() IS ClientBuilder::new(), and
+    # ClientBuilder: Default delegates to it.
+    { path = "reqwest::ClientBuilder::new", reason = "use reqwest::Client::builder() and pass it to rupu_netflow::http::client_from(ctx, builder)" },
+    # Same trait-derived-path limitation as `Client::default` above.
+    { path = "reqwest::ClientBuilder::default", reason = "use reqwest::Client::builder() and pass it to rupu_netflow::http::client_from(ctx, builder)", allow-invalid = true },
+    # THE actual bypass point. `Client::builder()` is deliberately NOT
+    # disallowed — client_from requires callers to build a tuned builder.
+    { path = "reqwest::ClientBuilder::build", reason = "pass the builder to rupu_netflow::http::client_from(ctx, builder) instead of building it yourself" },
 ]

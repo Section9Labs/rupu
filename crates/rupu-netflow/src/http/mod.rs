@@ -1,7 +1,12 @@
 //! The instrumented client — the ONE door for rupu's outbound HTTP.
 //!
-//! `clippy.toml` denies `reqwest::Client::new` and `::builder` outside
-//! this crate (Task 11), so this factory cannot be bypassed by accident.
+//! `clippy.toml` denies `reqwest::Client::new`, `Client::default`,
+//! `ClientBuilder::new`, `ClientBuilder::default`, and — the actual
+//! bypass point — `ClientBuilder::build` everywhere except here (Task 11).
+//! `Client::builder()` itself is deliberately allowed everywhere: every
+//! legitimate caller of `client_from` must build a tuned `ClientBuilder`
+//! first, so banning that call would produce a false positive at every
+//! correct call site instead of catching the one real escape hatch.
 
 pub mod middleware;
 pub mod resolver;
@@ -46,6 +51,7 @@ pub fn sink() -> Arc<dyn FlowSink> {
 /// broken identically. That residual, environment-wide case is the one
 /// spot this function cannot avoid a panic; it never manufactures one
 /// on its own.
+#[allow(clippy::disallowed_methods)] // the panicking-fallback `.build()` below is the factory itself
 pub fn client(ctx: FlowCtx) -> ClientWithMiddleware {
     client_from(ctx, default_builder()).unwrap_or_else(|_| {
         let bare = default_builder()
@@ -65,6 +71,10 @@ pub fn client_from(
 }
 
 /// As `client_from`, with an explicit sink. Used by tests.
+///
+/// This is the one legitimate `ClientBuilder::build()` call site in the
+/// repo — the actual choke point the rest of Task 11's lint protects.
+#[allow(clippy::disallowed_methods)]
 pub fn client_with(
     ctx: FlowCtx,
     builder: reqwest::ClientBuilder,
@@ -81,7 +91,6 @@ pub fn client_with(
         .build())
 }
 
-#[allow(clippy::disallowed_methods)]
 fn default_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
 }

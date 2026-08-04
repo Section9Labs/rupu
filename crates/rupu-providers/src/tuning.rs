@@ -94,8 +94,9 @@ impl ProviderTuning {
     ///
     /// `client_from` takes a caller-tuned `ClientBuilder` by design, so
     /// constructing one here (never calling `.build()` on it) is the
-    /// sanctioned pattern, not a bypass — see Task 11's `clippy.toml`.
-    #[allow(clippy::disallowed_methods)]
+    /// sanctioned pattern, not a bypass. `Client::builder()` itself is
+    /// not clippy-disallowed (see Task 11's `clippy.toml`) — only
+    /// `ClientBuilder::build()` is, and this function never calls it.
     pub fn http_client_builder(&self) -> reqwest::ClientBuilder {
         reqwest::Client::builder()
             .connect_timeout(self.timeout)
@@ -137,6 +138,12 @@ pub fn retry_backoff(attempt: u32) -> Duration {
 }
 
 #[cfg(test)]
+// Two tests below call `.http_client_builder().build()` directly to unit-
+// test the builder's timeout configuration in isolation against a real
+// httpmock server — that's the builder-construction function itself
+// under test, not live provider traffic bypassing capture. Same pattern
+// as rupu-netflow's own `asn/acquire.rs` test module.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

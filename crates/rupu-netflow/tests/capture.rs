@@ -1,8 +1,4 @@
 #![cfg(feature = "http")]
-// This file tests `client_with`'s own contract, which takes a caller-built
-// `reqwest::ClientBuilder` by design — legitimate use within rupu-netflow
-// itself (Task 11 locks the choke point everywhere else).
-#![allow(clippy::disallowed_methods)]
 
 use rupu_netflow::{FlowCtx, FlowSink, MemorySink, Origin};
 use std::sync::Arc;

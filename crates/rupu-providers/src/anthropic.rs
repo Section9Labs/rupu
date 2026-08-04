@@ -278,8 +278,8 @@ fn build_http_client() -> ClientWithMiddleware {
 ///
 /// The builder below is never `.build()`'d directly — it flows straight
 /// into `rupu_netflow::http::client_from`, the sanctioned pattern (see
-/// Task 11's `clippy.toml`), not a bypass of it.
-#[allow(clippy::disallowed_methods)]
+/// Task 11's `clippy.toml`); only `ClientBuilder::build()` is
+/// clippy-disallowed, and this function never calls it.
 fn build_http_client_with_timeout(timeout: Option<std::time::Duration>) -> ClientWithMiddleware {
     let mut builder = reqwest::Client::builder().http1_only();
     if let Some(t) = timeout {

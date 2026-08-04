@@ -1,4 +1,12 @@
 #![deny(clippy::all)]
+// disallowed_methods is grouped under clippy::all in this clippy version;
+// the workspace-level `disallowed_methods = "warn"` (Cargo.toml) is meant
+// to keep this crate buildable under clippy until Plan 2 migrates it onto
+// rupu-netflow, but a crate-level `deny(clippy::all)` would otherwise
+// silently escalate it back to a hard error. Downgrade it back to warn
+// here explicitly; Plan 2's final task removes this override along with
+// the last raw reqwest call in this crate.
+#![warn(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
 pub mod model;

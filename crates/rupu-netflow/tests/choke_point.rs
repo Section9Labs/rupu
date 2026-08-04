@@ -4,33 +4,63 @@
 //! Paired with the `clippy.toml` `disallowed-methods` lint: the lint
 //! catches it at compile time in CI, this catches it even when someone
 //! runs a bare `cargo test`.
+//!
+//! `Client::builder()` is deliberately NOT banned: `client_from` requires
+//! every legitimate caller to build a tuned `ClientBuilder` first, so
+//! banning that call would produce a false positive at every correct call
+//! site. The actual bypass is calling `.build()` on that builder instead
+//! of handing it to `client_from` — that is what `BANNED` catches.
 
 use std::path::Path;
 
-/// Files permitted to construct a raw reqwest client.
+/// Method paths that bypass netflow capture. Mirrors `clippy.toml`'s
+/// `disallowed-methods`.
+const BANNED: &[&str] = &[
+    "reqwest::Client::new",
+    "reqwest::Client::default",
+    "reqwest::ClientBuilder::new",
+    "reqwest::ClientBuilder::default",
+    "reqwest::ClientBuilder::build",
+];
+
+/// Files permitted to construct or finalize a raw reqwest client.
 const ALLOWED: &[&str] = &[
-    // The factory itself.
+    // The factory itself: `client()`'s panicking fallback and
+    // `client_with()`'s `ClientBuilder::build()` are the one legitimate
+    // `.build()` call site in the repo.
     "crates/rupu-netflow/src/http/mod.rs",
-    // Its `#[cfg(test)]` module builds a throwaway client to exercise
-    // `refresh`. Inline test modules live in `src/`, so the `/tests/`
-    // skip below does not cover them.
+    // Its `#[cfg(test)]` module builds a throwaway client (`Client::new`)
+    // to exercise `refresh`. Inline test modules live in `src/`, so the
+    // `/tests/` skip below does not cover them.
     "crates/rupu-netflow/src/asn/acquire.rs",
-    // `client_from` takes a caller-tuned `reqwest::ClientBuilder` by
-    // design (timeouts, `http1_only`, proxies). These two sites build
-    // one and hand it straight to `client_from` — they never call
-    // `.build()` on it directly, so capture is never bypassed. Both
-    // carry a matching `#[allow(clippy::disallowed_methods)]`.
-    "crates/rupu-providers/src/tuning.rs",
-    "crates/rupu-providers/src/anthropic.rs",
 ];
 
 /// NOT yet migrated. Plan 2 empties this list; it must never grow.
-/// Every entry here is a client whose egress is currently invisible.
+/// Every entry here is a client whose egress is currently invisible to
+/// THIS scanner.
 ///
 /// Built from the actual failure output of
-/// `no_raw_reqwest_client_outside_rupu_netflow` on 2026-08-03 (see
-/// `pending_migration_list_matches_reality` below), not copied from the
-/// task brief — the repo moved since the brief was written.
+/// `no_raw_reqwest_client_outside_rupu_netflow` on 2026-08-03 (fix round
+/// 1, after inverting the banned-method set — see module docs above),
+/// not copied from the task brief — the repo moved since the brief was
+/// written.
+///
+/// COVERAGE NOTE: this is a plain-text scan, so it only sees banned
+/// calls written as fully-qualified paths (`reqwest::Client::new(...)`).
+/// It cannot see `ClientBuilder::build()` invoked as a bare method call
+/// on a previously-built builder (`.build()`), which is how idiomatic
+/// Rust normally writes it — that pattern has no literal
+/// `reqwest::ClientBuilder::build` substring anywhere on the line. Eight
+/// more files (all in `rupu-scm`: `client_options.rs`,
+/// `connectors/{github,gitlab,jira,linear}/{client,events,issues}.rs`)
+/// are ALSO not yet migrated and hit exactly that blind spot — they do
+/// NOT appear here or trip this test, but they DO trip the semantic
+/// `clippy::disallowed_methods` lint (`cargo clippy -p rupu-scm
+/// --all-targets`), which resolves the receiver type regardless of call
+/// syntax and is the authoritative check. This list is therefore a
+/// strict subset of "genuinely unmigrated files" — Plan 2's real
+/// checklist is `cargo clippy --workspace --all-targets 2>&1 | grep
+/// disallowed`, not this constant.
 const PENDING_PLAN_2: &[&str] = &[
     "crates/rupu-auth/src/oauth/device.rs",
     "crates/rupu-auth/src/oauth/callback.rs",
@@ -38,14 +68,6 @@ const PENDING_PLAN_2: &[&str] = &[
     "crates/rupu-cli/src/cmd/cp.rs",
     "crates/rupu-cp/src/host/http.rs",
     "crates/rupu-update/src/github.rs",
-    "crates/rupu-scm/src/client_options.rs",
-    "crates/rupu-scm/src/connectors/github/client.rs",
-    "crates/rupu-scm/src/connectors/github/events.rs",
-    "crates/rupu-scm/src/connectors/gitlab/events.rs",
-    "crates/rupu-scm/src/connectors/jira/events.rs",
-    "crates/rupu-scm/src/connectors/jira/issues.rs",
-    "crates/rupu-scm/src/connectors/linear/events.rs",
-    "crates/rupu-scm/src/connectors/linear/issues.rs",
 ];
 
 fn repo_root() -> std::path::PathBuf {
@@ -75,8 +97,25 @@ fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-#[test]
-fn no_raw_reqwest_client_outside_rupu_netflow() {
+/// Strip a trailing line comment WITHOUT being fooled by `//` inside a
+/// string literal (e.g. `"http://x"`).
+fn strip_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_string => i += 1,
+            b'"' => in_string = !in_string,
+            b'/' if !in_string && bytes[i + 1] == b'/' => return &line[..i],
+            _ => {}
+        }
+        i += 1;
+    }
+    line
+}
+
+fn scan(skip: impl Fn(&str) -> bool) -> Vec<String> {
     let root = repo_root();
     let mut files = Vec::new();
     walk(&root.join("crates"), &mut files);
@@ -90,22 +129,27 @@ fn no_raw_reqwest_client_outside_rupu_netflow() {
             .replace('\\', "/");
 
         // Tests may build throwaway clients; they are not rupu's egress.
-        if rel.contains("/tests/")
-            || ALLOWED.contains(&rel.as_str())
-            || PENDING_PLAN_2.contains(&rel.as_str())
-        {
+        if rel.contains("/tests/") || skip(&rel) {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(&file) else {
             continue;
         };
         for (i, line) in text.lines().enumerate() {
-            let code = line.split("//").next().unwrap_or(line);
-            if code.contains("reqwest::Client::new") || code.contains("reqwest::Client::builder") {
-                offenders.push(format!("{rel}:{}", i + 1));
+            let code = strip_comment(line);
+            for method in BANNED {
+                if code.contains(method) {
+                    offenders.push(format!("{rel}:{} ({method})", i + 1));
+                }
             }
         }
     }
+    offenders
+}
+
+#[test]
+fn no_raw_reqwest_client_outside_rupu_netflow() {
+    let offenders = scan(|rel| ALLOWED.contains(&rel) || PENDING_PLAN_2.contains(&rel));
 
     assert!(
         offenders.is_empty(),
@@ -125,4 +169,22 @@ fn pending_migration_list_matches_reality() {
              remove it from PENDING_PLAN_2"
         );
     }
+}
+
+#[test]
+fn strip_comment_is_not_fooled_by_a_url_literal_before_a_banned_call() {
+    // A `"http://…"` literal earlier on the line contains `//`; a naive
+    // `line.split("//").next()` would truncate there and silently miss
+    // the banned call that follows.
+    let line = r#"let base = "http://x"; let client = reqwest::Client::new();  // never seen"#;
+    let stripped = strip_comment(line);
+    assert!(
+        stripped.contains("reqwest::Client::new"),
+        "stripper truncated at the URL literal's `//` instead of the real \
+         comment: {stripped:?}"
+    );
+    assert!(
+        !stripped.contains("never seen"),
+        "stripper failed to remove the trailing comment: {stripped:?}"
+    );
 }
