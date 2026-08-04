@@ -796,6 +796,7 @@ mod tests {
 
     fn sample_step_result(transcript_path: &Path) -> StepResultRecord {
         StepResultRecord {
+            run_outcome: None,
             step_id: "implement".into(),
             run_id: "run_01".into(),
             transcript_path: transcript_path.to_path_buf(),

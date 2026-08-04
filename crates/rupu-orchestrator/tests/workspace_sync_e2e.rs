@@ -309,6 +309,7 @@ async fn synced_placed_step_edit_is_visible_to_downstream_local_step() {
 
     let wf = Workflow::parse(WF_PLACED_SYNC_LOCAL).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_sync_e2e_placed".into(),
@@ -401,6 +402,7 @@ async fn fanout_sync_disjoint_edits_merge() {
 
     let wf = Workflow::parse(WF_FANOUT_SYNC).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_sync_e2e_fanout".into(),

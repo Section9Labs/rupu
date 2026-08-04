@@ -302,6 +302,7 @@ async fn rebuild_opts_from_disk(
     });
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow,
         inputs: inputs_map,
         workspace_id: record.workspace_id.clone(),

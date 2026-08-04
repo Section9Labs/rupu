@@ -89,7 +89,10 @@ impl RepoConnector for RecordingConnector {
                 message: "boom: connector rejected the comment".into(),
             });
         }
-        self.calls.lock().unwrap().push((p.clone(), body.to_string()));
+        self.calls
+            .lock()
+            .unwrap()
+            .push((p.clone(), body.to_string()));
         Ok(Comment {
             id: "comment_1".into(),
             author: "rupu-bot".into(),
@@ -153,7 +156,10 @@ impl IssueConnector for RecordingIssueConnector {
         unimplemented!()
     }
     async fn comment_issue(&self, i: &IssueRef, body: &str) -> Result<Comment, ScmError> {
-        self.calls.lock().unwrap().push((i.clone(), body.to_string()));
+        self.calls
+            .lock()
+            .unwrap()
+            .push((i.clone(), body.to_string()));
         Ok(Comment {
             id: "comment_1".into(),
             author: "rupu-bot".into(),
@@ -164,11 +170,7 @@ impl IssueConnector for RecordingIssueConnector {
     async fn create_issue(&self, _project: &str, _opts: CreateIssue) -> Result<Issue, ScmError> {
         unimplemented!()
     }
-    async fn update_issue_state(
-        &self,
-        _i: &IssueRef,
-        _state: IssueState,
-    ) -> Result<(), ScmError> {
+    async fn update_issue_state(&self, _i: &IssueRef, _state: IssueState) -> Result<(), ScmError> {
         unimplemented!()
     }
 }
@@ -338,6 +340,7 @@ async fn happy_path_action_step_dispatches_through_tool_dispatcher() {
     let sink = Arc::new(JsonlSink::create(&events_path).expect("create jsonl sink"));
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_action_happy".into(),
@@ -380,10 +383,7 @@ async fn happy_path_action_step_dispatches_through_tool_dispatcher() {
     drop(calls);
 
     let types = event_types_for_step(&events_path, "comment");
-    assert!(
-        types.contains(&"step_started".to_string()),
-        "got {types:?}"
-    );
+    assert!(types.contains(&"step_started".to_string()), "got {types:?}");
     assert!(
         types.contains(&"step_completed".to_string()),
         "got {types:?}"
@@ -398,7 +398,11 @@ async fn happy_path_action_step_dispatches_through_tool_dispatcher() {
         comment.transcript_path
     );
     let lines = read_transcript_lines(&comment.transcript_path);
-    assert_eq!(lines.len(), 2, "action_emitted + tool_audit lines; got {lines:?}");
+    assert_eq!(
+        lines.len(),
+        2,
+        "action_emitted + tool_audit lines; got {lines:?}"
+    );
     let data = &lines[0]["data"];
     assert_eq!(lines[0]["type"], "action_emitted");
     assert_eq!(data["kind"], "scm.prs.comment");
@@ -435,6 +439,7 @@ async fn templated_with_values_render_before_reaching_the_connector() {
     let (dispatcher, connector) = dispatcher_with_connector(PermissionMode::Bypass, false);
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_action_templated".into(),
@@ -495,6 +500,7 @@ async fn templated_numeric_field_reaches_the_connector_as_a_json_number() {
     let (dispatcher, connector) = dispatcher_with_issue_connector(PermissionMode::Bypass);
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::from([("number".to_string(), "42".to_string())]),
         workspace_id: "ws_issue_number_coerce".into(),
@@ -550,6 +556,7 @@ steps:
     let (dispatcher, connector) = dispatcher_with_issue_connector(PermissionMode::Bypass);
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::from([("title".to_string(), "abc".to_string())]),
         workspace_id: "ws_issue_number_bad".into(),
@@ -612,6 +619,7 @@ steps:
     let (dispatcher, connector) = dispatcher_with_issue_connector(PermissionMode::Bypass);
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::from([("project_suffix".to_string(), "007".to_string())]),
         workspace_id: "ws_issue_no_overcoerce".into(),
@@ -674,6 +682,7 @@ async fn connector_error_fails_the_run_by_default() {
     let sink = Arc::new(JsonlSink::create(&events_path).expect("create jsonl sink"));
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_action_fail".into(),
@@ -694,18 +703,20 @@ async fn connector_error_fails_the_run_by_default() {
         pause: None,
     };
 
-    let err = run_workflow(opts).await.expect_err("connector error aborts the run");
-    assert!(matches!(err, RunWorkflowError::Action { .. }), "got: {err:?}");
+    let err = run_workflow(opts)
+        .await
+        .expect_err("connector error aborts the run");
+    assert!(
+        matches!(err, RunWorkflowError::Action { .. }),
+        "got: {err:?}"
+    );
     assert!(
         err.to_string().contains("boom"),
         "error must carry the connector's message; got: {err}"
     );
 
     let types = event_types_for_step(&events_path, "comment");
-    assert!(
-        types.contains(&"step_failed".to_string()),
-        "got {types:?}"
-    );
+    assert!(types.contains(&"step_failed".to_string()), "got {types:?}");
 }
 
 #[tokio::test]
@@ -732,6 +743,7 @@ steps:
     let (dispatcher, _connector) = dispatcher_with_connector(PermissionMode::Bypass, true);
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_action_fail_tolerated".into(),
@@ -752,14 +764,19 @@ steps:
         pause: None,
     };
 
-    let res = run_workflow(opts).await.expect("continue_on_error tolerates the failure");
+    let res = run_workflow(opts)
+        .await
+        .expect("continue_on_error tolerates the failure");
     assert!(res.awaiting.is_none());
     assert_eq!(res.step_results.len(), 2);
 
     let comment = &res.step_results[0];
     assert_eq!(comment.step_id, "comment");
     assert_eq!(comment.kind, StepKind::Action);
-    assert!(!comment.success, "the connector error must be recorded as a failure");
+    assert!(
+        !comment.success,
+        "the connector error must be recorded as a failure"
+    );
 
     // Failure case: the audit line still gets written (exactly once),
     // with `applied: false` and the connector's error string carried in
@@ -768,12 +785,19 @@ steps:
     // `output/live_run.rs` consumers already reading it that way.
     assert!(comment.transcript_path.exists());
     let lines = read_transcript_lines(&comment.transcript_path);
-    assert_eq!(lines.len(), 2, "action_emitted + tool_audit lines; got {lines:?}");
+    assert_eq!(
+        lines.len(),
+        2,
+        "action_emitted + tool_audit lines; got {lines:?}"
+    );
     let data = &lines[0]["data"];
     assert_eq!(lines[0]["type"], "action_emitted");
     assert_eq!(data["kind"], "scm.prs.comment");
     assert_eq!(data["applied"], false);
-    assert_eq!(data["allowed"], true, "the call reached the connector; only permission denial sets allowed:false");
+    assert_eq!(
+        data["allowed"], true,
+        "the call reached the connector; only permission denial sets allowed:false"
+    );
     assert!(
         data["reason"].as_str().unwrap_or_default().contains("boom"),
         "reason must carry the connector's error string; got {data:?}"
@@ -784,11 +808,17 @@ steps:
     // connector; it just failed there.
     let audit = &lines[1]["data"];
     assert_eq!(lines[1]["type"], "tool_audit");
-    assert_eq!(audit["blocked"], false, "a connector error is not a permission denial");
+    assert_eq!(
+        audit["blocked"], false,
+        "a connector error is not a permission denial"
+    );
 
     let after = &res.step_results[1];
     assert_eq!(after.step_id, "after");
-    assert!(after.success, "the workflow must continue past the tolerated failure");
+    assert!(
+        after.success,
+        "the workflow must continue past the tolerated failure"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -803,6 +833,7 @@ async fn readonly_mode_blocks_write_tool_before_the_connector_is_called() {
     let (dispatcher, connector) = dispatcher_with_connector(PermissionMode::Readonly, false);
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_action_readonly".into(),
@@ -863,6 +894,7 @@ steps:
     let (dispatcher, connector) = dispatcher_with_connector(PermissionMode::Readonly, false);
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_action_readonly_tolerated".into(),
@@ -883,14 +915,26 @@ steps:
         pause: None,
     };
 
-    let res = run_workflow(opts).await.expect("continue_on_error tolerates the denial");
-    assert!(connector.calls.lock().unwrap().is_empty(), "a denied call must never reach the connector");
+    let res = run_workflow(opts)
+        .await
+        .expect("continue_on_error tolerates the denial");
+    assert!(
+        connector.calls.lock().unwrap().is_empty(),
+        "a denied call must never reach the connector"
+    );
 
     let comment = &res.step_results[0];
-    assert!(!comment.success, "a permission denial must record as a failure");
+    assert!(
+        !comment.success,
+        "a permission denial must record as a failure"
+    );
     assert!(comment.transcript_path.exists());
     let lines = read_transcript_lines(&comment.transcript_path);
-    assert_eq!(lines.len(), 2, "action_emitted + tool_audit lines; got {lines:?}");
+    assert_eq!(
+        lines.len(),
+        2,
+        "action_emitted + tool_audit lines; got {lines:?}"
+    );
     assert_eq!(lines[0]["type"], "action_emitted");
     assert_eq!(lines[0]["data"]["allowed"], false);
 
@@ -900,7 +944,10 @@ steps:
     assert_eq!(audit["declared"], true);
     assert_eq!(audit["granted"], true);
     assert_eq!(audit["restricted"], false);
-    assert_eq!(audit["blocked"], true, "a readonly-mode permission denial must read as blocked:true");
+    assert_eq!(
+        audit["blocked"], true,
+        "a readonly-mode permission denial must read as blocked:true"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -914,6 +961,7 @@ async fn missing_action_dispatcher_errors_naming_the_step() {
     let wf = Workflow::parse(WF_ACTION_FAILS).unwrap();
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_action_missing".into(),
@@ -975,6 +1023,7 @@ async fn on_reject_cleanup_dispatches_action_step_for_real() {
     // --- Phase 1: pause at the gate (no dispatcher needed — gates never
     // dispatch actions themselves). ---
     let opts1 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf.clone(),
         inputs: BTreeMap::new(),
         workspace_id: "ws_gate_reject_action".into(),
@@ -1012,12 +1061,15 @@ async fn on_reject_cleanup_dispatches_action_step_for_real() {
 
     let record_after_reject = store.load(&run_id).unwrap();
     let prior_records = store.read_step_results(&run_id).unwrap();
-    let prior_step_results: Vec<rupu_orchestrator::StepResult> =
-        prior_records.iter().map(rupu_orchestrator::StepResult::from).collect();
+    let prior_step_results: Vec<rupu_orchestrator::StepResult> = prior_records
+        .iter()
+        .map(rupu_orchestrator::StepResult::from)
+        .collect();
 
     // --- Cleanup: dispatch the on_reject chain with a REAL dispatcher. ---
     let (dispatcher, connector) = dispatcher_with_connector(PermissionMode::Bypass, false);
     let opts2 = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: record_after_reject.workspace_id.clone(),
@@ -1096,6 +1148,7 @@ steps:
     let (dispatcher, connector) = dispatcher_with_connector(PermissionMode::Ask, false);
 
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_action_when_skip".into(),
@@ -1128,5 +1181,9 @@ steps:
     );
 
     let calls = connector.calls.lock().unwrap();
-    assert_eq!(calls.len(), 0, "skipped action step must never reach the connector");
+    assert_eq!(
+        calls.len(),
+        0,
+        "skipped action step must never reach the connector"
+    );
 }

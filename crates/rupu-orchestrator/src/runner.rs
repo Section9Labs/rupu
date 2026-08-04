@@ -23,8 +23,8 @@ use crate::templates::{
     StepOutput,
 };
 use crate::workflow::{
-    effective_workspace_mode, is_nonlinear, workflow_edges, yaml_scalar_to_string, InputType,
-    Step, Workflow, WorkflowParseError, WorkspaceMode,
+    effective_workspace_mode, is_nonlinear, workflow_edges, yaml_scalar_to_string, InputType, Step,
+    Workflow, WorkflowParseError, WorkspaceMode,
 };
 use async_trait::async_trait;
 use rupu_agent::{run_agent, AgentRunOpts, RunError, RunResult};
@@ -132,6 +132,14 @@ pub enum RunWorkflowError {
         #[source]
         source: rupu_mcp::McpError,
     },
+    #[error("run step `{step}` refused: {reason}")]
+    RunStepDenied { step: String, reason: String },
+    #[error("run step `{step}` failed: {source}")]
+    RunStep {
+        step: String,
+        #[source]
+        source: crate::run_step::RunStepError,
+    },
     #[error("input `{name}` is required but was not provided")]
     MissingRequiredInput { name: String },
     #[error("input `{name}`: value `{value}` is not in the declared `enum` ({allowed:?})")]
@@ -238,8 +246,41 @@ pub trait StepFactory: Send + Sync {
 /// not only inside one fan-out step. Every field is itself `Clone` (plain
 /// data or an `Arc<dyn Trait + Send + Sync>`), so this is a cheap,
 /// non-semantic addition — no behavior depends on it outside the scheduler.
+/// Policy governing `run:` step execution: whether they may run at all,
+/// which executables are permitted, the permission mode to gate under,
+/// and the default working directory for a step with no `cwd:`.
+///
+/// Bundled into one field so `run:` support did not require a
+/// three-field change at every one of the ~120 `OrchestratorRunOpts`
+/// construction sites.
+#[derive(Debug, Clone)]
+pub struct RunStepPolicy {
+    /// Permission mode this run was launched under.
+    pub mode: rupu_tools::permission::PermissionMode,
+    /// The resolved `[workflow]` config block.
+    pub config: rupu_config::policy_config::WorkflowConfig,
+    /// Default `cwd` for a `run:` step that does not declare one.
+    pub workspace_root: PathBuf,
+}
+
+impl Default for RunStepPolicy {
+    fn default() -> Self {
+        Self {
+            // `Ask` is the safe default: a caller that never wires an
+            // operator decider gets a refusal, never silent execution.
+            mode: rupu_tools::permission::PermissionMode::Ask,
+            // Mirrors `[workflow].run_step_enabled` defaulting to false —
+            // a harness that does not opt in cannot run commands.
+            config: rupu_config::policy_config::WorkflowConfig::default(),
+            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct OrchestratorRunOpts {
+    /// Policy for `run:` steps. Defaults to "disabled, ask mode".
+    pub run_step: RunStepPolicy,
     pub workflow: Workflow,
     pub inputs: BTreeMap<String, String>,
     pub workspace_id: String,
@@ -337,6 +378,13 @@ pub enum PauseReason {
 
 #[derive(Debug, Clone)]
 pub struct StepResult {
+    /// Process outcome for a `run:` step; `None` for every other kind.
+    ///
+    /// Boxed deliberately: `StepResult` is the payload of
+    /// `Completed(..)` in three hot enums, and an inline `RunOutcome`
+    /// (two Strings + i32 + u64) grows every StepResult by ~64 bytes to
+    /// serve the one step kind that uses it.
+    pub run_outcome: Option<Box<crate::runs::RunOutcome>>,
     pub step_id: String,
     pub rendered_prompt: String,
     pub run_id: String,
@@ -403,6 +451,7 @@ pub struct Finding {
 impl Default for StepResult {
     fn default() -> Self {
         Self {
+            run_outcome: None,
             step_id: String::new(),
             rendered_prompt: String::new(),
             run_id: String::new(),
@@ -934,22 +983,24 @@ pub async fn run_workflow(
                 let gate_set: Vec<crate::runs::AwaitingGate> = match reason {
                     PauseReason::Approval => gates
                         .iter()
-                        .map(|g| match prior_gates.iter().find(|p| p.step_id == g.step_id) {
-                            Some(prior) => crate::runs::AwaitingGate {
-                                step_id: g.step_id.clone(),
-                                prompt: Some(g.prompt.clone()),
-                                since: prior.since,
-                                expires_at: prior.expires_at,
+                        .map(
+                            |g| match prior_gates.iter().find(|p| p.step_id == g.step_id) {
+                                Some(prior) => crate::runs::AwaitingGate {
+                                    step_id: g.step_id.clone(),
+                                    prompt: Some(g.prompt.clone()),
+                                    since: prior.since,
+                                    expires_at: prior.expires_at,
+                                },
+                                None => crate::runs::AwaitingGate {
+                                    step_id: g.step_id.clone(),
+                                    prompt: Some(g.prompt.clone()),
+                                    since: now,
+                                    expires_at: g
+                                        .timeout_seconds
+                                        .map(|secs| now + chrono::Duration::seconds(secs as i64)),
+                                },
                             },
-                            None => crate::runs::AwaitingGate {
-                                step_id: g.step_id.clone(),
-                                prompt: Some(g.prompt.clone()),
-                                since: now,
-                                expires_at: g
-                                    .timeout_seconds
-                                    .map(|secs| now + chrono::Duration::seconds(secs as i64)),
-                            },
-                        })
+                        )
                         .collect(),
                     PauseReason::Manual => Vec::new(),
                 };
@@ -1018,8 +1069,7 @@ pub async fn run_workflow(
         // No store but the run paused (approval gate or manual pause) — surface
         // the paused state to the caller anyway.
         let now = chrono::Utc::now();
-        let expires_at =
-            timeout_seconds.map(|secs| now + chrono::Duration::seconds(secs as i64));
+        let expires_at = timeout_seconds.map(|secs| now + chrono::Duration::seconds(secs as i64));
         let gate_set: Vec<crate::runs::AwaitingGate> = match reason {
             PauseReason::Approval => gates
                 .iter()
@@ -2171,15 +2221,13 @@ async fn run_scheduler_scoped(
                     || resume_paused_step_id == Some(step.id.as_str());
                 if approval.required && !gate_suppressed {
                     let prompt = match &approval.prompt {
-                        Some(template) => render_step_prompt(
-                            template,
-                            &ctx,
-                            render_mode(opts.strict_templates),
-                        )
-                        .map_err(|e| RunWorkflowError::Render {
-                            step: step.id.clone(),
-                            source: e,
-                        })?,
+                        Some(template) => {
+                            render_step_prompt(template, &ctx, render_mode(opts.strict_templates))
+                                .map_err(|e| RunWorkflowError::Render {
+                                step: step.id.clone(),
+                                source: e,
+                            })?
+                        }
                         None => format!(
                             "Approve step `{}` of workflow `{}`?",
                             step.id, opts.workflow.name
@@ -2789,6 +2837,7 @@ fn augment_workflow_with_loop_supernodes(wf: &Workflow) -> Workflow {
             join: None,
             action: None,
             with: None,
+            run: None,
         });
     }
     augmented
@@ -3218,7 +3267,12 @@ enum LoopNodeOutcome {
 /// there's no run store or run id (in-memory harness / unit tests
 /// without persistence) — the loop still runs correctly in a single
 /// process, it just has nothing to resume FROM if the process exits.
-fn persist_loop_progress(opts: &OrchestratorRunOpts, run_id: &str, loop_name: &str, iteration: u32) {
+fn persist_loop_progress(
+    opts: &OrchestratorRunOpts,
+    run_id: &str,
+    loop_name: &str,
+    iteration: u32,
+) {
     let Some(store) = &opts.run_store else { return };
     if run_id.is_empty() {
         return;
@@ -3226,7 +3280,9 @@ fn persist_loop_progress(opts: &OrchestratorRunOpts, run_id: &str, loop_name: &s
     let Ok(mut record) = store.load(run_id) else {
         return;
     };
-    record.loop_progress.insert(loop_name.to_string(), iteration);
+    record
+        .loop_progress
+        .insert(loop_name.to_string(), iteration);
     if let Err(e) = store.update(&record) {
         warn!(loop_name, iteration, error = %e, "failed to persist loop progress checkpoint");
     }
@@ -3247,7 +3303,9 @@ fn persist_loop_progress(opts: &OrchestratorRunOpts, run_id: &str, loop_name: &s
 /// loop's very first iteration was checkpointed (nothing to skip
 /// either way).
 fn load_loop_start_iteration(opts: &OrchestratorRunOpts, run_id: &str, loop_name: &str) -> u32 {
-    let Some(store) = &opts.run_store else { return 0 };
+    let Some(store) = &opts.run_store else {
+        return 0;
+    };
     if run_id.is_empty() {
         return 0;
     }
@@ -3466,10 +3524,7 @@ struct Cancellation {
 ///   it's reachable from that side and NOT reachable from the other — see
 ///   [`branch_prune_set`] and [`drain_joins`], which both compute a set
 ///   difference of two `reachable_via` calls.
-fn reachable_via(
-    starts: &[usize],
-    adj: &[Vec<usize>],
-) -> std::collections::BTreeSet<usize> {
+fn reachable_via(starts: &[usize], adj: &[Vec<usize>]) -> std::collections::BTreeSet<usize> {
     let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     let mut stack: Vec<usize> = starts.to_vec();
     while let Some(n) = stack.pop() {
@@ -3824,7 +3879,16 @@ fn drain_joins(
             );
         }
         let more = finish_node(
-            j, true, join_result, opts, run_id, step_results, done, successors, indegree, ready,
+            j,
+            true,
+            join_result,
+            opts,
+            run_id,
+            step_results,
+            done,
+            successors,
+            indegree,
+            ready,
             joins,
         );
         worklist.extend(more);
@@ -3853,7 +3917,17 @@ fn complete_and_drain_joins(
     cancel: &mut Cancellation,
 ) {
     let worklist = finish_node(
-        i, live, result, opts, run_id, step_results, done, successors, indegree, ready, joins,
+        i,
+        live,
+        result,
+        opts,
+        run_id,
+        step_results,
+        done,
+        successors,
+        indegree,
+        ready,
+        joins,
     );
     drain_joins(
         worklist,
@@ -4082,12 +4156,11 @@ async fn run_steps_over(
                 continue;
             }
             if let Some(expr) = &ap.auto_approve {
-                let truthy =
-                    render_when_expression(expr, &ctx, render_mode(opts.strict_templates))
-                        .map_err(|e| RunWorkflowError::Render {
-                            step: step.id.clone(),
-                            source: e,
-                        })?;
+                let truthy = render_when_expression(expr, &ctx, render_mode(opts.strict_templates))
+                    .map_err(|e| RunWorkflowError::Render {
+                        step: step.id.clone(),
+                        source: e,
+                    })?;
                 if truthy {
                     info!(step = %step.id, "gate auto-approved");
                     emit_gate_result(
@@ -4212,15 +4285,12 @@ async fn run_steps_over(
                     },
                 );
             }
-            let take = render_when_expression(
-                &branch.condition,
-                &ctx,
-                render_mode(opts.strict_templates),
-            )
-            .map_err(|e| RunWorkflowError::Render {
-                step: step.id.clone(),
-                source: e,
-            })?;
+            let take =
+                render_when_expression(&branch.condition, &ctx, render_mode(opts.strict_templates))
+                    .map_err(|e| RunWorkflowError::Render {
+                        step: step.id.clone(),
+                        source: e,
+                    })?;
             let taken = if take { "then" } else { "else" };
             // The arm NOT taken is skipped. `then`/`else` are validated
             // (parse-time) to be forward references and non-overlapping.
@@ -4361,6 +4431,10 @@ async fn run_node(
         run_panel_step(run_id, step, ctx, opts, effective_continue_on_error).await
     } else if step.parallel.is_some() {
         run_parallel_step(step, ctx, opts, effective_continue_on_error).await
+    } else if step.run.is_some() && step.for_each.is_some() {
+        // `run:` + `for_each:` — fan the command across items. Checked
+        // BEFORE the generic for_each arm, which assumes an agent.
+        run_fanout_run_step(run_id, step, ctx, opts, effective_continue_on_error).await
     } else if step.for_each.is_some() {
         // A distributed fan-out honors the cooperative pause token
         // MID-UNIT (not just at the step boundary): a paused-incomplete
@@ -4392,6 +4466,18 @@ async fn run_node(
             Ok(FanoutStepOutcome::Completed(sr)) => Ok(sr),
             Err(e) => Err(e),
         }
+    } else if step.run.is_some() && step.for_each.is_none() {
+        // Linear `run:` step. Like action steps, it never pauses mid-run:
+        // a command either completes or fails outright.
+        execute_run_step(
+            step,
+            ctx,
+            render_mode(opts.strict_templates),
+            &opts.run_step,
+            effective_continue_on_error,
+            &opts.transcript_dir,
+        )
+        .await
     } else if step.action.is_some() {
         // Action steps never pause mid-run — a single dispatcher call is
         // either fast enough to run to completion or fails outright; no
@@ -4536,6 +4622,26 @@ fn base_context_for_step(
         ctx.steps.insert(
             sr.step_id.clone(),
             StepOutput {
+                // `run:` steps publish their process outcome for
+                // downstream `{{ steps.<id>.exit_code }}` etc. Every
+                // other kind leaves these at their zero values.
+                json: sr
+                    .run_outcome
+                    .as_ref()
+                    .map(|o| o.parsed.clone())
+                    .unwrap_or(serde_json::Value::Null),
+                stdout: sr
+                    .run_outcome
+                    .as_ref()
+                    .map(|o| o.stdout.clone())
+                    .unwrap_or_default(),
+                stderr: sr
+                    .run_outcome
+                    .as_ref()
+                    .map(|o| o.stderr.clone())
+                    .unwrap_or_default(),
+                exit_code: sr.run_outcome.as_ref().map(|o| o.exit_code).unwrap_or(0),
+                duration_ms: sr.run_outcome.as_ref().map(|o| o.duration_ms).unwrap_or(0),
                 output: sr.output.clone(),
                 success: sr.success,
                 skipped: sr.skipped,
@@ -4583,9 +4689,13 @@ fn gate_decision(sr: &StepResult) -> String {
         .unwrap_or_default()
 }
 
-fn step_kind_for_run_record(step: &Step) -> crate::runs::StepKind {
+pub(crate) fn step_kind_for_run_record(step: &Step) -> crate::runs::StepKind {
     if crate::workflow::is_approval_gate(step) {
         crate::runs::StepKind::ApprovalGate
+    } else if step.run.is_some() {
+        // Checked before `for_each` on purpose: a `for_each:` + `run:`
+        // step is a Run node whose units fan out, not a ForEach node.
+        crate::runs::StepKind::Run
     } else if step.branch.is_some() {
         crate::runs::StepKind::Branch
     } else if step.split.is_some() {
@@ -4824,6 +4934,178 @@ fn render_action_leaf(
 /// both tolerate (rather than error on) a first line that isn't
 /// `RunStart` — an action step has no agent/provider/model to put in one
 /// anyway, so a bare single-line file is the correct shape, not a gap.
+/// Execute a `run:` step: render its templates, gate it, run the command,
+/// and shape the result.
+///
+/// Rendering happens BEFORE gating on purpose — the allowlist and the
+/// operator prompt must both see the command that will actually execute,
+/// not the template that produced it.
+async fn execute_run_step(
+    step: &Step,
+    ctx: &StepContext,
+    mode: RenderMode,
+    policy: &RunStepPolicy,
+    continue_on_error: bool,
+    transcript_dir: &Path,
+) -> Result<StepResult, RunWorkflowError> {
+    use crate::run_step::{execute, gate, ResolvedRun, RunGateDecision};
+
+    let spec = step
+        .run
+        .as_ref()
+        .expect("execute_run_step called for a non-run step");
+
+    let render = |t: &str| -> Result<String, RunWorkflowError> {
+        render_step_prompt(t, ctx, mode).map_err(|source| RunWorkflowError::Render {
+            step: step.id.clone(),
+            source,
+        })
+    };
+
+    let cmd = render(&spec.cmd)?;
+    let mut args = Vec::with_capacity(spec.args.len());
+    for a in &spec.args {
+        // Each arg renders independently and becomes exactly ONE argv
+        // element — a rendered value is never re-split on whitespace.
+        args.push(render(a)?);
+    }
+    let cwd = match &spec.cwd {
+        Some(c) => PathBuf::from(render(c)?),
+        None => policy.workspace_root.clone(),
+    };
+    let mut env = std::collections::BTreeMap::new();
+    for (k, v) in &spec.env {
+        env.insert(k.clone(), render(v)?);
+    }
+
+    match gate(policy.mode, &policy.config, &cmd) {
+        RunGateDecision::Allow => {}
+        RunGateDecision::NeedsOperatorDecision => {
+            // `ask` is resolved by the CLI before the runner is entered.
+            // Reaching here means no decider was wired — refuse rather
+            // than assume approval.
+            return Err(RunWorkflowError::RunStepDenied {
+                step: step.id.clone(),
+                reason: "ask mode requires an operator decision, but no decider is wired"
+                    .to_string(),
+            });
+        }
+        RunGateDecision::Denied(reason) => {
+            return Err(RunWorkflowError::RunStepDenied {
+                step: step.id.clone(),
+                reason: reason.explain().to_string(),
+            });
+        }
+    }
+
+    let resolved = ResolvedRun {
+        cmd: cmd.clone(),
+        args: args.clone(),
+        cwd,
+        env,
+        parse: spec.parse,
+        timeout: spec.timeout_seconds.map(std::time::Duration::from_secs),
+        allow_exit_codes: spec.allow_exit_codes.clone(),
+    };
+
+    // One JSONL record so the CP / app can display a run: step's output
+    // the same way they display an agent transcript.
+    let transcript_path = transcript_dir.join(format!("run_{}.jsonl", Ulid::new()));
+
+    let out = match execute(&resolved).await {
+        Ok(out) => out,
+        Err(source) => {
+            if continue_on_error {
+                warn!(
+                    step = %step.id,
+                    error = %source,
+                    "run step failed but continue_on_error is set; proceeding"
+                );
+                return Ok(StepResult {
+                    step_id: step.id.clone(),
+                    output: String::new(),
+                    success: false,
+                    skipped: false,
+                    kind: crate::runs::StepKind::Run,
+                    transcript_path,
+                    ..Default::default()
+                });
+            }
+            return Err(RunWorkflowError::RunStep {
+                step: step.id.clone(),
+                source,
+            });
+        }
+    };
+
+    write_run_step_transcript(&transcript_path, &cmd, &args, &out);
+
+    if !out.success && !continue_on_error {
+        return Err(RunWorkflowError::RunStepDenied {
+            step: step.id.clone(),
+            reason: format!(
+                "exit code {} is not in allow_exit_codes {:?}; stderr: {}",
+                out.exit_code,
+                spec.allow_exit_codes,
+                out.stderr.trim()
+            ),
+        });
+    }
+
+    // `output` is what downstream `{{ steps.<id>.output }}` sees. For
+    // `parse: raw` that is the raw stdout; for json/lines it is the
+    // parsed value re-serialized, so template indexing works.
+    let output = match spec.parse {
+        crate::workflow::ParseMode::Raw => out.stdout.clone(),
+        _ => serde_json::to_string(&out.parsed).unwrap_or_default(),
+    };
+
+    Ok(StepResult {
+        step_id: step.id.clone(),
+        output,
+        success: out.success,
+        skipped: false,
+        kind: crate::runs::StepKind::Run,
+        transcript_path,
+        run_outcome: Some(Box::new(crate::runs::RunOutcome {
+            parsed: out.parsed,
+            stdout: out.stdout,
+            stderr: out.stderr,
+            exit_code: out.exit_code,
+            duration_ms: out.duration_ms,
+        })),
+        ..Default::default()
+    })
+}
+
+/// Write a `run:` step's process outcome as a single JSONL record so the
+/// CP and app have something to render where an agent step would have a
+/// transcript. Best-effort: a transcript write failure must not fail an
+/// otherwise-successful benchmark unit.
+fn write_run_step_transcript(
+    path: &Path,
+    cmd: &str,
+    args: &[String],
+    out: &crate::run_step::RunStepOutput,
+) {
+    let record = serde_json::json!({
+        "type": "RunStep",
+        "cmd": cmd,
+        "args": args,
+        "exit_code": out.exit_code,
+        "duration_ms": out.duration_ms,
+        "stdout": out.stdout,
+        "stderr": out.stderr,
+        "success": out.success,
+    });
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(path, format!("{record}\n")) {
+        warn!(path = %path.display(), error = %e, "failed to write run step transcript");
+    }
+}
+
 async fn execute_action_step(
     dispatcher: &rupu_mcp::ToolDispatcher,
     step: &Step,
@@ -4992,9 +5274,9 @@ async fn fire_notify_hooks(
             join: None,
             action: Some(n.action.clone()),
             with: Some(n.with.clone()),
+            run: None,
         };
-        match execute_action_step(dispatcher, &synth, ctx, mode, true, &opts.transcript_dir).await
-        {
+        match execute_action_step(dispatcher, &synth, ctx, mode, true, &opts.transcript_dir).await {
             Ok(result) => {
                 persist_step_result(opts, run_id, &result);
                 step_results.push(result);
@@ -5117,7 +5399,12 @@ pub async fn run_reject_cleanup(
     via: &str,
     approver: Option<&str>,
 ) -> Result<(), RunWorkflowError> {
-    let Some(gate) = opts.workflow.steps.iter().find(|s| s.id == rejected_step_id) else {
+    let Some(gate) = opts
+        .workflow
+        .steps
+        .iter()
+        .find(|s| s.id == rejected_step_id)
+    else {
         return Ok(()); // legacy inline approval or unknown id — nothing to run
     };
     if !crate::workflow::is_approval_gate(gate) {
@@ -5296,8 +5583,7 @@ pub async fn run_reject_cleanup(
             );
         }
 
-        let rendered = match render_step_prompt(prompt, &ctx, render_mode(opts.strict_templates))
-        {
+        let rendered = match render_step_prompt(prompt, &ctx, render_mode(opts.strict_templates)) {
             Ok(r) => r,
             Err(e) => {
                 warn!(
@@ -5667,22 +5953,24 @@ async fn run_linear_step(
                     let sink = sink.clone();
                     let wf_run_id = workflow_run_id.to_string();
                     let step_id = step.id.clone();
-                    std::sync::Arc::new(move |_caller_step_id: &str, tool_name: &str, blocked: bool| {
-                        let note = if blocked {
-                            format!("{tool_name} — blocked")
-                        } else {
-                            tool_name.to_string()
-                        };
-                        sink.emit(
-                            &wf_run_id,
-                            &crate::executor::Event::StepWorking {
-                                run_id: wf_run_id.clone(),
-                                step_id: step_id.clone(),
-                                note: Some(note),
-                                transcript_path: None,
-                            },
-                        );
-                    }) as rupu_agent::OnToolCallCallback
+                    std::sync::Arc::new(
+                        move |_caller_step_id: &str, tool_name: &str, blocked: bool| {
+                            let note = if blocked {
+                                format!("{tool_name} — blocked")
+                            } else {
+                                tool_name.to_string()
+                            };
+                            sink.emit(
+                                &wf_run_id,
+                                &crate::executor::Event::StepWorking {
+                                    run_id: wf_run_id.clone(),
+                                    step_id: step_id.clone(),
+                                    note: Some(note),
+                                    transcript_path: None,
+                                },
+                            );
+                        },
+                    ) as rupu_agent::OnToolCallCallback
                 });
 
             // Resume-seed: if this exact step paused mid-run in a prior
@@ -5762,6 +6050,221 @@ async fn run_linear_step(
 /// `continue_on_error`: when set, failed items are recorded with
 /// `success=false` and the rest still run; otherwise the first
 /// failed item aborts the workflow.
+/// Fan a `run:` step's command across `for_each:` items.
+///
+/// Deliberately separate from [`run_fanout_step`], which is built end to
+/// end around agent dispatch (remote placement, mid-turn pause tokens,
+/// agent transcripts). A `run:` unit has none of those: it is a process
+/// that either finishes or does not, so threading a second mode through
+/// that function would add branches to a hot path for no shared logic.
+///
+/// Units run under the same `max_parallel` cap as an agent fan-out and
+/// are returned in DECLARED order regardless of finish order.
+async fn run_fanout_run_step(
+    workflow_run_id: &str,
+    step: &Step,
+    ctx: &StepContext,
+    opts: &OrchestratorRunOpts,
+    continue_on_error: bool,
+) -> Result<StepResult, RunWorkflowError> {
+    let for_each_expr = step
+        .for_each
+        .as_ref()
+        .expect("run_fanout_run_step called for a non-fan-out step");
+    let rendered_list = render_step_prompt(for_each_expr, ctx, render_mode(opts.strict_templates))
+        .map_err(|e| RunWorkflowError::Render {
+            step: step.id.clone(),
+            source: e,
+        })?;
+    let items = parse_fanout_items(&rendered_list);
+    let total = items.len();
+
+    if items.is_empty() {
+        info!(step = %step.id, "for_each rendered to an empty list; recording as success with no items");
+        return Ok(StepResult {
+            step_id: step.id.clone(),
+            output: "[]".into(),
+            success: true,
+            skipped: false,
+            kind: crate::runs::StepKind::Run,
+            items: Vec::new(),
+            ..Default::default()
+        });
+    }
+
+    // Replay units that already succeeded in a prior run. Same contract
+    // as the agent fan-out: the rendered list is deterministic, so the
+    // index is a stable key — but if the checkpointed length exceeds the
+    // rendered one the `for_each` source changed underneath us and the
+    // index mapping can't be trusted, so re-run everything.
+    let mut resumed: std::collections::BTreeMap<usize, ItemResult> =
+        std::collections::BTreeMap::new();
+    if let Some(prior) = opts
+        .resume_from
+        .as_ref()
+        .and_then(|r| r.completed_units.get(&step.id))
+    {
+        let checkpointed_len = prior.keys().copied().max().map(|m| m + 1).unwrap_or(0);
+        if checkpointed_len > total {
+            warn!(
+                step = %step.id,
+                checkpointed = checkpointed_len,
+                rendered = total,
+                "resume: checkpointed fan-out length exceeds rendered list; re-running all units"
+            );
+        } else {
+            for (idx, item_result) in prior {
+                if *idx < total && item_result.success {
+                    resumed.insert(*idx, item_result.clone());
+                }
+            }
+            if !resumed.is_empty() {
+                info!(
+                    step = %step.id,
+                    replayed = resumed.len(),
+                    total,
+                    "resume: replaying succeeded run: units from disk"
+                );
+            }
+        }
+    }
+
+    let max_parallel = step.max_parallel.unwrap_or(1).max(1) as usize;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallel));
+
+    let mut handles = Vec::with_capacity(total);
+    for (idx, item) in items.iter().enumerate() {
+        // Already succeeded in a prior run — don't re-execute it.
+        if resumed.contains_key(&idx) {
+            continue;
+        }
+        let item_ctx = ctx.clone().with_item(
+            item.clone(),
+            LoopInfo {
+                index: idx + 1,
+                index0: idx,
+                length: total,
+                first: idx == 0,
+                last: idx + 1 == total,
+            },
+        );
+        let permit_sem = semaphore.clone();
+        let step_clone = step.clone();
+        let policy = opts.run_step.clone();
+        let transcript_dir = opts.transcript_dir.clone();
+        let strict = opts.strict_templates;
+        let item_value = item.clone();
+
+        handles.push(tokio::spawn(async move {
+            let _permit = permit_sem
+                .acquire()
+                .await
+                .expect("fan-out semaphore is never closed");
+            // Per-unit `continue_on_error` is forced true so ONE failing
+            // unit never aborts the remaining units mid-flight; the
+            // parent decides below whether the step as a whole fails.
+            let res = execute_run_step(
+                &step_clone,
+                &item_ctx,
+                render_mode(strict),
+                &policy,
+                true,
+                &transcript_dir,
+            )
+            .await;
+            (idx, item_value, res)
+        }));
+    }
+
+    let mut collected: Vec<(usize, ItemResult)> = Vec::with_capacity(total);
+    for h in handles {
+        let (idx, item_value, res) = h.await.map_err(|source| RunWorkflowError::FanoutJoin {
+            step: step.id.clone(),
+            source,
+        })?;
+        let (output, success, transcript_path) = match res {
+            Ok(sr) => (sr.output, sr.success, sr.transcript_path),
+            // A refusal (gate denial) or render error is a real unit
+            // failure, recorded rather than dropped.
+            Err(e) => (format!("{e}"), false, PathBuf::new()),
+        };
+        collected.push((
+            idx,
+            ItemResult {
+                index: idx,
+                item: item_value,
+                sub_id: String::new(),
+                rendered_prompt: String::new(),
+                run_id: String::new(),
+                transcript_path,
+                output,
+                success,
+            },
+        ));
+    }
+    // Checkpoint every unit that ran to completion in THIS pass, before
+    // the failure check below — so a crash or an early return mid-fan-out
+    // still leaves finished units durable for `rupu workflow resume`.
+    // Replayed units are already on disk, so they are not re-appended.
+    if let Some(store) = &opts.run_store {
+        if !workflow_run_id.is_empty() {
+            for (idx, r) in &collected {
+                let checkpoint = crate::runs::UnitCheckpoint {
+                    step_id: step.id.clone(),
+                    index: *idx,
+                    item: r.item.clone(),
+                    // `run:` units have no agent run id and never run
+                    // remotely (validation rejects `distribute:`).
+                    run_id: String::new(),
+                    transcript_path: r.transcript_path.clone(),
+                    output: r.output.clone(),
+                    success: r.success,
+                    finished_at: chrono::Utc::now(),
+                    host: None,
+                };
+                if let Err(e) = store.append_unit_checkpoint(workflow_run_id, &checkpoint) {
+                    warn!(step = %step.id, index = idx, error = %e, "failed to append unit checkpoint");
+                }
+            }
+        }
+    }
+
+    // Fold the replayed units back in so the step's result covers the
+    // whole list, not just what re-ran.
+    collected.extend(resumed);
+    collected.sort_by_key(|(idx, _)| *idx);
+    let unit_results: Vec<ItemResult> = collected.into_iter().map(|(_, r)| r).collect();
+
+    let all_ok = unit_results.iter().all(|r| r.success);
+    if !all_ok && !continue_on_error {
+        let failed: Vec<String> = unit_results
+            .iter()
+            .filter(|r| !r.success)
+            .map(|r| format!("[{}]", r.index))
+            .collect();
+        return Err(RunWorkflowError::RunStepDenied {
+            step: step.id.clone(),
+            reason: format!(
+                "{} of {} units failed ({}); set continue_on_error: true to tolerate this",
+                failed.len(),
+                total,
+                failed.join(", ")
+            ),
+        });
+    }
+
+    let outputs: Vec<&str> = unit_results.iter().map(|r| r.output.as_str()).collect();
+    Ok(StepResult {
+        step_id: step.id.clone(),
+        output: serde_json::to_string(&outputs).unwrap_or_else(|_| "[]".into()),
+        success: all_ok,
+        skipped: false,
+        kind: crate::runs::StepKind::Run,
+        items: unit_results,
+        ..Default::default()
+    })
+}
+
 async fn run_fanout_step(
     workflow_run_id: &str,
     step: &Step,
@@ -6978,6 +7481,7 @@ impl PanelPass {
         )
         .unwrap_or_else(|_| "[]".into());
         StepResult {
+            run_outcome: None,
             step_id: step.id.clone(),
             rendered_prompt: rendered_subject.to_string(),
             run_id: String::new(),
@@ -7506,6 +8010,7 @@ mod tests {
         dispatcher: Arc<dyn UnitDispatcher>,
     ) -> OrchestratorRunOpts {
         OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_test".into(),
@@ -7555,8 +8060,9 @@ mod tests {
             "labels": ["{{ steps.seed.output }}", "static"],
         });
 
-        let rendered = render_action_args(Some(&with), &ctx, RenderMode::Permissive, "issues.create")
-            .expect("array-valued with: renders");
+        let rendered =
+            render_action_args(Some(&with), &ctx, RenderMode::Permissive, "issues.create")
+                .expect("array-valued with: renders");
 
         assert_eq!(rendered["labels"][0], "bug-report");
         assert_eq!(
@@ -7822,6 +8328,7 @@ steps:
         // Build opts directly (without `make_opts`) so we can set
         // `unit_dispatcher: None`.
         let opts = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_test".into(),
@@ -8322,6 +8829,7 @@ steps:
         sink: Arc<dyn crate::executor::EventSink>,
     ) -> OrchestratorRunOpts {
         OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_pause".into(),
@@ -8819,6 +9327,7 @@ steps:
         });
         let sink1 = Arc::new(CollectingSink::default());
         let opts1 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf.clone(),
             inputs: BTreeMap::new(),
             workspace_id: "ws_fanout_pause".into(),
@@ -8912,6 +9421,7 @@ steps:
         let dispatcher2 = Arc::new(FakeUnitDispatcher::new());
         let sink2 = Arc::new(CollectingSink::default());
         let opts2 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: record.workspace_id.clone(),
@@ -9692,6 +10202,19 @@ mod dag_scheduler_golden {
             }
             let name = p.file_name().unwrap().to_str().unwrap().to_string();
             let raw = std::fs::read_to_string(&p).unwrap();
+            // Skip workflows containing `run:` steps. These golden tests
+            // EXECUTE each workflow to compare the scheduler's walk against
+            // the linear driver's, and a `run:` step would shell out to a
+            // real benchmark script — slow, environment-dependent, and
+            // irrelevant to step ORDERING, which is all this compares.
+            // `run:` dispatch has its own coverage in
+            // tests/run_step_workflow.rs.
+            if Workflow::parse(&raw)
+                .map(|wf| wf.steps.iter().any(|st| st.run.is_some()))
+                .unwrap_or(false)
+            {
+                continue;
+            }
             out.push((name, raw));
         }
         out.sort();
@@ -9708,6 +10231,7 @@ mod dag_scheduler_golden {
         let wf = Workflow::parse(raw).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
         let (inputs, issue, event) = fixture_for(name);
         let opts = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs,
             workspace_id: format!("ws_{name}"),
@@ -10019,8 +10543,13 @@ steps:
         }
     }
 
-    fn opts_for(wf: Workflow, factory: SchedulerTestFactory, tmp: &tempfile::TempDir) -> OrchestratorRunOpts {
+    fn opts_for(
+        wf: Workflow,
+        factory: SchedulerTestFactory,
+        tmp: &tempfile::TempDir,
+    ) -> OrchestratorRunOpts {
         OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_sched".into(),
@@ -10065,7 +10594,15 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+            run_scheduler(
+                &opts,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                None,
+            ),
         )
         .await
         .expect("scheduler must not hang")
@@ -10099,7 +10636,10 @@ steps:
             3,
             "fanout must never be dispatched (orchestration no-op): {calls:?}"
         );
-        assert_eq!(calls[2], "d", "reconverge must be the last dispatch: {calls:?}");
+        assert_eq!(
+            calls[2], "d",
+            "reconverge must be the last dispatch: {calls:?}"
+        );
         let first_two: std::collections::BTreeSet<&str> =
             [calls[0].as_str(), calls[1].as_str()].into_iter().collect();
         assert_eq!(first_two, std::collections::BTreeSet::from(["a", "b"]));
@@ -10117,9 +10657,17 @@ steps:
         let resolved_inputs = BTreeMap::new();
         let mut step_results: Vec<StepResult> = Vec::new();
 
-        run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None)
-            .await
-            .expect("scheduler must not error");
+        run_scheduler(
+            &opts,
+            "",
+            &resolved_inputs,
+            false,
+            None,
+            &mut step_results,
+            None,
+        )
+        .await
+        .expect("scheduler must not error");
 
         let fanout = step_results
             .iter()
@@ -10150,7 +10698,15 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+            run_scheduler(
+                &opts,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                None,
+            ),
         )
         .await
         .expect("scheduler must not hang")
@@ -10186,10 +10742,7 @@ steps:
         );
         let err = Workflow::parse(&raw).expect_err("max_concurrency: 0 must fail to parse");
         assert!(
-            matches!(
-                err,
-                WorkflowParseError::InvalidMaxConcurrency { value: 0 }
-            ),
+            matches!(err, WorkflowParseError::InvalidMaxConcurrency { value: 0 }),
             "unexpected error: {err:?}"
         );
     }
@@ -10236,7 +10789,15 @@ steps:
 
         let err = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+            run_scheduler(
+                &opts,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                None,
+            ),
         )
         .await
         .expect("scheduler must not hang")
@@ -10506,6 +11067,7 @@ loops:
         tmp: &tempfile::TempDir,
     ) -> OrchestratorRunOpts {
         OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_loop".into(),
@@ -10698,6 +11260,7 @@ loops:
             calls: Arc::clone(&calls),
         };
         let opts = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_loop".into(),
@@ -10979,6 +11542,7 @@ loops:
 
     fn opts_for_never_converges(wf: Workflow, tmp: &tempfile::TempDir) -> OrchestratorRunOpts {
         OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_loop".into(),
@@ -11177,6 +11741,7 @@ loops:
         };
         let max_seen = Arc::clone(&factory.max_seen);
         let opts = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_loop".into(),
@@ -11332,8 +11897,8 @@ loops:
                     self.critique_started.notify_one();
                     tokio::time::sleep(Duration::from_millis(ms)).await;
                 }
-                let n = self.critique_call_offset
-                    + self.critique_calls.fetch_add(1, Ordering::SeqCst);
+                let n =
+                    self.critique_call_offset + self.critique_calls.fetch_add(1, Ordering::SeqCst);
                 if n < self.false_calls {
                     "false".to_string()
                 } else {
@@ -11402,6 +11967,7 @@ loops:
         resume_from: Option<ResumeState>,
     ) -> OrchestratorRunOpts {
         OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_loop_resume".into(),
@@ -11480,7 +12046,10 @@ loops:
             .find(|sr| sr.step_id == "gen" && sr.loop_iteration == Some(2))
             .cloned()
             .expect("gen@iteration2 must be persisted with its iteration tag");
-        assert!(gen_at_2.rendered_prompt.contains("attempt=2") && gen_at_2.rendered_prompt.contains("critique=false"));
+        assert!(
+            gen_at_2.rendered_prompt.contains("attempt=2")
+                && gen_at_2.rendered_prompt.contains("critique=false")
+        );
         // Every non-loop step (seed) keeps `loop_iteration` absent.
         let seed = full_results.iter().find(|sr| sr.step_id == "seed").unwrap();
         assert_eq!(seed.loop_iteration, None);
@@ -11629,7 +12198,10 @@ loops:
                 on_tool_call: Option<rupu_agent::OnToolCallCallback>,
             ) -> AgentRunOpts {
                 assert_ne!(step_id, "gen", "a converged loop must not re-dispatch gen");
-                assert_ne!(step_id, "test", "a converged loop must not re-dispatch test");
+                assert_ne!(
+                    step_id, "test",
+                    "a converged loop must not re-dispatch test"
+                );
                 assert_ne!(
                     step_id, "critique",
                     "a converged loop must not re-dispatch critique"
@@ -11686,6 +12258,7 @@ loops:
             }
         }
         let opts2 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_loop_resume".into(),
@@ -11834,6 +12407,7 @@ loops:
         }
 
         let opts1 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf.clone(),
             inputs: BTreeMap::new(),
             workspace_id: "ws_loop_resume".into(),
@@ -11872,8 +12446,11 @@ loops:
         // --- Approve + resume: the gate resolves, `until` holds
         // (non-empty decision JSON), the loop converges at iteration 0,
         // `ship` runs exactly once.
-        store.approve_gate(&run_id, "matt", chrono::Utc::now(), None).unwrap();
+        store
+            .approve_gate(&run_id, "matt", chrono::Utc::now(), None)
+            .unwrap();
         let opts2 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_loop_resume".into(),
@@ -11902,8 +12479,16 @@ loops:
             .expect("resume must not hang")
             .expect("resume must converge and complete");
         assert!(res2.awaiting.is_none());
-        assert_eq!(count_ids(&res2.step_results, "work"), 1, "work must not be re-dispatched");
-        assert_eq!(count_ids(&res2.step_results, "ship"), 1, "ship exactly once");
+        assert_eq!(
+            count_ids(&res2.step_results, "work"),
+            1,
+            "work must not be re-dispatched"
+        );
+        assert_eq!(
+            count_ids(&res2.step_results, "ship"),
+            1,
+            "ship exactly once"
+        );
     }
 
     /// Plan Task 4 Step 5 / spec §3: cancel mid-loop (Phase-2 hard
@@ -11975,6 +12560,7 @@ loops:
         let calls1 = Arc::clone(&factory1.calls);
         let critique_started = Arc::clone(&factory1.critique_started);
         let opts1 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf.clone(),
             inputs: BTreeMap::new(),
             workspace_id: "ws_loop_resume".into(),
@@ -12034,8 +12620,16 @@ loops:
         }
 
         let calls1 = calls1.lock().unwrap().clone();
-        assert_eq!(count(&calls1, "gen"), 1, "only iteration 0's gen: {calls1:?}");
-        assert_eq!(count(&calls1, "test"), 1, "only iteration 0's test: {calls1:?}");
+        assert_eq!(
+            count(&calls1, "gen"),
+            1,
+            "only iteration 0's gen: {calls1:?}"
+        );
+        assert_eq!(
+            count(&calls1, "test"),
+            1,
+            "only iteration 0's test: {calls1:?}"
+        );
         assert_eq!(
             count(&calls1, "critique"),
             1,
@@ -12064,6 +12658,7 @@ loops:
         let factory2 = ResumableRefineFactory::new(2);
         let calls2 = Arc::clone(&factory2.calls);
         let opts2 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_loop_resume".into(),
@@ -12242,6 +12837,7 @@ mod join_and_prune {
         tmp: &tempfile::TempDir,
     ) -> OrchestratorRunOpts {
         OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_join".into(),
@@ -12306,7 +12902,15 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+            run_scheduler(
+                &opts,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                None,
+            ),
         )
         .await
         .expect("scheduler must not hang")
@@ -12374,7 +12978,15 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+            run_scheduler(
+                &opts,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                None,
+            ),
         )
         .await
         .expect("scheduler must not hang")
@@ -12443,7 +13055,15 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+            run_scheduler(
+                &opts,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                None,
+            ),
         )
         .await
         .expect("scheduler must not hang")
@@ -12515,7 +13135,15 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+            run_scheduler(
+                &opts,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                None,
+            ),
         )
         .await
         .expect("scheduler must not hang")
@@ -12594,7 +13222,15 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+            run_scheduler(
+                &opts,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                None,
+            ),
         )
         .await
         .expect("scheduler must not hang")
@@ -12674,7 +13310,15 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+            run_scheduler(
+                &opts,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                None,
+            ),
         )
         .await
         .expect("scheduler must not hang")
@@ -12750,7 +13394,10 @@ steps:
     async fn branch_prune_does_not_strand_a_node_fed_by_an_unrelated_live_predecessor() {
         let tmp = tempfile::tempdir().unwrap();
         let wf = Workflow::parse(BRANCH_PRUNE_UNRELATED_LIVE_PREDECESSOR_WF).unwrap();
-        assert!(crate::workflow::is_nonlinear(&wf), "fixture must be graph mode");
+        assert!(
+            crate::workflow::is_nonlinear(&wf),
+            "fixture must be graph mode"
+        );
         let factory = JoinTestFactory::new(&[]);
         let calls = Arc::clone(&factory.calls);
         let opts = opts_for(wf, factory, &tmp);
@@ -12759,7 +13406,15 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+            run_scheduler(
+                &opts,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                None,
+            ),
         )
         .await
         .expect("scheduler must not hang")
@@ -12767,7 +13422,10 @@ steps:
         assert!(matches!(outcome, InnerOutcome::Done));
 
         let b = result_for(&step_results, "b");
-        assert!(b.skipped && b.output == "pruned", "b must still be pruned: {b:?}");
+        assert!(
+            b.skipped && b.output == "pruned",
+            "b must still be pruned: {b:?}"
+        );
 
         let shared = result_for(&step_results, "shared");
         assert!(
@@ -12832,7 +13490,15 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+            run_scheduler(
+                &opts,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                None,
+            ),
         )
         .await
         .expect("scheduler must not hang")
@@ -12935,7 +13601,15 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+            run_scheduler(
+                &opts,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                None,
+            ),
         )
         .await
         .expect("scheduler must not hang")
@@ -13132,9 +13806,7 @@ steps:
         let factory1 = JoinTestFactory::new(&[]);
         let calls1 = Arc::clone(&factory1.calls);
         let opts1 = opts_for(wf.clone(), factory1, &tmp);
-        let res1 = run_workflow(opts1)
-            .await
-            .expect("a pause is Ok, not Err");
+        let res1 = run_workflow(opts1).await.expect("a pause is Ok, not Err");
         let awaiting = res1.awaiting.clone().expect("the gate must pause the run");
         assert_eq!(awaiting.step_id, "gate");
         assert!(
@@ -13168,8 +13840,14 @@ steps:
         assert!(gate.success);
         let a = result_for(&res2.step_results, "a");
         let b = result_for(&res2.step_results, "b");
-        assert!(!a.skipped && a.success, "a must run after the gate resolves: {a:?}");
-        assert!(!b.skipped && b.success, "b must run after the gate resolves: {b:?}");
+        assert!(
+            !a.skipped && a.success,
+            "a must run after the gate resolves: {a:?}"
+        );
+        assert!(
+            !b.skipped && b.success,
+            "b must run after the gate resolves: {b:?}"
+        );
         let dispatched = calls2.lock().unwrap();
         assert!(
             dispatched.contains(&"a".to_string()) && dispatched.contains(&"b".to_string()),
@@ -13221,7 +13899,10 @@ steps:
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::runs::RunStore::new(tmp.path().join("runs")));
         let wf = Workflow::parse(NONLINEAR_TWO_GATE_WF).unwrap();
-        assert!(is_nonlinear(&wf), "fixture must fork to exercise the DAG scheduler");
+        assert!(
+            is_nonlinear(&wf),
+            "fixture must fork to exercise the DAG scheduler"
+        );
 
         // --- Phase 1: fanout unlocks gate_a + gate_b + indep together.
         // `indep` is slowed so it's still in-flight when both gates park in
@@ -13229,6 +13910,7 @@ steps:
         let factory1 = JoinTestFactory::new(&[("indep", 60)]);
         let calls1 = Arc::clone(&factory1.calls);
         let opts1 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf.clone(),
             inputs: BTreeMap::new(),
             workspace_id: "ws_two_gate".into(),
@@ -13248,10 +13930,15 @@ steps:
             action_dispatcher: None,
             pause: None,
         };
-        let res1 = run_workflow(opts1).await.expect("a batch-park is Ok, not Err");
+        let res1 = run_workflow(opts1)
+            .await
+            .expect("a batch-park is Ok, not Err");
         let run_id = res1.run_id.clone();
 
-        let awaiting = res1.awaiting.clone().expect("both gates must pause the run");
+        let awaiting = res1
+            .awaiting
+            .clone()
+            .expect("both gates must pause the run");
         assert_eq!(awaiting.gates.len(), 2, "both gates must land in ONE pause");
         let parked_ids: std::collections::BTreeSet<&str> =
             awaiting.gates.iter().map(|g| g.step_id.as_str()).collect();
@@ -13269,7 +13956,10 @@ steps:
             "indep must have reached the StepFactory"
         );
         // Neither gated path was ever reachable yet.
-        assert!(res1.step_results.iter().all(|sr| sr.step_id != "a" && sr.step_id != "b"));
+        assert!(res1
+            .step_results
+            .iter()
+            .all(|sr| sr.step_id != "a" && sr.step_id != "b"));
 
         // Persisted state: the RunRecord itself carries the full set.
         let rec1 = store.load(&run_id).unwrap();
@@ -13282,7 +13972,10 @@ steps:
             std::collections::BTreeSet::from(["gate_a", "gate_b"])
         );
         // Derived-compat mirrors the FIRST gate in the set.
-        assert_eq!(rec1.awaiting_step_id.as_deref(), Some(rec1.awaiting[0].step_id.as_str()));
+        assert_eq!(
+            rec1.awaiting_step_id.as_deref(),
+            Some(rec1.awaiting[0].step_id.as_str())
+        );
 
         // --- Phase 2: approve gate_a only (by id, via the store) —
         // gate_b must stay parked; the run must stay AwaitingApproval, NOT
@@ -13298,6 +13991,7 @@ steps:
         let factory2 = JoinTestFactory::new(&[]);
         let calls2 = Arc::clone(&factory2.calls);
         let opts2 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf.clone(),
             inputs: BTreeMap::new(),
             workspace_id: "ws_two_gate".into(),
@@ -13321,14 +14015,19 @@ steps:
             action_dispatcher: None,
             pause: None,
         };
-        let res2 = run_workflow(opts2).await.expect("resume of gate_a's path is Ok");
+        let res2 = run_workflow(opts2)
+            .await
+            .expect("resume of gate_a's path is Ok");
         // gate_b is still parked — the resumed run pauses AGAIN, it does
         // not run to completion.
         let awaiting2 = res2.awaiting.clone().expect("gate_b must still be parked");
         assert_eq!(awaiting2.gates.len(), 1);
         assert_eq!(awaiting2.gates[0].step_id, "gate_b");
         let a = result_for(&res2.step_results, "a");
-        assert!(a.success && !a.skipped, "a must run once gate_a is approved: {a:?}");
+        assert!(
+            a.success && !a.skipped,
+            "a must run once gate_a is approved: {a:?}"
+        );
         assert!(
             calls2.lock().unwrap().contains(&"a".to_string())
                 && !calls2.lock().unwrap().contains(&"b".to_string()),
@@ -13351,6 +14050,7 @@ steps:
         let factory3 = JoinTestFactory::new(&[]);
         let calls3 = Arc::clone(&factory3.calls);
         let opts3 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_two_gate".into(),
@@ -13374,10 +14074,18 @@ steps:
             action_dispatcher: None,
             pause: None,
         };
-        let res3 = run_workflow(opts3).await.expect("resume of gate_b's path completes");
-        assert!(res3.awaiting.is_none(), "the run must reach Done once both gates are resolved");
+        let res3 = run_workflow(opts3)
+            .await
+            .expect("resume of gate_b's path completes");
+        assert!(
+            res3.awaiting.is_none(),
+            "the run must reach Done once both gates are resolved"
+        );
         let b = result_for(&res3.step_results, "b");
-        assert!(b.success && !b.skipped, "b must run once gate_b is approved: {b:?}");
+        assert!(
+            b.success && !b.skipped,
+            "b must run once gate_b is approved: {b:?}"
+        );
         assert!(calls3.lock().unwrap().contains(&"b".to_string()));
 
         let rec5 = store.load(&run_id).unwrap();
@@ -13424,11 +14132,15 @@ steps:
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::runs::RunStore::new(tmp.path().join("runs")));
         let wf = Workflow::parse(NONLINEAR_TWO_GATE_TIMEOUT_WF).unwrap();
-        assert!(is_nonlinear(&wf), "fixture must fork to exercise the DAG scheduler");
+        assert!(
+            is_nonlinear(&wf),
+            "fixture must fork to exercise the DAG scheduler"
+        );
 
         // --- Phase 1: fanout parks both gates in one batch. ---
         let factory1 = JoinTestFactory::new(&[]);
         let opts1 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf.clone(),
             inputs: BTreeMap::new(),
             workspace_id: "ws_gate_clock".into(),
@@ -13478,6 +14190,7 @@ steps:
 
         let factory2 = JoinTestFactory::new(&[]);
         let opts2 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf.clone(),
             inputs: BTreeMap::new(),
             workspace_id: "ws_gate_clock".into(),
@@ -13501,7 +14214,9 @@ steps:
             action_dispatcher: None,
             pause: None,
         };
-        let res2 = run_workflow(opts2).await.expect("resume of gate_a's path re-parks on gate_b");
+        let res2 = run_workflow(opts2)
+            .await
+            .expect("resume of gate_a's path re-parks on gate_b");
         let awaiting2 = res2.awaiting.clone().expect("gate_b must still be parked");
         assert_eq!(awaiting2.gates.len(), 1);
         assert_eq!(awaiting2.gates[0].step_id, "gate_b");
@@ -13552,6 +14267,7 @@ steps:
         let wf = Workflow::parse(WF).unwrap();
 
         let opts1 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf.clone(),
             inputs: BTreeMap::new(),
             workspace_id: "ws_new_gate_clock".into(),
@@ -13585,6 +14301,7 @@ steps:
             .expect("approve gate_a");
 
         let opts2 = OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_new_gate_clock".into(),
@@ -13608,7 +14325,9 @@ steps:
             action_dispatcher: None,
             pause: None,
         };
-        let res2 = run_workflow(opts2).await.expect("resume reaches the newly-unlocked gate_b");
+        let res2 = run_workflow(opts2)
+            .await
+            .expect("resume reaches the newly-unlocked gate_b");
         let awaiting2 = res2.awaiting.expect("gate_b must park");
         assert_eq!(awaiting2.gates.len(), 1);
         assert_eq!(awaiting2.gates[0].step_id, "gate_b");
@@ -13742,6 +14461,7 @@ mod resume_and_cancel {
         resume_from: Option<ResumeState>,
     ) -> OrchestratorRunOpts {
         OrchestratorRunOpts {
+            run_step: Default::default(),
             workflow: wf,
             inputs: BTreeMap::new(),
             workspace_id: "ws_resume_cancel".into(),
@@ -13830,7 +14550,15 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+            run_scheduler(
+                &opts,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                None,
+            ),
         )
         .await
         .expect("resume must not hang")
@@ -13933,7 +14661,15 @@ steps:
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts, "", &resolved_inputs, false, None, &mut step_results, None),
+            run_scheduler(
+                &opts,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                None,
+            ),
         )
         .await
         .expect("resume must not hang")
@@ -14000,7 +14736,15 @@ steps:
         let mut step_results: Vec<StepResult> = Vec::new();
         let outcome1 = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts1, "", &resolved_inputs, false, None, &mut step_results, None),
+            run_scheduler(
+                &opts1,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results,
+                None,
+            ),
         )
         .await
         .expect("run 1 must not hang")
@@ -14020,7 +14764,15 @@ steps:
         let mut step_results2 = step_results.clone();
         let outcome2 = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts2, "", &resolved_inputs, false, None, &mut step_results2, None),
+            run_scheduler(
+                &opts2,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results2,
+                None,
+            ),
         )
         .await
         .expect("resume must not hang")
@@ -14095,7 +14847,10 @@ steps:
 
         match outcome {
             Err(RunWorkflowError::RunCancelled { aborted }) => {
-                assert_eq!(aborted, 2, "both a and b must have been in-flight and aborted");
+                assert_eq!(
+                    aborted, 2,
+                    "both a and b must have been in-flight and aborted"
+                );
             }
             other => panic!("expected Err(RunCancelled), got {other:?}"),
         }
@@ -14207,19 +14962,21 @@ steps:
             token: token.clone(),
             calls: Mutex::new(Vec::new()),
         });
-        let mut opts1 = opts_for(
-            wf.clone(),
-            RecordingFactory::new(),
-            &tmp,
-            Some(token),
-            None,
-        );
+        let mut opts1 = opts_for(wf.clone(), RecordingFactory::new(), &tmp, Some(token), None);
         opts1.unit_dispatcher = Some(dispatcher1.clone());
         let mut step_results1: Vec<StepResult> = Vec::new();
 
         let outcome1 = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts1, "", &resolved_inputs, false, None, &mut step_results1, None),
+            run_scheduler(
+                &opts1,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results1,
+                None,
+            ),
         )
         .await
         .expect("phase 1 must not hang")
@@ -14271,7 +15028,15 @@ steps:
         let mut step_results2: Vec<StepResult> = Vec::new();
         let outcome2 = tokio::time::timeout(
             Duration::from_secs(5),
-            run_scheduler(&opts2, "", &resolved_inputs, false, None, &mut step_results2, None),
+            run_scheduler(
+                &opts2,
+                "",
+                &resolved_inputs,
+                false,
+                None,
+                &mut step_results2,
+                None,
+            ),
         )
         .await
         .expect("resume must not hang")

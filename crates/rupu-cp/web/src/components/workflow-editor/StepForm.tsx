@@ -93,6 +93,7 @@ const KIND_LABELS: Record<StepKind, string> = {
   branch: 'Branch (if)',
   approval_gate: 'Approval gate',
   action: 'Action',
+  run: 'Run (command)',
   // split/join (Phase 1 non-linear orchestration nodes, Task 6).
   split: 'Split (fan-out)',
   join: 'Join (barrier)',

@@ -176,6 +176,29 @@ pub struct LoopProgress {
 #[derive(Debug, Serialize, Clone)]
 pub struct StepOutput {
     pub output: String,
+    /// A `run:` step's stdout parsed per its `parse:` mode — an object
+    /// or array for `parse: json` / `parse: lines`. Bound as
+    /// `steps.<id>.json` so templates can index into it
+    /// (`{{ steps.score.json.score }}`).
+    ///
+    /// `output` deliberately stays a String for every step kind, so
+    /// making a command emit JSON never changes what
+    /// `{{ steps.<id>.output }}` renders for existing workflows.
+    /// Null for every non-`run:` step and for `parse: raw`.
+    #[serde(default)]
+    pub json: serde_json::Value,
+    /// `run:` step stdout, verbatim. Empty for every other kind.
+    #[serde(default)]
+    pub stdout: String,
+    /// `run:` step stderr, verbatim. Empty for every other kind.
+    #[serde(default)]
+    pub stderr: String,
+    /// `run:` step exit code. `0` for every other kind.
+    #[serde(default)]
+    pub exit_code: i32,
+    /// `run:` step wall-clock duration. `0` for every other kind.
+    #[serde(default)]
+    pub duration_ms: u64,
     #[serde(default)]
     pub success: bool,
     #[serde(default)]
@@ -255,6 +278,11 @@ impl Default for StepOutput {
     fn default() -> Self {
         Self {
             output: String::new(),
+            json: serde_json::Value::Null,
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+            duration_ms: 0,
             success: false,
             skipped: false,
             results: Vec::new(),

@@ -206,6 +206,7 @@ async fn distributed_fanout_round_robin_results_and_host_persisted() {
 
     let wf = Workflow::parse(WF_DISTRIBUTED).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_e2e_dist".into(),
@@ -298,6 +299,7 @@ async fn local_fanout_control_produces_results_with_no_host_attribution() {
 
     let wf = Workflow::parse(WF_LOCAL).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: BTreeMap::new(),
         workspace_id: "ws_e2e_local".into(),

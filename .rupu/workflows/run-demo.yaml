@@ -1,0 +1,37 @@
+name: run-demo
+description: >
+  Demonstrate the `run:` step kind — a deterministic, non-LLM step that
+  executes a declared command. Fans one command across a list, then reads
+  the parsed output of an earlier step. No model is dispatched: this
+  workflow reports 0 tokens.
+
+  `run:` is opt-in; set `[workflow] run_step_enabled = true` first.
+  See docs/workflow-format.md.
+
+steps:
+  # `parse: json` makes stdout available at `steps.<id>.json`, which is
+  # indexable. `steps.<id>.output` stays the raw string for every mode.
+  - id: plan
+    run:
+      cmd: echo
+      args: ['{"items": ["alpha", "beta", "gamma"]}']
+      parse: json
+      timeout_seconds: 30
+
+  # `run:` composes with `for_each:` — this is how a benchmark scores N
+  # items concurrently.
+  - id: fan_out
+    for_each: "{{ steps.plan.json.items }}"
+    max_parallel: 3
+    run:
+      cmd: echo
+      args: ["processing {{ item }}"]
+      timeout_seconds: 30
+
+  # Downstream steps see the earlier step's exit code and unit results.
+  - id: summarize
+    run:
+      cmd: echo
+      args:
+        - "plan exited {{ steps.plan.exit_code }}; {{ steps.fan_out.results | length }} unit(s) processed"
+      timeout_seconds: 30

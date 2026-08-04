@@ -1182,7 +1182,10 @@ mod tests {
         let rows = collect_standalone_runs(tmp.path());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status.as_deref(), Some("running"));
-        assert!(agent_in_lifecycle(rows[0].status.as_deref(), Some("active")));
+        assert!(agent_in_lifecycle(
+            rows[0].status.as_deref(),
+            Some("active")
+        ));
         assert!(!agent_in_lifecycle(
             rows[0].status.as_deref(),
             Some("completed")
@@ -1198,7 +1201,10 @@ mod tests {
         let rows = collect_standalone_runs(tmp.path());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, None);
-        assert!(agent_in_lifecycle(rows[0].status.as_deref(), Some("completed")));
+        assert!(agent_in_lifecycle(
+            rows[0].status.as_deref(),
+            Some("completed")
+        ));
     }
 
     #[test]
@@ -1210,7 +1216,10 @@ mod tests {
         let rows = collect_standalone_runs(tmp.path());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, None);
-        assert!(agent_in_lifecycle(rows[0].status.as_deref(), Some("completed")));
+        assert!(agent_in_lifecycle(
+            rows[0].status.as_deref(),
+            Some("completed")
+        ));
     }
 
     // ── Liveness-probe cap (STANDALONE_LIVENESS_PROBE_CAP) ────────────────────
@@ -1266,7 +1275,10 @@ mod tests {
         let rows = collect_standalone_runs_capped(tmp.path(), 2);
         let live_row = rows.iter().find(|r| r.run_id == "run_live").unwrap();
         assert_eq!(live_row.status.as_deref(), Some("running"));
-        assert!(agent_in_lifecycle(live_row.status.as_deref(), Some("active")));
+        assert!(agent_in_lifecycle(
+            live_row.status.as_deref(),
+            Some("active")
+        ));
     }
 
     /// RED test for the bound itself: a row OLDER than the newest `cap`
@@ -1307,7 +1319,10 @@ mod tests {
         // Not probed → falls through to `None`, same as today's "no pid"
         // behavior, DESPITE the pid actually being alive.
         assert_eq!(beyond.status, None);
-        assert!(agent_in_lifecycle(beyond.status.as_deref(), Some("completed")));
+        assert!(agent_in_lifecycle(
+            beyond.status.as_deref(),
+            Some("completed")
+        ));
     }
 
     /// Dedupe: a pid repeated across multiple rows is probed once and the
@@ -1846,7 +1861,11 @@ mod tests {
     /// `duration_ms`. Mirrors `api::agents::tests::seed_run_with_agent_usage`
     /// (same run-store + step-result-record wiring), extended with the extra
     /// transcript events `run_metrics` needs.
-    fn seed_completed_run_with_metrics(s: &AppState, run_id: &str, transcript_path: &std::path::Path) {
+    fn seed_completed_run_with_metrics(
+        s: &AppState,
+        run_id: &str,
+        transcript_path: &std::path::Path,
+    ) {
         let record = rupu_orchestrator::RunRecord {
             id: run_id.into(),
             workflow_name: "wf".into(),
@@ -1935,6 +1954,7 @@ mod tests {
             .append_step_result(
                 run_id,
                 &rupu_orchestrator::runs::StepResultRecord {
+                    run_outcome: None,
                     step_id: "s1".into(),
                     run_id: run_id.into(),
                     transcript_path: transcript_path.to_path_buf(),
@@ -1961,7 +1981,10 @@ mod tests {
     #[tokio::test]
     async fn list_autoflow_events_surfaces_real_turns_and_duration_for_linked_run() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let s = crate::state::AppState::new(tmp.path().to_path_buf(), rupu_config::PricingConfig::default());
+        let s = crate::state::AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
 
         seed_completed_run_with_metrics(&s, "run_1", &tmp.path().join("t1.jsonl"));
 

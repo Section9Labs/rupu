@@ -15,6 +15,7 @@ pub mod event_match;
 pub mod event_vocab;
 pub mod executor;
 pub mod generate;
+pub mod run_step;
 pub mod runner;
 pub mod runs;
 pub mod step_factory;

@@ -108,6 +108,7 @@ async fn run_workflow_emits_run_and_step_events_in_order() {
 
     let wf = Workflow::parse(WF_TWO_STEPS).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_events".into(),
@@ -123,10 +124,10 @@ async fn run_workflow_emits_run_and_step_events_in_order() {
         run_id_override: None,
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
-                unit_dispatcher: None,
-                action_dispatcher: None,
-                pause: None,
-            };
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+    };
 
     run_workflow(opts).await.unwrap();
 
@@ -196,6 +197,7 @@ steps:
 
     let wf = Workflow::parse(wf_yaml).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_skip".into(),
@@ -211,10 +213,10 @@ steps:
         run_id_override: None,
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
-                unit_dispatcher: None,
-                action_dispatcher: None,
-                pause: None,
-            };
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+    };
 
     run_workflow(opts).await.unwrap();
 
@@ -254,6 +256,7 @@ steps:
 
     let wf = Workflow::parse(wf_yaml).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_panel".into(),
@@ -269,10 +272,10 @@ steps:
         run_id_override: None,
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
-                unit_dispatcher: None,
-                action_dispatcher: None,
-                pause: None,
-            };
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+    };
 
     run_workflow(opts).await.unwrap();
 
@@ -432,6 +435,7 @@ steps:
     let sink: Arc<CollectSink2> = Arc::new(CollectSink2::default());
     let wf = Workflow::parse(wf_yaml).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_gate".into(),
@@ -447,10 +451,10 @@ steps:
         run_id_override: None,
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
-                unit_dispatcher: None,
-                action_dispatcher: None,
-                pause: None,
-            };
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+    };
 
     run_workflow(opts).await.unwrap();
 
@@ -471,13 +475,19 @@ steps:
     let max_iter: Vec<u32> = events
         .iter()
         .filter_map(|e| match e {
-            Event::PanelRound { step_id, max_iterations, .. } if step_id == "scan" => {
-                Some(*max_iterations)
-            }
+            Event::PanelRound {
+                step_id,
+                max_iterations,
+                ..
+            } if step_id == "scan" => Some(*max_iterations),
             _ => None,
         })
         .collect();
-    assert_eq!(max_iter, vec![2, 2], "max_iterations must be 2 for both rounds");
+    assert_eq!(
+        max_iter,
+        vec![2, 2],
+        "max_iterations must be 2 for both rounds"
+    );
 }
 
 #[tokio::test]
@@ -487,6 +497,7 @@ async fn no_event_sink_does_not_emit_any_events() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let wf = Workflow::parse(WF_TWO_STEPS).unwrap();
     let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
         workflow: wf,
         inputs: std::collections::BTreeMap::new(),
         workspace_id: "ws_no_sink".into(),
@@ -502,10 +513,10 @@ async fn no_event_sink_does_not_emit_any_events() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
-                unit_dispatcher: None,
-                action_dispatcher: None,
-                pause: None,
-            };
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+    };
 
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);

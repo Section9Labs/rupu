@@ -56,6 +56,7 @@ fn seed_run(id: &str) -> RunRecord {
 /// Build a minimal StepResultRecord for `run_id`.
 fn seed_step(run_id: &str, step_id: &str) -> StepResultRecord {
     StepResultRecord {
+        run_outcome: None,
         step_id: step_id.into(),
         run_id: run_id.into(),
         transcript_path: PathBuf::from(format!("/tmp/{step_id}.jsonl")),
@@ -74,8 +75,7 @@ fn seed_step(run_id: &str, step_id: &str) -> StepResultRecord {
 }
 
 async fn spawn_server(dir: &std::path::Path) -> std::net::SocketAddr {
-    let state =
-        rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
     let app = rupu_cp::server::router(state, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -93,10 +93,7 @@ async fn list_runs_returns_seeded_run() {
     let store = RunStore::new(tmp.path().join("runs"));
     let run_id = "run_test_list_01";
     store
-        .create(
-            seed_run(run_id),
-            "name: test-workflow\nsteps: []\n",
-        )
+        .create(seed_run(run_id), "name: test-workflow\nsteps: []\n")
         .unwrap();
 
     let addr = spawn_server(tmp.path()).await;
@@ -109,10 +106,7 @@ async fn list_runs_returns_seeded_run() {
     let body: serde_json::Value = resp.json().await.unwrap();
     let arr = body.as_array().expect("body should be a JSON array");
     assert!(!arr.is_empty(), "array should contain at least one run");
-    let ids: Vec<&str> = arr
-        .iter()
-        .filter_map(|r| r["id"].as_str())
-        .collect();
+    let ids: Vec<&str> = arr.iter().filter_map(|r| r["id"].as_str()).collect();
     assert!(
         ids.contains(&run_id),
         "seeded run id not found in list; got {ids:?}"
@@ -126,10 +120,7 @@ async fn get_run_returns_run_and_steps() {
     let store = RunStore::new(tmp.path().join("runs"));
     let run_id = "run_test_get_01";
     store
-        .create(
-            seed_run(run_id),
-            "name: test-workflow\nsteps: []\n",
-        )
+        .create(seed_run(run_id), "name: test-workflow\nsteps: []\n")
         .unwrap();
     store
         .append_step_result(run_id, &seed_step(run_id, "step-a"))
@@ -198,17 +189,17 @@ async fn app_state_run_store_path_matches_seed_location() {
     let run_id = "run_path_check_01";
     state
         .run_store
-        .create(
-            seed_run(run_id),
-            "name: test-workflow\nsteps: []\n",
-        )
+        .create(seed_run(run_id), "name: test-workflow\nsteps: []\n")
         .unwrap();
 
     // Re-open a fresh RunStore at the same path and verify it sees the run.
     let store2 = Arc::new(RunStore::new(tmp.path().join("runs")));
     let listed = store2.list().unwrap();
     let ids: Vec<&str> = listed.iter().map(|r| r.id.as_str()).collect();
-    assert!(ids.contains(&run_id), "run seeded via AppState not visible from explicit path; got {ids:?}");
+    assert!(
+        ids.contains(&run_id),
+        "run seeded via AppState not visible from explicit path; got {ids:?}"
+    );
 }
 
 // ── Trigger-type tests ───────────────────────────────────────────────────────
@@ -249,7 +240,12 @@ async fn list_runs_carries_trigger_field() {
 
     let body: serde_json::Value = resp.json().await.unwrap();
     let arr = body.as_array().expect("body should be a JSON array");
-    assert_eq!(arr.len(), 3, "expected all three seeded runs; got {}", arr.len());
+    assert_eq!(
+        arr.len(),
+        3,
+        "expected all three seeded runs; got {}",
+        arr.len()
+    );
 
     let find_trigger = |id: &str| -> &str {
         arr.iter()

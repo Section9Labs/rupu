@@ -211,6 +211,7 @@ fn seed_run(id: &str, workspace_path: PathBuf) -> RunRecord {
 
 fn seed_step(run_id: &str, transcript_path: PathBuf) -> StepResultRecord {
     StepResultRecord {
+        run_outcome: None,
         step_id: "s1".into(),
         run_id: run_id.into(),
         transcript_path,

@@ -68,6 +68,8 @@ pub struct Config {
     pub netflow: NetflowConfig,
     #[serde(default)]
     pub update: crate::update_config::UpdateConfig,
+    #[serde(default)]
+    pub workflow: crate::policy_config::WorkflowConfig,
 }
 
 /// Terminal-output rendering preferences. Consumed by

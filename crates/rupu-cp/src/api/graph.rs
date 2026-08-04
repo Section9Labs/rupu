@@ -265,7 +265,7 @@ pub struct StepDag {
 pub struct StepNodeDto {
     /// Matches the `id:` in the workflow YAML.
     pub id: String,
-    /// `"step"` | `"for_each"` | `"parallel"` | `"panel"` | `"action"` |
+    /// `"step"` | `"for_each"` | `"parallel"` | `"panel"` | `"action"` | `"run"` |
     /// `"gate"` — precedence: parallel > panel > gate > action > for_each >
     /// step.
     pub kind: String,
@@ -444,6 +444,22 @@ fn map_step(step: &rupu_orchestrator::Step) -> StepNodeDto {
         };
     }
 
+    // Checked before `for_each`: a `for_each:` + `run:` step is a Run
+    // node whose units fan out, matching the runner's StepKind precedence.
+    if step.run.is_some() {
+        return StepNodeDto {
+            id: step.id.clone(),
+            kind: "run".to_string(),
+            agent: None,
+            for_each: step.for_each.clone(),
+            parallel: None,
+            panelists: None,
+            gate: None,
+            action: step.run.as_ref().map(|r| r.cmd.clone()),
+            approval_gate: None,
+        };
+    }
+
     if step.action.is_some() {
         return StepNodeDto {
             id: step.id.clone(),
@@ -524,7 +540,9 @@ mod tests {
         let dto = map_step(&step);
         assert_eq!(dto.kind, "gate");
         assert_eq!(dto.action, None);
-        let gate = dto.approval_gate.expect("approval_gate populated for a gate node");
+        let gate = dto
+            .approval_gate
+            .expect("approval_gate populated for a gate node");
         assert!(gate.auto_approve);
         assert!(gate.has_on_reject);
         assert_eq!(gate.timeout_seconds, Some(3600));

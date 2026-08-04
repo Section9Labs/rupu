@@ -834,7 +834,12 @@ fn replay_step_result_history(
         // I-39: an unrecognized future kind falls back to the generic
         // linear rendering, never a panic.
         | StepKind::Unknown => replay_linear_step_history(state, rec, view_mode, prefs),
-        StepKind::ForEach | StepKind::Parallel | StepKind::Panel => {
+        // A `run:` step is fan-out iff it actually produced units; a
+        // linear one renders like any other single-result step.
+        StepKind::Run if rec.items.is_empty() => {
+            replay_linear_step_history(state, rec, view_mode, prefs)
+        }
+        StepKind::ForEach | StepKind::Parallel | StepKind::Panel | StepKind::Run => {
             append_step_result_lines(state, rec, view_mode, prefs)
         }
     }
@@ -1020,7 +1025,15 @@ fn append_step_result_lines(
     view_mode: LiveViewMode,
     prefs: &UiPrefs,
 ) {
-    match rec.kind {
+    // A `run:` step is fan-out iff it actually produced units (i.e. it
+    // carried `for_each:`). Normalize it to one of the two rendering
+    // shapes so the match below stays a pure shape dispatch.
+    let render_kind = match rec.kind {
+        StepKind::Run if !rec.items.is_empty() => StepKind::ForEach,
+        StepKind::Run => StepKind::Linear,
+        other => other,
+    };
+    match render_kind {
         StepKind::Linear
         | StepKind::Branch
         | StepKind::Split
@@ -1030,7 +1043,10 @@ fn append_step_result_lines(
         | StepKind::ApprovalGate
         // I-39: an unrecognized future kind falls back to the generic
         // linear rendering, never a panic.
-        | StepKind::Unknown => {
+        | StepKind::Unknown
+        // Never produced by the normalization above; listed so this match
+        // stays exhaustive without a catch-all.
+        | StepKind::Run => {
             let status = if rec.success {
                 UiStatus::Complete
             } else {
@@ -1098,6 +1114,7 @@ fn append_step_result_lines(
                 StepKind::ForEach => "for_each",
                 StepKind::Parallel => "parallel",
                 StepKind::Panel => "panel",
+                StepKind::Run => "run",
                 StepKind::Linear => unreachable!(),
                 StepKind::Branch => unreachable!(),
                 StepKind::Split => unreachable!(),
@@ -1149,7 +1166,7 @@ fn append_fanout_item_lines(
             };
         let summary = summarize_compact_child_events(&events);
         let headline = match rec.kind {
-            StepKind::ForEach => {
+            StepKind::ForEach | StepKind::Run => {
                 let label = item_input_label(&item.item);
                 if label.is_empty() {
                     format!("iter[{}]", item.index + 1)
@@ -2735,7 +2752,14 @@ fn drain_step_results(
         }
         *step_count += 1;
 
-        match rec.kind {
+        // Same normalization as `retain_step_result`: a `run:` step
+        // renders as fan-out only when it produced units.
+        let render_kind = match rec.kind {
+            StepKind::Run if !rec.items.is_empty() => StepKind::ForEach,
+            StepKind::Run => StepKind::Linear,
+            other => other,
+        };
+        match render_kind {
             StepKind::ForEach | StepKind::Parallel | StepKind::Panel => {
                 render_fanout_step(&rec, printer, view_mode);
             }
@@ -2746,6 +2770,8 @@ fn drain_step_results(
             | StepKind::Loop
             | StepKind::Action
             | StepKind::ApprovalGate
+            // Never produced by the normalization above.
+            | StepKind::Run
             // I-39: an unrecognized future kind falls back to the generic
             // linear rendering, never a panic.
             | StepKind::Unknown => {
@@ -2801,6 +2827,7 @@ fn render_fanout_step(
     let parent_spinner = match rec.kind {
         StepKind::Panel => printer.panel_start(&rec.step_id, rec.items.len()),
         StepKind::ForEach => printer.fanout_start(&rec.step_id, "for_each", rec.items.len()),
+        StepKind::Run => printer.fanout_start(&rec.step_id, "run", rec.items.len()),
         StepKind::Parallel => printer.fanout_start(&rec.step_id, "parallel", rec.items.len()),
         StepKind::Linear => unreachable!("render_fanout_step called for linear step"),
         StepKind::Branch => unreachable!("render_fanout_step called for branch step"),
@@ -2832,7 +2859,7 @@ fn render_fanout_step(
                 Duration::ZERO,
             );
         }
-        StepKind::ForEach | StepKind::Parallel => {
+        StepKind::ForEach | StepKind::Parallel | StepKind::Run => {
             let success_count = rec.items.iter().filter(|i| i.success).count();
             let total = rec.items.len();
             printer.fanout_done(
@@ -2896,7 +2923,7 @@ fn render_child_item(
     // parallel + panel, the sub_id (which is the YAML-declared
     // sub-step or panelist agent name) is the right label.
     let headline = match parent.kind {
-        StepKind::ForEach => {
+        StepKind::ForEach | StepKind::Run => {
             let input_label = item_input_label(&item.item);
             if input_label.is_empty() {
                 format!("iter[{}]", item.index + 1)
@@ -4127,6 +4154,7 @@ mod tests {
             ],
         );
         let record = StepResultRecord {
+            run_outcome: None,
             step_id: "understand".into(),
             run_id: "run_linear".into(),
             transcript_path: transcript,
@@ -4399,6 +4427,7 @@ mod tests {
         std::fs::write(&transcript_path, format!("{body}\n")).unwrap();
 
         let rec = StepResultRecord {
+            run_outcome: None,
             step_id: "review_each".into(),
             run_id: "run_parent".into(),
             transcript_path: PathBuf::new(),

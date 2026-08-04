@@ -1143,6 +1143,7 @@ mod tests {
             .append_step_result(
                 run_id,
                 &rupu_orchestrator::runs::StepResultRecord {
+                    run_outcome: None,
                     step_id: "s1".into(),
                     run_id: run_id.into(),
                     transcript_path: transcript_path.to_path_buf(),
