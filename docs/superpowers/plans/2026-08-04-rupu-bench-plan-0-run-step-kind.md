@@ -1369,3 +1369,52 @@ git commit -m "feat: render run: nodes in canvas + CP, document the step kind"
 **Type consistency:** `ParseMode` is defined in `workflow.rs` (Task 1) and imported by `run_step.rs` (Task 3) — one definition, no duplicate. `RunStepOutput.parsed` is `serde_json::Value` in Task 3 and consumed as such by `step_result_from_run_output` in Task 6. `WorkflowConfig::allows` is defined in Task 4 and called by `gate` in Task 5 with the same signature.
 
 **Known gap for the implementer:** Task 6's `step_result_from_run_output` requires `StepResult`/`StepResultRecord` to carry `stdout`, `stderr`, `exit_code`, and `duration_ms`. Those fields do not exist today (`StepResultRecord` is at `crates/rupu-orchestrator/src/runs.rs:561`). Add them as `#[serde(default, skip_serializing_if = "Option::is_none")] Option<...>` so existing on-disk `step_results.jsonl` round-trips byte-for-byte, matching the precedent set by `loop_iteration` on that same struct.
+
+---
+
+## As-built notes (2026-08-04)
+
+Plan 0 is **implemented and merged to the branch**. Five deviations from the plan
+above — read these before writing Plans 1 and 2's workflow YAML.
+
+**1. Parsed output binds to `steps.<id>.json`, not `steps.<id>.output`.**
+`output` is a `String` for every step kind in the engine, so `{{ steps.x.output.field }}`
+renders empty — a test caught this. Use:
+
+```yaml
+args: ["--score", "{{ steps.score.json.score }}"]      # correct
+args: ["--jobs",  "{{ steps.plan.json.jobs | length }}"]
+```
+
+`output` still holds stdout as a string for all `parse:` modes. Both plans' YAML
+uses `steps.<id>.output.<field>` in places — **change those to `.json.`**.
+
+**2. `ask` mode allows `run:` steps.** It does not prompt and does not refuse.
+This follows the documented 2026-07-28 decision that workflow agent tools resolve
+`ask` to bypass (no operator exists mid-run). The workspace opt-in is the real
+control. Practically: benchmarks run under the default mode, and `--mode bypass`
+is only needed to silence the warning.
+
+**3. `distribute:` is rejected on a `run:` step** (`RunWithDistribute`), not
+ignored. Only agent steps can be distributed. Both plans' "add `distribute:` to
+the solve step" gap item still applies — `solve` is an agent step, so it is fine.
+
+**4. `unit_checkpoints.jsonl` is NOT written for `run:` fan-out.** Resume re-runs
+every unit rather than only the failures. Plan 1's `gen`/`verify` and Plan 2's
+`score` steps therefore re-execute in full on resume. They are idempotent, so this
+costs time, not correctness — but a long benchmark does not get the partial-resume
+benefit the plan advertised. Worth closing before a full-corpus run.
+
+**5. `rupu workflow list` remains the only parse check**, and it still exits 0 on
+an unparseable workflow — the `STEPS` column shows `—`. The
+`bench_workflows_parse.rs` test in Plan 1 Task 7 is the real guard.
+
+### Verified end to end
+
+A three-step workflow (`run:` → `for_each` + `run:` → assertion steps) was executed
+through the real `rupu` binary: units fan out and render as `run · 3 items`, the
+run reports `0 tokens total` (no model involved), and `steps.<id>.exit_code`,
+`steps.<id>.results | length`, and `steps.<id>.json.jobs[1].id` all resolve. A
+negative control with a deliberately wrong expected value fails the run with a
+precise error. All three gates (`run_step_enabled = false`, a non-matching
+allowlist, `--mode readonly`) refuse with actionable remedies.
