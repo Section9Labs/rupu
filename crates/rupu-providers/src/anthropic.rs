@@ -261,7 +261,7 @@ const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 /// shows it negotiates HTTP/1.1 for `/v1/messages`. Matching that on
 /// the wire keeps rupu's requests in the same Cloudflare/WAF
 /// classification bucket as claude-code traffic.
-fn build_http_client() -> ClientWithMiddleware {
+fn build_http_client() -> (ClientWithMiddleware, Arc<dyn rupu_netflow::FlowSink>) {
     build_http_client_with_timeout(None)
 }
 
@@ -277,20 +277,44 @@ fn build_http_client() -> ClientWithMiddleware {
 /// the real run id through once the provider factory is touched.
 ///
 /// The builder below is never `.build()`'d directly — it flows straight
-/// into `rupu_netflow::http::client_from`, the sanctioned pattern (see
+/// into `rupu_netflow::http::client_with`, the sanctioned pattern (see
 /// Task 11's `clippy.toml`); only `ClientBuilder::build()` is
 /// clippy-disallowed, and this function never calls it.
-fn build_http_client_with_timeout(timeout: Option<std::time::Duration>) -> ClientWithMiddleware {
+///
+/// Returns the `Arc<dyn FlowSink>` the client was actually bound to,
+/// alongside the client itself. `AnthropicClient` stores both, and its
+/// two-phase streaming completion (`FlowCompletionGuard`) calls `complete`
+/// on this stored sink directly rather than re-resolving
+/// `rupu_netflow::http::sink()` a second time at completion. Today those
+/// are the same object (a single process-wide global), so this has no
+/// behavioral effect yet — but it is what makes the completion pair safe
+/// once a per-workspace sink (Plan 2) replaces the global for some
+/// clients: the `Flow` and its `Complete` are then guaranteed to travel
+/// together instead of the `Complete` silently re-targeting whatever the
+/// global happens to be at completion time. See the 2026-08-03
+/// whole-branch review, Fix 1.
+fn build_http_client_with_timeout(
+    timeout: Option<std::time::Duration>,
+) -> (ClientWithMiddleware, Arc<dyn rupu_netflow::FlowSink>) {
     let mut builder = reqwest::Client::builder().http1_only();
     if let Some(t) = timeout {
         builder = builder.connect_timeout(t).read_timeout(t);
     }
+    let sink = rupu_netflow::http::sink();
     let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider(PROVIDER_TAG.into()));
-    rupu_netflow::http::client_from(ctx, builder).unwrap_or_else(|_| {
-        rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
-            rupu_netflow::Origin::Provider(PROVIDER_TAG.into()),
-        ))
-    })
+    match rupu_netflow::http::client_with(ctx, builder, sink.clone()) {
+        Ok(client) => (client, sink),
+        Err(_) => {
+            // The panicking-only-as-last-resort factory: see its own
+            // docstring for why a second failure here means the process
+            // cannot do TLS at all. It re-resolves `sink()` internally,
+            // but since `sink()` is a `OnceLock` (first-call-wins), that
+            // is guaranteed to be the SAME object as `sink` above.
+            let ctx =
+                rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider(PROVIDER_TAG.into()));
+            (rupu_netflow::http::client(ctx), sink)
+        }
+    }
 }
 
 /// Whether the model string carries the explicit 1M-context opt-in
@@ -660,6 +684,12 @@ pub fn save_auth_json(path: &Path, auth_method: &AuthMethod) -> Result<(), Provi
 /// Supports both API key (`x-api-key`) and OAuth (`Authorization: Bearer`) auth.
 pub struct AnthropicClient {
     client: ClientWithMiddleware,
+    /// The exact sink `client` was bound to. Stored alongside the client
+    /// (rather than re-resolved from `rupu_netflow::http::sink()` at
+    /// completion time) so `FlowCompletionGuard`'s two-phase streaming
+    /// completion always targets the same ledger its `Flow` line was
+    /// written to. See `build_http_client_with_timeout`'s docstring.
+    sink: Arc<dyn rupu_netflow::FlowSink>,
     auth: AuthMethod,
     api_url: String,
     /// Path to auth.json for writing refreshed tokens back (legacy).
@@ -696,8 +726,10 @@ pub struct AnthropicClient {
 impl AnthropicClient {
     /// Create a new client from a resolved AuthMethod.
     pub fn from_auth(auth: AuthMethod) -> Self {
+        let (client, sink) = build_http_client();
         Self {
-            client: build_http_client(),
+            client,
+            sink,
             auth,
             api_url: ANTHROPIC_API_URL.to_string(),
             auth_json_path: None,
@@ -719,7 +751,9 @@ impl AnthropicClient {
     /// below makes stacking one either double-count permits or deadlock
     /// outright at `max_concurrency == 1`).
     pub fn with_tuning(mut self, tuning: &crate::tuning::ProviderTuning) -> Self {
-        self.client = build_http_client_with_timeout(Some(tuning.timeout));
+        let (client, sink) = build_http_client_with_timeout(Some(tuning.timeout));
+        self.client = client;
+        self.sink = sink;
         self.max_rate_limit_retries = tuning.max_retries;
         self.semaphore = Some(tuning.semaphore("anthropic"));
         self
@@ -769,8 +803,10 @@ impl AnthropicClient {
 
     /// Create a client with an auth.json path for persisting refreshed tokens.
     pub fn from_auth_with_path(auth: AuthMethod, auth_json_path: std::path::PathBuf) -> Self {
+        let (client, sink) = build_http_client();
         Self {
-            client: build_http_client(),
+            client,
+            sink,
             auth,
             api_url: ANTHROPIC_API_URL.to_string(),
             auth_json_path: Some(auth_json_path),
@@ -787,8 +823,10 @@ impl AnthropicClient {
         auth: AuthMethod,
         store: std::sync::Arc<dyn crate::credential_source::CredentialSource>,
     ) -> Self {
+        let (client, sink) = build_http_client();
         Self {
-            client: build_http_client(),
+            client,
+            sink,
             auth,
             api_url: ANTHROPIC_API_URL.to_string(),
             auth_json_path: None,
@@ -813,8 +851,10 @@ impl AnthropicClient {
 
     /// Create a client pointing at a custom URL (for testing with mock servers).
     pub fn with_url(api_key: String, api_url: String) -> Self {
+        let (client, sink) = build_http_client();
         Self {
-            client: build_http_client(),
+            client,
+            sink,
             auth: AuthMethod::ApiKey(api_key),
             api_url,
             auth_json_path: None,
@@ -830,8 +870,10 @@ impl AnthropicClient {
     /// (for testing OAuth flows against mock servers — the api-key-only
     /// `with_url` cannot exercise the OAuth header path).
     pub fn from_auth_with_url(auth: AuthMethod, api_url: String) -> Self {
+        let (client, sink) = build_http_client();
         Self {
-            client: build_http_client(),
+            client,
+            sink,
             auth,
             api_url,
             auth_json_path: None,
@@ -1013,20 +1055,40 @@ fn stream_event_counts_as_emitted_content(ev: &StreamEvent) -> bool {
 /// runtime is still current; outside one it logs at debug and gives up,
 /// matching this subsystem's rule that capture may degrade but must never
 /// panic or fail the request that produced it.
+///
+/// Carries the `Arc<dyn FlowSink>` the client was built with (rather than
+/// completing through the free-standing `rupu_netflow::http::complete`,
+/// which re-resolves the process-global sink) so this guard's `Complete`
+/// line is guaranteed to land in the same ledger as the `Flow` line the
+/// middleware wrote for this same `id` — see Fix 1 of the 2026-08-03
+/// whole-branch review.
+///
+/// Only ever constructed AFTER `.send()` has returned `Ok`: a `?` on the
+/// `.send()` future itself must never drop an armed guard, or its `Drop`
+/// impl fabricates a `bytes_in: Some(0)` completion for a request whose
+/// body was never observed — the middleware's own `Err` arm already wrote
+/// the honest record (`bytes_in: None, body_complete: true`) in that case.
+/// See Fix 2 of the same review.
 struct FlowCompletionGuard {
     id: rupu_netflow::FlowId,
     started: std::time::Instant,
     bytes: u64,
     fired: bool,
+    sink: Arc<dyn rupu_netflow::FlowSink>,
 }
 
 impl FlowCompletionGuard {
-    fn new(id: rupu_netflow::FlowId, started: std::time::Instant) -> Self {
+    fn new(
+        id: rupu_netflow::FlowId,
+        started: std::time::Instant,
+        sink: Arc<dyn rupu_netflow::FlowSink>,
+    ) -> Self {
         Self {
             id,
             started,
             bytes: 0,
             fired: false,
+            sink,
         }
     }
 
@@ -1041,12 +1103,13 @@ impl FlowCompletionGuard {
     /// trigger `Drop`'s fallback completion for the same flow.
     async fn complete(mut self) {
         self.fired = true;
-        rupu_netflow::http::complete(
-            self.id,
-            self.bytes,
-            self.started.elapsed().as_millis() as u64,
-        )
-        .await;
+        self.sink
+            .complete(
+                self.id,
+                self.bytes,
+                self.started.elapsed().as_millis() as u64,
+            )
+            .await;
     }
 }
 
@@ -1058,10 +1121,11 @@ impl Drop for FlowCompletionGuard {
         let id = self.id;
         let bytes = self.bytes;
         let elapsed_ms = self.started.elapsed().as_millis() as u64;
+        let sink = self.sink.clone();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    rupu_netflow::http::complete(id, bytes, elapsed_ms).await;
+                    sink.complete(id, bytes, elapsed_ms).await;
                 });
             }
             Err(_) => {
@@ -1359,13 +1423,9 @@ impl AnthropicClient {
                     // gets its own fresh `FlowId`. Minted before `.send()` and
                     // attached via `with_extension` so the middleware defers
                     // finalizing this record until we call `complete` below,
-                    // instead of (mis)completing it at header time. Wrapped
-                    // in a `FlowCompletionGuard` so a cancellation mid-attempt
-                    // (e.g. a user pause) still finalizes the record with
-                    // whatever was observed, instead of leaving it dangling.
+                    // instead of (mis)completing it at header time.
                     let attempt_flow_id = rupu_netflow::FlowId::new();
                     let attempt_started = std::time::Instant::now();
-                    let mut flow_guard = FlowCompletionGuard::new(attempt_flow_id, attempt_started);
 
                     let builder = self
                         .client
@@ -1382,6 +1442,27 @@ impl AnthropicClient {
                         .with_extension(attempt_flow_id)
                         .send()
                         .await?;
+
+                    // Constructed ONLY after `.send()` returned `Ok` — Fix 2
+                    // of the 2026-08-03 review. If `.send()` itself fails,
+                    // the `?` above returns before any guard exists, so
+                    // nothing is armed to fabricate a completion for a body
+                    // that was never observed; the middleware's own `Err`
+                    // arm already wrote the honest record
+                    // (`bytes_in: None, body_complete: true`). A
+                    // cancellation DURING `.send()` cannot dangle either:
+                    // the whole future — including the not-yet-created
+                    // guard — is simply dropped with it, and no record
+                    // exists to finalize. Wrapped in a `FlowCompletionGuard`
+                    // from here on so a cancellation mid-attempt (e.g. a
+                    // user pause) while draining the body still finalizes
+                    // the record with whatever was observed, instead of
+                    // leaving it dangling.
+                    let mut flow_guard = FlowCompletionGuard::new(
+                        attempt_flow_id,
+                        attempt_started,
+                        self.sink.clone(),
+                    );
 
                     let status = resp.status();
                     if status.as_u16() == 429 {

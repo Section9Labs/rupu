@@ -27,11 +27,23 @@ pub enum AsnError {
     Empty,
 }
 
-/// `~/.rupu/netflow/asn.db`. `None` when the home directory is unknown.
+/// `<RUPU_HOME>/netflow/asn.db`, honoring `$RUPU_HOME` (set by integration
+/// tests and by users who want a non-default location) before falling back
+/// to `~/.rupu/`. Mirrors `rupu_auth::resolver::rupu_home_dir` and
+/// `rupu_workspace::host_store::rupu_home_dir` so every `~/.rupu` consumer
+/// in the workspace agrees on where "global" is. `None` when neither
+/// `RUPU_HOME` nor the home directory is resolvable.
 pub fn asn_db_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|h| h.join(".rupu").join("netflow").join("asn.db"))
+    rupu_home_dir().map(|h| h.join("netflow").join("asn.db"))
+}
+
+/// Resolve the global rupu directory, honoring `$RUPU_HOME` before falling
+/// back to `~/.rupu/`.
+fn rupu_home_dir() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("RUPU_HOME") {
+        return Some(PathBuf::from(p));
+    }
+    dirs::home_dir().map(|h| h.join(".rupu"))
 }
 
 /// True when the table is absent, unreadable, or older than the interval.
@@ -115,6 +127,22 @@ mod tests {
     fn ingest_gz_decompresses_and_builds_the_table() {
         let table = ingest_gz(std::io::Cursor::new(gzipped(TSV))).unwrap();
         assert_eq!(table.lookup("1.0.0.7".parse().unwrap()).unwrap().asn, 13335);
+    }
+
+    #[test]
+    #[serial_test::serial(rupu_home_env)]
+    fn asn_db_path_honors_rupu_home_override() {
+        // Fix 6 (2026-08-03 review): every other `~/.rupu` consumer in the
+        // workspace (rupu-auth's resolver, rupu-workspace's host_store)
+        // checks `RUPU_HOME` before falling back to `~/.rupu`. This must
+        // too, or a `RUPU_HOME`-redirected integration test environment
+        // silently writes/reads the ASN table from the real home
+        // directory instead.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("RUPU_HOME", tmp.path());
+        let path = asn_db_path();
+        std::env::remove_var("RUPU_HOME");
+        assert_eq!(path, Some(tmp.path().join("netflow").join("asn.db")));
     }
 
     #[test]

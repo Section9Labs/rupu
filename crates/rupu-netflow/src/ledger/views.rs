@@ -85,8 +85,16 @@ pub struct HostRollup {
     pub bytes_in: Option<u64>,
     pub bytes_out: Option<u64>,
     pub errors: u64,
-    pub p50_ms: u64,
-    pub p95_ms: u64,
+    /// `None` when no contributing flow had a known `duration_ms` — e.g.
+    /// every flow for this host is a streamed request still in flight, or
+    /// this host only ever produced transport failures before `Instant`
+    /// timing was captured. A CP reading `p50_ms: 0` cannot tell
+    /// "sub-millisecond" from "we timed nothing"; `None` says so
+    /// honestly. Mirrors the `bytes_in` / `bytes_out` honesty contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p95_ms: Option<u64>,
 }
 
 fn is_error(f: &FlowRecord) -> bool {
@@ -97,16 +105,20 @@ fn is_error(f: &FlowRecord) -> bool {
 /// at or below which at least `pct` of the samples fall, i.e. index
 /// `ceil(pct * n) - 1`. `pct` in 0.0..=1.0. `sorted` must be ascending.
 ///
-/// Do NOT "fix" this to `ceil(pct * (n - 1))` to make a test pass. That
-/// is a different, nonstandard definition; if a test disagrees with
-/// nearest-rank, the test's expected value is what is wrong.
-fn percentile(sorted: &[u64], pct: f64) -> u64 {
+/// `None` on an empty slice — "no timings observed" is not the same fact
+/// as "the observed timings were all zero". A bare `0` fallback here would
+/// have been indistinguishable from a genuine sub-millisecond p50.
+///
+/// Do NOT "fix" the non-empty case to `ceil(pct * (n - 1))` to make a test
+/// pass. That is a different, nonstandard definition; if a test disagrees
+/// with nearest-rank, the test's expected value is what is wrong.
+fn percentile(sorted: &[u64], pct: f64) -> Option<u64> {
     if sorted.is_empty() {
-        return 0;
+        return None;
     }
     let rank = (pct * sorted.len() as f64).ceil() as usize;
     let idx = rank.saturating_sub(1).min(sorted.len() - 1);
-    sorted[idx]
+    Some(sorted[idx])
 }
 
 /// `bytes_in` and `bytes_out` are tracked INDEPENDENTLY. A single shared
@@ -375,10 +387,54 @@ mod tests {
         assert_eq!(rollup[0].errors, 1);
         assert_eq!(rollup[0].bytes_in, Some(600));
         assert_eq!(rollup[0].bytes_out, Some(300));
-        assert_eq!(rollup[0].p50_ms, 20);
-        assert_eq!(rollup[0].p95_ms, 100);
+        assert_eq!(rollup[0].p50_ms, Some(20));
+        assert_eq!(rollup[0].p95_ms, Some(100));
         assert_eq!(rollup[1].host, "api.github.com");
         assert_eq!(rollup[1].calls, 1);
+    }
+
+    #[test]
+    fn a_host_serving_only_gets_keeps_a_real_bytes_out_total() {
+        // Fix 3 (2026-08-03 review): before the fix, the middleware
+        // recorded `bytes_out: None` for every bodyless GET (the update
+        // checker, every `/v1/models` probe). Composed with
+        // `host_rollup`'s collapse-on-unknown rule, ANY host that ever
+        // served a GET would permanently report `bytes_out: None`. Now
+        // that a bodyless request records a known `Some(0)`, a host with
+        // only GET flows must keep a real (summed, non-None) total.
+        let mut get_one = flow(1, "api.github.com", Some("r1"), 10, true);
+        get_one.bytes_out = Some(0);
+        let mut get_two = flow(2, "api.github.com", Some("r1"), 20, true);
+        get_two.bytes_out = Some(0);
+
+        let rollup = host_rollup(&[get_one, get_two]);
+
+        assert_eq!(
+            rollup[0].bytes_out,
+            Some(0),
+            "an all-GET host's bytes_out total must stay a real known \
+             value, not collapse to None"
+        );
+    }
+
+    #[test]
+    fn a_host_with_no_observed_durations_reports_none_not_zero() {
+        // Fix 4 (2026-08-03 review): `p50_ms`/`p95_ms` must distinguish
+        // "no flow contributed a duration" from "the duration was zero" —
+        // the same honesty contract `bytes_in`/`bytes_out` already have.
+        // A transport failure recorded before any timing was captured is
+        // exactly this shape: `duration_ms: None`.
+        let mut untimed = flow(1, "api.github.com", Some("r1"), 0, true);
+        untimed.duration_ms = None;
+
+        let rollup = host_rollup(&[untimed]);
+
+        assert_eq!(rollup[0].calls, 1);
+        assert_eq!(
+            rollup[0].p50_ms, None,
+            "no contributing flow had a known duration"
+        );
+        assert_eq!(rollup[0].p95_ms, None);
     }
 
     #[test]
@@ -400,7 +456,7 @@ mod tests {
         // Durations are [10, 20]; nearest-rank p50 = ceil(0.5*2) = rank 1
         // = the LOWER of the two. Timings stay exact even though bytes
         // became unknowable.
-        assert_eq!(rollup[0].p50_ms, 10, "timings are still exact");
+        assert_eq!(rollup[0].p50_ms, Some(10), "timings are still exact");
     }
 
     #[test]

@@ -6563,6 +6563,7 @@ version = "0.72.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "dirs 5.0.1",
  "flate2",
  "http 1.4.0",
  "httpmock",
@@ -6570,6 +6571,7 @@ dependencies = [
  "reqwest-middleware",
  "serde",
  "serde_json",
+ "serial_test",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

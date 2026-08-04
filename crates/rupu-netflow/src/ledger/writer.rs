@@ -315,6 +315,34 @@ mod tests {
         );
     }
 
+    // `write_line`'s own `Err` arm — invariant 2's disk-failure half (spec
+    // §10: "a full disk or revoked permission must not silently vanish a
+    // record any more than channel overflow may") — is NOT covered by a
+    // test here. `dropped_count_is_recorded_not_silent` below only
+    // exercises the bounded-channel half.
+    //
+    // Investigated and rejected as fragile rather than shipped: opening
+    // the destination with `.read(true)` only (no `.write`) looks like it
+    // should force an OS-level EBADF on the next `write_all`, and it does
+    // for a raw `std::fs::File` — but empirically, on `tokio` 1.53 /
+    // macOS (arm64, this workstation), `tokio::fs::File::write_all`
+    // reports `Ok(())` for that same read-only-opened file while writing
+    // ZERO bytes; the real EBADF only surfaces later, on `sync_all()`. A
+    // test built on that call would assert something true on this
+    // machine today for the wrong reason, and could just as easily assert
+    // the opposite on a different tokio/OS combination — exactly the
+    // "fragile" case this task's instructions call out. No other
+    // portable, `unsafe`-free way to force a real OS write failure was
+    // found (`/dev/full` is Linux-only, not present on macOS; disk-quota
+    // / tmpfs-size tricks need root or platform-specific mount tooling
+    // and would not run identically in CI and on a dev machine).
+    //
+    // `write_line`'s failure-handling CODE itself (increment the counter,
+    // log, return without propagating) is still exercised indirectly by
+    // `dropped_count_is_recorded_not_silent`'s `Dropped`-line write, which
+    // goes through the very same function on the success path; only the
+    // `Err` branch specifically is unverified.
+
     #[tokio::test]
     async fn dropped_count_is_recorded_not_silent() {
         let tmp = tempfile::TempDir::new().unwrap();

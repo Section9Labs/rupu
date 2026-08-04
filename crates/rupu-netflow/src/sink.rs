@@ -70,7 +70,7 @@ impl FlowSink for FanoutSink {
     }
 }
 
-/// Test double. Also used by CP for the live broadcast buffer.
+/// Test double.
 #[derive(Default)]
 pub struct MemorySink {
     inner: Mutex<MemoryState>,

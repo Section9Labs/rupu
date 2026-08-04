@@ -1,7 +1,61 @@
 #![cfg(feature = "http")]
 
-use rupu_netflow::{FlowCtx, FlowSink, MemorySink, Origin};
+use rupu_netflow::{FlowCtx, FlowRecord, FlowSink, MemorySink, Origin};
 use std::sync::Arc;
+
+/// A sink that panics on every call. Drives invariant 1 directly through
+/// the middleware — NOT wrapped in a `FanoutSink`, since that already
+/// isolates panics per-child on its own and is not on the production
+/// path (nothing in the repo installs it yet; see `sink.rs`'s doc
+/// comments). This proves the middleware itself is panic-safe
+/// unconditionally, for whatever sink is actually plugged in.
+struct PanicSink;
+
+#[async_trait::async_trait]
+impl FlowSink for PanicSink {
+    async fn record(&self, _flow: FlowRecord) {
+        panic!("intentional panic in PanicSink::record");
+    }
+
+    async fn complete(&self, _id: rupu_netflow::FlowId, _bytes_in: u64, _duration_ms: u64) {
+        panic!("intentional panic in PanicSink::complete");
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_sink_never_breaks_the_request() {
+    // Invariant 1, non-negotiable per spec §10: "A panic in the middleware
+    // must not propagate into the request path." Before the middleware
+    // isolated its `sink.record(...).await` call in a spawned task, a
+    // panicking sink would panic the whole request future — this test
+    // would have failed (or aborted the test process) against that code.
+    let server = httpmock::MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::GET).path("/v1/models");
+            then.status(200).body("hello");
+        })
+        .await;
+
+    // Suppress panic-hook output so a passing test run stays clean; the
+    // panic itself is expected and contained by `tokio::task::spawn`.
+    let old_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+
+    let client = rupu_netflow::http::client_with(
+        FlowCtx::system(Origin::System),
+        reqwest::Client::builder(),
+        Arc::new(PanicSink),
+    )
+    .unwrap();
+
+    let result = client.get(server.url("/v1/models")).send().await;
+
+    std::panic::set_hook(old_hook);
+
+    let resp = result.expect("a panicking sink must never fail the HTTP request");
+    assert_eq!(resp.status(), 200);
+}
 
 #[tokio::test]
 async fn records_a_successful_request() {
@@ -40,6 +94,40 @@ async fn records_a_successful_request() {
     assert!(matches!(r.outcome, rupu_netflow::Outcome::Ok));
     assert!(r.peer_ip.is_some(), "remote_addr must be captured");
     assert!(r.ttfb_ms.is_some());
+}
+
+#[tokio::test]
+async fn a_bodyless_get_records_a_known_zero_bytes_out_not_unknown() {
+    // Fix 3 (2026-08-03 review): a GET has no body — that is a genuinely
+    // known zero, not an unobserved count. Composed with `host_rollup`'s
+    // (correct) collapse-on-unknown rule, treating "no body" as unknown
+    // would permanently blank `bytes_out` for any host that ever served a
+    // GET, which is exactly what the update checker and every
+    // `/v1/models` probe do.
+    let server = httpmock::MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::GET).path("/v1/models");
+            then.status(200).body("hello");
+        })
+        .await;
+
+    let sink = Arc::new(MemorySink::default());
+    let client = rupu_netflow::http::client_with(
+        FlowCtx::system(Origin::Update),
+        reqwest::Client::builder(),
+        sink.clone(),
+    )
+    .unwrap();
+
+    client.get(server.url("/v1/models")).send().await.unwrap();
+
+    let r = &sink.records()[0];
+    assert_eq!(
+        r.bytes_out,
+        Some(0),
+        "a bodyless GET must record a KNOWN zero, not None"
+    );
 }
 
 #[tokio::test]

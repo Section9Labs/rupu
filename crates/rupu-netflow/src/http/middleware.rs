@@ -44,10 +44,19 @@ impl Middleware for NetflowMiddleware {
         let scheme = url.scheme().to_string();
         // Query-stripped. Query strings routinely carry tokens.
         let path = url.path().to_string();
-        let bytes_out = req
-            .body()
-            .and_then(|b| b.as_bytes())
-            .map(|b| b.len() as u64);
+        // No body (GET, HEAD, …) is a genuinely known zero, not an unknown
+        // — `req.body()` returning `None` means "there is no body", which
+        // is exactly as observed as any other count. Only an unbuffered
+        // streaming body (`body()` is `Some` but `as_bytes()` is `None`
+        // because it isn't held in memory) is genuinely unknown. Collapsing
+        // both cases to `None` would turn a known zero into "we could not
+        // see it" — invariant 3, inverted — and `host_rollup`'s (correct)
+        // collapse-on-unknown rule would then permanently blank
+        // `bytes_out` for any host that ever served a GET.
+        let bytes_out = match req.body() {
+            None => Some(0),
+            Some(b) => b.as_bytes().map(|s| s.len() as u64),
+        };
 
         let started = Instant::now();
         let result = next.run(req, extensions).await;
@@ -114,7 +123,22 @@ impl Middleware for NetflowMiddleware {
             }
         }
 
-        self.sink.record(record).await;
+        // Spawned rather than awaited inline so a panicking sink can never
+        // propagate into the request path — invariant 1, non-negotiable
+        // per spec §10 ("A panic in the middleware must not propagate into
+        // the request path"). `FanoutSink` isolates panics per-child the
+        // same way, but this middleware is the one place EVERY sink runs
+        // through regardless of whether it's wrapped in a `FanoutSink`, so
+        // the isolation has to live here to hold unconditionally.
+        let sink = self.sink.clone();
+        if tokio::task::spawn(async move { sink.record(record).await })
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "netflow sink panicked while recording a flow; request unaffected, record lost"
+            );
+        }
         result
     }
 }
