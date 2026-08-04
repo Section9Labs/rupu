@@ -16,6 +16,7 @@ thiserror.workspace = true
 chrono.workspace = true
 ulid.workspace = true
 tracing.workspace = true
+rupu-netflow = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
