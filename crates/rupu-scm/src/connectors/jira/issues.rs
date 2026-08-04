@@ -19,7 +19,7 @@ use crate::types::{Comment, CreateIssue, Issue, IssueFilter, IssueRef, IssueStat
 const DEFAULT_SITE_SCHEME: &str = "https";
 
 pub struct JiraIssueConnector {
-    http: reqwest::Client,
+    http: reqwest_middleware::ClientWithMiddleware,
     auth: JiraAuth,
     base_url: Option<String>,
 }
@@ -30,9 +30,15 @@ impl JiraIssueConnector {
         base_url: Option<String>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            http: reqwest::Client::builder()
-                .build()
-                .expect("reqwest client build"),
+            http: rupu_netflow::http::client_from(
+                rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm("jira".into())),
+                reqwest::Client::builder(),
+            )
+            .unwrap_or_else(|_| {
+                rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
+                    rupu_netflow::Origin::Scm("jira".into()),
+                ))
+            }),
             auth: JiraAuth::from_credentials(creds)?,
             base_url: base_url.map(|url| normalize_site_base_url(&url)),
         })

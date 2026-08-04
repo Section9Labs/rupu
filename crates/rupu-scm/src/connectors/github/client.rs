@@ -142,10 +142,15 @@ impl GithubClient {
     /// typed builder API doesn't expose response headers cleanly, so
     /// this goes through reqwest directly.
     pub async fn fetch_token_scopes(&self) -> Option<Vec<String>> {
-        let http = reqwest::Client::builder()
-            .timeout(self.timeout)
-            .build()
-            .ok()?;
+        let http = rupu_netflow::http::client_from(
+            rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm("github".into())),
+            reqwest::Client::builder().timeout(self.timeout),
+        )
+        .unwrap_or_else(|_| {
+            rupu_netflow::http::client(rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm(
+                "github".into(),
+            )))
+        });
         let resp = http
             .get("https://api.github.com/user")
             .header(reqwest::header::USER_AGENT, "rupu/0")
@@ -188,12 +193,15 @@ impl GithubClient {
             let token = token.clone();
             async move {
                 let _permit = self.permit().await;
-                let http = reqwest::Client::builder()
-                    .timeout(self.timeout)
-                    .build()
-                    .map_err(|e| {
-                        ScmError::Network(anyhow::anyhow!("github graphql client: {e}"))
-                    })?;
+                let http = rupu_netflow::http::client_from(
+                    rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm("github".into())),
+                    reqwest::Client::builder().timeout(self.timeout),
+                )
+                .unwrap_or_else(|_| {
+                    rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
+                        rupu_netflow::Origin::Scm("github".into()),
+                    ))
+                });
                 let resp = http
                     .post(&url)
                     .header(reqwest::header::USER_AGENT, "rupu/0")

@@ -62,17 +62,25 @@ const ALLOWED: &[&str] = &[
 /// It cannot see `ClientBuilder::build()` invoked as a bare method call
 /// on a previously-built builder (`.build()`), which is how idiomatic
 /// Rust normally writes it — that pattern has no literal
-/// `reqwest::ClientBuilder::build` substring anywhere on the line. Eight
-/// more files (all in `rupu-scm`: `client_options.rs`,
-/// `connectors/{github,gitlab,jira,linear}/{client,events,issues}.rs`)
-/// are ALSO not yet migrated and hit exactly that blind spot — they do
-/// NOT appear here or trip this test, but they DO trip the semantic
-/// `clippy::disallowed_methods` lint (`cargo clippy -p rupu-scm
-/// --all-targets`), which resolves the receiver type regardless of call
-/// syntax and is the authoritative check. This list is therefore a
-/// strict subset of "genuinely unmigrated files" — Plan 2's real
-/// checklist is `cargo clippy --workspace --all-targets 2>&1 | grep
-/// disallowed`, not this constant.
+/// `reqwest::ClientBuilder::build` substring anywhere on the line.
+///
+/// As of Plan 2 Task 5 (2026-08-04), three files in `rupu-scm` still hit
+/// exactly that blind spot — `connectors/github/events.rs`,
+/// `connectors/gitlab/client.rs`, `connectors/linear/issues.rs` — down
+/// from the eight Task 5 started with (`client_options.rs` and
+/// `connectors/{github,gitlab,jira,linear}/{client,events,issues}.rs`;
+/// Task 5's scope was the other five: `client_options.rs`,
+/// `gitlab/events.rs`, `jira/events.rs`, `jira/issues.rs`,
+/// `linear/events.rs`, plus both ad-hoc clients in `github/client.rs`).
+/// The three that remain do NOT appear here or trip this test, but they
+/// DO trip the semantic `clippy::disallowed_methods` lint (`cargo
+/// clippy -p rupu-scm --all-targets`), which resolves the receiver type
+/// regardless of call syntax and is the authoritative check — hence
+/// `rupu-scm`'s `#![warn(clippy::disallowed_methods)]` override in
+/// `lib.rs` is still needed and has NOT been removed. This list is
+/// therefore a strict subset of "genuinely unmigrated files" — Plan 2's
+/// real checklist is `cargo clippy --workspace --all-targets 2>&1 |
+/// grep disallowed`, not this constant.
 const PENDING_PLAN_2: &[&str] = &[
     "crates/rupu-cli/src/cmd/cp.rs",
     "crates/rupu-cp/src/host/http.rs",
