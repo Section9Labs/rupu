@@ -98,15 +98,17 @@ impl Middleware for NetflowMiddleware {
                 }
             }
             Err(e) => {
-                let msg = e.to_string();
-                record.outcome = if msg.to_ascii_lowercase().contains("timed out")
-                    || msg.to_ascii_lowercase().contains("timeout")
-                {
+                // Type-based, NOT substring matching on the message.
+                // `reqwest::Error`'s Display appends " for url (<url>)",
+                // so matching on "timeout" would misclassify an ordinary
+                // connection failure to any host whose URL contains that
+                // word.
+                record.outcome = if e.is_timeout() {
                     Outcome::Timeout
                 } else {
                     Outcome::TransportError
                 };
-                record.error = Some(msg);
+                record.error = Some(e.to_string());
                 record.duration_ms = Some(elapsed_ms);
                 record.body_complete = true;
             }

@@ -66,6 +66,12 @@ pub struct FlowRecord {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes_out: Option<u64>,
+    /// DECLARED, not confirmed-drained, when no explicit `complete()`
+    /// follows: the middleware records at response-header time and takes
+    /// this from `Content-Length`. If the connection drops mid-body the
+    /// record still shows the declared count. A value finalized by a
+    /// `LedgerLine::Complete` (i.e. `body_complete == true` via the fold)
+    /// IS an observed count. Do not present the two as equally exact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes_in: Option<u64>,
     /// `false` while a streamed body is still draining. Flipped by a
