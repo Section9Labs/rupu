@@ -535,6 +535,43 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         warn!(path = %pwd.display(), error = %err, "failed to auto-track checkout");
     }
 
+    // Transcript path. Computed here — earlier than it logically "belongs"
+    // relative to the provider build below — because the netflow sink
+    // installed right after it needs a concrete path to stream into, and
+    // that install must land before `build_for_provider_with_config` (a
+    // few lines down) constructs the provider client. See the netflow
+    // comment below for why the ordering is load-bearing.
+    let run_id = args
+        .run_id
+        .clone()
+        .unwrap_or_else(|| format!("run_{}", Ulid::new()));
+    let transcripts = paths::transcripts_dir(&global, project_root.as_deref());
+    paths::ensure_dir(&transcripts)?;
+    let transcript_path = transcripts.join(format!("{run_id}.jsonl"));
+
+    // Netflow capture. Two destinations: the ledger under `<pwd>/.rupu/netflow/`
+    // (persists across runs — `pwd`, not the resolved `workspace_path` below,
+    // so a `--tmp`/`--into` clone target being torn down doesn't take the
+    // ledger with it; it is also the only home for `Origin::System` egress
+    // that has no run to attach to) and this run's transcript (streams live).
+    // Best-effort: a ledger that cannot be opened degrades to transcript-only
+    // capture, never a hard failure.
+    //
+    // MUST run before `build_for_provider_with_config` below —
+    // provider clients resolve `rupu_netflow::http::sink()` into their own
+    // field at construction time, so installing the sink after the
+    // provider is built would leave it permanently wired to the default
+    // `NullSink` for the whole run.
+    let netflow_paths = rupu_netflow::NetflowPaths::new(&pwd);
+    let mut netflow_sinks: Vec<Arc<dyn rupu_netflow::FlowSink>> = vec![Arc::new(
+        rupu_transcript::TranscriptSink::new(transcript_path.clone()),
+    )];
+    match rupu_netflow::NetflowWriterHandle::spawn(netflow_paths) {
+        Ok(handle) => netflow_sinks.push(handle.writer.clone()),
+        Err(e) => tracing::debug!(error = %e, "netflow ledger unavailable for this run"),
+    }
+    rupu_netflow::http::init(Arc::new(rupu_netflow::FanoutSink::new(netflow_sinks)));
+
     // Provider build via CredentialResolver. Wrapped in an `Arc` so the
     // same resolver instance can also be handed to `CliAgentDispatcher`
     // below without a second construction; existing call sites that need
@@ -583,20 +620,11 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     .await?;
 
     // Print the agent header via the line-stream printer.
-    // The run_id isn't known yet; we'll use a placeholder.
+    // `run_id`/`transcript_path` were resolved earlier (see the netflow
+    // comment above) so they're already in scope here.
     let agent_header_name = spec.name.clone();
     let agent_header_provider = provider_name.clone();
     let agent_header_model = model.clone();
-    // (printed after run_id is set below)
-
-    // Transcript path.
-    let run_id = args
-        .run_id
-        .clone()
-        .unwrap_or_else(|| format!("run_{}", Ulid::new()));
-    let transcripts = paths::transcripts_dir(&global, project_root.as_deref());
-    paths::ensure_dir(&transcripts)?;
-    let transcript_path = transcripts.join(format!("{run_id}.jsonl"));
 
     // Construct ONE LineStreamPrinter for the whole run. Keeping a
     // single instance means a single MultiProgress + ticker — earlier

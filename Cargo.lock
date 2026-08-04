@@ -6430,6 +6430,7 @@ dependencies = [
  "rupu-coverage",
  "rupu-cp",
  "rupu-mcp",
+ "rupu-netflow",
  "rupu-orchestrator",
  "rupu-providers",
  "rupu-runtime",
