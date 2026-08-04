@@ -23,6 +23,7 @@ import {
   FolderGit2,
   LayoutDashboard,
   MessageSquare,
+  Network,
   Radio,
   Repeat,
   Search,
@@ -88,6 +89,10 @@ const NAV_PAGES_V2: PaletteItem[] = [
   { kind: 'page', id: 'fleet',    title: 'Fleet',        to: '/fleet' },
   { kind: 'page', id: 'usage',    title: 'Usage',        to: '/usage' },
   { kind: 'page', id: 'events',   title: 'Live Events',  to: '/events' },
+  // Netflow landed on main after the v2 IA was drawn; it has no v2 rail leaf
+  // yet, so the palette keeps it reachable (same treatment as Live Events)
+  // until the arc decides where it lives.
+  { kind: 'page', id: 'netflow',  title: 'Network',      to: '/netflow' },
   { kind: 'page', id: 'settings', title: 'Settings',     to: '/settings' },
 ];
 
@@ -117,6 +122,7 @@ const PAGE_ICON: Record<string, LucideIcon> = {
   library:   BookMarked,
   fleet:     Server,
   usage:     DollarSign,
+  netflow:   Network,
 };
 
 // ---------------------------------------------------------------------------
