@@ -9,19 +9,32 @@ pub fn releases_api_url(owner_repo: &str) -> String {
 
 pub struct GithubReleaseSource {
     owner_repo: String,
-    client: reqwest::Client,
+    api_base: String,
+    client: reqwest_middleware::ClientWithMiddleware,
 }
 
 impl GithubReleaseSource {
     pub fn new(owner_repo: impl Into<String>) -> Self {
+        Self::with_api_base(owner_repo, API)
+    }
+
+    /// As [`Self::new`], with the GitHub API base overridden. Exists so
+    /// tests can point at a mock server instead of `api.github.com`.
+    pub fn with_api_base(owner_repo: impl Into<String>, api_base: impl Into<String>) -> Self {
         Self {
             owner_repo: owner_repo.into(),
-            client: reqwest::Client::new(),
+            api_base: api_base.into(),
+            client: rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
+                rupu_netflow::Origin::Update,
+            )),
         }
     }
 }
 
-fn req(client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
+fn req(
+    client: &reqwest_middleware::ClientWithMiddleware,
+    url: &str,
+) -> reqwest_middleware::RequestBuilder {
     let mut b = client.get(url).header("User-Agent", "rupu-update");
     if let Ok(tok) = std::env::var("GITHUB_TOKEN") {
         if !tok.is_empty() {
@@ -34,7 +47,10 @@ fn req(client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
 #[async_trait::async_trait]
 impl ReleaseSource for GithubReleaseSource {
     async fn list_releases(&self) -> Result<Vec<Release>, crate::UpdateError> {
-        let url = releases_api_url(&self.owner_repo);
+        let url = format!(
+            "{}/repos/{}/releases?per_page=100",
+            self.api_base, self.owner_repo
+        );
         let resp = req(&self.client, &url)
             .send()
             .await
@@ -68,10 +84,11 @@ pub async fn download_bytes_with_progress(
     url: &str,
     mut on_progress: impl FnMut(u64, Option<u64>),
 ) -> Result<Vec<u8>, crate::UpdateError> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| crate::UpdateError::Network(e.to_string()))?;
+    let client = rupu_netflow::http::client_from(
+        rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Update),
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)),
+    )
+    .map_err(|e| crate::UpdateError::Network(e.to_string()))?;
     let mut resp = req(&client, url)
         .send()
         .await

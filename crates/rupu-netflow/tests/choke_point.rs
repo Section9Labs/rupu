@@ -76,7 +76,6 @@ const ALLOWED: &[&str] = &[
 const PENDING_PLAN_2: &[&str] = &[
     "crates/rupu-cli/src/cmd/cp.rs",
     "crates/rupu-cp/src/host/http.rs",
-    "crates/rupu-update/src/github.rs",
 ];
 
 fn repo_root() -> std::path::PathBuf {
