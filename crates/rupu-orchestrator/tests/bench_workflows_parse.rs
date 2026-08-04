@@ -37,7 +37,14 @@ fn cybergym_has_the_expected_step_shape() {
     assert_eq!(
         ids,
         vec![
-            "preflight", "plan", "gen", "solve", "verify", "collect", "render", "analyze"
+            "preflight",
+            "plan",
+            "gen",
+            "solve",
+            "verify",
+            "collect",
+            "render",
+            "analyze"
         ]
     );
 

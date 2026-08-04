@@ -10072,6 +10072,27 @@ mod dag_scheduler_golden {
         Option<serde_json::Value>,
     ) {
         match name {
+            // Benchmark workflows: every required input gets a placeholder,
+            // so any test that resolves inputs for every sample workflow
+            // still works. The golden scheduler tests skip `run:` workflows
+            // outright (see `sample_workflow_files`), but other callers of
+            // `fixture_for` do not.
+            "cybergym.yaml" => (
+                BTreeMap::from([
+                    ("task_ids_file".to_string(), "/tmp/tasks.txt".to_string()),
+                    ("data_dir".to_string(), "/tmp/cybergym-data".to_string()),
+                    (
+                        "server_url".to_string(),
+                        "http://127.0.0.1:8666".to_string(),
+                    ),
+                    ("mask_map".to_string(), "/tmp/mask_map.json".to_string()),
+                    ("verify_script".to_string(), "/tmp/verify.py".to_string()),
+                    ("run_dir".to_string(), "/tmp/cybergym-run".to_string()),
+                    ("run_salt".to_string(), "golden".to_string()),
+                ]),
+                None,
+                None,
+            ),
             "code-review-panel.yaml" => (
                 BTreeMap::from([("diff".to_string(), "+ x".to_string())]),
                 None,
@@ -10197,6 +10218,19 @@ mod dag_scheduler_golden {
             }
             let name = p.file_name().unwrap().to_str().unwrap().to_string();
             let raw = std::fs::read_to_string(&p).unwrap();
+            // Skip workflows containing `run:` steps. These golden tests
+            // EXECUTE each workflow to compare the scheduler's walk against
+            // the linear driver's, and a `run:` step would shell out to a
+            // real benchmark script — slow, environment-dependent, and
+            // irrelevant to step ORDERING, which is all this compares.
+            // `run:` dispatch has its own coverage in
+            // tests/run_step_workflow.rs.
+            if Workflow::parse(&raw)
+                .map(|wf| wf.steps.iter().any(|st| st.run.is_some()))
+                .unwrap_or(false)
+            {
+                continue;
+            }
             out.push((name, raw));
         }
         out.sort();
