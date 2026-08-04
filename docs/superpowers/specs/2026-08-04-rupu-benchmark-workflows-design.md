@@ -74,10 +74,25 @@ process. Template-rendered values are inserted as single argv elements and are n
 re-parsed by a shell. A rendered value containing `; rm -rf /` is passed as literal argument
 text.
 
-**Bindings.** Downstream templates see `steps.<id>.output` (parsed per `parse:`), plus
-`.stdout`, `.stderr`, `.exit_code`, `.success`, and `.duration_ms`. Under `for_each:`, the
-same fields are available per unit at `steps.<id>.results[i].*`, mirroring the existing
-`ItemResultRecord` shape.
+**Bindings.** Downstream templates see:
+
+| Binding | Contents |
+|---|---|
+| `steps.<id>.output` | stdout as a **string**, for every `parse:` mode |
+| `steps.<id>.json` | stdout **parsed** per `parse:` — indexable (`{{ steps.score.json.score }}`) |
+| `steps.<id>.stdout` / `.stderr` | raw streams |
+| `steps.<id>.exit_code` / `.duration_ms` | process outcome |
+| `steps.<id>.success` | exit code was in `allow_exit_codes` |
+
+The parsed value lives under `json`, **not** `output`. `output` is a `String` for every step
+kind in the engine; overloading it to sometimes hold a structured value would either change
+what `{{ steps.<id>.output }}` renders for existing workflows or force the field polymorphic
+across all kinds. A separate binding is additive and costs nothing. (Corrected during
+implementation — an earlier draft of this spec said `output` binds the parsed value, which a
+test disproved: minijinja cannot index into a string.)
+
+Under `for_each:`, the same fields are available per unit at `steps.<id>.results[i].*`,
+mirroring the existing `ItemResultRecord` shape.
 
 **Composability.** `run:` combines with `for_each:` + `max_parallel:` and with `distribute:`
 for fleet placement, so scoring N items in parallel uses the same primitive as solving them.

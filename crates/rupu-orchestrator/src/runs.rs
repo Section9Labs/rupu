@@ -609,6 +609,10 @@ pub struct StepResultRecord {
 /// round-trips byte-for-byte (same approach as `loop_iteration`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunOutcome {
+    /// stdout parsed per the step's `parse:` mode. `Value::String` for
+    /// `parse: raw`.
+    #[serde(default)]
+    pub parsed: serde_json::Value,
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,

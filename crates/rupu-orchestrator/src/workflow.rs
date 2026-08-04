@@ -1963,6 +1963,7 @@ const STEP_OUTPUT_FIELDS: &[&str] = &[
     "resolved",
     "decision",
     // `run:` step fields (Bench Plan 0)
+    "json",
     "stdout",
     "stderr",
     "exit_code",

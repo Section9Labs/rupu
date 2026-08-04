@@ -4457,6 +4457,18 @@ async fn run_node(
             Ok(FanoutStepOutcome::Completed(sr)) => Ok(sr),
             Err(e) => Err(e),
         }
+    } else if step.run.is_some() && step.for_each.is_none() {
+        // Linear `run:` step. Like action steps, it never pauses mid-run:
+        // a command either completes or fails outright.
+        execute_run_step(
+            step,
+            ctx,
+            render_mode(opts.strict_templates),
+            &opts.run_step,
+            effective_continue_on_error,
+            &opts.transcript_dir,
+        )
+        .await
     } else if step.action.is_some() {
         // Action steps never pause mid-run — a single dispatcher call is
         // either fast enough to run to completion or fails outright; no
@@ -4601,10 +4613,26 @@ fn base_context_for_step(
         ctx.steps.insert(
             sr.step_id.clone(),
             StepOutput {
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code: 0,
-                duration_ms: 0,
+                // `run:` steps publish their process outcome for
+                // downstream `{{ steps.<id>.exit_code }}` etc. Every
+                // other kind leaves these at their zero values.
+                json: sr
+                    .run_outcome
+                    .as_ref()
+                    .map(|o| o.parsed.clone())
+                    .unwrap_or(serde_json::Value::Null),
+                stdout: sr
+                    .run_outcome
+                    .as_ref()
+                    .map(|o| o.stdout.clone())
+                    .unwrap_or_default(),
+                stderr: sr
+                    .run_outcome
+                    .as_ref()
+                    .map(|o| o.stderr.clone())
+                    .unwrap_or_default(),
+                exit_code: sr.run_outcome.as_ref().map(|o| o.exit_code).unwrap_or(0),
+                duration_ms: sr.run_outcome.as_ref().map(|o| o.duration_ms).unwrap_or(0),
                 output: sr.output.clone(),
                 success: sr.success,
                 skipped: sr.skipped,
@@ -4897,6 +4925,178 @@ fn render_action_leaf(
 /// both tolerate (rather than error on) a first line that isn't
 /// `RunStart` — an action step has no agent/provider/model to put in one
 /// anyway, so a bare single-line file is the correct shape, not a gap.
+/// Execute a `run:` step: render its templates, gate it, run the command,
+/// and shape the result.
+///
+/// Rendering happens BEFORE gating on purpose — the allowlist and the
+/// operator prompt must both see the command that will actually execute,
+/// not the template that produced it.
+async fn execute_run_step(
+    step: &Step,
+    ctx: &StepContext,
+    mode: RenderMode,
+    policy: &RunStepPolicy,
+    continue_on_error: bool,
+    transcript_dir: &Path,
+) -> Result<StepResult, RunWorkflowError> {
+    use crate::run_step::{execute, gate, ResolvedRun, RunGateDecision};
+
+    let spec = step
+        .run
+        .as_ref()
+        .expect("execute_run_step called for a non-run step");
+
+    let render = |t: &str| -> Result<String, RunWorkflowError> {
+        render_step_prompt(t, ctx, mode).map_err(|source| RunWorkflowError::Render {
+            step: step.id.clone(),
+            source,
+        })
+    };
+
+    let cmd = render(&spec.cmd)?;
+    let mut args = Vec::with_capacity(spec.args.len());
+    for a in &spec.args {
+        // Each arg renders independently and becomes exactly ONE argv
+        // element — a rendered value is never re-split on whitespace.
+        args.push(render(a)?);
+    }
+    let cwd = match &spec.cwd {
+        Some(c) => PathBuf::from(render(c)?),
+        None => policy.workspace_root.clone(),
+    };
+    let mut env = std::collections::BTreeMap::new();
+    for (k, v) in &spec.env {
+        env.insert(k.clone(), render(v)?);
+    }
+
+    match gate(policy.mode, &policy.config, &cmd) {
+        RunGateDecision::Allow => {}
+        RunGateDecision::NeedsOperatorDecision => {
+            // `ask` is resolved by the CLI before the runner is entered.
+            // Reaching here means no decider was wired — refuse rather
+            // than assume approval.
+            return Err(RunWorkflowError::RunStepDenied {
+                step: step.id.clone(),
+                reason: "ask mode requires an operator decision, but no decider is wired"
+                    .to_string(),
+            });
+        }
+        RunGateDecision::Denied(reason) => {
+            return Err(RunWorkflowError::RunStepDenied {
+                step: step.id.clone(),
+                reason: reason.explain().to_string(),
+            });
+        }
+    }
+
+    let resolved = ResolvedRun {
+        cmd: cmd.clone(),
+        args: args.clone(),
+        cwd,
+        env,
+        parse: spec.parse,
+        timeout: spec.timeout_seconds.map(std::time::Duration::from_secs),
+        allow_exit_codes: spec.allow_exit_codes.clone(),
+    };
+
+    // One JSONL record so the CP / app can display a run: step's output
+    // the same way they display an agent transcript.
+    let transcript_path = transcript_dir.join(format!("run_{}.jsonl", Ulid::new()));
+
+    let out = match execute(&resolved).await {
+        Ok(out) => out,
+        Err(source) => {
+            if continue_on_error {
+                warn!(
+                    step = %step.id,
+                    error = %source,
+                    "run step failed but continue_on_error is set; proceeding"
+                );
+                return Ok(StepResult {
+                    step_id: step.id.clone(),
+                    output: String::new(),
+                    success: false,
+                    skipped: false,
+                    kind: crate::runs::StepKind::Run,
+                    transcript_path,
+                    ..Default::default()
+                });
+            }
+            return Err(RunWorkflowError::RunStep {
+                step: step.id.clone(),
+                source,
+            });
+        }
+    };
+
+    write_run_step_transcript(&transcript_path, &cmd, &args, &out);
+
+    if !out.success && !continue_on_error {
+        return Err(RunWorkflowError::RunStepDenied {
+            step: step.id.clone(),
+            reason: format!(
+                "exit code {} is not in allow_exit_codes {:?}; stderr: {}",
+                out.exit_code,
+                spec.allow_exit_codes,
+                out.stderr.trim()
+            ),
+        });
+    }
+
+    // `output` is what downstream `{{ steps.<id>.output }}` sees. For
+    // `parse: raw` that is the raw stdout; for json/lines it is the
+    // parsed value re-serialized, so template indexing works.
+    let output = match spec.parse {
+        crate::workflow::ParseMode::Raw => out.stdout.clone(),
+        _ => serde_json::to_string(&out.parsed).unwrap_or_default(),
+    };
+
+    Ok(StepResult {
+        step_id: step.id.clone(),
+        output,
+        success: out.success,
+        skipped: false,
+        kind: crate::runs::StepKind::Run,
+        transcript_path,
+        run_outcome: Some(crate::runs::RunOutcome {
+            parsed: out.parsed,
+            stdout: out.stdout,
+            stderr: out.stderr,
+            exit_code: out.exit_code,
+            duration_ms: out.duration_ms,
+        }),
+        ..Default::default()
+    })
+}
+
+/// Write a `run:` step's process outcome as a single JSONL record so the
+/// CP and app have something to render where an agent step would have a
+/// transcript. Best-effort: a transcript write failure must not fail an
+/// otherwise-successful benchmark unit.
+fn write_run_step_transcript(
+    path: &Path,
+    cmd: &str,
+    args: &[String],
+    out: &crate::run_step::RunStepOutput,
+) {
+    let record = serde_json::json!({
+        "type": "RunStep",
+        "cmd": cmd,
+        "args": args,
+        "exit_code": out.exit_code,
+        "duration_ms": out.duration_ms,
+        "stdout": out.stdout,
+        "stderr": out.stderr,
+        "success": out.success,
+    });
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(path, format!("{record}\n")) {
+        warn!(path = %path.display(), error = %e, "failed to write run step transcript");
+    }
+}
+
 async fn execute_action_step(
     dispatcher: &rupu_mcp::ToolDispatcher,
     step: &Step,
