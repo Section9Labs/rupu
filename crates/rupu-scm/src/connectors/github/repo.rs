@@ -31,7 +31,7 @@ impl RepoConnector for GithubRepoConnector {
         let _permit = self.client.permit().await;
         let inner = self.client.inner.clone();
         self.client
-            .with_retry(|| {
+            .with_retry_octocrab(|| {
                 let inner = inner.clone();
                 async move {
                     let pages = inner
@@ -61,7 +61,7 @@ impl RepoConnector for GithubRepoConnector {
         let repo = r.repo.clone();
         let model = self
             .client
-            .with_retry(|| {
+            .with_retry_octocrab(|| {
                 let inner = inner.clone();
                 let owner = owner.clone();
                 let repo = repo.clone();
@@ -85,7 +85,7 @@ impl RepoConnector for GithubRepoConnector {
         let owner = r.owner.clone();
         let repo = r.repo.clone();
         self.client
-            .with_retry(|| {
+            .with_retry_octocrab(|| {
                 let inner = inner.clone();
                 let owner = owner.clone();
                 let repo = repo.clone();
@@ -126,7 +126,7 @@ impl RepoConnector for GithubRepoConnector {
         let name_owned = name.to_string();
         let sha_owned = from_sha.to_string();
         self.client
-            .with_retry(|| {
+            .with_retry_octocrab(|| {
                 let inner = inner.clone();
                 let owner = owner.clone();
                 let repo = repo.clone();
@@ -165,7 +165,7 @@ impl RepoConnector for GithubRepoConnector {
         let ref_owned = ref_.map(|s| s.to_string());
         let mut items = self
             .client
-            .with_retry(|| {
+            .with_retry_octocrab(|| {
                 let inner = inner.clone();
                 let owner = owner.clone();
                 let repo = repo.clone();
@@ -207,7 +207,7 @@ impl RepoConnector for GithubRepoConnector {
         let repo_ref = r.clone();
         let state = filter.state;
         self.client
-            .with_retry(|| {
+            .with_retry_octocrab(|| {
                 let inner = inner.clone();
                 let owner = owner.clone();
                 let repo = repo.clone();
@@ -248,7 +248,7 @@ impl RepoConnector for GithubRepoConnector {
         let number = p.number;
         let pr = self
             .client
-            .with_retry(|| {
+            .with_retry_octocrab(|| {
                 let inner = inner.clone();
                 let owner = owner.clone();
                 let repo = repo.clone();
@@ -270,7 +270,7 @@ impl RepoConnector for GithubRepoConnector {
         let inner = self.client.inner.clone();
         let patch = self
             .client
-            .with_retry(|| {
+            .with_retry_octocrab(|| {
                 let inner = inner.clone();
                 let path = path.clone();
                 async move {
@@ -323,7 +323,7 @@ impl RepoConnector for GithubRepoConnector {
         let body = body.to_string();
         let model = self
             .client
-            .with_retry(|| {
+            .with_retry_octocrab(|| {
                 let inner = inner.clone();
                 let owner = owner.clone();
                 let repo = repo.clone();
@@ -353,7 +353,7 @@ impl RepoConnector for GithubRepoConnector {
         let repo_ref = r.clone();
         let pr = self
             .client
-            .with_retry(|| {
+            .with_retry_octocrab(|| {
                 let inner = inner.clone();
                 let owner = owner.clone();
                 let repo = repo.clone();
@@ -378,7 +378,7 @@ impl RepoConnector for GithubRepoConnector {
         let path = format!("/repos/{}/{}/collaborators/{}", r.owner, r.repo, login);
         let inner = self.client.inner.clone();
         self.client
-            .with_retry(|| {
+            .with_retry_octocrab(|| {
                 let inner = inner.clone();
                 let path = path.clone();
                 async move {
@@ -414,7 +414,7 @@ impl RepoConnector for GithubRepoConnector {
         let number = p.number;
         let labels = labels.to_vec();
         self.client
-            .with_retry(|| {
+            .with_retry_octocrab(|| {
                 let inner = inner.clone();
                 let owner = owner.clone();
                 let repo = repo.clone();

@@ -38,6 +38,11 @@ pub struct GithubClient {
     timeout: Duration,
     /// `[scm.github].clone_protocol` (ISSUES.md I-16).
     clone_protocol: CloneProtocol,
+    /// Host this client talks to. Derived once from `graphql_url` so a
+    /// GitHub Enterprise install is recorded as itself, not hardcoded as
+    /// `api.github.com`. Computed once at construction — `with_retry_octocrab`
+    /// needs a `&str` per attempt and must not derive or leak one per call.
+    host_label: String,
 }
 
 struct CacheEntry {
@@ -64,6 +69,10 @@ impl GithubClient {
     pub fn with_options(token: String, opts: &ScmClientOptions) -> Self {
         let graphql_url =
             graphql_url_for(opts.base_url.as_deref()).expect("valid github graphql url");
+        let host_label = Url::parse(&graphql_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_else(|| "api.github.com".to_string());
         let mut builder = Octocrab::builder()
             .personal_token(token.clone())
             .set_connect_timeout(Some(opts.timeout))
@@ -84,7 +93,15 @@ impl GithubClient {
             cache,
             timeout: opts.timeout,
             clone_protocol: opts.clone_protocol,
+            host_label,
         }
+    }
+
+    /// The host this client talks to (e.g. `api.github.com`, or a GitHub
+    /// Enterprise install's domain). Computed once at construction from
+    /// `graphql_url` — see the `host_label` field doc.
+    pub(crate) fn host_label(&self) -> &str {
+        &self.host_label
     }
 
     /// The configured clone protocol, read by `GithubRepoConnector::clone_to`.
@@ -255,14 +272,57 @@ impl GithubClient {
     /// Run `f` with retry-with-backoff. Recoverable RateLimited /
     /// Transient errors are retried up to MAX_RETRIES with exponential
     /// jitter (cap 60s). Unrecoverable errors abort immediately.
-    pub async fn with_retry<F, Fut, T>(&self, mut f: F) -> Result<T, ScmError>
+    ///
+    /// Does NOT emit a netflow record per attempt. The one caller that
+    /// uses this directly — `graphql_json` — already sends its request
+    /// through `rupu_netflow::http::client_from`, which records an
+    /// accurate `Fidelity::Http` entry per real send via the netflow
+    /// middleware. Recording a second, less-precise `Coarse` entry here
+    /// for the same connection would duplicate data, not complement it.
+    /// Octocrab-backed callers, whose transport genuinely is invisible to
+    /// us, use `with_retry_octocrab` below instead.
+    pub async fn with_retry<F, Fut, T>(&self, f: F) -> Result<T, ScmError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, ScmError>>,
+    {
+        self.retry_loop(f, false).await
+    }
+
+    /// As `with_retry`, but also records one `Fidelity::Coarse` flow (see
+    /// `coarse_flow`) per attempt — every octocrab-backed call site uses
+    /// this, since `octocrab` owns its own hyper/tower stack and this
+    /// retry boundary is the only place we can observe those attempts at
+    /// all. One record per attempt, not per logical call: a retried call
+    /// is a real repeated connection.
+    pub async fn with_retry_octocrab<F, Fut, T>(&self, f: F) -> Result<T, ScmError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, ScmError>>,
+    {
+        self.retry_loop(f, true).await
+    }
+
+    async fn retry_loop<F, Fut, T>(&self, mut f: F, record_coarse: bool) -> Result<T, ScmError>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<T, ScmError>>,
     {
         let mut attempt: u32 = 0;
         loop {
-            match f().await {
+            let attempt_started = Instant::now();
+            let result = f().await;
+            if record_coarse {
+                rupu_netflow::http::sink()
+                    .record(coarse_flow(
+                        self.host_label(),
+                        "*",
+                        result.is_ok(),
+                        attempt_started.elapsed().as_millis() as u64,
+                    ))
+                    .await;
+            }
+            match result {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     let is_retryable =
@@ -281,6 +341,48 @@ impl GithubClient {
                 }
             }
         }
+    }
+}
+
+/// Build a `Coarse`-fidelity record for one `octocrab` attempt.
+///
+/// `octocrab` owns its own hyper/tower stack, so bytes, peer IP and raw
+/// status are genuinely unavailable here. They stay `None` — the
+/// `Fidelity::Coarse` marker is how a view knows the difference between
+/// "zero bytes" and "we could not see the bytes". `method` and `path` are
+/// `"*"` for the same reason: `with_retry_octocrab` is generic over the
+/// closure and does not know the verb or the route it retried.
+pub fn coarse_flow(
+    host: &str,
+    path: &str,
+    success: bool,
+    duration_ms: u64,
+) -> rupu_netflow::FlowRecord {
+    rupu_netflow::FlowRecord {
+        id: rupu_netflow::FlowId::new(),
+        ts: chrono::Utc::now(),
+        ctx: rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm("github".into())),
+        fidelity: rupu_netflow::Fidelity::Coarse,
+        method: "*".into(),
+        scheme: "https".into(),
+        host: host.to_string(),
+        port: 443,
+        path: path.to_string(),
+        peer_ip: None,
+        resolved_ips: Vec::new(),
+        http_version: None,
+        status: None,
+        outcome: if success {
+            rupu_netflow::Outcome::Ok
+        } else {
+            rupu_netflow::Outcome::TransportError
+        },
+        error: None,
+        bytes_out: None,
+        bytes_in: None,
+        body_complete: true,
+        ttfb_ms: None,
+        duration_ms: Some(duration_ms),
     }
 }
 
