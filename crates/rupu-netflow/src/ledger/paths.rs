@@ -60,6 +60,15 @@ impl NetflowPaths {
     /// are atomic (no separate `exists()` + `write()` TOCTOU window);
     /// an `AlreadyExists` error means the file is already there, which
     /// is success for our purposes, not a failure to propagate.
+    ///
+    /// Note this intentionally does *not* re-validate or heal an
+    /// existing `.gitignore`, even one that is empty or lacks the `*`
+    /// pattern (e.g. a user deliberately cleared it): requirement 1 is
+    /// "never clobber a file the user may have customised", and an
+    /// empty file is a valid customisation, not corruption, from
+    /// `ensure_dir`'s point of view. See `write_all`'s error arm below
+    /// for the one case this crate itself can produce that *does* need
+    /// cleaning up.
     fn ensure_self_ignore(&self) -> std::io::Result<()> {
         let gitignore = self.root.join(".gitignore");
         match std::fs::OpenOptions::new()
@@ -67,7 +76,24 @@ impl NetflowPaths {
             .create_new(true)
             .open(&gitignore)
         {
-            Ok(mut file) => file.write_all(NETFLOW_GITIGNORE.as_bytes()),
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(NETFLOW_GITIGNORE.as_bytes()) {
+                    // `create_new` already succeeded, so a 0-byte (or
+                    // partially written) file is sitting on disk. Left
+                    // alone, every future call would hit `AlreadyExists`
+                    // below and treat that corpse as "already
+                    // protected" forever — silently reintroducing the
+                    // exact leak this function exists to close, just
+                    // one layer down. Best-effort delete it so the next
+                    // call retries `create_new` cleanly; if the cleanup
+                    // itself fails there's nothing further to do, so
+                    // its result is deliberately ignored and the
+                    // original write error is what gets surfaced.
+                    let _ = std::fs::remove_file(&gitignore);
+                    return Err(e);
+                }
+                Ok(())
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
             Err(e) => Err(e),
         }
@@ -139,6 +165,31 @@ mod tests {
 
         let contents = std::fs::read_to_string(&gitignore).unwrap();
         assert_eq!(contents, "# user customised this\n!flows.jsonl\n");
+    }
+
+    /// An existing but empty (or otherwise pattern-less) `.gitignore` is a
+    /// distinct case from a customised one, but gets the same treatment:
+    /// `ensure_dir` does not heal or rewrite it. A user may have
+    /// deliberately emptied the file, and clobbering user files is exactly
+    /// what requirement 1 forbids — `ensure_self_ignore`'s `remove_file`
+    /// cleanup only ever fires on a file *this crate* just created and
+    /// failed to finish writing, never on a pre-existing file it didn't
+    /// create.
+    #[test]
+    fn ensure_dir_leaves_a_preexisting_empty_gitignore_untouched() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = NetflowPaths::new(tmp.path());
+        std::fs::create_dir_all(&paths.root).unwrap();
+        let gitignore = paths.root.join(".gitignore");
+        std::fs::write(&gitignore, "").unwrap();
+
+        paths.ensure_dir().unwrap();
+
+        let contents = std::fs::read_to_string(&gitignore).unwrap();
+        assert_eq!(
+            contents, "",
+            "a pre-existing empty .gitignore must not be rewritten"
+        );
     }
 
     /// The strongest test of the actual property: run `ensure_dir` inside a
