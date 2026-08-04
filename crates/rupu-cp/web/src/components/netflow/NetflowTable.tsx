@@ -10,7 +10,11 @@
 //   - The fidelity badge is unconditional: every row gets one, so a Coarse
 //     row never LOOKS as complete as an HTTP row.
 //   - `dropped > 0` gets a loud banner — the list is silently incomplete
-//     without it, which is the exact defect this subsystem prevents.
+//     without it, which is the exact defect this subsystem prevents. This
+//     banner renders even when `flows` is empty (an all-dropped scope):
+//     the empty state and the loss banner are not mutually exclusive, and
+//     showing only the empty state there would be the same silent-loss
+//     defect in its worst form.
 //   - `asnLoaded === false` gets its own note: a blank Network column would
 //     read as "this peer has no ASN", not "enrichment wasn't available".
 //   - The empty state states netflow's scope limit (rupu's own egress, not
@@ -36,13 +40,40 @@ function originLabel(f: FlowView): string {
   return f.ctx.origin.name ?? f.ctx.origin.kind;
 }
 
+/**
+ * `dropped > 0` banner — factored out so it renders identically whether the
+ * surviving-flows list is empty or not. Fix round 1: this used to live only
+ * in the non-empty return path, so a scope where EVERY flow was dropped
+ * rendered a bare "No network flows recorded" with zero indication that
+ * anything was lost — the exact silent-incompleteness defect this banner
+ * exists to prevent, reachable in the one case (all-dropped) where it
+ * matters most. The empty state and the loss banner are not mutually
+ * exclusive; the loss is the more important of the two, so it renders
+ * first.
+ */
+function DroppedBanner({ dropped }: { dropped: number }) {
+  if (dropped <= 0) return null;
+  return (
+    <div
+      role="status"
+      className="rounded-lg border border-warn/30 bg-warn-bg px-4 py-2 text-sm text-warn"
+    >
+      <span className="font-medium">{dropped} flows dropped</span> — the capture buffer
+      overflowed, so this list is incomplete.
+    </div>
+  );
+}
+
 export function NetflowTable({ flows, dropped, asnLoaded }: NetflowTableProps) {
   if (flows.length === 0) {
     return (
-      <EmptyState
-        title="No network flows recorded for this scope"
-        hint="Netflow covers rupu's own egress — provider APIs, SCM connectors, MCP and webhooks. It does not cover traffic from the agent's bash subprocess."
-      />
+      <div className="space-y-3">
+        <DroppedBanner dropped={dropped} />
+        <EmptyState
+          title="No network flows recorded for this scope"
+          hint="Netflow covers rupu's own egress — provider APIs, SCM connectors, MCP and webhooks. It does not cover traffic from the agent's bash subprocess."
+        />
+      </div>
     );
   }
 
@@ -137,15 +168,7 @@ export function NetflowTable({ flows, dropped, asnLoaded }: NetflowTableProps) {
 
   return (
     <div className="space-y-3">
-      {dropped > 0 && (
-        <div
-          role="status"
-          className="rounded-lg border border-warn/30 bg-warn-bg px-4 py-2 text-sm text-warn"
-        >
-          <span className="font-medium">{dropped} flows dropped</span> — the capture buffer
-          overflowed, so this list is incomplete.
-        </div>
-      )}
+      <DroppedBanner dropped={dropped} />
       {!asnLoaded && (
         <p className="text-note text-ink-mute">
           ASN data not loaded — network enrichment will appear once the table has been fetched.

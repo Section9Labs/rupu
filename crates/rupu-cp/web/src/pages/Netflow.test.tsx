@@ -52,7 +52,11 @@ describe('Netflow global page', () => {
     await waitFor(() => expect(screen.getAllByText('api.github.com').length).toBeGreaterThan(0));
   });
 
-  it('surfaces dropped flows at global scope', async () => {
+  it('surfaces the dropped count at global scope, even when every flow was dropped', async () => {
+    // Fix round 1: this test used to assert only the empty-state text,
+    // which passed even when the dropped count silently vanished — the
+    // name overclaimed what it verified. NetflowTable now renders the
+    // dropped banner alongside the empty state rather than instead of it.
     fetchGlobalNetflow.mockResolvedValue({ flows: [], hosts: [], dropped: 9, asn_loaded: true });
     fetchNetflowGraph.mockResolvedValue({ nodes: [], edges: [] });
 
@@ -60,6 +64,7 @@ describe('Netflow global page', () => {
     await waitFor(() =>
       expect(screen.getByText(/No network flows recorded/i)).toBeInTheDocument(),
     );
+    expect(screen.getByText(/9 flows dropped/i)).toBeInTheDocument();
   });
 
   it('fetches global scope by omitting the scope param entirely', async () => {

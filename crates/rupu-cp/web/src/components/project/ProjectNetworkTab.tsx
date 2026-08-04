@@ -17,6 +17,15 @@
 // run-scoped Network tab uses: graph, summary, table) precisely so its
 // "renders nothing when hosts is empty" behavior is never orphaned without
 // explanation — NetflowTable's own empty state covers that case for both.
+//
+// Fix round 1: the scope-limit/non-HTTP-blind-spot disclosure that
+// pages/Netflow.tsx states unconditionally used to be missing here — a
+// project's Network tab is one of the three surfaces where a viewer forms
+// a mental model of what this subsystem covers (run / project / global),
+// and NetflowTable's own hint only fires on its empty branch, so a project
+// with real traffic never showed it anywhere. Restated verbatim (the
+// wording carries no scope-specific claim) rather than paraphrased, so the
+// two disclosures can't drift apart.
 
 import { useEffect, useState } from 'react';
 import NetflowGraph from '../netflow/NetflowGraph';
@@ -51,6 +60,12 @@ export default function ProjectNetworkTab({ wsId }: { wsId: string }) {
 
   return (
     <div className="space-y-4">
+      <p className="text-note text-ink-mute max-w-2xl">
+        This covers rupu&apos;s own egress — provider APIs, SCM connectors, MCP, webhooks, the
+        updater, and CP fleet traffic — never traffic from the agent&apos;s bash subprocess. It
+        also can&apos;t see non-HTTP egress: git2 clones (often a run&apos;s largest byte volume),
+        object_store bucket traffic, and the node WebSocket are invisible here too.
+      </p>
       {graph && <NetflowGraph graph={graph} />}
       {data && <NetflowSummary hosts={data.hosts} />}
       {data && (

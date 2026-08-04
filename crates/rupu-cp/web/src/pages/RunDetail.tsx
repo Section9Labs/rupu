@@ -348,11 +348,24 @@ export default function RunDetail() {
 
   // Lazy-load this run's flows the first time the Network tab is opened.
   // Keyed on (id, tab); the ref guard ensures a single fetch per run id.
+  // `cancelled` mirrors the findings effect above it: RunDetail doesn't
+  // unmount across a same-route run switch (see the sidebar/`<Link>`
+  // navigation the existing tests exercise), so a slow fetch for the
+  // previous run id can resolve after `id` has already moved on and
+  // clobber the new run's state with stale data without this guard.
   useEffect(() => {
     if (!id || tab !== 'netflow' || netflowRequestedRef.current) return;
     netflowRequestedRef.current = true;
-    fetchRunNetflow(id).then(setNetflow).catch(() => setNetflow(null));
-    fetchNetflowGraph(`run:${id}`).then(setNetflowGraph).catch(() => setNetflowGraph(null));
+    let cancelled = false;
+    fetchRunNetflow(id)
+      .then((d) => { if (!cancelled) setNetflow(d); })
+      .catch(() => { if (!cancelled) setNetflow(null); });
+    fetchNetflowGraph(`run:${id}`)
+      .then((g) => { if (!cancelled) setNetflowGraph(g); })
+      .catch(() => { if (!cancelled) setNetflowGraph(null); });
+    return () => {
+      cancelled = true;
+    };
   }, [id, tab]);
 
   // ONE SSE subscription per open run — shared by graph + feed.

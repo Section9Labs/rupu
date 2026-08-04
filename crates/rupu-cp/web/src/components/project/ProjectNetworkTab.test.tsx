@@ -54,10 +54,6 @@ describe('ProjectNetworkTab', () => {
   });
 
   it('surfaces a non-zero dropped count alongside surviving flows', async () => {
-    // NetflowTable's dropped banner only renders on the non-empty path (an
-    // all-dropped fetch falls through to its EmptyState instead — see
-    // Netflow.test.tsx's "surfaces dropped flows at global scope" for that
-    // established contract), so this exercises the banner with >=1 flow.
     fetchProjectNetflow.mockResolvedValue({
       flows: [
         {
@@ -78,6 +74,47 @@ describe('ProjectNetworkTab', () => {
     render(<ProjectNetworkTab wsId="ws-1" />);
 
     await waitFor(() => expect(screen.getByText(/4 flows dropped/i)).toBeInTheDocument());
+  });
+
+  it('surfaces a non-zero dropped count even when every flow was dropped', async () => {
+    // Fix round 1: NetflowTable's dropped banner now renders alongside its
+    // empty state rather than being unreachable behind it.
+    fetchProjectNetflow.mockResolvedValue({ flows: [], hosts: [], dropped: 6, asn_loaded: true });
+    fetchNetflowGraph.mockResolvedValue({ nodes: [], edges: [] });
+
+    render(<ProjectNetworkTab wsId="ws-1" />);
+
+    await waitFor(() => expect(screen.getByText(/6 flows dropped/i)).toBeInTheDocument());
+    expect(screen.getByText(/No network flows recorded/i)).toBeInTheDocument();
+  });
+
+  it('states the scope limit and the non-HTTP blind spot even when flows exist', async () => {
+    // Fix round 1: this disclosure used to be missing from the project
+    // panel entirely — NetflowTable's own hint only fires on its empty
+    // branch, so a project with real traffic (the common case) never
+    // showed it. Asserted here unconditionally, i.e. with non-empty flows.
+    fetchProjectNetflow.mockResolvedValue({
+      flows: [
+        {
+          id: '1', ts: '2026-08-03T00:00:00Z',
+          ctx: { origin: { kind: 'provider', name: 'anthropic' } },
+          fidelity: 'http', method: 'POST', scheme: 'https',
+          host: 'api.anthropic.com', port: 443, path: '/v1/messages',
+          outcome: 'ok', body_complete: true,
+          bytes_in: 200, bytes_out: 50, duration_ms: 340,
+        },
+      ],
+      hosts: [{ host: 'api.anthropic.com', port: 443, calls: 1, bytes_in: 200, bytes_out: 50, errors: 0 }],
+      dropped: 0,
+      asn_loaded: true,
+    });
+    fetchNetflowGraph.mockResolvedValue({ nodes: [], edges: [] });
+
+    render(<ProjectNetworkTab wsId="ws-1" />);
+
+    expect(screen.getByText(/bash subprocess/i)).toBeInTheDocument();
+    expect(screen.getByText(/git2|object.store|WebSocket/i)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getAllByText('api.anthropic.com').length).toBeGreaterThan(0));
   });
 
   it('re-fetches when wsId changes', async () => {

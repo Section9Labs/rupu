@@ -82,4 +82,14 @@ describe('NetflowTable', () => {
     expect(screen.getByText(/No network flows recorded/i)).toBeInTheDocument();
     expect(screen.getByText(/does not cover.*subprocess/i)).toBeInTheDocument();
   });
+
+  it('surfaces a non-zero dropped count even when every flow was dropped', () => {
+    // Fix round 1: the empty-flows branch used to return EmptyState alone,
+    // so an all-dropped scope silently under-reported — exactly the defect
+    // the dropped banner exists to prevent, in its worst form (total loss
+    // reads as "nothing happened" rather than "everything was lost").
+    render(<NetflowTable flows={[]} dropped={9} asnLoaded />);
+    expect(screen.getByText(/9 flows dropped/i)).toBeInTheDocument();
+    expect(screen.getByText(/No network flows recorded/i)).toBeInTheDocument();
+  });
 });
