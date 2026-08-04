@@ -42,6 +42,7 @@ import CyclesTab from '../components/run/CyclesTab';
 import NetflowTable from '../components/netflow/NetflowTable';
 import NetflowSummary from '../components/netflow/NetflowSummary';
 import NetflowGraph from '../components/netflow/NetflowGraph';
+import { NetflowScopeDisclosure } from '../components/netflow/ScopeDisclosure';
 import { fetchNetflowGraph, fetchRunNetflow, type GraphView, type NetflowResponse } from '../lib/netflow';
 import { buildRunGraphModel, type GraphNode, type RunGraphModel } from '../lib/runGraphModel';
 import { layoutGraph, type Pos } from '../lib/graphLayout';
@@ -171,6 +172,7 @@ export default function RunDetail() {
   // opened, same contract as findings above. `null` = not yet loaded / loading.
   const [netflow, setNetflow] = useState<NetflowResponse | null>(null);
   const [netflowGraph, setNetflowGraph] = useState<GraphView | null>(null);
+  const [netflowError, setNetflowError] = useState<string | null>(null);
   const netflowRequestedRef = useRef(false);
 
   // Autoflow-history context — `null` means either "not fetched yet" or "this
@@ -256,6 +258,7 @@ export default function RunDetail() {
     findingsRequestedRef.current = false;
     setNetflow(null);
     setNetflowGraph(null);
+    setNetflowError(null);
     netflowRequestedRef.current = false;
     setAutoflowCtx(null);
 
@@ -357,12 +360,21 @@ export default function RunDetail() {
     if (!id || tab !== 'netflow' || netflowRequestedRef.current) return;
     netflowRequestedRef.current = true;
     let cancelled = false;
-    fetchRunNetflow(id)
-      .then((d) => { if (!cancelled) setNetflow(d); })
-      .catch(() => { if (!cancelled) setNetflow(null); });
-    fetchNetflowGraph(`run:${id}`)
-      .then((g) => { if (!cancelled) setNetflowGraph(g); })
-      .catch(() => { if (!cancelled) setNetflowGraph(null); });
+    // Combined into one `Promise.all` (Fix 6, netflow Plan 3 review round
+    // 3) — previously each fetch independently swallowed its own failure
+    // into a `null`, so e.g. an unreachable host (`RunLocation::Host`)
+    // produced a permanently blank panel with no message and no retry.
+    // Mirrors pages/Netflow.tsx and ProjectNetworkTab.tsx's identical fix.
+    Promise.all([fetchRunNetflow(id), fetchNetflowGraph(`run:${id}`)])
+      .then(([d, g]) => {
+        if (cancelled) return;
+        setNetflow(d);
+        setNetflowGraph(g);
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setNetflowError(e instanceof Error ? e.message : 'Failed to load network flows');
+      });
     return () => {
       cancelled = true;
     };
@@ -1271,14 +1283,21 @@ export default function RunDetail() {
         )}
         {tab === 'netflow' && (
           <div className="h-full min-h-0 space-y-4 overflow-auto">
-            {netflowGraph && <NetflowGraph graph={netflowGraph} />}
-            {netflow && <NetflowSummary hosts={netflow.hosts} />}
-            {netflow && (
-              <NetflowTable
-                flows={netflow.flows}
-                dropped={netflow.dropped}
-                asnLoaded={netflow.asn_loaded}
-              />
+            <NetflowScopeDisclosure />
+            {netflowError ? (
+              <p className="text-sm text-err">{netflowError}</p>
+            ) : netflow === null ? (
+              <p className="text-sm text-ink-dim">Loading network flows…</p>
+            ) : (
+              <>
+                {netflowGraph && <NetflowGraph graph={netflowGraph} />}
+                <NetflowSummary hosts={netflow.hosts} />
+                <NetflowTable
+                  flows={netflow.flows}
+                  dropped={netflow.dropped}
+                  asnLoaded={netflow.asn_loaded}
+                />
+              </>
             )}
           </div>
         )}

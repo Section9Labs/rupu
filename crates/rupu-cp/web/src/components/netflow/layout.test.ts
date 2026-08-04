@@ -30,10 +30,10 @@ describe('layoutBipartite', () => {
     expect(new Set(ys).size).toBe(ys.length);
   });
 
-  it('scales edge weight by the chosen metric', () => {
-    const byCalls = layoutBipartite(graph, { width: 800, rowHeight: 40, weightBy: 'calls' });
-    const heavy = byCalls.edges.find((e) => e.from === 'run-1')!;
-    const light = byCalls.edges.find((e) => e.from === 'run-2')!;
+  it('scales edge weight by call count', () => {
+    const out = layoutBipartite(graph, { width: 800, rowHeight: 40 });
+    const heavy = out.edges.find((e) => e.from === 'run-1')!;
+    const light = out.edges.find((e) => e.from === 'run-2')!;
     expect(heavy.width).toBeGreaterThan(light.width);
   });
 
@@ -50,9 +50,8 @@ describe('layoutBipartite', () => {
   });
 
   it('falls back to the minimum stroke width when every edge weighs zero', () => {
-    // All-Coarse data is a real case: GraphEdge.bytes sums bytes_in/out with
-    // unwrap_or(0), so a Coarse flow contributes 0 and every edge in a
-    // Coarse-only scope has weight 0. maxWeight must not become a divisor.
+    // Defensive: `calls` is normally >= 1 for any edge that exists at all,
+    // but maxWeight must still not become a divisor if it somehow isn't.
     const zeroGraph: GraphView = {
       nodes: [
         { id: 'run-1', label: 'run-1', side: 'source' },
@@ -60,7 +59,7 @@ describe('layoutBipartite', () => {
       ],
       edges: [{ from: 'run-1', to: 'host:443', calls: 0, bytes: 0, errors: 0 }],
     };
-    const out = layoutBipartite(zeroGraph, { width: 800, rowHeight: 40, weightBy: 'bytes' });
+    const out = layoutBipartite(zeroGraph, { width: 800, rowHeight: 40 });
     expect(out.edges[0].width).toBe(1);
     expect(Number.isFinite(out.edges[0].width)).toBe(true);
   });

@@ -72,6 +72,12 @@ pub struct AppState {
     /// token directly), so it can never be echoed back through the config
     /// API.
     pub token_set: bool,
+    /// Process-wide cache of the parsed ASN table (Fix 5, netflow Plan 3
+    /// review round 3) — see [`crate::api::netflow::AsnCache`]'s doc comment
+    /// for why every netflow-read handler goes through this instead of
+    /// re-reading and re-parsing the multi-megabyte table file on every
+    /// request.
+    pub asn_cache: Arc<crate::api::netflow::AsnCache>,
 }
 
 impl AppState {
@@ -129,6 +135,7 @@ impl AppState {
             node_mirror,
             bind: "127.0.0.1:7878".to_string(),
             token_set: false,
+            asn_cache: Arc::new(crate::api::netflow::AsnCache::default()),
         }
     }
 

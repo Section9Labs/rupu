@@ -35,10 +35,12 @@ describe('NetflowGraph', () => {
     expect(document.querySelector('svg')).not.toBeInTheDocument();
   });
 
-  it('never surfaces GraphEdge.bytes as a byte count, even for a zero-weight edge', () => {
+  it('never surfaces GraphEdge.bytes as a byte count, even for a Coarse (bytes: 0) edge', () => {
     // A Coarse-only flow has bytes: 0 (see GraphEdge.bytes doc in
-    // lib/netflow.ts) — the edge must still render (thin), and the number
-    // 0 must never appear as a rendered "0 B"-style claim anywhere.
+    // lib/netflow.ts). Edge width is scaled by `calls` only (Fix 4 removed
+    // the bytes-weighting control entirely) — the edge still renders, and
+    // the number 0 must never appear as a rendered "0 B"-style claim
+    // anywhere regardless.
     const coarseGraph: GraphView = {
       nodes: [
         { id: 'run-1', label: 'run-1', side: 'source' },
@@ -46,7 +48,7 @@ describe('NetflowGraph', () => {
       ],
       edges: [{ from: 'run-1', to: 'host:443', calls: 1, bytes: 0, errors: 0 }],
     };
-    const { container } = render(<NetflowGraph graph={coarseGraph} weightBy="bytes" />);
+    const { container } = render(<NetflowGraph graph={coarseGraph} />);
     expect(container.querySelectorAll('line')).toHaveLength(1);
     expect(screen.queryByText(/0 B/)).not.toBeInTheDocument();
   });

@@ -35,11 +35,6 @@ export interface PositionedGraph {
 export interface LayoutOpts {
   width: number;
   rowHeight: number;
-  /** Which `GraphEdge` field drives stroke width. Defaults to `calls`
-   *  because `bytes` is 0 for Coarse-fidelity flows (see `GraphEdge.bytes`
-   *  doc in `lib/netflow.ts`) — `calls` stays meaningful even when a scope
-   *  is entirely Coarse. */
-  weightBy?: 'calls' | 'bytes';
 }
 
 const PAD_X = 140;
@@ -48,9 +43,17 @@ const MIN_W = 1;
 const MAX_W = 8;
 
 /** Two columns: sources left, endpoints right. Not a DAG layout —
- *  netflow topology is bipartite by construction. */
+ *  netflow topology is bipartite by construction.
+ *
+ *  Edge stroke width is always scaled by call count, never by bytes (Fix 4,
+ *  netflow Plan 3 review round 3): a Coarse-fidelity flow's `bytes` sums to
+ *  0 (see `GraphEdge.bytes` doc in `lib/netflow.ts`), so weighting by bytes
+ *  drew those edges at the same minimum width as a genuinely tiny transfer
+ *  — the one place in the UI where "unobservable" rendered as a quantity
+ *  instead of an absence. `calls` has no such gap: every edge that exists
+ *  had at least one call. */
 export function layoutBipartite(graph: GraphView, opts: LayoutOpts): PositionedGraph {
-  const { width, rowHeight, weightBy = 'calls' } = opts;
+  const { width, rowHeight } = opts;
 
   const sources = graph.nodes.filter((n) => n.side === 'source');
   const endpoints = graph.nodes.filter((n) => n.side === 'endpoint');
@@ -64,19 +67,16 @@ export function layoutBipartite(graph: GraphView, opts: LayoutOpts): PositionedG
   ];
   const byId = new Map(positioned.map((n) => [n.id, n]));
 
-  const maxWeight = graph.edges.reduce(
-    (m, e) => Math.max(m, weightBy === 'bytes' ? e.bytes : e.calls),
-    0,
-  );
+  const maxWeight = graph.edges.reduce((m, e) => Math.max(m, e.calls), 0);
 
   const edges: PositionedEdge[] = graph.edges.flatMap((e) => {
     const a = byId.get(e.from);
     const b = byId.get(e.to);
     if (!a || !b) return [];
-    const w = weightBy === 'bytes' ? e.bytes : e.calls;
-    // maxWeight is 0 when every edge is 0 (a real case: an all-Coarse scope
-    // has bytes=0 on every edge, see GraphEdge.bytes) — keep the minimum
-    // width rather than dividing by zero / producing NaN.
+    const w = e.calls;
+    // maxWeight is 0 when every edge has 0 calls (an empty graph's edge
+    // list, or defensively for malformed data) — keep the minimum width
+    // rather than dividing by zero / producing NaN.
     const scaled = maxWeight > 0 ? MIN_W + (w / maxWeight) * (MAX_W - MIN_W) : MIN_W;
     return [
       {

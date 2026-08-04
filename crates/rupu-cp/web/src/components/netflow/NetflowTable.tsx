@@ -25,6 +25,7 @@ import { formatBytes, type FlowView } from '../../lib/netflow';
 import SortableTable, { type Column } from '../lists/SortableTable';
 import { EmptyState } from '../ui/EmptyState';
 import { FidelityBadge } from './FidelityBadge';
+import { NETFLOW_COVERAGE_LIST } from './ScopeDisclosure';
 
 export interface NetflowTableProps {
   flows: FlowView[];
@@ -71,7 +72,7 @@ export function NetflowTable({ flows, dropped, asnLoaded }: NetflowTableProps) {
         <DroppedBanner dropped={dropped} />
         <EmptyState
           title="No network flows recorded for this scope"
-          hint="Netflow covers rupu's own egress — provider APIs, SCM connectors, MCP and webhooks. It does not cover traffic from the agent's bash subprocess."
+          hint={`Netflow covers rupu's own egress — ${NETFLOW_COVERAGE_LIST}. It does not cover traffic from the agent's bash subprocess.`}
         />
       </div>
     );

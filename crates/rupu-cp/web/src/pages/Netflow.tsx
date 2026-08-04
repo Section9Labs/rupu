@@ -2,27 +2,26 @@
 // across every run, plus `system`-origin traffic (updater, ASN refresh, CP
 // fleet traffic) that carries no run_id and therefore never surfaces on a
 // per-run Network tab or a workflow page (flows belong to a run, never to a
-// workflow *definition* — nothing netflow-shaped is mounted there).
+// workflow *definition* — nothing netflow-shaped is mounted there). This is
+// also the ONE scope that reads the CP daemon's own global ledger
+// (`$RUPU_HOME/netflow/flows.jsonl`) alongside every registered workspace's
+// — see `rupu_cp::api::netflow::read_all_workspaces_sync`'s doc comment
+// (Fix 1, netflow Plan 3 review round 3).
 //
 // This is the one place a viewer forms their mental model of what this
-// subsystem covers, so the two honesty notes below are load-bearing, not
-// decoration:
-//   1. Scope limit — netflow only sees rupu's OWN egress (provider APIs,
-//      SCM connectors, MCP, webhooks, the updater, CP fleet traffic), never
-//      the agent's `bash` subprocess.
-//   2. Non-HTTP blind spot — `git2` clones (often a run's largest byte
-//      volume), `object_store` bucket traffic, and the node WebSocket
-//      aren't captured by this subsystem at all, HTTP or not.
-// NetflowTable's own empty-state hint restates (1) for a table with zero
-// rows; this header states both unconditionally, because a page full of
-// rows is exactly when a viewer is most likely to assume they're seeing
-// everything.
+// subsystem covers, so <NetflowScopeDisclosure /> below is load-bearing,
+// not decoration — it states both the scope limit and the non-HTTP blind
+// spot unconditionally, because a page full of rows is exactly when a
+// viewer is most likely to assume they're seeing everything.
+// NetflowTable's own empty-state hint restates the scope limit for a table
+// with zero rows; both quote the same `NETFLOW_COVERAGE_LIST` constant so
+// they can't drift apart (Fix 2).
 
 import { useEffect, useState } from 'react';
 import NetflowGraph from '../components/netflow/NetflowGraph';
+import { NetflowScopeDisclosure } from '../components/netflow/ScopeDisclosure';
 import NetflowSummary from '../components/netflow/NetflowSummary';
 import NetflowTable from '../components/netflow/NetflowTable';
-import { Select } from '../components/ui/Select';
 import {
   fetchGlobalNetflow,
   fetchNetflowGraph,
@@ -30,24 +29,34 @@ import {
   type NetflowResponse,
 } from '../lib/netflow';
 
-type WeightBy = 'calls' | 'bytes';
-
 export default function Netflow() {
   const [data, setData] = useState<NetflowResponse | null>(null);
   const [graph, setGraph] = useState<GraphView | null>(null);
-  const [weightBy, setWeightBy] = useState<WeightBy>('calls');
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
+    setData(null);
+    setGraph(null);
+    setError(null);
     // Global scope: call both fetchers with NO scope argument at all,
     // rather than passing an empty string — the API contract distinguishes
     // "no scope param" (global) from a malformed scoped request.
-    fetchGlobalNetflow()
-      .then((d) => { if (!cancelled) setData(d); })
-      .catch(() => { if (!cancelled) setData(null); });
-    fetchNetflowGraph()
-      .then((g) => { if (!cancelled) setGraph(g); })
-      .catch(() => { if (!cancelled) setGraph(null); });
+    //
+    // Combined into one `Promise.all` (Fix 6) rather than two independent
+    // `.then`/`.catch` pairs: a failure on EITHER fetch now surfaces one
+    // error message and one retry story instead of a panel that silently
+    // renders whatever half succeeded with no explanation for the rest.
+    Promise.all([fetchGlobalNetflow(), fetchNetflowGraph()])
+      .then(([d, g]) => {
+        if (cancelled) return;
+        setData(d);
+        setGraph(g);
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : 'Failed to load network flows');
+      });
     return () => {
       cancelled = true;
     };
@@ -61,35 +70,20 @@ export default function Netflow() {
           Every flow recorded across all runs, plus unattributed system egress that belongs to no
           single run.
         </p>
-        <p className="mt-2 text-note text-ink-mute max-w-2xl">
-          This covers rupu&apos;s own egress — provider APIs, SCM connectors, MCP, webhooks, the
-          updater, and CP fleet traffic — never traffic from the agent&apos;s bash subprocess. It
-          also can&apos;t see non-HTTP egress: git2 clones (often a run&apos;s largest byte
-          volume), object_store bucket traffic, and the node WebSocket are invisible here too.
-        </p>
+        <NetflowScopeDisclosure className="mt-2" />
       </header>
 
-      <div className="mb-4 flex items-center gap-2">
-        <label className="text-note text-ink-dim" htmlFor="netflow-weight-by">
-          Weight edges by
-        </label>
-        <Select
-          id="netflow-weight-by"
-          value={weightBy}
-          onChange={(e) => setWeightBy(e.target.value as WeightBy)}
-        >
-          <option value="calls">calls</option>
-          <option value="bytes">bytes</option>
-        </Select>
-      </div>
-
-      <div className="space-y-6">
-        {graph && <NetflowGraph graph={graph} weightBy={weightBy} />}
-        {data && <NetflowSummary hosts={data.hosts} />}
-        {data && (
+      {error ? (
+        <p className="text-sm text-err">{error}</p>
+      ) : data === null ? (
+        <p className="text-sm text-ink-dim">Loading network flows…</p>
+      ) : (
+        <div className="space-y-6">
+          {graph && <NetflowGraph graph={graph} />}
+          <NetflowSummary hosts={data.hosts} />
           <NetflowTable flows={data.flows} dropped={data.dropped} asnLoaded={data.asn_loaded} />
-        )}
-      </div>
+        </div>
+      )}
     </div>
   );
 }

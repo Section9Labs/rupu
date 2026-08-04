@@ -18,33 +18,33 @@
 // network-flow-adjacent charts (ThroughputChart), and `status.failed` is
 // the same red RunGraph already uses to mark a problem edge.
 //
-// GraphEdge.bytes is a VISUAL WEIGHT (`ledger::graph_view` sums
-// bytes_in/out with `unwrap_or(0)`, so a Coarse flow contributes 0), never
-// an honest total — this component only ever feeds it through
-// `layoutBipartite` as a stroke-width scale. It is never rendered as a
-// label, tooltip, or byte count.
+// Edge stroke width is always scaled by call count (`layoutBipartite`),
+// never by `GraphEdge.bytes` (Fix 4, netflow Plan 3 review round 3): a
+// former "weight by bytes" control drew Coarse-fidelity edges — whose bytes
+// sum to 0 by construction — at the same minimum width as a genuinely tiny
+// transfer, i.e. the one place in the UI where "unobservable" rendered as a
+// quantity. `bytes` is never rendered as a label, tooltip, or byte count
+// here, or fed into layout at all anymore.
 
 import { useMemo } from 'react';
 import type { GraphView } from '../../lib/netflow';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { EmptyState } from '../ui/EmptyState';
-import { layoutBipartite, type LayoutOpts } from './layout';
+import { layoutBipartite } from './layout';
 
 export interface NetflowGraphProps {
   graph: GraphView;
-  /** Defaults to `calls` — see `LayoutOpts.weightBy` doc for why. */
-  weightBy?: LayoutOpts['weightBy'];
   width?: number;
 }
 
 const ROW_HEIGHT = 34;
 const NODE_R = 4;
 
-export function NetflowGraph({ graph, weightBy = 'calls', width = 880 }: NetflowGraphProps) {
+export function NetflowGraph({ graph, width = 880 }: NetflowGraphProps) {
   const colors = useThemeColors();
   const laid = useMemo(
-    () => layoutBipartite(graph, { width, rowHeight: ROW_HEIGHT, weightBy }),
-    [graph, width, weightBy],
+    () => layoutBipartite(graph, { width, rowHeight: ROW_HEIGHT }),
+    [graph, width],
   );
 
   if (graph.nodes.length === 0) {

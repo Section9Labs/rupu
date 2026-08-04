@@ -543,6 +543,90 @@ async fn global_netflow_unions_every_workspace_including_system_egress() {
     );
 }
 
+// ── The CP daemon's own ledger (Fix 1, netflow Plan 3 review round 3) ─────
+//
+// `rupu cp serve` roots its netflow sink at `$RUPU_HOME/netflow/flows.jsonl`
+// (`rupu-cli/src/cmd/cp.rs`), NOT under any registered workspace — a daemon
+// has no single project to anchor a project-relative ledger at. Every
+// `Origin::Cp` flow (and any `Origin::Update`/ASN-refresh traffic `cp serve`
+// produces) lands there. This is the regression guard for the whole class of
+// bug the review found: that ledger was written but never read by ANY
+// handler, so its traffic was recorded and then permanently invisible.
+
+#[tokio::test]
+async fn global_netflow_includes_the_cp_daemons_own_global_ledger() {
+    let global = tempfile::tempdir().unwrap();
+
+    // The CP daemon's own ledger, written exactly where `cmd/cp.rs`'s
+    // `Action::Serve` handler roots it: `<global_dir>/netflow/flows.jsonl`,
+    // NOT `<global_dir>/.rupu/netflow/...` (that would be
+    // `NetflowPaths::new(global_dir)`, a different — wrong — path).
+    let global_ledger_dir = global.path().join("netflow");
+    std::fs::create_dir_all(&global_ledger_dir).unwrap();
+    let cp_flow = e2e_flow(FlowId::new(), None, "api.other-cp.example", Origin::Cp);
+    std::fs::write(
+        global_ledger_dir.join("flows.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::to_string(&LedgerLine::Flow(Box::new(cp_flow))).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let addr = serve(new_state(global.path())).await;
+    let resp = reqwest::get(format!("http://{addr}/api/netflow"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    assert_eq!(
+        flows.len(),
+        1,
+        "the CP daemon's own ledger must surface at global scope: {body}"
+    );
+    assert_eq!(flows[0]["host"], "api.other-cp.example");
+}
+
+#[tokio::test]
+async fn project_netflow_does_not_leak_the_cp_daemons_global_ledger() {
+    // The mirror case: the global ledger's traffic is the CP daemon's own,
+    // not any one project's, so it must NOT appear when scoped to a
+    // registered project even though that project has zero traffic of its
+    // own recorded.
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let global_ledger_dir = global.path().join("netflow");
+    std::fs::create_dir_all(&global_ledger_dir).unwrap();
+    let cp_flow = e2e_flow(FlowId::new(), None, "api.other-cp.example", Origin::Cp);
+    std::fs::write(
+        global_ledger_dir.join("flows.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::to_string(&LedgerLine::Flow(Box::new(cp_flow))).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let store = rupu_workspace::WorkspaceStore {
+        root: global.path().join("workspaces"),
+    };
+    let ws = rupu_workspace::upsert(&store, project.path()).unwrap();
+
+    let addr = serve(new_state(global.path())).await;
+    let resp = reqwest::get(format!("http://{addr}/api/projects/{}/netflow", ws.id))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["flows"].as_array().unwrap().len(),
+        0,
+        "the CP daemon's own global ledger is not this project's traffic: {body}"
+    );
+}
+
 #[tokio::test]
 async fn global_netflow_with_no_registered_workspaces_is_empty_not_an_error() {
     let global = tempfile::tempdir().unwrap();
