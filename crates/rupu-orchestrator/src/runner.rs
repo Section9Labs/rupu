@@ -4426,6 +4426,10 @@ async fn run_node(
         run_panel_step(run_id, step, ctx, opts, effective_continue_on_error).await
     } else if step.parallel.is_some() {
         run_parallel_step(step, ctx, opts, effective_continue_on_error).await
+    } else if step.run.is_some() && step.for_each.is_some() {
+        // `run:` + `for_each:` — fan the command across items. Checked
+        // BEFORE the generic for_each arm, which assumes an agent.
+        run_fanout_run_step(step, ctx, opts, effective_continue_on_error).await
     } else if step.for_each.is_some() {
         // A distributed fan-out honors the cooperative pause token
         // MID-UNIT (not just at the step boundary): a paused-incomplete
@@ -6041,6 +6045,149 @@ async fn run_linear_step(
 /// `continue_on_error`: when set, failed items are recorded with
 /// `success=false` and the rest still run; otherwise the first
 /// failed item aborts the workflow.
+/// Fan a `run:` step's command across `for_each:` items.
+///
+/// Deliberately separate from [`run_fanout_step`], which is built end to
+/// end around agent dispatch (remote placement, mid-turn pause tokens,
+/// agent transcripts). A `run:` unit has none of those: it is a process
+/// that either finishes or does not, so threading a second mode through
+/// that function would add branches to a hot path for no shared logic.
+///
+/// Units run under the same `max_parallel` cap as an agent fan-out and
+/// are returned in DECLARED order regardless of finish order.
+async fn run_fanout_run_step(
+    step: &Step,
+    ctx: &StepContext,
+    opts: &OrchestratorRunOpts,
+    continue_on_error: bool,
+) -> Result<StepResult, RunWorkflowError> {
+    let for_each_expr = step
+        .for_each
+        .as_ref()
+        .expect("run_fanout_run_step called for a non-fan-out step");
+    let rendered_list = render_step_prompt(for_each_expr, ctx, render_mode(opts.strict_templates))
+        .map_err(|e| RunWorkflowError::Render {
+            step: step.id.clone(),
+            source: e,
+        })?;
+    let items = parse_fanout_items(&rendered_list);
+    let total = items.len();
+
+    if items.is_empty() {
+        info!(step = %step.id, "for_each rendered to an empty list; recording as success with no items");
+        return Ok(StepResult {
+            step_id: step.id.clone(),
+            output: "[]".into(),
+            success: true,
+            skipped: false,
+            kind: crate::runs::StepKind::Run,
+            items: Vec::new(),
+            ..Default::default()
+        });
+    }
+
+    let max_parallel = step.max_parallel.unwrap_or(1).max(1) as usize;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallel));
+
+    let mut handles = Vec::with_capacity(total);
+    for (idx, item) in items.iter().enumerate() {
+        let item_ctx = ctx.clone().with_item(
+            item.clone(),
+            LoopInfo {
+                index: idx + 1,
+                index0: idx,
+                length: total,
+                first: idx == 0,
+                last: idx + 1 == total,
+            },
+        );
+        let permit_sem = semaphore.clone();
+        let step_clone = step.clone();
+        let policy = opts.run_step.clone();
+        let transcript_dir = opts.transcript_dir.clone();
+        let strict = opts.strict_templates;
+        let item_value = item.clone();
+
+        handles.push(tokio::spawn(async move {
+            let _permit = permit_sem
+                .acquire()
+                .await
+                .expect("fan-out semaphore is never closed");
+            // Per-unit `continue_on_error` is forced true so ONE failing
+            // unit never aborts the remaining units mid-flight; the
+            // parent decides below whether the step as a whole fails.
+            let res = execute_run_step(
+                &step_clone,
+                &item_ctx,
+                render_mode(strict),
+                &policy,
+                true,
+                &transcript_dir,
+            )
+            .await;
+            (idx, item_value, res)
+        }));
+    }
+
+    let mut collected: Vec<(usize, ItemResult)> = Vec::with_capacity(total);
+    for h in handles {
+        let (idx, item_value, res) = h.await.map_err(|source| RunWorkflowError::FanoutJoin {
+            step: step.id.clone(),
+            source,
+        })?;
+        let (output, success, transcript_path) = match res {
+            Ok(sr) => (sr.output, sr.success, sr.transcript_path),
+            // A refusal (gate denial) or render error is a real unit
+            // failure, recorded rather than dropped.
+            Err(e) => (format!("{e}"), false, PathBuf::new()),
+        };
+        collected.push((
+            idx,
+            ItemResult {
+                index: idx,
+                item: item_value,
+                sub_id: String::new(),
+                rendered_prompt: String::new(),
+                run_id: String::new(),
+                transcript_path,
+                output,
+                success,
+            },
+        ));
+    }
+    collected.sort_by_key(|(idx, _)| *idx);
+    let unit_results: Vec<ItemResult> = collected.into_iter().map(|(_, r)| r).collect();
+
+    let all_ok = unit_results.iter().all(|r| r.success);
+    if !all_ok && !continue_on_error {
+        let failed: Vec<String> = unit_results
+            .iter()
+            .filter(|r| !r.success)
+            .map(|r| format!("[{}]", r.index))
+            .collect();
+        return Err(RunWorkflowError::RunStepDenied {
+            step: step.id.clone(),
+            reason: format!(
+                "{} of {} units failed ({}); set continue_on_error: true to tolerate this",
+                failed.len(),
+                total,
+                failed.join(", ")
+            ),
+        });
+    }
+
+    let outputs: Vec<&str> = unit_results.iter().map(|r| r.output.as_str()).collect();
+    Ok(StepResult {
+        step_id: step.id.clone(),
+        output: serde_json::to_string(&outputs).unwrap_or_else(|_| "[]".into()),
+        success: all_ok,
+        skipped: false,
+        kind: crate::runs::StepKind::Run,
+        items: unit_results,
+        ..Default::default()
+    })
+}
+
 async fn run_fanout_step(
     workflow_run_id: &str,
     step: &Step,

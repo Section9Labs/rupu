@@ -285,3 +285,155 @@ steps:
         "a templated arg must not be shell-interpreted"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `for_each:` + `run:` fan-out — the shape both benchmarks depend on.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn for_each_run_fans_out_per_item_in_declared_order() {
+    let yaml = r#"
+name: bench-fanout
+steps:
+  - id: score
+    for_each: '["alpha", "beta", "gamma"]'
+    max_parallel: 3
+    run:
+      cmd: echo
+      args: ["{{ item }}"]
+"#;
+    let res = run_with(yaml, "ws_fanout_basic", bypass())
+        .await
+        .expect("run completes");
+
+    let step = &res.step_results[0];
+    assert_eq!(
+        step.kind,
+        StepKind::Run,
+        "a for_each run: step is a Run node"
+    );
+    assert_eq!(step.items.len(), 3);
+    // Declared order regardless of finish order under max_parallel: 3.
+    assert_eq!(step.items[0].output.trim(), "alpha");
+    assert_eq!(step.items[1].output.trim(), "beta");
+    assert_eq!(step.items[2].output.trim(), "gamma");
+    assert!(step.items.iter().all(|i| i.success));
+    assert!(step.success);
+}
+
+#[tokio::test]
+async fn for_each_run_continue_on_error_records_failures_and_proceeds() {
+    // A benchmark must not lose 199 results because unit 2 exited nonzero.
+    // `sh -c` here is an EXPLICITLY authored shell invocation, which is
+    // allowed — what the executor must never do is wrap an author's
+    // cmd/args in a shell implicitly.
+    let yaml = r#"
+name: bench-fanout
+steps:
+  - id: score
+    for_each: '["0", "1", "0"]'
+    max_parallel: 1
+    continue_on_error: true
+    run:
+      cmd: sh
+      args: ["-c", "exit {{ item }}"]
+"#;
+    let res = run_with(yaml, "ws_fanout_coe", bypass())
+        .await
+        .expect("run completes");
+
+    let step = &res.step_results[0];
+    assert_eq!(step.items.len(), 3, "every unit is recorded, none dropped");
+    assert!(step.items[0].success);
+    assert!(!step.items[1].success, "the failing unit is recorded");
+    assert!(step.items[2].success, "later units still dispatch");
+    assert!(!step.success, "the step as a whole reports failure");
+}
+
+#[tokio::test]
+async fn for_each_run_without_continue_on_error_fails_the_run() {
+    let yaml = r#"
+name: bench-fanout
+steps:
+  - id: score
+    for_each: '["0", "1"]'
+    run:
+      cmd: sh
+      args: ["-c", "exit {{ item }}"]
+"#;
+    let err = run_with(yaml, "ws_fanout_strict", bypass())
+        .await
+        .expect_err("a failing unit must fail the run by default");
+    let msg = format!("{err}");
+    assert!(msg.contains("1 of 2 units failed"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn for_each_run_binds_object_item_fields() {
+    // The real benchmark shape: jobs.json is a list of objects.
+    let yaml = r#"
+name: bench-fanout
+steps:
+  - id: score
+    for_each: '[{"id": "CB-001"}, {"id": "CB-002"}]'
+    max_parallel: 2
+    run:
+      cmd: echo
+      args: ["{{ item.id }}"]
+"#;
+    let res = run_with(yaml, "ws_fanout_objects", bypass())
+        .await
+        .expect("run completes");
+    let step = &res.step_results[0];
+    assert_eq!(step.items[0].output.trim(), "CB-001");
+    assert_eq!(step.items[1].output.trim(), "CB-002");
+}
+
+#[tokio::test]
+async fn empty_for_each_run_is_success_with_no_units() {
+    let yaml = r#"
+name: bench-fanout
+steps:
+  - id: score
+    for_each: '[]'
+    run: { cmd: echo, args: ["never"] }
+"#;
+    let res = run_with(yaml, "ws_fanout_empty", bypass())
+        .await
+        .expect("run completes");
+    assert!(res.step_results[0].items.is_empty());
+    assert!(res.step_results[0].success);
+}
+
+#[tokio::test]
+async fn fanout_units_are_gated_too() {
+    // The gate must apply per unit, not only to linear steps — otherwise
+    // fan-out is a hole straight through the permission model.
+    let yaml = r#"
+name: bench-fanout
+steps:
+  - id: score
+    for_each: '["a", "b"]'
+    continue_on_error: true
+    run: { cmd: echo, args: ["{{ item }}"] }
+"#;
+    let res = run_with(
+        yaml,
+        "ws_fanout_gated",
+        policy(PermissionMode::Bypass, true, vec!["python3".into()]),
+    )
+    .await
+    .expect("continue_on_error tolerates the refusals");
+
+    let step = &res.step_results[0];
+    assert_eq!(step.items.len(), 2);
+    assert!(
+        step.items.iter().all(|i| !i.success),
+        "every unit must be refused; echo is not allowlisted"
+    );
+    assert!(
+        step.items[0].output.contains("allowlist"),
+        "the refusal reason is recorded: {}",
+        step.items[0].output
+    );
+}
