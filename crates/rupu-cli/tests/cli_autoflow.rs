@@ -2019,12 +2019,12 @@ fn autoflow_wakes_lists_queued_and_processed_rows() {
         // function (rupu-cli's `src/lib.rs` exposes `pub mod output`,
         // so it's reachable here) instead of asserting a bare
         // substring, so this still proves the *specific* wake is listed.
-        .stdout(predicate::str::contains(
-            rupu_cli::output::ids::compact_id(&queued.wake_id),
-        ))
-        .stdout(predicate::str::contains(
-            rupu_cli::output::ids::compact_id(&processed.wake_id),
-        ))
+        .stdout(predicate::str::contains(rupu_cli::output::ids::compact_id(
+            &queued.wake_id,
+        )))
+        .stdout(predicate::str::contains(rupu_cli::output::ids::compact_id(
+            &processed.wake_id,
+        )))
         .stdout(predicate::str::contains("queued"))
         .stdout(predicate::str::contains("processed"))
         .stdout(predicate::str::contains("github:Section9Labs/okegu/issues/9").not());

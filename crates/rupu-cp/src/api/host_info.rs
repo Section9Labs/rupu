@@ -1,13 +1,9 @@
 #![deny(clippy::all)]
 
-use crate::{
-    error::ApiResult,
-    host::connector::HostCapabilities,
-    state::AppState,
-};
+use crate::{error::ApiResult, host::connector::HostCapabilities, state::AppState};
 use axum::{extract::State, routing::get, Json, Router};
-use serde::Serialize;
 use rupu_workspace::worker_store::WorkerStore;
+use serde::Serialize;
 
 pub fn routes() -> Router<AppState> {
     Router::new().route("/api/host/info", get(get_host_info))

@@ -4604,9 +4604,13 @@ fn gate_decision(sr: &StepResult) -> String {
         .unwrap_or_default()
 }
 
-fn step_kind_for_run_record(step: &Step) -> crate::runs::StepKind {
+pub(crate) fn step_kind_for_run_record(step: &Step) -> crate::runs::StepKind {
     if crate::workflow::is_approval_gate(step) {
         crate::runs::StepKind::ApprovalGate
+    } else if step.run.is_some() {
+        // Checked before `for_each` on purpose: a `for_each:` + `run:`
+        // step is a Run node whose units fan out, not a ForEach node.
+        crate::runs::StepKind::Run
     } else if step.branch.is_some() {
         crate::runs::StepKind::Branch
     } else if step.split.is_some() {

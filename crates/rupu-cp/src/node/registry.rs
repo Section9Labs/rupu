@@ -213,7 +213,10 @@ mod tests {
 
         // Remove with the correct (new) Arc — should work.
         reg.remove("node-4", &new_conn);
-        assert!(!reg.is_online("node-4"), "conn should be gone after correct remove");
+        assert!(
+            !reg.is_online("node-4"),
+            "conn should be gone after correct remove"
+        );
     }
 
     /// `mark_seen` updates `last_seen` to a time ≥ `connected_at`.
@@ -230,10 +233,7 @@ mod tests {
         reg.mark_seen("node-5");
 
         let after = *conn.last_seen.lock().unwrap();
-        assert!(
-            after >= before,
-            "last_seen should advance after mark_seen"
-        );
+        assert!(after >= before, "last_seen should advance after mark_seen");
     }
 
     /// `send` succeeds when the receiver is alive.
@@ -243,7 +243,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let conn = reg.register("node-6", tx);
 
-        conn.send(Frame::Ping {}).await.expect("send should succeed");
+        conn.send(Frame::Ping {})
+            .await
+            .expect("send should succeed");
         let frame = rx.recv().await.expect("should receive frame");
         assert!(matches!(frame, Frame::Ping {}));
     }

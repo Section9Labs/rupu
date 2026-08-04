@@ -79,11 +79,7 @@ fn linear_step_has_agent() {
 #[test]
 fn parallel_step_captures_sub_steps() {
     let dag = parsed_dag();
-    let node = dag
-        .steps
-        .iter()
-        .find(|s| s.id == "parallel-step")
-        .unwrap();
+    let node = dag.steps.iter().find(|s| s.id == "parallel-step").unwrap();
     assert_eq!(node.kind, "parallel");
     let subs = node.parallel.as_ref().expect("parallel field present");
     assert_eq!(subs.len(), 2);
@@ -99,11 +95,7 @@ fn parallel_step_captures_sub_steps() {
 #[test]
 fn for_each_step_captures_expression() {
     let dag = parsed_dag();
-    let node = dag
-        .steps
-        .iter()
-        .find(|s| s.id == "foreach-step")
-        .unwrap();
+    let node = dag.steps.iter().find(|s| s.id == "foreach-step").unwrap();
     assert_eq!(node.kind, "for_each");
     assert_eq!(node.for_each.as_deref(), Some("{{ inputs.files }}"));
     assert_eq!(node.agent.as_deref(), Some("file-reviewer"));

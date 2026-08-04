@@ -41,7 +41,9 @@ async fn list_workers(State(s): State<AppState>) -> ApiResult<Json<Vec<WorkerVie
     let store = WorkerStore {
         root: s.global_dir.join("autoflows").join("workers"),
     };
-    let workers = store.list().map_err(|e| ApiError::internal(e.to_string()))?;
+    let workers = store
+        .list()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
 
     // Attribute every run to its `worker_id` (runs without one are ignored).
     let runs = s

@@ -164,7 +164,10 @@ mod tests {
         // Invalid: delete without --force (defensive; the adapter always
         // passes it, but classification should still be correct).
         assert!(matches!(
-            classify_failure(TranscriptAction::Delete, "transcript delete requires --force"),
+            classify_failure(
+                TranscriptAction::Delete,
+                "transcript delete requires --force"
+            ),
             TranscriptMutateError::Invalid(_)
         ));
         // Failed: unrecognised stderr falls through.

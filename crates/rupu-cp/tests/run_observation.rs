@@ -70,8 +70,7 @@ async fn spawn_server_with_remote(
     dir: &std::path::Path,
     mock_base_url: &str,
 ) -> (std::net::SocketAddr, String) {
-    let state =
-        rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
     // Add the remote host directly via the registry (bypasses the need for a
     // launcher; no token → keychain is not touched).
     let host = state
@@ -90,8 +89,7 @@ async fn spawn_server_with_remote(
 
 /// Spawn a read-only server. Used for single-host tests.
 async fn spawn_server(dir: &std::path::Path) -> std::net::SocketAddr {
-    let state =
-        rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
     let app = rupu_cp::server::router(state, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -133,8 +131,7 @@ async fn run_list_fan_out_merges_local_and_remote() {
         then.status(200).json_body(serde_json::json!([remote_row]));
     });
 
-    let (addr, host_id) =
-        spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
+    let (addr, host_id) = spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
 
     let client = reqwest::Client::new();
     let resp = client
@@ -169,8 +166,7 @@ async fn run_list_fan_out_merges_local_and_remote() {
         .find(|r| r["id"] == "local_obs_r1")
         .expect("local run must appear");
     assert_eq!(
-        local_row["host_id"],
-        "local",
+        local_row["host_id"], "local",
         "local run should be tagged host_id=local"
     );
 
@@ -292,8 +288,7 @@ async fn run_list_host_param_scopes_to_one_host() {
         }]));
     });
 
-    let (addr, host_id) =
-        spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
+    let (addr, host_id) = spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
 
     let client = reqwest::Client::new();
     let resp = client
@@ -351,8 +346,7 @@ async fn get_run_proxies_to_remote_host() {
         then.status(200).json_body(mock_detail.clone());
     });
 
-    let (addr, host_id) =
-        spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
+    let (addr, host_id) = spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
 
     let client = reqwest::Client::new();
     let resp = client
@@ -425,8 +419,7 @@ async fn events_stream_proxies_to_remote_host() {
             .body("data: {\"type\":\"run_started\",\"run_id\":\"remote_sse_r1\"}\n\n");
     });
 
-    let (addr, host_id) =
-        spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
+    let (addr, host_id) = spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
 
     let client = reqwest::Client::new();
     let resp = client
@@ -468,7 +461,10 @@ async fn events_stream_proxies_to_remote_host() {
     .await
     .expect("timed out waiting for proxied SSE frame");
 
-    assert!(found, "proxied SSE stream should carry the remote run's event");
+    assert!(
+        found,
+        "proxied SSE stream should carry the remote run's event"
+    );
 }
 
 /// `GET /api/events/stream?run=<id>&host=<unknown>` → 404.
@@ -506,8 +502,7 @@ async fn get_transcript_proxies_to_remote_host() {
         then.status(200).json_body(transcript_body.clone());
     });
 
-    let (addr, host_id) =
-        spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
+    let (addr, host_id) = spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
 
     let client = reqwest::Client::new();
     let resp = client
@@ -579,13 +574,10 @@ async fn get_run_log_proxies_to_remote_host() {
             .query_param("run", "remote_log_r1");
         then.status(200)
             .header("content-type", "text/event-stream")
-            .body(
-                "data: {\"type\":\"step_completed\",\"run_id\":\"remote_log_r1\"}\n\n",
-            );
+            .body("data: {\"type\":\"step_completed\",\"run_id\":\"remote_log_r1\"}\n\n");
     });
 
-    let (addr, host_id) =
-        spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
+    let (addr, host_id) = spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
 
     let client = reqwest::Client::new();
     let resp = client
@@ -627,7 +619,10 @@ async fn get_run_log_proxies_to_remote_host() {
     .await
     .expect("timed out waiting for proxied SSE frame");
 
-    assert!(found, "proxied SSE log stream should carry the remote run's event");
+    assert!(
+        found,
+        "proxied SSE log stream should carry the remote run's event"
+    );
 }
 
 /// `GET /api/runs/:id/log?host=<unknown>` → 404.
@@ -666,8 +661,7 @@ async fn get_run_graph_proxies_to_remote_host() {
         then.status(200).json_body(mock_graph.clone());
     });
 
-    let (addr, host_id) =
-        spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
+    let (addr, host_id) = spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
 
     let client = reqwest::Client::new();
     let resp = client
@@ -724,8 +718,7 @@ async fn get_run_usage_timeline_proxies_to_remote_host() {
         then.status(200).json_body(mock_series.clone());
     });
 
-    let (addr, host_id) =
-        spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
+    let (addr, host_id) = spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
 
     let client = reqwest::Client::new();
     let resp = client

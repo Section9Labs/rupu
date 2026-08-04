@@ -275,7 +275,9 @@ async fn session_list_survives_a_malformed_config_across_all_formats() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"kind\": \"session_list\""))
-        .stdout(predicate::str::contains("\"session_id\": \"ses_cfgfail01\""));
+        .stdout(predicate::str::contains(
+            "\"session_id\": \"ses_cfgfail01\"",
+        ));
 
     Command::cargo_bin("rupu")
         .unwrap()

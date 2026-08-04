@@ -457,7 +457,11 @@ impl HostConnector for HttpHostConnector {
         id: &str,
         ignore_liveness: bool,
     ) -> Result<(), HostConnectorError> {
-        let qs = if ignore_liveness { "?ignore_liveness=true" } else { "" };
+        let qs = if ignore_liveness {
+            "?ignore_liveness=true"
+        } else {
+            ""
+        };
         self.send(
             self.client
                 .post(self.url(&format!("/api/transcripts/{id}/archive{qs}")))
@@ -473,7 +477,11 @@ impl HostConnector for HttpHostConnector {
         id: &str,
         ignore_liveness: bool,
     ) -> Result<(), HostConnectorError> {
-        let qs = if ignore_liveness { "?ignore_liveness=true" } else { "" };
+        let qs = if ignore_liveness {
+            "?ignore_liveness=true"
+        } else {
+            ""
+        };
         self.send(
             self.client
                 .delete(self.url(&format!("/api/transcripts/{id}{qs}"))),

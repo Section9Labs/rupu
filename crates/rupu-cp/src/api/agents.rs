@@ -334,7 +334,13 @@ fn load_detail(s: &AppState, name: &str) -> ApiResult<AgentDetailDto> {
             let slug = agent_slug_map(&s.global_dir)
                 .remove(name)
                 .unwrap_or_else(|| name.to_string());
-            Ok(detail_from_spec(spec, "global", ScopeKind::Global, slug, None))
+            Ok(detail_from_spec(
+                spec,
+                "global",
+                ScopeKind::Global,
+                slug,
+                None,
+            ))
         }
         Err(AgentLoadError::NotFound(_)) => {
             Err(ApiError::not_found(format!("agent {name} not found")))
@@ -667,12 +673,13 @@ async fn write_agent(
     match q.scope_kind {
         Some(kind) => {
             let (_path, dir, _scope, _kind) =
-                resolve_agent_scoped_explicit(&s, &name, kind, q.scope_id.as_deref())
-                    .ok_or_else(|| {
+                resolve_agent_scoped_explicit(&s, &name, kind, q.scope_id.as_deref()).ok_or_else(
+                    || {
                         ApiError::not_found(format!(
                             "agent {name} not found in the requested scope"
                         ))
-                    })?;
+                    },
+                )?;
             save_agent_file_at(&name, &body.raw, &dir)?;
         }
         None => match resolve_agent_scoped(&s, &name) {
@@ -1081,7 +1088,14 @@ mod tests {
 
         // `AgentDetailDto` (the `Ok` payload) doesn't implement `Debug`, so
         // `expect_err` isn't usable here — match explicitly instead.
-        let err = match create_agent(State(s.clone()), Json(AgentWriteBody { raw: VALID_MD.into() })).await {
+        let err = match create_agent(
+            State(s.clone()),
+            Json(AgentWriteBody {
+                raw: VALID_MD.into(),
+            }),
+        )
+        .await
+        {
             Err(e) => e,
             Ok(_) => panic!("must conflict against the project-only definition"),
         };
@@ -1127,14 +1141,13 @@ mod tests {
                 scope_kind: Some(ScopeKind::Project),
                 scope_id: Some("ws_a".to_string()),
             }),
-            Json(AgentWriteBody { raw: edited.clone() }),
+            Json(AgentWriteBody {
+                raw: edited.clone(),
+            }),
         )
         .await
         .expect("explicit project-scoped put should succeed");
-        assert_eq!(
-            resp.0.summary.scope_kind,
-            ScopeKind::Project
-        );
+        assert_eq!(resp.0.summary.scope_kind, ScopeKind::Project);
         assert_eq!(
             std::fs::read_to_string(proj_agents.join("code-reviewer.md")).unwrap(),
             edited,
@@ -1170,7 +1183,9 @@ mod tests {
                 scope_kind: Some(ScopeKind::Project),
                 scope_id: Some("ws_a".to_string()),
             }),
-            Json(AgentWriteBody { raw: edited.to_string() }),
+            Json(AgentWriteBody {
+                raw: edited.to_string(),
+            }),
         )
         .await
         .expect("explicit project-scoped put should succeed");
@@ -1252,7 +1267,9 @@ mod tests {
             State(s.clone()),
             Path("code-reviewer".into()),
             Query(ScopeQuery::default()),
-            Json(AgentWriteBody { raw: edited.clone() }),
+            Json(AgentWriteBody {
+                raw: edited.clone(),
+            }),
         )
         .await
         .expect("implicit project-first put should succeed");
@@ -1279,7 +1296,9 @@ mod tests {
             State(s.clone()),
             Path("code-reviewer".into()),
             Query(ScopeQuery::default()),
-            Json(AgentWriteBody { raw: VALID_MD.to_string() }),
+            Json(AgentWriteBody {
+                raw: VALID_MD.to_string(),
+            }),
         )
         .await
         .expect("put ok");
@@ -1532,7 +1551,10 @@ mod tests {
         .await
         .expect_err("mismatched explicit scope must 404, never fall back");
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
-        assert!(agents_dir(&s).join("shared-name.md").exists(), "global file untouched");
+        assert!(
+            agents_dir(&s).join("shared-name.md").exists(),
+            "global file untouched"
+        );
         assert!(
             proj_agents.join("shared-name.md").exists(),
             "project file untouched"
@@ -1820,7 +1842,11 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].tools,
-            vec!["issues.list".to_string(), "issues.comment".to_string(), "issues.create".to_string()]
+            vec![
+                "issues.list".to_string(),
+                "issues.comment".to_string(),
+                "issues.create".to_string()
+            ]
         );
     }
 
@@ -1848,7 +1874,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "code-reviewer");
         assert_eq!(rows[0].scope, "global");
-        assert_eq!(rows[0].scope_kind, crate::api::repo_scope::ScopeKind::Global);
+        assert_eq!(
+            rows[0].scope_kind,
+            crate::api::repo_scope::ScopeKind::Global
+        );
     }
 
     #[tokio::test]

@@ -64,7 +64,10 @@ mod tests {
     fn each_builtin_resolves_to_template_with_matching_name() {
         for name in builtin_names() {
             let resolved = resolve_builtin(name).expect("name exists").expect("parses");
-            assert_eq!(resolved.name, name, "template body's name field must match registry key");
+            assert_eq!(
+                resolved.name, name,
+                "template body's name field must match registry key"
+            );
         }
     }
 

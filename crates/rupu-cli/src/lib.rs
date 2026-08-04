@@ -638,15 +638,15 @@ mod arg_parse_tests {
 
     #[test]
     fn cron_list_honours_all_columns() {
-        let cli = crate::Cli::try_parse_from(["rupu", "cron", "list", "--all-columns"])
-            .expect("parses");
+        let cli =
+            crate::Cli::try_parse_from(["rupu", "cron", "list", "--all-columns"]).expect("parses");
         assert!(cli.all_columns);
     }
 
     #[test]
     fn agent_list_honours_absolute() {
-        let cli = crate::Cli::try_parse_from(["rupu", "agent", "list", "--absolute"])
-            .expect("parses");
+        let cli =
+            crate::Cli::try_parse_from(["rupu", "agent", "list", "--absolute"]).expect("parses");
         assert!(cli.absolute);
     }
 }

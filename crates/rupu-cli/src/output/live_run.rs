@@ -774,7 +774,7 @@ fn overall_progress_fraction(state: &LiveRunState) -> f64 {
         .iter()
         .find(|s| matches!(s.status, NodeStatus::Active | NodeStatus::Working))
         .map(|step| match step.kind {
-            StepKind::ForEach | StepKind::Parallel => {
+            StepKind::ForEach | StepKind::Parallel | StepKind::Run => {
                 let total_units = step.fanout_total.unwrap_or(step.units.len());
                 if total_units == 0 {
                     0.0
@@ -1017,14 +1017,14 @@ pub fn render_graph(state: &LiveRunState, _workflow: &Workflow, width: usize) ->
                     width,
                 ));
             }
-            StepKind::ForEach | StepKind::Parallel => {
+            StepKind::ForEach | StepKind::Parallel | StepKind::Run => {
                 let is_active = matches!(step.status, NodeStatus::Active | NodeStatus::Working);
                 let total_units = step.fanout_total.unwrap_or(step.units.len());
                 let done = step.done_units();
-                let kind_word = if step.kind == StepKind::ForEach {
-                    "for_each"
-                } else {
-                    "parallel"
+                let kind_word = match step.kind {
+                    StepKind::ForEach => "for_each",
+                    StepKind::Run => "run",
+                    _ => "parallel",
                 };
                 let label = mark_selected(&format!("{} · {kind_word}", step.id), step_selected);
 

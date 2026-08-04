@@ -2972,7 +2972,9 @@ mod tuning_tests {
         client.api_url = "https://api.openai.com/v1/responses".into();
         let headers = client.build_headers().expect("headers");
         assert_eq!(
-            headers.get("OpenAI-Organization").map(|v| v.to_str().unwrap()),
+            headers
+                .get("OpenAI-Organization")
+                .map(|v| v.to_str().unwrap()),
             Some("org-abc123")
         );
 

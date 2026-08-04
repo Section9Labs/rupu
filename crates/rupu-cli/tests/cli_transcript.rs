@@ -560,7 +560,12 @@ async fn ignore_liveness_overrides_a_live_pid_refusal() {
         .unwrap()
         .env("RUPU_HOME", global.path())
         .current_dir(tmp.path())
-        .args(["transcript", "archive", "run_live_arch", "--ignore-liveness"])
+        .args([
+            "transcript",
+            "archive",
+            "run_live_arch",
+            "--ignore-liveness",
+        ])
         .assert()
         .success();
     assert!(!transcripts_dir.join("run_live_arch.jsonl").exists());

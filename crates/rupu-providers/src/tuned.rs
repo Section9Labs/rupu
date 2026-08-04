@@ -62,12 +62,10 @@ impl ThrottledProvider {
 #[async_trait]
 impl LlmProvider for ThrottledProvider {
     async fn send(&mut self, request: &LlmRequest) -> Result<LlmResponse, ProviderError> {
-        let _permit = self
-            .semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|e| ProviderError::Other(anyhow::anyhow!("provider semaphore closed: {e}")))?;
+        let _permit =
+            self.semaphore.clone().acquire_owned().await.map_err(|e| {
+                ProviderError::Other(anyhow::anyhow!("provider semaphore closed: {e}"))
+            })?;
         self.inner.send(request).await
     }
 
@@ -76,12 +74,10 @@ impl LlmProvider for ThrottledProvider {
         request: &LlmRequest,
         on_event: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<LlmResponse, ProviderError> {
-        let _permit = self
-            .semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|e| ProviderError::Other(anyhow::anyhow!("provider semaphore closed: {e}")))?;
+        let _permit =
+            self.semaphore.clone().acquire_owned().await.map_err(|e| {
+                ProviderError::Other(anyhow::anyhow!("provider semaphore closed: {e}"))
+            })?;
         self.inner.stream(request, on_event).await
     }
 
@@ -112,9 +108,9 @@ impl LlmProvider for ThrottledProvider {
 /// the user's time.
 pub fn is_retryable(e: &ProviderError) -> bool {
     match e {
-        ProviderError::RateLimited { .. } | ProviderError::Transient(_) | ProviderError::Http(_) => {
-            true
-        }
+        ProviderError::RateLimited { .. }
+        | ProviderError::Transient(_)
+        | ProviderError::Http(_) => true,
         ProviderError::Api { status, .. } => *status == 429 || *status == 529 || *status >= 500,
         _ => false,
     }
@@ -317,7 +313,8 @@ mod tests {
     impl LlmProvider for Probe {
         async fn send(&mut self, _r: &LlmRequest) -> Result<LlmResponse, ProviderError> {
             if let Some(s) = &self.semaphore {
-                self.permits_seen.store(s.available_permits(), Ordering::SeqCst);
+                self.permits_seen
+                    .store(s.available_permits(), Ordering::SeqCst);
             }
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n < self.fail_times {
@@ -595,8 +592,12 @@ mod tests {
 
     #[test]
     fn retryability_matches_the_documented_error_classes() {
-        assert!(is_retryable(&ProviderError::RateLimited { retry_after: None }));
-        assert!(is_retryable(&ProviderError::Transient(anyhow::anyhow!("x"))));
+        assert!(is_retryable(&ProviderError::RateLimited {
+            retry_after: None
+        }));
+        assert!(is_retryable(&ProviderError::Transient(anyhow::anyhow!(
+            "x"
+        ))));
         assert!(is_retryable(&ProviderError::Api {
             status: 503,
             message: String::new()

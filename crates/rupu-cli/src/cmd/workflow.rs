@@ -6017,8 +6017,18 @@ steps:
     fn workflow_runs_keeps_expires_when_a_run_has_one() {
         // Suppression must be driven by the data, not hardcoded.
         let rows = vec![
-            runs_row_for_test("run_a1b2c3d4e5f6g7h8i9j0k1l2", "running", "2026-07-30T16:00:00+00:00", Some(300)),
-            runs_row_for_test("run_z9y8x7w6v5u4t3s2r1q0p9o8", "completed", "2026-07-30T15:00:00+00:00", None),
+            runs_row_for_test(
+                "run_a1b2c3d4e5f6g7h8i9j0k1l2",
+                "running",
+                "2026-07-30T16:00:00+00:00",
+                Some(300),
+            ),
+            runs_row_for_test(
+                "run_z9y8x7w6v5u4t3s2r1q0p9o8",
+                "completed",
+                "2026-07-30T15:00:00+00:00",
+                None,
+            ),
         ];
         let out = render_workflow_runs_table(
             &rows,
@@ -6213,9 +6223,24 @@ steps:
         let older = chrono::Utc.with_ymd_and_hms(2026, 7, 28, 9, 0, 0).unwrap();
         let newer = chrono::Utc.with_ymd_and_hms(2026, 7, 30, 9, 0, 0).unwrap();
         let runs = vec![
-            run_for_test("run_old", "nightly", rupu_orchestrator::RunStatus::Failed, older),
-            run_for_test("run_new", "nightly", rupu_orchestrator::RunStatus::Completed, newer),
-            run_for_test("run_other", "review", rupu_orchestrator::RunStatus::Completed, older),
+            run_for_test(
+                "run_old",
+                "nightly",
+                rupu_orchestrator::RunStatus::Failed,
+                older,
+            ),
+            run_for_test(
+                "run_new",
+                "nightly",
+                rupu_orchestrator::RunStatus::Completed,
+                newer,
+            ),
+            run_for_test(
+                "run_other",
+                "review",
+                rupu_orchestrator::RunStatus::Completed,
+                older,
+            ),
         ];
         let map = latest_run_by_workflow(&runs);
         assert_eq!(map.len(), 2);

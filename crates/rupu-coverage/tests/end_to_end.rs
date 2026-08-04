@@ -1,9 +1,9 @@
-use rupu_coverage::{
-    coverage_mark, flatten, read_snapshot, target_id, write_snapshot, AssertionStatus,
-    Attribution, ConcernAssertion, ConcernsBlock, ConcernsEntry, CoveragePaths,
-    CoverageWriterHandle, Evidence, FileTouchEvent, IncludeDirective, Surface,
-};
 use chrono::Utc;
+use rupu_coverage::{
+    coverage_mark, flatten, read_snapshot, target_id, write_snapshot, AssertionStatus, Attribution,
+    ConcernAssertion, ConcernsBlock, ConcernsEntry, CoveragePaths, CoverageWriterHandle, Evidence,
+    FileTouchEvent, IncludeDirective, Surface,
+};
 
 #[tokio::test]
 async fn end_to_end_workflow_with_stride_catalog() {

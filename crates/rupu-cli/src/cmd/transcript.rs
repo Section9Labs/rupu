@@ -1349,8 +1349,13 @@ pub(crate) fn render_pretty_transcript_event(
             blocked,
             ..
         } => {
-            let status = if *blocked { Status::Failed } else { Status::Complete };
-            let detail = format!("{tool}  ·  declared={declared} granted={granted} blocked={blocked}");
+            let status = if *blocked {
+                Status::Failed
+            } else {
+                Status::Complete
+            };
+            let detail =
+                format!("{tool}  ·  declared={declared} granted={granted} blocked={blocked}");
             printer.sideband_event(status, "tool audit", Some(&detail));
         }
         TranscriptEvent::GateRequested {
@@ -2162,7 +2167,10 @@ mod tests {
         let own_pid = std::process::id();
         let meta = sample_metadata(Some(own_pid));
         let err = ensure_standalone_not_running("run_live", "delete", Some(&meta)).unwrap_err();
-        assert!(err.to_string().contains("still running"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("still running"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -2494,8 +2502,7 @@ mod tests {
             "deleted",
         )];
         let absolute_prefs = transcript_list_test_prefs().with_table_flags(true, false);
-        let out =
-            render_transcript_prune_table(&rows, &absolute_prefs, transcript_list_test_now());
+        let out = render_transcript_prune_table(&rows, &absolute_prefs, transcript_list_test_now());
         assert!(out.contains("2026-07-30T13:00:00"), "got: {out}");
     }
 

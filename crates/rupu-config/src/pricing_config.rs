@@ -104,7 +104,6 @@ impl ModelPricing {
 mod tests {
     use super::*;
 
-
     #[test]
     fn cost_zero_when_no_tokens() {
         let p = ModelPricing {

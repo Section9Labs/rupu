@@ -490,6 +490,10 @@ pub enum StepKind {
     Parallel,
     Panel,
     Branch,
+    /// `run:` deterministic command node (Bench Plan 0). A `run:` step
+    /// that also carries `for_each:` is still a `Run` node — the fan-out
+    /// is an attribute of it, not a separate kind.
+    Run,
     /// `split:` orchestration node — fans control flow into N named
     /// targets (no `wait:`/merge semantics of its own; each target is a
     /// normal node with its own inbound edge). Distinct from [`Self::Branch`]
@@ -2011,13 +2015,14 @@ impl RunStore {
                     }
                     Some(id) => {
                         let mut reordered = gates;
-                        let pos = reordered
-                            .iter()
-                            .position(|g| g.step_id == id)
-                            .ok_or_else(|| ApprovalError::GateNotFound {
-                                run_id: run_id.to_string(),
-                                step_id: id.to_string(),
-                            })?;
+                        let pos =
+                            reordered
+                                .iter()
+                                .position(|g| g.step_id == id)
+                                .ok_or_else(|| ApprovalError::GateNotFound {
+                                    run_id: run_id.to_string(),
+                                    step_id: id.to_string(),
+                                })?;
                         let target = reordered.remove(pos);
                         reordered.insert(0, target);
                         record.awaiting = reordered;
@@ -3173,9 +3178,7 @@ mod tests {
         assert_eq!(reloaded.status, RunStatus::Rejected);
 
         match last_event(&store, "run_timeout_reject") {
-            crate::executor::Event::RunCompleted {
-                run_id, status, ..
-            } => {
+            crate::executor::Event::RunCompleted { run_id, status, .. } => {
                 assert_eq!(run_id, "run_timeout_reject");
                 assert_eq!(status, RunStatus::Rejected);
             }
@@ -3330,7 +3333,9 @@ mod tests {
         rec.awaiting_step_id = Some("deploy".into());
         rec.awaiting_since = Some(now - chrono::Duration::seconds(120));
         rec.expires_at = Some(now - chrono::Duration::seconds(30));
-        store.create(rec.clone(), GATE_YAML_ON_TIMEOUT_APPROVE).unwrap();
+        store
+            .create(rec.clone(), GATE_YAML_ON_TIMEOUT_APPROVE)
+            .unwrap();
 
         let decision = store.approve(&rec.id, "matt", now).unwrap();
         assert!(matches!(
@@ -3351,7 +3356,9 @@ mod tests {
         rec.awaiting_step_id = Some("deploy".into());
         rec.awaiting_since = Some(now - chrono::Duration::seconds(120));
         rec.expires_at = Some(now - chrono::Duration::seconds(30));
-        store.create(rec.clone(), GATE_YAML_ON_TIMEOUT_REJECT).unwrap();
+        store
+            .create(rec.clone(), GATE_YAML_ON_TIMEOUT_REJECT)
+            .unwrap();
 
         let err = store.approve(&rec.id, "matt", now).unwrap_err();
         match err {
@@ -3379,11 +3386,17 @@ mod tests {
         rec.awaiting_step_id = Some("deploy".into());
         rec.awaiting_since = Some(now - chrono::Duration::seconds(120));
         rec.expires_at = Some(now - chrono::Duration::seconds(30));
-        store.create(rec.clone(), GATE_YAML_ON_TIMEOUT_REJECT).unwrap();
+        store
+            .create(rec.clone(), GATE_YAML_ON_TIMEOUT_REJECT)
+            .unwrap();
 
-        let decision = store.reject(&rec.id, "matt", "operator reason", now).unwrap();
+        let decision = store
+            .reject(&rec.id, "matt", "operator reason", now)
+            .unwrap();
         match decision {
-            ApprovalDecision::Rejected { step_id, reason, .. } => {
+            ApprovalDecision::Rejected {
+                step_id, reason, ..
+            } => {
                 assert_eq!(step_id, "deploy");
                 // The auto-reject reason wins — the run was already
                 // terminal by the time this explicit reject landed.
@@ -3522,7 +3535,8 @@ mod tests {
             "approval_prompt": "ok?",
             "awaiting_since": "2026-01-01T00:05:00Z"
         }"#;
-        let rec: RunRecord = serde_json::from_str(json).expect("no `awaiting` key must still parse");
+        let rec: RunRecord =
+            serde_json::from_str(json).expect("no `awaiting` key must still parse");
         assert!(
             rec.awaiting.is_empty(),
             "absent key must default to empty, not error or synthesize eagerly"
@@ -3845,10 +3859,19 @@ mod tests {
 
         let mut loaded = rec;
         let outcome = store
-            .expire_gate_if_overdue(&mut loaded, "no_such_gate", now, Some(TimeoutAction::Reject))
+            .expire_gate_if_overdue(
+                &mut loaded,
+                "no_such_gate",
+                now,
+                Some(TimeoutAction::Reject),
+            )
             .unwrap();
         assert!(outcome.is_none());
-        assert_eq!(loaded.awaiting.len(), 2, "unrelated gate id must not touch the set");
+        assert_eq!(
+            loaded.awaiting.len(),
+            2,
+            "unrelated gate id must not touch the set"
+        );
     }
 
     #[test]
@@ -4705,9 +4728,7 @@ mod tests {
         store.cancel(&rec.id, "matt", "stop it", now).unwrap();
 
         match last_event(&store, &rec.id) {
-            crate::executor::Event::RunCompleted {
-                run_id, status, ..
-            } => {
+            crate::executor::Event::RunCompleted { run_id, status, .. } => {
                 assert_eq!(run_id, rec.id);
                 assert_eq!(status, RunStatus::Cancelled);
             }
@@ -4722,12 +4743,12 @@ mod tests {
         let rec = awaiting_record("run_reject_event");
         store.create(rec.clone(), SAMPLE_YAML).unwrap();
 
-        store.reject(&rec.id, "matt", "not now", Utc::now()).unwrap();
+        store
+            .reject(&rec.id, "matt", "not now", Utc::now())
+            .unwrap();
 
         match last_event(&store, &rec.id) {
-            crate::executor::Event::RunCompleted {
-                run_id, status, ..
-            } => {
+            crate::executor::Event::RunCompleted { run_id, status, .. } => {
                 assert_eq!(run_id, rec.id);
                 assert_eq!(status, RunStatus::Rejected);
             }

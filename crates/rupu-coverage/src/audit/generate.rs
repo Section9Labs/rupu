@@ -4,7 +4,9 @@ use crate::audit::types::{
 use crate::catalog::types::FlatCatalog;
 use crate::ledger::events::{AssertionStatus, ConcernAssertion, FindingRecord};
 use crate::ledger::paths::CoveragePaths;
-use crate::ledger::views::{file_views, read_concern_assertions, read_file_events, read_findings, FileView};
+use crate::ledger::views::{
+    file_views, read_concern_assertions, read_file_events, read_findings, FileView,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Build a full audit report for a target by joining the three ledgers
@@ -53,9 +55,11 @@ fn glob_match(globs: &[String], path: &str) -> bool {
     if globs.is_empty() {
         return true;
     }
-    globs
-        .iter()
-        .any(|g| glob::Pattern::new(g).map(|p| p.matches(path)).unwrap_or(false))
+    globs.iter().any(|g| {
+        glob::Pattern::new(g)
+            .map(|p| p.matches(path))
+            .unwrap_or(false)
+    })
 }
 
 fn concern_coverage(
@@ -317,12 +321,7 @@ mod tests {
     #[test]
     fn cross_model_flags_disagreement() {
         let assertions = vec![
-            assertion(
-                "stride:spoofing",
-                "src/a.rs",
-                AssertionStatus::Clean,
-                "m1",
-            ),
+            assertion("stride:spoofing", "src/a.rs", AssertionStatus::Clean, "m1"),
             assertion(
                 "stride:spoofing",
                 "src/a.rs",
@@ -339,18 +338,8 @@ mod tests {
     #[test]
     fn cross_model_agreement_not_flagged() {
         let assertions = vec![
-            assertion(
-                "stride:spoofing",
-                "src/a.rs",
-                AssertionStatus::Clean,
-                "m1",
-            ),
-            assertion(
-                "stride:spoofing",
-                "src/a.rs",
-                AssertionStatus::Clean,
-                "m2",
-            ),
+            assertion("stride:spoofing", "src/a.rs", AssertionStatus::Clean, "m1"),
+            assertion("stride:spoofing", "src/a.rs", AssertionStatus::Clean, "m2"),
         ];
         let xm = cross_model(&assertions);
         assert_eq!(xm.len(), 1);

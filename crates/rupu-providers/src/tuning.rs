@@ -97,7 +97,11 @@ impl ProviderTuning {
 /// [`DEFAULT_TIMEOUT_MS`]. `0` is treated as absent: a zero-length deadline
 /// would fail every request instantly, which is never what a user means.
 pub fn client_timeout(timeout_ms: Option<u64>) -> Duration {
-    Duration::from_millis(timeout_ms.filter(|ms| *ms > 0).unwrap_or(DEFAULT_TIMEOUT_MS))
+    Duration::from_millis(
+        timeout_ms
+            .filter(|ms| *ms > 0)
+            .unwrap_or(DEFAULT_TIMEOUT_MS),
+    )
 }
 
 /// `max_retries` → retries after the first attempt. Absent ⇒

@@ -626,7 +626,15 @@ fn render_autoflow_wakes_table(
     let mut table = EntityTable::new(
         prefs,
         prefs.render_opts(),
-        vec!["Wake", "State", "Source", "Event", "Entity", "Not Before", "Repo"],
+        vec![
+            "Wake",
+            "State",
+            "Source",
+            "Event",
+            "Entity",
+            "Not Before",
+            "Repo",
+        ],
     );
 
     for row in rows {
@@ -1434,8 +1442,7 @@ pub async fn handle(
     all_columns: bool,
 ) -> ExitCode {
     let resolver: Arc<dyn CredentialResolver> = Arc::new(KeychainResolver::new());
-    let result =
-        handle_with_resolver(action, resolver, global_format, absolute, all_columns).await;
+    let result = handle_with_resolver(action, resolver, global_format, absolute, all_columns).await;
     match result {
         Ok(()) => ExitCode::from(0),
         Err(e) => crate::output::diag::fail(e),
@@ -4100,6 +4107,7 @@ fn step_kind_label(kind: StepKind) -> &'static str {
         StepKind::Join => "join",
         StepKind::Loop => "loop",
         StepKind::Action => "action",
+        StepKind::Run => "run",
         StepKind::ApprovalGate => "gate",
         // I-39: an unrecognized future kind — render it like a linear step
         // rather than panicking or fabricating a made-up label.
@@ -12407,7 +12415,10 @@ mod tests {
         )];
         let out =
             render_autoflow_wakes_table(&rows, &wakes_table_test_prefs(), wakes_table_test_now());
-        assert!(!out.contains(" wakes\n\n"), "unexpected summary line: {out}");
+        assert!(
+            !out.contains(" wakes\n\n"),
+            "unexpected summary line: {out}"
+        );
     }
 
     /// Everything the `rupu autoflow create` scaffold writes must be
