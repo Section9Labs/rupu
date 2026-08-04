@@ -74,7 +74,9 @@ impl TranscriptTail {
             }
         });
 
-        Ok(Self { rx })
+        Ok(Self {
+            rx,
+        })
     }
 }
 
@@ -210,7 +212,9 @@ mod tests {
             agent: "agent".into(),
             provider: "anthropic".into(),
             model: "claude-opus-4-8".into(),
-            started_at: chrono::Utc.with_ymd_and_hms(2026, 6, 16, 12, 0, 0).unwrap(),
+            started_at: chrono::Utc
+                .with_ymd_and_hms(2026, 6, 16, 12, 0, 0)
+                .unwrap(),
             mode: RunMode::Ask,
         };
         let mut line = serde_json::to_vec(&ev).unwrap();

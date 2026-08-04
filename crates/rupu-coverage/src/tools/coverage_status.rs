@@ -49,10 +49,7 @@ pub fn coverage_status(
     Ok(deduped
         .into_iter()
         .filter(|a| {
-            input
-                .concern_id
-                .as_deref()
-                .is_none_or(|c| a.concern_id == c)
+            input.concern_id.as_deref().is_none_or(|c| a.concern_id == c)
                 && input
                     .file_path_prefix
                     .as_deref()

@@ -1,7 +1,5 @@
 use crate::catalog::builtin::resolve_builtin;
-use crate::catalog::types::{
-    CatalogMode, Concern, ConcernsBlock, ConcernsEntry, FlatCatalog, Template,
-};
+use crate::catalog::types::{CatalogMode, Concern, ConcernsBlock, ConcernsEntry, FlatCatalog, Template};
 use std::collections::BTreeMap;
 
 #[derive(Debug, thiserror::Error)]
@@ -252,14 +250,8 @@ mod tests {
         // owasp-top10-2021 (10) + cwe-top25-2023 (25) + secrets-in-source (1) = 36
         // assuming no id collisions between the three templates.
         assert!(cat.concerns.len() >= 30);
-        assert!(cat
-            .concerns
-            .iter()
-            .any(|c| c.id.starts_with("owasp-top10-2021:")));
-        assert!(cat
-            .concerns
-            .iter()
-            .any(|c| c.id.starts_with("cwe-top25-2023:")));
+        assert!(cat.concerns.iter().any(|c| c.id.starts_with("owasp-top10-2021:")));
+        assert!(cat.concerns.iter().any(|c| c.id.starts_with("cwe-top25-2023:")));
         assert!(cat.concerns.iter().any(|c| c.id == "secrets-in-source"));
     }
 
@@ -298,10 +290,7 @@ mod tests {
             })],
         };
         let cat = flatten(&block).unwrap();
-        assert_eq!(
-            cat.render_modes.get("stride:spoofing"),
-            Some(&CatalogMode::Index)
-        );
+        assert_eq!(cat.render_modes.get("stride:spoofing"), Some(&CatalogMode::Index));
     }
 
     #[test]

@@ -58,9 +58,7 @@ pub fn file_views(events: &[FileTouchEvent]) -> Vec<FileView> {
     let mut by_path: BTreeMap<String, FileView> = BTreeMap::new();
     for ev in events {
         let Some(path) = ev.path() else { continue };
-        let Some(strength) = ev.strength() else {
-            continue;
-        };
+        let Some(strength) = ev.strength() else { continue };
         let at = match ev {
             FileTouchEvent::Read { at, .. }
             | FileTouchEvent::Grep { at, .. }
@@ -129,9 +127,7 @@ mod tests {
     #[test]
     fn read_findings_parses_jsonl_and_handles_missing_file() {
         use crate::catalog::types::Severity;
-        use crate::ledger::events::{
-            Attribution, FindingEvidence, FindingRecord, FindingScope, Surface,
-        };
+        use crate::ledger::events::{Attribution, FindingEvidence, FindingRecord, FindingScope, Surface};
 
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CoveragePaths::new(tmp.path(), "t");

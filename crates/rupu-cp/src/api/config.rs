@@ -765,7 +765,8 @@ input_per_mtok = 5.0
         // This is the "took effect" assertion: it does not touch `s` at all,
         // it just re-reads the file the handler wrote, the same way any
         // other process (a `rupu` CLI invocation, a fresh `cp serve`) would.
-        let resolved = rupu_config::resolve(Some(&global_path), None).expect("on-disk resolve ok");
+        let resolved = rupu_config::resolve(Some(&global_path), None)
+            .expect("on-disk resolve ok");
         assert_eq!(resolved.config.default_model.as_deref(), Some("sonnet"));
 
         // ── 4. Hand-add a comment, then form-patch a DIFFERENT key ──────────
@@ -827,7 +828,8 @@ input_per_mtok = 5.0
 
         // ── 1. Direct resolve(): locked global wins, provenance says so ─────
         let resolved =
-            rupu_config::resolve(Some(&global_path), Some(&project_path)).expect("resolve ok");
+            rupu_config::resolve(Some(&global_path), Some(&project_path))
+                .expect("resolve ok");
         assert_eq!(resolved.config.permission_mode.as_deref(), Some("ask"));
         let prov = resolved
             .provenance

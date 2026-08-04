@@ -136,9 +136,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(results
-            .iter()
-            .any(|r| matches!(r, SearchResult::Summary(s) if s.concern_id == "stride:spoofing")));
+        assert!(results.iter().any(|r| matches!(r, SearchResult::Summary(s) if s.concern_id == "stride:spoofing")));
     }
 
     #[test]

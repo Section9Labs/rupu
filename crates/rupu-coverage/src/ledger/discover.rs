@@ -28,11 +28,7 @@ pub fn discover_targets(workspace: &Path) -> std::io::Result<Vec<DiscoveredTarge
             .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
             .unwrap_or(0);
         let has_catalog = dir.join("catalog.yaml").exists();
-        out.push(DiscoveredTarget {
-            target_id,
-            assertion_lines,
-            has_catalog,
-        });
+        out.push(DiscoveredTarget { target_id, assertion_lines, has_catalog });
     }
     out.sort_by(|a, b| a.target_id.cmp(&b.target_id));
     Ok(out)

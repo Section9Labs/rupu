@@ -48,10 +48,7 @@ fn map_weakness(w: &RawWeakness, namespace: &str) -> Concern {
         severity: severity_from_impact(&w.impact_tags),
         applicable_globs: globs_from_languages(&w.applicable_languages),
         min_strength: TouchStrength::Read,
-        references: vec![format!(
-            "https://cwe.mitre.org/data/definitions/{}.html",
-            w.id
-        )],
+        references: vec![format!("https://cwe.mitre.org/data/definitions/{}.html", w.id)],
         tags: tags_from_languages(&w.applicable_languages),
     }
 }
@@ -146,9 +143,7 @@ fn globs_from_languages(langs: &[String]) -> Vec<String> {
 
 fn language_to_globs(lang: &str) -> &'static [&'static str] {
     match lang.to_lowercase().as_str() {
-        "c" | "c++" => &[
-            "**/*.c", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.cc", "**/*.cxx",
-        ],
+        "c" | "c++" => &["**/*.c", "**/*.cpp", "**/*.h", "**/*.hpp", "**/*.cc", "**/*.cxx"],
         "rust" => &["**/*.rs"],
         "python" => &["**/*.py"],
         "java" => &["**/*.java"],
@@ -251,10 +246,7 @@ mod tests {
     fn slug_handles_special_chars() {
         assert_eq!(slug("Out-of-bounds Write"), "out-of-bounds-write");
         assert_eq!(slug("OS Command Injection"), "os-command-injection");
-        assert_eq!(
-            slug("XSS / Cross-site Scripting"),
-            "xss-cross-site-scripting"
-        );
+        assert_eq!(slug("XSS / Cross-site Scripting"), "xss-cross-site-scripting");
     }
 
     #[test]

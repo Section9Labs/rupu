@@ -67,7 +67,8 @@ pub struct DefaultStepFactory {
     /// (`provider_factory::provider_tuning_map`). Lets a workflow step honor
     /// `timeout_ms` / `max_retries` / `max_concurrency` / `org_id` exactly as
     /// `rupu run` does (ISSUES.md I-9…I-12). Empty ⇒ documented defaults.
-    pub provider_tuning: std::collections::HashMap<String, rupu_providers::ProviderTuning>,
+    pub provider_tuning:
+        std::collections::HashMap<String, rupu_providers::ProviderTuning>,
     /// `default_provider` from `config.toml`. Used when a step's agent pins no
     /// `provider:`. `None` falls back to `provider_factory::FALLBACK_PROVIDER`.
     pub default_provider: Option<String>,
@@ -525,9 +526,7 @@ fn tool_is_granted(pre_narrow_tools: &Option<Vec<String>>, tool_name: &str) -> b
             for name in &catalog {
                 push_unique(&mut universe, name);
             }
-            expand_grant(grant, &universe)
-                .iter()
-                .any(|t| t == tool_name)
+            expand_grant(grant, &universe).iter().any(|t| t == tool_name)
         }
     }
 }
@@ -630,13 +629,7 @@ fn wrap_on_tool_call_with_audit(
             cb(step_id, tool_name, blocked);
         }
         if catalog.iter().any(|c| c == tool_name) {
-            emit_tool_audit(
-                &transcript_path,
-                tool_name,
-                &step_actions,
-                &pre_narrow_tools,
-                blocked,
-            );
+            emit_tool_audit(&transcript_path, tool_name, &step_actions, &pre_narrow_tools, blocked);
         }
     })
 }
@@ -888,29 +881,15 @@ mod narrow_agent_tools_tests {
         let got = narrow_agent_tools(Some(granted), &strs(&["scm.prs.get"])).unwrap();
 
         for builtin in ["read_file", "grep", "bash"] {
-            assert!(
-                got.contains(&builtin.to_string()),
-                "missing builtin {builtin} in {got:?}"
-            );
+            assert!(got.contains(&builtin.to_string()), "missing builtin {builtin} in {got:?}");
         }
         let connector_count = got
             .iter()
-            .filter(|t| {
-                t.starts_with("scm.")
-                    || t.starts_with("issues.")
-                    || t.starts_with("github.")
-                    || t.starts_with("gitlab.")
-            })
+            .filter(|t| t.starts_with("scm.") || t.starts_with("issues.") || t.starts_with("github.") || t.starts_with("gitlab."))
             .count();
-        assert_eq!(
-            connector_count, 1,
-            "expected exactly one connector tool, got {got:?}"
-        );
+        assert_eq!(connector_count, 1, "expected exactly one connector tool, got {got:?}");
         assert!(got.contains(&"scm.prs.get".to_string()));
-        assert!(
-            !got.contains(&"scm.prs.diff".to_string()),
-            "scm.prs.diff must be narrowed away: {got:?}"
-        );
+        assert!(!got.contains(&"scm.prs.diff".to_string()), "scm.prs.diff must be narrowed away: {got:?}");
     }
 
     #[test]
@@ -920,11 +899,7 @@ mod narrow_agent_tools_tests {
         // This is exactly the case the original (wrong) raw-intersection
         // formulation collapsed to `Some([])`.
         let got = narrow_agent_tools(Some(strs(&["scm.*"])), &strs(&["scm.prs.get"])).unwrap();
-        assert_eq!(
-            got,
-            vec!["scm.prs.get".to_string()],
-            "must not collapse to []: {got:?}"
-        );
+        assert_eq!(got, vec!["scm.prs.get".to_string()], "must not collapse to []: {got:?}");
     }
 
     #[test]
@@ -933,10 +908,7 @@ mod narrow_agent_tools_tests {
         // exactly `issues.list` of the catalog.
         let got = narrow_agent_tools(Some(strs(&["*"])), &strs(&["issues.list"])).unwrap();
         for builtin in builtin_tool_names() {
-            assert!(
-                got.contains(&builtin),
-                "missing builtin {builtin} in {got:?}"
-            );
+            assert!(got.contains(&builtin), "missing builtin {builtin} in {got:?}");
         }
         let catalog_entries: Vec<&String> = got
             .iter()
@@ -957,16 +929,10 @@ mod narrow_agent_tools_tests {
         // its connector calls.
         let got = narrow_agent_tools(None, &strs(&["issues.list"])).unwrap();
         for builtin in builtin_tool_names() {
-            assert!(
-                got.contains(&builtin),
-                "missing builtin {builtin} in {got:?}"
-            );
+            assert!(got.contains(&builtin), "missing builtin {builtin} in {got:?}");
         }
         assert!(got.contains(&"issues.list".to_string()));
-        assert!(
-            !got.contains(&"issues.create".to_string()),
-            "must narrow the catalog too: {got:?}"
-        );
+        assert!(!got.contains(&"issues.create".to_string()), "must narrow the catalog too: {got:?}");
     }
 
     #[test]
@@ -975,11 +941,7 @@ mod narrow_agent_tools_tests {
         // gain it — narrowing only ever shrinks, never extends.
         let granted = strs(&["read_file"]);
         let got = narrow_agent_tools(Some(granted), &strs(&["issues.list"])).unwrap();
-        assert_eq!(
-            got,
-            vec!["read_file".to_string()],
-            "must not escalate: {got:?}"
-        );
+        assert_eq!(got, vec!["read_file".to_string()], "must not escalate: {got:?}");
     }
 
     #[test]
@@ -991,11 +953,7 @@ mod narrow_agent_tools_tests {
         let got = narrow_agent_tools(Some(granted), &strs(&["scm.prs.get"])).unwrap();
         assert_eq!(
             got,
-            vec![
-                "bash".to_string(),
-                "read_file".to_string(),
-                "grep".to_string()
-            ],
+            vec!["bash".to_string(), "read_file".to_string(), "grep".to_string()],
             "empty connector intersection must not strip builtins: {got:?}"
         );
     }
@@ -1190,24 +1148,11 @@ steps:
         cb("unrestricted", "issues.list", false);
 
         let lines = read_tool_audit_lines(&transcript_path);
-        assert_eq!(
-            lines.len(),
-            1,
-            "expected exactly one tool_audit line; got {lines:?}"
-        );
+        assert_eq!(lines.len(), 1, "expected exactly one tool_audit line; got {lines:?}");
         assert_eq!(lines[0]["data"]["tool"], "issues.list");
-        assert_eq!(
-            lines[0]["data"]["declared"], false,
-            "actions: [] -> not declared"
-        );
-        assert_eq!(
-            lines[0]["data"]["restricted"], false,
-            "actions: [] -> unrestricted"
-        );
-        assert_eq!(
-            lines[0]["data"]["granted"], true,
-            "issues.list IS in the agent's grant"
-        );
+        assert_eq!(lines[0]["data"]["declared"], false, "actions: [] -> not declared");
+        assert_eq!(lines[0]["data"]["restricted"], false, "actions: [] -> unrestricted");
+        assert_eq!(lines[0]["data"]["granted"], true, "issues.list IS in the agent's grant");
         assert_eq!(lines[0]["data"]["blocked"], false);
     }
 
@@ -1244,11 +1189,7 @@ steps:
         // A builtin call on the same narrowed step: no audit line.
         cb("narrowed", "bash", false);
         let lines = read_tool_audit_lines(&transcript_path);
-        assert_eq!(
-            lines.len(),
-            0,
-            "a builtin call must not be audited: {lines:?}"
-        );
+        assert_eq!(lines.len(), 0, "a builtin call must not be audited: {lines:?}");
 
         // A catalog call on the same step: exactly one audit line.
         cb("narrowed", "issues.list", false);
@@ -1371,10 +1312,7 @@ steps:
         assert_eq!(lines[0]["data"]["tool"], "issues.get");
         assert_eq!(lines[0]["data"]["declared"], true);
         assert_eq!(lines[0]["data"]["restricted"], true);
-        assert_eq!(
-            lines[0]["data"]["granted"], false,
-            "agent never granted issues.get"
-        );
+        assert_eq!(lines[0]["data"]["granted"], false, "agent never granted issues.get");
         assert_eq!(lines[0]["data"]["blocked"], true);
     }
 
@@ -1437,10 +1375,7 @@ steps:
 
         let lines = read_tool_audit_lines(&transcript_path);
         assert_eq!(lines.len(), 1);
-        assert_eq!(
-            lines[0]["data"]["granted"], true,
-            "scm.* must cover scm.prs.get: {lines:?}"
-        );
+        assert_eq!(lines[0]["data"]["granted"], true, "scm.* must cover scm.prs.get: {lines:?}");
         assert_eq!(lines[0]["data"]["declared"], true);
         assert_eq!(lines[0]["data"]["blocked"], false);
     }

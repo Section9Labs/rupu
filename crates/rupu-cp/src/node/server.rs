@@ -34,13 +34,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
+    Router,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::Response,
     routing::get,
-    Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
@@ -143,9 +143,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     //
     // Look up the host by scanning the list for a `Tunnel { node_id }` match.
     // `list_hosts()` is cheap (one disk read + sort for a handful of hosts).
-    let host = state.hosts.list_hosts().into_iter().find(
-        |h| matches!(&h.transport, HostTransport::Tunnel { node_id: nid } if *nid == node_id),
-    );
+    let host = state.hosts.list_hosts().into_iter().find(|h| {
+        matches!(&h.transport, HostTransport::Tunnel { node_id: nid } if *nid == node_id)
+    });
 
     let host = match host {
         Some(h) => h,
@@ -257,13 +257,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                     match frame {
                         Frame::Artifact { run_id, file, line } => {
-                            if let Err(e) = mirror.append(&run_id, &node_id_r, file, &line) {
+                            if let Err(e) =
+                                mirror.append(&run_id, &node_id_r, file, &line)
+                            {
                                 warn!(error = %e, run_id,
                                       "node_tunnel: mirror.append failed");
                             }
                         }
                         Frame::RunFinished { run_id, status } => {
-                            if let Err(e) = mirror.finish(&run_id, &node_id_r, &status) {
+                            if let Err(e) =
+                                mirror.finish(&run_id, &node_id_r, &status)
+                            {
                                 warn!(error = %e, run_id,
                                       "node_tunnel: mirror.finish failed");
                             }

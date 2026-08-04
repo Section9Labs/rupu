@@ -89,7 +89,8 @@ fn seed_run(id: &str, status: RunStatus) -> RunRecord {
 /// Spawn a read-only CP server (no launcher) on an ephemeral port.
 /// The provided directory becomes the `global_dir` for the `AppState`.
 async fn spawn_server(dir: &std::path::Path) -> std::net::SocketAddr {
-    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    let state =
+        rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
     let app = rupu_cp::server::router(state, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

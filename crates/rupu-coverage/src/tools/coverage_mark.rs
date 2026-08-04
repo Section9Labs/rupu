@@ -1,5 +1,7 @@
 use crate::catalog::types::{FlatCatalog, TouchStrength};
-use crate::ledger::events::{AssertionStatus, Attribution, ConcernAssertion, Evidence};
+use crate::ledger::events::{
+    AssertionStatus, Attribution, ConcernAssertion, Evidence,
+};
 use crate::ledger::paths::CoveragePaths;
 use crate::ledger::views::{file_views, read_file_events};
 use chrono::Utc;

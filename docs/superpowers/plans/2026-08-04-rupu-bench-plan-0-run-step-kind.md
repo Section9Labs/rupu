@@ -15,7 +15,11 @@
 - `#![deny(clippy::all)]` workspace-wide via `[workspace.lints]`; `unsafe_code` is forbidden.
 - Errors: `thiserror` in libraries, `anyhow` only in `rupu-cli`.
 - `rupu-cli` stays thin — arg parsing and delegation only, no business logic.
-- **Never run package-wide `cargo fmt`.** `main` is fmt-dirty under the pinned toolchain. Format only the files you touched: `cargo fmt -- <path>`.
+- **Never run `cargo fmt`, in any form.** `main` is fmt-dirty under the pinned toolchain, and
+  `cargo fmt -- <path>` does NOT scope to that path — it formats the whole workspace and
+  passes the path as an extra rustfmt arg. Combined with a non-pinned rustfmt this rewrites
+  ~90 unrelated files. Format a single file with `rustfmt <path>` directly, and only when
+  you have the pinned toolchain. (Learned the hard way on 2026-08-04.)
 - Never use bare `git stash` / `git stash pop` — the stash stack is shared across worktrees.
 - No silent no-ops. A capability that cannot run must fail loudly, never degrade quietly.
 

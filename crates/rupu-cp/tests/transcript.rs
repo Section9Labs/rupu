@@ -62,10 +62,7 @@ fn validator_accepts_in_root_jsonl_rejects_escape() {
     assert!(v(outside.to_str().unwrap(), &roots).is_err());
 
     // a `..` component is rejected even when it points back inside the root.
-    let dotdot = format!(
-        "{}/transcripts/../transcripts/run_x.jsonl",
-        global.display()
-    );
+    let dotdot = format!("{}/transcripts/../transcripts/run_x.jsonl", global.display());
     assert!(v(&dotdot, &roots).is_err());
 }
 
@@ -82,8 +79,7 @@ async fn get_transcript_empty_when_file_absent() {
     std::fs::create_dir_all(global.join("transcripts")).unwrap();
     let pending = global.join("transcripts").join("run_pending.jsonl");
 
-    let state =
-        rupu_cp::state::AppState::new(global.clone(), rupu_config::PricingConfig::default());
+    let state = rupu_cp::state::AppState::new(global.clone(), rupu_config::PricingConfig::default());
     let app = rupu_cp::server::router(state, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -112,8 +108,7 @@ async fn get_transcript_returns_events() {
     std::fs::create_dir_all(tpath.parent().unwrap()).unwrap();
     write_two_event_jsonl(&tpath);
 
-    let state =
-        rupu_cp::state::AppState::new(global.clone(), rupu_config::PricingConfig::default());
+    let state = rupu_cp::state::AppState::new(global.clone(), rupu_config::PricingConfig::default());
     let app = rupu_cp::server::router(state, None);
 
     // Serve on an ephemeral port.
@@ -180,8 +175,7 @@ async fn stream_transcript_emits_first_event() {
     std::fs::create_dir_all(tpath.parent().unwrap()).unwrap();
     let want_type = write_one_event_jsonl(&tpath);
 
-    let state =
-        rupu_cp::state::AppState::new(global.clone(), rupu_config::PricingConfig::default());
+    let state = rupu_cp::state::AppState::new(global.clone(), rupu_config::PricingConfig::default());
     let app = rupu_cp::server::router(state, None);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

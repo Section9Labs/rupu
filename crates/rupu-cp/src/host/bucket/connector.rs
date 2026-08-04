@@ -84,8 +84,8 @@ impl BucketHostConnector {
         // put_control_envelope calls cannot race to the same seq number
         // (len() would give both N; the second put would silently overwrite).
         let seq = existing.iter().map(|(s, _)| *s + 1).max().unwrap_or(0);
-        let bytes = serde_json::to_vec(&envelope)
-            .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
+        let bytes =
+            serde_json::to_vec(&envelope).map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
         self.bucket
             .put_control(run_id, seq, &bytes)
             .await
@@ -131,10 +131,13 @@ impl HostConnector for BucketHostConnector {
             let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
             HostConnectorError::Invalid(e.to_string())
         })?;
-        self.bucket.put_job(&run_id, &bytes).await.map_err(|e| {
-            let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
-            bucket_err_to_unreachable(e)
-        })?;
+        self.bucket
+            .put_job(&run_id, &bytes)
+            .await
+            .map_err(|e| {
+                let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
+                bucket_err_to_unreachable(e)
+            })?;
 
         Ok(run_id)
     }
@@ -159,15 +162,21 @@ impl HostConnector for BucketHostConnector {
             let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
             HostConnectorError::Invalid(e.to_string())
         })?;
-        self.bucket.put_job(&run_id, &bytes).await.map_err(|e| {
-            let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
-            bucket_err_to_unreachable(e)
-        })?;
+        self.bucket
+            .put_job(&run_id, &bytes)
+            .await
+            .map_err(|e| {
+                let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
+                bucket_err_to_unreachable(e)
+            })?;
 
         Ok(run_id)
     }
 
-    async fn start_session(&self, _req: SessionStartRequest) -> Result<String, HostConnectorError> {
+    async fn start_session(
+        &self,
+        _req: SessionStartRequest,
+    ) -> Result<String, HostConnectorError> {
         Err(HostConnectorError::Invalid(
             "sessions not supported over bucket (slice 2b)".into(),
         ))
@@ -238,11 +247,17 @@ impl HostConnector for BucketHostConnector {
         .await
     }
 
-    async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
+    async fn stream_run_events(
+        &self,
+        run_id: &str,
+    ) -> Result<EventByteStream, HostConnectorError> {
         mirror_stream_run_events(&self.run_store, &self.host_id, run_id).await
     }
 
-    async fn get_transcript(&self, path: &str) -> Result<serde_json::Value, HostConnectorError> {
+    async fn get_transcript(
+        &self,
+        path: &str,
+    ) -> Result<serde_json::Value, HostConnectorError> {
         read_transcript_file(path)
     }
 
@@ -353,7 +368,10 @@ mod tests {
             Some("agent"),
             "job envelope kind must be 'agent'"
         );
-        assert_eq!(spec.get("name").and_then(|v| v.as_str()), Some("my-agent"));
+        assert_eq!(
+            spec.get("name").and_then(|v| v.as_str()),
+            Some("my-agent")
+        );
     }
 
     #[tokio::test]
@@ -456,10 +474,7 @@ mod tests {
         assert_eq!(controls.len(), 1);
         let env: ControlEnvelope = serde_json::from_slice(&controls[0].1).unwrap();
         assert_eq!(env.kind, "approve");
-        assert!(
-            env.mode.is_none(),
-            "empty mode string must be stored as None"
-        );
+        assert!(env.mode.is_none(), "empty mode string must be stored as None");
     }
 
     #[tokio::test]
@@ -535,7 +550,10 @@ mod tests {
         ) -> Result<(), BucketError> {
             unimplemented!("FailingBucket::put_result")
         }
-        async fn list_results(&self, _run_id: &str) -> Result<Vec<(String, Vec<u8>)>, BucketError> {
+        async fn list_results(
+            &self,
+            _run_id: &str,
+        ) -> Result<Vec<(String, Vec<u8>)>, BucketError> {
             unimplemented!("FailingBucket::list_results")
         }
         async fn put_finished(&self, _run_id: &str, _status: &str) -> Result<(), BucketError> {

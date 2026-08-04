@@ -1520,13 +1520,12 @@ mod on_tool_call_tests {
     async fn on_tool_call_fires_once_per_tool_invocation() {
         let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let calls_clone = calls.clone();
-        let cb: OnToolCallCallback =
-            Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
-                calls_clone
-                    .lock()
-                    .unwrap()
-                    .push(format!("{step_id}:{tool_name}:{blocked}"));
-            });
+        let cb: OnToolCallCallback = Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
+            calls_clone
+                .lock()
+                .unwrap()
+                .push(format!("{step_id}:{tool_name}:{blocked}"));
+        });
 
         // Two-turn script: turn 0 → tool use (read_file), turn 1 → final text.
         // The read_file tool needs a `path` input; we point it at a real
@@ -1626,14 +1625,12 @@ mod on_tool_call_tests {
         // hard run failure).
         let calls: Arc<Mutex<Vec<(String, String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
         let calls_clone = calls.clone();
-        let cb: OnToolCallCallback =
-            Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
-                calls_clone.lock().unwrap().push((
-                    step_id.to_string(),
-                    tool_name.to_string(),
-                    blocked,
-                ));
-            });
+        let cb: OnToolCallCallback = Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
+            calls_clone
+                .lock()
+                .unwrap()
+                .push((step_id.to_string(), tool_name.to_string(), blocked));
+        });
 
         let tmp_dir = tempfile::tempdir().expect("tmpdir");
         let transcript_path = tmp_dir.path().join("run_test_denied.jsonl");
@@ -1706,11 +1703,7 @@ mod on_tool_call_tests {
         assert_eq!(result.status, RunStatus::Ok, "run must complete Ok");
 
         let log = calls.lock().unwrap();
-        assert_eq!(
-            log.len(),
-            1,
-            "expected exactly one on_tool_call, got {log:?}"
-        );
+        assert_eq!(log.len(), 1, "expected exactly one on_tool_call, got {log:?}");
         assert_eq!(log[0], ("s1".to_string(), "bash".to_string(), true));
 
         // The model got a tool error back, not a hard failure.
@@ -1724,10 +1717,7 @@ mod on_tool_call_tests {
                 Event::ToolResult { error: Some(msg), .. } if msg.contains("unknown tool: bash")
             )
         });
-        assert!(
-            saw_tool_error,
-            "expected a tool-error ToolResult for the denied call; got {events:?}"
-        );
+        assert!(saw_tool_error, "expected a tool-error ToolResult for the denied call; got {events:?}");
     }
 
     #[tokio::test]
@@ -1744,14 +1734,12 @@ mod on_tool_call_tests {
         // exactly this case. It must now report `blocked: true`.
         let calls: Arc<Mutex<Vec<(String, String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
         let calls_clone = calls.clone();
-        let cb: OnToolCallCallback =
-            Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
-                calls_clone.lock().unwrap().push((
-                    step_id.to_string(),
-                    tool_name.to_string(),
-                    blocked,
-                ));
-            });
+        let cb: OnToolCallCallback = Arc::new(move |step_id: &str, tool_name: &str, blocked: bool| {
+            calls_clone
+                .lock()
+                .unwrap()
+                .push((step_id.to_string(), tool_name.to_string(), blocked));
+        });
 
         let tmp_dir = tempfile::tempdir().expect("tmpdir");
         let transcript_path = tmp_dir.path().join("run_test_readonly_denied.jsonl");
@@ -1828,11 +1816,7 @@ mod on_tool_call_tests {
         assert_eq!(result.status, RunStatus::Ok, "run must complete Ok");
 
         let log = calls.lock().unwrap();
-        assert_eq!(
-            log.len(),
-            1,
-            "expected exactly one on_tool_call, got {log:?}"
-        );
+        assert_eq!(log.len(), 1, "expected exactly one on_tool_call, got {log:?}");
         assert_eq!(
             log[0],
             ("s1".to_string(), "issues.create".to_string(), true),
@@ -2410,9 +2394,7 @@ impl LlmProvider for MockProvider {
             rupu_providers::ProviderError::Other(anyhow::anyhow!("mock script exhausted"))
         })?;
         match turn {
-            ScriptedTurn::ProviderError(e) => {
-                Err(rupu_providers::ProviderError::Other(anyhow::anyhow!(e)))
-            }
+            ScriptedTurn::ProviderError(e) => Err(rupu_providers::ProviderError::Other(anyhow::anyhow!(e))),
             ScriptedTurn::AssistantText {
                 text,
                 stop,

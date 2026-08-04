@@ -50,7 +50,8 @@ fn syntax_error_returns_render_error() {
 
 #[test]
 fn fromjson_makes_an_action_steps_output_indexable() {
-    let ctx = StepContext::new().with_step_output("act", r#"{"number": 7, "title": "the title"}"#);
+    let ctx = StepContext::new()
+        .with_step_output("act", r#"{"number": 7, "title": "the title"}"#);
     let out = render_step_prompt(
         "Title: {{ (steps.act.output | fromjson).title }}",
         &ctx,
@@ -76,8 +77,8 @@ fn fromjson_yields_a_real_number_not_a_string() {
 
 #[test]
 fn fromjson_indexes_into_nested_structures_and_arrays() {
-    let ctx =
-        StepContext::new().with_step_output("act", r#"{"items": [{"id": "a"}, {"id": "b"}]}"#);
+    let ctx = StepContext::new()
+        .with_step_output("act", r#"{"items": [{"id": "a"}, {"id": "b"}]}"#);
     let out = render_step_prompt(
         "{{ (steps.act.output | fromjson)['items'][1]['id'] }}",
         &ctx,

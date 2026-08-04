@@ -144,10 +144,7 @@ fn sweep_reachable_pieces_expire_overdue_gate_to_rejected_with_terminal_event() 
     assert!(reloaded.awaiting_step_id.is_none());
 
     let last = last_event_line(tmp.path(), &rec.id);
-    assert_eq!(
-        last["type"], "run_completed",
-        "events.jsonl must end terminal, last: {last}"
-    );
+    assert_eq!(last["type"], "run_completed", "events.jsonl must end terminal, last: {last}");
     assert_eq!(last["status"], "rejected", "last: {last}");
 }
 
@@ -183,10 +180,7 @@ fn sweep_reachable_pieces_reap_orphaned_running_run_to_failed_with_terminal_even
     assert!(reloaded.runner_pid.is_none());
 
     let last = last_event_line(tmp.path(), &rec.id);
-    assert_eq!(
-        last["type"], "run_failed",
-        "events.jsonl must end terminal, last: {last}"
-    );
+    assert_eq!(last["type"], "run_failed", "events.jsonl must end terminal, last: {last}");
     assert!(
         last["error"]
             .as_str()

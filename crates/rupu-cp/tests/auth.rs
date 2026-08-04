@@ -67,7 +67,11 @@ async fn healthz_and_static_stay_open_with_token() {
     assert_eq!(resp.status(), 200, "/healthz must stay open");
 
     // Static SPA fallback is open (the browser loads without a header).
-    let resp = client.get(format!("http://{addr}/")).send().await.unwrap();
+    let resp = client
+        .get(format!("http://{addr}/"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200, "static UI must stay open");
 }
 

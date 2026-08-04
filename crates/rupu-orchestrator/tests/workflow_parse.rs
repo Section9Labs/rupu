@@ -1170,10 +1170,7 @@ fn approval_gate_node_parses() {
     let gate = &wf.steps[1];
     assert!(is_approval_gate(gate));
     let ap = gate.approval.as_ref().unwrap();
-    assert_eq!(
-        ap.auto_approve.as_deref(),
-        Some("{{ steps.review.output == 'clean' }}")
-    );
+    assert_eq!(ap.auto_approve.as_deref(), Some("{{ steps.review.output == 'clean' }}"));
     assert_eq!(ap.on_timeout, Some(TimeoutAction::Reject));
     assert_eq!(ap.on_reject.len(), 1);
     assert_eq!(ap.on_reject[0].id, "note_rejection");

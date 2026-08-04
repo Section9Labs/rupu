@@ -18,9 +18,7 @@ async fn live_non_streaming_completion() {
         rupu_providers::OpenAiCompatibleClient::new(&base, &key, &model, vec![], false);
     let req = LlmRequest {
         model: model.clone(),
-        messages: vec![Message::user(
-            "What is 17 * 23? Reply with just the number.",
-        )],
+        messages: vec![Message::user("What is 17 * 23? Reply with just the number.")],
         max_tokens: 64,
         ..Default::default()
     };

@@ -71,7 +71,9 @@ pub async fn poll_bucket_run(
                     }
                     mirror
                         .append(run_id, host_id, file.clone(), line)
-                        .with_context(|| format!("mirror.append {file:?} line for run {run_id}"))?;
+                        .with_context(|| {
+                            format!("mirror.append {file:?} line for run {run_id}")
+                        })?;
                 }
             }
         }
@@ -140,10 +142,7 @@ mod tests {
             classify_key("unit_checkpoints.0001.jsonl"),
             Some(ArtifactFile::UnitCheckpoints)
         ));
-        assert!(matches!(
-            classify_key("run.json"),
-            Some(ArtifactFile::RunJson)
-        ));
+        assert!(matches!(classify_key("run.json"), Some(ArtifactFile::RunJson)));
         assert!(classify_key("finished").is_none());
         assert!(classify_key("unknown.txt").is_none());
         assert!(classify_key("").is_none());

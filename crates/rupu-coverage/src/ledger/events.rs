@@ -224,9 +224,7 @@ mod tests {
             line_range: [1, 240],
             tool: "read_file".to_string(),
             attribution: attribution(),
-            at: DateTime::parse_from_rfc3339("2026-05-23T14:01:32Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            at: DateTime::parse_from_rfc3339("2026-05-23T14:01:32Z").unwrap().with_timezone(&Utc),
         };
         let json = serde_json::to_string(&event).unwrap();
         let decoded: FileTouchEvent = serde_json::from_str(&json).unwrap();

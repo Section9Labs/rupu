@@ -19,11 +19,7 @@ pub(crate) fn build_session_start_argv(
     req: &SessionStartRequest,
     clone_dir: Option<&str>,
 ) -> Vec<String> {
-    let mut argv = vec![
-        "session".to_string(),
-        "start".to_string(),
-        req.agent.clone(),
-    ];
+    let mut argv = vec!["session".to_string(), "start".to_string(), req.agent.clone()];
     if let Some(t) = &req.target {
         argv.push(t.clone());
     }
@@ -70,7 +66,8 @@ impl SessionStarter for SubprocessSessionStarter {
                 .map_err(|e| SessionStartError::Spawn(e.to_string()))?
                 .join("clones")
                 .join(ulid::Ulid::new().to_string());
-            std::fs::create_dir_all(&base).map_err(|e| SessionStartError::Spawn(e.to_string()))?;
+            std::fs::create_dir_all(&base)
+                .map_err(|e| SessionStartError::Spawn(e.to_string()))?;
             Some(base.to_string_lossy().into_owned())
         } else {
             None
@@ -98,9 +95,8 @@ impl SessionStarter for SubprocessSessionStarter {
             }));
         }
 
-        parse_session_id(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| {
-            SessionStartError::Spawn("could not determine session id from output".into())
-        })
+        parse_session_id(&String::from_utf8_lossy(&out.stdout))
+            .ok_or_else(|| SessionStartError::Spawn("could not determine session id from output".into()))
     }
 }
 
