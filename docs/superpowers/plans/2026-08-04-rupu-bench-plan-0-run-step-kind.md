@@ -1399,11 +1399,11 @@ is only needed to silence the warning.
 ignored. Only agent steps can be distributed. Both plans' "add `distribute:` to
 the solve step" gap item still applies — `solve` is an agent step, so it is fine.
 
-**4. `unit_checkpoints.jsonl` is NOT written for `run:` fan-out.** Resume re-runs
-every unit rather than only the failures. Plan 1's `gen`/`verify` and Plan 2's
-`score` steps therefore re-execute in full on resume. They are idempotent, so this
-costs time, not correctness — but a long benchmark does not get the partial-resume
-benefit the plan advertised. Worth closing before a full-corpus run.
+**4. `unit_checkpoints.jsonl` IS written for `run:` fan-out.** (Originally shipped
+without it; fixed the same day.) A resumed run replays succeeded units from disk
+and re-executes only the failures, matching the agent fan-out path. So Plan 1's
+`gen`/`verify` and Plan 2's `score` do get partial resume — a 600-unit cybermark
+run that dies at unit 550 re-runs 50, not 600.
 
 **5. `rupu workflow list` remains the only parse check**, and it still exits 0 on
 an unparseable workflow — the `STEPS` column shows `—`. The

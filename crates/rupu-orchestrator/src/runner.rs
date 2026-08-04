@@ -4429,7 +4429,7 @@ async fn run_node(
     } else if step.run.is_some() && step.for_each.is_some() {
         // `run:` + `for_each:` — fan the command across items. Checked
         // BEFORE the generic for_each arm, which assumes an agent.
-        run_fanout_run_step(step, ctx, opts, effective_continue_on_error).await
+        run_fanout_run_step(run_id, step, ctx, opts, effective_continue_on_error).await
     } else if step.for_each.is_some() {
         // A distributed fan-out honors the cooperative pause token
         // MID-UNIT (not just at the step boundary): a paused-incomplete
@@ -6056,6 +6056,7 @@ async fn run_linear_step(
 /// Units run under the same `max_parallel` cap as an agent fan-out and
 /// are returned in DECLARED order regardless of finish order.
 async fn run_fanout_run_step(
+    workflow_run_id: &str,
     step: &Step,
     ctx: &StepContext,
     opts: &OrchestratorRunOpts,
@@ -6086,11 +6087,52 @@ async fn run_fanout_run_step(
         });
     }
 
+    // Replay units that already succeeded in a prior run. Same contract
+    // as the agent fan-out: the rendered list is deterministic, so the
+    // index is a stable key — but if the checkpointed length exceeds the
+    // rendered one the `for_each` source changed underneath us and the
+    // index mapping can't be trusted, so re-run everything.
+    let mut resumed: std::collections::BTreeMap<usize, ItemResult> =
+        std::collections::BTreeMap::new();
+    if let Some(prior) = opts
+        .resume_from
+        .as_ref()
+        .and_then(|r| r.completed_units.get(&step.id))
+    {
+        let checkpointed_len = prior.keys().copied().max().map(|m| m + 1).unwrap_or(0);
+        if checkpointed_len > total {
+            warn!(
+                step = %step.id,
+                checkpointed = checkpointed_len,
+                rendered = total,
+                "resume: checkpointed fan-out length exceeds rendered list; re-running all units"
+            );
+        } else {
+            for (idx, item_result) in prior {
+                if *idx < total && item_result.success {
+                    resumed.insert(*idx, item_result.clone());
+                }
+            }
+            if !resumed.is_empty() {
+                info!(
+                    step = %step.id,
+                    replayed = resumed.len(),
+                    total,
+                    "resume: replaying succeeded run: units from disk"
+                );
+            }
+        }
+    }
+
     let max_parallel = step.max_parallel.unwrap_or(1).max(1) as usize;
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallel));
 
     let mut handles = Vec::with_capacity(total);
     for (idx, item) in items.iter().enumerate() {
+        // Already succeeded in a prior run — don't re-execute it.
+        if resumed.contains_key(&idx) {
+            continue;
+        }
         let item_ctx = ctx.clone().with_item(
             item.clone(),
             LoopInfo {
@@ -6155,6 +6197,36 @@ async fn run_fanout_run_step(
             },
         ));
     }
+    // Checkpoint every unit that ran to completion in THIS pass, before
+    // the failure check below — so a crash or an early return mid-fan-out
+    // still leaves finished units durable for `rupu workflow resume`.
+    // Replayed units are already on disk, so they are not re-appended.
+    if let Some(store) = &opts.run_store {
+        if !workflow_run_id.is_empty() {
+            for (idx, r) in &collected {
+                let checkpoint = crate::runs::UnitCheckpoint {
+                    step_id: step.id.clone(),
+                    index: *idx,
+                    item: r.item.clone(),
+                    // `run:` units have no agent run id and never run
+                    // remotely (validation rejects `distribute:`).
+                    run_id: String::new(),
+                    transcript_path: r.transcript_path.clone(),
+                    output: r.output.clone(),
+                    success: r.success,
+                    finished_at: chrono::Utc::now(),
+                    host: None,
+                };
+                if let Err(e) = store.append_unit_checkpoint(workflow_run_id, &checkpoint) {
+                    warn!(step = %step.id, index = idx, error = %e, "failed to append unit checkpoint");
+                }
+            }
+        }
+    }
+
+    // Fold the replayed units back in so the step's result covers the
+    // whole list, not just what re-ran.
+    collected.extend(resumed.into_iter());
     collected.sort_by_key(|(idx, _)| *idx);
     let unit_results: Vec<ItemResult> = collected.into_iter().map(|(_, r)| r).collect();
 

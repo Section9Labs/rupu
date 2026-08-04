@@ -437,3 +437,166 @@ steps:
         step.items[0].output
     );
 }
+
+// ---------------------------------------------------------------------------
+// Resume: a partially-completed run: fan-out must re-run ONLY the failures.
+// ---------------------------------------------------------------------------
+
+/// Run a workflow twice against the SAME store/run id, seeding the second
+/// pass with the first pass's succeeded units — the shape
+/// `rupu workflow resume` produces.
+async fn run_then_resume(
+    yaml: &str,
+    label: &str,
+    ledger: &std::path::Path,
+) -> (OrchestratorRunResult, OrchestratorRunResult, usize) {
+    let wf = Workflow::parse(yaml).expect("workflow parses");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+
+    let mk = |resume: Option<rupu_orchestrator::runner::ResumeState>| OrchestratorRunOpts {
+        run_step: bypass(),
+        workflow: wf.clone(),
+        inputs: BTreeMap::new(),
+        workspace_id: label.into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(NoAgentFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(yaml.to_string()),
+        resume_from: resume,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+    };
+
+    let first = run_workflow(mk(None)).await.expect("first pass completes");
+    // Snapshot the ledger BETWEEN passes — reading it afterwards would
+    // count both passes and make the assertion meaningless.
+    let lines_after_first = std::fs::read_to_string(ledger)
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+
+    // Seed the resume with exactly what the first pass got through, the
+    // way the CLI builds it from unit_checkpoints.jsonl.
+    let mut completed_units = BTreeMap::new();
+    for sr in &first.step_results {
+        let done: BTreeMap<usize, _> = sr
+            .items
+            .iter()
+            .filter(|i| i.success)
+            .map(|i| (i.index, i.clone()))
+            .collect();
+        if !done.is_empty() {
+            completed_units.insert(sr.step_id.clone(), done);
+        }
+    }
+    let resume = rupu_orchestrator::runner::ResumeState {
+        run_id: first.run_id.clone(),
+        prior_step_results: Vec::new(),
+        approved_step_id: String::new(),
+        completed_units,
+        ..Default::default()
+    };
+
+    let second = run_workflow(mk(Some(resume)))
+        .await
+        .expect("resume completes");
+    (first, second, lines_after_first)
+}
+
+#[tokio::test]
+async fn resume_reruns_only_the_failed_units() {
+    // Each unit appends a line to a shared file, so the file's line count
+    // is the ground truth for how many units ACTUALLY executed — a status
+    // assertion alone could pass while everything silently re-ran.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = dir.path().join("executions.txt");
+
+    let yaml = format!(
+        r#"
+name: bench-resume
+steps:
+  - id: score
+    for_each: '["ok1", "BAD", "ok2"]'
+    max_parallel: 1
+    continue_on_error: true
+    run:
+      cmd: sh
+      args:
+        - "-c"
+        - 'echo {{{{ item }}}} >> {ledger}; echo {{{{ item }}}}; test "{{{{ item }}}}" != BAD'
+"#,
+        ledger = ledger.display()
+    );
+
+    let (first, second, lines_after_first) = run_then_resume(&yaml, "ws_resume", &ledger).await;
+
+    // First pass: all three ran, one failed.
+    assert_eq!(first.step_results[0].items.len(), 3);
+    assert_eq!(
+        first.step_results[0]
+            .items
+            .iter()
+            .filter(|i| i.success)
+            .count(),
+        2
+    );
+    assert_eq!(lines_after_first, 3, "first pass executes every unit");
+
+    // Resume: the step still reports all three units...
+    assert_eq!(
+        second.step_results[0].items.len(),
+        3,
+        "the resumed step still covers the whole list"
+    );
+
+    // ...but only the failed one actually re-executed.
+    let after_second = std::fs::read_to_string(&ledger).unwrap();
+    let new_lines: Vec<&str> = after_second.lines().skip(lines_after_first).collect();
+    assert_eq!(
+        new_lines,
+        vec!["BAD"],
+        "resume must re-run ONLY the failed unit, got {new_lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn resume_replays_succeeded_units_in_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = dir.path().join("order.txt");
+    let yaml = format!(
+        r#"
+name: bench-resume-order
+steps:
+  - id: score
+    for_each: '["a", "BAD", "c"]'
+    max_parallel: 1
+    continue_on_error: true
+    run:
+      cmd: sh
+      args:
+        - "-c"
+        - 'echo {{{{ item }}}} >> {ledger}; echo {{{{ item }}}}; test "{{{{ item }}}}" != BAD'
+"#,
+        ledger = ledger.display()
+    );
+
+    let (_, second, _) = run_then_resume(&yaml, "ws_resume_order", &ledger).await;
+
+    let items = &second.step_results[0].items;
+    assert_eq!(items.len(), 3);
+    // Declared order preserved even though unit 1 came from disk and
+    // units 0/2 were replayed.
+    assert_eq!(items[0].index, 0);
+    assert_eq!(items[1].index, 1);
+    assert_eq!(items[2].index, 2);
+    assert_eq!(items[0].output.trim(), "a");
+    assert_eq!(items[2].output.trim(), "c");
+}
