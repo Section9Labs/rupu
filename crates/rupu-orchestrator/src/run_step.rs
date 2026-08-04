@@ -273,3 +273,144 @@ mod tests {
         assert_eq!(got, want);
     }
 }
+
+/// Why a `run:` step was refused. Each variant is a hard stop — no
+/// operator decision changes the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunDenyReason {
+    /// `--mode readonly`: a `run:` step executes, so it is write-class.
+    ReadonlyMode,
+    /// `[workflow].run_step_enabled = false`.
+    ConfigDisabled,
+    /// `[workflow].run_step_allowlist` does not contain this executable.
+    NotAllowlisted,
+}
+
+impl RunDenyReason {
+    /// Operator-facing explanation, including the remedy.
+    pub fn explain(self) -> &'static str {
+        match self {
+            Self::ReadonlyMode => {
+                "`run:` steps execute commands and are refused under --mode readonly; \
+                 re-run with --mode ask or --mode bypass"
+            }
+            Self::ConfigDisabled => {
+                "`run:` steps are disabled; set `[workflow] run_step_enabled = true` \
+                 in your rupu config to allow them"
+            }
+            Self::NotAllowlisted => {
+                "this executable is not in `[workflow] run_step_allowlist`; \
+                 add it or clear the allowlist to permit any executable"
+            }
+        }
+    }
+}
+
+/// Outcome of gating one `run:` step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunGateDecision {
+    Allow,
+    /// `ask` mode: the CLI prompts the operator with the fully-resolved
+    /// argv, cwd, and env keys before this runs.
+    NeedsOperatorDecision,
+    Denied(RunDenyReason),
+}
+
+/// Pure gate for a `run:` step.
+///
+/// Config is checked BEFORE permission mode, so `--mode bypass` cannot
+/// override a workspace that has not opted in. Bypass is about skipping
+/// per-call prompts, not about escalating past a workspace policy.
+pub fn gate(
+    mode: rupu_tools::permission::PermissionMode,
+    cfg: &rupu_config::policy_config::WorkflowConfig,
+    cmd: &str,
+) -> RunGateDecision {
+    use rupu_tools::permission::PermissionMode;
+
+    if !cfg.run_step_enabled {
+        return RunGateDecision::Denied(RunDenyReason::ConfigDisabled);
+    }
+    if !cfg.allows(cmd) {
+        return RunGateDecision::Denied(RunDenyReason::NotAllowlisted);
+    }
+    match mode {
+        PermissionMode::Readonly => RunGateDecision::Denied(RunDenyReason::ReadonlyMode),
+        PermissionMode::Ask => RunGateDecision::NeedsOperatorDecision,
+        PermissionMode::Bypass => RunGateDecision::Allow,
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use rupu_config::policy_config::WorkflowConfig;
+    use rupu_tools::permission::PermissionMode;
+
+    fn enabled() -> WorkflowConfig {
+        WorkflowConfig {
+            run_step_enabled: true,
+            run_step_allowlist: vec![],
+        }
+    }
+
+    #[test]
+    fn readonly_denies_run_steps() {
+        assert_eq!(
+            gate(PermissionMode::Readonly, &enabled(), "python3"),
+            RunGateDecision::Denied(RunDenyReason::ReadonlyMode)
+        );
+    }
+
+    #[test]
+    fn ask_requires_an_operator_decision() {
+        assert_eq!(
+            gate(PermissionMode::Ask, &enabled(), "python3"),
+            RunGateDecision::NeedsOperatorDecision
+        );
+    }
+
+    #[test]
+    fn bypass_allows() {
+        assert_eq!(
+            gate(PermissionMode::Bypass, &enabled(), "python3"),
+            RunGateDecision::Allow
+        );
+    }
+
+    #[test]
+    fn config_disabled_denies_even_under_bypass() {
+        // The workspace opt-in is not overridable by permission mode.
+        assert_eq!(
+            gate(
+                PermissionMode::Bypass,
+                &WorkflowConfig::default(),
+                "python3"
+            ),
+            RunGateDecision::Denied(RunDenyReason::ConfigDisabled)
+        );
+    }
+
+    #[test]
+    fn non_allowlisted_executable_denies_under_bypass() {
+        let cfg = WorkflowConfig {
+            run_step_enabled: true,
+            run_step_allowlist: vec!["python3".into()],
+        };
+        assert_eq!(
+            gate(PermissionMode::Bypass, &cfg, "/bin/bash"),
+            RunGateDecision::Denied(RunDenyReason::NotAllowlisted)
+        );
+    }
+
+    #[test]
+    fn every_deny_reason_explains_its_remedy() {
+        for r in [
+            RunDenyReason::ReadonlyMode,
+            RunDenyReason::ConfigDisabled,
+            RunDenyReason::NotAllowlisted,
+        ] {
+            assert!(!r.explain().is_empty(), "{r:?} needs an explanation");
+        }
+    }
+}

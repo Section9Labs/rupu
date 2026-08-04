@@ -132,6 +132,14 @@ pub enum RunWorkflowError {
         #[source]
         source: rupu_mcp::McpError,
     },
+    #[error("run step `{step}` refused: {reason}")]
+    RunStepDenied { step: String, reason: String },
+    #[error("run step `{step}` failed: {source}")]
+    RunStep {
+        step: String,
+        #[source]
+        source: crate::run_step::RunStepError,
+    },
     #[error("input `{name}` is required but was not provided")]
     MissingRequiredInput { name: String },
     #[error("input `{name}`: value `{value}` is not in the declared `enum` ({allowed:?})")]
