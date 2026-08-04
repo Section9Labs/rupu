@@ -101,3 +101,89 @@ impl Default for CpConfig {
         }
     }
 }
+
+/// `[workflow]` config block. Gates the `run:` step kind, which executes
+/// declared commands and is therefore opt-in per workspace.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkflowConfig {
+    /// Whether `run:` steps may execute. Default `false`.
+    ///
+    /// A workflow containing a `run:` step FAILS when this is off — it
+    /// does not silently skip the step. A benchmark that quietly omitted
+    /// its scoring step would report a plausible-looking but meaningless
+    /// result.
+    pub run_step_enabled: bool,
+    /// Optional allowlist of permitted executables, matched on basename.
+    /// Empty ⇒ any executable is permitted (when `run_step_enabled`).
+    pub run_step_allowlist: Vec<String>,
+}
+
+impl WorkflowConfig {
+    /// True if `cmd` may be executed. Matches on basename so an absolute
+    /// path cannot bypass the list (`/bin/bash` and `bash` gate alike).
+    pub fn allows(&self, cmd: &str) -> bool {
+        if self.run_step_allowlist.is_empty() {
+            return true;
+        }
+        let base = std::path::Path::new(cmd)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(cmd);
+        self.run_step_allowlist.iter().any(|a| a == base)
+    }
+}
+
+#[cfg(test)]
+mod workflow_config_tests {
+    use super::*;
+
+    #[test]
+    fn run_step_is_disabled_by_default() {
+        assert!(
+            !WorkflowConfig::default().run_step_enabled,
+            "run: executes arbitrary commands; it must be opt-in"
+        );
+    }
+
+    #[test]
+    fn empty_allowlist_permits_any_executable_when_enabled() {
+        let c = WorkflowConfig {
+            run_step_enabled: true,
+            run_step_allowlist: vec![],
+        };
+        assert!(c.allows("python3"));
+    }
+
+    #[test]
+    fn allowlist_matches_on_basename_not_path() {
+        // Otherwise the allowlist is trivially bypassed by absolute path.
+        let c = WorkflowConfig {
+            run_step_enabled: true,
+            run_step_allowlist: vec!["python3".into()],
+        };
+        assert!(c.allows("python3"));
+        assert!(c.allows("/usr/bin/python3"));
+        assert!(!c.allows("bash"));
+        assert!(!c.allows("/bin/bash"));
+    }
+
+    #[test]
+    fn round_trips_through_toml() {
+        let c = WorkflowConfig {
+            run_step_enabled: true,
+            run_step_allowlist: vec!["python3".into(), "make".into()],
+        };
+        let s = toml::to_string(&c).unwrap();
+        assert_eq!(toml::from_str::<WorkflowConfig>(&s).unwrap(), c);
+    }
+
+    #[test]
+    fn unknown_key_is_rejected() {
+        assert!(
+            toml::from_str::<WorkflowConfig>("run_step_enabled = true\nrun_step_shell = true\n")
+                .is_err(),
+            "deny_unknown_fields must reject a typo rather than ignore it"
+        );
+    }
+}
