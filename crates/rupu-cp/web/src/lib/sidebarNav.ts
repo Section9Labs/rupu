@@ -1,5 +1,7 @@
 import type { LucideIcon } from 'lucide-react';
 import {
+  Activity,
+  BookMarked,
   DollarSign,
   FolderGit2,
   LayoutDashboard,
@@ -80,3 +82,27 @@ export const sidebarNav: NavSection[] = [
   { kind: 'divider' },
   { kind: 'leaf', item: { to: '/settings', label: 'Settings', icon: Settings, enabled: true } },
 ];
+
+/* ── Shell v2 (flat rail, 7 leaves + pinned Settings) ─────────────────── */
+
+export type NavLeafV2 = {
+  to: string;
+  label: string;
+  icon: LucideIcon;
+  /** Which live count fills the right-aligned rail badge. Rendering is
+   *  wired in Plan 3 (`/api/attention`); a leaf with no source shows no
+   *  badge, and an unknown count renders nothing — never `0`. */
+  badge?: 'attention' | 'running' | 'projects' | 'critical' | 'unhealthy';
+};
+
+export const sidebarNavV2: NavLeafV2[] = [
+  { to: '/overview', label: 'Overview', icon: LayoutDashboard, badge: 'attention' },
+  { to: '/activity', label: 'Activity', icon: Activity, badge: 'running' },
+  { to: '/projects', label: 'Projects', icon: FolderGit2, badge: 'projects' },
+  { to: '/security', label: 'Security', icon: ShieldCheck, badge: 'critical' },
+  { to: '/library', label: 'Library', icon: BookMarked },
+  { to: '/fleet', label: 'Fleet', icon: Server, badge: 'unhealthy' },
+  { to: '/usage', label: 'Usage', icon: DollarSign },
+];
+
+export const settingsLeafV2: NavLeafV2 = { to: '/settings', label: 'Settings', icon: Settings };
