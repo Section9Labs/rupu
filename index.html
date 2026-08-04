@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu — Don't code it, rupu it.</title>
+<meta name="description" content="rupu is an agentic code-development platform. Describe the work; autonomous agents and workflows do it — with a visual editor and a control plane to run it all.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="canonical" href="https://rupu.sh/">
+<!-- Open Graph -->
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://rupu.sh/">
+<meta property="og:title" content="rupu — Don't code it, rupu it.">
+<meta property="og:description" content="The agentic code-development platform. Describe the work; agents and workflows do it.">
+<meta name="theme-color" content="#0a0a0a">
+<meta name="twitter:card" content="summary">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<nav class="nav">
+  <a class="brand" href="/" aria-label="rupu home">
+    <span class="mark" aria-hidden="true">&#8734;</span>
+    <span class="name">rupu</span>
+  </a>
+  <span class="navlinks">
+    <a href="/docs/">Docs</a>
+    <a class="hide-sm" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub</a>
+    <a class="dl" href="#download">Download</a>
+  </span>
+</nav>
+
+<!-- ── Hero ─────────────────────────────────────────────── -->
+<header class="hero">
+  <div class="glyph" aria-hidden="true">&#8734;</div>
+  <h1 class="tagline">Don&rsquo;t code it, rupu it.</h1>
+  <p class="subtagline">The agentic code-development platform.</p>
+  <div class="cta-row">
+    <a class="btn primary" href="/docs/quickstart.html">Get started</a>
+    <a class="btn" href="#download">Download</a>
+  </div>
+  <a class="scroll-cue" href="#what" aria-label="Scroll down">&#8595;</a>
+</header>
+
+<main>
+  <!-- ── What is rupu ───────────────────────────────────── -->
+  <section id="what" class="wrap">
+    <p class="eyebrow reveal">What is rupu</p>
+    <p class="lede reveal">You describe the work. <span class="accent">Agents and workflows</span> do it.</p>
+    <p class="section-note reveal">
+      rupu turns plain-language intent into real software changes. Define agents as simple
+      Markdown files, compose them into workflows, and let rupu plan, run, and review the work —
+      end to end, with full transcripts and human approval where it matters.
+    </p>
+  </section>
+
+  <!-- ── Capabilities ───────────────────────────────────── -->
+  <section class="wrap">
+    <div class="cap-head">
+      <p class="eyebrow reveal">Capabilities</p>
+      <p class="lede reveal">Everything you need to ship with agents.</p>
+    </div>
+    <div class="cards">
+      <article class="card reveal">
+        <div class="ic" aria-hidden="true">&#9673;</div>
+        <h3>Agents</h3>
+        <p>Author agents as Markdown + YAML. Pick a provider and model, grant tools and permissions, declare structured outputs — and let them dispatch other agents as tools.</p>
+      </article>
+      <article class="card reveal">
+        <div class="ic" aria-hidden="true">&#9783;</div>
+        <h3>Workflows</h3>
+        <p>Compose agents into multi-step workflows — fan-out, parallel panels, review loops, conditional branches, human gates, and direct connector calls.</p>
+      </article>
+      <article class="card reveal">
+        <div class="ic" aria-hidden="true">&#8734;</div>
+        <h3>Visual editor</h3>
+        <p>Build workflows on a drag-and-drop canvas that stays in lock-step with the YAML — with live validation and expression autocomplete.</p>
+      </article>
+      <article class="card reveal">
+        <div class="ic" aria-hidden="true">&#9635;</div>
+        <h3>Control plane</h3>
+        <p>Launch, watch, and approve runs from one place. Live graphs, transcripts, token spend, and findings across every host.</p>
+      </article>
+    </div>
+  </section>
+
+  <!-- ── How it works ───────────────────────────────────── -->
+  <section class="wrap">
+    <p class="eyebrow reveal">How it works</p>
+    <p class="lede reveal">From intent to merged change.</p>
+    <div class="steps">
+      <div class="step reveal">
+        <h4>Describe</h4>
+        <p>State the outcome you want — or point rupu at an issue. No glue code, no orchestration boilerplate.</p>
+      </div>
+      <div class="step reveal">
+        <h4>Run</h4>
+        <p>Agents and workflows execute autonomously, in parallel where it helps, pausing for approval at the gates you set.</p>
+      </div>
+      <div class="step reveal">
+        <h4>Review</h4>
+        <p>Inspect every transcript, finding, and diff in the control plane, then ship with confidence.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Works with your stack ──────────────────────────── -->
+  <section class="wrap">
+    <p class="eyebrow reveal">Works with your stack</p>
+    <p class="lede reveal">One platform. <span class="accent">Your whole toolchain.</span></p>
+    <p class="section-note reveal">Mix model providers in a single run, drive your real repos and issue trackers, expose and consume tools over MCP, and fire it all on a schedule or an event.</p>
+    <div class="stack-grid">
+      <div class="stack-col reveal">
+        <h3>Model providers</h3>
+        <p class="blurb">Pick a provider <em>per agent</em> — combine them in one workflow, or bring your own.</p>
+        <div class="chips">
+          <span class="chip accent">Anthropic</span>
+          <span class="chip accent">OpenAI</span>
+          <span class="chip accent">Gemini</span>
+          <span class="chip accent">Copilot</span>
+          <span class="chip">+ any OpenAI-compatible</span>
+        </div>
+      </div>
+      <div class="stack-col reveal">
+        <h3>Source control</h3>
+        <p class="blurb">Work in real repos, open pull requests.</p>
+        <div class="chips">
+          <span class="chip">GitHub</span>
+          <span class="chip">GitLab</span>
+        </div>
+      </div>
+      <div class="stack-col reveal">
+        <h3>Issue trackers</h3>
+        <p class="blurb">Run agents straight off an issue.</p>
+        <div class="chips">
+          <span class="chip">GitHub</span>
+          <span class="chip">GitLab</span>
+          <span class="chip">Jira</span>
+          <span class="chip">Linear</span>
+          <span class="chip">Projects</span>
+        </div>
+      </div>
+      <div class="stack-col reveal">
+        <h3>Tools &amp; MCP</h3>
+        <p class="blurb">Built-in tools, plus rupu serves its own MCP server.</p>
+        <div class="chips">
+          <span class="chip">bash</span>
+          <span class="chip">read / write / edit</span>
+          <span class="chip">grep / glob</span>
+          <span class="chip accent">MCP server</span>
+        </div>
+      </div>
+      <div class="stack-col reveal">
+        <h3>Automation</h3>
+        <p class="blurb">Manual, scheduled, or event-driven — autonomously.</p>
+        <div class="chips">
+          <span class="chip">Cron</span>
+          <span class="chip">Webhooks</span>
+          <span class="chip">Autoflows</span>
+        </div>
+      </div>
+      <div class="stack-col reveal">
+        <h3>Control plane</h3>
+        <p class="blurb">Launch, watch, author, and approve from the browser.</p>
+        <div class="chips">
+          <span class="chip">Live runs</span>
+          <span class="chip">Visual editor</span>
+          <span class="chip">Approvals</span>
+          <span class="chip accent">Multi-host</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Download ───────────────────────────────────────── -->
+  <section id="download" class="wrap download">
+    <p class="eyebrow reveal">Download</p>
+    <p class="lede reveal">Get rupu.</p>
+
+    <div class="dl-card reveal">
+      <div class="dl-ver" id="dl-ver">Latest release</div>
+
+      <div class="dl-primary">
+        <a class="btn primary" id="dl-btn" href="https://github.com/Section9Labs/rupu/releases" target="_blank" rel="noopener">Download for macOS</a>
+      </div>
+      <div class="dl-sub" id="dl-sub">macOS · Apple Silicon · signed binary · <a class="link" href="https://github.com/Section9Labs/rupu/releases" target="_blank" rel="noopener">all releases</a></div>
+
+      <div class="dl-or">then install it</div>
+      <div class="code-line">
+        <code id="dl-install">chmod +x rupu-darwin-arm64 &amp;&amp; sudo mv rupu-darwin-arm64 /usr/local/bin/rupu</code>
+        <button class="copy-btn" data-copy="#dl-install" type="button">Copy</button>
+      </div>
+
+      <div class="dl-or">or use a package manager</div>
+      <div class="dl-tabs" role="tablist">
+        <button class="dl-tab is-on" type="button" data-panel="pm-brew" role="tab">Homebrew</button>
+        <button class="dl-tab" type="button" data-panel="pm-deb" role="tab">Debian ·  Ubuntu</button>
+        <button class="dl-tab" type="button" data-panel="pm-rpm" role="tab">Fedora · RHEL</button>
+        <button class="dl-tab" type="button" data-panel="pm-arch" role="tab">Arch</button>
+        <button class="dl-tab" type="button" data-panel="pm-nix" role="tab">Nix</button>
+        <button class="dl-tab" type="button" data-panel="pm-src" role="tab">Source</button>
+      </div>
+
+      <div class="dl-panel is-on" id="pm-brew">
+        <div class="code-line">
+          <code id="cp-brew">brew install section9labs/tap/rupu</code>
+          <button class="copy-btn" data-copy="#cp-brew" type="button">Copy</button>
+        </div>
+        <p class="dl-hint">macOS and Linux.</p>
+      </div>
+
+      <div class="dl-panel" id="pm-deb">
+        <div class="dl-step">Add the repository <span class="dl-rec">recommended</span></div>
+        <div class="code-block">
+          <button class="copy-btn" data-copy="#cp-deb-repo" type="button">Copy</button>
+<pre class="code" id="cp-deb-repo">sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL -o /etc/apt/keyrings/rupu.asc \
+  https://rupu.sh/rupu-archive-keyring.asc
+sudo tee /etc/apt/sources.list.d/rupu.sources &gt; /dev/null &lt;&lt;'EOF'
+Types: deb
+URIs: https://rupu.sh/apt
+Suites: stable
+Components: main
+Architectures: amd64 arm64
+Signed-By: /etc/apt/keyrings/rupu.asc
+EOF
+sudo apt update &amp;&amp; sudo apt install rupu</pre>
+        </div>
+        <p class="dl-hint">Upgrades then arrive with <code class="inline">apt upgrade</code>.</p>
+
+        <div class="dl-step">Or a single package</div>
+        <div class="code-line">
+          <code id="cp-deb">sudo apt install ./rupu_&lt;version&gt;_amd64.deb</code>
+          <button class="copy-btn" data-copy="#cp-deb" type="button">Copy</button>
+        </div>
+        <p class="dl-hint">From the <a class="link" href="https://github.com/Section9Labs/rupu/releases" target="_blank" rel="noopener">releases page</a>. <a class="link" href="https://github.com/Section9Labs/rupu#hosted-apt--yum-repositories" target="_blank" rel="noopener">Beta channel &amp; pinning</a></p>
+      </div>
+
+      <div class="dl-panel" id="pm-rpm">
+        <div class="dl-step">Add the repository <span class="dl-rec">recommended</span></div>
+        <div class="code-block">
+          <button class="copy-btn" data-copy="#cp-rpm-repo" type="button">Copy</button>
+<pre class="code" id="cp-rpm-repo">sudo rpm --import https://rupu.sh/rupu-archive-keyring.asc
+sudo tee /etc/yum.repos.d/rupu.repo &gt; /dev/null &lt;&lt;'EOF'
+[rupu]
+name=rupu
+baseurl=https://rupu.sh/yum/stable
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://rupu.sh/rupu-archive-keyring.asc
+EOF
+sudo dnf install rupu</pre>
+        </div>
+        <p class="dl-hint">Upgrades then arrive with <code class="inline">dnf upgrade</code>.</p>
+
+        <div class="dl-step">Or a single package</div>
+        <div class="code-line">
+          <code id="cp-rpm">sudo dnf install ./rupu-&lt;version&gt;.x86_64.rpm</code>
+          <button class="copy-btn" data-copy="#cp-rpm" type="button">Copy</button>
+        </div>
+        <p class="dl-hint">From the <a class="link" href="https://github.com/Section9Labs/rupu/releases" target="_blank" rel="noopener">releases page</a>. <a class="link" href="https://github.com/Section9Labs/rupu#hosted-apt--yum-repositories" target="_blank" rel="noopener">Beta channel &amp; pinning</a></p>
+      </div>
+
+      <div class="dl-panel" id="pm-arch">
+        <div class="code-line">
+          <code id="cp-arch">yay -S rupu-bin</code>
+          <button class="copy-btn" data-copy="#cp-arch" type="button">Copy</button>
+        </div>
+        <p class="dl-hint">Or <code class="inline">paru -S rupu-bin</code>.</p>
+      </div>
+
+      <div class="dl-panel" id="pm-nix">
+        <div class="code-line">
+          <code id="cp-nix">nix profile install github:Section9Labs/rupu</code>
+          <button class="copy-btn" data-copy="#cp-nix" type="button">Copy</button>
+        </div>
+        <p class="dl-hint">Or <code class="inline">nix run github:Section9Labs/rupu</code> to try it once.</p>
+      </div>
+
+      <div class="dl-panel" id="pm-src">
+        <div class="code-line">
+          <code id="dl-cargo">cargo install --git https://github.com/Section9Labs/rupu</code>
+          <button class="copy-btn" data-copy="#dl-cargo" type="button">Copy</button>
+        </div>
+        <p class="dl-hint">Requires Rust 1.95+.</p>
+      </div>
+
+      <p class="dl-sub">Then <code class="inline">rupu init</code> — and keep it current with <code class="inline">rupu update</code>. See the <a class="link" href="/docs/">docs</a>.</p>
+    </div>
+
+    <!-- Beta channel: deliberately understated. Stable stays the default. -->
+    <div class="beta-strip reveal" id="beta-strip" hidden>
+      <span class="beta-tag">Beta</span>
+      <span class="beta-txt">
+        <a class="link" id="beta-link" href="https://github.com/Section9Labs/rupu/releases" target="_blank" rel="noopener"><span id="beta-ver">latest beta</span></a>
+        — ships ahead of stable. Switch with <code class="inline">rupu update --channel beta</code>.
+      </span>
+    </div>
+  </section>
+
+  <!-- ── Closing CTA ────────────────────────────────────── -->
+  <section class="wrap closing">
+    <div class="mark reveal" aria-hidden="true">&#8734;</div>
+    <h2 class="reveal">Don&rsquo;t code it, rupu it.</h2>
+    <p class="reveal">Open source &middot; available now.</p>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap foot">
+    <span>&copy; <span id="year">2026</span> Section9&nbsp;Labs</span>
+    <span class="links">
+      <a href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub</a>
+      <a href="mailto:hello@rupu.sh">Contact</a>
+    </span>
+  </div>
+</footer>
+
+<script>
+  // current year
+  document.getElementById('year').textContent = new Date().getFullYear();
+  // scroll reveal
+  (function () {
+    var els = document.querySelectorAll('.reveal');
+    if (!('IntersectionObserver' in window)) { els.forEach(function (e) { e.classList.add('in'); }); return; }
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (en) { if (en.isIntersecting) { en.target.classList.add('in'); io.unobserve(en.target); } });
+    }, { threshold: 0.15 });
+    els.forEach(function (e) { io.observe(e); });
+  })();
+
+  // copy-to-clipboard buttons
+  document.querySelectorAll('.copy-btn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var el = document.querySelector(btn.getAttribute('data-copy'));
+      if (!el) return;
+      navigator.clipboard.writeText(el.textContent.trim()).then(function () {
+        var t = btn.textContent; btn.textContent = 'Copied'; setTimeout(function () { btn.textContent = t; }, 1400);
+      });
+    });
+  });
+
+  // Package-manager tabs.
+  (function () {
+    var tabs = [].slice.call(document.querySelectorAll('.dl-tab'));
+    if (!tabs.length) return;
+    tabs.forEach(function (t) {
+      t.addEventListener('click', function () {
+        tabs.forEach(function (o) { o.classList.remove('is-on'); });
+        [].slice.call(document.querySelectorAll('.dl-panel')).forEach(function (p) { p.classList.remove('is-on'); });
+        t.classList.add('is-on');
+        var panel = document.getElementById(t.dataset.panel);
+        if (panel) panel.classList.add('is-on');
+      });
+    });
+  })();
+
+  // Live channel versions.
+  //
+  // Deliberately /releases, not /releases/latest: the latter returns only the
+  // newest NON-prerelease, so the beta channel would be invisible. One call
+  // gives both — newest stable for the primary button, newest prerelease for
+  // the beta strip. The strip stays hidden unless a beta actually exists that
+  // is NEWER than stable, so it never advertises a stale prerelease.
+  (function () {
+    var verEl = document.getElementById('dl-ver');
+    var btn = document.getElementById('dl-btn');
+    var sub = document.getElementById('dl-sub');
+    if (!verEl || !btn) return;
+
+    fetch('https://api.github.com/repos/Section9Labs/rupu/releases?per_page=30', {
+      headers: { 'Accept': 'application/vnd.github+json' }
+    }).then(function (r) { return r.ok ? r.json() : null; }).then(function (list) {
+      if (!list || !list.length) return;
+      // Only versioned tags. The repo also publishes ROLLING tags
+      // (latest-stable / latest-beta / latest-build) as real releases, and
+      // they sort into this list ahead of the versioned one — picking the
+      // first non-prerelease rendered "Stable · latest-stable" instead of
+      // "Stable · v0.71.0".
+      var versioned = /^v\d+\.\d+\.\d+/;
+      var live = list.filter(function (r) { return !r.draft && versioned.test(r.tag_name || ''); });
+      var stable = live.filter(function (r) { return !r.prerelease; })[0];
+      var beta = live.filter(function (r) { return r.prerelease; })[0];
+
+      if (stable) {
+        var ver = (stable.tag_name || '').replace(/-(cli|build)$/, '');
+        verEl.textContent = ver ? 'Stable · ' + ver : 'Latest release';
+        var assets = stable.assets || [];
+        // Prefer the canonical macOS binary, then any bare rupu-<os>-<arch>.
+        var bin = assets.filter(function (a) { return a.name === 'rupu-darwin-arm64'; })[0]
+               || assets.filter(function (a) { return /^rupu-[a-z0-9_]+-[a-z0-9_]+$/i.test(a.name); })[0];
+        if (bin) {
+          btn.href = bin.browser_download_url;
+          btn.removeAttribute('target');
+          if (sub) sub.innerHTML = 'macOS · Apple Silicon · signed binary (' + ver + ') · <a class="link" href="' + stable.html_url + '" target="_blank" rel="noopener">all releases</a>';
+        } else {
+          btn.href = stable.html_url;
+        }
+      }
+
+      // Only surface a beta that is actually ahead of stable. GitHub returns
+      // releases newest-first, so "beta appears before stable in the list" is
+      // the ordering test — no semver parsing needed.
+      if (beta && (!stable || live.indexOf(beta) < live.indexOf(stable))) {
+        var strip = document.getElementById('beta-strip');
+        var bver = document.getElementById('beta-ver');
+        var blink = document.getElementById('beta-link');
+        if (bver) bver.textContent = beta.tag_name || 'latest beta';
+        if (blink) blink.href = beta.html_url;
+        if (strip) strip.hidden = false;
+      }
+    }).catch(function () { /* keep the static fallback (releases page) */ });
+  })();
+</script>
+</body>
+</html>

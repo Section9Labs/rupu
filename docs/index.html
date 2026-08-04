@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Getting started</title>
+<meta name="description" content="rupu documentation: install rupu and learn to build agents, workflows, autoflows, and sessions.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item active" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>rupu documentation</h1>
+    <p class="intro">rupu is an agentic code-development platform. You describe the work; agents and workflows do it — from the terminal, autonomously on triggers, or from a visual control plane.</p>
+
+    <div class="callout"><strong>Don't code it, rupu it.</strong> Define agents as plain Markdown, compose them into workflows, run them by hand or on triggers, and review everything with full transcripts and approvals.</div>
+
+    <h2>Install</h2>
+    <p>rupu is open source. Grab the latest signed macOS binary, or build from source with Cargo (any platform with a Rust toolchain).</p>
+    <h3>macOS (Apple Silicon)</h3>
+    <p>Download the latest signed <code class="inline">rupu-darwin-arm64</code> binary from the <a class="link" href="https://github.com/Section9Labs/rupu/releases/latest" target="_blank" rel="noopener">latest release</a> (or the <a class="link" href="/#download">Download</a> section) — each release ships a bare <code class="inline">rupu-&lt;os&gt;-&lt;arch&gt;</code> binary plus a matching <code class="inline">.sha256</code>. Then:</p>
+    <pre class="code"><span class="c"># make executable, put it on your PATH</span>
+chmod +x rupu-darwin-arm64
+sudo mv rupu-darwin-arm64 /usr/local/bin/rupu
+rupu --version</pre>
+    <h3>From source</h3>
+    <pre class="code">cargo install --git https://github.com/Section9Labs/rupu</pre>
+
+    <h2>Keeping rupu up to date</h2>
+    <p>Once rupu is on your PATH it can update itself. <code class="inline">rupu update</code> fetches the latest build for your release channel, verifies its integrity against the published <code class="inline">.sha256</code>, swaps it in place, and keeps a backup of the previous binary so you can <code class="inline">--rollback</code> if anything looks wrong.</p>
+    <pre class="code"><span class="c"># update to the latest release on your channel (prompts to confirm)</span>
+rupu update
+
+<span class="c"># report only — exits 10 if an update is available (handy in CI)</span>
+rupu update --check
+
+<span class="c"># restore the previous binary from the last backup</span>
+rupu update --rollback</pre>
+    <p>Other flags: <code class="inline">--yes</code> skips the confirm prompt, <code class="inline">--force</code> reinstalls (or downgrades) to the channel's latest, and <code class="inline">--channel beta|stable</code> overrides the channel for a single run.</p>
+
+    <h3>Release channels</h3>
+    <p>Every release flows through two channels. A <code class="inline">vX.Y.Z-beta</code> prerelease is cut first, then promoted to a <code class="inline">vX.Y.Z</code> stable release.</p>
+    <table>
+      <thead><tr><th>Channel</th><th>What you get</th></tr></thead>
+      <tbody>
+        <tr><td><code>stable</code></td><td>Full releases. The default — pick this unless you want to help test.</td></tr>
+        <tr><td><code>beta</code></td><td>Prereleases. Early access to features before they're promoted to stable.</td></tr>
+      </tbody>
+    </table>
+    <p>Choose a channel for a single run with the flag, or set it once in your config. Channel precedence is <code class="inline">--channel</code> flag &gt; <code class="inline">[update] channel</code> config &gt; <code class="inline">stable</code> (the default).</p>
+    <pre class="code"><span class="c"># one-off: pull the latest beta</span>
+rupu update --channel beta</pre>
+    <pre class="code"><span class="c"># config.toml — track the beta channel by default</span>
+<span class="k">[update]</span>
+channel = <span class="s">"beta"</span>
+<span class="c"># passive "update available" notice on normal commands (default: on)</span>
+check = <span class="v">true</span></pre>
+    <p>Normal commands also surface a passive <strong>update available</strong> notice when you're behind; set <code class="inline">check = false</code> in the <code class="inline">[update]</code> section to silence it.</p>
+
+    <h2>Your first run</h2>
+    <p>Initialize rupu in a repo, authenticate a provider, then run an agent:</p>
+    <pre class="code"><span class="c"># scaffold .rupu/ (agents + workflows) in the current repo</span>
+rupu init
+
+<span class="c"># connect a model provider (Anthropic, OpenAI, Gemini, Copilot…)</span>
+rupu auth login
+
+<span class="c"># run a one-off agent against a prompt</span>
+rupu run code-reviewer --prompt "Review the diff on this branch"</pre>
+    <p>Everything rupu does is recorded as a JSONL transcript you can inspect with <code class="inline">rupu transcript</code>.</p>
+
+    <h2>The four building blocks</h2>
+    <p>Read these in order — each builds on the last.</p>
+    <div class="doc-grid">
+      <a class="card" href="/docs/agents.html">
+        <div class="ic" aria-hidden="true">&#9673;</div>
+        <h3>Agents &#8594;</h3>
+        <p>A single AI worker defined in Markdown + YAML: provider, model, tools, permissions, and a system prompt.</p>
+      </a>
+      <a class="card" href="/docs/workflows.html">
+        <div class="ic" aria-hidden="true">&#9783;</div>
+        <h3>Workflows &#8594;</h3>
+        <p>Multiple agents composed into steps — sequential, fan-out, parallel panels, gated review loops, approvals.</p>
+      </a>
+      <a class="card" href="/docs/autoflows.html">
+        <div class="ic" aria-hidden="true">&#8635;</div>
+        <h3>Autoflows &#8594;</h3>
+        <p>Workflows that run themselves — fired by cron or SCM events, claiming issues and opening PRs autonomously.</p>
+      </a>
+      <a class="card" href="/docs/sessions.html">
+        <div class="ic" aria-hidden="true">&#9636;</div>
+        <h3>Sessions &#8594;</h3>
+        <p>Long-lived, interactive agent conversations — in the terminal or live in the web control plane.</p>
+      </a>
+    </div>
+
+    <h2>Then go further</h2>
+    <ul>
+      <li><a class="link" href="/docs/examples/">Examples</a> — complete, real-world scenarios you can copy.</li>
+      <li><a class="link" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">Source &amp; issues on GitHub</a>.</li>
+    </ul>
+
+    <div class="doc-nav">
+      <span></span>
+      <a href="/docs/quickstart.html">Quickstart &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

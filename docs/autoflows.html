@@ -1,0 +1,701 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Autoflows</title>
+<meta name="description" content="Autoflows turn a rupu workflow into a self-running loop: a trigger wakes it, it claims an issue, runs the workflow in a durable worktree, and opens a PR — no human kicking it off.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR — copy verbatim; set .active on THIS page's item ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
+    <a class="item active" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Autoflows</h1>
+    <p class="intro">An autoflow is a workflow that runs itself: an event wakes it, it claims a unit of work — an issue or a pull request — runs the workflow in a durable worktree, and opens a PR or posts a review. No human kicks it off.</p>
+
+    <h2>What is an autoflow</h2>
+    <p>
+      A <a class="link" href="/docs/workflows.html">workflow</a> answers two questions: <em>how does one run execute</em> and <em>when may it start</em>. An autoflow answers the
+      questions a workflow can't: <strong>which issue is already claimed, who owns the repo when you're not standing in it, how do we
+      revisit an issue after a PR merge or a backoff timer, and how do we keep one durable branch per issue across many runs.</strong>
+    </p>
+    <p>
+      The key design choice: there is <strong>one</strong> workflow YAML language. An autoflow is not a new file type and not a second
+      step DSL — it is an ordinary workflow file plus an optional top-level <code class="inline">autoflow:</code> block. The same file runs
+      manually through <code class="inline">rupu workflow run</code> or autonomously through the <code class="inline">rupu autoflow …</code> command family.
+      <code class="inline">workflow</code> stays the unit of execution; <code class="inline">autoflow</code> is the persistent, lifecycle-oriented runner for it.
+    </p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 700 200" role="img" aria-label="The autoflow loop: a trigger fires, a claim is taken on an issue, the workflow runs, and a PR or comment is delivered — then it repeats.">
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+          </marker>
+        </defs>
+        <rect class="d-box" x="14" y="36" width="150" height="50" rx="10"></rect>
+        <text class="d-label" x="89" y="58" text-anchor="middle">trigger</text>
+        <text class="d-sub" x="89" y="74" text-anchor="middle">cron / event</text>
+        <line class="d-edge" x1="164" y1="61" x2="194" y2="61" marker-end="url(#ar)"></line>
+        <rect class="d-box-accent" x="194" y="36" width="150" height="50" rx="10"></rect>
+        <text class="d-label" x="269" y="58" text-anchor="middle">claim issue</text>
+        <text class="d-sub" x="269" y="74" text-anchor="middle">lock + worktree</text>
+        <line class="d-edge" x1="344" y1="61" x2="374" y2="61" marker-end="url(#ar)"></line>
+        <rect class="d-box" x="374" y="36" width="150" height="50" rx="10"></rect>
+        <text class="d-label" x="449" y="58" text-anchor="middle">run workflow</text>
+        <text class="d-sub" x="449" y="74" text-anchor="middle">agents + steps</text>
+        <line class="d-edge" x1="524" y1="61" x2="554" y2="61" marker-end="url(#ar)"></line>
+        <rect class="d-box" x="554" y="36" width="134" height="50" rx="10"></rect>
+        <text class="d-label" x="621" y="58" text-anchor="middle">open PR</text>
+        <text class="d-sub" x="621" y="74" text-anchor="middle">/ comment</text>
+        <!-- loop back to trigger -->
+        <path class="d-edge" d="M621,86 L621,150 L89,150 L89,90" marker-end="url(#ar)"></path>
+        <text class="d-sub" x="355" y="170" text-anchor="middle">reconcile on the next tick — the claim persists across runs</text>
+      </svg>
+      <figcaption>The autoflow loop: wake, claim, run, deliver — then reconcile again on the next tick.</figcaption>
+    </figure>
+
+    <h2>Triggers</h2>
+    <p>
+      Any workflow can declare a top-level <code class="inline">trigger:</code> block that decides <strong>when a one-shot run may fire</strong>.
+      The <code class="inline">trigger.on:</code> field takes one of three values.
+    </p>
+
+    <table>
+      <thead><tr><th>Trigger</th><th>When it fires</th><th>Mechanism</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>manual</code></td>
+          <td>You run <code>rupu workflow run &lt;name&gt;</code></td>
+          <td>The default. Every install. No scheduler needed.</td>
+        </tr>
+        <tr>
+          <td><code>cron</code></td>
+          <td>The schedule in <code>trigger.cron:</code> (5-field UTC) matches</td>
+          <td>System cron / launchd invokes <code>rupu cron tick</code>. There is no rupu daemon — the OS scheduler drives it.</td>
+        </tr>
+        <tr>
+          <td><code>event</code></td>
+          <td>A matching SCM event appears</td>
+          <td>Polled tier via <code>rupu cron tick</code>, and/or the live tier via <code>rupu webhook serve</code> (HMAC-validated).</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Cron</h3>
+    <p>
+      You install <em>one</em> crontab / launchd entry that runs <code class="inline">rupu cron tick</code> every minute. The tick walks every
+      cron-triggered workflow and fires those whose schedule matched between the persisted <code class="inline">last_fired</code> timestamp and now —
+      idempotent at one-minute granularity. <code class="inline">rupu cron list</code> is read-only and prints every cron workflow plus its next
+      firing time; <code class="inline">--dry-run</code> verifies a crontab line without firing anything.
+    </p>
+    <pre class="code"><span class="c"># one line in your crontab drives every cron + event trigger</span>
+* * * * *  /usr/local/bin/rupu cron tick</pre>
+
+    <h3>Events — two tiers, no double-firing</h3>
+    <p>
+      rupu reacts to SCM events two ways, and you can run both at once:
+    </p>
+    <ul>
+      <li>
+        <strong>Polled (CLI-native).</strong> The same <code class="inline">rupu cron tick</code> calls each configured connector for new events
+        between ticks. Configure sources in <code class="inline">[triggers].poll_sources</code> (empty by default — rupu polls nothing until you ask).
+        Shipped connectors: GitHub repo feeds, GitLab repo feeds, Linear team feeds (<code class="inline">linear:&lt;team-id&gt;</code>), and Jira project
+        feeds (<code class="inline">jira:&lt;site&gt;/&lt;project&gt;</code>). Latency is one tick interval.
+      </li>
+      <li>
+        <strong>Webhook (live).</strong> Run <code class="inline">rupu webhook serve</code> as a long-lived process under your own supervisor for
+        sub-second latency and broader event coverage. The receiver validates each delivery's signature
+        (<code class="inline">X-Hub-Signature-256</code> for GitHub, <code class="inline">X-Gitlab-Token</code> for GitLab, <code class="inline">Linear-Signature</code> for Linear,
+        <code class="inline">X-Hub-Signature</code> for Jira Cloud), maps the raw delivery onto the rupu event id, and fires matching workflows.
+      </li>
+    </ul>
+    <div class="callout">
+      <strong>One logical event fires once.</strong> The deterministic run-id lets the polled tier and the webhook tier coexist on the
+      same workflow without double-firing the same delivery — see <a class="link" href="#idempotency">Idempotency &amp; ownership</a> below.
+    </div>
+    <p>
+      Webhook secrets are read from environment variables only — never config files, never the keychain. Bind to <code class="inline">127.0.0.1</code>
+      and front with a TLS-terminating reverse proxy in production; rupu does not terminate TLS itself.
+    </p>
+    <pre class="code"><span class="c"># split the tiers across different cadences if you like</span>
+* * * * *      rupu cron tick <span class="v">--skip-events</span>   <span class="c"># cron only, every minute</span>
+*/5 * * * *    rupu cron tick <span class="v">--only-events</span>   <span class="c"># events every 5 minutes</span>
+
+<span class="c"># or run the live receiver under your supervisor</span>
+RUPU_GITHUB_WEBHOOK_SECRET=<span class="v">&lt;secret&gt;</span> rupu webhook serve <span class="v">--addr</span> <span class="s">0.0.0.0:8080</span></pre>
+
+    <h2 id="authoring">Writing an autoflow</h2>
+    <p>
+      An autoflow file <em>is</em> a workflow file. You write the same <code class="inline">name:</code>, the same
+      <code class="inline">steps:</code>, and add one top-level <code class="inline">autoflow:</code> block that marks the file as autonomously
+      runnable. The runtime owns only the autonomous concerns — candidate discovery, claims, repo-to-path resolution, worktree lifecycle,
+      scheduling/retries, and structured outcome handling. Repo-specific reasoning stays in the workflow <code class="inline">steps:</code>.
+    </p>
+    <p>
+      The smallest valid autoflow is a <code class="inline">name:</code>, <code class="inline">autoflow: { enabled: true }</code>, and one step.
+      Everything else below narrows <em>what</em> it claims, <em>when</em> it wakes, <em>where</em> it works, and <em>what</em> it hands back.
+    </p>
+
+    <h3>Where autoflow files live</h3>
+    <p>
+      Autoflow files are ordinary workflow files, so they live in the usual two places: <code class="inline">~/.rupu/workflows/</code>
+      (global) and <code class="inline">&lt;repo&gt;/.rupu/workflows/</code> (project). Discovery for an autonomous tick is <em>not</em>
+      <code class="inline">cwd</code>-rooted — it walks the global workflow directory <em>and</em> every preferred repo checkout recorded in the
+      global repo registry, so reconciliation keeps working when you're not standing in the repo.
+      <code class="inline">rupu autoflow create &lt;name&gt;</code> scaffolds a file with an <code class="inline">autoflow:</code> block, opens it in
+      your editor, and re-parses it on save.
+    </p>
+    <pre class="code">rupu autoflow create <span class="v">phase-ready</span> <span class="v">--scope</span> <span class="s">project</span>   <span class="c"># writes .rupu/workflows/phase-ready.yaml</span>
+rupu autoflow list                                <span class="c"># everything with autoflow.enabled = true</span>
+rupu autoflow show <span class="v">phase-ready</span>                    <span class="c"># the file + its resolved metadata</span></pre>
+
+    <h3>The <code class="inline">autoflow:</code> block, field by field</h3>
+    <p>
+      Every field is optional except <code class="inline">enabled</code>. The block rejects unknown keys — a typo like
+      <code class="inline">labels_alll:</code> is a parse error, not a silently ignored line.
+    </p>
+
+    <table>
+      <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>enabled</code></td><td><code>bool</code></td><td><code>false</code></td>
+          <td>Marks this workflow as autonomously runnable. Anything else in the block is inert until this is <code>true</code>; the CLI refuses the file with <em>“workflow … is not autoflow-enabled”</em>.</td>
+        </tr>
+        <tr>
+          <td><code>entity</code></td><td><code>issue</code> | <code>pull_request</code></td><td><code>issue</code></td>
+          <td>The entity type this autoflow owns. <code>issue</code> claims issues from an issue tracker; <code>pull_request</code> claims PRs and unlocks the PR-only selector fields.</td>
+        </tr>
+        <tr>
+          <td><code>source</code></td><td>string</td><td>inferred from the repo binding</td>
+          <td>Explicit event/discovery source when the work doesn't live in the repo itself — <code>linear:&lt;team-id&gt;</code>, <code>jira:&lt;site&gt;/&lt;project&gt;</code>, <code>github:owner/repo</code>, <code>gitlab:group/project</code>. Omitted, discovery and wake matching run against the repo this workflow file is bound to.</td>
+        </tr>
+        <tr>
+          <td><code>priority</code></td><td><code>int</code></td><td><code>0</code></td>
+          <td>Match precedence when several autoflows select the same item; the highest wins the claim, ties break on the workflow <code>name</code> that sorts first. Negative values are legal.</td>
+        </tr>
+        <tr>
+          <td><code>selector</code></td><td>block</td><td>empty (matches everything of that entity)</td>
+          <td>Candidate filter — states, labels, authors, and PR-only draft/base narrowing. <a class="link" href="#selector">Fields below</a>.</td>
+        </tr>
+        <tr>
+          <td><code>wake_on</code></td><td>list of strings</td><td><code>[]</code></td>
+          <td>Event ids that mark a candidate dirty and make it due for reconciliation. Same vocabulary and same <code>*</code> glob matching as triggers. Empty means no autoflow polls events for this file at all — it only becomes due on first sight, on <code>reconcile_every</code>, or on a retry backoff.</td>
+        </tr>
+        <tr>
+          <td><code>reconcile_every</code></td><td>duration string</td><td>unset (never due on a timer)</td>
+          <td>Maximum time between reconciliations of an already-claimed item, measured from the claim's <code>updated_at</code>.</td>
+        </tr>
+        <tr>
+          <td><code>claim</code></td><td>block</td><td>unset (<code>key: issue</code>, no lease TTL)</td>
+          <td>The claim/lease policy that stops two workers from grabbing the same item. <a class="link" href="#claim">Fields below</a>.</td>
+        </tr>
+        <tr>
+          <td><code>workspace</code></td><td>block</td><td>unset (falls back to <code>[autoflow].checkout</code>, itself <code>worktree</code>)</td>
+          <td>Where the run's checkout comes from and what branch it sits on. <a class="link" href="#workspace">Fields below</a>.</td>
+        </tr>
+        <tr>
+          <td><code>outcome</code></td><td>block</td><td>unset (no structured outcome consumed)</td>
+          <td>Names the declared workflow output the runtime should parse to decide what happens next. <a class="link" href="#outcome">Fields below</a>.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="callout">
+      <strong>Duration grammar.</strong> <code>reconcile_every</code> and <code>claim.ttl</code> take a compact relative duration: digits
+      followed by exactly one unit of <code>s</code>, <code>m</code>, <code>h</code>, or <code>d</code> — <code>30s</code>, <code>10m</code>,
+      <code>3h</code>, <code>7d</code>. Compound forms like <code>1h30m</code> and bare numbers are rejected at parse time.
+    </div>
+
+    <h3>A complete autoflow, commented</h3>
+    <p>
+      One file, top to bottom: what it claims, when it wakes, where it works, what it produces. Every value here is a real field —
+      copy it and change the labels.
+    </p>
+    <pre class="code"><span class="k">name</span>: <span class="s">phase-ready-autoflow</span>
+<span class="k">description</span>: <span class="s">Implement the ready phase for a labelled issue, then open a draft PR.</span>
+
+<span class="k">autoflow</span>:
+  <span class="k">enabled</span>: <span class="v">true</span>                  <span class="c"># required — without it nothing autonomous happens</span>
+  <span class="k">entity</span>: <span class="s">issue</span>                  <span class="c"># issue | pull_request</span>
+  <span class="c"># source: linear:&lt;team-id&gt;      # omit to bind to this file&#39;s repo</span>
+  <span class="k">priority</span>: <span class="v">200</span>                  <span class="c"># highest priority wins the claim on a contested item</span>
+
+  <span class="k">selector</span>:                     <span class="c"># which issues this autoflow may claim</span>
+    <span class="k">states</span>: [<span class="s">&quot;open&quot;</span>]
+    <span class="k">labels_all</span>: [<span class="s">&quot;autoflow&quot;</span>, <span class="s">&quot;phase:phase-1&quot;</span>]
+    <span class="k">limit</span>: <span class="v">100</span>                  <span class="c"># cap per discovery query</span>
+
+  <span class="k">wake_on</span>:                      <span class="c"># event ids that mark a candidate dirty</span>
+    - <span class="s">github.issue.labeled</span>
+    - <span class="s">github.pull_request.closed</span>
+    - <span class="s">github.pull_request.reopened</span>
+
+  <span class="k">reconcile_every</span>: <span class="s">&quot;10m&quot;</span>        <span class="c"># ...and revisit at least this often anyway</span>
+
+  <span class="k">claim</span>:
+    <span class="k">key</span>: <span class="s">issue</span>                  <span class="c"># issue | pr_head_sha</span>
+    <span class="k">ttl</span>: <span class="s">&quot;3h&quot;</span>                    <span class="c"># ownership lease, not just retry timing</span>
+
+  <span class="k">workspace</span>:
+    <span class="k">strategy</span>: <span class="s">worktree</span>           <span class="c"># durable per-issue worktree, never a temp clone</span>
+    <span class="k">branch</span>: <span class="s">&quot;rupu/issue-&#123;&#123; issue.number &#125;&#125;&quot;</span>   <span class="c"># the one templated autoflow field</span>
+
+  <span class="k">outcome</span>:
+    <span class="k">output</span>: <span class="s">result</span>                <span class="c"># must name a key under contracts.outputs</span>
+
+<span class="k">contracts</span>:                      <span class="c"># the machine-readable handback</span>
+  <span class="k">outputs</span>:
+    <span class="k">result</span>:
+      <span class="k">from_step</span>: <span class="s">result</span>
+      <span class="k">format</span>: <span class="s">json</span>
+      <span class="k">schema</span>: <span class="s">autoflow_outcome_v1</span>
+
+<span class="k">steps</span>:
+  - <span class="k">id</span>: <span class="s">implement</span>
+    <span class="k">agent</span>: <span class="s">repo-implementer</span>
+    <span class="k">actions</span>: []
+    <span class="k">prompt</span>: |
+      Implement the ready phase for issue #&#123;&#123; issue.number &#125;&#125; (&#123;&#123; issue.ref &#125;&#125;).
+
+      Title: &#123;&#123; issue.title &#125;&#125;
+      Labels: &#123;&#123; issue.labels | join(&quot;, &quot;) &#125;&#125;
+
+      &#123;&#123; issue.body &#125;&#125;
+
+      Keep the change scoped to that one phase. End with branch name,
+      changed files, and a validation summary.
+
+  - <span class="k">id</span>: <span class="s">open_pr</span>
+    <span class="k">agent</span>: <span class="s">pr-author</span>
+    <span class="k">actions</span>: []
+    <span class="k">prompt</span>: |
+      Open a draft PR for issue #&#123;&#123; issue.number &#125;&#125;.
+
+      &#123;&#123; steps.implement.output &#125;&#125;
+
+  - <span class="k">id</span>: <span class="s">result</span>              <span class="c"># the step contracts.outputs.result reads</span>
+    <span class="k">agent</span>: <span class="s">writer</span>
+    <span class="k">actions</span>: []
+    <span class="k">contract</span>:
+      <span class="k">emits</span>: <span class="s">autoflow_outcome_v1</span>
+      <span class="k">format</span>: <span class="s">json</span>
+    <span class="k">prompt</span>: |
+      Return only valid JSON for `autoflow_outcome_v1`.
+      Use status &quot;await_human&quot; when the PR is ready for human review,
+      &quot;blocked&quot; when it needs manual intervention.</pre>
+
+    <p>
+      An optional sibling <code class="inline">contracts:</code> block declares the workflow's machine-readable output — the
+      <code class="inline">from_step</code> it comes from, its <code class="inline">format</code>, and the JSON Schema it must validate against (for example
+      <code class="inline">autoflow_outcome_v1</code>). The runtime parses that structured outcome to decide what happens next; it never parses prose.
+    </p>
+    <div class="callout">
+      <strong>Two modes, one file.</strong> Run through <code>rupu workflow run</code> and the <code>steps:</code> execute normally while the
+      <code>autoflow:</code> metadata is ignored except for contract validation. Run through <code>rupu autoflow …</code> and the runtime
+      activates claim, worktree, outcome, and retry behavior.
+    </div>
+
+    <h3 id="selector">Sub-block: <code class="inline">selector:</code></h3>
+    <p>
+      The selector decides <strong>which items this autoflow is allowed to claim</strong>. An empty selector matches every item of the
+      declared <code class="inline">entity</code>, which is almost never what you want — start from <code class="inline">states</code> plus a
+      label convention. Part of the selector is pushed to the connector as a server-side query
+      (<code class="inline">states</code> when it names exactly one state, <code class="inline">labels_all</code>, <code class="inline">limit</code>);
+      the rest is applied locally after the fetch, because the issue connectors only support a conjunctive label filter.
+    </p>
+    <table>
+      <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>states</code></td><td>list of <code>open</code> / <code>closed</code></td><td><code>[]</code> — any state</td><td>Item state must be one of these. A single-element list also narrows the connector query itself.</td></tr>
+        <tr><td><code>labels_all</code></td><td>list of strings</td><td><code>[]</code></td><td>Every one of these labels must be present. This is the set sent to the connector as the server-side narrowing filter.</td></tr>
+        <tr><td><code>labels_any</code></td><td>list of strings</td><td><code>[]</code></td><td>At least one of these labels must be present. Applied locally after the fetch.</td></tr>
+        <tr><td><code>labels_none</code></td><td>list of strings</td><td><code>[]</code></td><td>None of these labels may be present — the standard way to make an item drop out of the loop once it's been handled. Applied locally.</td></tr>
+        <tr><td><code>limit</code></td><td><code>int</code></td><td>unset — connector default</td><td>Cap on how many candidates one discovery query returns.</td></tr>
+        <tr><td><code>draft</code></td><td><code>include</code> | <code>exclude</code> | <code>only</code></td><td>unset — both</td><td><strong>PR only.</strong> <code>exclude</code> skips drafts, <code>only</code> matches nothing but drafts. Setting it on <code>entity: issue</code> is a parse error.</td></tr>
+        <tr><td><code>base</code></td><td>string</td><td>unset — any base</td><td><strong>PR only.</strong> Restrict to pull requests targeting this base branch, e.g. <code>main</code>. Setting it on <code>entity: issue</code> is a parse error.</td></tr>
+        <tr><td><code>authors</code></td><td>list of logins</td><td><code>[]</code></td><td>Explicit author allowlist. A login in this list is always allowed, whatever <code>authors_from</code> says.</td></tr>
+        <tr><td><code>authors_from</code></td><td><code>collaborators</code> | <code>org_members</code></td><td>unset</td><td>Broader author scope — repo collaborator, or member of the owning org. The SCM connector resolves the membership at tick time (and caches it per tick).</td></tr>
+        <tr><td><code>on_skip</code></td><td><code>skip</code> | <code>label_needs_human</code></td><td><code>skip</code></td><td>What to do when an otherwise-eligible item is excluded <em>solely</em> by the author gate.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The author gate resolves in one pass: an explicit <code class="inline">authors</code> match wins outright; otherwise, if
+      <code class="inline">authors_from</code> is set, the item is allowed only if the connector confirms the scope; if both fields are unset
+      there is no author restriction at all; and a non-empty <code class="inline">authors</code> list with no match and no
+      <code class="inline">authors_from</code> denies. That last rule is what makes an autoflow safe to point at a public repo — a drive-by
+      issue from a stranger never reaches an agent.
+    </p>
+    <div class="callout">
+      <strong><code>on_skip: label_needs_human</code> is PR-only today.</strong> On a pull request rupu applies a
+      <code>needs-human</code> label before skipping. On an issue there is no label-add API on the issue connector, so rupu logs a warning
+      and falls back to a plain skip. Don't rely on the label appearing on issues.
+    </div>
+
+    <h3 id="claim">Sub-block: <code class="inline">claim:</code></h3>
+    <p>
+      A claim is rupu's answer to “who owns this issue right now.” Before touching an item the runtime writes one claim file per owned
+      entity under <code class="inline">~/.rupu/autoflows/claims/</code> recording the workflow, the repo, the branch, the worktree path, the
+      last run id, the claim status, an owner id (<code class="inline">&lt;user&gt;:pid-&lt;n&gt;</code>), and a lease expiry.
+    </p>
+    <table>
+      <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>key</code></td><td><code>issue</code> | <code>pr_head_sha</code></td><td><code>issue</code></td><td>What the claim is keyed on. <code>issue</code> gives one durable claim per issue that survives many runs. <code>pr_head_sha</code> scopes the claim to a pull request <em>at one head SHA</em>, so a new push is genuinely new work rather than a re-entry into the old claim.</td></tr>
+        <tr><td><code>ttl</code></td><td>duration string</td><td>unset — no lease expiry written</td><td>How long the ownership lease is valid. This is a <strong>lease</strong>, not a retry timer: it is what lets another worker eventually take over an item abandoned by a crashed process.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Duplicate claiming is prevented by lease + lock together, not by either alone:
+    </p>
+    <ul>
+      <li>Each claim carries an owner id and a lease expiry derived from <code class="inline">claim.ttl</code>.</li>
+      <li>An active cycle holds an exclusive lock file for the claim and renews the lease while it runs.</li>
+      <li>A second process may steal a claim <strong>only</strong> when the lease has expired <em>and</em> no active lock is present.</li>
+      <li>Claims parked in <code class="inline">await_human</code> or <code class="inline">await_external</code> keep the lease — they stay owned —
+        but they release the active-cycle lock, so the item isn't held hostage by a stuck process.</li>
+      <li>Release is explicit: a terminal outcome, or an operator running <code class="inline">rupu autoflow release &lt;ref&gt;</code>.</li>
+    </ul>
+
+    <h3 id="workspace">Sub-block: <code class="inline">workspace:</code></h3>
+    <p>
+      Autoflows deliberately do <em>not</em> use the throwaway temp clone that a one-shot <code class="inline">workflow run</code> against a
+      remote target uses. Autonomous work needs a checkout that survives between runs so an issue can be resumed, retried, and pushed from
+      the same branch a week later.
+    </p>
+    <table>
+      <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>strategy</code></td><td><code>worktree</code> | <code>in_place</code></td><td><code>worktree</code></td>
+          <td><code>worktree</code> creates (or reuses) a durable git worktree per entity under <code>~/.rupu/autoflows/worktrees/&lt;repo-slug&gt;/&lt;entity&gt;/</code>, branched from the preferred checkout's <code>HEAD</code>. <code>in_place</code> runs directly in the repo's preferred checkout — no worktree, no isolation.</td>
+        </tr>
+        <tr>
+          <td><code>branch</code></td><td>templated string</td><td>derived from the entity</td>
+          <td>The branch the worktree sits on, e.g. <code>rupu/issue-42</code>. This is the <strong>only</strong> template-rendered field in the whole <code>autoflow:</code> block.</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      Prefer <code class="inline">worktree</code>: it never mutates your main working tree, gives one issue exactly one durable branch,
+      makes cleanup explicit, and lets several issues be owned concurrently in the same repo. Reach for
+      <code class="inline">in_place</code> only when a checkout is dedicated to the autoflow and you actively want the changes in the tree you
+      look at. If you omit the <code class="inline">workspace:</code> block entirely, the strategy falls back to
+      <code class="inline">[autoflow].checkout</code> in config (<code class="inline">worktree</code> by default), and the worktree location to
+      <code class="inline">[autoflow].worktree_root</code>.
+    </p>
+    <div class="callout">
+      <strong>Branch templating is strict — and PR autoflows ignore it.</strong> Autoflow template rendering uses strict undefined
+      handling: a variable that doesn't resolve is a protocol error, not an empty string. And for <code>entity: pull_request</code> the
+      branch is always derived as <code>rupu/pr-&lt;number&gt;-&lt;short-head-sha&gt;</code> so a re-review after a push can never collide with
+      the previous review's worktree — <code>workspace.branch</code> is not consulted on that path.
+    </div>
+
+    <h3 id="outcome">Sub-block: <code class="inline">outcome:</code></h3>
+    <table>
+      <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>output</code></td><td>string (required inside the block)</td><td>—</td><td>Names a key under <code>contracts.outputs</code>. The runtime parses that step's declared output and uses it to decide the claim's next state. Naming an output that isn't declared in <code>contracts:</code> is a parse error, so a typo fails the file rather than silently disabling the loop.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The canonical schema is <code class="inline">autoflow_outcome_v1</code>. The runtime reads these keys from it:
+      <code class="inline">status</code> (one of <code class="inline">continue</code>, <code class="inline">await_human</code>,
+      <code class="inline">await_external</code>, <code class="inline">retry</code>, <code class="inline">blocked</code>,
+      <code class="inline">complete</code>), <code class="inline">summary</code>, <code class="inline">pr_url</code>,
+      <code class="inline">retry_after</code>, and an optional <code class="inline">dispatch</code> object naming a child workflow.
+    </p>
+    <pre class="code"><span class="c">// what the final step must emit — JSON, never prose</span>
+{
+  <span class="k">&quot;status&quot;</span>: <span class="s">&quot;await_human&quot;</span>,
+  <span class="k">&quot;summary&quot;</span>: <span class="s">&quot;Draft PR opened and panel findings addressed&quot;</span>,
+  <span class="k">&quot;pr_url&quot;</span>: <span class="s">&quot;https://github.com/org/repo/pull/123&quot;</span>,
+  <span class="k">&quot;retry_after&quot;</span>: <span class="s">&quot;30m&quot;</span>,
+  <span class="k">&quot;dispatch&quot;</span>: {
+    <span class="k">&quot;workflow&quot;</span>: <span class="s">&quot;phase-delivery-cycle&quot;</span>,
+    <span class="k">&quot;target&quot;</span>: <span class="s">&quot;github:org/repo/issues/42&quot;</span>,
+    <span class="k">&quot;inputs&quot;</span>: { <span class="k">&quot;phase&quot;</span>: <span class="s">&quot;phase-2&quot;</span> }
+  }
+}</pre>
+    <p>
+      A requested <code class="inline">dispatch</code> is <em>not</em> executed inline. It is persisted onto the claim and picked up on the
+      next reconciliation cycle — that's what keeps dispatch idempotent and crash recovery boring.
+    </p>
+
+    <h3>What your prompts can see</h3>
+    <p>
+      An autoflow binds the claimed entity into the step context, so prompts can address it directly. For
+      <code class="inline">entity: issue</code> you get <code class="inline">&#123;&#123; issue.* &#125;&#125;</code>:
+      <code class="inline">number</code>, <code class="inline">ref</code>, <code class="inline">title</code>, <code class="inline">body</code>,
+      <code class="inline">state</code>, <code class="inline">state_name</code>, <code class="inline">labels</code>,
+      <code class="inline">author</code>, <code class="inline">project</code>, <code class="inline">tracker</code>,
+      <code class="inline">url</code>, <code class="inline">created_at</code>, <code class="inline">updated_at</code>. For
+      <code class="inline">entity: pull_request</code> you get the event shape instead —
+      <code class="inline">&#123;&#123; event.pull_request.number | title | base | head | head_sha | author | url | diff &#125;&#125;</code> and
+      <code class="inline">&#123;&#123; event.repository.full_name &#125;&#125;</code>. The <code class="inline">diff</code> is truncated to a byte cap
+      with a trailing note, so a huge PR degrades instead of blowing the context.
+    </p>
+    <pre class="code"><span class="k">prompt</span>: |
+  Triage issue #&#123;&#123; issue.number &#125;&#125; (&#123;&#123; issue.ref &#125;&#125;).
+
+  Title:  &#123;&#123; issue.title &#125;&#125;
+  Author: &#123;&#123; issue.author &#125;&#125;
+  Labels: &#123;&#123; issue.labels | join(&quot;, &quot;) &#125;&#125;
+
+  &#123;&#123; issue.body &#125;&#125;</pre>
+
+    <h3>Waking an autoflow: <code class="inline">trigger:</code> vs <code class="inline">wake_on:</code></h3>
+    <p>
+      An autoflow does <strong>not</strong> need a <code class="inline">trigger:</code> block, and the two do different jobs. A
+      <code class="inline">trigger:</code> means <em>dispatch this workflow now</em> — a one-shot run. A <code class="inline">wake_on:</code> entry
+      means <em>mark this item dirty and reconcile it on the next cycle</em>. Same event vocabulary, same glob matching, same ingestion
+      path; different semantics on the other end. See <a class="link" href="/docs/triggers.html">Triggers</a> for the full event catalogue.
+    </p>
+    <table>
+      <thead><tr><th>What fires</th><th>Who feeds it</th><th>What it does to an autoflow</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>trigger.on: cron</code></td>
+          <td><code>rupu cron tick</code> from your OS scheduler</td>
+          <td>Fires a normal one-shot run of the same file. It does <em>not</em> drive the autoflow loop — <code>rupu autoflow tick</code> does.</td>
+        </tr>
+        <tr>
+          <td><code>trigger.on: event</code></td>
+          <td>Polled connectors, or <code>rupu webhook serve</code></td>
+          <td>Fires a one-shot run per matching delivery, with <code>filter:</code> narrowing it.</td>
+        </tr>
+        <tr>
+          <td><code>autoflow.wake_on</code></td>
+          <td>The same shared event ingress — no second poller, no second cursor store</td>
+          <td>Queues a wake for the matching item. On the next autoflow cycle that item is <em>due</em>, and the claim advances.</td>
+        </tr>
+        <tr>
+          <td><code>autoflow.reconcile_every</code></td>
+          <td>The autoflow cycle itself</td>
+          <td>Makes a claimed item due once this long has passed since the claim was last updated — the safety net for events you never receive.</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      In practice: cron drives <em>ingestion and cadence</em>, <code class="inline">wake_on:</code> decides <em>which items got interesting</em>,
+      and <code class="inline">reconcile_every:</code> guarantees forward progress even when nothing at all arrives. An autoflow with an empty
+      <code class="inline">wake_on:</code> is legal — it simply never polls events and relies on first sight, the reconcile interval, and retry
+      backoff.
+    </p>
+
+    <h2>Lifecycle of one claim</h2>
+    <p>
+      One reconciliation cycle, start to finish. Everything here is idempotent — two cycles racing each other must not duplicate
+      ownership or dispatch.
+    </p>
+    <ol>
+      <li><strong>Wake.</strong> A cycle starts — <code class="inline">rupu autoflow tick</code> from launchd / a systemd timer / Task Scheduler,
+        or a long-lived <code class="inline">rupu autoflow serve</code> worker. Enabled autoflows are discovered and each one's repo binding is
+        resolved from the repo registry.</li>
+      <li><strong>Select.</strong> Candidates are fetched from the tracker or SCM using the server-side part of
+        <code class="inline">selector:</code>, then narrowed locally by the rest — labels, draft/base, and the author gate.</li>
+      <li><strong>Resolve precedence.</strong> Every autoflow whose <code class="inline">entity</code> and <code class="inline">selector</code>
+        match is evaluated; highest <code class="inline">priority</code> wins, ties break on the workflow name that sorts first. Only the winner
+        may hold the claim.</li>
+      <li><strong>Claim.</strong> Acquire the claim lock, then write or renew the claim record with an owner id and a lease expiry from
+        <code class="inline">claim.ttl</code>.</li>
+      <li><strong>Check due.</strong> An item is due on first sight, on a matching <code class="inline">wake_on:</code> event, when
+        <code class="inline">reconcile_every</code> has elapsed, or when a retry backoff expired. Not due means the claim is kept and nothing
+        runs.</li>
+      <li><strong>Prepare the workspace.</strong> Create or reuse the durable worktree on <code class="inline">workspace.branch</code>, or use
+        the preferred checkout for <code class="inline">in_place</code>.</li>
+      <li><strong>Run the steps.</strong> The ordinary workflow engine, with the entity bound into the step context. A step
+        <code class="inline">approval:</code> gate sets the run to <code class="inline">awaiting_approval</code> and the claim to
+        <code class="inline">await_human</code> — the item stays owned while it waits for a person.</li>
+      <li><strong>Read the outcome.</strong> Parse and validate the document named by <code class="inline">outcome.output</code> against its
+        declared contract.</li>
+      <li><strong>Deliver and record.</strong> The PR or comment itself came from a step's own tools; the runtime records the PR URL and
+        summary onto the claim, sets the next claim status, schedules any retry, and persists a requested child dispatch for the
+        <em>next</em> cycle.</li>
+      <li><strong>Release or retain.</strong> A terminal outcome releases the claim; anything else retains it with its lease so the next
+        cycle resumes exactly where this one stopped. <code class="inline">rupu autoflow release &lt;ref&gt;</code> force-releases a stuck one.</li>
+    </ol>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 700 240" role="img" aria-label="Claim lifecycle: eligible becomes claimed, then running; a terminal outcome moves it to complete and then released, while a non-terminal outcome parks it in a waiting state that is re-claimed on the next reconcile.">
+        <defs>
+          <marker id="ar2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+          </marker>
+        </defs>
+        <rect class="d-box" x="8" y="20" width="110" height="40" rx="10"></rect>
+        <text class="d-label" x="63" y="45" text-anchor="middle">eligible</text>
+        <line class="d-edge" x1="118" y1="40" x2="148" y2="40" marker-end="url(#ar2)"></line>
+        <rect class="d-box" x="148" y="20" width="110" height="40" rx="10"></rect>
+        <text class="d-label" x="203" y="45" text-anchor="middle">claimed</text>
+        <line class="d-edge" x1="258" y1="40" x2="288" y2="40" marker-end="url(#ar2)"></line>
+        <rect class="d-box-accent" x="288" y="20" width="110" height="40" rx="10"></rect>
+        <text class="d-label" x="343" y="45" text-anchor="middle">running</text>
+        <line class="d-edge" x1="398" y1="40" x2="428" y2="40" marker-end="url(#ar2)"></line>
+        <rect class="d-box" x="428" y="20" width="110" height="40" rx="10"></rect>
+        <text class="d-label" x="483" y="45" text-anchor="middle">complete</text>
+        <line class="d-edge" x1="538" y1="40" x2="568" y2="40" marker-end="url(#ar2)"></line>
+        <rect class="d-box" x="568" y="20" width="110" height="40" rx="10"></rect>
+        <text class="d-label" x="623" y="45" text-anchor="middle">released</text>
+        <!-- non-terminal outcome parks the claim -->
+        <line class="d-edge" x1="343" y1="60" x2="343" y2="140" marker-end="url(#ar2)"></line>
+        <text class="d-sub" x="354" y="106">non-terminal outcome</text>
+        <rect class="d-box" x="200" y="140" width="300" height="64" rx="10"></rect>
+        <text class="d-label" x="350" y="164" text-anchor="middle">waiting states</text>
+        <text class="d-sub" x="350" y="182" text-anchor="middle">await_human &#183; await_external</text>
+        <text class="d-sub" x="350" y="196" text-anchor="middle">retry_backoff &#183; blocked</text>
+        <!-- re-claimed on the next reconcile -->
+        <path class="d-edge" d="M200,172 L130,172 L130,40 L148,40" marker-end="url(#ar2)"></path>
+        <text class="d-sub" x="122" y="106" text-anchor="end">next reconcile</text>
+      </svg>
+      <figcaption>The lease keeps the item owned through every waiting state — only a terminal outcome or an operator release lets it go.</figcaption>
+    </figure>
+
+    <h2 id="idempotency">Idempotency &amp; ownership</h2>
+    <p>
+      Autoflows are unattended, so the whole tick algorithm is <strong>idempotent</strong>: running two ticks close together must never
+      duplicate ownership or dispatch.
+    </p>
+    <ul>
+      <li>
+        <strong>Deterministic run-ids.</strong> A polled or webhook delivery yields a deterministic run-id of the shape
+        <code class="inline">evt-&lt;workflow&gt;-&lt;vendor&gt;-&lt;delivery&gt;</code>. That is what lets the polled and webhook tiers process the same logical event
+        without firing it twice. Event ingestion is <em>at-most-once</em> by design: if a process crashes after the cursor advances, the event
+        is dropped rather than re-run, because re-firing a triage workflow is worse than missing one event during a crash.
+      </li>
+      <li>
+        <strong>One claim per issue.</strong> Before working an issue the runtime acquires an exclusive claim. Each claim records an owner id
+        and a lease expiry, and the active cycle holds a lock file and renews the lease while it runs. A second process may steal only an
+        <em>expired</em> claim whose active lock is absent — so two autoflows can never grab the same issue at once.
+      </li>
+      <li>
+        <strong>Deterministic precedence.</strong> It is legal for more than one autoflow to match an issue. v1 resolves it by evaluating
+        every autoflow whose <code class="inline">entity</code> and <code class="inline">selector</code> match, choosing the highest <code class="inline">priority</code>, and
+        breaking ties by the workflow <code class="inline">name</code> that sorts first lexicographically. Only the winner may hold the claim — no hidden
+        first-match behavior.
+      </li>
+      <li>
+        <strong>Deferred dispatch.</strong> When an outcome asks to dispatch a child workflow, the request is persisted onto the claim and
+        picked up on the <em>next</em> reconciliation cycle rather than run inline. That keeps dispatch idempotent and crash recovery simple.
+      </li>
+    </ul>
+    <p>
+      Claim state lives under <code class="inline">~/.rupu/autoflows/</code> (one file per owned entity in <code class="inline">claims/</code>, durable per-entity
+      <code class="inline">worktrees/</code>, supervisor <code class="inline">logs/</code>), separate from the run's own <code class="inline">RunStatus</code>. A workflow paused at an
+      <code class="inline">approval:</code> gate maps the run to <code class="inline">awaiting_approval</code> and the claim lifecycle to <code class="inline">await_human</code>,
+      so the issue stays owned while it waits.
+    </p>
+
+    <h2>Event vocabulary</h2>
+    <p>
+      Both trigger tiers and <code class="inline">wake_on:</code> share one normalized event vocabulary. The polled connector lifts events from each
+      vendor's API and maps them onto canonical rupu ids, then derives broader semantic aliases on top.
+    </p>
+    <ul>
+      <li><strong>Canonical ids</strong> name a specific vendor delivery: <code class="inline">github.issue.opened</code>, <code class="inline">github.issue.labeled</code>,
+        <code class="inline">github.pr.merged</code>, <code class="inline">github.push</code>, <code class="inline">gitlab.issue.opened</code>, <code class="inline">gitlab.mr.merged</code>.</li>
+      <li><strong>Semantic aliases</strong> express intent across deliveries and vendors: <code class="inline">issue.queue_entered</code>,
+        <code class="inline">issue.queue_changed</code>, <code class="inline">pr.review_activity</code>. They are matchable but never replace canonical ids.</li>
+      <li><strong>Glob matching.</strong> <code class="inline">*</code> matches any sequence of characters and does not special-case <code class="inline">.</code> boundaries:
+        <code class="inline">github.issue.*</code> matches every GitHub issue event, <code class="inline">*.pr.merged</code> matches across vendors, and <code class="inline">*</code> wakes on anything.</li>
+    </ul>
+    <p>
+      Inside step prompts and the trigger <code class="inline">filter:</code> expression, the matched event is bound as <code class="inline">&#123;&#123; event.* &#125;&#125;</code> —
+      for example <code class="inline">&#123;&#123; event.repo.full_name &#125;&#125;</code>, <code class="inline">&#123;&#123; event.payload.issue.number &#125;&#125;</code>, and
+      <code class="inline">&#123;&#123; event.canonical_id &#125;&#125;</code>. <code class="inline">filter:</code> is the same minijinja you'd write in a step <code class="inline">when:</code>, evaluated at
+      match time against the event payload, and must render to <code class="inline">true</code> or <code class="inline">false</code>.
+    </p>
+
+    <h2>Operating autoflows</h2>
+    <p>
+      v1 is idempotent and tick-based — there is no mandatory daemon. An OS scheduler (launchd on macOS, a <code class="inline">systemd --user</code>
+      timer on Linux, Task Scheduler on Windows) invokes <code class="inline">rupu autoflow tick</code> periodically; each tick discovers enabled
+      autoflows, reconciles eligible issues, and exits. The <code class="inline">rupu autoflow …</code> family is the operator surface:
+    </p>
+    <table>
+      <thead><tr><th>Command</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>rupu autoflow create [name]</code></td><td>Scaffold a new autoflow-enabled workflow YAML and open it for editing. <code>--scope global|project</code>, <code>--editor</code>.</td></tr>
+        <tr><td><code>rupu autoflow list</code></td><td>List workflow files that declare <code>autoflow.enabled = true</code>. <code>--repo</code>.</td></tr>
+        <tr><td><code>rupu autoflow show &lt;name&gt;</code></td><td>Print a workflow and its resolved autoflow metadata. <code>--repo</code>.</td></tr>
+        <tr><td><code>rupu autoflow run &lt;name&gt; &lt;target&gt;</code></td><td>Run one autonomous cycle for one target (e.g. <code>github:owner/repo/issues/42</code>), bypassing discovery. <code>--repo</code>, <code>--mode bypass|readonly</code>.</td></tr>
+        <tr><td><code>rupu autoflow tick</code></td><td>Discover and reconcile every enabled autoflow once, then exit. The primary tick runtime.</td></tr>
+        <tr><td><code>rupu autoflow serve</code></td><td>Run the reconciler as a long-lived local worker with a live operator view. <code>--repo</code>, <code>--worker</code>, <code>--idle-sleep 10s</code>, <code>--view focused|compact|full</code>, <code>--quiet</code>.</td></tr>
+        <tr><td><code>rupu autoflow stop</code></td><td>Stop a running local <code>serve</code> worker. <code>--worker</code>, <code>--repo</code>.</td></tr>
+        <tr><td><code>rupu autoflow status</code></td><td>Summarize active / waiting / retrying / complete claims. <code>--repo</code>.</td></tr>
+        <tr><td><code>rupu autoflow claims</code></td><td>Inspect persisted claims directly (subject, source, repo, branch, PR, status). <code>--repo</code>.</td></tr>
+        <tr><td><code>rupu autoflow wakes</code></td><td>Inspect queued and recently processed wakes. <code>--repo</code>.</td></tr>
+        <tr><td><code>rupu autoflow monitor</code></td><td>Read-only operator view across workers, claims, wakes, and recent activity. <code>--watch</code>, <code>--interval 2s</code>, <code>--view</code>, <code>--repo</code>, <code>--worker</code>.</td></tr>
+        <tr><td><code>rupu autoflow history [ref]</code></td><td>Durable cycle and event history. <code>--repo</code>, <code>--source</code>, <code>--worker</code>, <code>--event</code>, <code>--limit 50</code>, <code>--watch</code>, <code>--interval</code>, <code>--view</code>.</td></tr>
+        <tr><td><code>rupu autoflow explain &lt;ref&gt;</code></td><td>Explain the current autonomous state for one issue. <code>--repo</code>.</td></tr>
+        <tr><td><code>rupu autoflow doctor</code></td><td>Run consistency checks across claims, wakes, and runs. <code>--repo</code>.</td></tr>
+        <tr><td><code>rupu autoflow repair &lt;ref&gt;</code></td><td>Apply safe, bounded remediation to one claim. <code>--release</code>, <code>--requeue</code>.</td></tr>
+        <tr><td><code>rupu autoflow requeue &lt;ref&gt;</code></td><td>Enqueue one manual wake. <code>--event &lt;id&gt;</code> overrides the synthetic event id, <code>--not-before 10m</code> delays visibility.</td></tr>
+        <tr><td><code>rupu autoflow release &lt;ref&gt;</code></td><td>Force-release a stuck claim.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code"><span class="c"># the operator's usual three</span>
+rupu autoflow status <span class="v">--repo</span> <span class="s">github:Section9Labs/rupu</span>
+rupu autoflow monitor <span class="v">--watch</span> <span class="v">--interval</span> <span class="s">2s</span>
+rupu autoflow history <span class="s">github:Section9Labs/rupu/issues/42</span>
+
+<span class="c"># something is stuck — diagnose, then remediate</span>
+rupu autoflow explain <span class="s">github:Section9Labs/rupu/issues/42</span>
+rupu autoflow doctor
+rupu autoflow repair <span class="s">github:Section9Labs/rupu/issues/42</span> <span class="v">--release</span> <span class="v">--requeue</span></pre>
+    <p>
+      A repo-local <code class="inline">[autoflow]</code> config section tunes the runtime around the workflow files:
+      <code class="inline">checkout</code> and <code class="inline">worktree_root</code> set the workspace fallback,
+      <code class="inline">max_active</code> caps how many claims one repo may hold at once, <code class="inline">permission_mode</code> sets the
+      unattended permission posture, <code class="inline">strict_templates</code> controls undefined-variable strictness, and
+      <code class="inline">cleanup_after</code> ages out terminal claims and their worktrees.
+    </p>
+    <p>
+      Event ingestion is shared with triggers: <code class="inline">rupu cron tick</code> drives both cron-scheduled fires and polled events
+      (<code class="inline">rupu cron list</code> / <code class="inline">rupu cron events</code> inspect what's wired), and <code class="inline">rupu webhook serve</code> feeds the live
+      tier. Autoflows consume those events as <em>reconciliation hints</em> via <code class="inline">wake_on:</code> rather than as direct one-shot
+      dispatch — they don't get a second polling config or a second cursor store.
+    </p>
+
+    <!-- prev / next footer nav -->
+    <div class="doc-nav">
+      <a href="/docs/workflows.html">&#8592; Workflows</a>
+      <a href="/docs/sessions.html">Sessions &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

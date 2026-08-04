@@ -1,0 +1,20 @@
+Package: rupu
+Version: 0.72.0~beta.5
+Architecture: arm64
+Maintainer: Section9Labs <matias@section9labs.com>
+Installed-Size: 79326
+Depends: ripgrep
+Recommends: git
+Suggests: ast-grep
+Filename: pool/beta/rupu_0.72.0~beta.5_arm64.deb
+Size: 30645126
+MD5sum: e69e61b56204343925ced6415bb4b688
+SHA1: 0a60a6e16ca14599965b7ab1e98661d9e9905e64
+SHA256: 24b7911f896789cc44d7ec2262400059a348eb14bac3822d0598854e5a0ffce6
+Section: devel
+Priority: optional
+Homepage: https://github.com/Section9Labs/rupu
+Description: Agentic code-development CLI.
+ Runs agents and workflows against your repositories from the terminal.
+License: Apache-2.0
+
