@@ -429,3 +429,248 @@ async fn run_netflow_missing_ledger_is_empty_not_an_error() {
     assert_eq!(body["flows"].as_array().unwrap().len(), 0);
     assert_eq!(body["dropped"], 0);
 }
+
+// ── Project scope: must include system-origin egress with no run_id ───────
+//
+// The updater, the ASN refresh and CP's own fleet traffic are all
+// `run_id: None` (`Origin::System`/`Update`/`Cp`). Project scope is where
+// that egress becomes visible — a filter that dropped it here would hide
+// exactly the traffic this scope exists to show.
+
+#[tokio::test]
+async fn project_netflow_includes_run_scoped_and_system_origin_flows() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let run_flow = e2e_flow(
+        FlowId::new(),
+        Some("run-a"),
+        "api.anthropic.com",
+        Origin::Provider("anthropic".into()),
+    );
+    let system_flow = e2e_flow(FlowId::new(), None, "iptoasn.com", Origin::System);
+    write_ledger(
+        project.path(),
+        &[
+            LedgerLine::Flow(Box::new(run_flow.clone())),
+            LedgerLine::Flow(Box::new(system_flow.clone())),
+        ],
+    );
+
+    let store = rupu_workspace::WorkspaceStore {
+        root: global.path().join("workspaces"),
+    };
+    let ws = rupu_workspace::upsert(&store, project.path()).unwrap();
+
+    let addr = serve(new_state(global.path())).await;
+    let resp = reqwest::get(format!("http://{addr}/api/projects/{}/netflow", ws.id))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    assert_eq!(
+        flows.len(),
+        2,
+        "run-scoped and system-origin flows both present: {body}"
+    );
+
+    let hosts: std::collections::HashSet<&str> =
+        flows.iter().map(|f| f["host"].as_str().unwrap()).collect();
+    assert!(
+        hosts.contains("iptoasn.com"),
+        "system-origin egress must survive project scope: {body}"
+    );
+}
+
+#[tokio::test]
+async fn project_netflow_unknown_project_is_404() {
+    let global = tempfile::tempdir().unwrap();
+    let addr = serve(new_state(global.path())).await;
+    let resp = reqwest::get(format!("http://{addr}/api/projects/nope/netflow"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+// ── Global scope: union across every workspace, including system egress ───
+
+#[tokio::test]
+async fn global_netflow_unions_every_workspace_including_system_egress() {
+    let global = tempfile::tempdir().unwrap();
+    let project_a = tempfile::tempdir().unwrap();
+    let project_b = tempfile::tempdir().unwrap();
+
+    write_ledger(
+        project_a.path(),
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            Some("run-a"),
+            "api.anthropic.com",
+            Origin::Provider("anthropic".into()),
+        )))],
+    );
+    write_ledger(
+        project_b.path(),
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            None,
+            "iptoasn.com",
+            Origin::System,
+        )))],
+    );
+
+    let store = rupu_workspace::WorkspaceStore {
+        root: global.path().join("workspaces"),
+    };
+    rupu_workspace::upsert(&store, project_a.path()).unwrap();
+    rupu_workspace::upsert(&store, project_b.path()).unwrap();
+
+    let addr = serve(new_state(global.path())).await;
+    let resp = reqwest::get(format!("http://{addr}/api/netflow"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    assert_eq!(flows.len(), 2, "both workspaces' flows present: {body}");
+    let hosts: std::collections::HashSet<&str> =
+        flows.iter().map(|f| f["host"].as_str().unwrap()).collect();
+    assert!(hosts.contains("api.anthropic.com"));
+    assert!(
+        hosts.contains("iptoasn.com"),
+        "system-origin egress must survive global scope: {body}"
+    );
+}
+
+#[tokio::test]
+async fn global_netflow_with_no_registered_workspaces_is_empty_not_an_error() {
+    let global = tempfile::tempdir().unwrap();
+    let addr = serve(new_state(global.path())).await;
+    let resp = reqwest::get(format!("http://{addr}/api/netflow"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["flows"].as_array().unwrap().len(), 0);
+}
+
+// ── Graph scope ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn netflow_graph_project_scope_is_bipartite_and_keeps_system_source() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    write_ledger(
+        project.path(),
+        &[
+            LedgerLine::Flow(Box::new(e2e_flow(
+                FlowId::new(),
+                Some("run-a"),
+                "api.anthropic.com",
+                Origin::Provider("anthropic".into()),
+            ))),
+            LedgerLine::Flow(Box::new(e2e_flow(
+                FlowId::new(),
+                None,
+                "api.anthropic.com",
+                Origin::System,
+            ))),
+        ],
+    );
+
+    let store = rupu_workspace::WorkspaceStore {
+        root: global.path().join("workspaces"),
+    };
+    let ws = rupu_workspace::upsert(&store, project.path()).unwrap();
+
+    let addr = serve(new_state(global.path())).await;
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/netflow/graph?scope=project:{}",
+        ws.id
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let nodes = body["nodes"].as_array().unwrap();
+
+    let sources: Vec<_> = nodes.iter().filter(|n| n["side"] == "source").collect();
+    let endpoints: Vec<_> = nodes.iter().filter(|n| n["side"] == "endpoint").collect();
+    assert_eq!(sources.len(), 2, "run-a and system: {body}");
+    assert_eq!(endpoints.len(), 1);
+    assert!(
+        sources.iter().any(|n| n["id"] == "system"),
+        "unattributed egress keeps a system source node: {body}"
+    );
+}
+
+#[tokio::test]
+async fn netflow_graph_run_scope_matches_the_runs_netflow_route() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_id = "run_graph";
+
+    write_ledger(
+        project.path(),
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            Some(run_id),
+            "api.anthropic.com",
+            Origin::Provider("anthropic".into()),
+        )))],
+    );
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/netflow/graph?scope=run:{run_id}"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let nodes = body["nodes"].as_array().unwrap();
+    assert!(nodes.iter().any(|n| n["id"] == run_id));
+    assert!(nodes.iter().any(|n| n["id"] == "api.anthropic.com:443"));
+}
+
+#[tokio::test]
+async fn netflow_graph_defaults_to_global_scope_when_absent() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    write_ledger(
+        project.path(),
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            Some("run-a"),
+            "api.anthropic.com",
+            Origin::Provider("anthropic".into()),
+        )))],
+    );
+    let store = rupu_workspace::WorkspaceStore {
+        root: global.path().join("workspaces"),
+    };
+    rupu_workspace::upsert(&store, project.path()).unwrap();
+
+    let addr = serve(new_state(global.path())).await;
+    let resp = reqwest::get(format!("http://{addr}/api/netflow/graph"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n["id"] == "run-a"));
+}

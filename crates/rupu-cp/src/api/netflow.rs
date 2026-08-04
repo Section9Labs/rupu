@@ -26,19 +26,24 @@ use crate::{
     state::AppState,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::get,
     Json, Router,
 };
 use rupu_netflow::{AsnInfo, AsnTable, FlowId, FlowRecord, NetflowPaths};
 use rupu_orchestrator::runs::RunStore;
 use rupu_transcript::{Event as TranscriptEvent, JsonlReader};
+use rupu_workspace::WorkspaceStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path as StdPath, PathBuf};
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/runs/:id/netflow", get(get_run_netflow))
+    Router::new()
+        .route("/api/runs/:id/netflow", get(get_run_netflow))
+        .route("/api/projects/:id/netflow", get(get_project_netflow))
+        .route("/api/netflow", get(get_global_netflow))
+        .route("/api/netflow/graph", get(get_netflow_graph))
 }
 
 /// A flow plus its read-time enrichment.
@@ -148,6 +153,19 @@ pub(crate) fn build_response(flows: Vec<FlowRecord>, dropped: u64) -> NetflowRes
     }
 }
 
+/// The ledger's run-scoped flows for `run_id`, merged with the run's own
+/// transcript (see the module doc for why the ledger alone under-reports).
+/// Shared by [`collect_run_netflow`] (which wraps this into the enriched
+/// [`NetflowResponse`]) and the graph endpoint's `run:` scope (which only
+/// needs raw [`FlowRecord`]s to feed [`rupu_netflow::ledger::graph_view`]).
+fn run_scoped_flows(store: &RunStore, run_id: &str, workspace: &StdPath) -> Vec<FlowRecord> {
+    let paths = NetflowPaths::new(workspace);
+    let all = rupu_netflow::ledger::read_flows(&paths.flows).unwrap_or_default();
+    let scoped = filter_by_run(&all, run_id);
+    let transcript_paths = crate::usage::run_transcript_paths(store, run_id);
+    merge_with_transcript(scoped, &transcript_paths)
+}
+
 /// Read the ledger + run transcript for a run whose artifacts live under
 /// `workspace` (a project root, `<workspace>/.rupu/netflow/flows.jsonl` and
 /// whatever `store` reports as this run's step transcript paths), scope to
@@ -155,14 +173,122 @@ pub(crate) fn build_response(flows: Vec<FlowRecord>, dropped: u64) -> NetflowRes
 /// result, not an error.
 fn collect_run_netflow(store: &RunStore, run_id: &str, workspace: &StdPath) -> NetflowResponse {
     let paths = NetflowPaths::new(workspace);
-    let all = rupu_netflow::ledger::read_flows(&paths.flows).unwrap_or_default();
     let dropped = rupu_netflow::ledger::read_dropped_total(&paths.flows).unwrap_or(0);
-
-    let scoped = filter_by_run(&all, run_id);
-    let transcript_paths = crate::usage::run_transcript_paths(store, run_id);
-    let merged = merge_with_transcript(scoped, &transcript_paths);
-
+    let merged = run_scoped_flows(store, run_id, workspace);
     build_response(merged, dropped)
+}
+
+/// A registered workspace store, rooted at `<global_dir>/workspaces/` —
+/// mirrors `coverage.rs`'s `store()`, the established pattern for
+/// enumerating every project a global netflow view must union over.
+fn workspace_store(s: &AppState) -> WorkspaceStore {
+    WorkspaceStore {
+        root: s.global_dir.join("workspaces"),
+    }
+}
+
+/// Resolve a `:id` path param (a `WorkspaceStore` id, e.g. `ws_...`) to its
+/// registered workspace path. 404 when no such workspace is registered.
+pub(crate) fn workspace_for_project(s: &AppState, project_id: &str) -> ApiResult<PathBuf> {
+    let ws = workspace_store(s)
+        .load(project_id)
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found(format!("project {project_id} not found")))?;
+    Ok(PathBuf::from(ws.path))
+}
+
+/// Every flow across every registered workspace's ledger, and the summed
+/// dropped-count. Mirrors `coverage.rs`'s `list_coverage`: a workspace whose
+/// path is gone/unreadable is skipped (its ledger read degrades to empty via
+/// `read_flows`'s own missing-file tolerance), never a hard error — an
+/// unregistered/empty registry yields `([], 0)`.
+fn read_all_workspaces(s: &AppState) -> (Vec<FlowRecord>, u64) {
+    let workspaces = workspace_store(s).list().unwrap_or_default();
+
+    let mut flows = Vec::new();
+    let mut dropped = 0u64;
+    for w in &workspaces {
+        let wp = std::path::Path::new(&w.path);
+        let paths = NetflowPaths::new(wp);
+        flows.extend(rupu_netflow::ledger::read_flows(&paths.flows).unwrap_or_default());
+        dropped += rupu_netflow::ledger::read_dropped_total(&paths.flows).unwrap_or(0);
+    }
+    (flows, dropped)
+}
+
+/// `GET /api/projects/:id/netflow` — every flow in a workspace's ledger,
+/// including `system`-origin egress (`run_id: None`) that has no run to
+/// attach to. Unlike run scope, this reads the ledger directly with no
+/// `run_id` filter — that's exactly what keeps the updater / ASN-refresh /
+/// CP fleet traffic visible here.
+async fn get_project_netflow(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> ApiResult<Json<NetflowResponse>> {
+    let workspace = workspace_for_project(&state, &project_id)?;
+    let paths = NetflowPaths::new(&workspace);
+    let flows = rupu_netflow::ledger::read_flows(&paths.flows).unwrap_or_default();
+    let dropped = rupu_netflow::ledger::read_dropped_total(&paths.flows).unwrap_or(0);
+    Ok(Json(build_response(flows, dropped)))
+}
+
+/// `GET /api/netflow` — the union across every registered workspace.
+async fn get_global_netflow(State(state): State<AppState>) -> ApiResult<Json<NetflowResponse>> {
+    let (flows, dropped) = read_all_workspaces(&state);
+    Ok(Json(build_response(flows, dropped)))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphQuery {
+    /// `run:<id>`, `project:<id>`, or absent for global.
+    pub scope: Option<String>,
+}
+
+/// Raw (unenriched) flows for the graph endpoint's `run:` scope — mirrors
+/// `get_run_netflow`'s dispatch on [`resolve_run_location`] so a run graph
+/// looks in exactly the same places the run's own netflow page does
+/// (global store / project-local store / remote host / unpersisted / 404).
+async fn run_scoped_flows_for_graph(s: &AppState, run_id: &str) -> ApiResult<Vec<FlowRecord>> {
+    match resolve_run_location(s, run_id).await {
+        RunLocation::Global => {
+            let run = s
+                .run_store
+                .load(run_id)
+                .map_err(|e| run_not_found_or_internal(run_id, e))?;
+            Ok(run_scoped_flows(&s.run_store, run_id, &run.workspace_path))
+        }
+        RunLocation::ProjectLocal { path } => {
+            let store = RunStore::new(path.join(".rupu").join("runs"));
+            Ok(run_scoped_flows(&store, run_id, &path))
+        }
+        RunLocation::Host { host_id } => {
+            let resp = run_netflow_from_host(s, &host_id, run_id).await?;
+            Ok(resp.flows.into_iter().map(|v| v.flow).collect())
+        }
+        // No artifacts anywhere to build a graph from — empty, not an
+        // error, mirroring `get_run_netflow`'s `Unpersisted` branch.
+        RunLocation::Unpersisted { .. } => Ok(Vec::new()),
+        RunLocation::NotFound => Err(ApiError::not_found(format!("run {run_id} not found"))),
+    }
+}
+
+/// `GET /api/netflow/graph?scope=` — the bipartite source↔endpoint graph
+/// (`rupu_netflow::ledger::graph_view` does the actual bipartite build; this
+/// only resolves `scope` to the flow set it runs over).
+async fn get_netflow_graph(
+    State(state): State<AppState>,
+    Query(q): Query<GraphQuery>,
+) -> ApiResult<Json<rupu_netflow::ledger::GraphView>> {
+    let flows = if let Some(run_id) = q.scope.as_deref().and_then(|s| s.strip_prefix("run:")) {
+        run_scoped_flows_for_graph(&state, run_id).await?
+    } else if let Some(project_id) = q.scope.as_deref().and_then(|s| s.strip_prefix("project:")) {
+        let workspace = workspace_for_project(&state, project_id)?;
+        let paths = NetflowPaths::new(&workspace);
+        rupu_netflow::ledger::read_flows(&paths.flows).unwrap_or_default()
+    } else {
+        read_all_workspaces(&state).0
+    };
+    Ok(Json(rupu_netflow::ledger::graph_view(&flows)))
 }
 
 /// Proxy `GET /api/runs/:id/netflow` to a resolved host. Mirrors
