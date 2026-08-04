@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lru::LruCache;
-use reqwest::{Client, Method};
+use reqwest::Method;
 use rupu_providers::concurrency;
 use tokio::sync::Semaphore;
 
@@ -31,7 +31,7 @@ const MAX_RETRIES: u32 = 5;
 #[allow(dead_code)]
 #[derive(Clone)]
 pub struct GitlabClient {
-    pub(crate) http: Client,
+    pub(crate) http: reqwest_middleware::ClientWithMiddleware,
     pub(crate) base_url: String,
     pub(crate) token: String,
     semaphore: Arc<Semaphore>,
@@ -67,7 +67,11 @@ impl GitlabClient {
             .base_url
             .clone()
             .unwrap_or_else(|| "https://gitlab.com/api/v4".to_string());
-        let http = opts.http_client_builder().build().expect("reqwest builder");
+        let http = opts.netflow_client("gitlab").unwrap_or_else(|_| {
+            rupu_netflow::http::client(rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm(
+                "gitlab".into(),
+            )))
+        });
         let semaphore = concurrency::semaphore_for("gitlab", opts.max_concurrency);
         let cache = Arc::new(Mutex::new(LruCache::new(
             NonZeroUsize::new(CACHE_CAP).unwrap(),

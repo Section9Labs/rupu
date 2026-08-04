@@ -64,21 +64,20 @@ const ALLOWED: &[&str] = &[
 /// Rust normally writes it — that pattern has no literal
 /// `reqwest::ClientBuilder::build` substring anywhere on the line.
 ///
-/// As of Plan 2 Task 5 (2026-08-04), three files in `rupu-scm` still hit
-/// exactly that blind spot — `connectors/github/events.rs`,
-/// `connectors/gitlab/client.rs`, `connectors/linear/issues.rs` — down
-/// from the eight Task 5 started with (`client_options.rs` and
-/// `connectors/{github,gitlab,jira,linear}/{client,events,issues}.rs`;
-/// Task 5's scope was the other five: `client_options.rs`,
-/// `gitlab/events.rs`, `jira/events.rs`, `jira/issues.rs`,
-/// `linear/events.rs`, plus both ad-hoc clients in `github/client.rs`).
-/// The three that remain do NOT appear here or trip this test, but they
-/// DO trip the semantic `clippy::disallowed_methods` lint (`cargo
-/// clippy -p rupu-scm --all-targets`), which resolves the receiver type
-/// regardless of call syntax and is the authoritative check — hence
-/// `rupu-scm`'s `#![warn(clippy::disallowed_methods)]` override in
-/// `lib.rs` is still needed and has NOT been removed. This list is
-/// therefore a strict subset of "genuinely unmigrated files" — Plan 2's
+/// As of Plan 2 Task 5 (2026-08-04, fix round 1), `rupu-scm` no longer has
+/// ANY file in that blind spot: all nine hand-rolled `reqwest` call sites
+/// (`client_options.rs`, `connectors/gitlab/{client,events}.rs`,
+/// `connectors/linear/{events,issues}.rs`, `connectors/jira/{events,
+/// issues}.rs`, `connectors/github/{client,events}.rs`) are migrated onto
+/// `rupu_netflow::http::client_from`. None of them ever appeared in this
+/// list — this scanner never saw them (the blind spot above) — but they
+/// no longer trip the semantic `clippy::disallowed_methods` lint either
+/// (`cargo clippy -p rupu-scm --all-targets`, the authoritative check,
+/// which resolves the receiver type regardless of call syntax). With the
+/// crate clean, `rupu-scm`'s former `#![warn(clippy::disallowed_methods)]`
+/// override in `lib.rs` has been REMOVED — `#![deny(clippy::all)]` alone
+/// now enforces it, so a regression is a hard build error, not a warning.
+/// This list is therefore a strict subset of "genuinely unmigrated files" — Plan 2's
 /// real checklist is `cargo clippy --workspace --all-targets 2>&1 |
 /// grep disallowed`, not this constant.
 const PENDING_PLAN_2: &[&str] = &[

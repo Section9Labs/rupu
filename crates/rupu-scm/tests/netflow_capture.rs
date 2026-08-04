@@ -11,10 +11,12 @@
 //!
 //! `real_connectors_reach_the_netflow_sink_with_scm_origin` is the test that
 //! would catch that: it drives the actual migrated constructors —
-//! `GitlabEventConnector`, `LinearEventConnector`, `JiraEventConnector`,
-//! `JiraIssueConnector`, and `GithubClient::graphql_json` — against mock
+//! `GitlabEventConnector`, `GitlabClient`, `LinearEventConnector`,
+//! `LinearIssueConnector`, `JiraEventConnector`, `JiraIssueConnector`,
+//! `GithubEventConnector`, and `GithubClient::graphql_json` — against mock
 //! servers and asserts the resulting flows land in the netflow sink under
-//! `Origin::Scm(<platform>)`.
+//! `Origin::Scm(<platform>)`. That is all nine migrated call sites except
+//! one (see below), covering every hand-rolled connector in the crate.
 //!
 //! `GithubClient::fetch_token_scopes` (the other ad-hoc GitHub client, in
 //! `client.rs:145`) is migrated but NOT exercised here: it POSTs to a
@@ -128,6 +130,27 @@ async fn real_connectors_reach_the_netflow_sink_with_scm_origin() {
             .expect("gitlab poll_events against the mock server");
     }
 
+    // ── GitLab: GitlabClient::get_json (shares client_options.rs's tuning) ──
+    {
+        use rupu_scm::connectors::gitlab::GitlabClient;
+
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path("/projects/1");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body("{}");
+            })
+            .await;
+
+        let client = GitlabClient::new("glpat-fake".into(), Some(server.base_url()), Some(1));
+        client
+            .get_json("/projects/1")
+            .await
+            .expect("gitlab get_json against the mock server");
+    }
+
     // ── Linear: LinearEventConnector::poll_events ──────────────────────────
     {
         use rupu_scm::connectors::linear::LinearEventConnector;
@@ -167,6 +190,37 @@ async fn real_connectors_reach_the_netflow_sink_with_scm_origin() {
             .poll_events(&source, None, 10)
             .await
             .expect("linear poll_events against the mock server");
+    }
+
+    // ── Linear: LinearIssueConnector::list_issues ───────────────────────────
+    {
+        use rupu_scm::connectors::linear::LinearIssueConnector;
+        use rupu_scm::{IssueConnector, IssueFilter};
+
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "data": {
+                            "team": {
+                                "issues": {
+                                    "nodes": [],
+                                    "pageInfo": { "hasNextPage": false, "endCursor": null }
+                                }
+                            }
+                        }
+                    }));
+            })
+            .await;
+
+        let connector = LinearIssueConnector::new("lin_api_fake".into(), Some(server.url("/")));
+        connector
+            .list_issues("team-1", IssueFilter::default())
+            .await
+            .expect("linear list_issues against the mock server");
     }
 
     // ── Jira: JiraEventConnector::poll_events ──────────────────────────────
@@ -271,6 +325,39 @@ async fn real_connectors_reach_the_netflow_sink_with_scm_origin() {
             .expect("github graphql_json against the mock server");
     }
 
+    // ── GitHub: GithubEventConnector::poll_events (not octocrab-routed) ─────
+    {
+        use rupu_scm::connectors::github::GithubEventConnector;
+        use rupu_scm::event_connector::EventConnector;
+        use rupu_scm::{EventSourceRef, Platform, RepoRef};
+
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path("/repos/acme/repo/events");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body("[]");
+            })
+            .await;
+
+        let connector = GithubEventConnector::new("ghp_fake".into(), Some(server.base_url()));
+        let source = EventSourceRef::Repo {
+            repo: RepoRef {
+                platform: Platform::Github,
+                owner: "acme".into(),
+                repo: "repo".into(),
+            },
+        };
+        // `since:` alone (empty etag) already skips the warmup fast-path,
+        // which requires BOTH `since` absent AND `etag` empty.
+        connector
+            .poll_events(&source, Some("since:2020-01-01T00:00:00+00:00"), 10)
+            .await
+            .expect("github poll_events against the mock server");
+    }
+
     let records = sink.records();
     let origins: Vec<_> = records.iter().map(|r| r.ctx.origin.clone()).collect();
     assert_eq!(
@@ -278,16 +365,16 @@ async fn real_connectors_reach_the_netflow_sink_with_scm_origin() {
             .iter()
             .filter(|o| **o == Origin::Scm("gitlab".into()))
             .count(),
-        1,
-        "gitlab: {origins:?}"
+        2,
+        "gitlab: GitlabEventConnector::poll_events + GitlabClient::get_json: {origins:?}"
     );
     assert_eq!(
         origins
             .iter()
             .filter(|o| **o == Origin::Scm("linear".into()))
             .count(),
-        1,
-        "linear: {origins:?}"
+        2,
+        "linear: LinearEventConnector::poll_events + LinearIssueConnector::list_issues: {origins:?}"
     );
     assert_eq!(
         origins
@@ -303,12 +390,12 @@ async fn real_connectors_reach_the_netflow_sink_with_scm_origin() {
             .iter()
             .filter(|o| **o == Origin::Scm("github".into()))
             .count(),
-        1,
-        "github: {origins:?}"
+        2,
+        "github: GithubClient::graphql_json + GithubEventConnector::poll_events: {origins:?}"
     );
     assert_eq!(
         records.len(),
-        6,
+        9,
         "one flow per connector HTTP call: {origins:?}"
     );
     for r in records.iter() {

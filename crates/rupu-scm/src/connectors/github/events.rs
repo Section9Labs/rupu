@@ -30,7 +30,7 @@ use crate::types::{EventSourceRef, EventSubjectRef, IssueRef, PrRef, RepoRef};
 /// Multiple repos share one connector instance; each call is scoped to
 /// the supplied `RepoRef`.
 pub struct GithubEventConnector {
-    http: reqwest::Client,
+    http: reqwest_middleware::ClientWithMiddleware,
     token: String,
     /// API root, default `https://api.github.com`. Overrideable for
     /// GitHub Enterprise via `[scm.github].base_url` config.
@@ -41,9 +41,15 @@ impl GithubEventConnector {
     pub fn new(token: String, base_url: Option<String>) -> Self {
         let base_url = base_url.unwrap_or_else(|| "https://api.github.com".to_string());
         Self {
-            http: reqwest::Client::builder()
-                .build()
-                .expect("reqwest client build"),
+            http: rupu_netflow::http::client_from(
+                rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm("github".into())),
+                reqwest::Client::builder(),
+            )
+            .unwrap_or_else(|_| {
+                rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
+                    rupu_netflow::Origin::Scm("github".into()),
+                ))
+            }),
             token,
             base_url,
         }
