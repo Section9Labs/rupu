@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from './api';
+import type { HostRollup } from './netflow';
 import { fetchNetflowGraph, fetchRunNetflow, formatBytes } from './netflow';
 
 describe('formatBytes', () => {
@@ -70,5 +71,26 @@ describe('fetch helpers', () => {
       expect((e as ApiError).status).toBe(404);
     }
     vi.unstubAllGlobals();
+  });
+});
+
+describe('HostRollup optionality', () => {
+  it('handles the percentile keys entirely absent, not null', () => {
+    // p50_ms/p95_ms have `skip_serializing_if` on the Rust side, so an
+    // unobservable percentile OMITS the key — it is never serialized as
+    // `null`. Parse a JSON string built without those keys at all (not an
+    // object literal with `p50_ms: undefined`, which is a different runtime
+    // shape) so the fixture matches what the server actually sends.
+    const rollup: HostRollup = JSON.parse(
+      '{"host":"api.github.com","port":443,"calls":3,"bytes_in":null,"bytes_out":120,"errors":0}',
+    );
+
+    expect('p50_ms' in rollup).toBe(false);
+    expect(rollup.p50_ms).toBeUndefined();
+    // The trap this type shape guards against: `!== null` reads true for
+    // an absent key, so a naive guard would wrongly treat it as present.
+    expect(rollup.p50_ms !== null).toBe(true);
+    // The correct guard.
+    expect(rollup.p50_ms === undefined).toBe(true);
   });
 });

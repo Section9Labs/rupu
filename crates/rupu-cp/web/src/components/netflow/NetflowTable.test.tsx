@@ -46,9 +46,15 @@ describe('NetflowTable', () => {
   });
 
   it('renders an unknown byte count as a dash, not zero', () => {
+    // `FlowView.bytes_in`/`bytes_out` are `number | undefined` — Rust's
+    // `skip_serializing_if` OMITS the key when unobservable, it never
+    // serializes `null`. `undefined` is therefore the correct fixture
+    // value here, matching real wire payloads (see `NetflowSummary`'s
+    // `p50_ms`/`p95_ms` doc comment for the identical Rust attribute
+    // combination).
     render(
       <NetflowTable
-        flows={[flow({ fidelity: 'coarse', bytes_in: null, bytes_out: null })]}
+        flows={[flow({ fidelity: 'coarse', bytes_in: undefined, bytes_out: undefined })]}
         dropped={0}
         asnLoaded
       />,

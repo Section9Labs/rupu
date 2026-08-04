@@ -8,9 +8,11 @@
 import { formatBytes, type HostRollup } from '../../lib/netflow';
 import SortableTable, { type Column } from '../lists/SortableTable';
 
-/** `p50_ms`/`p95_ms` are typed `number | null` but arrive as `undefined`
- *  when serde omits the key (`Option<u64>`, no default). Treat both as
- *  "no data" — never render either as `0 ms`. */
+/** `p50_ms`/`p95_ms` are typed `number | undefined`: serde omits the key
+ *  entirely (never `null`) when a percentile is unobservable. Accept
+ *  `null` too so this stays correct even if a caller widens the type or
+ *  passes a raw `HostRollup.bytes_in`-style field through by mistake —
+ *  either way, "no data" renders the same, never `0 ms`. */
 function formatMs(n: number | null | undefined): string {
   return n != null ? `${n} ms` : '—';
 }
@@ -70,7 +72,11 @@ export function NetflowSummary({ hosts }: { hosts: HostRollup[] }) {
       fit: true,
       align: 'right',
       sortable: true,
-      sortValue: (h) => h.p50_ms,
+      // Column['sortValue'] is `string | number | null` (no `undefined`);
+      // `p50_ms` is `number | undefined` (key omitted, not nulled, when
+      // unobservable — see `HostRollup`'s doc comment) so coerce for the
+      // sort comparator only. `formatMs` above is what actually renders.
+      sortValue: (h) => h.p50_ms ?? null,
       render: (h) => formatMs(h.p50_ms),
     },
     {
@@ -79,7 +85,7 @@ export function NetflowSummary({ hosts }: { hosts: HostRollup[] }) {
       fit: true,
       align: 'right',
       sortable: true,
-      sortValue: (h) => h.p95_ms,
+      sortValue: (h) => h.p95_ms ?? null,
       render: (h) => formatMs(h.p95_ms),
     },
   ];

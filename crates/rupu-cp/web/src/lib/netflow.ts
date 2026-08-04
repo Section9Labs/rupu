@@ -21,6 +21,15 @@ import { ApiError } from './api';
 
 // ---------------------------------------------------------------------------
 // Types — mirror crates/rupu-netflow's wire shapes field-for-field.
+//
+// Optionality rule (verify every field against its Rust attribute, don't
+// guess): a Rust `Option<T>` with `skip_serializing_if` becomes `field?: T`
+// here — the key is OMITTED when `None`, so the runtime value is
+// `undefined`, never `null`. A plain `Option<T>` with no
+// `skip_serializing_if` becomes `field: T | null` — the key is always
+// present, `null` when `None`. Typing an omitted-key field as `T | null`
+// (or vice versa) compiles fine but is a runtime trap: `x.p !== null`
+// reads true for an absent key, so a `.toFixed()` on it throws.
 // ---------------------------------------------------------------------------
 
 export type Fidelity = 'coarse' | 'http' | 'full';
@@ -45,12 +54,16 @@ export interface Origin {
   name?: string;
 }
 
-/** `rupu_netflow::ctx::FlowCtx`. */
+/**
+ * `rupu_netflow::ctx::FlowCtx`. All four id fields are
+ * `#[serde(default, skip_serializing_if = "Option::is_none")]` — omitted,
+ * never `null`, when absent.
+ */
 export interface FlowCtx {
-  run_id?: string | null;
-  step_id?: string | null;
-  agent?: string | null;
-  workspace_id?: string | null;
+  run_id?: string;
+  step_id?: string;
+  agent?: string;
+  workspace_id?: string;
   origin: Origin;
 }
 
@@ -82,8 +95,9 @@ export interface FlowView {
   status?: number;
   outcome: Outcome;
   error?: string;
-  bytes_out?: number | null;
-  bytes_in?: number | null;
+  /** `Option<u64>` with `skip_serializing_if` — omitted, never `null`. */
+  bytes_out?: number;
+  bytes_in?: number;
   body_complete: boolean;
   ttfb_ms?: number;
   duration_ms?: number;
@@ -94,10 +108,12 @@ export interface FlowView {
  * `rupu_netflow::ledger::views::HostRollup` — computed server-side. Do not
  * re-derive any of this in TypeScript.
  *
- * `bytes_in`/`bytes_out` always serialize (as `null` when unobservable —
- * no `skip_serializing_if` on the Rust side). `p50_ms`/`p95_ms` are also
- * `Option<u64>` on the Rust side; mirrored here as `number | null` per the
- * same "never coerce unknown into zero" rule.
+ * `bytes_in`/`bytes_out` have NO `skip_serializing_if` — the key always
+ * serializes, `null` when unobservable, hence `T | null` (required key).
+ * `p50_ms`/`p95_ms` DO have `skip_serializing_if` — the key is omitted
+ * entirely when `None`, hence `field?: T` (optional, never actually
+ * `null`), matching `FlowView.ttfb_ms`/`duration_ms`'s treatment of the
+ * identical Rust attribute combination.
  */
 export interface HostRollup {
   host: string;
@@ -106,8 +122,8 @@ export interface HostRollup {
   bytes_in: number | null;
   bytes_out: number | null;
   errors: number;
-  p50_ms: number | null;
-  p95_ms: number | null;
+  p50_ms?: number;
+  p95_ms?: number;
 }
 
 /** `rupu_cp::api::netflow::NetflowResponse`. */
