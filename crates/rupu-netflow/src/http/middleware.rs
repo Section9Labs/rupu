@@ -117,7 +117,21 @@ impl Middleware for NetflowMiddleware {
                 } else {
                     Outcome::TransportError
                 };
-                record.error = Some(e.to_string());
+                // `redact_url_suffix` — NOT `e.without_url()`. The latter
+                // exists on both `reqwest::Error` and
+                // `reqwest_middleware::Error` but consumes `self`, and `e`
+                // here only borrows out of `result` (matched via `&result`
+                // above) — `result` still has to be returned to the
+                // caller byte-identical at the end of this fn, so it can't
+                // be consumed here to redact the copy we record. Neither
+                // error type implements `Clone`. Stripping the known fixed
+                // suffix from the rendered string is the "strip at the
+                // record boundary" fallback the invariant calls for: a
+                // query string routinely carries tokens, and this is the
+                // one field on the `Err` path that could otherwise leak
+                // one (`record.rs` documents `path` as query-stripped, but
+                // `error` had no such treatment before this fix).
+                record.error = Some(redact_url_suffix(&e.to_string()));
                 record.duration_ms = Some(elapsed_ms);
                 record.body_complete = true;
             }
@@ -140,5 +154,51 @@ impl Middleware for NetflowMiddleware {
             );
         }
         result
+    }
+}
+
+/// Strip reqwest's `" for url (<url>)"` suffix from an error's rendered
+/// `Display` string.
+///
+/// `reqwest::Error::fmt` (and `reqwest_middleware::Error`'s
+/// transparent delegation to it) appends this suffix verbatim,
+/// `query included`, whenever the error carries a known URL — see
+/// reqwest's `error.rs`: `write!(f, " for url ({url})")?` is
+/// unconditionally the LAST thing written, with nothing after it. That
+/// makes truncating at the first occurrence of the suffix's fixed prefix
+/// safe regardless of which URL ended up in it (initial request vs. a
+/// followed redirect) and regardless of reqwest's exact wording upstream
+/// of it — this only depends on the suffix being last, which the same
+/// source confirms.
+///
+/// A message with no such suffix (crate-internal middleware errors,
+/// `reqwest_middleware::Error::Middleware(_)`) passes through unchanged.
+fn redact_url_suffix(message: &str) -> String {
+    match message.find(" for url (") {
+        Some(idx) => message[..idx].to_string(),
+        None => message.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_url_suffix;
+
+    #[test]
+    fn strips_the_reqwest_url_suffix() {
+        assert_eq!(
+            redact_url_suffix(
+                "error sending request for url (https://api.example.com/x?api_key=SECRET)"
+            ),
+            "error sending request"
+        );
+    }
+
+    #[test]
+    fn leaves_a_message_with_no_url_suffix_untouched() {
+        assert_eq!(
+            redact_url_suffix("some middleware error"),
+            "some middleware error"
+        );
     }
 }

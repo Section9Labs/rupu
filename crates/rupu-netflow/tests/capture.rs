@@ -161,6 +161,52 @@ async fn never_stores_the_query_string() {
     );
 }
 
+/// Fix 6 (Task 10 review round 2): `record.error` on a transport failure
+/// used to carry `e.to_string()` verbatim, and `reqwest::Error`'s
+/// `Display` appends the full request URL — query included — whenever
+/// it's known. `never_stores_the_query_string` above only proves `path`
+/// is query-stripped on a SUCCESSFUL request; it never populates
+/// `record.error` at all (that field is only set on the `Err` arm), so it
+/// couldn't have caught this. This drives a genuine transport failure
+/// (unroutable port, exactly like `records_a_transport_failure_with_no_status`)
+/// against a URL carrying a secret in its query and asserts the secret
+/// appears nowhere in the serialized record — not just not in `path`.
+#[tokio::test]
+async fn a_transport_failure_never_leaks_the_query_string() {
+    let sink = Arc::new(MemorySink::default());
+    let client = rupu_netflow::http::client_with(
+        FlowCtx::system(Origin::System),
+        reqwest::Client::builder(),
+        sink.clone(),
+    )
+    .unwrap();
+
+    // Port 1 on loopback refuses connections — a real transport failure,
+    // not a mocked one, so `e.to_string()` goes through reqwest's actual
+    // `Display` impl instead of a stand-in.
+    let result = client
+        .get("http://127.0.0.1:1/nope?api_key=SUPERSECRET&q=x")
+        .send()
+        .await;
+    assert!(result.is_err());
+
+    let r = &sink.records()[0];
+    assert!(matches!(
+        r.outcome,
+        rupu_netflow::Outcome::TransportError | rupu_netflow::Outcome::Timeout
+    ));
+    let error = r.error.as_deref().unwrap_or_default();
+    assert!(
+        !error.contains("SUPERSECRET"),
+        "record.error must never carry a query value: {error:?}"
+    );
+    let json = serde_json::to_string(r).unwrap();
+    assert!(
+        !json.contains("SUPERSECRET"),
+        "no part of the serialized record may carry query values: {json}"
+    );
+}
+
 #[tokio::test]
 async fn records_an_http_error_status_as_http_error() {
     let server = httpmock::MockServer::start_async().await;

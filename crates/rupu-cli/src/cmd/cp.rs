@@ -53,6 +53,44 @@ pub async fn handle(action: Action) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+
+            // Install the process-wide netflow sink BEFORE anything below
+            // can construct a `HostConnector` (Fix 3, Task 10 review
+            // round 2): `rupu_netflow::http::client_from` resolves
+            // `rupu_netflow::http::sink()` at CLIENT construction time,
+            // and rupu-cp's `HostRegistry` (built inside `rupu_cp::serve`
+            // further down, plus caches connectors) never rebuilds its
+            // connectors afterward. Installing the sink any later than
+            // this line would leave `HttpHostConnector`'s fleet egress —
+            // and the ASN refresh's own `Origin::System` traffic just
+            // below — permanently wired to the default `NullSink` for the
+            // life of the daemon, exactly like `rupu run` would be if its
+            // own `init` call moved after `build_for_provider_with_config`
+            // (see that call site's comment).
+            //
+            // Ledger-only: a daemon has no run transcript to stream into.
+            // Rooted at the global `$RUPU_HOME/netflow/` — `cp serve` has
+            // no single project it's serving (it's the fleet-wide control
+            // plane), so there is no sensible project root to anchor a
+            // `NetflowPaths::new(...)`-style project-relative ledger at.
+            // `NetflowPaths` isn't used here for that reason: it always
+            // appends `.rupu/netflow/`, which would double up `.rupu`
+            // since `global_dir` already IS `~/.rupu` (or `$RUPU_HOME`).
+            let netflow_paths = rupu_netflow::NetflowPaths {
+                root: global_dir.join("netflow"),
+                flows: global_dir.join("netflow").join("flows.jsonl"),
+            };
+            let netflow_handle = match rupu_netflow::NetflowWriterHandle::spawn(netflow_paths) {
+                Ok(handle) => {
+                    rupu_netflow::http::init(handle.writer.clone());
+                    Some(handle)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "netflow ledger unavailable for cp serve; egress capture degrades to nothing recorded");
+                    None
+                }
+            };
+
             // `[cp]` runtime settings gate the two background-tick loops
             // below (autoflow reconcile / cron tick). A missing/malformed
             // config file just falls back to `CpConfig::default()` — both
@@ -209,27 +247,45 @@ pub async fn handle(action: Action) -> ExitCode {
                         // loaded" rather than to wrong answers.
                         //
                         // Single-flight guarded: `should_refresh_asn` only
-                        // looks at on-disk mtime, so a stalled download
-                        // (the netflow HTTP client sets no request
-                        // timeout) that outlives one tick would otherwise
-                        // still look "stale" next tick and spawn a second,
-                        // overlapping refresh. `AsnTable::write` uses a
-                        // FIXED `<path>.db.tmp` intermediate file, not a
-                        // per-call unique name, so two concurrent refreshes
-                        // would race writing that same file — a data race,
-                        // not just wasted bandwidth. `try_claim_asn_refresh`
-                        // makes at most one refresh in flight at a time;
-                        // the guard is released on BOTH the `Ok` and `Err`
-                        // arms so a failed refresh can never wedge it shut.
+                        // looks at on-disk mtime, so a download that stalls
+                        // forever (no server-side close, dead connection
+                        // that never times out at the TCP layer) would
+                        // otherwise still look "stale" next tick and spawn
+                        // a second, overlapping refresh. `AsnTable::write`
+                        // uses a FIXED `<path>.db.tmp` intermediate file,
+                        // not a per-call unique name, so two concurrent
+                        // refreshes would race writing that same file — a
+                        // data race, not just wasted bandwidth.
+                        // `try_claim_asn_refresh` makes at most one refresh
+                        // in flight at a time; the guard is released on
+                        // BOTH the `Ok` and `Err` arms so a failed refresh
+                        // can never wedge it shut.
+                        //
+                        // A bounded total timeout closes the other half of
+                        // that same hazard: without ONE, a genuinely stuck
+                        // download (not a race, just a slow/dead peer)
+                        // holds `ASN_REFRESH_IN_FLIGHT` forever, and the
+                        // guard above then silently ends auto-refresh for
+                        // the rest of the daemon's life — every future tick
+                        // sees the guard held and skips. Generous because
+                        // this is a multi-megabyte download, not a normal
+                        // API call: minutes, not the usual per-request
+                        // seconds-scale timeout.
+                        const ASN_REFRESH_TIMEOUT: std::time::Duration =
+                            std::time::Duration::from_secs(300);
                         if let Some(db) = rupu_netflow::asn::asn_db_path() {
                             if should_refresh_asn(&netflow_cfg, &db)
                                 && try_claim_asn_refresh(&ASN_REFRESH_IN_FLIGHT)
                             {
                                 let url = netflow_cfg.asn_source_url.clone();
                                 tokio::spawn(async move {
-                                    let client = rupu_netflow::http::client(
-                                        rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System),
-                                    );
+                                    let ctx =
+                                        rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System);
+                                    let client = rupu_netflow::http::client_from(
+                                        ctx.clone(),
+                                        reqwest::Client::builder().timeout(ASN_REFRESH_TIMEOUT),
+                                    )
+                                    .unwrap_or_else(|_| rupu_netflow::http::client(ctx));
                                     match rupu_netflow::asn::refresh(&url, &db, &client).await {
                                         Ok(()) => {
                                             tracing::info!(path = ?db, "netflow ASN table refreshed")
@@ -379,6 +435,15 @@ pub async fn handle(action: Action) -> ExitCode {
             let _ = gate_sweep_handle.await;
             let _ = inventory_handle.await;
             let _ = scm_inventory_handle.await;
+            // Best-effort final flush on a clean shutdown. Not load-bearing
+            // for loss VISIBILITY — the writer task's own periodic ticker
+            // (`DROPPED_VISIBILITY_INTERVAL`) already surfaces drops while
+            // the daemon runs, unprompted — this just lets an orderly
+            // `Ctrl-C` land the last few records promptly instead of
+            // whenever the process actually terminates.
+            if let Some(handle) = netflow_handle {
+                handle.shutdown().await;
+            }
 
             serve_result
         }

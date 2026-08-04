@@ -168,6 +168,12 @@ pub const CONFIG_SKELETON: &str = r#"# rupu project config — see https://githu
 # strict_templates = true
 "#;
 
-/// `.gitignore` line that rupu owns. Init appends this to an existing
-/// `.gitignore` (or creates one) when missing.
-pub const GITIGNORE_ENTRY: &str = ".rupu/transcripts/";
+/// `.gitignore` lines that rupu owns. Init appends any of these missing
+/// from an existing `.gitignore` (or creates one) when missing.
+///
+/// `.rupu/netflow/` MUST be here alongside `.rupu/transcripts/` — the
+/// netflow ledger (`<project>/.rupu/netflow/flows.jsonl`) records every
+/// host, IP, path and timing rupu contacted on the user's behalf.
+/// Without this entry, `git add .` in a freshly-`init`'d project commits
+/// that record straight into the user's repo.
+pub const GITIGNORE_ENTRIES: &[&str] = &[".rupu/transcripts/", ".rupu/netflow/"];

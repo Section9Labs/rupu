@@ -317,7 +317,7 @@ impl GithubClient {
                     .record(coarse_flow(
                         self.host_label(),
                         "*",
-                        result.is_ok(),
+                        result.as_ref().err(),
                         attempt_started.elapsed().as_millis() as u64,
                     ))
                     .await;
@@ -352,10 +352,22 @@ impl GithubClient {
 /// "zero bytes" and "we could not see the bytes". `method` and `path` are
 /// `"*"` for the same reason: `with_retry_octocrab` is generic over the
 /// closure and does not know the verb or the route it retried.
+///
+/// `error` is `None` on success, `Some(&ScmError)` on failure — NOT a
+/// plain `bool`. Every `ScmError` variant except `Network` was already
+/// classified from an HTTP status code (`classify_scm_error` /
+/// `classify_octocrab_error`'s `GitHub { .. }` arm): `RateLimited` is a
+/// 403/429, `NotFound` a 404, `Forbidden` a header-less 403, and so on.
+/// Only `Network` (octocrab's `Hyper`/`Service` variants) represents a
+/// genuine transport fault where no HTTP response was ever received.
+/// Collapsing that distinction to a bare `bool` (the pre-fix signature)
+/// mapped every failure — including a plain 404 or a rate limit — to
+/// `Outcome::TransportError`, which is invariant 3 inverted: a real HTTP
+/// exchange gets recorded as a network fault that never happened.
 pub fn coarse_flow(
     host: &str,
     path: &str,
-    success: bool,
+    error: Option<&ScmError>,
     duration_ms: u64,
 ) -> rupu_netflow::FlowRecord {
     rupu_netflow::FlowRecord {
@@ -372,15 +384,22 @@ pub fn coarse_flow(
         resolved_ips: Vec::new(),
         http_version: None,
         status: None,
-        outcome: if success {
-            rupu_netflow::Outcome::Ok
-        } else {
-            rupu_netflow::Outcome::TransportError
+        outcome: match error {
+            None => rupu_netflow::Outcome::Ok,
+            Some(ScmError::Network(_)) => rupu_netflow::Outcome::TransportError,
+            Some(_) => rupu_netflow::Outcome::HttpError,
         },
         error: None,
         bytes_out: None,
         bytes_in: None,
-        body_complete: true,
+        // No body was observed here by construction — `octocrab` never
+        // hands this boundary a byte count either way — so asserting
+        // completeness would claim coverage this record does not have
+        // (invariant 3). See `record.rs`'s `body_complete` doc: it is
+        // only ever `true` for a record that has an actual observed
+        // count behind it (a `Content-Length` or a `LedgerLine::Complete`
+        // fold), neither of which applies to a Coarse record.
+        body_complete: false,
         ttfb_ms: None,
         duration_ms: Some(duration_ms),
     }

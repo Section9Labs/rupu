@@ -2,9 +2,11 @@
 //! timing are real; bytes and peer IP are genuinely unknown and stay
 //! `None` rather than being guessed.
 //!
-//! `a_coarse_record_states_what_it_does_not_know` and
-//! `a_failed_attempt_records_a_transport_error` exercise `coarse_flow`
-//! directly — they prove the constructor's field shape, nothing more.
+//! `a_coarse_record_states_what_it_does_not_know`,
+//! `an_http_status_failure_records_an_http_error`, and
+//! `a_genuine_network_failure_records_a_transport_error` exercise
+//! `coarse_flow` directly — they prove the constructor's field shape and
+//! its error-classification, nothing more.
 //!
 //! `a_retried_octocrab_attempt_emits_one_coarse_record_per_attempt` is the
 //! test that actually proves emission: it drives the real
@@ -40,7 +42,7 @@ async fn a_coarse_record_states_what_it_does_not_know() {
     let record = rupu_scm::connectors::github::client::coarse_flow(
         "api.github.com",
         "/repos/foo/bar",
-        true,
+        None,
         42,
     );
     rupu_netflow::FlowSink::record(sink.as_ref(), record).await;
@@ -58,14 +60,60 @@ async fn a_coarse_record_states_what_it_does_not_know() {
         r.status, None,
         "octocrab does not surface the raw status here"
     );
+    assert!(
+        !r.body_complete,
+        "no body was observed at this boundary; asserting completeness would claim coverage we don't have"
+    );
 }
 
+/// A rate-limited or missing-resource GitHub call is a real HTTP exchange
+/// — GitHub answered with a status code — not a network fault. Every
+/// `ScmError` variant classified from an HTTP status (see
+/// `classify_scm_error` / `classify_octocrab_error`) must map to
+/// `Outcome::HttpError`, not `TransportError`. This replaces the pre-fix
+/// `a_failed_attempt_records_a_transport_error`, which asserted the
+/// opposite (and wrong) mapping as correct.
 #[tokio::test]
-async fn a_failed_attempt_records_a_transport_error() {
+async fn an_http_status_failure_records_an_http_error() {
+    let not_found = ScmError::NotFound {
+        what: "repo".into(),
+    };
     let record = rupu_scm::connectors::github::client::coarse_flow(
         "api.github.com",
         "/repos/foo/bar",
-        false,
+        Some(&not_found),
+        10,
+    );
+    assert!(
+        matches!(record.outcome, Outcome::HttpError),
+        "a 404 is an HTTP exchange, not a transport fault: {:?}",
+        record.outcome
+    );
+
+    let rate_limited = ScmError::RateLimited { retry_after: None };
+    let record = rupu_scm::connectors::github::client::coarse_flow(
+        "api.github.com",
+        "/repos/foo/bar",
+        Some(&rate_limited),
+        10,
+    );
+    assert!(
+        matches!(record.outcome, Outcome::HttpError),
+        "a rate limit is an HTTP exchange, not a transport fault: {:?}",
+        record.outcome
+    );
+}
+
+/// A genuine transport fault (no HTTP response at all — octocrab's
+/// `Hyper`/`Service` variants, classified to `ScmError::Network`) is the
+/// ONLY case that should still record `Outcome::TransportError`.
+#[tokio::test]
+async fn a_genuine_network_failure_records_a_transport_error() {
+    let network = ScmError::Network(anyhow::anyhow!("connection reset"));
+    let record = rupu_scm::connectors::github::client::coarse_flow(
+        "api.github.com",
+        "/repos/foo/bar",
+        Some(&network),
         10,
     );
     assert!(matches!(record.outcome, Outcome::TransportError));
@@ -131,8 +179,8 @@ async fn a_retried_octocrab_attempt_emits_one_coarse_record_per_attempt() {
     }
     assert_eq!(
         records[0].outcome,
-        Outcome::TransportError,
-        "first attempt failed"
+        Outcome::HttpError,
+        "first attempt failed with a rate limit — a real HTTP exchange, not a transport fault"
     );
     assert_eq!(records[1].outcome, Outcome::Ok, "second attempt succeeded");
 }
