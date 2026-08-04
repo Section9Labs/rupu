@@ -33,6 +33,13 @@ const BANNED: &[&str] = &[
     "reqwest::ClientBuilder::new",
     "reqwest::ClientBuilder::default",
     "reqwest::ClientBuilder::build",
+    // Unlike `.build()`, this one IS written fully-qualified at every
+    // call site (it's a free function, not a method on a local
+    // variable), so — unusually for this text scanner — it can actually
+    // catch a `reqwest::get(...)` bypass, not just backstop clippy.
+    // Found live in crates/rupu-cli/src/output/theme.rs (2026-08-04) and
+    // migrated onto rupu_netflow::http::client in the same fix.
+    "reqwest::get",
 ];
 
 /// Files permitted to construct or finalize a raw reqwest client.
