@@ -24,6 +24,7 @@ const STEP_KIND: Record<RunKind, StepKind> = {
   panel: 'panel',
   gate: 'approval_gate',
   action: 'action',
+  run: 'run',
 };
 
 /** Map a run-model step kind onto the editor's `StepKind` vocabulary. */
@@ -48,6 +49,7 @@ const LABELS: Record<RunKind, string> = {
   panel: 'panel',
   gate: 'gate',
   action: 'action',
+  run: 'run',
 };
 
 /** Short human label rendered in a node's kind pill. */

@@ -21,6 +21,7 @@ export type StepKind =
   | 'branch'
   | 'approval_gate'
   | 'action'
+  | 'run'
   | 'split'
   | 'join';
 

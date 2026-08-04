@@ -363,7 +363,7 @@ export interface RunListRow {
 /** Step-DAG node from /api/runs/:id/graph .workflow.steps */
 export interface StepNodeDto {
   id: string;
-  kind: 'step' | 'for_each' | 'parallel' | 'panel' | 'action' | 'gate';
+  kind: 'step' | 'for_each' | 'parallel' | 'panel' | 'action' | 'gate' | 'run';
   agent?: string | null;
   for_each?: string | null;
   parallel?: { id: string; agent: string }[] | null;

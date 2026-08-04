@@ -109,6 +109,11 @@ where
 
         if is_approval_gate(step) {
             emit_gate_step(&mut rows, step, &status_lookup);
+        } else if step.run.is_some() {
+            // Checked before `for_each` — a `for_each:` + `run:` step is
+            // a Run node whose units fan out, matching how the runner
+            // records its StepKind.
+            emit_run_step(&mut rows, step, &status_lookup);
         } else if step.action.is_some() {
             emit_action_step(&mut rows, step, &status_lookup);
         } else if let Some(panel) = &step.panel {
@@ -305,6 +310,37 @@ fn emit_gate_step<F: Fn(&str) -> NodeStatus>(
 }
 
 /// Emit a single action-step row: `● <step_id>   action · <tool>`.
+/// Emit a `run:` (deterministic command) node.
+///
+/// The meta shows the executable and, when the step fans out, that it
+/// does — an operator scanning the graph should be able to tell a
+/// command node from an agent node without opening it.
+fn emit_run_step<F: Fn(&str) -> NodeStatus>(
+    rows: &mut Vec<GraphRow>,
+    step: &rupu_orchestrator::Step,
+    status_lookup: &F,
+) {
+    let step_id = &step.id;
+    let status = status_lookup(step_id);
+    let cmd = step.run.as_ref().map(|r| r.cmd.as_str()).unwrap_or("?");
+    let meta = if step.for_each.is_some() {
+        format!("run · {cmd} · for_each")
+    } else {
+        format!("run · {cmd}")
+    };
+    let cells = vec![
+        GraphCell::Bullet(status),
+        GraphCell::Space(2),
+        GraphCell::Label(step_id.to_string()),
+        GraphCell::Space(2),
+        GraphCell::Meta(meta),
+    ];
+    rows.push(GraphRow {
+        cells,
+        anchor: Some((step_id.to_string(), status)),
+    });
+}
+
 fn emit_action_step<F: Fn(&str) -> NodeStatus>(
     rows: &mut Vec<GraphRow>,
     step: &rupu_orchestrator::Step,
@@ -592,5 +628,91 @@ steps:
             .cells
             .iter()
             .any(|cell| matches!(cell, GraphCell::Branch(BranchGlyph::Merge, _)))));
+    }
+}
+
+#[cfg(test)]
+mod run_step_rows_tests {
+    use super::*;
+    use rupu_orchestrator::Workflow;
+
+    fn rows_for(yaml: &str) -> Vec<GraphRow> {
+        let wf = Workflow::parse(yaml).expect("workflow parses");
+        render_rows(&wf, |_| NodeStatus::Waiting)
+    }
+
+    fn metas(rows: &[GraphRow]) -> Vec<String> {
+        rows.iter()
+            .flat_map(|r| r.cells.iter())
+            .filter_map(|c| match c {
+                GraphCell::Meta(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn renders_a_linear_run_node_with_its_command() {
+        let rows = rows_for(
+            r#"
+name: t
+steps:
+  - id: score
+    run: { cmd: python3, args: ["score.py"] }
+"#,
+        );
+        assert_eq!(metas(&rows), vec!["run · python3"]);
+    }
+
+    #[test]
+    fn renders_a_fanout_run_node_distinctly() {
+        // An operator scanning the graph must be able to tell a fan-out
+        // command node from a single one without opening it.
+        let rows = rows_for(
+            r#"
+name: t
+steps:
+  - id: score
+    for_each: '["a"]'
+    run: { cmd: python3 }
+"#,
+        );
+        assert_eq!(metas(&rows), vec!["run · python3 · for_each"]);
+    }
+
+    #[test]
+    fn a_run_node_is_not_rendered_as_a_plain_for_each() {
+        // Regression guard: `for_each` is checked AFTER `run` in
+        // render_rows, mirroring the runner's StepKind precedence.
+        let rows = rows_for(
+            r#"
+name: t
+steps:
+  - id: score
+    for_each: '["a"]'
+    run: { cmd: echo }
+"#,
+        );
+        assert!(
+            !metas(&rows).iter().any(|m| m == "for_each"),
+            "must not fall through to the agent for_each renderer"
+        );
+    }
+
+    #[test]
+    fn run_node_anchors_for_status_painting() {
+        let rows = rows_for(
+            r#"
+name: t
+steps:
+  - id: score
+    run: { cmd: echo }
+"#,
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.anchor.as_ref().map(|(id, _)| id.as_str()) == Some("score")),
+            "the run node must anchor so live status can paint it"
+        );
     }
 }

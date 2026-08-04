@@ -7,7 +7,7 @@ import { KIND_ACCENT, KIND_ICON, KIND_SHAPE, KIND_FAMILY } from './kindVisuals';
 import type { StepKind } from '../../lib/workflowGraph';
 import type { ColorKey } from '../../lib/useThemeColors';
 
-const KINDS: StepKind[] = ['step', 'for_each', 'parallel', 'panel', 'branch', 'approval_gate', 'action', 'split', 'join'];
+const KINDS: StepKind[] = ['step', 'for_each', 'parallel', 'panel', 'branch', 'approval_gate', 'action', 'run', 'split', 'join'];
 
 const EXPECTED_ACCENT: Record<StepKind, ColorKey> = {
   step: 'status.running',
@@ -17,6 +17,7 @@ const EXPECTED_ACCENT: Record<StepKind, ColorKey> = {
   branch: 'status.done',
   approval_gate: 'status.paused',
   action: 'sev.info',
+  run: 'sev.medium',
   split: 'brand.600',
   join: 'brand.700',
 };
@@ -47,6 +48,7 @@ describe('kindVisuals', () => {
       branch: 'vhex',
       approval_gate: 'trapezoid',
       action: 'parallelogram',
+      run: 'rect',
       split: 'fanout',
       join: 'fanin',
     });
@@ -59,6 +61,7 @@ describe('kindVisuals', () => {
       parallel: 'work',
       panel: 'work',
       action: 'work',
+      run: 'work',
       branch: 'orchestration',
       split: 'orchestration',
       join: 'orchestration',

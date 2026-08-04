@@ -568,6 +568,127 @@ Because `output` is a JSON *string*, pull fields out of it with the `fromjson` f
 
 ---
 
+## `run:` deterministic command steps
+
+Use `run:` when a step must produce an **exact** value — scoring, validation,
+report rendering, a preflight check. No language model is involved: the runner
+executes a declared command and binds its output.
+
+```yaml
+- id: score
+  run:
+    cmd: python3
+    args: ["tools/score_fixture.py", "{{ item.fixture }}", "{{ item.candidate }}"]
+    cwd: "{{ inputs.cybermark_root }}"
+    env: { CYBERBENCH_RELEASE_KEY: "{{ inputs.release_key }}" }
+    parse: json            # json | lines | raw   (default: raw)
+    timeout_seconds: 300
+    allow_exit_codes: [0]  # default [0]; anything else fails the step
+```
+
+### There is no shell
+
+`cmd` and `args` are handed to the OS as an **argv vector**. There are no pipes,
+no redirection, no globbing, and no word splitting. Each `args` entry renders
+independently and becomes exactly one argument, so a rendered value containing
+`;`, `&&`, or `$(...)` arrives as literal text rather than executing.
+
+If you genuinely need shell features, invoke a shell explicitly
+(`cmd: sh`, `args: ["-c", "..."]`) — that is your decision to make, visible in
+the workflow file, rather than something the engine does to every step behind
+your back.
+
+### Output bindings
+
+| Binding | Contents |
+|---|---|
+| `steps.<id>.output` | stdout as a **string** (all `parse:` modes) |
+| `steps.<id>.json` | stdout **parsed** per `parse:` — indexable |
+| `steps.<id>.stdout` / `.stderr` | raw streams |
+| `steps.<id>.exit_code` | the process exit code |
+| `steps.<id>.duration_ms` | wall-clock duration |
+| `steps.<id>.success` | exit code was in `allow_exit_codes` |
+
+Index structured output through `json`, not `output`:
+
+```yaml
+- id: report
+  run:
+    cmd: echo
+    args: ["scored {{ steps.score.json.score }} / 100"]
+```
+
+`output` stays a string for every step kind in the engine, so a step that starts
+emitting JSON never changes what `{{ steps.<id>.output }}` renders elsewhere.
+
+Under `parse: json`, stdout that is not valid JSON **fails the step**. It does
+not fall back to the raw string — binding garbage as "the output" would let a
+broken tool produce a plausible-looking but meaningless downstream result.
+
+### Fan-out
+
+`run:` composes with `for_each:` and `max_parallel:`, which is how you score N
+items concurrently:
+
+```yaml
+- id: score
+  for_each: "{{ steps.plan.json.jobs }}"
+  max_parallel: 8
+  continue_on_error: true
+  run:
+    cmd: python3
+    args: ["score_job.py", "--job-id", "{{ item.job_id }}"]
+    parse: json
+```
+
+Per-unit results land in `steps.<id>.results[*]` in **declared** order regardless
+of finish order. With `continue_on_error: true`, a failing unit is recorded with
+`success=false` and the remaining units still dispatch — one bad item never costs
+you the other 199. Without it, any failing unit fails the step.
+
+`distribute:` is **not** supported on a `run:` step and is rejected at parse time
+rather than ignored: `run:` executes on the coordinator, and silently dropping a
+`distribute:` would let you believe work was spread across a fleet when it never
+left the local host.
+
+### Enabling it
+
+`run:` executes commands, so it is opt-in per workspace:
+
+```toml
+[workflow]
+run_step_enabled = true
+# Optional. Empty (the default) permits any executable.
+# Matched on basename, so "/bin/bash" and "bash" gate alike.
+run_step_allowlist = ["python3", "make"]
+```
+
+A workflow containing a `run:` step **fails** when the toggle is off — it does
+not skip the step. A benchmark that quietly omitted its scoring step would report
+a plausible-looking but meaningless number.
+
+Permission modes:
+
+| Mode | Behaviour |
+|---|---|
+| `readonly` | `run:` steps are refused |
+| `ask` | allowed — see below |
+| `bypass` | allowed |
+
+`ask` allows `run:` steps for the same reason it allows agent writes in a
+workflow: there is no operator present mid-run to answer a prompt, so a
+genuinely-prompting `ask` would hang every scheduled run. That gap is announced
+by the same warning agent steps print. The workspace opt-in above is the real
+control, and `bypass` cannot override it.
+
+### Mutual exclusivity
+
+`run:` cannot be combined with `agent`/`prompt`, `parallel:`, `panel:`,
+`branch:`, `action:`, `split:`, or `join:`. It *is* compatible with `for_each:`,
+`when:`, and `continue_on_error:`.
+
+---
+
 ## `for_each:` fan-out steps
 
 Use `for_each:` when one agent should process many independent items.
