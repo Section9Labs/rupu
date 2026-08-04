@@ -48,7 +48,8 @@ use rupu_workspace::WorkspaceStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path as StdPath, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -122,10 +123,112 @@ pub fn filter_by_run(flows: &[FlowRecord], run_id: &str) -> Vec<FlowRecord> {
         .collect()
 }
 
+/// Snapshot `[netflow]` out of `AppState`'s shared config lock, cloned so
+/// the lock is not held across the `maybe_refresh_asn` call (which may
+/// spawn a task) or any `.await` point. Mirrors `workspace.rs`'s
+/// `s.config.read().map(|c| c.cp.clone()).unwrap_or_default()` — a
+/// poisoned lock degrades to defaults rather than panicking the handler.
+fn netflow_config(s: &AppState) -> rupu_config::NetflowConfig {
+    s.config
+        .read()
+        .map(|c| c.netflow.clone())
+        .unwrap_or_default()
+}
+
 /// Load the ASN table if present. A missing table is not an error —
 /// enrichment simply degrades.
 pub(crate) fn load_asn_table() -> Option<AsnTable> {
     rupu_netflow::asn::asn_db_path().and_then(|p| AsnTable::load(&p).ok())
+}
+
+/// Process-wide single-flight guard: ensures at most one ASN refresh
+/// spawned from a netflow read is ever in flight at a time.
+///
+/// `cp serve`'s gate-sweep tick (`rupu-cli/src/cmd/cp.rs`) has its own
+/// process-wide `AtomicBool` guarding the SAME hazard for the SAME
+/// resource (`AsnTable::write`'s fixed `<path>.db.tmp` intermediate file —
+/// two concurrent writers race on it, a data race, not just wasted
+/// bandwidth) — but that guard lives in `rupu-cli`, a downstream crate this
+/// one (`rupu-cp`) cannot depend on, so it cannot be shared. A burst of CP
+/// requests hitting a missing/stale table here must still collapse to one
+/// download, hence this crate's own guard for its own trigger path.
+#[derive(Debug, Default)]
+pub struct RefreshGuard {
+    running: AtomicBool,
+}
+
+impl RefreshGuard {
+    /// `true` if the caller now owns the refresh and must call [`Self::finish`]
+    /// when done — on BOTH the success and failure path, so a failed refresh
+    /// never wedges the guard shut for the rest of the process's life.
+    pub fn try_begin(&self) -> bool {
+        self.running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Release a claim taken by [`Self::try_begin`].
+    pub fn finish(&self) {
+        self.running.store(false, Ordering::Release);
+    }
+}
+
+static ASN_REFRESH_GUARD: OnceLock<RefreshGuard> = OnceLock::new();
+
+fn asn_refresh_guard() -> &'static RefreshGuard {
+    ASN_REFRESH_GUARD.get_or_init(RefreshGuard::default)
+}
+
+/// Same generous bound as `cp serve`'s gate-sweep tick
+/// (`rupu-cli/src/cmd/cp.rs`'s `ASN_REFRESH_TIMEOUT`): this is a
+/// multi-megabyte download over an HTTP client that otherwise sets no
+/// request timeout, so without a bound a stalled peer would hold the guard
+/// (see [`RefreshGuard`]) for the life of the process — every future read
+/// would see it held and silently stop triggering refreshes forever.
+const ASN_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The backstop trigger: called from every netflow-read handler. If the
+/// table is missing or stale AND `[netflow].asn_auto_refresh` is on, spawn
+/// a refresh so the *next* request benefits — this one already answered
+/// (or is about to) with whatever table it found, `asn_loaded: false` if
+/// none. Never blocks the caller: the network request happens on a
+/// detached `tokio::spawn`, not awaited here.
+///
+/// This is the backstop for operators who never run `cp serve` (whose
+/// sweep loop is the primary trigger, per netflow Plan 2 Task 9) — a
+/// read-triggered path exists precisely so enrichment can start working
+/// without the operator running any command at all.
+pub(crate) fn maybe_refresh_asn(cfg: &rupu_config::NetflowConfig) {
+    if !cfg.asn_auto_refresh {
+        return;
+    }
+    let Some(db) = rupu_netflow::asn::asn_db_path() else {
+        return;
+    };
+    if !rupu_netflow::asn::is_stale(&db, cfg.asn_refresh_interval_days) {
+        return;
+    }
+    let guard = asn_refresh_guard();
+    if !guard.try_begin() {
+        return;
+    }
+    let url = cfg.asn_source_url.clone();
+    tokio::spawn(async move {
+        let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System);
+        let client = rupu_netflow::http::client_from(
+            ctx.clone(),
+            reqwest::Client::builder().timeout(ASN_REFRESH_TIMEOUT),
+        )
+        .unwrap_or_else(|_| rupu_netflow::http::client(ctx));
+        match rupu_netflow::asn::refresh(&url, &db, &client).await {
+            Ok(()) => tracing::info!(path = ?db, "netflow ASN table refreshed on demand"),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "on-demand netflow ASN refresh failed; keeping existing table"
+            ),
+        }
+        guard.finish();
+    });
 }
 
 /// Merge the ledger's run-scoped flows with the `Event::NetFlow` lines
@@ -286,6 +389,7 @@ async fn get_project_netflow(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
 ) -> ApiResult<Json<NetflowResponse>> {
+    maybe_refresh_asn(&netflow_config(&state));
     let workspace = workspace_for_project(&state, &project_id)?;
     let resp = run_blocking(move || {
         let paths = NetflowPaths::new(&workspace);
@@ -300,6 +404,7 @@ async fn get_project_netflow(
 
 /// `GET /api/netflow` — the union across every registered workspace.
 async fn get_global_netflow(State(state): State<AppState>) -> ApiResult<Json<NetflowResponse>> {
+    maybe_refresh_asn(&netflow_config(&state));
     let global_dir = state.global_dir.clone();
     let resp = run_blocking(move || {
         let (flows, dropped) = read_all_workspaces_sync(&global_dir);
@@ -416,6 +521,7 @@ async fn get_run_netflow(
     State(s): State<AppState>,
     Path(run_id): Path<String>,
 ) -> ApiResult<Json<NetflowResponse>> {
+    maybe_refresh_asn(&netflow_config(&s));
     match resolve_run_location(&s, &run_id).await {
         RunLocation::Global => {
             let run = s

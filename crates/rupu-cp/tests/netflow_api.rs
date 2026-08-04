@@ -674,3 +674,17 @@ async fn netflow_graph_defaults_to_global_scope_when_absent() {
         .iter()
         .any(|n| n["id"] == "run-a"));
 }
+
+#[test]
+fn a_stale_table_triggers_at_most_one_concurrent_refresh() {
+    // The guard is a flag, not a lock — a second request while a
+    // refresh is in flight must not spawn a second download.
+    let guard = rupu_cp::api::netflow::RefreshGuard::default();
+    assert!(guard.try_begin(), "first caller wins");
+    assert!(!guard.try_begin(), "second caller is turned away");
+    guard.finish();
+    assert!(
+        guard.try_begin(),
+        "after finishing, a later caller may retry"
+    );
+}
