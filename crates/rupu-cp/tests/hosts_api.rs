@@ -4,6 +4,11 @@
 //! - `POST /api/hosts`    (register a remote host)
 //! - `DELETE /api/hosts/:id` (remove a host)
 
+// Throwaway in-process mock-server client, not rupu's egress
+// (choke_point.rs's guard test already exempts everything under `/tests/`
+// on that basis).
+#![allow(clippy::disallowed_methods)]
+
 use reqwest::StatusCode;
 use rupu_cp::launcher::{LaunchError, LaunchRequest, RunLauncher};
 use std::sync::Arc;

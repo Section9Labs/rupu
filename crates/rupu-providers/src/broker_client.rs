@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use ed25519_dalek::{Signer, SigningKey};
-use reqwest::Client;
+use reqwest_middleware::ClientWithMiddleware;
 
 use crate::broker_types::{BrokerRequest, LlmRequestWire};
 use crate::error::ProviderError;
@@ -16,7 +16,7 @@ use crate::types::{ContentBlock, LlmRequest, LlmResponse, StopReason, StreamEven
 
 /// Client that sends signed LLM requests to the Credential Broker.
 pub struct BrokerClient {
-    client: Client,
+    client: ClientWithMiddleware,
     broker_url: String,
     signing_key: SigningKey,
     nonce: u64,
@@ -31,7 +31,12 @@ impl BrokerClient {
             .unwrap_or_default()
             .as_nanos() as u64;
         Self {
-            client: Client::new(),
+            // No run context is available at construction — stamped
+            // `FlowCtx::system(Origin::Provider("broker"))`. Plan 2 threads
+            // the real run id through once the provider factory is touched.
+            client: rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
+                rupu_netflow::Origin::Provider("broker".into()),
+            )),
             broker_url,
             signing_key,
             nonce: seed,

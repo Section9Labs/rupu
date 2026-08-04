@@ -9,7 +9,7 @@ use rupu_config::Config;
 
 use crate::connectors::{IssueConnector, RepoConnector};
 
-mod client;
+pub mod client;
 pub mod events;
 pub mod extras;
 pub mod issues;

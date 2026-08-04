@@ -12,7 +12,7 @@ use crate::types::{Comment, CreateIssue, Issue, IssueFilter, IssueRef, IssueStat
 const DEFAULT_BASE_URL: &str = "https://api.linear.app/graphql";
 
 pub struct LinearIssueConnector {
-    http: reqwest::Client,
+    http: reqwest_middleware::ClientWithMiddleware,
     token: String,
     base_url: String,
 }
@@ -20,9 +20,15 @@ pub struct LinearIssueConnector {
 impl LinearIssueConnector {
     pub fn new(token: String, base_url: Option<String>) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .build()
-                .expect("reqwest client build"),
+            http: rupu_netflow::http::client_from(
+                rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm("linear".into())),
+                reqwest::Client::builder(),
+            )
+            .unwrap_or_else(|_| {
+                rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
+                    rupu_netflow::Origin::Scm("linear".into()),
+                ))
+            }),
             token,
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
         }

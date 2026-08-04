@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use crate::templates::{CONFIG_SKELETON, GITIGNORE_ENTRY};
+use crate::templates::{CONFIG_SKELETON, GITIGNORE_ENTRIES};
 
 #[derive(ClapArgs, Debug)]
 pub struct InitArgs {
@@ -174,26 +174,42 @@ fn write_manifest(root: &Path, force: bool, tally: &mut WriteTally) -> anyhow::R
 
 fn ensure_gitignore_entry(root: &Path) -> anyhow::Result<()> {
     let path = root.join(".gitignore");
-    let needle = GITIGNORE_ENTRY;
+    let needles = GITIGNORE_ENTRIES;
 
     if !path.exists() {
-        fs::write(&path, format!("{needle}\n"))?;
+        let mut content = String::new();
+        for needle in needles {
+            content.push_str(needle);
+            content.push('\n');
+        }
+        fs::write(&path, content)?;
         println!("CREATED {}", relpath(root, &path));
         return Ok(());
     }
 
     let body = fs::read_to_string(&path)?;
-    if body.lines().any(|l| l.trim() == needle) {
+    let mut new_body = body.clone();
+    let mut appended: Vec<&str> = Vec::new();
+    for needle in needles {
+        if body.lines().any(|l| l.trim() == *needle) {
+            continue;
+        }
+        if !new_body.is_empty() && !new_body.ends_with('\n') {
+            new_body.push('\n');
+        }
+        new_body.push_str(needle);
+        new_body.push('\n');
+        appended.push(needle);
+    }
+    if appended.is_empty() {
         return Ok(());
     }
-    let mut new_body = body;
-    if !new_body.ends_with('\n') {
-        new_body.push('\n');
-    }
-    new_body.push_str(needle);
-    new_body.push('\n');
     fs::write(&path, new_body)?;
-    println!("UPDATED {} (appended {needle})", relpath(root, &path));
+    println!(
+        "UPDATED {} (appended {})",
+        relpath(root, &path),
+        appended.join(", ")
+    );
     Ok(())
 }
 

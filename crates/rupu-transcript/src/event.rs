@@ -131,6 +131,18 @@ pub enum Event {
         /// at all (disambiguates `declared: false`; see its doc).
         restricted: bool,
     },
+    /// One outbound network flow attributed to this run.
+    ///
+    /// Phase 1 covers rupu's OWN egress — provider APIs, SCM connectors,
+    /// MCP, webhooks. It does NOT cover the agent's `bash` subprocess
+    /// traffic; `flow.fidelity` states what is actually known. See
+    /// docs/superpowers/specs/2026-08-03-rupu-netflow-observability-design.md
+    ///
+    /// Boxed: `FlowRecord` dwarfs every other variant and clippy's
+    /// `large_enum_variant` denies otherwise.
+    NetFlow {
+        flow: Box<rupu_netflow::FlowRecord>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,5 +241,56 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn netflow_event_round_trips() {
+        use rupu_netflow::{Fidelity, FlowCtx, FlowId, FlowRecord, Origin, Outcome};
+
+        let flow = FlowRecord {
+            id: FlowId::from_parts(5, 5),
+            ts: chrono::Utc::now(),
+            ctx: FlowCtx {
+                run_id: Some("run-9".into()),
+                step_id: Some("step-1".into()),
+                agent: Some("reviewer".into()),
+                workspace_id: Some("ws".into()),
+                origin: Origin::Provider("anthropic".into()),
+            },
+            fidelity: Fidelity::Http,
+            method: "POST".into(),
+            scheme: "https".into(),
+            host: "api.anthropic.com".into(),
+            port: 443,
+            path: "/v1/messages".into(),
+            peer_ip: None,
+            resolved_ips: vec![],
+            http_version: Some("HTTP/1.1".into()),
+            status: Some(200),
+            outcome: Outcome::Ok,
+            error: None,
+            bytes_out: Some(10),
+            bytes_in: Some(20),
+            body_complete: true,
+            ttfb_ms: Some(5),
+            duration_ms: Some(50),
+        };
+
+        let event = Event::NetFlow {
+            flow: Box::new(flow),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"net_flow""#));
+
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn legacy_transcripts_without_netflow_still_parse() {
+        // A transcript written before this variant existed must still read.
+        let line = r#"{"type":"turn_start","data":{"turn_idx":0}}"#;
+        let back: Event = serde_json::from_str(line).unwrap();
+        assert!(matches!(back, Event::TurnStart { turn_idx: 0 }));
     }
 }

@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use reqwest::Client;
+use reqwest_middleware::ClientWithMiddleware;
 
 use crate::error::ProviderError;
 use crate::model_pool::{ModelCapability, ModelCost, ModelInfo, ModelState, ModelStatus};
@@ -31,7 +31,7 @@ pub struct OpenAiCompatibleClient {
     default_model: String,
     models: Vec<OpenAiCompatibleModel>,
     stream: bool,
-    client: Client,
+    client: ClientWithMiddleware,
 }
 
 impl OpenAiCompatibleClient {
@@ -41,7 +41,10 @@ impl OpenAiCompatibleClient {
     /// never cut off mid-flight. A builder failure leaves the existing client
     /// in place rather than panicking on user-supplied config.
     pub fn with_tuning(mut self, tuning: &crate::tuning::ProviderTuning) -> Self {
-        if let Ok(client) = tuning.http_client_builder().build() {
+        let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider(
+            "openai_compatible".into(),
+        ));
+        if let Ok(client) = rupu_netflow::http::client_from(ctx, tuning.http_client_builder()) {
             self.client = client;
         }
         self
@@ -70,7 +73,9 @@ impl OpenAiCompatibleClient {
             default_model: default_model.to_string(),
             models,
             stream,
-            client: Client::new(),
+            client: rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
+                rupu_netflow::Origin::Provider("openai_compatible".into()),
+            )),
         }
     }
 

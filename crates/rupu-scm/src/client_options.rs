@@ -94,6 +94,17 @@ impl ScmClientOptions {
     pub fn http_client_builder(&self) -> reqwest::ClientBuilder {
         reqwest::Client::builder().timeout(self.timeout)
     }
+
+    /// Instrumented client carrying this connector's tuning.
+    pub fn netflow_client(
+        &self,
+        platform: &str,
+    ) -> reqwest::Result<reqwest_middleware::ClientWithMiddleware> {
+        rupu_netflow::http::client_from(
+            rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm(platform.to_string())),
+            self.http_client_builder(),
+        )
+    }
 }
 
 /// `timeout_ms` → the SCM client deadline. Absent ⇒ [`DEFAULT_TIMEOUT_MS`].

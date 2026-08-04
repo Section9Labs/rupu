@@ -1,6 +1,11 @@
 //! Integration test for `GET /api/workers` — verifies that worker records are
 //! enriched with run-activity attribution (active/total counts + last_run_at).
 
+// Throwaway in-process mock-server client, not rupu's egress
+// (choke_point.rs's guard test already exempts everything under `/tests/`
+// on that basis).
+#![allow(clippy::disallowed_methods)]
+
 use chrono::Utc;
 use rupu_orchestrator::runs::{RunRecord, RunStatus, RunStore};
 use rupu_runtime::{WorkerCapabilities, WorkerKind, WorkerRecord};

@@ -67,6 +67,7 @@ pub fn router(state: AppState, token: Option<String>) -> Router {
         .merge(crate::api::dashboard::routes())
         .merge(crate::api::events::routes())
         .merge(crate::api::graph::routes())
+        .merge(crate::api::netflow::routes())
         .merge(crate::api::run_streams::routes())
         .merge(crate::api::repos::routes())
         .merge(crate::api::fs::routes())

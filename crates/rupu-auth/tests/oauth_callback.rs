@@ -6,6 +6,11 @@
 //!   3. POSTing the redirect URL with a matching state directly to the listener.
 //!   4. Letting the flow exchange the code against an httpmock'd token endpoint.
 
+// Throwaway in-process mock-server client, not rupu's egress
+// (choke_point.rs's guard test already exempts everything under `/tests/`
+// on that basis).
+#![allow(clippy::disallowed_methods)]
+
 use httpmock::prelude::*;
 use rupu_auth::backend::ProviderId;
 use rupu_auth::oauth::callback;

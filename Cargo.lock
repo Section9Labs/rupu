@@ -6211,6 +6211,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "reqwest-middleware"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57f17d28a6e6acfe1733fe24bcd30774d13bffa4b8a22535b4c8c98423088d4e"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "http 1.4.0",
+ "reqwest 0.12.28",
+ "serde",
+ "thiserror 1.0.69",
+ "tower-service",
+]
+
+[[package]]
 name = "resvg"
 version = "0.45.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6367,6 +6382,7 @@ dependencies = [
  "predicates",
  "rand 0.8.6",
  "reqwest 0.12.28",
+ "rupu-netflow",
  "rupu-providers",
  "serde",
  "serde_json",
@@ -6408,6 +6424,7 @@ dependencies = [
  "owo-colors",
  "predicates",
  "reqwest 0.12.28",
+ "reqwest-middleware",
  "rupu-agent",
  "rupu-app-canvas",
  "rupu-auth",
@@ -6415,6 +6432,7 @@ dependencies = [
  "rupu-coverage",
  "rupu-cp",
  "rupu-mcp",
+ "rupu-netflow",
  "rupu-orchestrator",
  "rupu-providers",
  "rupu-runtime",
@@ -6492,11 +6510,13 @@ dependencies = [
  "mime_guess",
  "object_store",
  "reqwest 0.12.28",
+ "reqwest-middleware",
  "rupu-agent",
  "rupu-ast",
  "rupu-config",
  "rupu-coverage",
  "rupu-mcp",
+ "rupu-netflow",
  "rupu-orchestrator",
  "rupu-runtime",
  "rupu-scm",
@@ -6505,6 +6525,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "serial_test",
  "subtle",
  "tar",
  "tempfile",
@@ -6540,6 +6561,28 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rupu-netflow"
+version = "0.72.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "dirs 5.0.1",
+ "flate2",
+ "http 1.4.0",
+ "httpmock",
+ "reqwest 0.12.28",
+ "reqwest-middleware",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "ulid",
 ]
 
 [[package]]
@@ -6587,6 +6630,8 @@ dependencies = [
  "futures-util",
  "httpmock",
  "reqwest 0.12.28",
+ "reqwest-middleware",
+ "rupu-netflow",
  "serde",
  "serde_json",
  "tempfile",
@@ -6635,8 +6680,10 @@ dependencies = [
  "octocrab",
  "rand 0.8.6",
  "reqwest 0.12.28",
+ "reqwest-middleware",
  "rupu-auth",
  "rupu-config",
+ "rupu-netflow",
  "rupu-providers",
  "rupu-scm",
  "rustls",
@@ -6672,11 +6719,14 @@ dependencies = [
 name = "rupu-transcript"
 version = "0.72.0"
 dependencies = [
+ "async-trait",
  "chrono",
+ "rupu-netflow",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "ulid",
 ]
@@ -6686,7 +6736,10 @@ name = "rupu-update"
 version = "0.72.0"
 dependencies = [
  "async-trait",
+ "httpmock",
  "reqwest 0.12.28",
+ "reqwest-middleware",
+ "rupu-netflow",
  "semver",
  "serde",
  "serde_json",

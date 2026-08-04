@@ -7,10 +7,10 @@ function findGroup(id: string): NavGroup {
   return section.group;
 }
 
-it('has a Security group with Coverage and Findings', () => {
+it('has a Security group with Coverage, Network and Findings', () => {
   const security = findGroup('security');
   expect(security.label).toBe('Security');
-  expect(security.items.map((i) => i.to)).toEqual(['/coverage', '/findings']);
+  expect(security.items.map((i) => i.to)).toEqual(['/coverage', '/netflow', '/findings']);
 });
 
 it('has a top-level Live Events leaf right after Projects', () => {

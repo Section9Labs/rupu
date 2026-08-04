@@ -20,6 +20,7 @@ members = [
     "crates/rupu-cp",
     "crates/rupu-cli",
     "crates/rupu-update",
+    "crates/rupu-netflow",
 ]
 
 [workspace.package]
@@ -70,6 +71,10 @@ git2 = { version = "0.19", default-features = false, features = ["https", "vendo
 gitlab = "0.1710"
 octocrab = "0.42"
 http = "1"
+reqwest-middleware = { version = "0.4", features = ["json"] }
+
+# Compression
+flate2 = "1"
 
 # Crypto (lifted)
 ed25519-dalek = { version = "2", features = ["serde", "rand_core", "zeroize"] }
@@ -161,8 +166,16 @@ objc2 = "0.5"
 objc2-app-kit = "0.2"
 objc2-foundation = "0.2"
 
+# Network egress observability (netflow)
+rupu-netflow = { path = "crates/rupu-netflow", default-features = false }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
+# Every crate is migrated onto rupu-netflow (Plan 2's job — see
+# PENDING_PLAN_2 in crates/rupu-netflow/tests/choke_point.rs, which is
+# empty). A raw reqwest client anywhere outside rupu-netflow's http module
+# or a /tests/ integration test is now a build failure.
+disallowed_methods = "deny"

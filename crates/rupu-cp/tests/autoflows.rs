@@ -2,6 +2,11 @@
 //! `autoflow.enabled = true`).  Distinct from `/api/runs/autoflows` in
 //! run_streams.rs which returns execution history.
 
+// Throwaway in-process mock-server client, not rupu's egress
+// (choke_point.rs's guard test already exempts everything under `/tests/`
+// on that basis).
+#![allow(clippy::disallowed_methods)]
+
 async fn spawn_server(dir: &std::path::Path) -> std::net::SocketAddr {
     let state =
         rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());

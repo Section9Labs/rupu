@@ -4,6 +4,7 @@ import {
   FolderGit2,
   LayoutDashboard,
   MessageSquare,
+  Network,
   Radio,
   Repeat,
   Server,
@@ -59,6 +60,7 @@ export const sidebarNav: NavSection[] = [
   { kind: 'group', group: {
     id: 'security', label: 'Security', items: [
       { to: '/coverage', label: 'Coverage', icon: ShieldCheck, enabled: true },
+      { to: '/netflow',  label: 'Network',  icon: Network,     enabled: true },
       { to: '/findings', label: 'Findings', icon: ShieldAlert, enabled: true },
     ],
   }},

@@ -14,7 +14,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { Archive, ArrowLeft, FileText, GitBranch, ListOrdered, Pause, ShieldAlert, Trash2 } from 'lucide-react';
+import { Archive, ArrowLeft, FileText, GitBranch, ListOrdered, Network as NetworkIcon, Pause, ShieldAlert, Trash2 } from 'lucide-react';
 import {
   api,
   ApiError,
@@ -39,6 +39,11 @@ import StepTranscriptBrowser from '../components/run/StepTranscriptBrowser';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
 import AutoflowPanel from '../components/AutoflowPanel';
 import CyclesTab from '../components/run/CyclesTab';
+import NetflowTable from '../components/netflow/NetflowTable';
+import NetflowSummary from '../components/netflow/NetflowSummary';
+import NetflowGraph from '../components/netflow/NetflowGraph';
+import { NetflowScopeDisclosure } from '../components/netflow/ScopeDisclosure';
+import { fetchNetflowGraph, fetchRunNetflow, type GraphView, type NetflowResponse } from '../lib/netflow';
 import { buildRunGraphModel, type GraphNode, type RunGraphModel } from '../lib/runGraphModel';
 import { layoutGraph, type Pos } from '../lib/graphLayout';
 import { absoluteTime } from '../lib/time';
@@ -46,7 +51,7 @@ import { formatTokens, formatCost } from '../lib/usage';
 
 const MAX_EVENTS = 2000;
 
-type Tab = 'transcript' | 'events' | 'findings' | 'cycles';
+type Tab = 'transcript' | 'events' | 'findings' | 'cycles' | 'netflow';
 
 /**
  * A single selection cursor that the whole tab panel follows. `unitIndex` is an
@@ -163,6 +168,13 @@ export default function RunDetail() {
   const [findingsError, setFindingsError] = useState<string | null>(null);
   const findingsRequestedRef = useRef(false);
 
+  // Scoped netflow for THIS run — lazy-loaded when the Network tab is first
+  // opened, same contract as findings above. `null` = not yet loaded / loading.
+  const [netflow, setNetflow] = useState<NetflowResponse | null>(null);
+  const [netflowGraph, setNetflowGraph] = useState<GraphView | null>(null);
+  const [netflowError, setNetflowError] = useState<string | null>(null);
+  const netflowRequestedRef = useRef(false);
+
   // Autoflow-history context — `null` means either "not fetched yet" or "this
   // run has no autoflow trail" (a plain, non-autoflow run); either way no
   // panel renders. Fetched independently of the graph/usage-timeline effects
@@ -244,6 +256,10 @@ export default function RunDetail() {
     setFindings(null);
     setFindingsError(null);
     findingsRequestedRef.current = false;
+    setNetflow(null);
+    setNetflowGraph(null);
+    setNetflowError(null);
+    netflowRequestedRef.current = false;
     setAutoflowCtx(null);
 
     fetchRunGraphWithRetry(id, () => cancelled, host)
@@ -327,6 +343,37 @@ export default function RunDetail() {
       .catch((e: unknown) => {
         if (cancelled) return;
         setFindingsError(e instanceof Error ? e.message : 'Failed to load findings');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id, tab]);
+
+  // Lazy-load this run's flows the first time the Network tab is opened.
+  // Keyed on (id, tab); the ref guard ensures a single fetch per run id.
+  // `cancelled` mirrors the findings effect above it: RunDetail doesn't
+  // unmount across a same-route run switch (see the sidebar/`<Link>`
+  // navigation the existing tests exercise), so a slow fetch for the
+  // previous run id can resolve after `id` has already moved on and
+  // clobber the new run's state with stale data without this guard.
+  useEffect(() => {
+    if (!id || tab !== 'netflow' || netflowRequestedRef.current) return;
+    netflowRequestedRef.current = true;
+    let cancelled = false;
+    // Combined into one `Promise.all` (Fix 6, netflow Plan 3 review round
+    // 3) — previously each fetch independently swallowed its own failure
+    // into a `null`, so e.g. an unreachable host (`RunLocation::Host`)
+    // produced a permanently blank panel with no message and no retry.
+    // Mirrors pages/Netflow.tsx and ProjectNetworkTab.tsx's identical fix.
+    Promise.all([fetchRunNetflow(id), fetchNetflowGraph(`run:${id}`)])
+      .then(([d, g]) => {
+        if (cancelled) return;
+        setNetflow(d);
+        setNetflowGraph(g);
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setNetflowError(e instanceof Error ? e.message : 'Failed to load network flows');
       });
     return () => {
       cancelled = true;
@@ -1144,6 +1191,7 @@ export default function RunDetail() {
           <TabButton active={tab === 'transcript'} onClick={() => setTab('transcript')} icon={FileText} label="Transcript" />
           <TabButton active={tab === 'events'} onClick={() => setTab('events')} icon={ListOrdered} label="Events" />
           <TabButton active={tab === 'findings'} onClick={() => setTab('findings')} icon={ShieldAlert} label={findingsCount > 0 ? `Findings (${findingsCount})` : 'Findings'} />
+          <TabButton active={tab === 'netflow'} onClick={() => setTab('netflow')} icon={NetworkIcon} label="Network" />
           {autoflowCtx && (
             <TabButton active={tab === 'cycles'} onClick={() => setTab('cycles')} icon={GitBranch} label="Cycles" />
           )}
@@ -1231,6 +1279,26 @@ export default function RunDetail() {
               currentRunStartedAt={run.started_at}
               host={host}
             />
+          </div>
+        )}
+        {tab === 'netflow' && (
+          <div className="h-full min-h-0 space-y-4 overflow-auto">
+            <NetflowScopeDisclosure scope="run" />
+            {netflowError ? (
+              <p className="text-sm text-err">{netflowError}</p>
+            ) : netflow === null ? (
+              <p className="text-sm text-ink-dim">Loading network flows…</p>
+            ) : (
+              <>
+                {netflowGraph && <NetflowGraph graph={netflowGraph} scope="run" />}
+                <NetflowSummary hosts={netflow.hosts} />
+                <NetflowTable
+                  flows={netflow.flows}
+                  dropped={netflow.dropped}
+                  asnLoaded={netflow.asn_loaded}
+                />
+              </>
+            )}
           </div>
         )}
       </div>

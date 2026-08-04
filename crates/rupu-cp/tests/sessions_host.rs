@@ -10,6 +10,11 @@
 //! - `GET /api/sessions/:id/runs?host=<remote>` — proxies.
 //! - `GET /api/sessions/:id/usage-timeline?host=<remote>` — proxies.
 
+// Throwaway in-process mock-server client, not rupu's egress
+// (choke_point.rs's guard test already exempts everything under `/tests/`
+// on that basis).
+#![allow(clippy::disallowed_methods)]
+
 use reqwest::StatusCode;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

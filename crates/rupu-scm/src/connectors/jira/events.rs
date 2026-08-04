@@ -33,7 +33,7 @@ use crate::types::{EventSourceRef, EventSubjectRef, IssueRef};
 const DEFAULT_SITE_SCHEME: &str = "https";
 
 pub struct JiraEventConnector {
-    http: reqwest::Client,
+    http: reqwest_middleware::ClientWithMiddleware,
     auth: JiraAuth,
     base_url: Option<String>,
     snapshot_root: PathBuf,
@@ -43,9 +43,15 @@ pub struct JiraEventConnector {
 impl JiraEventConnector {
     pub fn new(auth: JiraAuth, base_url: Option<String>, snapshot_root: Option<PathBuf>) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .build()
-                .expect("reqwest client build"),
+            http: rupu_netflow::http::client_from(
+                rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm("jira".into())),
+                reqwest::Client::builder(),
+            )
+            .unwrap_or_else(|_| {
+                rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
+                    rupu_netflow::Origin::Scm("jira".into()),
+                ))
+            }),
             auth,
             base_url: base_url.map(|url| normalize_site_base_url(&url)),
             snapshot_root: snapshot_root.unwrap_or_else(default_snapshot_root),

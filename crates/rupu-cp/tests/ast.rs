@@ -1,5 +1,10 @@
 //! Endpoint-level tests for `GET /api/runs/:id/ast`.
 
+// Throwaway in-process mock-server client, not rupu's egress
+// (choke_point.rs's guard test already exempts everything under `/tests/`
+// on that basis).
+#![allow(clippy::disallowed_methods)]
+
 use chrono::Utc;
 use rupu_orchestrator::runs::{RunRecord, RunStatus, RunStore};
 use std::collections::BTreeMap;

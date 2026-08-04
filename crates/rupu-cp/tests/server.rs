@@ -1,3 +1,8 @@
+// Throwaway in-process mock-server client, not rupu's egress
+// (choke_point.rs's guard test already exempts everything under `/tests/`
+// on that basis).
+#![allow(clippy::disallowed_methods)]
+
 /// `AppState::new` must expose a host registry whose `list_hosts()` returns
 /// exactly the built-in `local` host. No remote hosts should be present in a
 /// freshly-created state against an empty temp directory.

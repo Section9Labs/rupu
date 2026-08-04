@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::autoflow_config::AutoflowConfig;
+use crate::netflow_config::NetflowConfig;
 use crate::pricing_config::PricingConfig;
 use crate::provider_config::ProviderConfig;
 use crate::scm_config::{IssuesSection, ScmSection};
@@ -63,6 +64,8 @@ pub struct Config {
     pub policy: crate::policy_config::PolicyConfig,
     #[serde(default)]
     pub cp: crate::policy_config::CpConfig,
+    #[serde(default)]
+    pub netflow: NetflowConfig,
     #[serde(default)]
     pub update: crate::update_config::UpdateConfig,
 }

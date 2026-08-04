@@ -14,6 +14,7 @@ import {
   LayoutDashboard,
   ListOrdered,
   MessageSquare,
+  Network as NetworkIcon,
   Settings as SettingsIcon,
   ShieldAlert,
   ShieldCheck,
@@ -30,6 +31,7 @@ import ProjectRunsTab from '../components/project/ProjectRunsTab';
 import ProjectFindingsTab from '../components/project/ProjectFindingsTab';
 import ProjectSessionsTab from '../components/project/ProjectSessionsTab';
 import ProjectCoverageTab from '../components/project/ProjectCoverageTab';
+import ProjectNetworkTab from '../components/project/ProjectNetworkTab';
 import ProjectConfigTab from '../components/project/ProjectConfigTab';
 import { relativeTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
@@ -41,7 +43,15 @@ import { formatTokens, formatCost } from '../lib/usage';
 // rather than with every ProjectDetail chunk load.
 const ProjectCodeTab = lazy(() => import('../components/project/ProjectCodeTab'));
 
-export type ProjectTab = 'overview' | 'runs' | 'findings' | 'code' | 'sessions' | 'coverage' | 'config';
+export type ProjectTab =
+  | 'overview'
+  | 'runs'
+  | 'findings'
+  | 'code'
+  | 'sessions'
+  | 'coverage'
+  | 'network'
+  | 'config';
 
 // ---------------------------------------------------------------------------
 // Rollup tile
@@ -296,6 +306,12 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
             label="Coverage"
           />
           <TabButton
+            active={tab === 'network'}
+            onClick={() => navigate(`/projects/${encodedId}/network`)}
+            icon={NetworkIcon}
+            label="Network"
+          />
+          <TabButton
             active={tab === 'config'}
             onClick={() => navigate(`/projects/${encodedId}/config`)}
             icon={SettingsIcon}
@@ -328,6 +344,7 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
       )}
       {tab === 'sessions' && <ProjectSessionsTab wsId={p.ws_id} />}
       {tab === 'coverage' && <ProjectCoverageTab wsId={p.ws_id} />}
+      {tab === 'network' && <ProjectNetworkTab wsId={p.ws_id} />}
       {tab === 'config' && <ProjectConfigTab wsId={p.ws_id} />}
     </div>
   );

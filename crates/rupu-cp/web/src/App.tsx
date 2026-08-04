@@ -11,6 +11,7 @@ const Usage             = React.lazy(() => import('./pages/Usage'));
 const RunDetail         = React.lazy(() => import('./pages/RunDetail'));
 const Events            = React.lazy(() => import('./pages/Events'));
 const Coverage          = React.lazy(() => import('./pages/Coverage'));
+const Netflow           = React.lazy(() => import('./pages/Netflow'));
 const CoverageDetail    = React.lazy(() => import('./pages/CoverageDetail'));
 const CoverageTemplates = React.lazy(() => import('./pages/CoverageTemplates'));
 const Findings          = React.lazy(() => import('./pages/Findings'));
@@ -69,6 +70,7 @@ export default function App() {
             <Route path="/coverage/:target/gap" element={<Suspense fallback={<PageFallback />}><CoverageDetail tab="gap" /></Suspense>} />
             <Route path="/coverage/:target/diff" element={<Suspense fallback={<PageFallback />}><CoverageDetail tab="diff" /></Suspense>} />
             <Route path="/coverage/:target" element={<Suspense fallback={<PageFallback />}><CoverageDetail /></Suspense>} />
+            <Route path="/netflow" element={<Suspense fallback={<PageFallback />}><Netflow /></Suspense>} />
             <Route path="/findings" element={<Suspense fallback={<PageFallback />}><Findings /></Suspense>} />
             <Route path="/workflows" element={<Suspense fallback={<PageFallback />}><Workflows /></Suspense>} />
             <Route path="/workflows/:name" element={<Suspense fallback={<PageFallback />}><WorkflowDetail /></Suspense>} />
@@ -95,6 +97,7 @@ export default function App() {
             <Route path="/projects/:wsId/code" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="code" /></Suspense>} />
             <Route path="/projects/:wsId/sessions" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="sessions" /></Suspense>} />
             <Route path="/projects/:wsId/coverage" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="coverage" /></Suspense>} />
+            <Route path="/projects/:wsId/network" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="network" /></Suspense>} />
             <Route path="/projects/:wsId/config" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="config" /></Suspense>} />
             <Route path="/projects/:wsId/definitions" element={<Suspense fallback={<PageFallback />}><ProjectDefinitions /></Suspense>} />
             <Route path="/projects/:wsId" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="overview" /></Suspense>} />

@@ -8,6 +8,14 @@
 //!   server's HTTP API using [`reqwest`].
 
 #![deny(clippy::all)]
+// This is an integration test — the two `reqwest::Client::new()` calls
+// below are throwaway clients driving in-process test servers, not
+// rupu's egress (choke_point.rs's guard test already exempts everything
+// under `/tests/` on that basis). `disallowed_methods` is grouped under
+// `clippy::all` in this clippy version, so the `deny` above would
+// otherwise escalate it to a hard error despite the workspace-level
+// `disallowed_methods = "warn"` (root Cargo.toml).
+#![allow(clippy::disallowed_methods)]
 
 use chrono::Utc;
 use reqwest::StatusCode;

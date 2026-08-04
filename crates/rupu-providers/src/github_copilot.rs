@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use reqwest::Client;
+use reqwest_middleware::ClientWithMiddleware;
 use tracing::{info, warn};
 
 use crate::auth::{save_provider_auth, AuthCredentials};
@@ -15,6 +15,16 @@ use crate::types::*;
 const DEFAULT_COPILOT_API_URL: &str = "https://api.githubcopilot.com";
 const COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
 
+/// Default netflow-instrumented client. No run context is available at
+/// construction — stamped `FlowCtx::system(Origin::Provider("copilot"))`.
+/// `with_tuning` (the path every factory-built client goes through) rebuilds
+/// this with the configured timeout via `client_from`.
+fn copilot_http_client() -> ClientWithMiddleware {
+    rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
+        rupu_netflow::Origin::Provider("copilot".into()),
+    ))
+}
+
 /// GitHub Copilot client using OpenAI chat/completions format.
 ///
 /// Auth flow:
@@ -23,7 +33,7 @@ const COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/toke
 /// 3. Returns short-lived Copilot `token` + `expires_at` + `proxy-ep`
 /// 4. The Copilot token is used as Bearer for chat/completions
 pub struct GithubCopilotClient {
-    client: Client,
+    client: ClientWithMiddleware,
     /// Long-lived GitHub OAuth token (used to exchange for Copilot tokens).
     github_token: String,
     /// Short-lived Copilot API token (from token exchange).
@@ -44,7 +54,8 @@ impl GithubCopilotClient {
     /// never cut off mid-flight. A builder failure leaves the existing client
     /// in place rather than panicking on user-supplied config.
     pub fn with_tuning(mut self, tuning: &crate::tuning::ProviderTuning) -> Self {
-        if let Ok(client) = tuning.http_client_builder().build() {
+        let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider("copilot".into()));
+        if let Ok(client) = rupu_netflow::http::client_from(ctx, tuning.http_client_builder()) {
             self.client = client;
         }
         self
@@ -68,7 +79,7 @@ impl GithubCopilotClient {
                     .map(String::from);
 
                 Ok(Self {
-                    client: Client::new(),
+                    client: copilot_http_client(),
                     github_token: access,
                     copilot_token: String::new(),
                     copilot_expires_ms: 0,
@@ -78,7 +89,7 @@ impl GithubCopilotClient {
                 })
             }
             AuthCredentials::ApiKey { key } => Ok(Self {
-                client: Client::new(),
+                client: copilot_http_client(),
                 github_token: key,
                 copilot_token: String::new(),
                 copilot_expires_ms: 0,

@@ -23,7 +23,7 @@ use crate::platform::Platform;
 use crate::types::{EventSourceRef, EventSubjectRef, IssueRef, PrRef, RepoRef};
 
 pub struct GitlabEventConnector {
-    http: reqwest::Client,
+    http: reqwest_middleware::ClientWithMiddleware,
     token: String,
     base_url: String,
 }
@@ -32,9 +32,15 @@ impl GitlabEventConnector {
     pub fn new(token: String, base_url: Option<String>) -> Self {
         let base_url = base_url.unwrap_or_else(|| "https://gitlab.com".to_string());
         Self {
-            http: reqwest::Client::builder()
-                .build()
-                .expect("reqwest client build"),
+            http: rupu_netflow::http::client_from(
+                rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm("gitlab".into())),
+                reqwest::Client::builder(),
+            )
+            .unwrap_or_else(|_| {
+                rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
+                    rupu_netflow::Origin::Scm("gitlab".into()),
+                ))
+            }),
             token,
             base_url,
         }

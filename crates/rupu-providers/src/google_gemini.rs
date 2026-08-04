@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use reqwest::Client;
+use reqwest_middleware::ClientWithMiddleware;
 use tracing::{debug, info, warn};
 
 use crate::auth::{is_token_expired, save_provider_auth, AuthCredentials};
@@ -20,6 +20,16 @@ const ANTIGRAVITY_ENDPOINT: &str = "https://daily-cloudcode-pa.sandbox.googleapi
 const AI_STUDIO_ENDPOINT: &str = "https://generativelanguage.googleapis.com";
 
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+
+/// Default netflow-instrumented client. No run context is available at
+/// construction — stamped `FlowCtx::system(Origin::Provider("gemini"))`.
+/// `with_tuning` (the path every factory-built client goes through) rebuilds
+/// this with the configured timeout via `client_from`.
+fn gemini_http_client() -> ClientWithMiddleware {
+    rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
+        rupu_netflow::Origin::Provider("gemini".into()),
+    ))
+}
 
 /// Canonical provider tag stamped on Reasoning blocks; gates the replay.
 pub(crate) const PROVIDER_TAG: &str = "google_gemini";
@@ -106,7 +116,7 @@ impl GeminiVariant {
 /// Google Gemini client for Cloud Code Assist API.
 /// Shared implementation for both Gemini CLI and Antigravity variants.
 pub struct GoogleGeminiClient {
-    client: Client,
+    client: ClientWithMiddleware,
     variant: GeminiVariant,
     access_token: String,
     refresh_token: String,
@@ -122,7 +132,8 @@ impl GoogleGeminiClient {
     /// never cut off mid-flight. A builder failure leaves the existing client
     /// in place rather than panicking on user-supplied config.
     pub fn with_tuning(mut self, tuning: &crate::tuning::ProviderTuning) -> Self {
-        if let Ok(client) = tuning.http_client_builder().build() {
+        let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider("gemini".into()));
+        if let Ok(client) = rupu_netflow::http::client_from(ctx, tuning.http_client_builder()) {
             self.client = client;
         }
         self
@@ -159,7 +170,7 @@ impl GoogleGeminiClient {
                     .to_string();
 
                 Ok(Self {
-                    client: Client::new(),
+                    client: gemini_http_client(),
                     variant,
                     access_token: access,
                     refresh_token: refresh,
@@ -169,7 +180,7 @@ impl GoogleGeminiClient {
                 })
             }
             (AuthCredentials::ApiKey { key, .. }, GeminiVariant::AiStudio) => Ok(Self {
-                client: Client::new(),
+                client: gemini_http_client(),
                 variant,
                 access_token: key,
                 refresh_token: String::new(),

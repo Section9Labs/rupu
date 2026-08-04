@@ -1,5 +1,10 @@
 //! Tests for `GET /api/transcript` and its security-critical path validator.
 
+// Throwaway in-process mock-server client, not rupu's egress
+// (choke_point.rs's guard test already exempts everything under `/tests/`
+// on that basis).
+#![allow(clippy::disallowed_methods)]
+
 use chrono::TimeZone as _;
 use rupu_cp::api::transcript::validate_transcript_path as v;
 use rupu_transcript::{Event, RunMode};
