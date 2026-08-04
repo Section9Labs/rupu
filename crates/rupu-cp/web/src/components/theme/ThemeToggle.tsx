@@ -22,13 +22,28 @@ const LABEL: Record<Theme, string> = {
   dark: 'Dark',
 };
 
-export function ThemeToggle() {
+export function ThemeToggle({ variant = 'row' }: { variant?: 'row' | 'icon' }) {
   const { theme, mode, setTheme } = useTheme();
 
   const next = ORDER[(ORDER.indexOf(theme) + 1) % ORDER.length];
   const Icon = ICON[theme];
   const description =
     theme === 'system' ? `System (${LABEL[mode]})` : LABEL[theme];
+
+  if (variant === 'icon') {
+    return (
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={() => setTheme(next)}
+        aria-label={`Theme: ${description}. Switch to ${LABEL[next]}.`}
+        title={`Theme: ${description}`}
+        className="h-[26px] w-[26px] p-0 justify-center text-ink-dim hover:text-ink"
+      >
+        <Icon size={16} strokeWidth={2} />
+      </Button>
+    );
+  }
 
   return (
     <Button

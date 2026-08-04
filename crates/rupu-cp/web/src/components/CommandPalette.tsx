@@ -16,11 +16,14 @@ import { useNavigate } from 'react-router-dom';
 import {
   Activity,
   AlertTriangle,
+  BookMarked,
   Bug,
+  DollarSign,
   FileText,
   FolderGit2,
   LayoutDashboard,
   MessageSquare,
+  Network,
   Radio,
   Repeat,
   Search,
@@ -37,6 +40,7 @@ import { Spinner } from './ui/Spinner';
 import { useHotkey } from '../lib/useHotkey';
 import { api } from '../lib/api';
 import { fuzzyScore } from '../lib/fuzzy';
+import type { ShellVersion } from '../lib/shell';
 import {
   rankPalette,
   runItems,
@@ -72,6 +76,32 @@ const NAV_PAGES: PaletteItem[] = [
   { kind: 'page', id: 'settings',  title: 'Settings',      to: '/settings' },
 ];
 
+// Shell v2's nav-page set — replaces `NAV_PAGES` when `shell="v2"`. Several
+// v1 pages were folded into new composite pages (Overview, Activity,
+// Security, Library, Fleet, Usage); see `V2_LIST_REWRITE` below for the
+// matching entity-list route rewrites.
+const NAV_PAGES_V2: PaletteItem[] = [
+  { kind: 'page', id: 'overview', title: 'Overview',     to: '/overview' },
+  { kind: 'page', id: 'activity', title: 'Activity',     to: '/activity' },
+  { kind: 'page', id: 'projects', title: 'Projects',     to: '/projects' },
+  { kind: 'page', id: 'security', title: 'Security',     to: '/security' },
+  { kind: 'page', id: 'library',  title: 'Library',      to: '/library' },
+  { kind: 'page', id: 'fleet',    title: 'Fleet',        to: '/fleet' },
+  { kind: 'page', id: 'usage',    title: 'Usage',        to: '/usage' },
+  { kind: 'page', id: 'events',   title: 'Live Events',  to: '/events' },
+  // Netflow landed on main after the v2 IA was drawn; it has no v2 rail leaf
+  // yet, so the palette keeps it reachable (same treatment as Live Events)
+  // until the arc decides where it lives.
+  { kind: 'page', id: 'netflow',  title: 'Network',      to: '/netflow' },
+  { kind: 'page', id: 'settings', title: 'Settings',     to: '/settings' },
+];
+
+/** Entity list pages that moved in v2 — detail routes are unchanged. */
+const V2_LIST_REWRITE: Record<string, string> = {
+  '/findings': '/security',
+  '/workers': '/fleet?tab=workers',
+};
+
 // Per-page icon, keyed by page id (falls back to a generic glyph).
 const PAGE_ICON: Record<string, LucideIcon> = {
   dashboard: LayoutDashboard,
@@ -86,7 +116,25 @@ const PAGE_ICON: Record<string, LucideIcon> = {
   findings:  AlertTriangle,
   workers:   Server,
   settings:  Settings,
+  overview:  LayoutDashboard,
+  activity:  Activity,
+  security:  ShieldCheck,
+  library:   BookMarked,
+  fleet:     Server,
+  usage:     DollarSign,
+  netflow:   Network,
 };
+
+// ---------------------------------------------------------------------------
+// External open — Task 9's v2 search field (and anything else) can open the
+// palette without going through the ⌘K hotkey by dispatching this event.
+// ---------------------------------------------------------------------------
+
+export const OPEN_COMMAND_PALETTE_EVENT = 'rupu:command-palette:open';
+
+export function openCommandPalette() {
+  window.dispatchEvent(new CustomEvent(OPEN_COMMAND_PALETTE_EVENT));
+}
 
 // ---------------------------------------------------------------------------
 // Per-kind presentation.
@@ -176,7 +224,7 @@ function Hint({ k, label }: { k: string; label: string }) {
   );
 }
 
-export default function CommandPalette() {
+export default function CommandPalette({ shell = 'v1' }: { shell?: ShellVersion }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
@@ -191,6 +239,17 @@ export default function CommandPalette() {
     e.preventDefault();
     setOpen((prev) => !prev);
   }, []));
+
+  // External open — dispatched by `openCommandPalette()` (Task 9's search
+  // field, etc.). Bound for the component's whole lifetime, not just while
+  // open, since its job is to flip `open` from false to true.
+  useEffect(() => {
+    function onExternalOpen() {
+      setOpen(true);
+    }
+    window.addEventListener(OPEN_COMMAND_PALETTE_EVENT, onExternalOpen);
+    return () => window.removeEventListener(OPEN_COMMAND_PALETTE_EVENT, onExternalOpen);
+  }, []);
 
   // Esc closes — only bound while open.
   useEffect(() => {
@@ -242,8 +301,8 @@ export default function CommandPalette() {
   }, [open]);
 
   const groups = useMemo(
-    () => rankPalette(query, items, NAV_PAGES),
-    [query, items],
+    () => rankPalette(query, items, shell === 'v2' ? NAV_PAGES_V2 : NAV_PAGES),
+    [query, items, shell],
   );
 
   // Flat ordered list for keyboard nav — mirrors the visual group order.
@@ -260,7 +319,7 @@ export default function CommandPalette() {
   function go(to: string | null) {
     if (!to) return;
     setOpen(false);
-    navigate(to);
+    navigate(shell === 'v2' ? (V2_LIST_REWRITE[to] ?? to) : to);
   }
 
   function onInputKey(e: React.KeyboardEvent<HTMLInputElement>) {

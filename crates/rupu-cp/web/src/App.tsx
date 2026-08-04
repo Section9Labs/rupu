@@ -1,8 +1,9 @@
-import React, { Suspense } from 'react';
+import React, { Suspense, type ReactElement } from 'react';
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import Layout from './components/Layout';
 import { Spinner } from './components/ui/Spinner';
+import { getShell, type ShellVersion } from './lib/shell';
 
 // All page-level routes are lazy-loaded so each page lands in its own chunk
 // and the main bundle only pays for the shell (Layout + router plumbing).
@@ -35,6 +36,14 @@ const ProjectDetail     = React.lazy(() => import('./pages/ProjectDetail'));
 const ProjectDefinitions = React.lazy(() => import('./pages/ProjectDefinitions'));
 const RunTranscript     = React.lazy(() => import('./pages/RunTranscript'));
 
+// Shell v2 chrome + the composite destination pages that carry the 7-leaf IA
+// (docs/redesign) over the existing v1 page bodies.
+const ShellV2   = React.lazy(() => import('./components/v2/Shell'));
+const ActivityV2 = React.lazy(() => import('./components/v2/pages/ActivityV2'));
+const SecurityV2 = React.lazy(() => import('./components/v2/pages/SecurityV2'));
+const LibraryV2  = React.lazy(() => import('./components/v2/pages/LibraryV2'));
+const FleetV2    = React.lazy(() => import('./components/v2/pages/FleetV2'));
+
 function PageFallback() {
   return (
     <div className="flex items-center justify-center h-48">
@@ -43,66 +52,93 @@ function PageFallback() {
   );
 }
 
+// Wraps a lazily-loaded page element in the shared Suspense fallback — a
+// pure refactor of the `<Suspense fallback={<PageFallback/>}>{el}</Suspense>`
+// pattern that used to be repeated at every `<Route element=…>`.
+function page(el: ReactElement) {
+  return <Suspense fallback={<PageFallback />}>{el}</Suspense>;
+}
+
+export function AppRoutes({ shell }: { shell: ShellVersion }) {
+  const v2 = shell === 'v2';
+  const layoutEl = v2
+    ? <Suspense fallback={<PageFallback />}><ShellV2 /></Suspense>
+    : <Layout />;
+  return (
+    <Routes>
+      <Route element={layoutEl}>
+        {/* Index redirect */}
+        <Route index element={<Navigate to={v2 ? '/overview' : '/dashboard'} replace />} />
+
+        {/* v2 destinations — registered under BOTH shells so deep links work */}
+        <Route path="/overview" element={page(<Dashboard />)} />
+        <Route path="/activity" element={page(<ActivityV2 />)} />
+        <Route path="/security" element={page(<SecurityV2 />)} />
+        <Route path="/library" element={page(<LibraryV2 />)} />
+        <Route path="/fleet" element={page(<FleetV2 />)} />
+
+        {/* Pages — wrapped in Suspense so the eager Layout shell paints first.
+            v1 list paths redirect into the v2 IA only when the flag is on. */}
+        <Route path="/dashboard" element={v2 ? <Navigate to="/overview" replace /> : page(<Dashboard />)} />
+        <Route path="/usage" element={page(<Usage />)} />
+        {/* Run-stream pages — static segments MUST precede the :id wildcard */}
+        <Route path="/runs/agents"    element={v2 ? <Navigate to="/activity?tab=agents" replace /> : page(<AgentRuns />)} />
+        <Route path="/runs/workflows" element={v2 ? <Navigate to="/activity?tab=workflows" replace /> : page(<WorkflowRuns />)} />
+        <Route path="/runs/autoflows" element={v2 ? <Navigate to="/activity?tab=autoflows" replace /> : page(<AutoflowRuns />)} />
+        {/* Bare /runs → redirect to workflow runs (canonical execution list) */}
+        <Route path="/runs" element={<Navigate to={v2 ? '/activity' : '/runs/workflows'} replace />} />
+        {/* Run detail graph — wildcard must come after static /runs/* segments */}
+        <Route path="/runs/:id" element={page(<RunDetail />)} />
+        <Route path="/events" element={page(<Events />)} />
+        <Route path="/coverage" element={v2 ? <Navigate to="/security?tab=coverage" replace /> : page(<Coverage />)} />
+        <Route path="/coverage/templates" element={v2 ? <Navigate to="/security?tab=catalog" replace /> : page(<CoverageTemplates />)} />
+        <Route path="/coverage/:target/catalog" element={page(<CoverageDetail tab="catalog" />)} />
+        <Route path="/coverage/:target/audit" element={page(<CoverageDetail tab="audit" />)} />
+        <Route path="/coverage/:target/gap" element={page(<CoverageDetail tab="gap" />)} />
+        <Route path="/coverage/:target/diff" element={page(<CoverageDetail tab="diff" />)} />
+        <Route path="/coverage/:target" element={page(<CoverageDetail />)} />
+        <Route path="/netflow" element={page(<Netflow />)} />
+        <Route path="/findings" element={v2 ? <Navigate to="/security?tab=findings" replace /> : page(<Findings />)} />
+        <Route path="/workflows" element={v2 ? <Navigate to="/library?tab=workflows" replace /> : page(<Workflows />)} />
+        <Route path="/workflows/:name" element={page(<WorkflowDetail />)} />
+        <Route path="/agents" element={v2 ? <Navigate to="/library?tab=agents" replace /> : page(<Agents />)} />
+        {/* Static /agents/new MUST precede the :name wildcard */}
+        <Route path="/agents/new" element={page(<AgentNew />)} />
+        <Route path="/agents/:name" element={page(<AgentDetail />)} />
+        <Route path="/autoflows" element={v2 ? <Navigate to="/library?tab=autoflows" replace /> : page(<AutoflowsDefs />)} />
+        <Route path="/sessions" element={v2 ? <Navigate to="/activity?tab=sessions" replace /> : page(<Sessions />)} />
+        <Route path="/sessions/:id" element={page(<SessionDetail />)} />
+        <Route path="/hosts" element={v2 ? <Navigate to="/fleet" replace /> : page(<Hosts />)} />
+        <Route path="/hosts/:id" element={page(<HostDetail />)} />
+        <Route path="/workers" element={v2 ? <Navigate to="/fleet?tab=workers" replace /> : page(<Workers />)} />
+        <Route path="/settings" element={page(<Settings />)} />
+        {/* Transcript-only page (agent/session/standalone runs with no DAG) */}
+        <Route path="/transcript" element={page(<RunTranscript />)} />
+        {/* Projects */}
+        <Route path="/projects" element={page(<Projects />)} />
+        {/* Static scoped sub-pages MUST come before the :wsId wildcard.
+            The tabbed shell renders for overview + 5 tab routes; only
+            Definitions stays a standalone page. */}
+        <Route path="/projects/:wsId/runs" element={page(<ProjectDetail tab="runs" />)} />
+        <Route path="/projects/:wsId/findings" element={page(<ProjectDetail tab="findings" />)} />
+        <Route path="/projects/:wsId/code" element={page(<ProjectDetail tab="code" />)} />
+        <Route path="/projects/:wsId/sessions" element={page(<ProjectDetail tab="sessions" />)} />
+        <Route path="/projects/:wsId/coverage" element={page(<ProjectDetail tab="coverage" />)} />
+        <Route path="/projects/:wsId/network" element={page(<ProjectDetail tab="network" />)} />
+        <Route path="/projects/:wsId/config" element={page(<ProjectDetail tab="config" />)} />
+        <Route path="/projects/:wsId/definitions" element={page(<ProjectDefinitions />)} />
+        <Route path="/projects/:wsId" element={page(<ProjectDetail tab="overview" />)} />
+      </Route>
+    </Routes>
+  );
+}
+
 export default function App() {
+  const shell = getShell();
   return (
     <BrowserRouter>
       <ErrorBoundary>
-        <Routes>
-          <Route element={<Layout />}>
-            {/* Index redirect */}
-            <Route index element={<Navigate to="/dashboard" replace />} />
-            {/* Pages — wrapped in Suspense so the eager Layout shell paints first */}
-            <Route path="/dashboard" element={<Suspense fallback={<PageFallback />}><Dashboard /></Suspense>} />
-            <Route path="/usage" element={<Suspense fallback={<PageFallback />}><Usage /></Suspense>} />
-            {/* Run-stream pages — static segments MUST precede the :id wildcard */}
-            <Route path="/runs/agents"    element={<Suspense fallback={<PageFallback />}><AgentRuns /></Suspense>} />
-            <Route path="/runs/workflows" element={<Suspense fallback={<PageFallback />}><WorkflowRuns /></Suspense>} />
-            <Route path="/runs/autoflows" element={<Suspense fallback={<PageFallback />}><AutoflowRuns /></Suspense>} />
-            {/* Bare /runs → redirect to workflow runs (canonical execution list) */}
-            <Route path="/runs" element={<Navigate to="/runs/workflows" replace />} />
-            {/* Run detail graph — wildcard must come after static /runs/* segments */}
-            <Route path="/runs/:id" element={<Suspense fallback={<PageFallback />}><RunDetail /></Suspense>} />
-            <Route path="/events" element={<Suspense fallback={<PageFallback />}><Events /></Suspense>} />
-            <Route path="/coverage" element={<Suspense fallback={<PageFallback />}><Coverage /></Suspense>} />
-            <Route path="/coverage/templates" element={<Suspense fallback={<PageFallback />}><CoverageTemplates /></Suspense>} />
-            <Route path="/coverage/:target/catalog" element={<Suspense fallback={<PageFallback />}><CoverageDetail tab="catalog" /></Suspense>} />
-            <Route path="/coverage/:target/audit" element={<Suspense fallback={<PageFallback />}><CoverageDetail tab="audit" /></Suspense>} />
-            <Route path="/coverage/:target/gap" element={<Suspense fallback={<PageFallback />}><CoverageDetail tab="gap" /></Suspense>} />
-            <Route path="/coverage/:target/diff" element={<Suspense fallback={<PageFallback />}><CoverageDetail tab="diff" /></Suspense>} />
-            <Route path="/coverage/:target" element={<Suspense fallback={<PageFallback />}><CoverageDetail /></Suspense>} />
-            <Route path="/netflow" element={<Suspense fallback={<PageFallback />}><Netflow /></Suspense>} />
-            <Route path="/findings" element={<Suspense fallback={<PageFallback />}><Findings /></Suspense>} />
-            <Route path="/workflows" element={<Suspense fallback={<PageFallback />}><Workflows /></Suspense>} />
-            <Route path="/workflows/:name" element={<Suspense fallback={<PageFallback />}><WorkflowDetail /></Suspense>} />
-            <Route path="/agents" element={<Suspense fallback={<PageFallback />}><Agents /></Suspense>} />
-            {/* Static /agents/new MUST precede the :name wildcard */}
-            <Route path="/agents/new" element={<Suspense fallback={<PageFallback />}><AgentNew /></Suspense>} />
-            <Route path="/agents/:name" element={<Suspense fallback={<PageFallback />}><AgentDetail /></Suspense>} />
-            <Route path="/autoflows" element={<Suspense fallback={<PageFallback />}><AutoflowsDefs /></Suspense>} />
-            <Route path="/sessions" element={<Suspense fallback={<PageFallback />}><Sessions /></Suspense>} />
-            <Route path="/sessions/:id" element={<Suspense fallback={<PageFallback />}><SessionDetail /></Suspense>} />
-            <Route path="/hosts" element={<Suspense fallback={<PageFallback />}><Hosts /></Suspense>} />
-            <Route path="/hosts/:id" element={<Suspense fallback={<PageFallback />}><HostDetail /></Suspense>} />
-            <Route path="/workers" element={<Suspense fallback={<PageFallback />}><Workers /></Suspense>} />
-            <Route path="/settings" element={<Suspense fallback={<PageFallback />}><Settings /></Suspense>} />
-            {/* Transcript-only page (agent/session/standalone runs with no DAG) */}
-            <Route path="/transcript" element={<Suspense fallback={<PageFallback />}><RunTranscript /></Suspense>} />
-            {/* Projects */}
-            <Route path="/projects" element={<Suspense fallback={<PageFallback />}><Projects /></Suspense>} />
-            {/* Static scoped sub-pages MUST come before the :wsId wildcard.
-                The tabbed shell renders for overview + 5 tab routes; only
-                Definitions stays a standalone page. */}
-            <Route path="/projects/:wsId/runs" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="runs" /></Suspense>} />
-            <Route path="/projects/:wsId/findings" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="findings" /></Suspense>} />
-            <Route path="/projects/:wsId/code" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="code" /></Suspense>} />
-            <Route path="/projects/:wsId/sessions" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="sessions" /></Suspense>} />
-            <Route path="/projects/:wsId/coverage" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="coverage" /></Suspense>} />
-            <Route path="/projects/:wsId/network" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="network" /></Suspense>} />
-            <Route path="/projects/:wsId/config" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="config" /></Suspense>} />
-            <Route path="/projects/:wsId/definitions" element={<Suspense fallback={<PageFallback />}><ProjectDefinitions /></Suspense>} />
-            <Route path="/projects/:wsId" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="overview" /></Suspense>} />
-          </Route>
-        </Routes>
+        <AppRoutes shell={shell} />
       </ErrorBoundary>
     </BrowserRouter>
   );

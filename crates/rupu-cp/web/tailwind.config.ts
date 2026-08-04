@@ -15,6 +15,8 @@ export default {
         surface: 'rgb(var(--c-surface) / <alpha-value>)',
         'surface-hover': 'rgb(var(--c-surface-hover) / <alpha-value>)',
         border: 'rgb(var(--c-border) / <alpha-value>)',
+        'border-strong': 'rgb(var(--c-border-strong) / <alpha-value>)',
+        'surface-active': 'rgb(var(--c-surface-active) / <alpha-value>)',
         ink: {
           DEFAULT: 'rgb(var(--c-ink) / <alpha-value>)',
           dim: 'rgb(var(--c-ink-dim) / <alpha-value>)',

@@ -887,12 +887,7 @@ mod tests {
         std::env::set_var("NO_COLOR", "1");
         let cfg = UiConfig {
             color: Some("always".into()),
-            theme: None,
-            syntax: Default::default(),
-            palette: Default::default(),
-            live_view: None,
-            pager: None,
-            editor: None,
+            ..Default::default()
         };
         let prefs = UiPrefs::resolve(&cfg, false, None, None, None);
         assert_eq!(prefs.color, ColorMode::Never);
