@@ -1,15 +1,27 @@
-//! rupu has exactly ONE door for outbound HTTP. This test fails if a new
-//! one appears, so a regression is a red build rather than a review miss.
+//! rupu has exactly ONE door for outbound HTTP. Two layers enforce it,
+//! and they cover different things — neither is sufficient alone.
 //!
-//! Paired with the `clippy.toml` `disallowed-methods` lint: the lint
-//! catches it at compile time in CI, this catches it even when someone
-//! runs a bare `cargo test`.
+//! * `clippy.toml`'s `disallowed-methods` is the PRIMARY guard. It
+//!   resolves calls semantically, so it catches a bare `.build()` — the
+//!   idiomatic way the real bypass would actually be written.
+//! * This test is a SECONDARY, text-level backstop. It only matches
+//!   fully-qualified paths (`reqwest::ClientBuilder::build(...)`), so it
+//!   is structurally blind to bare method calls (`builder.build()`
+//!   without the type spelled out). That is permanent, not a gap to be
+//!   closed later — it exists so a regression is still caught even when
+//!   someone runs a bare `cargo test` without clippy.
 //!
-//! `Client::builder()` is deliberately NOT banned: `client_from` requires
-//! every legitimate caller to build a tuned `ClientBuilder` first, so
-//! banning that call would produce a false positive at every correct call
-//! site. The actual bypass is calling `.build()` on that builder instead
-//! of handing it to `client_from` — that is what `BANNED` catches.
+//! Consequence: `PENDING_PLAN_2` below is a strict SUBSET of the real
+//! migration debt — see its doc comment. The authoritative checklist for
+//! "is anything still unmigrated" is `cargo clippy --workspace 2>&1 |
+//! grep disallowed`, not this constant.
+//!
+//! `Client::builder()` is deliberately NOT banned by either layer:
+//! `client_from` requires every legitimate caller to build a tuned
+//! `ClientBuilder` first, so banning that call would produce a false
+//! positive at every correct call site. The actual bypass is calling
+//! `.build()` on that builder instead of handing it to `client_from` —
+//! that is what `BANNED` (below) and `clippy.toml` both target.
 
 use std::path::Path;
 

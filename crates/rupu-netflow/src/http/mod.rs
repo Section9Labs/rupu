@@ -72,8 +72,10 @@ pub fn client_from(
 
 /// As `client_from`, with an explicit sink. Used by tests.
 ///
-/// This is the one legitimate `ClientBuilder::build()` call site in the
-/// repo — the actual choke point the rest of Task 11's lint protects.
+/// This is one of two legitimate `ClientBuilder::build()` call sites in
+/// the repo — both confined to this file. The other is `client()`'s
+/// panicking fallback above. Together they are the actual choke point
+/// the rest of Task 11's lint protects.
 #[allow(clippy::disallowed_methods)]
 pub fn client_with(
     ctx: FlowCtx,
