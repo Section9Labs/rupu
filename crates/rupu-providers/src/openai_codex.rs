@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use reqwest::Client;
+use reqwest_middleware::ClientWithMiddleware;
 use tracing::{debug, info, warn};
 
 use crate::auth::{is_token_expired, save_provider_auth, AuthCredentials};
@@ -14,6 +14,16 @@ const DEFAULT_API_URL: &str = "https://api.openai.com/v1/responses";
 const CODEX_BACKEND_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+
+/// Default netflow-instrumented client. No run context is available at
+/// construction — stamped `FlowCtx::system(Origin::Provider("openai"))`.
+/// `with_tuning` (the path every factory-built client goes through) rebuilds
+/// this with the configured timeout via `client_from`.
+fn codex_http_client() -> ClientWithMiddleware {
+    rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
+        rupu_netflow::Origin::Provider("openai".into()),
+    ))
+}
 
 /// OpenAI's Responses API enforces `^[a-zA-Z0-9_-]+$` on tool names
 /// and rejects the request with HTTP 400 when any tool's name
@@ -132,7 +142,7 @@ fn normalize_function_call_output(content: &str) -> String {
 /// OpenAI Codex client using the Responses API.
 /// Translates LlmRequest/LlmResponse to/from OpenAI's Responses API format.
 pub struct OpenAiCodexClient {
-    client: Client,
+    client: ClientWithMiddleware,
     access_token: String,
     refresh_token: String,
     expires_ms: u64,
@@ -203,7 +213,7 @@ impl OpenAiCodexClient {
                     });
 
                 Ok(Self {
-                    client: Client::new(),
+                    client: codex_http_client(),
                     access_token: access,
                     refresh_token: refresh,
                     expires_ms: expires,
@@ -215,7 +225,7 @@ impl OpenAiCodexClient {
                 })
             }
             AuthCredentials::ApiKey { key } => Ok(Self {
-                client: Client::new(),
+                client: codex_http_client(),
                 access_token: key,
                 refresh_token: String::new(),
                 expires_ms: 0,
@@ -231,7 +241,8 @@ impl OpenAiCodexClient {
     /// Apply `[providers.openai]` tuning: an HTTP client honoring
     /// `timeout_ms` (I-9) and the `org_id` organization scope (I-12).
     pub fn with_tuning(mut self, tuning: &crate::tuning::ProviderTuning) -> Self {
-        if let Ok(client) = tuning.http_client_builder().build() {
+        let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider("openai".into()));
+        if let Ok(client) = rupu_netflow::http::client_from(ctx, tuning.http_client_builder()) {
             self.client = client;
         }
         self.org_id = tuning.org_id.clone();
@@ -2972,7 +2983,9 @@ mod tuning_tests {
         client.api_url = "https://api.openai.com/v1/responses".into();
         let headers = client.build_headers().expect("headers");
         assert_eq!(
-            headers.get("OpenAI-Organization").map(|v| v.to_str().unwrap()),
+            headers
+                .get("OpenAI-Organization")
+                .map(|v| v.to_str().unwrap()),
             Some("org-abc123")
         );
 

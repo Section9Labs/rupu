@@ -64,6 +64,17 @@ impl From<reqwest::Error> for ProviderError {
     }
 }
 
+/// The instrumented client's `.send()` returns `reqwest_middleware::Error`
+/// (a superset of `reqwest::Error` that also covers middleware failures)
+/// instead of a bare `reqwest::Error`. This keeps every existing `?` call
+/// site on a provider's `.send()` compiling unchanged after the netflow
+/// migration (rupu-netflow Plan 1 Task 10).
+impl From<reqwest_middleware::Error> for ProviderError {
+    fn from(e: reqwest_middleware::Error) -> Self {
+        Self::Http(e.to_string())
+    }
+}
+
 impl From<serde_json::Error> for ProviderError {
     fn from(e: serde_json::Error) -> Self {
         Self::Json(e.to_string())

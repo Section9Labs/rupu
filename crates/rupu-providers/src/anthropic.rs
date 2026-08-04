@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use reqwest::Client;
+use reqwest_middleware::{ClientWithMiddleware, RequestBuilder};
 use serde::Deserialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
@@ -255,13 +255,13 @@ fn should_retry_idle_stall(
 const ANTHROPIC_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
-/// Build the reqwest client used for Anthropic requests.
+/// Build the netflow-instrumented client used for Anthropic requests.
 ///
 /// Forces HTTP/1.1: MITM capture of the first-party Claude Code binary
 /// shows it negotiates HTTP/1.1 for `/v1/messages`. Matching that on
 /// the wire keeps rupu's requests in the same Cloudflare/WAF
 /// classification bucket as claude-code traffic.
-fn build_http_client() -> reqwest::Client {
+fn build_http_client() -> ClientWithMiddleware {
     build_http_client_with_timeout(None)
 }
 
@@ -271,12 +271,21 @@ fn build_http_client() -> reqwest::Client {
 /// Applied as connect + read timeouts, never as reqwest's total `timeout`:
 /// a total deadline would abort a long generation mid-stream. `None` keeps
 /// the historical no-deadline client (used by every non-factory constructor).
-fn build_http_client_with_timeout(timeout: Option<std::time::Duration>) -> reqwest::Client {
+///
+/// No run context is available at this layer — every client built here is
+/// stamped `FlowCtx::system(Origin::Provider("anthropic"))`. Plan 2 threads
+/// the real run id through once the provider factory is touched.
+fn build_http_client_with_timeout(timeout: Option<std::time::Duration>) -> ClientWithMiddleware {
     let mut builder = reqwest::Client::builder().http1_only();
     if let Some(t) = timeout {
         builder = builder.connect_timeout(t).read_timeout(t);
     }
-    builder.build().expect("reqwest build")
+    let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider(PROVIDER_TAG.into()));
+    rupu_netflow::http::client_from(ctx, builder).unwrap_or_else(|_| {
+        rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
+            rupu_netflow::Origin::Provider(PROVIDER_TAG.into()),
+        ))
+    })
 }
 
 /// Whether the model string carries the explicit 1M-context opt-in
@@ -520,7 +529,7 @@ pub(crate) fn load_claude_code_keychain() -> Option<AuthMethod> {
 /// Refresh an Anthropic OAuth token. Returns updated AuthMethod.
 /// Uses application/x-www-form-urlencoded as required by the token endpoint.
 pub async fn refresh_anthropic_token(
-    client: &Client,
+    client: &ClientWithMiddleware,
     refresh_token: &str,
 ) -> Result<AuthMethod, ProviderError> {
     info!("refreshing Anthropic OAuth token");
@@ -645,7 +654,7 @@ pub fn save_auth_json(path: &Path, auth_method: &AuthMethod) -> Result<(), Provi
 /// Anthropic Messages API client with SSE streaming.
 /// Supports both API key (`x-api-key`) and OAuth (`Authorization: Bearer`) auth.
 pub struct AnthropicClient {
-    client: Client,
+    client: ClientWithMiddleware,
     auth: AuthMethod,
     api_url: String,
     /// Path to auth.json for writing refreshed tokens back (legacy).
@@ -891,11 +900,11 @@ impl AnthropicClient {
     /// non-Haiku tiers.
     fn apply_auth_headers(
         &self,
-        builder: reqwest::RequestBuilder,
+        builder: RequestBuilder,
         model: &str,
         context_window: Option<crate::model_tier::ContextWindow>,
         wants_context_management: bool,
-    ) -> reqwest::RequestBuilder {
+    ) -> RequestBuilder {
         // Headers verbatim from MITM capture of real `claude --print`
         // against api.anthropic.com. Order is preserved to match the
         // fingerprint. Anthropic's WAF / OAuth-quota router checks for
@@ -1244,10 +1253,9 @@ impl AnthropicClient {
             // dropped before its own backoff sleep, exactly like `send()`.
             // Never read directly; kept alive purely for its `Drop`, which
             // is why it's underscore-prefixed.
-            let (response, _stream_permit) = {
+            let (response, _stream_permit, flow_id, flow_started) = {
                 let mut last_err = None;
-                let mut got_response = None;
-                let mut acquired_permit = None;
+                let mut winner = None;
                 for attempt in 0..=self.max_rate_limit_retries {
                     if attempt > 0 {
                         let backoff = INITIAL_BACKOFF_MS * 2u64.pow(attempt - 1);
@@ -1261,6 +1269,15 @@ impl AnthropicClient {
 
                     let permit = self.acquire_permit().await?;
 
+                    // Every attempt here is a genuinely separate connection —
+                    // a 429 retry as much as an idle-restart pass — so each
+                    // gets its own fresh `FlowId`. Minted before `.send()` and
+                    // attached via `with_extension` so the middleware defers
+                    // finalizing this record until we call `complete` below,
+                    // instead of (mis)completing it at header time.
+                    let attempt_flow_id = rupu_netflow::FlowId::new();
+                    let attempt_started = std::time::Instant::now();
+
                     let builder = self
                         .client
                         .post(&self.api_url)
@@ -1273,12 +1290,19 @@ impl AnthropicClient {
                             request.context_window,
                             request.anthropic_context_management.is_some(),
                         )
+                        .with_extension(attempt_flow_id)
                         .send()
                         .await?;
 
                     let status = resp.status();
                     if status.as_u16() == 429 {
                         let text = resp.text().await.unwrap_or_default();
+                        rupu_netflow::http::complete(
+                            attempt_flow_id,
+                            text.len() as u64,
+                            attempt_started.elapsed().as_millis() as u64,
+                        )
+                        .await;
                         last_err = Some(ProviderError::Api {
                             status: 429,
                             message: text,
@@ -1288,22 +1312,28 @@ impl AnthropicClient {
                     }
                     if !status.is_success() {
                         let text = resp.text().await.unwrap_or_default();
+                        let bytes_in = text.len() as u64;
                         let truncated = if text.len() > 4096 {
                             format!("{}... (truncated)", &text[..4096])
                         } else {
                             text
                         };
+                        rupu_netflow::http::complete(
+                            attempt_flow_id,
+                            bytes_in,
+                            attempt_started.elapsed().as_millis() as u64,
+                        )
+                        .await;
                         return Err(ProviderError::Api {
                             status: status.as_u16(),
                             message: truncated,
                         });
                     }
-                    got_response = Some(resp);
-                    acquired_permit = permit;
+                    winner = Some((resp, permit, attempt_flow_id, attempt_started));
                     break;
                 }
-                match got_response {
-                    Some(r) => (r, acquired_permit),
+                match winner {
+                    Some(w) => w,
                     None => {
                         return Err(last_err.unwrap_or_else(|| ProviderError::Api {
                             status: 429,
@@ -1317,36 +1347,52 @@ impl AnthropicClient {
             let mut accumulator = StreamAccumulator::new();
             let mut response = response;
             let mut emitted_content = false;
+            let mut flow_bytes_in: u64 = 0;
             // `_stream_permit` (if any) stays alive through the SSE-reading
             // loop below and is dropped when this outer-loop iteration
             // ends — either by returning, or by falling through to the
             // next idle-restart pass, which acquires its own fresh permit.
 
             // Read chunks with a per-chunk IDLE timeout. A timeout means the
-            // server stopped emitting bytes — treat as a stall.
-            let stalled = loop {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS),
-                    response.chunk(),
-                )
-                .await
-                {
-                    Ok(chunk_result) => match chunk_result? {
-                        Some(chunk) => {
-                            for event in parser.feed(&chunk)? {
-                                self.process_sse_event(&event, &mut accumulator, &mut |ev| {
-                                    if stream_event_counts_as_emitted_content(&ev) {
-                                        emitted_content = true;
-                                    }
-                                    on_event(ev);
-                                })?;
+            // server stopped emitting bytes — treat as a stall. Wrapped in an
+            // inner async block so `complete` below fires exactly once on
+            // EVERY exit — normal completion, idle stall, or any `?`
+            // error — no matter which branch actually exits the loop.
+            let stalled_result: Result<bool, ProviderError> = async {
+                loop {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS),
+                        response.chunk(),
+                    )
+                    .await
+                    {
+                        Ok(chunk_result) => match chunk_result? {
+                            Some(chunk) => {
+                                flow_bytes_in += chunk.len() as u64;
+                                for event in parser.feed(&chunk)? {
+                                    self.process_sse_event(&event, &mut accumulator, &mut |ev| {
+                                        if stream_event_counts_as_emitted_content(&ev) {
+                                            emitted_content = true;
+                                        }
+                                        on_event(ev);
+                                    })?;
+                                }
                             }
-                        }
-                        None => break false, // stream completed normally
-                    },
-                    Err(_elapsed) => break true, // idle timeout → stalled
+                            None => return Ok(false), // stream completed normally
+                        },
+                        Err(_elapsed) => return Ok(true), // idle timeout → stalled
+                    }
                 }
-            };
+            }
+            .await;
+
+            rupu_netflow::http::complete(
+                flow_id,
+                flow_bytes_in,
+                flow_started.elapsed().as_millis() as u64,
+            )
+            .await;
+            let stalled = stalled_result?;
 
             if !stalled {
                 return accumulator

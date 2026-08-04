@@ -77,7 +77,7 @@ impl ProviderTuning {
         crate::concurrency::semaphore_for(provider, Some(self.max_concurrency))
     }
 
-    /// An HTTP client honoring [`Self::timeout`].
+    /// A tuned [`reqwest::ClientBuilder`] honoring [`Self::timeout`].
     ///
     /// The timeout is applied as `connect_timeout` + `read_timeout`, NOT as
     /// reqwest's total `timeout`. A total deadline would abort a legitimately
@@ -86,6 +86,11 @@ impl ProviderTuning {
     /// pre-existing hand-rolled `STREAM_IDLE_TIMEOUT_SECS = 120` in the
     /// Anthropic client, which is where the documented 120000 ms default
     /// comes from.
+    ///
+    /// Callers must never `.build()` this directly (rupu-netflow Plan 1 Task
+    /// 10 / Task 11's `clippy.toml` lint) — pass it through
+    /// `rupu_netflow::http::client_from` so the resulting client is
+    /// instrumented, preserving every option set here.
     pub fn http_client_builder(&self) -> reqwest::ClientBuilder {
         reqwest::Client::builder()
             .connect_timeout(self.timeout)
@@ -97,7 +102,11 @@ impl ProviderTuning {
 /// [`DEFAULT_TIMEOUT_MS`]. `0` is treated as absent: a zero-length deadline
 /// would fail every request instantly, which is never what a user means.
 pub fn client_timeout(timeout_ms: Option<u64>) -> Duration {
-    Duration::from_millis(timeout_ms.filter(|ms| *ms > 0).unwrap_or(DEFAULT_TIMEOUT_MS))
+    Duration::from_millis(
+        timeout_ms
+            .filter(|ms| *ms > 0)
+            .unwrap_or(DEFAULT_TIMEOUT_MS),
+    )
 }
 
 /// `max_retries` → retries after the first attempt. Absent ⇒
