@@ -24,7 +24,7 @@ use clap::Subcommand;
 use clap_complete::ArgValueCompleter;
 use rupu_agent::load_agents as load_agent_specs;
 use rupu_app_canvas::{render_rows as render_graph_rows, GraphCell, NodeStatus};
-use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts};
+use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, RunStepPolicy};
 use rupu_orchestrator::runs::{CancelError, CancelOutcome, PauseError};
 use rupu_orchestrator::{DefaultStepFactory, RunWorkflowError};
 use rupu_runtime::{
@@ -3202,6 +3202,7 @@ pub(crate) async fn resume_run(
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let action_dispatcher = crate::resume::action_dispatcher_for(&mcp_registry, &mode_str);
+    let mode_str_for_policy = mode_str.clone();
     let factory = Arc::new(DefaultStepFactory {
         workflow: workflow.clone(),
         global: global.clone(),
@@ -3289,7 +3290,7 @@ pub(crate) async fn resume_run(
         spawn_pause_marker_poller(Arc::clone(&store), run_id.to_string(), pause_token.clone());
 
     let opts = OrchestratorRunOpts {
-        run_step: Default::default(),
+        run_step: run_step_policy_for(&mode_str_for_policy, &cfg, workspace_path.clone()),
         workflow,
         inputs: inputs_map,
         workspace_id: record.workspace_id.clone(),
@@ -4691,6 +4692,7 @@ async fn execute_workflow_invocation(
     let run_store_for_resume = Arc::clone(&run_store);
     let body_for_resume = body.clone();
     let inputs_for_resume = inputs_map.clone();
+    let mode_for_resume = ctx.mode.clone();
     let strict_templates = ctx.strict_templates;
 
     let unit_dispatcher = build_dispatcher_if_needed(
@@ -4715,7 +4717,7 @@ async fn execute_workflow_invocation(
     );
 
     let opts = OrchestratorRunOpts {
-        run_step: Default::default(),
+        run_step: run_step_policy_for(&ctx.mode, &cfg, ctx.workspace_path.clone()),
         workflow,
         inputs: inputs_map,
         workspace_id: ctx.workspace_id,
@@ -4896,7 +4898,11 @@ async fn execute_workflow_invocation(
                         cfg.pricing.clone(),
                     );
                     let resume_opts = OrchestratorRunOpts {
-                        run_step: Default::default(),
+                        run_step: run_step_policy_for(
+                            &mode_for_resume,
+                            &cfg,
+                            workspace_path_for_resume.clone(),
+                        ),
                         workflow: workflow_for_resume.clone(),
                         inputs: inputs_for_resume.clone(),
                         workspace_id: workspace_id_for_resume.clone(),
@@ -5072,6 +5078,63 @@ async fn post_run_summary_to_issue(
 ///
 /// Split from the printing so the condition is unit-testable without
 /// capturing stderr.
+/// Build the [`RunStepPolicy`] for a workflow run from the resolved mode
+/// string and config.
+///
+/// `ask` resolves to `Bypass` here, deliberately and for the same reason
+/// [`should_warn_ask_is_bypass`] documents for agent tool calls: a
+/// workflow step has no operator to answer a prompt, so a genuinely
+/// prompting `ask` would hang every scheduled run. Refusing instead
+/// would be worse for `run:` than for agent tools, not better — a `run:`
+/// command is declared in reviewed workflow YAML, whereas an agent's
+/// `bash` call is invented by the model at runtime. Gating the
+/// author-declared one more strictly makes no sense.
+///
+/// The real protection is `[workflow].run_step_enabled`, which defaults
+/// to false and which `bypass` cannot override.
+fn run_step_policy_for(
+    mode_str: &str,
+    cfg: &rupu_config::Config,
+    workspace_path: PathBuf,
+) -> RunStepPolicy {
+    let mode = match mode_str {
+        "readonly" => rupu_tools::PermissionMode::Readonly,
+        // "ask" included: see the doc comment above.
+        _ => rupu_tools::PermissionMode::Bypass,
+    };
+    RunStepPolicy {
+        mode,
+        config: cfg.workflow.clone(),
+        workspace_root: workspace_path,
+    }
+}
+
+/// Operator-facing description of a `run:` step's resolved command.
+///
+/// Shows the argv that will ACTUALLY execute, not the template that
+/// produced it. Env KEYS are listed; env VALUES never are — they carry
+/// API keys (`CYBERGYM_API_KEY`, `CYBERBENCH_RELEASE_KEY`).
+pub fn render_run_step_prompt(
+    step_id: &str,
+    cmd: &str,
+    args: &[String],
+    cwd: &std::path::Path,
+    env_keys: &[String],
+) -> String {
+    let argv = std::iter::once(cmd.to_string())
+        .chain(args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut s = format!(
+        "run step `{step_id}` will execute:\n  {argv}\n  cwd: {}\n",
+        cwd.display()
+    );
+    if !env_keys.is_empty() {
+        s.push_str(&format!("  env: {}\n", env_keys.join(", ")));
+    }
+    s
+}
+
 fn should_warn_ask_is_bypass(mode: Option<&str>, mode_str: &str) -> bool {
     mode.is_none() && mode_str == "ask"
 }
@@ -5081,13 +5144,66 @@ fn warn_if_ask_mode_is_effectively_bypass(mode: Option<&str>, mode_str: &str) {
         eprintln!(
             "warning: --mode not set; workflow steps run at `bypass` \
              (there is no operator to answer `ask` mid-run).\n         \
-             Pass --mode readonly to deny bash/write_file/edit_file."
+             Pass --mode readonly to deny bash/write_file/edit_file and `run:` steps."
         );
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn run_step_prompt_shows_resolved_argv_and_hides_env_values() {
+        let prompt = super::render_run_step_prompt(
+            "score",
+            "python3",
+            &["tools/score.py".into(), "fixtures/kr/001".into()],
+            std::path::Path::new("/work"),
+            &["CYBERBENCH_RELEASE_KEY".into()],
+        );
+        assert!(prompt.contains("python3 tools/score.py fixtures/kr/001"));
+        assert!(prompt.contains("/work"));
+        assert!(prompt.contains("CYBERBENCH_RELEASE_KEY"));
+        assert!(
+            !prompt.contains("release-secret"),
+            "env VALUES must never be printed"
+        );
+    }
+
+    #[test]
+    fn run_step_policy_maps_modes() {
+        use rupu_tools::PermissionMode;
+        let cfg = rupu_config::Config::default();
+        let wp = std::path::PathBuf::from("/w");
+
+        // readonly denies; ask and bypass both allow, matching how agent
+        // tool calls already resolve in a workflow (no operator mid-run).
+        assert_eq!(
+            super::run_step_policy_for("readonly", &cfg, wp.clone()).mode,
+            PermissionMode::Readonly
+        );
+        assert_eq!(
+            super::run_step_policy_for("ask", &cfg, wp.clone()).mode,
+            PermissionMode::Bypass
+        );
+        assert_eq!(
+            super::run_step_policy_for("bypass", &cfg, wp).mode,
+            PermissionMode::Bypass
+        );
+    }
+
+    #[test]
+    fn run_step_policy_carries_the_workspace_config() {
+        // The workspace opt-in must reach the runner; if this regresses,
+        // run: steps silently stay disabled (or silently become enabled).
+        let mut cfg = rupu_config::Config::default();
+        cfg.workflow.run_step_enabled = true;
+        cfg.workflow.run_step_allowlist = vec!["python3".into()];
+        let p = super::run_step_policy_for("bypass", &cfg, std::path::PathBuf::from("/w"));
+        assert!(p.config.run_step_enabled);
+        assert!(p.config.allows("python3"));
+        assert!(!p.config.allows("bash"));
+    }
+
     use super::*;
     use chrono::Utc;
     use rupu_orchestrator::{RunRecord, RunStatus};
