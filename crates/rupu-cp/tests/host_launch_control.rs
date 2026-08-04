@@ -7,6 +7,11 @@
 //! 4. Issues an HTTP request to the local CP with `host:<remote-id>`.
 //! 5. Asserts the mock was called and the response contains `{host_id, run_id}`.
 
+// Throwaway in-process mock-server client, not rupu's egress
+// (choke_point.rs's guard test already exempts everything under `/tests/`
+// on that basis).
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Arc;
 
 use reqwest::StatusCode;

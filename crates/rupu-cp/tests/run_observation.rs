@@ -9,6 +9,11 @@
 //! - `GET /api/transcript?path=<p>&host=<id>` proxies transcript to the mock.
 //! - Unknown `?host=` values → 404.
 
+// Throwaway in-process mock-server client, not rupu's egress
+// (choke_point.rs's guard test already exempts everything under `/tests/`
+// on that basis).
+#![allow(clippy::disallowed_methods)]
+
 use chrono::Utc;
 use reqwest::StatusCode;
 use rupu_orchestrator::runs::{RunRecord, RunStatus, RunStore};
