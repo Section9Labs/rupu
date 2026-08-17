@@ -88,8 +88,8 @@ alongside the binary — that's the reason to prefer it over the bare binary:
 
 ```sh
 sudo apt install ./rupu_<version>_amd64.deb
-# or
-sudo dnf install ./rupu-<version>.x86_64.rpm
+# or — note the `-1` package release field in the .rpm name
+sudo dnf install ./rupu-<version>-1.x86_64.rpm
 ```
 
 A package-installed `rupu` defers upgrades to the package manager (`rupu

@@ -73,34 +73,51 @@ pub(crate) fn load_cli_config() -> rupu_config::Config {
 ///
 /// `--check` is deliberately always allowed: a user should be able to learn
 /// they are behind no matter how they installed. Everything that would
-/// *write* the binary is refused, because the package manager owns
-/// `/usr/bin/rupu` — a self-update needs root and would be silently
-/// reverted by the next upgrade, leaving the version to go backwards for
-/// no visible reason.
+/// *write* the binary is refused, because the manager owns the file — a
+/// self-update would be silently reverted by the next `brew`/`apt`/`dnf`
+/// upgrade (leaving the version to go backwards for no visible reason), or
+/// refused outright by the read-only Nix store.
 ///
-/// Pure so the whole matrix is testable; `INSTALL_METHOD` is fixed at
-/// compile time and cannot be varied from a test.
-fn packaged_refusal(packaged: bool, pm: &str, check: bool, rollback: bool) -> Option<String> {
-    if !packaged {
-        return None;
-    }
+/// Takes the resolved owner rather than a bare bool so the message can name
+/// the *right* manager: Homebrew and the AUR install the plain published
+/// binary and carry no compile-time marker, so
+/// [`crate::build_info::installed_owner`] falls back to the exe path.
+///
+/// Pure so the whole matrix is testable; the real owner is fixed at compile
+/// time / by the exe path and cannot be varied from a test.
+fn packaged_refusal(
+    owner: Option<crate::build_info::InstallOwner>,
+    pm: &str,
+    check: bool,
+    rollback: bool,
+) -> Option<String> {
+    let owner = owner?;
     if check && !rollback {
         return None;
     }
     let action = if rollback { "roll back" } else { "update" };
-    // `pm` is only ever a real command name ("apt", "dnf") or the
-    // `UNKNOWN_PACKAGE_MANAGER_HINT` prose fallback — never interpolate the
-    // fallback into a backticked command, or an unrecognized distro (e.g.
-    // openSUSE) renders the uncopy-pasteable
+    let manager = match owner {
+        crate::build_info::InstallOwner::Brew => "Homebrew",
+        crate::build_info::InstallOwner::Nix => "Nix",
+        crate::build_info::InstallOwner::Distro => "a system package",
+    };
+    // Only ever name a command we can spell correctly. `upgrade_command`
+    // returns `None` for Nix (no single command) and for an unrecognized
+    // distro — interpolating the `UNKNOWN_PACKAGE_MANAGER_HINT` prose into a
+    // backticked command renders the uncopy-pasteable
     // `Run \`sudo your system package manager upgrade rupu\` instead.`
-    let upgrade_hint = if pm == crate::build_info::UNKNOWN_PACKAGE_MANAGER_HINT {
-        "Upgrade it with your system package manager instead.".to_string()
-    } else {
-        format!("Run `sudo {pm} upgrade rupu` instead.")
+    let upgrade_hint = match crate::build_info::upgrade_command(owner, pm) {
+        Some(cmd) => format!("Run `{cmd}` instead."),
+        // Nix has no single upgrade command (profile vs flake vs NixOS
+        // module); an unrecognized distro has no name we can spell.
+        None if owner == crate::build_info::InstallOwner::Nix => {
+            "Upgrade it through the Nix profile or flake that installed it instead.".to_string()
+        }
+        None => "Upgrade it with your system package manager instead.".to_string(),
     };
     Some(format!(
-        "rupu was installed from a system package, so it cannot {action} itself — \
-         the next `{pm} upgrade` would overwrite whatever it wrote.\n  \
+        "rupu was installed from {manager}, so it cannot {action} itself — \
+         whatever it wrote would be overwritten (or refused) by the manager that owns the file.\n  \
          {upgrade_hint}\n  \
          `rupu update --check` still works and will tell you if a newer version exists."
     ))
@@ -124,7 +141,7 @@ async fn run(args: UpdateArgs) -> anyhow::Result<ExitCode> {
     }
 
     if let Some(message) = packaged_refusal(
-        crate::build_info::is_packaged(),
+        crate::build_info::installed_owner(),
         crate::build_info::package_manager_hint(),
         args.check,
         args.rollback,
@@ -401,18 +418,52 @@ mod tests {
 #[cfg(test)]
 mod packaged_tests {
     use super::*;
+    use crate::build_info::InstallOwner;
+
+    /// The common case under test: a distro-package install (.deb/.rpm/AUR).
+    const DISTRO: Option<InstallOwner> = Some(InstallOwner::Distro);
+
+    #[test]
+    fn homebrew_is_refused_without_ever_saying_sudo_brew() {
+        // Homebrew installs the plain published binary, so it carries no
+        // compile-time package marker — the path is what gives it away. And
+        // `brew` refuses to run under sudo, so naming it would be wrong.
+        let msg = packaged_refusal(Some(InstallOwner::Brew), "apt", false, false)
+            .expect("a brew-owned binary must refuse to self-update");
+        assert!(msg.contains("Homebrew"), "message was: {msg}");
+        assert!(
+            msg.contains("Run `brew upgrade rupu` instead."),
+            "message was: {msg}"
+        );
+        assert!(!msg.contains("sudo brew"), "message was: {msg}");
+    }
+
+    #[test]
+    fn nix_is_refused_with_prose_not_a_made_up_command() {
+        // The Nix store is read-only and there is no single upgrade command.
+        let msg = packaged_refusal(Some(InstallOwner::Nix), "apt", false, false)
+            .expect("a nix-store binary must refuse to self-update");
+        assert!(msg.contains("Nix"), "message was: {msg}");
+        // No invented upgrade command — the `--check` mention at the end is
+        // the only backticked command, and that one is real.
+        assert!(
+            !msg.contains("Run `"),
+            "must not name an upgrade command: {msg}"
+        );
+        assert!(msg.contains("Nix profile or flake"), "message was: {msg}");
+    }
 
     #[test]
     fn unpackaged_installs_are_never_refused() {
         // Tarball / install.sh / dev builds own their own binary.
-        assert!(packaged_refusal(false, "apt", false, false).is_none());
-        assert!(packaged_refusal(false, "apt", true, false).is_none());
-        assert!(packaged_refusal(false, "apt", false, true).is_none());
+        assert!(packaged_refusal(None, "apt", false, false).is_none());
+        assert!(packaged_refusal(None, "apt", true, false).is_none());
+        assert!(packaged_refusal(None, "apt", false, true).is_none());
     }
 
     #[test]
     fn packaged_install_refuses_an_actual_update() {
-        let msg = packaged_refusal(true, "apt", false, false).expect("must refuse");
+        let msg = packaged_refusal(DISTRO, "apt", false, false).expect("must refuse");
         assert!(msg.contains("apt upgrade rupu"), "message was: {msg}");
         assert!(
             msg.contains("--check"),
@@ -424,7 +475,7 @@ mod packaged_tests {
     fn packaged_install_refuses_rollback() {
         // Rolling back under a package manager leaves it disagreeing with
         // what is on disk, and the next upgrade silently undoes it.
-        let msg = packaged_refusal(true, "dnf", false, true).expect("must refuse");
+        let msg = packaged_refusal(DISTRO, "dnf", false, true).expect("must refuse");
         assert!(msg.contains("dnf"), "message was: {msg}");
     }
 
@@ -432,20 +483,20 @@ mod packaged_tests {
     fn packaged_install_still_allows_check() {
         // A user must be able to learn they are behind regardless of how
         // they installed.
-        assert!(packaged_refusal(true, "apt", true, false).is_none());
+        assert!(packaged_refusal(DISTRO, "apt", true, false).is_none());
     }
 
     #[test]
     fn the_message_names_the_package_manager_it_was_given() {
-        let apt = packaged_refusal(true, "apt", false, false).unwrap();
-        let dnf = packaged_refusal(true, "dnf", false, false).unwrap();
+        let apt = packaged_refusal(DISTRO, "apt", false, false).unwrap();
+        let dnf = packaged_refusal(DISTRO, "dnf", false, false).unwrap();
         assert!(apt.contains("apt") && !apt.contains("dnf"));
         assert!(dnf.contains("dnf") && !dnf.contains("apt"));
     }
 
     #[test]
     fn an_unknown_distro_still_refuses_without_naming_a_wrong_command() {
-        let msg = packaged_refusal(true, "your system package manager", false, false)
+        let msg = packaged_refusal(DISTRO, "your system package manager", false, false)
             .expect("must still refuse");
         assert!(
             msg.contains("your system package manager"),
@@ -465,12 +516,12 @@ mod packaged_tests {
 
     #[test]
     fn a_known_distro_keeps_the_exact_backticked_command() {
-        let apt = packaged_refusal(true, "apt", false, false).expect("must refuse");
+        let apt = packaged_refusal(DISTRO, "apt", false, false).expect("must refuse");
         assert!(
             apt.contains("Run `sudo apt upgrade rupu` instead."),
             "message was: {apt}"
         );
-        let dnf = packaged_refusal(true, "dnf", false, false).expect("must refuse");
+        let dnf = packaged_refusal(DISTRO, "dnf", false, false).expect("must refuse");
         assert!(
             dnf.contains("Run `sudo dnf upgrade rupu` instead."),
             "message was: {dnf}"
@@ -482,7 +533,7 @@ mod packaged_tests {
         // `--check` alone is allowed, but pairing it with `--rollback` must
         // not smuggle a rollback past the refusal — the flags are not
         // mutually exclusive in clap, so this combination is reachable.
-        let msg = packaged_refusal(true, "apt", true, true)
+        let msg = packaged_refusal(DISTRO, "apt", true, true)
             .expect("check + rollback must still be refused");
         assert!(msg.contains("roll back"), "message was: {msg}");
     }
