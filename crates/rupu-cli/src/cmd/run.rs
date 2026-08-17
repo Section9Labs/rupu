@@ -570,7 +570,6 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // promptly rather than rely on that ticker's multi-second cadence).
     let (netflow_sink, netflow_handle) =
         build_netflow_sink(project_root.as_deref(), &pwd, &transcript_path);
-    rupu_netflow::http::init(netflow_sink);
 
     // Everything below that can generate outbound HTTP (provider build,
     // SCM registry discovery, repo clone, the agent run itself) is wrapped
@@ -589,7 +588,11 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // Build the SCM/issue registry from the same resolver + config the
         // LLM provider factory uses. Cheap when no platforms are configured;
         // missing credentials are skipped with INFO logs.
-        let scm_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
+        // TODO(netflow task 7): pass the run's sink
+        let scm_registry = Arc::new(
+            rupu_scm::Registry::discover(resolver.as_ref(), &cfg, Arc::new(rupu_netflow::NullSink))
+                .await,
+        );
 
         let provider_name = provider_factory::resolve_provider_name(
             spec.provider.as_deref(),

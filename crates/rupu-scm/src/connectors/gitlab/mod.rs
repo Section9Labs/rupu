@@ -27,6 +27,7 @@ use crate::connectors::{IssueConnector, RepoConnector};
 pub async fn try_build(
     resolver: &dyn CredentialResolver,
     cfg: &Config,
+    sink: Arc<dyn rupu_netflow::FlowSink>,
 ) -> Result<
     Option<(
         Arc<dyn RepoConnector>,
@@ -45,7 +46,7 @@ pub async fn try_build(
     let opts = crate::client_options::ScmClientOptions::from_platform_config(
         cfg.scm.platforms.get("gitlab"),
     );
-    let client = GitlabClient::with_options(token, &opts);
+    let client = GitlabClient::with_options(token, &opts, sink);
     let repo: Arc<dyn RepoConnector> = Arc::new(GitlabRepoConnector::new(client.clone()));
     let issues: Arc<dyn IssueConnector> = Arc::new(GitlabIssueConnector::new(client.clone()));
     let extras = Arc::new(GitlabExtras::new(client));

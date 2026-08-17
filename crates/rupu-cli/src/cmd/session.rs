@@ -1328,7 +1328,12 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     }
 
     let resolver = rupu_auth::KeychainResolver::new();
-    let scm_registry = Arc::new(rupu_scm::Registry::discover(&resolver, &cfg).await);
+    // No run exists yet at this point, so this SCM traffic is not attributed
+    // to a ledger. A run-routing FlowSink would close this; see the netflow
+    // per-run plan.
+    let scm_registry = Arc::new(
+        rupu_scm::Registry::discover(&resolver, &cfg, Arc::new(rupu_netflow::NullSink)).await,
+    );
 
     let effective_prompt = args.prompt_flag.clone().or_else(|| args.prompt.clone());
     let (run_target, user_message) = match args.target.as_deref() {
@@ -6812,7 +6817,10 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         .map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
     let resolver = rupu_auth::KeychainResolver::new();
-    let scm_registry = Arc::new(rupu_scm::Registry::discover(&resolver, &cfg).await);
+    // TODO(netflow task 7): pass the run's sink
+    let scm_registry = Arc::new(
+        rupu_scm::Registry::discover(&resolver, &cfg, Arc::new(rupu_netflow::NullSink)).await,
+    );
 
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,

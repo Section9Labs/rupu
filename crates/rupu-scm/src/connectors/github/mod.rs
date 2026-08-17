@@ -27,6 +27,7 @@ pub use repo::GithubRepoConnector;
 pub async fn try_build(
     resolver: &dyn CredentialResolver,
     cfg: &Config,
+    sink: Arc<dyn rupu_netflow::FlowSink>,
 ) -> Result<
     Option<(
         Arc<dyn RepoConnector>,
@@ -45,7 +46,7 @@ pub async fn try_build(
     let opts = crate::client_options::ScmClientOptions::from_platform_config(
         cfg.scm.platforms.get("github"),
     );
-    let client = GithubClient::with_options(token, &opts);
+    let client = GithubClient::with_options(token, &opts, sink);
     let repo: Arc<dyn RepoConnector> = Arc::new(repo::GithubRepoConnector::new(client.clone()));
     let issues: Arc<dyn IssueConnector> =
         Arc::new(issues::GithubIssueConnector::new(client.clone()));

@@ -228,7 +228,11 @@ async fn rebuild_opts_from_disk(
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
-    let mcp_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
+    // TODO(netflow task 7): pass the run's sink
+    let mcp_registry = Arc::new(
+        rupu_scm::Registry::discover(resolver.as_ref(), &cfg, Arc::new(rupu_netflow::NullSink))
+            .await,
+    );
 
     // ISSUES.md I-24: precedence, most specific first — an explicit
     // `--mode` on the calling command (if one exists; `reject` has none),

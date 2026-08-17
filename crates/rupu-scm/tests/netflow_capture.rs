@@ -24,10 +24,10 @@
 //! migration) with no seam to redirect it to a mock server, so driving it
 //! for real would require live network I/O against the real GitHub API.
 //!
-//! `rupu_netflow::http::init` is process-wide and first-call-wins. This file
-//! has exactly ONE test that calls it (`real_connectors_...`); the other two
-//! use `client_with`'s explicit-sink overload, which never touches the
-//! global one — so there is no cross-test race within this binary.
+//! There is deliberately no process-global sink (see `rupu_netflow::http`'s
+//! module doc): every connector constructor below takes the same
+//! `Arc<dyn FlowSink>` explicitly, so there is no cross-test race within
+//! this binary.
 
 use rupu_netflow::{FlowCtx, MemorySink, Origin};
 use rupu_scm::client_options::ScmClientOptions;
@@ -95,7 +95,6 @@ async fn private_token_in_a_query_never_reaches_the_record() {
 async fn real_connectors_reach_the_netflow_sink_with_scm_origin() {
     rupu_scm::install_default_crypto_provider();
     let sink = Arc::new(MemorySink::default());
-    rupu_netflow::http::init(sink.clone());
 
     // ── GitLab: GitlabEventConnector::poll_events ──────────────────────────
     {
@@ -114,7 +113,8 @@ async fn real_connectors_reach_the_netflow_sink_with_scm_origin() {
             })
             .await;
 
-        let connector = GitlabEventConnector::new("glpat-fake".into(), Some(server.base_url()));
+        let connector =
+            GitlabEventConnector::new("glpat-fake".into(), Some(server.base_url()), sink.clone());
         let source = EventSourceRef::Repo {
             repo: RepoRef {
                 platform: Platform::Gitlab,
@@ -144,7 +144,12 @@ async fn real_connectors_reach_the_netflow_sink_with_scm_origin() {
             })
             .await;
 
-        let client = GitlabClient::new("glpat-fake".into(), Some(server.base_url()), Some(1));
+        let client = GitlabClient::new(
+            "glpat-fake".into(),
+            Some(server.base_url()),
+            Some(1),
+            sink.clone(),
+        );
         client
             .get_json("/projects/1")
             .await
@@ -181,6 +186,7 @@ async fn real_connectors_reach_the_netflow_sink_with_scm_origin() {
             "lin_api_fake".into(),
             Some(server.url("/")),
             Some(temp.path().to_path_buf()),
+            sink.clone(),
         );
         let source = EventSourceRef::TrackerProject {
             tracker: IssueTracker::Linear,
@@ -216,7 +222,8 @@ async fn real_connectors_reach_the_netflow_sink_with_scm_origin() {
             })
             .await;
 
-        let connector = LinearIssueConnector::new("lin_api_fake".into(), Some(server.url("/")));
+        let connector =
+            LinearIssueConnector::new("lin_api_fake".into(), Some(server.url("/")), sink.clone());
         connector
             .list_issues("team-1", IssueFilter::default())
             .await
@@ -253,6 +260,7 @@ async fn real_connectors_reach_the_netflow_sink_with_scm_origin() {
             },
             Some(server.base_url()),
             Some(temp.path().to_path_buf()),
+            sink.clone(),
         );
         let source = EventSourceRef::TrackerProject {
             tracker: IssueTracker::Jira,
@@ -294,7 +302,8 @@ async fn real_connectors_reach_the_netflow_sink_with_scm_origin() {
         let creds = rupu_providers::auth::AuthCredentials::ApiKey {
             key: "matt@example.com:tok".into(),
         };
-        let connector = JiraIssueConnector::new(creds, Some(server.base_url())).unwrap();
+        let connector =
+            JiraIssueConnector::new(creds, Some(server.base_url()), sink.clone()).unwrap();
         connector
             .get_issue(&IssueRef {
                 tracker: IssueTracker::Jira,
@@ -318,7 +327,12 @@ async fn real_connectors_reach_the_netflow_sink_with_scm_origin() {
             })
             .await;
 
-        let client = GithubClient::new("ghp_fake".into(), Some(server.base_url()), Some(1));
+        let client = GithubClient::new(
+            "ghp_fake".into(),
+            Some(server.base_url()),
+            Some(1),
+            sink.clone(),
+        );
         client
             .graphql_json("query { viewer { login } }", serde_json::json!({}))
             .await
@@ -342,7 +356,8 @@ async fn real_connectors_reach_the_netflow_sink_with_scm_origin() {
             })
             .await;
 
-        let connector = GithubEventConnector::new("ghp_fake".into(), Some(server.base_url()));
+        let connector =
+            GithubEventConnector::new("ghp_fake".into(), Some(server.base_url()), sink.clone());
         let source = EventSourceRef::Repo {
             repo: RepoRef {
                 platform: Platform::Github,

@@ -99,10 +99,12 @@ impl ScmClientOptions {
     pub fn netflow_client(
         &self,
         platform: &str,
+        sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
     ) -> reqwest::Result<reqwest_middleware::ClientWithMiddleware> {
-        rupu_netflow::http::client_from(
+        rupu_netflow::http::client_with(
             rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm(platform.to_string())),
             self.http_client_builder(),
+            sink,
         )
     }
 }

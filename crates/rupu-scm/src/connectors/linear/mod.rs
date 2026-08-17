@@ -20,6 +20,7 @@ use crate::connectors::IssueConnector;
 pub async fn try_build(
     resolver: &dyn CredentialResolver,
     cfg: &Config,
+    sink: Arc<dyn rupu_netflow::FlowSink>,
 ) -> Result<Option<Arc<dyn IssueConnector>>> {
     let creds = match resolver
         .get("linear", Some(rupu_providers::AuthMode::ApiKey))
@@ -37,5 +38,7 @@ pub async fn try_build(
         .platforms
         .get("linear")
         .and_then(|platform| platform.base_url.clone());
-    Ok(Some(Arc::new(LinearIssueConnector::new(token, base_url))))
+    Ok(Some(Arc::new(LinearIssueConnector::new(
+        token, base_url, sink,
+    ))))
 }

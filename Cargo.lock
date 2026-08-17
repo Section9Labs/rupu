@@ -6325,6 +6325,7 @@ dependencies = [
  "rupu-app-canvas",
  "rupu-auth",
  "rupu-config",
+ "rupu-netflow",
  "rupu-orchestrator",
  "rupu-providers",
  "rupu-runtime",

@@ -20,6 +20,7 @@ use crate::connectors::IssueConnector;
 pub async fn try_build(
     resolver: &dyn CredentialResolver,
     cfg: &Config,
+    sink: Arc<dyn rupu_netflow::FlowSink>,
 ) -> Result<Option<Arc<dyn IssueConnector>>> {
     let creds = match resolver
         .get("jira", Some(rupu_providers::AuthMode::ApiKey))
@@ -33,5 +34,7 @@ pub async fn try_build(
         .platforms
         .get("jira")
         .and_then(|platform| platform.base_url.clone());
-    Ok(Some(Arc::new(JiraIssueConnector::new(creds, base_url)?)))
+    Ok(Some(Arc::new(JiraIssueConnector::new(
+        creds, base_url, sink,
+    )?)))
 }

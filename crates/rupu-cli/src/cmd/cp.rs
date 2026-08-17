@@ -354,7 +354,14 @@ pub async fn handle(action: Action) -> ExitCode {
                 let global_cfg = global_dir.join("config.toml");
                 let cfg =
                     rupu_config::layer_files_locked(Some(&global_cfg), None).unwrap_or_default();
-                Arc::new(rupu_scm::Registry::discover(scm_resolver.as_ref(), &cfg).await)
+                Arc::new(
+                    rupu_scm::Registry::discover(
+                        scm_resolver.as_ref(),
+                        &cfg,
+                        Arc::new(rupu_netflow::NullSink),
+                    )
+                    .await,
+                )
             };
             let repo_lister: Arc<dyn rupu_cp::repos::RepoLister> =
                 Arc::new(crate::cp_repos::CpRepoLister {

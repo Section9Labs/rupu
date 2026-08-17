@@ -71,7 +71,18 @@ impl Registry {
     /// is probed independently; missing credentials are logged at INFO
     /// level and skipped. Errors during build are logged at WARN level
     /// and also skipped — the registry continues with whatever succeeded.
-    pub async fn discover(resolver: &dyn CredentialResolver, cfg: &Config) -> Self {
+    ///
+    /// `sink` is stored on every connector this call builds and is reused
+    /// for every future call through them — a `Registry` is long-lived
+    /// relative to any one run (see the module doc / netflow-per-run plan).
+    /// Callers backing a single in-flight run pass that run's
+    /// `Arc<dyn FlowSink>`; run-less callers (bare CLI list commands, cron
+    /// pollers) pass `Arc::new(rupu_netflow::NullSink)`.
+    pub async fn discover(
+        resolver: &dyn CredentialResolver,
+        cfg: &Config,
+        sink: Arc<dyn rupu_netflow::FlowSink>,
+    ) -> Self {
         // Capture `[scm.default]` / `[issues.default]` up front so
         // `default_platform`/`default_tracker` can consult them later
         // without needing the `Config` back in scope. An unset or
@@ -97,7 +108,7 @@ impl Registry {
         };
 
         // GitHub
-        match crate::connectors::github::try_build(resolver, cfg).await {
+        match crate::connectors::github::try_build(resolver, cfg, sink.clone()).await {
             Ok(Some((repo, issues, extras))) => {
                 reg.repo_connectors.insert(Platform::Github, repo);
                 reg.issue_connectors.insert(IssueTracker::Github, issues);
@@ -114,7 +125,7 @@ impl Registry {
         // GitHub events (separate path because it uses reqwest directly
         // rather than octocrab; same credential resolver). No-op when
         // GitHub credentials are absent.
-        match crate::connectors::github::events::try_build(resolver, cfg).await {
+        match crate::connectors::github::events::try_build(resolver, cfg, sink.clone()).await {
             Ok(Some(c)) => {
                 reg.event_connectors.insert(Platform::Github, c);
             }
@@ -125,7 +136,7 @@ impl Registry {
         }
 
         // GitLab
-        match crate::connectors::gitlab::try_build(resolver, cfg).await {
+        match crate::connectors::gitlab::try_build(resolver, cfg, sink.clone()).await {
             Ok(Some((repo, issues, extras))) => {
                 reg.repo_connectors.insert(Platform::Gitlab, repo);
                 reg.issue_connectors.insert(IssueTracker::Gitlab, issues);
@@ -140,7 +151,7 @@ impl Registry {
         }
 
         // GitLab events.
-        match crate::connectors::gitlab::events::try_build(resolver, cfg).await {
+        match crate::connectors::gitlab::events::try_build(resolver, cfg, sink.clone()).await {
             Ok(Some(c)) => {
                 reg.event_connectors.insert(Platform::Gitlab, c);
             }
@@ -151,7 +162,7 @@ impl Registry {
         }
 
         // Linear events.
-        match crate::connectors::linear::try_build(resolver, cfg).await {
+        match crate::connectors::linear::try_build(resolver, cfg, sink.clone()).await {
             Ok(Some(issues)) => {
                 reg.issue_connectors.insert(IssueTracker::Linear, issues);
             }
@@ -164,7 +175,7 @@ impl Registry {
         }
 
         // Linear events.
-        match crate::connectors::linear::events::try_build(resolver, cfg).await {
+        match crate::connectors::linear::events::try_build(resolver, cfg, sink.clone()).await {
             Ok(Some(c)) => {
                 reg.tracker_event_connectors.insert(IssueTracker::Linear, c);
             }
@@ -175,7 +186,7 @@ impl Registry {
         }
 
         // Jira issues.
-        match crate::connectors::jira::try_build(resolver, cfg).await {
+        match crate::connectors::jira::try_build(resolver, cfg, sink.clone()).await {
             Ok(Some(issues)) => {
                 reg.issue_connectors.insert(IssueTracker::Jira, issues);
             }
@@ -188,7 +199,7 @@ impl Registry {
         }
 
         // Jira events.
-        match crate::connectors::jira::events::try_build(resolver, cfg).await {
+        match crate::connectors::jira::events::try_build(resolver, cfg, sink.clone()).await {
             Ok(Some(c)) => {
                 reg.tracker_event_connectors.insert(IssueTracker::Jira, c);
             }

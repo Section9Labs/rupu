@@ -3161,7 +3161,11 @@ pub(crate) async fn resume_run(
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
-    let mcp_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
+    // TODO(netflow task 7): pass the run's sink
+    let mcp_registry = Arc::new(
+        rupu_scm::Registry::discover(resolver.as_ref(), &cfg, Arc::new(rupu_netflow::NullSink))
+            .await,
+    );
 
     let mode_str = mode.unwrap_or("ask").to_string();
 
@@ -3997,7 +4001,11 @@ async fn run_with_outcome(
     // Build the SCM/issue registry once for the entire workflow run.
     // Cheap when no platforms are configured; missing credentials are
     // skipped with INFO logs.
-    let mcp_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
+    // TODO(netflow task 7): pass the run's sink
+    let mcp_registry = Arc::new(
+        rupu_scm::Registry::discover(resolver.as_ref(), &cfg, Arc::new(rupu_netflow::NullSink))
+            .await,
+    );
 
     // Parse the workflow-level target (if any) and derive a system-prompt
     // suffix that each step prepends. Clone-to-tmpdir for Repo/Pr targets
@@ -4599,7 +4607,11 @@ async fn execute_workflow_invocation(
         .as_ref()
         .map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
-    let mcp_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
+    // TODO(netflow task 7): pass the run's sink
+    let mcp_registry = Arc::new(
+        rupu_scm::Registry::discover(resolver.as_ref(), &cfg, Arc::new(rupu_netflow::NullSink))
+            .await,
+    );
 
     let transcripts = paths::transcripts_dir(&global, ctx.project_root.as_deref());
     paths::ensure_dir(&transcripts)?;

@@ -37,17 +37,22 @@ pub struct LinearEventConnector {
 }
 
 impl LinearEventConnector {
-    pub fn new(token: String, base_url: Option<String>, snapshot_root: Option<PathBuf>) -> Self {
+    pub fn new(
+        token: String,
+        base_url: Option<String>,
+        snapshot_root: Option<PathBuf>,
+        sink: Arc<dyn rupu_netflow::FlowSink>,
+    ) -> Self {
         Self {
-            http: rupu_netflow::http::client_from(
+            // Infallible constructor (`-> Self`); `.expect()` preserves the
+            // deleted `http::client()` fallback's panic-on-failure behaviour.
+            // No fallback to an uninstrumented client.
+            http: rupu_netflow::http::client_with(
                 rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm("linear".into())),
                 reqwest::Client::builder(),
+                sink,
             )
-            .unwrap_or_else(|_| {
-                rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
-                    rupu_netflow::Origin::Scm("linear".into()),
-                ))
-            }),
+            .expect("linear events netflow client build"),
             token,
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             snapshot_root: snapshot_root.unwrap_or_else(default_snapshot_root),
@@ -638,6 +643,7 @@ fn truncate_message(body: &str) -> String {
 pub async fn try_build(
     resolver: &dyn rupu_auth::CredentialResolver,
     cfg: &rupu_config::Config,
+    sink: Arc<dyn rupu_netflow::FlowSink>,
 ) -> anyhow::Result<Option<Arc<dyn EventConnector>>> {
     let creds = match resolver
         .get("linear", Some(rupu_providers::AuthMode::ApiKey))
@@ -656,7 +662,7 @@ pub async fn try_build(
         .get("linear")
         .and_then(|platform| platform.base_url.clone());
     Ok(Some(Arc::new(LinearEventConnector::new(
-        token, base_url, None,
+        token, base_url, None, sink,
     ))))
 }
 
@@ -899,6 +905,7 @@ mod tests {
             "lin_api_test".into(),
             Some(server.url("/")),
             Some(temp.path().to_path_buf()),
+            Arc::new(rupu_netflow::NullSink),
         );
 
         let result = connector
@@ -978,6 +985,7 @@ mod tests {
             "lin_api_test".into(),
             Some(server.url("/")),
             Some(temp.path().to_path_buf()),
+            Arc::new(rupu_netflow::NullSink),
         );
 
         let result = connector

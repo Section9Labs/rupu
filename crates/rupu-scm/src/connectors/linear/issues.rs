@@ -18,17 +18,21 @@ pub struct LinearIssueConnector {
 }
 
 impl LinearIssueConnector {
-    pub fn new(token: String, base_url: Option<String>) -> Self {
+    pub fn new(
+        token: String,
+        base_url: Option<String>,
+        sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
+    ) -> Self {
         Self {
-            http: rupu_netflow::http::client_from(
+            // Infallible constructor (`-> Self`); `.expect()` preserves the
+            // deleted `http::client()` fallback's panic-on-failure behaviour.
+            // No fallback to an uninstrumented client.
+            http: rupu_netflow::http::client_with(
                 rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm("linear".into())),
                 reqwest::Client::builder(),
+                sink,
             )
-            .unwrap_or_else(|_| {
-                rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
-                    rupu_netflow::Origin::Scm("linear".into()),
-                ))
-            }),
+            .expect("linear issues netflow client build"),
             token,
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
         }

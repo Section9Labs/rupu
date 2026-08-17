@@ -11,6 +11,7 @@ fn connector_against(server: &MockServer) -> JiraIssueConnector {
             key: "matt@example.com:api-token".into(),
         },
         Some(server.base_url()),
+        std::sync::Arc::new(rupu_netflow::NullSink),
     )
     .unwrap()
 }

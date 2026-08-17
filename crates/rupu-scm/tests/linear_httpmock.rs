@@ -3,7 +3,11 @@ use rupu_scm::connectors::linear::LinearIssueConnector;
 use rupu_scm::connectors::IssueConnector;
 
 fn connector_against(server: &MockServer) -> LinearIssueConnector {
-    LinearIssueConnector::new("lin_api_test".into(), Some(server.base_url()))
+    LinearIssueConnector::new(
+        "lin_api_test".into(),
+        Some(server.base_url()),
+        std::sync::Arc::new(rupu_netflow::NullSink),
+    )
 }
 
 fn issue_node(identifier: &str, state_type: &str, label_name: &str) -> serde_json::Value {
