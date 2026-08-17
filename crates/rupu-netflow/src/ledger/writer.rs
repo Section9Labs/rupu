@@ -294,7 +294,7 @@ mod tests {
     #[tokio::test]
     async fn writer_appends_flow_and_complete_lines() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let paths = NetflowPaths::new(tmp.path());
+        let paths = NetflowPaths::for_run(tmp.path(), "run-1");
         let handle = NetflowWriterHandle::spawn(paths.clone()).unwrap();
 
         let id = FlowId::from_parts(9, 9);
@@ -341,7 +341,7 @@ mod tests {
         // finally runs. Only then is the production `shutdown()` called,
         // exercising the real close-then-drain fix end to end.
         let tmp = tempfile::TempDir::new().unwrap();
-        let paths = NetflowPaths::new(tmp.path());
+        let paths = NetflowPaths::for_run(tmp.path(), "run-1");
         let handle = NetflowWriterHandle::spawn(paths.clone()).unwrap();
         let writer_clone = handle.writer.clone();
 
@@ -404,7 +404,7 @@ mod tests {
     #[tokio::test]
     async fn dropped_count_is_recorded_not_silent() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let paths = NetflowPaths::new(tmp.path());
+        let paths = NetflowPaths::for_run(tmp.path(), "run-1");
         let handle = NetflowWriterHandle::spawn_with_capacity(paths.clone(), 1).unwrap();
 
         // Flood far past the channel capacity. The writer task cannot
@@ -462,7 +462,7 @@ mod tests {
     #[tokio::test]
     async fn loss_becomes_visible_without_an_explicit_shutdown() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let paths = NetflowPaths::new(tmp.path());
+        let paths = NetflowPaths::for_run(tmp.path(), "run-1");
         let handle = NetflowWriterHandle::spawn_with_capacity_and_interval(
             paths.clone(),
             1,
