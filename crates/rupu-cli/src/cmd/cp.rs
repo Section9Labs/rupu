@@ -1403,6 +1403,32 @@ mod tests {
         );
     }
 
+    /// Poll for the capture script's argv output and return it.
+    ///
+    /// Waits for a NON-EMPTY read, which is the whole point: the script is
+    /// `echo "$@" >> file`, and the shell's `>>` redirect creates the file
+    /// *before* `echo` writes into it. Breaking on the first successful
+    /// `read_to_string` therefore has a real window in which it returns
+    /// `Ok("")` — the child has started but not yet written. On a loaded
+    /// runner that window is wide enough to hit, and an empty capture
+    /// silently satisfies any `!captured.contains(..)` assertion, so this
+    /// was both a flake and a false-negative.
+    async fn poll_captured_argv(capture_path: &std::path::Path) -> String {
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(capture_path) {
+                if !s.trim().is_empty() {
+                    return s;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "capture script should have run and recorded its argv within 2s \
+             (at {})",
+            capture_path.display()
+        );
+    }
+
     /// A 2-gate `AwaitingApproval` run for the resume-worker round-trip
     /// tests — both `gate_a` and `gate_b` genuinely parked.
     fn multi_gate_resume_record(id: &str) -> rupu_orchestrator::RunRecord {
@@ -1526,15 +1552,7 @@ mod tests {
 
         // The script runs asynchronously (detached, not awaited by
         // `resume_one_run` itself) — poll briefly for its output.
-        let mut captured = None;
-        for _ in 0..100 {
-            if let Ok(s) = std::fs::read_to_string(&capture_path) {
-                captured = Some(s);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let captured = captured.expect("capture script should have run and recorded its argv");
+        let captured = poll_captured_argv(&capture_path).await;
         assert!(
             captured.contains("--gate gate_b"),
             "spawned child's argv was: {captured:?} — missing --gate gate_b"
@@ -1603,15 +1621,10 @@ mod tests {
         )
         .await;
 
-        let mut captured = None;
-        for _ in 0..100 {
-            if let Ok(s) = std::fs::read_to_string(&capture_path) {
-                captured = Some(s);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let captured = captured.expect("capture script should have run and recorded its argv");
+        // Must wait for a non-empty capture: this assertion is a negative
+        // one, so an empty string would satisfy it vacuously and let the
+        // test pass even if the child never spawned.
+        let captured = poll_captured_argv(&capture_path).await;
         assert!(
             !captured.contains("--gate"),
             "sole-gate resume must not pass --gate: {captured:?}"
