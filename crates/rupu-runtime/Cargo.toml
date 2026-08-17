@@ -29,6 +29,7 @@ rupu-providers = { path = "../rupu-providers" }
 rupu-auth = { path = "../rupu-auth" }
 rupu-agent = { path = "../rupu-agent" }
 rupu-config = { path = "../rupu-config" }
+rupu-netflow = { workspace = true, features = ["http"] }
 
 [dev-dependencies]
 serde_json.workspace = true
@@ -36,3 +37,4 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 rupu-auth = { path = "../rupu-auth" }
 rupu-providers = { path = "../rupu-providers" }
+httpmock.workspace = true
