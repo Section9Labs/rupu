@@ -27,10 +27,21 @@ const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 /// `FlowCtx::system(Origin::Provider("gemini"))`. `with_tuning` (the
 /// path every factory-built client goes through) rebuilds this with the
 /// configured timeout via `client_with`, reusing the same sink.
-fn gemini_http_client(sink: Arc<dyn rupu_netflow::FlowSink>) -> ClientWithMiddleware {
+///
+/// Fallible rather than panicking: `client_with`'s only failure mode is
+/// `builder.build()` (TLS backend / resolver init), an environment
+/// condition a long-lived daemon (`rupu cp serve`) can genuinely hit per
+/// run. `new` already returns `Result`, so this propagates via `?`
+/// instead of aborting the process.
+fn gemini_http_client(
+    sink: Arc<dyn rupu_netflow::FlowSink>,
+) -> Result<ClientWithMiddleware, ProviderError> {
     let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider("gemini".into()));
-    rupu_netflow::http::client_with(ctx, reqwest::Client::builder(), sink)
-        .expect("reqwest TLS backend failed to initialise; no HTTP client can be built")
+    Ok(rupu_netflow::http::client_with(
+        ctx,
+        reqwest::Client::builder(),
+        sink,
+    )?)
 }
 
 /// Canonical provider tag stamped on Reasoning blocks; gates the replay.
@@ -181,7 +192,7 @@ impl GoogleGeminiClient {
                     .to_string();
 
                 Ok(Self {
-                    client: gemini_http_client(sink.clone()),
+                    client: gemini_http_client(sink.clone())?,
                     sink,
                     variant,
                     access_token: access,
@@ -192,7 +203,7 @@ impl GoogleGeminiClient {
                 })
             }
             (AuthCredentials::ApiKey { key, .. }, GeminiVariant::AiStudio) => Ok(Self {
-                client: gemini_http_client(sink.clone()),
+                client: gemini_http_client(sink.clone())?,
                 sink,
                 variant,
                 access_token: key,

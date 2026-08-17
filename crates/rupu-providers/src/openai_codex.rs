@@ -21,10 +21,21 @@ const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// `FlowCtx::system(Origin::Provider("openai"))`. `with_tuning` (the
 /// path every factory-built client goes through) rebuilds this with the
 /// configured timeout via `client_with`, reusing the same sink.
-fn codex_http_client(sink: Arc<dyn rupu_netflow::FlowSink>) -> ClientWithMiddleware {
+///
+/// Fallible rather than panicking: `client_with`'s only failure mode is
+/// `builder.build()` (TLS backend / resolver init), an environment
+/// condition a long-lived daemon (`rupu cp serve`) can genuinely hit per
+/// run. `new` already returns `Result`, so this propagates via `?`
+/// instead of aborting the process.
+fn codex_http_client(
+    sink: Arc<dyn rupu_netflow::FlowSink>,
+) -> Result<ClientWithMiddleware, ProviderError> {
     let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider("openai".into()));
-    rupu_netflow::http::client_with(ctx, reqwest::Client::builder(), sink)
-        .expect("reqwest TLS backend failed to initialise; no HTTP client can be built")
+    Ok(rupu_netflow::http::client_with(
+        ctx,
+        reqwest::Client::builder(),
+        sink,
+    )?)
 }
 
 /// OpenAI's Responses API enforces `^[a-zA-Z0-9_-]+$` on tool names
@@ -222,7 +233,7 @@ impl OpenAiCodexClient {
                     });
 
                 Ok(Self {
-                    client: codex_http_client(sink.clone()),
+                    client: codex_http_client(sink.clone())?,
                     sink,
                     access_token: access,
                     refresh_token: refresh,
@@ -235,7 +246,7 @@ impl OpenAiCodexClient {
                 })
             }
             AuthCredentials::ApiKey { key } => Ok(Self {
-                client: codex_http_client(sink.clone()),
+                client: codex_http_client(sink.clone())?,
                 sink,
                 access_token: key,
                 refresh_token: String::new(),

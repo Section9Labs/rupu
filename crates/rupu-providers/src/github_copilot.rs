@@ -21,10 +21,21 @@ const COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/toke
 /// `FlowCtx::system(Origin::Provider("copilot"))`. `with_tuning` (the
 /// path every factory-built client goes through) rebuilds this with the
 /// configured timeout via `client_with`, reusing the same sink.
-fn copilot_http_client(sink: Arc<dyn rupu_netflow::FlowSink>) -> ClientWithMiddleware {
+///
+/// Fallible rather than panicking: `client_with`'s only failure mode is
+/// `builder.build()` (TLS backend / resolver init), an environment
+/// condition a long-lived daemon (`rupu cp serve`) can genuinely hit per
+/// run. `new` already returns `Result`, so this propagates via `?`
+/// instead of aborting the process.
+fn copilot_http_client(
+    sink: Arc<dyn rupu_netflow::FlowSink>,
+) -> Result<ClientWithMiddleware, ProviderError> {
     let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider("copilot".into()));
-    rupu_netflow::http::client_with(ctx, reqwest::Client::builder(), sink)
-        .expect("reqwest TLS backend failed to initialise; no HTTP client can be built")
+    Ok(rupu_netflow::http::client_with(
+        ctx,
+        reqwest::Client::builder(),
+        sink,
+    )?)
 }
 
 /// GitHub Copilot client using OpenAI chat/completions format.
@@ -90,7 +101,7 @@ impl GithubCopilotClient {
                     .map(String::from);
 
                 Ok(Self {
-                    client: copilot_http_client(sink.clone()),
+                    client: copilot_http_client(sink.clone())?,
                     sink,
                     github_token: access,
                     copilot_token: String::new(),
@@ -101,7 +112,7 @@ impl GithubCopilotClient {
                 })
             }
             AuthCredentials::ApiKey { key } => Ok(Self {
-                client: copilot_http_client(sink.clone()),
+                client: copilot_http_client(sink.clone())?,
                 sink,
                 github_token: key,
                 copilot_token: String::new(),
