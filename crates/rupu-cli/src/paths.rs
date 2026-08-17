@@ -42,6 +42,24 @@ pub fn transcripts_dir(global: &Path, project_root: Option<&Path>) -> PathBuf {
     global.join("transcripts")
 }
 
+/// Pick the netflow directory. Project-local when
+/// `<project>/.rupu/netflow/` exists; global default otherwise.
+///
+/// Deliberately the same shape as [`transcripts_dir`] — a netflow ledger
+/// has the same lifecycle as a transcript and the two resolutions must not
+/// drift. The existence check is load-bearing: a repo that was never
+/// `rupu init`'d falls back to global, so no ledger is ever written inside
+/// a project that has not opted in.
+pub fn netflow_dir(global: &Path, project_root: Option<&Path>) -> PathBuf {
+    if let Some(p) = project_root {
+        let local = p.join(".rupu/netflow");
+        if local.is_dir() {
+            return local;
+        }
+    }
+    global.join("netflow")
+}
+
 /// Global repo registry directory.
 pub fn repos_dir(global: &Path) -> PathBuf {
     global.join("repos")
@@ -60,6 +78,11 @@ pub fn archived_sessions_dir(global: &Path) -> PathBuf {
 /// Archive directory nested under a transcript root.
 pub fn archived_transcripts_dir(transcripts_dir: &Path) -> PathBuf {
     transcripts_dir.join("archive")
+}
+
+/// Archive directory nested under a netflow root.
+pub fn archived_netflow_dir(netflow_dir: &Path) -> PathBuf {
+    netflow_dir.join("archive")
 }
 
 /// Global UI theme directory.
@@ -132,4 +155,48 @@ pub fn autoflow_wake_dedupe_dir(global: &Path) -> PathBuf {
 pub fn ensure_dir(p: &Path) -> Result<()> {
     std::fs::create_dir_all(p).with_context(|| format!("create_dir_all {}", p.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn netflow_dir_prefers_an_existing_project_local_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let global = tmp.path().join("global");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(project.join(".rupu/netflow")).unwrap();
+
+        assert_eq!(
+            netflow_dir(&global, Some(&project)),
+            project.join(".rupu/netflow")
+        );
+    }
+
+    #[test]
+    fn netflow_dir_falls_back_to_global_when_the_project_dir_does_not_exist() {
+        // Load-bearing: a repo that was never `rupu init`'d must never get a
+        // ledger written inside it. This is what closes the git-leak class
+        // structurally rather than by patching ensure_dir.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let global = tmp.path().join("global");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        assert_eq!(netflow_dir(&global, Some(&project)), global.join("netflow"));
+    }
+
+    #[test]
+    fn netflow_dir_falls_back_to_global_with_no_project_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let global = tmp.path().join("global");
+        assert_eq!(netflow_dir(&global, None), global.join("netflow"));
+    }
+
+    #[test]
+    fn archived_netflow_dir_nests_under_the_netflow_root() {
+        let dir = std::path::Path::new("/tmp/x/netflow");
+        assert_eq!(archived_netflow_dir(dir), dir.join("archive"));
+    }
 }
