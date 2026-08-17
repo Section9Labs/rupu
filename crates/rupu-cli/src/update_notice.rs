@@ -105,24 +105,28 @@ pub fn stderr_is_tty() -> bool {
 /// user straight into that refusal. `None` leaves the default in place.
 fn packaged_call_to_action() -> Option<String> {
     packaged_call_to_action_for(
-        crate::build_info::is_packaged(),
+        crate::build_info::installed_owner(),
         crate::build_info::package_manager_hint(),
     )
 }
 
-/// Pure so the packaged/unknown-distro matrix is testable; `is_packaged`
-/// and `package_manager_hint` are fixed at compile time / read from
-/// `/etc/os-release` and cannot be varied from a test — same reasoning as
-/// `cmd::update::packaged_refusal`, whose fallback-vs-known-pm branching
-/// this mirrors.
-fn packaged_call_to_action_for(packaged: bool, pm: &str) -> Option<String> {
-    if !packaged {
-        return None;
-    }
-    if pm == crate::build_info::UNKNOWN_PACKAGE_MANAGER_HINT {
-        Some("Upgrade it with your system package manager instead.".to_string())
-    } else {
-        Some(format!("Run 'sudo {pm} upgrade rupu'."))
+/// Pure so the packaged/unknown-distro matrix is testable; the owner and
+/// `package_manager_hint` are fixed at compile time / read from the exe path
+/// and `/etc/os-release` and cannot be varied from a test — same reasoning as
+/// `cmd::update::packaged_refusal`, whose command-naming this mirrors (in
+/// particular: never `sudo brew`, and never a backticked command we cannot
+/// spell).
+fn packaged_call_to_action_for(
+    owner: Option<crate::build_info::InstallOwner>,
+    pm: &str,
+) -> Option<String> {
+    let owner = owner?;
+    match crate::build_info::upgrade_command(owner, pm) {
+        Some(cmd) => Some(format!("Run '{cmd}'.")),
+        None if owner == crate::build_info::InstallOwner::Nix => Some(
+            "Upgrade it through the Nix profile or flake that installed it instead.".to_string(),
+        ),
+        None => Some("Upgrade it with your system package manager instead.".to_string()),
     }
 }
 
@@ -153,27 +157,35 @@ mod tests {
 
     #[test]
     fn unpackaged_install_keeps_the_default_call_to_action() {
-        assert!(packaged_call_to_action_for(false, "apt").is_none());
+        assert!(packaged_call_to_action_for(None, "apt").is_none());
     }
 
     #[test]
     fn packaged_install_names_the_package_manager() {
-        let cta = packaged_call_to_action_for(true, "apt").expect("must override");
+        let distro = Some(crate::build_info::InstallOwner::Distro);
+        let cta = packaged_call_to_action_for(distro, "apt").expect("must override");
         assert_eq!(cta, "Run 'sudo apt upgrade rupu'.");
 
-        let cta = packaged_call_to_action_for(true, "dnf").expect("must override");
+        let cta = packaged_call_to_action_for(distro, "dnf").expect("must override");
         assert_eq!(cta, "Run 'sudo dnf upgrade rupu'.");
+    }
+
+    #[test]
+    fn a_homebrew_install_is_never_told_to_sudo_brew() {
+        let cta = packaged_call_to_action_for(Some(crate::build_info::InstallOwner::Brew), "apt")
+            .expect("brew-owned binaries must override the default too");
+        assert_eq!(cta, "Run 'brew upgrade rupu'.");
     }
 
     #[test]
     fn packaged_install_on_an_unknown_distro_reads_as_prose() {
         // Must not render the non-command
         // "Run 'sudo your system package manager upgrade rupu'."
-        let cta =
-            packaged_call_to_action_for(true, crate::build_info::UNKNOWN_PACKAGE_MANAGER_HINT)
-                .expect(
-                    "must still override — the default also contradicts `rupu update`'s refusal",
-                );
+        let cta = packaged_call_to_action_for(
+            Some(crate::build_info::InstallOwner::Distro),
+            crate::build_info::UNKNOWN_PACKAGE_MANAGER_HINT,
+        )
+        .expect("must still override — the default also contradicts `rupu update`'s refusal");
         assert_eq!(cta, "Upgrade it with your system package manager instead.");
     }
 }

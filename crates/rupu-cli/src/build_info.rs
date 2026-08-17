@@ -70,6 +70,81 @@ pub fn package_manager_hint() -> &'static str {
     package_manager_hint_from(&std::fs::read_to_string("/etc/os-release").unwrap_or_default())
 }
 
+/// Who owns this binary, when it was not placed by hand.
+///
+/// [`INSTALL_METHOD`] only covers the formats rupu itself builds (.deb/.rpm).
+/// Homebrew, the AUR and Nix all install the *plain* published binary, so they
+/// carry no marker — yet they own the file just as much, and self-updating one
+/// fights the manager that owns it (brew/pacman revert it on the next upgrade;
+/// the Nix store is read-only). Hence the second, path-based signal below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallOwner {
+    /// Homebrew, on macOS or Linux. Never takes `sudo`.
+    Brew,
+    /// The Nix store — immutable by construction.
+    Nix,
+    /// A distro package manager: apt / dnf / pacman (.deb, .rpm, AUR).
+    Distro,
+}
+
+/// Which package manager owns a binary living at `path`, if any.
+///
+/// `/usr/local/bin` is deliberately **absent**: that is exactly where the docs
+/// tell you to `mv` a downloaded binary, and those installs *should* keep
+/// self-updating. The Intel Homebrew prefix is matched via its `Cellar` keg
+/// path for the same reason — so a hand-placed `/usr/local/bin/rupu` is never
+/// mistaken for a brew install.
+///
+/// Pure so the whole matrix is testable; the real path comes from
+/// [`installed_owner`].
+pub fn owner_for_path(path: &str) -> Option<InstallOwner> {
+    if path.starts_with("/nix/store/") {
+        return Some(InstallOwner::Nix);
+    }
+    if path.starts_with("/opt/homebrew/")
+        || path.starts_with("/home/linuxbrew/")
+        || path.contains("/Cellar/")
+    {
+        return Some(InstallOwner::Brew);
+    }
+    // Distro territory on Linux (pacman/AUR land here, as do .deb/.rpm).
+    if path.starts_with("/usr/bin/") {
+        return Some(InstallOwner::Distro);
+    }
+    None
+}
+
+/// Who owns *this* binary: the compile-time package marker first, then the
+/// path it is running from. `None` means a hand-placed or `cargo install`
+/// binary that is free to replace itself.
+pub fn installed_owner() -> Option<InstallOwner> {
+    if is_packaged_for(INSTALL_METHOD) {
+        return Some(InstallOwner::Distro);
+    }
+    let exe = std::env::current_exe().ok()?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    owner_for_path(&exe.to_string_lossy())
+}
+
+/// The exact upgrade command to name for `owner`, or `None` when no single
+/// command is correct — the caller must then fall back to prose rather than
+/// print something uncopy-pasteable.
+///
+/// Note `brew` is returned **without** `sudo`: Homebrew refuses to run under
+/// sudo, so `sudo brew upgrade` is actively wrong advice. Nix has no single
+/// upgrade command (it depends on profile vs flake vs NixOS module), so it
+/// returns `None` on purpose.
+pub fn upgrade_command(owner: InstallOwner, distro_pm: &str) -> Option<String> {
+    match owner {
+        InstallOwner::Brew => Some("brew upgrade rupu".to_string()),
+        InstallOwner::Nix => None,
+        InstallOwner::Distro if distro_pm != UNKNOWN_PACKAGE_MANAGER_HINT => {
+            Some(format!("sudo {distro_pm} upgrade rupu"))
+        }
+        InstallOwner::Distro => None,
+    }
+}
+
 /// True when this binary was not built by the release tooling.
 pub fn is_dev_build() -> bool {
     RELEASE_CHANNEL.is_none()
@@ -94,6 +169,64 @@ pub fn version_line_static() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_manager_owned_paths_are_recognized() {
+        // Homebrew: Apple Silicon, Linuxbrew, and any Cellar keg.
+        assert_eq!(
+            owner_for_path("/opt/homebrew/bin/rupu"),
+            Some(InstallOwner::Brew)
+        );
+        assert_eq!(
+            owner_for_path("/home/linuxbrew/.linuxbrew/bin/rupu"),
+            Some(InstallOwner::Brew)
+        );
+        assert_eq!(
+            owner_for_path("/usr/local/Cellar/rupu/0.74.0/bin/rupu"),
+            Some(InstallOwner::Brew)
+        );
+        // Nix store paths are immutable.
+        assert_eq!(
+            owner_for_path("/nix/store/abc123-rupu-0.74.0/bin/rupu"),
+            Some(InstallOwner::Nix)
+        );
+        // Distro territory — where pacman/AUR and .deb/.rpm land.
+        assert_eq!(owner_for_path("/usr/bin/rupu"), Some(InstallOwner::Distro));
+    }
+
+    #[test]
+    fn hand_placed_binaries_stay_self_updatable() {
+        // The documented manual install location must NOT be treated as
+        // package-owned, or `rupu update` refuses the very install path the
+        // docs tell people to use.
+        assert_eq!(owner_for_path("/usr/local/bin/rupu"), None);
+        assert_eq!(owner_for_path("/home/matt/.cargo/bin/rupu"), None);
+        assert_eq!(owner_for_path("/home/matt/bin/rupu"), None);
+        assert_eq!(owner_for_path("./target/release/rupu"), None);
+    }
+
+    #[test]
+    fn upgrade_command_never_tells_you_to_sudo_brew() {
+        // Homebrew refuses to run under sudo — naming it would be wrong.
+        assert_eq!(
+            upgrade_command(InstallOwner::Brew, "apt").as_deref(),
+            Some("brew upgrade rupu")
+        );
+        assert_eq!(
+            upgrade_command(InstallOwner::Distro, "apt").as_deref(),
+            Some("sudo apt upgrade rupu")
+        );
+        assert_eq!(
+            upgrade_command(InstallOwner::Distro, "dnf").as_deref(),
+            Some("sudo dnf upgrade rupu")
+        );
+        // Nix has no single upgrade command; an unknown distro has no name.
+        assert_eq!(upgrade_command(InstallOwner::Nix, "apt"), None);
+        assert_eq!(
+            upgrade_command(InstallOwner::Distro, UNKNOWN_PACKAGE_MANAGER_HINT),
+            None
+        );
+    }
 
     #[test]
     fn dev_build_when_env_absent() {
