@@ -30,16 +30,22 @@ impl LocalModelProvider {
     ///
     /// * `endpoint` — base URL of the local server, e.g. `"http://localhost:8080"`
     /// * `model_name` — model identifier the server expects in the `model` field
-    pub fn new(endpoint: &str, model_name: &str) -> Self {
+    /// * `sink` — the run's netflow sink; there is no process-global fallback.
+    pub fn new(
+        endpoint: &str,
+        model_name: &str,
+        sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
+    ) -> Self {
+        // No run context is available at construction — stamped
+        // `FlowCtx::system(Origin::Provider("local"))`. Plan 2 threads
+        // the real run id through once the provider factory is touched.
+        let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider("local".into()));
+        let client = rupu_netflow::http::client_with(ctx, reqwest::Client::builder(), sink)
+            .expect("reqwest TLS backend failed to initialise; no HTTP client can be built");
         Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             model_name: model_name.to_string(),
-            // No run context is available at construction — stamped
-            // `FlowCtx::system(Origin::Provider("local"))`. Plan 2 threads
-            // the real run id through once the provider factory is touched.
-            client: rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
-                rupu_netflow::Origin::Provider("local".into()),
-            )),
+            client,
         }
     }
 
@@ -255,14 +261,22 @@ mod tests {
 
     #[test]
     fn test_local_model_provider_new_trims_trailing_slash() {
-        let provider = LocalModelProvider::new("http://localhost:8080/", "phi-local");
+        let provider = LocalModelProvider::new(
+            "http://localhost:8080/",
+            "phi-local",
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        );
         assert_eq!(provider.endpoint(), "http://localhost:8080");
         assert_eq!(provider.model_name(), "phi-local");
     }
 
     #[test]
     fn test_local_model_provider_builds_request_with_system() {
-        let provider = LocalModelProvider::new("http://localhost:8080", "phi-local");
+        let provider = LocalModelProvider::new(
+            "http://localhost:8080",
+            "phi-local",
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        );
         let request = LlmRequest {
             model: "test".into(),
             system: Some("You are helpful.".into()),
@@ -296,7 +310,11 @@ mod tests {
 
     #[test]
     fn test_local_model_provider_builds_request_without_system() {
-        let provider = LocalModelProvider::new("http://localhost:8080", "phi-local");
+        let provider = LocalModelProvider::new(
+            "http://localhost:8080",
+            "phi-local",
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        );
         let request = LlmRequest {
             model: "test".into(),
             system: None,

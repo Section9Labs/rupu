@@ -44,7 +44,8 @@ async fn anthropic_live_round_trip() {
         Ok(k) => k,
         Err(_) => return,
     };
-    let mut client = rupu_providers::AnthropicClient::new(key);
+    let mut client =
+        rupu_providers::AnthropicClient::new(key, std::sync::Arc::new(rupu_netflow::NullSink));
     let resp = client
         .send(&minimal_request("claude-haiku-4-5"))
         .await
@@ -63,7 +64,12 @@ async fn openai_live_round_trip() {
         Err(_) => return,
     };
     let creds = AuthCredentials::ApiKey { key };
-    let mut client = rupu_providers::OpenAiCodexClient::new(creds, None).expect("init");
+    let mut client = rupu_providers::OpenAiCodexClient::new(
+        creds,
+        None,
+        std::sync::Arc::new(rupu_netflow::NullSink),
+    )
+    .expect("init");
     let resp = client
         .send(&minimal_request("gpt-4o-mini"))
         .await
@@ -81,7 +87,12 @@ async fn copilot_live_round_trip() {
         Err(_) => return,
     };
     let creds = AuthCredentials::ApiKey { key: token };
-    let mut client = rupu_providers::GithubCopilotClient::new(creds, None).expect("init");
+    let mut client = rupu_providers::GithubCopilotClient::new(
+        creds,
+        None,
+        std::sync::Arc::new(rupu_netflow::NullSink),
+    )
+    .expect("init");
     let resp = client
         .send(&minimal_request("gpt-4o-mini"))
         .await

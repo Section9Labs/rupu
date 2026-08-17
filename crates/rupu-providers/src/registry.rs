@@ -13,13 +13,21 @@ use crate::provider_id::ProviderId;
 pub struct ProviderRegistry {
     store: Arc<dyn CredentialSource>,
     auth_json_path: Option<PathBuf>,
+    /// Every client this registry creates is bound to this sink. There is
+    /// no process-global fallback — see `rupu_netflow::http::client_with`.
+    sink: Arc<dyn rupu_netflow::FlowSink>,
 }
 
 impl ProviderRegistry {
-    pub fn new(store: Arc<dyn CredentialSource>, auth_json_path: Option<PathBuf>) -> Self {
+    pub fn new(
+        store: Arc<dyn CredentialSource>,
+        auth_json_path: Option<PathBuf>,
+        sink: Arc<dyn rupu_netflow::FlowSink>,
+    ) -> Self {
         Self {
             store,
             auth_json_path,
+            sink,
         }
     }
 
@@ -39,6 +47,7 @@ impl ProviderRegistry {
                 let client = crate::anthropic::AnthropicClient::from_auth_with_store(
                     auth_method,
                     self.store.clone(),
+                    self.sink.clone(),
                 );
                 info!(provider = "anthropic", "provider created");
                 Ok(Box::new(client))
@@ -47,6 +56,7 @@ impl ProviderRegistry {
                 let mut client = crate::openai_codex::OpenAiCodexClient::new(
                     creds,
                     self.auth_json_path.clone(),
+                    self.sink.clone(),
                 )?;
                 client.set_credential_store(self.store.clone());
                 info!(provider = "openai-codex", "provider created");
@@ -57,6 +67,7 @@ impl ProviderRegistry {
                     creds,
                     crate::google_gemini::GeminiVariant::GeminiCli,
                     self.auth_json_path.clone(),
+                    self.sink.clone(),
                 )?;
                 info!(provider = "google-gemini-cli", "provider created");
                 Ok(Box::new(client))
@@ -66,6 +77,7 @@ impl ProviderRegistry {
                     creds,
                     crate::google_gemini::GeminiVariant::Antigravity,
                     self.auth_json_path.clone(),
+                    self.sink.clone(),
                 )?;
                 info!(provider = "google-antigravity", "provider created");
                 Ok(Box::new(client))
@@ -74,6 +86,7 @@ impl ProviderRegistry {
                 let client = crate::github_copilot::GithubCopilotClient::new(
                     creds,
                     self.auth_json_path.clone(),
+                    self.sink.clone(),
                 )?;
                 info!(provider = "github-copilot", "provider created");
                 Ok(Box::new(client))
@@ -119,7 +132,7 @@ mod tests {
         std::fs::write(&path, json).unwrap();
         let store =
             Arc::new(CredentialStore::load(path.clone(), dir.join("auth_status.json")).unwrap());
-        ProviderRegistry::new(store, Some(path))
+        ProviderRegistry::new(store, Some(path), Arc::new(rupu_netflow::NullSink))
     }
 
     #[test]

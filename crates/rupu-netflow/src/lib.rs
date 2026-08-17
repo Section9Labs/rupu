@@ -8,11 +8,11 @@
 //!
 //! # Adding an HTTP client
 //!
-//! Don't. Call [`http::client`] or [`http::client_from`] instead — a raw
-//! `reqwest::Client` bypasses capture entirely and `clippy.toml` denies
-//! it workspace-wide. If you need custom tuning, pass a tuned
-//! `reqwest::ClientBuilder` to [`http::client_from`]; every builder
-//! option survives.
+//! Don't. Call [`http::client_with`] instead — a raw `reqwest::Client`
+//! bypasses capture entirely and `clippy.toml` denies it workspace-wide.
+//! Pass a tuned `reqwest::ClientBuilder` for custom timeouts/proxies/etc;
+//! every builder option survives. There is deliberately no process-global
+//! sink — callers supply their run's `Arc<dyn FlowSink>` explicitly.
 
 pub mod asn;
 pub mod ctx;

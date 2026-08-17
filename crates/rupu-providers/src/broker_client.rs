@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 use ed25519_dalek::{Signer, SigningKey};
 use reqwest_middleware::ClientWithMiddleware;
+use std::sync::Arc;
 
 use crate::broker_types::{BrokerRequest, LlmRequestWire};
 use crate::error::ProviderError;
@@ -23,20 +24,25 @@ pub struct BrokerClient {
 }
 
 impl BrokerClient {
-    pub fn new(broker_url: String, signing_key: SigningKey) -> Self {
+    pub fn new(
+        broker_url: String,
+        signing_key: SigningKey,
+        sink: Arc<dyn rupu_netflow::FlowSink>,
+    ) -> Self {
         // Random nonce seed so each process session produces disjoint nonce ranges.
         // Prevents nonce collision across process restarts (Spec Compliance HIGH).
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
+        // No run context is available at construction — stamped
+        // `FlowCtx::system(Origin::Provider("broker"))`. Plan 2 threads
+        // the real run id through once the provider factory is touched.
+        let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider("broker".into()));
+        let client = rupu_netflow::http::client_with(ctx, reqwest::Client::builder(), sink)
+            .expect("reqwest TLS backend failed to initialise; no HTTP client can be built");
         Self {
-            // No run context is available at construction — stamped
-            // `FlowCtx::system(Origin::Provider("broker"))`. Plan 2 threads
-            // the real run id through once the provider factory is touched.
-            client: rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
-                rupu_netflow::Origin::Provider("broker".into()),
-            )),
+            client,
             broker_url,
             signing_key,
             nonce: seed,
@@ -248,7 +254,11 @@ mod tests {
     #[test]
     fn test_broker_client_signs_request() {
         let sk = SigningKey::from_bytes(&[42u8; 32]);
-        let mut client = BrokerClient::new("http://localhost:9901".into(), sk);
+        let mut client = BrokerClient::new(
+            "http://localhost:9901".into(),
+            sk,
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        );
 
         let request = LlmRequest {
             model: "claude-sonnet-4-6-20250514".into(),
@@ -281,7 +291,11 @@ mod tests {
     #[test]
     fn test_nonce_increments() {
         let sk = SigningKey::from_bytes(&[42u8; 32]);
-        let mut client = BrokerClient::new("http://localhost:9901".into(), sk);
+        let mut client = BrokerClient::new(
+            "http://localhost:9901".into(),
+            sk,
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        );
         let n1 = client.next_nonce();
         let n2 = client.next_nonce();
         let n3 = client.next_nonce();
@@ -293,7 +307,11 @@ mod tests {
     fn test_signed_request_is_verifiable() {
         let sk = SigningKey::from_bytes(&[42u8; 32]);
         let vk = sk.verifying_key();
-        let mut client = BrokerClient::new("http://localhost:9901".into(), sk);
+        let mut client = BrokerClient::new(
+            "http://localhost:9901".into(),
+            sk,
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        );
 
         let wire = LlmRequestWire {
             model: "test".into(),

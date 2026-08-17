@@ -255,14 +255,17 @@ fn should_retry_idle_stall(
 const ANTHROPIC_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
-/// Build the netflow-instrumented client used for Anthropic requests.
+/// Build the netflow-instrumented client used for Anthropic requests,
+/// bound to `sink`.
 ///
 /// Forces HTTP/1.1: MITM capture of the first-party Claude Code binary
 /// shows it negotiates HTTP/1.1 for `/v1/messages`. Matching that on
 /// the wire keeps rupu's requests in the same Cloudflare/WAF
 /// classification bucket as claude-code traffic.
-fn build_http_client() -> (ClientWithMiddleware, Arc<dyn rupu_netflow::FlowSink>) {
-    build_http_client_with_timeout(None)
+fn build_http_client(
+    sink: Arc<dyn rupu_netflow::FlowSink>,
+) -> (ClientWithMiddleware, Arc<dyn rupu_netflow::FlowSink>) {
+    build_http_client_with_timeout(None, sink)
 }
 
 /// `build_http_client` with an optional inactivity deadline from
@@ -281,40 +284,32 @@ fn build_http_client() -> (ClientWithMiddleware, Arc<dyn rupu_netflow::FlowSink>
 /// Task 11's `clippy.toml`); only `ClientBuilder::build()` is
 /// clippy-disallowed, and this function never calls it.
 ///
-/// Returns the `Arc<dyn FlowSink>` the client was actually bound to,
-/// alongside the client itself. `AnthropicClient` stores both, and its
-/// two-phase streaming completion (`FlowCompletionGuard`) calls `complete`
-/// on this stored sink directly rather than re-resolving
-/// `rupu_netflow::http::sink()` a second time at completion. Today those
-/// are the same object (a single process-wide global), so this has no
-/// behavioral effect yet — but it is what makes the completion pair safe
-/// once a per-workspace sink (Plan 2) replaces the global for some
-/// clients: the `Flow` and its `Complete` are then guaranteed to travel
-/// together instead of the `Complete` silently re-targeting whatever the
-/// global happens to be at completion time. See the 2026-08-03
-/// whole-branch review, Fix 1.
+/// There is deliberately no process-global sink to fall back to: `sink`
+/// is the only source of truth. Returns the same `Arc<dyn FlowSink>` back
+/// alongside the client so callers can store both — `AnthropicClient`
+/// does, and its two-phase streaming completion (`FlowCompletionGuard`)
+/// calls `complete` on this stored sink directly, guaranteeing the `Flow`
+/// and its `Complete` always travel together instead of either one
+/// silently re-targeting some other sink at completion time. See the
+/// 2026-08-03 whole-branch review, Fix 1.
+///
+/// A `client_with` failure here means the process's TLS backend / DNS
+/// resolver setup failed — a process-wide condition, not something this
+/// function's own (infallible) config assignments can trigger. There is
+/// no infallible `reqwest::Client` constructor to fall back to, so this
+/// panics rather than silently returning an uninstrumented client.
 fn build_http_client_with_timeout(
     timeout: Option<std::time::Duration>,
+    sink: Arc<dyn rupu_netflow::FlowSink>,
 ) -> (ClientWithMiddleware, Arc<dyn rupu_netflow::FlowSink>) {
     let mut builder = reqwest::Client::builder().http1_only();
     if let Some(t) = timeout {
         builder = builder.connect_timeout(t).read_timeout(t);
     }
-    let sink = rupu_netflow::http::sink();
     let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider(PROVIDER_TAG.into()));
-    match rupu_netflow::http::client_with(ctx, builder, sink.clone()) {
-        Ok(client) => (client, sink),
-        Err(_) => {
-            // The panicking-only-as-last-resort factory: see its own
-            // docstring for why a second failure here means the process
-            // cannot do TLS at all. It re-resolves `sink()` internally,
-            // but since `sink()` is a `OnceLock` (first-call-wins), that
-            // is guaranteed to be the SAME object as `sink` above.
-            let ctx =
-                rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider(PROVIDER_TAG.into()));
-            (rupu_netflow::http::client(ctx), sink)
-        }
-    }
+    let client = rupu_netflow::http::client_with(ctx, builder, sink.clone())
+        .expect("reqwest TLS backend failed to initialise; no HTTP client can be built");
+    (client, sink)
 }
 
 /// Whether the model string carries the explicit 1M-context opt-in
@@ -685,10 +680,10 @@ pub fn save_auth_json(path: &Path, auth_method: &AuthMethod) -> Result<(), Provi
 pub struct AnthropicClient {
     client: ClientWithMiddleware,
     /// The exact sink `client` was bound to. Stored alongside the client
-    /// (rather than re-resolved from `rupu_netflow::http::sink()` at
-    /// completion time) so `FlowCompletionGuard`'s two-phase streaming
-    /// completion always targets the same ledger its `Flow` line was
-    /// written to. See `build_http_client_with_timeout`'s docstring.
+    /// (there is no process-global sink to re-resolve — see Task 4) so
+    /// `FlowCompletionGuard`'s two-phase streaming completion always
+    /// targets the same ledger its `Flow` line was written to. See
+    /// `build_http_client_with_timeout`'s docstring.
     sink: Arc<dyn rupu_netflow::FlowSink>,
     auth: AuthMethod,
     api_url: String,
@@ -725,8 +720,11 @@ pub struct AnthropicClient {
 
 impl AnthropicClient {
     /// Create a new client from a resolved AuthMethod.
-    pub fn from_auth(auth: AuthMethod) -> Self {
-        let (client, sink) = build_http_client();
+    ///
+    /// `sink` is the run's netflow sink; there is no process-global
+    /// fallback.
+    pub fn from_auth(auth: AuthMethod, sink: Arc<dyn rupu_netflow::FlowSink>) -> Self {
+        let (client, sink) = build_http_client(sink);
         Self {
             client,
             sink,
@@ -751,7 +749,8 @@ impl AnthropicClient {
     /// below makes stacking one either double-count permits or deadlock
     /// outright at `max_concurrency == 1`).
     pub fn with_tuning(mut self, tuning: &crate::tuning::ProviderTuning) -> Self {
-        let (client, sink) = build_http_client_with_timeout(Some(tuning.timeout));
+        let (client, sink) =
+            build_http_client_with_timeout(Some(tuning.timeout), self.sink.clone());
         self.client = client;
         self.sink = sink;
         self.max_rate_limit_retries = tuning.max_retries;
@@ -802,8 +801,15 @@ impl AnthropicClient {
     }
 
     /// Create a client with an auth.json path for persisting refreshed tokens.
-    pub fn from_auth_with_path(auth: AuthMethod, auth_json_path: std::path::PathBuf) -> Self {
-        let (client, sink) = build_http_client();
+    ///
+    /// `sink` is the run's netflow sink; there is no process-global
+    /// fallback.
+    pub fn from_auth_with_path(
+        auth: AuthMethod,
+        auth_json_path: std::path::PathBuf,
+        sink: Arc<dyn rupu_netflow::FlowSink>,
+    ) -> Self {
+        let (client, sink) = build_http_client(sink);
         Self {
             client,
             sink,
@@ -819,11 +825,15 @@ impl AnthropicClient {
     }
 
     /// Create a client backed by a CredentialStore for token persistence.
+    ///
+    /// `sink` is the run's netflow sink; there is no process-global
+    /// fallback.
     pub fn from_auth_with_store(
         auth: AuthMethod,
         store: std::sync::Arc<dyn crate::credential_source::CredentialSource>,
+        sink: Arc<dyn rupu_netflow::FlowSink>,
     ) -> Self {
-        let (client, sink) = build_http_client();
+        let (client, sink) = build_http_client(sink);
         Self {
             client,
             sink,
@@ -839,19 +849,29 @@ impl AnthropicClient {
     }
 
     /// Create a new client. Reads `ANTHROPIC_API_KEY` from environment.
-    pub fn from_env() -> Result<Self, ProviderError> {
+    ///
+    /// `sink` is the run's netflow sink; there is no process-global
+    /// fallback.
+    pub fn from_env(sink: Arc<dyn rupu_netflow::FlowSink>) -> Result<Self, ProviderError> {
         let auth = resolve_anthropic_auth(None, None)?;
-        Ok(Self::from_auth(auth))
+        Ok(Self::from_auth(auth, sink))
     }
 
     /// Create a client with an explicit API key (for testing).
-    pub fn new(api_key: String) -> Self {
-        Self::from_auth(AuthMethod::ApiKey(api_key))
+    pub fn new(api_key: String, sink: Arc<dyn rupu_netflow::FlowSink>) -> Self {
+        Self::from_auth(AuthMethod::ApiKey(api_key), sink)
     }
 
     /// Create a client pointing at a custom URL (for testing with mock servers).
-    pub fn with_url(api_key: String, api_url: String) -> Self {
-        let (client, sink) = build_http_client();
+    ///
+    /// `sink` is the run's netflow sink; there is no process-global
+    /// fallback.
+    pub fn with_url(
+        api_key: String,
+        api_url: String,
+        sink: Arc<dyn rupu_netflow::FlowSink>,
+    ) -> Self {
+        let (client, sink) = build_http_client(sink);
         Self {
             client,
             sink,
@@ -869,8 +889,15 @@ impl AnthropicClient {
     /// Create a client from an explicit `AuthMethod` pointing at a custom URL
     /// (for testing OAuth flows against mock servers — the api-key-only
     /// `with_url` cannot exercise the OAuth header path).
-    pub fn from_auth_with_url(auth: AuthMethod, api_url: String) -> Self {
-        let (client, sink) = build_http_client();
+    ///
+    /// `sink` is the run's netflow sink; there is no process-global
+    /// fallback.
+    pub fn from_auth_with_url(
+        auth: AuthMethod,
+        api_url: String,
+        sink: Arc<dyn rupu_netflow::FlowSink>,
+    ) -> Self {
+        let (client, sink) = build_http_client(sink);
         Self {
             client,
             sink,
@@ -2371,7 +2398,7 @@ mod tests {
 
     #[test]
     fn build_request_body_sanitizes_tool_names() {
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
@@ -2461,6 +2488,7 @@ mod tests {
         let client = AnthropicClient::with_url(
             "test-key".into(),
             "http://localhost:8080/v1/messages".into(),
+            Arc::new(rupu_netflow::NullSink),
         );
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
@@ -2485,7 +2513,7 @@ mod tests {
 
     #[test]
     fn test_build_request_body_minimal() {
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             system: None,
@@ -2513,7 +2541,7 @@ mod tests {
 
     #[test]
     fn test_build_request_body_with_system_and_tools() {
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             system: Some("You are helpful.".into()),
@@ -2545,11 +2573,14 @@ mod tests {
     }
 
     fn oauth_client() -> AnthropicClient {
-        AnthropicClient::from_auth(AuthMethod::OAuth {
-            access_token: "oauth-access".into(),
-            refresh_token: "oauth-refresh".into(),
-            expires_ms: 0,
-        })
+        AnthropicClient::from_auth(
+            AuthMethod::OAuth {
+                access_token: "oauth-access".into(),
+                refresh_token: "oauth-refresh".into(),
+                expires_ms: 0,
+            },
+            Arc::new(rupu_netflow::NullSink),
+        )
     }
 
     fn oauth_client_with_account_uuid(uuid: &str) -> AnthropicClient {
@@ -2593,7 +2624,7 @@ mod tests {
 
     #[test]
     fn api_key_body_omits_oauth_only_fields() {
-        let client = AnthropicClient::new("sk-ant-test".into());
+        let client = AnthropicClient::new("sk-ant-test".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             system: None,
@@ -2729,7 +2760,7 @@ mod tests {
 
     #[test]
     fn api_key_request_never_emits_billing_blocks() {
-        let client = AnthropicClient::new("sk-ant-test".into());
+        let client = AnthropicClient::new("sk-ant-test".into(), Arc::new(rupu_netflow::NullSink));
         let body = client.build_request_body(&make_request(Some("agent persona")), false);
         let blocks = body["system"].as_array().expect("system is array");
         assert_eq!(
@@ -2752,7 +2783,7 @@ mod tests {
 
     #[test]
     fn test_build_request_body_thinking_low() {
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             system: None,
@@ -2780,7 +2811,7 @@ mod tests {
         // Auto → `thinking.type: "adaptive"` regardless of auth mode, plus
         // `display: "summarized"`. Without `display`, it defaults to "omitted"
         // on Opus 4.7/4.8 + Sonnet 5 and every captured thinking text is empty.
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-opus-4-7".into(),
             system: None,
@@ -2838,7 +2869,7 @@ mod tests {
     fn budget_tokens_thinking_does_not_set_display() {
         // The budget_tokens path targets pre-4.6 models, which predate
         // `display`; sending it there risks a 400 on every request.
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             system: None,
@@ -2907,7 +2938,7 @@ mod tests {
 
     #[test]
     fn reasoning_block_is_restored_to_anthropic_wire_shape() {
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let raw = anthropic_thinking_raw();
         let request = request_with_assistant_blocks(vec![
             ContentBlock::Reasoning {
@@ -2942,7 +2973,7 @@ mod tests {
     fn foreign_provider_reasoning_block_is_dropped_from_request() {
         // A Gemini thoughtSignature is an alien wire format; it must never
         // reach Anthropic.
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = request_with_assistant_blocks(vec![
             ContentBlock::Reasoning {
                 text: Some("gemini thoughts".into()),
@@ -2968,7 +2999,7 @@ mod tests {
         // blocks are not origin-locked — they replay across models fine, and
         // *stripping* them is what triggers ordering/signature 400s. Do not
         // reintroduce a model gate.
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let raw = anthropic_thinking_raw();
         let request = request_with_assistant_blocks(vec![ContentBlock::Reasoning {
             text: Some("step one, then step two".into()),
@@ -2986,7 +3017,7 @@ mod tests {
     fn empty_text_reasoning_block_is_still_echoed() {
         // The `display: "omitted"` case: a thinking block with no readable
         // text still carries a signature and must be passed back as received.
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let raw = serde_json::json!({
             "type": "thinking",
             "thinking": "",
@@ -3006,7 +3037,7 @@ mod tests {
     fn unknown_block_is_dropped_from_request() {
         // `ContentBlock::Unknown` serializes as `{"type":"Unknown"}` (pinned by
         // a test in types.rs), which no provider accepts.
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         assert_eq!(
             serde_json::to_value(ContentBlock::Unknown).unwrap()["type"],
             "Unknown",
@@ -3031,7 +3062,7 @@ mod tests {
         // `Some` — a `null`, scalar, or `{}` `raw` must still be rejected
         // before being echoed, or it goes on the wire as a malformed content
         // block and Anthropic 400s the request.
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = request_with_assistant_blocks(vec![
             ContentBlock::Reasoning {
                 text: Some("null raw".into()),
@@ -3065,7 +3096,7 @@ mod tests {
 
     #[test]
     fn test_build_request_body_thinking_medium() {
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             system: None,
@@ -3090,7 +3121,7 @@ mod tests {
 
     #[test]
     fn test_build_request_body_with_thinking_high() {
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             system: None,
@@ -3115,7 +3146,7 @@ mod tests {
 
     #[test]
     fn test_build_request_body_thinking_none() {
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             system: None,
@@ -3139,7 +3170,7 @@ mod tests {
 
     #[test]
     fn test_build_request_body_thinking_minimal_skipped() {
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             system: None,
@@ -3163,7 +3194,7 @@ mod tests {
 
     #[test]
     fn test_build_request_body_thinking_max() {
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-opus-4-6".into(),
             system: None,
@@ -3188,7 +3219,7 @@ mod tests {
 
     #[test]
     fn test_build_request_body_thinking_high_clamped_to_max_tokens() {
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             system: None,
@@ -3217,7 +3248,7 @@ mod tests {
 
     #[test]
     fn test_build_request_body_thinking_skipped_when_max_tokens_too_small() {
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             system: None,
@@ -3285,7 +3316,8 @@ mod tests {
 
     #[test]
     fn test_new_creates_api_key_auth() {
-        let client = AnthropicClient::new("sk-ant-api-test".into());
+        let client =
+            AnthropicClient::new("sk-ant-api-test".into(), Arc::new(rupu_netflow::NullSink));
         assert!(!client.auth.is_oauth());
     }
 
@@ -3296,7 +3328,7 @@ mod tests {
             refresh_token: "refresh".into(),
             expires_ms: 9999999999999,
         };
-        let client = AnthropicClient::from_auth(auth);
+        let client = AnthropicClient::from_auth(auth, Arc::new(rupu_netflow::NullSink));
         assert!(client.auth.is_oauth());
     }
 
@@ -3318,7 +3350,7 @@ mod tests {
     #[test]
     fn test_process_sse_events_full_text_stream() {
         // Architect requested: test process_sse_event through a full event sequence
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let mut acc = StreamAccumulator::new();
         let mut events_received: Vec<String> = Vec::new();
 
@@ -3375,7 +3407,7 @@ mod tests {
 
     #[test]
     fn test_process_sse_events_tool_use_stream() {
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let mut acc = StreamAccumulator::new();
         acc.id = "msg_2".into();
         acc.model = "claude-sonnet-4-6".into();
@@ -3422,7 +3454,7 @@ mod tests {
 
     #[test]
     fn test_process_sse_event_malformed_json_returns_error() {
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let mut acc = StreamAccumulator::new();
         let bad_event = crate::sse::SseEvent {
             event_type: "message_start".into(),
@@ -3434,7 +3466,7 @@ mod tests {
 
     #[test]
     fn test_process_sse_event_malformed_tool_input_json() {
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let mut acc = StreamAccumulator::new();
         acc.id = "msg_1".into();
         acc.current_tool_id = Some("toolu_bad".into());
@@ -3605,7 +3637,7 @@ mod tests {
         // field at all (a bare string 400s every request). An agent with
         // only `output_format: Json` and no task_budget should therefore
         // produce a request body with no `output_config` key whatsoever.
-        let client = AnthropicClient::new("k".into());
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
@@ -3626,7 +3658,7 @@ mod tests {
         // The real fix: an agent that declares `outputSchema` gets a
         // correctly-shaped `output_config.format = {type: "json_schema",
         // schema: <the schema>}` — the only shape Anthropic accepts.
-        let client = AnthropicClient::new("k".into());
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
         let schema = serde_json::json!({
             "type": "object",
             "properties": { "findings": { "type": "array" } },
@@ -3652,7 +3684,7 @@ mod tests {
         // Floor (#469): `outputFormat: json` alone is prompt-driven only.
         // Without a schema there is nothing valid to send, so `format`
         // must never appear even though `output_format` is `Json`.
-        let client = AnthropicClient::new("k".into());
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
@@ -3671,7 +3703,7 @@ mod tests {
 
     #[test]
     fn build_body_output_config_carries_both_schema_format_and_task_budget() {
-        let client = AnthropicClient::new("k".into());
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
         let schema = serde_json::json!({"type": "object"});
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
@@ -3691,7 +3723,7 @@ mod tests {
 
     #[test]
     fn build_body_emits_output_config_task_budget() {
-        let client = AnthropicClient::new("k".into());
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
@@ -3705,7 +3737,7 @@ mod tests {
 
     #[test]
     fn build_body_emits_context_management_tool_clearing() {
-        let client = AnthropicClient::new("k".into());
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
@@ -3719,7 +3751,7 @@ mod tests {
 
     #[test]
     fn build_body_emits_speed_fast() {
-        let client = AnthropicClient::new("k".into());
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
@@ -3733,7 +3765,7 @@ mod tests {
 
     #[test]
     fn build_body_omits_optional_fields_when_none() {
-        let client = AnthropicClient::new("k".into());
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
@@ -3755,7 +3787,7 @@ mod tests {
         // `output_config` construction) — it must never surface in the
         // wire body, even when `anthropic_task_budget` is also set and
         // legitimately populates `output_config`.
-        let client = AnthropicClient::new("k".into());
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             messages: vec![Message::user("hi")],
@@ -3796,6 +3828,7 @@ mod tests {
         let client = AnthropicClient::with_url(
             "sk-ant-test".into(),
             format!("{}/v1/messages?beta=true", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
         );
         let models = <AnthropicClient as crate::provider::LlmProvider>::list_models(&client).await;
         assert!(models.iter().any(|m| m.id == "claude-opus-4-1-20250805"));
@@ -3807,13 +3840,15 @@ mod tests {
 
     #[test]
     fn tuning_sets_the_retry_budget_the_client_will_spend() {
-        let client = AnthropicClient::new("k".into());
+        let client = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink));
         // Historical default, unchanged for non-factory constructors.
         assert_eq!(client.max_rate_limit_retries(), 1);
-        let tuned = AnthropicClient::new("k".into()).with_tuning(&crate::tuning::ProviderTuning {
-            max_retries: 4,
-            ..crate::tuning::ProviderTuning::for_provider("anthropic")
-        });
+        let tuned = AnthropicClient::new("k".into(), Arc::new(rupu_netflow::NullSink)).with_tuning(
+            &crate::tuning::ProviderTuning {
+                max_retries: 4,
+                ..crate::tuning::ProviderTuning::for_provider("anthropic")
+            },
+        );
         assert_eq!(tuned.max_rate_limit_retries(), 4);
     }
 
@@ -3833,6 +3868,7 @@ mod tests {
         let mut client = AnthropicClient::with_url(
             "sk-ant-test".into(),
             format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
         )
         .with_tuning(&crate::tuning::ProviderTuning {
             max_retries: 0,
@@ -3858,6 +3894,7 @@ mod tests {
         let mut client = AnthropicClient::with_url(
             "sk-ant-test".into(),
             format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
         )
         .with_tuning(&crate::tuning::ProviderTuning {
             max_retries: 1,
@@ -3922,6 +3959,7 @@ mod tests {
         let mut client = AnthropicClient::with_url(
             "sk-ant-test".into(),
             format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
         )
         .with_tuning(&crate::tuning::ProviderTuning {
             max_retries: 1,
@@ -3959,6 +3997,7 @@ mod tests {
         let mut client = AnthropicClient::with_url(
             "sk-ant-test".into(),
             format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
         )
         .with_tuning(&crate::tuning::ProviderTuning {
             max_retries: 1,
@@ -4000,6 +4039,7 @@ mod tests {
         let mut client = AnthropicClient::with_url(
             "sk-ant-test".into(),
             format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
         )
         .with_tuning(&crate::tuning::ProviderTuning {
             max_retries: 1,
@@ -4035,8 +4075,11 @@ mod tests {
                 .header("content-type", "application/json")
                 .body(r#"{"error":{"type":"authentication_error"}}"#);
         });
-        let client =
-            AnthropicClient::with_url("bad-key".into(), format!("{}/v1/messages", server.url("")));
+        let client = AnthropicClient::with_url(
+            "bad-key".into(),
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
         let models = <AnthropicClient as crate::provider::LlmProvider>::list_models(&client).await;
         assert!(models.is_empty());
     }
@@ -4054,8 +4097,11 @@ mod tests {
                 .header("content-type", "application/json")
                 .body(r#"{"error":{"type":"authentication_error"}}"#);
         });
-        let client =
-            AnthropicClient::with_url("bad-key".into(), format!("{}/v1/messages", server.url("")));
+        let client = AnthropicClient::with_url(
+            "bad-key".into(),
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
 
         let err = <AnthropicClient as crate::provider::LlmProvider>::probe(&client)
             .await
@@ -4080,8 +4126,11 @@ mod tests {
                 .header("content-type", "application/json")
                 .body(r#"{"data":[]}"#);
         });
-        let client =
-            AnthropicClient::with_url("good-key".into(), format!("{}/v1/messages", server.url("")));
+        let client = AnthropicClient::with_url(
+            "good-key".into(),
+            format!("{}/v1/messages", server.url("")),
+            Arc::new(rupu_netflow::NullSink),
+        );
 
         <AnthropicClient as crate::provider::LlmProvider>::probe(&client)
             .await
@@ -4093,8 +4142,11 @@ mod tests {
     #[tokio::test]
     async fn probe_maps_transport_failure_to_http() {
         // Port 1 is reserved and never listening.
-        let client =
-            AnthropicClient::with_url("k".into(), "http://127.0.0.1:1/v1/messages".to_string());
+        let client = AnthropicClient::with_url(
+            "k".into(),
+            "http://127.0.0.1:1/v1/messages".to_string(),
+            Arc::new(rupu_netflow::NullSink),
+        );
 
         let err = <AnthropicClient as crate::provider::LlmProvider>::probe(&client)
             .await
@@ -4124,7 +4176,7 @@ mod tests {
 
     #[test]
     fn stream_captures_thinking_block_with_signature() {
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let mut acc = reasoning_acc();
         let events = vec![
             sse(
@@ -4179,7 +4231,7 @@ mod tests {
         // display:"omitted" -> a thinking block arrives with no thinking_delta,
         // only a signature_delta. It MUST still produce a Reasoning block so it
         // can be echoed back unchanged.
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let mut acc = reasoning_acc();
         let events = vec![
             sse(
@@ -4224,7 +4276,7 @@ mod tests {
 
     #[test]
     fn stream_captures_redacted_thinking_block() {
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let mut acc = reasoning_acc();
         let events = vec![
             sse(
@@ -4263,7 +4315,7 @@ mod tests {
 
     #[test]
     fn stream_emits_reasoning_delta_events() {
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let mut acc = reasoning_acc();
         let mut events_received = Vec::new();
         let events = vec![
@@ -4308,7 +4360,7 @@ mod tests {
         // a reasoning buffer for it — doing so would let `content_block_stop`
         // push a `{"type":"thinking", ...}` raw block that was never really
         // opened, which Anthropic rejects when echoed back.
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let mut acc = reasoning_acc();
         let mut events_received = Vec::new();
         let events = vec![
@@ -4375,7 +4427,7 @@ mod tests {
     #[test]
     fn into_response_places_reasoning_before_text() {
         // Anthropic requires thinking blocks first in an assistant turn.
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let mut acc = reasoning_acc();
         let events = vec![
             sse(
@@ -4421,7 +4473,7 @@ mod tests {
         // also resolves (or otherwise disturbs) a tool_use that hasn't even
         // started yet, and against tool input getting corrupted by the
         // unrelated reasoning block that preceded it.
-        let client = AnthropicClient::new("test-key".into());
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let mut acc = reasoning_acc();
 
         let thinking_events = vec![

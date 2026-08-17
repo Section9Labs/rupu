@@ -29,6 +29,10 @@ pub struct ProviderRouter {
     store: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
     /// Auth.json path for re-creating providers after reload.
     auth_json_path: Option<std::path::PathBuf>,
+    /// Sink bound to any provider re-created by `try_reload`. Always
+    /// `Some` exactly when `store` is `Some` — set together by
+    /// `with_store`. There is no process-global fallback.
+    sink: Option<std::sync::Arc<dyn rupu_netflow::FlowSink>>,
 }
 
 impl ProviderRouter {
@@ -42,16 +46,21 @@ impl ProviderRouter {
             providers,
             store: None,
             auth_json_path: None,
+            sink: None,
         })
     }
 
     /// Create a router with live-reload support.
     /// When all providers are exhausted, the router calls store.reload() to
     /// pick up credential changes from disk, then re-discovers providers.
+    ///
+    /// `sink` is the netflow sink any reload-created provider is bound
+    /// to; there is no process-global fallback.
     pub fn with_store(
         providers: Vec<Box<dyn LlmProvider>>,
         store: std::sync::Arc<dyn crate::credential_source::CredentialSource>,
         auth_json_path: Option<std::path::PathBuf>,
+        sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
     ) -> Result<Self, ProviderError> {
         if providers.is_empty() {
             return Err(ProviderError::AuthConfig(
@@ -62,6 +71,7 @@ impl ProviderRouter {
             providers,
             store: Some(store),
             auth_json_path,
+            sink: Some(sink),
         })
     }
 
@@ -71,14 +81,20 @@ impl ProviderRouter {
         let Some(store) = &self.store else {
             return false;
         };
+        let Some(sink) = &self.sink else {
+            return false;
+        };
 
         if let Err(e) = store.reload() {
             warn!(error = %e, "credential store reload failed");
             return false;
         }
 
-        let registry =
-            crate::registry::ProviderRegistry::new(store.clone(), self.auth_json_path.clone());
+        let registry = crate::registry::ProviderRegistry::new(
+            store.clone(),
+            self.auth_json_path.clone(),
+            sink.clone(),
+        );
         let new_providers = registry.discover_all();
         if new_providers.is_empty() {
             return false;

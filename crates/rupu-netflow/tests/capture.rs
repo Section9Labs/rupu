@@ -310,7 +310,7 @@ async fn a_streamed_body_is_finalized_through_the_ledger() {
         .await;
 
     let tmp = tempfile::TempDir::new().unwrap();
-    let paths = NetflowPaths::new(tmp.path());
+    let paths = NetflowPaths::for_run(tmp.path(), "run-1");
     let handle = NetflowWriterHandle::spawn(paths.clone()).unwrap();
 
     let client = rupu_netflow::http::client_with(
@@ -354,5 +354,49 @@ async fn a_streamed_body_is_finalized_through_the_ledger() {
          record look complete-ish — a caller-supplied FlowId means the \
          middleware deliberately withholds body_complete until this \
          explicit finalization"
+    );
+}
+
+#[tokio::test]
+async fn two_clients_with_different_sinks_do_not_cross_contaminate() {
+    // The regression this whole plan exists to prevent: under the old
+    // process-global OnceLock the second sink was silently ignored and
+    // both clients wrote to the first.
+    let server = httpmock::MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::GET).path("/ping");
+            then.status(200).body("pong");
+        })
+        .await;
+
+    let sink_a = Arc::new(MemorySink::default());
+    let sink_b = Arc::new(MemorySink::default());
+
+    let client_a = rupu_netflow::http::client_with(
+        FlowCtx::system(Origin::Provider("a".into())),
+        reqwest::Client::builder(),
+        sink_a.clone(),
+    )
+    .unwrap();
+    let client_b = rupu_netflow::http::client_with(
+        FlowCtx::system(Origin::Provider("b".into())),
+        reqwest::Client::builder(),
+        sink_b.clone(),
+    )
+    .unwrap();
+
+    client_a.get(server.url("/ping")).send().await.unwrap();
+    client_b.get(server.url("/ping")).send().await.unwrap();
+
+    assert_eq!(sink_a.records().len(), 1, "sink A saw only its own flow");
+    assert_eq!(sink_b.records().len(), 1, "sink B saw only its own flow");
+    assert_eq!(
+        sink_a.records()[0].ctx.origin,
+        Origin::Provider("a".to_string())
+    );
+    assert_eq!(
+        sink_b.records()[0].ctx.origin,
+        Origin::Provider("b".to_string())
     );
 }

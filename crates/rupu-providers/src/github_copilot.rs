@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest_middleware::ClientWithMiddleware;
@@ -15,14 +16,15 @@ use crate::types::*;
 const DEFAULT_COPILOT_API_URL: &str = "https://api.githubcopilot.com";
 const COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
 
-/// Default netflow-instrumented client. No run context is available at
-/// construction — stamped `FlowCtx::system(Origin::Provider("copilot"))`.
-/// `with_tuning` (the path every factory-built client goes through) rebuilds
-/// this with the configured timeout via `client_from`.
-fn copilot_http_client() -> ClientWithMiddleware {
-    rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
-        rupu_netflow::Origin::Provider("copilot".into()),
-    ))
+/// Netflow-instrumented client bound to `sink`. No run context is
+/// available at construction — stamped
+/// `FlowCtx::system(Origin::Provider("copilot"))`. `with_tuning` (the
+/// path every factory-built client goes through) rebuilds this with the
+/// configured timeout via `client_with`, reusing the same sink.
+fn copilot_http_client(sink: Arc<dyn rupu_netflow::FlowSink>) -> ClientWithMiddleware {
+    let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider("copilot".into()));
+    rupu_netflow::http::client_with(ctx, reqwest::Client::builder(), sink)
+        .expect("reqwest TLS backend failed to initialise; no HTTP client can be built")
 }
 
 /// GitHub Copilot client using OpenAI chat/completions format.
@@ -34,6 +36,9 @@ fn copilot_http_client() -> ClientWithMiddleware {
 /// 4. The Copilot token is used as Bearer for chat/completions
 pub struct GithubCopilotClient {
     client: ClientWithMiddleware,
+    /// The exact sink `client` was bound to, so `with_tuning`'s rebuild
+    /// keeps using the same run's sink. See `AnthropicClient`'s `sink`.
+    sink: Arc<dyn rupu_netflow::FlowSink>,
     /// Long-lived GitHub OAuth token (used to exchange for Copilot tokens).
     github_token: String,
     /// Short-lived Copilot API token (from token exchange).
@@ -55,16 +60,22 @@ impl GithubCopilotClient {
     /// in place rather than panicking on user-supplied config.
     pub fn with_tuning(mut self, tuning: &crate::tuning::ProviderTuning) -> Self {
         let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider("copilot".into()));
-        if let Ok(client) = rupu_netflow::http::client_from(ctx, tuning.http_client_builder()) {
+        if let Ok(client) =
+            rupu_netflow::http::client_with(ctx, tuning.http_client_builder(), self.sink.clone())
+        {
             self.client = client;
         }
         self
     }
 
     /// Create from resolved AuthCredentials.
+    ///
+    /// `sink` is the run's netflow sink; there is no process-global
+    /// fallback.
     pub fn new(
         creds: AuthCredentials,
         auth_json_path: Option<PathBuf>,
+        sink: Arc<dyn rupu_netflow::FlowSink>,
     ) -> Result<Self, ProviderError> {
         match creds {
             AuthCredentials::OAuth {
@@ -79,7 +90,8 @@ impl GithubCopilotClient {
                     .map(String::from);
 
                 Ok(Self {
-                    client: copilot_http_client(),
+                    client: copilot_http_client(sink.clone()),
+                    sink,
                     github_token: access,
                     copilot_token: String::new(),
                     copilot_expires_ms: 0,
@@ -89,7 +101,8 @@ impl GithubCopilotClient {
                 })
             }
             AuthCredentials::ApiKey { key } => Ok(Self {
-                client: copilot_http_client(),
+                client: copilot_http_client(sink.clone()),
+                sink,
                 github_token: key,
                 copilot_token: String::new(),
                 copilot_expires_ms: 0,
@@ -452,7 +465,8 @@ mod tests {
 
     #[test]
     fn test_new_from_oauth() {
-        let client = GithubCopilotClient::new(test_creds(), None).unwrap();
+        let client =
+            GithubCopilotClient::new(test_creds(), None, Arc::new(rupu_netflow::NullSink)).unwrap();
         assert_eq!(client.github_token, "ghu_test_github_token");
         assert!(client.copilot_token.is_empty());
         assert!(client.enterprise_domain.is_none());
@@ -460,7 +474,12 @@ mod tests {
 
     #[test]
     fn test_new_enterprise() {
-        let client = GithubCopilotClient::new(test_creds_enterprise(), None).unwrap();
+        let client = GithubCopilotClient::new(
+            test_creds_enterprise(),
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
         assert_eq!(
             client.enterprise_domain,
             Some("mycompany.ghe.com".to_string())
@@ -472,7 +491,8 @@ mod tests {
         let creds = AuthCredentials::ApiKey {
             key: "ghp_test".into(),
         };
-        let client = GithubCopilotClient::new(creds, None).unwrap();
+        let client =
+            GithubCopilotClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         assert_eq!(client.github_token, "ghp_test");
     }
 
@@ -907,7 +927,8 @@ mod llm_provider_impl_tests {
         let creds = AuthCredentials::ApiKey {
             key: "ghp_test".into(),
         };
-        let client = GithubCopilotClient::new(creds, None).expect("new");
+        let client =
+            GithubCopilotClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).expect("new");
         let boxed: Box<dyn LlmProvider> = Box::new(client);
         assert_eq!(boxed.provider_id(), ProviderId::GithubCopilot);
         assert!(!boxed.default_model().is_empty());
@@ -925,7 +946,8 @@ mod baked_in_tests {
         let creds = AuthCredentials::ApiKey {
             key: "ghp-test".into(),
         };
-        let client = GithubCopilotClient::new(creds, None).unwrap();
+        let client =
+            GithubCopilotClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         let models = client.list_models().await;
         assert!(!models.is_empty());
         assert!(models.iter().any(|m| m.id == "gpt-4o"));
