@@ -3,6 +3,7 @@ use rupu_auth::in_memory::InMemoryResolver;
 use rupu_auth::stored::StoredCredential;
 use rupu_providers::AuthMode;
 use rupu_runtime::provider_factory::build_for_provider;
+use std::sync::Arc;
 
 /// Test-only seam consumed by `build_anthropic` to redirect the Anthropic
 /// Messages endpoint at an httpmock server. Mirrors the
@@ -14,7 +15,14 @@ async fn anthropic_factory_requires_credential() {
     // No stored secret. Should fail with a clear missing-credential message.
     std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
     let resolver = InMemoryResolver::new();
-    let res = build_for_provider("anthropic", "claude-sonnet-4-6", None, &resolver).await;
+    let res = build_for_provider(
+        "anthropic",
+        "claude-sonnet-4-6",
+        None,
+        &resolver,
+        Arc::new(rupu_netflow::NullSink),
+    )
+    .await;
     let err = format!("{}", res.err().expect("expected Err"));
     assert!(
         err.contains("anthropic") || err.contains("credential"),
@@ -26,7 +34,14 @@ async fn anthropic_factory_requires_credential() {
 async fn unknown_provider_errors_clearly() {
     std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
     let resolver = InMemoryResolver::new();
-    let res = build_for_provider("teleport", "model-x", None, &resolver).await;
+    let res = build_for_provider(
+        "teleport",
+        "model-x",
+        None,
+        &resolver,
+        Arc::new(rupu_netflow::NullSink),
+    )
+    .await;
     let err = format!("{}", res.err().expect("expected Err"));
     assert!(
         err.contains("teleport"),
@@ -45,7 +60,8 @@ async fn deferred_provider_returns_blocked_error() {
 
     // openai + copilot: wired, should fail with MissingCredential when no key.
     for p in ["openai", "copilot"] {
-        let res = build_for_provider(p, "x", None, &resolver).await;
+        let res =
+            build_for_provider(p, "x", None, &resolver, Arc::new(rupu_netflow::NullSink)).await;
         let err = format!("{}", res.err().expect("expected Err"));
         assert!(
             err.contains(p) && err.contains("missing credential"),
@@ -66,7 +82,8 @@ async fn deferred_provider_returns_blocked_error() {
         .await;
 
     for p in ["local"] {
-        let res = build_for_provider(p, "x", None, &resolver).await;
+        let res =
+            build_for_provider(p, "x", None, &resolver, Arc::new(rupu_netflow::NullSink)).await;
         let err = format!("{}", res.err().expect("expected Err"));
         assert!(
             err.contains(p) && (err.contains("not wired") || err.contains("v0")),
@@ -84,7 +101,14 @@ async fn deferred_provider_returns_blocked_error() {
 async fn missing_credential_error_keeps_suggestion_command_clean() {
     std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
     let resolver = InMemoryResolver::new();
-    let res = build_for_provider("anthropic", "claude-sonnet-4-6", None, &resolver).await;
+    let res = build_for_provider(
+        "anthropic",
+        "claude-sonnet-4-6",
+        None,
+        &resolver,
+        Arc::new(rupu_netflow::NullSink),
+    )
+    .await;
     let err = format!("{}", res.err().expect("expected Err"));
     assert!(
         err.contains("`rupu auth login --provider anthropic`"),
@@ -175,6 +199,7 @@ async fn anthropic_factory_oauth_credential_uses_bearer_not_x_api_key() {
         "claude-sonnet-4-6",
         Some(AuthMode::Sso),
         &resolver,
+        Arc::new(rupu_netflow::NullSink),
     )
     .await
     .expect("build_for_provider should succeed with OAuth credential");

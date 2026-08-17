@@ -6234,12 +6234,17 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
             &cfg.providers,
         )),
     };
+    // No run exists here: `rupu session compact` summarizes an existing
+    // session's message history in place — it mints no run id, writes no
+    // transcript, and isn't a step of any run in progress. This traffic
+    // is deliberately not attributed to a ledger.
     let (_resolved_auth, mut provider) = provider_factory::build_for_provider_with_config(
         &session.provider_name,
         &session.model,
         session.auth_mode,
         &resolver,
         &provider_config,
+        Arc::new(rupu_netflow::NullSink),
     )
     .await?;
 
@@ -6539,6 +6544,22 @@ async fn run_compact_request(
     )
     .unwrap_or_default();
     let resolver = rupu_auth::KeychainResolver::new();
+
+    paths::ensure_dir(&session.transcripts_dir)?;
+
+    // Netflow capture for this compaction run. Built here, before the
+    // provider below, and per-request (never once for the whole session
+    // worker) — a compaction request is its own run (`request.run_id` /
+    // `request.transcript_path`, RunStart/RunComplete below), so its sink
+    // must not outlive it. See `crate::netflow_sink::for_run`'s doc
+    // comment for the "one sink per run, never per daemon" rule.
+    let (netflow_sink, netflow_handle) = crate::netflow_sink::for_run(
+        global,
+        session.project_root.as_deref(),
+        &request.run_id,
+        &request.transcript_path,
+    );
+
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
         openai_compatible: None,
@@ -6553,10 +6574,9 @@ async fn run_compact_request(
         session.auth_mode,
         &resolver,
         &provider_config,
+        netflow_sink,
     )
     .await?;
-
-    paths::ensure_dir(&session.transcripts_dir)?;
 
     // Determine the mode string for the transcript RunStart event.
     let run_mode = match session.permission_mode.as_str() {
@@ -6604,6 +6624,9 @@ async fn run_compact_request(
                 RunStatus::Ok,
                 None,
             )?;
+            if let Some(h) = netflow_handle {
+                h.shutdown().await;
+            }
             return Ok(());
         }
     };
@@ -6629,6 +6652,9 @@ async fn run_compact_request(
             RunStatus::Ok,
             None,
         )?;
+        if let Some(h) = netflow_handle {
+            h.shutdown().await;
+        }
         return Ok(());
     }
 
@@ -6751,6 +6777,9 @@ async fn run_compact_request(
         }
     }
 
+    if let Some(h) = netflow_handle {
+        h.shutdown().await;
+    }
     Ok(())
 }
 
@@ -6817,10 +6846,27 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         .map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
     let resolver = rupu_auth::KeychainResolver::new();
-    // TODO(netflow task 7): pass the run's sink
-    let scm_registry = Arc::new(
-        rupu_scm::Registry::discover(&resolver, &cfg, Arc::new(rupu_netflow::NullSink)).await,
+
+    paths::ensure_dir(&session.transcripts_dir)?;
+    let transcript_path = session
+        .transcripts_dir
+        .join(format!("{}.jsonl", args.run_id));
+
+    // Netflow capture for this turn. Built PER TURN, never once at daemon
+    // start — `rupu session`'s worker handles many turns across many
+    // sessions in one long-lived process, and a sink built once here would
+    // reintroduce exactly the "first turn wins" defect this plan removes.
+    // Must be built before the SCM registry / provider below so both take
+    // this turn's real sink rather than a `NullSink` placeholder.
+    let (netflow_sink, netflow_handle) = crate::netflow_sink::for_run(
+        &global,
+        session.project_root.as_deref(),
+        &args.run_id,
+        &transcript_path,
     );
+
+    let scm_registry =
+        Arc::new(rupu_scm::Registry::discover(&resolver, &cfg, netflow_sink.clone()).await);
 
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
@@ -6836,6 +6882,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         session.auth_mode,
         &resolver,
         &provider_config,
+        netflow_sink,
     )
     .await?;
 
@@ -6849,10 +6896,6 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         session.repo_ref.as_deref(),
     )?;
 
-    paths::ensure_dir(&session.transcripts_dir)?;
-    let transcript_path = session
-        .transcripts_dir
-        .join(format!("{}.jsonl", args.run_id));
     let metadata = StandaloneRunMetadata {
         version: StandaloneRunMetadata::VERSION,
         run_id: args.run_id.clone(),
@@ -7057,6 +7100,14 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
     }
 
     write_session(&global, scope, &session)?;
+
+    // Flush this turn's ledger before returning — see
+    // `crate::netflow_sink::for_run`'s doc comment; the writer task's own
+    // periodic ticker is a safety net, not a substitute, for a worker
+    // process that may exit shortly after this turn completes.
+    if let Some(handle) = netflow_handle {
+        handle.shutdown().await;
+    }
     Ok(())
 }
 

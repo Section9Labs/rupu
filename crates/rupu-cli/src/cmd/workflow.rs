@@ -3161,11 +3161,22 @@ pub(crate) async fn resume_run(
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
-    // TODO(netflow task 7): pass the run's sink
-    let mcp_registry = Arc::new(
-        rupu_scm::Registry::discover(resolver.as_ref(), &cfg, Arc::new(rupu_netflow::NullSink))
-            .await,
+
+    // Netflow capture for this resumed run — same reasoning as
+    // `resume.rs::rebuild_opts_from_disk`: this run's linear steps share
+    // `<transcripts>/<run_id>.jsonl`, matching `DefaultStepFactory`'s own
+    // per-step ledger naming, so this registry's sink lands in the same
+    // ledger every step's sink independently resolves to. The writer
+    // handle is intentionally left unheld — the sink Arc lives on inside
+    // `mcp_registry` for as long as this resumed run needs it.
+    let (netflow_sink, _netflow_handle) = crate::netflow_sink::for_run(
+        &global,
+        project_root.as_deref(),
+        run_id,
+        &transcripts.join(format!("{run_id}.jsonl")),
     );
+    let mcp_registry =
+        Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink).await);
 
     let mode_str = mode.unwrap_or("ask").to_string();
 
@@ -3998,14 +4009,28 @@ async fn run_with_outcome(
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
     let live_view = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, view).live_view;
 
+    // Mint this run's id NOW (rather than letting `execute_workflow_
+    // invocation` do it further down the call chain) so the SCM registry
+    // built just below — and every step's own sink, resolved later from
+    // the SAME id — land in one ledger for this run. Threaded through as
+    // `run_id_override` so `execute_workflow_invocation` uses this exact
+    // id instead of minting a second, different one.
+    let run_id = run_id_override
+        .clone()
+        .unwrap_or_else(|| format!("run_{}", Ulid::new()));
+    let transcripts_dir = paths::transcripts_dir(&global, project_root.as_deref());
+    let (netflow_sink, _netflow_handle) = crate::netflow_sink::for_run(
+        &global,
+        project_root.as_deref(),
+        &run_id,
+        &transcripts_dir.join(format!("{run_id}.jsonl")),
+    );
+
     // Build the SCM/issue registry once for the entire workflow run.
     // Cheap when no platforms are configured; missing credentials are
     // skipped with INFO logs.
-    // TODO(netflow task 7): pass the run's sink
-    let mcp_registry = Arc::new(
-        rupu_scm::Registry::discover(resolver.as_ref(), &cfg, Arc::new(rupu_netflow::NullSink))
-            .await,
-    );
+    let mcp_registry =
+        Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink).await);
 
     // Parse the workflow-level target (if any) and derive a system-prompt
     // suffix that each step prepends. Clone-to-tmpdir for Repo/Pr targets
@@ -4136,7 +4161,11 @@ async fn run_with_outcome(
             issue_ref: issue_ref_text,
             system_prompt_suffix,
             attach_ui,
-            run_id_override,
+            // Pass the id minted above so `execute_workflow_invocation`
+            // uses the SAME run id the netflow sink / SCM registry just
+            // built above were rooted at, rather than minting a second,
+            // different one.
+            run_id_override: Some(run_id.clone()),
             strict_templates: false,
             run_envelope_template: None,
             worker: None,
@@ -4607,15 +4636,26 @@ async fn execute_workflow_invocation(
         .as_ref()
         .map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
-    // TODO(netflow task 7): pass the run's sink
-    let mcp_registry = Arc::new(
-        rupu_scm::Registry::discover(resolver.as_ref(), &cfg, Arc::new(rupu_netflow::NullSink))
-            .await,
-    );
 
     let transcripts = paths::transcripts_dir(&global, ctx.project_root.as_deref());
     paths::ensure_dir(&transcripts)?;
     let transcripts_dir_snapshot = transcripts.clone();
+
+    // Netflow capture for this run. `run_id` is already resolved above
+    // (either `ctx.run_id_override` or a freshly minted one); this run's
+    // linear steps will independently resolve the SAME
+    // `<transcripts>/<run_id>.jsonl` via `DefaultStepFactory`, so this
+    // registry's sink and every step's own sink converge on one ledger.
+    // The writer handle is intentionally left unheld — the sink Arc lives
+    // on inside `mcp_registry` for as long as this run needs it.
+    let (netflow_sink, _netflow_handle) = crate::netflow_sink::for_run(
+        &global,
+        ctx.project_root.as_deref(),
+        &run_id,
+        &transcripts.join(format!("{run_id}.jsonl")),
+    );
+    let mcp_registry =
+        Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink).await);
 
     let registry_for_notify = Arc::clone(&mcp_registry);
     let notify_issue_enabled = workflow.notify_issue;

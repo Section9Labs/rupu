@@ -3,6 +3,7 @@
 use crate::output::formats::OutputFormat;
 use crate::output::report::{self, CollectionOutput};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::Subcommand;
 use rupu_providers::{ModelRegistry, ModelSource};
@@ -213,13 +214,19 @@ async fn populate_live(
             // access token into `AnthropicClient::new(key)` builds an
             // api-key client that sends `x-api-key: <bearer>`,
             // which the server rejects with 401 "invalid x-api-key".
+            // No run exists yet at this point — `rupu models` is a bare
+            // discovery command, not an agent run — so this traffic is
+            // deliberately not attributed to a ledger.
             let auth_method = creds.into_anthropic_auth_method();
-            rupu_providers::AnthropicClient::from_auth(auth_method)
-                .list_models()
-                .await
+            rupu_providers::AnthropicClient::from_auth(
+                auth_method,
+                Arc::new(rupu_netflow::NullSink),
+            )
+            .list_models()
+            .await
         }
         "openai" => {
-            rupu_providers::OpenAiCodexClient::new(creds, None)
+            rupu_providers::OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink))
                 .map_err(|e| anyhow::anyhow!("{e}"))?
                 .list_models()
                 .await
@@ -229,13 +236,14 @@ async fn populate_live(
                 creds,
                 rupu_providers::google_gemini::GeminiVariant::GeminiCli,
                 None,
+                Arc::new(rupu_netflow::NullSink),
             )
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .list_models()
             .await
         }
         "copilot" => {
-            rupu_providers::GithubCopilotClient::new(creds, None)
+            rupu_providers::GithubCopilotClient::new(creds, None, Arc::new(rupu_netflow::NullSink))
                 .map_err(|e| anyhow::anyhow!("{e}"))?
                 .list_models()
                 .await

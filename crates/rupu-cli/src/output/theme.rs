@@ -844,9 +844,14 @@ async fn read_theme_source(source: &str) -> anyhow::Result<String> {
         // Not tied to any specific subsystem (provider/scm/mcp/webhook/
         // update/cp) — a one-off fetch of a user-supplied theme URL, so
         // `Origin::System` (same call shape as the ASN-table refresh in
-        // cmd/cp.rs).
-        let client =
-            rupu_netflow::http::client(rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System));
+        // cmd/cp.rs). `Arc::new(NullSink)`: no run exists at this point —
+        // this is a bare `rupu theme` command, not an agent run — so this
+        // traffic is deliberately not attributed to a ledger.
+        let client = rupu_netflow::http::client_with(
+            rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System),
+            reqwest::Client::builder(),
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        )?;
         let response = client.get(source).send().await?;
         if !response.status().is_success() {
             anyhow::bail!("failed to fetch theme: HTTP {}", response.status());

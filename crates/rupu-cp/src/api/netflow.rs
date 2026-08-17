@@ -278,11 +278,22 @@ pub(crate) fn maybe_refresh_asn(cfg: &rupu_config::NetflowConfig, cache: &Arc<As
     let cache = Arc::clone(cache);
     tokio::spawn(async move {
         let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System);
-        let client = rupu_netflow::http::client_from(
-            ctx.clone(),
+        // `Arc::new(NullSink)`: this is `cp serve`'s own background ASN-table
+        // download, not run-scoped traffic — the daemon's own egress is
+        // deliberately not recorded (see `rupu-cli/src/cmd/cp.rs`'s deleted
+        // `http::init` call).
+        let client = match rupu_netflow::http::client_with(
+            ctx,
             reqwest::Client::builder().timeout(ASN_REFRESH_TIMEOUT),
-        )
-        .unwrap_or_else(|_| rupu_netflow::http::client(ctx));
+            Arc::new(rupu_netflow::NullSink),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to build netflow ASN-refresh client");
+                guard.finish();
+                return;
+            }
+        };
         match rupu_netflow::asn::refresh(&url, &db, &client).await {
             Ok(()) => {
                 cache.invalidate();
@@ -372,12 +383,15 @@ fn run_scoped_flows_and_dropped(
     run_id: &str,
     workspace: &StdPath,
 ) -> (Vec<FlowRecord>, u64) {
-    let paths = NetflowPaths::new(workspace);
+    // One ledger file per run (`NetflowPaths::for_run`) — the file is
+    // already scoped to `run_id`, so no `filter_by_run` pass is needed
+    // here any more (it's still exported/used by tests exercising the
+    // merge logic directly against an in-memory flow list).
+    let paths = NetflowPaths::for_run(&workspace.join(".rupu/netflow"), run_id);
     let (all, dropped) =
         rupu_netflow::ledger::read_flows_and_dropped(&paths.flows).unwrap_or_default();
-    let scoped = filter_by_run(&all, run_id);
     let transcript_paths = crate::usage::run_transcript_paths(store, run_id);
-    let merged = merge_with_transcript(scoped, &transcript_paths);
+    let merged = merge_with_transcript(all, &transcript_paths);
     (merged, dropped)
 }
 
@@ -423,35 +437,50 @@ pub(crate) fn workspace_for_project(s: &AppState, project_id: &str) -> ApiResult
     Ok(PathBuf::from(ws.path))
 }
 
-/// Every flow across every registered workspace's ledger, PLUS the CP
-/// daemon's own global ledger, and the summed dropped-count — one
-/// [`rupu_netflow::ledger::read_flows_and_dropped`] pass per source, not
-/// two. Mirrors `coverage.rs`'s `list_coverage`: a workspace whose path is
-/// gone/unreadable is skipped (its ledger read degrades to empty via the
-/// reader's own missing-file tolerance), never a hard error — an
-/// unregistered/empty registry with no global ledger file yields `([], 0)`.
+/// Union every per-run ledger file (`NetflowPaths::for_run` writes one
+/// `<run_id>.jsonl` per run, not one shared `flows.jsonl`) under
+/// `netflow_dir` into one flow list + summed dropped-count. A directory
+/// that doesn't exist yet (no run has ever written a ledger there)
+/// degrades to `([], 0)`, the same "missing data" tolerance every other
+/// read in this module already relies on. The `.gitignore` that
+/// `NetflowPaths::ensure_dir` drops into every such directory is skipped
+/// (no `.jsonl` extension).
+fn read_all_run_ledgers_in_dir(netflow_dir: &StdPath) -> (Vec<FlowRecord>, u64) {
+    let mut flows = Vec::new();
+    let mut dropped = 0u64;
+    let Ok(entries) = std::fs::read_dir(netflow_dir) else {
+        return (flows, dropped);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let (f, d) = rupu_netflow::ledger::read_flows_and_dropped(&path).unwrap_or_default();
+        flows.extend(f);
+        dropped += d;
+    }
+    (flows, dropped)
+}
+
+/// Every flow across every registered workspace's ledger directory, and the
+/// summed dropped-count. Mirrors `coverage.rs`'s `list_coverage`: a
+/// workspace whose path is gone/unreadable is skipped (its ledger read
+/// degrades to empty via [`read_all_run_ledgers_in_dir`]'s own
+/// missing-directory tolerance), never a hard error.
+///
 /// Synchronous — always run through [`run_blocking`] (this is the read that
-/// scales with the number of registered workspaces, so it's the one most
-/// worth keeping off the async task).
+/// scales with the number of registered workspaces AND with the number of
+/// runs each one has, so it's the one most worth keeping off the async
+/// task).
 ///
-/// ## Why the global ledger is read here too (Fix 1, netflow Plan 3 review)
-///
-/// `rupu cp serve` deliberately does NOT install its netflow sink at
-/// `NetflowPaths::new(<some workspace>)` — a daemon has no single project to
-/// anchor a project-relative ledger at, so it roots one directly at
-/// `$RUPU_HOME/netflow/flows.jsonl` instead (see `rupu-cli/src/cmd/cp.rs`'s
-/// `Action::Serve` handler). Every `Origin::Cp` flow (the CP's own fleet
-/// HTTP traffic to remote hosts), every `Origin::Update` flow a `cp serve`
-/// process happens to produce, and every `Origin::System` ASN-refresh
-/// download this module's own [`maybe_refresh_asn`] triggers (regardless of
-/// which scope's handler called it — the HTTP client it builds always
-/// resolves whatever sink `cp serve` installed at startup) land there. None
-/// of that path is a registered workspace, so without this the traffic is
-/// recorded and then permanently unreachable through any read handler —
-/// exactly the defect this fix closes. It is added here (global scope),
-/// not to [`get_project_netflow`] — this ledger's traffic belongs to the CP
-/// daemon as a whole, not to any one project, so unioning it into every
-/// project's Network tab would misattribute it.
+/// Does NOT union in a CP-daemon-wide ledger the way an earlier revision of
+/// this function did (Fix 1, netflow Plan 3 review): per the netflow
+/// per-run plan, `cp serve`'s own fleet/ASN-refresh traffic is
+/// deliberately not recorded at all any more — it has no run to attribute
+/// to and installing a daemon-lifetime sink is exactly the "first run
+/// wins" defect this plan removes (see `rupu-cli/src/cmd/cp.rs`'s deleted
+/// `http::init` call). There is no global ledger file left to read.
 fn read_all_workspaces_sync(global_dir: &StdPath) -> (Vec<FlowRecord>, u64) {
     let workspaces = (WorkspaceStore {
         root: global_dir.join("workspaces"),
@@ -463,21 +492,10 @@ fn read_all_workspaces_sync(global_dir: &StdPath) -> (Vec<FlowRecord>, u64) {
     let mut dropped = 0u64;
     for w in &workspaces {
         let wp = std::path::Path::new(&w.path);
-        let paths = NetflowPaths::new(wp);
-        let (f, d) = rupu_netflow::ledger::read_flows_and_dropped(&paths.flows).unwrap_or_default();
+        let (f, d) = read_all_run_ledgers_in_dir(&wp.join(".rupu/netflow"));
         flows.extend(f);
         dropped += d;
     }
-
-    // The CP daemon's own ledger — NOT under any registered workspace. See
-    // this function's doc comment for why it belongs here and not in
-    // `get_project_netflow`. A missing file (no `cp serve` has ever run
-    // against this `$RUPU_HOME`) degrades to empty via the same reader
-    // tolerance every other source here already relies on.
-    let global_ledger = global_dir.join("netflow").join("flows.jsonl");
-    let (gf, gd) = rupu_netflow::ledger::read_flows_and_dropped(&global_ledger).unwrap_or_default();
-    flows.extend(gf);
-    dropped += gd;
 
     (flows, dropped)
 }
@@ -501,9 +519,7 @@ async fn get_project_netflow(
     let workspace = workspace_for_project(&state, &project_id)?;
     let cache = Arc::clone(&state.asn_cache);
     let resp = run_blocking(move || {
-        let paths = NetflowPaths::new(&workspace);
-        let (flows, dropped) =
-            rupu_netflow::ledger::read_flows_and_dropped(&paths.flows).unwrap_or_default();
+        let (flows, dropped) = read_all_run_ledgers_in_dir(&workspace.join(".rupu/netflow"));
         let table = load_asn_table(&cache);
         build_response(flows, dropped, table.as_deref())
     })
@@ -583,13 +599,8 @@ async fn get_netflow_graph(
         run_scoped_flows_for_graph(&state, run_id).await?
     } else if let Some(project_id) = q.scope.as_deref().and_then(|s| s.strip_prefix("project:")) {
         let workspace = workspace_for_project(&state, project_id)?;
-        run_blocking(move || {
-            let paths = NetflowPaths::new(&workspace);
-            rupu_netflow::ledger::read_flows_and_dropped(&paths.flows)
-                .unwrap_or_default()
-                .0
-        })
-        .await?
+        run_blocking(move || read_all_run_ledgers_in_dir(&workspace.join(".rupu/netflow")).0)
+            .await?
     } else {
         let global_dir = state.global_dir.clone();
         run_blocking(move || read_all_workspaces_sync(&global_dir).0).await?

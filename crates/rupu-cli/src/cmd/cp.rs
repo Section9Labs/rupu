@@ -54,42 +54,16 @@ pub async fn handle(action: Action) -> ExitCode {
                 }
             };
 
-            // Install the process-wide netflow sink BEFORE anything below
-            // can construct a `HostConnector` (Fix 3, Task 10 review
-            // round 2): `rupu_netflow::http::client_from` resolves
-            // `rupu_netflow::http::sink()` at CLIENT construction time,
-            // and rupu-cp's `HostRegistry` (built inside `rupu_cp::serve`
-            // further down, plus caches connectors) never rebuilds its
-            // connectors afterward. Installing the sink any later than
-            // this line would leave `HttpHostConnector`'s fleet egress —
-            // and the ASN refresh's own `Origin::System` traffic just
-            // below — permanently wired to the default `NullSink` for the
-            // life of the daemon, exactly like `rupu run` would be if its
-            // own `init` call moved after `build_for_provider_with_config`
-            // (see that call site's comment).
-            //
-            // Ledger-only: a daemon has no run transcript to stream into.
-            // Rooted at the global `$RUPU_HOME/netflow/` — `cp serve` has
-            // no single project it's serving (it's the fleet-wide control
-            // plane), so there is no sensible project root to anchor a
-            // `NetflowPaths::new(...)`-style project-relative ledger at.
-            // `NetflowPaths` isn't used here for that reason: it always
-            // appends `.rupu/netflow/`, which would double up `.rupu`
-            // since `global_dir` already IS `~/.rupu` (or `$RUPU_HOME`).
-            let netflow_paths = rupu_netflow::NetflowPaths {
-                root: global_dir.join("netflow"),
-                flows: global_dir.join("netflow").join("flows.jsonl"),
-            };
-            let netflow_handle = match rupu_netflow::NetflowWriterHandle::spawn(netflow_paths) {
-                Ok(handle) => {
-                    rupu_netflow::http::init(handle.writer.clone());
-                    Some(handle)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "netflow ledger unavailable for cp serve; egress capture degrades to nothing recorded");
-                    None
-                }
-            };
+            // `cp serve`'s own traffic (fleet HTTP to remote hosts, the ASN
+            // refresh download, the SCM registry built below) is
+            // deliberately NOT recorded, per the netflow per-run plan: a
+            // daemon has no single run to attribute its own egress to, and
+            // installing a daemon-lifetime sink here is exactly the "first
+            // run wins" defect this plan removes (the old shared
+            // `$RUPU_HOME/netflow/flows.jsonl` ledger this used to install
+            // via a process-wide `http::init` no longer exists). Every
+            // `HostConnector`/ASN-refresh/registry construction below takes
+            // `Arc::new(NullSink)` explicitly instead.
 
             // `[cp]` runtime settings gate the two background-tick loops
             // below (autoflow reconcile / cron tick). A missing/malformed
@@ -281,11 +255,23 @@ pub async fn handle(action: Action) -> ExitCode {
                                 tokio::spawn(async move {
                                     let ctx =
                                         rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System);
-                                    let client = rupu_netflow::http::client_from(
-                                        ctx.clone(),
+                                    // `Arc::new(NullSink)`: `cp serve`'s own
+                                    // background ASN refresh is daemon
+                                    // traffic, not run-scoped — deliberately
+                                    // unrecorded (see the netflow sink note
+                                    // at the top of `Action::Serve`).
+                                    let client = match rupu_netflow::http::client_with(
+                                        ctx,
                                         reqwest::Client::builder().timeout(ASN_REFRESH_TIMEOUT),
-                                    )
-                                    .unwrap_or_else(|_| rupu_netflow::http::client(ctx));
+                                        Arc::new(rupu_netflow::NullSink),
+                                    ) {
+                                        Ok(c) => c,
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "failed to build netflow ASN-refresh client");
+                                            ASN_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+                                            return;
+                                        }
+                                    };
                                     match rupu_netflow::asn::refresh(&url, &db, &client).await {
                                         Ok(()) => {
                                             tracing::info!(path = ?db, "netflow ASN table refreshed")
@@ -442,15 +428,6 @@ pub async fn handle(action: Action) -> ExitCode {
             let _ = gate_sweep_handle.await;
             let _ = inventory_handle.await;
             let _ = scm_inventory_handle.await;
-            // Best-effort final flush on a clean shutdown. Not load-bearing
-            // for loss VISIBILITY — the writer task's own periodic ticker
-            // (`DROPPED_VISIBILITY_INTERVAL`) already surfaces drops while
-            // the daemon runs, unprompted — this just lets an orderly
-            // `Ctrl-C` land the last few records promptly instead of
-            // whenever the process actually terminates.
-            if let Some(handle) = netflow_handle {
-                handle.shutdown().await;
-            }
 
             serve_result
         }
@@ -2323,8 +2300,12 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let client =
-            rupu_netflow::http::client(rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Cp));
+        let client = rupu_netflow::http::client_with(
+            rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Cp),
+            reqwest::Client::builder(),
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .expect("test client build");
         let resp = client
             .post(format!("http://{addr}/api/runs/{}/reject", rec.id))
             .json(&serde_json::json!({ "reason": "not today" }))
