@@ -87,9 +87,16 @@ Per-run files make this cheap: a run's ledger has a bounded time span, so a rang
 
 Absent bounds means everything, so existing callers are unaffected.
 
-## 7. MCP and webhook origins
+## 7. MCP and webhook origins are deleted, not constructed
 
-`Origin::Mcp(server)` and `Origin::Webhook` are constructed where those calls actually happen, so the enum stops describing coverage that does not exist. Both are inference-adjacent: an MCP tool call is made on an agent's behalf and belongs in that agent's run ledger. Where an MCP or webhook call has no run context, §3.3 applies and it is not recorded.
+**Revised after tracing the code.** The original intent was to construct `Origin::Mcp` and `Origin::Webhook` at their real call sites. There are none:
+
+- **`rupu-mcp` makes no outbound HTTP whatsoever** — it has no `reqwest` dependency. It dispatches tool calls into `rupu-scm`'s `Registry`, and those connectors make the actual requests, already tagged `Origin::Scm`. Re-tagging them `Origin::Mcp` would be *less* accurate, not more: the call really is to GitHub's or GitLab's API, and that is what an operator auditing egress needs to see. The MCP layer is dispatch, not transport.
+- **`rupu-webhook` is an inbound axum server.** It receives webhooks on `/webhook/{github,gitlab,linear,jira}` and makes no outbound calls. Its `reqwest` dependency is used only by its test files.
+
+So both variants describe egress that structurally cannot occur. They are **removed from the `Origin` enum** rather than populated. The enum should enumerate what can happen, not what someone imagined might.
+
+This also retires the standing CP note that filter chips must not be built from the enum — once the variants are gone, the enum becomes a truthful list again.
 
 ## 8. Error handling
 
@@ -109,7 +116,7 @@ Unchanged from the original design and non-negotiable: capture never breaks a re
 | Plan | Content |
 |---|---|
 | **1** | Per-run ledger + per-run sink: `netflow_dir`/`archived_netflow_dir`, sink through `provider_factory`, remove `http::init`/`sink()`, wire `run` / `session` / `workflow` / autoflow / `dispatch`, delete the merge and the global enumeration. |
-| **2** | Construct `Origin::Mcp` and `Origin::Webhook` at their real call sites. |
+| **2** | Remove `Origin::Mcp` and `Origin::Webhook` — neither crate makes outbound HTTP, so both describe egress that cannot occur. |
 | **3** | `rupu netflow prune` + time-range filtering through views → API → UI. |
 
 Plan 1 is the enabler and by far the largest; 2 and 3 are independent of each other and both depend on 1.
