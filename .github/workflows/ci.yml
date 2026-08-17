@@ -4,6 +4,18 @@ on:
   pull_request:
   push:
     branches: [main]
+  # release-beta.yml refuses to cut a tag unless ci.yml is green for main's
+  # EXACT HEAD SHA, and that check is deliberately not force-bypassable. So a
+  # single dropped `push` event — GitHub does occasionally fail to create a
+  # run, with Actions itself reporting operational — strands the release: the
+  # commit has no run, the gate sees none, and every later beta skips.
+  #
+  # Without this trigger the only recovery is pushing a junk commit to main
+  # purely to re-fire the event, which is a bad thing to need at exactly the
+  # moment the release path is stuck. A dispatched run on main carries main's
+  # HEAD as its headSha, so it satisfies the gate's query the same way a push
+  # run does.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
