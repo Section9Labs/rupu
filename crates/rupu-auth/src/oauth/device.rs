@@ -51,8 +51,15 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
     let token_url = std::env::var("RUPU_DEVICE_TOKEN_URL_OVERRIDE")
         .unwrap_or_else(|_| oauth.token_url.to_string());
 
-    let client =
-        rupu_netflow::http::client(rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System));
+    // Pre-existing compile break from Task 4 (netflow-per-run plan) removing
+    // the process-global sink; auth/OAuth traffic is deliberately out of
+    // netflow's scope, so `NullSink` here is correct, not a stopgap. Task 7
+    // owns the final wiring of this call site.
+    let client = rupu_netflow::http::client_with(
+        rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System),
+        reqwest::Client::builder(),
+        std::sync::Arc::new(rupu_netflow::NullSink),
+    )?;
     let dc: DeviceCodeResponse = client
         .post(&device_url)
         .header("Accept", "application/json")

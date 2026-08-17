@@ -293,8 +293,15 @@ impl KeychainResolver {
         // Provider-agnostic refresh: standard OAuth refresh-token grant.
         let token_url = std::env::var("RUPU_OAUTH_TOKEN_URL_OVERRIDE")
             .unwrap_or_else(|_| oauth.token_url.to_string());
-        let client =
-            rupu_netflow::http::client(rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System));
+        // Pre-existing compile break from Task 4 (netflow-per-run plan) removing
+        // the process-global sink; auth/OAuth traffic is deliberately out of
+        // netflow's scope, so `NullSink` here is correct, not a stopgap. Task 7
+        // owns the final wiring of this call site.
+        let client = rupu_netflow::http::client_with(
+            rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System),
+            reqwest::Client::builder(),
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        )?;
         let resp = client
             .post(&token_url)
             .form(&[
@@ -559,7 +566,11 @@ mod resolver_named_tests {
     #[tokio::test]
     async fn named_provider_falls_back_to_env() {
         let _lock = ENV_LOCK.lock().await;
-        let _guard = EnvGuard(vec!["RUPU_AUTH_FILE", "RUPU_AUTH_BACKEND", "RUPU_ACME_API_KEY"]);
+        let _guard = EnvGuard(vec![
+            "RUPU_AUTH_FILE",
+            "RUPU_AUTH_BACKEND",
+            "RUPU_ACME_API_KEY",
+        ]);
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");

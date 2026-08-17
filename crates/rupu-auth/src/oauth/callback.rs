@@ -197,8 +197,16 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
     let token_url = std::env::var("RUPU_OAUTH_TOKEN_URL_OVERRIDE")
         .unwrap_or_else(|_| oauth.token_url.to_string());
 
-    let client =
-        rupu_netflow::http::client(rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System));
+    // Pre-existing compile break from Task 4 (netflow-per-run plan) removing
+    // the process-global sink; not this call site's concern to attribute
+    // egress (auth/OAuth traffic is deliberately out of netflow's scope —
+    // see the plan's progress ledger), so a `NullSink` here is correct, not
+    // a stopgap. Task 7 owns the final wiring of this call site.
+    let client = rupu_netflow::http::client_with(
+        rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System),
+        reqwest::Client::builder(),
+        std::sync::Arc::new(rupu_netflow::NullSink),
+    )?;
     let mut params: Vec<(&str, String)> = vec![
         ("grant_type", "authorization_code".into()),
         ("code", code.clone()),
