@@ -396,7 +396,7 @@ fn run_scoped_flows_and_dropped(
 }
 
 /// Read the ledger + run transcript for a run whose artifacts live under
-/// `workspace` (a project root, `<workspace>/.rupu/netflow/flows.jsonl` and
+/// `workspace` (a project root, `<workspace>/.rupu/netflow/<run_id>.jsonl` and
 /// whatever `store` reports as this run's step transcript paths), scope to
 /// `run_id`, merge, and build the response. A missing ledger is an empty
 /// result, not an error. Synchronous — see [`run_scoped_flows_and_dropped`].

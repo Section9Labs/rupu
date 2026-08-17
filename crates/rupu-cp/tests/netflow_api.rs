@@ -7,12 +7,26 @@
 //! `ctx.run_id`, so a run's SCM/auth/update calls are `run_id: None` in the
 //! ledger and only recoverable from the run's own transcript. See
 //! `rupu-cp/src/api/netflow.rs`'s module doc for the full rationale.
+//!
+//! ## One ledger file per run, not one shared `flows.jsonl`
+//!
+//! `NetflowPaths::for_run(netflow_dir, run_id)` names each run's ledger
+//! `<netflow_dir>/<run_id>.jsonl` (the netflow-per-run plan). `write_ledger`
+//! below always writes to one such file; most fixtures below call it once
+//! per run they want to exist so a run-scoped read only ever sees its own
+//! file, matching production. `run_scope_filters_to_that_run_only` is the
+//! one exception — it exercises `filter_by_run` (a pure function, still
+//! exported, no longer called by any production read path) directly against
+//! a hand-mixed in-memory set, so it deliberately writes multiple runs into
+//! one file; that is NOT a claim about how production lays ledgers out.
 
 // Throwaway in-process HTTP client hitting our own spawned test server, not
 // rupu's own egress (mirrors `tests/run_graph.rs`).
 #![allow(clippy::disallowed_methods)]
 
-use rupu_netflow::{Fidelity, FlowCtx, FlowId, FlowRecord, LedgerLine, Origin, Outcome};
+use rupu_netflow::{
+    Fidelity, FlowCtx, FlowId, FlowRecord, LedgerLine, NetflowPaths, Origin, Outcome,
+};
 
 fn flow(run: Option<&str>, host: &str, fidelity: Fidelity, peer: Option<&str>) -> FlowRecord {
     FlowRecord {
@@ -53,21 +67,33 @@ fn flow(run: Option<&str>, host: &str, fidelity: Fidelity, peer: Option<&str>) -
     }
 }
 
-fn write_ledger(workspace: &std::path::Path, lines: &[LedgerLine]) {
-    let paths = rupu_netflow::NetflowPaths::new(workspace);
+/// Write `lines` to `run_id`'s own ledger file under `workspace`'s netflow
+/// directory (`NetflowPaths::for_run`), creating the directory (and its
+/// self-ignoring `.gitignore`) first. Returns the `NetflowPaths` so callers
+/// don't have to re-derive the same path a second time to read it back.
+fn write_ledger(workspace: &std::path::Path, run_id: &str, lines: &[LedgerLine]) -> NetflowPaths {
+    let paths = NetflowPaths::for_run(&workspace.join(".rupu/netflow"), run_id);
     paths.ensure_dir().unwrap();
     let body: String = lines
         .iter()
         .map(|l| format!("{}\n", serde_json::to_string(l).unwrap()))
         .collect();
     std::fs::write(&paths.flows, body).unwrap();
+    paths
 }
 
 #[test]
 fn run_scope_filters_to_that_run_only() {
+    // See the module doc: this exercises `filter_by_run` directly against a
+    // hand-mixed set, not the per-run-file routing a real run-scoped read
+    // relies on today (that's `run_netflow_route_merges_ledger_and_
+    // transcript_dedupes_and_excludes_other_runs`, below). The run id
+    // passed to `write_ledger` here is therefore just a label for this one
+    // fixture file, not a claim that production ever mixes runs together.
     let tmp = tempfile::TempDir::new().unwrap();
-    write_ledger(
+    let paths = write_ledger(
         tmp.path(),
+        "mixed-fixture",
         &[
             LedgerLine::Flow(Box::new(flow(
                 Some("run-a"),
@@ -85,7 +111,6 @@ fn run_scope_filters_to_that_run_only() {
         ],
     );
 
-    let paths = rupu_netflow::NetflowPaths::new(tmp.path());
     let all = rupu_netflow::ledger::read_flows(&paths.flows).unwrap();
     let scoped = rupu_cp::api::netflow::filter_by_run(&all, "run-a");
 
@@ -144,14 +169,14 @@ fn a_flow_with_no_peer_ip_gets_no_asn() {
 #[test]
 fn dropped_lines_are_reported_not_swallowed() {
     let tmp = tempfile::TempDir::new().unwrap();
-    write_ledger(
+    let paths = write_ledger(
         tmp.path(),
+        "run-with-drops",
         &[LedgerLine::Dropped {
             count: 12,
             ts: chrono::Utc::now(),
         }],
     );
-    let paths = rupu_netflow::NetflowPaths::new(tmp.path());
     assert_eq!(
         rupu_netflow::ledger::read_dropped_total(&paths.flows).unwrap(),
         12
@@ -274,13 +299,15 @@ fn e2e_flow(id: FlowId, run: Option<&str>, host: &str, origin: Origin) -> FlowRe
     }
 }
 
-/// The full arc: the ledger has this run's finalized flow (A) and another
-/// run's flow (must be excluded); the run's transcript has a stale
-/// pre-completion copy of A (must lose to the ledger's finalized copy) and
-/// a `run_id: None` SCM flow (C) that the ledger's `run_id` filter alone
-/// would have dropped entirely. Response must contain exactly A (finalized)
-/// + C, report the ledger's dropped-count, and roll `hosts` up from that
-/// same merged set (not leaking the other run's host).
+/// The full arc: `run_id`'s own ledger file has this run's finalized flow
+/// (A); `other_run_id` has its own SEPARATE ledger file with a different
+/// run's flow that must never be read for this request at all (not merely
+/// filtered out — proving the route only ever opens `run_id`'s own file).
+/// The run's transcript has a stale pre-completion copy of A (must lose to
+/// the ledger's finalized copy) and a `run_id: None` SCM flow (C) that a
+/// ledger read alone would never see. Response must contain exactly A
+/// (finalized) + C, report `run_id`'s own ledger's dropped-count, and roll
+/// `hosts` up from that same merged set (not leaking the other run's host).
 #[tokio::test]
 async fn run_netflow_route_merges_ledger_and_transcript_dedupes_and_excludes_other_runs() {
     let global = tempfile::tempdir().unwrap();
@@ -307,16 +334,24 @@ async fn run_netflow_route_merges_ledger_and_transcript_dedupes_and_excludes_oth
         Origin::Provider("anthropic".into()),
     );
 
+    // `run_id`'s own ledger file: flow A plus this run's dropped-count.
     write_ledger(
         project.path(),
+        run_id,
         &[
             LedgerLine::Flow(Box::new(ledger_flow_a.clone())),
-            LedgerLine::Flow(Box::new(ledger_flow_other)),
             LedgerLine::Dropped {
                 count: 3,
                 ts: chrono::Utc::now(),
             },
         ],
+    );
+    // `other_run_id`'s own, separate ledger file — the route under test
+    // must never open this file for a `run_id` request.
+    write_ledger(
+        project.path(),
+        other_run_id,
+        &[LedgerLine::Flow(Box::new(ledger_flow_other))],
     );
 
     let id_c = FlowId::new();
@@ -450,8 +485,13 @@ async fn project_netflow_includes_run_scoped_and_system_origin_flows() {
         Origin::Provider("anthropic".into()),
     );
     let system_flow = e2e_flow(FlowId::new(), None, "iptoasn.com", Origin::System);
+    // Project scope unions EVERY `.jsonl` file under the workspace's
+    // netflow directory, so which run id names this particular file is
+    // incidental to what's under test here (unlike the run-scope test
+    // above, where the filename IS the thing under test).
     write_ledger(
         project.path(),
+        "run-a",
         &[
             LedgerLine::Flow(Box::new(run_flow.clone())),
             LedgerLine::Flow(Box::new(system_flow.clone())),
@@ -504,6 +544,7 @@ async fn global_netflow_unions_every_workspace_including_system_egress() {
 
     write_ledger(
         project_a.path(),
+        "run-a",
         &[LedgerLine::Flow(Box::new(e2e_flow(
             FlowId::new(),
             Some("run-a"),
@@ -513,6 +554,7 @@ async fn global_netflow_unions_every_workspace_including_system_egress() {
     );
     write_ledger(
         project_b.path(),
+        "system",
         &[LedgerLine::Flow(Box::new(e2e_flow(
             FlowId::new(),
             None,
@@ -544,29 +586,31 @@ async fn global_netflow_unions_every_workspace_including_system_egress() {
     );
 }
 
-// ── The CP daemon's own ledger (Fix 1, netflow Plan 3 review round 3) ─────
+// ── Regression guards: no daemon-wide (non-workspace) ledger union ────────
 //
-// `rupu cp serve` roots its netflow sink at `$RUPU_HOME/netflow/flows.jsonl`
-// (`rupu-cli/src/cmd/cp.rs`), NOT under any registered workspace — a daemon
-// has no single project to anchor a project-relative ledger at. Every
-// `Origin::Cp` flow (and any `Origin::Update`/ASN-refresh traffic `cp serve`
-// produces) lands there. This is the regression guard for the whole class of
-// bug the review found: that ledger was written but never read by ANY
-// handler, so its traffic was recorded and then permanently invisible.
+// A prior revision of this API unioned a `cp serve`-daemon-wide ledger at
+// `$RUPU_HOME/netflow/flows.jsonl` into global scope (Fix 1, netflow Plan 3
+// review round 3) — that file no longer exists at all: per the netflow
+// per-run plan, `cp serve`'s own fleet/ASN-refresh traffic is deliberately
+// unrecorded (see `rupu-cli/src/cmd/cp.rs`'s deleted `http::init` call), and
+// `read_all_workspaces_sync` no longer reads any path outside a registered
+// workspace's own `.rupu/netflow/` directory. These two tests are now
+// regression guards for that: a stray `.jsonl` sitting directly under
+// `$RUPU_HOME/netflow/` (e.g. left over from an install that predates this
+// plan) must stay invisible at both global and project scope, not silently
+// start leaking again if a future change re-adds a shared-directory read.
 
 #[tokio::test]
-async fn global_netflow_includes_the_cp_daemons_own_global_ledger() {
+async fn global_netflow_ignores_a_legacy_daemon_wide_ledger_file() {
     let global = tempfile::tempdir().unwrap();
 
-    // The CP daemon's own ledger, written exactly where `cmd/cp.rs`'s
-    // `Action::Serve` handler roots it: `<global_dir>/netflow/flows.jsonl`,
-    // NOT `<global_dir>/.rupu/netflow/...` (that would be
-    // `NetflowPaths::new(global_dir)`, a different — wrong — path).
-    let global_ledger_dir = global.path().join("netflow");
-    std::fs::create_dir_all(&global_ledger_dir).unwrap();
+    // A leftover from the pre-plan shared-ledger model — NOT under any
+    // registered workspace's `.rupu/netflow/`.
+    let legacy_ledger_dir = global.path().join("netflow");
+    std::fs::create_dir_all(&legacy_ledger_dir).unwrap();
     let cp_flow = e2e_flow(FlowId::new(), None, "api.other-cp.example", Origin::Cp);
     std::fs::write(
-        global_ledger_dir.join("flows.jsonl"),
+        legacy_ledger_dir.join("flows.jsonl"),
         format!(
             "{}\n",
             serde_json::to_string(&LedgerLine::Flow(Box::new(cp_flow))).unwrap()
@@ -580,29 +624,23 @@ async fn global_netflow_includes_the_cp_daemons_own_global_ledger() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    let flows = body["flows"].as_array().unwrap();
     assert_eq!(
-        flows.len(),
-        1,
-        "the CP daemon's own ledger must surface at global scope: {body}"
+        body["flows"].as_array().unwrap().len(),
+        0,
+        "a legacy daemon-wide ledger file must not surface at global scope: {body}"
     );
-    assert_eq!(flows[0]["host"], "api.other-cp.example");
 }
 
 #[tokio::test]
-async fn project_netflow_does_not_leak_the_cp_daemons_global_ledger() {
-    // The mirror case: the global ledger's traffic is the CP daemon's own,
-    // not any one project's, so it must NOT appear when scoped to a
-    // registered project even though that project has zero traffic of its
-    // own recorded.
+async fn project_netflow_does_not_leak_a_legacy_daemon_wide_ledger_file() {
     let global = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
 
-    let global_ledger_dir = global.path().join("netflow");
-    std::fs::create_dir_all(&global_ledger_dir).unwrap();
+    let legacy_ledger_dir = global.path().join("netflow");
+    std::fs::create_dir_all(&legacy_ledger_dir).unwrap();
     let cp_flow = e2e_flow(FlowId::new(), None, "api.other-cp.example", Origin::Cp);
     std::fs::write(
-        global_ledger_dir.join("flows.jsonl"),
+        legacy_ledger_dir.join("flows.jsonl"),
         format!(
             "{}\n",
             serde_json::to_string(&LedgerLine::Flow(Box::new(cp_flow))).unwrap()
@@ -624,7 +662,7 @@ async fn project_netflow_does_not_leak_the_cp_daemons_global_ledger() {
     assert_eq!(
         body["flows"].as_array().unwrap().len(),
         0,
-        "the CP daemon's own global ledger is not this project's traffic: {body}"
+        "a legacy daemon-wide ledger file is not this project's traffic: {body}"
     );
 }
 
@@ -649,6 +687,7 @@ async fn netflow_graph_project_scope_is_bipartite_and_keeps_system_source() {
 
     write_ledger(
         project.path(),
+        "run-a",
         &[
             LedgerLine::Flow(Box::new(e2e_flow(
                 FlowId::new(),
@@ -699,6 +738,7 @@ async fn netflow_graph_run_scope_matches_the_runs_netflow_route() {
 
     write_ledger(
         project.path(),
+        run_id,
         &[LedgerLine::Flow(Box::new(e2e_flow(
             FlowId::new(),
             Some(run_id),
@@ -735,6 +775,7 @@ async fn netflow_graph_defaults_to_global_scope_when_absent() {
     let project = tempfile::tempdir().unwrap();
     write_ledger(
         project.path(),
+        "run-a",
         &[LedgerLine::Flow(Box::new(e2e_flow(
             FlowId::new(),
             Some("run-a"),
