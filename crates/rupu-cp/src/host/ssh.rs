@@ -2478,16 +2478,31 @@ mod tests {
         // this field pairs with `active.running` on the "Active now" tile.
         let runs_json = r#"{"kind":"run_list","version":1,"rows":[
             {"id":"r1","workflow_name":"w","status":"running",
-             "started_at":"2026-07-16T14:03:11Z","finished_at":null,"trigger":"manual",
+             "started_at":"__R1_STARTED__","finished_at":null,"trigger":"manual",
              "usage":{"input_tokens":0,"output_tokens":0,"cached_tokens":0,
                       "total_tokens":0,"cost_usd":null,"priced":false,"runs":1},
              "turns":0,"duration_ms":null},
             {"id":"r2","workflow_name":"w","status":"awaiting_approval",
-             "started_at":"2026-07-16T14:02:11Z","finished_at":null,"trigger":"cron",
+             "started_at":"__R2_STARTED__","finished_at":null,"trigger":"cron",
              "usage":{"input_tokens":0,"output_tokens":0,"cached_tokens":0,
                       "total_tokens":0,"cost_usd":null,"priced":false,"runs":1},
              "turns":0,"duration_ms":null}
         ],"summary":{"count":2,"limit":10000,"status_filter":null}}"#;
+        // Anchored to `now`: the query below asks for `Days30`, so hard-coded
+        // fixture dates silently age out of the window and the test starts
+        // failing on a calendar date rather than on a code change. `r1` is the
+        // older of the two so it stays the `active_longest` pick.
+        let r1_started = chrono::Utc::now() - chrono::Duration::hours(2);
+        let r2_started = chrono::Utc::now() - chrono::Duration::hours(1);
+        let runs_json = runs_json
+            .replace(
+                "__R1_STARTED__",
+                &r1_started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            )
+            .replace(
+                "__R2_STARTED__",
+                &r2_started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            );
         let cycles_json = r#"{"kind":"autoflow_history","version":1,"rows":[]}"#;
 
         let stub = std::sync::Arc::new(StubExec {
@@ -2571,13 +2586,29 @@ mod tests {
         }
 
         // A completed run at a raw, decidedly non-midnight timestamp.
-        let runs_json = r#"{"kind":"run_list","version":1,"rows":[
-            {"id":"r1","workflow_name":"w","status":"completed",
-             "started_at":"2026-07-15T13:47:22Z","finished_at":"2026-07-15T13:50:00Z","trigger":"manual",
-             "usage":{"input_tokens":0,"output_tokens":0,"cached_tokens":0,
-                      "total_tokens":0,"cost_usd":null,"priced":false,"runs":1},
-             "turns":0,"duration_ms":null}
-        ],"summary":{"count":1,"limit":10000,"status_filter":null}}"#;
+        //
+        // Anchored to `now` rather than a frozen date: the query below asks for
+        // `Days30`, so a hard-coded fixture silently ages out of the window and
+        // the test starts failing on a calendar date rather than on a code
+        // change. Two days back is safely inside the window while still being a
+        // different day from "today" in every timezone.
+        let started = (chrono::Utc::now() - chrono::Duration::days(2))
+            .date_naive()
+            .and_hms_opt(13, 47, 22)
+            .expect("13:47:22 is a valid time")
+            .and_utc();
+        let finished = started + chrono::Duration::minutes(3);
+        let runs_json = format!(
+            r#"{{"kind":"run_list","version":1,"rows":[
+            {{"id":"r1","workflow_name":"w","status":"completed",
+             "started_at":"{}","finished_at":"{}","trigger":"manual",
+             "usage":{{"input_tokens":0,"output_tokens":0,"cached_tokens":0,
+                      "total_tokens":0,"cost_usd":null,"priced":false,"runs":1}},
+             "turns":0,"duration_ms":null}}
+        ],"summary":{{"count":1,"limit":10000,"status_filter":null}}}}"#,
+            started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            finished.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        );
         let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(StubExec {
             runs_json: runs_json.into(),
         }));
@@ -2593,13 +2624,15 @@ mod tests {
             "expected exactly one terminal bucket, got {:?}",
             s.terminal_buckets
         );
-        let expected_midnight = "2026-07-15T00:00:00Z"
-            .parse::<chrono::DateTime<chrono::Utc>>()
-            .unwrap();
+        let expected_midnight = started
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is a valid time")
+            .and_utc();
         assert_eq!(
             s.terminal_buckets[0].ts, expected_midnight,
             "bucket ts must be midnight-truncated, not the raw started_at \
-             (2026-07-15T13:47:22Z) — a non-midnight ts never matches a \
+             ({started}) — a non-midnight ts never matches a \
              fill-grid cursor and is silently dropped"
         );
         assert_eq!(s.terminal_buckets[0].completed, 1);
