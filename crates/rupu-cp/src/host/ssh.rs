@@ -2506,7 +2506,7 @@ mod tests {
         let cycles_json = r#"{"kind":"autoflow_history","version":1,"rows":[]}"#;
 
         let stub = std::sync::Arc::new(StubExec {
-            runs_json: runs_json.into(),
+            runs_json,
             cycles_json: cycles_json.into(),
             cmds: std::sync::Mutex::new(Vec::new()),
         });
@@ -2609,9 +2609,7 @@ mod tests {
             started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             finished.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         );
-        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(StubExec {
-            runs_json: runs_json.into(),
-        }));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(StubExec { runs_json }));
 
         let s = conn
             .dashboard_summary(crate::host::dashboard_summary::DashboardRange::Days30)
