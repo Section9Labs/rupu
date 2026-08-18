@@ -19,11 +19,13 @@
 //! --older-than <duration>` (`rupu-cli`'s `cmd::netflow` module) is the
 //! retention tool, mirroring `rupu transcript prune`; nothing in this
 //! crate or `rupu-cli` schedules it, so an installation that never runs
-//! it keeps every ledger forever. A prune sweep never touches a run
-//! that might still be Running/Pending, the directory's own
-//! self-ignoring `.gitignore`, or the legacy pre-per-run `flows.jsonl`
-//! — see that module's doc comment for the full accept/reject and
-//! liveness reasoning.
+//! it keeps every ledger forever. A prune sweep never touches a ledger
+//! modified within `MIN_LEDGER_AGE`, the directory's own self-ignoring
+//! `.gitignore`, or the legacy pre-per-run `flows.jsonl`. Note that the
+//! age floor is a proxy for liveness, not a guarantee of it: there is no
+//! cheap filename-to-run-state lookup, so a genuinely long-idle
+//! `Running` run is not provably safe — see that module's doc comment
+//! for the full accept/reject and liveness reasoning.
 //!
 //! # Adding an HTTP client
 //!

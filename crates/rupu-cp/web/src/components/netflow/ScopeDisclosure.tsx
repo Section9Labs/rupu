@@ -19,8 +19,8 @@
 //
 // It also excludes "the updater" entirely: `rupu_netflow::http::init` (the
 // process-global sink installer this paragraph used to cite) was deleted
-// in the netflow-per-run rewrite — see `rupu-providers/tests/netflow_
-// capture.rs`'s header comment. Every remaining `rupu update` / update-
+// in the netflow-per-run rewrite — `rupu-netflow/src/http/` has no `init`
+// at all any more. Every remaining `rupu update` / update-
 // notice call site (`GithubReleaseSource::new`, `rupu-update/src/
 // github.rs`) constructs its HTTP client with `Arc::new(NullSink)`
 // directly, including the passive update-notice check spawned in
