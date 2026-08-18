@@ -90,7 +90,8 @@ function disclosureText(scope: NetflowScope): string {
     `This covers rupu's own egress — ${coverage} — never traffic from the agent's bash ` +
     `subprocess. It also can't see non-HTTP egress: git2 clones (often a run's ` +
     `largest byte volume), object_store bucket traffic, and the node WebSocket are invisible ` +
-    `here too.`
+    `here too. Ledgers are kept indefinitely unless an operator runs \`rupu netflow prune\` ` +
+    `— nothing here expires or rotates on its own.`
   );
 }
 
