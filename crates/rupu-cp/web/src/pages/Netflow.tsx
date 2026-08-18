@@ -1,13 +1,15 @@
 // Netflow — the global egress page: the UNION of every flow rupu recorded,
-// across every run, plus `system`-origin traffic (updater, ASN refresh)
-// that carries no run_id and therefore never surfaces on a per-run Network
-// tab or a workflow page (flows belong to a run, never to a workflow
-// *definition* — nothing netflow-shaped is mounted there). CP's own fleet
-// traffic is NOT among that system-origin traffic — `Origin::Cp` is wired
-// to a `NullSink` (`HttpHostConnector`, `crates/rupu-cp/src/host/http.rs`)
-// and recorded nowhere, at any scope (netflow-per-run plan, Task 8). This
-// is also the ONE scope that unions every per-run ledger file
-// (`<run_id>.jsonl`) under `$RUPU_HOME/netflow/` alongside every
+// across every run, plus `system`-origin traffic (the rare passive
+// update-notice check, `Origin::Update`) that carries no run_id and
+// therefore never surfaces on a per-run Network tab or a workflow page
+// (flows belong to a run, never to a workflow *definition* — nothing
+// netflow-shaped is mounted there). Neither CP's own fleet traffic nor
+// its ASN-table refresh are among that system-origin traffic — both
+// `Origin::Cp` (`HttpHostConnector`) and `Origin::System` ASN downloads
+// (`cmd/cp.rs`'s sweep, this crate's own `maybe_refresh_asn`) are wired to
+// a `NullSink` and recorded nowhere, at any scope (netflow-per-run plan,
+// Task 8). This is also the ONE scope that unions every per-run ledger
+// file (`<run_id>.jsonl`) under `$RUPU_HOME/netflow/` alongside every
 // registered workspace's own `.rupu/netflow/` — see
 // `rupu_cp::api::netflow::read_all_workspaces_sync`'s doc comment.
 //

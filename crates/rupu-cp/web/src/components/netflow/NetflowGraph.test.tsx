@@ -52,10 +52,13 @@ describe('NetflowGraph', () => {
     expect(screen.queryByText(/CP fleet traffic/i)).not.toBeInTheDocument();
   });
 
-  it('never claims ASN refresh in the empty-state hint at project or run scope', () => {
-    // Round 5: `Origin::System` ASN-refresh downloads are global-only (see
-    // `netflowSystemSourceHint`'s doc comment) — untouched by Task 8, which
-    // only removed "CP fleet traffic" above.
+  it('never claims ASN refresh in the empty-state hint at any scope', () => {
+    // On review (same Task 8 pass): `Origin::System` ASN-refresh downloads
+    // turned out to be the identical defect as CP fleet traffic —
+    // `cmd/cp.rs`'s sweep AND this crate's own `maybe_refresh_asn` both
+    // build their client with `NullSink`, so it is recorded nowhere, at
+    // any scope. Previously (round 5) this was claimed at global scope
+    // only; now no scope may claim it.
     render(<NetflowGraph graph={{ nodes: [], edges: [] }} scope="project" />);
     expect(screen.queryByText(/ASN refresh/i)).not.toBeInTheDocument();
     cleanup();
@@ -63,7 +66,7 @@ describe('NetflowGraph', () => {
     expect(screen.queryByText(/ASN refresh/i)).not.toBeInTheDocument();
     cleanup();
     render(<NetflowGraph graph={{ nodes: [], edges: [] }} scope="global" />);
-    expect(screen.getByText(/ASN refresh/i)).toBeInTheDocument();
+    expect(screen.queryByText(/ASN refresh/i)).not.toBeInTheDocument();
   });
 
   it('never surfaces GraphEdge.bytes as a byte count, even for a Coarse (bytes: 0) edge', () => {

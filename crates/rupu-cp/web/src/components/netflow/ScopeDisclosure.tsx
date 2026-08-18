@@ -38,22 +38,34 @@
 // `Origin::Cp` specifically. There is no scope left where the claim is
 // true, so it comes out everywhere, with no `scope`-conditional branch
 // left to qualify it.
+//
+// It ALSO excludes "ASN refresh" entirely now (same pass, on review):
+// every `Origin::System` ASN-refresh download — `cmd/cp.rs`'s gate-sweep
+// tick AND this crate's own read-triggered `maybe_refresh_asn` — builds
+// its client with `Arc::new(NullSink)` too, for the identical reason as
+// CP fleet traffic (a background download tied to the daemon, not to any
+// run). This was ALSO claimed at `scope === 'global'` only (round 5's
+// fix), on the same now-gone "cp serve installs a persistent global
+// ledger at startup" premise the CP-fleet-traffic carve-out relied on.
+// Same conclusion: nothing captures it at any scope, so nothing here may
+// claim it either.
 
 export type NetflowScope = 'run' | 'project' | 'global';
 
 /** Netflow's full coverage list — true at EVERY scope now (no scope adds
  *  anything on top of this one; see the header comment's "CP fleet
- *  traffic" note for why that stopped being true for global scope). Safe
- *  to use standalone (e.g. NetflowTable's empty-state hint, which has no
- *  scope of its own to key off) or through [`netflowCoverageList`], which
- *  now just returns this same string for every scope. */
+ *  traffic" and "ASN refresh" notes for why that stopped being true for
+ *  global scope). Safe to use standalone (e.g. NetflowTable's empty-state
+ *  hint, which has no scope of its own to key off) or through
+ *  [`netflowCoverageList`], which now just returns this same string for
+ *  every scope. */
 export const NETFLOW_COVERAGE_LIST = 'provider APIs, SCM connectors';
 
 /** `NETFLOW_COVERAGE_LIST`, at every scope — see the header comment's "CP
- *  fleet traffic" note for why global scope no longer adds anything on
- *  top. Kept scope-parameterized (the parameter is currently unused) so a
- *  genuinely scope-specific category can be reintroduced here later
- *  without every call site changing shape. */
+ *  fleet traffic" and "ASN refresh" notes for why global scope no longer
+ *  adds anything on top. Kept scope-parameterized (the parameter is
+ *  currently unused) so a genuinely scope-specific category can be
+ *  reintroduced here later without every call site changing shape. */
 export function netflowCoverageList(_scope: NetflowScope): string {
   return NETFLOW_COVERAGE_LIST;
 }
@@ -90,15 +102,11 @@ export function NetflowScopeDisclosure({
  *  two defects as the main disclosure, just in a fourth, un-centralized
  *  copy.
  *
- *  "CP fleet traffic" came out of the example list entirely (netflow-
- *  per-run plan, Task 8) for the same reason it came out of the main
- *  disclosure — see this file's header comment. It is no longer
- *  conditional on `scope`; it simply isn't offered as an example anywhere
- *  anymore.
- *
- *  "ASN refresh" is still offered conditionally at `scope === 'global'`
- *  only (round 5's fix) — untouched by the Task 8 pass that removed "CP
- *  fleet traffic" above.
+ *  Both parenthetical examples this used to offer at `scope === 'global'`
+ *  — "CP fleet traffic" and "ASN refresh" — are gone now (netflow-per-run
+ *  plan, Task 8; see this file's header comment for both). Nothing in
+ *  either category reaches any ledger anymore, at any scope, so there is
+ *  currently no example left to offer here at all.
  *
  *  The `system` SOURCE ITSELF stays valid at every scope, though — that's
  *  a decision, not an oversight: `Origin::System` also covers auth/oauth
@@ -111,11 +119,10 @@ export function NetflowScopeDisclosure({
  *  which the same per-run sink always writes to regardless of the
  *  ledger's fate (`merge_with_transcript` in
  *  `rupu-cp/src/api/netflow.rs`; see that module's doc). Only the
- *  PARENTHETICAL EXAMPLE is scope-gated here, not the "or system for
- *  unattributed egress" clause that names the source. */
-export function netflowSystemSourceHint(scope: NetflowScope): string {
-  const examples = scope === 'global' ? ' (ASN refresh)' : '';
-  return `Sources — runs, or system for unattributed egress${examples} — connect to the host:port endpoints they reached.`;
+ *  PARENTHETICAL EXAMPLE(S) were ever scope-gated here, not the "or
+ *  system for unattributed egress" clause that names the source. */
+export function netflowSystemSourceHint(_scope: NetflowScope): string {
+  return `Sources — runs, or system for unattributed egress — connect to the host:port endpoints they reached.`;
 }
 
 export default NetflowScopeDisclosure;

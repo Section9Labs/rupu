@@ -14,6 +14,13 @@
 // scope, so the global-only carve-out below is gone too. Every assertion
 // that used to check "global scope claims it, the other two don't" now
 // checks "no scope claims it."
+//
+// Same file, same pass, on review: "ASN refresh" turned out to be the
+// identical defect — `cmd/cp.rs`'s sweep AND `maybe_refresh_asn` both
+// build their download client with `NullSink` too, so it is equally
+// unrecorded at every scope, global included. Its assertions below were
+// updated the same way, not left as the one example that still claims
+// global-only visibility.
 
 import '@testing-library/jest-dom/vitest';
 import { render, screen, cleanup } from '@testing-library/react';
@@ -55,20 +62,19 @@ describe('netflowCoverageList', () => {
 });
 
 describe('netflowSystemSourceHint', () => {
-  it('includes ASN refresh ONLY for global scope', () => {
-    // Round 5: every `Origin::System` ASN-refresh download resolves a
-    // sink built inline at its call site (`cmd/cp.rs`'s sweep,
-    // `maybe_refresh_asn`); there is no other `asn::refresh` call site, so
-    // it can never appear at project or run scope. Untouched by Task 8.
-    expect(netflowSystemSourceHint('project')).not.toMatch(/ASN refresh/i);
-    expect(netflowSystemSourceHint('run')).not.toMatch(/ASN refresh/i);
-    expect(netflowSystemSourceHint('global')).toMatch(/ASN refresh/i);
-  });
-
   it.each(SCOPES)('never claims CP fleet traffic at %s scope', (scope) => {
     // Task 8: "CP fleet traffic" is gone from this example list
     // entirely — see the file header note above.
     expect(netflowSystemSourceHint(scope)).not.toMatch(/CP fleet traffic/i);
+  });
+
+  it.each(SCOPES)('never claims ASN refresh at %s scope', (scope) => {
+    // `Origin::System` ASN-refresh downloads are wired to `NullSink` at
+    // both call sites (`cmd/cp.rs`'s sweep, this crate's own
+    // `maybe_refresh_asn`) — recorded nowhere, at any scope, global
+    // included. Previously (round 5) this was claimed at global scope
+    // only; that carve-out is gone along with the claim.
+    expect(netflowSystemSourceHint(scope)).not.toMatch(/ASN refresh/i);
   });
 
   it.each(SCOPES)('still names `system` as a source at %s scope', (scope) => {
