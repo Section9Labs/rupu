@@ -82,6 +82,27 @@ fn write_ledger(workspace: &std::path::Path, run_id: &str, lines: &[LedgerLine])
     paths
 }
 
+/// As [`write_ledger`], but writes directly under `<global>/netflow/`
+/// instead of `<workspace>/.rupu/netflow/` — the routing a run's ledger
+/// falls back to whenever its workspace never got its own `.rupu/netflow/`
+/// (see `rupu_netflow::netflow_dir`'s doc comment). On a fresh install
+/// this is where EVERY run's ledger actually lands, so it's the shape the
+/// Critical-fix regression tests below need to reproduce.
+fn write_global_ledger(
+    global: &std::path::Path,
+    run_id: &str,
+    lines: &[LedgerLine],
+) -> NetflowPaths {
+    let paths = NetflowPaths::for_run(&global.join("netflow"), run_id);
+    paths.ensure_dir().unwrap();
+    let body: String = lines
+        .iter()
+        .map(|l| format!("{}\n", serde_json::to_string(l).unwrap()))
+        .collect();
+    std::fs::write(&paths.flows, body).unwrap();
+    paths
+}
+
 #[test]
 fn run_scope_filters_to_that_run_only() {
     // See the module doc: this exercises `filter_by_run` directly against a
@@ -663,6 +684,171 @@ async fn project_netflow_does_not_leak_a_legacy_daemon_wide_ledger_file() {
         body["flows"].as_array().unwrap().len(),
         0,
         "a legacy daemon-wide ledger file is not this project's traffic: {body}"
+    );
+}
+
+// ── Critical-fix regression tests: global-fallback routing ────────────────
+//
+// On a fresh install `<project>/.rupu/netflow/` never gets created (`rupu
+// init` only ever adds a `.gitignore` entry there -- see `rupu_netflow::
+// netflow_dir`'s doc comment), so EVERY run's ledger actually lands in
+// `<global_dir>/netflow/<run_id>.jsonl`, not under any registered
+// workspace. These prove the read side now mirrors that write-side
+// routing rule, rather than only ever finding project-rooted ledgers a
+// fresh install never produces.
+
+#[tokio::test]
+async fn global_netflow_includes_a_run_that_fell_back_to_the_global_netflow_dir() {
+    let global = tempfile::tempdir().unwrap();
+
+    // Simulates the common case: this run's workspace never got its own
+    // `.rupu/netflow/`, so its ledger landed here instead.
+    write_global_ledger(
+        global.path(),
+        "run-fallback",
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            Some("run-fallback"),
+            "api.anthropic.com",
+            Origin::Provider("anthropic".into()),
+        )))],
+    );
+
+    let addr = serve(new_state(global.path())).await;
+    let resp = reqwest::get(format!("http://{addr}/api/netflow"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    assert_eq!(
+        flows.len(),
+        1,
+        "a run whose ledger fell back to <global_dir>/netflow/ must still          surface at global scope: {body}"
+    );
+    assert_eq!(flows[0]["host"], "api.anthropic.com");
+}
+
+#[tokio::test]
+async fn run_netflow_falls_back_to_the_global_netflow_dir_when_the_workspace_has_none() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_id = "run_fallback_scoped";
+
+    // Deliberately do NOT create `<project>/.rupu/netflow/` -- this is the
+    // fresh-install shape the Critical fix exists for. The run's ledger
+    // lives only at the global fallback path.
+    write_global_ledger(
+        global.path(),
+        run_id,
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            Some(run_id),
+            "api.anthropic.com",
+            Origin::Provider("anthropic".into()),
+        )))],
+    );
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!("http://{addr}/api/runs/{run_id}/netflow"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    assert_eq!(
+        flows.len(),
+        1,
+        "run scope must fall back to the global netflow dir when the          workspace has none: {body}"
+    );
+    assert_eq!(flows[0]["host"], "api.anthropic.com");
+}
+
+/// The DAG scheduler mints a fresh run id per dispatched step, so a
+/// step's provider flows AND its `Dropped` line land in
+/// `<netflow_dir>/<step_run_id>.jsonl`, not the parent workflow run's own
+/// file (`Dropped` is a ledger-only line -- unlike a flow record, there
+/// is no transcript fallback to recover it under a different id). A
+/// run-scoped read that only opened the workflow's own ledger would
+/// silently under-report loss for any run with a dispatched step -- proven
+/// here by putting the workflow's own Dropped count in one file and a
+/// step's in another, both of which must be summed.
+#[tokio::test]
+async fn run_netflow_sums_dropped_counts_across_a_dispatched_steps_own_ledger() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_id = "run_with_step";
+    let step_run_id = "run_step_own_id";
+
+    write_ledger(
+        project.path(),
+        run_id,
+        &[LedgerLine::Dropped {
+            count: 5,
+            ts: chrono::Utc::now(),
+        }],
+    );
+    let step_flow = e2e_flow(
+        FlowId::new(),
+        Some(step_run_id),
+        "api.github.com",
+        Origin::Scm("github".into()),
+    );
+    write_ledger(
+        project.path(),
+        step_run_id,
+        &[
+            LedgerLine::Flow(Box::new(step_flow)),
+            LedgerLine::Dropped {
+                count: 7,
+                ts: chrono::Utc::now(),
+            },
+        ],
+    );
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+    let step_transcript = project
+        .path()
+        .join(".rupu")
+        .join("transcripts")
+        .join("s1.jsonl");
+    JsonlWriter::create(&step_transcript).unwrap();
+    state
+        .run_store
+        .append_step_result(run_id, &seed_step(step_run_id, step_transcript))
+        .unwrap();
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!("http://{addr}/api/runs/{run_id}/netflow"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["dropped"], 12,
+        "dropped must sum the workflow's own ledger (5) AND the dispatched \
+         step's own ledger (7), not just the workflow's: {body}"
+    );
+    let flows = body["flows"].as_array().unwrap();
+    assert!(
+        flows.iter().any(|f| f["host"] == "api.github.com"),
+        "the dispatched step's own flow must surface too: {body}"
     );
 }
 

@@ -20,14 +20,42 @@ pub struct NetflowPaths {
     pub flows: PathBuf,
 }
 
+/// Resolve which directory a run's netflow ledger belongs in:
+/// project-local `<project_root>/.rupu/netflow/` when that directory
+/// ALREADY EXISTS, the global `<global>/netflow/` fallback otherwise.
+/// Mirrors `transcripts_dir`'s existing-only gate — the load-bearing
+/// property that keeps ledgers out of repos that never opted in (an
+/// un-`rupu init`'d project, or one initialised before this directory
+/// existed, gets no ledger written inside it; `rupu init` only ever adds
+/// a `.gitignore` entry, it does not create this directory, so "never
+/// opted in" is the common case, not the edge case).
+///
+/// Both `rupu-cli` (every agent-driven entry point: `rupu run`, `rupu
+/// session`, `rupu workflow`, sub-agent dispatch) and `rupu-orchestrator`
+/// (`DefaultStepFactory`, which cannot depend on `rupu-cli` — the
+/// dependency runs the other way) resolve through this ONE function so
+/// the write side's routing decision can never drift into two competing
+/// copies of the same rule. `rupu-cp`'s read side
+/// (`crates/rupu-cp/src/api/netflow.rs`) must mirror this same rule on
+/// the read path — see that module's fallback-to-global handling.
+pub fn netflow_dir(global: &Path, project_root: Option<&Path>) -> PathBuf {
+    if let Some(p) = project_root {
+        let local = p.join(".rupu/netflow");
+        if local.is_dir() {
+            return local;
+        }
+    }
+    global.join("netflow")
+}
+
 impl NetflowPaths {
     /// One ledger per run, mirroring how transcripts are laid out.
     ///
-    /// `netflow_dir` comes from `rupu_cli::paths::netflow_dir`, which
-    /// resolves project-local-when-present with a global fallback. The
-    /// per-run file is what makes a ledger's lifecycle match a
-    /// transcript's: it ends when the run ends, so there is nothing to
-    /// rotate, and the file itself is the run attribution.
+    /// `netflow_dir` is usually [`netflow_dir`] (the shared
+    /// project-local-when-present-else-global resolution rule) — see its
+    /// doc comment. The per-run file is what makes a ledger's lifecycle
+    /// match a transcript's: it ends when the run ends, so there is
+    /// nothing to rotate, and the file itself is the run attribution.
     pub fn for_run(netflow_dir: &Path, run_id: &str) -> Self {
         Self {
             root: netflow_dir.to_path_buf(),

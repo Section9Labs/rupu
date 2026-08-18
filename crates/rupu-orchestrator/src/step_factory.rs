@@ -20,29 +20,16 @@ use rupu_tools::{AgentDispatcher, ToolContext};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Mirror of `rupu_cli::paths::netflow_dir`, duplicated here rather than
-/// shared: `rupu-orchestrator` cannot depend on `rupu-cli` (the
-/// dependency runs the other way — `rupu-cli` depends on this crate), and
-/// every other agent-driven entry point in `rupu-cli` already applies
-/// this exact rule via `crate::netflow_sink::for_run`. Same gate:
-/// project-local ONLY if `<project_root>/.rupu/netflow/` already exists,
-/// global otherwise, so a repo that was never `rupu init`'d never gets a
-/// ledger written inside it. Keep in sync if the `rupu-cli` original ever
-/// changes.
-fn netflow_dir(global: &Path, project_root: Option<&Path>) -> PathBuf {
-    if let Some(p) = project_root {
-        let local = p.join(".rupu/netflow");
-        if local.is_dir() {
-            return local;
-        }
-    }
-    global.join("netflow")
-}
-
 /// Build this step's netflow sink: a ledger writer rooted at
-/// [`netflow_dir`] plus a `TranscriptSink` streaming into the step's own
-/// transcript. Best-effort — a ledger that cannot be opened logs at debug
-/// and the step continues with transcript-only capture.
+/// [`rupu_netflow::netflow_dir`] (the one shared write-side routing rule
+/// -- see its doc comment for why this crate calls it directly instead of
+/// keeping its own copy: `rupu-orchestrator` cannot depend on `rupu-cli`,
+/// the dependency runs the other way, and a second copy of this rule is
+/// exactly the kind of write/read routing divergence that made CP's own
+/// netflow API unable to find ledgers `rupu-cli` had actually written)
+/// plus a `TranscriptSink` streaming into the step's own transcript.
+/// Best-effort -- a ledger that cannot be opened logs at debug and the
+/// step continues with transcript-only capture.
 ///
 /// Called once per [`DefaultStepFactory::build_opts_for_step`] invocation
 /// — i.e. once per dispatched step, using THAT call's `run_id` (the
@@ -74,7 +61,7 @@ fn step_netflow_sink(
     run_id: &str,
     transcript_path: &Path,
 ) -> Arc<dyn rupu_netflow::FlowSink> {
-    let dir = netflow_dir(global, project_root);
+    let dir = rupu_netflow::netflow_dir(global, project_root);
     let netflow_paths = rupu_netflow::NetflowPaths::for_run(&dir, run_id);
     let mut sinks: Vec<Arc<dyn rupu_netflow::FlowSink>> = vec![Arc::new(
         rupu_transcript::TranscriptSink::new(transcript_path.to_path_buf()),

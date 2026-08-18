@@ -367,46 +367,98 @@ pub(crate) fn build_response(
     }
 }
 
-/// The ledger's run-scoped flows for `run_id`, merged with the run's own
-/// transcript (see the module doc for why the ledger alone under-reports),
-/// plus the workspace's total dropped-count — both from ONE pass over the
-/// ledger file via [`rupu_netflow::ledger::read_flows_and_dropped`], not two
-/// (re-scanning the same file just to recount `dropped` doubles exactly the
-/// I/O the "Blocking I/O" module-doc note is about). Synchronous — every
-/// caller runs this through [`run_blocking`], never inline on the async
-/// task. Shared by [`collect_run_netflow`] (which wraps this into the
-/// enriched [`NetflowResponse`]) and the graph endpoint's `run:` scope
-/// (which only needs raw [`FlowRecord`]s to feed
-/// [`rupu_netflow::ledger::graph_view`]).
+/// Resolve which ledger file a given run/step id's flows actually landed
+/// in: the workspace-local `<workspace>/.rupu/netflow/<id>.jsonl` when it
+/// exists, the global `<global_dir>/netflow/<id>.jsonl` fallback
+/// otherwise. Mirrors `rupu_netflow::netflow_dir`'s write-side routing
+/// rule exactly (project-local ONLY if the directory already existed at
+/// write time) — this is the read side of that same decision, applied
+/// per id rather than once per process, because two different ids
+/// belonging to the SAME workspace can legitimately have been written to
+/// different roots if `<workspace>/.rupu/netflow/` was created partway
+/// through the workspace's history (e.g. by an operator running `mkdir`,
+/// or a future `rupu init` enhancement). Neither branch is created here —
+/// this only READS whichever one the writer actually used.
+fn resolve_ledger_path(workspace: &StdPath, global_dir: &StdPath, id: &str) -> PathBuf {
+    let workspace_paths = NetflowPaths::for_run(&workspace.join(".rupu/netflow"), id);
+    if workspace_paths.flows.is_file() {
+        workspace_paths.flows
+    } else {
+        NetflowPaths::for_run(&global_dir.join("netflow"), id).flows
+    }
+}
+
+/// Every ledger-file id this run's own dispatch could have written to:
+/// the run's own id (covers `Registry::discover`'s SCM sink, and every
+/// non-DAG-scheduled provider call — `rupu session`'s per-turn worker,
+/// sub-agent dispatch — which reuse the run's own id directly), PLUS
+/// every dispatched step's — and fan-out item's — own freshly-minted id
+/// recorded in `step_results.jsonl`. The concurrent DAG scheduler mints a
+/// fresh run id per dispatched unit (see `rupu-orchestrator`'s
+/// `runner.rs`, and `step_factory.rs`'s `step_netflow_sink`, which is
+/// handed that id and builds THAT unit's own `NetflowPaths::for_run`), so
+/// a step's provider flows AND its ledger-only `Dropped` count live in
+/// their own file, never the parent workflow run's. A `Dropped` line has
+/// no transcript fallback (unlike a flow record, which the transcript
+/// merge below can still recover under a different id) — skipping a
+/// step's own ledger file here would silently under-report loss for any
+/// run with more than one dispatched step, which is the common case.
+fn run_and_unit_ids(store: &RunStore, run_id: &str) -> Vec<String> {
+    let mut ids = vec![run_id.to_string()];
+    for record in store.read_step_results(run_id).unwrap_or_default() {
+        ids.push(record.run_id);
+        for item in record.items {
+            ids.push(item.run_id);
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// The ledger's run-scoped flows for `run_id` — unioned across every id
+/// [`run_and_unit_ids`] names, each resolved through [`resolve_ledger_path`]
+/// — merged with the run's own transcript (see the module doc for why the
+/// ledger alone under-reports), plus the summed dropped-count from those
+/// same files. Synchronous — every caller runs this through
+/// [`run_blocking`], never inline on the async task. Shared by
+/// [`collect_run_netflow`] (which wraps this into the enriched
+/// [`NetflowResponse`]) and the graph endpoint's `run:` scope (which only
+/// needs raw [`FlowRecord`]s to feed [`rupu_netflow::ledger::graph_view`]).
 fn run_scoped_flows_and_dropped(
     store: &RunStore,
     run_id: &str,
     workspace: &StdPath,
+    global_dir: &StdPath,
 ) -> (Vec<FlowRecord>, u64) {
-    // One ledger file per run (`NetflowPaths::for_run`) — the file is
-    // already scoped to `run_id`, so no `filter_by_run` pass is needed
-    // here any more (it's still exported/used by tests exercising the
-    // merge logic directly against an in-memory flow list).
-    let paths = NetflowPaths::for_run(&workspace.join(".rupu/netflow"), run_id);
-    let (all, dropped) =
-        rupu_netflow::ledger::read_flows_and_dropped(&paths.flows).unwrap_or_default();
+    let mut all = Vec::new();
+    let mut dropped = 0u64;
+    for id in run_and_unit_ids(store, run_id) {
+        let ledger_path = resolve_ledger_path(workspace, global_dir, &id);
+        let (f, d) = rupu_netflow::ledger::read_flows_and_dropped(&ledger_path).unwrap_or_default();
+        all.extend(f);
+        dropped += d;
+    }
     let transcript_paths = crate::usage::run_transcript_paths(store, run_id);
     let merged = merge_with_transcript(all, &transcript_paths);
     (merged, dropped)
 }
 
-/// Read the ledger + run transcript for a run whose artifacts live under
-/// `workspace` (a project root, `<workspace>/.rupu/netflow/<run_id>.jsonl` and
-/// whatever `store` reports as this run's step transcript paths), scope to
-/// `run_id`, merge, and build the response. A missing ledger is an empty
-/// result, not an error. Synchronous — see [`run_scoped_flows_and_dropped`].
+/// Read the ledger(s) + run transcript for a run whose artifacts live
+/// under `workspace` (a project root; `global_dir` is the fallback root
+/// `resolve_ledger_path` reads from when the workspace never got its own
+/// `.rupu/netflow/` — see that function's doc) and whatever `store`
+/// reports as this run's step transcript paths, scope to `run_id`, merge,
+/// and build the response. A missing ledger is an empty result, not an
+/// error. Synchronous — see [`run_scoped_flows_and_dropped`].
 fn collect_run_netflow(
     store: &RunStore,
     run_id: &str,
     workspace: &StdPath,
+    global_dir: &StdPath,
     cache: &AsnCache,
 ) -> NetflowResponse {
-    let (merged, dropped) = run_scoped_flows_and_dropped(store, run_id, workspace);
+    let (merged, dropped) = run_scoped_flows_and_dropped(store, run_id, workspace, global_dir);
     let table = load_asn_table(cache);
     build_response(merged, dropped, table.as_deref())
 }
@@ -438,13 +490,22 @@ pub(crate) fn workspace_for_project(s: &AppState, project_id: &str) -> ApiResult
 }
 
 /// Union every per-run ledger file (`NetflowPaths::for_run` writes one
-/// `<run_id>.jsonl` per run, not one shared `flows.jsonl`) under
-/// `netflow_dir` into one flow list + summed dropped-count. A directory
-/// that doesn't exist yet (no run has ever written a ledger there)
-/// degrades to `([], 0)`, the same "missing data" tolerance every other
-/// read in this module already relies on. The `.gitignore` that
-/// `NetflowPaths::ensure_dir` drops into every such directory is skipped
-/// (no `.jsonl` extension).
+/// `<run_id>.jsonl` per run) under `netflow_dir` into one flow list +
+/// summed dropped-count. A directory that doesn't exist yet (no run has
+/// ever written a ledger there) degrades to `([], 0)`, the same "missing
+/// data" tolerance every other read in this module already relies on.
+///
+/// Skips exactly two kinds of file: the `.gitignore` `NetflowPaths::
+/// ensure_dir` drops into every such directory (no `.jsonl` extension),
+/// and a file literally named `flows.jsonl` — the pre-plan shared-ledger
+/// filename (one file for a whole workspace/daemon, before the
+/// netflow-per-run migration). `NetflowPaths::for_run` never produces
+/// that name: every real run id comes from `run_<ULID>` or an
+/// operator-supplied `--run-id`, so a bare `flows.jsonl` sitting in this
+/// directory is unambiguously a leftover from before this plan, not a
+/// run that happens to be named "flows" — reading it back in as if it
+/// were one would silently resurrect the exact shared-file model this
+/// plan replaced.
 fn read_all_run_ledgers_in_dir(netflow_dir: &StdPath) -> (Vec<FlowRecord>, u64) {
     let mut flows = Vec::new();
     let mut dropped = 0u64;
@@ -456,6 +517,9 @@ fn read_all_run_ledgers_in_dir(netflow_dir: &StdPath) -> (Vec<FlowRecord>, u64) 
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
+        if path.file_name().and_then(|n| n.to_str()) == Some("flows.jsonl") {
+            continue;
+        }
         let (f, d) = rupu_netflow::ledger::read_flows_and_dropped(&path).unwrap_or_default();
         flows.extend(f);
         dropped += d;
@@ -463,24 +527,27 @@ fn read_all_run_ledgers_in_dir(netflow_dir: &StdPath) -> (Vec<FlowRecord>, u64) 
     (flows, dropped)
 }
 
-/// Every flow across every registered workspace's ledger directory, and the
-/// summed dropped-count. Mirrors `coverage.rs`'s `list_coverage`: a
-/// workspace whose path is gone/unreadable is skipped (its ledger read
-/// degrades to empty via [`read_all_run_ledgers_in_dir`]'s own
-/// missing-directory tolerance), never a hard error.
+/// Every flow across every registered workspace's ledger directory, PLUS
+/// `<global_dir>/netflow/` — the fallback root every run writes to when
+/// its workspace never got its own `.rupu/netflow/` (see
+/// `rupu_netflow::netflow_dir`'s doc comment: `rupu init` only ever adds
+/// a `.gitignore` entry, it does not create that directory, so on a
+/// fresh install EVERY run's ledger lands in `<global_dir>/netflow/`
+/// regardless of which project it belongs to). Without this union, global
+/// scope would show nothing for the common case — the same "recorded,
+/// then permanently unreachable" defect a prior arc already had to fix
+/// once for the (now-removed) CP-daemon-wide ledger.
+///
+/// The summed dropped-count follows the same union. Mirrors
+/// `coverage.rs`'s `list_coverage`: a workspace whose path is
+/// gone/unreadable is skipped (its ledger read degrades to empty via
+/// [`read_all_run_ledgers_in_dir`]'s own missing-directory tolerance),
+/// never a hard error.
 ///
 /// Synchronous — always run through [`run_blocking`] (this is the read that
 /// scales with the number of registered workspaces AND with the number of
 /// runs each one has, so it's the one most worth keeping off the async
 /// task).
-///
-/// Does NOT union in a CP-daemon-wide ledger the way an earlier revision of
-/// this function did (Fix 1, netflow Plan 3 review): per the netflow
-/// per-run plan, `cp serve`'s own fleet/ASN-refresh traffic is
-/// deliberately not recorded at all any more — it has no run to attribute
-/// to and installing a daemon-lifetime sink is exactly the "first run
-/// wins" defect this plan removes (see `rupu-cli/src/cmd/cp.rs`'s deleted
-/// `http::init` call). There is no global ledger file left to read.
 fn read_all_workspaces_sync(global_dir: &StdPath) -> (Vec<FlowRecord>, u64) {
     let workspaces = (WorkspaceStore {
         root: global_dir.join("workspaces"),
@@ -497,20 +564,31 @@ fn read_all_workspaces_sync(global_dir: &StdPath) -> (Vec<FlowRecord>, u64) {
         dropped += d;
     }
 
+    let (gf, gd) = read_all_run_ledgers_in_dir(&global_dir.join("netflow"));
+    flows.extend(gf);
+    dropped += gd;
+
     (flows, dropped)
 }
 
-/// `GET /api/projects/:id/netflow` — every flow in a workspace's ledger,
-/// including `system`-origin egress (`run_id: None`) that has no run to
-/// attach to (e.g. a `rupu run` invocation's own update-notice check, which
-/// carries `Origin::Update` but no `run_id`). Unlike run scope, this reads
-/// the ledger directly with no `run_id` filter.
+/// `GET /api/projects/:id/netflow` — every flow in a workspace's own
+/// `.rupu/netflow/` ledger directory, including `system`-origin egress
+/// (`run_id: None`) that has no run to attach to (e.g. a `rupu run`
+/// invocation's own update-notice check, which carries `Origin::Update`
+/// but no `run_id`). Unlike run scope, this reads the ledger directly
+/// with no `run_id` filter.
 ///
-/// This does NOT include the CP daemon's own global ledger
-/// (`$RUPU_HOME/netflow/flows.jsonl`, see [`read_all_workspaces_sync`]'s
-/// doc comment) — `cp serve`'s own fleet traffic, `Origin::Cp`, and any
-/// `Origin::Update`/ASN-refresh egress it produces are not this project's
-/// traffic, so they surface only at global scope, never here.
+/// KNOWN GAP (unlike run scope and global scope, deliberately not fixed
+/// in this pass): this does NOT fall back to `<global_dir>/netflow/` for
+/// runs that landed there because `<workspace>/.rupu/netflow/` didn't
+/// exist yet at write time (see `rupu_netflow::netflow_dir`'s doc
+/// comment) — there is no cheap way to tell, from the global directory
+/// alone, which of its per-run files belong to THIS project versus some
+/// other one without cross-referencing every registered workspace's own
+/// `RunStore`. Project scope can therefore under-report on a fresh
+/// install the same way global scope used to; run scope
+/// (`collect_run_netflow`) and global scope (`read_all_workspaces_sync`)
+/// both already resolve this correctly for the ids they know about.
 async fn get_project_netflow(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -567,13 +645,18 @@ async fn run_scoped_flows_for_graph(s: &AppState, run_id: &str) -> ApiResult<Vec
             let store = Arc::clone(&s.run_store);
             let run_id = run_id.to_string();
             let workspace = run.workspace_path.clone();
-            run_blocking(move || run_scoped_flows_and_dropped(&store, &run_id, &workspace).0).await
+            let global_dir = s.global_dir.clone();
+            run_blocking(move || {
+                run_scoped_flows_and_dropped(&store, &run_id, &workspace, &global_dir).0
+            })
+            .await
         }
         RunLocation::ProjectLocal { path } => {
             let run_id = run_id.to_string();
+            let global_dir = s.global_dir.clone();
             run_blocking(move || {
                 let store = RunStore::new(path.join(".rupu").join("runs"));
-                run_scoped_flows_and_dropped(&store, &run_id, &path).0
+                run_scoped_flows_and_dropped(&store, &run_id, &path, &global_dir).0
             })
             .await
         }
@@ -599,6 +682,9 @@ async fn get_netflow_graph(
         run_scoped_flows_for_graph(&state, run_id).await?
     } else if let Some(project_id) = q.scope.as_deref().and_then(|s| s.strip_prefix("project:")) {
         let workspace = workspace_for_project(&state, project_id)?;
+        // Same known gap as `get_project_netflow`: no fallback to
+        // `<global_dir>/netflow/` for this project's runs that landed
+        // there. See that function's doc comment.
         run_blocking(move || read_all_run_ledgers_in_dir(&workspace.join(".rupu/netflow")).0)
             .await?
     } else {
@@ -652,17 +738,21 @@ async fn get_run_netflow(
             let store = Arc::clone(&s.run_store);
             let rid = run_id.clone();
             let workspace = run.workspace_path.clone();
+            let global_dir = s.global_dir.clone();
             let cache = Arc::clone(&s.asn_cache);
-            let resp =
-                run_blocking(move || collect_run_netflow(&store, &rid, &workspace, &cache)).await?;
+            let resp = run_blocking(move || {
+                collect_run_netflow(&store, &rid, &workspace, &global_dir, &cache)
+            })
+            .await?;
             Ok(Json(resp))
         }
         RunLocation::ProjectLocal { path } => {
             let rid = run_id.clone();
+            let global_dir = s.global_dir.clone();
             let cache = Arc::clone(&s.asn_cache);
             let resp = run_blocking(move || {
                 let store = RunStore::new(path.join(".rupu").join("runs"));
-                collect_run_netflow(&store, &rid, &path, &cache)
+                collect_run_netflow(&store, &rid, &path, &global_dir, &cache)
             })
             .await?;
             Ok(Json(resp))

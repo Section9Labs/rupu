@@ -50,14 +50,14 @@ pub fn transcripts_dir(global: &Path, project_root: Option<&Path>) -> PathBuf {
 /// drift. The existence check is load-bearing: a repo that was never
 /// `rupu init`'d falls back to global, so no ledger is ever written inside
 /// a project that has not opted in.
+///
+/// Thin wrapper over `rupu_netflow::netflow_dir` — the actual rule now
+/// lives there (a shared crate both `rupu-cli` and `rupu-orchestrator`
+/// depend on) so the write side can never drift into two competing
+/// copies of the same resolution logic. `rupu-cp`'s read side must
+/// mirror this same rule; see `rupu_netflow::netflow_dir`'s doc comment.
 pub fn netflow_dir(global: &Path, project_root: Option<&Path>) -> PathBuf {
-    if let Some(p) = project_root {
-        let local = p.join(".rupu/netflow");
-        if local.is_dir() {
-            return local;
-        }
-    }
-    global.join("netflow")
+    rupu_netflow::netflow_dir(global, project_root)
 }
 
 /// Global repo registry directory.

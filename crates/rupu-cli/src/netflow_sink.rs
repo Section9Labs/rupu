@@ -108,8 +108,18 @@ mod tests {
 
     #[tokio::test]
     async fn two_runs_in_one_process_get_separate_ledgers() {
-        // The test that would have failed under the OnceLock, and the exact
-        // shape of `rupu session` and `rupu cp serve`.
+        // Proves the BUILDER itself: two direct `for_run` calls never
+        // collide on a shared `OnceLock`-style sink. It does NOT prove any
+        // real entry point actually calls `for_run` per run/turn rather
+        // than once at process start -- a `run_turn` (or a future daemon
+        // path) that regressed to building one sink before its turn/
+        // request loop would still pass THIS test, since it never touches
+        // `run_turn` at all.
+        // `crates/rupu-cli/tests/netflow_run.rs`'s
+        // `two_sequential_rupu_run_invocations_in_one_process_get_separate_ledgers`
+        // is the one that drives a real entry point (`rupu_cli::run`)
+        // twice in one process and is the actual regression guard for
+        // that class of bug.
         let tmp = tempfile::TempDir::new().unwrap();
         let global = tmp.path().join("global");
         let t_a = tmp.path().join("a.jsonl");
