@@ -18,7 +18,7 @@
 // comment on why that banner's "whole ledger history" framing must never
 // be allowed to read as scoped to whatever this picker currently selects.
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Segmented } from '../ui/Segmented';
 import { Input } from '../ui/Input';
 import { Button } from '../ui/Button';
@@ -110,9 +110,15 @@ export interface TimeRangePickerProps {
 }
 
 export function TimeRangePicker({ value, onChange, now = () => new Date() }: TimeRangePickerProps) {
-  const [customOpen, setCustomOpen] = useState(value.preset === 'custom');
-  // Lazy initializers so an already-applied custom value survives a
-  // remount — see `rfc3339ToLocalInputValue`'s doc comment.
+  // `customEditorOpen` controls ONLY whether the from/to input row is
+  // visible. It is NOT what drives the Segmented control's pressed
+  // segment below — that reads `value.preset` directly, always — so
+  // clicking "Custom" to start an edit can never make the control claim a
+  // range that hasn't actually been applied yet (Critical 1 / Important 4,
+  // whole-branch review round 1: this control is the operator's only
+  // statement of what's currently in effect, and it was wrong the moment
+  // "which button did I just click" leaked into "what's pressed").
+  const [customEditorOpen, setCustomEditorOpen] = useState(value.preset === 'custom');
   const [customFrom, setCustomFrom] = useState(() =>
     rfc3339ToLocalInputValue(value.preset === 'custom' ? value.from : undefined),
   );
@@ -120,12 +126,27 @@ export function TimeRangePicker({ value, onChange, now = () => new Date() }: Tim
     rfc3339ToLocalInputValue(value.preset === 'custom' ? value.to : undefined),
   );
 
+  // Re-sync ALL of the above to the APPLIED value whenever it changes from
+  // outside this component — e.g. RunDetail resetting its range state to
+  // {preset:'all'} on a run switch without unmounting this picker. Without
+  // this, the editor and its fields kept showing the previous run's
+  // custom bounds while the new run's flows were being fetched
+  // unfiltered — exactly the false statement this control exists to
+  // avoid. Keyed on the primitive fields (not the `value` object
+  // reference) so a parent re-render with an equal-by-value object never
+  // wipes out an in-progress, not-yet-applied edit.
+  useEffect(() => {
+    setCustomEditorOpen(value.preset === 'custom');
+    setCustomFrom(rfc3339ToLocalInputValue(value.preset === 'custom' ? value.from : undefined));
+    setCustomTo(rfc3339ToLocalInputValue(value.preset === 'custom' ? value.to : undefined));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value.preset, value.from, value.to]);
+
   function selectPreset(preset: TimeRangePreset) {
     if (preset === 'custom') {
-      setCustomOpen(true);
+      setCustomEditorOpen(true);
       return;
     }
-    setCustomOpen(false);
     const from = presetFrom(preset, now());
     onChange(from !== undefined ? { preset, from } : { preset });
   }
@@ -144,16 +165,15 @@ export function TimeRangePicker({ value, onChange, now = () => new Date() }: Tim
         ariaLabel="Time range"
         size="sm"
         options={PRESET_OPTIONS}
-        value={customOpen ? 'custom' : value.preset}
+        value={value.preset}
         onChange={(v) => selectPreset(v as TimeRangePreset)}
       />
-      {customOpen && (
+      {customEditorOpen && (
         <div className="flex flex-wrap items-center gap-2">
           <label className="flex items-center gap-1 text-note text-ink-dim">
             From
             <Input
               type="datetime-local"
-              aria-label="Custom range start"
               value={customFrom}
               onChange={(e) => setCustomFrom(e.target.value)}
               className="w-auto max-w-none py-1"
@@ -163,7 +183,6 @@ export function TimeRangePicker({ value, onChange, now = () => new Date() }: Tim
             To
             <Input
               type="datetime-local"
-              aria-label="Custom range end"
               value={customTo}
               onChange={(e) => setCustomTo(e.target.value)}
               className="w-auto max-w-none py-1"

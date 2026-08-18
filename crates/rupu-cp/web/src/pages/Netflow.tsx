@@ -30,6 +30,7 @@ import NetflowGraph from '../components/netflow/NetflowGraph';
 import { NetflowScopeDisclosure } from '../components/netflow/ScopeDisclosure';
 import NetflowSummary from '../components/netflow/NetflowSummary';
 import NetflowTable from '../components/netflow/NetflowTable';
+import NetflowWindowReadout from '../components/netflow/NetflowWindowReadout';
 import TimeRangePicker, { toNetflowRange, type TimeRangeValue } from '../components/netflow/TimeRangePicker';
 import {
   fetchGlobalNetflow,
@@ -88,14 +89,17 @@ export default function Netflow() {
       <header className="mb-6">
         <h1 className="text-2xl font-semibold text-ink">Network</h1>
         <p className="mt-1 text-sm text-ink-dim">
-          Every flow recorded across all runs, plus unattributed system egress that belongs to no
-          single run.
+          Every flow recorded across all runs in the selected time range, plus unattributed system
+          egress that belongs to no single run.
         </p>
         <NetflowScopeDisclosure scope="global" className="mt-2" />
       </header>
 
-      <div className="mb-4">
+      <div className="mb-4 flex flex-wrap items-center gap-3">
         <TimeRangePicker value={range} onChange={setRange} />
+        {/* Server-echoed, never picker-state-derived — see the component's
+            header comment (whole-branch review round 1, "Also do"). */}
+        {data && <NetflowWindowReadout appliedWindow={data.window} />}
       </div>
 
       {error ? (
@@ -104,7 +108,7 @@ export default function Netflow() {
         <p className="text-sm text-ink-dim">Loading network flows…</p>
       ) : (
         <div className="space-y-6">
-          {graph && <NetflowGraph graph={graph} scope="global" />}
+          {graph && <NetflowGraph graph={graph} scope="global" appliedWindow={data.window} />}
           <NetflowSummary hosts={data.hosts} />
           <NetflowTable
             flows={data.flows}

@@ -167,4 +167,42 @@ export function netflowSystemSourceHint(_scope: NetflowScope): string {
   return `Sources — runs — connect to the host:port endpoints they reached.`;
 }
 
+/** `NetflowResponse.window` — the wire shape (kept structurally typed
+ *  rather than imported from `lib/netflow.ts` to avoid a dependency
+ *  cycle: that module doesn't need to know about this one). */
+export interface NetflowWindowEcho {
+  from: string | null;
+  to: string | null;
+}
+
+/** Whether the server actually applied a `?from=`/`?to=` bound to produce
+ *  the current result — read from the response's OWN echo
+ *  (`NetflowResponse.window`), never from the picker's local UI state.
+ *  Shared by `NetflowTable` and `NetflowGraph` (Critical 1/2, whole-branch
+ *  review round 1) so "was a range applied" can't end up computed two
+ *  different ways that drift apart. */
+export function netflowWindowApplied(window?: NetflowWindowEcho | null): boolean {
+  return window != null && (window.from !== null || window.to !== null);
+}
+
+/** The empty-state hint for "a `?from=`/`?to=` window was applied and
+ *  matched nothing" — shared by `NetflowTable`'s per-flow empty state and
+ *  `NetflowGraph`'s topology empty state (Critical 2, whole-branch review
+ *  round 1: these two used to disagree on the same screen — an in-range-
+ *  empty result showed the table's "No network flows in this range"
+ *  directly above the graph's unqualified "No flows to graph for this
+ *  scope", and only one of those two adjacent sentences could be true).
+ *  Says flows "may still exist outside" rather than asserting they do —
+ *  an empty windowed result is not proof the wider scope is empty, only
+ *  that this window is. Names the actual clearing affordance ("All")
+ *  rather than the vaguer "clear the range" (Minor finding, same round:
+ *  the hint and the control it referred to used different words for the
+ *  same action). */
+export function netflowRangeEmptyHint(): string {
+  return (
+    `Flows may still exist outside the selected window — widen the range, or choose All to ` +
+    `see everything recorded.`
+  );
+}
+
 export default NetflowScopeDisclosure;

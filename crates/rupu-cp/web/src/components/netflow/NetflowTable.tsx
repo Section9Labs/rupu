@@ -28,7 +28,10 @@ import { EmptyState } from '../ui/EmptyState';
 import { FidelityBadge } from './FidelityBadge';
 import {
   netflowEmptyStateHint,
+  netflowRangeEmptyHint,
+  netflowWindowApplied,
   type NetflowScope,
+  type NetflowWindowEcho,
 } from './ScopeDisclosure';
 
 export interface NetflowTableProps {
@@ -60,7 +63,7 @@ export interface NetflowTableProps {
    *  pass it keeps the exact prior wording. Named `appliedWindow` (not
    *  `window`) purely to avoid shadowing the global `window` object inside
    *  this component. */
-  appliedWindow?: { from: string | null; to: string | null };
+  appliedWindow?: NetflowWindowEcho;
 }
 
 function originLabel(f: FlowView): string {
@@ -109,9 +112,9 @@ export function NetflowTable({
 }: NetflowTableProps) {
   if (flows.length === 0) {
     // A bound is "applied" per the SERVER's echo, not per whatever the
-    // picker's local value happens to be — see this prop's doc comment.
-    const windowApplied =
-      appliedWindow != null && (appliedWindow.from !== null || appliedWindow.to !== null);
+    // picker's local value happens to be — see this prop's doc comment and
+    // `netflowWindowApplied`'s.
+    const windowApplied = netflowWindowApplied(appliedWindow);
     return (
       <div className="space-y-3">
         <DroppedBanner droppedTotal={droppedTotal} />
@@ -120,8 +123,7 @@ export function NetflowTable({
             title="No network flows in this range"
             hint={
               <>
-                Flows may still exist outside the selected window — widen or clear the range to
-                check. {netflowEmptyStateHint(scope)}
+                {netflowRangeEmptyHint()} {netflowEmptyStateHint(scope)}
               </>
             }
           />

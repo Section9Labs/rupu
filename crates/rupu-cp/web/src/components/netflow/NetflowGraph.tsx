@@ -33,7 +33,13 @@ import type { GraphView } from '../../lib/netflow';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { EmptyState } from '../ui/EmptyState';
 import { layoutBipartite } from './layout';
-import { netflowSystemSourceHint, type NetflowScope } from './ScopeDisclosure';
+import {
+  netflowRangeEmptyHint,
+  netflowSystemSourceHint,
+  netflowWindowApplied,
+  type NetflowScope,
+  type NetflowWindowEcho,
+} from './ScopeDisclosure';
 
 export interface NetflowGraphProps {
   graph: GraphView;
@@ -47,12 +53,21 @@ export interface NetflowGraphProps {
    *  change to land. See `netflowSystemSourceHint`'s doc comment. */
   scope: NetflowScope;
   width?: number;
+  /** `NetflowResponse.window` — the server's OWN echo of the `?from=`/
+   *  `?to=` it actually applied to produce `graph`, NOT the picker's local
+   *  UI state (Task 4, Critical 2 fix-round). Same contract as
+   *  `NetflowTable`'s `appliedWindow`: picks the empty-state wording
+   *  ("in this range" vs "for this scope") so this graph can never
+   *  disagree with the table rendered alongside it on the same screen.
+   *  Optional and defaulting to "no window" so a caller that doesn't pass
+   *  it keeps the exact prior wording. */
+  appliedWindow?: NetflowWindowEcho;
 }
 
 const ROW_HEIGHT = 34;
 const NODE_R = 4;
 
-export function NetflowGraph({ graph, scope, width = 880 }: NetflowGraphProps) {
+export function NetflowGraph({ graph, scope, width = 880, appliedWindow }: NetflowGraphProps) {
   const colors = useThemeColors();
   const laid = useMemo(
     () => layoutBipartite(graph, { width, rowHeight: ROW_HEIGHT }),
@@ -60,7 +75,9 @@ export function NetflowGraph({ graph, scope, width = 880 }: NetflowGraphProps) {
   );
 
   if (graph.nodes.length === 0) {
-    return (
+    return netflowWindowApplied(appliedWindow) ? (
+      <EmptyState title="No flows to graph in this range" hint={netflowRangeEmptyHint()} />
+    ) : (
       <EmptyState title="No flows to graph for this scope" hint={netflowSystemSourceHint(scope)} />
     );
   }

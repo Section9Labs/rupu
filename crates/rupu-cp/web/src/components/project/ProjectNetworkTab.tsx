@@ -43,6 +43,7 @@ import NetflowGraph from '../netflow/NetflowGraph';
 import { NetflowScopeDisclosure } from '../netflow/ScopeDisclosure';
 import NetflowSummary from '../netflow/NetflowSummary';
 import NetflowTable from '../netflow/NetflowTable';
+import NetflowWindowReadout from '../netflow/NetflowWindowReadout';
 import TimeRangePicker, { toNetflowRange, type TimeRangeValue } from '../netflow/TimeRangePicker';
 import {
   fetchNetflowGraph,
@@ -90,14 +91,19 @@ export default function ProjectNetworkTab({ wsId }: { wsId: string }) {
   return (
     <div className="space-y-4">
       <NetflowScopeDisclosure scope="project" />
-      <TimeRangePicker value={range} onChange={setRange} />
+      <div className="flex flex-wrap items-center gap-3">
+        <TimeRangePicker value={range} onChange={setRange} />
+        {/* Server-echoed, never picker-state-derived — see the component's
+            header comment (whole-branch review round 1, "Also do"). */}
+        {data && <NetflowWindowReadout appliedWindow={data.window} />}
+      </div>
       {error ? (
         <p className="text-sm text-err">{error}</p>
       ) : data === null ? (
         <p className="text-sm text-ink-dim">Loading network flows…</p>
       ) : (
         <>
-          {graph && <NetflowGraph graph={graph} scope="project" />}
+          {graph && <NetflowGraph graph={graph} scope="project" appliedWindow={data.window} />}
           <NetflowSummary hosts={data.hosts} />
           <NetflowTable
             flows={data.flows}

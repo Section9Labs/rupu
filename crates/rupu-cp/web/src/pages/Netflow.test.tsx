@@ -9,8 +9,8 @@
 // tests cover their internals.
 
 import '@testing-library/jest-dom/vitest';
-import { render, screen, cleanup, waitFor } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router-dom';
 
 const { fetchGlobalNetflow, fetchNetflowGraph } = vi.hoisted(() => ({
@@ -29,6 +29,16 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+// `restoreAllMocks` (above) doesn't clear call history for a plain
+// `vi.fn()` created via `vi.hoisted` the way it does for a `vi.spyOn`
+// spy — without this, exact-call-count assertions (added below, Important
+// 5) see every prior test's calls accumulated onto the same mock. Matches
+// RunDetail.netflow.test.tsx's identical `beforeEach` for the same mocks.
+beforeEach(() => {
+  fetchGlobalNetflow.mockReset();
+  fetchNetflowGraph.mockReset();
+});
+
 describe('Netflow global page', () => {
   it('renders the summary and table once loaded', async () => {
     fetchGlobalNetflow.mockResolvedValue({
@@ -45,6 +55,7 @@ describe('Netflow global page', () => {
       hosts: [{ host: 'api.github.com', port: 443, calls: 1, bytes_in: 10, bytes_out: 5, errors: 0, p50_ms: 12, p95_ms: 12 }],
       dropped_total: 0,
       asn_loaded: true,
+      window: { from: null, to: null },
     });
     fetchNetflowGraph.mockResolvedValue({ nodes: [], edges: [] });
 
@@ -60,7 +71,13 @@ describe('Netflow global page', () => {
     // which passed even when the dropped count silently vanished — the
     // name overclaimed what it verified. NetflowTable now renders the
     // dropped banner alongside the empty state rather than instead of it.
-    fetchGlobalNetflow.mockResolvedValue({ flows: [], hosts: [], dropped_total: 9, asn_loaded: true });
+    fetchGlobalNetflow.mockResolvedValue({
+      flows: [],
+      hosts: [],
+      dropped_total: 9,
+      asn_loaded: true,
+      window: { from: null, to: null },
+    });
     fetchNetflowGraph.mockResolvedValue({ nodes: [], edges: [] });
 
     render(<MemoryRouter><Netflow /></MemoryRouter>);
@@ -71,7 +88,13 @@ describe('Netflow global page', () => {
   });
 
   it('fetches global scope by omitting the scope param entirely', async () => {
-    fetchGlobalNetflow.mockResolvedValue({ flows: [], hosts: [], dropped_total: 0, asn_loaded: true });
+    fetchGlobalNetflow.mockResolvedValue({
+      flows: [],
+      hosts: [],
+      dropped_total: 0,
+      asn_loaded: true,
+      window: { from: null, to: null },
+    });
     fetchNetflowGraph.mockResolvedValue({ nodes: [], edges: [] });
 
     render(<MemoryRouter><Netflow /></MemoryRouter>);
@@ -81,12 +104,65 @@ describe('Netflow global page', () => {
   });
 
   it('states the scope limit and the non-HTTP blind spot up front', async () => {
-    fetchGlobalNetflow.mockResolvedValue({ flows: [], hosts: [], dropped_total: 0, asn_loaded: true });
+    fetchGlobalNetflow.mockResolvedValue({
+      flows: [],
+      hosts: [],
+      dropped_total: 0,
+      asn_loaded: true,
+      window: { from: null, to: null },
+    });
     fetchNetflowGraph.mockResolvedValue({ nodes: [], edges: [] });
 
     render(<MemoryRouter><Netflow /></MemoryRouter>);
 
     expect(screen.getByText(/bash subprocess/i)).toBeInTheDocument();
     expect(screen.getByText(/git2|object.store|WebSocket/i)).toBeInTheDocument();
+  });
+
+  // Important 5 (whole-branch review round 1): nothing previously asserted
+  // `data.window` actually reaches `NetflowTable`'s `appliedWindow` prop,
+  // or that changing the picker's range re-fetches at all.
+
+  it('threads the server-echoed window into the table, producing the range-aware empty state', async () => {
+    fetchGlobalNetflow.mockResolvedValue({
+      flows: [],
+      hosts: [],
+      dropped_total: 0,
+      asn_loaded: true,
+      window: { from: '2026-08-17T14:00:00Z', to: null },
+    });
+    fetchNetflowGraph.mockResolvedValue({ nodes: [], edges: [] });
+
+    render(<MemoryRouter><Netflow /></MemoryRouter>);
+
+    // Only reachable if `appliedWindow={data.window}` actually threaded
+    // through — the unbounded wording ("for this scope") would render
+    // instead if it hadn't.
+    await waitFor(() =>
+      expect(screen.getByText(/No network flows in this range/i)).toBeInTheDocument(),
+    );
+  });
+
+  it('re-fetches with the new range when the time-range picker selection changes', async () => {
+    fetchGlobalNetflow.mockResolvedValue({
+      flows: [],
+      hosts: [],
+      dropped_total: 0,
+      asn_loaded: true,
+      window: { from: null, to: null },
+    });
+    fetchNetflowGraph.mockResolvedValue({ nodes: [], edges: [] });
+
+    render(<MemoryRouter><Netflow /></MemoryRouter>);
+    await waitFor(() => expect(fetchGlobalNetflow).toHaveBeenCalledTimes(1));
+    expect(fetchGlobalNetflow).toHaveBeenCalledWith();
+
+    fireEvent.click(screen.getByRole('button', { name: /last hour/i }));
+
+    await waitFor(() => expect(fetchGlobalNetflow).toHaveBeenCalledTimes(2));
+    const secondCallArgs = fetchGlobalNetflow.mock.calls[1];
+    expect(secondCallArgs).toHaveLength(1);
+    expect(secondCallArgs[0]).toHaveProperty('from');
+    expect(secondCallArgs[0].to).toBeUndefined();
   });
 });
