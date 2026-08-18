@@ -147,7 +147,7 @@ impl HostRegistry {
     ///   [`Self::resolve`] unchanged — bounding those is out of scope for
     ///   this fix (they don't share `HttpHostConnector`'s original
     ///   unbounded-client root cause; both of its constructors build their
-    ///   client through `rupu_netflow::http::client_from` now and are
+    ///   client through `rupu_netflow::http::client_with` now and are
     ///   bounded either way).
     pub fn resolve_for_probe(
         &self,
@@ -236,8 +236,9 @@ impl HostRegistry {
         self.store.save(&host)?;
 
         if let Some(tok) = token {
-            set_host_token(&id, tok)
-                .map_err(|e| HostConnectorError::Invalid(format!("could not store token for host {id}: {e}")))?;
+            set_host_token(&id, tok).map_err(|e| {
+                HostConnectorError::Invalid(format!("could not store token for host {id}: {e}"))
+            })?;
         }
 
         // Invalidate any stale cache entry for this id (shouldn't exist on add,
@@ -346,15 +347,13 @@ impl HostRegistry {
             HostTransport::Local => Ok(Arc::clone(&self.local)),
             HostTransport::Tunnel { node_id } => {
                 match (&self.node_registry, &self.node_mirror, &self.run_store) {
-                    (Some(reg), Some(mir), Some(store)) => {
-                        Ok(Arc::new(TunnelHostConnector::new(
-                            node_id.clone(),
-                            Arc::clone(reg),
-                            Arc::clone(mir),
-                            Arc::clone(store),
-                            self.pricing.clone(),
-                        )))
-                    }
+                    (Some(reg), Some(mir), Some(store)) => Ok(Arc::new(TunnelHostConnector::new(
+                        node_id.clone(),
+                        Arc::clone(reg),
+                        Arc::clone(mir),
+                        Arc::clone(store),
+                        self.pricing.clone(),
+                    ))),
                     _ => Err(HostConnectorError::Invalid(
                         "tunnel deps not wired (call HostRegistry::with_tunnel_deps)".to_string(),
                     )),
@@ -384,33 +383,29 @@ impl HostRegistry {
                         .into(),
                 )),
             },
-            HostTransport::Bucket { url, prefix } => {
-                match (&self.node_mirror, &self.run_store) {
-                    (Some(mir), Some(store)) => {
-                        let bucket = crate::host::bucket::ObjectStoreBucket::from_url(
-                            url,
-                            prefix.as_deref(),
-                        )
-                        .map_err(|e| {
-                            HostConnectorError::Invalid(format!("bad bucket url: {e}"))
-                        })?;
-                        Ok(std::sync::Arc::new(
-                            crate::host::bucket::BucketHostConnector::new(
-                                host.id.clone(),
-                                std::sync::Arc::new(bucket),
-                                std::sync::Arc::clone(mir),
-                                std::sync::Arc::clone(store),
-                                self.pricing.clone(),
-                            ),
-                        ))
-                    }
-                    _ => Err(HostConnectorError::Invalid(
-                        "bucket deps not wired (call HostRegistry::with_tunnel_deps; \
-                         mirror + run_store shared with tunnel)"
-                            .into(),
-                    )),
+            HostTransport::Bucket { url, prefix } => match (&self.node_mirror, &self.run_store) {
+                (Some(mir), Some(store)) => {
+                    let bucket =
+                        crate::host::bucket::ObjectStoreBucket::from_url(url, prefix.as_deref())
+                            .map_err(|e| {
+                                HostConnectorError::Invalid(format!("bad bucket url: {e}"))
+                            })?;
+                    Ok(std::sync::Arc::new(
+                        crate::host::bucket::BucketHostConnector::new(
+                            host.id.clone(),
+                            std::sync::Arc::new(bucket),
+                            std::sync::Arc::clone(mir),
+                            std::sync::Arc::clone(store),
+                            self.pricing.clone(),
+                        ),
+                    ))
                 }
-            }
+                _ => Err(HostConnectorError::Invalid(
+                    "bucket deps not wired (call HostRegistry::with_tunnel_deps; \
+                         mirror + run_store shared with tunnel)"
+                        .into(),
+                )),
+            },
         }
     }
 }

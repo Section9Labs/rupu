@@ -82,9 +82,11 @@ impl HttpHostConnector {
     /// wall-clock is the slowest host and one unreachable box could stall the
     /// whole page on the OS's TCP connect timeout.
     ///
-    /// Falls back to an unbounded client if the `reqwest::ClientBuilder`
-    /// itself fails to build (e.g. an invalid TLS config) — best-effort, not
-    /// a hard requirement for probing to function.
+    /// Panics (`.expect()`) if the `reqwest::ClientBuilder` itself fails
+    /// to build (e.g. an invalid TLS config) — preserves the deleted
+    /// `http::client()` fallback's panic-on-failure behaviour (netflow
+    /// per-run plan, Task 67); there is no unbounded-client fallback any
+    /// more, uninstrumented or otherwise.
     pub fn new_with_timeout(base_url: String, token: Option<String>, timeout: Duration) -> Self {
         let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Cp);
         let builder = reqwest::Client::builder()

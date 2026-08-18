@@ -549,11 +549,19 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     paths::ensure_dir(&transcripts)?;
     let transcript_path = transcripts.join(format!("{run_id}.jsonl"));
 
-    // Netflow capture. Two destinations: the ledger (persists across
-    // runs — rooted at the project when one is found, global otherwise;
-    // see `crate::netflow_sink::for_run` / `paths::netflow_dir`'s doc
-    // comments. Also the only home for `Origin::System` egress that has
-    // no run to attach to) and this run's transcript (streams live).
+    // Netflow capture. Two destinations: this run's own ledger FILE
+    // (`<run_id>.jsonl`, rooted at the project when one already has a
+    // `.rupu/netflow/` directory, global otherwise — see
+    // `crate::netflow_sink::for_run` / `paths::netflow_dir`'s doc
+    // comments; a ledger's lifecycle now matches this ONE run, it does
+    // not persist traffic across other runs the way the pre-per-run-plan
+    // shared ledger did) and this run's transcript (streams live).
+    // `Origin::System` egress (auth/oauth, the update checker, ASN
+    // refresh, CP fleet traffic) is NOT captured here or anywhere —
+    // every production `Origin::System`/`Update`/`Cp` construction site
+    // is wired to `Arc::new(NullSink)`; see
+    // `crates/rupu-cp/web/src/components/netflow/ScopeDisclosure.tsx`
+    // for the full accounting of what is and is not captured.
     //
     // MUST be built before `build_for_provider_with_config` below —
     // this run's provider client and SCM registry take the sink

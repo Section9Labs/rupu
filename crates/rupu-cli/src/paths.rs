@@ -80,11 +80,6 @@ pub fn archived_transcripts_dir(transcripts_dir: &Path) -> PathBuf {
     transcripts_dir.join("archive")
 }
 
-/// Archive directory nested under a netflow root.
-pub fn archived_netflow_dir(netflow_dir: &Path) -> PathBuf {
-    netflow_dir.join("archive")
-}
-
 /// Global UI theme directory.
 pub fn themes_dir(global: &Path) -> PathBuf {
     global.join("themes")
@@ -192,11 +187,5 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let global = tmp.path().join("global");
         assert_eq!(netflow_dir(&global, None), global.join("netflow"));
-    }
-
-    #[test]
-    fn archived_netflow_dir_nests_under_the_netflow_root() {
-        let dir = std::path::Path::new("/tmp/x/netflow");
-        assert_eq!(archived_netflow_dir(dir), dir.join("archive"));
     }
 }

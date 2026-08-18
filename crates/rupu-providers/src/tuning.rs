@@ -89,10 +89,10 @@ impl ProviderTuning {
     ///
     /// Callers must never `.build()` this directly (rupu-netflow Plan 1 Task
     /// 10 / Task 11's `clippy.toml` lint) — pass it through
-    /// `rupu_netflow::http::client_from` so the resulting client is
+    /// `rupu_netflow::http::client_with` so the resulting client is
     /// instrumented, preserving every option set here.
     ///
-    /// `client_from` takes a caller-tuned `ClientBuilder` by design, so
+    /// `client_with` takes a caller-tuned `ClientBuilder` by design, so
     /// constructing one here (never calling `.build()` on it) is the
     /// sanctioned pattern, not a bypass. `Client::builder()` itself is
     /// not clippy-disallowed (see Task 11's `clippy.toml`) — only
