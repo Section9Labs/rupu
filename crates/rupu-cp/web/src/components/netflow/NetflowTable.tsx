@@ -50,6 +50,17 @@ export interface NetflowTableProps {
    *  (the generic hint) so existing callers that don't pass this keep
    *  their prior behaviour exactly. */
   scope?: NetflowScope;
+  /** `NetflowResponse.window` — the server's OWN echo of the `?from=`/
+   *  `?to=` it actually applied, NOT the picker's local UI state (Task 4).
+   *  Used ONLY to pick which empty-state copy is honest: "nothing in this
+   *  range" (a bound was applied and matched nothing — flows may still
+   *  exist outside it) vs "nothing recorded at all" (no bound was applied,
+   *  so an empty `flows` really does mean the whole scope is empty). Optional
+   *  and defaulting to "no window" so every pre-Task-4 caller that doesn't
+   *  pass it keeps the exact prior wording. Named `appliedWindow` (not
+   *  `window`) purely to avoid shadowing the global `window` object inside
+   *  this component. */
+  appliedWindow?: { from: string | null; to: string | null };
 }
 
 function originLabel(f: FlowView): string {
@@ -89,15 +100,37 @@ function DroppedBanner({ droppedTotal }: { droppedTotal: number }) {
   );
 }
 
-export function NetflowTable({ flows, droppedTotal, asnLoaded, scope = 'run' }: NetflowTableProps) {
+export function NetflowTable({
+  flows,
+  droppedTotal,
+  asnLoaded,
+  scope = 'run',
+  appliedWindow,
+}: NetflowTableProps) {
   if (flows.length === 0) {
+    // A bound is "applied" per the SERVER's echo, not per whatever the
+    // picker's local value happens to be — see this prop's doc comment.
+    const windowApplied =
+      appliedWindow != null && (appliedWindow.from !== null || appliedWindow.to !== null);
     return (
       <div className="space-y-3">
         <DroppedBanner droppedTotal={droppedTotal} />
-        <EmptyState
-          title="No network flows recorded for this scope"
-          hint={netflowEmptyStateHint(scope)}
-        />
+        {windowApplied ? (
+          <EmptyState
+            title="No network flows in this range"
+            hint={
+              <>
+                Flows may still exist outside the selected window — widen or clear the range to
+                check. {netflowEmptyStateHint(scope)}
+              </>
+            }
+          />
+        ) : (
+          <EmptyState
+            title="No network flows recorded for this scope"
+            hint={netflowEmptyStateHint(scope)}
+          />
+        )}
       </div>
     );
   }

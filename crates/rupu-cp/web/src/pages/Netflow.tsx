@@ -30,6 +30,7 @@ import NetflowGraph from '../components/netflow/NetflowGraph';
 import { NetflowScopeDisclosure } from '../components/netflow/ScopeDisclosure';
 import NetflowSummary from '../components/netflow/NetflowSummary';
 import NetflowTable from '../components/netflow/NetflowTable';
+import TimeRangePicker, { toNetflowRange, type TimeRangeValue } from '../components/netflow/TimeRangePicker';
 import {
   fetchGlobalNetflow,
   fetchNetflowGraph,
@@ -41,21 +42,33 @@ export default function Netflow() {
   const [data, setData] = useState<NetflowResponse | null>(null);
   const [graph, setGraph] = useState<GraphView | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Relative-default time-range filter (Task 4). `toNetflowRange` collapses
+  // the 'all' preset (and an as-yet-unapplied 'custom') to `undefined`, so
+  // the fetches below stay call-compatible with the pre-Task-4 "no scope,
+  // no range" shape whenever no filter is actually in effect.
+  const [range, setRange] = useState<TimeRangeValue>({ preset: 'all' });
 
   useEffect(() => {
     let cancelled = false;
     setData(null);
     setGraph(null);
     setError(null);
+    const q = toNetflowRange(range);
     // Global scope: call both fetchers with NO scope argument at all,
     // rather than passing an empty string — the API contract distinguishes
-    // "no scope param" (global) from a malformed scoped request.
+    // "no scope param" (global) from a malformed scoped request. The range
+    // argument is likewise omitted entirely (not passed as `undefined`)
+    // when `q` is `undefined`, so an unfiltered load calls exactly as it
+    // did before this picker existed.
     //
     // Combined into one `Promise.all` (Fix 6) rather than two independent
     // `.then`/`.catch` pairs: a failure on EITHER fetch now surfaces one
     // error message and one retry story instead of a panel that silently
     // renders whatever half succeeded with no explanation for the rest.
-    Promise.all([fetchGlobalNetflow(), fetchNetflowGraph()])
+    Promise.all([
+      q ? fetchGlobalNetflow(q) : fetchGlobalNetflow(),
+      q ? fetchNetflowGraph(undefined, q) : fetchNetflowGraph(),
+    ])
       .then(([d, g]) => {
         if (cancelled) return;
         setData(d);
@@ -68,7 +81,7 @@ export default function Netflow() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [range]);
 
   return (
     <div className="p-8">
@@ -81,6 +94,10 @@ export default function Netflow() {
         <NetflowScopeDisclosure scope="global" className="mt-2" />
       </header>
 
+      <div className="mb-4">
+        <TimeRangePicker value={range} onChange={setRange} />
+      </div>
+
       {error ? (
         <p className="text-sm text-err">{error}</p>
       ) : data === null ? (
@@ -89,7 +106,13 @@ export default function Netflow() {
         <div className="space-y-6">
           {graph && <NetflowGraph graph={graph} scope="global" />}
           <NetflowSummary hosts={data.hosts} />
-          <NetflowTable flows={data.flows} droppedTotal={data.dropped_total} asnLoaded={data.asn_loaded} scope="global" />
+          <NetflowTable
+            flows={data.flows}
+            droppedTotal={data.dropped_total}
+            asnLoaded={data.asn_loaded}
+            scope="global"
+            appliedWindow={data.window}
+          />
         </div>
       )}
     </div>

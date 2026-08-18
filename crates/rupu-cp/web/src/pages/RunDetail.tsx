@@ -43,6 +43,7 @@ import NetflowTable from '../components/netflow/NetflowTable';
 import NetflowSummary from '../components/netflow/NetflowSummary';
 import NetflowGraph from '../components/netflow/NetflowGraph';
 import { NetflowScopeDisclosure } from '../components/netflow/ScopeDisclosure';
+import TimeRangePicker, { toNetflowRange, type TimeRangeValue } from '../components/netflow/TimeRangePicker';
 import { fetchNetflowGraph, fetchRunNetflow, type GraphView, type NetflowResponse } from '../lib/netflow';
 import { buildRunGraphModel, type GraphNode, type RunGraphModel } from '../lib/runGraphModel';
 import { layoutGraph, type Pos } from '../lib/graphLayout';
@@ -173,7 +174,15 @@ export default function RunDetail() {
   const [netflow, setNetflow] = useState<NetflowResponse | null>(null);
   const [netflowGraph, setNetflowGraph] = useState<GraphView | null>(null);
   const [netflowError, setNetflowError] = useState<string | null>(null);
-  const netflowRequestedRef = useRef(false);
+  // Relative-default time-range filter (Task 4) — see pages/Netflow.tsx's
+  // identical field for the `toNetflowRange` rationale.
+  const [netflowRange, setNetflowRange] = useState<TimeRangeValue>({ preset: 'all' });
+  // Replaces the old plain boolean guard: keyed on (run id, range) rather
+  // than just "has this run's netflow ever been requested", so opening the
+  // tab a second time with an UNCHANGED range still skips the fetch (the
+  // original guard's whole point), but changing the range while the tab is
+  // already open — the one new case Task 4 introduces — DOES re-fire it.
+  const netflowRequestedKeyRef = useRef<string | null>(null);
 
   // Autoflow-history context — `null` means either "not fetched yet" or "this
   // run has no autoflow trail" (a plain, non-autoflow run); either way no
@@ -259,7 +268,8 @@ export default function RunDetail() {
     setNetflow(null);
     setNetflowGraph(null);
     setNetflowError(null);
-    netflowRequestedRef.current = false;
+    setNetflowRange({ preset: 'all' });
+    netflowRequestedKeyRef.current = null;
     setAutoflowCtx(null);
 
     fetchRunGraphWithRetry(id, () => cancelled, host)
@@ -349,23 +359,33 @@ export default function RunDetail() {
     };
   }, [id, tab]);
 
-  // Lazy-load this run's flows the first time the Network tab is opened.
-  // Keyed on (id, tab); the ref guard ensures a single fetch per run id.
-  // `cancelled` mirrors the findings effect above it: RunDetail doesn't
-  // unmount across a same-route run switch (see the sidebar/`<Link>`
-  // navigation the existing tests exercise), so a slow fetch for the
-  // previous run id can resolve after `id` has already moved on and
-  // clobber the new run's state with stale data without this guard.
+  // Lazy-load this run's flows the first time the Network tab is opened,
+  // and re-load when the operator changes the time-range picker while it's
+  // open. Keyed on (id, tab, range) via `netflowRequestedKeyRef` — a
+  // re-render with the SAME key (e.g. re-clicking the tab) skips the
+  // fetch, but a genuinely new key (a different run, or a different range
+  // on the same run) fires it. `cancelled` mirrors the findings effect
+  // above it: RunDetail doesn't unmount across a same-route run switch
+  // (see the sidebar/`<Link>` navigation the existing tests exercise), so
+  // a slow fetch for the previous run id can resolve after `id` has
+  // already moved on and clobber the new run's state with stale data
+  // without this guard.
   useEffect(() => {
-    if (!id || tab !== 'netflow' || netflowRequestedRef.current) return;
-    netflowRequestedRef.current = true;
+    if (!id || tab !== 'netflow') return;
+    const q = toNetflowRange(netflowRange);
+    const key = `${id}::${netflowRange.preset}::${q?.from ?? ''}::${q?.to ?? ''}`;
+    if (netflowRequestedKeyRef.current === key) return;
+    netflowRequestedKeyRef.current = key;
     let cancelled = false;
     // Combined into one `Promise.all` (Fix 6, netflow Plan 3 review round
     // 3) — previously each fetch independently swallowed its own failure
     // into a `null`, so e.g. an unreachable host (`RunLocation::Host`)
     // produced a permanently blank panel with no message and no retry.
     // Mirrors pages/Netflow.tsx and ProjectNetworkTab.tsx's identical fix.
-    Promise.all([fetchRunNetflow(id), fetchNetflowGraph(`run:${id}`)])
+    Promise.all([
+      q ? fetchRunNetflow(id, q) : fetchRunNetflow(id),
+      q ? fetchNetflowGraph(`run:${id}`, q) : fetchNetflowGraph(`run:${id}`),
+    ])
       .then(([d, g]) => {
         if (cancelled) return;
         setNetflow(d);
@@ -378,7 +398,7 @@ export default function RunDetail() {
     return () => {
       cancelled = true;
     };
-  }, [id, tab]);
+  }, [id, tab, netflowRange]);
 
   // ONE SSE subscription per open run — shared by graph + feed.
   // Thread the host param for remote runs.
@@ -1284,6 +1304,7 @@ export default function RunDetail() {
         {tab === 'netflow' && (
           <div className="h-full min-h-0 space-y-4 overflow-auto">
             <NetflowScopeDisclosure scope="run" />
+            <TimeRangePicker value={netflowRange} onChange={setNetflowRange} />
             {netflowError ? (
               <p className="text-sm text-err">{netflowError}</p>
             ) : netflow === null ? (
@@ -1297,6 +1318,7 @@ export default function RunDetail() {
                   droppedTotal={netflow.dropped_total}
                   asnLoaded={netflow.asn_loaded}
                   scope="run"
+                  appliedWindow={netflow.window}
                 />
               </>
             )}
