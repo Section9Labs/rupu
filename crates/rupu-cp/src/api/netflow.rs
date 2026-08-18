@@ -685,10 +685,12 @@ fn canonicalize_or_self(path: &StdPath) -> PathBuf {
 }
 
 /// `GET /api/projects/:id/netflow` — every flow in a workspace's own
-/// `.rupu/netflow/` ledger directory, including `system`-origin egress
-/// (`run_id: None`, e.g. `Origin::Scm` traffic from `Registry::discover`)
-/// that has no run to attach to. NOT the update checker, which despite
-/// also using `Origin::Update` reaches no ledger at all —
+/// `.rupu/netflow/` ledger directory, including unattributed
+/// (`run_id: None`) egress that has no run to attach to — e.g.
+/// `Origin::Scm` traffic from `Registry::discover` (NOT `Origin::System`;
+/// see `ScopeDisclosure.tsx`'s header comment for why that's a separate,
+/// unrecorded-at-any-scope case). NOT the update checker either, which
+/// despite also using `Origin::Update` reaches no ledger at all —
 /// `rupu-update`'s client is wired to `Arc::new(NullSink)`. Unlike run
 /// scope, this reads the ledger directly with no `run_id` filter.
 ///
