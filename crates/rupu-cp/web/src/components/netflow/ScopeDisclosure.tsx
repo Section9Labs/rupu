@@ -8,12 +8,14 @@
 // fix (four copy-pasted/hand-written fragments, several of them wrong).
 //
 // Coverage list intentionally excludes MCP and webhooks (Fix 2, round 3):
-// grep the workspace and `Origin::Mcp` / `Origin::Webhook` are constructed
-// nowhere — see `rupu_netflow::ctx::Origin`'s variants and
+// `rupu_netflow::ctx::Origin` no longer even HAS an `Mcp`/`Webhook` variant
+// (netflow-per-run Plan 2, Task 1) — neither subsystem makes outbound HTTP,
+// so there was nothing for those variants to ever be constructed for. See
+// `rupu_netflow::ctx::Origin`'s doc comment and
 // `crates/rupu-cp/web/src/lib/netflow.ts`'s `Origin` doc comment. Claiming
 // coverage that cannot exist is exactly the failure this subsystem was
-// built to prevent. Add them back here the day something actually
-// constructs one, not before.
+// built to prevent. Add an entry back here only if a future subsystem
+// change actually gives one of them outbound HTTP to make.
 //
 // It also excludes "the updater" entirely (Fix 2, round 4 — Blocker 2):
 // there are exactly two production `rupu_netflow::http::init` call sites in

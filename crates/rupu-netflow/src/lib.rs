@@ -1,10 +1,15 @@
 //! Network egress observability for rupu.
 //!
-//! Phase 1 captures rupu's OWN outbound HTTP — provider APIs, SCM
-//! connectors, MCP, webhooks, the update checker. It does NOT cover
-//! traffic from the agent's `bash` subprocesses; that arrives with the
-//! microVM backend (spec §9). Every record carries a [`Fidelity`] so no
-//! view ever claims coverage it does not have.
+//! Phase 1 captures rupu's OWN outbound HTTP — provider APIs and SCM
+//! connectors, wired to a per-run sink. Login/OAuth, the update checker,
+//! and CP's own fleet traffic are deliberately captured nowhere (wired to
+//! [`sink::NullSink`]) — see [`ctx::Origin`]'s doc for the full accounting,
+//! including why `Mcp`/`Webhook` variants don't exist at all: `rupu-mcp`
+//! dispatches into SCM connectors, which tag their own calls `Scm`, and
+//! `rupu-webhook` is an inbound server that makes no outbound HTTP. It does
+//! NOT cover traffic from the agent's `bash` subprocesses; that arrives
+//! with the microVM backend (spec §9). Every record carries a [`Fidelity`]
+//! so no view ever claims coverage it does not have.
 //!
 //! # Adding an HTTP client
 //!
