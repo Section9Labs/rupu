@@ -3,10 +3,12 @@
 // (updater, ASN refresh) that carries no run_id and so never surfaces on a
 // per-run Network tab. That's a property of this scope, not an accident —
 // those flows only ever attach to a workspace, never to a single run. This
-// scope deliberately does NOT include the CP daemon's own global ledger —
-// that traffic belongs to the CP fleet as a whole, not to this project; see
-// `rupu_cp::api::netflow::get_project_netflow`'s doc comment (Fix 1,
-// netflow Plan 3 review round 3).
+// scope deliberately does NOT include the CP daemon's own fleet traffic
+// (`Origin::Cp`) — not because that traffic lives somewhere else, but
+// because it doesn't live anywhere: `HttpHostConnector` wires it to a
+// `NullSink` (netflow-per-run plan, Task 8), so it's recorded at no scope,
+// this one included; see `rupu_cp::api::netflow::get_project_netflow`'s
+// doc comment.
 //
 // Mirrors ProjectCoverageTab's shape: self-fetches on the `wsId` prop, no
 // filter chips. This tab body only mounts while "Network" is the active

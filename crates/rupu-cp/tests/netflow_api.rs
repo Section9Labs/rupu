@@ -2,11 +2,14 @@
 //! stays null through serialization; a missing ASN table is reported as
 //! `asn_loaded: false` rather than silently producing empty enrichment.
 //!
-//! The end-to-end tests below also prove Plan 3's ledger+transcript merge
-//! correction over the real HTTP route: only *provider* flows carry
-//! `ctx.run_id`, so a run's SCM/auth/update calls are `run_id: None` in the
-//! ledger and only recoverable from the run's own transcript. See
-//! `rupu-cp/src/api/netflow.rs`'s module doc for the full rationale.
+//! The end-to-end tests below also prove the ledger+transcript merge still
+//! recovers a run whose ledger file could never be opened at all
+//! (`netflow_sink::for_run` degrades to transcript-only capture rather than
+//! break the run) — with one ledger file per run, attribution is by FILE,
+//! not by the `ctx.run_id` field, so a flow with `run_id: None` (SCM/auth/
+//! update/`Cp` origins) is already in the ledger read on a normal run; the
+//! merge exists for the degraded one. See `rupu-cp/src/api/netflow.rs`'s
+//! module doc for the full rationale.
 //!
 //! ## One ledger file per run, not one shared `flows.jsonl`
 //!
@@ -325,8 +328,11 @@ fn e2e_flow(id: FlowId, run: Option<&str>, host: &str, origin: Origin) -> FlowRe
 /// run's flow that must never be read for this request at all (not merely
 /// filtered out — proving the route only ever opens `run_id`'s own file).
 /// The run's transcript has a stale pre-completion copy of A (must lose to
-/// the ledger's finalized copy) and a `run_id: None` SCM flow (C) that a
-/// ledger read alone would never see. Response must contain exactly A
+/// the ledger's finalized copy) and an SCM flow (C) that is deliberately
+/// written to the transcript ONLY, standing in for a flow that landed in
+/// this run's transcript but never made it into its ledger file (the
+/// `netflow_sink::for_run` degrade case the merge exists for) — a ledger
+/// read alone would never see it. Response must contain exactly A
 /// (finalized) + C, report `run_id`'s own ledger's dropped-count, and roll
 /// `hosts` up from that same merged set (not leaking the other run's host).
 #[tokio::test]

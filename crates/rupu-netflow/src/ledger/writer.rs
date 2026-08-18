@@ -14,15 +14,18 @@ const CHANNEL_CAPACITY: usize = 1024;
 /// How often the writer task checks for loss and surfaces it, even with
 /// no explicit `Flush`/`Stop` and no channel close.
 ///
-/// Load-bearing for every LONG-RUNNING production caller: `rupu cp
-/// serve` installs its sink once and never calls `shutdown()` — the
-/// process just keeps running — and the global `OnceLock` the sink lives
-/// in is never dropped before process exit either, so neither the
-/// `Flush`/`Stop` path nor the "all senders dropped" natural-close path
-/// (the tail of this file's main loop) was ever reachable in practice.
-/// Without an independent timer, a channel-overflow drop could sit
-/// silently unrecorded on disk for the entire remaining life of the
-/// daemon — invariant 2 ("loss must be visible, never silent"), broken.
+/// This is the safety net for any run/turn whose writer never reaches an
+/// explicit `Flush`/`Stop`. Every writer is scoped to exactly one run
+/// (`netflow_sink::for_run` in rupu-cli builds a fresh one per run/turn —
+/// there is no process-wide sink any caller installs once and keeps for
+/// the life of the process; `rupu cp serve` in particular records none of
+/// its own egress at all, via an explicit `NullSink`). The happy path DOES
+/// call `handle.shutdown()`, which sends `Flush` then `Stop` — but a run
+/// that panics, is killed, or otherwise exits abruptly never reaches that
+/// call, and nothing guarantees it does. Without an independent timer, a
+/// channel-overflow drop on such a run could sit silently unrecorded on
+/// disk for however long that run's process/task stays up — invariant 2
+/// ("loss must be visible, never silent"), broken.
 const DROPPED_VISIBILITY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug)]
@@ -154,14 +157,14 @@ async fn run_writer(
 
     let mut last_dropped = 0u64;
     // See `DROPPED_VISIBILITY_INTERVAL`'s doc comment: this is the ONLY
-    // mechanism that surfaces loss for a caller that never calls
-    // `Flush`/`Stop` and never lets the channel close naturally — which,
-    // in production, is every caller (`rupu run` keeps the sink installed
-    // in a process-wide `OnceLock` for the whole process; `rupu cp serve`
-    // runs indefinitely). The `Line` arm below ALSO checks on every
-    // successful write, so loss is typically visible on the very next
-    // record rather than waiting out a full tick; the interval exists for
-    // the case where nothing more is ever successfully sent.
+    // mechanism that surfaces loss for a run/turn whose writer never
+    // receives an explicit `Flush`/`Stop` and never lets the channel close
+    // naturally — i.e. any run that exits before reaching its own
+    // `netflow_sink::for_run` handle's `shutdown()` call (panic, hard
+    // kill, any other abrupt exit). The `Line` arm below ALSO checks on
+    // every successful write, so loss is typically visible on the very
+    // next record rather than waiting out a full tick; the interval exists
+    // for the case where nothing more is ever successfully sent.
     let mut ticker = tokio::time::interval(flush_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await; // consume the immediate first tick (interval fires at t=0)
@@ -441,21 +444,25 @@ mod tests {
         );
     }
 
-    /// Fix 2 (Task 10 review): the ONLY thing that ever calls
-    /// `shutdown()` in production is a test. `rupu run` installs the sink
-    /// into a process-wide `OnceLock` that's never cleared before process
-    /// exit, and `rupu cp serve` never exits at all under normal
-    /// operation — so `dropped_count_is_recorded_not_silent` above,
-    /// which calls `handle.shutdown()` directly, was proving a code path
-    /// no real invocation ever takes. Loss accounting that only reaches
-    /// disk via a method nothing calls is loss that is, in practice,
-    /// silent — invariant 2, broken.
+    /// Under the explicit per-run sink model (`netflow_sink::for_run` in
+    /// rupu-cli), the happy path DOES call `handle.shutdown()` once a
+    /// run/turn ends — `dropped_count_is_recorded_not_silent` above proves
+    /// that path works. This test proves the other path still holds: a
+    /// run whose process/task ends before its own `shutdown()` call runs
+    /// (a panic, a hard kill, any other abrupt exit) must still not lose
+    /// loss silently. There is no process-wide sink installed once and
+    /// kept for the life of the process anymore — that `OnceLock` model is
+    /// exactly what this plan removed. Every writer belongs to one run, so
+    /// "never shuts down" now means "this one run ended abruptly," not
+    /// "the daemon just keeps going forever." Loss accounting that only
+    /// ever reached disk via a method an abruptly-ending run never calls
+    /// would be loss that is, in practice, silent — invariant 2, broken.
     ///
     /// This test is shaped like that reality: it floods a
     /// capacity-1 channel past its limit exactly like the test above, but
-    /// then does NOT call `shutdown()` — the handle is just held (mirroring
-    /// `rupu run`'s `Arc<dyn FlowSink>` sitting in `OnceLock` forever) and
-    /// the test polls the ledger FILE ON DISK until the `Dropped` line
+    /// then does NOT call `shutdown()` — the handle is just held, standing
+    /// in for a run that never reaches its own shutdown call — and the
+    /// test polls the ledger FILE ON DISK until the `Dropped` line
     /// appears. A short `spawn_with_capacity_and_interval` keeps the poll
     /// fast without weakening what's proven: the SAME periodic mechanism
     /// runs at `DROPPED_VISIBILITY_INTERVAL` in production.
@@ -479,11 +486,13 @@ mod tests {
         let dropped = handle.writer.dropped();
         assert!(dropped > 0, "flooding a capacity-1 channel must drop");
 
-        // Deliberately NOT calling `handle.shutdown()` — that is exactly
-        // the production shape this test exists to cover. `handle` (and
-        // therefore the channel) stays alive for the rest of the test,
-        // same as the process-wide `OnceLock` keeps it alive for the rest
-        // of a real `rupu run` / `rupu cp serve` process.
+        // Deliberately NOT calling `handle.shutdown()` — standing in for a
+        // run whose process/task ends before its own shutdown call runs
+        // (panic, hard kill, any other abrupt exit), which is the one
+        // production case this test exists to cover now that the happy
+        // path always calls `shutdown()` explicitly (see this test's doc
+        // comment above). `handle` (and therefore the channel) just stays
+        // alive for the rest of the test in place of that abrupt exit.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Ok(text) = std::fs::read_to_string(&paths.flows) {

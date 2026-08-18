@@ -1,22 +1,31 @@
-//! Netflow API — run-scoped read of the workspace ledger + run transcript,
-//! merged, with read-time ASN enrichment.
+//! Netflow API — run-scoped read of the run's own per-run ledger file(s)
+//! plus its transcript, merged, with read-time ASN enrichment.
 //!
 //! ASN is resolved HERE, at render time, not stamped into the record (spec
 //! §6.2). A table that arrives later therefore improves every historical
 //! flow with no backfill.
 //!
-//! ## Why this reads the ledger AND the transcript (do not "simplify")
+//! ## Why this still reads the ledger AND the transcript (do not "simplify")
 //!
-//! Only *provider* flows carry `ctx.run_id` — `Origin::Scm`, `Auth`/
-//! `System`, `Update` and `Cp` flows are ALWAYS `run_id: None` by design
-//! (see `rupu_netflow::ctx::FlowCtx::system`). Filtering the
-//! workspace-level ledger by `run_id` alone therefore silently drops every
-//! SCM/auth/update call the process made *while this run was active* — the
-//! response would look complete but isn't. The run's own transcript carries
-//! an `Event::NetFlow` line for every flow the process observed during the
-//! run regardless of `ctx.run_id`, which is exactly the set that recovers
-//! that gap. [`merge_with_transcript`] does the merge; see its doc for the
-//! dedup rule.
+//! With one ledger file per run (`NetflowPaths::for_run`), a flow's
+//! attribution to a run is the FILE it landed in, not the `ctx.run_id`
+//! field — `Origin::Scm`, `Auth`/`System`, `Update` and `Cp` flows still
+//! carry `run_id: None` (see `rupu_netflow::ctx::FlowCtx::system`), but a
+//! per-run sink writes them into THIS run's own ledger file regardless, so
+//! a plain read of that file already includes them. `filter_by_run`'s old
+//! job — recovering `run_id: None` flows a shared ledger's field filter
+//! would otherwise drop — is not what the transcript merge is for anymore.
+//!
+//! What it's for instead: `netflow_sink::for_run` (rupu-cli) is
+//! best-effort — capture must never break a run, so a ledger file that
+//! fails to open is not fatal, and the run's sink degrades to
+//! transcript-only capture for the rest of that run's life (see that
+//! function's doc). For such a run the ledger file never exists at all, so
+//! a ledger-only read reports nothing for it — the run's own transcript,
+//! which the same sink always writes to independent of the ledger's fate,
+//! is the ONLY surviving record of that run's network activity.
+//! [`merge_with_transcript`] is what makes those flows reachable at all;
+//! see its doc for the dedup rule.
 //!
 //! ## Blocking I/O never runs on the async task
 //!
@@ -112,9 +121,17 @@ pub struct NetflowResponse {
     pub asn_loaded: bool,
 }
 
-/// Flows belonging to one run, as recorded in the ledger. Callers almost
-/// always want [`merge_with_transcript`] applied on top of this — see the
-/// module doc for why the ledger alone under-reports.
+/// Flows belonging to one run, filtered from an in-memory set by
+/// `ctx.run_id`.
+///
+/// No production read path calls this anymore: a run-scoped read opens
+/// that run's own per-run ledger FILE directly (`resolve_ledger_path` /
+/// [`run_scoped_flows_and_dropped`]), so attribution comes from which file
+/// a flow landed in, not from this field — see the module doc. Kept as a
+/// pure, still-exported function because
+/// `crates/rupu-cp/tests/netflow_api.rs`'s `run_scope_filters_to_that_run_only`
+/// exercises it directly against a hand-mixed fixture; there is no other
+/// caller.
 pub fn filter_by_run(flows: &[FlowRecord], run_id: &str) -> Vec<FlowRecord> {
     flows
         .iter()
@@ -308,16 +325,36 @@ pub(crate) fn maybe_refresh_asn(cfg: &rupu_config::NetflowConfig, cache: &Arc<As
     });
 }
 
-/// Merge the ledger's run-scoped flows with the `Event::NetFlow` lines
-/// found in the run's own transcript files, deduped by [`FlowId`].
+/// Merge a run's ledger-scoped flows with the `Event::NetFlow` lines found
+/// in the run's own transcript files, deduped by [`FlowId`].
+///
+/// This exists for exactly one reason now: `netflow_sink::for_run`
+/// (rupu-cli) is a best-effort sink builder — a ledger file it cannot open
+/// is not fatal ("capture must never break a run"), so that run's sink
+/// degrades to transcript-only capture for the rest of its life. When that
+/// happens, this run's ledger file was never created at all, so
+/// `run_scoped_flows_and_dropped`'s ledger read for it returns nothing —
+/// the run's own transcript, which the same sink always writes to
+/// regardless of the ledger's fate, is the ONLY surviving record of that
+/// run's network activity. This merge is what makes those flows reachable
+/// at all. It is deliberately NOT here to recover `ctx.run_id: None` flows
+/// from a shared ledger — with one ledger file per run, attribution is by
+/// file, so those flows are already in the ledger read (see the module
+/// doc).
+///
+/// On a normal run (ledger opened fine), every flow already exists in the
+/// ledger; the merge is then a no-op union — nothing new is added, because
+/// every transcript-side id the dedup below sees already has a ledger-side
+/// entry.
 ///
 /// On an id collision the LEDGER's copy wins: `ledger::read_flows` folds
 /// any `LedgerLine::Complete` into it, so its `bytes_in`/`duration_ms` are
 /// finalized, whereas the transcript's copy is only the snapshot taken at
 /// the moment the flow was first recorded (a streaming flow is written to
-/// the transcript before it completes). Transcript-only flows — everything
-/// with `ctx.run_id: None` that the ledger's run-id filter dropped — are
-/// added as-is; there is no more-authoritative copy of them anywhere.
+/// the transcript before it completes). Transcript-only flows — every id
+/// the ledger read never produced, whether because that run's ledger
+/// degraded entirely or (rarer) one line failed to parse — are added
+/// as-is; there is no more-authoritative copy of them anywhere.
 ///
 /// A transcript file that fails to open/parse is skipped, not fatal — the
 /// same "missing data degrades, never errors" contract as the ledger read.
@@ -921,11 +958,15 @@ mod tests {
     }
 
     #[test]
-    fn merge_adds_transcript_only_flows_the_ledger_run_filter_dropped() {
-        // Simulates the SCM/auth/update gap: an Scm flow is `run_id: None`
-        // so it never survives `filter_by_run` against the ledger, but it
-        // DID land in the run's transcript (the process saw it while the
-        // run was active).
+    fn merge_adds_flows_the_ledger_read_never_produced() {
+        // Simulates the ledger-degrade case this merge exists for now:
+        // `netflow_sink::for_run` couldn't open the run's ledger file, so
+        // that run's sink fell back to transcript-only capture — the
+        // ledger read for this run comes back empty (`Vec::new()` below),
+        // and the transcript is the only place this flow was ever
+        // recorded. The flow's origin (`Scm` here) is incidental: the
+        // merge doesn't special-case it, unlike the old run-id-field
+        // filter it replaced.
         let tmp = tempfile::TempDir::new().unwrap();
         let scm_flow = {
             let mut f = flow(FlowId::new(), None, "api.github.com");

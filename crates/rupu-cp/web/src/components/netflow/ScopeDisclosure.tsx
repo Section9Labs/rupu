@@ -25,39 +25,44 @@
 // not a claim worth making. Installing a sink in `cmd/update.rs` is new
 // capability work, tracked as a follow-up, not a wording fix.
 //
-// `NetflowScope` gates "CP fleet traffic" (Fix 2, round 4 — Blocker 1):
-// `Origin::Cp` flows live ONLY in the CP daemon's global ledger
-// (`rupu_cp::api::netflow::read_all_workspaces_sync`, Fix 1) — deliberately
-// never unioned into project scope, and a run's flows never carry
-// `Origin::Cp` either (they're process-global, not attributable to one
-// run). Asserting "this covers CP fleet traffic" on the project or run
-// Network tab would claim a category the code deliberately withholds at
-// that scope. `scope === 'global'` is therefore the only branch that
-// includes it; the other two carry a pointer to where it actually lives.
+// It ALSO excludes "CP fleet traffic" entirely now (netflow-per-run plan,
+// Task 8): `Origin::Cp` flows are the CP daemon's own fleet HTTP traffic
+// (`HttpHostConnector::new` / `::new_with_timeout`,
+// `crates/rupu-cp/src/host/http.rs`), which is deliberately wired to
+// `Arc::new(NullSink)` — daemon-lifetime, not run-scoped, so it is
+// recorded nowhere, at ANY scope. This used to be claimed at
+// `scope === 'global'` only (Fix 2, round 4 — Blocker 1: `Origin::Cp`
+// flows lived in the CP daemon's own process-wide global ledger back
+// then). That ledger is gone under the per-run model — every sink this
+// plan builds is scoped to one run/turn — and nothing replaced it for
+// `Origin::Cp` specifically. There is no scope left where the claim is
+// true, so it comes out everywhere, with no `scope`-conditional branch
+// left to qualify it.
 
 export type NetflowScope = 'run' | 'project' | 'global';
 
-/** The subset of netflow's coverage that is true at EVERY scope — safe to
- *  use standalone (e.g. NetflowTable's empty-state hint, which has no
- *  scope of its own to key off). Scope-aware callers should go through
- *  [`netflowCoverageList`] instead so global scope's extra category
- *  (CP fleet traffic) is represented correctly. */
+/** Netflow's full coverage list — true at EVERY scope now (no scope adds
+ *  anything on top of this one; see the header comment's "CP fleet
+ *  traffic" note for why that stopped being true for global scope). Safe
+ *  to use standalone (e.g. NetflowTable's empty-state hint, which has no
+ *  scope of its own to key off) or through [`netflowCoverageList`], which
+ *  now just returns this same string for every scope. */
 export const NETFLOW_COVERAGE_LIST = 'provider APIs, SCM connectors';
 
-/** `NETFLOW_COVERAGE_LIST`, plus CP fleet traffic when (and only when)
- *  `scope` is `'global'` — see this file's header comment (Blocker 1) for
- *  why the other two scopes must not claim it. */
-export function netflowCoverageList(scope: NetflowScope): string {
-  return scope === 'global' ? `${NETFLOW_COVERAGE_LIST}, and CP fleet traffic` : NETFLOW_COVERAGE_LIST;
+/** `NETFLOW_COVERAGE_LIST`, at every scope — see the header comment's "CP
+ *  fleet traffic" note for why global scope no longer adds anything on
+ *  top. Kept scope-parameterized (the parameter is currently unused) so a
+ *  genuinely scope-specific category can be reintroduced here later
+ *  without every call site changing shape. */
+export function netflowCoverageList(_scope: NetflowScope): string {
+  return NETFLOW_COVERAGE_LIST;
 }
 
 function disclosureText(scope: NetflowScope): string {
   const coverage = netflowCoverageList(scope);
-  const cpNote =
-    scope === 'global' ? '' : ' CP fleet traffic appears on the global Network page only.';
   return (
     `This covers rupu's own egress — ${coverage} — never traffic from the agent's bash ` +
-    `subprocess.${cpNote} It also can't see non-HTTP egress: git2 clones (often a run's ` +
+    `subprocess. It also can't see non-HTTP egress: git2 clones (often a run's ` +
     `largest byte volume), object_store bucket traffic, and the node WebSocket are invisible ` +
     `here too.`
   );
@@ -85,27 +90,31 @@ export function NetflowScopeDisclosure({
  *  two defects as the main disclosure, just in a fourth, un-centralized
  *  copy.
  *
- *  Round 5 fixed a THIRD instance of the same defect, one example over:
- *  "ASN refresh" is exactly as global-only as "CP fleet traffic" is. Every
- *  `Origin::System` ASN-refresh download — whether from `cmd/cp.rs`'s sweep
- *  or from this crate's own `maybe_refresh_asn` — resolves the sink
- *  `cp serve` installs at startup, which is always the daemon's
- *  global-only ledger; `get_project_netflow`/`collect_run_netflow` never
- *  read it, only `read_all_workspaces_sync` (global scope) does, and there
- *  is no other `asn::refresh` call site in the workspace. So it can never
- *  appear at project or run scope — offering it as an example there was
- *  false in exactly the way the round-4 fix was supposed to close off.
+ *  "CP fleet traffic" came out of the example list entirely (netflow-
+ *  per-run plan, Task 8) for the same reason it came out of the main
+ *  disclosure — see this file's header comment. It is no longer
+ *  conditional on `scope`; it simply isn't offered as an example anywhere
+ *  anymore.
+ *
+ *  "ASN refresh" is still offered conditionally at `scope === 'global'`
+ *  only (round 5's fix) — untouched by the Task 8 pass that removed "CP
+ *  fleet traffic" above.
  *
  *  The `system` SOURCE ITSELF stays valid at every scope, though — that's
  *  a decision, not an oversight: `Origin::System` also covers auth/oauth
- *  token exchange (`rupu-auth`'s resolver / oauth/device / oauth/callback),
- *  which genuinely can reach project scope (the project's own ledger, no
- *  run_id filter) and run scope (the run's own transcript, which records
- *  every flow observed while the run was active regardless of
- *  `ctx.run_id`). Only the PARENTHETICAL EXAMPLE is scope-gated here, not
- *  the "or system for unattributed egress" clause that names the source. */
+ *  token exchange (`rupu-auth`'s resolver / oauth/device / oauth/callback).
+ *  With one ledger file per run (and project scope reading every ledger
+ *  file under a workspace's netflow directory), that traffic reaches
+ *  project and run scope because it lands directly in the relevant ledger
+ *  file — attribution is by FILE, not by `ctx.run_id` — or, for a run
+ *  whose own ledger file could not be opened, via that run's transcript,
+ *  which the same per-run sink always writes to regardless of the
+ *  ledger's fate (`merge_with_transcript` in
+ *  `rupu-cp/src/api/netflow.rs`; see that module's doc). Only the
+ *  PARENTHETICAL EXAMPLE is scope-gated here, not the "or system for
+ *  unattributed egress" clause that names the source. */
 export function netflowSystemSourceHint(scope: NetflowScope): string {
-  const examples = scope === 'global' ? ' (ASN refresh, CP fleet traffic)' : '';
+  const examples = scope === 'global' ? ' (ASN refresh)' : '';
   return `Sources — runs, or system for unattributed egress${examples} — connect to the host:port endpoints they reached.`;
 }
 
