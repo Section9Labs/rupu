@@ -494,6 +494,23 @@ pub struct ItemResult {
     pub transcript_path: PathBuf,
     pub output: String,
     pub success: bool,
+    /// `true` only for a panel gate's `fix_with:` fixer dispatch
+    /// (`run_panel_step`'s gate loop). Every other constructor of this
+    /// struct -- `for_each`/`parallel` units, panelists, joins, resume
+    /// reconstruction -- leaves this `false`. Exists so
+    /// `base_context_for_step` can exclude fixer dispatches from the
+    /// `results`/`sub_results` template surface it builds from a step's
+    /// `items` (the fixer's output already flows forward as the next
+    /// panel iteration's subject; it was never meant to additionally
+    /// appear as one more entry in a downstream step's `{{ steps.<id>.
+    /// results }}`) while the fixer's `run_id` still reaches
+    /// `step_results.jsonl` through the same `items` list CP's netflow
+    /// read side already unions run ids from. An explicit field rather
+    /// than sniffing `sub_id`'s `"fixer:iterN"` naming convention, which
+    /// would make template-context filtering silently depend on string
+    /// formatting chosen for an unrelated purpose (human-readable unit
+    /// labelling).
+    pub is_fixer: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3840,6 +3857,7 @@ fn drain_joins(
                 transcript_path: src.transcript_path.clone(),
                 output: src.output.clone(),
                 success: src.success,
+                is_fixer: false,
             });
         }
         let join_step = &wf.steps[j];
@@ -4604,21 +4622,32 @@ fn base_context_for_step(
     ctx.event = event.cloned();
     ctx.issue = issue.cloned();
     for sr in prior {
-        let results: Vec<String> = sr.items.iter().map(|i| i.output.clone()).collect();
-        let sub_results: std::collections::BTreeMap<String, crate::templates::SubResult> = sr
-            .items
-            .iter()
-            .filter(|i| !i.sub_id.is_empty())
-            .map(|i| {
-                (
-                    i.sub_id.clone(),
-                    crate::templates::SubResult {
-                        output: i.output.clone(),
-                        success: i.success,
-                    },
-                )
-            })
-            .collect();
+        // A panel gate's `fix_with:` fixer is recorded as an `ItemResult`
+        // so its own run id (and ledger-only Dropped count) reaches
+        // `step_results.jsonl` (see `run_panel_step`'s gate loop and
+        // `ItemResult::is_fixer`'s doc comment) -- but it is not one more
+        // parallel/for_each unit or panelist, and was never meant to
+        // additionally appear in a downstream step's `{{ steps.<id>.
+        // results }}`/`sub_results`: the fixer's output already flows
+        // forward as the NEXT panel iteration's subject, which is the
+        // only place it was ever meant to be visible. Excluding it here
+        // keeps this template surface byte-identical to what it was
+        // before the fixer started being recorded as an item at all.
+        let template_items = sr.items.iter().filter(|i| !i.is_fixer);
+        let results: Vec<String> = template_items.clone().map(|i| i.output.clone()).collect();
+        let sub_results: std::collections::BTreeMap<String, crate::templates::SubResult> =
+            template_items
+                .filter(|i| !i.sub_id.is_empty())
+                .map(|i| {
+                    (
+                        i.sub_id.clone(),
+                        crate::templates::SubResult {
+                            output: i.output.clone(),
+                            success: i.success,
+                        },
+                    )
+                })
+                .collect();
         ctx.steps.insert(
             sr.step_id.clone(),
             StepOutput {
@@ -6199,6 +6228,7 @@ async fn run_fanout_run_step(
                 transcript_path,
                 output,
                 success,
+                is_fixer: false,
             },
         ));
     }
@@ -6788,6 +6818,7 @@ async fn run_fanout_step(
                     transcript_path: o.transcript_path.clone(),
                     output: o.output.clone(),
                     success: true,
+                    is_fixer: false,
                 },
             );
         }
@@ -6812,6 +6843,7 @@ async fn run_fanout_step(
             transcript_path: o.transcript_path.clone(),
             output: o.output.clone(),
             success: o.success,
+            is_fixer: false,
         })
         .collect();
     items_vec.extend(resumed.into_values());
@@ -7014,6 +7046,7 @@ async fn run_parallel_step(
             transcript_path: o.transcript_path.clone(),
             output: o.output.clone(),
             success: o.success,
+            is_fixer: false,
         })
         .collect();
     let outputs: Vec<String> = items_vec.iter().map(|i| i.output.clone()).collect();
@@ -7447,6 +7480,7 @@ async fn run_panel_step(
                     transcript_path,
                     output: output.clone(),
                     success: true,
+                    is_fixer: true,
                 });
                 subject = output;
                 // Loop continues; pass is dropped — its findings are
@@ -7480,6 +7514,7 @@ async fn run_panel_step(
                     transcript_path,
                     output: error.to_string(),
                     success: false,
+                    is_fixer: true,
                 });
                 warn!(step = %step.id, error = %error, "fixer agent failed; tolerating via continue_on_error");
                 break (pass, false);
@@ -7877,6 +7912,7 @@ async fn run_panel_iteration(
             transcript_path: o.transcript_path.clone(),
             output: o.output.clone(),
             success: o.success,
+            is_fixer: false,
         })
         .collect();
     let success = items_vec.iter().all(|i| i.success);
@@ -9474,6 +9510,7 @@ steps:
                         transcript_path: cp.transcript_path.clone(),
                         output: cp.output.clone(),
                         success: true,
+                        is_fixer: false,
                     },
                 );
         }

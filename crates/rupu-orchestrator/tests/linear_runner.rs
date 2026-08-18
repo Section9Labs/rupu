@@ -1660,12 +1660,91 @@ async fn panel_gate_loops_with_fixer_until_severity_clears() {
     let fixer_item = panel
         .items
         .iter()
-        .find(|i| i.sub_id.starts_with("fixer:"))
+        .find(|i| i.is_fixer)
         .expect("the fixer's own dispatch must be recorded as an item");
     assert!(
         fixer_item.run_id.starts_with("run_"),
         "the fixer's own minted run id must be recorded, got: {:?}",
         fixer_item.run_id
+    );
+}
+
+const WF_PANEL_GATE_WITH_DOWNSTREAM: &str = r#"
+name: panel-with-gate-downstream
+inputs:
+  diff: { type: string, default: "+ buggy line" }
+steps:
+  - id: panel
+    actions: []
+    panel:
+      panelists:
+        - security-reviewer
+      subject: "{{ inputs.diff }}"
+      gate:
+        until_no_findings_at_severity_or_above: high
+        fix_with: fixer
+        max_iterations: 3
+  - id: after
+    agent: echo
+    actions: []
+    prompt: "{{ steps.panel.results }}"
+"#;
+
+/// Pins the fix for the templating ripple the fixer-run-id change (above)
+/// introduced: routing the fixer's `ItemResult` through the SAME `items`
+/// list a downstream step's `{{ steps.<id>.results }}`/`sub_results` are
+/// built from means a fixer dispatch must NOT change what those bindings
+/// evaluate to, even though its `run_id` now reaches `step_results.jsonl`
+/// through that same list. `LoopingPanelFactory`'s catch-all agent arm
+/// echoes the rendered prompt back as the step's own output, so `after`'s
+/// `StepResult.output` literally contains whatever `{{ steps.panel.
+/// results }}` rendered to -- the fixer's distinctive output text must
+/// not appear in it.
+#[tokio::test]
+async fn panel_fixer_dispatch_does_not_leak_into_downstream_template_context() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let factory = Arc::new(LoopingPanelFactory::new());
+    let wf = Workflow::parse(WF_PANEL_GATE_WITH_DOWNSTREAM).unwrap();
+    let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_gate_downstream".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().to_path_buf(),
+        factory: Arc::clone(&factory) as Arc<dyn StepFactory>,
+        event: None,
+        run_store: None,
+        workflow_yaml: None,
+        resume_from: None,
+        issue: None,
+        issue_ref: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: None,
+        pause: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+    let panel = &res.step_results[0];
+    assert!(panel.resolved);
+
+    // Sanity: the fixer really did run, same as the sibling test above.
+    let calls = factory.calls.lock().unwrap().clone();
+    assert_eq!(calls.get("fixer").copied(), Some(1));
+
+    let after = &res.step_results[1];
+    assert!(
+        after.output.contains("step after agent echo"),
+        "sanity: the downstream step actually ran with a rendered prompt: {}",
+        after.output
+    );
+    assert!(
+        !after.output.contains("diff applied; sql injection patched"),
+        "the fixer's output must not leak into a downstream step's \
+         {{{{ steps.panel.results }}}}: {}",
+        after.output
     );
 }
 
@@ -2147,6 +2226,7 @@ async fn resume_reruns_only_failed_fanout_units() {
                     transcript_path: cp.transcript_path.clone(),
                     output: cp.output.clone(),
                     success: true,
+                    is_fixer: false,
                 },
             );
     }

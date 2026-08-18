@@ -650,6 +650,18 @@ pub struct ItemResultRecord {
     pub transcript_path: PathBuf,
     pub output: String,
     pub success: bool,
+    /// Mirrors `runner::ItemResult::is_fixer` -- see that field's doc
+    /// comment. `#[serde(default)]` so a `step_results.jsonl` record
+    /// persisted before this field existed deserializes as `false`,
+    /// which is correct: no record from before this field was added
+    /// could have been a fixer item in the first place (the fixer's own
+    /// `ItemResult` didn't exist until the same change that added this
+    /// field). Round-trips through both `From` impls below so a fixer
+    /// item reconstructed for a resumed run's template context is
+    /// excluded from `results`/`sub_results` the same way a freshly
+    /// dispatched one is.
+    #[serde(default)]
+    pub is_fixer: bool,
 }
 
 /// One durable per-unit checkpoint for a fan-out (`for_each`) step,
@@ -725,6 +737,7 @@ impl From<&ItemResult> for ItemResultRecord {
             transcript_path: i.transcript_path.clone(),
             output: i.output.clone(),
             success: i.success,
+            is_fixer: i.is_fixer,
         }
     }
 }
@@ -770,6 +783,7 @@ impl From<&ItemResultRecord> for ItemResult {
             transcript_path: rec.transcript_path.clone(),
             output: rec.output.clone(),
             success: rec.success,
+            is_fixer: rec.is_fixer,
         }
     }
 }

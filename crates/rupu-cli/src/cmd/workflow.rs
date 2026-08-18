@@ -3107,6 +3107,7 @@ pub(crate) async fn resume_run(
                     transcript_path: cp.transcript_path.clone(),
                     output: cp.output.clone(),
                     success: true,
+                    is_fixer: false,
                 },
             );
         } else {

@@ -933,6 +933,7 @@ async fn fanout_pause_resumes_only_incomplete_units() {
                     transcript_path: cp.transcript_path.clone(),
                     output: cp.output.clone(),
                     success: true,
+                    is_fixer: false,
                 },
             );
     }
