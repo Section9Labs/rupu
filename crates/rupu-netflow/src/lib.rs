@@ -11,6 +11,20 @@
 //! with the microVM backend (spec §9). Every record carries a [`Fidelity`]
 //! so no view ever claims coverage it does not have.
 //!
+//! # Retention
+//!
+//! A ledger is never deleted automatically — one file per run
+//! accumulates in `<netflow_dir>/<run_id>.jsonl` (see [`NetflowPaths`])
+//! for as long as an operator leaves it there. `rupu netflow prune
+//! --older-than <duration>` (`rupu-cli`'s `cmd::netflow` module) is the
+//! retention tool, mirroring `rupu transcript prune`; nothing in this
+//! crate or `rupu-cli` schedules it, so an installation that never runs
+//! it keeps every ledger forever. A prune sweep never touches a run
+//! that might still be Running/Pending, the directory's own
+//! self-ignoring `.gitignore`, or the legacy pre-per-run `flows.jsonl`
+//! — see that module's doc comment for the full accept/reject and
+//! liveness reasoning.
+//!
 //! # Adding an HTTP client
 //!
 //! Don't. Call [`http::client_with`] instead — a raw `reqwest::Client`

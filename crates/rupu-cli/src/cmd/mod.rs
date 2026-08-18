@@ -22,6 +22,7 @@ pub mod issues;
 pub mod man;
 pub mod mcp;
 pub mod models;
+pub mod netflow;
 pub mod node;
 pub mod repos;
 pub mod retention;
