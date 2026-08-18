@@ -231,6 +231,66 @@ pub struct GraphView {
     pub edges: Vec<GraphEdge>,
 }
 
+/// An inclusive time window over `FlowRecord::ts`.
+///
+/// `ts` is the ONLY timestamp a `FlowRecord` carries, and it is stamped
+/// after the response headers land (or after a transport failure settles)
+/// — see `http/middleware.rs`, which calls `chrono::Utc::now()` right
+/// after `next.run(...)` returns, not before the request is sent. A later
+/// `LedgerLine::Complete` (streamed-body drain finishing) updates
+/// `bytes_in`/`duration_ms` but never `ts`. So a long-running streamed
+/// request that started before this window and finished draining inside
+/// it is judged by when its headers arrived, not by when it started or
+/// by when its body finally completed — the only instant this subsystem
+/// actually captures.
+///
+/// Both bounds are INCLUSIVE: a flow at exactly `from` or exactly `to` is
+/// in range. Absent bounds mean unbounded on that side, so
+/// `TimeRange::unbounded()` selects everything and existing callers are
+/// unaffected. `from > to` is not rejected — it is simply an empty
+/// window, since no timestamp can satisfy both `>= from` and `<= to`
+/// (see `an_inverted_range_contains_nothing`); callers building a range
+/// from untrusted input get an empty result, not a panic or a
+/// silently-reordered range.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TimeRange {
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl TimeRange {
+    pub fn unbounded() -> Self {
+        Self::default()
+    }
+
+    pub fn contains(&self, ts: chrono::DateTime<chrono::Utc>) -> bool {
+        self.from.is_none_or(|f| ts >= f) && self.to.is_none_or(|t| ts <= t)
+    }
+}
+
+/// Read a ledger, keeping only flows whose `ts` falls inside `range`
+/// (see [`TimeRange`] for the inclusive/inclusive, `from > to` = empty,
+/// and "which timestamp" semantics).
+///
+/// The returned `Dropped` total is NOT filtered by `range` — it is the
+/// same whole-file total `read_flows_and_dropped` returns. A record lost
+/// to writer-channel overflow has no timestamp to test against a window,
+/// and suppressing (or partially counting) it because of a time filter
+/// would silently under-report loss on a filtered view — exactly the
+/// defect this subsystem exists to prevent. A caller must not read
+/// `dropped: 0` on a narrow window as "nothing was lost in this window";
+/// it means "nothing was lost in this FILE", full stop.
+pub fn read_flows_in_range(
+    path: &Path,
+    range: &TimeRange,
+) -> std::io::Result<(Vec<FlowRecord>, u64)> {
+    let (flows, dropped) = read_flows_and_dropped(path)?;
+    Ok((
+        flows.into_iter().filter(|f| range.contains(f.ts)).collect(),
+        dropped,
+    ))
+}
+
 /// Bipartite topology: sources on one side, `host:port` endpoints on the
 /// other. The source id for each flow is supplied by the CALLER, not
 /// derived from `f.ctx.run_id` — no production `FlowCtx` ever populates
@@ -614,5 +674,110 @@ mod tests {
             ],
         );
         assert_eq!(read_dropped_total(&path).unwrap(), 7);
+    }
+
+    fn at(secs: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(secs, 0).unwrap()
+    }
+
+    fn flow_at(id: u64, ts: chrono::DateTime<chrono::Utc>) -> FlowRecord {
+        let mut f = flow(id, "example.test", Some("r1"), 5, true);
+        f.ts = ts;
+        f
+    }
+
+    #[test]
+    fn an_unbounded_range_contains_everything() {
+        let r = TimeRange::unbounded();
+        assert!(r.contains(at(0)));
+        assert!(r.contains(at(1_900_000_000)));
+    }
+
+    #[test]
+    fn bounds_are_inclusive_at_both_ends() {
+        let r = TimeRange {
+            from: Some(at(100)),
+            to: Some(at(200)),
+        };
+        assert!(r.contains(at(100)), "from is inclusive");
+        assert!(r.contains(at(200)), "to is inclusive");
+        assert!(!r.contains(at(99)));
+        assert!(!r.contains(at(201)));
+    }
+
+    #[test]
+    fn a_half_open_range_bounds_only_the_side_it_names() {
+        let from_only = TimeRange {
+            from: Some(at(100)),
+            to: None,
+        };
+        assert!(!from_only.contains(at(99)));
+        assert!(from_only.contains(at(1_900_000_000)));
+
+        let to_only = TimeRange {
+            from: None,
+            to: Some(at(100)),
+        };
+        assert!(to_only.contains(at(0)));
+        assert!(!to_only.contains(at(101)));
+    }
+
+    #[test]
+    fn an_inverted_range_contains_nothing() {
+        // `from > to` is not an error to construct — it is simply an
+        // empty window: no timestamp can be both `>= from` and `<= to`
+        // when `from` is after `to`. Callers that build a range from
+        // untrusted input (Task 2's CLI, Task 3's API) get an empty
+        // result rather than a panic or a silently-reordered range.
+        let inverted = TimeRange {
+            from: Some(at(200)),
+            to: Some(at(100)),
+        };
+        assert!(!inverted.contains(at(100)));
+        assert!(!inverted.contains(at(150)));
+        assert!(!inverted.contains(at(200)));
+    }
+
+    #[test]
+    fn read_flows_in_range_filters_rows_and_keeps_the_dropped_count() {
+        // The dropped count describes the whole file, not the window: a
+        // record lost to overflow has no timestamp to filter on, and
+        // hiding it because of a time filter would be exactly the silent
+        // under-reporting this subsystem exists to prevent.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("run-a.jsonl");
+        write_lines(
+            &path,
+            &[
+                LedgerLine::Flow(Box::new(flow_at(1, at(100)))),
+                LedgerLine::Flow(Box::new(flow_at(2, at(150)))),
+                LedgerLine::Flow(Box::new(flow_at(3, at(250)))),
+                LedgerLine::Dropped {
+                    count: 4,
+                    ts: at(150),
+                },
+            ],
+        );
+
+        let (flows, dropped) = read_flows_in_range(
+            &path,
+            &TimeRange {
+                from: Some(at(120)),
+                to: Some(at(200)),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(flows.len(), 1, "only the t=150 flow is in range");
+        assert_eq!(dropped, 4, "loss is reported regardless of the window");
+    }
+
+    #[test]
+    fn read_flows_in_range_on_a_missing_file_is_empty_not_an_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (flows, dropped) =
+            read_flows_in_range(&tmp.path().join("absent.jsonl"), &TimeRange::unbounded()).unwrap();
+        assert!(flows.is_empty());
+        assert_eq!(dropped, 0);
     }
 }
