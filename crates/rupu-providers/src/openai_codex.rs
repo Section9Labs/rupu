@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest_middleware::ClientWithMiddleware;
@@ -15,14 +16,26 @@ const CODEX_BACKEND_URL: &str = "https://chatgpt.com/backend-api/codex/responses
 const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
-/// Default netflow-instrumented client. No run context is available at
-/// construction — stamped `FlowCtx::system(Origin::Provider("openai"))`.
-/// `with_tuning` (the path every factory-built client goes through) rebuilds
-/// this with the configured timeout via `client_from`.
-fn codex_http_client() -> ClientWithMiddleware {
-    rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
-        rupu_netflow::Origin::Provider("openai".into()),
-    ))
+/// Netflow-instrumented client bound to `sink`. No run context is
+/// available at construction — stamped
+/// `FlowCtx::system(Origin::Provider("openai"))`. `with_tuning` (the
+/// path every factory-built client goes through) rebuilds this with the
+/// configured timeout via `client_with`, reusing the same sink.
+///
+/// Fallible rather than panicking: `client_with`'s only failure mode is
+/// `builder.build()` (TLS backend / resolver init), an environment
+/// condition a long-lived daemon (`rupu cp serve`) can genuinely hit per
+/// run. `new` already returns `Result`, so this propagates via `?`
+/// instead of aborting the process.
+fn codex_http_client(
+    sink: Arc<dyn rupu_netflow::FlowSink>,
+) -> Result<ClientWithMiddleware, ProviderError> {
+    let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider("openai".into()));
+    Ok(rupu_netflow::http::client_with(
+        ctx,
+        reqwest::Client::builder(),
+        sink,
+    )?)
 }
 
 /// OpenAI's Responses API enforces `^[a-zA-Z0-9_-]+$` on tool names
@@ -143,6 +156,9 @@ fn normalize_function_call_output(content: &str) -> String {
 /// Translates LlmRequest/LlmResponse to/from OpenAI's Responses API format.
 pub struct OpenAiCodexClient {
     client: ClientWithMiddleware,
+    /// The exact sink `client` was bound to, so `with_tuning`'s rebuild
+    /// keeps using the same run's sink. See `AnthropicClient`'s `sink`.
+    sink: Arc<dyn rupu_netflow::FlowSink>,
     access_token: String,
     refresh_token: String,
     expires_ms: u64,
@@ -172,9 +188,13 @@ pub fn organization_header(api_url: &str, org_id: Option<&str>) -> Option<String
 
 impl OpenAiCodexClient {
     /// Create from resolved AuthCredentials.
+    ///
+    /// `sink` is the run's netflow sink; there is no process-global
+    /// fallback.
     pub fn new(
         creds: AuthCredentials,
         auth_json_path: Option<PathBuf>,
+        sink: Arc<dyn rupu_netflow::FlowSink>,
     ) -> Result<Self, ProviderError> {
         match creds {
             AuthCredentials::OAuth {
@@ -213,7 +233,8 @@ impl OpenAiCodexClient {
                     });
 
                 Ok(Self {
-                    client: codex_http_client(),
+                    client: codex_http_client(sink.clone())?,
+                    sink,
                     access_token: access,
                     refresh_token: refresh,
                     expires_ms: expires,
@@ -225,7 +246,8 @@ impl OpenAiCodexClient {
                 })
             }
             AuthCredentials::ApiKey { key } => Ok(Self {
-                client: codex_http_client(),
+                client: codex_http_client(sink.clone())?,
+                sink,
                 access_token: key,
                 refresh_token: String::new(),
                 expires_ms: 0,
@@ -242,7 +264,9 @@ impl OpenAiCodexClient {
     /// `timeout_ms` (I-9) and the `org_id` organization scope (I-12).
     pub fn with_tuning(mut self, tuning: &crate::tuning::ProviderTuning) -> Self {
         let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider("openai".into()));
-        if let Ok(client) = rupu_netflow::http::client_from(ctx, tuning.http_client_builder()) {
+        if let Ok(client) =
+            rupu_netflow::http::client_with(ctx, tuning.http_client_builder(), self.sink.clone())
+        {
             self.client = client;
         }
         self.org_id = tuning.org_id.clone();
@@ -1219,7 +1243,8 @@ mod llm_provider_impl_tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let client = OpenAiCodexClient::new(creds, None).expect("new");
+        let client =
+            OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).expect("new");
         // The trait object cast must succeed. If `OpenAiCodexClient`
         // does not impl `LlmProvider`, this fails to compile.
         let boxed: Box<dyn LlmProvider> = Box::new(client);
@@ -1285,7 +1310,8 @@ mod tool_name_sanitize_tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let client = OpenAiCodexClient::new(creds, None).expect("new");
+        let client =
+            OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).expect("new");
         let req = LlmRequest {
             model: "gpt-5".into(),
             system: None,
@@ -1323,7 +1349,8 @@ mod tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let mut client = OpenAiCodexClient::new(creds, None).unwrap();
+        let mut client =
+            OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         client.api_url = "http://test".into();
 
         let request = LlmRequest {
@@ -1357,7 +1384,8 @@ mod tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let mut client = OpenAiCodexClient::new(creds, None).unwrap();
+        let mut client =
+            OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         client.api_url = "http://test".into();
 
         let request = LlmRequest {
@@ -1394,7 +1422,8 @@ mod tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let mut client = OpenAiCodexClient::new(creds, None).unwrap();
+        let mut client =
+            OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         client.api_url = "http://test".into();
 
         let request = LlmRequest {
@@ -1424,7 +1453,8 @@ mod tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let mut client = OpenAiCodexClient::new(creds, None).unwrap();
+        let mut client =
+            OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         client.api_url = "http://test".into();
 
         let request = LlmRequest {
@@ -1561,7 +1591,7 @@ mod tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let client = OpenAiCodexClient::new(creds, None).unwrap();
+        let client = OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         let mut acc = ResponseAccumulator::new();
         let mut events = Vec::new();
 
@@ -1613,7 +1643,7 @@ mod tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let client = OpenAiCodexClient::new(creds, None).unwrap();
+        let client = OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         let mut acc = ResponseAccumulator::new();
         let mut events = Vec::new();
 
@@ -1674,7 +1704,7 @@ mod tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let client = OpenAiCodexClient::new(creds, None).unwrap();
+        let client = OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         let mut acc = ResponseAccumulator::new();
 
         let failed = crate::sse::SseEvent {
@@ -1694,7 +1724,7 @@ mod tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let client = OpenAiCodexClient::new(creds, None).unwrap();
+        let client = OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         let mut acc = ResponseAccumulator::new();
 
         let done = crate::sse::SseEvent {
@@ -1710,7 +1740,8 @@ mod tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let mut client = OpenAiCodexClient::new(creds, None).unwrap();
+        let mut client =
+            OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         client.api_url = "http://test".into();
 
         let request = LlmRequest {
@@ -1749,7 +1780,8 @@ mod tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let mut client = OpenAiCodexClient::new(creds, None).unwrap();
+        let mut client =
+            OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         client.api_url = "http://test".into();
 
         let request = LlmRequest {
@@ -1783,7 +1815,8 @@ mod tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let mut client = OpenAiCodexClient::new(creds, None).unwrap();
+        let mut client =
+            OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         client.api_url = "http://test".into();
 
         let request = LlmRequest {
@@ -1819,7 +1852,8 @@ mod tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let mut client = OpenAiCodexClient::new(creds, None).unwrap();
+        let mut client =
+            OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         client.api_url = "http://test".into();
 
         // Simulate: user asks → assistant calls tool → tool result → next turn
@@ -1884,7 +1918,7 @@ mod tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let client = OpenAiCodexClient::new(creds, None).unwrap();
+        let client = OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         let mut acc = ResponseAccumulator::new();
 
         let bad_event = crate::sse::SseEvent {
@@ -1900,7 +1934,7 @@ mod tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let client = OpenAiCodexClient::new(creds, None).unwrap();
+        let client = OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         let mut acc = ResponseAccumulator::new();
 
         let malformed = crate::sse::SseEvent {
@@ -1937,7 +1971,8 @@ mod tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let mut client = OpenAiCodexClient::new(creds, None).unwrap();
+        let mut client =
+            OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         // Override api_url so list_models hits the mock instead of api.openai.com.
         // The list_models implementation strips the /responses suffix and appends /models,
         // so set api_url to "<server>/v1/responses".
@@ -1970,7 +2005,8 @@ mod tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let mut client = OpenAiCodexClient::new(creds, None).unwrap();
+        let mut client =
+            OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         // Mimic the ChatGPT-OAuth state: backend URL + non-empty
         // account_id. The list_models impl branches on the URL.
         client.api_url = format!("{}/backend-api/codex/responses", server.url(""));
@@ -1998,7 +2034,8 @@ mod tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let mut client = OpenAiCodexClient::new(creds, None).unwrap();
+        let mut client =
+            OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         client.api_url = format!("{}/backend-api/codex/responses", server.url(""));
         let models =
             <OpenAiCodexClient as crate::provider::LlmProvider>::list_models(&client).await;
@@ -2038,7 +2075,8 @@ mod tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let mut client = OpenAiCodexClient::new(creds, None).unwrap();
+        let mut client =
+            OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         client.api_url = format!("{}/backend-api/codex/responses", server.url(""));
         let models =
             <OpenAiCodexClient as crate::provider::LlmProvider>::list_models(&client).await;
@@ -2084,6 +2122,7 @@ mod tests {
         let client = OpenAiCodexClient::new(
             crate::auth::AuthCredentials::ApiKey { key: "k".into() },
             None,
+            Arc::new(rupu_netflow::NullSink),
         )
         .unwrap();
         let request = LlmRequest {
@@ -2106,6 +2145,7 @@ mod tests {
         let client = OpenAiCodexClient::new(
             crate::auth::AuthCredentials::ApiKey { key: "k".into() },
             None,
+            Arc::new(rupu_netflow::NullSink),
         )
         .unwrap();
         let request = LlmRequest {
@@ -2130,6 +2170,7 @@ mod reasoning_capture_tests {
         OpenAiCodexClient::new(
             crate::auth::AuthCredentials::ApiKey { key: "k".into() },
             None,
+            Arc::new(rupu_netflow::NullSink),
         )
         .unwrap()
     }
@@ -2974,6 +3015,7 @@ mod tuning_tests {
                 key: "sk-test".into(),
             },
             None,
+            Arc::new(rupu_netflow::NullSink),
         )
         .unwrap()
         .with_tuning(&crate::tuning::ProviderTuning {
@@ -2995,6 +3037,7 @@ mod tuning_tests {
                 key: "sk-test".into(),
             },
             None,
+            Arc::new(rupu_netflow::NullSink),
         )
         .unwrap();
         assert!(client

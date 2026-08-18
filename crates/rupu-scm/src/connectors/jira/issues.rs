@@ -28,17 +28,17 @@ impl JiraIssueConnector {
     pub fn new(
         creds: rupu_providers::auth::AuthCredentials,
         base_url: Option<String>,
+        sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
     ) -> anyhow::Result<Self> {
+        // Already fallible (`JiraAuth::from_credentials` can fail), so the
+        // client build propagates via `?` too — no fallback to an
+        // uninstrumented client.
         Ok(Self {
-            http: rupu_netflow::http::client_from(
+            http: rupu_netflow::http::client_with(
                 rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm("jira".into())),
                 reqwest::Client::builder(),
-            )
-            .unwrap_or_else(|_| {
-                rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
-                    rupu_netflow::Origin::Scm("jira".into()),
-                ))
-            }),
+                sink,
+            )?,
             auth: JiraAuth::from_credentials(creds)?,
             base_url: base_url.map(|url| normalize_site_base_url(&url)),
         })

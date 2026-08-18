@@ -18,7 +18,12 @@ fn build_connectors() -> Option<(
 )> {
     let token = token()?;
     use rupu_scm::connectors::github::GithubClient;
-    let client = GithubClient::new(token, None, Some(2));
+    let client = GithubClient::new(
+        token,
+        None,
+        Some(2),
+        std::sync::Arc::new(rupu_netflow::NullSink),
+    );
     let repo: std::sync::Arc<dyn RepoConnector> = std::sync::Arc::new(
         rupu_scm::connectors::github::repo::GithubRepoConnector::new(client.clone()),
     );
@@ -83,7 +88,12 @@ fn build_gitlab_connectors() -> Option<(
 )> {
     let token = gitlab_token()?;
     use rupu_scm::connectors::gitlab::GitlabClient;
-    let client = GitlabClient::new(token, None, Some(2));
+    let client = GitlabClient::new(
+        token,
+        None,
+        Some(2),
+        std::sync::Arc::new(rupu_netflow::NullSink),
+    );
     let repo: std::sync::Arc<dyn RepoConnector> = std::sync::Arc::new(
         rupu_scm::connectors::gitlab::repo::GitlabRepoConnector::new(client.clone()),
     );

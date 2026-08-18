@@ -75,7 +75,12 @@ pub use types::*;
 
 /// Discover all providers with valid credentials.
 /// Convenience wrapper: loads CredentialStore from auth.json, creates registry, discovers.
-pub fn discover_providers(auth_json_path: &std::path::Path) -> Vec<Box<dyn LlmProvider>> {
+///
+/// `sink` is the run's netflow sink; there is no process-global fallback.
+pub fn discover_providers(
+    auth_json_path: &std::path::Path,
+    sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
+) -> Vec<Box<dyn LlmProvider>> {
     let status_path = auth_json_path.with_file_name("auth_status.json");
     let store = match CredentialStore::load(auth_json_path.to_path_buf(), status_path) {
         Ok(s) => std::sync::Arc::new(s),
@@ -84,6 +89,6 @@ pub fn discover_providers(auth_json_path: &std::path::Path) -> Vec<Box<dyn LlmPr
             return Vec::new();
         }
     };
-    let registry = ProviderRegistry::new(store, Some(auth_json_path.to_path_buf()));
+    let registry = ProviderRegistry::new(store, Some(auth_json_path.to_path_buf()), sink);
     registry.discover_all()
 }

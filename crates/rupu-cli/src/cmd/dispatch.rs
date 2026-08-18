@@ -213,6 +213,18 @@ impl AgentDispatcher for CliAgentDispatcher {
             );
         }
 
+        // Netflow capture for the CHILD run this dispatch is about to
+        // start — its own sink, scoped to `sub_run_id`, not the parent's.
+        // A dispatched sub-agent is its own run with its own transcript
+        // (`create_sub_run` above), so its outbound HTTP must land in its
+        // own ledger, never the parent's and never nothing.
+        let (netflow_sink, netflow_handle) = crate::netflow_sink::for_run(
+            &self.global,
+            self.project_root.as_deref(),
+            &sub_run_id,
+            &transcript_path,
+        );
+
         // Provider/model resolution goes through the SHARED resolvers, the
         // same sequence `rupu run` (`cmd/run.rs`), `rupu session` and
         // `DefaultStepFactory` use. This used to hardcode
@@ -244,12 +256,16 @@ impl AgentDispatcher for CliAgentDispatcher {
             spec.auth,
             self.resolver.as_ref(),
             &provider_config,
+            netflow_sink,
         )
         .await
         {
             Ok((_resolved, p)) => p,
             Err(e) => {
                 self.emit_dispatch_completed(parent_run_id, &sub_run_id, false, 0, 0);
+                if let Some(h) = netflow_handle {
+                    h.shutdown().await;
+                }
                 return Err(DispatchError::ProviderBuild(e.to_string()));
             }
         };
@@ -328,10 +344,19 @@ impl AgentDispatcher for CliAgentDispatcher {
             Ok(r) => r,
             Err(e) => {
                 self.emit_dispatch_completed(parent_run_id, &sub_run_id, false, 0, 0);
+                if let Some(h) = netflow_handle {
+                    h.shutdown().await;
+                }
                 return Err(DispatchError::ChildRun(e.to_string()));
             }
         };
         let duration_ms = started.elapsed().as_millis() as u64;
+
+        // Flush the child's ledger now that its run is over — see
+        // `crate::netflow_sink::for_run`'s doc comment.
+        if let Some(h) = netflow_handle {
+            h.shutdown().await;
+        }
 
         write_delegation_narrowing_notice(&transcript_path, agent_name, parent_run_id);
 
@@ -378,7 +403,11 @@ impl AgentDispatcher for CliAgentDispatcher {
 /// Best-effort: a write failure is logged and swallowed, same as every
 /// other observability side-channel in this arc — never allowed to
 /// fail the dispatch it's annotating.
-fn write_delegation_narrowing_notice(transcript_path: &Path, child_agent: &str, parent_run_id: &str) {
+fn write_delegation_narrowing_notice(
+    transcript_path: &Path,
+    child_agent: &str,
+    parent_run_id: &str,
+) {
     let call_id = format!("delegation_narrowing_notice_{child_agent}");
     let note = format!(
         "KNOWN LIMITATION: this child agent (`{child_agent}`, dispatched from parent run \

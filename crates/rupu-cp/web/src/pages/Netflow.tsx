@@ -1,12 +1,20 @@
 // Netflow — the global egress page: the UNION of every flow rupu recorded,
-// across every run, plus `system`-origin traffic (updater, ASN refresh, CP
-// fleet traffic) that carries no run_id and therefore never surfaces on a
-// per-run Network tab or a workflow page (flows belong to a run, never to a
-// workflow *definition* — nothing netflow-shaped is mounted there). This is
-// also the ONE scope that reads the CP daemon's own global ledger
-// (`$RUPU_HOME/netflow/flows.jsonl`) alongside every registered workspace's
-// — see `rupu_cp::api::netflow::read_all_workspaces_sync`'s doc comment
-// (Fix 1, netflow Plan 3 review round 3).
+// across every run. `Origin::System` covers several unrelated things —
+// auth/oauth token exchange (`resolver.rs`, `oauth/device.rs`,
+// `oauth/callback.rs`), the theme-URL fetch (`output/theme.rs`), and the
+// ASN-table refresh (`cmd/cp.rs`'s sweep, this crate's own
+// `maybe_refresh_asn`) — and EVERY production construction site for it
+// builds its client with `Arc::new(NullSink)`. None of that traffic
+// reaches any ledger, at any scope; see `ScopeDisclosure.tsx`'s header
+// comment for the full accounting.
+//
+// The update checker (`Origin::Update`, `rupu-update`'s client) and CP's
+// own fleet traffic (`Origin::Cp`, `HttpHostConnector`) are the same
+// story: both wired to `Arc::new(NullSink)`, both produce no flow record
+// at all, at any scope. This is also the ONE scope that unions every
+// per-run ledger file (`<run_id>.jsonl`) under `$RUPU_HOME/netflow/`
+// alongside every registered workspace's own `.rupu/netflow/` — see
+// `rupu_cp::api::netflow::read_all_workspaces_sync`'s doc comment.
 //
 // This is the one place a viewer forms their mental model of what this
 // subsystem covers, so <NetflowScopeDisclosure /> below is load-bearing,
@@ -81,7 +89,7 @@ export default function Netflow() {
         <div className="space-y-6">
           {graph && <NetflowGraph graph={graph} scope="global" />}
           <NetflowSummary hosts={data.hosts} />
-          <NetflowTable flows={data.flows} dropped={data.dropped} asnLoaded={data.asn_loaded} />
+          <NetflowTable flows={data.flows} dropped={data.dropped} asnLoaded={data.asn_loaded} scope="global" />
         </div>
       )}
     </div>

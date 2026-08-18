@@ -23,9 +23,18 @@ pub enum Origin {
 
 /// Attribution for every flow a client produces.
 ///
-/// `run_id` is `None` for process-global clients (the update checker,
-/// CP's host registry). Those flows reach the ledger but no transcript —
-/// that is the honest shape of the data, not a gap.
+/// `run_id` is `None` for every production flow today — there is no
+/// per-request call site anywhere in the workspace that sets it (the
+/// netflow-per-run plan attributes by LEDGER FILE, not by this field: a
+/// run's sink is scoped to one `NetflowPaths::for_run` file at
+/// construction time, so which run a flow belongs to is answered by
+/// which file it landed in, never by reading `ctx.run_id` back out of
+/// the record). Long-lived, run-less clients (the update checker,
+/// CP's host registry / fleet traffic, auth/oauth token exchange) are
+/// wired to `NullSink` and produce no flow at all, not a
+/// `run_id: None` one — see `rupu-cp/src/api/netflow.rs`'s module doc
+/// and `crates/rupu-cp/web/src/components/netflow/ScopeDisclosure.tsx`
+/// for the full accounting of what is and is not captured.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlowCtx {
     #[serde(default, skip_serializing_if = "Option::is_none")]

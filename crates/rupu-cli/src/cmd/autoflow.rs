@@ -9577,7 +9577,10 @@ async fn enqueue_polled_wakes(
                 warn!(source_ref, error = %err, "invalid autoflow poll interval; polling anyway");
             }
         }
-        let registry = Arc::new(rupu_scm::Registry::discover(resolver, &resolved.cfg).await);
+        let registry = Arc::new(
+            rupu_scm::Registry::discover(resolver, &resolved.cfg, Arc::new(rupu_netflow::NullSink))
+                .await,
+        );
         let Some(connector) = registry.events_for_source(&event_source) else {
             warn!(
                 source_ref,
@@ -9667,7 +9670,10 @@ pub(crate) async fn collect_issue_matches(
             }
         };
         let (tracker, project) = issue_discovery_target(&source_ref);
-        let registry = Arc::new(rupu_scm::Registry::discover(resolver, &resolved.cfg).await);
+        let registry = Arc::new(
+            rupu_scm::Registry::discover(resolver, &resolved.cfg, Arc::new(rupu_netflow::NullSink))
+                .await,
+        );
         let Some(connector) = registry.issues(tracker) else {
             warn!(source = %source_ref, repo_ref = %resolved.repo_ref, workflow = %resolved.name, "skipping autoflow because no issue connector is configured");
             continue;
@@ -10232,7 +10238,13 @@ pub(crate) async fn fetch_pr(
     resolver: &dyn CredentialResolver,
     pr_ref: &PrRef,
 ) -> anyhow::Result<(Pr, String)> {
-    let registry = Arc::new(rupu_scm::Registry::discover(resolver, cfg).await);
+    // Fetches the PR to feed a run that has not been dispatched yet — no
+    // run exists yet at this point, so this SCM traffic is not attributed
+    // to a ledger. A run-routing FlowSink would close this; see the
+    // netflow per-run plan.
+    let registry = Arc::new(
+        rupu_scm::Registry::discover(resolver, cfg, Arc::new(rupu_netflow::NullSink)).await,
+    );
     let connector = registry.repo(pr_ref.repo.platform).ok_or_else(|| {
         anyhow!(
             "no {} credential — run `rupu auth login --provider {}`",
@@ -10337,7 +10349,10 @@ pub(crate) async fn collect_pr_matches(
                 continue;
             }
         };
-        let registry = Arc::new(rupu_scm::Registry::discover(resolver, &resolved.cfg).await);
+        let registry = Arc::new(
+            rupu_scm::Registry::discover(resolver, &resolved.cfg, Arc::new(rupu_netflow::NullSink))
+                .await,
+        );
         let Some(connector) = registry.repo(repo.platform) else {
             warn!(source = %resolved.repo_ref, workflow = %resolved.name, "skipping PR autoflow because no repo connector is configured");
             continue;
@@ -11931,7 +11946,13 @@ pub(crate) async fn fetch_issue(
     resolver: &dyn CredentialResolver,
     issue_ref: &IssueRef,
 ) -> anyhow::Result<Issue> {
-    let registry = Arc::new(rupu_scm::Registry::discover(resolver, cfg).await);
+    // Fetches the issue to feed a run that has not been dispatched yet — no
+    // run exists yet at this point, so this SCM traffic is not attributed
+    // to a ledger. A run-routing FlowSink would close this; see the
+    // netflow per-run plan.
+    let registry = Arc::new(
+        rupu_scm::Registry::discover(resolver, cfg, Arc::new(rupu_netflow::NullSink)).await,
+    );
     let connector = registry.issues(issue_ref.tracker).ok_or_else(|| {
         anyhow!(
             "no {} credential — run `rupu auth login --provider {}`",

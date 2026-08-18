@@ -495,7 +495,9 @@ async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> 
     }
 
     let resolver = rupu_auth::KeychainResolver::new();
-    let registry = Arc::new(rupu_scm::Registry::discover(&resolver, &cfg).await);
+    let registry = Arc::new(
+        rupu_scm::Registry::discover(&resolver, &cfg, Arc::new(rupu_netflow::NullSink)).await,
+    );
 
     let cursors_root = global.join("cron-state").join("event-cursors");
     if !dry_run {
@@ -1297,7 +1299,6 @@ steps:
             "`autoflow.enabled: true` must still fire on schedule"
         );
     }
-
 
     fn cron_list_test_now() -> DateTime<Utc> {
         use chrono::TimeZone;

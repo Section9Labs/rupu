@@ -7,6 +7,7 @@
 #![deny(clippy::all)]
 
 use futures_util::StreamExt as _;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
@@ -52,8 +53,16 @@ impl HttpHostConnector {
         let builder = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30));
-        let client = rupu_netflow::http::client_from(ctx.clone(), builder)
-            .unwrap_or_else(|_| rupu_netflow::http::client(ctx));
+        // `Arc::new(NullSink)`, deliberately: `cp serve`'s own fleet HTTP
+        // traffic is daemon-lifetime, not run-scoped, and per the netflow
+        // per-run plan the daemon's own traffic is no longer recorded (the
+        // old shared `$RUPU_HOME/netflow/flows.jsonl` ledger this used to
+        // land in — installed via the now-deleted `http::init` call in
+        // `rupu-cli/src/cmd/cp.rs` — is gone). `.expect(...)` preserves the
+        // deleted `http::client()` fallback's panic-on-failure behaviour.
+        let client =
+            rupu_netflow::http::client_with(ctx, builder, Arc::new(rupu_netflow::NullSink))
+                .expect("cp host client build");
         Self {
             client,
             base_url,
@@ -73,16 +82,21 @@ impl HttpHostConnector {
     /// wall-clock is the slowest host and one unreachable box could stall the
     /// whole page on the OS's TCP connect timeout.
     ///
-    /// Falls back to an unbounded client if the `reqwest::ClientBuilder`
-    /// itself fails to build (e.g. an invalid TLS config) — best-effort, not
-    /// a hard requirement for probing to function.
+    /// Panics (`.expect()`) if the `reqwest::ClientBuilder` itself fails
+    /// to build (e.g. an invalid TLS config) — preserves the deleted
+    /// `http::client()` fallback's panic-on-failure behaviour (netflow
+    /// per-run plan, Task 67); there is no unbounded-client fallback any
+    /// more, uninstrumented or otherwise.
     pub fn new_with_timeout(base_url: String, token: Option<String>, timeout: Duration) -> Self {
         let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Cp);
         let builder = reqwest::Client::builder()
             .connect_timeout(timeout)
             .timeout(timeout);
-        let client = rupu_netflow::http::client_from(ctx.clone(), builder)
-            .unwrap_or_else(|_| rupu_netflow::http::client(ctx));
+        // See `Self::new` — `cp serve`'s own fleet traffic is deliberately
+        // unrecorded (daemon-lifetime, not run-scoped).
+        let client =
+            rupu_netflow::http::client_with(ctx, builder, Arc::new(rupu_netflow::NullSink))
+                .expect("cp host client build");
         Self {
             client,
             base_url,
@@ -459,7 +473,11 @@ impl HostConnector for HttpHostConnector {
         id: &str,
         ignore_liveness: bool,
     ) -> Result<(), HostConnectorError> {
-        let qs = if ignore_liveness { "?ignore_liveness=true" } else { "" };
+        let qs = if ignore_liveness {
+            "?ignore_liveness=true"
+        } else {
+            ""
+        };
         self.send(
             self.client
                 .post(self.url(&format!("/api/transcripts/{id}/archive{qs}")))
@@ -475,7 +493,11 @@ impl HostConnector for HttpHostConnector {
         id: &str,
         ignore_liveness: bool,
     ) -> Result<(), HostConnectorError> {
-        let qs = if ignore_liveness { "?ignore_liveness=true" } else { "" };
+        let qs = if ignore_liveness {
+            "?ignore_liveness=true"
+        } else {
+            ""
+        };
         self.send(
             self.client
                 .delete(self.url(&format!("/api/transcripts/{id}{qs}"))),

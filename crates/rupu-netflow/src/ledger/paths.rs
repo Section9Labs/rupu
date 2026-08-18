@@ -20,12 +20,46 @@ pub struct NetflowPaths {
     pub flows: PathBuf,
 }
 
+/// Resolve which directory a run's netflow ledger belongs in:
+/// project-local `<project_root>/.rupu/netflow/` when that directory
+/// ALREADY EXISTS, the global `<global>/netflow/` fallback otherwise.
+/// Mirrors `transcripts_dir`'s existing-only gate — the load-bearing
+/// property that keeps ledgers out of repos that never opted in (an
+/// un-`rupu init`'d project, or one initialised before this directory
+/// existed, gets no ledger written inside it; `rupu init` only ever adds
+/// a `.gitignore` entry, it does not create this directory, so "never
+/// opted in" is the common case, not the edge case).
+///
+/// Both `rupu-cli` (every agent-driven entry point: `rupu run`, `rupu
+/// session`, `rupu workflow`, sub-agent dispatch) and `rupu-orchestrator`
+/// (`DefaultStepFactory`, which cannot depend on `rupu-cli` — the
+/// dependency runs the other way) resolve through this ONE function so
+/// the write side's routing decision can never drift into two competing
+/// copies of the same rule. `rupu-cp`'s read side
+/// (`crates/rupu-cp/src/api/netflow.rs`) must mirror this same rule on
+/// the read path — see that module's fallback-to-global handling.
+pub fn netflow_dir(global: &Path, project_root: Option<&Path>) -> PathBuf {
+    if let Some(p) = project_root {
+        let local = p.join(".rupu/netflow");
+        if local.is_dir() {
+            return local;
+        }
+    }
+    global.join("netflow")
+}
+
 impl NetflowPaths {
-    pub fn new(workspace: &Path) -> Self {
-        let root = workspace.join(".rupu").join("netflow");
+    /// One ledger per run, mirroring how transcripts are laid out.
+    ///
+    /// `netflow_dir` is usually [`netflow_dir`] (the shared
+    /// project-local-when-present-else-global resolution rule) — see its
+    /// doc comment. The per-run file is what makes a ledger's lifecycle
+    /// match a transcript's: it ends when the run ends, so there is
+    /// nothing to rotate, and the file itself is the run attribution.
+    pub fn for_run(netflow_dir: &Path, run_id: &str) -> Self {
         Self {
-            flows: root.join("flows.jsonl"),
-            root,
+            root: netflow_dir.to_path_buf(),
+            flows: netflow_dir.join(format!("{run_id}.jsonl")),
         }
     }
 
@@ -105,17 +139,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn paths_layout_under_dotrupu_netflow() {
+    fn for_run_puts_each_run_in_its_own_file() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let paths = NetflowPaths::new(tmp.path());
-        assert_eq!(paths.root, tmp.path().join(".rupu/netflow"));
-        assert_eq!(paths.flows, paths.root.join("flows.jsonl"));
+        let a = NetflowPaths::for_run(tmp.path(), "run-a");
+        let b = NetflowPaths::for_run(tmp.path(), "run-b");
+
+        assert_eq!(a.root, tmp.path());
+        assert_eq!(a.flows, tmp.path().join("run-a.jsonl"));
+        assert_eq!(b.flows, tmp.path().join("run-b.jsonl"));
+        assert_ne!(a.flows, b.flows, "two runs must never share a ledger");
     }
 
     #[test]
     fn ensure_dir_is_idempotent() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let paths = NetflowPaths::new(tmp.path());
+        let paths = NetflowPaths::for_run(tmp.path(), "run-1");
         paths.ensure_dir().unwrap();
         paths.ensure_dir().unwrap();
         assert!(paths.root.is_dir());
@@ -124,7 +162,7 @@ mod tests {
     #[test]
     fn ensure_dir_writes_self_ignoring_gitignore() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let paths = NetflowPaths::new(tmp.path());
+        let paths = NetflowPaths::for_run(tmp.path(), "run-1");
         paths.ensure_dir().unwrap();
 
         let gitignore = paths.root.join(".gitignore");
@@ -138,7 +176,7 @@ mod tests {
     #[test]
     fn ensure_dir_does_not_rewrite_gitignore_on_second_call() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let paths = NetflowPaths::new(tmp.path());
+        let paths = NetflowPaths::for_run(tmp.path(), "run-1");
         paths.ensure_dir().unwrap();
 
         let gitignore = paths.root.join(".gitignore");
@@ -156,7 +194,7 @@ mod tests {
     #[test]
     fn ensure_dir_leaves_a_preexisting_customised_gitignore_untouched() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let paths = NetflowPaths::new(tmp.path());
+        let paths = NetflowPaths::for_run(tmp.path(), "run-1");
         std::fs::create_dir_all(&paths.root).unwrap();
         let gitignore = paths.root.join(".gitignore");
         std::fs::write(&gitignore, "# user customised this\n!flows.jsonl\n").unwrap();
@@ -178,7 +216,7 @@ mod tests {
     #[test]
     fn ensure_dir_leaves_a_preexisting_empty_gitignore_untouched() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let paths = NetflowPaths::new(tmp.path());
+        let paths = NetflowPaths::for_run(tmp.path(), "run-1");
         std::fs::create_dir_all(&paths.root).unwrap();
         let gitignore = paths.root.join(".gitignore");
         std::fs::write(&gitignore, "").unwrap();
@@ -209,7 +247,7 @@ mod tests {
             .unwrap();
         assert!(status.success());
 
-        let paths = NetflowPaths::new(tmp.path());
+        let paths = NetflowPaths::for_run(tmp.path(), "run-1");
         paths.ensure_dir().unwrap();
         std::fs::write(&paths.flows, "{}\n").unwrap();
 

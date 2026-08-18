@@ -21,8 +21,9 @@
 //! production path (`AnthropicClient::stream()`) and reads the ledger
 //! back.
 //!
-//! `rupu_netflow::http::init` is process-wide and first-call-wins; this is
-//! the only test in this binary, so there is no cross-test race.
+//! There is no process-global sink anymore (Task 4 removed `http::init`):
+//! the sink is passed straight into `AnthropicClient::with_url` below, so
+//! this test proves the same thing more directly than before.
 
 use rupu_netflow::{FlowSink, NetflowPaths, NetflowWriterHandle};
 use rupu_providers::types::{LlmRequest, Message};
@@ -67,14 +68,14 @@ async fn streamed_anthropic_response_flow_and_complete_land_in_the_same_ledger()
         .await;
 
     let tmp = tempfile::TempDir::new().unwrap();
-    let paths = NetflowPaths::new(tmp.path());
+    let paths = NetflowPaths::for_run(tmp.path(), "run-1");
     let handle = NetflowWriterHandle::spawn(paths.clone()).unwrap();
     let sink: Arc<dyn FlowSink> = handle.writer.clone();
-    rupu_netflow::http::init(sink);
 
     let mut client = rupu_providers::AnthropicClient::with_url(
         "test-key".into(),
         format!("{}/v1/messages", server.url("")),
+        sink,
     );
 
     let result = client.stream(&make_request(), |_ev| {}).await;

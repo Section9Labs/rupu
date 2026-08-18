@@ -17,8 +17,89 @@ use rupu_agent::{
 };
 use rupu_runtime::provider_factory;
 use rupu_tools::{AgentDispatcher, ToolContext};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Build this step's netflow sink: a ledger writer rooted at
+/// [`rupu_netflow::netflow_dir`] (the one shared write-side routing rule
+/// -- see its doc comment for why this crate calls it directly instead of
+/// keeping its own copy: `rupu-orchestrator` cannot depend on `rupu-cli`,
+/// the dependency runs the other way, and a second copy of this rule is
+/// exactly the kind of write/read routing divergence that made CP's own
+/// netflow API unable to find ledgers `rupu-cli` had actually written)
+/// plus a `TranscriptSink` streaming into the step's own transcript.
+/// Best-effort -- a ledger that cannot be opened logs at debug and the
+/// step continues with transcript-only capture.
+///
+/// Called once per [`DefaultStepFactory::build_opts_for_step`] invocation
+/// — i.e. once per dispatched step, using THAT call's `run_id` (the
+/// workflow's own run id for a linear step; a freshly minted id for a
+/// `parallel:`/`on_reject` sub-step — see `runner.rs`'s `dispatch_one`
+/// call sites) and `transcript_path`. This is deliberately NOT built once
+/// and cached on `DefaultStepFactory` itself: the factory is long-lived
+/// across every step of a run (and, for autoflow / `rupu cp serve`,
+/// across many runs sharing one process), so a sink built once at
+/// construction time would reintroduce the exact "first run wins" defect
+/// this plan removes. Building it fresh per call, scoped to that call's
+/// own run id, is what keeps a sink's lifetime matched to one run.
+///
+/// The returned `NetflowWriterHandle` is intentionally NOT kept alive or
+/// explicitly shut down by the caller — this function returns an
+/// `AgentRunOpts`, not a handle-owning scope that outlives the step's own
+/// async work, so there is nowhere to hold it until the step's HTTP
+/// traffic is done. This is safe: `Arc<NetflowWriter>` (cloned into the
+/// returned sink) keeps the writer task's channel open independent of the
+/// local `NetflowWriterHandle`, and the background task naturally closes
+/// once every sink holder (the step's own provider/registry clients) is
+/// dropped at the end of the step's run — see
+/// `NetflowWriterHandle::shutdown`'s doc comment for why a caller-held
+/// `Arc<NetflowWriter>` clone is exactly the case that keeps a dropped
+/// handle's task alive rather than hanging it.
+///
+/// KNOWN, ACCEPTED OVERHEAD (whole-branch review, Minor #15): a workflow
+/// run's linear steps share the WORKFLOW's own `run_id` (see the `run_id`
+/// doc above), so calling this once per linear step spawns one
+/// independent `NetflowWriterHandle` — its own bounded channel,
+/// background task, open fd, and `dropped` counter — per step, all
+/// pointed at the SAME `<run_id>.jsonl` file rather than one shared
+/// writer. This is safe in practice, not silently lossy: each writer
+/// issues one `write_all` of a complete JSON line per append (see
+/// `writer.rs`) — that's a loop over partial writes in general, not an
+/// atomic syscall, so the real guarantee against a torn line rests on
+/// `O_APPEND` plus regular-file write behaviour, not on the `write_all`
+/// API itself. In practice these appenders barely overlap: each one only
+/// runs for the brief window around its own step's dispatch. And the
+/// read side sums every `Dropped` line it finds in a file regardless of
+/// which writer instance produced it
+/// (`rupu_netflow::ledger::read_flows_and_dropped`) — so a step's own
+/// overflow is still counted, just via its own line rather than a
+/// merged counter. The cost is purely resource waste (N
+/// short-lived tasks/fds instead of one long-lived one for one workflow
+/// run), not a correctness gap. Left as-is rather than caching/sharing a
+/// writer keyed by run id: a process-wide cache keyed by run id is
+/// shaped exactly like the `OnceLock` this whole plan removed, just
+/// scoped smaller — worth reconsidering only if this overhead is ever
+/// shown to matter in practice (heavy fan-out with many steps sharing one
+/// id), not preemptively.
+fn step_netflow_sink(
+    global: &Path,
+    project_root: Option<&Path>,
+    run_id: &str,
+    transcript_path: &Path,
+) -> Arc<dyn rupu_netflow::FlowSink> {
+    let dir = rupu_netflow::netflow_dir(global, project_root);
+    let netflow_paths = rupu_netflow::NetflowPaths::for_run(&dir, run_id);
+    let mut sinks: Vec<Arc<dyn rupu_netflow::FlowSink>> = vec![Arc::new(
+        rupu_transcript::TranscriptSink::new(transcript_path.to_path_buf()),
+    )];
+    match rupu_netflow::NetflowWriterHandle::spawn(netflow_paths) {
+        Ok(handle) => sinks.push(handle.writer.clone()),
+        Err(e) => {
+            tracing::debug!(error = %e, run_id, "netflow ledger unavailable for this step");
+        }
+    }
+    Arc::new(rupu_netflow::FanoutSink::new(sinks))
+}
 
 /// Resolve which concerns block a workflow step runs against.
 ///
@@ -67,8 +148,7 @@ pub struct DefaultStepFactory {
     /// (`provider_factory::provider_tuning_map`). Lets a workflow step honor
     /// `timeout_ms` / `max_retries` / `max_concurrency` / `org_id` exactly as
     /// `rupu run` does (ISSUES.md I-9…I-12). Empty ⇒ documented defaults.
-    pub provider_tuning:
-        std::collections::HashMap<String, rupu_providers::ProviderTuning>,
+    pub provider_tuning: std::collections::HashMap<String, rupu_providers::ProviderTuning>,
     /// `default_provider` from `config.toml`. Used when a step's agent pins no
     /// `provider:`. `None` falls back to `provider_factory::FALLBACK_PROVIDER`.
     pub default_provider: Option<String>,
@@ -232,12 +312,23 @@ impl StepFactory for DefaultStepFactory {
                     openai_compatible: oai_params,
                     tuning: self.provider_tuning.get(&provider_name).cloned(),
                 };
+                // This step's netflow sink — built fresh per step call,
+                // scoped to THIS call's `run_id`/`transcript_path`. See
+                // `step_netflow_sink`'s doc comment for why it is built
+                // here rather than once on the factory.
+                let netflow_sink = step_netflow_sink(
+                    &self.global,
+                    self.project_root.as_deref(),
+                    &run_id,
+                    &transcript_path,
+                );
                 match provider_factory::build_for_provider_with_config(
                     &provider_name,
                     &model,
                     auth_hint,
                     self.resolver.as_ref(),
                     &provider_config,
+                    netflow_sink,
                 )
                 .await
                 {
@@ -526,7 +617,9 @@ fn tool_is_granted(pre_narrow_tools: &Option<Vec<String>>, tool_name: &str) -> b
             for name in &catalog {
                 push_unique(&mut universe, name);
             }
-            expand_grant(grant, &universe).iter().any(|t| t == tool_name)
+            expand_grant(grant, &universe)
+                .iter()
+                .any(|t| t == tool_name)
         }
     }
 }
@@ -629,7 +722,13 @@ fn wrap_on_tool_call_with_audit(
             cb(step_id, tool_name, blocked);
         }
         if catalog.iter().any(|c| c == tool_name) {
-            emit_tool_audit(&transcript_path, tool_name, &step_actions, &pre_narrow_tools, blocked);
+            emit_tool_audit(
+                &transcript_path,
+                tool_name,
+                &step_actions,
+                &pre_narrow_tools,
+                blocked,
+            );
         }
     })
 }
@@ -881,15 +980,29 @@ mod narrow_agent_tools_tests {
         let got = narrow_agent_tools(Some(granted), &strs(&["scm.prs.get"])).unwrap();
 
         for builtin in ["read_file", "grep", "bash"] {
-            assert!(got.contains(&builtin.to_string()), "missing builtin {builtin} in {got:?}");
+            assert!(
+                got.contains(&builtin.to_string()),
+                "missing builtin {builtin} in {got:?}"
+            );
         }
         let connector_count = got
             .iter()
-            .filter(|t| t.starts_with("scm.") || t.starts_with("issues.") || t.starts_with("github.") || t.starts_with("gitlab."))
+            .filter(|t| {
+                t.starts_with("scm.")
+                    || t.starts_with("issues.")
+                    || t.starts_with("github.")
+                    || t.starts_with("gitlab.")
+            })
             .count();
-        assert_eq!(connector_count, 1, "expected exactly one connector tool, got {got:?}");
+        assert_eq!(
+            connector_count, 1,
+            "expected exactly one connector tool, got {got:?}"
+        );
         assert!(got.contains(&"scm.prs.get".to_string()));
-        assert!(!got.contains(&"scm.prs.diff".to_string()), "scm.prs.diff must be narrowed away: {got:?}");
+        assert!(
+            !got.contains(&"scm.prs.diff".to_string()),
+            "scm.prs.diff must be narrowed away: {got:?}"
+        );
     }
 
     #[test]
@@ -899,7 +1012,11 @@ mod narrow_agent_tools_tests {
         // This is exactly the case the original (wrong) raw-intersection
         // formulation collapsed to `Some([])`.
         let got = narrow_agent_tools(Some(strs(&["scm.*"])), &strs(&["scm.prs.get"])).unwrap();
-        assert_eq!(got, vec!["scm.prs.get".to_string()], "must not collapse to []: {got:?}");
+        assert_eq!(
+            got,
+            vec!["scm.prs.get".to_string()],
+            "must not collapse to []: {got:?}"
+        );
     }
 
     #[test]
@@ -908,7 +1025,10 @@ mod narrow_agent_tools_tests {
         // exactly `issues.list` of the catalog.
         let got = narrow_agent_tools(Some(strs(&["*"])), &strs(&["issues.list"])).unwrap();
         for builtin in builtin_tool_names() {
-            assert!(got.contains(&builtin), "missing builtin {builtin} in {got:?}");
+            assert!(
+                got.contains(&builtin),
+                "missing builtin {builtin} in {got:?}"
+            );
         }
         let catalog_entries: Vec<&String> = got
             .iter()
@@ -929,10 +1049,16 @@ mod narrow_agent_tools_tests {
         // its connector calls.
         let got = narrow_agent_tools(None, &strs(&["issues.list"])).unwrap();
         for builtin in builtin_tool_names() {
-            assert!(got.contains(&builtin), "missing builtin {builtin} in {got:?}");
+            assert!(
+                got.contains(&builtin),
+                "missing builtin {builtin} in {got:?}"
+            );
         }
         assert!(got.contains(&"issues.list".to_string()));
-        assert!(!got.contains(&"issues.create".to_string()), "must narrow the catalog too: {got:?}");
+        assert!(
+            !got.contains(&"issues.create".to_string()),
+            "must narrow the catalog too: {got:?}"
+        );
     }
 
     #[test]
@@ -941,7 +1067,11 @@ mod narrow_agent_tools_tests {
         // gain it — narrowing only ever shrinks, never extends.
         let granted = strs(&["read_file"]);
         let got = narrow_agent_tools(Some(granted), &strs(&["issues.list"])).unwrap();
-        assert_eq!(got, vec!["read_file".to_string()], "must not escalate: {got:?}");
+        assert_eq!(
+            got,
+            vec!["read_file".to_string()],
+            "must not escalate: {got:?}"
+        );
     }
 
     #[test]
@@ -953,7 +1083,11 @@ mod narrow_agent_tools_tests {
         let got = narrow_agent_tools(Some(granted), &strs(&["scm.prs.get"])).unwrap();
         assert_eq!(
             got,
-            vec!["bash".to_string(), "read_file".to_string(), "grep".to_string()],
+            vec![
+                "bash".to_string(),
+                "read_file".to_string(),
+                "grep".to_string()
+            ],
             "empty connector intersection must not strip builtins: {got:?}"
         );
     }
@@ -1148,11 +1282,24 @@ steps:
         cb("unrestricted", "issues.list", false);
 
         let lines = read_tool_audit_lines(&transcript_path);
-        assert_eq!(lines.len(), 1, "expected exactly one tool_audit line; got {lines:?}");
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected exactly one tool_audit line; got {lines:?}"
+        );
         assert_eq!(lines[0]["data"]["tool"], "issues.list");
-        assert_eq!(lines[0]["data"]["declared"], false, "actions: [] -> not declared");
-        assert_eq!(lines[0]["data"]["restricted"], false, "actions: [] -> unrestricted");
-        assert_eq!(lines[0]["data"]["granted"], true, "issues.list IS in the agent's grant");
+        assert_eq!(
+            lines[0]["data"]["declared"], false,
+            "actions: [] -> not declared"
+        );
+        assert_eq!(
+            lines[0]["data"]["restricted"], false,
+            "actions: [] -> unrestricted"
+        );
+        assert_eq!(
+            lines[0]["data"]["granted"], true,
+            "issues.list IS in the agent's grant"
+        );
         assert_eq!(lines[0]["data"]["blocked"], false);
     }
 
@@ -1189,7 +1336,11 @@ steps:
         // A builtin call on the same narrowed step: no audit line.
         cb("narrowed", "bash", false);
         let lines = read_tool_audit_lines(&transcript_path);
-        assert_eq!(lines.len(), 0, "a builtin call must not be audited: {lines:?}");
+        assert_eq!(
+            lines.len(),
+            0,
+            "a builtin call must not be audited: {lines:?}"
+        );
 
         // A catalog call on the same step: exactly one audit line.
         cb("narrowed", "issues.list", false);
@@ -1312,7 +1463,10 @@ steps:
         assert_eq!(lines[0]["data"]["tool"], "issues.get");
         assert_eq!(lines[0]["data"]["declared"], true);
         assert_eq!(lines[0]["data"]["restricted"], true);
-        assert_eq!(lines[0]["data"]["granted"], false, "agent never granted issues.get");
+        assert_eq!(
+            lines[0]["data"]["granted"], false,
+            "agent never granted issues.get"
+        );
         assert_eq!(lines[0]["data"]["blocked"], true);
     }
 
@@ -1375,7 +1529,10 @@ steps:
 
         let lines = read_tool_audit_lines(&transcript_path);
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0]["data"]["granted"], true, "scm.* must cover scm.prs.get: {lines:?}");
+        assert_eq!(
+            lines[0]["data"]["granted"], true,
+            "scm.* must cover scm.prs.get: {lines:?}"
+        );
         assert_eq!(lines[0]["data"]["declared"], true);
         assert_eq!(lines[0]["data"]["blocked"], false);
     }

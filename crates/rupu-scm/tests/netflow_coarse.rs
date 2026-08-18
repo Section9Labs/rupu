@@ -13,7 +13,7 @@
 //! `GithubClient::with_retry_octocrab` — the production retry loop, not a
 //! stand-in — with a closure that fails once (a `RateLimited` error, same
 //! as a real octocrab 403/429 would classify to) and then succeeds, and
-//! asserts the process-wide sink received exactly one `Coarse` record per
+//! asserts the client's stored sink received exactly one `Coarse` record per
 //! attempt: a failed one, then a succeeded one. That is the "retried call
 //! emits more than one" case the task calls out explicitly.
 //!
@@ -121,17 +121,16 @@ async fn a_genuine_network_failure_records_a_transport_error() {
 
 /// Drives the real production retry loop (not a copy of it) with a
 /// closure that fails on the first attempt and succeeds on the second,
-/// and proves the process-wide sink receives one `Coarse` record per
+/// and proves the client's stored sink receives one `Coarse` record per
 /// attempt — not one per logical call.
 #[tokio::test]
 async fn a_retried_octocrab_attempt_emits_one_coarse_record_per_attempt() {
     rupu_scm::install_default_crypto_provider();
     let sink = Arc::new(MemorySink::default());
-    rupu_netflow::http::init(sink.clone());
 
     // No base_url ⇒ host_label derives to "api.github.com" from the
     // default public GraphQL URL, computed once at construction.
-    let client = GithubClient::new("ghp_fake".into(), None, Some(1));
+    let client = GithubClient::new("ghp_fake".into(), None, Some(1), sink.clone());
 
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_closure = calls.clone();

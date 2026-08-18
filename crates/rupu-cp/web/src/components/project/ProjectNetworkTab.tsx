@@ -1,12 +1,24 @@
 // Project Network tab body — the project-scoped netflow aggregate: every
-// flow across every run under this project, PLUS `system`-origin egress
-// (updater, ASN refresh) that carries no run_id and so never surfaces on a
-// per-run Network tab. That's a property of this scope, not an accident —
-// those flows only ever attach to a workspace, never to a single run. This
-// scope deliberately does NOT include the CP daemon's own global ledger —
-// that traffic belongs to the CP fleet as a whole, not to this project; see
-// `rupu_cp::api::netflow::get_project_netflow`'s doc comment (Fix 1,
-// netflow Plan 3 review round 3).
+// flow across every run under this project. This scope deliberately does
+// NOT include the update checker's traffic (`Origin::Update`), the CP
+// daemon's own fleet traffic (`Origin::Cp`), or `Origin::System` — which
+// covers auth/oauth token exchange, the theme-URL fetch, AND the
+// ASN-table refresh (`cmd/cp.rs`'s sweep / this crate's
+// `maybe_refresh_asn`) — not because any of those live somewhere else,
+// but because none of them live anywhere: every production construction
+// site for all three origins is wired to a `NullSink` (netflow-per-run
+// plan), so they're recorded at no scope, this one included; see
+// `ScopeDisclosure.tsx`'s header comment and
+// `rupu_cp::api::netflow::get_project_netflow`'s doc comment.
+//
+// KNOWN GAP (Blocker 1, whole-branch review): `get_project_netflow` reads
+// only `<workspace>/.rupu/netflow/`, and nothing creates that directory on
+// `rupu init` — so on a default install this scope is EMPTY for every
+// project, even ones with real captured runs, because those runs' ledgers
+// all landed at the global fallback instead. `NetflowTable`'s empty-state
+// hint (`scope="project"`) says so explicitly; this comment is not a
+// substitute for reading that fix — see
+// `ScopeDisclosure.tsx`'s `netflowEmptyStateHint`.
 //
 // Mirrors ProjectCoverageTab's shape: self-fetches on the `wsId` prop, no
 // filter chips. This tab body only mounts while "Network" is the active
@@ -78,7 +90,7 @@ export default function ProjectNetworkTab({ wsId }: { wsId: string }) {
         <>
           {graph && <NetflowGraph graph={graph} scope="project" />}
           <NetflowSummary hosts={data.hosts} />
-          <NetflowTable flows={data.flows} dropped={data.dropped} asnLoaded={data.asn_loaded} />
+          <NetflowTable flows={data.flows} dropped={data.dropped} asnLoaded={data.asn_loaded} scope="project" />
         </>
       )}
     </div>

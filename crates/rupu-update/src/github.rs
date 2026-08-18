@@ -24,9 +24,18 @@ impl GithubReleaseSource {
         Self {
             owner_repo: owner_repo.into(),
             api_base: api_base.into(),
-            client: rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
-                rupu_netflow::Origin::Update,
-            )),
+            // Self-update egress, explicitly out of netflow's scope (it is
+            // not inference-driven traffic) — a caller-constructed
+            // `NullSink`, not a stopgap. Infallible constructor (`-> Self`);
+            // `.expect()` preserves the deleted `http::client()` fallback's
+            // panic-on-failure behaviour. No fallback to an uninstrumented
+            // client.
+            client: rupu_netflow::http::client_with(
+                rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Update),
+                reqwest::Client::builder(),
+                std::sync::Arc::new(rupu_netflow::NullSink),
+            )
+            .expect("update client build"),
         }
     }
 }
@@ -84,9 +93,14 @@ pub async fn download_bytes_with_progress(
     url: &str,
     mut on_progress: impl FnMut(u64, Option<u64>),
 ) -> Result<Vec<u8>, crate::UpdateError> {
-    let client = rupu_netflow::http::client_from(
+    // Self-update egress, explicitly out of netflow's scope (it is not
+    // inference-driven traffic) — a caller-constructed `NullSink`, not a
+    // stopgap. Already fallible (`-> Result<_, UpdateError>`), so the
+    // client build propagates via `?` too.
+    let client = rupu_netflow::http::client_with(
         rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Update),
         reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)),
+        std::sync::Arc::new(rupu_netflow::NullSink),
     )
     .map_err(|e| crate::UpdateError::Network(e.to_string()))?;
     let mut resp = req(&client, url)

@@ -1,9 +1,12 @@
 // @vitest-environment jsdom
 // Global Netflow page — the union scope: every flow across every run plus
-// `system`-origin egress that carries no run_id (updater, ASN refresh, CP
-// fleet traffic). This file only exercises the load/render contract (data
-// arrives → summary + table render; dropped flows surface even with zero
-// rows); the netflow components' own tests cover their internals.
+// `system`-origin egress that carries no run_id (in practice, only the
+// rare passive update-notice check — CP's own fleet traffic and its
+// ASN-table refresh are both wired to `NullSink` and recorded nowhere;
+// see `ScopeDisclosure.tsx`'s header comment). This file only exercises
+// the load/render contract (data arrives → summary + table render;
+// dropped flows surface even with zero rows); the netflow components' own
+// tests cover their internals.
 
 import '@testing-library/jest-dom/vitest';
 import { render, screen, cleanup, waitFor } from '@testing-library/react';

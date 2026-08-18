@@ -47,16 +47,14 @@ async fn provider_client_records_flows_with_provider_origin() {
 }
 
 /// Drives an actual migrated provider constructor (`AnthropicClient::with_url`
-/// → `build_http_client` → `client_from`) against a mock server and asserts
+/// → `build_http_client` → `client_with`) against a mock server and asserts
 /// the resulting flow lands in the netflow sink with `Origin::Provider`. This
 /// is the test that would catch a provider reverting to a bare
 /// `reqwest::Client::new()` — the test above cannot, since it never calls
 /// into `rupu-providers`' own client-construction code.
 ///
-/// `rupu_netflow::http::init` is process-wide and first-call-wins; this is
-/// the only test in this binary that calls it (the test above uses
-/// `client_with`'s explicit-sink overload, which never touches the global
-/// one), so there is no cross-test race.
+/// There is no process-global sink anymore (Task 4 removed `http::init`):
+/// the sink is passed straight into `with_url` below.
 #[tokio::test]
 async fn anthropic_client_reaches_the_netflow_sink() {
     let server = httpmock::MockServer::start_async().await;
@@ -70,11 +68,11 @@ async fn anthropic_client_reaches_the_netflow_sink() {
         .await;
 
     let sink = Arc::new(MemorySink::default());
-    rupu_netflow::http::init(sink.clone());
 
     let client = rupu_providers::AnthropicClient::with_url(
         "test-key".into(),
         format!("{}/v1/messages", server.url("")),
+        sink.clone(),
     );
 
     <rupu_providers::AnthropicClient as rupu_providers::LlmProvider>::probe(&client)

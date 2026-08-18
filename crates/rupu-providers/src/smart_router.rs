@@ -32,6 +32,10 @@ pub struct SmartRouter {
     budget_mode: BudgetMode,
     store: Option<Arc<dyn CredentialSource>>,
     auth_json_path: Option<PathBuf>,
+    /// Sink bound to any provider re-created by `try_reload`. Always
+    /// `Some` exactly when `store` is `Some` — set together by
+    /// `with_store`. There is no process-global fallback.
+    sink: Option<Arc<dyn rupu_netflow::FlowSink>>,
 }
 
 impl SmartRouter {
@@ -55,17 +59,23 @@ impl SmartRouter {
             budget_mode,
             store: None,
             auth_json_path: None,
+            sink: None,
         })
     }
 
     /// Set credential store for live reload support.
+    ///
+    /// `sink` is the netflow sink any reload-created provider is bound
+    /// to; there is no process-global fallback.
     pub fn with_store(
         mut self,
         store: Arc<dyn CredentialSource>,
         auth_json_path: Option<PathBuf>,
+        sink: Arc<dyn rupu_netflow::FlowSink>,
     ) -> Self {
         self.store = Some(store);
         self.auth_json_path = auth_json_path;
+        self.sink = Some(sink);
         self
     }
 
@@ -74,12 +84,18 @@ impl SmartRouter {
         let Some(store) = &self.store else {
             return false;
         };
+        let Some(sink) = &self.sink else {
+            return false;
+        };
         if let Err(e) = store.reload() {
             warn!(error = %e, "credential store reload failed");
             return false;
         }
-        let registry =
-            crate::registry::ProviderRegistry::new(store.clone(), self.auth_json_path.clone());
+        let registry = crate::registry::ProviderRegistry::new(
+            store.clone(),
+            self.auth_json_path.clone(),
+            sink.clone(),
+        );
         let new_providers = registry.discover_all();
         if new_providers.is_empty() {
             return false;

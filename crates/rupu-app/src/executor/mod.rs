@@ -264,7 +264,20 @@ pub fn build_executor(workspace: &Workspace) -> Arc<AppExecutor> {
         let cfg_ref = &cfg;
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
-                Arc::new(rupu_scm::Registry::discover(resolver_ref.as_ref(), cfg_ref).await)
+                // One registry per workspace, built once here and reused for
+                // every future run this workspace dispatches — there is no
+                // run id in scope at this point. No run exists yet at this
+                // point, so this SCM traffic is not attributed to a ledger.
+                // A run-routing FlowSink would close this; see the netflow
+                // per-run plan.
+                Arc::new(
+                    rupu_scm::Registry::discover(
+                        resolver_ref.as_ref(),
+                        cfg_ref,
+                        Arc::new(rupu_netflow::NullSink),
+                    )
+                    .await,
+                )
             })
         })
     };

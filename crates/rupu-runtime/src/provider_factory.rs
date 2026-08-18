@@ -228,20 +228,38 @@ pub async fn build_for_provider(
     model: &str,
     auth_hint: Option<rupu_providers::AuthMode>,
     resolver: &dyn rupu_auth::CredentialResolver,
+    sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
 ) -> Result<(rupu_providers::AuthMode, Box<dyn LlmProvider>), FactoryError> {
-    build_for_provider_with_config(name, model, auth_hint, resolver, &ProviderConfig::default())
-        .await
+    build_for_provider_with_config(
+        name,
+        model,
+        auth_hint,
+        resolver,
+        &ProviderConfig::default(),
+        sink,
+    )
+    .await
 }
 
 /// Same as [`build_for_provider`] but accepts a [`ProviderConfig`] for
 /// per-build knobs that flow from agent frontmatter / workflow step
 /// config (currently: `anthropic_oauth_system_prefix`).
+///
+/// `sink` is taken explicitly rather than defaulted: there is no
+/// process-global netflow sink (removed alongside the seven provider
+/// constructors' own `Arc<dyn FlowSink>` params — see `rupu-netflow`'s
+/// `http::client_with`), so every caller must decide which run's ledger
+/// this provider's outbound HTTP belongs to. This function is the single
+/// chokepoint through which every agent-driven provider is built; whatever
+/// `sink` a caller passes here is the one every one of that provider's
+/// requests lands in.
 pub async fn build_for_provider_with_config(
     name: &str,
     model: &str,
     auth_hint: Option<rupu_providers::AuthMode>,
     resolver: &dyn rupu_auth::CredentialResolver,
     config: &ProviderConfig,
+    sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
 ) -> Result<(rupu_providers::AuthMode, Box<dyn LlmProvider>), FactoryError> {
     if let Ok(json) = std::env::var("RUPU_MOCK_PROVIDER_SCRIPT") {
         return Ok((
@@ -262,10 +280,12 @@ pub async fn build_for_provider_with_config(
         .clone()
         .unwrap_or_else(|| rupu_providers::ProviderTuning::for_provider(name));
     let client = match name {
-        "anthropic" => build_anthropic(creds, model, config, &tuning).await?,
-        "openai" | "openai_codex" | "codex" => build_openai(creds, model, &tuning).await?,
-        "gemini" | "google_gemini" => build_gemini(creds, model, &tuning).await?,
-        "copilot" | "github_copilot" => build_copilot(creds, model, &tuning).await?,
+        "anthropic" => build_anthropic(creds, model, config, &tuning, sink.clone()).await?,
+        "openai" | "openai_codex" | "codex" => {
+            build_openai(creds, model, &tuning, sink.clone()).await?
+        }
+        "gemini" | "google_gemini" => build_gemini(creds, model, &tuning, sink.clone()).await?,
+        "copilot" | "github_copilot" => build_copilot(creds, model, &tuning, sink.clone()).await?,
         "local" => return Err(FactoryError::NotWiredInV0("local".to_string())),
         _ => {
             if let Some(params) = &config.openai_compatible {
@@ -280,6 +300,7 @@ pub async fn build_for_provider_with_config(
                         &params.default_model,
                         params.models.clone(),
                         params.stream,
+                        sink.clone(),
                     )
                     .with_tuning(&tuning),
                 ) as Box<dyn LlmProvider>
@@ -355,6 +376,7 @@ async fn build_anthropic(
     _model: &str,
     config: &ProviderConfig,
     tuning: &rupu_providers::ProviderTuning,
+    sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
     // Convert the resolved credential into an Anthropic AuthMethod so OAuth
     // tokens travel via `Authorization: Bearer …` and API keys via
@@ -376,8 +398,8 @@ async fn build_anthropic(
     };
     let auth = creds.into_anthropic_auth_method();
     let mut client = match std::env::var("RUPU_ANTHROPIC_BASE_URL_OVERRIDE") {
-        Ok(url) => rupu_providers::anthropic::AnthropicClient::from_auth_with_url(auth, url),
-        Err(_) => rupu_providers::anthropic::AnthropicClient::from_auth(auth),
+        Ok(url) => rupu_providers::anthropic::AnthropicClient::from_auth_with_url(auth, url, sink),
+        Err(_) => rupu_providers::anthropic::AnthropicClient::from_auth(auth, sink),
     }
     .with_tuning(tuning)
     .with_oauth_account_uuid(account_uuid);
@@ -396,8 +418,9 @@ async fn build_openai(
     creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
     tuning: &rupu_providers::ProviderTuning,
+    sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
-    let client = rupu_providers::openai_codex::OpenAiCodexClient::new(creds, None)
+    let client = rupu_providers::openai_codex::OpenAiCodexClient::new(creds, None, sink)
         .map_err(|e| FactoryError::Other(format!("openai client init: {e}")))?
         .with_tuning(tuning);
     Ok(Box::new(client))
@@ -407,6 +430,7 @@ async fn build_gemini(
     creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
     tuning: &rupu_providers::ProviderTuning,
+    sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
     // Branch on credential shape:
     // - `ApiKey` → AI Studio (`generativelanguage.googleapis.com`,
@@ -428,7 +452,7 @@ async fn build_gemini(
             })
             .unwrap_or(GeminiVariant::GeminiCli),
     };
-    let client = GoogleGeminiClient::new(creds, variant, None)
+    let client = GoogleGeminiClient::new(creds, variant, None, sink)
         .map_err(|e| FactoryError::Other(format!("gemini client init: {e}")))?
         .with_tuning(tuning);
     Ok(Box::new(client))
@@ -438,8 +462,9 @@ async fn build_copilot(
     creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
     tuning: &rupu_providers::ProviderTuning,
+    sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
-    let client = rupu_providers::github_copilot::GithubCopilotClient::new(creds, None)
+    let client = rupu_providers::github_copilot::GithubCopilotClient::new(creds, None, sink)
         .map_err(|e| FactoryError::Other(format!("copilot client init: {e}")))?
         .with_tuning(tuning);
     Ok(Box::new(client))
@@ -607,9 +632,15 @@ mod build_copilot_tests {
                 StoredCredential::api_key("ghp_test_copilot"),
             )
             .await;
-        let (_mode, p) = build_for_provider("copilot", "gpt-4o", None, &resolver)
-            .await
-            .expect("build");
+        let (_mode, p) = build_for_provider(
+            "copilot",
+            "gpt-4o",
+            None,
+            &resolver,
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        )
+        .await
+        .expect("build");
         assert_eq!(p.provider_id(), rupu_providers::ProviderId::GithubCopilot);
     }
 }
@@ -637,9 +668,15 @@ mod build_openai_tests {
                 StoredCredential::api_key("sk-test-openai"),
             )
             .await;
-        let (_mode, p) = build_for_provider("openai", "gpt-5", None, &resolver)
-            .await
-            .expect("build");
+        let (_mode, p) = build_for_provider(
+            "openai",
+            "gpt-5",
+            None,
+            &resolver,
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        )
+        .await
+        .expect("build");
         assert_eq!(p.provider_id(), rupu_providers::ProviderId::OpenaiCodex);
     }
 
@@ -649,7 +686,14 @@ mod build_openai_tests {
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
         let resolver = InMemoryResolver::new();
         // No credentials inserted — resolver returns missing-credential error.
-        let result = build_for_provider("openai", "gpt-5", None, &resolver).await;
+        let result = build_for_provider(
+            "openai",
+            "gpt-5",
+            None,
+            &resolver,
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        )
+        .await;
         assert!(matches!(
             result,
             Err(FactoryError::MissingCredential { .. })
@@ -680,7 +724,14 @@ mod build_gemini_tests {
                 StoredCredential::api_key("AIzaSy-test-key"),
             )
             .await;
-        let result = build_for_provider("gemini", "gemini-2.5-pro", None, &resolver).await;
+        let result = build_for_provider(
+            "gemini",
+            "gemini-2.5-pro",
+            None,
+            &resolver,
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        )
+        .await;
         assert!(result.is_ok(), "expected Ok(provider), got error");
     }
 
@@ -689,7 +740,14 @@ mod build_gemini_tests {
         let _guard = ENV_LOCK.lock().await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
         let resolver = InMemoryResolver::new();
-        let result = build_for_provider("gemini", "gemini-2.5-pro", None, &resolver).await;
+        let result = build_for_provider(
+            "gemini",
+            "gemini-2.5-pro",
+            None,
+            &resolver,
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        )
+        .await;
         assert!(matches!(
             result,
             Err(FactoryError::MissingCredential { .. })

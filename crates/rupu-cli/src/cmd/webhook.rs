@@ -159,8 +159,13 @@ async fn maybe_build_github_projects_hydrator(
         .platforms
         .get("github")
         .and_then(|platform| platform.base_url.clone());
+    // Built once at `rupu webhook serve` daemon startup and reused for
+    // every future incoming webhook, each of which may independently
+    // dispatch a workflow run with its own fresh run id. No run exists yet
+    // at this point, so this SCM traffic is not attributed to a ledger. A
+    // run-routing FlowSink would close this; see the netflow per-run plan.
     Some(Arc::new(CliGithubProjectsHydrator {
-        client: GithubClient::new(token, base_url, Some(2)),
+        client: GithubClient::new(token, base_url, Some(2), Arc::new(rupu_netflow::NullSink)),
     }))
 }
 
@@ -1153,7 +1158,12 @@ steps:
         });
 
         let hydrator = CliGithubProjectsHydrator {
-            client: GithubClient::new("ghp_test".into(), Some(server.base_url()), Some(2)),
+            client: GithubClient::new(
+                "ghp_test".into(),
+                Some(server.base_url()),
+                Some(2),
+                Arc::new(rupu_netflow::NullSink),
+            ),
         };
         let payload = json!({
             "action": "edited",

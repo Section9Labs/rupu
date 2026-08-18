@@ -34,6 +34,7 @@ notify.workspace = true
 rupu-app-canvas = { path = "../rupu-app-canvas" }
 rupu-auth = { path = "../rupu-auth" }
 rupu-config = { path = "../rupu-config" }
+rupu-netflow = { workspace = true, features = ["http"] }
 rupu-orchestrator = { path = "../rupu-orchestrator" }
 rupu-providers = { path = "../rupu-providers" }
 rupu-runtime = { path = "../rupu-runtime" }

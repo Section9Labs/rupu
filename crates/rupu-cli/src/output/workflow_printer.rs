@@ -4445,6 +4445,7 @@ mod tests {
                 transcript_path,
                 output: String::new(),
                 success: true,
+                is_fixer: false,
             }],
             findings: Vec::new(),
             iterations: 0,

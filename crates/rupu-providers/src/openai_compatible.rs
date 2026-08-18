@@ -8,6 +8,7 @@
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest_middleware::ClientWithMiddleware;
+use std::sync::Arc;
 
 use crate::error::ProviderError;
 use crate::model_pool::{ModelCapability, ModelCost, ModelInfo, ModelState, ModelStatus};
@@ -32,6 +33,10 @@ pub struct OpenAiCompatibleClient {
     models: Vec<OpenAiCompatibleModel>,
     stream: bool,
     client: ClientWithMiddleware,
+    /// The exact sink `client` was bound to, so `with_tuning`'s rebuild
+    /// keeps using the same run's sink rather than requiring the caller
+    /// to pass it again. See `AnthropicClient`'s `sink` field.
+    sink: Arc<dyn rupu_netflow::FlowSink>,
 }
 
 impl OpenAiCompatibleClient {
@@ -44,7 +49,9 @@ impl OpenAiCompatibleClient {
         let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider(
             "openai_compatible".into(),
         ));
-        if let Ok(client) = rupu_netflow::http::client_from(ctx, tuning.http_client_builder()) {
+        if let Ok(client) =
+            rupu_netflow::http::client_with(ctx, tuning.http_client_builder(), self.sink.clone())
+        {
             self.client = client;
         }
         self
@@ -56,26 +63,32 @@ impl OpenAiCompatibleClient {
     /// * `default_model` — model id sent when the request doesn't override it.
     /// * `models` — config-declared models, surfaced via `list_models`.
     /// * `stream` — when false, never request SSE (servers without it).
+    /// * `sink` — the run's netflow sink; there is no process-global fallback.
     pub fn new(
         base_url: &str,
         api_key: &str,
         default_model: &str,
         models: Vec<OpenAiCompatibleModel>,
         stream: bool,
+        sink: Arc<dyn rupu_netflow::FlowSink>,
     ) -> Self {
         // Normalize: strip trailing slashes, then strip a trailing `/v1`
         // so we hold the bare root and append `/v1/...` consistently.
         let trimmed = base_url.trim_end_matches('/');
         let root = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+        let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider(
+            "openai_compatible".into(),
+        ));
+        let client = rupu_netflow::http::client_with(ctx, reqwest::Client::builder(), sink.clone())
+            .expect("reqwest TLS backend failed to initialise; no HTTP client can be built");
         Self {
             base_url: root.to_string(),
             api_key: api_key.to_string(),
             default_model: default_model.to_string(),
             models,
             stream,
-            client: rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
-                rupu_netflow::Origin::Provider("openai_compatible".into()),
-            )),
+            client,
+            sink,
         }
     }
 
@@ -270,6 +283,7 @@ mod tests {
                 max_output: 8192,
             }],
             true,
+            Arc::new(rupu_netflow::NullSink),
         )
     }
 
@@ -284,7 +298,14 @@ mod tests {
 
     #[test]
     fn base_url_tolerates_explicit_v1() {
-        let c = OpenAiCompatibleClient::new("http://host:8080/v1", "k", "m", vec![], true);
+        let c = OpenAiCompatibleClient::new(
+            "http://host:8080/v1",
+            "k",
+            "m",
+            vec![],
+            true,
+            Arc::new(rupu_netflow::NullSink),
+        );
         assert_eq!(c.completions_url(), "http://host:8080/v1/chat/completions");
     }
 
@@ -391,6 +412,7 @@ mod tests {
                 max_output: 1024,
             }],
             false,
+            Arc::new(rupu_netflow::NullSink),
         );
         let models = c.list_models().await;
         assert!(!models[0].capabilities.contains(&ModelCapability::Streaming));

@@ -1328,7 +1328,12 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     }
 
     let resolver = rupu_auth::KeychainResolver::new();
-    let scm_registry = Arc::new(rupu_scm::Registry::discover(&resolver, &cfg).await);
+    // No run exists yet at this point, so this SCM traffic is not attributed
+    // to a ledger. A run-routing FlowSink would close this; see the netflow
+    // per-run plan.
+    let scm_registry = Arc::new(
+        rupu_scm::Registry::discover(&resolver, &cfg, Arc::new(rupu_netflow::NullSink)).await,
+    );
 
     let effective_prompt = args.prompt_flag.clone().or_else(|| args.prompt.clone());
     let (run_target, user_message) = match args.target.as_deref() {
@@ -6229,12 +6234,17 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
             &cfg.providers,
         )),
     };
+    // No run exists here: `rupu session compact` summarizes an existing
+    // session's message history in place — it mints no run id, writes no
+    // transcript, and isn't a step of any run in progress. This traffic
+    // is deliberately not attributed to a ledger.
     let (_resolved_auth, mut provider) = provider_factory::build_for_provider_with_config(
         &session.provider_name,
         &session.model,
         session.auth_mode,
         &resolver,
         &provider_config,
+        Arc::new(rupu_netflow::NullSink),
     )
     .await?;
 
@@ -6534,6 +6544,22 @@ async fn run_compact_request(
     )
     .unwrap_or_default();
     let resolver = rupu_auth::KeychainResolver::new();
+
+    paths::ensure_dir(&session.transcripts_dir)?;
+
+    // Netflow capture for this compaction run. Built here, before the
+    // provider below, and per-request (never once for the whole session
+    // worker) — a compaction request is its own run (`request.run_id` /
+    // `request.transcript_path`, RunStart/RunComplete below), so its sink
+    // must not outlive it. See `crate::netflow_sink::for_run`'s doc
+    // comment for the "one sink per run, never per daemon" rule.
+    let (netflow_sink, netflow_handle) = crate::netflow_sink::for_run(
+        global,
+        session.project_root.as_deref(),
+        &request.run_id,
+        &request.transcript_path,
+    );
+
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
         openai_compatible: None,
@@ -6548,10 +6574,9 @@ async fn run_compact_request(
         session.auth_mode,
         &resolver,
         &provider_config,
+        netflow_sink,
     )
     .await?;
-
-    paths::ensure_dir(&session.transcripts_dir)?;
 
     // Determine the mode string for the transcript RunStart event.
     let run_mode = match session.permission_mode.as_str() {
@@ -6599,6 +6624,9 @@ async fn run_compact_request(
                 RunStatus::Ok,
                 None,
             )?;
+            if let Some(h) = netflow_handle {
+                h.shutdown().await;
+            }
             return Ok(());
         }
     };
@@ -6624,6 +6652,9 @@ async fn run_compact_request(
             RunStatus::Ok,
             None,
         )?;
+        if let Some(h) = netflow_handle {
+            h.shutdown().await;
+        }
         return Ok(());
     }
 
@@ -6746,6 +6777,9 @@ async fn run_compact_request(
         }
     }
 
+    if let Some(h) = netflow_handle {
+        h.shutdown().await;
+    }
     Ok(())
 }
 
@@ -6812,244 +6846,286 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         .map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
     let resolver = rupu_auth::KeychainResolver::new();
-    let scm_registry = Arc::new(rupu_scm::Registry::discover(&resolver, &cfg).await);
-
-    let provider_config = provider_factory::ProviderConfig {
-        anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
-        openai_compatible: None,
-        tuning: Some(provider_factory::provider_tuning(
-            &session.provider_name,
-            &cfg.providers,
-        )),
-    };
-    let (_resolved_auth, provider) = provider_factory::build_for_provider_with_config(
-        &session.provider_name,
-        &session.model,
-        session.auth_mode,
-        &resolver,
-        &provider_config,
-    )
-    .await?;
-
-    let backend_id = "local_checkout".to_string();
-    let worker_ctx = crate::cmd::workflow::default_execution_worker_context(WorkerKind::Cli, None);
-    let worker_record = crate::cmd::workflow::upsert_worker_record(
-        &global,
-        &worker_ctx,
-        &backend_id,
-        &session.permission_mode,
-        session.repo_ref.as_deref(),
-    )?;
 
     paths::ensure_dir(&session.transcripts_dir)?;
     let transcript_path = session
         .transcripts_dir
         .join(format!("{}.jsonl", args.run_id));
-    let metadata = StandaloneRunMetadata {
-        version: StandaloneRunMetadata::VERSION,
-        run_id: args.run_id.clone(),
-        session_id: Some(session.session_id.clone()),
-        archived_at: None,
-        workspace_path: canonicalize_if_exists(&session.workspace_path),
-        project_root: session.project_root.clone(),
-        repo_ref: session.repo_ref.clone(),
-        issue_ref: session.issue_ref.clone(),
-        backend_id,
-        worker_id: Some(worker_record.worker_id.clone()),
-        trigger_source: "session_turn".into(),
-        target: session.target.clone(),
-        workspace_strategy: session.workspace_strategy.clone(),
-        pid: Some(std::process::id()),
-    };
-    write_metadata(
-        &metadata_path_for_run(&session.transcripts_dir, &args.run_id),
-        &metadata,
-    )?;
 
-    let tool_context = ToolContext {
-        workspace_path: session.workspace_path.clone(),
-        bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
-        bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
-        dispatcher: None,
-        dispatchable_agents: session.dispatchable_agents.clone(),
-        parent_run_id: None,
-        depth: 0,
-        coverage_writer: None,
-        surface_tag: None,
-        run_id: None,
-        model: None,
-        tool_mappings: None,
-    };
+    // Netflow capture for this turn. Built PER TURN, never once at daemon
+    // start — `rupu session`'s worker handles many turns across many
+    // sessions in one long-lived process, and a sink built once here would
+    // reintroduce exactly the "first turn wins" defect this plan removes.
+    // Must be built before the SCM registry / provider below so both take
+    // this turn's real sink rather than a `NullSink` placeholder.
+    let (netflow_sink, netflow_handle) = crate::netflow_sink::for_run(
+        &global,
+        session.project_root.as_deref(),
+        &args.run_id,
+        &transcript_path,
+    );
 
-    let decider: Arc<dyn PermissionDecider> = match session.permission_mode.as_str() {
-        "readonly" => Arc::new(ReadonlyDecider),
-        _ => Arc::new(BypassDecider),
-    };
-    let live_usage_state = Arc::new(Mutex::new(SessionLiveUsageWriterState::new(
-        &session.provider_name,
-        &session.model,
-    )));
-    let live_usage_global = global.clone();
-    let live_usage_session_id = args.session_id.clone();
-    let live_usage_run_id = args.run_id.clone();
-    let live_usage_state_cb = Arc::clone(&live_usage_state);
-    let on_stream_event = Arc::new(move |event: StreamEvent| {
-        let force = matches!(event, StreamEvent::UsageSnapshot(_));
-        let Ok(mut state) = live_usage_state_cb.lock() else {
-            return;
+    // Everything below that can fail via `?` is wrapped in this block so
+    // the netflow-handle shutdown after it runs on BOTH the success and
+    // failure paths (Finding 6, whole-branch review — `run.rs`'s
+    // `run_inner` already solves exactly this with the identical shape,
+    // for the identical reason: a failed run must still flush its
+    // ledger). `run_turn` is a short-lived per-turn worker process that
+    // may exit right after an early `?` return; without this, whatever
+    // this turn's sink had buffered — including a `Dropped` accounting
+    // line, which has no other way to reach disk — stays unflushed.
+    let body_result: anyhow::Result<()> = async move {
+        let scm_registry =
+            Arc::new(rupu_scm::Registry::discover(&resolver, &cfg, netflow_sink.clone()).await);
+
+        let provider_config = provider_factory::ProviderConfig {
+            anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
+            openai_compatible: None,
+            tuning: Some(provider_factory::provider_tuning(
+                &session.provider_name,
+                &cfg.providers,
+            )),
         };
-        if !state.apply_event(&event) || !state.should_flush(force) {
-            return;
-        }
-        if persist_session_live_usage_snapshot(
-            &live_usage_global,
-            scope,
-            &live_usage_session_id,
-            &live_usage_run_id,
-            &state.usage,
+        let (_resolved_auth, provider) = provider_factory::build_for_provider_with_config(
+            &session.provider_name,
+            &session.model,
+            session.auth_mode,
+            &resolver,
+            &provider_config,
+            netflow_sink,
         )
-        .is_ok()
+        .await?;
+
+        let backend_id = "local_checkout".to_string();
+        let worker_ctx =
+            crate::cmd::workflow::default_execution_worker_context(WorkerKind::Cli, None);
+        let worker_record = crate::cmd::workflow::upsert_worker_record(
+            &global,
+            &worker_ctx,
+            &backend_id,
+            &session.permission_mode,
+            session.repo_ref.as_deref(),
+        )?;
+
+        let metadata = StandaloneRunMetadata {
+            version: StandaloneRunMetadata::VERSION,
+            run_id: args.run_id.clone(),
+            session_id: Some(session.session_id.clone()),
+            archived_at: None,
+            workspace_path: canonicalize_if_exists(&session.workspace_path),
+            project_root: session.project_root.clone(),
+            repo_ref: session.repo_ref.clone(),
+            issue_ref: session.issue_ref.clone(),
+            backend_id,
+            worker_id: Some(worker_record.worker_id.clone()),
+            trigger_source: "session_turn".into(),
+            target: session.target.clone(),
+            workspace_strategy: session.workspace_strategy.clone(),
+            pid: Some(std::process::id()),
+        };
+        write_metadata(
+            &metadata_path_for_run(&session.transcripts_dir, &args.run_id),
+            &metadata,
+        )?;
+
+        let tool_context = ToolContext {
+            workspace_path: session.workspace_path.clone(),
+            bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
+            bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
+            dispatcher: None,
+            dispatchable_agents: session.dispatchable_agents.clone(),
+            parent_run_id: None,
+            depth: 0,
+            coverage_writer: None,
+            surface_tag: None,
+            run_id: None,
+            model: None,
+            tool_mappings: None,
+        };
+
+        let decider: Arc<dyn PermissionDecider> = match session.permission_mode.as_str() {
+            "readonly" => Arc::new(ReadonlyDecider),
+            _ => Arc::new(BypassDecider),
+        };
+        let live_usage_state = Arc::new(Mutex::new(SessionLiveUsageWriterState::new(
+            &session.provider_name,
+            &session.model,
+        )));
+        let live_usage_global = global.clone();
+        let live_usage_session_id = args.session_id.clone();
+        let live_usage_run_id = args.run_id.clone();
+        let live_usage_state_cb = Arc::clone(&live_usage_state);
+        let on_stream_event = Arc::new(move |event: StreamEvent| {
+            let force = matches!(event, StreamEvent::UsageSnapshot(_));
+            let Ok(mut state) = live_usage_state_cb.lock() else {
+                return;
+            };
+            if !state.apply_event(&event) || !state.should_flush(force) {
+                return;
+            }
+            if persist_session_live_usage_snapshot(
+                &live_usage_global,
+                scope,
+                &live_usage_session_id,
+                &live_usage_run_id,
+                &state.usage,
+            )
+            .is_ok()
+            {
+                state.mark_persisted();
+            }
+        });
+
+        let opts = AgentRunOpts {
+            agent_name: session.agent_name.clone(),
+            agent_system_prompt: session.agent_system_prompt.clone(),
+            agent_tools: session.agent_tools.clone(),
+            provider,
+            provider_name: session.provider_name.clone(),
+            model: session.model.clone(),
+            run_id: args.run_id.clone(),
+            workspace_id: session.workspace_id.clone(),
+            workspace_path: session.workspace_path.clone(),
+            transcript_path: transcript_path.clone(),
+            max_turns: session.max_turns,
+            decider,
+            tool_context,
+            user_message: args.prompt.clone(),
+            initial_messages: session.message_history.clone(),
+            turn_index_offset: session.total_turns,
+            mode_str: session.permission_mode.clone(),
+            no_stream: session.no_stream,
+            suppress_stream_stdout: true,
+            mcp_registry: Some(scm_registry),
+            effort: session.effort,
+            context_window: session.context_window,
+            output_format: session.output_format,
+            output_schema: session.output_schema.clone(),
+            anthropic_task_budget: session.anthropic_task_budget,
+            anthropic_context_management: session.anthropic_context_management,
+            anthropic_speed: session.anthropic_speed,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: session.dispatchable_agents.clone(),
+            step_id: String::new(),
+            on_tool_call: None,
+            on_stream_event: Some(on_stream_event),
+            concerns: session.concerns.clone(),
+            max_tokens: session
+                .max_tokens
+                .unwrap_or(rupu_agent::runner::DEFAULT_MAX_TOKENS),
+            context_window_tokens: session.context_window_tokens,
+            compact_at_percent: session.compact_at_percent,
+            // Sessions key their coverage ledger off the session_id so multiple
+            // sessions against the same workspace stay distinct, and target_id
+            // matches the spec's per-session derivation.
+            scope_name: Some(session.session_id.clone()),
+            surface_tag: Some("session".to_string()),
+            pause: None,
+        };
+
+        let outcome = rupu_agent::run_agent(opts).await;
+        // Snapshot live cached_tokens before clearing — UsageSnapshot events
+        // populated it during streaming, but RunResult (from rupu-agent) only
+        // carries in/out. Keep cached as an additive grand-total dimension.
+        let cached_tokens = read_session_live_usage(&global, scope, &args.session_id)?
+            .map(|record| record.usage.cached_tokens)
+            .unwrap_or(0);
+        clear_session_live_usage(&global, scope, &args.session_id)?;
+
+        session = read_session(&global, &args.session_id)?.0;
+        session.updated_at = Utc::now();
+        session.active_run_id = None;
+        session.active_transcript_path = None;
+        session.active_pid = None;
+        session.last_run_id = Some(args.run_id.clone());
+        session.last_transcript_path = Some(transcript_path.clone());
+
+        let mut run_status = Some(RunStatus::Error);
+        let mut duration_ms = 0;
+        let mut error_message = None;
+        if let Some(run) = session
+            .runs
+            .iter_mut()
+            .find(|run| run.run_id == args.run_id)
         {
-            state.mark_persisted();
+            run.completed_at = Some(Utc::now());
+            run.transcript_path = transcript_path.clone();
+            match &outcome {
+                Ok(result) => {
+                    run.status = Some(result.status);
+                    run_status = Some(result.status);
+                    run.total_tokens_in = result.total_tokens_in;
+                    run.total_tokens_out = result.total_tokens_out;
+                    run.total_tokens_cached = cached_tokens;
+                    run.duration_ms = duration_ms_from_transcript(&transcript_path).unwrap_or(0);
+                    duration_ms = run.duration_ms;
+                }
+                Err(err) => {
+                    let error = err.to_string();
+                    run.status = Some(RunStatus::Error);
+                    run.error = Some(error.clone());
+                    error_message = Some(error.clone());
+                    session.last_error = Some(error);
+                }
+            }
         }
-    });
 
-    let opts = AgentRunOpts {
-        agent_name: session.agent_name.clone(),
-        agent_system_prompt: session.agent_system_prompt.clone(),
-        agent_tools: session.agent_tools.clone(),
-        provider,
-        provider_name: session.provider_name.clone(),
-        model: session.model.clone(),
-        run_id: args.run_id.clone(),
-        workspace_id: session.workspace_id.clone(),
-        workspace_path: session.workspace_path.clone(),
-        transcript_path: transcript_path.clone(),
-        max_turns: session.max_turns,
-        decider,
-        tool_context,
-        user_message: args.prompt.clone(),
-        initial_messages: session.message_history.clone(),
-        turn_index_offset: session.total_turns,
-        mode_str: session.permission_mode.clone(),
-        no_stream: session.no_stream,
-        suppress_stream_stdout: true,
-        mcp_registry: Some(scm_registry),
-        effort: session.effort,
-        context_window: session.context_window,
-        output_format: session.output_format,
-        output_schema: session.output_schema.clone(),
-        anthropic_task_budget: session.anthropic_task_budget,
-        anthropic_context_management: session.anthropic_context_management,
-        anthropic_speed: session.anthropic_speed,
-        parent_run_id: None,
-        depth: 0,
-        dispatchable_agents: session.dispatchable_agents.clone(),
-        step_id: String::new(),
-        on_tool_call: None,
-        on_stream_event: Some(on_stream_event),
-        concerns: session.concerns.clone(),
-        max_tokens: session
-            .max_tokens
-            .unwrap_or(rupu_agent::runner::DEFAULT_MAX_TOKENS),
-        context_window_tokens: session.context_window_tokens,
-        compact_at_percent: session.compact_at_percent,
-        // Sessions key their coverage ledger off the session_id so multiple
-        // sessions against the same workspace stay distinct, and target_id
-        // matches the spec's per-session derivation.
-        scope_name: Some(session.session_id.clone()),
-        surface_tag: Some("session".to_string()),
-        pause: None,
-    };
-
-    let outcome = rupu_agent::run_agent(opts).await;
-    // Snapshot live cached_tokens before clearing — UsageSnapshot events
-    // populated it during streaming, but RunResult (from rupu-agent) only
-    // carries in/out. Keep cached as an additive grand-total dimension.
-    let cached_tokens = read_session_live_usage(&global, scope, &args.session_id)?
-        .map(|record| record.usage.cached_tokens)
-        .unwrap_or(0);
-    clear_session_live_usage(&global, scope, &args.session_id)?;
-
-    session = read_session(&global, &args.session_id)?.0;
-    session.updated_at = Utc::now();
-    session.active_run_id = None;
-    session.active_transcript_path = None;
-    session.active_pid = None;
-    session.last_run_id = Some(args.run_id.clone());
-    session.last_transcript_path = Some(transcript_path.clone());
-
-    let mut run_status = Some(RunStatus::Error);
-    let mut duration_ms = 0;
-    let mut error_message = None;
-    if let Some(run) = session
-        .runs
-        .iter_mut()
-        .find(|run| run.run_id == args.run_id)
-    {
-        run.completed_at = Some(Utc::now());
-        run.transcript_path = transcript_path.clone();
-        match &outcome {
+        match outcome {
             Ok(result) => {
-                run.status = Some(result.status);
-                run_status = Some(result.status);
-                run.total_tokens_in = result.total_tokens_in;
-                run.total_tokens_out = result.total_tokens_out;
-                run.total_tokens_cached = cached_tokens;
-                run.duration_ms = duration_ms_from_transcript(&transcript_path).unwrap_or(0);
-                duration_ms = run.duration_ms;
+                session.status = if result.status == RunStatus::Ok {
+                    SessionStatus::Idle
+                } else {
+                    SessionStatus::Failed
+                };
+                session.total_turns += result.turns;
+                session.total_tokens_in += result.total_tokens_in;
+                session.total_tokens_out += result.total_tokens_out;
+                session.total_tokens_cached += cached_tokens;
+                session.message_history = result.final_messages;
+                session.last_error = if result.status == RunStatus::Ok {
+                    None
+                } else {
+                    Some(format!(
+                        "turn ended with status {}",
+                        format!("{:?}", result.status).to_lowercase()
+                    ))
+                };
             }
             Err(err) => {
-                let error = err.to_string();
-                run.status = Some(RunStatus::Error);
-                run.error = Some(error.clone());
-                error_message = Some(error.clone());
-                session.last_error = Some(error);
+                session.status = SessionStatus::Failed;
+                session.last_error = Some(err.to_string());
             }
         }
-    }
 
-    match outcome {
-        Ok(result) => {
-            session.status = if result.status == RunStatus::Ok {
-                SessionStatus::Idle
-            } else {
-                SessionStatus::Failed
-            };
-            session.total_turns += result.turns;
-            session.total_tokens_in += result.total_tokens_in;
-            session.total_tokens_out += result.total_tokens_out;
-            session.total_tokens_cached += cached_tokens;
-            session.message_history = result.final_messages;
-            session.last_error = if result.status == RunStatus::Ok {
-                None
-            } else {
-                Some(format!(
-                    "turn ended with status {}",
-                    format!("{:?}", result.status).to_lowercase()
-                ))
-            };
+        if let Some(run) = session
+            .runs
+            .iter_mut()
+            .find(|run| run.run_id == args.run_id)
+        {
+            run.status = run_status;
+            run.duration_ms = duration_ms;
+            if run.error.is_none() {
+                run.error = error_message.or_else(|| session.last_error.clone());
+            }
         }
-        Err(err) => {
-            session.status = SessionStatus::Failed;
-            session.last_error = Some(err.to_string());
-        }
-    }
 
-    if let Some(run) = session
-        .runs
-        .iter_mut()
-        .find(|run| run.run_id == args.run_id)
-    {
-        run.status = run_status;
-        run.duration_ms = duration_ms;
-        if run.error.is_none() {
-            run.error = error_message.or_else(|| session.last_error.clone());
-        }
+        write_session(&global, scope, &session)?;
+        Ok(())
     }
+    .await;
 
-    write_session(&global, scope, &session)?;
-    Ok(())
+    // Flush this turn's ledger — including a `Dropped` line if the
+    // writer channel overflowed — whether the block above succeeded or
+    // returned early via `?`. See the comment at this function's
+    // `body_result` declaration, and `crate::netflow_sink::for_run`'s doc
+    // comment: the writer task's periodic ticker is a safety net, not a
+    // substitute, for a worker process that may exit shortly after this
+    // turn completes.
+    if let Some(handle) = netflow_handle {
+        handle.shutdown().await;
+    }
+    body_result
 }
 
 fn duration_ms_from_transcript(path: &Path) -> anyhow::Result<u64> {

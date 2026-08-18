@@ -38,18 +38,22 @@ pub struct GithubEventConnector {
 }
 
 impl GithubEventConnector {
-    pub fn new(token: String, base_url: Option<String>) -> Self {
+    pub fn new(
+        token: String,
+        base_url: Option<String>,
+        sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
+    ) -> Self {
         let base_url = base_url.unwrap_or_else(|| "https://api.github.com".to_string());
         Self {
-            http: rupu_netflow::http::client_from(
+            // Infallible constructor (`-> Self`); `.expect()` preserves the
+            // deleted `http::client()` fallback's panic-on-failure behaviour.
+            // No fallback to an uninstrumented client.
+            http: rupu_netflow::http::client_with(
                 rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm("github".into())),
                 reqwest::Client::builder(),
+                sink,
             )
-            .unwrap_or_else(|_| {
-                rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
-                    rupu_netflow::Origin::Scm("github".into()),
-                ))
-            }),
+            .expect("github events netflow client build"),
             token,
             base_url,
         }
@@ -356,6 +360,7 @@ fn map_github_event(ev: &Value) -> Option<String> {
 pub async fn try_build(
     resolver: &dyn rupu_auth::CredentialResolver,
     cfg: &rupu_config::Config,
+    sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
 ) -> anyhow::Result<Option<std::sync::Arc<dyn EventConnector>>> {
     let creds = match resolver.get("github", None).await {
         Ok((_mode, creds)) => creds,
@@ -371,7 +376,7 @@ pub async fn try_build(
         .get("github")
         .and_then(|p| p.base_url.clone());
     let connector: std::sync::Arc<dyn EventConnector> =
-        std::sync::Arc::new(GithubEventConnector::new(token, base_url));
+        std::sync::Arc::new(GithubEventConnector::new(token, base_url, sink));
     Ok(Some(connector))
 }
 
@@ -485,7 +490,11 @@ mod tests {
     #[tokio::test]
     async fn first_poll_returns_empty_with_warmup_cursor() {
         // No HTTP call: empty cursor short-circuits at the top of poll_events.
-        let c = GithubEventConnector::new("fake".into(), Some("http://127.0.0.1:1".into()));
+        let c = GithubEventConnector::new(
+            "fake".into(),
+            Some("http://127.0.0.1:1".into()),
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        );
         let source: EventSourceRef = rr().into();
         let r = c.poll_events(&source, None, 50).await.unwrap();
         assert_eq!(r.events.len(), 0);

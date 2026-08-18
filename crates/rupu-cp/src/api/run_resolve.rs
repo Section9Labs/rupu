@@ -140,7 +140,7 @@ const RUN_LOCATION_CACHE_TTL: Duration = Duration::from_secs(8);
 /// shorter than an explicit `?host=<id>` request (which keeps
 /// [`HttpHostConnector::new`](crate::host::http::HttpHostConnector::new)'s
 /// fixed 5s-connect/30s-total bound, routed through
-/// `rupu_netflow::http::client_from` — a caller who names a host explicitly
+/// `rupu_netflow::http::client_with` — a caller who names a host explicitly
 /// may accept that longer wait): this path fires at *every* registered host
 /// speculatively, so a single unreachable one must fail fast rather than
 /// making the page wait out that full 5s/30s bound.

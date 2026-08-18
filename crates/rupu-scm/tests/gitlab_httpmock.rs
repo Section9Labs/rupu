@@ -35,7 +35,12 @@ async fn list_repos_paginates_until_empty() {
             .body("[]");
     });
 
-    let client = GitlabClient::new("fake-token".into(), Some(server.base_url()), Some(2));
+    let client = GitlabClient::new(
+        "fake-token".into(),
+        Some(server.base_url()),
+        Some(2),
+        std::sync::Arc::new(rupu_netflow::NullSink),
+    );
     let conn = GitlabRepoConnector::new(client);
     let repos = conn.list_repos().await.unwrap();
     assert_eq!(repos.len(), 200, "two pages × 100 per page");

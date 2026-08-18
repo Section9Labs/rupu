@@ -17,10 +17,10 @@
 //! grep disallowed`, not this constant.
 //!
 //! `Client::builder()` is deliberately NOT banned by either layer:
-//! `client_from` requires every legitimate caller to build a tuned
+//! `client_with` requires every legitimate caller to build a tuned
 //! `ClientBuilder` first, so banning that call would produce a false
 //! positive at every correct call site. The actual bypass is calling
-//! `.build()` on that builder instead of handing it to `client_from` —
+//! `.build()` on that builder instead of handing it to `client_with` —
 //! that is what `BANNED` (below) and `clippy.toml` both target.
 
 use std::path::Path;
@@ -38,15 +38,14 @@ const BANNED: &[&str] = &[
     // variable), so — unusually for this text scanner — it can actually
     // catch a `reqwest::get(...)` bypass, not just backstop clippy.
     // Found live in crates/rupu-cli/src/output/theme.rs (2026-08-04) and
-    // migrated onto rupu_netflow::http::client in the same fix.
+    // migrated onto rupu_netflow::http::client_with in the same fix.
     "reqwest::get",
 ];
 
 /// Files permitted to construct or finalize a raw reqwest client.
 const ALLOWED: &[&str] = &[
-    // The factory itself: `client()`'s panicking fallback and
-    // `client_with()`'s `ClientBuilder::build()` are the one legitimate
-    // `.build()` call site in the repo.
+    // The factory itself: `client_with()`'s `ClientBuilder::build()` is
+    // the one legitimate `.build()` call site in the repo.
     "crates/rupu-netflow/src/http/mod.rs",
     // Its `#[cfg(test)]` module builds a throwaway client (`Client::new`)
     // to exercise `refresh`. Inline test modules live in `src/`, so the
@@ -76,7 +75,7 @@ const ALLOWED: &[&str] = &[
 /// (`client_options.rs`, `connectors/gitlab/{client,events}.rs`,
 /// `connectors/linear/{events,issues}.rs`, `connectors/jira/{events,
 /// issues}.rs`, `connectors/github/{client,events}.rs`) are migrated onto
-/// `rupu_netflow::http::client_from`. None of them ever appeared in this
+/// `rupu_netflow::http::client_with`. None of them ever appeared in this
 /// list — this scanner never saw them (the blind spot above) — but they
 /// no longer trip the semantic `clippy::disallowed_methods` lint either
 /// (`cargo clippy -p rupu-scm --all-targets`, the authoritative check,
@@ -89,8 +88,8 @@ const ALLOWED: &[&str] = &[
 /// `crates/rupu-cli/src/cmd/cp.rs`'s test-only client and
 /// `crates/rupu-cp/src/host/http.rs`'s fleet-host `HttpHostConnector` (both
 /// constructors, `new` and `new_with_timeout`, now route through
-/// `rupu_netflow::http::client_from` with their existing timeout tuning
-/// preserved) — onto `rupu_netflow::http::client` / `client_from`. This
+/// `rupu_netflow::http::client_with` with their existing timeout tuning
+/// preserved) — onto `rupu_netflow::http::client_with`. This
 /// list is now empty; the authoritative check remains
 /// `cargo clippy --workspace --all-targets 2>&1 | grep disallowed`, not
 /// this constant.
@@ -180,7 +179,7 @@ fn no_raw_reqwest_client_outside_rupu_netflow() {
     assert!(
         offenders.is_empty(),
         "raw reqwest clients bypass netflow capture — route them through \
-         rupu_netflow::http::client / client_from instead:\n  {}",
+         rupu_netflow::http::client_with instead:\n  {}",
         offenders.join("\n  ")
     );
 }

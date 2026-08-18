@@ -494,6 +494,23 @@ pub struct ItemResult {
     pub transcript_path: PathBuf,
     pub output: String,
     pub success: bool,
+    /// `true` only for a panel gate's `fix_with:` fixer dispatch
+    /// (`run_panel_step`'s gate loop). Every other constructor of this
+    /// struct -- `for_each`/`parallel` units, panelists, joins, resume
+    /// reconstruction -- leaves this `false`. Exists so
+    /// `base_context_for_step` can exclude fixer dispatches from the
+    /// `results`/`sub_results` template surface it builds from a step's
+    /// `items` (the fixer's output already flows forward as the next
+    /// panel iteration's subject; it was never meant to additionally
+    /// appear as one more entry in a downstream step's `{{ steps.<id>.
+    /// results }}`) while the fixer's `run_id` still reaches
+    /// `step_results.jsonl` through the same `items` list CP's netflow
+    /// read side already unions run ids from. An explicit field rather
+    /// than sniffing `sub_id`'s `"fixer:iterN"` naming convention, which
+    /// would make template-context filtering silently depend on string
+    /// formatting chosen for an unrelated purpose (human-readable unit
+    /// labelling).
+    pub is_fixer: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3840,6 +3857,7 @@ fn drain_joins(
                 transcript_path: src.transcript_path.clone(),
                 output: src.output.clone(),
                 success: src.success,
+                is_fixer: false,
             });
         }
         let join_step = &wf.steps[j];
@@ -4604,21 +4622,32 @@ fn base_context_for_step(
     ctx.event = event.cloned();
     ctx.issue = issue.cloned();
     for sr in prior {
-        let results: Vec<String> = sr.items.iter().map(|i| i.output.clone()).collect();
-        let sub_results: std::collections::BTreeMap<String, crate::templates::SubResult> = sr
-            .items
-            .iter()
-            .filter(|i| !i.sub_id.is_empty())
-            .map(|i| {
-                (
-                    i.sub_id.clone(),
-                    crate::templates::SubResult {
-                        output: i.output.clone(),
-                        success: i.success,
-                    },
-                )
-            })
-            .collect();
+        // A panel gate's `fix_with:` fixer is recorded as an `ItemResult`
+        // so its own run id (and ledger-only Dropped count) reaches
+        // `step_results.jsonl` (see `run_panel_step`'s gate loop and
+        // `ItemResult::is_fixer`'s doc comment) -- but it is not one more
+        // parallel/for_each unit or panelist, and was never meant to
+        // additionally appear in a downstream step's `{{ steps.<id>.
+        // results }}`/`sub_results`: the fixer's output already flows
+        // forward as the NEXT panel iteration's subject, which is the
+        // only place it was ever meant to be visible. Excluding it here
+        // keeps this template surface byte-identical to what it was
+        // before the fixer started being recorded as an item at all.
+        let template_items = sr.items.iter().filter(|i| !i.is_fixer);
+        let results: Vec<String> = template_items.clone().map(|i| i.output.clone()).collect();
+        let sub_results: std::collections::BTreeMap<String, crate::templates::SubResult> =
+            template_items
+                .filter(|i| !i.sub_id.is_empty())
+                .map(|i| {
+                    (
+                        i.sub_id.clone(),
+                        crate::templates::SubResult {
+                            output: i.output.clone(),
+                            success: i.success,
+                        },
+                    )
+                })
+                .collect();
         ctx.steps.insert(
             sr.step_id.clone(),
             StepOutput {
@@ -6199,6 +6228,7 @@ async fn run_fanout_run_step(
                 transcript_path,
                 output,
                 success,
+                is_fixer: false,
             },
         ));
     }
@@ -6788,6 +6818,7 @@ async fn run_fanout_step(
                     transcript_path: o.transcript_path.clone(),
                     output: o.output.clone(),
                     success: true,
+                    is_fixer: false,
                 },
             );
         }
@@ -6812,6 +6843,7 @@ async fn run_fanout_step(
             transcript_path: o.transcript_path.clone(),
             output: o.output.clone(),
             success: o.success,
+            is_fixer: false,
         })
         .collect();
     items_vec.extend(resumed.into_values());
@@ -7014,6 +7046,7 @@ async fn run_parallel_step(
             transcript_path: o.transcript_path.clone(),
             output: o.output.clone(),
             success: o.success,
+            is_fixer: false,
         })
         .collect();
     let outputs: Vec<String> = items_vec.iter().map(|i| i.output.clone()).collect();
@@ -7363,7 +7396,17 @@ async fn run_panel_step(
     //      fixer's output becomes the next iteration's subject.
     let mut subject = initial_subject.clone();
     let mut iterations = 0u32;
-    let (final_pass, resolved) = loop {
+    // Every fixer dispatch across every iteration, in order. Each
+    // fixer mints its own run id (`dispatch_fixer`) independent of any
+    // panelist's — that id needs to reach the persisted `StepResult`
+    // the same way a panelist's does, or its ledger (and specifically
+    // its `Dropped` line, which has no transcript fallback) is
+    // unreachable from `step_results.jsonl`. Accumulated across ALL
+    // iterations, not just the final one, so an early iteration's
+    // fixer is not silently dropped the way an early iteration's
+    // panelist items already are (`final_pass.items` only).
+    let mut fixer_items: Vec<ItemResult> = Vec::new();
+    let (mut final_pass, resolved) = loop {
         iterations += 1;
         if let Some(sink) = opts.event_sink.as_ref() {
             sink.emit(
@@ -7423,23 +7466,62 @@ async fn run_panel_step(
         )
         .await?;
         match fixer_outcome {
-            FixerOutcome::Ok { output } => {
+            FixerOutcome::Ok {
+                output,
+                run_id,
+                transcript_path,
+            } => {
+                fixer_items.push(ItemResult {
+                    index: fixer_index,
+                    item: serde_json::Value::Null,
+                    sub_id: format!("fixer:iter{iterations}"),
+                    rendered_prompt: fixer_subject,
+                    run_id,
+                    transcript_path,
+                    output: output.clone(),
+                    success: true,
+                    is_fixer: true,
+                });
                 subject = output;
                 // Loop continues; pass is dropped — its findings are
                 // about to be addressed by the fixer.
             }
-            FixerOutcome::Failed(e) if !continue_on_error => {
+            FixerOutcome::Failed {
+                error,
+                run_id: _,
+                transcript_path: _,
+            } if !continue_on_error => {
+                // Aborting the whole step here (no `StepResult` is ever
+                // built or persisted on this path — same as any other
+                // hard failure), so there is nothing to record the
+                // fixer's id onto; recording it would be dead code.
                 return Err(RunWorkflowError::Agent {
                     step: format!("{}.fixer({})", step.id, gate.fix_with),
-                    source: e,
+                    source: error,
                 });
             }
-            FixerOutcome::Failed(e) => {
-                warn!(step = %step.id, error = %e, "fixer agent failed; tolerating via continue_on_error");
+            FixerOutcome::Failed {
+                error,
+                run_id,
+                transcript_path,
+            } => {
+                fixer_items.push(ItemResult {
+                    index: fixer_index,
+                    item: serde_json::Value::Null,
+                    sub_id: format!("fixer:iter{iterations}"),
+                    rendered_prompt: fixer_subject,
+                    run_id,
+                    transcript_path,
+                    output: error.to_string(),
+                    success: false,
+                    is_fixer: true,
+                });
+                warn!(step = %step.id, error = %error, "fixer agent failed; tolerating via continue_on_error");
                 break (pass, false);
             }
         }
     };
+    final_pass.items.extend(fixer_items);
 
     Ok(final_pass.into_step_result(step, &initial_subject, iterations, resolved))
 }
@@ -7499,10 +7581,22 @@ impl PanelPass {
     }
 }
 
-/// Outcome of one fixer-agent dispatch in the gate loop.
+/// Outcome of one fixer-agent dispatch in the gate loop. Carries the
+/// fixer's own minted `run_id`/`transcript_path` (see `dispatch_fixer`)
+/// on BOTH arms — even a failed fixer may have produced ledger traffic
+/// (and possibly a `Dropped` line) before it failed, so the caller needs
+/// the id in either case to record it as an `ItemResult`.
 enum FixerOutcome {
-    Ok { output: String },
-    Failed(RunError),
+    Ok {
+        output: String,
+        run_id: String,
+        transcript_path: PathBuf,
+    },
+    Failed {
+        error: RunError,
+        run_id: String,
+        transcript_path: PathBuf,
+    },
 }
 
 /// Render a structured prompt for the fixer agent given the current
@@ -7592,9 +7686,17 @@ async fn dispatch_fixer(
     match outcome {
         Ok(_) => {
             let output = read_final_assistant_text(&transcript_path, true, &run_id, &step.id);
-            Ok(FixerOutcome::Ok { output })
+            Ok(FixerOutcome::Ok {
+                output,
+                run_id,
+                transcript_path,
+            })
         }
-        Err(e) => Ok(FixerOutcome::Failed(e)),
+        Err(e) => Ok(FixerOutcome::Failed {
+            error: e,
+            run_id,
+            transcript_path,
+        }),
     }
 }
 
@@ -7810,6 +7912,7 @@ async fn run_panel_iteration(
             transcript_path: o.transcript_path.clone(),
             output: o.output.clone(),
             success: o.success,
+            is_fixer: false,
         })
         .collect();
     let success = items_vec.iter().all(|i| i.success);
@@ -9407,6 +9510,7 @@ steps:
                         transcript_path: cp.transcript_path.clone(),
                         output: cp.output.clone(),
                         success: true,
+                        is_fixer: false,
                     },
                 );
         }

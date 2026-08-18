@@ -228,7 +228,26 @@ async fn rebuild_opts_from_disk(
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
-    let mcp_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
+
+    // Netflow capture for this resumed run. This run's own linear steps
+    // write to the SAME `<transcripts>/<run_id>.jsonl` file (mirrors
+    // `DefaultStepFactory::build_opts_for_step`'s per-step ledger/
+    // transcript naming for a linear step, which reuses the workflow's own
+    // run id) — so this registry's sink and every step's own sink converge
+    // on the one ledger for this run. The writer handle is intentionally
+    // not held/shut down here: the sink Arc lives on inside `mcp_registry`
+    // (and every connector it hands out) for as long as the resumed run
+    // needs it, which is the same "drop the local handle, let the last
+    // sink holder's drop close the channel" pattern every other in-run
+    // sink build in this crate relies on.
+    let (netflow_sink, _netflow_handle) = crate::netflow_sink::for_run(
+        &global,
+        project_root.as_deref(),
+        run_id,
+        &transcripts.join(format!("{run_id}.jsonl")),
+    );
+    let mcp_registry =
+        Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink).await);
 
     // ISSUES.md I-24: precedence, most specific first — an explicit
     // `--mode` on the calling command (if one exists; `reject` has none),

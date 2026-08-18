@@ -43,6 +43,12 @@ pub struct GithubClient {
     /// `api.github.com`. Computed once at construction — `with_retry_octocrab`
     /// needs a `&str` per attempt and must not derive or leak one per call.
     host_label: String,
+    /// `octocrab` owns its own hyper/tower stack, so it never goes through
+    /// `rupu_netflow::http::client_with` for its main traffic — this is the
+    /// only client field that observes it, via the `Fidelity::Coarse` record
+    /// `retry_loop` writes directly. Also reused by `fetch_token_scopes` /
+    /// `graphql_json`, the two ad-hoc reqwest paths on this type.
+    sink: Arc<dyn rupu_netflow::FlowSink>,
 }
 
 struct CacheEntry {
@@ -53,7 +59,12 @@ struct CacheEntry {
 
 impl GithubClient {
     /// Convenience constructor with default `[scm.github]` options.
-    pub fn new(token: String, base_url: Option<String>, max_concurrency: Option<usize>) -> Self {
+    pub fn new(
+        token: String,
+        base_url: Option<String>,
+        max_concurrency: Option<usize>,
+        sink: Arc<dyn rupu_netflow::FlowSink>,
+    ) -> Self {
         Self::with_options(
             token,
             &ScmClientOptions {
@@ -61,12 +72,17 @@ impl GithubClient {
                 max_concurrency,
                 ..Default::default()
             },
+            sink,
         )
     }
 
     /// Build from resolved `[scm.github]` options — `base_url`,
     /// `max_concurrency`, `timeout_ms` (I-17), `clone_protocol` (I-16).
-    pub fn with_options(token: String, opts: &ScmClientOptions) -> Self {
+    pub fn with_options(
+        token: String,
+        opts: &ScmClientOptions,
+        sink: Arc<dyn rupu_netflow::FlowSink>,
+    ) -> Self {
         let graphql_url =
             graphql_url_for(opts.base_url.as_deref()).expect("valid github graphql url");
         let host_label = Url::parse(&graphql_url)
@@ -94,6 +110,7 @@ impl GithubClient {
             timeout: opts.timeout,
             clone_protocol: opts.clone_protocol,
             host_label,
+            sink,
         }
     }
 
@@ -159,15 +176,16 @@ impl GithubClient {
     /// typed builder API doesn't expose response headers cleanly, so
     /// this goes through reqwest directly.
     pub async fn fetch_token_scopes(&self) -> Option<Vec<String>> {
-        let http = rupu_netflow::http::client_from(
+        // Infallible w.r.t. this method's `Option` return — a client-build
+        // failure collapses to `None`, the same as every other failure path
+        // below (network error, non-2xx, missing header). No fallback to an
+        // uninstrumented client.
+        let http = rupu_netflow::http::client_with(
             rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm("github".into())),
             reqwest::Client::builder().timeout(self.timeout),
+            self.sink.clone(),
         )
-        .unwrap_or_else(|_| {
-            rupu_netflow::http::client(rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm(
-                "github".into(),
-            )))
-        });
+        .ok()?;
         let resp = http
             .get("https://api.github.com/user")
             .header(reqwest::header::USER_AGENT, "rupu/0")
@@ -210,15 +228,17 @@ impl GithubClient {
             let token = token.clone();
             async move {
                 let _permit = self.permit().await;
-                let http = rupu_netflow::http::client_from(
+                // `graphql_json` already returns `Result<_, ScmError>`, so a
+                // client-build failure propagates as a real error instead of
+                // falling back to an uninstrumented client.
+                let http = rupu_netflow::http::client_with(
                     rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm("github".into())),
                     reqwest::Client::builder().timeout(self.timeout),
+                    self.sink.clone(),
                 )
-                .unwrap_or_else(|_| {
-                    rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
-                        rupu_netflow::Origin::Scm("github".into()),
-                    ))
-                });
+                .map_err(|e| {
+                    ScmError::Transient(anyhow::anyhow!("github graphql client build: {e}"))
+                })?;
                 let resp = http
                     .post(&url)
                     .header(reqwest::header::USER_AGENT, "rupu/0")
@@ -275,7 +295,7 @@ impl GithubClient {
     ///
     /// Does NOT emit a netflow record per attempt. The one caller that
     /// uses this directly — `graphql_json` — already sends its request
-    /// through `rupu_netflow::http::client_from`, which records an
+    /// through `rupu_netflow::http::client_with`, which records an
     /// accurate `Fidelity::Http` entry per real send via the netflow
     /// middleware. Recording a second, less-precise `Coarse` entry here
     /// for the same connection would duplicate data, not complement it.
@@ -313,7 +333,7 @@ impl GithubClient {
             let attempt_started = Instant::now();
             let result = f().await;
             if record_coarse {
-                rupu_netflow::http::sink()
+                self.sink
                     .record(coarse_flow(
                         self.host_label(),
                         "*",
@@ -534,13 +554,16 @@ mod tests {
             ..Default::default()
         };
         let opts = ScmClientOptions::from_platform_config(Some(&cfg));
-        let c = GithubClient::with_options("ghp".into(), &opts);
+        let c = GithubClient::with_options("ghp".into(), &opts, Arc::new(rupu_netflow::NullSink));
         assert_eq!(c.clone_protocol(), CloneProtocol::Ssh);
         assert_eq!(c.timeout(), Duration::from_millis(4_000));
 
         // No [scm.github] table ⇒ documented defaults.
-        let d =
-            GithubClient::with_options("ghp".into(), &ScmClientOptions::from_platform_config(None));
+        let d = GithubClient::with_options(
+            "ghp".into(),
+            &ScmClientOptions::from_platform_config(None),
+            Arc::new(rupu_netflow::NullSink),
+        );
         assert_eq!(d.clone_protocol(), CloneProtocol::Https);
         assert_eq!(d.timeout(), Duration::from_millis(30_000));
     }
@@ -557,6 +580,7 @@ mod tests {
         let c = GithubClient::with_options(
             "ghp_secret".into(),
             &ScmClientOptions::from_platform_config(Some(&cfg)),
+            Arc::new(rupu_netflow::NullSink),
         );
         let url = crate::client_options::clone_url(
             "github.com",
@@ -587,7 +611,12 @@ mod tests {
             }));
         });
 
-        let client = GithubClient::new("ghp_test".into(), Some(server.base_url()), Some(2));
+        let client = GithubClient::new(
+            "ghp_test".into(),
+            Some(server.base_url()),
+            Some(2),
+            Arc::new(rupu_netflow::NullSink),
+        );
         let data = client
             .graphql_json(
                 "query Test($id: ID!) { node(id: $id) { __typename } }",

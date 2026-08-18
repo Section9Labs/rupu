@@ -170,7 +170,10 @@ async fn list_inner(args: ListArgs, global_format: Option<OutputFormat>) -> anyh
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg), project_cfg.as_deref())?;
 
     let resolver = rupu_auth::KeychainResolver::new();
-    let registry = Arc::new(Registry::discover(&resolver, &cfg).await);
+    // Bare read-only CLI command (`rupu repos list`), same shape as
+    // `issues.rs`'s `build_registry()` — run-less, per the approved spec.
+    let registry =
+        Arc::new(Registry::discover(&resolver, &cfg, Arc::new(rupu_netflow::NullSink)).await);
 
     let platforms: Vec<Platform> = match args.platform.as_deref() {
         Some(s) => vec![s.parse().map_err(|e: String| anyhow::anyhow!(e))?],

@@ -1,5 +1,7 @@
-// NetflowGraph — bipartite topology: sources (runs, or `system` for
-// unattributed egress) on the left, endpoints (`host:port`) on the right.
+// NetflowGraph — bipartite topology: sources (runs — one node per run id
+// the read side attributed a flow to; see ScopeDisclosure.tsx's Finding-4
+// note, there is no `system` fallback source any more) on the left,
+// endpoints (`host:port`) on the right.
 //
 // This is the honest alternative to a geographic map: nearly every endpoint
 // resolves to a CDN edge, so a country pin would show a PoP, not who was
@@ -35,10 +37,14 @@ import { netflowSystemSourceHint, type NetflowScope } from './ScopeDisclosure';
 
 export interface NetflowGraphProps {
   graph: GraphView;
-  /** Which Network tab this graph renders on — gates the empty-state hint's
-   *  "system" source examples the same way NetflowScopeDisclosure gates the
-   *  main disclosure (Fix 2, round 4): CP fleet traffic is only true at
-   *  global scope. See `netflowSystemSourceHint`'s doc comment. */
+  /** Which Network tab this graph renders on. Historically gated the
+   *  empty-state hint's "system" source examples the same way
+   *  NetflowScopeDisclosure gated the main disclosure (Fix 2, round 4: CP
+   *  fleet traffic; round 5: ASN refresh, both global-scope-only) — both
+   *  examples are gone now (netflow-per-run plan, Task 8), so there is
+   *  currently nothing left for `scope` to gate here. Kept on the prop so
+   *  a future genuinely scope-specific example doesn't need a signature
+   *  change to land. See `netflowSystemSourceHint`'s doc comment. */
   scope: NetflowScope;
   width?: number;
 }

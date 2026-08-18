@@ -341,12 +341,22 @@ async fn probe_one(name: &str, creds: rupu_providers::auth::AuthCredentials) -> 
             // `Authorization: Bearer` + the OAuth beta; stuffing an OAuth
             // token into the api-key constructor yields a 401 that would be
             // misreported as a bad credential (see `cmd/models.rs`).
+            // No run exists yet at this point — this is a fleet health
+            // probe (`rupu cp inventory`), not an agent run — so this
+            // traffic is deliberately not attributed to a ledger.
             let auth_method = creds.into_anthropic_auth_method();
-            rupu_providers::AnthropicClient::from_auth(auth_method)
-                .probe()
-                .await
+            rupu_providers::AnthropicClient::from_auth(
+                auth_method,
+                Arc::new(rupu_netflow::NullSink),
+            )
+            .probe()
+            .await
         }
-        "openai" => match rupu_providers::OpenAiCodexClient::new(creds, None) {
+        "openai" => match rupu_providers::OpenAiCodexClient::new(
+            creds,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        ) {
             Ok(c) => c.probe().await,
             Err(e) => Err(e),
         },
@@ -354,11 +364,16 @@ async fn probe_one(name: &str, creds: rupu_providers::auth::AuthCredentials) -> 
             creds,
             rupu_providers::google_gemini::GeminiVariant::GeminiCli,
             None,
+            Arc::new(rupu_netflow::NullSink),
         ) {
             Ok(c) => c.probe().await,
             Err(e) => Err(e),
         },
-        "copilot" => match rupu_providers::GithubCopilotClient::new(creds, None) {
+        "copilot" => match rupu_providers::GithubCopilotClient::new(
+            creds,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        ) {
             Ok(c) => c.probe().await,
             Err(e) => Err(e),
         },

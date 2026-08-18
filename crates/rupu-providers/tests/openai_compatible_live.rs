@@ -14,11 +14,19 @@ async fn live_non_streaming_completion() {
     let key = std::env::var("RUPU_LIVE_OAI_KEY").expect("RUPU_LIVE_OAI_KEY");
     let model = std::env::var("RUPU_LIVE_OAI_MODEL").expect("RUPU_LIVE_OAI_MODEL");
 
-    let mut client =
-        rupu_providers::OpenAiCompatibleClient::new(&base, &key, &model, vec![], false);
+    let mut client = rupu_providers::OpenAiCompatibleClient::new(
+        &base,
+        &key,
+        &model,
+        vec![],
+        false,
+        std::sync::Arc::new(rupu_netflow::NullSink),
+    );
     let req = LlmRequest {
         model: model.clone(),
-        messages: vec![Message::user("What is 17 * 23? Reply with just the number.")],
+        messages: vec![Message::user(
+            "What is 17 * 23? Reply with just the number.",
+        )],
         max_tokens: 64,
         ..Default::default()
     };

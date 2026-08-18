@@ -48,7 +48,12 @@ struct CacheEntry {
 
 impl GitlabClient {
     /// Convenience constructor with default `[scm.gitlab]` options.
-    pub fn new(token: String, base_url: Option<String>, max_concurrency: Option<usize>) -> Self {
+    pub fn new(
+        token: String,
+        base_url: Option<String>,
+        max_concurrency: Option<usize>,
+        sink: Arc<dyn rupu_netflow::FlowSink>,
+    ) -> Self {
         Self::with_options(
             token,
             &ScmClientOptions {
@@ -56,22 +61,29 @@ impl GitlabClient {
                 max_concurrency,
                 ..Default::default()
             },
+            sink,
         )
     }
 
     /// Build from resolved `[scm.gitlab]` options — `base_url`,
     /// `max_concurrency`, `timeout_ms` (I-17, previously hardcoded 30s),
     /// `clone_protocol` (I-16).
-    pub fn with_options(token: String, opts: &ScmClientOptions) -> Self {
+    pub fn with_options(
+        token: String,
+        opts: &ScmClientOptions,
+        sink: Arc<dyn rupu_netflow::FlowSink>,
+    ) -> Self {
         let base = opts
             .base_url
             .clone()
             .unwrap_or_else(|| "https://gitlab.com/api/v4".to_string());
-        let http = opts.netflow_client("gitlab").unwrap_or_else(|_| {
-            rupu_netflow::http::client(rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm(
-                "gitlab".into(),
-            )))
-        });
+        // `with_options` is infallible (`-> Self`); a client-build failure here
+        // preserves the deleted `http::client()` fallback's panic-on-failure
+        // behaviour rather than silently falling back to an uninstrumented
+        // client (there is no such fallback any more).
+        let http = opts
+            .netflow_client("gitlab", sink)
+            .expect("gitlab netflow client build");
         let semaphore = concurrency::semaphore_for("gitlab", opts.max_concurrency);
         let cache = Arc::new(Mutex::new(LruCache::new(
             NonZeroUsize::new(CACHE_CAP).unwrap(),

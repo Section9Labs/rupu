@@ -197,8 +197,16 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
     let token_url = std::env::var("RUPU_OAUTH_TOKEN_URL_OVERRIDE")
         .unwrap_or_else(|_| oauth.token_url.to_string());
 
-    let client =
-        rupu_netflow::http::client(rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System));
+    // `Arc::new(NullSink)`, deliberately: auth/OAuth traffic is out of
+    // netflow's scope by matt's explicit ruling — "I do not care about
+    // update or login" — not a stopgap pending further wiring. See
+    // `resolver.rs`'s `refresh_inner` doc comment for the same ruling
+    // stated at its call site; there is no further wiring planned here.
+    let client = rupu_netflow::http::client_with(
+        rupu_netflow::FlowCtx::system(rupu_netflow::Origin::System),
+        reqwest::Client::builder(),
+        std::sync::Arc::new(rupu_netflow::NullSink),
+    )?;
     let mut params: Vec<(&str, String)> = vec![
         ("grant_type", "authorization_code".into()),
         ("code", code.clone()),

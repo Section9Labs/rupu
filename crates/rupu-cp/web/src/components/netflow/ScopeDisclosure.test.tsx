@@ -7,6 +7,20 @@
 // updater" entirely; scoped "CP fleet traffic" to global only) — this file
 // is the regression guard so a future copy edit can't silently reintroduce
 // either defect.
+//
+// netflow-per-run plan, Task 8: "CP fleet traffic" came out entirely —
+// `Origin::Cp` is wired to a `NullSink` (`HttpHostConnector`,
+// `crates/rupu-cp/src/host/http.rs`) and is recorded nowhere, at any
+// scope, so the global-only carve-out below is gone too. Every assertion
+// that used to check "global scope claims it, the other two don't" now
+// checks "no scope claims it."
+//
+// Same file, same pass, on review: "ASN refresh" turned out to be the
+// identical defect — `cmd/cp.rs`'s sweep AND `maybe_refresh_asn` both
+// build their download client with `NullSink` too, so it is equally
+// unrecorded at every scope, global included. Its assertions below were
+// updated the same way, not left as the one example that still claims
+// global-only visibility.
 
 import '@testing-library/jest-dom/vitest';
 import { render, screen, cleanup } from '@testing-library/react';
@@ -14,6 +28,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   NetflowScopeDisclosure,
   netflowCoverageList,
+  netflowEmptyStateHint,
   netflowSystemSourceHint,
   type NetflowScope,
 } from './ScopeDisclosure';
@@ -25,16 +40,12 @@ afterEach(() => {
 const SCOPES: NetflowScope[] = ['run', 'project', 'global'];
 
 describe('netflowCoverageList', () => {
-  it('includes CP fleet traffic ONLY for global scope', () => {
-    // Blocker 1: `Origin::Cp` flows live only in the CP daemon's global
-    // ledger (Fix 1) — never unioned into project scope, never
-    // attributable to a single run. The coverage-LIST fragment (as opposed
-    // to the pointer sentence that also legitimately names "CP fleet
-    // traffic" when explaining where it went) must not claim it anywhere
-    // else.
-    expect(netflowCoverageList('project')).not.toMatch(/CP fleet traffic/i);
-    expect(netflowCoverageList('run')).not.toMatch(/CP fleet traffic/i);
-    expect(netflowCoverageList('global')).toMatch(/CP fleet traffic/i);
+  it.each(SCOPES)('never claims CP fleet traffic at %s scope', (scope) => {
+    // `Origin::Cp` (`HttpHostConnector`'s fleet HTTP traffic) is wired to
+    // `NullSink` and recorded nowhere — not even at global scope anymore,
+    // now that the CP daemon no longer installs a persistent process-wide
+    // ledger at startup. No scope may claim it.
+    expect(netflowCoverageList(scope)).not.toMatch(/CP fleet traffic/i);
   });
 
   it.each(SCOPES)('never claims the updater at %s scope', (scope) => {
@@ -51,31 +62,47 @@ describe('netflowCoverageList', () => {
   });
 });
 
+describe('netflowEmptyStateHint', () => {
+  // Blocker 1, whole-branch review: nothing creates
+  // `<workspace>/.rupu/netflow/` on `rupu init`, so on a default install a
+  // project's own scope is empty even for a project with real, captured
+  // runs — the flows landed at global scope instead. Only project scope's
+  // hint may point the operator at the global Network view; run and
+  // global scope have no such gap to disclose.
+  it.each(SCOPES)('names the global-scope fallback only at project scope, not %s', (scope) => {
+    if (scope === 'project') {
+      expect(netflowEmptyStateHint(scope)).toMatch(/global scope/i);
+    } else {
+      expect(netflowEmptyStateHint(scope)).not.toMatch(/global scope/i);
+    }
+  });
+});
+
 describe('netflowSystemSourceHint', () => {
-  it('includes ASN refresh and CP fleet traffic ONLY for global scope', () => {
-    // Round 5: the same defect as Blocker 1, one example over — every
-    // `Origin::System` ASN-refresh download resolves the sink `cp serve`
-    // installs at startup (always the daemon's global-only ledger); there
-    // is no other `asn::refresh` call site, so it can never appear at
-    // project or run scope either. Guarding both strings in one test keeps
-    // them from drifting apart the way round 4 -> round 5 just showed they
-    // can.
-    expect(netflowSystemSourceHint('project')).not.toMatch(/ASN refresh/i);
-    expect(netflowSystemSourceHint('project')).not.toMatch(/CP fleet traffic/i);
-    expect(netflowSystemSourceHint('run')).not.toMatch(/ASN refresh/i);
-    expect(netflowSystemSourceHint('run')).not.toMatch(/CP fleet traffic/i);
-    expect(netflowSystemSourceHint('global')).toMatch(/ASN refresh/i);
-    expect(netflowSystemSourceHint('global')).toMatch(/CP fleet traffic/i);
+  it.each(SCOPES)('never claims CP fleet traffic at %s scope', (scope) => {
+    // Task 8: "CP fleet traffic" is gone from this example list
+    // entirely — see the file header note above.
+    expect(netflowSystemSourceHint(scope)).not.toMatch(/CP fleet traffic/i);
   });
 
-  it.each(SCOPES)('still names `system` as a source at %s scope', (scope) => {
-    // The scope-gated piece is the PARENTHETICAL EXAMPLE, not the "or
-    // system for unattributed egress" clause itself — `Origin::System`
-    // also covers auth/oauth token exchange, which genuinely can reach
-    // project scope (the project's own ledger) and run scope (the run's
-    // own transcript). Dropping the whole clause at those scopes would
-    // overcorrect into a different inaccuracy.
-    expect(netflowSystemSourceHint(scope)).toMatch(/system for unattributed egress/i);
+  it.each(SCOPES)('never claims ASN refresh at %s scope', (scope) => {
+    // `Origin::System` ASN-refresh downloads are wired to `NullSink` at
+    // both call sites (`cmd/cp.rs`'s sweep, this crate's own
+    // `maybe_refresh_asn`) — recorded nowhere, at any scope, global
+    // included. Previously (round 5) this was claimed at global scope
+    // only; that carve-out is gone along with the claim.
+    expect(netflowSystemSourceHint(scope)).not.toMatch(/ASN refresh/i);
+  });
+
+  it.each(SCOPES)('no longer claims a `system` fallback source at %s scope', (scope) => {
+    // Finding 4, whole-branch review: `graph_view` used to derive the
+    // source id from `f.ctx.run_id`, which no production `FlowCtx` ever
+    // populates, so every graph collapsed to one node literally called
+    // `system`. The read side now passes the owning run id in explicitly
+    // (the ledger file's own name), so every source is a real run id and
+    // there is no more "unattributed" fallback case to name here.
+    expect(netflowSystemSourceHint(scope)).not.toMatch(/system for unattributed egress/i);
+    expect(netflowSystemSourceHint(scope)).toMatch(/runs/i);
   });
 });
 
@@ -91,17 +118,13 @@ describe('NetflowScopeDisclosure', () => {
     expect(screen.queryByText(/updater/i)).not.toBeInTheDocument();
   });
 
-  it('points project/run viewers at the global page for CP fleet traffic', () => {
-    render(<NetflowScopeDisclosure scope="project" />);
-    expect(screen.getByText(/global Network page only/i)).toBeInTheDocument();
-    cleanup();
-
-    render(<NetflowScopeDisclosure scope="run" />);
-    expect(screen.getByText(/global Network page only/i)).toBeInTheDocument();
-    cleanup();
-
-    // Global scope already shows the real thing — no pointer note needed.
-    render(<NetflowScopeDisclosure scope="global" />);
+  it.each(SCOPES)('never claims CP fleet traffic at %s scope', (scope) => {
+    // Task 8: the pointer sentence ("CP fleet traffic appears on the
+    // global Network page only") is gone along with the claim it used to
+    // qualify — `Origin::Cp` is recorded nowhere, so there is no page to
+    // point a project/run viewer at anymore.
+    render(<NetflowScopeDisclosure scope={scope} />);
+    expect(screen.queryByText(/CP fleet traffic/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/global Network page only/i)).not.toBeInTheDocument();
   });
 });

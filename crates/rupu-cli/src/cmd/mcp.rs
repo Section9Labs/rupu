@@ -49,7 +49,14 @@ async fn serve_inner(args: ServeArgs) -> anyhow::Result<()> {
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg), project_cfg.as_deref())?;
 
     let resolver = rupu_auth::KeychainResolver::new();
-    let registry = Arc::new(Registry::discover(&resolver, &cfg).await);
+    // `rupu mcp serve` is a long-lived daemon that builds one registry at
+    // startup and serves every future external MCP client request through
+    // it (Claude Desktop, Cursor, ...) — there's no rupu run id to attach
+    // to any of this traffic. No run exists yet at this point, so this SCM
+    // traffic is not attributed to a ledger. A run-routing FlowSink would
+    // close this; see the netflow per-run plan.
+    let registry =
+        Arc::new(Registry::discover(&resolver, &cfg, Arc::new(rupu_netflow::NullSink)).await);
 
     // External-client mode: trust the upstream client's permission UX.
     // Bypass mode + allow-all listing — Claude Desktop / Cursor handle

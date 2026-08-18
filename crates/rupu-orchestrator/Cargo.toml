@@ -31,6 +31,7 @@ rupu-agent = { path = "../rupu-agent" }
 rupu-auth = { path = "../rupu-auth" }
 rupu-config = { path = "../rupu-config" }
 rupu-mcp = { path = "../rupu-mcp" }
+rupu-netflow = { workspace = true }
 rupu-providers = { path = "../rupu-providers" }
 rupu-runtime = { path = "../rupu-runtime" }
 rupu-scm = { path = "../rupu-scm" }

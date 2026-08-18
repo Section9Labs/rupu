@@ -172,12 +172,24 @@ pub async fn generate_definition(
     // `org_id` / `region` settings — the same silent-dead-config class Arc 1
     // fixed everywhere else (see I-8, the identical defect in
     // `dispatch_agent`).
+    //
+    // Netflow sink: `Arc::new(NullSink)`, deliberately. Definition
+    // generation is invoked from three call sites (`cp_definition_
+    // generator.rs`, `cmd/workflow.rs`'s `generate` subcommand,
+    // `cmd/agent.rs`'s `generate` subcommand) and none of them are inside
+    // an agent run — there is no run id, no transcript, nothing to
+    // attribute this inference call to. It is its own standalone
+    // "generate a definition" operation, not a step of a run in
+    // progress. If a caller is ever added that DOES run this from inside
+    // an active run, thread that run's sink through instead of reaching
+    // for NullSink here.
     let (_mode, mut provider) = build_for_provider_with_config(
         &req.provider,
         &req.model,
         None,
         resolver,
         provider_config,
+        std::sync::Arc::new(rupu_netflow::NullSink),
     )
     .await
     .map_err(|_| GenerateError::NoCredentials)?;

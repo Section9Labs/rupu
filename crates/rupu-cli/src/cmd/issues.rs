@@ -493,7 +493,8 @@ async fn build_registry() -> anyhow::Result<(
     let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files_locked(Some(&global_cfg), project_cfg.as_deref())?;
     let resolver = rupu_auth::KeychainResolver::new();
-    let registry = Arc::new(Registry::discover(&resolver, &cfg).await);
+    let registry =
+        Arc::new(Registry::discover(&resolver, &cfg, Arc::new(rupu_netflow::NullSink)).await);
     Ok((registry, global, project_root, cfg))
 }
 
@@ -943,11 +944,8 @@ mod tests {
             owner: "acme".into(),
             repo: "widgets".into(),
         };
-        let r = resolve_repo_or_autodetect(
-            Some("github:Section9Labs/rupu"),
-            Some(configured),
-        )
-        .unwrap();
+        let r =
+            resolve_repo_or_autodetect(Some("github:Section9Labs/rupu"), Some(configured)).unwrap();
         assert_eq!(r.platform, Platform::Github);
         assert_eq!(r.owner, "Section9Labs");
         assert_eq!(r.repo, "rupu");

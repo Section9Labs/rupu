@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest_middleware::ClientWithMiddleware;
@@ -21,14 +22,26 @@ const AI_STUDIO_ENDPOINT: &str = "https://generativelanguage.googleapis.com";
 
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
-/// Default netflow-instrumented client. No run context is available at
-/// construction — stamped `FlowCtx::system(Origin::Provider("gemini"))`.
-/// `with_tuning` (the path every factory-built client goes through) rebuilds
-/// this with the configured timeout via `client_from`.
-fn gemini_http_client() -> ClientWithMiddleware {
-    rupu_netflow::http::client(rupu_netflow::FlowCtx::system(
-        rupu_netflow::Origin::Provider("gemini".into()),
-    ))
+/// Netflow-instrumented client bound to `sink`. No run context is
+/// available at construction — stamped
+/// `FlowCtx::system(Origin::Provider("gemini"))`. `with_tuning` (the
+/// path every factory-built client goes through) rebuilds this with the
+/// configured timeout via `client_with`, reusing the same sink.
+///
+/// Fallible rather than panicking: `client_with`'s only failure mode is
+/// `builder.build()` (TLS backend / resolver init), an environment
+/// condition a long-lived daemon (`rupu cp serve`) can genuinely hit per
+/// run. `new` already returns `Result`, so this propagates via `?`
+/// instead of aborting the process.
+fn gemini_http_client(
+    sink: Arc<dyn rupu_netflow::FlowSink>,
+) -> Result<ClientWithMiddleware, ProviderError> {
+    let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider("gemini".into()));
+    Ok(rupu_netflow::http::client_with(
+        ctx,
+        reqwest::Client::builder(),
+        sink,
+    )?)
 }
 
 /// Canonical provider tag stamped on Reasoning blocks; gates the replay.
@@ -117,6 +130,9 @@ impl GeminiVariant {
 /// Shared implementation for both Gemini CLI and Antigravity variants.
 pub struct GoogleGeminiClient {
     client: ClientWithMiddleware,
+    /// The exact sink `client` was bound to, so `with_tuning`'s rebuild
+    /// keeps using the same run's sink. See `AnthropicClient`'s `sink`.
+    sink: Arc<dyn rupu_netflow::FlowSink>,
     variant: GeminiVariant,
     access_token: String,
     refresh_token: String,
@@ -133,7 +149,9 @@ impl GoogleGeminiClient {
     /// in place rather than panicking on user-supplied config.
     pub fn with_tuning(mut self, tuning: &crate::tuning::ProviderTuning) -> Self {
         let ctx = rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Provider("gemini".into()));
-        if let Ok(client) = rupu_netflow::http::client_from(ctx, tuning.http_client_builder()) {
+        if let Ok(client) =
+            rupu_netflow::http::client_with(ctx, tuning.http_client_builder(), self.sink.clone())
+        {
             self.client = client;
         }
         self
@@ -148,10 +166,14 @@ impl GoogleGeminiClient {
     /// - `AiStudio` requires `ApiKey` credentials. The api-key is
     ///   stored in `access_token` and `refresh_token` is empty so
     ///   `ensure_valid_token` never tries to refresh.
+    ///
+    /// `sink` is the run's netflow sink; there is no process-global
+    /// fallback.
     pub fn new(
         creds: AuthCredentials,
         variant: GeminiVariant,
         auth_json_path: Option<PathBuf>,
+        sink: Arc<dyn rupu_netflow::FlowSink>,
     ) -> Result<Self, ProviderError> {
         match (creds, variant) {
             (
@@ -170,7 +192,8 @@ impl GoogleGeminiClient {
                     .to_string();
 
                 Ok(Self {
-                    client: gemini_http_client(),
+                    client: gemini_http_client(sink.clone())?,
+                    sink,
                     variant,
                     access_token: access,
                     refresh_token: refresh,
@@ -180,7 +203,8 @@ impl GoogleGeminiClient {
                 })
             }
             (AuthCredentials::ApiKey { key, .. }, GeminiVariant::AiStudio) => Ok(Self {
-                client: gemini_http_client(),
+                client: gemini_http_client(sink.clone())?,
+                sink,
                 variant,
                 access_token: key,
                 refresh_token: String::new(),
@@ -1006,18 +1030,26 @@ mod tests {
 
     #[test]
     fn test_new_gemini_cli() {
-        let client =
-            GoogleGeminiClient::new(test_creds("my-project"), GeminiVariant::GeminiCli, None)
-                .unwrap();
+        let client = GoogleGeminiClient::new(
+            test_creds("my-project"),
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
         assert_eq!(client.project_id, "my-project");
         assert_eq!(client.variant, GeminiVariant::GeminiCli);
     }
 
     #[test]
     fn test_new_antigravity() {
-        let client =
-            GoogleGeminiClient::new(test_creds("ag-project"), GeminiVariant::Antigravity, None)
-                .unwrap();
+        let client = GoogleGeminiClient::new(
+            test_creds("ag-project"),
+            GeminiVariant::Antigravity,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
         assert_eq!(client.project_id, "ag-project");
         assert_eq!(client.variant, GeminiVariant::Antigravity);
     }
@@ -1027,7 +1059,12 @@ mod tests {
         let creds = AuthCredentials::ApiKey {
             key: "sk-test".into(),
         };
-        let result = GoogleGeminiClient::new(creds, GeminiVariant::GeminiCli, None);
+        let result = GoogleGeminiClient::new(
+            creds,
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        );
         match result {
             Err(e) => assert!(
                 e.to_string().contains("OAuth"),
@@ -1039,8 +1076,13 @@ mod tests {
 
     #[test]
     fn test_build_request_body_basic() {
-        let client =
-            GoogleGeminiClient::new(test_creds("proj"), GeminiVariant::GeminiCli, None).unwrap();
+        let client = GoogleGeminiClient::new(
+            test_creds("proj"),
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
 
         let request = LlmRequest {
             model: "gemini-2.5-pro".into(),
@@ -1076,8 +1118,13 @@ mod tests {
 
     #[test]
     fn test_build_request_body_antigravity_user_agent() {
-        let client =
-            GoogleGeminiClient::new(test_creds("proj"), GeminiVariant::Antigravity, None).unwrap();
+        let client = GoogleGeminiClient::new(
+            test_creds("proj"),
+            GeminiVariant::Antigravity,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
 
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
@@ -1103,8 +1150,13 @@ mod tests {
 
     #[test]
     fn test_build_request_body_with_tools() {
-        let client =
-            GoogleGeminiClient::new(test_creds("proj"), GeminiVariant::GeminiCli, None).unwrap();
+        let client = GoogleGeminiClient::new(
+            test_creds("proj"),
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
 
         let request = LlmRequest {
             model: "gemini-2.5-pro".into(),
@@ -1138,8 +1190,13 @@ mod tests {
 
     #[test]
     fn test_build_request_body_with_thinking() {
-        let client =
-            GoogleGeminiClient::new(test_creds("proj"), GeminiVariant::GeminiCli, None).unwrap();
+        let client = GoogleGeminiClient::new(
+            test_creds("proj"),
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
 
         let request = LlmRequest {
             model: "gemini-2.5-pro".into(),
@@ -1173,8 +1230,13 @@ mod tests {
 
     #[test]
     fn test_build_request_body_thinking_max_clamped() {
-        let client =
-            GoogleGeminiClient::new(test_creds("proj"), GeminiVariant::GeminiCli, None).unwrap();
+        let client = GoogleGeminiClient::new(
+            test_creds("proj"),
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
 
         let request = LlmRequest {
             model: "gemini-2.5-pro".into(),
@@ -1205,8 +1267,13 @@ mod tests {
 
     #[test]
     fn test_build_request_body_thinking_gemini_3_uses_level_not_budget() {
-        let client =
-            GoogleGeminiClient::new(test_creds("proj"), GeminiVariant::GeminiCli, None).unwrap();
+        let client = GoogleGeminiClient::new(
+            test_creds("proj"),
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
 
         let request = LlmRequest {
             model: "gemini-3-pro-preview".into(),
@@ -1241,8 +1308,13 @@ mod tests {
     fn test_thinking_config_never_sends_both_keys() {
         // Mutual exclusion is the invariant worth pinning: whichever model
         // family, thinkingLevel and thinkingBudget must never co-occur.
-        let client =
-            GoogleGeminiClient::new(test_creds("proj"), GeminiVariant::GeminiCli, None).unwrap();
+        let client = GoogleGeminiClient::new(
+            test_creds("proj"),
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
 
         for model in ["gemini-2.5-pro", "gemini-3-pro-preview"] {
             for level in [
@@ -1984,8 +2056,13 @@ mod tests {
 
     #[test]
     fn test_stream_url() {
-        let client =
-            GoogleGeminiClient::new(test_creds("proj"), GeminiVariant::GeminiCli, None).unwrap();
+        let client = GoogleGeminiClient::new(
+            test_creds("proj"),
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
         assert!(client
             .build_stream_url("gemini-2.5-pro")
             .contains("streamGenerateContent"));
@@ -1999,7 +2076,13 @@ mod tests {
         let key_creds = AuthCredentials::ApiKey {
             key: "AIzaSy-test".into(),
         };
-        let client = GoogleGeminiClient::new(key_creds, GeminiVariant::AiStudio, None).unwrap();
+        let client = GoogleGeminiClient::new(
+            key_creds,
+            GeminiVariant::AiStudio,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
         let url = client.build_url("gemini-2.5-pro");
         assert!(
             url.contains("generativelanguage.googleapis.com")
@@ -2015,7 +2098,13 @@ mod tests {
         let key_creds = AuthCredentials::ApiKey {
             key: "AIzaSy-key".into(),
         };
-        let client = GoogleGeminiClient::new(key_creds, GeminiVariant::AiStudio, None).unwrap();
+        let client = GoogleGeminiClient::new(
+            key_creds,
+            GeminiVariant::AiStudio,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
         let headers = client.build_headers().unwrap();
         assert_eq!(
             headers.get("x-goog-api-key").unwrap().to_str().unwrap(),
@@ -2032,7 +2121,12 @@ mod tests {
             expires: 0,
             extra: HashMap::new(),
         };
-        let result = GoogleGeminiClient::new(oauth_creds, GeminiVariant::AiStudio, None);
+        let result = GoogleGeminiClient::new(
+            oauth_creds,
+            GeminiVariant::AiStudio,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        );
         let err = result.err().expect("AI Studio + OAuth should fail");
         match err {
             ProviderError::AuthConfig(msg) => {
@@ -2048,14 +2142,24 @@ mod tests {
     #[test]
     fn cloud_code_assist_still_rejects_api_key() {
         let key_creds = AuthCredentials::ApiKey { key: "k".into() };
-        let result = GoogleGeminiClient::new(key_creds, GeminiVariant::GeminiCli, None);
+        let result = GoogleGeminiClient::new(
+            key_creds,
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        );
         assert!(matches!(result, Err(ProviderError::AuthConfig(_))));
     }
 
     #[test]
     fn test_thinking_levels() {
-        let client =
-            GoogleGeminiClient::new(test_creds("proj"), GeminiVariant::GeminiCli, None).unwrap();
+        let client = GoogleGeminiClient::new(
+            test_creds("proj"),
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
 
         for (level, expected_budget) in [
             (crate::model_tier::ThinkingLevel::Minimal, 128),
@@ -2136,8 +2240,13 @@ mod llm_provider_impl_tests {
 
     #[test]
     fn implements_llm_provider_trait() {
-        let client =
-            GoogleGeminiClient::new(oauth_creds(), GeminiVariant::GeminiCli, None).expect("new");
+        let client = GoogleGeminiClient::new(
+            oauth_creds(),
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .expect("new");
         let boxed: Box<dyn LlmProvider> = Box::new(client);
         assert_eq!(boxed.provider_id(), ProviderId::GoogleGeminiCli);
         assert!(!boxed.default_model().is_empty());
@@ -2150,8 +2259,13 @@ mod llm_provider_impl_tests {
         // (see TODO.md). Until then, list_models defaults to empty and the
         // ModelRegistry's baked-in fallback (Plan 3 Task 5) provides a
         // curated v0 list.
-        let client =
-            GoogleGeminiClient::new(oauth_creds(), GeminiVariant::GeminiCli, None).unwrap();
+        let client = GoogleGeminiClient::new(
+            oauth_creds(),
+            GeminiVariant::GeminiCli,
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
         let models = <GoogleGeminiClient as LlmProvider>::list_models(&client).await;
         assert!(
             models.is_empty(),
