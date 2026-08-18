@@ -383,6 +383,31 @@ async fn two_sequential_rupu_run_invocations_in_one_process_get_separate_ledgers
 /// Strips write permission from the ledger directory so `remove_file`
 /// fails deterministically for the one eligible ledger inside it, then
 /// asserts BOTH halves of requirement 4: the process exits non-zero,
+/// Can this process actually be denied by directory permissions? Root
+/// holds `CAP_DAC_OVERRIDE`, so stripping write permission from a parent
+/// directory does not stop `remove_file` — and CI runs as root, which is
+/// where this first bit. Probe by attempting the operation rather than
+/// reading the uid: `geteuid` needs `libc` and `unsafe`, forbidden
+/// workspace-wide, and the probe answers whether the denial is enforced
+/// *here* rather than a proxy for it.
+#[cfg(unix)]
+fn permission_denial_is_enforced() -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let probe = assert_fs::TempDir::new().unwrap();
+    let dir = probe.path();
+    let victim = dir.join("probe.jsonl");
+    std::fs::write(&victim, "{}\n").unwrap();
+
+    let original = std::fs::metadata(dir).unwrap().permissions();
+    let mut locked = original.clone();
+    locked.set_mode(0o555);
+    std::fs::set_permissions(dir, locked).unwrap();
+    let denied = std::fs::remove_file(&victim).is_err();
+    std::fs::set_permissions(dir, original).unwrap();
+    denied
+}
+
 /// AND the report (naming the failed ledger) was still printed to
 /// stdout before that exit — a failure must not look like silence.
 #[cfg(unix)]
@@ -391,6 +416,15 @@ async fn prune_reports_a_removal_failure_and_exits_non_zero() {
     use std::os::unix::fs::PermissionsExt;
 
     let _guard = ENV_LOCK.lock().await;
+
+    if !permission_denial_is_enforced() {
+        eprintln!(
+            "skipping prune_reports_a_removal_failure_and_exits_non_zero: this process can \
+             bypass directory permissions (running as root?), so the removal cannot be made \
+             to fail and the non-zero-exit assertion would be vacuous"
+        );
+        return;
+    }
 
     let tmp = assert_fs::TempDir::new().unwrap();
     let global = tmp.child(".rupu");
@@ -490,7 +524,14 @@ async fn prune_sweeps_both_a_distinct_project_local_root_and_the_global_root() {
         .unwrap()
         .env("RUPU_HOME", home.path().join(".rupu"))
         .current_dir(project_dir.path())
-        .args(["--format", "json", "netflow", "prune", "--older-than", "30d"])
+        .args([
+            "--format",
+            "json",
+            "netflow",
+            "prune",
+            "--older-than",
+            "30d",
+        ])
         .output()
         .unwrap();
 
@@ -522,10 +563,7 @@ async fn prune_sweeps_both_a_distinct_project_local_root_and_the_global_root() {
         !project_ledger.exists(),
         "the project-local ledger must be removed"
     );
-    assert!(
-        !global_ledger.exists(),
-        "the global ledger must be removed"
-    );
+    assert!(!global_ledger.exists(), "the global ledger must be removed");
 }
 
 /// Important 1 (netflow-per-run Plan 3 Task 2 review round 2): when

@@ -672,6 +672,38 @@ mod tests {
         file.set_modified(then).unwrap();
     }
 
+    /// Can this process actually be denied by directory permissions?
+    ///
+    /// The two failure-path tests below force `EACCES` by stripping write
+    /// or search permission from a ledger's parent directory. That only
+    /// works unprivileged: root holds `CAP_DAC_OVERRIDE`, so `remove_file`
+    /// and `metadata` succeed anyway and the tests would assert on errors
+    /// that never happened. CI runs as root, which is exactly where they
+    /// first failed.
+    ///
+    /// Probe by attempting the operation rather than reading the uid —
+    /// `geteuid` needs `libc` and `unsafe`, which is forbidden
+    /// workspace-wide, and the probe answers the question that actually
+    /// matters (is the denial enforced *here*) rather than a proxy for it.
+    #[cfg(unix)]
+    fn permission_denial_is_enforced() -> bool {
+        use std::os::unix::fs::PermissionsExt;
+
+        let probe = tempfile::TempDir::new().unwrap();
+        let dir = probe.path();
+        let victim = dir.join("probe.jsonl");
+        std::fs::write(&victim, "{}\n").unwrap();
+
+        let original = std::fs::metadata(dir).unwrap().permissions();
+        let mut locked = original.clone();
+        locked.set_mode(0o555);
+        std::fs::set_permissions(dir, locked).unwrap();
+        let denied = std::fs::remove_file(&victim).is_err();
+        // Restore before the TempDir drops, or its own cleanup fails.
+        std::fs::set_permissions(dir, original).unwrap();
+        denied
+    }
+
     #[test]
     fn run_id_from_ledger_path_uses_a_sentinel_for_a_non_jsonl_path() {
         // Minor 3 (netflow-per-run Plan 3 Task 2 review round 2): a
@@ -833,6 +865,15 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::TempDir::new().unwrap();
+        if !permission_denial_is_enforced() {
+            eprintln!(
+                "skipping a_removal_failure_is_reported_and_does_not_abort_the_rest: this \
+                 process can bypass directory permissions (running as root?), so EACCES \
+                 cannot be forced and the assertions would be vacuous"
+            );
+            return;
+        }
+
         let dir = tmp.path();
         let stuck = dir.join("run-stuck.jsonl");
         let removable = dir.join("run-removable.jsonl");
@@ -998,6 +1039,15 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::TempDir::new().unwrap();
+        if !permission_denial_is_enforced() {
+            eprintln!(
+                "skipping a_metadata_read_failure_is_reported_and_does_not_abort_the_rest: \
+                 this process can bypass directory permissions (running as root?), so the \
+                 metadata read cannot be made to fail"
+            );
+            return;
+        }
+
         let dir = tmp.path();
         let blocked = dir.join("run-blocked.jsonl");
         std::fs::write(&blocked, "{}\n").unwrap();
