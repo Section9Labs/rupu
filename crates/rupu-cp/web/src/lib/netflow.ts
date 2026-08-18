@@ -42,15 +42,16 @@ export type NodeSide = 'source' | 'endpoint';
 /**
  * `rupu_netflow::ctx::Origin` — adjacently tagged (`tag = "kind", content =
  * "name"`). `name` is present only for the variants that carry data
- * (`provider` / `scm` / `mcp`); the unit variants (`webhook` / `update` /
- * `cp` / `system`) serialize with no `name` key at all, not `name: null`.
+ * (`provider` / `scm`); the unit variants (`update` / `cp` / `system`)
+ * serialize with no `name` key at all, not `name: null`.
  *
- * `mcp` and `webhook` are never constructed in practice (see the netflow
- * Plan 3 Task 4 brief) — don't build UI affordances that assume they occur,
- * but keep them in the type since the wire format allows them.
+ * This lists only egress that can actually occur, mirroring the Rust enum:
+ * `mcp` and `webhook` don't exist because neither subsystem makes outbound
+ * HTTP (MCP dispatches into SCM connectors, which tag their own calls
+ * `scm`; the webhook server is inbound-only).
  */
 export interface Origin {
-  kind: 'provider' | 'scm' | 'mcp' | 'webhook' | 'update' | 'cp' | 'system';
+  kind: 'provider' | 'scm' | 'update' | 'cp' | 'system';
   name?: string;
 }
 
