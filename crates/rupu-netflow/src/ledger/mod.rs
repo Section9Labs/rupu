@@ -7,7 +7,7 @@ pub use paths::{
     NetflowPaths, LEGACY_LEDGER_FILENAME,
 };
 pub use views::{
-    graph_view, host_rollup, read_dropped_total, read_flows, read_flows_and_dropped, GraphEdge,
-    GraphNode, GraphView, HostRollup, NodeSide,
+    graph_view, host_rollup, read_dropped_total, read_flows, read_flows_and_dropped,
+    read_flows_in_range, GraphEdge, GraphNode, GraphView, HostRollup, NodeSide, TimeRange,
 };
 pub use writer::{NetflowWriter, NetflowWriterHandle};

@@ -43,7 +43,7 @@ describe('Netflow global page', () => {
         },
       ],
       hosts: [{ host: 'api.github.com', port: 443, calls: 1, bytes_in: 10, bytes_out: 5, errors: 0, p50_ms: 12, p95_ms: 12 }],
-      dropped: 0,
+      dropped_total: 0,
       asn_loaded: true,
     });
     fetchNetflowGraph.mockResolvedValue({ nodes: [], edges: [] });
@@ -60,7 +60,7 @@ describe('Netflow global page', () => {
     // which passed even when the dropped count silently vanished — the
     // name overclaimed what it verified. NetflowTable now renders the
     // dropped banner alongside the empty state rather than instead of it.
-    fetchGlobalNetflow.mockResolvedValue({ flows: [], hosts: [], dropped: 9, asn_loaded: true });
+    fetchGlobalNetflow.mockResolvedValue({ flows: [], hosts: [], dropped_total: 9, asn_loaded: true });
     fetchNetflowGraph.mockResolvedValue({ nodes: [], edges: [] });
 
     render(<MemoryRouter><Netflow /></MemoryRouter>);
@@ -71,7 +71,7 @@ describe('Netflow global page', () => {
   });
 
   it('fetches global scope by omitting the scope param entirely', async () => {
-    fetchGlobalNetflow.mockResolvedValue({ flows: [], hosts: [], dropped: 0, asn_loaded: true });
+    fetchGlobalNetflow.mockResolvedValue({ flows: [], hosts: [], dropped_total: 0, asn_loaded: true });
     fetchNetflowGraph.mockResolvedValue({ nodes: [], edges: [] });
 
     render(<MemoryRouter><Netflow /></MemoryRouter>);
@@ -81,7 +81,7 @@ describe('Netflow global page', () => {
   });
 
   it('states the scope limit and the non-HTTP blind spot up front', async () => {
-    fetchGlobalNetflow.mockResolvedValue({ flows: [], hosts: [], dropped: 0, asn_loaded: true });
+    fetchGlobalNetflow.mockResolvedValue({ flows: [], hosts: [], dropped_total: 0, asn_loaded: true });
     fetchNetflowGraph.mockResolvedValue({ nodes: [], edges: [] });
 
     render(<MemoryRouter><Netflow /></MemoryRouter>);
