@@ -213,9 +213,11 @@ impl CollectionOutput for NetflowPruneOutput {
             println!("would reclaim {would_reclaim} byte(s)");
         }
         println!(
-            "ledgers newer than the cutoff, and anything that is not a per-run \
-             ledger file (the directory's own `.gitignore`, a legacy \
-             `flows.jsonl`), are left untouched."
+            "ledgers newer than the cutoff, anything modified in roughly the \
+             last {} hour(s) regardless of the cutoff, and anything that is \
+             not a per-run ledger file (the directory's own `.gitignore`, a \
+             legacy `flows.jsonl`), are left untouched.",
+            MIN_LEDGER_AGE.num_hours(),
         );
         Ok(())
     }
@@ -264,14 +266,36 @@ async fn prune(
     // `rupu-netflow`'s own path helpers, not hardcoded here a second
     // time — see `rupu_netflow::ledger::paths`'s doc comment on why a
     // second copy of this suffix is exactly the drift it warns against.
+    //
+    // DEDUP by canonicalized path before the sweep — `project_root_for`
+    // walks up looking for ANY `.rupu/` directory, and the global root
+    // IS `~/.rupu`, so running from `$HOME` (or anywhere under it that
+    // isn't inside a rupu project) resolves `project_root = ~`, which
+    // makes `project_local_netflow_dir(~)` and `global_netflow_dir`
+    // literally the same directory. Undeduped, that directory would be
+    // swept twice: the real prune is harmless (the second pass finds
+    // the files already gone), but `--dry-run` would list every
+    // eligible ledger twice and report double the reclaimable bytes —
+    // the one number an operator is consulting the preview for. Same
+    // fix shape `transcript prune` (`canonicalize(&p).unwrap_or_else
+    // (|_| p.clone())`, `cmd/transcript.rs`) and `rupu-cp`'s read side
+    // (`canonicalize_or_self`) already use for the identical collision.
+    // The FIRST occurrence wins, so "project" is kept over "global"
+    // when the two collide — a project-scoped ledger reads better than
+    // a global one in the report.
     let mut candidates: Vec<(&'static str, PathBuf)> = Vec::new();
+    let mut seen_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let dedupe_key = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     if let Some(root) = project_root.as_deref() {
         let local = rupu_netflow::project_local_netflow_dir(root);
-        if local.is_dir() {
+        if local.is_dir() && seen_dirs.insert(dedupe_key(&local)) {
             candidates.push(("project", local));
         }
     }
-    candidates.push(("global", rupu_netflow::global_netflow_dir(&global)));
+    let global_netflow = rupu_netflow::global_netflow_dir(&global);
+    if seen_dirs.insert(dedupe_key(&global_netflow)) {
+        candidates.push(("global", global_netflow));
+    }
 
     let mut rows = Vec::new();
     // Two DIFFERENT failure shapes, both non-silent: `failures` is a
@@ -378,6 +402,18 @@ async fn prune(
 }
 
 fn run_id_from_ledger_path(path: &Path) -> String {
+    // A directory-entry read failure (see `prune_ledgers`'s "Partial
+    // failure" doc section) is recorded against the DIRECTORY itself,
+    // not a `.jsonl` file — no path was ever identified for it.
+    // `file_stem()` on a bare directory path returns its last
+    // component (e.g. `netflow`), which would print as a run id and
+    // read like a specific run failed when none was ever named. Any
+    // real ledger entry — success or a per-file failure — always has a
+    // `.jsonl` path, so gating on the extension cleanly separates the
+    // two cases.
+    if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+        return "-".to_string();
+    }
     path.file_stem()
         .and_then(|value| value.to_str())
         .map(ToOwned::to_owned)
@@ -634,6 +670,23 @@ mod tests {
         let then =
             std::time::SystemTime::now() - std::time::Duration::from_secs(days_ago * 24 * 60 * 60);
         file.set_modified(then).unwrap();
+    }
+
+    #[test]
+    fn run_id_from_ledger_path_uses_a_sentinel_for_a_non_jsonl_path() {
+        // Minor 3 (netflow-per-run Plan 3 Task 2 review round 2): a
+        // directory-entry read failure is recorded against the
+        // directory itself, not a `.jsonl` file. `file_stem()` on that
+        // bare directory path would print its own last component
+        // (`netflow`) as though it were a failed run's id.
+        assert_eq!(
+            run_id_from_ledger_path(Path::new("/home/x/.rupu/netflow")),
+            "-"
+        );
+        assert_eq!(
+            run_id_from_ledger_path(Path::new("/home/x/.rupu/netflow/run_01ABC.jsonl")),
+            "run_01ABC"
+        );
     }
 
     #[test]
