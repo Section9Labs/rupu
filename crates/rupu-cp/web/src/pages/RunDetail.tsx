@@ -1294,7 +1294,7 @@ export default function RunDetail() {
                 <NetflowSummary hosts={netflow.hosts} />
                 <NetflowTable
                   flows={netflow.flows}
-                  dropped={netflow.dropped_total}
+                  droppedTotal={netflow.dropped_total}
                   asnLoaded={netflow.asn_loaded}
                   scope="run"
                 />

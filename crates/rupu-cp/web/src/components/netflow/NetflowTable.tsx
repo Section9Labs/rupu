@@ -9,12 +9,13 @@
 //     `0 B` — an unobserved byte count must never read as a real zero.
 //   - The fidelity badge is unconditional: every row gets one, so a Coarse
 //     row never LOOKS as complete as an HTTP row.
-//   - `dropped > 0` gets a loud banner — the list is silently incomplete
-//     without it, which is the exact defect this subsystem prevents. This
-//     banner renders even when `flows` is empty (an all-dropped scope):
-//     the empty state and the loss banner are not mutually exclusive, and
-//     showing only the empty state there would be the same silent-loss
-//     defect in its worst form.
+//   - `droppedTotal > 0` gets a loud banner, explicitly scoped ("full
+//     history") to the whole ledger rather than any active date filter —
+//     the list is silently incomplete without it, which is the exact
+//     defect this subsystem prevents. This banner renders even when
+//     `flows` is empty (an all-dropped scope): the empty state and the
+//     loss banner are not mutually exclusive, and showing only the empty
+//     state there would be the same silent-loss defect in its worst form.
 //   - `asnLoaded === false` gets its own note: a blank Network column would
 //     read as "this peer has no ASN", not "enrichment wasn't available".
 //   - The empty state states netflow's scope limit (rupu's own egress, not
@@ -32,9 +33,15 @@ import {
 
 export interface NetflowTableProps {
   flows: FlowView[];
-  /** Records lost to writer overflow. Non-zero means this list is
-   *  incomplete — surfaced as a banner, never silently absorbed. */
-  dropped: number;
+  /** Records lost to writer overflow, for the WHOLE ledger — never scoped
+   *  to whatever date range (if any) produced `flows`. Named to match the
+   *  wire field (`NetflowResponse.dropped_total`) rather than a bare
+   *  `dropped`, and the banner text below echoes the same "whole history"
+   *  scope, so this number can't misread as "lost within the current
+   *  view" the moment a date-range picker sits above this table (Task 4).
+   *  Non-zero means this list is incomplete — surfaced as a banner, never
+   *  silently absorbed. */
+  droppedTotal: number;
   /** `false` means ASN enrichment was unavailable, not that flows lack an
    *  ASN. Drives an explanatory note rather than a blank Network column. */
   asnLoaded: boolean;
@@ -50,34 +57,43 @@ function originLabel(f: FlowView): string {
 }
 
 /**
- * `dropped > 0` banner — factored out so it renders identically whether the
- * surviving-flows list is empty or not. Fix round 1: this used to live only
- * in the non-empty return path, so a scope where EVERY flow was dropped
- * rendered a bare "No network flows recorded" with zero indication that
- * anything was lost — the exact silent-incompleteness defect this banner
- * exists to prevent, reachable in the one case (all-dropped) where it
- * matters most. The empty state and the loss banner are not mutually
- * exclusive; the loss is the more important of the two, so it renders
- * first.
+ * `droppedTotal > 0` banner — factored out so it renders identically
+ * whether the surviving-flows list is empty or not. Fix round 1: this used
+ * to live only in the non-empty return path, so a scope where EVERY flow
+ * was dropped rendered a bare "No network flows recorded" with zero
+ * indication that anything was lost — the exact silent-incompleteness
+ * defect this banner exists to prevent, reachable in the one case
+ * (all-dropped) where it matters most. The empty state and the loss banner
+ * are not mutually exclusive; the loss is the more important of the two, so
+ * it renders first.
+ *
+ * Netflow Plan 3 Task 3, review round 1: the copy explicitly says "full
+ * history" rather than just "N flows dropped" — `droppedTotal` is the whole
+ * ledger's loss regardless of any date-range filter applied to `flows`
+ * (`NetflowResponse.dropped_total`'s doc comment), and once Task 4 puts a
+ * date picker above this table, an unqualified count would read as
+ * "dropped within the selected range", which is exactly the silent-gap
+ * misreading this whole subsystem exists to prevent.
  */
-function DroppedBanner({ dropped }: { dropped: number }) {
-  if (dropped <= 0) return null;
+function DroppedBanner({ droppedTotal }: { droppedTotal: number }) {
+  if (droppedTotal <= 0) return null;
   return (
     <div
       role="status"
       className="rounded-lg border border-warn/30 bg-warn-bg px-4 py-2 text-sm text-warn"
     >
-      <span className="font-medium">{dropped} flows dropped</span> — the capture buffer
-      overflowed, so this list is incomplete.
+      <span className="font-medium">{droppedTotal} flows dropped</span> across this
+      ledger's full history — the capture buffer overflowed at some point, so this list
+      may be incomplete regardless of any date range shown here.
     </div>
   );
 }
 
-export function NetflowTable({ flows, dropped, asnLoaded, scope = 'run' }: NetflowTableProps) {
+export function NetflowTable({ flows, droppedTotal, asnLoaded, scope = 'run' }: NetflowTableProps) {
   if (flows.length === 0) {
     return (
       <div className="space-y-3">
-        <DroppedBanner dropped={dropped} />
+        <DroppedBanner droppedTotal={droppedTotal} />
         <EmptyState
           title="No network flows recorded for this scope"
           hint={netflowEmptyStateHint(scope)}
@@ -177,7 +193,7 @@ export function NetflowTable({ flows, dropped, asnLoaded, scope = 'run' }: Netfl
 
   return (
     <div className="space-y-3">
-      <DroppedBanner dropped={dropped} />
+      <DroppedBanner droppedTotal={droppedTotal} />
       {!asnLoaded && (
         <p className="text-note text-ink-mute">
           ASN data not loaded — network enrichment will appear once the table has been fetched.

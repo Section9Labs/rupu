@@ -90,7 +90,7 @@ export default function ProjectNetworkTab({ wsId }: { wsId: string }) {
         <>
           {graph && <NetflowGraph graph={graph} scope="project" />}
           <NetflowSummary hosts={data.hosts} />
-          <NetflowTable flows={data.flows} dropped={data.dropped_total} asnLoaded={data.asn_loaded} scope="project" />
+          <NetflowTable flows={data.flows} droppedTotal={data.dropped_total} asnLoaded={data.asn_loaded} scope="project" />
         </>
       )}
     </div>

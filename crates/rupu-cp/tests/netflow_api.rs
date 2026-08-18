@@ -1253,6 +1253,103 @@ async fn a_range_query_returns_only_flows_inside_the_window() {
     assert_eq!(flows[0]["id"], in_window.id.to_string());
 }
 
+/// Important 1 (Fix round 1 review): the bypass Task 3 found and fixed —
+/// `run_scoped_flows_and_dropped` filtering the ledger read by range but
+/// then unconditionally re-adding whatever `merge_with_transcript` recovers
+/// — had NO regression test. This is the model fixture
+/// (`run_netflow_route_merges_ledger_and_transcript_dedupes_and_excludes_
+/// other_runs`) with a window applied and a transcript-only flow placed
+/// OUTSIDE it: no ledger counterpart exists for this flow at all, so the
+/// only way it could appear in the response is via the unfiltered merge
+/// output — which is exactly the code path the `.filter(|f| range.
+/// contains(f.ts))` at the end of `run_scoped_flows_and_dropped` guards.
+/// Deleting that filter must turn this test red.
+#[tokio::test]
+async fn run_scope_time_range_excludes_an_out_of_window_transcript_only_flow() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_id = "run_tr_merge";
+
+    let id_in = FlowId::new();
+    let ledger_flow_in_window = flow_at(id_in, "in.example", at(150));
+    write_ledger(
+        project.path(),
+        run_id,
+        &[LedgerLine::Flow(Box::new(ledger_flow_in_window))],
+    );
+
+    // Transcript-only flow: no ledger counterpart anywhere, and its `ts` is
+    // OUTSIDE the window this test queries for. If the merge's output were
+    // ever re-exposed without a second filter pass, this is exactly the
+    // flow that would leak back in.
+    let id_out = FlowId::new();
+    let transcript_only_out_of_window = {
+        let mut f = e2e_flow(
+            id_out,
+            None,
+            "recovered.example",
+            Origin::Scm("github".into()),
+        );
+        f.ts = at(500);
+        f
+    };
+    let transcript_path = project
+        .path()
+        .join(".rupu")
+        .join("transcripts")
+        .join("s1.jsonl");
+    let mut w = JsonlWriter::create(&transcript_path).unwrap();
+    w.write(&TxEvent::NetFlow {
+        flow: Box::new(transcript_only_out_of_window),
+    })
+    .unwrap();
+    w.flush().unwrap();
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+    state
+        .run_store
+        .append_step_result(run_id, &seed_step(run_id, transcript_path))
+        .unwrap();
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/runs/{run_id}/netflow?from={}&to={}",
+        qs(at(100)),
+        qs(at(200)),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let flows = body["flows"].as_array().unwrap();
+    let ids: std::collections::HashSet<String> = flows
+        .iter()
+        .map(|f| f["id"].as_str().unwrap().to_string())
+        .collect();
+
+    assert!(
+        ids.contains(&id_in.to_string()),
+        "the in-window ledger flow must still be present: {body}"
+    );
+    assert!(
+        !ids.contains(&id_out.to_string()),
+        "a transcript-only flow recovered by the merge, but outside the \
+         requested window, must NOT leak into a filtered response: {body}"
+    );
+    assert_eq!(
+        flows.len(),
+        1,
+        "exactly the in-window flow, nothing recovered-but-out-of-window: {body}"
+    );
+}
+
 #[tokio::test]
 async fn absent_bounds_return_everything() {
     let global = tempfile::tempdir().unwrap();
@@ -1288,6 +1385,61 @@ async fn absent_bounds_return_everything() {
         2,
         "no from/to must behave exactly as before the feature existed: {body}"
     );
+    assert!(
+        body["window"]["from"].is_null() && body["window"]["to"].is_null(),
+        "no filter requested must echo a null window, not omit the key: {body}"
+    );
+}
+
+/// Minor 4 (Task 3 review round 1): the applied window must be echoed back
+/// verbatim so a caller has positive confirmation its filter was honoured,
+/// distinct from `dropped_total`'s whole-file scope.
+#[tokio::test]
+async fn response_echoes_the_applied_window() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_id = "run_tr";
+
+    write_ledger(
+        project.path(),
+        run_id,
+        &[LedgerLine::Flow(Box::new(flow_at(
+            FlowId::new(),
+            "a.example",
+            at(150),
+        )))],
+    );
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/runs/{run_id}/netflow?from={}&to={}",
+        qs(at(100)),
+        qs(at(200)),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    // Compare parsed instants, not raw strings: chrono's serde
+    // serialization renders a UTC `DateTime` with a `Z` suffix, while
+    // `.to_rfc3339()` (used by `qs()` to build the request) renders
+    // `+00:00` — both are valid RFC 3339 for the same instant, so a
+    // string-literal comparison would be a false negative here.
+    let got_from: chrono::DateTime<chrono::Utc> =
+        body["window"]["from"].as_str().unwrap().parse().unwrap();
+    let got_to: chrono::DateTime<chrono::Utc> =
+        body["window"]["to"].as_str().unwrap().parse().unwrap();
+    assert_eq!(got_from, at(100));
+    assert_eq!(got_to, at(200));
 }
 
 #[tokio::test]
@@ -1604,6 +1756,144 @@ async fn graph_scope_time_range_filters_edges() {
     assert!(
         !nodes.iter().any(|n| n["id"] == "out.example:443"),
         "the out-of-window endpoint must not appear as a node: {body}"
+    );
+}
+
+/// "Also fold in if cheap" (Task 3 review round 1): the prior
+/// `graph_scope_time_range_filters_edges` only exercised the global
+/// fall-through (no `scope=` param) — the `run:`/`project:` sub-scopes
+/// each have their own read path in `get_netflow_graph`/
+/// `run_scoped_flows_for_graph`, so filtering there needs its own proof.
+#[tokio::test]
+async fn graph_scope_run_time_range_filters_edges() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_id = "run_graph_tr";
+
+    write_ledger(
+        project.path(),
+        run_id,
+        &[
+            LedgerLine::Flow(Box::new(flow_at(FlowId::new(), "in.example", at(150)))),
+            LedgerLine::Flow(Box::new(flow_at(FlowId::new(), "out.example", at(500)))),
+        ],
+    );
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+
+    let addr = serve(state).await;
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/netflow/graph?scope=run:{run_id}&from={}&to={}",
+        qs(at(100)),
+        qs(at(200)),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let nodes = body["nodes"].as_array().unwrap();
+    assert!(nodes.iter().any(|n| n["id"] == "in.example:443"));
+    assert!(
+        !nodes.iter().any(|n| n["id"] == "out.example:443"),
+        "run scope's graph must respect the window too: {body}"
+    );
+}
+
+#[tokio::test]
+async fn graph_scope_project_time_range_filters_edges() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    write_ledger(
+        project.path(),
+        "run-a",
+        &[
+            LedgerLine::Flow(Box::new(flow_at(FlowId::new(), "in.example", at(150)))),
+            LedgerLine::Flow(Box::new(flow_at(FlowId::new(), "out.example", at(500)))),
+        ],
+    );
+
+    let store = rupu_workspace::WorkspaceStore {
+        root: global.path().join("workspaces"),
+    };
+    let ws = rupu_workspace::upsert(&store, project.path()).unwrap();
+
+    let addr = serve(new_state(global.path())).await;
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/netflow/graph?scope=project:{}&from={}&to={}",
+        ws.id,
+        qs(at(100)),
+        qs(at(200)),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let nodes = body["nodes"].as_array().unwrap();
+    assert!(nodes.iter().any(|n| n["id"] == "in.example:443"));
+    assert!(
+        !nodes.iter().any(|n| n["id"] == "out.example:443"),
+        "project scope's graph must respect the window too: {body}"
+    );
+}
+
+/// "Also fold in if cheap": `an_inverted_range_contains_nothing` already
+/// proves `from > to` is an empty window at the `TimeRange` unit-test
+/// level — this is the HTTP-layer counterpart, proving the route doesn't
+/// reject an inverted range as malformed (it's a well-formed pair of
+/// timestamps, just an unsatisfiable window) nor silently swap/ignore it.
+#[tokio::test]
+async fn an_inverted_window_is_a_valid_empty_result_not_a_400() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run_id = "run_tr";
+
+    write_ledger(
+        project.path(),
+        run_id,
+        &[LedgerLine::Flow(Box::new(flow_at(
+            FlowId::new(),
+            "a.example",
+            at(150),
+        )))],
+    );
+
+    let state = new_state(global.path());
+    state
+        .run_store
+        .create(
+            seed_run(run_id, project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+
+    let addr = serve(state).await;
+    // `from` (200) is AFTER `to` (100) — well-formed timestamps, inverted
+    // order.
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/runs/{run_id}/netflow?from={}&to={}",
+        qs(at(200)),
+        qs(at(100)),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "an inverted range is a valid (empty) request, not a 400"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["flows"].as_array().unwrap().len(),
+        0,
+        "no timestamp can satisfy both bounds: {body}"
     );
 }
 
